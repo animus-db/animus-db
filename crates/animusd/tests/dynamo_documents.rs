@@ -5,6 +5,7 @@
 //! driven by the actual DynamoDB JSON protocol over hand-written HTTP/1.1. Real
 //! time/sockets, so it polls with generous timeouts.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use animusd::{Node, bind_cluster, start_cluster};
@@ -62,6 +63,34 @@ async fn dynamo(addr: std::net::SocketAddr, target: &str, body: &str) -> (u16, S
         .and_then(|code| code.parse().ok())
         .expect("status line");
     (status, payload.to_string())
+}
+
+/// Poll a GSI `Query` until `accept` is satisfied, returning the last body
+/// observed. A GSI is materialized **asynchronously** by the drain (ADR 0041
+/// §4/§5) — DynamoDB's own eventually-consistent contract — so every
+/// assertion against one must be a converged-or-timeout poll, never a fixed
+/// sleep followed by a one-shot check. (An LSI, in contrast, is written
+/// atomically with the base row and stays a plain immediate assertion.)
+async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> bool) -> String {
+    let last = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = std::sync::Arc::clone(&last);
+    let converged = async move {
+        loop {
+            let (status, got) = dynamo(addr, "DynamoDB_20120810.Query", body).await;
+            if status == 200 && accept(&got) {
+                return got;
+            }
+            *seen.lock().unwrap() = got;
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    match timeout(Duration::from_secs(15), converged).await {
+        Ok(body) => body,
+        Err(_) => panic!(
+            "GSI query never converged within 15s (last saw: {})",
+            last.lock().unwrap()
+        ),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -226,29 +255,27 @@ async fn multiple_gsis_composite_gsi_and_lsi() {
     put(addr0, "p1", "c", "click", "bob", "20").await;
     put(addr0, "p2", "a", "click", "alice", "05").await;
 
-    // Hash-only GSI by-kind = click: three items (p1/a, p1/c, p2/a).
-    let (status, body) = dynamo(
+    // Hash-only GSI by-kind = click: three items (p1/a, p1/c, p2/a). GSI rows
+    // are materialized asynchronously by the drain (ADR 0041 §4/§5), so this
+    // is a converged-or-timeout poll.
+    await_gsi_query(
         addr1,
-        "DynamoDB_20120810.Query",
         r#"{"TableName":"events","IndexName":"by-kind",
             "KeyConditionExpression":"kind = :k",
             "ExpressionAttributeValues":{":k":{"S":"click"}}}"#,
+        |b| b.contains("\"Count\":3"),
     )
     .await;
-    assert_eq!(status, 200, "GSI by-kind failed: {body}");
-    assert!(body.contains("\"Count\":3"), "by-kind: {body}");
 
     // Composite GSI by-actor-ts: actor=alice, ts BETWEEN 10 AND 30 → p1/a, p1/b.
-    let (status, body) = dynamo(
+    let body = await_gsi_query(
         addr1,
-        "DynamoDB_20120810.Query",
         r#"{"TableName":"events","IndexName":"by-actor-ts",
             "KeyConditionExpression":"actor = :a AND ts BETWEEN :lo AND :hi",
             "ExpressionAttributeValues":{":a":{"S":"alice"},":lo":{"S":"10"},":hi":{"S":"30"}}}"#,
+        |b| b.contains("\"Count\":2"),
     )
     .await;
-    assert_eq!(status, 200, "composite GSI failed: {body}");
-    assert!(body.contains("\"Count\":2"), "by-actor-ts count: {body}");
     // p2/a (ts 05) is excluded by the BETWEEN; the items are ts-ordered (b, a).
     let b = body.find(r#""sk":{"S":"b"}"#).expect("b present");
     let a = body.find(r#""sk":{"S":"a"}"#).expect("a present");

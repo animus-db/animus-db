@@ -301,7 +301,33 @@ here.
 - **Deleted**: `note_put`, `note_delete`, `index_query_keys`,
   `backfill_index_if_needed`, `touched_since_backfill`, and the registry's
   in-memory index entry maps. `SchemaRegistry` keeps only definition
-  reconciliation (`sync_indexes`).
+  reconciliation (`sync_indexes`, `index_projected_attributes`,
+  `index_is_composite`).
+
+> **As-built corrective note (2026-08-13, the native read path's landing).**
+> A GSI `Query` scans the hidden table directly — `partition_token(ihash) ||
+> escape(ihash)`, narrowed to `escape(ihash) || escape(isort)` for an `Equals`
+> sort condition, filtering every other shape on the recovered sort segment
+> (`animus_dynamo::index::parse_gsi_row_key`) — mirroring the drain's own
+> `gsi_row_key` byte-for-byte, with **no per-key base-table read-back**: a row's
+> stored value is already the drain's projected image. A hidden table with no
+> tablet yet (an index that has never drained anything) reads as **empty**
+> rather than waiting on routing, the same gate `ClientCtx::cp_get` uses for an
+> unprovisioned table — this is the eventually-consistent contract surfacing at
+> read time, not a bug.
+>
+> An LSI `Query` needed one new primitive each in `animus-cp-data` and
+> `animusd`: `RaftKvNode::linearizable_scan_kind` (the ReadIndex-barrier dual of
+> `local_scan_kind`, since a non-base scope only ever holds committed values —
+> no intent resolution needed) and `ClientCtx::cp_scan_kind` (routes by the
+> scan's start key, since an LSI query is scoped to one base partition — one
+> tablet by construction — verifying start/end resolve to the same tablet, the
+> read-side scope pre-check `cp_scan_local` already does for a base scan, and
+> forwarding via a new **internal-only** `ClientRequest::KindScan`, refused bare
+> exactly like `KindWrite`, handled only inside `cp_serve_forwarded`). Neither
+> index `Query` supports `Limit`/`ExclusiveStartKey`/`LastEvaluatedKey`
+> pagination — a pre-existing gap this PR did not close, since a base `Query`
+> never gained it either (only `Scan` did).
 
 Adding or dropping an index on a **populated** table (`UpdateTable`, with an
 `IndexStatus` lifecycle and a backfill) is **deferred to a follow-up**; indexes

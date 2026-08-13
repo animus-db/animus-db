@@ -219,6 +219,21 @@ impl CpGroup {
         }
     }
 
+    /// Linearizable ReadIndex range scan of a non-base row-kind scope (ADR
+    /// 0041 §3) — the LSI `Query` read primitive. See
+    /// [`RaftKvNode::linearizable_scan_kind`].
+    async fn linearizable_scan_kind(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: &[u8],
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            CpGroup::Lsm(n) => n.linearizable_scan_kind(kind, start, end).await,
+            CpGroup::Mem(n) => n.linearizable_scan_kind(kind, start, end).await,
+        }
+    }
+
     /// As [`put_fenced`](Self::put_fenced), but for a delete (tombstone). See
     /// [`RaftKvNode::delete_fenced`].
     fn delete_fenced(&self, key: Vec<u8>, fence: KeyRange) -> ProposeResult {
@@ -922,6 +937,26 @@ pub enum ClientRequest {
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         #[serde(default)]
         change_log: Option<(Vec<u8>, Vec<u8>)>,
+    },
+    /// **Internal index-read RPC — never sent bare, only wrapped in
+    /// [`Forwarded`](Self::Forwarded)** (ADR 0041 §5): a **linearizable**
+    /// range scan of one of `table`'s non-base row-kind scopes over
+    /// `[start, end)` — the forwarding payload behind an LSI `Query`
+    /// (`KIND_LSI`). Unlike [`Scan`](Self::Scan), `start`/`end` must resolve
+    /// to the **same tablet** (an LSI query is scoped to one base partition,
+    /// which is one tablet by construction), so this is never a per-table
+    /// fan-out.
+    ///
+    /// Bare delivery is rejected for the same reason [`KindWrite`](Self::KindWrite)
+    /// is: this reads a scope a client operation never names directly, and
+    /// exposing it bare would let an arbitrary caller read a table's
+    /// LSI/change-log/footprint bytes by kind number rather than through the
+    /// DynamoDB surface that interprets them.
+    KindScan {
+        table: String,
+        kind: u8,
+        start: Vec<u8>,
+        end: Vec<u8>,
     },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
@@ -5446,6 +5481,90 @@ impl ClientCtx {
         }
     }
 
+    /// Linearizable CP range scan of one of `table`'s non-base row-kind
+    /// scopes over `[start, end)` (ADR 0041 §3/§5) — the LSI `Query` read
+    /// primitive. **Not** a per-table fan-out like [`cp_scan`](Self::cp_scan):
+    /// an LSI query is scoped to one base partition, which is one tablet by
+    /// construction (the same tablet the base row itself lives on), so
+    /// `start` and `end` must resolve to that same tablet — checked here
+    /// rather than assumed, mirroring [`cp_kind_write`](Self::cp_kind_write)'s
+    /// cross-tablet guard: silently scanning only the first tablet's share of
+    /// a straddling range would be a silent partial read.
+    pub(crate) async fn cp_scan_kind(
+        &self,
+        table: &str,
+        kind: u8,
+        start: Vec<u8>,
+        end: Vec<u8>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        let start_tablet = self
+            .tablet_for(table, &start)
+            .ok_or_else(|| format!("no tablet owns the kind-scan start of table `{table}`"))?;
+        if self.tablet_for(table, &end) != Some(start_tablet) {
+            return Err(format!(
+                "kind-scan range of table `{table}` spans more than one tablet; \
+                 an LSI query is scoped to one partition"
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            let err = match self.cp_route(table, &start).await {
+                CpRoute::Local(leader) => {
+                    match Self::cp_scan_kind_local(&leader, kind, &start, &end).await {
+                        Ok(p) => return Ok(p),
+                        Err(e) => e,
+                    }
+                }
+                CpRoute::Forward(addr) => {
+                    let request = ClientRequest::KindScan {
+                        table: table.to_owned(),
+                        kind,
+                        start: start.clone(),
+                        end: end.clone(),
+                    };
+                    match self.cp_forward(table, &start, addr, request).await {
+                        ClientResponse::Pairs(p) => return Ok(p),
+                        ClientResponse::Error(e) => e,
+                        other => {
+                            return Err(format!(
+                                "unexpected reply to forwarded CP kind scan: {other:?}"
+                            ));
+                        }
+                    }
+                }
+                CpRoute::None => return Err("no CP group leader reachable".into()),
+            };
+            if !Self::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+                return Err(err);
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Serve a linearizable **kind-scoped scan** on a known-leader local
+    /// handle, enforcing the read-side scope pre-check (ADR 0033) — the
+    /// kind-scan dual of [`cp_scan_local`](Self::cp_scan_local): a scope that
+    /// has not yet caught up to the metadata-derived request window (a
+    /// merge's widen in flight) would otherwise silently truncate the results
+    /// rather than error.
+    async fn cp_scan_kind_local(
+        leader: &CpGroup,
+        kind: u8,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        let requested = KeyRange::new(start.to_vec(), Some(end.to_vec()));
+        if !leader.scope_range().contains_range(&requested) {
+            return Err(format!(
+                "scan window {requested:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
+            ));
+        }
+        match leader.linearizable_scan_kind(kind, start, end).await {
+            Some(p) => Ok(p),
+            None => Err("CP group leader moved; retry".into()),
+        }
+    }
+
     /// Propose a CP write on a **known-leader** local handle and wait until it is
     /// committed + durable + applied before returning — durable-before-ack.
     ///
@@ -6009,6 +6128,25 @@ impl ClientCtx {
                 // scope lagging the metadata-derived scan window would
                 // silently truncate results, not error.
                 match Self::cp_scan_local(&leader, &start, end.as_deref(), limit).await {
+                    Ok(p) => ClientResponse::Pairs(p),
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
+            // ADR 0041 §5: the LSI `Query` forwarding payload. `start`/`end`
+            // resolve to one tablet by construction (the forwarder already
+            // checked this in `cp_scan_kind`), so resolve the leader by
+            // `start` alone.
+            ClientRequest::KindScan {
+                table,
+                kind,
+                start,
+                end,
+            } => {
+                let tablet = self.tablet_for(&table, &start);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
+                };
+                match Self::cp_scan_kind_local(&leader, kind, &start, &end).await {
                     Ok(p) => ClientResponse::Pairs(p),
                     Err(e) => ClientResponse::Error(e),
                 }
@@ -7806,6 +7944,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::Put { .. } => "put",
         ClientRequest::PutBatch { .. } => "put_batch",
         ClientRequest::KindWrite { .. } => "kind_write",
+        ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::Get { .. } => "get",
         ClientRequest::Scan { .. } => "scan",
         ClientRequest::Delete { .. } => "delete",
@@ -7942,6 +8081,17 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         ClientRequest::KindWrite { .. } => ClientResponse::Error(
             "this request is an internal index-maintenance RPC and must be sent wrapped in \
              `Forwarded`"
+                .into(),
+        ),
+        // ADR 0041 §5: the LSI `Query` read primitive, the read-side dual of
+        // `KindWrite` just above and refused for the identical reason — a
+        // bare caller could otherwise read a table's LSI/change-log/
+        // footprint bytes by kind number directly, bypassing the DynamoDB
+        // surface that interprets them. Not a `MetaCommand`, so
+        // `is_relayable_command` does not apply; real handling lives in
+        // `cp_serve_forwarded`'s match, reached only through `Forwarded`.
+        ClientRequest::KindScan { .. } => ClientResponse::Error(
+            "this request is an internal index-read RPC and must be sent wrapped in `Forwarded`"
                 .into(),
         ),
         ClientRequest::TxnPrepare { .. }

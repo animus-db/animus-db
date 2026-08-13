@@ -3007,6 +3007,47 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .collect()
     }
 
+    /// A **linearizable** range scan of a non-base row-kind scope (ADR 0041
+    /// §3) via ReadIndex — the read-barrier dual of
+    /// [`local_scan_kind`](Self::local_scan_kind), and the read primitive
+    /// behind an LSI `Query` (the `KIND_LSI` scope). Same barrier + ceiling
+    /// drive as [`linearizable_scan`](Self::linearizable_scan): only the
+    /// confirmed leader serves it, so a deposed leader returns `None` rather
+    /// than a stale/partial range.
+    ///
+    /// A non-base scope only ever holds **committed** values (see
+    /// [`local_scan_kind`](Self::local_scan_kind)'s doc — only
+    /// [`KvCommand::KindBatch`] writes them, and it always commits outright),
+    /// so there is no intent to resolve here, unlike
+    /// [`linearizable_scan`](Self::linearizable_scan)'s base-scope reads.
+    /// Bounded on both ends, like `local_scan_kind` — every caller scans one
+    /// partition's contiguous sub-range, and an unbounded form would make an
+    /// accidental full-tablet read easy to write.
+    pub async fn linearizable_scan_kind(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: &[u8],
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        if !self.read_barrier().await {
+            return None;
+        }
+        let ts = self.hlc.mint(self.env.now());
+        if !self.ensure_ceiling_above(ts).await {
+            return None;
+        }
+        let rows = self.local_scan_kind(kind, start, end).await;
+        // Bump the *whole requested span*, mirroring `linearizable_scan`'s
+        // identical reasoning — a future write anywhere in `[start, end)` is
+        // pushed above this read regardless of how many rows it returned.
+        self.ts_cache.lock().expect("ts cache poisoned").bump(
+            start.to_vec(),
+            Some(end.to_vec()),
+            ts,
+        );
+        Some(rows)
+    }
+
     /// Every pending change-log record this tablet holds, in **commit order**
     /// (ADR 0041 §4): `(record key, encoded record)`.
     ///

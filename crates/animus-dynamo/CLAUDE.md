@@ -26,30 +26,40 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   `Query` sort conditions and conditional writes.
 - `registry` module — `SchemaRegistry`: a pure, in-memory per-table schema map
   (`create_table` / `create_table_with_indexes` / `create_table_legacy` /
-  `extract_key`) plus per-table secondary indexes (`note_put` / `note_delete`
-  maintain them; `index_query_keys` + `index_is_composite` +
-  `index_projected_attributes` query them). **The base-table written-key index is
-  gone** — base `Query`/`Scan` now use the data plane's native quorum range scan
-  (`DataClient::scan`), so `query_keys`/`scan_keys`/`ScanPage` were removed.
-  `note_put`/`note_delete` now maintain only the GSI/LSI entries (a no-op for a
-  table with no secondary indexes).
-  `SecondaryIndex` is either a `GlobalSecondaryIndex` (name + hash key attribute +
-  optional sort attribute + `IndexProjection`) or a `LocalSecondaryIndex` (name +
-  alternate sort attribute + `IndexProjection`, hashing by the base partition key).
-  Any number of indexes per table. `IndexProjection` is `All` / `KeysOnly` /
+  `extract_key`) plus per-table secondary-index **shape** bookkeeping
+  (`index_is_composite` + `index_projected_attributes` query it). **Neither the
+  base table's items nor a secondary index's entries are tracked here (ADR
+  0041 §5)** — a base `Query`/`Scan` uses the data plane's native quorum
+  range scan (`DataClient::scan`), and an index `Query` is now a *second*
+  native range scan (over a GSI's own hidden table or an LSI's colocated
+  `KIND_LSI` scope, `animusd::dynamo`'s `run_gsi_query`/`run_lsi_query`) —
+  neither reads this registry at all. What survives is purely the shape a
+  table needs regardless of any index entry: `SecondaryIndex` is either a
+  `GlobalSecondaryIndex` (name + hash key attribute + optional sort attribute
+  + `IndexProjection`) or a `LocalSecondaryIndex` (name + alternate sort
+  attribute + `IndexProjection`, hashing by the base partition key). Any
+  number of indexes per table. `IndexProjection` is `All` / `KeysOnly` /
   `Include(names)`; `index_projected_attributes` resolves it to the returned
-  attribute set (`None` ⇒ all). `RegistryError` carries the failure cause (incl.
-  `IndexSortMismatch` for a sort condition against a hash-only index).
+  attribute set (`None` ⇒ all) — used by neither read path today (an index
+  row's *stored* value is already projected by the writer/drain), kept as
+  definition-level API. `RegistryError` carries the failure cause (incl.
+  `IndexSortMismatch` for a sort condition against a hash-only index, though
+  that check itself now lives at the `animusd` edge, against the replicated
+  catalog's `IndexDef`, not this registry).
   `sync_indexes(table, schema, &[SecondaryIndex])` reconciles a table's index
-  *definitions* to a desired set (registering the table if absent), **preserving
-  entry data for an unchanged-shape index, clearing it for a changed-shape one, and
-  dropping a removed one** — how the edge rebuilds its index machinery from the
-  **replicated** definitions (ADR 0013) rather than process-local
-  `create_table_with_indexes` state.
-  **Note:** `animusd` now keeps the *table key schema* **and the GSI/LSI
-  definitions** in the **control plane's replicated catalog** (ADR 0013) and uses
-  this registry only for the GSI/LSI *entry data* (still in-memory, rebuilt from
-  writes).
+  *definitions* to a desired set (registering the table if absent) — a plain
+  resync now, not a merge: there is no per-index entry data left to preserve
+  or discard across a shape change, so a removed index is simply gone and a
+  changed/new one simply replaces/appears — how the edge rebuilds its
+  key/index-*definition* bookkeeping from the **replicated** definitions (ADR
+  0013) rather than process-local `create_table_with_indexes` state.
+  **Note:** `animusd` keeps the *table key schema* **and the GSI/LSI
+  definitions** in the **control plane's replicated catalog** (ADR 0013); this
+  registry mirrors only that definition shape now, nothing about index
+  contents (deleted: `note_put`/`note_delete`, `index_query_keys`,
+  `touched_since_backfill`/`mark_table_backfilled`/`index_needs_backfill`,
+  and the per-index `entries`/`entry_by_base` maps — see ADR 0041 §5's
+  as-built note).
 - `schema` module — the pure bridge between this crate's DynamoDB `TableSchema`
   (partition key + optional sort key) and the control plane's `TableSchema`
   (`animus_control`: partition key + ordered clustering keys + typed columns):
@@ -67,9 +77,11 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   the catalog.
 - `storage_key(pk, sk)` — the data-plane key for an item, exposed so a caller
   can route an item through `animus-data` without instantiating a local `Table`.
-- `index` module (**ADR 0041, codec only — not yet wired**) — every byte layout
-  materialized secondary indexes introduce, kept pure so the `animusd` edge, the
-  CQL edge and the drain agree by construction. Like `storage_key` these are
+- `index` module (**ADR 0041 — the codec every layer of materialized secondary
+  indexes is built on**: the write path, the GSI drain, and the native index
+  read path all construct/parse keys through these same functions) — every
+  byte layout materialized secondary indexes introduce, kept pure so every
+  layer agrees by construction. Like `storage_key` these are
   **within-table** keys: the ADR 0022 partition token is prepended at the
   `animusd` edge, and each builder documents *which* value to token-hash (the
   base partition key for base/LSI/marker keys, the **index hash value** for a GSI
@@ -136,8 +148,9 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   **pure** — no I/O, no storage, no network, `BTreeMap`/`BTreeSet` only (ADR 0003).
   `animusd::dynamo` owns the HTTP edge, **proposes `CreateTable`'s key schema into
   the control plane's replicated catalog (ADR 0013)** and reads schemas back from
-  `Metadata`, holds one process-wide `SchemaRegistry` (now only GSI/LSI + the
-  written-key index) behind a lock, and routes decoded ops through the data plane.
+  `Metadata`, holds one process-wide `SchemaRegistry` (now purely key-schema +
+  index-*shape* bookkeeping, ADR 0041 §5 — no index entries at all) behind a
+  lock, and routes decoded ops through the data plane.
 - This crate's `storage_key` = `escape(partition_key) || sort_key`, using an
   order-preserving, prefix-free escape (no key's encoding prefixes another's).
   So a partition's items are contiguous and sort-ordered, and `query` is one
@@ -155,25 +168,30 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   `[token(pk) || escape(pk), …)`; a `Scan` fans out across the table's tablets
   in token order and paginates with `Limit` +
   `ExclusiveStartKey`/`LastEvaluatedKey` over the **live** keys the scan returns.
-  An **index** `Query` still uses the in-memory GSI/LSI index (`index_query_keys`)
-  — the native scan covers the base keyspace, not an index's alternate ordering.
+  **An index `Query` (ADR 0041 §5) is now a *second* native range scan, not an
+  in-memory lookup**: a GSI `Query` scans the index's own hidden table
+  (`index_table_name`) over its token-prefixed hash-value range (`animusd`'s
+  `run_gsi_query`), and an LSI `Query` scans the base table's own tablet over
+  its `KIND_LSI` scope (`ClientCtx::cp_scan_kind`/`run_lsi_query`) — neither
+  reads the base keyspace or this crate's registry. Either way a sort
+  condition narrows the scan (an `Equals` GSI condition) or filters the
+  decoded rows by recovering the sort segment from the row's own key
+  (`index::parse_gsi_row_key`/`parse_lsi_row_key`); an index row's *stored*
+  value is already the declared projection (applied by the writer/drain), so
+  neither path ever reads the base item back.
   The range math (escape is prefix-free, ending `0x00 0x00`, so the first key past
   a prefix bumps the last byte to `0x01`) lives at the `animusd` edge.
   `Table::query_with` is the *local-engine* equivalent (a real engine scan),
   used by the item-API tests.
-- **Secondary indexes** (any number per table, GSI + LSI): `note_put` extracts
-  each index's hash attribute (for an LSI: the base partition key) and, for a
-  composite index, its sort attribute, recording an
-  `escape(hash) [|| escape(sort)] || base_key` entry (re-indexing on overwrite,
-  since attributes may change — the stale entry is dropped by recovering the base
-  key past 1 or 2 escaped segments); `note_delete` drops it. Only base keys are
-  stored — never item copies — so the base item is the single source of truth.
-  `index_query_keys` resolves a hash value's contiguous entry sub-range back to
-  its base keys, optionally narrowing by a `SortKeyCondition` on the recovered
-  sort bytes (a hash-only index rejects a sort condition with
-  `IndexSortMismatch`). The escapes are prefix-free, so the sort value and base
-  key are recoverable and one hash value's entries are contiguous and
-  sort-ordered.
+- **Secondary indexes** (any number per table, GSI + LSI) are materialized
+  **replicated data-plane rows** (ADR 0041), not anything this crate's
+  registry tracks. An LSI row is written atomically with the base row
+  (`animusd::dynamo::kind_writes_for_item`, one `KvCommand::KindBatch` Raft
+  entry); a GSI row is materialized asynchronously by a per-node drain
+  (`animusd::index_drain`) from a change-log record the same write leaves.
+  The `index` module's key builders (`gsi_row_key`/`lsi_row_key`/etc.) are
+  the byte layout every layer — the writer, the drain, and both native read
+  paths — agrees on.
 - `CreateTable` records a schema in the registry; `create_table_legacy` registers
   the old `pk`/`sk` convention (sort key optional) so pre-`CreateTable` clients
   keep working unchanged. **In `animusd` the authoritative key schema is the
@@ -215,30 +233,24 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   condition, found while building it). **`TransactGetItems`** (new, PR7) is a
   consistent multi-key read — a quiescence-confirmed serializable snapshot,
   not a wait-free one; see the same amendment.
-- **Secondary-index *entry data* is edge-local, not replicated — but is no
-  longer silently incomplete after a restart or on a node that missed the
-  writes.** The GSI/LSI *definitions* live in the control plane's replicated
-  catalog (ADR 0013 — `sync_indexes` rebuilds the edge machinery from them);
-  the index *entries* themselves stay in-memory, maintained by `note_put`/
-  `note_delete` on observed writes, and each index carries a `backfilled` flag
-  (`false` on fresh/shape-changed machinery). `animusd`'s
-  `backfill_index_if_needed` closes the gap lazily, on the first query against
-  such an index: one base-table scan (the same native range scan `Query`/`Scan`
-  use) replayed through `note_put`, then `mark_table_backfilled` — so a
-  restarted node or a node that never observed the writes still returns
-  complete GSI/LSI results (`animusd/tests/dynamo_schema.rs`
+- **Secondary-index *entries* are now replicated data-plane rows, not
+  edge-local state — and there is no backfill (ADR 0041 §5).** Before this,
+  index entries were an edge-local, in-memory map rebuilt from observed
+  writes, with a lazy restart/cross-node backfill (`animusd`'s
+  `backfill_index_if_needed`, `SchemaRegistry::note_put`/`note_delete`/
+  `touched_since_backfill`) papering over what a given process never
+  observed — all **deleted**. A restarted node or a node that never observed
+  the writes now returns complete GSI/LSI results because the index's own
+  hidden table (GSI) or `KIND_LSI` scope (LSI) *is* the durable, replicated
+  data (`animusd/tests/dynamo_schema.rs`
   `create_table_index_survives_node_restart` /
-  `create_table_index_replicates_to_second_node`). A write racing the backfill's
-  scan (which runs without the registry lock) cannot be silently reverted:
-  `SchemaRegistry::touched_since_backfill` tracks keys a real `note_put`/
-  `note_delete` already handled since the backfill became pending, and the
-  replay skips them rather than reapplying its own (possibly stale) scanned
-  value (`registry.rs`
-  `racing_write_during_backfill_is_not_reverted_by_the_stale_replay`). (Base
-  `Query`/`Scan` no longer track keys at all — they use the data plane's native
-  quorum range scan; only an *index* query still needs this edge-local
-  bookkeeping, since a range scan can't serve an index's alternate key
-  ordering.)
+  `create_table_index_replicates_to_second_node`) — nothing to rebuild, and
+  nothing that ever needed a stale-write race guard. There is deliberately no
+  backfill mechanism today because indexes are only declarable at
+  `CreateTable` time, so a pre-existing item that predates an index can never
+  exist; `UpdateTable` (adding an index to a populated table) will need a real
+  backfill when it lands — a reuse of the GSI drain applied to every key
+  rather than one, not a new mechanism (ADR 0041 §5).
 - **Still deferred** (don't represent as a full adapter): `BatchGetItem`,
   list-index document paths (`a[0]`), `ADD`/`DELETE` `UpdateExpression`
   arithmetic, `TransactWriteItems`/`TransactGetItems` idempotency tokens
@@ -248,6 +260,13 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   `Scan`/`Query` `FilterExpression` reuses the `ConditionExpression` predicate
   subset (`attribute_exists`/`attribute_not_exists`/`a = :v`), not the fuller
   filter grammar. `animus-cql` would map onto the same core the same way.
+  **A real, pre-existing gap**: only `animusd`'s single-item `PutItem`/
+  `DeleteItem` path goes through `index_aware_write` (ADR 0041 §2/§4) —
+  `UpdateItem`, `BatchWriteItem`, and `TransactWriteItems` all still commit
+  through the plain single-key/batch write primitives, so none of them
+  maintain a table's LSI rows or GSI change-log records at all. A secondary
+  index on a table written exclusively through those three ops will silently
+  never see those writes; see `docs/engineering-lessons.md`.
 
 ## Tests
 
@@ -256,9 +275,9 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
 unit tests (JSON decode/encode incl. document/set types + document-path projection
 + ReturnValues + UpdateItem/BatchWriteItem/TransactWriteItems/TransactGetItems
 decode + index projection types, base64 round-trip, tombstone, sort/condition
-predicates, GSI/LSI write/overwrite/delete + index
-query, multiple GSIs, composite-index sort narrowing, `sync_indexes` preserving
-entries on an unchanged shape + dropping a removed index, and the DynamoDB↔control
+predicates, `sync_indexes` adding/dropping index *definitions* (no entry data
+left to preserve, ADR 0041 §5) and `index_is_composite`/
+`index_projected_attributes` reflecting a declared shape, and the DynamoDB↔control
 `TableSchema` + `IndexDef` bridge), plus `index` unit tests (ADR 0041: the base
 layout being ADR 0022 unchanged, every kind leading with `escape(pk)` so all four
 share one tablet, byte-identical keys in different scopes not being a collision,
@@ -278,7 +297,11 @@ replicated catalog — surviving a node restart**, plus UpdateItem/BatchWriteIte
 TransactWriteItems, document-path projection, a `KEYS_ONLY` GSI projection, and
 **`scan_and_query_read_live_storage_after_restart`** — base `Query`/`Scan` return
 the rows from live storage after a restart wipes the registry, proving they no
-longer depend on any in-memory written-key tracking), and `tests/dynamo_txn.rs`
+longer depend on any in-memory written-key tracking), `tests/dynamo_gsi_drain.rs`
+(ADR 0041 §4/§5 — the drain materializing + pruning a GSI's hidden-table rows,
+then a real `Query` against it), `tests/kind_scan.rs` (ADR 0041 §5 — the LSI
+`Query` native read path forwarding correctly through a non-leader node, and a
+bare `KindScan`'s refusal), and `tests/dynamo_txn.rs`
 (ADR 0018 §2/PR7 — atomic `TransactWriteItems`/`TransactGetItems` over a
 genuine multi-process, pre-split-table cluster: cross-tablet atomic
 visibility through a follower-connected client, a failing `ConditionCheck`
@@ -286,4 +309,6 @@ cancelling the whole transaction, `TransactGetItems` never observing a torn
 pair under a concurrent writer, same-node concurrent transactions racing a
 shared conditioned key resolving to one winner, and `/admin/txns` showing a
 pending record during a simulated coordinator stall then clearing once
-recovery decides it).
+recovery decides it). **Every GSI query assertion in these files is a
+converged-or-timeout poll** (ADR 0041's own eventually-consistent contract);
+an LSI query stays a plain immediate assertion.

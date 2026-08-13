@@ -56,32 +56,28 @@
 //! `CreateTable` must target the leader.
 //!
 //! The secondary-index **definitions** (GSI/LSI name, kind, hash/sort attributes,
-//! projection) now also live in the **replicated catalog** (ADR 0013):
+//! projection) also live in the **replicated catalog** (ADR 0013):
 //! `CreateTable` proposes a `MetaCommand::CreateTableIndex` per declared index
 //! (after the table schema commits) and waits for it to replicate, so the index
 //! definitions are durable + cluster-agreed. The in-memory `SchemaRegistry` is
 //! reconciled to that replicated set via `SchemaRegistry::sync_indexes`
 //! ([`mirror_catalog_schema`]) — on `CreateTable`, and lazily on a read/write path
 //! — so a freshly restarted node (or a follower that never saw a write) rebuilds
-//! its index machinery from the catalog, not from process-local memory. Only the
-//! index **entry data** (the `escape(hash) [|| escape(sort)] || base_key` index)
-//! stays in-memory and not durable, rebuilt from observed `note_put`/`note_delete`
-//! writes. The registry is **per-node** (ADR 0031 PR2 — `ClusterEdgeState` is
-//! always per-node, in `--cluster N` exactly as in one-process-per-node): held in
-//! the node's own `ClusterEdgeState` (threaded through `ClientCtx`), not a
-//! process `OnceLock`, so two in-process clusters — or two nodes of the same
-//! `--cluster N` cluster — never share a registry. The index *definitions*
-//! (replicated, above) reach every node the same way regardless; a node whose
-//! registry doesn't yet have an index's entry data lazily backfills it on the
-//! first query against that index (`backfill_index_if_needed`), so a
-//! cross-node index query is correct without a shared in-memory registry. A
-//! write racing the backfill's base-table scan is never lost: the backfill
-//! replay consults `SchemaRegistry::touched_since_backfill` and skips any key a
-//! real `note_put`/`note_delete` already handled more recently than the scan
-//! read it, so it never overwrites an already-correct index entry with a stale
-//! scanned one.
+//! its key/index *definition* bookkeeping from the catalog, not from
+//! process-local memory. The registry is **per-node** (ADR 0031 PR2 —
+//! `ClusterEdgeState` is always per-node, in `--cluster N` exactly as in
+//! one-process-per-node): held in the node's own `ClusterEdgeState` (threaded
+//! through `ClientCtx`), not a process `OnceLock`, so two in-process clusters —
+//! or two nodes of the same `--cluster N` cluster — never share a registry.
 //!
-//! ## Query, Scan, and secondary indexes
+//! **The index *entries* themselves are no longer edge-local (ADR 0041).** Where
+//! this crate used to maintain a per-index in-memory `escape(hash) [||
+//! escape(sort)] || base_key` map from observed writes (with a lazy
+//! restart/cross-node backfill to paper over what a given process never
+//! observed), index rows are now ordinary **replicated data-plane rows** — see
+//! below.
+//!
+//! ## Query, Scan, and secondary indexes (ADR 0041 §5)
 //!
 //! A **base-table** `Query` and a `Scan` are served by a **native quorum range
 //! scan** ([`DataClient::scan`]) — no in-memory written-key tracking. The data
@@ -108,16 +104,42 @@
 //! tombstone. A table the scan must reject as unknown is checked against the
 //! replicated catalog / legacy registration ([`table_known`]).
 //!
-//! `CreateTable` may declare any number of **global / local secondary indexes**,
-//! each with a `Projection` (`ALL`/`KEYS_ONLY`/`INCLUDE`); the registry maintains
-//! an `escape(hash) [|| escape(sort)] || base_key` index per index on every
-//! `note_put`/`note_delete` (no item copies — the base item stays authoritative),
-//! and a `Query` with an `IndexName` resolves an index value back to its base
-//! storage keys, which are quorum-read the same way (the native scan covers the
-//! base keyspace, not an index's alternate ordering, so an *index* query keeps the
-//! in-memory index). An index query with no explicit `ProjectionExpression`
-//! returns the index's declared projected attributes (applied at the edge after
-//! the base item is read).
+//! **An index `Query` is now a second native range scan, not an in-memory
+//! lookup.** `CreateTable` may declare any number of **global / local secondary
+//! indexes**, each with a `Projection` (`ALL`/`KEYS_ONLY`/`INCLUDE`); an indexed
+//! write (`index_aware_write`/`kind_writes_for_item`) maintains this item's LSI
+//! rows and a change-log record atomically with the base row (ADR 0041 §2/§4),
+//! and the GSI drain (`index_drain.rs`) asynchronously materializes GSI rows
+//! into the index's own hidden table (`index_table_name`). Every index row's
+//! *stored value* is already the declared projection (`projected_item`, applied
+//! by the writer/drain) — an index `Query` therefore decodes it directly, with
+//! **no per-key base-table read-back**:
+//!
+//! - A **GSI** `Query` ([`run_gsi_query`]) scans the hidden table
+//!   `<base>$<index>` over `[token(ihash) || escape(ihash), …)` (narrowed to
+//!   `escape(ihash) || escape(isort)` for an `Equals` sort condition), the same
+//!   primitive a base `Query` uses. A hidden table with no tablet yet (the
+//!   index has never drained anything) reads as **empty** rather than waiting
+//!   on routing — this is DynamoDB's own eventually-consistent GSI contract,
+//!   not a bug: the drain provisions the hidden table lazily, on its first tick
+//!   with records to apply.
+//! - An **LSI** `Query` ([`run_lsi_query`]) scans the *base table's own tablet*
+//!   over its `KIND_LSI` scope (`ClientCtx::cp_scan_kind`, a linearizable
+//!   ReadIndex scan, ADR 0041 §3/§5) — strongly consistent, since LSI rows
+//!   commit in the same Raft entry as the base row they derive from.
+//!
+//! A sort condition narrows the scan (an `Equals` GSI condition) or filters the
+//! decoded rows by recovering the sort segment from the row's own key
+//! (`animus_dynamo::index::parse_gsi_row_key`/`parse_lsi_row_key`) — a sort
+//! condition against a hash-only index is rejected (`IndexSortMismatch`) before
+//! either path runs. An explicit `ProjectionExpression` still applies on top of
+//! the stored (already-projected) item; without one, the stored item *is* the
+//! index's declared projection, returned as-is.
+//!
+//! **There is no backfill.** Indexes are only declarable at `CreateTable` time
+//! today, so a pre-existing item that predates an index can never exist —
+//! nothing to backfill. `UpdateTable` (adding an index to a populated table)
+//! will need a real backfill when it lands (ADR 0041 §5).
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -134,7 +156,7 @@ use animus_dynamo::{
     index as dynamo_index, schema as schema_bridge, storage_key,
 };
 use animus_env::Metric;
-use animus_tablet::partition_token;
+use animus_tablet::{TOKEN_BYTES, partition_token};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::ClientCtx;
@@ -412,7 +434,6 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 Some(&item),
             )
             .await?;
-            note_put(ctx, &table, &key, &item);
             Ok(wire::write_response(return_values, old.as_ref()))
         }
         Operation::DeleteItem {
@@ -457,7 +478,6 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 None,
             )
             .await?;
-            note_delete(ctx, &table, &data_key);
             Ok(wire::write_response(return_values, old.as_ref()))
         }
         // (The `put_item` / `delete_item` helpers above serve the batch/transact
@@ -558,20 +578,6 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 ctx.cp_batch_write(table, batch)
                     .await
                     .map_err(|e| internal(&e))?;
-                // Update the edge-local GSI/LSI index after the durable commit (as
-                // the single-item helpers do), re-resolving each item's key.
-                for req in reqs {
-                    match req {
-                        WriteRequest::Put(item) => {
-                            let (pk, sk) = resolve_key(ctx, meta, table, item)?;
-                            note_put(ctx, table, &item_key(&pk, sk.as_ref()), item);
-                        }
-                        WriteRequest::Delete(key_item) => {
-                            let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
-                            note_delete(ctx, table, &item_key(&pk, sk.as_ref()));
-                        }
-                    }
-                }
             }
             Ok(wire::batch_write_response())
         }
@@ -727,22 +733,11 @@ async fn run_update_item(
     let new = wire::apply_update(base, actions);
     let value = wire::encode_stored_item(&new);
     quorum_write(ctx, meta, table, &key, &value).await?;
-    note_put(ctx, table, &key, &new);
     Ok(wire::update_response(
         return_values,
         old.as_ref(),
         Some(&new),
     ))
-}
-
-/// What a committed `TransactWriteItems` action does to the edge-local
-/// GSI/LSI index after the atomic commit lands (`note_put`/`note_delete`,
-/// applied post-commit — see [`run_transact`]'s doc for why this happens
-/// after `cp_txn` returns rather than per-action, unlike the old serial-loop
-/// implementation).
-enum IndexNote {
-    Put(Item),
-    Delete,
 }
 
 /// `TransactWriteItems`: apply every condition-gated action **atomically**
@@ -848,7 +843,6 @@ async fn run_transact(
     let mut writes: Vec<crate::TxnTableWrite> = Vec::new();
     let mut preconditions: Vec<crate::TxnPrecondition> = Vec::new();
     let mut write_conditions: Vec<crate::TxnWriteCondition> = Vec::new();
-    let mut index_notes: Vec<(String, Vec<u8>, IndexNote)> = Vec::new();
     let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
 
     for action in actions {
@@ -898,11 +892,6 @@ async fn run_transact(
                     data_key.clone(),
                     Some(wire::encode_stored_item(item)),
                 ));
-                index_notes.push((
-                    table.clone(),
-                    data_key.clone(),
-                    IndexNote::Put(item.clone()),
-                ));
             }
             TransactAction::Delete { .. } => {
                 writes.push((
@@ -910,7 +899,6 @@ async fn run_transact(
                     data_key.clone(),
                     Some(wire::encode_tombstone()),
                 ));
-                index_notes.push((table.clone(), data_key.clone(), IndexNote::Delete));
             }
             TransactAction::Update {
                 actions: update_actions,
@@ -923,7 +911,6 @@ async fn run_transact(
                     data_key.clone(),
                     Some(wire::encode_stored_item(&new)),
                 ));
-                index_notes.push((table.clone(), data_key.clone(), IndexNote::Put(new)));
             }
             TransactAction::ConditionCheck { .. } => {
                 // No write — the condition was already validated above.
@@ -970,17 +957,6 @@ async fn run_transact(
 
     match ctx.cp_txn(writes, preconditions, write_conditions).await {
         Ok(_commit_ts) => {
-            // Update the edge-local GSI/LSI index after the durable atomic
-            // commit (mirroring `PutItem`/`DeleteItem`'s own post-write
-            // bookkeeping), never before — an index update racing ahead of
-            // a transaction that goes on to abort would leak a write that
-            // never happened into `Query`/`Scan` over a secondary index.
-            for (table, key, note) in index_notes {
-                match note {
-                    IndexNote::Put(item) => note_put(ctx, &table, &key, &item),
-                    IndexNote::Delete => note_delete(ctx, &table, &key),
-                }
-            }
             ctx.data()
                 .raftkv_metrics
                 .incr(Metric::DynamoTransactWritesCommitted);
@@ -1126,10 +1102,11 @@ async fn quiescent_multi_get(
 /// quorum range scan** ([`DataClient::scan`]) over the partition's contiguous
 /// key sub-range `[escape(table)||escape(pk), …)` — no in-memory key tracking —
 /// applying an optional sort-key condition on the recovered sort bytes. An
-/// **index** query still resolves the index's base storage keys from the
-/// in-memory GSI/LSI index (the native scan covers the base keyspace, not an
-/// index's alternate ordering) and quorum-reads each. An optional `projection`
-/// keeps only the requested attributes of each returned item.
+/// **index** query (ADR 0041 §5) is now a *second* native range scan — over the
+/// GSI's hidden table or the LSI's `KIND_LSI` scope — decoding each row's
+/// already-projected stored value directly, with no base-table read-back. An
+/// optional `projection` keeps only the requested attributes of each returned
+/// item.
 async fn run_query(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -1214,10 +1191,11 @@ async fn run_base_query(
     Ok(wire::query_response(&items))
 }
 
-/// A secondary-index `Query`: resolve the index's base storage keys from the
-/// in-memory GSI/LSI index and quorum-read each (the native scan covers the base
-/// keyspace, not an index's alternate ordering). Backfills the index's entry data
-/// lazily first (see [`backfill_index_if_needed`]).
+/// A secondary-index `Query` (ADR 0041 §5): dispatches to the GSI or LSI native
+/// scan per the index's replicated **kind** (`meta.table_indexes`, not the
+/// registry — an unknown index is the same `NoSuchIndex` `ValidationException`
+/// as before). A sort condition against a hash-only index is rejected
+/// (`IndexSortMismatch`) before either path runs.
 async fn run_index_query(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -1227,104 +1205,166 @@ async fn run_index_query(
     sort_condition: Option<&SortKeyCondition>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
-    backfill_index_if_needed(ctx, table, index).await?;
-    // An index query with no explicit `ProjectionExpression` falls back to the
-    // index's *declared* projection (`ALL` / `KEYS_ONLY` / `INCLUDE`), applied at
-    // the edge after the base item is read (the index stores only base keys).
-    let index_projection = match projection {
-        None => ctx
-            .edge
-            .dynamo_registry()
-            .lock()
-            .expect("registry poisoned")
-            .index_projected_attributes(table, index)
-            .map_err(registry_error)?
-            .map(Projection),
-        Some(_) => None,
+    if !table_known(ctx, meta, table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    let Some(idx) = meta
+        .table_indexes(table)
+        .iter()
+        .find(|d| d.name == index)
+        .cloned()
+    else {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchIndex(
+            index.to_owned(),
+        )));
     };
-    let effective = projection.or(index_projection.as_ref());
-    let within_keys = {
-        let reg = ctx
-            .edge
-            .dynamo_registry()
-            .lock()
-            .expect("registry poisoned");
-        // A hash-only GSI takes no sort condition; a composite GSI / LSI may
-        // narrow by one (the registry enforces this).
-        reg.index_query_keys(table, index, partition_value, sort_condition)
-            .map_err(registry_error)?
-    };
-    let mut items = Vec::with_capacity(within_keys.len());
-    for base_key in &within_keys {
-        // The index stores the full engine key (`item_key`) as its base key, so it
-        // reads back directly — no table prefix to reattach (ADR 0023).
-        if let Some(item) = quorum_read(ctx, meta, table, base_key).await? {
-            items.push(wire::project(effective, &item));
+    if sort_condition.is_some() && idx.sort_attribute.is_none() {
+        return Err(registry_error(
+            animus_dynamo::RegistryError::IndexSortMismatch(index.to_owned()),
+        ));
+    }
+    match idx.kind {
+        IndexKind::Global => {
+            run_gsi_query(
+                ctx,
+                meta,
+                table,
+                &idx,
+                partition_value,
+                sort_condition,
+                projection,
+            )
+            .await
         }
+        IndexKind::Local => {
+            run_lsi_query(
+                ctx,
+                meta,
+                table,
+                &idx,
+                partition_value,
+                sort_condition,
+                projection,
+            )
+            .await
+        }
+    }
+}
+
+/// A **GSI** `Query` (ADR 0041 §5): a native quorum range scan of the index's
+/// own hidden table (`index_table_name`), over `token(ihash) || escape(ihash)`
+/// (narrowed to `escape(ihash) || escape(isort)` for an `Equals` sort
+/// condition — [`dynamo_index::gsi_hash_sort_prefix`]) — the same scan
+/// primitive [`run_base_query`] uses, mirroring `index_drain.rs::gsi_row_key`
+/// byte-for-byte. Row values are already `wire::encode_stored_item(projected
+/// item)` (the drain applies the index's declared projection when it
+/// materializes each row), so this decodes them directly — **no per-key
+/// base-table read-back**.
+///
+/// **Eventually consistent, by DynamoDB's own contract**: a hidden table with
+/// no tablet yet (this index has never drained anything) reads as **empty**
+/// rather than waiting on routing for a tablet that may not exist yet — the
+/// same gate [`ClientCtx::cp_get`] uses for an unprovisioned table.
+async fn run_gsi_query(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    idx: &IndexDef,
+    partition_value: &AttributeValue,
+    sort_condition: Option<&SortKeyCondition>,
+    projection: Option<&Projection>,
+) -> Result<String, WireError> {
+    let index_table = dynamo_index::index_table_name(table, &idx.name);
+    if !meta.has_table_tablet(&index_table) {
+        return Ok(wire::query_response(&[]));
+    }
+    let composite = idx.sort_attribute.is_some();
+    // Narrow to the `Equals` sub-prefix when possible (an engine-level
+    // optimization); every other shape (no condition, `Between`,
+    // `BeginsWith`) scans the whole hash value's rows and filters below.
+    let (within_prefix, narrowed) = match sort_condition {
+        Some(SortKeyCondition::Equals(v)) if composite => {
+            (dynamo_index::gsi_hash_sort_prefix(partition_value, v), true)
+        }
+        _ => (dynamo_index::gsi_hash_prefix(partition_value), false),
+    };
+    let mut prefix = partition_token(&storage_key(partition_value, None)).to_vec();
+    prefix.extend_from_slice(&within_prefix);
+    let end = dynamo_index::range_end(&prefix);
+    let pairs = native_scan(ctx, &index_table, &prefix, Some(&end), None).await?;
+    let mut items = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        // A pruned/undecodable row shouldn't normally occur (the drain deletes
+        // stale rows outright, never tombstones them), but skip rather than
+        // fail a whole query on one corrupt row.
+        let Some(item) = wire::decode_stored_item(&value)? else {
+            continue;
+        };
+        if !narrowed && let Some(cond) = sort_condition {
+            let within = key.get(TOKEN_BYTES..).unwrap_or(&[]);
+            let Some(parsed) = dynamo_index::parse_gsi_row_key(within, composite) else {
+                continue;
+            };
+            let Some(sort_bytes) = parsed.sort else {
+                continue;
+            };
+            if !cond.matches(&AttributeValue::B(sort_bytes)) {
+                continue;
+            }
+        }
+        items.push(wire::project(projection, &item));
     }
     Ok(wire::query_response(&items))
 }
 
-/// **Lazy restart backfill** for a GSI/LSI's entry data (ADR 0013): the index
-/// *definitions* are replicated (and rebuilt via `sync_indexes`), but the entry
-/// data is edge-local, populated only from writes *this process* observed — so
-/// after a restart (or on a node that never saw the writes) an index query would
-/// silently return nothing. Rather than scanning the base table inline on every
-/// `sync_indexes` (which runs on read/write paths), the rebuild happens **here,
-/// on the first index query** against a freshly-created index: one linearizable
-/// base-table scan, replayed through `note_put` (which populates *every* index of
-/// the table, so the whole table is then marked backfilled).
-///
-/// The scan runs without the registry lock (it is a network read); a write that
-/// lands between the scan and the replay would otherwise be replayed with its
-/// pre-scan (stale) attributes, silently reverting the concurrent write's own
-/// already-correct index update. `SchemaRegistry::touched_since_backfill` closes
-/// this: a real `note_put`/`note_delete` for a key marks it, and the replay below
-/// skips any such key rather than overwriting it with the stale scanned value —
-/// so a write racing the backfill is never lost from (or duplicated in) the
-/// index, only a genuinely untouched key is seeded from the scan. (The base item,
-/// quorum-read afterwards, remains the source of truth for the returned data
-/// regardless — this only protects the index's own bookkeeping.)
-async fn backfill_index_if_needed(
+/// An **LSI** `Query` (ADR 0041 §5): a **linearizable** range scan of the
+/// *base table's own tablet*, over its `KIND_LSI` scope
+/// (`ClientCtx::cp_scan_kind`) — strongly consistent, since LSI rows commit in
+/// the same Raft entry as the base row they derive from (ADR 0041 §2). Scans
+/// the partition's whole LSI-index sub-range (`lsi_index_prefix`) and filters
+/// by any sort condition on the recovered alt-sort segment
+/// (`parse_lsi_row_key`) — LSI rows also store the projected item (see
+/// `kind_writes_for_item`), so this decodes them directly.
+async fn run_lsi_query(
     ctx: &ClientCtx,
+    meta: &Metadata,
     table: &str,
-    index: &str,
-) -> Result<(), WireError> {
-    let needs = {
-        let reg = ctx
-            .edge
-            .dynamo_registry()
-            .lock()
-            .expect("registry poisoned");
-        reg.index_needs_backfill(table, index)
-    };
-    if !needs {
-        return Ok(());
+    idx: &IndexDef,
+    partition_value: &AttributeValue,
+    sort_condition: Option<&SortKeyCondition>,
+    projection: Option<&Projection>,
+) -> Result<String, WireError> {
+    if !meta.has_table_tablet(table) {
+        return Ok(wire::query_response(&[]));
     }
-    // Full base-table scan — the same live source a base `Scan` reads.
-    let pairs = native_scan(ctx, table, &[], None, None).await?;
-    let mut reg = ctx
-        .edge
-        .dynamo_registry()
-        .lock()
-        .expect("registry poisoned");
-    // Re-check under the lock: a concurrent index query may have backfilled while
-    // we scanned (the replay is idempotent, but skipping repeats the work less).
-    if !reg.index_needs_backfill(table, index) {
-        return Ok(());
-    }
-    for (key, value) in &pairs {
-        // DynamoDB tombstone values decode to `None` — logically absent, skipped.
-        if let Some(item) = wire::decode_stored_item(value)? {
-            // A real write already handled this key more recently than our scan
-            // read it — applying our stale value here would revert it.
-            if !reg.touched_since_backfill(table, key) {
-                let _ = reg.note_put(table, key, &item);
+    let prefix = token_prefixed(
+        partition_value,
+        &dynamo_index::lsi_index_prefix(partition_value, &idx.name),
+    );
+    let end = dynamo_index::range_end(&prefix);
+    let pairs = ctx
+        .cp_scan_kind(table, KIND_LSI, prefix, end)
+        .await
+        .map_err(|e| internal(&e))?;
+    let mut items = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        let Some(item) = wire::decode_stored_item(&value)? else {
+            continue;
+        };
+        if let Some(cond) = sort_condition {
+            let within = key.get(TOKEN_BYTES..).unwrap_or(&[]);
+            let Some(parsed) = dynamo_index::parse_lsi_row_key(within) else {
+                continue;
+            };
+            if !cond.matches(&AttributeValue::B(parsed.alt_sort)) {
+                continue;
             }
         }
+        items.push(wire::project(projection, &item));
     }
-    reg.mark_table_backfilled(table);
-    Ok(())
+    Ok(wire::query_response(&items))
 }
 
 /// Serve a `Scan` via a **native quorum range scan** ([`DataClient::scan`]) over
@@ -1458,27 +1498,6 @@ fn key_item_of(ctx: &ClientCtx, table: &str, item: &Item) -> Option<Item> {
         key.insert(sk.clone(), v.clone());
     }
     Some(key)
-}
-
-fn note_put(ctx: &ClientCtx, table: &str, within_key: &[u8], item: &Item) {
-    let mut reg = ctx
-        .edge
-        .dynamo_registry()
-        .lock()
-        .expect("registry poisoned");
-    if !reg.has_table(table) {
-        reg.create_table_legacy(table);
-    }
-    let _ = reg.note_put(table, within_key, item);
-}
-
-fn note_delete(ctx: &ClientCtx, table: &str, within_key: &[u8]) {
-    let mut reg = ctx
-        .edge
-        .dynamo_registry()
-        .lock()
-        .expect("registry poisoned");
-    let _ = reg.note_delete(table, within_key);
 }
 
 /// Map a registry error to a DynamoDB wire error code.

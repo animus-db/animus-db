@@ -193,4 +193,56 @@ async fn the_drain_materializes_and_prunes_a_gsis_rows() {
     // grow without bound. Nothing is asserted about the base table's own row
     // count here beyond it being unaffected by index maintenance.
     await_row_count(client_addr, "users", 2, "base table after the delete").await;
+
+    // The acceptance the whole mechanism exists for: a real DynamoDB `Query`
+    // against the GSI, over the actual wire, returns the drain's materialized
+    // rows — not just the raw row counts asserted above. Still a
+    // converged-or-timeout poll (a GSI is eventually consistent by contract),
+    // even though the row-count polls above already imply convergence at this
+    // point.
+    await_gsi_query(
+        dynamo_addr,
+        r#"{"TableName":"users","IndexName":"by-email",
+            "KeyConditionExpression":"email = :e",
+            "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#,
+        |b| b.contains("\"Count\":1") && b.contains(r#""id":{"S":"u1"}"#),
+    )
+    .await;
+
+    // c@x was u3's overwritten email, and u3 was then deleted — the GSI must
+    // show it gone, not merely absent-because-never-written.
+    await_gsi_query(
+        dynamo_addr,
+        r#"{"TableName":"users","IndexName":"by-email",
+            "KeyConditionExpression":"email = :e",
+            "ExpressionAttributeValues":{":e":{"S":"c@x"}}}"#,
+        |b| b.contains("\"Count\":0"),
+    )
+    .await;
+}
+
+/// Poll a GSI `Query` until `accept` is satisfied. A GSI is materialized
+/// **asynchronously** by the drain (ADR 0041 §4/§5) — DynamoDB's own
+/// eventually-consistent contract — so this is a converged-or-timeout poll,
+/// never a fixed sleep followed by a one-shot check, mirroring this file's own
+/// `await_row_count` discipline above.
+async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> bool) {
+    let last = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = std::sync::Arc::clone(&last);
+    let converged = async move {
+        loop {
+            let (status, got) = dynamo(addr, "DynamoDB_20120810.Query", body).await;
+            if status == 200 && accept(&got) {
+                return;
+            }
+            *seen.lock().unwrap() = got;
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    if timeout(Duration::from_secs(30), converged).await.is_err() {
+        panic!(
+            "GSI query never converged within 30s (last saw: {})",
+            last.lock().unwrap()
+        );
+    }
 }
