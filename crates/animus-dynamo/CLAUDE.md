@@ -122,7 +122,14 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   `Scan` a `Limit`/`ExclusiveStartKey`/`FilterExpression`, GetItem/Query/Scan an
   optional `ProjectionExpression`/`AttributesToGet`, Put/DeleteItem an optional
   `ReturnValues`, plus the existing `ConditionExpression` on writes and
-  `KeyConditionExpression` on Query; `UpdateItem` decodes a `SET`/`REMOVE`
+  `KeyConditionExpression` on Query; `GetItem`/`Query`/`Scan` all decode an
+  optional `ConsistentRead` boolean (default `false`, `decode_consistent_read`
+  — ADR 0041 §5, 2026-08-13 fix) **but this crate never enforces it**: whether
+  `true` is legal depends on an index's replicated *kind* (GSI vs LSI), which
+  lives in the control-plane catalog this crate never sees, so the field rides
+  through `Operation::Query`/`GetItem`/`Scan` for `animusd` to act on
+  (`animusd::dynamo::run_index_query` is the one place that ever rejects it —
+  see that crate's `CLAUDE.md`); `UpdateItem` decodes a `SET`/`REMOVE`
   `UpdateExpression` into `Vec<UpdateAction>` + `UpdateReturnValues`
   (`NONE`/`ALL_OLD`/`ALL_NEW`); `BatchWriteItem` a `RequestItems` map of
   `Put`/`Delete` `WriteRequest`s per table; `TransactWriteItems` a list of
@@ -294,7 +301,12 @@ sorting in commit order, base-key recovery from composite/hash-only GSI rows and
 from LSI rows — including values containing `0x00` bytes, two LSIs on one
 partition not interleaving, footprint round-trip + sort-invariance under
 out-of-order insertion, change-record round-trip + event naming, and
-`peel_escaped` rejecting malformed segments).
+`peel_escaped` rejecting malformed segments), and `wire` unit tests for
+`ConsistentRead` decode (ADR 0041 §5, 2026-08-13 fix: `true` decodes on
+`GetItem`/`Query`/`Scan` alike, and it defaults to `false` when omitted).
+The rejection itself (`true` against a GSI `Query` only) is
+`animusd`-only — this crate never sees the replicated catalog needed to know
+an index's kind — and is end-to-end tested in `tests/dynamo_consistent_read.rs`.
 The wire protocol is exercised end-to-end over real HTTP in
 `animusd`'s `tests/dynamo_wire.rs` (Put/Get/Delete), `tests/dynamo_extended.rs`
 (CreateTable/Query/conditional writes), `tests/dynamo_indexes.rs` (Scan with

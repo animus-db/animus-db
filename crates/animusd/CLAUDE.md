@@ -612,6 +612,35 @@ states) — test post-restart state with a poll, never a fixed sleep. A new
 `MetaCommand` that must commit from a follower-connected node must be added to
 `is_relayable_command` (missing there is a bimodal per-process flake).
 
+**`ClientCtx::drop_table` cascades to every GSI's hidden table (ADR 0041 §5,
+2026-08-13 fix).** A GSI's rows live in a *separate* table
+(`animus_dynamo::index_table_name`, ADR 0041 §1) with its own tablets — dropping
+only the base table's schema + tablets left that hidden table orphaned forever
+(its `IndexDef` died with the base schema, so a retry after a mid-drop crash
+couldn't even enumerate what to clean up). The fix's three steps run in a
+specific, load-bearing order: (1) read `metadata_fresh` (this feeds a
+permanent decision — once the base schema is gone, so are its `IndexDef`s) and
+drop each **global** index's hidden table's tablets via the same
+`MetaCommand::DropTableTablets` the base table itself uses (it needs no schema
+entry — its apply is keyed on the tablet map, not the catalog); (2) drop the
+base schema; (3) drop the base table's own tablets (base + colocated **LSI**
+rows + change log + footprints — all four `StorageScope` kinds share one
+tablet group, so `CpGroup::erase_scope` iterating `kind_scopes` reclaims every
+one; an LSI needs no separate cascade step). A crash between any two steps
+leaves a state a re-run of `drop_table` completes, because every step is
+independently idempotent. **Belt-and-suspenders second sweep**: the GSI drain
+(`index_drain.rs`) provisions a hidden table's first tablet lazily and can do
+so *concurrently* with a drop (a change record draining mid-drop, racing step
+1's enumeration) — after step 3, `drop_table` re-scans the tablet map itself
+(not the now-gone `IndexDef`s) for any tablet named `<table>$<index>`
+(`animus_dynamo::split_index_table_name`) and drops those too, which also
+mops up any orphan a **pre-fix** drop left behind. The drain's own
+provisioning/write errors during this race stay logged-and-swallowed by
+`index_drain_loop` (best-effort convergence, unchanged by this fix); once the
+base table's groups leave `hosted_groups()` (the reconciler's `Reclaim`
+teardown), the drain simply stops sweeping them. Regression:
+`tests/drop_table_index_cascade.rs`.
+
 ## Wire edges
 
 All edges are production-only I/O (real tokio sockets, hand-rolled framing) and
@@ -684,7 +713,17 @@ route below the edge through the same `ClientCtx` CP primitives.
   the read-side dual of `KindWrite`, handled only inside `cp_serve_forwarded`.
   **A GSI `Query` is eventually consistent** (DynamoDB's own contract — the
   drain materializes asynchronously); an LSI `Query` stays strongly
-  consistent (written atomically with the base row). Surface also covers
+  consistent (written atomically with the base row). **`ConsistentRead`
+  fidelity (ADR 0041 §5, 2026-08-13 fix)**: `wire::decode_request` now decodes
+  an optional `ConsistentRead` boolean on `GetItem`/`Query`/`Scan` (default
+  `false`) — accept-and-ignore everywhere except `run_index_query`, which
+  rejects it (`ValidationException`) when the queried index's replicated
+  `kind` is `Global`, matching DynamoDB's own contract exactly (an LSI or the
+  base table is already linearizable here, so the flag is simply dropped on
+  those branches). The decode has no way to know an index's kind (that lives
+  in the replicated catalog, not the wire), so `Operation::Query` always
+  carries the field through undecided; only `animusd` — with `Metadata` in
+  hand — makes the accept/reject call. Surface also covers
   `UpdateItem`/`BatchWriteItem` (condition-gated, per-request/per-tablet
   atomicity only) and, since ADR 0018 §2/PR7, **atomic** `TransactWriteItems`
   (whole-or-nothing across however many tablets/tables it spans, via
@@ -1263,6 +1302,14 @@ Test-file map (`tests/`):
 - `cp_rebalance.rs` / `cp_rebalance_gc.rs` — healthy rebalance + removed-replica GC
   (release, erase-bound, split-then-release).
 - `drop_table_gc.rs` — drop-table `Reclaim` (incl. the relay bimodal case).
+- `drop_table_index_cascade.rs` (ADR 0041 §5) — the GSI drop cascade: create a
+  table with a GSI, write items, wait for the drain to provision + materialize
+  the hidden table (`await_row_count`, the same converged-or-timeout idiom
+  `dynamo_gsi_drain.rs` uses), drop the base table via the admin sink, then
+  poll that **both** the base table's and the hidden index table's tablets
+  leave the replicated map and that every tablet's WAL file is reclaimed on
+  disk — verified to fail without the cascade fix by running it against the
+  pre-fix `drop_table` (only the base table's tablet ever disappeared).
 - `tablet_merge.rs` — end-to-end split → merge → read through the survivor.
 - `batch_write.rs` — `cp_batch_write` / `PutBatch` forwarding.
 - `durable_restart.rs` — write survives restart on LSM, lost on `--ephemeral`
@@ -1303,6 +1350,13 @@ Test-file map (`tests/`):
   forwards correctly when the receiving node isn't the base tablet's leader;
   plus a bare (non-`Forwarded`) `KindScan` refusal over the plain client
   protocol, mirroring `KindWrite`'s identical contract.
+- `dynamo_consistent_read.rs` (ADR 0041 §5) — `ConsistentRead` fidelity end to
+  end: `true` against a GSI `Query` is a `ValidationException` (after waiting
+  for the GSI to actually converge, so the rejection is proven not to be an
+  accident of an as-yet-empty hidden table); `true` against the same table's
+  LSI `Query`, its base `Query`, and a base `GetItem` are all accepted
+  (accept-and-ignore, since every one of those reads is already
+  linearizable here).
 - `dynamo_txn.rs` (ADR 0018 §2/PR7) — atomic `TransactWriteItems`/
   `TransactGetItems` over a genuine multi-process, pre-split-table cluster:
   cross-tablet atomic visibility through a follower-connected client, a

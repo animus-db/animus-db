@@ -270,6 +270,10 @@ pub enum Operation {
         key: Item,
         /// Optional projection (the attributes to return; `None` = all).
         projection: Option<Projection>,
+        /// Decoded but **accept-and-ignore** (ADR 0041 §5): a base-table read
+        /// is always linearizable here, so `ConsistentRead: true` is already
+        /// true and needs no enforcement. Only a GSI `Query` ever rejects it.
+        consistent_read: bool,
     },
     /// `DeleteItem`: remove the item identified by `key` from `table`.
     DeleteItem {
@@ -297,6 +301,12 @@ pub enum Operation {
         sort_condition: Option<SortKeyCondition>,
         /// Optional projection (the attributes to return; `None` = all).
         projection: Option<Projection>,
+        /// `ConsistentRead` (default `false`). DynamoDB's own contract (ADR
+        /// 0041 §5): legal and already-true against the base table or an LSI
+        /// (both linearizable here); an error against a **GSI** (eventually
+        /// consistent by construction) — the `animusd` edge is the one place
+        /// that rejects it, once `index` names a global index.
+        consistent_read: bool,
     },
     /// `Scan`: a full-table read with pagination and an optional filter.
     Scan {
@@ -310,6 +320,10 @@ pub enum Operation {
         filter: Option<ConditionExpression>,
         /// Optional projection (the attributes to return; `None` = all).
         projection: Option<Projection>,
+        /// Decoded but **accept-and-ignore** (ADR 0041 §5) — a base-table
+        /// `Scan` is always linearizable here, so `ConsistentRead: true` is
+        /// already true and needs no enforcement.
+        consistent_read: bool,
     },
     /// `UpdateItem`: read-modify-write the item at `key`, applying `actions`
     /// (`SET`/`REMOVE`), gated on an optional `condition`.
@@ -503,10 +517,12 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
             let table = table_name(obj)?;
             let key = decode_item_field(obj, "Key")?;
             let projection = decode_projection(obj)?;
+            let consistent_read = decode_consistent_read(obj);
             Ok(Operation::GetItem {
                 table,
                 key,
                 projection,
+                consistent_read,
             })
         }
         "DeleteItem" => {
@@ -1177,17 +1193,33 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         Some(clause) => Some(decode_sort_condition(obj, clause)?),
     };
     let projection = decode_projection(obj)?;
+    let consistent_read = decode_consistent_read(obj);
     // A sort condition on an index is meaningful only for a local secondary
     // index (which has an alternate sort key). The caller (registry) rejects a
     // sort condition against a hash-only GSI; here we accept the parse so the
-    // index-kind decision can live in one place.
+    // index-kind decision can live in one place. Likewise `consistent_read`
+    // is decoded unconditionally — whether it's legal depends on `index`'s
+    // *kind* (GSI vs LSI vs base), which is only known once the replicated
+    // catalog is consulted at the `animusd` edge, not here.
     Ok(Operation::Query {
         table,
         index,
         partition_value,
         sort_condition,
         projection,
+        consistent_read,
     })
+}
+
+/// Decode the optional `ConsistentRead` boolean (default `false`, matching
+/// DynamoDB). Shared by `GetItem`/`Query`/`Scan` — see [`Operation::Query`]'s
+/// doc for the one place this is ever enforced (a GSI `Query`, at the
+/// `animusd` edge); everywhere else it is accept-and-ignore, since a base or
+/// LSI read is already linearizable regardless of what the client asked for.
+fn decode_consistent_read(obj: &Map<String, Value>) -> bool {
+    obj.get("ConsistentRead")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Decode a `Scan` body: an optional `Limit`, an optional `ExclusiveStartKey`
@@ -1213,12 +1245,14 @@ fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     };
     let filter = decode_predicate(obj, "FilterExpression")?;
     let projection = decode_projection(obj)?;
+    let consistent_read = decode_consistent_read(obj);
     Ok(Operation::Scan {
         table,
         limit,
         exclusive_start_key,
         filter,
         projection,
+        consistent_read,
     })
 }
 
@@ -2222,15 +2256,71 @@ mod tests {
                 partition_value,
                 sort_condition,
                 projection,
+                consistent_read,
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(index, None);
                 assert_eq!(partition_value, s("part"));
                 assert_eq!(sort_condition, None);
                 assert_eq!(projection, None);
+                assert!(!consistent_read, "default is false");
             }
             other => panic!("expected Query, got {other:?}"),
         }
+    }
+
+    /// `ConsistentRead` decodes on `GetItem`/`Query`/`Scan` alike (ADR 0041
+    /// §5) — accept-and-ignore everywhere except a GSI `Query`, whose
+    /// rejection is enforced at the `animusd` edge (e2e-tested there, since
+    /// this crate never sees the replicated catalog needed to know an
+    /// index's kind).
+    #[test]
+    fn decodes_consistent_read_true_on_get_item_query_and_scan() {
+        let get = br#"{"TableName":"t","Key":{"pk":{"S":"a"}},"ConsistentRead":true}"#;
+        let Operation::GetItem {
+            consistent_read, ..
+        } = decode_request("DynamoDB_20120810.GetItem", get).unwrap()
+        else {
+            panic!("expected GetItem");
+        };
+        assert!(consistent_read);
+
+        let query = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"part"}},
+            "ConsistentRead":true}"#;
+        let Operation::Query {
+            consistent_read, ..
+        } = decode_request("DynamoDB_20120810.Query", query).unwrap()
+        else {
+            panic!("expected Query");
+        };
+        assert!(consistent_read);
+
+        let scan = br#"{"TableName":"t","ConsistentRead":true}"#;
+        let Operation::Scan {
+            consistent_read, ..
+        } = decode_request("DynamoDB_20120810.Scan", scan).unwrap()
+        else {
+            panic!("expected Scan");
+        };
+        assert!(consistent_read);
+    }
+
+    /// Omitting `ConsistentRead` entirely defaults to `false` — already
+    /// covered for `Query`/`Scan` above (`decodes_query_partition_only`/
+    /// `decodes_scan_with_limit_and_filter`); this covers `GetItem`, whose
+    /// happy-path decode test elsewhere uses `..`.
+    #[test]
+    fn get_item_consistent_read_defaults_to_false() {
+        let body = br#"{"TableName":"t","Key":{"pk":{"S":"a"}}}"#;
+        let Operation::GetItem {
+            consistent_read, ..
+        } = decode_request("DynamoDB_20120810.GetItem", body).unwrap()
+        else {
+            panic!("expected GetItem");
+        };
+        assert!(!consistent_read);
     }
 
     #[test]
@@ -2396,6 +2486,7 @@ mod tests {
                 exclusive_start_key,
                 filter,
                 projection,
+                consistent_read,
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(limit, Some(2));
@@ -2405,6 +2496,7 @@ mod tests {
                     Some(ConditionExpression::AttributeExists("v".into()))
                 );
                 assert_eq!(projection, None);
+                assert!(!consistent_read, "default is false");
             }
             other => panic!("expected Scan, got {other:?}"),
         }

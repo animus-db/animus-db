@@ -8515,9 +8515,10 @@ impl ClientCtx {
         })
     }
 
-    /// Drop `table` **and garbage-collect its data** (ADR 0024): remove the
-    /// schema from the replicated catalog, then remove the table's tablets from
-    /// the replicated tablet map — the trigger each hosting node's per-node
+    /// Drop `table` **and garbage-collect its data** (ADR 0024), cascading to
+    /// every GSI's hidden index table (ADR 0041 §5): remove the schema from the
+    /// replicated catalog, then remove every affected table's tablets from the
+    /// replicated tablet map — the trigger each hosting node's per-node
     /// tablet-host reconciler (ADR 0031 PR4) converges on by stopping its
     /// local group and deleting its engine + WAL files. This is the real
     /// `DROP TABLE` sink (CQL + the admin
@@ -8525,11 +8526,87 @@ impl ClientCtx {
     /// the schema-only primitive (the admin panel's schema-only drop) — an
     /// `ALTER TABLE` now mutates the schema in place via
     /// [`replace_table_schema`](Self::replace_table_schema) and never GCs data.
-    /// Returns once both the schema and
-    /// the tablets have left this node's replicated metadata; the per-node file
+    /// Returns once the schema and every tablet (base **and** hidden index)
+    /// have left this node's replicated metadata; the per-node file
     /// reclamation continues asynchronously on every replica.
+    ///
+    /// **Cascade order is load-bearing for convergence under a crash-and-retry
+    /// (ADR 0041 §5's as-built note)**:
+    ///
+    /// 1. **Enumerate the table's GSIs and drop each hidden table's tablets
+    ///    first**, while the definitions are still enumerable — a base
+    ///    table's LSIs need no separate step (colocated in the base table's
+    ///    own tablets, reclaimed by step 3's `erase_scope`, which walks every
+    ///    row kind). The read is [`metadata_fresh`](Self::metadata_fresh), not
+    ///    a cached/mirrored view: this is a **permanent** decision (once step
+    ///    2 removes the schema, the defs are gone for good), so it must not
+    ///    read stale. A crash here leaves the base schema and its defs
+    ///    intact, so a retry re-enumerates and finishes any hidden table this
+    ///    attempt didn't reach.
+    /// 2. **Drop the base schema** (which deletes the GSI/LSI *definitions*
+    ///    with it). A crash here leaves a state where step 1's hidden-table
+    ///    drops already landed but the base tablets have not — a retry's
+    ///    step 1 finds no GSIs left to enumerate (already gone) and proceeds
+    ///    straight to step 3.
+    /// 3. **Drop the base table's own tablets** (base rows, colocated LSI
+    ///    rows, the change log, and footprints — all four `StorageScope`
+    ///    kinds sharing one tablet group, reclaimed together by
+    ///    `CpGroup::erase_scope` iterating `kind_scopes`). A crash here
+    ///    leaves the schema gone but the base tablets present — a retry's
+    ///    steps 1/2 are no-ops (idempotent) and it finishes step 3.
+    ///
+    /// **Belt-and-suspenders second sweep**: the GSI drain provisions a
+    /// hidden table's first tablet *lazily*, and can do so **concurrently**
+    /// with this drop (a change record drained mid-drop, racing step 1's
+    /// enumeration). After step 3, sweep the tablet map itself — not the
+    /// now-gone index definitions — for any tablet named `<table>$<index>`
+    /// ([`animus_dynamo::split_index_table_name`]) and drop those too. This
+    /// is keyed on the tablet map, so it also cleans up any orphan left by a
+    /// **pre-fix** drop that never cascaded at all. `drain_tablet`'s own
+    /// provisioning and `reconcile_partition`'s writes race this drop
+    /// harmlessly — both error paths are logged-and-swallowed by
+    /// `index_drain_loop` (best-effort convergence; the next tick just
+    /// retries), and once this table's groups leave `hosted_groups()` (the
+    /// reconciler's `Reclaim` teardown), the drain simply stops sweeping
+    /// them.
     pub(crate) async fn drop_table(&self, table: String) -> Result<(), String> {
+        let indexes = self.metadata_fresh().await.table_indexes(&table).to_vec();
+        for idx in indexes
+            .iter()
+            .filter(|idx| idx.kind == animus_control::schema::IndexKind::Global)
+        {
+            let index_table = animus_dynamo::index_table_name(&table, &idx.name);
+            self.drop_table_tablets(index_table).await?;
+        }
+
         self.drop_table_schema(table.clone()).await?;
+        self.drop_table_tablets(table.clone()).await?;
+
+        let orphans: BTreeSet<String> = self
+            .effective_metadata()
+            .tablets
+            .values()
+            .filter_map(|t| t.table.as_deref())
+            .filter(|name| {
+                animus_dynamo::split_index_table_name(name).is_some_and(|(base, _)| base == table)
+            })
+            .map(str::to_owned)
+            .collect();
+        for orphan in orphans {
+            self.drop_table_tablets(orphan).await?;
+        }
+        Ok(())
+    }
+
+    /// Propose `MetaCommand::DropTableTablets` for `table` and wait until every
+    /// tablet scoped to it has left this node's replicated metadata (ADR 0024).
+    /// Shared by [`drop_table`](Self::drop_table)'s base-table drop and its
+    /// GSI-hidden-table cascade (ADR 0041 §5) — same command, same
+    /// commit-wait discipline either way. `table` need not have a schema
+    /// entry: a hidden index table never has one, and `DropTableTablets`'s
+    /// apply is keyed purely on the tablet map (`tablets_for_table`), not the
+    /// schema catalog.
+    async fn drop_table_tablets(&self, table: String) -> Result<(), String> {
         let command = MetaCommand::DropTableTablets {
             table: table.clone(),
         };
@@ -8538,9 +8615,10 @@ impl ClientCtx {
         // creation yet, so local absence cannot prove there is nothing to drop
         // (and `propose_and_await` returns on its first poll in that state).
         // The command is idempotent (`NoOp`) on the leader when there truly is
-        // nothing. (A *schema'd* table is safe either way — the schema-drop
-        // wait above already forced this replica past the tablet's creation in
-        // the log — but a plain-client table skips that wait.)
+        // nothing. (A *schema'd* base table is safe either way — the
+        // schema-drop wait already forced this replica past the tablet's
+        // creation in the log — but a plain-client table, or a hidden index
+        // table with no schema wait at all, skips that forcing.)
         self.propose_schema(&command).await;
         // `effective_metadata()`, not `self.control.metadata_cached()`
         // directly (ADR 0035 PR5 staleness-audit fix): the latter is

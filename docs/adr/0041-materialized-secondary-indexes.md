@@ -375,6 +375,64 @@ here.
 > pagination — a pre-existing gap this PR did not close, since a base `Query`
 > never gained it either (only `Scan` did).
 
+> **As-built corrective note (2026-08-13, the drop-table cascade and
+> `ConsistentRead` fidelity gaps closed).** Two gaps this section's body
+> already *describes as decided* shipped unimplemented with the §5 read-path
+> PR above, and are closed now:
+>
+> - **`drop_table` did not actually cascade.** `ClientCtx::drop_table` dropped
+>   only the base schema + the base table's own tablets — a table with GSIs
+>   left every `<base>$<index>` hidden table (tablets, data, and all)
+>   orphaned forever, and worse, the GSI *definitions* died with the base
+>   schema in the same call, so a retry after a mid-drop crash couldn't even
+>   enumerate what needed cleaning up. The fix orders three steps for
+>   crash-and-retry convergence: (1) read `metadata_fresh` — a **permanent**
+>   decision, since step 2 deletes the defs this step needs — and drop each
+>   global index's hidden table's tablets first, while they're still
+>   enumerable; (2) drop the base schema; (3) drop the base table's own
+>   tablets. LSI rows need no separate step — they, the change log, and the
+>   footprints all live in the base table's own tablet group's sibling
+>   scopes, and `CpGroup::erase_scope` already iterates every `kind_scopes`
+>   entry, not just the base one. A crash between any two steps leaves a
+>   state a re-run completes, because each step is independently idempotent
+>   (`MetaCommand::DropTableTablets`'s apply is a no-op when there is nothing
+>   left to drop, keyed on the tablet map, not the schema catalog — a hidden
+>   index table needs no schema entry of its own for this to work). A
+>   **second sweep**, run after step 3 and keyed on the tablet map itself
+>   rather than the (by-then-gone) index definitions, catches the belt-and-
+>   suspenders case: the GSI drain provisions a hidden table's first tablet
+>   *lazily*, and can race a fresh one into existence concurrently with the
+>   drop (a change record draining mid-drop); this sweep also mops up any
+>   orphan a **pre-fix** drop left behind, since it depends on nothing but
+>   the tablet map's own naming convention
+>   (`animus_dynamo::split_index_table_name`). The drain's own writes racing
+>   a concurrent drop were already handled: `index_drain_loop` logs and
+>   swallows both `provision_tablet` and `reconcile_partition` errors
+>   (best-effort convergence, unchanged by this fix), and the reconciler's
+>   `Reclaim` teardown removes a dropped table's groups from
+>   `hosted_groups()`, so the drain simply stops sweeping them once gone.
+>   Regression: `animusd/tests/drop_table_index_cascade.rs`.
+> - **`ConsistentRead` was not decoded at all**, so the rejection this
+>   section's body already describes as DynamoDB's contract had nothing to
+>   act on. `animus_dynamo::wire::decode_request` now decodes an optional
+>   `ConsistentRead` boolean (default `false`) on `GetItem`/`Query`/`Scan`
+>   alike — `decode_consistent_read`, shared by all three — but this crate
+>   never enforces it: whether `true` is legal depends on an index's
+>   replicated *kind*, which lives in the control-plane catalog this crate
+>   never sees. `animusd::dynamo::run_index_query` is the one place that
+>   ever rejects it, exactly matching the accept/reject matrix this section's
+>   body already stated: `ValidationException` when the queried index is
+>   `IndexKind::Global`; accepted-and-ignored against an LSI `Query`, a base
+>   `Query`/`Scan`, and a base `GetItem` alike, since every one of those
+>   reads is already linearizable here regardless of what the client asked
+>   for. Regression (decode): `animus-dynamo`'s `wire` unit tests. Regression
+>   (rejection/acceptance): `animusd/tests/dynamo_consistent_read.rs`.
+>
+> Neither gap was reachable from `CreateTable`-declared indexes without a
+> multi-step scenario (a populated GSI, then a drop; an explicit
+> `ConsistentRead: true`), which is why both shipped unnoticed with the read
+> path itself.
+
 Adding or dropping an index on a **populated** table (`UpdateTable`, with an
 `IndexStatus` lifecycle and a backfill) is **deferred to a follow-up**; indexes
 remain declarable at `CreateTable` time, as today. The backfill is the drain

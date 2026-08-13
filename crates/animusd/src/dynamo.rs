@@ -486,6 +486,10 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             table,
             key,
             projection,
+            // Accept-and-ignore (ADR 0041 §5): a base-table `GetItem` is
+            // already linearizable here, so `ConsistentRead: true` needs no
+            // enforcement — only a GSI `Query` ever rejects it.
+            consistent_read: _,
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
             let data_key = item_key(&pk, sk.as_ref());
@@ -499,6 +503,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             partition_value,
             sort_condition,
             projection,
+            consistent_read,
         } => {
             run_query(
                 ctx,
@@ -508,6 +513,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 &partition_value,
                 sort_condition.as_ref(),
                 projection.as_ref(),
+                consistent_read,
             )
             .await
         }
@@ -517,6 +523,9 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             exclusive_start_key,
             filter,
             projection,
+            // Accept-and-ignore, same as `GetItem` above — a base `Scan` is
+            // always linearizable here.
+            consistent_read: _,
         } => {
             run_scan(
                 ctx,
@@ -1202,7 +1211,10 @@ async fn quiescent_multi_get(
 /// GSI's hidden table or the LSI's `KIND_LSI` scope — decoding each row's
 /// already-projected stored value directly, with no base-table read-back. An
 /// optional `projection` keeps only the requested attributes of each returned
-/// item.
+/// item. `consistent_read` (ADR 0041 §5) is only ever meaningful for an
+/// **index** query — a base query is always linearizable here regardless, so
+/// it's accepted-and-ignored on that branch.
+#[allow(clippy::too_many_arguments)] // one `Query`'s full decoded shape, no natural grouping
 async fn run_query(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -1211,6 +1223,7 @@ async fn run_query(
     partition_value: &AttributeValue,
     sort_condition: Option<&SortKeyCondition>,
     projection: Option<&Projection>,
+    consistent_read: bool,
 ) -> Result<String, WireError> {
     // Mirror a catalog table's schema (so its GSI index exists after a restart or
     // on a follower that has not seen a write). A table absent from the catalog is
@@ -1226,6 +1239,7 @@ async fn run_query(
                 partition_value,
                 sort_condition,
                 projection,
+                consistent_read,
             )
             .await
         }
@@ -1291,7 +1305,13 @@ async fn run_base_query(
 /// scan per the index's replicated **kind** (`meta.table_indexes`, not the
 /// registry — an unknown index is the same `NoSuchIndex` `ValidationException`
 /// as before). A sort condition against a hash-only index is rejected
-/// (`IndexSortMismatch`) before either path runs.
+/// (`IndexSortMismatch`) before either path runs. `ConsistentRead: true`
+/// against a **global** index is rejected here too, matching DynamoDB exactly
+/// (§5: "`ConsistentRead=true` against a GSI is an error… against an LSI it is
+/// honoured and already true") — an LSI is strongly consistent by
+/// construction (written atomically with the base row), so `consistent_read`
+/// is simply dropped on that branch, same as a base `Query`/`Scan`/`GetItem`.
+#[allow(clippy::too_many_arguments)] // mirrors `run_query`'s own full decoded shape
 async fn run_index_query(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -1300,6 +1320,7 @@ async fn run_index_query(
     partition_value: &AttributeValue,
     sort_condition: Option<&SortKeyCondition>,
     projection: Option<&Projection>,
+    consistent_read: bool,
 ) -> Result<String, WireError> {
     if !table_known(ctx, meta, table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
@@ -1320,6 +1341,13 @@ async fn run_index_query(
         return Err(registry_error(
             animus_dynamo::RegistryError::IndexSortMismatch(index.to_owned()),
         ));
+    }
+    if consistent_read && idx.kind == IndexKind::Global {
+        return Err(WireError::validation(format!(
+            "ConsistentRead is not supported for global secondary index `{index}` \
+             (a GSI is maintained asynchronously; use a base-table or LSI Query for \
+             a strongly consistent read)"
+        )));
     }
     match idx.kind {
         IndexKind::Global => {
