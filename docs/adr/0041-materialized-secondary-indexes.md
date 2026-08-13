@@ -231,6 +231,34 @@ engine at group start**, the same discipline `TxnTracker` uses — so a leader t
 inherits a tablet after restart or election resumes from the durable cursor
 rather than from nothing.
 
+> **As-built corrective note (2026-08-13, the drain's landing).** Two
+> mechanisms this section describes came out simpler in implementation:
+>
+> - **There is no cursor.** Consuming a record *is* the trim: the drain
+>   deletes the records it has reconciled in the same Raft entry that writes
+>   the updated footprint, so "position in the log" is simply "whatever
+>   records still exist," durable and rebuilt-for-free at group start — no
+>   in-memory cursor, no rebuild scan, nothing to advance. A separate cursor
+>   only becomes necessary when records must **outlive** their first
+>   consumer — exactly the Streams case — and is deferred to that ADR
+>   alongside its retention window (§4a's trim-policy language reads
+>   accordingly).
+> - **The footprint is written only by the drain, never by the base write.**
+>   The writer's atomic batch is base row + LSI rows + change record; the
+>   footprint records what the drain last *materialized* (which trails the
+>   base write by design), so having the writer update it would claim rows
+>   that don't exist yet. It is keyed by partition, not by item, holding one
+>   `ItemFootprint` per sort key.
+>
+> Also settled at landing: the hidden index table's first tablet is
+> provisioned **lazily by the drain** (first tick with records to apply);
+> stale GSI rows are pruned with a genuine engine delete, not a
+> `StoredItem::Tombstone` sentinel value — the sentinel exists so a base
+> `DeleteItem` stays observable to conditional reads and to this very change
+> log, but an index row is wholly derived and nothing would ever reclaim a
+> sentinel from a hidden table (the LSI path's `KindBatch` `None`-value prune
+> is the same choice, made inline).
+
 ### 4a. Why the log is non-collapsing: DynamoDB Streams
 
 A collapsing dirty-marker would be marginally cheaper and is all the GSI drain
@@ -248,11 +276,14 @@ discriminator, the leader-swept consumer loop, the cursor rebuilt at group start
 and at-least-once delivery with an HLC sequence for dedup. A partition's record
 range maps naturally onto a stream shard.
 
-The log is trimmed behind the **slowest cursor** — today the GSI drain alone,
-which is also what bounds its growth. The Streams ADR extends that policy with a
-retention window and per-consumer iterators; the **shards, iterators,
-`StreamViewType` projections, and the wire surface are all deferred to it**. Only
-the record format, the ordering, and the trim are settled here.
+The log is trimmed behind the **slowest consumer** — today the GSI drain alone
+(whose consumption *is* the trim; see §4's as-built note), which is also what
+bounds its growth. The Streams ADR extends that policy with a retention window
+and per-consumer iterators — the point where a genuine cursor first becomes
+necessary, since records must then outlive the drain's own consumption; the
+**shards, iterators, `StreamViewType` projections, and the wire surface are all
+deferred to it**. Only the record format, the ordering, and the trim are settled
+here.
 
 ### 5. Reads, lifecycle, and what gets deleted
 

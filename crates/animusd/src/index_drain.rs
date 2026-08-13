@@ -105,6 +105,21 @@ async fn drain_tablet(
     if records.is_empty() {
         return Ok(());
     }
+    // A GSI's rows live in its own hidden table, provisioned lazily here on
+    // the first drain that has records to apply (ADR 0023). This is
+    // load-bearing, not an optimization: `reconcile_partition` writes rows
+    // via `cp_write`, which — unlike `cp_kind_write`/`cp_txn` — does NOT
+    // auto-provision; without a tablet to route to, its `cp_route` would
+    // wait out `CLIENT_TIMEOUT` and fail, every tick, forever. Gated on the
+    // caller's metadata snapshot: a stale "absent" just re-proposes an
+    // idempotent `CreateTablet` (first-committer wins), and the hit path is
+    // sound because tablets are only ever removed by drop-table.
+    for idx in gsis {
+        let index_table = index_table_name(table, &idx.name);
+        if !meta.has_table_tablet(&index_table) {
+            ctx.provision_tablet(&index_table).await?;
+        }
+    }
     // A record's key is `footprint_key || hlc`, so the partition it belongs to
     // is its key minus that fixed-width suffix — no parsing needed. Several
     // records for one partition collapse into a single reconciliation, which is
@@ -215,9 +230,15 @@ async fn reconcile_partition(
     for (index_table, key, value) in writes {
         ctx.cp_write(&index_table, key, value).await?;
     }
+    // A genuine engine delete, not a tombstone *value* (`encode_tombstone`):
+    // that sentinel exists so a base-table `DeleteItem` stays observable (to
+    // conditional reads and to the change log this very drain consumes), but
+    // an index row is wholly derived — a dead one has no reader to inform,
+    // and nothing would ever reclaim a sentinel from a hidden index table.
+    // The LSI half of an indexed write already prunes with a real tombstone
+    // (`KindBatch`'s `None` value); this is the GSI dual.
     for (index_table, key) in stale {
-        ctx.cp_write(&index_table, key, wire::encode_tombstone())
-            .await?;
+        ctx.cp_delete(&index_table, key).await?;
     }
 
     // One entry: the new footprint plus the records it accounts for. Consuming

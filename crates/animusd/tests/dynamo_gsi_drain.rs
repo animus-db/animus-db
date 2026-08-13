@@ -15,6 +15,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use animus_dynamo::wire;
 use animusd::{ClientRequest, ClientResponse, Node, bind_cluster, read_frame, start_cluster};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -39,8 +40,12 @@ async fn await_bootstrap(nodes: &[Node]) {
 /// One DynamoDB JSON request over the real HTTP wire.
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     let mut s = TcpStream::connect(addr).await.expect("connect");
+    // `Connection: close` is load-bearing: this helper reads to EOF, and an
+    // HTTP/1.1 request without it is kept alive by the server, which then
+    // waits for a next request that never comes — deadlocking the test.
     let req = format!(
         "POST / HTTP/1.1\r\nHost: x\r\nX-Amz-Target: {target}\r\n\
+         Connection: close\r\n\
          Content-Type: application/x-amz-json-1.0\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
@@ -59,6 +64,11 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
 
 /// How many live rows a table holds, via a whole-table client-protocol scan.
 ///
+/// Counts **decoded live items**, not raw pairs: a DynamoDB `DeleteItem`
+/// stores a tombstone *value* (a real stored pair the raw scan returns), so a
+/// raw count would keep counting a deleted item forever. Decoding through the
+/// same stored-item codec the Dynamo edge uses drops those.
+///
 /// Every step is individually bounded. A scan of a table whose tablet does not
 /// exist yet can legitimately block on routing until the server's own client
 /// timeout, and this is called from a poll loop — an unbounded read here turns
@@ -75,7 +85,11 @@ async fn row_count(addr: SocketAddr, table: &str) -> Option<usize> {
         };
         animusd::write_frame(&mut s, &req).await.ok()?;
         match read_frame(&mut s).await.ok()?? {
-            ClientResponse::Pairs(rows) => Some(rows.len()),
+            ClientResponse::Pairs(rows) => Some(
+                rows.iter()
+                    .filter(|(_, v)| matches!(wire::decode_stored_item(v), Ok(Some(_))))
+                    .count(),
+            ),
             // A table with no tablet yet reads as empty rather than as an error
             // to fail on: the drain provisions an index table lazily, on its
             // first write, exactly like any other table (ADR 0023).
@@ -110,9 +124,6 @@ async fn await_row_count(addr: SocketAddr, table: &str, want: usize, what: &str)
     }
 }
 
-#[ignore = "ADR 0041 WIP: the drain does not yet converge — this test times out \
-            waiting for the first index rows to appear. Un-ignore once the drain \
-            is debugged; see the commit message for what is known so far."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_drain_materializes_and_prunes_a_gsis_rows() {
     let dir = tempfile::TempDir::new().unwrap();

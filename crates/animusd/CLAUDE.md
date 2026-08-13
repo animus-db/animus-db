@@ -156,6 +156,15 @@ ReadIndex), `cp_write`/`cp_delete` (Raft-committed, waited to durable+applied),
 commits each group as one `KvCommand::Batch` entry — atomic within a tablet, not
 across; backs DynamoDB `BatchWriteItem` and the admin seeder).
 
+**`cp_write`/`cp_delete` do NOT auto-provision a table's first tablet** —
+unlike most of their write-side siblings (`cp_put`, `cp_kind_write`,
+`cp_batch_write`, `cp_batch_write_patient`, `cp_txn` all do). A caller
+targeting a table nothing upstream has provisioned must call
+`provision_tablet` itself first, or `cp_route` waits out `CLIENT_TIMEOUT` on
+a tablet that will never exist and fails — every tick, forever, if the
+caller is a retrying loop (the ADR 0041 GSI drain hit exactly this; see
+`docs/engineering-lessons.md`).
+
 `cp_route` serves **locally** if this node hosts the leader; **forwards** one hop
 (`ClientRequest::Forwarded { request, traceparent }`) to the leader's node if a
 local replica gives a hint + a `client_route` exists; otherwise **waits** for the
