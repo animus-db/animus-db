@@ -3,9 +3,13 @@
 - **Status:** Proposed
 - **Date:** 2026-08-13
 - **Amends:** [ADR 0013](0013-replicated-schemas.md) (the index *definitions* it
-  replicated now have index *data* to match), [ADR 0022](0022-hash-ring-partitioning.md)
-  (the data-plane key layout gains a row-kind discriminator),
-  [ADR 0023](0023-table-scoped-tablets.md) (a GSI is a table-scoped ring of its own)
+  replicated now have index *data* to match),
+  [ADR 0023](0023-table-scoped-tablets.md) (a GSI is a table-scoped ring of its
+  own), [ADR 0028](0028-shared-storage-single-command-split.md) (a tablet group
+  owns several `StorageScope`s, one per row kind, sharing its key range),
+  [ADR 0034](0034-byte-based-auto-split.md) (the byte estimate bounds to the base
+  scope, so auto-split ignores change-log churn). ADR 0022's key layout is
+  **unchanged** — the row kind lives in the scope prefix, above the token.
 - **Depends on:** [ADR 0018](0018-cross-tablet-transactions.md) (HLC timestamps;
   apply-time write-key conditions), [ADR 0024](0024-drop-table-data-gc.md) (drop
   cascade), [ADR 0034](0034-byte-based-auto-split.md) (index tablets auto-split
@@ -111,45 +115,74 @@ base row and LSI rows one `ClientRequest::PutBatch` — **one Raft log entry, on
 commit round, one apply**. LSI maintenance is thus atomic with the base write and
 strongly consistent, with no intent, no drain, and no 2PC.
 
-### 3. The key layout gains a row-kind discriminator
+### 3. Row kinds are separate storage scopes, not a discriminator in the key
 
-To let base rows, LSI rows, and maintenance markers share a partition, one
-discriminator byte follows the escaped partition key. The base layout of ADR 0022
-becomes:
-
-```
-base row      token(escape(pk)) || escape(pk) || 0x00 || sk
-LSI row       token(escape(pk)) || escape(pk) || 0x01 || escape(index) || escape(alt_sort) || sk
-change record token(escape(pk)) || escape(pk) || 0x02 || hlc
-footprint     token(escape(pk)) || escape(pk) || 0x03
-```
-
-`escape` is injective and prefix-free (every embedded `0x00` doubles to
-`0x00 0x01`, so the `0x00 0x00` terminator occurs exactly once, at the end), so
-the discriminator's position is unambiguous and each kind occupies a contiguous,
-sort-ordered sub-range of the partition:
-
-- a base `Query` is the range `[… || 0x00, … || 0x01)`;
-- an LSI `Query` on index `I` is `[… || 0x01 || escape(I), … )`, narrowed by the
-  sort condition exactly as the base range is.
-
-A **GSI row**, living in its own table's keyspace, needs no discriminator:
+A base tablet now holds four kinds of row. They are separated **above the
+partition token**, in the `StorageScope` prefix — not by a discriminator byte
+inside the key:
 
 ```
-GSI row       token(escape(ihash)) || escape(ihash) || escape(isort) || escape(base_pk) || base_sk
+physical:  escape(table) || KIND || token(escape(pk)) || escape(pk) || …
+           └────── scope prefix ──────┘└──────── logical key ────────┘
+
+KIND 0x00  base rows        logical: token || escape(pk) || sk
+KIND 0x01  LSI rows         logical: token || escape(pk) || escape(index) || escape(alt_sort) || sk
+KIND 0x02  change records   logical: token || escape(pk) || hlc
+KIND 0x03  footprints       logical: token || escape(pk)
+```
+
+All four scopes belong to **one tablet's Raft group** and share **one
+`KeyRange`** — literally the same `Arc<Mutex<KeyRange>>`, so a split's
+`narrow_scope` and a merge's `widen_scope` move every kind in one call. One
+`PutBatch` to that group therefore still writes base + LSI + change record +
+footprint as a single Raft entry, which is what §2 and §4 rest on. This is the
+column-family shape Cockroach and TiKV use for the same reason.
+
+**Why not a discriminator inside the logical key.** It was the original design
+here, and it is wrong three ways. Interleaving the kinds within each partition
+means a full `Scan` traverses all four to return one; the LSM mixes the
+high-churn change log with comparatively stable base rows in the same SSTables,
+so *trimming the log rewrites SSTables full of base rows*; and ADR 0034's byte
+estimate starts reacting to log churn rather than base-data volume. Separating in
+the prefix fixes all three, and lets `approx_bytes` bound to the base scope
+alone.
+
+**Why not above the token in the *logical* key either.** Two independent
+reasons. A tablet *is* a `[start, end)` range over token space and the router
+resolves key→tablet by the token prefix, so a kind above the token would stop a
+tablet's ownership being one contiguous range — breaking `KeyRange`, `contains`,
+`split_at`, the router, and split/merge together (ADR 0022/0023). And the
+transaction layer **asserts** the property outright: `RaftKvNode::txn_stage`
+requires `anchor.len() >= animus_tablet::TOKEN_BYTES` and slices
+`anchor[..TOKEN_BYTES]` as the token, then derives every `TxnRecord::intent_span`
+as a `KeyRange` over those same keys. A kind byte ahead of the token would have
+forced a revision of every span, fence, record key and seal marker in the 2PC
+machinery (ADR 0018) — far more dangerous than the index feature itself. Keeping
+the kind in the scope prefix leaves all of it untouched.
+
+A **GSI row** lives in its own hidden table's tablets (§1), so it needs neither a
+kind nor a scope of its own:
+
+```
+GSI row    token(escape(ihash)) || escape(ihash) || escape(isort) || escape(base_pk) || base_sk
 ```
 
 The trailing `escape(base_pk) || base_sk` both disambiguates two items sharing an
 index key and makes the base key recoverable by peeling escaped segments.
-`escape(isort)` is absent for a hash-only GSI.
+`escape(isort)` is absent for a hash-only GSI. Recovery needs to be told whether
+the index is composite: a hash-only index's `escape(base_pk)` sits in exactly the
+byte position a composite index's `escape(isort)` would, so the key alone cannot
+report its own shape.
 
 **Index row values carry the projection** (`ALL` / `KEYS_ONLY` / `INCLUDE`), so
 an index `Query` is one range scan that returns items directly — no base-table
 fan-out read. This is both DynamoDB's behaviour and the point of an index.
 
-*(This changes the base key layout. Per the repo's standing constraint there are
-no live deployments and no wire/WAL back-compat is required, so this is a clean
-break rather than a migration.)*
+*(The **base** logical key is unchanged from ADR 0022 — `token || escape(pk) ||
+sk`. Nothing existing moves on disk, and the CQL edge needs no change: the new
+kinds are new scopes alongside the base one, and `Put`/`PutBatch` keep meaning
+"the base kind". Only the snapshot image gains a per-entry kind tag, which is a
+format break the repo's no-live-deployments constraint makes free.)*
 
 ### 4. GSI maintenance is a per-tablet change log plus a derivative drain
 
@@ -225,10 +258,9 @@ the record format, the ordering, and the trim are settled here.
   value.
 - `ConsistentRead=true` against a **GSI** is rejected, as DynamoDB does; against
   an LSI it is honoured and already true.
-- A base `Scan` filters the non-`0x00` kinds. Because a full scan walks token
-  order across partitions, the kinds interleave, so pagination must keep filling
-  until `Limit` is met or the range is exhausted rather than truncating a
-  partially-filtered page.
+- A base `Query`/`Scan` reads the **base scope** and sees nothing else — no
+  filtering, no partially-filtered pages, and no change-log bytes traversed. Each
+  access pattern touches exactly one scope, which is the point of §3.
 - `drop_table` cascades to every index table's tablets (ADR 0024); LSI rows and
   markers are reclaimed with the base table's own tablets automatically.
 - **Deleted**: `note_put`, `note_delete`, `index_query_keys`,
@@ -251,6 +283,10 @@ mechanism.
   of it.
 - An index query stops costing a base-table read per match, and stops ever
   costing a full base-table scan.
+- Because the kinds are physically separated (§3), base reads never traverse
+  change-log bytes, trimming the log never rewrites SSTables full of base rows,
+  and ADR 0034's auto-split keeps measuring base-data volume rather than log
+  churn.
 - The largest correctness caveat in the Dynamo adapter — "index entry data is
   edge-local, not replicated" — goes away, along with the `touched_since_backfill`
   race defence that existed only to prop it up.
@@ -268,9 +304,14 @@ mechanism.
 - **A new background loop** joins the reconciler, GC, auto-split, and txn-resolver
   loops. It is modelled on the last of these, but it is another thing that must
   make progress under fault injection.
-- **The base key layout changed**, so every edge that assembles or parses a
-  data-plane key must move in lockstep — including CQL, which gains the same
-  discriminator despite having no LSI.
+- **A tablet group now owns several storage scopes rather than one.** That is a
+  new PR into `animus-cp-data`: sibling scopes sharing the base scope's
+  `KeyRange`, a `KvCommand` variant carrying a multi-kind atomic batch, a
+  per-entry kind tag in the snapshot image codec, `erase_scope` iterating scopes,
+  and kind-scoped scan accessors. Existing `Put`/`PutBatch` keep meaning "the base
+  kind", so no existing command, fence, or transaction path moves — but "which
+  scope does this key belong to" becomes a question every future data-plane
+  feature has to answer, where before there was only one answer.
 - **Write amplification is real**: an indexed write carries a footprint and a
   change record even when no index attribute changed, and the record holds both
   images. A later optimization can skip the footprint when the recomputation is

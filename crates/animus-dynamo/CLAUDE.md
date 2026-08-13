@@ -73,12 +73,22 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   **within-table** keys: the ADR 0022 partition token is prepended at the
   `animusd` edge, and each builder documents *which* value to token-hash (the
   base partition key for base/LSI/marker keys, the **index hash value** for a GSI
-  row — that difference is why a GSI is a separate table). Row kinds within a
-  base partition are separated by one discriminator byte after `escape(pk)`:
-  `KIND_BASE` `0x00` (`base_row_key`), `KIND_LSI` `0x01` (`lsi_row_key` /
-  `lsi_index_prefix`), `KIND_CHANGE` `0x02` (`change_record_key` /
-  `change_prefix`), `KIND_FOOTPRINT` `0x03` (`footprint_key`); `row_kind` reads it
-  back and `range_end` bounds any prefix. A GSI row needs no discriminator
+  row — that difference is why a GSI is a separate table). Row kinds are
+  **separate `StorageScope`s, not bytes in the key** (ADR 0041 §3): `KIND_BASE`
+  (`base_row_key`, byte-identical to `storage_key` — ADR 0022's layout is
+  *unchanged*), `KIND_LSI` (`lsi_row_key` / `lsi_index_prefix`), `KIND_CHANGE`
+  (`change_record_key` / `change_prefix`), `KIND_FOOTPRINT` (`footprint_key`),
+  enumerated by `ALL_KINDS`; `range_end` bounds any prefix. The kind rides in the
+  scope prefix — `escape(table) || KIND || token || …` — because a tablet is a
+  range over *token* space (a kind above the token would break `KeyRange`/the
+  router/split) **and** because `RaftKvNode::txn_stage` asserts a logical key
+  leads with the token, slicing `anchor[..TOKEN_BYTES]` and deriving every txn
+  intent span from it. All four scopes share one tablet group and one `KeyRange`,
+  so a `PutBatch` still writes every kind atomically and a split moves them
+  together. Two keys in different scopes can be byte-identical (a footprint key
+  and a base partition prefix are both bare `escape(pk)`) — the scope prefix is
+  what separates them, which is why there is no `row_kind()`. A GSI row needs no
+  kind at all
   (`gsi_row_key` / `gsi_hash_prefix` / `gsi_hash_sort_prefix`), living in the
   hidden table `index_table_name(base, index)` = `<base>$<index>`
   (`split_index_table_name` / `is_index_table_name`). `parse_gsi_row_key` /
@@ -249,8 +259,9 @@ decode + index projection types, base64 round-trip, tombstone, sort/condition
 predicates, GSI/LSI write/overwrite/delete + index
 query, multiple GSIs, composite-index sort narrowing, `sync_indexes` preserving
 entries on an unchanged shape + dropping a removed index, and the DynamoDB↔control
-`TableSchema` + `IndexDef` bridge), plus `index` unit tests (ADR 0041: the four
-row kinds sorting into disjoint blocks so a base range excludes every other kind,
+`TableSchema` + `IndexDef` bridge), plus `index` unit tests (ADR 0041: the base
+layout being ADR 0022 unchanged, every kind leading with `escape(pk)` so all four
+share one tablet, byte-identical keys in different scopes not being a collision,
 prefix-freedom across a partition whose key prefixes another's, change records
 sorting in commit order, base-key recovery from composite/hash-only GSI rows and
 from LSI rows — including values containing `0x00` bytes, two LSIs on one

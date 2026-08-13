@@ -13,25 +13,38 @@
 //! caller must token-hash — the base partition key for a base/LSI/marker key,
 //! the **index hash value** for a GSI row.
 //!
-//! ## Row kinds (ADR 0041 §3)
+//! ## Row kinds are scopes, not key bytes (ADR 0041 §3)
 //!
-//! A base partition holds four kinds of row, distinguished by one discriminator
-//! byte immediately after the escaped partition key:
+//! A base tablet holds four kinds of row, separated **above the partition
+//! token** by the `StorageScope` prefix — *not* by a discriminator inside the
+//! key:
 //!
 //! ```text
-//! base row      escape(pk) || 0x00 || sk
-//! LSI row       escape(pk) || 0x01 || escape(index) || escape(alt_sort) || sk
-//! change record escape(pk) || 0x02 || hlc
-//! footprint     escape(pk) || 0x03
+//! physical:  escape(table) || KIND || token(escape(pk)) || escape(pk) || …
+//!            └────── scope prefix ──────┘└──────── logical key ────────┘
+//!
+//! KIND_BASE       base rows       escape(pk) || sk
+//! KIND_LSI        LSI rows        escape(pk) || escape(index) || escape(alt_sort) || sk
+//! KIND_CHANGE     change records  escape(pk) || hlc
+//! KIND_FOOTPRINT  footprints      escape(pk)
 //! ```
 //!
-//! [`crate::escape`] is injective and prefix-free (every embedded `0x00` doubles
-//! to `0x00 0x01`, so the `0x00 0x00` terminator occurs exactly once, at the
-//! end), so the discriminator's position is unambiguous and each kind occupies a
-//! contiguous, sort-ordered sub-range of the partition.
+//! (Within-table again: the token shown above is prepended at the edge.) All
+//! four scopes belong to **one tablet's Raft group** and share **one**
+//! `KeyRange`, so one `PutBatch` still writes every kind as a single atomic Raft
+//! entry, and a split or merge moves all four at once.
 //!
-//! A **GSI row** lives in its own hidden table's keyspace
-//! ([`index_table_name`]) and so needs no discriminator:
+//! The kinds are `u8` **scope selectors** here rather than bytes this module
+//! emits — [`base_row_key`] returns exactly [`crate::storage_key`]'s ADR 0022
+//! layout, unchanged. Two reasons the kind must stay out of the logical key:
+//! a tablet is a `[start, end)` range over *token* space (so a kind above the
+//! token would stop its ownership being one contiguous range), and
+//! `RaftKvNode::txn_stage` **asserts** a logical key leads with the token,
+//! slicing `anchor[..TOKEN_BYTES]` and deriving every transaction intent span
+//! from it.
+//!
+//! A **GSI row** lives in its own hidden table's tablets
+//! ([`index_table_name`]), so it needs neither a kind nor a scope of its own:
 //!
 //! ```text
 //! GSI row       escape(ihash) || escape(isort)? || escape(base_pk) || base_sk
@@ -55,14 +68,21 @@ use crate::{AttributeValue, Item, escape};
 /// `syskv::is_reserved_name` gate.
 pub const INDEX_TABLE_SEPARATOR: char = '$';
 
-/// Discriminator: a base item row.
+/// Scope selector: base item rows — the ADR 0022 keyspace, unchanged.
 pub const KIND_BASE: u8 = 0x00;
-/// Discriminator: a local-secondary-index row (colocated, ADR 0041 §2).
+/// Scope selector: local-secondary-index rows (colocated, ADR 0041 §2).
 pub const KIND_LSI: u8 = 0x01;
-/// Discriminator: a change-log record (ADR 0041 §4/§4a).
+/// Scope selector: change-log records (ADR 0041 §4/§4a).
 pub const KIND_CHANGE: u8 = 0x02;
-/// Discriminator: the GSI footprint of a base key (ADR 0041 §4).
+/// Scope selector: GSI footprints (ADR 0041 §4).
 pub const KIND_FOOTPRINT: u8 = 0x03;
+
+/// Every row-kind scope a base table's tablet group owns, in selector order.
+///
+/// The one place the set is enumerated: `animus-cp-data` derives a sibling
+/// `StorageScope` per entry (prefix `escape(table) || KIND`, all sharing the
+/// group's one `KeyRange`), and drop-table GC erases each in turn.
+pub const ALL_KINDS: [u8; 4] = [KIND_BASE, KIND_LSI, KIND_CHANGE, KIND_FOOTPRINT];
 
 /// The hidden table a global secondary index's rows live in: `<base>$<index>`
 /// (ADR 0041 §1). It gets its own per-table hash ring, tablets, split/merge, GC
@@ -107,38 +127,43 @@ pub fn range_end(prefix: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Base-partition keys (token-hash the base partition key)
+// Base-tablet keys — one builder per scope (token-hash the base partition key)
 // ---------------------------------------------------------------------------
+//
+// Every key below leads with `escape(pk)`, so all four kinds land in the same
+// token range and therefore the same tablet — which is what lets one `PutBatch`
+// write them atomically (ADR 0041 §2/§4). Keys in *different* scopes may be
+// byte-identical (a footprint key and a base partition prefix both being bare
+// `escape(pk)`); they cannot collide, because the scope prefix separates them
+// physically.
 
-/// The within-table key of a base item row: `escape(pk) || 0x00 || sk`.
+/// The within-table key of a base item row: `escape(pk) || sk`, in the
+/// [`KIND_BASE`] scope.
 ///
-/// This is ADR 0022's layout plus ADR 0041's discriminator. Token-hash `pk`.
+/// Byte-identical to [`crate::storage_key`] — ADR 0022's layout, unchanged by
+/// ADR 0041. Kept as a named alias so index-maintenance code reads uniformly
+/// across the four scopes. Token-hash `pk`.
 #[must_use]
 pub fn base_row_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {
-    let mut key = base_partition_prefix(pk);
-    if let Some(sk) = sk {
-        key.extend_from_slice(&sk.key_bytes());
-    }
-    key
+    crate::storage_key(pk, sk)
 }
 
-/// The prefix every base row of `pk`'s partition starts with, and no other row
-/// kind does: `escape(pk) || 0x00`. A base `Query` is
-/// `[base_partition_prefix, range_end(base_partition_prefix))`.
+/// The prefix every base row of `pk`'s partition starts with: `escape(pk)`. A
+/// base `Query` is `[base_partition_prefix, range_end(base_partition_prefix))`
+/// within the [`KIND_BASE`] scope.
 #[must_use]
 pub fn base_partition_prefix(pk: &AttributeValue) -> Vec<u8> {
-    let mut key = escape(&pk.key_bytes());
-    key.push(KIND_BASE);
-    key
+    escape(&pk.key_bytes())
 }
 
-/// The within-table key of one LSI row:
-/// `escape(pk) || 0x01 || escape(index) || escape(alt_sort) || sk`.
+/// The within-table key of one LSI row, in the [`KIND_LSI`] scope:
+/// `escape(pk) || escape(index) || escape(alt_sort) || sk`.
 ///
 /// `sk` is the **base** sort key, which makes the row unique when two items in
 /// the partition share an `alt_sort` value, and lets [`parse_lsi_row_key`]
-/// recover the base key. Token-hash `pk` — the LSI shares the base row's tablet,
-/// which is what makes it atomic with the base write (ADR 0041 §2).
+/// recover the base key. Token-hash `pk` — leading with the base partition key
+/// puts the row in the base row's tablet, which is what makes it atomic with the
+/// base write (ADR 0041 §2).
 #[must_use]
 pub fn lsi_row_key(
     pk: &AttributeValue,
@@ -155,16 +180,16 @@ pub fn lsi_row_key(
 }
 
 /// The prefix every row of one LSI within one base partition starts with:
-/// `escape(pk) || 0x01 || escape(index)`. An LSI `Query` narrows within this.
+/// `escape(pk) || escape(index)`. An LSI `Query` narrows within this.
 #[must_use]
 pub fn lsi_index_prefix(pk: &AttributeValue, index: &str) -> Vec<u8> {
     let mut key = escape(&pk.key_bytes());
-    key.push(KIND_LSI);
     key.extend_from_slice(&escape(index.as_bytes()));
     key
 }
 
-/// The within-table key of a change-log record: `escape(pk) || 0x02 || hlc`.
+/// The within-table key of a change-log record, in the [`KIND_CHANGE`] scope:
+/// `escape(pk) || hlc`.
 ///
 /// `hlc` must be a **fixed-width, big-endian, order-preserving** encoding of the
 /// write's HLC commit timestamp, so records within a partition sort in commit
@@ -179,34 +204,21 @@ pub fn change_record_key(pk: &AttributeValue, hlc: &[u8]) -> Vec<u8> {
 }
 
 /// The prefix every change record of `pk`'s partition starts with:
-/// `escape(pk) || 0x02`. The drain (and, later, a stream shard reader) scans
-/// `[change_prefix, range_end(change_prefix))` in commit order.
+/// `escape(pk)`. The drain (and, later, a stream shard reader) scans
+/// `[change_prefix, range_end(change_prefix))` of the [`KIND_CHANGE`] scope in
+/// commit order.
 #[must_use]
 pub fn change_prefix(pk: &AttributeValue) -> Vec<u8> {
-    let mut key = escape(&pk.key_bytes());
-    key.push(KIND_CHANGE);
-    key
+    escape(&pk.key_bytes())
 }
 
-/// The within-table key of a base key's GSI footprint: `escape(pk) || 0x03`.
+/// The within-table key of a partition's GSI footprint, in the
+/// [`KIND_FOOTPRINT`] scope: `escape(pk)`.
 ///
 /// One per **partition key**, not per item: see [`IndexFootprint`].
 #[must_use]
 pub fn footprint_key(pk: &AttributeValue) -> Vec<u8> {
-    let mut key = escape(&pk.key_bytes());
-    key.push(KIND_FOOTPRINT);
-    key
-}
-
-/// The row kind of a within-table base-partition key, or `None` if the key does
-/// not carry a recognized discriminator (a malformed or foreign key).
-#[must_use]
-pub fn row_kind(key: &[u8]) -> Option<u8> {
-    let (_, rest) = peel_escaped(key)?;
-    match rest.first().copied() {
-        Some(k @ (KIND_BASE | KIND_LSI | KIND_CHANGE | KIND_FOOTPRINT)) => Some(k),
-        _ => None,
-    }
+    escape(&pk.key_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -309,15 +321,13 @@ pub struct LsiRowRef {
 
 /// Recover `(base_pk, index, alt_sort, base_sk)` from an LSI row key.
 ///
-/// Returns `None` if the key is not an LSI row (wrong or absent discriminator),
-/// if a segment is malformed, or if the index name is not UTF-8.
+/// The caller must already know this is an LSI row — it came from the
+/// [`KIND_LSI`] scope, which is what identifies it now that no discriminator
+/// rides in the key. Returns `None` only if a segment is malformed or the index
+/// name is not UTF-8.
 #[must_use]
 pub fn parse_lsi_row_key(key: &[u8]) -> Option<LsiRowRef> {
     let (base_pk, rest) = peel_escaped(key)?;
-    let (&kind, rest) = rest.split_first()?;
-    if kind != KIND_LSI {
-        return None;
-    }
     let (index, rest) = peel_escaped(rest)?;
     let (alt_sort, base_sk) = peel_escaped(rest)?;
     Some(LsiRowRef {
@@ -530,25 +540,44 @@ mod tests {
     }
 
     #[test]
-    fn row_kinds_partition_the_keyspace_in_discriminator_order() {
-        let pk = s("alice");
-        let base = base_row_key(&pk, Some(&s("z")));
-        let lsi = lsi_row_key(&pk, "byAge", &s("a"), Some(&s("z")));
-        let change = change_record_key(&pk, &7u64.to_be_bytes());
-        let footprint = footprint_key(&pk);
-
-        // Every kind sorts into its own contiguous block, in discriminator order.
-        assert!(base < lsi, "base rows precede LSI rows");
-        assert!(lsi < change, "LSI rows precede change records");
-        assert!(change < footprint, "change records precede the footprint");
-
-        // And a base Query's range excludes every other kind.
-        let prefix = base_partition_prefix(&pk);
-        let end = range_end(&prefix);
-        assert!(base >= prefix && base < end);
-        for other in [&lsi, &change, &footprint] {
-            assert!(other >= &end, "a base range must exclude other row kinds");
+    fn the_base_layout_is_adr_0022_unchanged() {
+        // ADR 0041 moved the row kind into the scope prefix precisely so this
+        // stays true: nothing existing moves on disk, and the CQL edge — which
+        // has no LSI — needs no change at all.
+        for (pk, sk) in [(s("alice"), None), (s("alice"), Some(s("42")))] {
+            assert_eq!(
+                base_row_key(&pk, sk.as_ref()),
+                crate::storage_key(&pk, sk.as_ref())
+            );
         }
+    }
+
+    #[test]
+    fn every_kind_leads_with_the_partition_key_so_all_share_one_tablet() {
+        // The atomicity property (ADR 0041 §2/§4): a tablet is a range over the
+        // token of `escape(pk)`, so every kind leading with `escape(pk)` lands in
+        // the same tablet and one PutBatch can write them as one Raft entry.
+        let pk = s("alice");
+        let prefix = escape(&pk.key_bytes());
+        for key in [
+            base_row_key(&pk, Some(&s("z"))),
+            lsi_row_key(&pk, "byAge", &s("a"), Some(&s("z"))),
+            change_record_key(&pk, &7u64.to_be_bytes()),
+            footprint_key(&pk),
+        ] {
+            assert!(key.starts_with(&prefix), "every kind leads with escape(pk)");
+        }
+    }
+
+    #[test]
+    fn identical_bytes_in_different_scopes_are_not_a_collision() {
+        // A footprint key and a base partition prefix are both bare escape(pk).
+        // They coexist because the scope prefix separates them physically — the
+        // reason `row_kind()` no longer exists.
+        let pk = s("alice");
+        assert_eq!(footprint_key(&pk), base_partition_prefix(&pk));
+        assert_eq!(footprint_key(&pk), change_prefix(&pk));
+        assert_eq!(ALL_KINDS.len(), 4, "four scopes share one tablet's range");
     }
 
     #[test]
@@ -559,22 +588,6 @@ mod tests {
         let long = base_row_key(&s("alice"), None);
         assert!(!long.starts_with(&short));
         assert!(long < short.clone() || long >= range_end(&short));
-    }
-
-    #[test]
-    fn row_kind_reads_the_discriminator_back() {
-        let pk = s("alice");
-        assert_eq!(row_kind(&base_row_key(&pk, Some(&s("z")))), Some(KIND_BASE));
-        assert_eq!(
-            row_kind(&lsi_row_key(&pk, "i", &s("a"), None)),
-            Some(KIND_LSI)
-        );
-        assert_eq!(
-            row_kind(&change_record_key(&pk, &[0, 0, 0, 1])),
-            Some(KIND_CHANGE)
-        );
-        assert_eq!(row_kind(&footprint_key(&pk)), Some(KIND_FOOTPRINT));
-        assert_eq!(row_kind(b"not a key"), None);
     }
 
     #[test]
@@ -650,9 +663,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_lsi_row_key_rejects_a_base_row() {
-        let base = base_row_key(&s("alice"), Some(&s("42")));
-        assert_eq!(parse_lsi_row_key(&base), None);
+    fn lsi_row_keys_recover_values_containing_zero_bytes() {
+        // Same prefix-freedom property the GSI rows rely on, across the extra
+        // index-name segment an LSI row carries.
+        let pk = AttributeValue::B(vec![0x00, 0x01]);
+        let alt = AttributeValue::B(vec![0x00]);
+        let row = lsi_row_key(&pk, "by\u{0}Age", &alt, None);
+        let parsed = parse_lsi_row_key(&row).expect("parses");
+        assert_eq!(parsed.base_pk, vec![0x00, 0x01]);
+        assert_eq!(parsed.index, "by\u{0}Age");
+        assert_eq!(parsed.alt_sort, vec![0x00]);
+        assert!(parsed.base_sk.is_empty());
     }
 
     #[test]
