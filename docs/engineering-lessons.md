@@ -1384,6 +1384,37 @@ debugging anything that feels like it might have happened before.
   quietly assume creation is atomic with the read that discovers a need
   for it? See the PR5 amendment's §2b for the full closing fix and its
   regression test.
+  **Update (2026-08-12, task #18): the fix above closed the *primitive*'s
+  shape but nobody ever verified its *real caller* actually used it — for
+  three subsequent PRs (PR5 through PR7), `ClientCtx::cp_txn` kept calling
+  `RaftKvNode::txn_stage` (an empty participant list) instead of the new
+  `txn_stage_anchor(.., participant_spans)` this very fix introduced,
+  so every production multi-participant transaction's `intent_spans` still
+  only ever named the anchor's own keys — a live, exploitable atomicity
+  violation on the recovery path (a transaction whose participant never
+  staged could be wrongly recovered as `Committed`), not merely the
+  observability gap it looked like on paper.** Nobody caught this because
+  every test that exercised recovery's participant-verification logic
+  called `txn_stage_anchor` **directly**, by hand, with a real span list —
+  proving the primitive, never the coordinator's wiring of it. And every
+  test that *did* go through the real coordinator (`animusd/tests/
+  cp_txn.rs`'s PR5 coordinator-crash pair) always staged every participant
+  genuinely before letting recovery run, so the verification loop's
+  incompleteness (checking a list that was silently too short) was never
+  exercised against a case where the answer would have been wrong — the
+  loop just never found anything to disagree about. **The generalizable
+  lesson, sharper than the one above**: when a fix teaches "the caller must
+  supply the fuller data" and changes a primitive's signature to accept
+  it, that is necessary but not sufficient — a follow-up (ideally the same
+  change) must grep the actual production call site and confirm it was
+  updated to *pass* the fuller data, not just that a test constructing the
+  call by hand now can. An ADR/CLAUDE.md sentence asserting "the
+  coordinator already computes X and hands it to the stage call" is a
+  claim about a specific call site, not about the type system — verify it
+  by reading that exact function, especially when what depends on it is a
+  correctness property (recovery's own atomicity), not a nice-to-have. See
+  ADR 0018's own corrective note on this section for the full account, the
+  wire-level test that reproduced the live failure, and the fix.
 - **A "full replace" update to `Arc`-shared cached state tolerates a bare
   monotonic-watermark check-then-mutate race; an "apply an incremental delta
   onto the existing cache" update to the *same* shared state does not, and

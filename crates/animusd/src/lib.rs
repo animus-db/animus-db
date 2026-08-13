@@ -555,25 +555,26 @@ impl CpGroup {
 
     // ---- multi-participant transactions (ADR 0018 §2/PR4) ----------------
 
-    /// **Anchor stage.** See [`RaftKvNode::txn_stage_anchor`]. `conditions`
-    /// is ADR 0018 §2's apply-time write-key conditions amendment; this
-    /// wrapper always passes an empty `participant_spans` (unchanged from
-    /// before that amendment — every existing caller here is the
-    /// single-participant convenience shape, `RaftKvNode::txn_stage`'s own
-    /// prior behavior).
+    /// **Anchor stage.** See [`RaftKvNode::txn_stage_anchor`] — this
+    /// wrapper always calls it directly (never the single-participant
+    /// `txn_stage` convenience) so `participant_spans` (ADR 0018 §2/PR5,
+    /// task #18 fix) actually reaches the freshly-created record's
+    /// `intent_spans`. `conditions` is ADR 0018 §2's apply-time write-key
+    /// conditions amendment.
     async fn txn_stage(
         &self,
         table: &str,
         writes: Vec<TxnWrite>,
+        participant_spans: Vec<(String, KeyRange)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Option<(TxnId, Vec<u8>, StageOutcome)> {
         match self {
             CpGroup::Lsm(n) => {
-                n.txn_stage_anchor(table, writes, Vec::new(), conditions)
+                n.txn_stage_anchor(table, writes, participant_spans, conditions)
                     .await
             }
             CpGroup::Mem(n) => {
-                n.txn_stage_anchor(table, writes, Vec::new(), conditions)
+                n.txn_stage_anchor(table, writes, participant_spans, conditions)
                     .await
             }
         }
@@ -979,12 +980,22 @@ pub enum ClientRequest {
     /// **`conditions`** (ADR 0018 §2 apply-time write-key conditions
     /// amendment): own-key byte-level OCC preconditions for this stage's
     /// own `writes` — see `animus_cp_data::KvCommand::TxnStage`'s doc.
+    ///
+    /// **`participant_spans`** (ADR 0018 §2/PR5, task #18 fix): every
+    /// *other* participant's `(table, span)` pairs — meaningful, and
+    /// merged into the freshly-created record's `intent_spans`, only for
+    /// the anchor case (`anchor: None`); a participant's own stage ignores
+    /// it (it creates no record). Both `#[serde(default)]` so these stay
+    /// internal-only wire shape additions, no back-compat concern (house
+    /// convention: no live deployments).
     TxnPrepare {
         table: String,
         anchor: Option<(TxnId, Vec<u8>, String)>,
         writes: Vec<TxnWrite>,
         #[serde(default)]
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        #[serde(default)]
+        participant_spans: Vec<(String, KeyRange)>,
     },
     /// **Internal 2PC coordinator RPC — anchor only, never sent bare**
     /// (ADR 0018 §2/PR4): commit or abort `txn_id`'s record at `record_key`
@@ -4028,12 +4039,22 @@ impl ClientCtx {
     /// did apply actually staged (see [`ClientResponse::TxnPrepared`]'s
     /// doc). `conditions` is ADR 0018 §2's apply-time write-key conditions
     /// amendment (own-key byte-level OCC — empty for a plain transaction).
+    ///
+    /// **`participant_spans`** (ADR 0018 §2/PR5, task #18 fix): every
+    /// *other* participant's `(table, span)` pairs, meaningful only for the
+    /// anchor case (`anchor: None`) — merged into the freshly-created
+    /// record's `intent_spans` alongside the anchor's own writes, so
+    /// in-doubt recovery's `all_staged` check (`ClientCtx::txn_recover`)
+    /// can actually verify every participant, not just the anchor. Ignored
+    /// for a participant's own stage (`anchor: Some(..)`), which never
+    /// creates a record to populate.
     async fn txn_prepare(
         &self,
         table: &str,
         anchor: Option<(TxnId, Vec<u8>, String)>,
         writes: Vec<TxnWrite>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        participant_spans: Vec<(String, KeyRange)>,
     ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), String> {
         let Some(first) = writes.first().map(|(k, _)| k.clone()) else {
             return Err("txn prepare: writes must be non-empty".into());
@@ -4042,7 +4063,7 @@ impl ClientCtx {
             CpRoute::Local(leader) => match &anchor {
                 None => {
                     let (txn_id, record_key, outcome) = leader
-                        .txn_stage(table, writes, conditions)
+                        .txn_stage(table, writes, participant_spans, conditions)
                         .await
                         .ok_or("CP group leader moved during anchor stage; retry")?;
                     let ts = txn_id.ts;
@@ -4074,6 +4095,7 @@ impl ClientCtx {
                     anchor,
                     writes,
                     conditions,
+                    participant_spans,
                 };
                 match self.cp_forward(table, &first, addr, request).await {
                     ClientResponse::TxnPrepared {
@@ -4126,10 +4148,17 @@ impl ClientCtx {
         anchor: Option<(TxnId, Vec<u8>, String)>,
         writes: Vec<TxnWrite>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        participant_spans: Vec<(String, KeyRange)>,
     ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp), String> {
         for attempt in 0..TXN_STAGE_PUSH_ATTEMPTS {
             let (txn_id, record_key, record_table, ts, outcome) = self
-                .txn_prepare(table, anchor.clone(), writes.clone(), conditions.clone())
+                .txn_prepare(
+                    table,
+                    anchor.clone(),
+                    writes.clone(),
+                    conditions.clone(),
+                    participant_spans.clone(),
+                )
                 .await?;
             match outcome {
                 StageOutcome::Staged => return Ok((txn_id, record_key, record_table, ts)),
@@ -4814,8 +4843,36 @@ impl ClientCtx {
         let (anchor_table, _anchor_tablet) = anchor_gk;
         let anchor_keys: Vec<Vec<u8>> = anchor_writes.iter().map(|(k, _)| k.clone()).collect();
 
+        // ADR 0018 §2/PR5 (task #18 fix): the anchor's record must name
+        // every OTHER participant's `(table, span)` pairs up front, not
+        // just its own — `groups` (with the anchor's own entry already
+        // removed above) holds exactly that. Without this, in-doubt
+        // recovery's `all_staged` check (`ClientCtx::txn_recover`) only
+        // ever verifies the anchor's own keys against `intent_spans`,
+        // trivially reporting "all staged" even when a real participant
+        // never staged at all — a genuine cross-tablet atomicity
+        // violation on the recovery path (see `docs/adr/
+        // 0018-cross-tablet-transactions.md`'s corrective note on this).
+        let participant_spans: Vec<(String, KeyRange)> = groups
+            .iter()
+            .flat_map(|((table, _tablet), writes)| {
+                let table = table.clone();
+                writes.iter().map(move |(key, _)| {
+                    let mut end = key.clone();
+                    end.push(0);
+                    (table.clone(), KeyRange::new(key.clone(), Some(end)))
+                })
+            })
+            .collect();
+
         let (txn_id, record_key, record_table, anchor_ts) = self
-            .txn_prepare_pushing(&anchor_table, None, anchor_writes, anchor_conditions)
+            .txn_prepare_pushing(
+                &anchor_table,
+                None,
+                anchor_writes,
+                anchor_conditions,
+                participant_spans,
+            )
             .await?;
 
         // Every other participant stages concurrently.
@@ -4835,6 +4892,7 @@ impl ClientCtx {
                         Some((txn_id, record_key, record_table)),
                         writes,
                         conditions,
+                        Vec::new(), // unused: a participant's own stage creates no record.
                     )
                     .await;
                 (table, keys, result)
@@ -5701,6 +5759,7 @@ impl ClientCtx {
                 anchor,
                 writes,
                 conditions,
+                participant_spans,
             } => {
                 let Some(first) = writes.first().map(|(k, _)| k.clone()) else {
                     return ClientResponse::Error("txn prepare: writes must be non-empty".into());
@@ -5710,7 +5769,10 @@ impl ClientCtx {
                     return self.not_leader_refusal(tablet);
                 };
                 match anchor {
-                    None => match leader.txn_stage(&table, writes, conditions).await {
+                    None => match leader
+                        .txn_stage(&table, writes, participant_spans, conditions)
+                        .await
+                    {
                         Some((txn_id, record_key, outcome)) => ClientResponse::TxnPrepared {
                             ts: txn_id.ts,
                             txn_id,
