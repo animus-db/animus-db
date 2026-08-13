@@ -633,12 +633,29 @@ route below the edge through the same `ClientCtx` CP primitives.
   partition key; a **GSI cannot** (its rows live in their own hidden table's
   tablets) and is materialized asynchronously by the drain (`index_drain.rs`)
   from those change records. A table with no indexes keeps the plain
-  single-key write path, paying nothing. **`UpdateItem`/`BatchWriteItem`/
-  `TransactWriteItems` do not go through `index_aware_write`** — a pre-existing
-  gap this PR did not close (only the single-item `PutItem`/`DeleteItem` path
-  does), so a secondary index on a table written exclusively through those
-  three ops never sees an LSI row or a GSI change-log record; see
-  `docs/engineering-lessons.md`.
+  single-key write path, paying nothing. **Every write op that lands on an
+  indexed table now maintains it (ADR 0041, 2026-08-13 fix)** —
+  `UpdateItem` routes its single final write through `index_aware_write`
+  exactly like `PutItem`/`DeleteItem` (passing the RMW's own before/after
+  images); `BatchWriteItem` keeps the fast `cp_batch_write` path for an
+  **unindexed** table but routes each `Put`/`Delete` through
+  `index_aware_write` individually for an **indexed** one (reading the old
+  item first — the LSI diff needs it — under the RMW lock per request, so
+  atomicity stays per-item, matching `BatchWriteItem`'s own pre-existing
+  non-atomic contract). **`TransactWriteItems` is the one op that still
+  can't participate**: a write action (`Put`/`Delete`/`Update`, not a bare
+  `ConditionCheck`) against a table with at least one secondary index makes
+  `run_transact` reject the **whole transaction** up front with a
+  `ValidationException` — `cp_txn`'s `KvCommand::TxnStage` has no
+  multi-kind-write extension yet, so staging just the base row inside a
+  transaction would commit the item while permanently never producing its
+  LSI rows or change-log record, a silent-wrong-index outcome strictly
+  worse than a loud unsupported-combination error. The real fix (extending
+  `TxnStage` with a transactional multi-kind write, the `cp_txn` analogue of
+  `cp_kind_write`) is a real `animus-cp-data` protocol change, named as a
+  follow-up in ADR 0041's as-built note under §2 rather than folded into
+  this fix. See `docs/engineering-lessons.md` for the original gap and its
+  resolution.
   `ClientRequest::KindWrite` is the forwarding payload — **internal-only,
   refused bare** (a client could otherwise write arbitrary bytes into a table's
   LSI/change scopes and desynchronise its indexes), handled only inside

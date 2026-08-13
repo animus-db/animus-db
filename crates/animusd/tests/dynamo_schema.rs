@@ -25,8 +25,10 @@
 //!   durable, replicated data (ADR 0041), not a rebuilt-from-writes in-memory
 //!   index, so there is no backfill to perform or need.
 //! - `extended_surface` mirrors `dynamo_extended.rs`: a 3-node in-process cluster
-//!   exercises UpdateItem, BatchWriteItem, TransactWriteItems, a document-path
-//!   projection, and a `KEYS_ONLY` GSI projection.
+//!   exercises UpdateItem, BatchWriteItem, TransactWriteItems (the latter on a
+//!   dedicated unindexed table — `dynamo_index_writes.rs` covers
+//!   `TransactWriteItems`' own ADR 0041 rejection on an *indexed* one), a
+//!   document-path projection, and a `KEYS_ONLY` GSI projection.
 //!
 //! Real time/sockets (the ProdEnv edge), so we poll with generous timeouts.
 
@@ -718,15 +720,38 @@ async fn extended_surface() {
     assert_eq!(status, 200);
     assert_eq!(body, "{}", "u1 should be deleted: {body}");
 
-    // TransactWriteItems: a ConditionCheck that u2 exists + a conditional Put of
-    // u4 only if absent. Both hold, so it succeeds.
+    // TransactWriteItems: exercised against a **separate, unindexed** table —
+    // `users` carries a GSI, and ADR 0041's write-coverage fix rejects any
+    // `TransactWriteItems` request whose writes touch an indexed table (see
+    // this file's `transact_write_items_rejected_on_indexed_table` and
+    // `dynamo_index_writes.rs` for that rejection itself). This section keeps
+    // covering the ordinary TransactWriteItems mechanics — a ConditionCheck +
+    // a conditional Put, and a failing condition — on a table with no
+    // secondary index, exactly like `dynamo_txn.rs`'s own coverage.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"notes","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable(notes) failed: {body}");
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.PutItem",
+        r#"{"TableName":"notes","Item":{"id":{"S":"n2"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "PutItem(n2) failed: {body}");
+
+    // A ConditionCheck that n2 exists + a conditional Put of n4 only if
+    // absent. Both hold, so it succeeds.
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.TransactWriteItems",
         r#"{"TransactItems":[
-            {"ConditionCheck":{"TableName":"users","Key":{"id":{"S":"u2"}},
+            {"ConditionCheck":{"TableName":"notes","Key":{"id":{"S":"n2"}},
                                "ConditionExpression":"attribute_exists(id)"}},
-            {"Put":{"TableName":"users","Item":{"id":{"S":"u4"},"email":{"S":"d@x"}},
+            {"Put":{"TableName":"notes","Item":{"id":{"S":"n4"},"body":{"S":"d@x"}},
                     "ConditionExpression":"attribute_not_exists(id)"}}]}"#,
     )
     .await;
@@ -734,13 +759,13 @@ async fn extended_surface() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"users","Key":{"id":{"S":"u4"}}}"#,
+        r#"{"TableName":"notes","Key":{"id":{"S":"n4"}}}"#,
     )
     .await;
     assert_eq!(status, 200);
     assert!(
-        body.contains(r#""email":{"S":"d@x"}"#),
-        "u4 not written: {body}"
+        body.contains(r#""body":{"S":"d@x"}"#),
+        "n4 not written: {body}"
     );
 
     // A failing transaction condition rejects the whole request. Since ADR
@@ -753,7 +778,7 @@ async fn extended_surface() {
         addr,
         "DynamoDB_20120810.TransactWriteItems",
         r#"{"TransactItems":[
-            {"ConditionCheck":{"TableName":"users","Key":{"id":{"S":"nope"}},
+            {"ConditionCheck":{"TableName":"notes","Key":{"id":{"S":"nope"}},
                                "ConditionExpression":"attribute_exists(id)"}}]}"#,
     )
     .await;

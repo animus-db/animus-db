@@ -115,6 +115,52 @@ base row and LSI rows one `ClientRequest::PutBatch` — **one Raft log entry, on
 commit round, one apply**. LSI maintenance is thus atomic with the base write and
 strongly consistent, with no intent, no drain, and no 2PC.
 
+> **As-built corrective note (2026-08-13, per-operation write coverage
+> closed).** §2/§4's `index_aware_write`/`kind_writes_for_item` mechanism
+> shipped wired into the single-item `PutItem`/`DeleteItem` handlers only;
+> `UpdateItem`, `BatchWriteItem`, and `TransactWriteItems` kept committing
+> through the plain pre-ADR-0041 write primitives, so a table's secondary
+> indexes silently never saw a write made exclusively through any of those
+> three ops (documented as a known gap in the §5 PR, invisible while the
+> now-deleted edge-local in-memory index still papered over it for a single
+> observing process). Coverage is now:
+>
+> - **`UpdateItem`** routes its single final write through
+>   `index_aware_write`, passing the RMW's own before/after images — an exact
+>   mirror of `PutItem`'s call shape, since both are "one item, one new
+>   value, an optional prior value already in hand."
+> - **`BatchWriteItem`** keeps the original `cp_batch_write` fast path
+>   (one Raft entry per tablet, no per-item read) for any table with **no**
+>   secondary index — unchanged, pays nothing. A table with at least one
+>   index instead routes each `Put`/`Delete` request through
+>   `index_aware_write` **individually**, reading the old item first (the
+>   LSI diff needs it — a real, unavoidable extra read, paid only by indexed
+>   tables) under the node's RMW lock for that one request's span. This is
+>   **per-item atomicity only**, matching `BatchWriteItem`'s own pre-existing
+>   non-atomic contract — one request's outcome was never allowed to depend
+>   on another's, before or after this fix.
+> - **`TransactWriteItems` is rejected up front** (`ValidationException`,
+>   *"transactional writes on an indexed table are not yet supported (ADR
+>   0041: TxnStage kind-write extension pending)"*) whenever any `Put`/
+>   `Delete`/`Update` action targets a table with at least one secondary
+>   index — a bare `ConditionCheck` doesn't count, so a transaction may still
+>   write freely to unindexed tables alongside a `ConditionCheck` on an
+>   indexed one. This is a **deliberate, not a stopgap, choice**: `cp_txn`'s
+>   `KvCommand::TxnStage` only ever stages the base row, with no multi-kind-
+>   write extension (the equivalent of `KindBatch` for a transaction's own
+>   apply). Staging just the base row would commit the item while silently
+>   never writing its LSI rows or change-log record — the table's indexes go
+>   **permanently stale** with no error, no warning, and no drain input ever
+>   produced for that write. In a pre-alpha, correctness-first system, a loud
+>   rejection of an unsupported combination is strictly better than a silent,
+>   permanent wrong answer. The genuine fix — extending `TxnStage` so a
+>   transaction's own apply can stage a multi-kind atomic write, the
+>   transactional analogue of `cp_kind_write` — is a real `animus-cp-data`
+>   protocol change and is intentionally deferred as a named follow-up, not
+>   folded into this correctness fix.
+>
+> Regression coverage: `animusd/tests/dynamo_index_writes.rs`.
+
 ### 3. Row kinds are separate storage scopes, not a discriminator in the key
 
 A base tablet now holds four kinds of row. They are separated **above the

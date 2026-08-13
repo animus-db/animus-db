@@ -560,24 +560,82 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // write of the tombstone *sentinel value* (as in `delete_item`), so both
             // ride the same batch. Within a table `cp_batch_write` groups by tablet
             // (atomic per tablet, non-atomic across tablets — DynamoDB semantics).
+            //
+            // **A table with at least one secondary index cannot use that fast
+            // path** (ADR 0041 §2/§4): `cp_batch_write` only ever writes the base
+            // kind, so it would silently produce no LSI rows and no change-log
+            // record. Such a table instead routes each request through
+            // [`index_aware_write`] individually, reading the old item first (the
+            // LSI diff needs it) — a real per-item read cost, paid only by
+            // indexed tables. Each request gets its own read → evaluate → write
+            // span under the node's RMW lock, mirroring `PutItem`/`DeleteItem`'s
+            // own discipline: **per-item atomicity only**, matching DynamoDB's
+            // own non-atomic `BatchWriteItem` contract (one request's outcome
+            // never affects another's).
             for (table, reqs) in &requests {
-                let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(reqs.len());
-                for req in reqs {
-                    match req {
-                        WriteRequest::Put(item) => {
-                            let (pk, sk) = resolve_key(ctx, meta, table, item)?;
-                            batch
-                                .push((item_key(&pk, sk.as_ref()), wire::encode_stored_item(item)));
+                if meta.table_indexes(table).is_empty() {
+                    let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(reqs.len());
+                    for req in reqs {
+                        match req {
+                            WriteRequest::Put(item) => {
+                                let (pk, sk) = resolve_key(ctx, meta, table, item)?;
+                                batch.push((
+                                    item_key(&pk, sk.as_ref()),
+                                    wire::encode_stored_item(item),
+                                ));
+                            }
+                            WriteRequest::Delete(key_item) => {
+                                let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
+                                batch.push((item_key(&pk, sk.as_ref()), wire::encode_tombstone()));
+                            }
                         }
-                        WriteRequest::Delete(key_item) => {
-                            let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
-                            batch.push((item_key(&pk, sk.as_ref()), wire::encode_tombstone()));
+                    }
+                    ctx.cp_batch_write(table, batch)
+                        .await
+                        .map_err(|e| internal(&e))?;
+                } else {
+                    for req in reqs {
+                        let _rmw = ctx.data().rmw_lock.lock().await;
+                        match req {
+                            WriteRequest::Put(item) => {
+                                let (pk, sk) = resolve_key(ctx, meta, table, item)?;
+                                let key = item_key(&pk, sk.as_ref());
+                                let old = quorum_read(ctx, meta, table, &key).await?;
+                                let value = wire::encode_stored_item(item);
+                                index_aware_write(
+                                    ctx,
+                                    meta,
+                                    table,
+                                    &pk,
+                                    sk.as_ref(),
+                                    &key,
+                                    value,
+                                    old.as_ref(),
+                                    Some(item),
+                                )
+                                .await?;
+                            }
+                            WriteRequest::Delete(key_item) => {
+                                let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
+                                let key = item_key(&pk, sk.as_ref());
+                                let old = quorum_read(ctx, meta, table, &key).await?;
+                                let value = wire::encode_tombstone();
+                                index_aware_write(
+                                    ctx,
+                                    meta,
+                                    table,
+                                    &pk,
+                                    sk.as_ref(),
+                                    &key,
+                                    value,
+                                    old.as_ref(),
+                                    None,
+                                )
+                                .await?;
+                            }
                         }
                     }
                 }
-                ctx.cp_batch_write(table, batch)
-                    .await
-                    .map_err(|e| internal(&e))?;
             }
             Ok(wire::batch_write_response())
         }
@@ -706,9 +764,12 @@ async fn create_table(
 
 /// `UpdateItem`: read-modify-write. Reads the current item, applies the SET/REMOVE
 /// actions (starting from the key attributes when the item is absent — an upsert,
-/// as in DynamoDB), gating on an optional `condition`, then quorum-writes the new
-/// item and echoes `ReturnValues`. Takes no RMW lock itself — both callers (the
-/// `UpdateItem` arm and `run_transact`) hold `ctx.data().rmw_lock` around the call.
+/// as in DynamoDB), gating on an optional `condition`, then commits the new item
+/// through [`index_aware_write`] (ADR 0041 §2/§4 — maintains this item's LSI rows
+/// and change-log record atomically with the base row on an indexed table; a
+/// plain single-key write on an unindexed one) and echoes `ReturnValues`. Takes no
+/// RMW lock itself — both callers (the `UpdateItem` arm and `run_transact`) hold
+/// `ctx.data().rmw_lock` around the call.
 async fn run_update_item(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -732,7 +793,18 @@ async fn run_update_item(
     let base = old.clone().unwrap_or_else(|| key_item.clone());
     let new = wire::apply_update(base, actions);
     let value = wire::encode_stored_item(&new);
-    quorum_write(ctx, meta, table, &key, &value).await?;
+    index_aware_write(
+        ctx,
+        meta,
+        table,
+        &pk,
+        sk.as_ref(),
+        &key,
+        value,
+        old.as_ref(),
+        Some(&new),
+    )
+    .await?;
     Ok(wire::update_response(
         return_values,
         old.as_ref(),
@@ -814,6 +886,21 @@ async fn run_update_item(
 /// calling it — the same OCC guarantee, just without a durable transaction
 /// record backing the window. A narrow, documented limitation of this
 /// corner case (see the PR7 ADR amendment), not the common path.
+///
+/// **A write action against a table with at least one secondary index is
+/// rejected outright, up front (ADR 0041)** — `cp_txn`'s `KvCommand::TxnStage`
+/// only ever stages the base row; it has no multi-kind-write extension yet, so
+/// staging a `Put`/`Delete`/`Update` on an indexed table would commit the base
+/// row while silently never writing an LSI row or a change-log record, leaving
+/// that table's indexes **permanently stale** with no error and no signal —
+/// worse than refusing the transaction, since a stale index looks correct
+/// until it silently isn't. A `ConditionCheck` alone doesn't count (it writes
+/// nothing); a transaction may still write freely to any *unindexed* table
+/// alongside a `ConditionCheck` on an indexed one. The real fix — extending
+/// `KvCommand::TxnStage` so it can stage a multi-kind atomic write (base + LSI
+/// rows + change record) the same way `cp_kind_write` does outside a
+/// transaction — is a genuine `animus-cp-data` protocol change, deliberately
+/// left as a follow-up rather than folded into this rejection.
 async fn run_transact(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -828,6 +915,15 @@ async fn run_transact(
         return Err(WireError::validation(format!(
             "TransactWriteItems supports at most {MAX_TRANSACT_ITEMS} actions"
         )));
+    }
+    for action in actions {
+        let is_write = !matches!(action, TransactAction::ConditionCheck { .. });
+        if is_write && !meta.table_indexes(action.table()).is_empty() {
+            return Err(WireError::validation(
+                "transactional writes on an indexed table are not yet supported \
+                 (ADR 0041: TxnStage kind-write extension pending)",
+            ));
+        }
     }
 
     // Serialize against this node's other RMWs across the whole pre-read/

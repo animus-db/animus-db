@@ -4067,6 +4067,24 @@ debugging anything that feels like it might have happened before.
   "Separate PRs for incidental bugs"); tracked in `animusd/CLAUDE.md`'s and
   `animus-dynamo/CLAUDE.md`'s ADR 0041 entries.
 
+  **Resolution (2026-08-13).** `UpdateItem` and `BatchWriteItem` now route
+  through `index_aware_write` (the latter per-item, and only for a table
+  that actually has an index — an unindexed table keeps its no-read
+  `cp_batch_write` fast path unchanged). `TransactWriteItems` did **not**
+  get the same treatment — it is rejected outright (`ValidationException`)
+  whenever any write action targets an indexed table, because closing this
+  gap for real would mean giving `cp_txn`'s `KvCommand::TxnStage` a
+  multi-kind-write extension (staging LSI rows + a change record atomically
+  with a transactional base-row write), which is a genuine `animus-cp-data`
+  protocol change, not a `dynamo.rs`-local fix — named as a follow-up in ADR
+  0041's as-built note under §2. The generalizable half of this entry
+  stands on its own; the corollary worth keeping: **when the honest fix for
+  one sibling in a "family of write operations" reaches into a lower layer's
+  protocol, a loud rejection of that one combination is a legitimate
+  interim closure of a correctness gap** — better than either leaving it
+  silently wrong or scope-creeping a wire-edge fix into a data-plane
+  protocol change. Regression: `animusd/tests/dynamo_index_writes.rs`.
+
 ### Parallel-agent orchestration
 - **A stacked series' final "docs/ADR finalization" PR must treat the stack's
   own shipped PR bodies (`gh pr view`) as the authoritative source for
