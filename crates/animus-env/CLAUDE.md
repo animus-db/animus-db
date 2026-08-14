@@ -15,10 +15,17 @@ the production implementation; the deterministic implementation lives in
   into the **`Env` supertrait** (scoped to one `NodeId`), plus `Nanos`,
   `Envelope`, `BoxFuture`, `PRIMARY_STREAM` (the default stream id the
   `send`/`recv` defaults ride on, ADR 0026), and the `EnvExt::spawn_task`
-  convenience.
+  convenience. Also `SegmentStore` (ADR 0043 §A7, below) — a seam that is
+  deliberately **not** part of `Env`.
 - `prod.rs` — `ProdEnv`: real monotonic clock, `OsRng`, `tokio::spawn`,
   length-prefixed TCP, `tokio::fs` + `fsync`. Owns a real recording metrics sink
-  and exposes `metrics_text()` (ADR 0015).
+  and exposes `metrics_text()` (ADR 0015). Also `FsSegmentStore` (below),
+  the single-directory `SegmentStore` impl, since it does the same real
+  `tokio::fs` I/O `ProdEnv` does.
+- `test_support.rs` — `assert_segment_store_contract` (below): a
+  `#[doc(hidden)]`, always-compiled (not `#[cfg(test)]`) cross-crate test
+  helper, since `#[cfg(test)]` only gates this crate's own test binaries and
+  `animus-sim`'s `SimSegmentStore` tests need the same assertions.
 - `metrics.rs` — the **observability seam** (ADR 0015): a closed `Metric` enum
   (`control_*` Raft + `storage_*` LSM-engine counters, plus legacy `data_*`
   leaderless-AP counters that are **dormant** — the AP plane was deleted, ADR
@@ -200,6 +207,54 @@ the production implementation; the deterministic implementation lives in
   recording handle in for a sim test. (The deleted AP data plane's
   `DataClient::with_metrics`/`serve_*_with_metrics` variants followed it too —
   gone with `animus-data`, ADR 0019.)
+- **`SegmentStore` (ADR 0043 §A7) is a seam like `Disk`/`Network`, but
+  deliberately excluded from the `Env` supertrait itself (decision F5).**
+  Every call site threads an explicit handle — the same way a
+  `StorageEngine` handle is threaded rather than folded into `Env` — instead
+  of gaining a `env.segment_store()`-shaped accessor. This keeps `Env`
+  itself free of a dependency on the stream-shard subsystem, and lets a
+  component's choice of store vary independently of its `Env` (a sim test
+  pairs a `SimEnv` with `animus-sim`'s fault-injecting `SimSegmentStore`;
+  production pairs `ProdEnv` with the cluster-replicated default). The
+  trait is four methods — `put`/`get`/`delete`/`list`, all `io::Result`,
+  `#[async_trait]` like `Disk` — over an opaque string `id` (production ids
+  are `{table}/{label}/{tablet}/{epoch}`, ADR 0043 §A3). Its **consistency
+  contract** (read-after-put, idempotent overwrite, `get` after `delete` is
+  a defined `None` not an error, `list` is debug/sweep-only and never
+  load-bearing for a read) is spelled out on the trait's own doc, including
+  the one deliberate exception: a crash-retried `put` may overwrite a
+  cataloged id with a *superset* of its previous content (same
+  deterministic id, more records) — the "superset-slice rule" — which is a
+  **reader**-side obligation this trait cannot enforce itself (see ADR 0043
+  §A3, ADR 0042 §10).
+- **`FsSegmentStore` (single directory) is `ProdEnv`'s `SegmentStore`
+  sibling, opt-in** (`--segment-store=dir:...`, wired by a later PR) for dev
+  use or a shared mount, and doubles as the default
+  `ClusterSegmentStore`'s own per-node local building block (ADR 0043
+  §A7b — a later PR; the default replicates across `K` nodes' own
+  `FsSegmentStore`-backed directories). `put` reuses `ProdEnv`'s own private
+  `ensure_parent`/`sync_dir` free functions and follows the identical
+  temp-write + fsync + rename + directory-fsync discipline
+  `ProdEnv::replace` uses for its atomic swaps — the same "POSIX doesn't
+  persist a rename until its directory is fsynced" reasoning applies here.
+  Ids contain `/` separators mapped to subdirectories (created on demand by
+  `put`); `resolve` rejects an empty id, an absolute id, or one with a
+  `..`/`.` leading component — `Path::components()` already lexically
+  normalizes away a *non-leading* `.` (e.g. `"table/./epoch"` parses as just
+  `["table", "epoch"]`, no traversal risk), so the guard only needs to catch
+  `ParentDir`/`RootDir`/`Prefix`/a leading `CurDir`, not scan for a literal
+  `".."` substring. `list` recurses the whole tree under `root` (unlike
+  `Disk::list`, deliberately non-recursive over a flat per-node data dir)
+  and filters out any `.tmp` sibling a crash mid-`put` could have
+  orphaned, so a debug/sweep caller never mistakes a half-written temp file
+  for a real segment.
+- **`assert_segment_store_contract` (`test_support.rs`) is the one place the
+  `SegmentStore` trait contract is pinned**, exercised against both
+  `FsSegmentStore` (this crate's own `#[tokio::test]`, real temp dir) and
+  `animus-sim`'s `SimSegmentStore` (a `#[test]` driven through the
+  simulator). Every id it writes is scoped under `"contract-test/"` and
+  cleaned up before returning, so it composes with a store a caller has
+  already put other data into.
 - **`Disk::list` is per-env and non-recursive** (ADR 0024): it enumerates only
   the files this handle's own `Disk` methods could open — production reads the
   env's data dir without descending into any nested subdirectory. It exists so
@@ -242,4 +297,11 @@ pure function of the `Rng` draws (same scripted draws in ⇒ same id out), and
 2000 draws off a plain incrementing-fallback scripted `Rng` never collide —
 via a hand-rolled `ScriptedRng` test double (atomics, not `Cell`, since `Rng`
 requires `Send + Sync` even for a single-threaded test double — see
-`docs/engineering-lessons.md` if this surprises you).
+`docs/engineering-lessons.md` if this surprises you). `prod::tests` also
+covers `FsSegmentStore` (ADR 0043 §A7): the shared contract via
+`assert_segment_store_contract`; a nested (`{table}/{label}/{tablet}/{epoch}`-
+shaped) id creates its intervening subdirectories and leaves no stray `.tmp`
+sibling behind; a path-traversal/absolute/empty id is rejected by every
+method (`put`/`get`/`delete`), never resolved outside `root`; and `list`
+recurses every nested level, filters by prefix, and hides a crash-orphaned
+`.tmp` file from the result.

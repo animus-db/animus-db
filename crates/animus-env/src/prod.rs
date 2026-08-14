@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll, Waker};
@@ -786,6 +786,192 @@ impl Disk for ProdEnv {
     }
 }
 
+/// A single-directory [`SegmentStore`](crate::SegmentStore) (ADR 0043 §A7):
+/// every id is a file under `root`, with `/`-separated ids
+/// (`{table}/{label}/{tablet}/{epoch}`, ADR 0043 §A3) mapped to
+/// subdirectories, created on demand. `put` follows the same
+/// temp-write + fsync + rename + directory-fsync discipline
+/// [`ProdEnv`]'s own [`Disk::replace`] uses for its atomic swaps: write a
+/// `.tmp` sibling, fsync it, rename over the target, then fsync the
+/// directory chain — POSIX does not persist a rename until its containing
+/// directory is fsynced, so skipping that step would let a completed `put`
+/// vanish on power loss even though the file itself was synced.
+///
+/// This is the **opt-in** local store (`--segment-store=dir:...`, wired by a
+/// later PR) for dev use or a shared mount, and doubles as
+/// `ClusterSegmentStore`'s own per-node local building block (ADR 0043
+/// §A7b) — the *default* store replicates across `K` nodes' own
+/// `FsSegmentStore`-backed directories rather than trusting any single one.
+///
+/// Cheap to clone: the root path is the only state.
+#[derive(Clone)]
+pub struct FsSegmentStore {
+    root: PathBuf,
+}
+
+impl FsSegmentStore {
+    /// Root the store at `root`, without touching the filesystem yet — `put`
+    /// creates `root` (and any id's subdirectories) on demand.
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        FsSegmentStore { root: root.into() }
+    }
+
+    /// The root directory this store writes under.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Resolve `id` to a path under `root`, rejecting a path-traversal
+    /// attempt (a `..` or `.` component) or an absolute id — every
+    /// component of `id` must be a plain name, and `id` itself must be
+    /// non-empty.
+    fn resolve(&self, id: &str) -> std::io::Result<PathBuf> {
+        if id.is_empty() {
+            return Err(invalid_segment_id(id));
+        }
+        let rel = Path::new(id);
+        if rel.is_absolute() {
+            return Err(invalid_segment_id(id));
+        }
+        for comp in rel.components() {
+            match comp {
+                std::path::Component::Normal(_) => {}
+                _ => return Err(invalid_segment_id(id)),
+            }
+        }
+        Ok(self.root.join(rel))
+    }
+
+    /// `fsync` every directory from `path`'s parent up to (and including)
+    /// `root` — the same chain-fsync discipline [`ProdEnv::sync_parents`]
+    /// uses, rooted at this store's own directory instead of a node's data
+    /// dir.
+    async fn sync_parents(&self, path: &Path) -> std::io::Result<()> {
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            sync_dir(d).await?;
+            if d == self.root || !d.starts_with(&self.root) {
+                break;
+            }
+            dir = d.parent();
+        }
+        Ok(())
+    }
+}
+
+/// The rejected-id error [`FsSegmentStore::resolve`] returns for an empty,
+/// absolute, or path-traversing segment id.
+fn invalid_segment_id(id: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "invalid segment id {id:?}: must be a non-empty relative path with no \
+             `..`/`.` component"
+        ),
+    )
+}
+
+#[async_trait::async_trait]
+impl crate::SegmentStore for FsSegmentStore {
+    async fn put(&self, id: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let target = self.resolve(id)?;
+        // Safe to `expect` a file name: `resolve` rejects an empty id and
+        // every non-`..`/`.` relative path has one.
+        let mut tmp_name = target
+            .file_name()
+            .expect("resolve guarantees a file name")
+            .to_os_string();
+        tmp_name.push(".tmp");
+        let tmp = target.with_file_name(tmp_name);
+
+        ensure_parent(&target).await?;
+        {
+            let mut f = tokio::fs::File::create(&tmp).await?;
+            f.write_all(bytes).await?;
+            // Explicit flush before fsync, matching `ProdEnv::replace`: a
+            // `tokio::fs::File` buffers writes and completes an in-flight
+            // one on the blocking pool in the background on drop, so a bare
+            // `sync_all` without a preceding flush can fsync before the
+            // bytes actually land.
+            f.flush().await?;
+            f.sync_all().await?;
+        }
+        tokio::fs::rename(&tmp, &target).await?;
+        // The rename is a namespace change: fsync the directory chain, or a
+        // completed `put` can be lost on power loss even though the file
+        // itself was synced above.
+        self.sync_parents(&target).await?;
+        Ok(())
+    }
+
+    async fn get(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
+        let path = self.resolve(id)?;
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn delete(&self, id: &str) -> std::io::Result<()> {
+        let path = self.resolve(id)?;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        // Recursive (unlike `Disk::list`, which is deliberately
+        // non-recursive over a node's flat data dir): segment ids are
+        // multi-component paths, so every level under `root` must be
+        // walked. Debug/sweep-only, per the trait's own contract — no read
+        // path depends on this.
+        let mut out = Vec::new();
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let mut rd = match tokio::fs::read_dir(&dir).await {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            while let Some(entry) = rd.next_entry().await? {
+                let file_type = entry.file_type().await?;
+                let path = entry.path();
+                if file_type.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.ends_with(".tmp") {
+                    continue; // an in-flight or crash-orphaned `put` temp file
+                }
+                let Ok(rel) = path.strip_prefix(&self.root) else {
+                    continue;
+                };
+                let id = rel
+                    .components()
+                    .filter_map(|c| c.as_os_str().to_str())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if id.starts_with(prefix) {
+                    out.push(id);
+                }
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
+}
+
 impl Spawner for ProdEnv {
     fn spawn(&self, fut: crate::BoxFuture<'static, ()>) {
         // Register the handle so [`ProdEnv::shutdown`] can abort the task on
@@ -812,7 +998,7 @@ impl Env for ProdEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Disk;
+    use crate::{Disk, SegmentStore};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A unique temp directory for one test (no extra deps): the system temp dir
@@ -1221,6 +1407,113 @@ mod tests {
         );
 
         env.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shared cross-crate contract (`animus_env::test_support`) holds
+    /// for `FsSegmentStore` over a real temp directory: put/get round-trip,
+    /// idempotent overwrite, delete semantics, `list` filtering, and
+    /// resurrect-after-delete.
+    #[tokio::test]
+    async fn fs_segment_store_satisfies_the_contract() {
+        let dir = unique_tmp_dir();
+        let store = FsSegmentStore::new(&dir);
+        crate::test_support::assert_segment_store_contract(&store).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ids map to nested subdirectories (the production shape,
+    /// `{table}/{label}/{tablet}/{epoch}`), created on demand, and the bytes
+    /// really land on disk at the expected nested path.
+    #[tokio::test]
+    async fn fs_segment_store_nested_id_creates_subdirectories() {
+        let dir = unique_tmp_dir();
+        let store = FsSegmentStore::new(&dir);
+        let id = "orders/label-1/17/3";
+
+        store
+            .put(id, b"segment-bytes")
+            .await
+            .expect("put nested id");
+        assert_eq!(
+            store.get(id).await.expect("get nested id"),
+            Some(b"segment-bytes".to_vec())
+        );
+        assert!(
+            dir.join("orders/label-1/17/3").exists(),
+            "put must create the intervening directories"
+        );
+        // No stray `.tmp` sibling left behind after a successful put.
+        assert!(!dir.join("orders/label-1/17/3.tmp").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path-traversal or absolute id is rejected outright, never resolved
+    /// to a path outside `root`.
+    #[tokio::test]
+    async fn fs_segment_store_rejects_path_traversal_and_absolute_ids() {
+        let dir = unique_tmp_dir();
+        let store = FsSegmentStore::new(&dir);
+
+        for bad_id in ["../escape", "table/../../escape", "/absolute/escape", ""] {
+            assert!(
+                store.put(bad_id, b"x").await.is_err(),
+                "put must reject {bad_id:?}"
+            );
+            assert!(
+                store.get(bad_id).await.is_err(),
+                "get must reject {bad_id:?}"
+            );
+            assert!(
+                store.delete(bad_id).await.is_err(),
+                "delete must reject {bad_id:?}"
+            );
+        }
+        // Nothing escaped the root: no file exists above/outside it.
+        assert!(!dir.parent().unwrap().join("escape").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `list` recurses through every nested level under `root`, filters by
+    /// prefix, and never surfaces an in-flight/crash-orphaned `.tmp` sibling
+    /// as if it were a real id.
+    #[tokio::test]
+    async fn fs_segment_store_list_recurses_and_filters_and_hides_tmp_files() {
+        let dir = unique_tmp_dir();
+        let store = FsSegmentStore::new(&dir);
+
+        store.put("t/label/1/0", b"a").await.expect("put a");
+        store.put("t/label/1/1", b"b").await.expect("put b");
+        store.put("t/label/2/0", b"c").await.expect("put c");
+        store.put("other/label/1/0", b"d").await.expect("put d");
+
+        // A crash-orphaned temp file (as `put` would leave one mid-write) is
+        // never surfaced by `list`.
+        let orphan = dir.join("t/label/1/9.tmp");
+        tokio::fs::write(&orphan, b"partial")
+            .await
+            .expect("write orphan tmp");
+
+        let mut all = store.list("t/").await.expect("list t/");
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                "t/label/1/0".to_string(),
+                "t/label/1/1".to_string(),
+                "t/label/2/0".to_string(),
+            ],
+            "list must recurse every level, filter by prefix, and hide .tmp files"
+        );
+
+        let narrower = store.list("t/label/1").await.expect("list t/label/1");
+        assert_eq!(
+            narrower,
+            vec!["t/label/1/0".to_string(), "t/label/1/1".to_string()]
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

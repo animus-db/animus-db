@@ -14,6 +14,7 @@
 //! `env.send(..)`, `env.recv()`, `env.spawn(..)`, and so on directly.
 
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,10 +22,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub mod prod;
-pub use prod::ProdEnv;
+pub use prod::{FsSegmentStore, ProdEnv};
 
 pub mod metrics;
 pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};
+
+pub mod test_support;
 
 /// Stable identifier for a node in the cluster.
 ///
@@ -406,6 +409,76 @@ pub trait Disk: Send + Sync {
     /// prefix-named component (e.g. a dropped tablet's `db-t{id}-*` LSM files)
     /// without knowing the exact set.
     async fn list(&self) -> std::io::Result<Vec<String>>;
+}
+
+/// A store for immutable, content-addressed byte blobs — the stream-shard
+/// subsystem's sealed segments (ADR 0043 §A7), addressed by an opaque `id`
+/// (production ids are `{table}/{label}/{tablet}/{epoch}`, ADR 0043 §A3, but
+/// this trait imposes no structure on `id` beyond treating it as a string a
+/// filesystem-backed implementation may map to a path).
+///
+/// Lives beside the other seams (`Clock`/`Rng`/`Network`/`Disk`/`Spawner`)
+/// but is **deliberately not** part of the [`Env`] supertrait (ADR 0043 §A7,
+/// decision F5): every call site threads an explicit `SegmentStore` handle,
+/// the same way a `StorageEngine` handle is threaded rather than folded into
+/// `Env`. This lets a component's choice of store vary independently of its
+/// `Env` (a sim test pairs a `SimEnv` with a fault-injecting store;
+/// production pairs `ProdEnv` with the cluster-replicated default), and
+/// keeps `Env` itself free of a dependency on the stream subsystem.
+///
+/// **Consistency contract** (binding on every implementation):
+/// - **Read-after-put**: once [`put`](SegmentStore::put) returns `Ok`, every
+///   reader's subsequent [`get`](SegmentStore::get) of that `id` sees the
+///   bytes just written (or a later overwrite of the same id) — never a
+///   value older than the last acknowledged put.
+/// - **Idempotent overwrite**: putting the same `id` again — with the same
+///   bytes or different ones — is `Ok`; the store does not enforce
+///   write-once, and overwrite is last-write-wins from the store's own
+///   point of view. Callers own any "first write wins" policy on top.
+/// - **Immutability once cataloged, modulo the superset-slice rule**: an id
+///   recorded in the replicated segment catalog
+///   (`MetaCommand::SealStreamShard`) is treated as immutable by every
+///   reader, *except* for the deliberate race a crash-retried seal can
+///   produce — a retried `put` may overwrite an id with a strict *superset*
+///   of the previously written records (ADR 0043 §A3's recovery path).
+///   Readers MUST slice a fetched object down to the catalog row's
+///   committed range rather than trusting the raw object's extent (the
+///   "superset-slice rule," ADR 0042 §10 / ADR 0043 §A3). This trait cannot
+///   enforce that on its own — it is a reader-side obligation.
+/// - **`get` returning `None` after a [`delete`](SegmentStore::delete)** is
+///   a defined, expected outcome (surfaces to a stream consumer as
+///   `TrimmedDataAccess`), never an error. `None` is also the answer for an
+///   id that was never written.
+/// - [`delete`](SegmentStore::delete) is idempotent: deleting an absent id
+///   is `Ok`, not an error.
+/// - [`list`](SegmentStore::list) is **debug/sweep-only** (retention,
+///   repair, operator introspection). It is never on the read path for
+///   serving a stream record, and no caller may treat its result as
+///   authoritative for correctness — only the replicated catalog is.
+///
+/// See `docs/adr/0043-stream-shard-subsystem.md` §A7/§A7b for the full
+/// design and each implementation's own contract:
+/// [`FsSegmentStore`](crate::FsSegmentStore) (single directory, opt-in) and
+/// `SimSegmentStore` (`animus-sim`, seeded + fault-injectable); the default
+/// `ClusterSegmentStore` (K-way replicated) lands in a later PR.
+#[async_trait::async_trait]
+pub trait SegmentStore: Send + Sync {
+    /// Write `bytes` at `id`. Durable, per this implementation's own
+    /// durability contract, once this returns `Ok`. Idempotent: overwriting
+    /// an existing `id` is `Ok`, last-write-wins.
+    async fn put(&self, id: &str, bytes: &[u8]) -> io::Result<()>;
+
+    /// Fetch the bytes at `id`, or `None` if `id` was never written or has
+    /// since been [`delete`](SegmentStore::delete)d — a defined outcome, not
+    /// an error.
+    async fn get(&self, id: &str) -> io::Result<Option<Vec<u8>>>;
+
+    /// Remove `id`. Idempotent: deleting an absent id is `Ok`.
+    async fn delete(&self, id: &str) -> io::Result<()>;
+
+    /// List every id currently starting with `prefix` — for debugging or a
+    /// sweep (retention, repair), never load-bearing for serving a read.
+    async fn list(&self, prefix: &str) -> io::Result<Vec<String>>;
 }
 
 /// Task spawning. Under production this is `tokio::spawn`; under simulation it

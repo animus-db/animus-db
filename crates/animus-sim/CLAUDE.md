@@ -35,6 +35,52 @@ function of one seed. This is the substrate every distributed test runs on.
 
 ## What's non-obvious
 
+- **`SimSegmentStore` (`segment_store.rs`, ADR 0043 §A7) is `animus-env`'s
+  `SegmentStore` seam's deterministic corpus impl** — a seeded,
+  fault-injectable in-memory `BTreeMap<String, Vec<u8>>` store, built from a
+  `SimEnv` handle (`SimSegmentStore::new(env)`) rather than pulled off the
+  `Simulator` the way `sim.env(node)` hands out an `Env` handle, because
+  `SegmentStore` is deliberately **not** part of the `Env` supertrait (F5) —
+  a consumer threads the store explicitly, same as `StorageEngine`.
+  Constructing it from *any* node's `SimEnv` handle is fine for determinism:
+  every node's `Rng` draws off the same single `SimState`-shared stream (see
+  `next_u64`'s `self.shared.lock().rng.next_u64()` above), so "which node's
+  handle" never changes the draw sequence — only *whether* a draw happens at
+  all changes it.
+  - **Fault knobs mirror `DiskConfig`'s own discipline exactly**: `roll`
+    draws RNG only when its threshold is non-zero, so a store with no
+    configured `SegmentFaultConfig` perturbs neither the RNG stream nor any
+    other test's determinism — a fault schedule is opt-in per test, just
+    like `NetConfig`/`DiskConfig`.
+  - **Ack-lost is the deliberate *opposite* of `DiskConfig`'s "no state
+    change on a fault" rule.** `inject_disk_fault` guarantees a failed op
+    changed nothing; `SimSegmentStore`'s `put_ack_lost`/`delete_ack_lost`
+    faults do the op for real (the object lands / is removed) and *then*
+    return an injected error — modeling the exact ambiguity ADR 0043 §A3's
+    seal step must tolerate (a crash or network error between the store
+    acking and the caller's proposal), not a clean failure. Don't reuse
+    `inject_disk_fault`'s "no state change" shape for a fault whose whole
+    point is that the state *did* change.
+  - **Unavailability windows are a plain `Option<Nanos>` deadline compared
+    against `Clock::now()`**, not a new timeline/RNG mechanism — no new
+    `Simulator` machinery needed since `SegmentStore` isn't part of `Env`'s
+    own event loop. `set_unavailable_until`/`clear_unavailable` are ordinary
+    setters a test calls directly (no RNG draw: the deadline is
+    caller-chosen, not sampled), and healing happens for free once virtual
+    time (driven by `sim.run_for`/`run_until`, as always) passes it.
+  - **Tests spawn the async workload via `env.spawn_task` and drive it with
+    `Simulator::run_until_quiescent`/`run_for`, not `#[tokio::test]`** — this
+    crate has no `tokio` dependency at all (async here is driven by the
+    simulator's own cooperative executor). None of `SegmentStore`'s methods
+    genuinely suspend, so a spawned task completes within the first drain
+    under `run_until_quiescent`; a test that calls `Clock::sleep` (to check
+    an unavailability window healing) needs `run_for(dur)` instead, bounded
+    past the sleep. A panicking assertion inside the spawned block
+    propagates out of the polling call exactly like any other panic (the
+    simulator polls synchronously on the test's own thread), so no
+    completion flag is needed to catch a task that silently never ran its
+    assertions.
+
 - **`Simulator` is `Clone`** (added for ADR 0031 PR5's reconciler corpus): it
   hands out another handle to the SAME shared world (clones the inner `Arc`),
   exactly like `SimEnv`'s own `Clone`, not a fork. This is what lets a test's
@@ -113,3 +159,17 @@ The HLC-specific causality-under-skew property (a behind-clock node's mint
 still exceeds an ahead-clock node's) is tested in
 `animus-cp-data/tests/hlc_skew.rs`, since it needs both this crate and
 `animus_cp_data::hlc`.
+
+`segment_store.rs`'s own `#[cfg(test)] mod tests` (unit tests, not a
+`tests/*.rs` integration file — small enough to sit beside the impl) covers
+`SimSegmentStore`: the shared `animus_env::test_support::
+assert_segment_store_contract`; an ack-lost `put`/`delete` leaves the actual
+state change intact while the caller sees an error (checked from a second
+clone of the store, not just the original handle); an unavailability window
+fails every op with no state change until virtual time (advanced via
+`Clock::sleep` + driving the simulator) passes the deadline, then heals on
+its own; `clear_unavailable` heals early regardless of virtual time; and a
+determinism regression comparing two runs of the same seed + fault schedule
+for byte-identical outcome sequences (plus a different seed diverging), with
+a sanity check that the configured fault probability actually produces both
+outcomes over the run.
