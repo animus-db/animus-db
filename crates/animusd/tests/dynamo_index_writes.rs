@@ -12,6 +12,13 @@
 //!   indexed table is rejected wholesale (nothing commits), while a
 //!   `ConditionCheck`-only action against one, alongside a genuine write on
 //!   an unindexed table, still succeeds.
+//! - `unconditional_put_and_delete_maintain_lsi_without_a_condition_or_all_old`
+//!   — the old-image-starvation fix: `PutItem`/`DeleteItem` with **no**
+//!   `ConditionExpression` and **no** `ReturnValues: ALL_OLD` must still fetch
+//!   the prior item on an indexed table, because `kind_writes_for_item`'s own
+//!   LSI diff needs it to clean up the stale row. Before the fix, `needs_old`
+//!   was gated only on the condition/`ALL_OLD` check, so an unconditional
+//!   replace/delete silently left the old LSI row behind.
 //!
 //! Mirrors `dynamo_documents.rs`/`dynamo_gsi_drain.rs`: a 3-node in-process
 //! cluster driven by the actual DynamoDB JSON protocol over hand-written
@@ -430,4 +437,130 @@ async fn transact_write_items_rejected_on_indexed_table() {
     .await;
     assert_eq!(status, 200);
     assert!(!body.is_empty() && body != "{}", "p1 not written: {body}");
+}
+
+/// The old-image-starvation fix: an **unconditional** `PutItem` (no
+/// `ConditionExpression`, no `ReturnValues: ALL_OLD`) that replaces an item's
+/// indexed alt-sort attribute must still move its LSI row, and an
+/// **unconditional** `DeleteItem` must still remove it. Before the fix,
+/// `needs_old` was computed from `condition.is_some() ||
+/// return_values == ReturnValues::AllOld` alone — neither is true here, so the
+/// prior item was never read, `kind_writes_for_item`'s LSI diff saw `old_alt
+/// == None`, and the stale LSI row was left behind (query-visible: the old
+/// alt value's row never disappears, and the base table quietly diverges from
+/// its own LSI forever).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unconditional_put_and_delete_maintain_lsi_without_a_condition_or_all_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr = nodes[0].dynamo_addr();
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"items",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
+                         {"AttributeName":"sk","KeyType":"RANGE"}],
+            "LocalSecondaryIndexes":[
+                {"IndexName":"by-alt",
+                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
+                              {"AttributeName":"alt","KeyType":"RANGE"}]}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+
+    // p1 starts at alt=A — its LSI row is immediate (written atomically with
+    // the base row).
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.PutItem",
+        r#"{"TableName":"items","Item":{"id":{"S":"p1"},"sk":{"S":"a"},"alt":{"S":"A"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "PutItem(p1, alt=A) failed: {body}");
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"items","IndexName":"by-alt",
+            "KeyConditionExpression":"id = :i AND alt = :a",
+            "ExpressionAttributeValues":{":i":{"S":"p1"},":a":{"S":"A"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("\"Count\":1"),
+        "LSI row for alt=A missing right after the first PutItem: {body}"
+    );
+
+    // --- An UNCONDITIONAL PutItem (no ConditionExpression, no ALL_OLD)
+    // replaces p1 with alt=B. The stale alt=A row must be gone and the new
+    // alt=B row must exist, both immediately (the LSI is written atomically
+    // with the base row) — this is the exact case the old `needs_old` gate
+    // silently skipped.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.PutItem",
+        r#"{"TableName":"items","Item":{"id":{"S":"p1"},"sk":{"S":"a"},"alt":{"S":"B"}}}"#,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "unconditional PutItem(p1, alt=B) failed: {body}"
+    );
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"items","IndexName":"by-alt",
+            "KeyConditionExpression":"id = :i AND alt = :a",
+            "ExpressionAttributeValues":{":i":{"S":"p1"},":a":{"S":"A"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("\"Count\":0"),
+        "stale LSI row at alt=A must be gone after an unconditional replace: {body}"
+    );
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"items","IndexName":"by-alt",
+            "KeyConditionExpression":"id = :i AND alt = :a",
+            "ExpressionAttributeValues":{":i":{"S":"p1"},":a":{"S":"B"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("\"Count\":1"),
+        "new LSI row at alt=B missing after an unconditional replace: {body}"
+    );
+
+    // --- An UNCONDITIONAL DeleteItem (no ConditionExpression, no ALL_OLD)
+    // removes p1. Its LSI row (alt=B) must be gone immediately too — the
+    // identical gap in `DeleteItem`'s own `needs_old`.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.DeleteItem",
+        r#"{"TableName":"items","Key":{"id":{"S":"p1"},"sk":{"S":"a"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "unconditional DeleteItem(p1) failed: {body}");
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"items","IndexName":"by-alt",
+            "KeyConditionExpression":"id = :i",
+            "ExpressionAttributeValues":{":i":{"S":"p1"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("\"Count\":0"),
+        "p1's LSI row must be gone after an unconditional delete: {body}"
+    );
 }

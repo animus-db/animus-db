@@ -397,7 +397,14 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             let (pk, sk) = resolve_key(ctx, meta, &table, &item)?;
             let key = item_key(&pk, sk.as_ref());
             // For ALL_OLD (or a condition) we need the prior item; read it once.
-            let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
+            // **Also required whenever this write takes the kind-write path**
+            // (ADR 0041 §2's LSI diff needs the alt-sort attribute's *old*
+            // value to clean up a stale row) — an unconditional replace must
+            // not silently skip this read just because no client-visible
+            // echo was requested.
+            let needs_old = condition.is_some()
+                || return_values == ReturnValues::AllOld
+                || table_takes_kind_write_path(meta, &table);
             // A conditional (or old-echoing) put is a read-modify-write: hold the
             // per-node RMW lock across the read → evaluate → write span, as the CQL
             // edge does, so two concurrent conditional puts on one node can't both
@@ -444,7 +451,11 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
             let data_key = item_key(&pk, sk.as_ref());
-            let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
+            // See the identical `PutItem` gate's doc above for why the
+            // kind-write path also forces this read.
+            let needs_old = condition.is_some()
+                || return_values == ReturnValues::AllOld
+                || table_takes_kind_write_path(meta, &table);
             // Same RMW serialization as the conditional `PutItem` above: a
             // conditional delete must not interleave with another RMW between its
             // read and its write.
@@ -2143,6 +2154,18 @@ pub(crate) fn projected_item(item: &Item, base: &TableSchema, idx: &IndexDef) ->
         .collect()
 }
 
+/// Whether `table` takes the multi-kind atomic-batch write path
+/// (`kind_writes_for_item`'s `Some` branch) rather than the plain single-key
+/// one: it has at least one secondary index (ADR 0041). The single gate both
+/// `kind_writes_for_item`'s own fast-path check and every write handler's
+/// `needs_old` computation share — kept as one function so the two can never
+/// silently drift apart (a write handler that reads `old` less often than
+/// `kind_writes_for_item` actually needs it would silently degrade LSI
+/// fidelity with no error).
+fn table_takes_kind_write_path(meta: &Metadata, table: &str) -> bool {
+    !meta.table_indexes(table).is_empty()
+}
+
 /// Build the multi-kind atomic batch one item write commits (ADR 0041 §2/§4):
 /// the base row, this item's LSI rows (adding the new, removing whatever the
 /// previous value occupied), and a change-log record.
@@ -2167,7 +2190,7 @@ fn kind_writes_for_item(
     new: Option<&Item>,
 ) -> Option<IndexedWrite> {
     let indexes = meta.table_indexes(table);
-    if indexes.is_empty() {
+    if !table_takes_kind_write_path(meta, table) {
         return None;
     }
     let base = schema_for(meta, table);
