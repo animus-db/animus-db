@@ -24,8 +24,6 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
 
 ## Entry points
 
-Three modules:
-
 - **`lib.rs`** — `RaftKvNode<E, S>` (the running tablet-group node) and its
   command/state types (`KvCommand`, `KvState`), `StorageScope`, the fenced
   commands, ReadIndex + CAS, the consensus-loop/apply-task split, and
@@ -34,6 +32,34 @@ Three modules:
   `plan()` decision, `Reconciler` executor, `MetadataView`/`TabletFacts`/
   `LocalState`, and the `HostAction` set (incl. `Absorb`/`WidenScope`). 34
   unit tests. See "The host module".
+- **`cluster_segment_store.rs`** (ADR 0043 §A7b, F5) — `ClusterSegmentStore<E,
+  S>`: the **default** `SegmentStore` for the stream-shard subsystem — K-way
+  replication of an immutable segment across `K` nodes' own local `S`-backed
+  directories (each backed by `FsSegmentStore` in production,
+  `SimSegmentStore` under sim), over `E`'s `Network` seam. `put_replicated`
+  returns `Ok` only once every chosen target has durably written the object
+  (all-or-error; a partial failure leaves harmless, idempotent-overwrite-
+  safe orphans on the replicas that *did* succeed); `get_from`/`delete_from`
+  take a catalog row's own recorded replica set (the load-bearing read/
+  reclaim path a later PR's sealer/janitor will call); the trait's own
+  `put`/`get`/`delete`/`list` are thinner, contract/testing-only paths (`get`/
+  `delete` fall back to the *current* `PlacementView` candidates rather than
+  a specific recorded set; `list` is local-only). One serving task per node
+  (`ClusterSegmentStore::start`, spawned via `env.spawn_task`) is the single
+  consumer of the reserved `SEGMENT_STREAM` (`u64::MAX`, ADR 0026 — chosen far
+  outside any `TabletId`'s realistic range) — request and reply variants of
+  its own `serde_json`'d `SegmentWire` enum share that one stream/inbox,
+  correlated by a `req_id` a caller's `env.sleep`-based poll loop watches (see
+  "What's non-obvious" and `docs/engineering-lessons.md`'s Testing section for
+  why this isn't a `tokio::sync::oneshot`). `PlacementView` (implemented by
+  `StaticPlacementView` for tests; `animusd`'s `Metadata`-mirror-backed
+  wiring is a later PR) hands back the current candidate node set;
+  `choose_targets` feeds it straight into `animus_placement::select_replicas`
+  with a plain, label-blind `PlacementPolicy::simple` — `K = min(default_k,
+  candidates.len())`, so a single-node cluster degrades to `K = 1` instead of
+  refusing to serve. Not yet wired into `animusd` (that, plus the
+  `SealStreamShard` catalog recording the chosen replica set, is a later PR);
+  today it is tested standalone against `SimSegmentStore`.
 - **`codec.rs`** — the crate's compact binary wire/image codec (ADR 0017 A.2):
   length-prefixed framing (like the storage manifest codec), magic/version
   checked. Carries `KvWire` messages and engine images; `serde_json`'s
@@ -699,10 +725,32 @@ the same node-shared engine) and drains before halting (see Key invariants).
   "Leadership transfer" entry for the core mechanics; the regressions are
   `tests/leader_transfer_reconfigure.rs` and
   `tests/reconfigure_down_extra_priority.rs`.
+- **`ClusterSegmentStore`'s request/reply correlation (ADR 0043 §A7b) is a
+  shared `Mutex<BTreeMap<req_id, Option<Reply>>>` polled via `env.sleep`,
+  never a `tokio::sync::oneshot`** — the identical shape `RaftKvNode`'s own
+  `ReadProbe`/`ReadProbeAck` read-barrier confirmation already uses, for the
+  same reason: a `SimEnv` caller has no tokio runtime present to drive a
+  oneshot's waker. See `docs/engineering-lessons.md`'s Testing section for
+  the general rule (does the primitive come from `std`/`futures`, or a
+  specific async runtime crate). A request and its reply are two variants of
+  one `serde_json`'d wire enum sharing **one** stream/inbox
+  ([`SEGMENT_STREAM`] `= u64::MAX`, deliberately outside any `TabletId`'s
+  realistic range) — the same "one dedicated stream, one single-consumer
+  serving task" shape the per-tablet driver loop uses on its own `stream`,
+  generalized to a cluster-wide (not per-tablet) responsibility.
+- **A `put_replicated`/`delete_from` failure can leave harmless orphans on
+  whichever targets *did* succeed** — never cataloged (a later PR's sealer
+  only commits `SealStreamShard` after `put_replicated` itself returns `Ok`),
+  and `SegmentStore::put`/`delete` are idempotent overwrite/delete by
+  contract, so a retry to the same deterministic id always converges. Don't
+  "fix" a partial failure by trying to roll back the targets that already
+  succeeded — that would add a second distributed failure mode (the rollback
+  itself can partially fail) to clean up a case that is already safe to leave
+  alone.
 
 ## Tests
 
-`cargo test -p animus-cp-data`. All but one of the 25 test binaries drive
+`cargo test -p animus-cp-data`. All but one of the 26 test binaries drive
 `SimEnv` — use `run_for`/`run_until`, never `run()` (the driver has perpetual
 heartbeat/election timers). Linearizable reads are async (a read-barrier probe
 round), so drive them as spawned tasks + `run_for`, and never `block_on` a
@@ -724,7 +772,9 @@ crates/animus-cp-data/tests/`) — covering single-tablet Raft mechanics
 snapshot catch-up), automatic reconfiguration and leadership-transfer
 cascades, the ADR 0026 stream-addressing/shared-engine primitives, the ADR
 0041 `KindBatch`/scope-set mechanics, the ADR 0042/0043 `KIND_CURSOR`
-scope-isolation and min-over-rows suite (`cursor_scope.rs`), the ADR 0018
+scope-isolation and min-over-rows suite (`cursor_scope.rs`), the ADR 0043
+`§A7b` `ClusterSegmentStore` replication/fault suite (`cluster_segment_
+store.rs`, a 3-node cluster over `SimSegmentStore`), the ADR 0018
 HLC/MVCC/range-seal/transaction suites (single- and multi-participant,
 in-doubt recovery, write-key conditions, snapshot reads, the read-timestamp
 cache), the `host.rs` reconciler end to end, and the real-thread `ProdEnv`

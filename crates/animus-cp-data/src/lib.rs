@@ -55,6 +55,7 @@ use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
 
 mod ceiling;
+pub mod cluster_segment_store;
 mod codec;
 pub mod cursor;
 pub mod hlc;
