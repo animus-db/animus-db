@@ -60,7 +60,7 @@ use animus_cp_data::host::{MetadataView, Reconciler};
 use animus_cp_data::{
     FastRead, RaftKvNode, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
 };
-use animus_env::{Clock, Env, Metric, MetricsHandle, NodeId, ProdEnv};
+use animus_env::{Clock, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
     WalRecordView,
@@ -416,6 +416,17 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.approx_bytes().await,
             CpGroup::Mem(n) => n.approx_bytes().await,
+        }
+    }
+
+    /// [`approx_bytes`](Self::approx_bytes)'s kind-scoped sibling
+    /// (`RaftKvNode::approx_bytes_kind`) — the seal arm's own size-trigger
+    /// input, `KIND_CHANGE`'s bytes specifically, never the base row bytes
+    /// `approx_bytes` measures.
+    pub(crate) async fn approx_bytes_kind(&self, kind: u8) -> u64 {
+        match self {
+            CpGroup::Lsm(n) => n.approx_bytes_kind(kind).await,
+            CpGroup::Mem(n) => n.approx_bytes_kind(kind).await,
         }
     }
 
@@ -1005,6 +1016,27 @@ pub enum ClientRequest {
         #[serde(default)]
         end: Option<Vec<u8>>,
     },
+    /// **Internal seal-trigger RPC — never sent bare, only wrapped in
+    /// [`Forwarded`](Self::Forwarded)** (ADR 0042/0043, round-3 sealer PR):
+    /// unconditionally run one seal pass (`index_drain::seal_now`) of
+    /// `tablet`'s own `KIND_CHANGE` hot tail — the same mechanism the
+    /// per-tablet `change_consumer_loop`'s periodic seal arm calls, just
+    /// invoked once, out of band, regardless of the size/age triggers. The
+    /// **one** production use is `ClientCtx::force_seal_tablet`, itself
+    /// called by the DynamoDB `UpdateTable` disable path (F12-b's
+    /// disable-triggered final seal) for every tablet of a table whose
+    /// stream is being disabled — a table's tablets can be led on any node,
+    /// not necessarily the one that received the `UpdateTable` request, so
+    /// this needs the identical one-hop forward/leader-resolution machinery
+    /// every other CP op already has. Addressed by `tablet` directly (the
+    /// caller already knows it — there is no client key to derive it from,
+    /// unlike `KindWrite`/`KindScan`). Bare delivery is refused for the same
+    /// reason those two are: an arbitrary caller must not be able to force a
+    /// tablet's own leader to seal on demand outside the one sanctioned
+    /// call path. Not a `MetaCommand`, so `is_relayable_command` does not
+    /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
+    /// only through the `Forwarded` arm.
+    ForceSeal { tablet: u64 },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
     Get { key: Vec<u8>, table: String },
@@ -1565,6 +1597,12 @@ fn default_ephemeral_addr() -> SocketAddr {
 pub struct BoundNode {
     id: NodeId,
     env: ProdEnv,
+    /// This node's own data directory (the `data_dir` [`Node::bind`] was
+    /// given) — kept, unlike before ADR 0043's sealer PR, so [`start_with`]
+    /// can root this node's local segment-store building block
+    /// (`FsSegmentStore`, ADR 0043 §A7b) at `dir.join("segments")`, a
+    /// sibling of the `internal/` subdirectory `ProdEnv::bind` already owns.
+    dir: PathBuf,
     internal_addr: SocketAddr,
     client_listener: TcpListener,
     client_addr: SocketAddr,
@@ -1805,6 +1843,7 @@ impl BoundNode {
     /// Propagates a failure to open the CP group's on-disk engine (LSM backend
     /// only).
     #[allow(clippy::too_many_arguments)] // node assembly: ids + backend + edge + route + split opts
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_with(
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
@@ -1817,6 +1856,49 @@ impl BoundNode {
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
         orphan_sweep_after: Duration,
+    ) -> std::io::Result<Node> {
+        self.start_with_streams(
+            peers,
+            control_ids,
+            data_ids,
+            backend,
+            edge,
+            client_route,
+            auto_split_threshold,
+            auto_split_bytes_threshold,
+            cluster_admin_addrs,
+            orphan_sweep_after,
+            StreamSealKnobs::default(),
+            SegmentStoreConfig::default(),
+        )
+        .await
+    }
+
+    /// Like [`start_with`](Self::start_with), with explicit DynamoDB Streams
+    /// sealer knobs and segment-store selection (ADR 0042/0043's round-3
+    /// sealer PR) — the same layered-wrapper convention `_with_orphan_sweep_
+    /// after` already established (see that entry in the `CLAUDE.md`
+    /// engineering log): every existing `start_with` call site (the whole
+    /// pre-existing test suite) keeps compiling and behaving identically,
+    /// defaulting internally to production knobs and the default cluster-
+    /// replicated store; a test that needs tiny seal thresholds (this
+    /// codebase's own testing discipline: never wait out a 4-hour age
+    /// trigger or write 4 MiB to trip a size one) calls this directly.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_streams(
+        self,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        control_ids: Vec<NodeId>,
+        data_ids: Vec<NodeId>,
+        backend: StorageBackend,
+        edge: ClusterEdgeState,
+        client_route: BTreeMap<NodeId, SocketAddr>,
+        auto_split_threshold: Option<usize>,
+        auto_split_bytes_threshold: Option<u64>,
+        cluster_admin_addrs: Vec<SocketAddr>,
+        orphan_sweep_after: Duration,
+        stream_seal_knobs: StreamSealKnobs,
+        segment_store_config: SegmentStoreConfig,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         // The initial (static) peer book + an env clone, kept for the
@@ -1982,10 +2064,23 @@ impl BoundNode {
         // `serve_clients`/`admin::serve` — every task a control-only node needs
         // too (see [`BoundControlNode::start_control_with`]); the tasks spawned
         // below this point are combined-mode/data-role-only.
+        // This node's stream-shard segment store (ADR 0043 §A7b, round-3
+        // sealer PR): built and started (its serving task claims this
+        // node's own `SEGMENT_STREAM` inbox, ADR 0026) here, alongside the
+        // other per-node infrastructure this same section already builds.
+        let segment_store = build_segment_store(
+            &self.env,
+            &self.dir,
+            ControlHandle::Local(raft.clone()),
+            my_id.clone(),
+            &segment_store_config,
+        );
         let data_role = DataRole {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
             base_id: my_id.clone(),
+            segment_store,
+            stream_seal_knobs,
         };
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -2170,7 +2265,7 @@ impl BoundNode {
         // the change records indexed writes leave behind. Data-role-only and
         // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
         // — a node that leads no tablet does nothing each tick.
-        tasks.push(tokio::spawn(index_drain::index_drain_loop(ctx.clone())));
+        tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
 
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
         // it leads once it exceeds **either** configured threshold (it checks
@@ -2277,6 +2372,7 @@ impl Node {
         Ok(BoundNode {
             id,
             env,
+            dir,
             internal_addr,
             client_listener,
             client_addr,
@@ -2346,6 +2442,7 @@ impl Node {
         Ok(BoundDataNode {
             id,
             env,
+            dir,
             internal_addr,
             client_listener,
             client_addr,
@@ -2773,6 +2870,9 @@ impl BoundControlNode {
 pub struct BoundDataNode {
     id: NodeId,
     env: ProdEnv,
+    /// See [`BoundNode::dir`]'s doc — the identical local segment-store
+    /// building-block rationale.
+    dir: PathBuf,
     internal_addr: SocketAddr,
     client_listener: TcpListener,
     client_addr: SocketAddr,
@@ -2848,6 +2948,7 @@ impl BoundDataNode {
     /// Propagates a failure to open the CP group's on-disk engine (LSM
     /// backend only).
     #[allow(clippy::too_many_arguments)] // node assembly: mirrors `BoundNode::start_with`'s arity
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with(
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
@@ -2859,6 +2960,40 @@ impl BoundDataNode {
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
+    ) -> std::io::Result<Node> {
+        self.start_data_with_streams(
+            peers,
+            control_ids,
+            control_seeds,
+            backend,
+            edge,
+            client_route,
+            auto_split_threshold,
+            auto_split_bytes_threshold,
+            cluster_admin_addrs,
+            StreamSealKnobs::default(),
+            SegmentStoreConfig::default(),
+        )
+        .await
+    }
+
+    /// Like [`start_data_with`](Self::start_data_with) — see
+    /// [`BoundNode::start_with_streams`]'s doc for the layered-wrapper
+    /// rationale.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_data_with_streams(
+        self,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        control_ids: Vec<NodeId>,
+        control_seeds: Vec<SocketAddr>,
+        backend: StorageBackend,
+        edge: ClusterEdgeState,
+        client_route: BTreeMap<NodeId, SocketAddr>,
+        auto_split_threshold: Option<usize>,
+        auto_split_bytes_threshold: Option<u64>,
+        cluster_admin_addrs: Vec<SocketAddr>,
+        stream_seal_knobs: StreamSealKnobs,
+        segment_store_config: SegmentStoreConfig,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         let static_peers = peers;
@@ -2908,10 +3043,23 @@ impl BoundDataNode {
             StorageBackend::Memory => SharedEngine::Mem(MemoryEngine::new()),
         };
 
+        // This node's stream-shard segment store (ADR 0043 §A7b) — see
+        // `BoundNode::start_with_streams`'s identical construction; `control`
+        // here is `ControlHandle::Remote` (this node's own polled mirror),
+        // which `ControlPlacementView` reads through unchanged.
+        let segment_store = build_segment_store(
+            &self.env,
+            &self.dir,
+            control.clone(),
+            my_id.clone(),
+            &segment_store_config,
+        );
         let data_role = DataRole {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
             base_id: my_id.clone(),
+            segment_store,
+            stream_seal_knobs,
         };
         let (ctx, mut tasks) = spawn_common_tail(
             control,
@@ -3022,7 +3170,7 @@ impl BoundDataNode {
         // the change records indexed writes leave behind. Data-role-only and
         // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
         // — a node that leads no tablet does nothing each tick.
-        tasks.push(tokio::spawn(index_drain::index_drain_loop(ctx.clone())));
+        tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
 
         if auto_split_threshold.is_some() || auto_split_bytes_threshold.is_some() {
             tasks.push(tokio::spawn(auto_split_loop(
@@ -3266,6 +3414,162 @@ impl ClusterEdgeState {
     }
 }
 
+/// The DynamoDB Streams sealer's own knobs (ADR 0042 §13, F6): size/age seal
+/// triggers, evaluated by the per-tablet `change_consumer_loop`'s seal arm
+/// (`index_drain.rs`). `Default` gives the ADR's own documented production
+/// defaults; a test constructs a tiny-knobbed value directly (this
+/// codebase's house testing discipline — see `--auto-split-bytes`'s own
+/// precedent — never the production defaults, or a size/age-triggered test
+/// would need to write megabytes/wait hours to trip).
+#[derive(Clone, Copy, Debug)]
+pub struct StreamSealKnobs {
+    /// `--stream-seal-bytes`: seal once a led tablet's `KIND_CHANGE` scope's
+    /// approximate size (`CpGroup::approx_bytes`) exceeds this many bytes.
+    pub seal_bytes: u64,
+    /// `--stream-seal-age`: seal once the oldest unsealed `KIND_CHANGE`
+    /// record's age — measured against the loop's own `env` clock, never
+    /// `std::time` directly (ADR 0003) — exceeds this.
+    pub seal_age: Duration,
+}
+
+impl Default for StreamSealKnobs {
+    fn default() -> Self {
+        StreamSealKnobs {
+            seal_bytes: 4 * 1024 * 1024,
+            seal_age: Duration::from_secs(4 * 60 * 60),
+        }
+    }
+}
+
+/// This node's stream-shard [`SegmentStore`](animus_env::SegmentStore) handle
+/// (ADR 0043 §A7b) — either the **default**
+/// [`ClusterSegmentStore`](animus_cp_data::cluster_segment_store::ClusterSegmentStore)
+/// (K-way replicated across nodes' own local segment directories, each
+/// backed by [`FsSegmentStore`]) or, opted into via `--segment-store
+/// dir:PATH`, a bare single-directory [`FsSegmentStore`] — dev use, or a
+/// genuinely shared mount every node in the cluster can reach at the
+/// identical path (the caveat `--segment-store`'s own CLI doc names: this
+/// mode gives up the K-replication durability upgrade F5 mandates for the
+/// *default*, in exchange for needing no cluster wiring at all — a single
+/// shared filesystem is its own, external, single point of failure/
+/// consistency the operator is choosing to accept).
+#[derive(Clone)]
+pub(crate) enum SegmentStoreHandle {
+    Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
+    Fs(FsSegmentStore),
+}
+
+impl SegmentStoreHandle {
+    /// Push a sealed segment's bytes durably to this store (the sealer's own
+    /// `SegmentStore::put`, ADR 0043 §A3 step 2), returning the replica set
+    /// to record in the `SealStreamShard` catalog row's own `replicas`
+    /// field (ADR 0043 §A3 step 3) — the **cluster** store's own sorted
+    /// K-replica set, or an **empty** one for the single-directory
+    /// `FsSegmentStore` opt-in: there is no per-node replica concept for a
+    /// store every node already reads the identical physical directory
+    /// through, so an empty `replicas` list is this PR's documented signal
+    /// for "no cluster replica set — ask any node" (the read path, a later
+    /// PR, is what interprets it).
+    async fn put_sealed(&self, id: &str, bytes: &[u8]) -> std::io::Result<Vec<NodeId>> {
+        match self {
+            SegmentStoreHandle::Cluster(c) => c.put_replicated(id, bytes).await,
+            SegmentStoreHandle::Fs(fs) => {
+                use animus_env::SegmentStore;
+                fs.put(id, bytes).await?;
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+/// A [`PlacementView`](animus_cp_data::cluster_segment_store::PlacementView)
+/// backed by this node's own control handle (ADR 0043 §A7b's wiring PR): the
+/// current candidate set is every member this node's replicated `Metadata`
+/// currently believes `Active` — the same "live, data-capable member" pool
+/// `ClientCtx::provision_tablet`'s own initial replica-set selection draws
+/// from. Deliberately label-blind, matching `cluster_segment_store.rs`'s own
+/// module doc (`choose_targets`'s policy is already label-blind today) — a
+/// future PR that wants failure-domain-aware segment placement would read
+/// each candidate's real `Metadata.node_addrs`/member labels here too,
+/// without changing the trait's shape. Uses `metadata_cached()`, not
+/// `effective_metadata()`: `PlacementView::candidates` is a **synchronous**
+/// trait method with no `.await` point to reach a growth node's polled
+/// mirror through, and `ClusterSegmentStore` is not wired onto a control-
+/// plane-follower-less growth node in this PR anyway (see
+/// [`BoundNode::start_with_streams`]'s own doc).
+#[derive(Clone)]
+struct ControlPlacementView {
+    control: ControlHandle,
+    self_id: NodeId,
+}
+
+impl animus_cp_data::cluster_segment_store::PlacementView for ControlPlacementView {
+    fn self_id(&self) -> NodeId {
+        self.self_id.clone()
+    }
+
+    fn candidates(&self) -> Vec<NodeId> {
+        self.control
+            .metadata_cached()
+            .members
+            .iter()
+            .filter(|(_, m)| m.status == NodeStatus::Active)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+}
+
+/// `--segment-store` CLI opt-in (ADR 0043 §A7b): the default,
+/// [`SegmentStoreConfig::Cluster`], selects [`SegmentStoreHandle::Cluster`]
+/// (the K-replicated default store, F5's durability mandate);
+/// `Fs(PATH)` (parsed by `main.rs` from `--segment-store dir:PATH`) selects a
+/// bare, single-directory `FsSegmentStore` at `PATH` instead — dev use, or a
+/// directory every node in the cluster mounts at the identical path (NFS or
+/// similar). **The shared-mount caveat**: this opt-in trades away the
+/// K-replication durability upgrade the *default* store exists to provide
+/// (ADR 0043's whole "the default store must uphold this database's own
+/// durability bar" argument) for needing no cluster wiring at all — the
+/// shared filesystem itself becomes a single point of failure/consistency
+/// this adapter no longer protects against, which is exactly the trade a dev
+/// setup or an operator with its own already-durable shared storage is
+/// choosing to accept.
+#[derive(Clone, Debug, Default)]
+pub enum SegmentStoreConfig {
+    #[default]
+    Cluster,
+    Fs(PathBuf),
+}
+
+/// Build (and, for the cluster variant, **start**) this node's
+/// [`SegmentStoreHandle`] (ADR 0043 §A7b) per `config`. `dir` is this node's
+/// own data directory ([`BoundNode::dir`]/[`BoundDataNode::dir`]) — the
+/// cluster variant's per-node local `FsSegmentStore` building block roots at
+/// `dir.join("segments")`, a sibling of the `internal/` subdirectory
+/// `ProdEnv::bind` already owns.
+fn build_segment_store(
+    env: &ProdEnv,
+    dir: &Path,
+    control: ControlHandle,
+    self_id: NodeId,
+    config: &SegmentStoreConfig,
+) -> SegmentStoreHandle {
+    match config {
+        SegmentStoreConfig::Cluster => {
+            let local = FsSegmentStore::new(dir.join("segments"));
+            let placement: Arc<dyn animus_cp_data::cluster_segment_store::PlacementView> =
+                Arc::new(ControlPlacementView { control, self_id });
+            SegmentStoreHandle::Cluster(
+                animus_cp_data::cluster_segment_store::ClusterSegmentStore::start(
+                    env.clone(),
+                    local,
+                    placement,
+                ),
+            )
+        }
+        SegmentStoreConfig::Fs(path) => SegmentStoreHandle::Fs(FsSegmentStore::new(path.clone())),
+    }
+}
+
 /// This node's data-plane fields (ADR 0035 PR3) — present in [`ClientCtx`]
 /// iff this node runs the data role (`NodeRole::Data`/`Both`); `None` on a
 /// control-only node, which never hosts a tablet and never runs the CP/
@@ -3289,6 +3593,12 @@ struct DataRole {
     /// wait for its own group to form" from "this node hosts nothing for the tablet,
     /// so forward."
     pub(crate) base_id: NodeId,
+    /// This node's stream-shard [`SegmentStoreHandle`] (ADR 0043 §A7b) — the
+    /// sealer's `SegmentStore::put` target, `index_drain.rs`'s
+    /// `change_consumer_loop` seal arm's only consumer today.
+    pub(crate) segment_store: SegmentStoreHandle,
+    /// The DynamoDB Streams sealer's own size/age knobs (ADR 0042 §13).
+    pub(crate) stream_seal_knobs: StreamSealKnobs,
 }
 
 /// Shared context for the client request server and the DynamoDB/CQL endpoints:
@@ -6318,6 +6628,27 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
+            // ADR 0042/0043 round-3 sealer PR: the force-seal RPC —
+            // addressed by `tablet` directly (see the variant's own doc for
+            // why there is no client key to derive it from).
+            ClientRequest::ForceSeal { tablet } => {
+                let tablet = TabletId(tablet);
+                let Some(leader) = self.edge.cp_leader(tablet) else {
+                    return self.not_leader_refusal(Some(tablet));
+                };
+                let table = self
+                    .effective_metadata()
+                    .tablets
+                    .get(&tablet)
+                    .and_then(|t| t.table.clone());
+                let Some(table) = table else {
+                    return ClientResponse::Error("no such tablet".into());
+                };
+                match index_drain::seal_now(self, &table, tablet, &leader).await {
+                    Ok(_) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
             // ADR 0018 §2/PR4: the four internal 2PC coordinator RPCs.
             // Routed by the first write key (`TxnPrepare`) or one of `keys`
             // (`TxnResolve`) — **never** `record_key` for a non-anchor
@@ -7946,8 +8277,12 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
         tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
 
         // `effective_metadata()` so a mirror-fed node (ADR 0030 / ADR 0035 PR4)
-        // sees the live tablet map, not an empty local core's.
-        let tablets: Vec<TabletId> = ctx.effective_metadata().tablets.keys().copied().collect();
+        // sees the live tablet map, not an empty local core's. Held for the
+        // whole tick (not just the key-collection step) so the F11
+        // token-alignment check below (ADR 0042 §14) shares one snapshot
+        // with the tablet-list read, rather than paying a second clone.
+        let meta = ctx.effective_metadata();
+        let tablets: Vec<TabletId> = meta.tablets.keys().copied().collect();
         for tablet in tablets {
             if matches!(last_triggered.get(&tablet), Some(at) if at.elapsed() < AUTO_SPLIT_COOLDOWN)
             {
@@ -8006,6 +8341,20 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
                 byte_weighted_median(&pairs)
             } else {
                 pairs[pairs.len() / 2].0.clone()
+            };
+            // F11 (ADR 0042 §14): a streamed table's split key rounds DOWN to
+            // its own 8-byte token boundary, so one partition key's records
+            // — and hence one shard's, ADR 0043 §A4 — never separate across
+            // the split. A plain, unstreamed table's split key is unchanged.
+            let split_key = if meta
+                .tablets
+                .get(&tablet)
+                .and_then(|t| t.table.as_deref())
+                .is_some_and(|table| meta.table_stream(table).is_some())
+            {
+                split_key[..TOKEN_BYTES.min(split_key.len())].to_vec()
+            } else {
+                split_key
             };
             last_triggered.insert(tablet, tokio::time::Instant::now());
             let span = tracing::info_span!("auto_split", tablet = tablet.0);
@@ -8112,6 +8461,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::PutBatch { .. } => "put_batch",
         ClientRequest::KindWrite { .. } => "kind_write",
         ClientRequest::KindScan { .. } => "kind_scan",
+        ClientRequest::ForceSeal { .. } => "force_seal",
         ClientRequest::Get { .. } => "get",
         ClientRequest::Scan { .. } => "scan",
         ClientRequest::Delete { .. } => "delete",
@@ -8259,6 +8609,11 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         // `cp_serve_forwarded`'s match, reached only through `Forwarded`.
         ClientRequest::KindScan { .. } => ClientResponse::Error(
             "this request is an internal index-read RPC and must be sent wrapped in `Forwarded`"
+                .into(),
+        ),
+        ClientRequest::ForceSeal { .. } => ClientResponse::Error(
+            "this request is an internal seal-trigger RPC and must be sent wrapped in \
+             `Forwarded`"
                 .into(),
         ),
         ClientRequest::TxnPrepare { .. }
@@ -8732,7 +9087,7 @@ impl ClientCtx {
     /// **pre-fix** drop that never cascaded at all. `drain_tablet`'s own
     /// provisioning and `reconcile_partition`'s writes race this drop
     /// harmlessly — both error paths are logged-and-swallowed by
-    /// `index_drain_loop` (best-effort convergence; the next tick just
+    /// `change_consumer_loop` (best-effort convergence; the next tick just
     /// retries), and once this table's groups leave `hosted_groups()` (the
     /// reconciler's `Reclaim` teardown), the drain simply stops sweeping
     /// them.
@@ -8888,6 +9243,61 @@ impl ClientCtx {
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
+
+    /// Force one seal pass of `tablet`'s own hot tail (ADR 0042/0043's F12-b
+    /// disable-triggered final seal), wherever that tablet's leader actually
+    /// runs — the caller (`dynamo.rs`'s disable flow) may be connected to
+    /// any node, not necessarily one that leads any of the table's tablets.
+    ///
+    /// Deliberately a **simpler** retry shape than [`cp_forward`](Self::cp_forward)'s
+    /// hint-chasing loop: this re-resolves [`resolve_cp_route`](Self::resolve_cp_route)
+    /// **from scratch** every iteration instead of chasing a stale hint —
+    /// correct (converged-or-timeout) and easier to reason about for a rare,
+    /// human-initiated admin-ish operation with no latency budget to protect,
+    /// unlike the hot per-request CP read/write path `cp_forward` serves.
+    pub(crate) async fn force_seal_tablet(&self, tablet: TabletId) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            match self.resolve_cp_route(tablet) {
+                Some(CpRoute::Local(leader)) => {
+                    let table = self
+                        .effective_metadata()
+                        .tablets
+                        .get(&tablet)
+                        .and_then(|t| t.table.clone());
+                    let Some(table) = table else {
+                        return Err("no such tablet".into());
+                    };
+                    return index_drain::seal_now(self, &table, tablet, &leader)
+                        .await
+                        .map(|_| ());
+                }
+                Some(CpRoute::Forward(addr)) => {
+                    let request = ClientRequest::Forwarded {
+                        request: Box::new(ClientRequest::ForceSeal { tablet: tablet.0 }),
+                        traceparent: otel::current_traceparent(),
+                    };
+                    match self.relay(addr, request).await {
+                        ClientResponse::PutOk => return Ok(()),
+                        ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
+                            return Err(e);
+                        }
+                        ClientResponse::Error(_) => {} // retry below
+                        other => {
+                            return Err(format!(
+                                "unexpected reply to forwarded force-seal: {other:?}"
+                            ));
+                        }
+                    }
+                }
+                Some(CpRoute::None) | None => {} // not settled yet, retry
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("force-seal did not reach a tablet leader in time".into());
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
 }
 
 /// Bind an `n`-node cluster on `ip` with ephemeral ports and the conventional
@@ -8936,7 +9346,16 @@ pub async fn start_cluster_with(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
 ) -> std::io::Result<Vec<Node>> {
-    start_cluster_inner(bound, backend, None, None, DEFAULT_ORPHAN_SWEEP_AFTER).await
+    start_cluster_inner(
+        bound,
+        backend,
+        None,
+        None,
+        DEFAULT_ORPHAN_SWEEP_AFTER,
+        StreamSealKnobs::default(),
+        SegmentStoreConfig::default(),
+    )
+    .await
 }
 
 /// Like [`start_cluster`], but enables the **automatic split trigger** (Phase 2.4)
@@ -8956,6 +9375,8 @@ pub async fn start_cluster_auto_split(
         Some(threshold),
         None,
         DEFAULT_ORPHAN_SWEEP_AFTER,
+        StreamSealKnobs::default(),
+        SegmentStoreConfig::default(),
     )
     .await
 }
@@ -8971,7 +9392,16 @@ pub async fn start_cluster_with_auto_split(
     backend: StorageBackend,
     auto_split: Option<usize>,
 ) -> std::io::Result<Vec<Node>> {
-    start_cluster_inner(bound, backend, auto_split, None, DEFAULT_ORPHAN_SWEEP_AFTER).await
+    start_cluster_inner(
+        bound,
+        backend,
+        auto_split,
+        None,
+        DEFAULT_ORPHAN_SWEEP_AFTER,
+        StreamSealKnobs::default(),
+        SegmentStoreConfig::default(),
+    )
+    .await
 }
 
 /// Like [`start_cluster_with_auto_split`], but also configures the **byte**
@@ -8994,6 +9424,8 @@ pub async fn start_cluster_with_auto_split_bytes(
         auto_split_keys,
         auto_split_bytes,
         DEFAULT_ORPHAN_SWEEP_AFTER,
+        StreamSealKnobs::default(),
+        SegmentStoreConfig::default(),
     )
     .await
 }
@@ -9019,6 +9451,38 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         auto_split_keys,
         auto_split_bytes,
         orphan_sweep_after,
+        StreamSealKnobs::default(),
+        SegmentStoreConfig::default(),
+    )
+    .await
+}
+
+/// Like [`start_cluster_with_auto_split_bytes_and_orphan_sweep_after`], with
+/// explicit DynamoDB Streams sealer knobs and segment-store selection — see
+/// [`BoundNode::start_with_streams`]'s doc for the layered-wrapper rationale.
+/// `--cluster N`'s `--stream-seal-bytes`/`--stream-seal-age`/
+/// `--segment-store` CLI flags thread through here.
+///
+/// # Errors
+/// Propagates a failure to open any node's CP group engine.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_cluster_with_streams(
+    bound: Vec<BoundNode>,
+    backend: StorageBackend,
+    auto_split_keys: Option<usize>,
+    auto_split_bytes: Option<u64>,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+) -> std::io::Result<Vec<Node>> {
+    start_cluster_inner(
+        bound,
+        backend,
+        auto_split_keys,
+        auto_split_bytes,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
     )
     .await
 }
@@ -9029,6 +9493,8 @@ async fn start_cluster_inner(
     auto_split_threshold: Option<usize>,
     auto_split_bytes_threshold: Option<u64>,
     orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -9065,7 +9531,7 @@ async fn start_cluster_inner(
     let mut nodes = Vec::with_capacity(n);
     for b in bound {
         let node = b
-            .start_with(
+            .start_with_streams(
                 peers.clone(),
                 control_ids.clone(),
                 data_ids.clone(),
@@ -9079,6 +9545,8 @@ async fn start_cluster_inner(
                 auto_split_bytes_threshold,
                 admin_addrs.clone(),
                 orphan_sweep_after,
+                stream_seal_knobs,
+                segment_store_config.clone(),
             )
             .await?;
         nodes.push(node);
@@ -9307,6 +9775,36 @@ pub async fn run_node_with_orphan_sweep_after(
     backend: StorageBackend,
     orphan_sweep_after: Duration,
 ) -> std::io::Result<Node> {
+    run_node_with_streams(
+        config,
+        index,
+        dir,
+        backend,
+        orphan_sweep_after,
+        StreamSealKnobs::default(),
+        SegmentStoreConfig::default(),
+    )
+    .await
+}
+
+/// Like [`run_node_with_orphan_sweep_after`], with explicit DynamoDB Streams
+/// sealer knobs and segment-store selection — see
+/// [`BoundNode::start_with_streams`]'s doc for the layered-wrapper rationale.
+/// A test that needs tiny seal thresholds (this codebase's own testing
+/// discipline — never wait out the 4-hour/4-MiB production defaults) calls
+/// this directly.
+///
+/// # Errors
+/// As [`run_node_with`].
+pub async fn run_node_with_streams(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
@@ -9326,7 +9824,7 @@ pub async fn run_node_with_orphan_sweep_after(
     // (ADR 0021) can fan out to the whole cluster.
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
     bound
-        .start_with(
+        .start_with_streams(
             config.peer_book(),
             config.control_ids(),
             config.data_ids(),
@@ -9337,6 +9835,8 @@ pub async fn run_node_with_orphan_sweep_after(
             None,
             admin_addrs,
             orphan_sweep_after,
+            stream_seal_knobs,
+            segment_store_config,
         )
         .await
 }

@@ -56,48 +56,80 @@ reason (see each file's own entry below).
   string suffix `cp_forward` chases). All `pub(crate)`.
 - **`dynamo.rs`** (~59 KB) — the DynamoDB JSON-over-HTTP edge; the `GET /metrics`
   route (ADR 0015) shares this listener.
-- **`index_drain.rs`** (ADR 0041 §4, cursor rework + trim janitor ADR 0042
-  §7/§8) — the per-node **GSI drain** background loop (`index_drain_loop`,
-  spawned alongside `tablet_host_reconciler_loop`/`auto_split_loop`): sweeps
-  every tablet group this node leads for change records past the "gsi"
-  cursor's own watermark (`drain_tablet`), reconciles each dirty partition's
-  GSI rows into the index's own hidden table (`reconcile_partition`,
-  derivative not delta-based — see its module doc), then advances the "gsi"
-  `KIND_CURSOR` row (`animus_cp_data::cursor`) to the sweep's own max HLC
-  **only after every dirtied partition's footprint update is durably
-  confirmed** — never fused into any one partition's own commit entry (see
-  the engineering-lessons entry on why that shortcut is unsound). No LSI
-  involvement (LSI rows are written atomically with the base row in
-  `dynamo.rs::index_aware_write`). `reconcile_partition` itself no longer
-  deletes the records it consumes — that's `trim_janitor`'s job, run right
-  after each tick's reconciliation: deletes change records `hlc ≤ min(every
-  *expected, present* consumer's watermark)` in bounded `KIND_CHANGE` batches
-  (`expected_consumer_tags(gsis, stream_enabled)` — "gsi" iff the table has a
-  GSI, "copier" iff its stream is enabled, ADR 0042 §2; a `// round-3 sealer
-  PR:` marker names where this tag/row scheme is replaced entirely by a
-  catalog-derived stream watermark, round-3 streams plan §A6/F10 — no
-  consumer ever writes a "copier" row), blocking trim entirely if an
-  expected tag has no row yet (the ADR 0042 §7 safe default — **today this
-  means a streamed table's change log is never trimmed at all**, since
-  nothing writes a "copier" cursor row and nothing ever will; safe, just
-  fully blocked until the round-3 sealer PR replaces this mechanism). The
-  loop's own per-tablet gate is `gsis.is_empty() && !stream_enabled` (was
-  `gsis.is_empty()`) — but `drain_tablet` itself (GSI-specific: it would
-  write a spurious "gsi" cursor row a streamed-but-unindexed table's schema
-  never expects) still only ever runs when `gsis` is non-empty; a
-  streamed-only table reaches `trim_janitor` alone. And tombstones stale
-  **merge-residue** cursor rows (an absorbed sibling's own row, physically
-  surviving in the widened scope, for a tag no longer expected) —
-  deliberately *not* an unexpected row at this tablet's own token (a
-  disabled stream's/dropped index's stale row is separate, later-PR
-  territory). `ClientCtx::cp_kind_write_raw`'s confirmation probe is generic
-  now (any single write in the atomic batch, not a `KIND_CHANGE`-deletion
-  search) for exactly this reason — see that method's doc and the
-  engineering-lessons entry. A `#[cfg(test)] mod gsi_drain_cursor_tests` at
-  the bottom of this file (mirroring `lib.rs`'s `split_fence_tests`) holds
-  the crash/split/merge/trim regressions that need `CpGroup`'s private
-  `pending_changes`/`cursor_min_watermark`/`cursor_rows_with_token`
-  accessors an external `tests/` crate can't reach.
+- **`index_drain.rs`** (ADR 0041 §4 GSI drain; ADR 0042/0043 the seal arm +
+  hot-trim rework, round-3 sealer PR) — the per-node **change-consumer
+  loop** (`change_consumer_loop`, renamed from `index_drain_loop` since it
+  is no longer GSI-specific; spawned alongside
+  `tablet_host_reconciler_loop`/`auto_split_loop`), three arms per tick per
+  led tablet:
+  1. **GSI drain** (unchanged from ADR 0041): sweeps change records past the
+     "gsi" cursor's own watermark (`drain_tablet`), reconciles each dirty
+     partition's GSI rows into the index's own hidden table
+     (`reconcile_partition`, derivative not delta-based — see its module
+     doc), then advances the "gsi" `KIND_CURSOR` row
+     (`animus_cp_data::cursor`) to the sweep's own max HLC **only after
+     every dirtied partition's footprint update is durably confirmed**.
+  2. **The seal arm** (`seal_tick`/`seal_now`, streamed tables only): on a
+     size trigger (`CpGroup::approx_bytes_kind(KIND_CHANGE)` —
+     deliberately **not** `approx_bytes`, which is base-kind-only, ADR
+     0034; see the engineering-lessons entry on the bug this distinction
+     fixed) or age trigger (the oldest unsealed record's wall-ms, this
+     loop's own `env` clock), `seal_now` scans `pending_changes()` past the
+     tablet's effective watermark (`Metadata::
+     effective_stream_shard_watermark`, walking split-parent provenance),
+     sorts by the packed-HLC key suffix (load-bearing — key order is
+     token-then-pk-then-HLC, not commit order), builds a segment
+     (`animus_cp_data::segment`), pushes it to this node's
+     `SegmentStoreHandle` (`ClientCtx.data().segment_store`), then proposes
+     and confirms `MetaCommand::SealStreamShard`. Never seals an empty
+     pending set. `seal_now` is the **one** seal code path — also called,
+     unconditionally (trigger-independent), by the internal-only
+     `ClientRequest::ForceSeal` RPC (`lib.rs`, refused bare, handled only
+     inside `cp_serve_forwarded`) that `ClientCtx::force_seal_tablet`
+     drives — `dynamo.rs`'s `disable_stream` calls it for every tablet of a
+     table before ever proposing `SetTableStream{None}` (F12-b's
+     disable-triggered final seal).
+  3. **The hot-trim arm** (`trim_janitor`, generalized from ADR 0041's
+     original trim janitor): deletes change records every *expected,
+     present* term has cleared — the "gsi" cursor term (unchanged) and,
+     **iff the table's current schema has an enabled stream**, the
+     catalog-derived stream watermark (`Metadata::
+     effective_stream_shard_watermark`) — never a `"copier"` cursor row
+     (round 2's tag/row scheme; deleted, along with `COPIER_TAG`/
+     `expected_consumer_tags`, in round 3). **The F10/F12-b rule, reviewed
+     hard**: an expected term with nothing to derive it from yet (no "gsi"
+     row; a stream that has never sealed) blocks trim entirely (the safe
+     default); the stream term applies *only* while the schema's stream is
+     currently enabled — a disabled stream's un-reaped catalog rows do
+     **not** re-add it, because by the time disable commits, the final
+     seal has already moved every one of that label's records into a
+     committed segment, so there is nothing left for a stream term to
+     protect; and **zero expected terms at all means trim everything, not
+     block everything** — reachable only for a table whose stream was
+     disabled and has no GSI, which the loop's own outer gate
+     (`gsis.is_empty() && !stream_enabled && !ever_streamed`) keeps
+     visiting specifically so this arm gets a guaranteed chance to run,
+     rather than depending on winning a race against `disable_stream`'s
+     own commit landing first (a real bug this PR's own tests found and
+     fixed — see the engineering-lessons entry). And tombstones stale
+     **merge-residue** cursor rows (an absorbed sibling's own row,
+     physically surviving in the widened scope, for a tag no longer
+     expected) — deliberately *not* an unexpected row at this tablet's own
+     token (a dropped index's stale row is separate, out of scope here;
+     round 3 has no cursor tag left for a stream to ever leave one of its
+     own). `ClientCtx::cp_kind_write_raw`'s confirmation probe is generic
+     (any single write in the atomic batch) for exactly this reason.
+
+  Two `#[cfg(test)] mod`s at the bottom of this file (mirroring `lib.rs`'s
+  `split_fence_tests`): `gsi_drain_cursor_tests` (unchanged, ADR 0041/0042
+  §7/§8's own crash/split/merge/trim regressions) and `stream_sealer_tests`
+  (round-3 sealer PR) — the seal arm's triggers/sequence, the F10/F12-b
+  hot-trim rework, and F11's split-key token alignment, needing `CpGroup`'s
+  private `pending_changes`/`approx_bytes_kind`/`cursor_min_watermark`
+  accessors and, for durability introspection, a **second** `FsSegmentStore`
+  handle pointed at the same deterministic `<node dir>/segments` path
+  `build_segment_store` roots the default cluster store's local building
+  block at (there is no production read-path accessor yet — that's PR6).
 - **`cql.rs`** (~42 KB) — the CQL (Cassandra) v4 binary-protocol edge.
 - **`cql_client.rs`** — a minimal loopback CQL client the admin dashboard's CQL
   editor uses (`POST /admin/data/cql`) to drive this node's own CQL port.
@@ -588,13 +620,16 @@ route below the edge through the same `ClientCtx` CP primitives.
   `TableDescription`-object builder). The synthetic ARN
   (`wire::stream_arn`) is `arn:aws:dynamodb:animus:0:table/<table>/
   stream/<label>` — fixed placeholder region/account, matching this
-  adapter's existing ARN conventions. **The round-3 sealer and read path
-  land in a later PR**: `update_table`'s enable/disable is schema-only today
-  (a `// round-3 sealer PR:` marker names where the disable-triggered final
-  seal, F12-b, hooks in) — nothing is actually readable via `GetRecords`
-  yet. Round 3 needs no shard provisioning at all: the hot shard is just the
-  table's own existing `KIND_CHANGE` change log (round-3 streams plan §A1),
-  not a separate hidden per-stream table.
+  adapter's existing ARN conventions. Round 3 needs no shard provisioning at
+  all: the hot shard is just the table's own existing `KIND_CHANGE` change
+  log (round-3 streams plan §A1), not a separate hidden per-stream table.
+  **The sealer landed in the round-3 sealer PR** (see `index_drain.rs`'s
+  entry above): `update_table`'s disable path now performs the F12-b
+  final seal (`dynamo.rs::disable_stream`, forcing every tablet's own hot
+  tail into a committed segment via `ClientCtx::force_seal_tablet` before
+  ever proposing `SetTableStream{None}`) — **the read path is still a later
+  PR (PR6)**, so nothing is actually readable via `GetRecords` yet, even
+  though every record is durably sealed once written.
 
   `mint_stream_label` (ADR 0042 §4) is the proposer-side label mint: an
   ISO8601-shaped string derived from **this node's own `env.now()`**
@@ -754,6 +789,54 @@ route below the edge through the same `ClientCtx` CP primitives.
 
 ## Gotchas
 
+- **The DynamoDB Streams segment store + sealer knobs are wired via the
+  `_with_orphan_sweep_after`-style layered-wrapper convention (ADR
+  0042/0043, round-3 sealer PR)** — `BoundNode::start_with`/
+  `BoundDataNode::start_data_with`/`run_node_with*`/`start_cluster_with*`
+  all keep their exact pre-existing signatures, defaulting internally to
+  `StreamSealKnobs::default()` (4 MiB / 4h, the ADR's own production
+  defaults) and `SegmentStoreConfig::default()` (`Cluster`, the default
+  K-replicated store); a `_streams`-suffixed sibling
+  (`start_with_streams`/`start_data_with_streams`/`run_node_with_streams`/
+  `start_cluster_with_streams`) takes the two explicit params. `main.rs`'s
+  `--stream-seal-bytes B`/`--stream-seal-age SECS`/`--segment-store
+  dir:PATH` flags (`--config/--node` and `--cluster N` only, so far — the
+  split-deployment and data-only CLI paths are a named follow-up) call the
+  `_streams` variants; a test that needs tiny seal thresholds (never the
+  production defaults — see `index_drain.rs`'s `stream_sealer_tests`) does
+  too. `SegmentStoreHandle` (`Cluster(ClusterSegmentStore<ProdEnv,
+  FsSegmentStore>)` or a bare opt-in `Fs(FsSegmentStore)`) and
+  `StreamSealKnobs` live on `DataRole` (`ClientCtx.data()`), built by
+  `build_segment_store` at node-assembly time — the **default** cluster
+  variant roots its own per-node local `FsSegmentStore` at
+  `<node dir>/segments` (a sibling of the `internal/` subdirectory
+  `ProdEnv::bind` already owns; `BoundNode`/`BoundDataNode` gained a `dir`
+  field to carry that path forward, since neither previously kept it past
+  bind time) and is backed by a `ControlPlacementView` over this node's own
+  control handle (live `Active` members; label-blind, matching
+  `cluster_segment_store.rs`'s own current policy — a later PR that wants
+  failure-domain-aware segment placement would extend this view).
+- **`ClientRequest::ForceSeal { tablet }`** (round-3 sealer PR) is the
+  internal-only RPC behind F12-b's disable-triggered final seal — addressed
+  by tablet id directly (no client key to derive it from, unlike
+  `KindWrite`/`KindScan`), refused bare, handled only inside
+  `cp_serve_forwarded`. `ClientCtx::force_seal_tablet` is its caller-side
+  wrapper (`dynamo.rs::disable_stream`, one call per tablet of the table
+  being disabled) — a deliberately **simpler** retry shape than
+  `cp_forward`'s hint-chasing loop (re-resolves routing from scratch every
+  iteration rather than chasing a stale hint), acceptable for a rare,
+  human-initiated admin-ish operation with no hot-path latency budget to
+  protect. **Every send of an internal-only variant across the wire must
+  wrap it in `ClientRequest::Forwarded`, even when the caller already knows
+  it isn't the leader** — a first attempt called `ClientCtx::relay`
+  directly with the bare `ForceSeal`, which compiled and passed every
+  single-node test (the local branch never goes through `relay` at all)
+  but failed loudly the moment a real multi-node test exercised the
+  forwarding branch, exactly because the receiving side's bare-request
+  refusal is designed to catch precisely that mistake. See
+  `docs/engineering-lessons.md`'s Testing section for the general rule this
+  is now an instance of (a forwarded-command test suite needs at least one
+  non-leader-issued call).
 - **A node runs one internal `ProdEnv`, on one id (ADR 0040)** — the control
   Raft rides `PRIMARY_STREAM` (stream 0, ADR 0026's default); every per-tablet
   Raft group this node hosts rides its own stream (`stream = tablet_id`, which
@@ -931,7 +1014,18 @@ one); `dynamo.rs`'s own `stream_write_path_tests` is a fourth (ADR 0042
 §1), needing `CpGroup`'s private `pending_changes`/`local_scan_kind_bounded`
 (a new, non-linearizable bounded kind-scan wrapper, mirroring
 `local_get_kind`'s existing shape) to prove a streamed-unindexed table's
-write commits exactly base + change, no LSI/footprint row.
+write commits exactly base + change, no LSI/footprint row;
+`index_drain.rs`'s own `stream_sealer_tests` is a fifth (round-3 sealer PR)
+— the seal arm's triggers/sequence (size, age, empty-hot no-seal, the
+exactly-at-watermark boundary), the F10/F12-b hot-trim rework (the
+GSI+stream min-rule, and — reviewed hard — the
+disabled-draining-does-not-block-trim rule), disable-as-final-seal with
+epoch continuity across a disable/re-enable cycle, and F11's split-key
+token alignment, needing `CpGroup`'s private `pending_changes`/
+`approx_bytes_kind`/`cursor_min_watermark` and, to confirm a segment
+genuinely landed, a second `FsSegmentStore` handle at the exact
+`<node dir>/segments` path the default store roots its own local building
+block at.
 
 One binary per behavior; the file names describe them (`ls
 crates/animusd/tests/`) — covering combined/control-only/data-only/split

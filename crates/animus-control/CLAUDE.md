@@ -101,8 +101,14 @@ per-tablet CP data plane (`animus-cp-data`).
   `RemoveMember`'s own exclusion). `Metadata` accessors:
   `stream_shard_chain(table, label, tablet)` (one tablet's chain in
   ascending epoch order), `stream_shard_watermark(tablet)` (the tablet's
-  own last-sealed end-HLC, regardless of label — the ADR 0042 §8/ADR 0043
-  §A6 F10 watermark), `stream_shard_rows_for_label(table, label)` (every
+  own last-sealed end-HLC, regardless of label — restricted to *this*
+  tablet's own chain, `None` for a fresh split child with no rows of its
+  own yet), `effective_stream_shard_watermark(tablet)` (round-3 sealer PR,
+  ADR 0043 §A4/§A6 — the one the sealer/hot-trim arm actually calls: walks
+  `split_parents` provenance when the plain accessor above answers `None`,
+  so a fresh split child inherits its parent tablet's own last-sealed
+  end-HLC instead of reading as absent, transitively through a chain of
+  splits), `stream_shard_rows_for_label(table, label)` (every
   row across every tablet), `stream_labels_with_rows(table)` (F12-b's
   coexistence set), `stream_shard_parent_id(tablet, epoch)` (derived
   `ParentShardId`, never stored redundantly). **F1 merge stopgap** (ADR

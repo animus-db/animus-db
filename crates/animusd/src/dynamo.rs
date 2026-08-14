@@ -156,7 +156,7 @@ use animus_dynamo::{
     index as dynamo_index, schema as schema_bridge, storage_key,
 };
 use animus_env::{Clock, Env, Metric};
-use animus_tablet::{TOKEN_BYTES, partition_token};
+use animus_tablet::{TOKEN_BYTES, TabletId, partition_token};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::ClientCtx;
@@ -845,7 +845,35 @@ async fn enable_stream(
 /// Disable `table`'s stream (`SetTableStream{None}`) and wait for it to
 /// commit. A no-op wait (still proposed, harmlessly idempotent) if no
 /// stream is currently enabled.
+///
+/// **F12-b's disable-triggered final seal (ADR 0042 §11, ADR 0043 §A3)
+/// happens first**, before the write gate ever closes: every one of
+/// `table`'s current tablets is force-sealed (`ClientCtx::force_seal_tablet`
+/// — one hop to wherever that tablet's own leader actually runs, calling the
+/// *identical* `index_drain::seal_now` the periodic seal arm calls, just
+/// unconditionally rather than trigger-gated — the "one seal code path"
+/// this PR's design keeps to) so every record written before disable,
+/// delivered to a consumer or not, reaches the readable (segment) tier
+/// before `SetTableStream{None}` ever proposes. If any tablet's final seal
+/// fails to confirm, this returns an error and the caller (the DynamoDB
+/// edge) never proposes the disable at all — a retried `UpdateTable` simply
+/// re-seals (idempotent: a repeat seal of an already-fully-sealed hot tail
+/// finds nothing pending and is a no-op) rather than risk disabling with an
+/// un-sealed tail.
 async fn disable_stream(ctx: &ClientCtx, table: &str) -> Result<(), WireError> {
+    let tablets: Vec<TabletId> = metadata_fresh(ctx)
+        .await
+        .tablets_for_table(table)
+        .map(|(&t, _)| t)
+        .collect();
+    for tablet in tablets {
+        ctx.force_seal_tablet(tablet).await.map_err(|e| {
+            internal(&format!(
+                "final seal of tablet {} before disabling table `{table}`'s stream: {e}",
+                tablet.0
+            ))
+        })?;
+    }
     let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
     loop {
         ctx.propose_schema(&MetaCommand::SetTableStream {
@@ -882,15 +910,13 @@ fn stream_description(spec: &animus_control::StreamSpec) -> wire::StreamDescript
 /// 0042 §9's "no same-command relabel" contract); disable proposes
 /// `SetTableStream{None}` via [`disable_stream`].
 ///
-/// **The round-3 sealer + read path land in a later PR** — for now enable/
-/// disable is schema-only: enabling needs no provisioning step (round 3's
-/// hot shard is just the table's own existing `KIND_CHANGE` change log, no
-/// separate shard tablets to stand up), but nothing is actually readable via
-/// `GetRecords` yet since the seal/wire-API arms don't exist; disabling does
-/// not yet perform the "final seal" of the hot tail F12-b requires.
-// round-3 sealer PR: hook the disable-triggered final seal (F12-b) in here
-// before `SetTableStream{None}` proposes; see the round-3 streams plan
-// §A3/§A9 for the sealer/disable-grace design this stands in for.
+/// **The round-3 read/wire-API path still lands in a later PR (PR6)** — the
+/// sealer itself (this PR) is wired: enabling needs no provisioning step
+/// (round 3's hot shard is just the table's own existing `KIND_CHANGE`
+/// change log, no separate shard tablets to stand up), and disabling now
+/// performs the F12-b "final seal" of the hot tail via [`disable_stream`]
+/// before `SetTableStream{None}` ever proposes — but nothing is actually
+/// readable via `GetRecords` yet, since the wire-API arm doesn't exist.
 async fn update_table(
     ctx: &ClientCtx,
     table: &str,

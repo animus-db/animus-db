@@ -52,14 +52,15 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   correlated by a `req_id` a caller's `env.sleep`-based poll loop watches (see
   "What's non-obvious" and `docs/engineering-lessons.md`'s Testing section for
   why this isn't a `tokio::sync::oneshot`). `PlacementView` (implemented by
-  `StaticPlacementView` for tests; `animusd`'s `Metadata`-mirror-backed
-  wiring is a later PR) hands back the current candidate node set;
+  `StaticPlacementView` for tests) hands back the current candidate node set;
   `choose_targets` feeds it straight into `animus_placement::select_replicas`
   with a plain, label-blind `PlacementPolicy::simple` — `K = min(default_k,
   candidates.len())`, so a single-node cluster degrades to `K = 1` instead of
-  refusing to serve. Not yet wired into `animusd` (that, plus the
-  `SealStreamShard` catalog recording the chosen replica set, is a later PR);
-  today it is tested standalone against `SimSegmentStore`.
+  refusing to serve. **Wired into `animusd` since the round-3 sealer PR**
+  (`animusd::build_segment_store`/`ControlPlacementView`, `SegmentStoreHandle`
+  in that crate's `lib.rs`) — the DynamoDB Streams sealer's own
+  `SealStreamShard.replicas` field is exactly `put_replicated`'s returned
+  set; see that crate's `CLAUDE.md` for the wiring.
 - **`codec.rs`** — the crate's compact binary wire/image codec (ADR 0017 A.2):
   length-prefixed framing (like the storage manifest codec), magic/version
   checked. Carries `KvWire` messages and engine images; `serde_json`'s
@@ -252,7 +253,14 @@ command*, stamped by the leader from its own `StorageScope.range` (see Key
 invariants for why this is load-bearing); `scope_range()` is the read-side
 snapshot used both to reject a key before proposing and to stamp the
 fence. `approx_bytes()` is the per-tablet cheap byte estimate
-`animusd::auto_split_loop` gates on. Batch put (`KvCommand::Batch` +
+`animusd::auto_split_loop` gates on — **deliberately pinned to the base
+kind scope** (measures only base data, the ADR 0034 fix that stops
+auto-split reacting to change-log churn). `approx_bytes_kind(kind)` (ADR
+0042/0043) is its kind-scoped sibling, over `self.kind_scopes[kind]`
+instead — the Streams sealer's size trigger needs `KIND_CHANGE`'s own
+bytes specifically, and reusing `approx_bytes` for that is exactly the
+trap this sibling exists to avoid (see `docs/engineering-lessons.md`'s
+Code-patterns entry). Batch put (`KvCommand::Batch` +
 `put_batch`) commits N keys as one Raft log entry. Linearizable CAS
 (`cas`/`cas_result`/`compare_and_swap`) is decided at apply time (see Key
 invariants); a current value covered by a `Pending`/unresolved intent

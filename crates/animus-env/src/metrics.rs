@@ -285,12 +285,52 @@ pub enum Metric {
     /// signals, hence one counter (see `run_transact_get`'s doc for why the
     /// two aren't split further).
     DynamoTransactGetsRetried,
+
+    // --- DynamoDB Streams sealer (ADR 0042/0043, round-3 sealer PR) ---
+    // Appended after the transact-gets-retried variant; every earlier
+    // variant's slot and the text-export order stay stable, so the snapshot
+    // remains byte-reproducible. Recorded by `animusd::index_drain`'s
+    // `change_consumer_loop` seal arm and hot-trim arm — a mix of genuine
+    // counters (`StreamSealsTotal`/`StreamSealFailuresTotal`) and **level**
+    // gauges written via `MetricsHandle::set` rather than `MetricsHandle::
+    // incr` (`StreamHotBytes`/`StreamSealBacklogMs`/`ChangeLogTrimBlocked`)
+    // — a plain counter slot re-purposed as a last-write-wins level, the
+    // same shape `MetricSink::is_leader` already uses for a boolean level,
+    // generalized here to an arbitrary `u64` level without a second array.
+    /// The sealing leader's own current `KIND_CHANGE` scope size (bytes,
+    /// `CpGroup::approx_bytes`) for the tablet its most recent seal-arm tick
+    /// evaluated — a level, not a count: each tick overwrites it via
+    /// `MetricsHandle::set`.
+    StreamHotBytes,
+    /// The age (milliseconds, the loop's own `env` clock) of the oldest
+    /// unsealed `KIND_CHANGE` record as of the most recent seal-arm tick that
+    /// found one — `0` when the hot tail is empty. A level, overwritten via
+    /// `MetricsHandle::set`.
+    StreamSealBacklogMs,
+    /// A stream shard seal committed (the segment `put` succeeded on every
+    /// replica and `MetaCommand::SealStreamShard` was confirmed in the
+    /// replicated catalog) — counts the confirmed commit, not the attempt
+    /// (a crash-retried re-seal of the same `(tablet, epoch)` counts once,
+    /// at whichever attempt's confirmation actually lands).
+    StreamSealsTotal,
+    /// A seal attempt failed (the segment store `put` errored, or the
+    /// `SealStreamShard` proposal never confirmed within its timeout) — the
+    /// next tick simply retries, per ADR 0043 §A3's recovery discipline.
+    StreamSealFailuresTotal,
+    /// Whether the most recent hot-trim arm tick found at least one
+    /// streamed-or-indexed tablet whose trim was blocked by a missing
+    /// expected watermark (1) or not (0) — a level (this tick's outcome
+    /// **OR**ed across every tablet this node leads), overwritten via
+    /// `MetricsHandle::set`; the consequence is real (an unhealed store or a
+    /// stream that has never sealed grows its hot scope unboundedly) but
+    /// never itself an error.
+    ChangeLogTrimBlocked,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 53] = [
+    pub const ALL: [Metric; 58] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -344,6 +384,11 @@ impl Metric {
         Metric::DynamoTransactWritesCanceled,
         Metric::DynamoTransactGetsOk,
         Metric::DynamoTransactGetsRetried,
+        Metric::StreamHotBytes,
+        Metric::StreamSealBacklogMs,
+        Metric::StreamSealsTotal,
+        Metric::StreamSealFailuresTotal,
+        Metric::ChangeLogTrimBlocked,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -404,6 +449,11 @@ impl Metric {
             Metric::DynamoTransactWritesCanceled => "dynamo_transact_writes_canceled",
             Metric::DynamoTransactGetsOk => "dynamo_transact_gets_ok",
             Metric::DynamoTransactGetsRetried => "dynamo_transact_gets_retried",
+            Metric::StreamHotBytes => "stream_hot_bytes",
+            Metric::StreamSealBacklogMs => "stream_seal_backlog_ms",
+            Metric::StreamSealsTotal => "stream_seals_total",
+            Metric::StreamSealFailuresTotal => "stream_seal_failures_total",
+            Metric::ChangeLogTrimBlocked => "change_log_trim_blocked",
         }
     }
 
@@ -447,6 +497,14 @@ impl MetricSink {
     #[must_use]
     pub fn get(&self, metric: Metric) -> u64 {
         self.counters[metric.slot()].load(Ordering::Relaxed)
+    }
+
+    /// Overwrite `metric`'s slot with `value` (relaxed) — for a **level**
+    /// metric re-using a counter slot (see e.g. `Metric::StreamHotBytes`'s
+    /// doc) rather than a monotonic count. Never mix `incr_by`/`set` calls
+    /// on the same variant; each metric's own doc says which it is.
+    pub fn set(&self, metric: Metric, value: u64) {
+        self.counters[metric.slot()].store(value, Ordering::Relaxed);
     }
 
     /// Set the leadership gauge (1 = this node believes it is leader, 0 = not).
@@ -524,6 +582,11 @@ impl MetricsHandle {
     /// Increment `metric` by `n`.
     pub fn incr_by(&self, metric: Metric, n: u64) {
         self.sink.incr_by(metric, n);
+    }
+
+    /// Overwrite a **level** metric's slot — see [`MetricSink::set`]'s doc.
+    pub fn set(&self, metric: Metric, value: u64) {
+        self.sink.set(metric, value);
     }
 
     /// Set the leadership gauge.

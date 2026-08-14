@@ -1621,6 +1621,32 @@ impl Metadata {
             .map(|(_, row)| row.hlc_range.1)
     }
 
+    /// `tablet`'s effective stream watermark **including split-parent
+    /// inheritance** (ADR 0043 §A4/§A6): [`stream_shard_watermark`]
+    /// restricted to `tablet`'s own chain is `None` for a fresh split child
+    /// that hasn't sealed a shard of its own yet — but ADR 0043 §A4 is
+    /// explicit that such a child's *initial* watermark is its parent
+    /// tablet's chain's own last-sealed end-HLC, not absent, since the
+    /// parent's sealed segments are shared history both children inherit.
+    /// This walks [`Metadata::split_parents`] (a tablet can itself be a
+    /// split child of a split child, so the walk continues until it finds a
+    /// tablet with a sealed row of its own, or runs out of provenance) and
+    /// is what the sealer/hot-trim arm (ADR 0043 §A3/§A6, `animusd::
+    /// index_drain`) actually calls — never the bare
+    /// [`stream_shard_watermark`], which only answers "this exact tablet's
+    /// own chain," a narrower question than the one a fresh child's watermark
+    /// computation needs answered.
+    #[must_use]
+    pub fn effective_stream_shard_watermark(&self, tablet: TabletId) -> Option<u64> {
+        let mut current = tablet;
+        loop {
+            if let Some(w) = self.stream_shard_watermark(current) {
+                return Some(w);
+            }
+            current = *self.split_parents.get(&current)?;
+        }
+    }
+
     /// Every catalog row for `(table, label)`, across every tablet, in
     /// ascending `(tablet, epoch)` order (ADR 0042 §3 — `DescribeStream`'s
     /// own read, and a later PR's lineage-walk consumer).
@@ -3733,5 +3759,51 @@ mod tests {
             Some("shardId-1-2".to_owned()),
             "the split child's epoch-0 parent is tablet 1's own LAST shard"
         );
+    }
+
+    /// `effective_stream_shard_watermark` (ADR 0043 §A4/§A6): a tablet with
+    /// its own sealed rows answers from its own chain (matching the plain
+    /// `stream_shard_watermark`); a fresh split child with NO rows of its
+    /// own inherits its parent's last-sealed end-HLC instead of reading as
+    /// absent; the inheritance walk continues through a **chain** of split
+    /// parents (a grandchild inherits from its grandparent's own last seal
+    /// when neither it nor its immediate parent has ever sealed); and a
+    /// tablet with no rows and no split-parent provenance at all is still
+    /// genuinely absent.
+    #[test]
+    fn effective_stream_shard_watermark_inherits_through_split_provenance() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        m.apply(&seal("orders", "L1", 1, 0, 100));
+        m.apply(&seal("orders", "L1", 1, 1, 200));
+
+        // Tablet 1 has its own rows: identical to the plain accessor.
+        assert_eq!(m.effective_stream_shard_watermark(TabletId(1)), Some(200));
+
+        // Tablet 2 is a split child of tablet 1 with no rows of its own yet:
+        // inherits tablet 1's last-sealed end-HLC.
+        m.split_parents.insert(TabletId(2), TabletId(1));
+        assert_eq!(
+            m.stream_shard_watermark(TabletId(2)),
+            None,
+            "test premise: tablet 2 has never sealed on its own"
+        );
+        assert_eq!(m.effective_stream_shard_watermark(TabletId(2)), Some(200));
+
+        // Tablet 3 is a split child of tablet 2 (itself a split child), with
+        // no rows anywhere in the chain: inherits transitively through both
+        // hops to tablet 1's watermark.
+        m.split_parents.insert(TabletId(3), TabletId(2));
+        assert_eq!(m.effective_stream_shard_watermark(TabletId(3)), Some(200));
+
+        // Once tablet 2 seals its own first shard, tablet 3 still has no
+        // rows of its own, but its immediate parent now does — the walk
+        // stops one hop earlier and answers from tablet 2 (350), not
+        // tablet 1's now-stale 200.
+        m.apply(&seal("orders", "L1", 2, 0, 350));
+        assert_eq!(m.effective_stream_shard_watermark(TabletId(3)), Some(350));
+
+        // No rows and no split-parent provenance at all: genuinely absent.
+        assert_eq!(m.effective_stream_shard_watermark(TabletId(99)), None);
     }
 }

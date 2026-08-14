@@ -5,8 +5,8 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS] # run an N-node cluster in one process
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--segment-store dir:PATH] # run node I of a cluster (one process)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--segment-store dir:PATH] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] # run node I as a control-only node (ADR 0035 PR3)
@@ -133,8 +133,8 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--segment-store dir:PATH]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--segment-store dir:PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS]\n  \
@@ -215,6 +215,17 @@ async fn run(args: &[String]) -> Result<(), String> {
     // it. Applies to every mode below that runs a local control `RaftNode`
     // (`--config`/`--node`, `--cluster`, `--cluster-control`/`--cluster-data`).
     let mut orphan_sweep_after: Option<u64> = None;
+    // `--stream-seal-bytes B` / `--stream-seal-age SECS` (ADR 0042 §13): the
+    // DynamoDB Streams sealer's size/age triggers — default to the ADR's own
+    // production defaults (4 MiB / 4h) when omitted.
+    let mut stream_seal_bytes: Option<u64> = None;
+    let mut stream_seal_age_secs: Option<u64> = None;
+    // `--segment-store dir:PATH` (ADR 0043 §A7b): opts out of the default
+    // K-replicated `ClusterSegmentStore` into a bare, single-directory
+    // `FsSegmentStore` at `PATH` — dev use, or a directory every node in the
+    // cluster mounts at the identical path. See `SegmentStoreConfig`'s own
+    // doc for the durability trade-off this opt-in accepts.
+    let mut segment_store: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -236,10 +247,21 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--orphan-sweep-after" => {
                 orphan_sweep_after = Some(parse_next(&mut it, "--orphan-sweep-after")?);
             }
+            "--stream-seal-bytes" => {
+                stream_seal_bytes = Some(parse_next(&mut it, "--stream-seal-bytes")?);
+            }
+            "--stream-seal-age" => {
+                stream_seal_age_secs = Some(parse_next(&mut it, "--stream-seal-age")?);
+            }
+            "--segment-store" => {
+                segment_store = Some(parse_next(&mut it, "--segment-store")?);
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
     let orphan_sweep_after = orphan_sweep_after_duration(orphan_sweep_after);
+    let stream_seal_knobs = stream_seal_knobs(stream_seal_bytes, stream_seal_age_secs);
+    let segment_store_config = parse_segment_store(segment_store.as_deref())?;
 
     if cluster_control.is_some() || cluster_data.is_some() {
         if config_path.is_some() || cluster.is_some() {
@@ -267,7 +289,16 @@ async fn run(args: &[String]) -> Result<(), String> {
         (Some(_), Some(_)) => Err("use either --config or --cluster, not both".into()),
         (Some(path), None) => {
             let index = node.ok_or("--config requires --node I")?;
-            run_single(&path, index, dir, backend, orphan_sweep_after).await
+            run_single(
+                &path,
+                index,
+                dir,
+                backend,
+                orphan_sweep_after,
+                stream_seal_knobs,
+                segment_store_config,
+            )
+            .await
         }
         (None, Some(n)) => {
             run_in_process_cluster(
@@ -278,10 +309,38 @@ async fn run(args: &[String]) -> Result<(), String> {
                 auto_split,
                 auto_split_bytes,
                 orphan_sweep_after,
+                stream_seal_knobs,
+                segment_store_config,
             )
             .await
         }
         (None, None) => Err("nothing to do".into()),
+    }
+}
+
+/// [`animusd::StreamSealKnobs`] from the optional `--stream-seal-bytes`/
+/// `--stream-seal-age` CLI values — each independently defaults to
+/// [`animusd::StreamSealKnobs::default`]'s own field when omitted.
+fn stream_seal_knobs(bytes: Option<u64>, age_secs: Option<u64>) -> animusd::StreamSealKnobs {
+    let default = animusd::StreamSealKnobs::default();
+    animusd::StreamSealKnobs {
+        seal_bytes: bytes.unwrap_or(default.seal_bytes),
+        seal_age: age_secs.map_or(default.seal_age, Duration::from_secs),
+    }
+}
+
+/// [`animusd::SegmentStoreConfig`] from the optional `--segment-store` CLI
+/// value: absent selects the default `ClusterSegmentStore`; `dir:PATH` (the
+/// only recognized form) opts into a bare `FsSegmentStore` at `PATH`.
+fn parse_segment_store(value: Option<&str>) -> Result<animusd::SegmentStoreConfig, String> {
+    match value {
+        None => Ok(animusd::SegmentStoreConfig::default()),
+        Some(v) => match v.strip_prefix("dir:") {
+            Some(path) if !path.is_empty() => Ok(animusd::SegmentStoreConfig::Fs(path.into())),
+            _ => Err(format!(
+                "--segment-store {v:?}: only `dir:PATH` is recognized"
+            )),
+        },
     }
 }
 
@@ -292,17 +351,21 @@ async fn run_single(
     dir: Option<std::path::PathBuf>,
     backend: animusd::StorageBackend,
     orphan_sweep_after: Duration,
+    stream_seal_knobs: animusd::StreamSealKnobs,
+    segment_store_config: animusd::SegmentStoreConfig,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-node-{index}")));
 
-    let node = animusd::run_node_with_orphan_sweep_after(
+    let node = animusd::run_node_with_streams(
         &config,
         index,
         &dir,
         backend,
         orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
     )
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;
@@ -619,6 +682,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
 }
 
 /// In-process: run an `n`-node cluster (dev convenience).
+#[allow(clippy::too_many_arguments)]
 async fn run_in_process_cluster(
     n: usize,
     ip: IpAddr,
@@ -627,6 +691,8 @@ async fn run_in_process_cluster(
     auto_split: Option<usize>,
     auto_split_bytes: Option<u64>,
     orphan_sweep_after: Duration,
+    stream_seal_knobs: animusd::StreamSealKnobs,
+    segment_store_config: animusd::SegmentStoreConfig,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
@@ -635,12 +701,14 @@ async fn run_in_process_cluster(
     let bound = animusd::bind_cluster(n, ip, &dir)
         .await
         .map_err(|e| format!("failed to bind cluster: {e}"))?;
-    let nodes = animusd::start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
+    let nodes = animusd::start_cluster_with_streams(
         bound,
         backend,
         auto_split,
         auto_split_bytes,
         orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
     )
     .await
     .map_err(|e| format!("failed to start cluster: {e}"))?;

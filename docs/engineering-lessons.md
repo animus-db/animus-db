@@ -1567,6 +1567,92 @@ debugging anything that feels like it might have happened before.
   directly. (`crates/animus-cp-data/src/lib.rs`,
   `crates/animusd/tests/dynamo_index_scan.rs`, adjudicated during ADR
   0042/0043 round-3 PR4, 2026-08-14.)
+- **"Reachable only via a gate that widened for exactly this case" needs an
+  end-to-end test, not just a component-level one — the gate and the
+  function it feeds can each look locally correct while their *composition*
+  drops the very case the gate was widened for.** Building the DynamoDB
+  Streams sealer's hot-trim rework (F10/F12-b), the per-tablet loop's outer
+  gate (`gsis.is_empty() && !stream_enabled`, `index_drain.rs`) skips a
+  tablet once its stream disables and it has no GSI — correct for a table
+  that *never* streamed, wrong for one that just finished a disable's final
+  seal: skipping it forever means the hot-trim arm never runs again to
+  actually delete the now-fully-sealed hot tail, whose correctness had been
+  silently depending on a *race* (the periodic loop happening to tick, with
+  the schema not yet flipped, in the narrow window between the final seal's
+  own commit and `SetTableStream{None}`'s). One test
+  (`disabled_draining_stream_does_not_block_trim`, 2 writes) passed reliably
+  because that race happened to resolve in its favor every run; a materially
+  identical second test (`disable_final_seal_then_reenable_continues_the_
+  epoch_chain`, 3 writes) reproducibly timed out, because the tiny
+  extra work shifted the race the other way. Neither `trim_janitor` in
+  isolation (its own unit-shaped tests all passed — "no expected term ⇒
+  block" was internally consistent) nor the outer gate in isolation looked
+  wrong; only running the *disable-then-verify-convergence* sequence
+  end-to-end, twice, with slightly different timing, exposed that the gate
+  needed widening (`ever_streamed`, keep visiting a tablet that has ever
+  sealed) **and** `trim_janitor`'s own "no expected term" branch needed to
+  flip from "block" to "trim unconditionally" (the two fixes are a pair —
+  widening the gate alone would have reached the old "block" branch and
+  changed nothing). General rule: when a background loop's own top-level
+  gate decides "does this item still matter to me," and a later lifecycle
+  event (disable, drop, expire) can make the answer flip from yes to no,
+  write the test that drives *through* that transition and polls for the
+  eventual-consistency property on the other side — a gate widened for a
+  new terminal state, paired with a function whose fallback branch was
+  never re-examined for that same state, is exactly the shape that passes
+  every unit test and flakes (or silently stalls) in integration.
+  (`crates/animusd/src/index_drain.rs`, ADR 0042/0043 round-3 PR5,
+  2026-08-14.)
+- **A "bytes" accessor's own scope is part of its contract, not an
+  implementation detail — check which `StorageScope`/row-kind it measures
+  before reusing it for a new trigger.** `RaftKvNode::approx_bytes` was
+  deliberately narrowed to the **base** kind scope by ADR 0034's own fix
+  (so auto-split stops reacting to change-log churn) — a fact stated
+  plainly in that method's doc and this crate's own `CLAUDE.md`, and easy
+  to miss when reaching for "the byte estimate" to build a *different*
+  trigger. The Streams sealer's size trigger needs `KIND_CHANGE`'s own
+  bytes specifically (ADR 0043 §A3's "When": "`KIND_CHANGE` scope
+  `approx_bytes`") — calling the existing `approx_bytes()` compiled, ran,
+  and even passed several tests (small test tables happen to write base
+  rows and change records of comparable size, so the wrong scope's number
+  still crossed the same threshold at roughly the same time), until an
+  end-to-end auto-split test on a *streamed* table exposed the mismatch
+  indirectly. Fixed by adding a kind-scoped sibling
+  (`RaftKvNode::approx_bytes_kind(kind)`/`CpGroup::approx_bytes_kind`) that
+  takes the row-kind's own `StorageScope` instead of assuming the base one
+  — never widen an existing narrowly-scoped accessor back out, add a
+  sibling with the same shape over a different scope. General rule: before
+  wiring an existing "cheap estimate" accessor into a new caller, re-read
+  its own doc for *which* scope/kind/range it was deliberately narrowed to
+  and *why* — a byte/count estimator that looks generic by name can be
+  pinned to one specific scope for a reason that has nothing to do with
+  your new use case. (`crates/animus-cp-data/src/lib.rs`,
+  `crates/animusd/src/index_drain.rs`, ADR 0042/0043 round-3 PR5,
+  2026-08-14.)
+- **A relayed internal-only `ClientRequest` variant must be wrapped in
+  `Forwarded` at *every* call site that sends it across the wire, not just
+  handled correctly on receipt** — the receiving side's "refuse if sent
+  bare" gate exists precisely to reject exactly the mistake of sending it
+  unwrapped, so a caller that forgets the wrapper doesn't hang or corrupt
+  state, it fails **loudly and immediately** with the refusal's own error
+  message. Adding `ClientRequest::ForceSeal` (the DynamoDB Streams
+  disable-triggered final seal, round-3 sealer PR) initially called
+  `ClientCtx::relay(addr, ClientRequest::ForceSeal { .. })` directly instead
+  of `relay(addr, ClientRequest::Forwarded { request: Box::new(ForceSeal
+  {..}), .. })` — every unit test passed (they all happened to run on a
+  single node, where the *local* branch of `force_seal_tablet` never goes
+  through `relay` at all), and the gap was caught only by
+  `dynamo_streams.rs`'s existing `update_table_stream_enable_and_disable_
+  through_every_node` test, which specifically issues the disable from a
+  **non-leader** node and therefore exercises the forwarding branch. The
+  loud, specific error (`"...must be sent wrapped in Forwarded"`) made the
+  diagnosis immediate once a real multi-node path exercised it. General
+  rule: a new forwarded-command variant's own test coverage must include at
+  least one call from a node that is **not** the tablet's leader — a
+  same-node test suite can pass in full while every cross-node send is
+  broken, because the wrapping mistake only manifests on the wire, not
+  in-process. (`crates/animusd/src/lib.rs`, ADR 0042/0043 round-3 PR5,
+  2026-08-14.)
 
 ### Code patterns
 - **A "does this write need the old value" gate and the "does this write

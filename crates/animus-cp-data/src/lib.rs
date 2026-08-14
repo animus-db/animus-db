@@ -3681,6 +3681,30 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .unwrap_or(0)
     }
 
+    /// [`approx_bytes`](Self::approx_bytes)'s **kind-scoped** sibling (ADR
+    /// 0042/0043's round-3 sealer PR): the identical cheap estimate, but
+    /// over one row-kind's own `StorageScope` (`self.kind_scopes[kind]`)
+    /// instead of the base scope `approx_bytes` is deliberately pinned to.
+    /// The seal arm's size trigger needs exactly this — `KIND_CHANGE`'s own
+    /// bytes, not the base row bytes `approx_bytes` measures (ADR 0034's
+    /// own fix made `approx_bytes` base-only *specifically* so auto-split
+    /// stops reacting to change-log churn; the seal arm is the one caller
+    /// that genuinely wants the change log's own size, so it needs its own
+    /// accessor rather than reusing that one). `0` for an unknown kind
+    /// index (defensive; every caller here passes a real [`KIND_CHANGE`]
+    /// constant) or a storage error, matching `approx_bytes`'s own "never
+    /// block the periodic gate on an estimate" contract.
+    pub async fn approx_bytes_kind(&self, kind: u8) -> u64 {
+        let Some(scope) = self.kind_scopes.get(kind as usize) else {
+            return 0;
+        };
+        let (start, end) = scope.physical_bounds();
+        self.storage
+            .approx_bytes_in_range(&start, end.as_deref())
+            .await
+            .unwrap_or(0)
+    }
+
     /// Erase every key in this group's own `StorageScope` from the (possibly
     /// node-shared, ADR 0026/0028) engine, without touching any other tablet's
     /// data on it. For **drop-table GC** (ADR 0024) only — call after the group's
