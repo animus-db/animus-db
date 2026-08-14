@@ -11,7 +11,8 @@
 //!
 //! ## Supported subset
 //!
-//! Operations: `CreateTable`, `PutItem`, `GetItem`, `DeleteItem`, `Query`,
+//! Operations: `CreateTable`, `UpdateTable` (stream-spec-only, ADR 0042 §2),
+//! `DescribeTable` (ADR 0042 §2), `PutItem`, `GetItem`, `DeleteItem`, `Query`,
 //! `Scan`, `UpdateItem`, `BatchWriteItem`, `TransactWriteItems` (atomic, ADR
 //! 0018 §2/PR7), `TransactGetItems` (a consistent multi-key read, ADR 0018 §2/
 //! PR7). AttributeValue types: the scalars `S` (string), `N` (number, carried
@@ -23,22 +24,54 @@
 //! plus an optional sort-key condition (`=`, `BETWEEN`, `begins_with`), and an
 //! optional `IndexName` to query a secondary index (a composite GSI / LSI may
 //! carry the sort condition; a hash-only GSI may not). `CreateTable` accepts
-//! `GlobalSecondaryIndexes` (hash-only or composite) and `LocalSecondaryIndexes`
-//! declarations. `Scan` reads a whole table with `Limit` / `ExclusiveStartKey`
+//! `GlobalSecondaryIndexes` (hash-only or composite), `LocalSecondaryIndexes`
+//! declarations, and an optional `StreamSpecification` (ADR 0042 §2 — the
+//! label itself is minted by `animusd`, not decoded here). `UpdateTable`
+//! accepts *only* a `StreamSpecification` change (any index/key/throughput
+//! field is rejected up front — ADR 0041 §5's own deferred item). `Scan`
+//! reads a whole table with `Limit` / `ExclusiveStartKey`
 //! pagination and an optional `FilterExpression` (the same predicate subset as
 //! `ConditionExpression`). GetItem/Query/Scan accept a `ProjectionExpression` /
 //! `AttributesToGet` (top-level attribute names only). Deferred (rejected with a
 //! clear error): document-path projections (`a.b`), per-index projection lists,
-//! and `UpdateItem`-only `ReturnValues` modes.
+//! `UpdateItem`-only `ReturnValues` modes, and an index-adding `UpdateTable`.
 
 use std::collections::BTreeMap;
 
+use animus_control::StreamViewType;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::condition::{ConditionExpression, SortKeyCondition};
 use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, SecondaryIndex};
 use crate::{AttributeValue, Item, TableSchema};
+
+/// A stream (de)configuration decoded from an `UpdateTable`'s
+/// `StreamSpecification` (ADR 0042 §2) — the only shape of `UpdateTable` this
+/// adapter accepts (any key/index/throughput change is rejected up front,
+/// ADR 0041 §5's own deferred item).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamUpdate {
+    /// Enable the stream (or change its view type) — `animusd` mints a fresh
+    /// `label` only when the table's stream was not already enabled.
+    Enable(StreamViewType),
+    /// Disable the stream.
+    Disable,
+}
+
+/// A stream's description for a response (`CreateTable`'s echoed
+/// `TableDescription`, or `DescribeTable`'s `Table`) — the pieces the wire
+/// layer needs to render `StreamSpecification`/`LatestStreamArn`/
+/// `LatestStreamLabel`, computed by the caller (`animusd`, which holds the
+/// full replicated [`animus_control::StreamSpec`] and the table name the ARN
+/// embeds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamDescription {
+    /// The declared view type.
+    pub view_type: StreamViewType,
+    /// This stream's current label (ADR 0042 §4).
+    pub label: String,
+}
 
 /// The `X-Amz-Target` service+version prefix DynamoDB clients send.
 pub const TARGET_PREFIX: &str = "DynamoDB_20120810.";
@@ -250,6 +283,26 @@ pub enum Operation {
         key_types: Vec<(String, String)>,
         /// Declared secondary indexes (global and local).
         indexes: Vec<SecondaryIndex>,
+        /// `StreamSpecification` with `StreamEnabled: true` (ADR 0042 §2):
+        /// the declared view type. `None` when the request declared no
+        /// stream, or `StreamEnabled: false`. The `label` is minted by
+        /// `animusd`, not decoded here — this is a pure wire layer.
+        stream_view_type: Option<StreamViewType>,
+    },
+    /// `UpdateTable` (ADR 0042 §2): stream-spec-only in this adapter — any
+    /// index/key/throughput change is rejected up front at decode time (ADR
+    /// 0041 §5's own deferred item, orthogonal to streams).
+    UpdateTable {
+        /// Target table name.
+        table: String,
+        /// The requested stream (de)configuration.
+        stream: StreamUpdate,
+    },
+    /// `DescribeTable` (ADR 0042 §2): a pure read of the replicated catalog
+    /// (key schema, secondary-index definitions, stream configuration).
+    DescribeTable {
+        /// Target table name.
+        table: String,
     },
     /// `PutItem`: insert or replace `item` in `table`.
     PutItem {
@@ -381,6 +434,8 @@ impl Operation {
     pub fn table(&self) -> Option<&str> {
         match self {
             Operation::CreateTable { table, .. }
+            | Operation::UpdateTable { table, .. }
+            | Operation::DescribeTable { table, .. }
             | Operation::PutItem { table, .. }
             | Operation::GetItem { table, .. }
             | Operation::DeleteItem { table, .. }
@@ -505,13 +560,19 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
             let schema = decode_key_schema(obj)?;
             let key_types = decode_attribute_types(obj);
             let indexes = decode_indexes(obj)?;
+            let stream_view_type = decode_create_table_stream_spec(obj)?;
             Ok(Operation::CreateTable {
                 table,
                 schema,
                 key_types,
                 indexes,
+                stream_view_type,
             })
         }
+        "UpdateTable" => decode_update_table(obj),
+        "DescribeTable" => Ok(Operation::DescribeTable {
+            table: table_name(obj)?,
+        }),
         "PutItem" => {
             let table = table_name(obj)?;
             let item = decode_item_field(obj, "Item")?;
@@ -985,6 +1046,95 @@ fn decode_index_projection(g: &Map<String, Value>) -> Result<IndexProjection, Wi
             "unsupported ProjectionType `{other}` (ALL, KEYS_ONLY, INCLUDE)"
         ))),
     }
+}
+
+/// Decode a `CreateTable`'s optional `StreamSpecification` (ADR 0042 §2) into
+/// the declared view type, or `None` if the request declares no stream (no
+/// `StreamSpecification` at all, or `StreamEnabled: false`).
+fn decode_create_table_stream_spec(
+    obj: &Map<String, Value>,
+) -> Result<Option<StreamViewType>, WireError> {
+    let Some(spec) = obj.get("StreamSpecification") else {
+        return Ok(None);
+    };
+    let spec = spec
+        .as_object()
+        .ok_or_else(|| WireError::validation("`StreamSpecification` must be an object"))?;
+    let enabled = spec
+        .get("StreamEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(None);
+    }
+    Ok(Some(decode_stream_view_type(spec)?))
+}
+
+/// Decode a `StreamSpecification` object's required `StreamViewType`.
+fn decode_stream_view_type(spec: &Map<String, Value>) -> Result<StreamViewType, WireError> {
+    let raw = spec
+        .get("StreamViewType")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WireError::validation(
+                "`StreamSpecification` with `StreamEnabled: true` requires `StreamViewType`",
+            )
+        })?;
+    match raw {
+        "NEW_AND_OLD_IMAGES" => Ok(StreamViewType::NewAndOldImages),
+        "NEW_IMAGE" => Ok(StreamViewType::NewImage),
+        "OLD_IMAGE" => Ok(StreamViewType::OldImage),
+        "KEYS_ONLY" => Ok(StreamViewType::KeysOnly),
+        other => Err(WireError::validation(format!(
+            "unsupported `StreamViewType` `{other}` (expected NEW_AND_OLD_IMAGES, \
+             NEW_IMAGE, OLD_IMAGE, or KEYS_ONLY)"
+        ))),
+    }
+}
+
+/// The wire string for a [`StreamViewType`], for response encoding.
+fn stream_view_type_str(vt: StreamViewType) -> &'static str {
+    match vt {
+        StreamViewType::NewAndOldImages => "NEW_AND_OLD_IMAGES",
+        StreamViewType::NewImage => "NEW_IMAGE",
+        StreamViewType::OldImage => "OLD_IMAGE",
+        StreamViewType::KeysOnly => "KEYS_ONLY",
+    }
+}
+
+/// Decode an `UpdateTable` request (ADR 0042 §2): stream-spec-only in this
+/// adapter. Rejects `GlobalSecondaryIndexUpdates` outright (the one
+/// AWS-recognized field name for an index-adding/removing `UpdateTable`,
+/// still a named follow-up per ADR 0041 §5) and requires a
+/// `StreamSpecification` (the only supported shape) — `StreamEnabled: true`
+/// decodes to [`StreamUpdate::Enable`] (requiring `StreamViewType`),
+/// `StreamEnabled: false` to [`StreamUpdate::Disable`].
+fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table = table_name(obj)?;
+    if obj.contains_key("GlobalSecondaryIndexUpdates") {
+        return Err(WireError::validation(
+            "UpdateTable does not yet support GlobalSecondaryIndexUpdates \
+             (ADR 0041 §5: index-adding UpdateTable is a named follow-up)",
+        ));
+    }
+    let Some(spec) = obj.get("StreamSpecification") else {
+        return Err(WireError::validation(
+            "UpdateTable only supports a StreamSpecification change in this adapter",
+        ));
+    };
+    let spec = spec
+        .as_object()
+        .ok_or_else(|| WireError::validation("`StreamSpecification` must be an object"))?;
+    let enabled = spec
+        .get("StreamEnabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| WireError::validation("`StreamSpecification` missing `StreamEnabled`"))?;
+    let stream = if enabled {
+        StreamUpdate::Enable(decode_stream_view_type(spec)?)
+    } else {
+        StreamUpdate::Disable
+    };
+    Ok(Operation::UpdateTable { table, stream })
 }
 
 /// Decode the optional `ConditionExpression` + `ExpressionAttributeValues` of a
@@ -1643,16 +1793,27 @@ pub fn scan_response(items: &[Item], scanned: usize, last_evaluated_key: Option<
     serde_json::to_string(&Value::Object(obj)).expect("scan response serializes")
 }
 
-/// The JSON body for a successful `CreateTable`: a minimal `TableDescription`
-/// echoing the name, key schema, any secondary indexes (under
-/// `GlobalSecondaryIndexes` / `LocalSecondaryIndexes`), and an `ACTIVE` status
-/// (tables are immediately usable here — there is no provisioning phase).
+/// The synthetic ARN this adapter surfaces for a stream (ADR 0042 §4):
+/// `arn:aws:dynamodb:animus:0:table/<table>/stream/<label>` — a
+/// DynamoDB-shaped string with fixed placeholder region/account
+/// (`animus`/`0`), matching this adapter's existing ARN conventions
+/// elsewhere.
 #[must_use]
-pub fn create_table_response(
+pub fn stream_arn(table: &str, label: &str) -> String {
+    format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{label}")
+}
+
+/// Build the shared `TableDescription`/`Table` object both
+/// [`create_table_response`] and [`describe_table_response`] wrap: name, key
+/// schema, `ACTIVE` status, any secondary indexes, and — when `stream` is
+/// `Some` — `StreamSpecification`/`LatestStreamArn`/`LatestStreamLabel` (ADR
+/// 0042 §2/§4).
+fn table_description_object(
     table: &str,
     schema: &TableSchema,
     indexes: &[SecondaryIndex],
-) -> String {
+    stream: Option<&StreamDescription>,
+) -> Map<String, Value> {
     let mut key_schema = vec![key_schema_entry(&schema.partition_key, "HASH")];
     if let Some(sk) = &schema.sort_key {
         key_schema.push(key_schema_entry(sk, "RANGE"));
@@ -1688,9 +1849,75 @@ pub fn create_table_response(
     if !lsis.is_empty() {
         desc.insert("LocalSecondaryIndexes".into(), Value::Array(lsis));
     }
+    if let Some(s) = stream {
+        let mut spec = Map::new();
+        spec.insert("StreamEnabled".into(), Value::Bool(true));
+        spec.insert(
+            "StreamViewType".into(),
+            Value::String(stream_view_type_str(s.view_type).into()),
+        );
+        desc.insert("StreamSpecification".into(), Value::Object(spec));
+        desc.insert(
+            "LatestStreamArn".into(),
+            Value::String(stream_arn(table, &s.label)),
+        );
+        desc.insert("LatestStreamLabel".into(), Value::String(s.label.clone()));
+    }
+    desc
+}
+
+/// The JSON body for a successful `CreateTable`: a minimal `TableDescription`
+/// echoing the name, key schema, any secondary indexes (under
+/// `GlobalSecondaryIndexes` / `LocalSecondaryIndexes`), an `ACTIVE` status
+/// (tables are immediately usable here — there is no provisioning phase),
+/// and — when a stream was enabled (ADR 0042) — its `StreamSpecification` +
+/// `LatestStreamArn`.
+#[must_use]
+pub fn create_table_response(
+    table: &str,
+    schema: &TableSchema,
+    indexes: &[SecondaryIndex],
+    stream: Option<&StreamDescription>,
+) -> String {
+    let desc = table_description_object(table, schema, indexes, stream);
     let mut obj = Map::new();
     obj.insert("TableDescription".into(), Value::Object(desc));
     serde_json::to_string(&Value::Object(obj)).expect("create-table response serializes")
+}
+
+/// The JSON body for a successful `DescribeTable` (ADR 0042 §2): the same
+/// shape as [`create_table_response`], plus `AttributeDefinitions` (derived
+/// from `key_types`, mirroring `CreateTable`'s own decode), wrapped under
+/// `Table` (DynamoDB's own `DescribeTable` response shape, distinct from
+/// `CreateTable`/`UpdateTable`'s `TableDescription`).
+#[must_use]
+pub fn describe_table_response(
+    table: &str,
+    schema: &TableSchema,
+    key_types: &[(String, String)],
+    indexes: &[SecondaryIndex],
+    stream: Option<&StreamDescription>,
+) -> String {
+    let mut desc = table_description_object(table, schema, indexes, stream);
+    let mut attrs = vec![attribute_definition(&schema.partition_key, key_types)];
+    if let Some(sk) = &schema.sort_key {
+        attrs.push(attribute_definition(sk, key_types));
+    }
+    desc.insert("AttributeDefinitions".into(), Value::Array(attrs));
+    let mut obj = Map::new();
+    obj.insert("Table".into(), Value::Object(desc));
+    serde_json::to_string(&Value::Object(obj)).expect("describe-table response serializes")
+}
+
+fn attribute_definition(name: &str, key_types: &[(String, String)]) -> Value {
+    let ty = key_types
+        .iter()
+        .find(|(n, _)| n == name)
+        .map_or("S", |(_, t)| t.as_str());
+    let mut e = Map::new();
+    e.insert("AttributeName".into(), Value::String(name.to_owned()));
+    e.insert("AttributeType".into(), Value::String(ty.to_owned()));
+    Value::Object(e)
 }
 
 /// One index entry in a `TableDescription`: name, key schema, `ACTIVE` status.
@@ -2201,6 +2428,7 @@ mod tests {
                 schema,
                 key_types,
                 indexes,
+                ..
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(schema, TableSchema::composite("pk", "sk"));
@@ -2393,11 +2621,118 @@ mod tests {
 
     #[test]
     fn create_table_response_shape() {
-        let body = create_table_response("t", &TableSchema::composite("pk", "sk"), &[]);
+        let body = create_table_response("t", &TableSchema::composite("pk", "sk"), &[], None);
         assert!(body.contains("\"TableStatus\":\"ACTIVE\""));
         assert!(body.contains("\"HASH\""));
         assert!(body.contains("\"RANGE\""));
         assert!(!body.contains("GlobalSecondaryIndexes"));
+        assert!(!body.contains("StreamSpecification"));
+    }
+
+    #[test]
+    fn create_table_response_includes_stream_spec_when_enabled() {
+        let stream = StreamDescription {
+            view_type: StreamViewType::NewAndOldImages,
+            label: "2026-08-14T00:00:00.000-n1".into(),
+        };
+        let body = create_table_response("t", &TableSchema::simple("id"), &[], Some(&stream));
+        assert!(body.contains("\"StreamEnabled\":true"));
+        assert!(body.contains("\"StreamViewType\":\"NEW_AND_OLD_IMAGES\""));
+        assert!(body.contains(
+            "\"LatestStreamArn\":\"arn:aws:dynamodb:animus:0:table/t/stream/2026-08-14T00:00:00.000-n1\""
+        ));
+        assert!(body.contains("\"LatestStreamLabel\""));
+    }
+
+    #[test]
+    fn describe_table_response_shape() {
+        let stream = StreamDescription {
+            view_type: StreamViewType::KeysOnly,
+            label: "lbl".into(),
+        };
+        let body = describe_table_response(
+            "t",
+            &TableSchema::composite("pk", "sk"),
+            &[("pk".into(), "S".into()), ("sk".into(), "N".into())],
+            &[],
+            Some(&stream),
+        );
+        assert!(body.contains("\"Table\""));
+        assert!(body.contains("\"AttributeDefinitions\""));
+        assert!(body.contains("\"AttributeType\":\"N\""));
+        assert!(body.contains("\"StreamViewType\":\"KEYS_ONLY\""));
+    }
+
+    #[test]
+    fn decodes_update_table_stream_enable_and_disable() {
+        let enable = br#"{"TableName":"t","StreamSpecification":
+            {"StreamEnabled":true,"StreamViewType":"NEW_IMAGE"}}"#;
+        match decode_request("DynamoDB_20120810.UpdateTable", enable).unwrap() {
+            Operation::UpdateTable { table, stream } => {
+                assert_eq!(table, "t");
+                assert_eq!(stream, StreamUpdate::Enable(StreamViewType::NewImage));
+            }
+            other => panic!("expected UpdateTable, got {other:?}"),
+        }
+
+        let disable = br#"{"TableName":"t","StreamSpecification":{"StreamEnabled":false}}"#;
+        match decode_request("DynamoDB_20120810.UpdateTable", disable).unwrap() {
+            Operation::UpdateTable { stream, .. } => {
+                assert_eq!(stream, StreamUpdate::Disable);
+            }
+            other => panic!("expected UpdateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_table_rejects_index_updates() {
+        let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[]}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn update_table_requires_stream_specification() {
+        let body = br#"{"TableName":"t"}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn decodes_create_table_with_stream_enabled() {
+        let body = br#"{"TableName":"t",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"OLD_IMAGE"}}"#;
+        match decode_request("DynamoDB_20120810.CreateTable", body).unwrap() {
+            Operation::CreateTable {
+                stream_view_type, ..
+            } => {
+                assert_eq!(stream_view_type, Some(StreamViewType::OldImage));
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_create_table_with_stream_disabled_or_absent() {
+        let disabled = br#"{"TableName":"t",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "StreamSpecification":{"StreamEnabled":false}}"#;
+        match decode_request("DynamoDB_20120810.CreateTable", disabled).unwrap() {
+            Operation::CreateTable {
+                stream_view_type, ..
+            } => assert_eq!(stream_view_type, None),
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+
+        let absent = br#"{"TableName":"t",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#;
+        match decode_request("DynamoDB_20120810.CreateTable", absent).unwrap() {
+            Operation::CreateTable {
+                stream_view_type, ..
+            } => assert_eq!(stream_view_type, None),
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
     }
 
     #[test]

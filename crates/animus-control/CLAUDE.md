@@ -50,7 +50,15 @@ per-tablet CP data plane (`animus-cp-data`).
   `SplitTablet`/`MergeTablets` — ADR 0028/0033, each the *entire* split/merge,
   epoch-CAS gated, no data-plane half; `SetTabletPolicy`); schema/keyspace
   (`Create/Drop/ReplaceTableSchema` — ADR 0013; `DropTableTablets` — ADR 0024
-  GC; `Create/DropTableIndex`; `SetTableMode`; `Create/DropKeyspace`);
+  GC; `Create/DropTableIndex`; `SetTableMode`; `SetTableStream` (ADR 0042
+  §2/§4/§9 — enable/disable a table's DynamoDB Streams config,
+  `schema::StreamSpec { view_type, label }` on `TableSchema.stream`; enable
+  is rejected if a stream is already enabled, since a fresh `label` is only
+  ever minted through an explicit disable → re-enable, never a
+  same-command relabel — what makes `(table, label)` a stable identity for
+  as long as the stream lives; the label itself is minted by the proposer,
+  `animusd`, through its own `env.now()`, never `Metadata::apply`, which
+  only ever records whatever `StreamSpec` it's handed); `Create/DropKeyspace`);
   addressing (`RegisterNodeAddrs` — update-only since ADR 0040, rejects if
   `node` is absent from both `members` and `node_addrs`; `RegisterCpAddr` —
   the predecessor, kept for WAL back-compat only); and `RegisterNode` (ADR
@@ -221,12 +229,21 @@ per-tablet CP data plane (`animus-cp-data`).
   `RaftNode`.
 
 - **`schema.rs`** — the replicated **table-schema catalog** (ADR 0013), all
-  plain data (no I/O/clock/RNG): `TableSchema`, `ColumnType`, `SchemaCatalog`
-  (a `BTreeMap<TableName, TableSchema>` held in `Metadata`), and
+  plain data (no I/O/clock/RNG): `TableSchema` (now also carrying `stream:
+  Option<StreamSpec>`), `ColumnType`, `SchemaCatalog` (a
+  `BTreeMap<TableName, TableSchema>` held in `Metadata`), and
   `IndexDef`/`IndexKind`/`IndexProjection` (the replicated GSI/LSI *shape*,
   not its entry data). `TableSchema::validate` is the pure malformed-schema
   check the state machine applies (unique index names; an LSI requires a
-  sort attribute).
+  sort attribute) — `stream` has no validation of its own (any `StreamSpec`
+  a `MetaCommand::SetTableStream` hands it is already well-formed by
+  construction). `StreamSpec { view_type: StreamViewType, label: String }`
+  (ADR 0042 §2/§4) is a table's DynamoDB Streams configuration when
+  enabled; `StreamViewType` (`NewAndOldImages`/`NewImage`/`OldImage`/
+  `KeysOnly`) is a **read-time projection only** — a shard record always
+  stores both images regardless (ADR 0043), so a view-type change never
+  needs a backfill. `Metadata::table_stream(table) -> Option<&StreamSpec>`
+  is the read accessor, alongside `table_schema`/`table_indexes`.
 
 - **`persist.rs`** — `WalRecord`, `PersistedState` (durability/recovery; the
   write/compact/recover flow is diagrammed in `docs/wal.md`).

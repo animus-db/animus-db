@@ -1457,26 +1457,29 @@ debugging anything that feels like it might have happened before.
 - **A "does this write need the old value" gate and the "does this write
   take the richer commit path" fast-path gate must be the *same*
   predicate, expressed once — not two conditions that happen to agree
-  today.** Auditing `kind_writes_for_item`'s own fast-path gate
-  (`indexes.is_empty()`) against every write handler's `needs_old`
-  computation surfaced a real, independent, pre-existing gap: the
+  today.** Building ADR 0042's stream write-path gate (`kind_writes_for_item`'s
+  `None` fast path widening from `indexes.is_empty()` to `!indexes.is_empty()
+  || stream.is_some()`) surfaced a real, independent, pre-existing gap: the
   DynamoDB edge's `PutItem`/`DeleteItem` handlers computed their own
   `needs_old` (whether to pay for a pre-read of the item) from
   `condition.is_some() || return_values == ReturnValues::AllOld` alone —
   never from whether the write was actually about to route through the
   kind-write path. An unconditional replace/delete on an *already-indexed*
   table therefore silently skipped the read `kind_writes_for_item`'s own LSI
-  diff needs (to remove a stale row when the alt-sort attribute changes).
-  `UpdateItem` and `BatchWriteItem`'s indexed branch had independently,
-  correctly always read old — only the two write paths nobody had reason to
-  touch since ADR 0041 shipped kept the narrower gate. The fix factors both
-  call sites' predicate into one function (`table_takes_kind_write_path`)
-  `kind_writes_for_item`'s own gate and every write handler's `needs_old`
-  both call — so the two structurally cannot drift apart again. When a "do
-  we need X" decision and a "does this path apply" decision are supposed to
-  always agree, don't let them be two separately-maintained booleans; a
-  passing test suite proves today's agreement, not tomorrow's.
-  (`crates/animusd/src/dynamo.rs`, ADR 0041 follow-up fix, 2026-08-14.)
+  diff needs (to remove a stale row when the alt-sort attribute changes),
+  and — once streams could also pull a table onto that path — a stream's
+  `OLD_IMAGE`/`NEW_AND_OLD_IMAGES` change record would just as silently miss
+  its old image. `UpdateItem` and `BatchWriteItem`'s indexed branch had
+  independently, correctly always read old — only the two write paths
+  nobody had reason to touch since ADR 0041 shipped kept the narrower gate.
+  The fix factors both call sites' predicate into one function
+  (`table_takes_kind_write_path`) `kind_writes_for_item`'s own gate and every
+  write handler's `needs_old` both call — so the two structurally cannot
+  drift apart again. When a "do we need X" decision and a "does this path
+  apply" decision are supposed to always agree, don't let them be two
+  separately-maintained booleans; a passing test suite proves today's
+  agreement, not tomorrow's. (`crates/animusd/src/dynamo.rs`, ADR 0042 PR A3,
+  2026-08-14.)
 - **A marker key built by truncating a tablet's own `range.start` to a fixed
   prefix is disjoint from real data (if it lives in its own kind scope) but
   is *not* thereby proven to stay within `[range.start, range.end)` —

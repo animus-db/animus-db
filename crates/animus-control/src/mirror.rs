@@ -217,7 +217,11 @@ pub fn apply_and_derive_mirror(
         }
         MetaCommand::CreateTableIndex { table, .. }
         | MetaCommand::DropTableIndex { table, .. }
-        | MetaCommand::SetTableMode { table, .. } => {
+        | MetaCommand::SetTableMode { table, .. }
+        // ADR 0042: a stream (de)configuration is part of the table's schema
+        // entry, so it mirrors identically to an index/mode change — the
+        // whole (already-mutated) schema, re-serialized.
+        | MetaCommand::SetTableStream { table, .. } => {
             if let Some(schema) = meta.schemas.get(table) {
                 writes.push(put_json(syskv::schema_key(table), schema));
             }

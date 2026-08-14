@@ -72,9 +72,14 @@ use crate::{ClientCtx, CpGroup};
 const INDEX_DRAIN_INTERVAL: Duration = Duration::from_millis(200);
 
 /// The consumer tag the GSI drain's own reconcile cursor writes (ADR 0042
-/// §7/§8) — the sibling of the stream copier's `"copier"` tag, which lands
-/// with the shard subsystem.
+/// §7/§8) — the sibling of the stream copier's `"copier"` tag, below.
 const GSI_TAG: &str = "gsi";
+
+/// The consumer tag the stream copier's own cursor writes (ADR 0042 §7/§8).
+/// Only *expected* today (`expected_consumer_tags`) — the copier itself
+/// (which would actually write this tag's row) lands with the shard
+/// subsystem, PR B8.
+const COPIER_TAG: &str = "copier";
 
 /// The packed HLC suffix every change-record key ends with (see
 /// `KvCommand::KindBatch`'s `change_log`) — the same 8-byte encoding a cursor
@@ -118,14 +123,26 @@ pub(crate) async fn index_drain_loop(ctx: ClientCtx) {
                 .filter(|i| i.kind == IndexKind::Global)
                 .cloned()
                 .collect();
-            if gsis.is_empty() {
+            let stream_enabled = meta.table_stream(&table).is_some();
+            if gsis.is_empty() && !stream_enabled {
                 continue;
             }
-            if let Err(e) = drain_tablet(&ctx, &meta, &table, &group, &gsis).await {
+            // `drain_tablet` is GSI-specific (it reconciles GSI rows and
+            // advances the `"gsi"` cursor) — never call it for a
+            // streamed-but-unindexed table, or it would write a spurious
+            // `"gsi"` cursor row this table's schema never expects (a
+            // permanent, own-token unexpected row `cleanup_merge_residue_
+            // cursor_rows` deliberately does not clean up — see its own
+            // doc). A streamed-only table still needs the trim janitor
+            // tick below, so the min-over-expected-tags rule sees its
+            // `"copier"` expectation and blocks trim correctly.
+            if !gsis.is_empty()
+                && let Err(e) = drain_tablet(&ctx, &meta, &table, &group, &gsis).await
+            {
                 tracing::debug!(tablet = tablet.0, table, error = %e, "index drain: tick failed");
                 continue; // don't trim behind a reconciliation pass that didn't complete
             }
-            if let Err(e) = trim_janitor(&ctx, &table, &group, &gsis).await {
+            if let Err(e) = trim_janitor(&ctx, &table, &group, &gsis, stream_enabled).await {
                 tracing::debug!(tablet = tablet.0, table, error = %e, "index drain: trim janitor tick failed");
             }
         }
@@ -346,15 +363,20 @@ async fn reconcile_partition(
 
 /// Every consumer tag this table's *current schema* expects a cursor row for
 /// (ADR 0042 §7's trim rule: "what does this table's schema expect, and what
-/// do those rows currently say"). Only `"gsi"` exists today.
+/// do those rows currently say"): `"gsi"` iff the table has at least one
+/// global secondary index, `"copier"` iff its stream is enabled — a table
+/// may expect neither, either, or both.
 //
-// PR A3/B8: once a table can have a stream enabled, push `"copier"` here too
-// (e.g. `meta.table_stream(table).is_some()`) — the unified change-consumer
-// loop's own trim step is meant to reuse this function verbatim.
-fn expected_consumer_tags(gsis: &[IndexDef]) -> Vec<&'static str> {
+// PR B8: the unified change-consumer loop's own trim step reuses this
+// function verbatim — the copier itself (which writes the `"copier"` row
+// this makes *expected*) lands with the shard subsystem.
+fn expected_consumer_tags(gsis: &[IndexDef], stream_enabled: bool) -> Vec<&'static str> {
     let mut tags = Vec::new();
     if !gsis.is_empty() {
         tags.push(GSI_TAG);
+    }
+    if stream_enabled {
+        tags.push(COPIER_TAG);
     }
     tags
 }
@@ -370,8 +392,9 @@ async fn trim_janitor(
     table: &str,
     group: &CpGroup,
     gsis: &[IndexDef],
+    stream_enabled: bool,
 ) -> Result<(), String> {
-    let expected = expected_consumer_tags(gsis);
+    let expected = expected_consumer_tags(gsis, stream_enabled);
     cleanup_merge_residue_cursor_rows(ctx, table, group, &expected).await?;
 
     // An expected tag with no row at all blocks trim entirely (ADR 0042 §7's
@@ -385,8 +408,10 @@ async fn trim_janitor(
     }
     let Some(trim_point) = trim_point else {
         // No expected consumer at all — not reachable at this call site
-        // today (the caller only reaches here when `gsis` is non-empty), but
-        // the safe default (block trim) is still the right one if it ever is.
+        // today (the caller only reaches here when `gsis` is non-empty or
+        // `stream_enabled`, so `expected` always names at least one tag),
+        // but the safe default (block trim) is still the right one if it
+        // ever is.
         return Ok(());
     };
 

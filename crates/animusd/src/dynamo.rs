@@ -155,7 +155,7 @@ use animus_dynamo::{
     AttributeValue, ChangeRecord, ConditionExpression, Item, SortKeyCondition, TableSchema,
     index as dynamo_index, schema as schema_bridge, storage_key,
 };
-use animus_env::Metric;
+use animus_env::{Clock, Env, Metric};
 use animus_tablet::{TOKEN_BYTES, partition_token};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -387,7 +387,10 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             schema,
             key_types,
             indexes,
-        } => create_table(ctx, &table, &schema, &key_types, &indexes).await,
+            stream_view_type,
+        } => create_table(ctx, &table, &schema, &key_types, &indexes, stream_view_type).await,
+        Operation::UpdateTable { table, stream } => update_table(ctx, &table, stream).await,
+        Operation::DescribeTable { table } => describe_table(ctx, meta, &table),
         Operation::PutItem {
             table,
             item,
@@ -399,7 +402,9 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // For ALL_OLD (or a condition) we need the prior item; read it once.
             // **Also required whenever this write takes the kind-write path**
             // (ADR 0041 §2's LSI diff needs the alt-sort attribute's *old*
-            // value to clean up a stale row) — an unconditional replace must
+            // value to clean up a stale row; ADR 0042 §1's stream change
+            // record needs a genuine old image for `OLD_IMAGE`/
+            // `NEW_AND_OLD_IMAGES` fidelity) — an unconditional replace must
             // not silently skip this read just because no client-visible
             // echo was requested.
             let needs_old = condition.is_some()
@@ -687,6 +692,7 @@ async fn create_table(
     schema: &TableSchema,
     key_types: &[(String, String)],
     indexes: &[animus_dynamo::SecondaryIndex],
+    stream_view_type: Option<animus_control::StreamViewType>,
 ) -> Result<String, WireError> {
     // Reject a name that collides with the control plane's reserved system
     // keyspace (ADR 0038) up front, client-side, with a clear message — the
@@ -768,6 +774,14 @@ async fn create_table(
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
+    // Enable the stream, if requested, the same commit-wait shape as the
+    // index definitions above (ADR 0042 §2/§9): mint a fresh label (this is
+    // the table's first-ever enable, so `SetTableStream`'s apply-time
+    // already-enabled guard can never fire here) and propose/wait.
+    let stream_spec = match stream_view_type {
+        Some(view_type) => Some(enable_stream(ctx, table, view_type).await?),
+        None => None,
+    };
     // Provision the table's CP tablet (ADR 0023): one tablet over the whole token
     // ring, scoped to this table, which the per-node join-host loop stands up. Until
     // this commits, the table has no tablet and its data ops would wait.
@@ -780,7 +794,201 @@ async fn create_table(
     // A *fresh* snapshot on purpose: the request-entry snapshot predates the schema
     // this very request just committed.
     mirror_catalog_schema(ctx, &metadata_fresh(ctx).await, table);
-    Ok(wire::create_table_response(table, schema, indexes))
+    let stream_desc = stream_spec.as_ref().map(stream_description);
+    Ok(wire::create_table_response(
+        table,
+        schema,
+        indexes,
+        stream_desc.as_ref(),
+    ))
+}
+
+/// Mint a fresh DynamoDB Streams label (ADR 0042 §4) and propose/wait for
+/// `MetaCommand::SetTableStream{Some(spec)}` to commit, exactly the same
+/// commit-wait shape `create_table`'s index-definition loop already uses.
+/// Callers must have already established that no stream is currently
+/// enabled for `table` (the apply-time guard rejects otherwise) — used by
+/// both `create_table`'s first-enable and `update_table`'s enable path.
+async fn enable_stream(
+    ctx: &ClientCtx,
+    table: &str,
+    view_type: animus_control::StreamViewType,
+) -> Result<animus_control::StreamSpec, WireError> {
+    let spec = animus_control::StreamSpec {
+        view_type,
+        label: mint_stream_label(ctx),
+    };
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::SetTableStream {
+            table: table.to_owned(),
+            spec: Some(spec.clone()),
+        })
+        .await;
+        if metadata_fresh(ctx)
+            .await
+            .table_stream(table)
+            .is_some_and(|s| s.label == spec.label)
+        {
+            return Ok(spec);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "stream enable did not commit to the control plane in time \
+                 (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+}
+
+/// Disable `table`'s stream (`SetTableStream{None}`) and wait for it to
+/// commit. A no-op wait (still proposed, harmlessly idempotent) if no
+/// stream is currently enabled.
+async fn disable_stream(ctx: &ClientCtx, table: &str) -> Result<(), WireError> {
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::SetTableStream {
+            table: table.to_owned(),
+            spec: None,
+        })
+        .await;
+        if metadata_fresh(ctx).await.table_stream(table).is_none() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "stream disable did not commit to the control plane in time \
+                 (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+}
+
+/// `wire::StreamDescription` for a replicated `StreamSpec` — the tiny bridge
+/// between the control-plane type and the wire response type.
+fn stream_description(spec: &animus_control::StreamSpec) -> wire::StreamDescription {
+    wire::StreamDescription {
+        view_type: spec.view_type,
+        label: spec.label.clone(),
+    }
+}
+
+/// `UpdateTable` (ADR 0042 §2): stream-spec-only in this adapter (the wire
+/// decoder already rejected any index/key/throughput change). Enable mints a
+/// fresh label via [`enable_stream`] (rejected by the state machine if a
+/// stream is already enabled — the caller must disable first, matching ADR
+/// 0042 §9's "no same-command relabel" contract); disable proposes
+/// `SetTableStream{None}` via [`disable_stream`].
+///
+/// **Shard provisioning/teardown is PR B5 territory** — for now enable/
+/// disable is schema-only: enabling does not yet stand up the stream's
+/// shard tablets (so nothing is actually readable via `GetRecords` yet, ADR
+/// 0043), and disabling does not yet tear any down.
+// PR B5: hook `CreateStreamShards` in here on enable, and the stream
+// table's `DropTableTablets` cascade in here on disable.
+async fn update_table(
+    ctx: &ClientCtx,
+    table: &str,
+    stream: wire::StreamUpdate,
+) -> Result<String, WireError> {
+    if !metadata_fresh(ctx).await.has_table_schema(table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    match stream {
+        wire::StreamUpdate::Enable(view_type) => {
+            if metadata_fresh(ctx).await.table_stream(table).is_some() {
+                return Err(WireError::validation(format!(
+                    "table `{table}` already has a stream enabled — disable it before \
+                     re-enabling (ADR 0042 §9: re-enable always mints a fresh, empty stream)"
+                )));
+            }
+            enable_stream(ctx, table, view_type).await?;
+        }
+        wire::StreamUpdate::Disable => disable_stream(ctx, table).await?,
+    }
+    let meta = metadata_fresh(ctx).await;
+    describe_table(ctx, &meta, table)
+}
+
+/// `DescribeTable` (ADR 0042 §2): a pure read of the replicated catalog — key
+/// schema, secondary-index definitions, and stream configuration (+ ARN).
+/// `ctx` is unused today (every input comes from `meta`) but kept for
+/// signature symmetry with the other operation handlers and in case a
+/// future addition needs it (e.g. live tablet stats).
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<String, WireError> {
+    let Some(control_schema) = meta.table_schema(table) else {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    };
+    let dynamo_schema = schema_bridge::to_dynamo(control_schema);
+    let key_types = schema_bridge::key_attribute_types(control_schema);
+    let indexes = schema_bridge::indexes_to_dynamo(meta.table_indexes(table));
+    let stream_desc = meta.table_stream(table).map(stream_description);
+    Ok(wire::describe_table_response(
+        table,
+        &dynamo_schema,
+        &key_types,
+        &indexes,
+        stream_desc.as_ref(),
+    ))
+}
+
+/// Mint a fresh DynamoDB Streams label (ADR 0042 §4): an ISO8601-ish
+/// timestamp derived from this node's own `env.now()` — never the wall clock
+/// directly (ADR 0003's `Env`-seam determinism rule) — suffixed with this
+/// node's own id so two different nodes minting at a coincidentally
+/// identical elapsed time can never collide. Not a genuine calendar
+/// timestamp: `ProdEnv::now()` is monotonic since **process start**, not
+/// wall-clock epoch, so the rendered date drifts from real time the longer a
+/// process has been up. That's an accepted cosmetic gap, not a correctness
+/// one — a stream's identity is `(table, label)`, and this adapter's own
+/// `DescribeStream`/`GetRecords`/`GetShardIterator` (ADR 0042 §4) validate
+/// the *current* label byte-for-byte, never parse it as a date; the ISO8601
+/// shape only matters for fidelity with real DynamoDB's own label format.
+fn mint_stream_label(ctx: &ClientCtx) -> String {
+    format!("{}-{}", iso8601_ish(ctx.env.now().0), ctx.env.node_id())
+}
+
+/// Render `nanos` (as this node's own `env.now()` reports it — see
+/// [`mint_stream_label`]'s doc) as a UTC ISO8601-shaped timestamp with
+/// millisecond precision (`"1970-01-01T00:00:00.000"`), matching real
+/// DynamoDB's own stream-label shape. A small, dependency-free Gregorian
+/// calendar conversion ([`civil_from_days`]) — this crate takes no date/time
+/// crate dependency for one cosmetic label format.
+fn iso8601_ish(nanos: u64) -> String {
+    let total_ms = nanos / 1_000_000;
+    let secs = i64::try_from(total_ms / 1000).unwrap_or(i64::MAX);
+    let ms = total_ms % 1000;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400); // seconds of day, always in [0, 86400)
+    let (y, m, d) = civil_from_days(days);
+    let hh = sod / 3600;
+    let mm = (sod % 3600) / 60;
+    let ss = sod % 60;
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{ms:03}")
+}
+
+/// Howard Hinnant's `civil_from_days` (public-domain date algorithm):
+/// days-since-1970-01-01 → `(year, month, day)`, proleptic Gregorian, valid
+/// for every `i64` input.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = i64::try_from(yoe).unwrap_or(0) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = u32::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(1); // [1, 31]
+    let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1); // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// `UpdateItem`: read-modify-write. Reads the current item, applies the SET/REMOVE
@@ -908,20 +1116,22 @@ async fn run_update_item(
 /// record backing the window. A narrow, documented limitation of this
 /// corner case (see the PR7 ADR amendment), not the common path.
 ///
-/// **A write action against a table with at least one secondary index is
-/// rejected outright, up front (ADR 0041)** — `cp_txn`'s `KvCommand::TxnStage`
-/// only ever stages the base row; it has no multi-kind-write extension yet, so
-/// staging a `Put`/`Delete`/`Update` on an indexed table would commit the base
-/// row while silently never writing an LSI row or a change-log record, leaving
-/// that table's indexes **permanently stale** with no error and no signal —
-/// worse than refusing the transaction, since a stale index looks correct
-/// until it silently isn't. A `ConditionCheck` alone doesn't count (it writes
-/// nothing); a transaction may still write freely to any *unindexed* table
-/// alongside a `ConditionCheck` on an indexed one. The real fix — extending
-/// `KvCommand::TxnStage` so it can stage a multi-kind atomic write (base + LSI
-/// rows + change record) the same way `cp_kind_write` does outside a
-/// transaction — is a genuine `animus-cp-data` protocol change, deliberately
-/// left as a follow-up rather than folded into this rejection.
+/// **A write action against a table with at least one secondary index, or a
+/// stream enabled, is rejected outright, up front (ADR 0041; ADR 0042)** —
+/// `cp_txn`'s `KvCommand::TxnStage` only ever stages the base row; it has no
+/// multi-kind-write extension yet, so staging a `Put`/`Delete`/`Update` on
+/// such a table would commit the base row while silently never writing an
+/// LSI row / change-log record, leaving that table's indexes **permanently
+/// stale** (or its stream permanently missing that write) with no error and
+/// no signal — worse than refusing the transaction, since a stale index (or
+/// a silently incomplete stream) looks correct until it silently isn't. A
+/// `ConditionCheck` alone doesn't count (it writes nothing); a transaction
+/// may still write freely to any *plain* table alongside a `ConditionCheck`
+/// on an indexed/streamed one. The real fix — extending `KvCommand::TxnStage`
+/// so it can stage a multi-kind atomic write (base + LSI rows + change
+/// record) the same way `cp_kind_write` does outside a transaction — is a
+/// genuine `animus-cp-data` protocol change, deliberately left as a
+/// follow-up rather than folded into this rejection (named in both ADRs).
 async fn run_transact(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -939,10 +1149,19 @@ async fn run_transact(
     }
     for action in actions {
         let is_write = !matches!(action, TransactAction::ConditionCheck { .. });
-        if is_write && !meta.table_indexes(action.table()).is_empty() {
+        if !is_write {
+            continue;
+        }
+        if !meta.table_indexes(action.table()).is_empty() {
             return Err(WireError::validation(
                 "transactional writes on an indexed table are not yet supported \
                  (ADR 0041: TxnStage kind-write extension pending)",
+            ));
+        }
+        if meta.table_stream(action.table()).is_some() {
+            return Err(WireError::validation(
+                "transactional writes on a streamed table are not yet supported \
+                 (ADR 0042: TxnStage kind-write extension pending)",
             ));
         }
     }
@@ -2156,28 +2375,37 @@ pub(crate) fn projected_item(item: &Item, base: &TableSchema, idx: &IndexDef) ->
 
 /// Whether `table` takes the multi-kind atomic-batch write path
 /// (`kind_writes_for_item`'s `Some` branch) rather than the plain single-key
-/// one: it has at least one secondary index (ADR 0041). The single gate both
-/// `kind_writes_for_item`'s own fast-path check and every write handler's
-/// `needs_old` computation share — kept as one function so the two can never
-/// silently drift apart (a write handler that reads `old` less often than
-/// `kind_writes_for_item` actually needs it would silently degrade LSI
-/// fidelity with no error).
+/// one: it has at least one secondary index (ADR 0041), or a stream enabled
+/// (ADR 0042 §1). The single gate both `kind_writes_for_item`'s own
+/// fast-path check and every write handler's `needs_old` computation share —
+/// kept as one function so the two can never silently drift apart (a write
+/// handler that reads `old` less often than `kind_writes_for_item` actually
+/// needs it would silently degrade LSI/stream fidelity with no error).
 fn table_takes_kind_write_path(meta: &Metadata, table: &str) -> bool {
-    !meta.table_indexes(table).is_empty()
+    !meta.table_indexes(table).is_empty() || meta.table_stream(table).is_some()
 }
 
-/// Build the multi-kind atomic batch one item write commits (ADR 0041 §2/§4):
-/// the base row, this item's LSI rows (adding the new, removing whatever the
-/// previous value occupied), and a change-log record.
+/// Build the multi-kind atomic batch one item write commits (ADR 0041 §2/§4;
+/// ADR 0042 §1 for the streamed case): the base row, this item's LSI rows
+/// (adding the new, removing whatever the previous value occupied), and a
+/// change-log record.
 ///
 /// **GSI rows are deliberately absent.** A GSI hashes by its own key, so its
 /// rows live in a different table's tablets and cannot join this entry; the
 /// drain materializes them asynchronously from the change record this writes.
 /// An LSI *can* be here precisely because it hashes by the base partition key.
 ///
-/// Returns `None` when the table has no secondary indexes at all — the caller
-/// then keeps the plain single-key write path, so an unindexed table pays
-/// nothing for this machinery.
+/// Returns `None` when the table has neither a secondary index nor a stream
+/// enabled — the caller then keeps the plain single-key write path, so a
+/// plain table pays nothing for this machinery. **A streamed-but-unindexed
+/// table takes this path too (ADR 0042 §1)**: `indexes` is then empty, so
+/// the LSI loop below is simply a no-op, and the entry commits exactly base
+/// row + change record — the change record is what the stream copier reads
+/// (ADR 0043 §7), and it is written **unconditionally** here regardless of
+/// which reason (an index, a stream, or both) pulled the table onto this
+/// path, since a stream's `NEW_AND_OLD_IMAGES` fidelity needs the same old
+/// image an LSI diff needs (`table_takes_kind_write_path` is the one gate
+/// both this function and every write handler's `needs_old` share).
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
 fn kind_writes_for_item(
     meta: &Metadata,
@@ -2374,5 +2602,313 @@ fn internal(message: &str) -> WireError {
     WireError {
         code: "InternalServerError",
         message: message.to_owned(),
+    }
+}
+
+/// The streamed write-path regressions (ADR 0042 §1): whether a table with a
+/// stream enabled — but no secondary index — takes the `kind_writes_for_item`
+/// path and commits *exactly* base row + change record, never an LSI or
+/// footprint row; and that an unstreamed, unindexed table still takes the
+/// plain fast path (no change log at all). These need `CpGroup`'s private
+/// kind-scan accessors (`pending_changes`/`local_scan_kind_bounded`) an
+/// external `tests/` crate cannot reach — the same reason
+/// `index_drain::gsi_drain_cursor_tests` lives in-crate.
+#[cfg(test)]
+mod stream_write_path_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use animus_cp_data::{KIND_FOOTPRINT, KIND_LSI};
+    use animus_dynamo::ChangeRecord;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, timeout};
+
+    use crate::config::NodeRole;
+    use crate::{ClusterConfig, Node, RoleAddrs, run_node};
+
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn single_node_config() -> ClusterConfig {
+        let addrs = free_addrs(5);
+        ClusterConfig {
+            nodes: vec![RoleAddrs {
+                id: crate::config::node_id(0),
+                role: NodeRole::Both,
+                internal: addrs[0],
+                client: addrs[1],
+                dynamo: addrs[2],
+                cql: addrs[3],
+                admin: addrs[4],
+            }],
+        }
+    }
+
+    async fn await_control_leader(node: &Node) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if node.is_control_leader() {
+                    return;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("node did not become control leader in time");
+    }
+
+    async fn single_node(dir: &Path) -> Node {
+        let config = single_node_config();
+        let node = run_node(&config, 0, dir.join("node-0"))
+            .await
+            .expect("bring up single node");
+        await_control_leader(&node).await;
+        node
+    }
+
+    /// Mirrors `index_drain::gsi_drain_cursor_tests`'s identical helper — a
+    /// different compilation unit, so duplicated rather than shared.
+    async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
+        let mut s = TcpStream::connect(addr).await.expect("connect");
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nX-Amz-Target: {target}\r\n\
+             Connection: close\r\n\
+             Content-Type: application/x-amz-json-1.0\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.expect("write");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.expect("read");
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        (status, body.to_owned())
+    }
+
+    async fn create_streamed_table(addr: SocketAddr, table: &str) {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.CreateTable",
+            &format!(
+                r#"{{"TableName":"{table}",
+                    "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                    "StreamSpecification":{{"StreamEnabled":true,
+                        "StreamViewType":"KEYS_ONLY"}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+    }
+
+    async fn await_group(node: &Node, table: &str) -> crate::CpGroup {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let meta = node.metadata();
+                if let Some((&tablet, _)) = meta.tablets_for_table(table).next()
+                    && let Some(group) = node.edge.local_cp(tablet)
+                {
+                    return group;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("table's tablet never hosted locally")
+    }
+
+    /// A streamed-but-unindexed table's `PutItem`/`UpdateItem`/`DeleteItem`
+    /// each commit exactly base row + change record (ADR 0042 §1) — never an
+    /// LSI or footprint row, since `indexes` is empty on this table and the
+    /// kind-write gate is pulled open only by the stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streamed_unindexed_table_writes_base_and_change_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = single_node(dir.path()).await;
+        create_streamed_table(node.dynamo_addr(), "s1").await;
+        let group = await_group(&node, "s1").await;
+        assert_eq!(group.pending_changes().await.len(), 0);
+
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.PutItem",
+            r#"{"TableName":"s1","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "PutItem failed: {body}");
+        assert_eq!(
+            group.pending_changes().await.len(),
+            1,
+            "PutItem must leave exactly one change record"
+        );
+        assert!(
+            group
+                .local_scan_kind_bounded(KIND_LSI, &[], None)
+                .await
+                .is_empty(),
+            "an unindexed table must never write an LSI row, streamed or not"
+        );
+        assert!(
+            group
+                .local_scan_kind_bounded(KIND_FOOTPRINT, &[], None)
+                .await
+                .is_empty(),
+            "an unindexed table must never write a footprint row (that's GSI-only)"
+        );
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.GetItem",
+            r#"{"TableName":"s1","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "GetItem failed: {body}");
+        assert!(body.contains("\"n\""), "base row must be readable: {body}");
+
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.UpdateItem",
+            r#"{"TableName":"s1","Key":{"id":{"S":"a"}},
+                "UpdateExpression":"SET n = :v",
+                "ExpressionAttributeValues":{":v":{"N":"2"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "UpdateItem failed: {body}");
+        assert_eq!(group.pending_changes().await.len(), 2);
+
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.DeleteItem",
+            r#"{"TableName":"s1","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "DeleteItem failed: {body}");
+        assert_eq!(group.pending_changes().await.len(), 3);
+        assert!(
+            group
+                .local_scan_kind_bounded(KIND_LSI, &[], None)
+                .await
+                .is_empty()
+        );
+        assert!(
+            group
+                .local_scan_kind_bounded(KIND_FOOTPRINT, &[], None)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// An unstreamed, unindexed table keeps the plain single-key write path:
+    /// no change-log record at all (the `None` fast path in
+    /// `kind_writes_for_item`, unaffected by ADR 0042).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unstreamed_unindexed_table_writes_no_change_log() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = single_node(dir.path()).await;
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"plain",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+        let group = await_group(&node, "plain").await;
+
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.PutItem",
+            r#"{"TableName":"plain","Item":{"id":{"S":"a"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "PutItem failed: {body}");
+        assert_eq!(
+            group.pending_changes().await.len(),
+            0,
+            "an unstreamed, unindexed table must pay nothing for the change log"
+        );
+    }
+
+    /// A shard record's stored form always carries both images regardless of
+    /// the table's declared `StreamViewType` (ADR 0042 §3: projection is a
+    /// read-time decision, made later in the stack — not yet built — never a
+    /// storage-time one). This table declares `KEYS_ONLY`; the change record
+    /// this write leaves still decodes both the old and new image.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn change_record_carries_both_images_regardless_of_view_type() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = single_node(dir.path()).await;
+        create_streamed_table(node.dynamo_addr(), "s2").await;
+        let group = await_group(&node, "s2").await;
+
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.PutItem",
+            r#"{"TableName":"s2","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "PutItem failed: {body}");
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.PutItem",
+            r#"{"TableName":"s2","Item":{"id":{"S":"a"},"n":{"N":"2"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "second PutItem failed: {body}");
+
+        let records = group.pending_changes().await;
+        assert_eq!(records.len(), 2, "one record per write");
+        let (_, second) = &records[1];
+        let record = ChangeRecord::decode(second).expect("change record decodes as Some");
+        assert!(
+            record.old_image.is_some(),
+            "old image must be stored even under KEYS_ONLY"
+        );
+        assert!(
+            record.new_image.is_some(),
+            "new image must be stored even under KEYS_ONLY"
+        );
+    }
+
+    /// ADR 0042 §7's trim rule extended to a stream: a table with a stream
+    /// enabled expects a `"copier"` cursor row, which doesn't exist yet (the
+    /// copier lands in PR B8) — so trim stays fully blocked and every change
+    /// record survives, mirroring `index_drain::gsi_drain_cursor_tests::
+    /// trim_never_deletes_past_an_expected_consumers_missing_cursor`'s GSI
+    /// version of the same property.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trim_blocked_on_a_streamed_table_with_no_copier_cursor_yet() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = single_node(dir.path()).await;
+        create_streamed_table(node.dynamo_addr(), "s3").await;
+        let group = await_group(&node, "s3").await;
+
+        for i in 0..5 {
+            let (status, body) = dynamo(
+                node.dynamo_addr(),
+                "DynamoDB_20120810.PutItem",
+                &format!(r#"{{"TableName":"s3","Item":{{"id":{{"S":"k{i}"}}}}}}"#),
+            )
+            .await;
+            assert_eq!(status, 200, "PutItem({i}) failed: {body}");
+        }
+        // Give the index-drain loop (which runs the trim janitor too) several
+        // ticks' worth of time to (wrongly, if this regressed) trim past the
+        // missing "copier" cursor.
+        sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            group.pending_changes().await.len(),
+            5,
+            "every change record must survive — the streamed table's \
+             expected \"copier\" tag has no cursor row yet"
+        );
     }
 }

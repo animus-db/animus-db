@@ -256,10 +256,30 @@ complete, unambiguous cursor with no positional bookkeeping needed — in
 sharp contrast to the change log's own **key** order, which is
 token-then-pk-then-HLC, not global commit order (`pending_changes`'s own
 documented shape), and is exactly why a *positional* cursor would not work
-here. Two tags exist today: `"gsi"` (the GSI drain's own reconcile cursor,
-reworked to write this row atomically with its footprint update) and
-`"copier"` (the stream copier's, landing with ADR 0043). See ADR 0043's
+here. Two tags exist today: `"gsi"` (the GSI drain's own reconcile cursor)
+and `"copier"` (the stream copier's, landing with ADR 0043). See ADR 0043's
 `cursor` module for the row's key/value encoding and disjointness proof.
+
+**The cursor advance is a separate, trailing write — never fused into any
+one partition's own footprint-update entry.** A naive design has the GSI
+drain's final `cp_kind_write_raw` of a reconciliation write the updated
+footprint *and* bump the `"gsi"` cursor atomically, in the same entry —
+sound for a single-partition tick, but **unsound the moment one tick
+reconciles more than one dirty partition** (the ordinary case under
+sustained writes): a crash between two partitions' own footprint-confirming
+writes would still leave the cursor naming the tick's max HLC, over-claiming
+the partition whose footprint never landed — a permanent stale GSI row that
+the trim janitor would then delete the very change record that could have
+repaired it. As built, the drain instead advances the `"gsi"` cursor in its
+**own trailing write**, issued only once *every* partition dirtied by that
+tick has had its footprint update independently confirmed durable
+(`drain_tablet`'s own doc). This keeps the same footprint-before-cursor
+crash property `reconcile_partition` alone provides, but sound for
+*any* number of partitions in one tick, not just one. **The stream copier
+(ADR 0043 §7, PR B8) must follow the identical discipline**: advance its own
+`"copier"` cursor in one trailing write, only after *every* destination
+shard a tick's batch was split across has confirmed the forwarded records
+applied — never as a side effect of any one shard's own append.
 
 **The min-over-rows rule.** A tablet's own `KIND_CURSOR` scope can, after a
 merge, hold more than one row for the same tag — one per absorbed tablet's

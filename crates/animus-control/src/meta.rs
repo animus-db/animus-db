@@ -16,7 +16,7 @@ use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{IndexDef, SchemaCatalog, TableName, TableSchema};
+use crate::schema::{IndexDef, SchemaCatalog, StreamSpec, TableName, TableSchema};
 
 /// Lifecycle status of a cluster member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,6 +367,19 @@ pub enum MetaCommand {
     SetTableMode {
         table: TableName,
         mode: crate::ReplicationMode,
+    },
+    /// Enable or disable a table's **DynamoDB Streams** configuration (ADR
+    /// 0042 §2/§4/§9). Rejected if the table has no schema. Enabling
+    /// (`spec: Some(..)`) is rejected if a stream is already enabled — the
+    /// caller mints a fresh `label` only through an explicit disable →
+    /// re-enable (never a same-command relabel), so `(table, label)` stays a
+    /// stable identity for as long as the stream lives. Disabling
+    /// (`spec: None`) is a no-op if no stream is enabled. Because this is a
+    /// replicated `MetaCommand`, the stream configuration is durable and
+    /// agreed cluster-wide, like the rest of the catalog.
+    SetTableStream {
+        table: TableName,
+        spec: Option<StreamSpec>,
     },
     /// Register a **keyspace** name (ADR 0013 / v1 A3). Idempotent: a no-op if the
     /// keyspace already exists. Replicated so a CQL `CREATE KEYSPACE` is durable +
@@ -987,6 +1000,29 @@ impl Metadata {
                 schema.mode = *mode;
                 ApplyOutcome::Applied
             }
+            MetaCommand::SetTableStream { table, spec } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                match spec {
+                    Some(new_spec) => {
+                        if schema.stream.is_some() {
+                            return ApplyOutcome::Rejected(
+                                "table stream already enabled (disable before re-enabling \
+                                 to mint a new label)",
+                            );
+                        }
+                        schema.stream = Some(new_spec.clone());
+                    }
+                    None => {
+                        if schema.stream.is_none() {
+                            return ApplyOutcome::NoOp;
+                        }
+                        schema.stream = None;
+                    }
+                }
+                ApplyOutcome::Applied
+            }
             MetaCommand::CreateKeyspace { keyspace } => {
                 if crate::syskv::is_reserved_name(keyspace) {
                     return ApplyOutcome::Rejected(
@@ -1255,6 +1291,14 @@ impl Metadata {
     #[must_use]
     pub fn table_indexes(&self, table: &str) -> &[IndexDef] {
         self.schemas.get(table).map_or(&[], |s| &s.indexes)
+    }
+
+    /// This table's DynamoDB Streams configuration (ADR 0042), if enabled.
+    /// `None` for an unknown table or one with no stream. A read accessor for
+    /// the wire adapters that consume the replicated catalog.
+    #[must_use]
+    pub fn table_stream(&self, table: &str) -> Option<&StreamSpec> {
+        self.schemas.get(table).and_then(|s| s.stream.as_ref())
     }
 
     /// The tablets scoped to `table` (ADR 0023), in ascending tablet-id order.

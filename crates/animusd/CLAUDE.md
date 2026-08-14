@@ -17,8 +17,9 @@ gone.
 **`lib.rs` is ~6800 lines** — grep for the symbol, don't scroll. It also holds
 two in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
 can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
-(lib.rs:6725). `index_drain.rs` has a third, `gsi_drain_cursor_tests`, for the
-same reason (see that file's own entry below).
+(lib.rs:6725). `index_drain.rs` has a third, `gsi_drain_cursor_tests`, and
+`dynamo.rs` a fourth, `stream_write_path_tests` (ADR 0042), for the same
+reason (see each file's own entry below).
 
 ## Module map (`src/`)
 
@@ -71,9 +72,18 @@ same reason (see that file's own entry below).
   deletes the records it consumes — that's `trim_janitor`'s job, run right
   after each tick's reconciliation: deletes change records `hlc ≤ min(every
   *expected, present* consumer's watermark)` in bounded `KIND_CHANGE` batches
-  (`expected_consumer_tags`, "gsi" today; a `// PR A3/B8:` marker names where
-  a stream's "copier" tag joins it), blocking trim entirely if an expected
-  tag has no row yet (the ADR 0042 §7 safe default), and tombstones stale
+  (`expected_consumer_tags(gsis, stream_enabled)` — "gsi" iff the table has a
+  GSI, "copier" iff its stream is enabled, ADR 0042 §2; a `// PR B8:` marker
+  names where the copier itself, which actually writes the "copier" row,
+  joins it), blocking trim entirely if an expected
+  tag has no row yet (the ADR 0042 §7 safe default — **today this means a
+  streamed table's change log is never trimmed at all**, since nothing
+  writes a "copier" cursor row until PR B8; safe, just fully blocked). The
+  loop's own per-tablet gate is `gsis.is_empty() && !stream_enabled` (was
+  `gsis.is_empty()`) — but `drain_tablet` itself (GSI-specific: it would
+  write a spurious "gsi" cursor row a streamed-but-unindexed table's schema
+  never expects) still only ever runs when `gsis` is non-empty; a
+  streamed-only table reaches `trim_janitor` alone. And tombstones stale
   **merge-residue** cursor rows (an absorbed sibling's own row, physically
   surviving in the widened scope, for a tag no longer expected) —
   deliberately *not* an unexpected row at this tablet's own token (a
@@ -545,7 +555,79 @@ route below the edge through the same `ClientCtx` CP primitives.
   multi-kind-write extension yet, so staging just the base row would
   silently never produce the LSI rows/change-log record. The real fix (a
   `cp_txn` analogue of `cp_kind_write`) is a named `animus-cp-data`
-  protocol follow-up in ADR 0041, not yet built.
+  protocol follow-up in ADR 0041, not yet built. **ADR 0042 extends this same rejection to a streamed table**
+  (`run_transact`'s per-action loop now checks `meta.table_stream`
+  alongside `meta.table_indexes`), for the identical reason: `TxnStage`
+  would silently never produce a streamed table's change-log record.
+
+  **DynamoDB Streams (ADR 0042 §1/§2/§4/§9).** `TableSchema.stream:
+  Option<StreamSpec>` (replicated, ADR 0013) rides through the identical
+  `CreateTable`/`UpdateTable` surface as the key schema/indexes:
+  `CreateTable`'s `StreamSpecification` (`StreamEnabled`/`StreamViewType`)
+  is decoded into `Operation::CreateTable.stream_view_type`
+  (`animus-dynamo`'s `wire` module, pure — no label minting there); when
+  `Some`, `create_table` (this crate) mints a fresh label
+  (`mint_stream_label`, below) and proposes `MetaCommand::SetTableStream`
+  the same commit-wait shape the index-definition loop already uses
+  (`enable_stream`, shared with `UpdateTable`'s enable path). **`UpdateTable`
+  is new and stream-spec-only**: `wire::decode_update_table` rejects any
+  `GlobalSecondaryIndexUpdates` up front (ADR 0041 §5's own deferred item)
+  and requires a `StreamSpecification` — `StreamEnabled: true` decodes to
+  `StreamUpdate::Enable(view_type)` (rejected by `update_table` if a stream
+  is already enabled — the caller must disable first, matching ADR 0042
+  §9's "no same-command relabel" contract), `false` to `StreamUpdate::
+  Disable`. **`DescribeTable` is also new**: a pure read
+  (`describe_table`) of the replicated catalog — key schema (+
+  `AttributeDefinitions`, recovered from the catalog's typed `ColumnDef`s
+  via `animus_dynamo::schema::key_attribute_types`, the reverse of
+  `CreateTable`'s own `key_types` decode), index definitions, and
+  `StreamSpecification`/`LatestStreamArn`/`LatestStreamLabel` when a stream
+  is enabled (`wire::describe_table_response`, sharing `create_table_response`'s
+  `TableDescription`-object builder). The synthetic ARN
+  (`wire::stream_arn`) is `arn:aws:dynamodb:animus:0:table/<table>/
+  stream/<label>` — fixed placeholder region/account, matching this
+  adapter's existing ARN conventions. **Shard provisioning/teardown is PR
+  B5 territory**: `update_table`'s enable/disable is schema-only today (a
+  `// PR B5:` marker names where `CreateStreamShards`/the stream table's
+  drop cascade will hook in) — nothing is actually readable via
+  `GetRecords` yet.
+
+  `mint_stream_label` (ADR 0042 §4) is the proposer-side label mint: an
+  ISO8601-shaped string derived from **this node's own `env.now()`**
+  (`ClientCtx.env: ProdEnv`, a new field every `spawn_common_tail` caller
+  now threads in — the *only* `Env`-seam access point `ClientCtx` exposes
+  to the wire edges) suffixed with this node's own id (so two different
+  nodes minting at a coincidentally identical elapsed time can never
+  collide) — never the wall clock directly (ADR 0003's determinism-rule
+  convention, even though this crate is production-only `ProdEnv` wiring).
+  **Not a genuine calendar timestamp**: `ProdEnv::now()` is monotonic since
+  **process start**, not wall-clock epoch, so the rendered date drifts from
+  real time the longer a process has been up — an accepted cosmetic gap
+  (a stream's identity is `(table, label)`, validated byte-for-byte, never
+  parsed as a date), documented on the function itself. `iso8601_ish`/
+  `civil_from_days` (Howard Hinnant's public-domain algorithm) are a small,
+  dependency-free Gregorian calendar conversion — this crate takes no
+  date/time crate dependency for one cosmetic label format.
+
+  **The write-path gate (`kind_writes_for_item`'s `None` fast path) becomes
+  `!table_takes_kind_write_path(meta, table)`** — a new shared predicate
+  (`!indexes.is_empty() || stream.is_some()`) both this function and every
+  write handler's `needs_old` computation call, kept as one function so the
+  two can never silently drift apart. **A streamed-but-unindexed table now
+  takes the `KindBatch` path too**: `indexes` is empty, so the LSI loop is
+  simply a no-op, and the entry commits exactly base row + change record —
+  the change record is what the stream copier will read (ADR 0043 §7).
+  **A real, independent correctness gap this surfaced**: `PutItem`/
+  `DeleteItem` only fetched the prior item (`needs_old`) when a
+  `ConditionExpression` or `ALL_OLD` was requested — an unconditional
+  replace/delete on an indexed *or* streamed table therefore silently
+  skipped the read `kind_writes_for_item`'s LSI diff (and now a stream's
+  `OLD_IMAGE`/`NEW_AND_OLD_IMAGES` fidelity) actually needs. Both handlers'
+  `needs_old` now also checks `table_takes_kind_write_path` (`UpdateItem`/
+  the indexed `BatchWriteItem` branch already read unconditionally — only
+  these two needed the fix). See `docs/engineering-lessons.md` for the
+  general lesson (a fast-path gate and a "do I need the old value" gate
+  must be the *same* predicate, not two that happen to agree today).
 
   `ClientRequest::KindWrite` is the forwarding payload — **internal-only,
   refused bare** (a client could otherwise write arbitrary bytes into a table's
@@ -840,13 +922,19 @@ cursor-based drain + trim janitor regressions, needing `CpGroup`'s private
 `pending_changes`/`cursor_min_watermark`/`cursor_rows_with_token` and the
 plain-client-protocol `ClientRequest::SplitTablet`/`MergeTablets` (an
 arbitrary binary `split_key`, unlike the admin HTTP surface's UTF8-string
-one).
+one); `dynamo.rs`'s own `stream_write_path_tests` is a fourth (ADR 0042
+§1), needing `CpGroup`'s private `pending_changes`/`local_scan_kind_bounded`
+(a new, non-linearizable bounded kind-scan wrapper, mirroring
+`local_get_kind`'s existing shape) to prove a streamed-unindexed table's
+write commits exactly base + change, no LSI/footprint row.
 
 One binary per behavior; the file names describe them (`ls
 crates/animusd/tests/`) — covering combined/control-only/data-only/split
 deployment shapes and growth/decommission, control-plane and CP-data-plane
 membership change, the DynamoDB/CQL/admin/dashboard wire edges (including
-the ADR 0041 secondary-index and ADR 0018 transaction suites), restart/
-durability across every deployment shape, and the `WatchMetadata`/
-system-table/OTel/metrics support surfaces. `support/mod.rs` holds the
-shared bring-up helpers (port-TOCTOU retries, split-cluster bring-up).
+the ADR 0041 secondary-index suites, the ADR 0042 `SetTableStream`/
+`DescribeTable`/`UpdateTable` streams surface in `dynamo_streams.rs`, and
+the ADR 0018 transaction suites), restart/durability across every
+deployment shape, and the `WatchMetadata`/system-table/OTel/metrics support
+surfaces. `support/mod.rs` holds the shared bring-up helpers (port-TOCTOU
+retries, split-cluster bring-up).

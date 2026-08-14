@@ -81,6 +81,41 @@ pub fn to_control(schema: &TableSchema, key_types: &[(String, String)]) -> Contr
     ControlSchema::with_columns(schema.partition_key.clone(), clustering_keys, columns)
 }
 
+/// The reverse of [`column_type_for`]: a control-plane [`ColumnType`] back to
+/// its DynamoDB `AttributeType` (`S`/`N`/`B`) — used to build `DescribeTable`'s
+/// `AttributeDefinitions` from the replicated catalog's typed key columns.
+/// Every non-key `ColumnType` (`Int`/`BigInt`/`Bool`/`Uuid`) only ever
+/// appears here from a CQL-declared table sharing the catalog; DynamoDB
+/// itself only ever stores `String`/`Number`/`Binary` for a key, so those
+/// fall back to `"S"` (the most permissive), mirroring `column_type_for`'s
+/// own default direction.
+#[must_use]
+pub fn attribute_type_for(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Number => "N",
+        ColumnType::Binary => "B",
+        _ => "S",
+    }
+}
+
+/// The `(name, AttributeType)` pairs for `control`'s key columns (partition +
+/// sort, if any) — the `key_types` shape `DescribeTable`'s response needs,
+/// recovered from the replicated catalog rather than the original
+/// `CreateTable` request (which the catalog read path no longer has).
+#[must_use]
+pub fn key_attribute_types(control: &ControlSchema) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(c) = control.partition_key_column() {
+        out.push((c.name.clone(), attribute_type_for(c.ty).to_owned()));
+    }
+    if let Some(sk) = control.clustering_keys.first()
+        && let Some(c) = control.column(sk)
+    {
+        out.push((c.name.clone(), attribute_type_for(c.ty).to_owned()));
+    }
+    out
+}
+
 /// Recover the DynamoDB key shape from a control-plane [`ControlSchema`]: the
 /// partition key, plus the first clustering key as the DynamoDB sort key (DynamoDB
 /// has at most one). Extra clustering columns — which a CQL `CREATE TABLE` may

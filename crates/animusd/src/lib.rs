@@ -219,6 +219,30 @@ impl CpGroup {
         }
     }
 
+    /// A non-linearizable, bounded scan of one non-base row-kind scope (ADR
+    /// 0041 §3) — the raw kind-scan primitive tests use to prove exactly
+    /// which kinds an entry wrote (e.g. a streamed-unindexed table's write
+    /// commits base + change only, never an LSI/footprint row). `end: None`
+    /// is unbounded above. See [`RaftKvNode::local_scan_kind`].
+    ///
+    /// Only called from `dynamo::stream_write_path_tests` today — the
+    /// `cfg_attr` below is a **precise**, not blanket, dead-code allowance
+    /// (only in effect for the non-`cfg(test)` build the `tests/` binaries
+    /// and the release lib link against; the `cargo test -p animusd --lib`
+    /// build, which actually exercises it, sees no allowance at all).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn local_scan_kind_bounded(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self {
+            CpGroup::Lsm(n) => n.local_scan_kind(kind, start, end).await,
+            CpGroup::Mem(n) => n.local_scan_kind(kind, start, end).await,
+        }
+    }
+
     /// This tablet's own ADR 0042 §7 min-over-rows cursor watermark for
     /// `consumer`. See [`RaftKvNode::cursor_min_watermark`].
     pub(crate) async fn cursor_min_watermark(&self, consumer: &str) -> Option<HlcTimestamp> {
@@ -1237,6 +1261,11 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             | MetaCommand::CreateTableIndex { .. }
             | MetaCommand::DropTableIndex { .. }
             | MetaCommand::SetTableMode { .. }
+            // DynamoDB Streams enable/disable (ADR 0042): schema-catalog
+            // class, same relay reason as `CreateTableIndex`/`SetTableMode` —
+            // a follower-connected `CreateTable`/`UpdateTable` must reach the
+            // control leader.
+            | MetaCommand::SetTableStream { .. }
             | MetaCommand::CreateKeyspace { .. }
             | MetaCommand::DropKeyspace { .. }
             | MetaCommand::RegisterCpAddr { .. }
@@ -1604,6 +1633,7 @@ fn spawn_common_tail(
     client_listener: TcpListener,
     admin_listener: TcpListener,
     control_storage: Option<SharedEngine>,
+    env: ProdEnv,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -1612,6 +1642,7 @@ fn spawn_common_tail(
     let ctx = ClientCtx {
         control,
         edge,
+        env,
         data,
         client_route: Arc::new(Mutex::new(client_route)),
         admin: admin_info,
@@ -1947,6 +1978,7 @@ impl BoundNode {
             self.client_listener,
             self.admin_listener,
             Some(storage.clone()),
+            self.env.clone(),
         );
 
         // The per-node **tablet-host reconciler** (ADR 0031 PR4): the single
@@ -2684,6 +2716,7 @@ impl BoundControlNode {
             self.client_listener,
             self.admin_listener,
             Some(control_storage),
+            sync_env.clone(),
         );
 
         // Peer-sync loop (ADR 0040 PR1) — a control-only node needs it
@@ -2873,6 +2906,7 @@ impl BoundDataNode {
             // A data-only node has no local control role at all (ADR 0035) —
             // no system-keyspace engine to surface (ADR 0038 PR4).
             None,
+            self.env.clone(),
         );
 
         // The per-node tablet-host reconciler (ADR 0031 PR4) — identical
@@ -3239,6 +3273,14 @@ struct DataRole {
 pub(crate) struct ClientCtx {
     control: ControlHandle,
     pub(crate) edge: ClusterEdgeState,
+    /// This node's one internal `ProdEnv` (ADR 0040 PR1) — every role's
+    /// clone of the same handle. The **only** `Env`-seam access point this
+    /// context exposes to the wire edges: e.g. minting a DynamoDB Streams
+    /// label at enable time (ADR 0042 §4) goes through `ctx.env.now()`,
+    /// never `std::time` directly (ADR 0003's determinism rule — this crate
+    /// is production-only `ProdEnv` wiring, but the seam convention still
+    /// holds so nothing here quietly grows a second, ambient time source).
+    pub(crate) env: ProdEnv,
     /// This node's data-plane fields, if it runs the data role — see
     /// [`DataRole`]'s doc. `None` on a control-only node (ADR 0035 PR3).
     /// Access via [`data`](Self::data), not directly.
