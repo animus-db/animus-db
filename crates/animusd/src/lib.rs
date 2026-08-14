@@ -50,6 +50,7 @@ mod dashboard;
 mod dynamo;
 mod dynamo_streams;
 mod http;
+mod segment_janitor;
 mod topology;
 
 use control_handle::{ControlHandle, RemoteControlClient};
@@ -1902,20 +1903,28 @@ impl BoundNode {
             orphan_sweep_after,
             StreamSealKnobs::default(),
             SegmentStoreConfig::default(),
+            DEFAULT_STREAM_RETENTION,
         )
         .await
     }
 
     /// Like [`start_with`](Self::start_with), with explicit DynamoDB Streams
-    /// sealer knobs and segment-store selection (ADR 0042/0043's round-3
-    /// sealer PR) — the same layered-wrapper convention `_with_orphan_sweep_
-    /// after` already established (see that entry in the `CLAUDE.md`
-    /// engineering log): every existing `start_with` call site (the whole
-    /// pre-existing test suite) keeps compiling and behaving identically,
-    /// defaulting internally to production knobs and the default cluster-
-    /// replicated store; a test that needs tiny seal thresholds (this
+    /// sealer knobs, segment-store selection, and the segment-janitor's own
+    /// retention grace period (ADR 0042/0043's round-3 sealer + janitor PRs)
+    /// — the same layered-wrapper convention `_with_orphan_sweep_after`
+    /// already established (see that entry in the `CLAUDE.md` engineering
+    /// log): every existing `start_with` call site (the whole pre-existing
+    /// test suite) keeps compiling and behaving identically, defaulting
+    /// internally to production knobs and the default cluster-replicated
+    /// store; a test that needs tiny seal/retention thresholds (this
     /// codebase's own testing discipline: never wait out a 4-hour age
-    /// trigger or write 4 MiB to trip a size one) calls this directly.
+    /// trigger, a 24-hour retention window, or write 4 MiB to trip a size
+    /// one) calls this directly. Also spawns the **segment janitor**
+    /// (`segment_janitor::segment_janitor_loop`, ADR 0043 §A9) — see that
+    /// module's own doc for why it is spawned unconditionally here (a
+    /// combined node can always become the control-plane leader) and
+    /// self-gates every tick on `ctx.edge.leader_handle()`, the identical
+    /// pattern `auto_split_loop`/`txn_resolver_loop` already use.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_streams(
         self,
@@ -1931,6 +1940,7 @@ impl BoundNode {
         orphan_sweep_after: Duration,
         stream_seal_knobs: StreamSealKnobs,
         segment_store_config: SegmentStoreConfig,
+        stream_retention: Duration,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         // The initial (static) peer book + an env clone, kept for the
@@ -2298,6 +2308,17 @@ impl BoundNode {
         // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
         // — a node that leads no tablet does nothing each tick.
         tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
+
+        // The segment janitor (ADR 0043 §A9, round-3 PR7): retention +
+        // replica repair over the whole stream-shard catalog. Control-
+        // plane-leader-only (self-gated every tick, `segment_janitor.rs`'s
+        // own doc) — spawned unconditionally here, exactly like
+        // `auto_split_loop`/`txn_resolver_loop` above self-gate on
+        // per-tablet leadership.
+        tasks.push(tokio::spawn(segment_janitor::segment_janitor_loop(
+            ctx.clone(),
+            stream_retention,
+        )));
 
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
         // it leads once it exceeds **either** configured threshold (it checks
@@ -2879,6 +2900,24 @@ impl BoundControlNode {
         // exactly as much as a combined node does, to reach a runtime-added
         // control voter's address.
         tasks.push(tokio::spawn(peer_sync_loop(ctx.clone(), sync_env, peers)));
+
+        // The segment janitor (ADR 0043 §A9, round-3 PR7): a control-only
+        // node can genuinely become the control-plane leader (ADR 0035
+        // split deployment), so it needs this loop too — retention
+        // *marking* and the drop-table retention-zero rule need only
+        // `Metadata`, which this node has. See `segment_janitor.rs`'s own
+        // doc for the documented gap this leaves (phases 2/3 — object
+        // deletion and replica repair — need a `SegmentStoreHandle`, which
+        // no control-only node provisions; a **pure** split deployment
+        // therefore never runs those two phases today). No CLI/config knob
+        // exists yet for a control-only node's own retention period —
+        // mirroring `StreamSealKnobs`/`SegmentStoreConfig`'s own documented
+        // "the split-deployment CLI path is a named follow-up" precedent —
+        // so this always uses the production default.
+        tasks.push(tokio::spawn(segment_janitor::segment_janitor_loop(
+            ctx.clone(),
+            DEFAULT_STREAM_RETENTION,
+        )));
 
         Ok(Node {
             raft: ControlHandle::Local(raft),
@@ -3473,6 +3512,14 @@ impl Default for StreamSealKnobs {
     }
 }
 
+/// The segment janitor's own retention grace period (ADR 0042 §13/ADR 0043
+/// §A9, `--stream-retention`, round-3 PR7): a catalog row past this age
+/// (measured from its own `seal_wall_ms`, the loop's `env` clock) becomes
+/// eligible for the two-phase reclaim. The ADR's own documented production
+/// default; a test constructs a tiny value directly (this codebase's house
+/// testing discipline — see [`StreamSealKnobs::default`]'s own precedent).
+pub const DEFAULT_STREAM_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// This node's stream-shard [`SegmentStore`](animus_env::SegmentStore) handle
 /// (ADR 0043 §A7b) — either the **default**
 /// [`ClusterSegmentStore`](animus_cp_data::cluster_segment_store::ClusterSegmentStore)
@@ -3533,6 +3580,51 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.get_from(replicas, id).await,
             SegmentStoreHandle::Fs(fs) => fs.get(id).await,
+        }
+    }
+
+    /// Delete a sealed segment's object at every one of `replicas` (the
+    /// segment janitor's own reclaim step, ADR 0043 §A9, round-3 PR7):
+    /// idempotent, all-or-error at the recorded `replicas` list — see
+    /// [`ClusterSegmentStore::delete_from`]'s own doc for the exact
+    /// contract. For the single-directory `Fs` opt-in, `replicas` is
+    /// ignored — every node already shares the identical directory, so a
+    /// plain local delete is the whole cluster's delete (mirroring
+    /// `get_sealed`'s identical "replicas ignored" convention there).
+    ///
+    /// [`ClusterSegmentStore::delete_from`]: animus_cp_data::cluster_segment_store::ClusterSegmentStore::delete_from
+    pub(crate) async fn delete_sealed(&self, replicas: &[NodeId], id: &str) -> std::io::Result<()> {
+        use animus_env::SegmentStore;
+        match self {
+            SegmentStoreHandle::Cluster(c) => c.delete_from(replicas, id).await,
+            SegmentStoreHandle::Fs(fs) => fs.delete(id).await,
+        }
+    }
+
+    /// Re-replicate a live shard's object to enough freshly-chosen targets
+    /// to restore `target_k` (the segment janitor's own replica-repair
+    /// step, ADR 0043 §A9, round-3 PR7) — delegates to
+    /// [`ClusterSegmentStore::repair`] for the default `Cluster` variant
+    /// (see that method's doc for the degraded-mode/candidate-exclusion
+    /// contract); a bare `Ok(surviving.to_vec())` no-op for the
+    /// single-directory `Fs` opt-in, since there is no per-node replica
+    /// concept to repair there at all — every node already reads the
+    /// identical shared directory, so "repair" is meaningless (the
+    /// janitor's own caller never calls this for an `Fs`-backed row in the
+    /// first place: such a row's own `replicas` field is always empty, the
+    /// signal `put_sealed`/`get_sealed` already document).
+    ///
+    /// [`ClusterSegmentStore::repair`]: animus_cp_data::cluster_segment_store::ClusterSegmentStore::repair
+    pub(crate) async fn repair_replicas(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        surviving: &[NodeId],
+        target_k: usize,
+    ) -> std::io::Result<Vec<NodeId>> {
+        match self {
+            SegmentStoreHandle::Cluster(c) => c.repair(id, bytes, surviving, target_k).await,
+            SegmentStoreHandle::Fs(_) => Ok(surviving.to_vec()),
         }
     }
 }
@@ -3741,6 +3833,18 @@ impl ClientCtx {
         self.data
             .as_ref()
             .expect("ClientCtx::data called on a control-only node (ADR 0035 PR3)")
+    }
+
+    /// Like [`data`](Self::data), but a non-panicking `Option` — for a path
+    /// that genuinely may run on a control-only node and must degrade
+    /// gracefully instead of asserting a data role exists. The segment
+    /// janitor (`segment_janitor.rs`, ADR 0043 §A9, round-3 PR7) is the one
+    /// caller today: it may run on **any** node that can become the
+    /// control-plane leader, including a control-only one (ADR 0035),
+    /// which has no [`SegmentStoreHandle`] at all — see that module's own
+    /// doc for the documented scope this gates.
+    pub(crate) fn data_opt(&self) -> Option<&DataRole> {
+        self.data.as_ref()
     }
 
     /// This node's best available **cache-tolerant** view of the cluster's
@@ -9493,6 +9597,7 @@ pub async fn start_cluster_with(
         DEFAULT_ORPHAN_SWEEP_AFTER,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
+        DEFAULT_STREAM_RETENTION,
     )
     .await
 }
@@ -9516,6 +9621,7 @@ pub async fn start_cluster_auto_split(
         DEFAULT_ORPHAN_SWEEP_AFTER,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
+        DEFAULT_STREAM_RETENTION,
     )
     .await
 }
@@ -9539,6 +9645,7 @@ pub async fn start_cluster_with_auto_split(
         DEFAULT_ORPHAN_SWEEP_AFTER,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
+        DEFAULT_STREAM_RETENTION,
     )
     .await
 }
@@ -9565,6 +9672,7 @@ pub async fn start_cluster_with_auto_split_bytes(
         DEFAULT_ORPHAN_SWEEP_AFTER,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
+        DEFAULT_STREAM_RETENTION,
     )
     .await
 }
@@ -9592,15 +9700,17 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         orphan_sweep_after,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
+        DEFAULT_STREAM_RETENTION,
     )
     .await
 }
 
 /// Like [`start_cluster_with_auto_split_bytes_and_orphan_sweep_after`], with
-/// explicit DynamoDB Streams sealer knobs and segment-store selection — see
-/// [`BoundNode::start_with_streams`]'s doc for the layered-wrapper rationale.
-/// `--cluster N`'s `--stream-seal-bytes`/`--stream-seal-age`/
-/// `--segment-store` CLI flags thread through here.
+/// explicit DynamoDB Streams sealer knobs, segment-store selection, and the
+/// segment-janitor's own retention grace period — see
+/// [`BoundNode::start_with_streams`]'s doc for the layered-wrapper
+/// rationale. `--cluster N`'s `--stream-seal-bytes`/`--stream-seal-age`/
+/// `--stream-retention`/`--segment-store` CLI flags thread through here.
 ///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
@@ -9613,6 +9723,7 @@ pub async fn start_cluster_with_streams(
     orphan_sweep_after: Duration,
     stream_seal_knobs: StreamSealKnobs,
     segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
@@ -9622,10 +9733,12 @@ pub async fn start_cluster_with_streams(
         orphan_sweep_after,
         stream_seal_knobs,
         segment_store_config,
+        stream_retention,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_cluster_inner(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
@@ -9634,6 +9747,7 @@ async fn start_cluster_inner(
     orphan_sweep_after: Duration,
     stream_seal_knobs: StreamSealKnobs,
     segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -9686,6 +9800,7 @@ async fn start_cluster_inner(
                 orphan_sweep_after,
                 stream_seal_knobs,
                 segment_store_config.clone(),
+                stream_retention,
             )
             .await?;
         nodes.push(node);
@@ -9922,19 +10037,21 @@ pub async fn run_node_with_orphan_sweep_after(
         orphan_sweep_after,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
+        DEFAULT_STREAM_RETENTION,
     )
     .await
 }
 
 /// Like [`run_node_with_orphan_sweep_after`], with explicit DynamoDB Streams
-/// sealer knobs and segment-store selection — see
-/// [`BoundNode::start_with_streams`]'s doc for the layered-wrapper rationale.
-/// A test that needs tiny seal thresholds (this codebase's own testing
-/// discipline — never wait out the 4-hour/4-MiB production defaults) calls
-/// this directly.
+/// sealer knobs, segment-store selection, and the segment-janitor's own
+/// retention grace period — see [`BoundNode::start_with_streams`]'s doc for
+/// the layered-wrapper rationale. A test that needs tiny seal/retention
+/// thresholds (this codebase's own testing discipline — never wait out the
+/// 4-hour/4-MiB/24-hour production defaults) calls this directly.
 ///
 /// # Errors
 /// As [`run_node_with`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_node_with_streams(
     config: &ClusterConfig,
     index: usize,
@@ -9943,6 +10060,7 @@ pub async fn run_node_with_streams(
     orphan_sweep_after: Duration,
     stream_seal_knobs: StreamSealKnobs,
     segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -9976,6 +10094,7 @@ pub async fn run_node_with_streams(
             orphan_sweep_after,
             stream_seal_knobs,
             segment_store_config,
+            stream_retention,
         )
         .await
 }

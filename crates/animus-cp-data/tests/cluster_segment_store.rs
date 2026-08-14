@@ -446,6 +446,112 @@ fn delete_from_is_idempotent_including_already_missing_replicas() {
 }
 
 // ---------------------------------------------------------------------------
+// Replica repair (ADR 0043 §A9, round-3 PR7)
+// ---------------------------------------------------------------------------
+
+/// The happy path: two surviving copies repair to one fresh target, reaching
+/// the requested `target_k`, and the fresh target genuinely holds the
+/// object afterward (checked directly on its own local store, not just
+/// inferred from the returned replica set).
+#[test]
+fn repair_pushes_a_surviving_copy_to_a_fresh_target_reaching_target_k() {
+    run(10, |sim| async move {
+        let ids = [100u64, 101, 102, 103];
+        let stores = build_cluster(&sim, &ids, 3);
+        // Seed as if node 102 (the original third replica) were lost — only
+        // 100/101 hold the object, mirroring "two of three replicas
+        // survive" without needing a real crash mid-put first.
+        stores[0]
+            .local()
+            .put("seg/repair-me", b"payload")
+            .await
+            .unwrap();
+        stores[1]
+            .local()
+            .put("seg/repair-me", b"payload")
+            .await
+            .unwrap();
+        let surviving = vec![nid(100), nid(101)];
+
+        let repaired = stores[0]
+            .repair("seg/repair-me", b"payload", &surviving, 3)
+            .await
+            .expect("repair must succeed with a spare candidate available");
+        assert_eq!(
+            repaired,
+            {
+                let mut expected = surviving.clone();
+                let fresh = repaired
+                    .iter()
+                    .find(|n| !surviving.contains(n))
+                    .expect("exactly one fresh replica chosen")
+                    .clone();
+                expected.push(fresh);
+                expected.sort();
+                expected
+            },
+            "repair must restore the full target_k, keeping both survivors"
+        );
+        let fresh = repaired
+            .iter()
+            .find(|n| !surviving.contains(n))
+            .expect("a fresh replica was chosen");
+        assert!(
+            [nid(102), nid(103)].contains(fresh),
+            "the fresh target must come from the candidate pool beyond `surviving`, got {fresh}"
+        );
+        let fresh_idx = ids
+            .iter()
+            .position(|&id| nid(id) == *fresh)
+            .expect("fresh target is one of the cluster's own ids");
+        assert_eq!(
+            stores[fresh_idx].local().stored_ids(),
+            vec!["seg/repair-me".to_string()],
+            "the fresh target must actually hold the repaired object locally"
+        );
+    });
+}
+
+/// `target_k <= surviving.len()`: a pure no-op, no network I/O, returning
+/// `surviving` sorted with no fresh target chosen.
+#[test]
+fn repair_is_a_noop_when_nothing_is_missing() {
+    run(11, |sim| async move {
+        let ids = [110u64, 111, 112];
+        let stores = build_cluster(&sim, &ids, 3);
+        let surviving = vec![nid(111), nid(110)];
+        let result = stores[0]
+            .repair("seg/healthy", b"x", &surviving, 2)
+            .await
+            .expect("a fully-satisfied repair must not error");
+        assert_eq!(result, vec![nid(110), nid(111)], "sorted, unchanged");
+    });
+}
+
+/// Degraded mode: no candidate remains beyond `surviving` (a single-node
+/// "cluster" — every candidate the placement view could ever offer is
+/// already in `surviving`) — repair degrades to `surviving` alone rather
+/// than erroring, mirroring `choose_targets`'s own degraded-mode
+/// philosophy.
+#[test]
+fn repair_degrades_to_surviving_when_no_fresh_candidate_exists() {
+    run(12, |sim| async move {
+        let ids = [120u64];
+        let stores = build_cluster(&sim, &ids, 1);
+        let surviving = vec![nid(120)];
+        let result = stores[0]
+            .repair("seg/degraded", b"x", &surviving, 2)
+            .await
+            .expect("a repair with no spare candidate must degrade, not error");
+        assert_eq!(
+            result,
+            vec![nid(120)],
+            "the only candidate is already the survivor, so the result is exactly it"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
 // K = 1 degraded single-node mode
 // ---------------------------------------------------------------------------
 

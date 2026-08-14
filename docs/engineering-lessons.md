@@ -1678,8 +1678,76 @@ debugging anything that feels like it might have happened before.
   the loop races the propagation it's supposed to be testing past, not the
   behavior itself. (`crates/animusd/tests/dynamo_streams.rs`, ADR 0042/0043
   round-3 PR6, 2026-08-14.)
+- **A test that exercises physical *removal* of a chained/derived-numbered
+  entity for the first time needs at least two generations in the chain,
+  not one — a single-entry test can pass for the wrong reason (or, worse,
+  hang) because the very row it means to reclaim is structurally
+  unreclaimable alone.** Building the DynamoDB Streams segment janitor
+  (ADR 0043 §A9, round-3 PR7), the first retention test wrote one item,
+  sealed it, waited for its row to be marked *and physically removed*, and
+  timed out — not a bug in the removal logic, but in the test's own
+  premise: `index_drain::seal_now`'s epoch numbering is "the chain's own
+  highest existing row, plus one" (a design that only holds while the
+  catalog never shrinks), so the janitor correctly refuses to ever
+  physically remove a tablet's *current* highest-epoch row while the
+  tablet still exists (removing it would let a future seal silently reuse
+  the same epoch number for different data). A single-write test's only
+  row is *always* the current max, so it can never be reclaimed by design
+  — the fix was two writes/seals in sequence, so the first stops being the
+  max once the second exists. General rule: before writing a test (or
+  reviewing PR-added retention/GC/reclaim code) for "the Nth generation of
+  a chained identity gets removed," check whether identity derivation for
+  that chain reads *only currently-present* entries (a count, a `max()`, a
+  `last()`) rather than an independent, ever-increasing counter — if so,
+  removing the wrong generation (or testing removal with too few
+  generations present) is a live correctness hazard, not just a
+  test-construction detail. (`crates/animusd/src/segment_janitor.rs`,
+  `crates/animusd/tests/stream_janitor.rs`, ADR 0043 §A9, round-3 PR7,
+  2026-08-14.)
+- **A pre-existing, timing-sensitive flake found incidentally while
+  running the full workspace gate — not caused by, or related to, the
+  change in flight — should be reported, not silently fixed or silently
+  ignored.** `animusd`'s `tests/dynamo_txn.rs::
+  transact_get_items_never_observes_a_torn_pair_under_concurrent_writes`
+  failed once under `cargo test --workspace`, then failed again roughly 1
+  in 4 *solo* re-runs (untouched by this PR's changes — a torn-snapshot
+  assertion in the ADR 0018 §2/PR7 `TransactGetItems` quiescence-retry
+  path, nothing to do with streams) — genuinely flaky on its own, not a
+  regression this PR introduced (confirmed by repeated solo runs both
+  passing and failing with identical code). Per this repo's own "separate
+  PRs for incidental bugs" convention, the fix belongs in its own change,
+  not folded into an unrelated PR's diff — but the *discovery* still
+  belongs in this log and in the reporting PR's own description, so the
+  next person who hits it doesn't have to re-derive "is this me?" from
+  scratch. (2026-08-14.)
 
 ### Code patterns
+- **Derived numbering from "the highest currently-present entry" is only
+  safe for an append-only collection — the moment anything in the system
+  starts physically *removing* old entries, that derivation can silently
+  collide.** ADR 0042/0043's stream-shard epoch (`seal_now`'s `next_epoch`,
+  `dynamo_streams::current_open_epoch`) was designed as "chain length,"
+  computed fresh each time from `stream_shards.range(..).next_back()` —
+  correct for two full rounds of PRs (4/5/6) because nothing ever removed
+  a row yet. The instant round-3 PR7 added retention (the *first* code
+  path that physically deletes a `stream_shards` entry), this became a
+  live hazard: reclaiming a tablet's own highest-epoch row would make the
+  very next seal recompute the *identical* epoch for genuinely different
+  data — two objects claiming the same identity at different points in
+  time, with nothing to tell them apart. The fix is a narrow, explicit
+  guard at the one call site that removes rows (`segment_janitor.rs`'s
+  `may_remove_row`: never remove a tablet's current max epoch while the
+  tablet still exists), not a redesign of the numbering scheme — but the
+  general lesson is the one to carry forward: **whenever a later PR adds
+  the first deletion/reclaim path over a collection some earlier, already-
+  shipped code derives an identity or ordering from via "count/max/last of
+  what currently exists," go back and re-audit every such derivation** —
+  the earlier code was correct when written, and the later PR's own review
+  has no reason to re-examine code it never touches, which is exactly how
+  this class of bug survives review. Grep for `.next_back()`/`.count()`/
+  `.len()` over the same collection a new deletion path touches as a
+  starting point. (`crates/animusd/src/segment_janitor.rs`, ADR 0043 §A9,
+  round-3 PR7, 2026-08-14.)
 - **A "does this write need the old value" gate and the "does this write
   take the richer commit path" fast-path gate must be the *same*
   predicate, expressed once — not two conditions that happen to agree

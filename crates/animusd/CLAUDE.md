@@ -64,6 +64,100 @@ reason (see each file's own entry below).
   `dynamo.rs`'s own write-side section above for the full design (label
   resolution, the sealed-vs-open serve split, `StreamHotRead`) — this
   entry is just the module pointer.
+- **`segment_janitor.rs`** (ADR 0043 §A9, round-3 PR7) — the **segment
+  janitor**: a distinct, control-plane-**leader**-only background loop
+  (`segment_janitor_loop`, self-gated every tick on
+  `ctx.edge.leader_handle()`, the identical pattern
+  `detect_loop`/`orphan_sweep_loop` use one layer down in `animus-control`)
+  — retention two-phase reclaim and replica repair over the *whole*
+  `stream_shards` catalog, a cluster-wide concern distinct from any one
+  tablet's own per-node sealer/hot-trim arm (`index_drain.rs`). Spawned
+  unconditionally by both `BoundNode::start_with_streams` (combined) and
+  `BoundControlNode::start_control_with` (control-only, hardcoded to
+  `DEFAULT_STREAM_RETENTION` — no CLI knob for that node shape yet, the
+  same documented follow-up `StreamSealKnobs`/`SegmentStoreConfig`
+  already have); **never** spawned on `BoundDataNode` (a data-only node
+  never registers a local control `RaftNode`, so `leader_handle()` there
+  is permanently `None`).
+
+  **Phase 1, two-phase retention**: mark every unexpired row past
+  `--stream-retention` (age from its own `seal_wall_ms`) *or* whose table
+  has been dropped entirely (`Metadata::table_schema` no longer names it —
+  see "the convergent drop-table cascade" below) via
+  `ExpireStreamShards{remove: false}`; then, for every marked row, delete
+  the segment object at every recorded replica still present in the
+  cluster's own membership (`ClientCtx::data_opt().segment_store
+  .delete_sealed`) and, once that succeeds (or nothing reachable was left
+  to delete), physically remove the row (`ExpireStreamShards{remove:
+  true}`). **The dead-replica rule**: a replica counts as
+  confirmed-absent (no delete owed) only once **removed from membership
+  entirely** — a merely `Down` member still gets a genuine delete attempt
+  every tick (it might come back with its copy intact); a permanently
+  dead-but-never-decommissioned member therefore blocks that row's
+  physical removal forever (an accepted durability-over-availability
+  tradeoff, not a bug — the operational remedy is decommissioning it).
+
+  **The epoch-derivation guard (`may_remove_row` in the phase-1 loop) is
+  the one correctness-load-bearing exception to "mark past retention,
+  remove once deleted."** `index_drain::seal_now`'s `next_epoch` and
+  `dynamo_streams::current_open_epoch` both derive a tablet's epoch from
+  its own chain's **highest currently-existing row**, not an independent
+  counter (round-3's whole "epoch = the chain length" design, ADR 0042
+  §2) — a design that only holds while the catalog never *shrinks*.
+  Physically removing a tablet's own current highest-epoch row while that
+  tablet still exists (`meta.tablets.contains_key(tablet)`) would let a
+  future seal silently recompute the *identical* epoch number for
+  genuinely new data. So: only the **object** may ever be deleted for such
+  a row (safe unconditionally — epoch derivation never reads object
+  bytes); the **row** stays marked `expired` (already invisible to
+  `DescribeStream`'s own enumeration) until either the tablet seals past
+  it (no longer the max) or the tablet is dropped (`!meta.tablets
+  .contains_key(tablet)` — the drop-table cascade's own exception, since
+  nothing will ever derive an epoch for a gone tablet again). See
+  `docs/engineering-lessons.md` for the story of how testing surfaced
+  this — a corpus/integration gap the round-2/round-3 ADR text didn't
+  anticipate, since PR6 never physically removed a row at all.
+
+  **Phase 2, replica repair** (F5's own durability mandate): for every
+  live row with a non-empty `replicas` (a `ClusterSegmentStore`-backed
+  row — the `FsSegmentStore` opt-in always records an empty list and has
+  no per-replica concept to repair), verify each recorded replica is a
+  current `Active` member; for however many are not, `get_sealed` a live
+  copy from whichever recorded replicas *are* `Active`, then
+  `repair_replicas` (`animus_cp_data::cluster_segment_store::
+  ClusterSegmentStore::repair`) it onto enough fresh targets to restore
+  the row's own original replica count, and — if the resulting set
+  differs — commit it via a **content-preserving** `SealStreamShard`
+  re-proposal (round-3 PR7's amendment to that command's apply arm,
+  `animus-control`'s own doc): same `table`/`label`/`view_type`/
+  `hlc_range`/`count`/`seal_wall_ms`, only `replicas` updated. Never
+  touches an expired row.
+
+  **The convergent drop-table cascade**: `ExpireStreamShards` is
+  deliberately **not relayable** (`is_relayable_command`'s own doc, below)
+  — its only sanctioned caller is this control-plane-leader-only loop,
+  which already holds a live `RaftNode` handle; `ClientCtx::drop_table`
+  runs on whichever node a client happens to connect to, essentially never
+  guaranteed to be that leader. Rather than adding a leader-only special
+  case to `drop_table` itself (duplicating this loop's own two-phase
+  decision the rare time it *is* the leader), phase 1's own retention rule
+  already treats a row whose table has no schema at all as **immediately
+  due** — "retention `0`" for a table that no longer exists to protect.
+  `drop_table`'s existing cascade (unchanged: drop the schema, then the
+  tablets) is exactly what flips that condition; **no new code in
+  `drop_table` at all**. `ClientCtx::data_opt() -> Option<&DataRole>`
+  (alongside the pre-existing panicking `data()`) is what lets phase 1's
+  own marking/drop-rule run correctly even on a control-only leader with
+  no `SegmentStoreHandle` at all — see the module's own doc for the
+  documented control-only-leader scope gap this leaves (phases 2/3 skip
+  there; a **pure** split deployment never runs them).
+
+  **Metrics** (ADR 0015): `stream_segments_live`/`stream_repair_backlog`
+  are levels (`MetricsHandle::set`, recomputed fresh every tick from the
+  snapshot); `stream_segments_expired_total`/`stream_repairs_total` are
+  genuine counters (`incr`/`incr_by`) — the former on a confirmed row
+  removal, not the mark; the latter once per row whose replica-set update
+  actually committed, not per replica copied.
 - **`index_drain.rs`** (ADR 0041 §4 GSI drain; ADR 0042/0043 the seal arm +
   hot-trim rework, round-3 sealer PR) — the per-node **change-consumer
   loop** (`change_consumer_loop`, renamed from `index_drain_loop` since it
@@ -887,7 +981,18 @@ route below the edge through the same `ClientCtx` CP primitives.
   split-deployment and data-only CLI paths are a named follow-up) call the
   `_streams` variants; a test that needs tiny seal thresholds (never the
   production defaults — see `index_drain.rs`'s `stream_sealer_tests`) does
-  too. `SegmentStoreHandle` (`Cluster(ClusterSegmentStore<ProdEnv,
+  too. **`--stream-retention SECS` (round-3 PR7, the segment janitor's own
+  knob) follows the identical convention** — `start_with_streams`/
+  `start_cluster_with_streams`/`run_node_with_streams`/`start_cluster_inner`
+  each gained one more trailing `Duration` parameter (defaulting to
+  `DEFAULT_STREAM_RETENTION`, 24h, at every non-`_streams` call site,
+  including every `start_cluster_with_auto_split*` wrapper), while
+  `BoundControlNode::start_control_with` (control-only) hardcodes the
+  default inline with no override yet — the same "split-deployment CLI
+  path is a named follow-up" precedent this bullet's own opening sentence
+  already established for the seal knobs/segment-store config. `main.rs`
+  parses it identically to `--stream-seal-age`. `SegmentStoreHandle`
+  (`Cluster(ClusterSegmentStore<ProdEnv,
   FsSegmentStore>)` or a bare opt-in `Fs(FsSegmentStore)`) and
   `StreamSealKnobs` live on `DataRole` (`ClientCtx.data()`), built by
   `build_segment_store` at node-assembly time — the **default** cluster
@@ -1138,7 +1243,13 @@ the ADR 0041 secondary-index suites, the ADR 0042 `SetTableStream`/
 (closed-shard chains, the iterator-survives-a-seal property, `Limit`
 pagination, cross-node reads of both sealed and open shards, and F12-b's
 disable grace window) in `dynamo_streams.rs`, and the ADR 0018 transaction
-suites), restart/durability across every deployment shape, and the
-`WatchMetadata`/system-table/OTel/metrics support surfaces. `support/mod.rs`
-holds the shared bring-up helpers (port-TOCTOU retries, split-cluster
-bring-up).
+suites), the ADR 0043 §A9 segment janitor end to end in `stream_janitor.rs`
+(two-phase retention with on-disk object deletion, a control-leader kill
+mid-sweep, no empty-success gap across expiry, replica repair onto a fresh
+target, the full disable-grace lifecycle, and the drop-table cascade
+converging via the janitor alone — every retention-focused test seals two
+epochs in sequence first, since the epoch-derivation guard never
+physically removes a tablet's own current last epoch), restart/durability
+across every deployment shape, and the `WatchMetadata`/system-table/OTel/
+metrics support surfaces. `support/mod.rs` holds the shared bring-up
+helpers (port-TOCTOU retries, split-cluster bring-up).

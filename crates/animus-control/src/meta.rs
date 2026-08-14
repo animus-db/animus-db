@@ -495,15 +495,23 @@ pub enum MetaCommand {
     /// 0042 §3/§9, ADR 0043 §A3/§A8) — the tablet leader's own commit of a
     /// `SegmentStore::put` it has already durably completed.
     ///
-    /// **First-committer-wins on `(tablet, epoch)`** — mirroring
-    /// `CreateTablet`'s own race-safety shape, generalized from "first
-    /// tablet" to "first seal of this epoch": a second proposal for an
-    /// already-recorded `(tablet, epoch)` is a **no-op, never a rejection**
-    /// — the sealer's own crash-retry loop races itself by design (ADR 0043
-    /// §A3: a crash before this command commits simply re-runs the whole
-    /// seal, landing here again with the identical `(tablet, epoch)`; the
-    /// proposer is expected to log the no-op outcome itself, since this
-    /// pure state machine performs no I/O).
+    /// **First-committer-wins on `(tablet, epoch)`'s CONTENT** (round-3 PR7
+    /// amendment) — mirroring `CreateTablet`'s own race-safety shape,
+    /// generalized from "first tablet" to "first seal of this epoch": a
+    /// second proposal for an already-recorded `(tablet, epoch)` whose
+    /// content (everything but `replicas`) matches exactly is a **no-op**
+    /// if `replicas` also matches (the sealer's own crash-retry loop racing
+    /// itself by design, ADR 0043 §A3: a crash before this command commits
+    /// simply re-runs the whole seal, landing here again with the identical
+    /// `(tablet, epoch)`), or a **replicas-only update, still `Applied`**,
+    /// if `replicas` differs — the shape the segment janitor's own
+    /// replica-repair sweep produces (ADR 0043 §A9): it re-proposes the
+    /// identical committed shard with a freshly-repaired `replicas` set,
+    /// never touching any other field. A proposal whose non-`replicas`
+    /// content genuinely conflicts with what is already recorded is
+    /// rejected as a no-op, exactly as the original design. The proposer is
+    /// expected to log whichever outcome it gets itself, since this pure
+    /// state machine performs no I/O.
     ///
     /// **Label validation (F12-b)**: `label` must be licensed either by the
     /// table's *current* schema `StreamSpec.label`, or by an existing
@@ -1267,14 +1275,43 @@ impl Metadata {
                 seal_wall_ms,
                 replicas,
             } => {
-                // First-committer-wins on (tablet, epoch): the sealer's own
-                // crash-retry loop races itself by design (ADR 0043 §A3) —
-                // a second proposal for an identity already in the catalog
-                // is a no-op, never an error. The proposer is expected to
-                // log this outcome itself; this pure state machine performs
-                // no I/O.
-                if self.stream_shards.contains_key(&(*tablet, *epoch)) {
-                    return ApplyOutcome::NoOp;
+                // First-committer-wins on CONTENT, not merely on identity
+                // (round-3 PR7 amendment, ADR 0043 §A3/§A9): a second
+                // proposal for an already-recorded (tablet, epoch) is
+                // evaluated against the existing row's own content fields
+                // (everything except `replicas`/`expired`). Two shapes are
+                // legitimate and must both apply cleanly:
+                //   - the sealer's own crash-retry loop racing itself
+                //     (identical content, including `replicas` — a true
+                //     no-op); and
+                //   - the segment janitor's replica-repair sweep (ADR 0043
+                //     §A9) re-proposing the *same* committed shard with an
+                //     updated `replicas` set, once it has re-replicated a
+                //     copy lost to a dead/removed member onto a fresh
+                //     target — everything else about the shard is, by
+                //     construction, unchanged (repair never re-derives
+                //     `hlc_range`/`count`/etc., it only moves bytes).
+                // A proposal whose non-`replicas` content genuinely
+                // differs from what is already recorded is rejected as a
+                // no-op exactly as before — this state machine never lets
+                // a second, conflicting seal silently overwrite a
+                // committed shard's own facts, only its replica location.
+                // Safe for every reader: `GetRecords`/the janitor always
+                // re-fetch the row fresh before consulting `replicas`, so
+                // an in-place update is observed atomically, never a torn
+                // read of a half-updated set.
+                if let Some(existing) = self.stream_shards.get_mut(&(*tablet, *epoch)) {
+                    let content_matches = existing.table == *table
+                        && existing.label == *label
+                        && existing.view_type == *view_type
+                        && existing.hlc_range == *hlc_range
+                        && existing.count == *count
+                        && existing.seal_wall_ms == *seal_wall_ms;
+                    if !content_matches || existing.replicas == *replicas {
+                        return ApplyOutcome::NoOp;
+                    }
+                    existing.replicas = replicas.clone();
+                    return ApplyOutcome::Applied;
                 }
                 // Label validation (F12-b): licensed by the table's
                 // *current* schema stream spec, or by an existing catalog
@@ -3419,11 +3456,13 @@ mod tests {
         }
     }
 
-    /// First-committer-wins on `(tablet, epoch)` (ADR 0043 §A8): the first
-    /// proposal for an identity lands; a second proposal for the identical
-    /// key — whether byte-identical (the sealer's own crash-retry) or
-    /// genuinely differing (a stale/duelling leader) — is a no-op that
-    /// never overwrites the winning row.
+    /// First-committer-wins on `(tablet, epoch)`'s **content** (ADR 0043
+    /// §A8, round-3 PR7 amendment): the first proposal for an identity
+    /// lands; a byte-identical re-propose (the sealer's own crash-retry) is
+    /// a no-op; a proposal whose non-`replicas` content genuinely differs
+    /// (a stale/duelling leader) is also a no-op that never overwrites the
+    /// winning row's own facts. The replicas-only-update case (the segment
+    /// janitor's repair sweep) is covered by its own test below.
     #[test]
     fn seal_stream_shard_first_committer_wins_on_tablet_epoch() {
         let mut m = Metadata::default();
@@ -3453,6 +3492,61 @@ mod tests {
             m.stream_shards[&(TabletId(1), 0)],
             first,
             "the first committer's row must survive unchanged"
+        );
+    }
+
+    /// The segment janitor's replica-repair shape (ADR 0043 §A9, round-3
+    /// PR7): a second proposal for an already-committed `(tablet, epoch)`
+    /// whose content matches exactly but whose `replicas` differs is
+    /// `Applied` — a genuine in-place update — never a `NoOp`. A
+    /// content-conflicting proposal (a different `hlc_range`) with the
+    /// identical new `replicas` is still rejected as a `NoOp`, proving the
+    /// content check runs independently of whether `replicas` also
+    /// happens to differ.
+    #[test]
+    fn seal_stream_shard_replicas_only_update_applies() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            ApplyOutcome::Applied
+        );
+        let original = m.stream_shards[&(TabletId(1), 0)].clone();
+        assert_eq!(original.replicas, vec![nid(1), nid(2), nid(3)]);
+
+        // Repair: node 2 was lost and replaced by node 4 — identical
+        // content, a different replica set.
+        let mut repaired = seal("orders", "L1", 1, 0, 100);
+        if let MetaCommand::SealStreamShard { replicas, .. } = &mut repaired {
+            *replicas = vec![nid(1), nid(3), nid(4)];
+        }
+        assert_eq!(m.apply(&repaired), ApplyOutcome::Applied);
+        let row = &m.stream_shards[&(TabletId(1), 0)];
+        assert_eq!(row.replicas, vec![nid(1), nid(3), nid(4)]);
+        // Every other field is untouched.
+        assert_eq!(row.hlc_range, original.hlc_range);
+        assert_eq!(row.count, original.count);
+        assert_eq!(row.seal_wall_ms, original.seal_wall_ms);
+        assert_eq!(row.view_type, original.view_type);
+        assert!(!row.expired, "a replicas update never touches `expired`");
+
+        // Re-proposing the now-current (repaired) replicas is a genuine
+        // no-op — nothing left to change.
+        assert_eq!(m.apply(&repaired), ApplyOutcome::NoOp);
+
+        // But a proposal that ALSO changes real content (a different
+        // `hlc_range`) alongside a new replica set is still rejected,
+        // never applied — the content check is independent of whether
+        // `replicas` happens to differ too.
+        let mut conflicting = seal("orders", "L1", 1, 0, 999);
+        if let MetaCommand::SealStreamShard { replicas, .. } = &mut conflicting {
+            *replicas = vec![nid(5)];
+        }
+        assert_eq!(m.apply(&conflicting), ApplyOutcome::NoOp);
+        assert_eq!(
+            m.stream_shards[&(TabletId(1), 0)].replicas,
+            vec![nid(1), nid(3), nid(4)],
+            "a content-conflicting proposal must not sneak a replicas update through"
         );
     }
 

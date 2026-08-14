@@ -74,31 +74,53 @@ per-tablet CP data plane (`animus-cp-data`).
   its first seal, never resetting across a disable/re-enable cycle), not
   of any one stream generation; `table`/`label` live inside
   `StreamShardRow` as descriptive fields. `SealStreamShard` is
-  **first-committer-wins** on that key (a second proposal for an
-  already-recorded identity is a `NoOp`, never a rejection — the sealer's
-  own crash-retry races itself by design), validated against **either**
-  the table's current schema `StreamSpec.label` **or** an existing catalog
-  row already present for that `(table, label)` (F12-b: a disabled
-  stream's un-reaped rows still license a further seal of the same
-  generation, e.g. the disable-triggered final seal proposed after
-  `SetTableStream{None}` already cleared the schema), plus a
+  **first-committer-wins on that key's content** (round-3 PR7 amendment):
+  a second proposal for an already-recorded identity whose content
+  (everything but `replicas`) matches exactly is a genuine `NoOp` if
+  `replicas` also matches (the sealer's own crash-retry racing itself, by
+  design), or an in-place **`Applied` replicas-only update** if `replicas`
+  differs — the shape the segment janitor's own replica-repair sweep
+  produces (ADR 0043 §A9): it re-proposes the identical committed shard
+  with a freshly-repaired `replicas` set, never touching any other field.
+  A proposal whose non-`replicas` content genuinely conflicts is still
+  rejected as a `NoOp`, exactly as originally designed — this is safe for
+  every reader because `GetRecords`/the janitor always re-fetch the row
+  fresh before consulting `replicas`, and repair is the only production
+  caller that ever proposes a different `replicas` for an existing
+  identity, so there is no other writer to race against. Validated
+  against **either** the table's current schema `StreamSpec.label` **or**
+  an existing catalog row already present for that `(table, label)`
+  (F12-b: a disabled stream's un-reaped rows still license a further seal
+  of the same generation, e.g. the disable-triggered final seal proposed
+  after `SetTableStream{None}` already cleared the schema), plus a
   permissive-but-sane epoch-chain check (`epoch == 0` always accepted;
   `epoch > 0` needs a local `epoch - 1` row or `split_parents` provenance
-  for this tablet). Relayable — a tablet leader proposing its own seal may
-  run on any data node, not necessarily one control-connected at all.
-  `ExpireStreamShards { rows: Vec<(TabletId, u64)>, remove: bool }` is the
-  janitor's (a later PR) two-phase reclaim, reused directly for the
-  drop-table cascade too: `remove: false` **marks** every named row
-  `expired: true` (idempotent; never a visibility gate — a
-  marked-but-not-removed row is still fully valid to serve), `remove:
-  true` **physically removes** it (idempotent). **Deliberately NOT
-  relayable** — its only intended caller (the segment janitor, a
-  control-plane-leader-only background loop like
-  `detect_loop`/`orphan_sweep_loop`) always already holds a live
-  `RaftNode` handle when it decides to act, so it proposes directly and
-  has no structural need for a relay path; see `animusd`'s
-  `is_relayable_command` for the full access-restriction argument (mirrors
-  `RemoveMember`'s own exclusion). `Metadata` accessors:
+  for this tablet). Relayable — a tablet leader proposing its own seal
+  may run on any data node, not necessarily one control-connected at
+  all. `ExpireStreamShards { rows: Vec<(TabletId, u64)>, remove: bool }`
+  is the segment janitor's (`animusd::segment_janitor`, round-3 PR7)
+  two-phase reclaim, reused directly for the drop-table cascade too
+  (that cascade has no dedicated code path of its own — see
+  `animusd/CLAUDE.md`'s `segment_janitor.rs` entry for the convergent
+  design): `remove: false` **marks** every named row `expired: true`
+  (idempotent; never a visibility gate — a marked-but-not-removed row is
+  still fully valid to serve), `remove: true` **physically removes** it
+  (idempotent). **Deliberately NOT relayable** — its only intended
+  caller (the segment janitor, a control-plane-leader-only background
+  loop like `detect_loop`/`orphan_sweep_loop`) always already holds a
+  live `RaftNode` handle when it decides to act, so it proposes directly
+  and has no structural need for a relay path; see `animusd`'s
+  `is_relayable_command` for the full access-restriction argument
+  (mirrors `RemoveMember`'s own exclusion). **The caller (never this pure
+  state machine) is responsible for never removing a tablet's own current
+  highest-epoch row while that tablet still exists** — `SealStreamShard`'s
+  own epoch derivation (mirrored in
+  `animusd::index_drain::seal_now`/`dynamo_streams::current_open_epoch`)
+  is "the chain's own highest existing row, plus one," so physically
+  removing that row out from under a still-live tablet would let a future
+  seal silently reuse the same epoch number; see `animusd/CLAUDE.md`'s
+  `segment_janitor.rs` entry for the guard that upholds this. `Metadata`
+  accessors:
   `stream_shard_chain(table, label, tablet)` (one tablet's chain in
   ascending epoch order), `stream_shard_watermark(tablet)` (the tablet's
   own last-sealed end-HLC, regardless of label — restricted to *this*

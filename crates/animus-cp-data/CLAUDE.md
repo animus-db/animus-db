@@ -60,7 +60,23 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   (`animusd::build_segment_store`/`ControlPlacementView`, `SegmentStoreHandle`
   in that crate's `lib.rs`) — the DynamoDB Streams sealer's own
   `SealStreamShard.replicas` field is exactly `put_replicated`'s returned
-  set; see that crate's `CLAUDE.md` for the wiring.
+  set; see that crate's `CLAUDE.md` for the wiring. **`put_to_targets`**
+  (round-3 PR7) is `put_replicated`'s own fan-out/wait body generalized to
+  an explicit target list instead of always calling `choose_targets`
+  itself; `put_replicated` is now a thin wrapper (`targets =
+  choose_targets()?`). **`repair`** (round-3 PR7, ADR 0043 §A9) is the
+  segment janitor's own replica-repair primitive: given `id`'s currently
+  **surviving** replica set and a live copy's bytes (the caller's own
+  `get_from(surviving, id)`), pushes that copy via `put_to_targets` to
+  enough freshly-chosen candidates — excluding every id already in
+  `surviving` — to reach `target_k`, returning the resulting sorted
+  replica set; degrades to `surviving` alone (no network I/O) if no spare
+  candidate exists, mirroring `choose_targets`'s own degraded-mode
+  philosophy. `animusd::SegmentStoreHandle::repair_replicas`/
+  `delete_sealed` are the thin per-variant dispatch wrappers (`Cluster`
+  delegates here/to `delete_from`; the single-directory `Fs` opt-in has no
+  per-replica concept to repair, so `repair_replicas` is a bare `Ok(
+  surviving.to_vec())` no-op there).
 - **`codec.rs`** — the crate's compact binary wire/image codec (ADR 0017 A.2):
   length-prefixed framing (like the storage manifest codec), magic/version
   checked. Carries `KvWire` messages and engine images; `serde_json`'s
@@ -807,7 +823,10 @@ scope-isolation and min-over-rows suite (`cursor_scope.rs`), `segment.rs`'s
 own in-module `#[cfg(test)]` unit tests (`cargo test -p animus-cp-data --lib
 segment::` — round-trip, decode rejections, and the superset-slice rule),
 the ADR 0043 `§A7b` `ClusterSegmentStore` replication/fault suite
-(`cluster_segment_store.rs`, a 3-node cluster over `SimSegmentStore`), the
+(`cluster_segment_store.rs`, a 3-node cluster over `SimSegmentStore`,
+including round-3 PR7's `repair` cases — reaching `target_k` from a
+surviving pair, a no-op when nothing is missing, and degrading to
+`surviving` alone with no network I/O when no spare candidate exists), the
 ADR 0018 HLC/MVCC/range-seal/transaction suites (single- and
 multi-participant, in-doubt recovery, write-key conditions, snapshot
 reads, the read-timestamp cache), the `host.rs` reconciler end to end, and

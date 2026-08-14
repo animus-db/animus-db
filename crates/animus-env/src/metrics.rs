@@ -325,12 +325,51 @@ pub enum Metric {
     /// stream that has never sealed grows its hot scope unboundedly) but
     /// never itself an error.
     ChangeLogTrimBlocked,
+
+    // --- DynamoDB Streams segment janitor (ADR 0042/0043, round-3 PR7) ---
+    // Appended after the sealer/hot-trim variants above; every earlier
+    // variant's slot and the text-export order stay stable. Recorded by
+    // `animusd::segment_janitor`'s own control-plane-leader-only background
+    // loop — a mix of genuine counters (`StreamSegmentsExpiredTotal`/
+    // `StreamRepairsTotal`) and **level** gauges written via
+    // `MetricsHandle::set` (`StreamSegmentsLive`/`StreamRepairBacklog`),
+    // the identical "counter slot re-purposed as a last-write-wins level"
+    // shape `StreamHotBytes`/`StreamSealBacklogMs` already use above.
+    /// The number of currently-unexpired stream-shard catalog rows this
+    /// tick's snapshot counted, across every table/label — a level,
+    /// overwritten via `MetricsHandle::set` each janitor tick (only ever
+    /// recorded by whichever node currently believes it is the
+    /// control-plane leader; every other node's sink simply stays at its
+    /// last-observed value from when it last led, which is an accepted
+    /// staleness for a metric that only means anything on the leader).
+    StreamSegmentsLive,
+    /// A stream-shard catalog row completed the janitor's two-phase reclaim
+    /// (its segment object was deleted at every still-membership-present
+    /// recorded replica, or confirmed unreachable-because-removed, and the
+    /// row itself was physically removed) — counts the confirmed removal,
+    /// not the mark (a row can sit marked-but-not-yet-removed for several
+    /// ticks while a slow/unreachable replica's delete is retried).
+    StreamSegmentsExpiredTotal,
+    /// A live (unexpired) row's replica set was successfully updated to
+    /// replace a replica lost to the cluster's own membership (a `Down` or
+    /// removed node) with a freshly-chosen one — one count per row whose
+    /// catalog update committed, not per replica copied (a single repair
+    /// tick backfilling two lost replicas of the same row still counts
+    /// once, since it is one catalog-row decision).
+    StreamRepairsTotal,
+    /// The number of live rows this tick's snapshot found under-replicated
+    /// (at least one recorded replica not currently an `Active` member) —
+    /// a level, overwritten via `MetricsHandle::set` each tick; the
+    /// convergent backlog a healthy cluster keeps at (or promptly returns
+    /// to) zero, and the signal an operator watches to tell "membership
+    /// churn the repair sweep is still catching up on" from "stuck."
+    StreamRepairBacklog,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 58] = [
+    pub const ALL: [Metric; 62] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -389,6 +428,10 @@ impl Metric {
         Metric::StreamSealsTotal,
         Metric::StreamSealFailuresTotal,
         Metric::ChangeLogTrimBlocked,
+        Metric::StreamSegmentsLive,
+        Metric::StreamSegmentsExpiredTotal,
+        Metric::StreamRepairsTotal,
+        Metric::StreamRepairBacklog,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -454,6 +497,10 @@ impl Metric {
             Metric::StreamSealsTotal => "stream_seals_total",
             Metric::StreamSealFailuresTotal => "stream_seal_failures_total",
             Metric::ChangeLogTrimBlocked => "change_log_trim_blocked",
+            Metric::StreamSegmentsLive => "stream_segments_live",
+            Metric::StreamSegmentsExpiredTotal => "stream_segments_expired_total",
+            Metric::StreamRepairsTotal => "stream_repairs_total",
+            Metric::StreamRepairBacklog => "stream_repair_backlog",
         }
     }
 

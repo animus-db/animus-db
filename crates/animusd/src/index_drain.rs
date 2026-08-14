@@ -1610,6 +1610,7 @@ mod stream_sealer_tests {
             Duration::from_secs(600),
             knobs,
             SegmentStoreConfig::default(),
+            crate::DEFAULT_STREAM_RETENTION,
         )
         .await
         .expect("bring up single node with stream knobs");
@@ -2201,6 +2202,7 @@ mod stream_sealer_tests {
                         seal_age: Duration::from_secs(3600),
                     },
                     SegmentStoreConfig::default(),
+                    crate::DEFAULT_STREAM_RETENTION,
                 )
                 .await
                 .expect("start with streams + auto-split-bytes");

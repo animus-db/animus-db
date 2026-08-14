@@ -428,6 +428,7 @@ async fn start_streamed_cluster(
         Duration::from_secs(600),
         knobs,
         SegmentStoreConfig::default(),
+        animusd::DEFAULT_STREAM_RETENTION,
     )
     .await
     .unwrap()

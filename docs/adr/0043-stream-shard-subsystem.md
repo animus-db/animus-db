@@ -340,10 +340,15 @@ only two new `MetaCommand`s this whole subsystem needs — no new
 `syskv::EntityKind`, since a `StreamSpec` already rides inside the existing
 table-schema catalog entry (ADR 0013) and a segment row is a small,
 self-contained addition beside it. `SealStreamShard` is
-**first-committer-wins on `(tablet, epoch)`** — the same race-safety shape
-`CreateTablet`'s own apply arm already established for "the first proposal
-for this identity wins," generalized from a tablet id to a
-`(tablet, epoch)` pair. `DescribeStream`/`ListStreams` (ADR 0042 §3) are
+**first-committer-wins on `(tablet, epoch)`'s content** (round-3 PR7
+amendment — see §A9's own "replicas-update decision" for the full
+argument) — the same race-safety shape `CreateTablet`'s own apply arm
+already established for "the first proposal for this identity wins,"
+generalized from a tablet id to a `(tablet, epoch)` pair, with one
+deliberate carve-out: a second proposal whose content matches exactly but
+whose `replicas` differs is a genuine in-place update (the segment
+janitor's own repair sweep), never treated as a conflicting second
+committer. `DescribeStream`/`ListStreams` (ADR 0042 §3) are
 pure functions of this catalog plus the tablet map — **the store is never
 load-bearing for a metadata read** (F7), matching how `ListStreams` never
 touched a shard tablet's own state even in round 2.
@@ -358,22 +363,108 @@ treat an object listing as authoritative over what the catalog says exists —
 an object store's listing consistency is, in general, weaker than a
 replicated Raft log's, and this design never needs to lean on it.
 
-### A9. The segment-janitor loop (F9, merging retention with replica repair)
+### A9. The segment-janitor loop (F9, merging retention with replica repair — round-3 PR7)
 
-A **distinct loop, run on the control-plane leader** — not an arm of the
-per-tablet `change_consumer_loop` (§A3), since retention and repair are
-cluster-wide concerns over the catalog as a whole, not per-source-tablet
-ones: for every catalog row past
-`--stream-retention`, a **two-phase** expire — mark expired, delete the
-segment object at every recorded replica, then drop the row — every step
-idempotent, so a crash mid-sweep simply resumes on the next tick with no
-special recovery logic. The **same loop also repairs** any segment whose
-recorded replica set has fallen under-replicated (a node death, a slow
-rebuild) by re-copying from a surviving replica — immutability is what
-makes this "a dumb copy," never a merge or reconciliation. F9's original
-plan (retention alone) and F5's own repair mandate turn out to be the same
-loop once the catalog exists to drive both from one snapshot, so they ship
-together rather than as two competing background tasks.
+A **distinct loop, run on the control-plane leader** (`animusd::
+segment_janitor::segment_janitor_loop`) — not an arm of the per-tablet
+`change_consumer_loop` (§A3), since retention and repair are cluster-wide
+concerns over the catalog as a whole, not per-source-tablet ones. Spawned
+unconditionally on every node shape that can ever become the control-plane
+leader (combined, and control-only — ADR 0035), self-gating every tick on
+whether *this* node currently holds a live control `RaftNode` believed to
+be leader — the identical pattern `detect_loop`/`orphan_sweep_loop`
+(`animus-control`) already use, generalized one layer up because this loop
+also needs a `SegmentStore` handle those two never do.
+
+**Two-phase retention**, over every catalog row: mark expired
+(`ExpireStreamShards{remove: false}`) once past `--stream-retention` (age
+from the row's own `seal_wall_ms`) *or* once its table has been dropped
+entirely (the drop-table cascade's own rule, below); then, for every marked
+row, delete the segment object at every recorded replica still present in
+the cluster's own membership and, once that succeeds (or there was nothing
+reachable left to delete), physically remove the row
+(`ExpireStreamShards{remove: true}`). Every step is idempotent, so a crash
+mid-sweep simply resumes on the next tick with no special recovery logic.
+
+**The epoch-derivation guard (a correctness-preserving exception the
+retention rule above must never violate).** A tablet's next seal epoch
+(`index_drain::seal_now`'s `next_epoch`) and its current open epoch
+(`dynamo_streams::current_open_epoch`) are both *derived*, not counted from
+an independent monotonic source — "the chain's own highest-numbered
+existing row, plus one" (§A2's own "epoch = the chain length"). That was a
+safe design for a catalog that only ever *grows*; retention's whole point
+is to physically *shrink* it. If the janitor ever removed a tablet's own
+**current highest-epoch row** while that tablet still exists (still in the
+tablet map — a table drop is the one case it doesn't), a future seal would
+silently recompute the *identical* epoch number for genuinely new data —
+two different segments both claiming to be `shardId-<tablet>-<epoch>` at
+different points in time, with no way for a reader to tell them apart. The
+janitor therefore **never physically removes a tablet's own current
+highest-epoch row while that tablet still exists** — only its *object* may
+be deleted (safe unconditionally: nothing about epoch derivation reads
+object bytes, only the catalog row's own numeric fields), and the row stays
+marked `expired` (already invisible to `DescribeStream`'s enumeration, so
+this is externally indistinguishable from full reclaim) until either the
+tablet seals past it — no longer the max, now ordinarily reclaimable — or
+the tablet itself is dropped. A quiet, idle tail shard can therefore sit
+"expired, object gone, row retained" indefinitely; this is an accepted,
+self-healing residual (see `docs/engineering-lessons.md`), not a leak a
+future seal ever needs to clean up by hand.
+
+**The dead-replica deletion rule.** A recorded replica counts as
+**confirmed-absent** (no delete owed) only once it has been **removed from
+the cluster's own membership entirely** (decommissioned) — a merely `Down`
+member still gets a genuine delete attempt on every tick, since it might
+come back with its copy intact and "confirmed" must mean confirmed, not
+assumed. The corollary, accepted deliberately: a member that crashes
+**permanently but is never decommissioned** blocks that row's *physical*
+row-removal forever (its object delete can never succeed, since
+`ClusterSegmentStore::delete_from` is all-or-error across every reachable
+recorded replica) — the row stays marked `expired` (so already correctly
+invisible/inaccessible to readers) but never reaches `remove: true`. This
+is a durability-over-availability tradeoff, not a bug: the operational
+remedy is decommissioning the dead node, which is the honest signal that
+its data is truly gone for good, not an inference this loop should ever
+make unilaterally from a mere heartbeat timeout.
+
+**Replica repair (F5's own mandate) runs in the same loop, over every
+still-*live* (unexpired) row with a non-empty `replicas`** (a
+`ClusterSegmentStore`-backed row — the single-directory `FsSegmentStore`
+opt-in always records an empty list and has no per-replica concept to
+repair, §A7b): verify every recorded replica is a current `Active` member;
+for however many are not, fetch a live copy from whichever recorded
+replicas *are* `Active` (`ClusterSegmentStore::get_from`) and push it
+(`ClusterSegmentStore::repair`) to enough freshly-chosen candidates —
+excluding every id already recorded — to restore the row's own original
+replica count, degrading gracefully if fewer candidates exist (mirroring
+`choose_targets`'s own degraded-mode philosophy) and re-attempting on a
+later tick once membership recovers. F9's original plan (retention alone)
+and F5's own repair mandate turn out to be the same loop once the catalog
+exists to drive both from one snapshot, so they ship together rather than
+as two competing background tasks. Repair never touches an expired row
+(reclaimed by this same loop anyway) and never resurrects a genuinely
+deleted object.
+
+**The replicas-update decision (round-3 PR7 amendment to §A8's
+`SealStreamShard` apply arm).** Repair needs to commit an updated
+`replicas` set for an *already-committed* `(tablet, epoch)` — a shape
+`SealStreamShard`'s original "first-committer-wins on `(tablet, epoch)`"
+design (§A8) treated as an unconditional no-op. Rather than adding a third
+`MetaCommand` (rejected: this subsystem's whole design goal is exactly two
+commands, and a replicas-only update is the *same* underlying fact
+`SealStreamShard` already records, just refreshed), the apply arm now
+evaluates first-committer-wins on the row's **content** (everything but
+`replicas`): a second proposal for an already-recorded identity whose
+content matches exactly is `Applied` — a genuine in-place `replicas`
+update — if `replicas` differs, or a true no-op if it doesn't (the sealer's
+own crash-retry, unchanged); a proposal whose *content* genuinely conflicts
+is still rejected as a no-op, exactly as originally designed. This is safe
+for every reader because both `GetRecords` and this loop always re-fetch
+the row fresh before consulting `replicas` — an in-place update is observed
+atomically, never a torn read of a half-updated set — and the repair sweep
+is the *only* production caller that ever proposes a genuinely different
+`replicas` for an existing identity, so there is no other writer to race
+against.
 
 **Disable (F12-b, ADR 0042 §11) needs no dedicated janitor path** — the
 disable-triggered final seal (§A3) already moves every record to the
@@ -381,11 +472,42 @@ sealed tier before the write gate closes, so a `DISABLED` stream's rows and
 objects simply age out through this same ordinary sweep, on the same
 timeline as any other stream's retention.
 
-**Drop table**: the cascade removes a streamed label's segment catalog rows
-and objects (both labels, if a grace-window pair currently exists) —
-`ExpireStreamShards` reused directly rather than a separate drop-specific
-command, since "these rows/objects should no longer exist" is the same
-fact whether the reason is retention or a table drop.
+**Drop table is a convergent design, not a dedicated code path.**
+`ExpireStreamShards` is deliberately **not relayable** (§A8) — its only
+sanctioned caller is this control-plane-leader-only loop, which already
+holds a live `RaftNode` handle. `ClientCtx::drop_table` runs on whichever
+node a client happens to connect to, essentially never guaranteed to be
+that leader, so it cannot reliably propose `ExpireStreamShards` itself.
+Rather than adding a leader-only special case to `drop_table` (reachable
+only when lucky, and a second copy of this loop's own two-phase decision
+when it *is*), the janitor's own retention-expiry rule treats a row whose
+table's schema no longer exists at all (`Metadata::table_schema(&row.table)
+.is_none()`) as **immediately due**, regardless of age — "retention `0`"
+for a table that no longer exists to protect. `drop_table`'s existing
+cascade (dropping the schema, then the tablets) is exactly what flips this
+condition; no new command, no new code path in `drop_table` at all, and the
+epoch-derivation guard above never blocks this case specifically, because a
+dropped table's tablets have also left the tablet map by the time this
+condition is ever true (`!meta.tablets.contains_key(tablet)`), so even a
+tablet's own last epoch is safely, fully reclaimable once its table is
+truly gone.
+
+**The control-only-leader scope gap.** Retention *marking* and the
+drop-table rule above need only `Metadata` — cheap on any node that can
+become control leader. Object deletion and replica repair need a
+`SegmentStoreHandle`, which today only exists on a node with a data role.
+A **control-only** leader (a genuine ADR 0035 split deployment) therefore
+marks rows and reacts to drops correctly, but cannot physically delete
+objects or repair replicas for as long as it leads — rows accumulate,
+marked but un-reclaimed, until a data-role node takes over leadership
+instead. In a **pure** split deployment (control-only nodes are the *only*
+control voters), this never happens at all today. This is a real,
+deliberate deferral — extending `SegmentStoreHandle` provisioning to a
+control-only node is its own follow-up, out of this PR's scope — not a
+correctness bug: a marked row is already invisible to `DescribeStream` and,
+once its object happens to be gone, inaccessible via `GetRecords` too; the
+residual is purely "this specific node shape's own leadership stint cannot
+finish the physical reclaim," never a stale or incorrect read.
 
 ### Rejected alternatives
 

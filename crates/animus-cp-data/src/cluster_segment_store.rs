@@ -428,10 +428,31 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> ClusterSegmentStor
     /// 0043 §A3 step 3 — a later PR).
     pub async fn put_replicated(&self, id: &str, bytes: &[u8]) -> io::Result<Vec<NodeId>> {
         let targets = self.choose_targets()?;
+        self.put_to_targets(&targets, id, bytes).await?;
+        let mut replicas = targets;
+        replicas.sort();
+        Ok(replicas)
+    }
+
+    /// [`put_replicated`](Self::put_replicated)'s own fan-out/wait body,
+    /// generalized to an explicit `targets` list instead of always calling
+    /// [`choose_targets`](Self::choose_targets) itself — the primitive the
+    /// segment janitor's own replica-repair sweep (ADR 0043 §A9, a later
+    /// PR) needs to push a re-replicated copy at exactly the fresh
+    /// target(s) it chose (excluding whichever replicas already survive),
+    /// rather than re-running the *whole* K-selection and potentially
+    /// re-writing replicas that already hold the object. `put_replicated`
+    /// is now a thin wrapper over this with `targets = choose_targets()?`.
+    pub async fn put_to_targets(
+        &self,
+        targets: &[NodeId],
+        id: &str,
+        bytes: &[u8],
+    ) -> io::Result<()> {
         let self_id = self.env.node_id();
 
         let mut req_ids: Vec<(NodeId, u64)> = Vec::with_capacity(targets.len());
-        for t in &targets {
+        for t in targets {
             let req_id = next_req_id(&self.pending);
             register_pending(&self.pending, req_id);
             req_ids.push((t.clone(), req_id));
@@ -478,9 +499,7 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> ClusterSegmentStor
             }
             if all_ok {
                 drop_pending_many(&self.pending, &req_ids);
-                let mut replicas = targets;
-                replicas.sort();
-                return Ok(replicas);
+                return Ok(());
             }
             if self.env.now() >= deadline {
                 drop_pending_many(&self.pending, &req_ids);
@@ -491,6 +510,49 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> ClusterSegmentStor
             }
             self.env.sleep(PUT_POLL).await;
         }
+    }
+
+    /// **Replica repair** (ADR 0043 §A9, the segment janitor's own
+    /// re-replication step, round-3 PR7): given `id`'s currently
+    /// **surviving** replica set and a live copy's `bytes` (the caller
+    /// already fetched them, typically via
+    /// [`get_from`](Self::get_from)`(surviving, id)`), push that copy to
+    /// enough freshly-chosen candidates — excluding every id already in
+    /// `surviving` — to reach `target_k`, and return the resulting replica
+    /// set (`surviving` plus whichever fresh targets were actually
+    /// written), sorted. Degrades to fewer than `target_k` if fewer
+    /// candidates exist beyond `surviving` (the identical degraded-mode
+    /// philosophy [`choose_targets`](Self::choose_targets) already uses for
+    /// a fresh put) — the janitor simply re-attempts on a later tick once
+    /// more candidates return. `target_k <= surviving.len()` (nothing to
+    /// repair) is a cheap no-op returning `surviving` sorted, with no
+    /// network I/O at all.
+    pub async fn repair(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        surviving: &[NodeId],
+        target_k: usize,
+    ) -> io::Result<Vec<NodeId>> {
+        let needed = target_k.saturating_sub(surviving.len());
+        let mut result: Vec<NodeId> = surviving.to_vec();
+        if needed == 0 {
+            result.sort();
+            return Ok(result);
+        }
+        let mut candidates = self.placement.candidates();
+        candidates.sort();
+        let fresh: Vec<NodeId> = candidates
+            .into_iter()
+            .filter(|c| !surviving.contains(c))
+            .take(needed)
+            .collect();
+        if !fresh.is_empty() {
+            self.put_to_targets(&fresh, id, bytes).await?;
+            result.extend(fresh);
+        }
+        result.sort();
+        Ok(result)
     }
 
     /// **The load-bearing read path** (ADR 0043 §A7b): fetch `id` from
