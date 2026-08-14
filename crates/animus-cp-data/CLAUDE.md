@@ -89,7 +89,9 @@ Three modules:
   method — since the existing `KvCommand::KindBatch` primitive already
   covers it; the `animusd` GSI drain (`index_drain.rs`, cursor-based since PR
   A2 — see that crate's own `CLAUDE.md`) is what actually calls it in
-  production today, the stream copier once it lands.
+  production today — the only production consumer. Round 3 has no separate
+  stream copier or `"copier"` cursor row: the eventual sealer reads a
+  table's own `KIND_CHANGE` change log directly (round-3 streams plan §A1).
 - **`seal.rs`** (ADR 0018 §2 amendment) — the **range seal**: the structural
   replacement for the retired `version_floor` cross-group-LWW fix.
   `KvCommand::Seal { range, ts }` is proposed by a range-handoff source (a

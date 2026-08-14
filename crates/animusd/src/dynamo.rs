@@ -882,12 +882,15 @@ fn stream_description(spec: &animus_control::StreamSpec) -> wire::StreamDescript
 /// 0042 §9's "no same-command relabel" contract); disable proposes
 /// `SetTableStream{None}` via [`disable_stream`].
 ///
-/// **Shard provisioning/teardown is PR B5 territory** — for now enable/
-/// disable is schema-only: enabling does not yet stand up the stream's
-/// shard tablets (so nothing is actually readable via `GetRecords` yet, ADR
-/// 0043), and disabling does not yet tear any down.
-// PR B5: hook `CreateStreamShards` in here on enable, and the stream
-// table's `DropTableTablets` cascade in here on disable.
+/// **The round-3 sealer + read path land in a later PR** — for now enable/
+/// disable is schema-only: enabling needs no provisioning step (round 3's
+/// hot shard is just the table's own existing `KIND_CHANGE` change log, no
+/// separate shard tablets to stand up), but nothing is actually readable via
+/// `GetRecords` yet since the seal/wire-API arms don't exist; disabling does
+/// not yet perform the "final seal" of the hot tail F12-b requires.
+// round-3 sealer PR: hook the disable-triggered final seal (F12-b) in here
+// before `SetTableStream{None}` proposes; see the round-3 streams plan
+// §A3/§A9 for the sealer/disable-grace design this stands in for.
 async fn update_table(
     ctx: &ClientCtx,
     table: &str,

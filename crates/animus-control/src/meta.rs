@@ -18,6 +18,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{IndexDef, SchemaCatalog, StreamSpec, TableName, TableSchema};
 
+/// Deliberate duplicate of `animus_dynamo::index::INDEX_TABLE_SEPARATOR` —
+/// this crate cannot depend on `animus-dynamo` (dependency direction: see
+/// `animus-tablet`'s `CLAUDE.md`, which documents the identical precedent for
+/// duplicating `escape` rather than adding a dependency edge). Must match
+/// byte-for-byte; used by `CreateTableSchema`'s apply-time rejection below.
+const RESERVED_TABLE_NAME_SEPARATOR: char = '$';
+
 /// Lifecycle status of a cluster member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeStatus {
@@ -918,6 +925,23 @@ impl Metadata {
                         "table name collides with the reserved system namespace",
                     );
                 }
+                // A hidden GSI/LSI index table (`<base>$<index>`, ADR 0041
+                // §1) can never collide with a user table's own name **only
+                // if** a user table name is itself forbidden from containing
+                // the separator that hidden-table convention builds on —
+                // checked here, at the one place a user table name is ever
+                // registered (a hidden table gets only a tablet-map row via
+                // `CreateTablet`, never a catalog schema entry of its own).
+                // `RESERVED_TABLE_NAME_SEPARATOR` is a deliberate duplicate of
+                // `animus_dynamo::index::INDEX_TABLE_SEPARATOR` — this crate
+                // cannot depend on `animus-dynamo` (dependency direction; see
+                // `animus-tablet`'s `CLAUDE.md` for the identical `escape`
+                // duplication precedent) — and must match it byte-for-byte.
+                if table.contains(RESERVED_TABLE_NAME_SEPARATOR) {
+                    return ApplyOutcome::Rejected(
+                        "table name may not contain the reserved `$` separator",
+                    );
+                }
                 if self.schemas.contains(table) {
                     return ApplyOutcome::Rejected("table schema already exists");
                 }
@@ -1538,6 +1562,21 @@ mod tests {
                 schema,
             }),
             ApplyOutcome::Applied
+        );
+    }
+
+    /// `CreateTableSchema` rejects any user table name containing the
+    /// reserved `$` separator (the collision-safety argument ADR 0041's
+    /// hidden index-table naming convention depends on).
+    #[test]
+    fn create_table_schema_rejects_the_reserved_separator() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders$byCustomer".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Rejected("table name may not contain the reserved `$` separator")
         );
     }
 

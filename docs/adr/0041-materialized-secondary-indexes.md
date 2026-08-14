@@ -107,6 +107,14 @@ user table — but this is **enforced, not assumed**: `Metadata::apply`'s
 existing `syskv::is_reserved_name` gate. Index tables get no `TableSchema` entry
 of their own; the authoritative shape stays the base table's `IndexDef`.
 
+**As-built correction (2026-08-14, ADR 0042/0043 round-3 salvage):** the
+apply-time rejection described above was **not actually wired in** until
+this fix — this paragraph described the intended design from the start, but
+no code path ever rejected a `$`-containing user table name before then (an
+audit found the gap while re-grounding the streams work in what the tree
+actually enforces). Closed at the same single call site this paragraph
+names, so the claim is now true, not merely intended.
+
 ### 2. An LSI is colocated in the base table's tablets
 
 A local secondary index hashes by the base partition key, so its rows share the

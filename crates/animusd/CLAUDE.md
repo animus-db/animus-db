@@ -73,12 +73,14 @@ reason (see each file's own entry below).
   after each tick's reconciliation: deletes change records `hlc ≤ min(every
   *expected, present* consumer's watermark)` in bounded `KIND_CHANGE` batches
   (`expected_consumer_tags(gsis, stream_enabled)` — "gsi" iff the table has a
-  GSI, "copier" iff its stream is enabled, ADR 0042 §2; a `// PR B8:` marker
-  names where the copier itself, which actually writes the "copier" row,
-  joins it), blocking trim entirely if an expected
-  tag has no row yet (the ADR 0042 §7 safe default — **today this means a
-  streamed table's change log is never trimmed at all**, since nothing
-  writes a "copier" cursor row until PR B8; safe, just fully blocked). The
+  GSI, "copier" iff its stream is enabled, ADR 0042 §2; a `// round-3 sealer
+  PR:` marker names where this tag/row scheme is replaced entirely by a
+  catalog-derived stream watermark, round-3 streams plan §A6/F10 — no
+  consumer ever writes a "copier" row), blocking trim entirely if an
+  expected tag has no row yet (the ADR 0042 §7 safe default — **today this
+  means a streamed table's change log is never trimmed at all**, since
+  nothing writes a "copier" cursor row and nothing ever will; safe, just
+  fully blocked until the round-3 sealer PR replaces this mechanism). The
   loop's own per-tablet gate is `gsis.is_empty() && !stream_enabled` (was
   `gsis.is_empty()`) — but `drain_tablet` itself (GSI-specific: it would
   write a spurious "gsi" cursor row a streamed-but-unindexed table's schema
@@ -586,11 +588,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   `TableDescription`-object builder). The synthetic ARN
   (`wire::stream_arn`) is `arn:aws:dynamodb:animus:0:table/<table>/
   stream/<label>` — fixed placeholder region/account, matching this
-  adapter's existing ARN conventions. **Shard provisioning/teardown is PR
-  B5 territory**: `update_table`'s enable/disable is schema-only today (a
-  `// PR B5:` marker names where `CreateStreamShards`/the stream table's
-  drop cascade will hook in) — nothing is actually readable via
-  `GetRecords` yet.
+  adapter's existing ARN conventions. **The round-3 sealer and read path
+  land in a later PR**: `update_table`'s enable/disable is schema-only today
+  (a `// round-3 sealer PR:` marker names where the disable-triggered final
+  seal, F12-b, hooks in) — nothing is actually readable via `GetRecords`
+  yet. Round 3 needs no shard provisioning at all: the hot shard is just the
+  table's own existing `KIND_CHANGE` change log (round-3 streams plan §A1),
+  not a separate hidden per-stream table.
 
   `mint_stream_label` (ADR 0042 §4) is the proposer-side label mint: an
   ISO8601-shaped string derived from **this node's own `env.now()`**
@@ -616,7 +620,8 @@ route below the edge through the same `ClientCtx` CP primitives.
   two can never silently drift apart. **A streamed-but-unindexed table now
   takes the `KindBatch` path too**: `indexes` is empty, so the LSI loop is
   simply a no-op, and the entry commits exactly base row + change record —
-  the change record is what the stream copier will read (ADR 0043 §7).
+  this same change record *is* the round-3 hot shard the eventual sealer
+  reads directly (round-3 streams plan §A1), no separate copier involved.
   **A real, independent correctness gap this surfaced**: `PutItem`/
   `DeleteItem` only fetched the prior item (`needs_old`) when a
   `ConditionExpression` or `ALL_OLD` was requested — an unconditional

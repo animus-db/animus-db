@@ -367,9 +367,10 @@ async fn reconcile_partition(
 /// global secondary index, `"copier"` iff its stream is enabled — a table
 /// may expect neither, either, or both.
 //
-// PR B8: the unified change-consumer loop's own trim step reuses this
-// function verbatim — the copier itself (which writes the `"copier"` row
-// this makes *expected*) lands with the shard subsystem.
+// round-3 sealer PR: replaces the `"copier"` tag/row here with a
+// catalog-derived stream watermark (round-3 streams plan §A6/F10) — no
+// consumer ever writes a `"copier"` cursor row in round 3; `COPIER_TAG` and
+// this branch are removed there, not given a producer.
 fn expected_consumer_tags(gsis: &[IndexDef], stream_enabled: bool) -> Vec<&'static str> {
     let mut tags = Vec::new();
     if !gsis.is_empty() {
