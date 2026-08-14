@@ -223,3 +223,16 @@ smaller, more mechanical diff for the same effect.
   practice (L0 tables are transient — leveled compaction promptly
   re-partitions them), and bounded by the same `AUTO_SPLIT_COOLDOWN`/confirm
   cadence that already bounds `approx_key_count`'s analogous bias.
+
+## Amendment (2026-08-14, ADR 0042/0043)
+
+A stream's hidden per-stream table is exempt from auto-split entirely:
+`animusd::auto_split_loop` skips a stream table's tablets, the same
+mechanism it already uses to skip a GSI's hidden table. A stream shard's
+range is fixed at `CreateStreamShards` time and is load-bearing for ADR
+0042's routing contract (`token(pk)` maps deterministically to exactly one
+shard) — auto-splitting one would silently break that mapping mid-stream,
+which no byte threshold could ever justify trading against. Growing a
+stream's shard count is ADR 0042's own committed roadmap item (generation-
+cut resharding, grow-by-doubling only), a control-plane-triggered event
+entirely distinct from this ADR's byte-driven auto-split.

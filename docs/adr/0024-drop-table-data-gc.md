@@ -153,3 +153,19 @@ later ticks / the next restart:
   nothing (waiting out the replay transient above), and a fresh table still
   serves. Three nodes per-process — **every replica** reclaims its own files off
   the replicated drop, no cross-node teardown message.
+
+## Amendment (2026-08-14, ADR 0042/0043)
+
+The drop cascade extends a second time (the first being ADR 0041 §5's GSI
+hidden-table cascade): a streamed table's hidden stream table
+(`<base>$streams$<label>`) drops in the same enumerable first step as its
+GSI hidden tables — read while the table's schema/`StreamSpec` are still
+present, before the base schema itself is dropped — and the second,
+tablet-map-keyed sweep (already needed to catch a GSI drain racing a lazy
+hidden-table provision against a concurrent drop) learns the stream
+table's own `$`-naming shape, so a copier racing a lazy `CreateStreamShards`
+against a concurrent drop is caught by the identical belt-and-suspenders
+mechanism, not a new one. `KIND_STREAM`/`KIND_STREAM_META`/`KIND_CURSOR`
+rows need no separate reclaim step: they live in `kind_scopes` exactly like
+an LSI row or a change-log record, and `erase_scope` already iterates every
+entry, not just the base one.

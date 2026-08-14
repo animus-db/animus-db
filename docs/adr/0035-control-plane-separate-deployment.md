@@ -418,3 +418,23 @@ existed then — recheck it against what has actually shipped since, especially
 when a later feature (here, growth *and* join) incrementally builds the exact
 mechanism the earlier ADR said was missing.** Recorded in the root `CLAUDE.md`
 Engineering Practices section.
+
+## Amendment (2026-08-14, ADR 0042/0043)
+
+A **third** role assembly joins the control/data pair this ADR established:
+`animusd streams --config FILE --node I` (ADR 0043 §2), a node hosting only
+DynamoDB stream-shard tablets — no local control `RaftCore` (a `Metadata`
+mirror, exactly like a data-only node), and no ordinary table data either.
+The rationale is payload-profile separation (a stream shard's sequential
+append/retention-trim access pattern versus a data node's mixed point
+reads/writes), not a control-plane-scaling concern this ADR's own two roles
+address — so this is a genuinely new axis of role separation, not a
+subdivision of the existing `data` role. A **combined** node
+(`animusd --cluster N`, or `--config FILE --node I` with no explicit role)
+carries all three roles at once, so single-process dev clusters and
+existing combined-mode deployments need no config change. Placement
+segregation reuses the existing label/residency policy machinery
+(`required_labels`, ADR 0005) rather than any new mechanism this ADR would
+need to account for — a streams-role node is simply labeled at startup, the
+same primitive that already keeps a data-only node's tablets off a
+control-only node in the two-role case.

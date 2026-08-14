@@ -223,3 +223,18 @@ completes), and the survivor's `WidenScope` additionally waits for that
 seal (`Metadata::absorbed_by` provenance) before considering the widen
 safe — layered on top of, never a substitute for, the drain-before-widen
 sequencing above. See ADR 0018's PR2 amendment for the full design.
+
+## Amendment (2026-08-14, ADR 0042/0043)
+
+A stream's hidden per-stream table (fixed, equal token-range tablets,
+provisioned once by `CreateStreamShards`) is exempt from this ADR's merge
+entirely: `Metadata::apply`'s `MergeTablets` arm rejects a stream table's
+tablets outright, the same guard ADR 0034's amendment adds for auto-split.
+A shard's range identity is load-bearing for ADR 0042's shard-routing
+contract (`token(pk)` maps to exactly one shard by construction) in a way
+an ordinary table's tablet range is not, so this ADR's whole
+absorb-and-drain mechanism — designed for tablets whose range boundaries
+are incidental, operator- or auto-split-driven — simply never applies to
+one. Growing a stream's shard count is instead ADR 0042's own committed
+roadmap item: a generation-cut resharding that closes an entire shard
+generation and opens a fresh one, never a merge of two existing shards.

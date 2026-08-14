@@ -214,3 +214,17 @@ one command/one apply — see Consequences), not a drop+recreate.
   Index *data* (as opposed to *definitions*) staying edge-local — now with the
   lazy backfill + race hardening described above — and drop+GC semantics for a
   whole table, are covered by later ADRs (0024, 0028).
+
+## Amendment (2026-08-14, ADR 0042/0043)
+
+A table's DynamoDB `StreamSpecification` — whether a stream is enabled, and
+its current `label` (ADR 0042 §4's ARN identity) — replicates as a
+`StreamSpec` inside the same catalog entry a table's schema and index defs
+already live in, mutated by `MetaCommand::SetTableStream` in exactly the
+shape `MetaCommand::CreateTableSchema`/`ReplaceTableSchema` already
+establish: idempotent apply, relayable, durable via `Metadata`'s own
+apply-task mirror (ADR 0038). No new `syskv::EntityKind` and no separate
+replicated map — `ListStreams`/`DescribeStream` (ADR 0042 §2) are pure
+functions of this one field plus the tablet map, matching how an index
+`Query`'s shape is already a pure function of a table's replicated
+`IndexDef`s.

@@ -56,6 +56,7 @@ use serde::{Deserialize, Serialize};
 
 mod ceiling;
 mod codec;
+pub mod cursor;
 pub mod hlc;
 pub mod host;
 mod seal;
@@ -164,14 +165,26 @@ pub const KIND_LSI: u8 = 0x01;
 pub const KIND_CHANGE: u8 = 0x02;
 /// Row-kind scope selector: GSI footprints (ADR 0041 §4).
 pub const KIND_FOOTPRINT: u8 = 0x03;
+/// Row-kind scope selector: per-consumer cursor rows (ADR 0042/0043 — see
+/// [`cursor`]'s module doc). Lives on a **base** tablet (a streamed/GSI'd
+/// table's own tablets), one row per `(consumer tag, this tablet's own
+/// lineage)`, holding a packed-HLC watermark.
+pub const KIND_CURSOR: u8 = 0x04;
 
-/// Every row-kind scope a tablet group owns, in selector order (ADR 0041 §3).
+/// Every row-kind scope a tablet group owns, in selector order (ADR 0041 §3,
+/// extended ADR 0042/0043).
 ///
 /// The single place the set is enumerated: a group derives one sibling
 /// [`StorageScope`] per entry at start, the snapshot image iterates it, and
 /// drop-table GC erases each in turn. Adding a kind here is what makes it
 /// exist everywhere at once.
-pub const ALL_KINDS: [u8; 4] = [KIND_BASE, KIND_LSI, KIND_CHANGE, KIND_FOOTPRINT];
+pub const ALL_KINDS: [u8; 5] = [
+    KIND_BASE,
+    KIND_LSI,
+    KIND_CHANGE,
+    KIND_FOOTPRINT,
+    KIND_CURSOR,
+];
 
 /// The sibling scope set a tablet group owns, derived from its **parent**
 /// scope (`escape(table)` + this tablet's range), indexed by kind selector.
@@ -3030,6 +3043,74 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 }
             })
             .collect()
+    }
+
+    /// This tablet's own consumer-cursor watermark for `consumer` (ADR
+    /// 0042/0043, `KIND_CURSOR` — see [`cursor`]'s module doc), keyed by this
+    /// group's own *current* [`scope_range`](Self::scope_range) start. A
+    /// **local**, non-linearizable read: the change-consumer loop that reads
+    /// this is leader-gated and best-effort, like every other in-process
+    /// cursor/reconciler read in this crate. `None` means either "no row for
+    /// this tag on this exact tablet lineage" or "the stored bytes failed to
+    /// decode" (a defensive read — this crate never writes anything else
+    /// there); the ADR 0042 §7 "expected tag with no row ⇒ `W = 0`, no trim"
+    /// convention is the caller's to apply.
+    pub async fn cursor_watermark(&self, consumer: &str) -> Option<HlcTimestamp> {
+        let key = cursor::cursor_key(&self.scope_range().start, consumer);
+        let raw = self.local_get_kind(KIND_CURSOR, &key).await?;
+        cursor::decode_watermark(&raw)
+    }
+
+    /// Every cursor row currently visible in this tablet's own `KIND_CURSOR`
+    /// scope, as `(tag, watermark)` pairs. After a merge, a survivor's
+    /// widened scope can hold more than one row for the same tag — one per
+    /// absorbed tablet's own lineage, still physically present on the shared
+    /// engine (`StorageScope::with_kind` shares one live `KeyRange` across
+    /// every kind, so widening exposes rows a sibling wrote while it was its
+    /// own tablet) — which is exactly the shape the ADR 0042 §7 min-over-rows
+    /// rule exists to resolve; see
+    /// [`cursor_min_watermark`](Self::cursor_min_watermark). A row whose raw
+    /// bytes fail to decode is dropped rather than surfaced, mirroring
+    /// [`cursor_watermark`](Self::cursor_watermark)'s own defensive read.
+    pub async fn cursor_rows(&self) -> Vec<(String, HlcTimestamp)> {
+        let scope = &self.kind_scopes[KIND_CURSOR as usize];
+        let (start, end) = scope.physical_bounds();
+        let Some(end) = end else {
+            return Vec::new(); // only `StorageScope::whole()`; no real tablet
+        };
+        self.storage
+            .scan(&start, &end)
+            .await
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, vv)| {
+                let logical = scope.strip_in_range(&k)?;
+                let (_, tag) = cursor::parse_cursor_key(logical)?;
+                let ts = match txn::decode_envelope(&vv.value) {
+                    txn::Envelope::Committed(v) => cursor::decode_watermark(&v)?,
+                    txn::Envelope::Intent { .. } => return None,
+                };
+                Some((tag.to_string(), ts))
+            })
+            .collect()
+    }
+
+    /// The ADR 0042 §7 **min-over-rows** watermark for `consumer`: the
+    /// minimum watermark among every `KIND_CURSOR` row tagged `consumer` in
+    /// this tablet's own (possibly merge-widened) scope, or `None` if no such
+    /// row exists at all — the "expected tag with no row ⇒ `W = 0`, no trim"
+    /// case, deliberately returned as `None` rather than a zero timestamp so
+    /// a caller conflating "never copied anything" with "copied everything
+    /// up to the epoch" is a compile-time-visible `Option`, not a silent
+    /// wrong answer.
+    pub async fn cursor_min_watermark(&self, consumer: &str) -> Option<HlcTimestamp> {
+        self.cursor_rows()
+            .await
+            .into_iter()
+            .filter(|(tag, _)| tag == consumer)
+            .map(|(_, ts)| ts)
+            .min()
     }
 
     /// A **linearizable** range scan of a non-base row-kind scope (ADR 0041

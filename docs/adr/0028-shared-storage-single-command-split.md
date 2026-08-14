@@ -280,3 +280,25 @@ source proposes `KvCommand::Seal` for the handed-off range, every
 later-ordered entry for a key inside it is rejected regardless of its own
 fence — a second, independent gate stacked on top of the fence, not a
 replacement for it. See ADR 0018's PR2 amendment for the full design.
+
+## Amendment (2026-08-14, ADR 0042/0043)
+
+The kind-scope set every tablet group owns (ADR 0041 §3's extension of this
+ADR's "one engine, many independently-versioned writers" mechanism) grows
+again: `KIND_CURSOR` (`0x04`, on a GSI'd/streamed table's own base tablets)
+plus `KIND_STREAM`/`KIND_STREAM_META` (`0x05`/`0x06`, on a stream's shard
+tablets) — seven kinds total, snapshot codec `VERSION` 13. Nothing about
+this ADR's own mechanism changes: a kind is still a `StorageScope` sibling
+sharing the group's one live `KeyRange`, `ALL_KINDS` is still the single
+registration point, and `engine_image`/`erase_scope` still iterate it
+generically with no per-kind special-casing required.
+
+A stream's shard tablets are also the first tablets this shared-storage
+model hosts that are **structurally exempt from ever splitting** (ADR 0043
+§1) — their ranges are fixed at provisioning and guarded against
+`SplitTablet`/`MergeTablets` at the state-machine level. This ADR's own
+"tablet is the unit of placement/hosting/snapshot" contract needed no
+change to accommodate that: nothing here assumed every tablet must
+eventually split, only that a tablet's range can *change* (narrow/widen)
+when one does. A tablet that never exercises that path is simply the
+degenerate case.

@@ -560,3 +560,24 @@ mechanism.
   a later nicety — a drain that stalls now costs disk as well as index freshness.
 - **Index lag needs observability** — an admin surface and a metric for the
   drain's backlog, or an operator has no way to see a drain that has stalled.
+
+## Amendment (2026-08-14, ADR 0042/0043)
+
+§4/§4a's "cursor deferred to Streams" language is now made concrete by ADR
+0042/0043: the change log gains a genuine multi-consumer cursor (a
+`KIND_CURSOR` row per `(tablet, consumer tag)`, holding a packed-HLC
+watermark) and a **min-over-rows** rule for split/merge convergence, in
+place of §4's as-built "no cursor, consumption is trim" design, which only
+ever had to reason about one consumer (the GSI drain). The GSI drain itself
+is reworked to write its own cursor row (tag `"gsi"`) atomically with its
+footprint update — preserving exactly the crash property §4's as-built note
+already relied on (the cursor only ever covers reconciliations whose
+footprint actually landed) — rather than trimming on consumption directly.
+Trim becomes "the minimum watermark over every *expected, present*
+consumer tag," generalizing §4a's "trimmed behind the slowest consumer"
+language from "the GSI drain alone" to any combination of a GSI and/or a
+stream. §4a's own prediction — *"Streams becomes a second consumer of the
+same log"* — is exactly what ships: no change to the record format, the
+per-partition HLC ordering, or the atomic co-write this ADR established:
+ADR 0042/0043 only had to add the multi-consumer cursor/trim machinery on
+top.

@@ -51,6 +51,34 @@ Three modules:
   `debug_assert!` (a silent overflow would silently collapse two distinct
   timestamps to one version). See the Key invariants section for how this
   is wired into the apply path and the witnessing chain.
+- **`cursor.rs`** (ADR 0042/0043, `KIND_CURSOR = 0x04`) — consumer cursor
+  rows: the per-tablet, per-consumer HLC watermark the DynamoDB Streams
+  change-log lifecycle rework rests on (ADR 0042 §7/§8). `cursor_key(range_start,
+  consumer) -> Vec<u8>` builds `token(8 bytes, this tablet's own live
+  `range.start` truncated/zero-padded) || [0x00, CURSOR_TAG] ||
+  consumer.as_bytes()` — the identical `token || [0x00, TAG] || id` shape
+  `txn.rs`'s `record_key` already establishes, with `CURSOR_TAG = 0x03`
+  taking the next tag value after `txn.rs`'s own `RECORD_TAG = 0x02`;
+  `parse_cursor_key` is the fixed-offset dual, used by the min-over-rows
+  scan (below). `encode_watermark`/`decode_watermark` pack/unpack a
+  `HlcTimestamp` as the row's 8-byte-BE value, reusing `hlc::pack`/`unpack`.
+  Unlike a txn record, a cursor row lives in its **own** kind scope, so it
+  can never alias a real client key regardless of byte content — the
+  module's escape-disjointness proof (mirroring `txn.rs`'s) is stated
+  anyway, since it is what makes the *parser* unambiguous, not what keeps
+  cursor rows out of client data. A documented residual gap (mirroring
+  `txn.rs`'s own "split_key not token-aligned" note): the module doc spells
+  out a pathological `Binary`-key edge case where the truncated-token key
+  is not proven to stay strictly below a tablet's own `range.end`; left for
+  a future corpus to stress. `RaftKvNode::cursor_watermark`/`cursor_rows`/
+  `cursor_min_watermark` (in `lib.rs`, next to `local_get_kind`/
+  `local_scan_kind`) are the read-side accessors — `cursor_min_watermark`
+  implements ADR 0042 §7's min-over-rows rule directly (the minimum
+  watermark across every row of a tag in this tablet's own, possibly
+  merge-widened, `KIND_CURSOR` scope). Write-side is deliberately just
+  `put_kind_batch(KIND_CURSOR, ..)` — no bespoke propose method — since the
+  existing `KvCommand::KindBatch` primitive already covers it; the GSI
+  drain/stream copier PRs are what actually call it in production.
 - **`seal.rs`** (ADR 0018 §2 amendment) — the **range seal**: the structural
   replacement for the retired `version_floor` cross-group-LWW fix.
   `KvCommand::Seal { range, ts }` is proposed by a range-handoff source (a
@@ -110,7 +138,10 @@ trick, so a periodic byte estimate never degrades into a whole-engine scan.
 
 **A group owns a scope *set*, not one scope (ADR 0041 §3).** `with_kind(kind)`
 derives a sibling scope for one row kind — `KIND_BASE`/`KIND_LSI`/
-`KIND_CHANGE`/`KIND_FOOTPRINT` (`ALL_KINDS`) — over the *same*
+`KIND_CHANGE`/`KIND_FOOTPRINT`/`KIND_CURSOR` (ADR 0042/0043 — consumer
+cursor rows, see `cursor.rs` above; `KIND_STREAM`/`KIND_STREAM_META` land
+with a later PR), enumerated by `ALL_KINDS` (five entries as of this PR,
+codec `VERSION` 13) — over the *same*
 `Arc<Mutex<KeyRange>>`, so one `narrow`/`widen` moves every kind at once.
 **Why kinds are scopes, not a discriminator byte in the key**: a tablet is a
 `[start, end)` range over *token* space, so a kind above the token would
@@ -679,11 +710,12 @@ crates/animus-cp-data/tests/`) — covering single-tablet Raft mechanics
 (election/replication/leader-kill, ReadIndex, CAS, batch, membership,
 snapshot catch-up), automatic reconfiguration and leadership-transfer
 cascades, the ADR 0026 stream-addressing/shared-engine primitives, the ADR
-0041 `KindBatch`/scope-set mechanics, the ADR 0018 HLC/MVCC/range-seal/
-transaction suites (single- and multi-participant, in-doubt recovery,
-write-key conditions, snapshot reads, the read-timestamp cache), the
-`host.rs` reconciler end to end, and the real-thread `ProdEnv` regression
-noted above.
+0041 `KindBatch`/scope-set mechanics, the ADR 0042/0043 `KIND_CURSOR`
+scope-isolation and min-over-rows suite (`cursor_scope.rs`), the ADR 0018
+HLC/MVCC/range-seal/transaction suites (single- and multi-participant,
+in-doubt recovery, write-key conditions, snapshot reads, the read-timestamp
+cache), the `host.rs` reconciler end to end, and the real-thread `ProdEnv`
+regression noted above.
 
 ### Reconciler lifecycle corpus (`tests/reconciler_corpus.rs`)
 
