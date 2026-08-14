@@ -1,6 +1,10 @@
 # ADR 0043 — In-place stream sealing and the `SegmentStore`
 
-- **Status:** Proposed
+- **Status:** Accepted — implemented (round-3 stack). PR map: PR0 salvage →
+  PR1 ADR 0042 + this ADR's rewrite → PR2 `SegmentStore` trait/`Sim`/`Fs` →
+  PR3 `ClusterSegmentStore` → PR4 segment codec + shard catalog + merge
+  guard → PR5 the sealer → PR6 read path + wire API → PR7 segment janitor →
+  PR8 lineage corpus + `ProdEnv` e2e + nightly (this PR).
 - **Date:** 2026-08-14 (round-3 rewrite, retitled from "The stream-shard
   subsystem" — that title described round 2's separate shard-tablet design,
   which this text replaces in place. Round 1/2 text is retrievable from git

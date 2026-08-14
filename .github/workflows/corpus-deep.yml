@@ -19,6 +19,10 @@ on:
         description: "Seeds per structural cell (ANIMUS_TXN_SEEDS, ADR 0018 multi-tablet txn corpus)"
         required: false
         default: "40"
+      stream_seeds:
+        description: "Seeds per structural cell (ANIMUS_STREAM_SEEDS, ADR 0042/0043 streams lineage corpus)"
+        required: false
+        default: "40"
 
 env:
   CARGO_TERM_COLOR: always
@@ -55,3 +59,12 @@ jobs:
         env:
           ANIMUS_TXN_SEEDS: ${{ github.event.inputs.txn_seeds || '40' }}
         run: cargo test -p animus-test --test txn_serializable -- --nocapture
+
+      # ADR 0042/0043's DynamoDB Streams lineage-walk corpus: exactly-once +
+      # per-item order + chain continuity under seals/splits/leader-kills/
+      # store faults, scaled to depth. Each cell is a pure function of its
+      # seed, so a failure names one cell + seed and is replayable.
+      - name: deep streams lineage corpus (ADR 0042/0043 exactly-once + lineage)
+        env:
+          ANIMUS_STREAM_SEEDS: ${{ github.event.inputs.stream_seeds || '40' }}
+        run: cargo test -p animus-test --test stream_lineage_corpus -- --nocapture

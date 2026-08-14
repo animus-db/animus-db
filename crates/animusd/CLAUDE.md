@@ -1249,7 +1249,15 @@ mid-sweep, no empty-success gap across expiry, replica repair onto a fresh
 target, the full disable-grace lifecycle, and the drop-table cascade
 converging via the janitor alone — every retention-focused test seals two
 epochs in sequence first, since the epoch-derivation guard never
-physically removes a tablet's own current last epoch), restart/durability
-across every deployment shape, and the `WatchMetadata`/system-table/OTel/
-metrics support surfaces. `support/mod.rs` holds the shared bring-up
-helpers (port-TOCTOU retries, split-cluster bring-up).
+physically removes a tablet's own current last epoch), the round-3 PR8
+`streams_e2e.rs` suite (an auto-split mid-stream with a live consumer
+walking the lineage handover, a real `LsmEngine` restart surviving the
+catalog/segments/label, the `FsSegmentStore` opt-in, a GSI+stream table
+proving ADR 0042 §8's trim min-rule coexistence, and the merge stopgap
+rejected through the real admin API — using a `drain_tablet_lineage`
+helper that walks a tablet's *whole* epoch chain, since a fixed shard's
+`NextShardIterator` null only ends one epoch, not the whole stream),
+restart/durability across every deployment shape, and the
+`WatchMetadata`/system-table/OTel/metrics support surfaces.
+`support/mod.rs` holds the shared bring-up helpers (port-TOCTOU retries,
+split-cluster bring-up).

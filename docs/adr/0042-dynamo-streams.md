@@ -1,6 +1,10 @@
 # ADR 0042 — DynamoDB Streams: semantics, API, and the change-log lifecycle
 
-- **Status:** Proposed
+- **Status:** Accepted — implemented (round-3 stack). PR map: PR0 salvage →
+  PR1 this ADR + ADR 0043 rewrite → PR2 `SegmentStore` trait/`Sim`/`Fs` →
+  PR3 `ClusterSegmentStore` → PR4 segment codec + shard catalog + merge
+  guard → PR5 the sealer → PR6 read path + wire API → PR7 segment janitor →
+  PR8 lineage corpus + `ProdEnv` e2e + nightly (this PR).
 - **Date:** 2026-08-14 (round-3 rewrite; supersedes this ADR's own round-2
   text in place — see [ADR 0043](0043-stream-shard-subsystem.md)'s Context
   for the round 1→2→3 fork history. The round-2 text is retrievable from git
@@ -420,6 +424,8 @@ amendment about a split racing an in-flight transaction's own token.
 | `GetRecords` consistency | Documented eventually consistent | Leader-local (open) / store-served-and-sliced (closed), no barrier | Same observable contract, cheaper — see §7/§9/§10 |
 | Post-disable readability | Records remain readable ~24h | Records remain readable until ordinary retention reaps them (F12-b) | Now AWS-faithful, not a v1 gap — see §11 |
 | Tablet/partition merge | Never happens, ever | Rejected on a streamed table (v1 stopgap; global removal scheduled) | Matches AWS's own never-merge invariant; see §12 |
+| `StartingSequenceNumber` | The first record's own actual sequence number (inclusive) | A shard's `hlc_range.0` — the record HLC's own **exclusive** lower bound (round-3 PR6) | Kept for internal position-convention consistency: every position this adapter carries (an iterator's own `position`, a segment's `slice_to_hlc_range` bound, `index_drain::hot_read`'s `from_position`) is uniformly "the exclusive floor the next read filters `hlc > position` against" — giving `StartingSequenceNumber` its own, inclusive convention would be the one position value in the whole subsystem that meant something different, a correctness trap for exactly the kind of code (a corpus checker, a future maintainer) that greps for "position" and assumes one meaning |
+| `GetShardIterator` on an unknown/stale shard id | Documented as `ResourceNotFoundException` in some cases | `TrimmedDataAccessException`, matching `GetRecords`'s own outcome for the identical condition (round-3 PR6) | One error mapping for "this shard id doesn't currently resolve to anything live," shared by both operations that can hit it, rather than two different exceptions for what is, from this adapter's own state, the same fact |
 
 ### 16. Named follow-ups (not part of the committed design)
 
@@ -439,6 +445,27 @@ amendment about a split racing an in-flight transaction's own token.
 - **`AdjacentParentShardId`-style extension**: only needed if tablet merge
   is ever revived *under* an active stream after the split-only ADR lands —
   documented as a shape, not built (ADR 0043 §A5).
+- **CLI threading for the split-deployment/data-only argv paths (PR5
+  deferral)**: `--stream-seal-bytes`/`--stream-seal-age`/`--stream-retention`/
+  `--segment-store` are wired for `--cluster N`/`--config FILE --node I`
+  (combined mode) only — `--cluster-control N --cluster-data M`,
+  `animusd control`/`animusd data --config FILE --node I`, and `animusd data
+  --seed ADDR` all still default silently to the production knobs
+  (`StreamSealKnobs::default()`/`SegmentStoreConfig::default()`) with no CLI
+  override. Every layered-wrapper function these flags would thread through
+  already exists (`animusd`'s `_streams`-suffixed convention, see that
+  crate's `CLAUDE.md`); this is argv plumbing, not new mechanism.
+- **The control-only-leader segment-janitor scope gap (PR7, ADR 0043 §A9's
+  own "control-only-leader scope gap" note)**: a control-only leader can
+  mark catalog rows expired and react to a table drop (both `Metadata`-only
+  decisions), but cannot physically delete segment objects or repair
+  under-replicated ones — those need a `SegmentStoreHandle`, which today
+  only exists on a node with a data role. In a **pure** split deployment
+  (control-only nodes are the *only* control voters) this never runs at
+  all; extending `SegmentStoreHandle` provisioning to a control-only node
+  is the fix, out of PR7's scope. Not a correctness bug — a marked row is
+  already invisible to `DescribeStream`, only "this leadership stint can't
+  finish the physical reclaim."
 
 Explicitly **not** adopted, per owner decision: a serving-tier extraction or
 any S3 *archival* feature beyond the plain trait-swap follow-up above — both
