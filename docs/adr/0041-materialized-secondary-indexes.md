@@ -107,6 +107,14 @@ user table — but this is **enforced, not assumed**: `Metadata::apply`'s
 existing `syskv::is_reserved_name` gate. Index tables get no `TableSchema` entry
 of their own; the authoritative shape stays the base table's `IndexDef`.
 
+**As-built correction (2026-08-14, ADR 0042/0043 round-3 salvage):** the
+apply-time rejection described above was **not actually wired in** until
+this fix — this paragraph described the intended design from the start, but
+no code path ever rejected a `$`-containing user table name before then (an
+audit found the gap while re-grounding the streams work in what the tree
+actually enforces). Closed at the same single call site this paragraph
+names, so the claim is now true, not merely intended.
+
 ### 2. An LSI is colocated in the base table's tablets
 
 A local secondary index hashes by the base partition key, so its rows share the
@@ -560,3 +568,32 @@ mechanism.
   a later nicety — a drain that stalls now costs disk as well as index freshness.
 - **Index lag needs observability** — an admin surface and a metric for the
   drain's backlog, or an operator has no way to see a drain that has stalled.
+
+## Amendment (2026-08-14, ADR 0042/0043)
+
+§4/§4a's "cursor deferred to Streams" language is now made concrete by ADR
+0042/0043: the change log gains a genuine multi-consumer cursor (a
+`KIND_CURSOR` row per `(tablet, consumer tag)`, holding a packed-HLC
+watermark) and a **min-over-rows** rule for split/merge convergence, in
+place of §4's as-built "no cursor, consumption is trim" design, which only
+ever had to reason about one consumer (the GSI drain). The GSI drain itself
+is reworked to write its own cursor row (tag `"gsi"`) in its own **separate,
+trailing** write — never fused into any one partition's own footprint-update
+entry — issued only once *every* partition a pass dirtied has had its
+footprint update independently confirmed durable. This is what actually
+preserves the crash property §4's as-built note relied on (the cursor only
+ever covers reconciliations whose footprint actually landed): fusing the
+cursor bump into a single partition's own commit would be sound for a tick
+that reconciles exactly one partition, but unsound the moment one tick
+dirties more than one (the ordinary case under sustained writes) — a crash
+between two partitions' own footprint-confirming writes would still leave
+the cursor naming the tick's max HLC, over-claiming a partition whose
+footprint never landed. Trim becomes "the minimum watermark over every
+*expected, present*
+consumer tag," generalizing §4a's "trimmed behind the slowest consumer"
+language from "the GSI drain alone" to any combination of a GSI and/or a
+stream. §4a's own prediction — *"Streams becomes a second consumer of the
+same log"* — is exactly what ships: no change to the record format, the
+per-partition HLC ordering, or the atomic co-write this ADR established:
+ADR 0042/0043 only had to add the multi-consumer cursor/trim machinery on
+top.

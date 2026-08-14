@@ -223,3 +223,42 @@ completes), and the survivor's `WidenScope` additionally waits for that
 seal (`Metadata::absorbed_by` provenance) before considering the widen
 safe — layered on top of, never a substitute for, the drain-before-widen
 sequencing above. See ADR 0018's PR2 amendment for the full design.
+
+## Amendment (2026-08-14, ADR 0042/0043)
+
+A stream's hidden per-stream table (fixed, equal token-range tablets,
+provisioned once by `CreateStreamShards`) is exempt from this ADR's merge
+entirely: `Metadata::apply`'s `MergeTablets` arm rejects a stream table's
+tablets outright, the same guard ADR 0034's amendment adds for auto-split.
+A shard's range identity is load-bearing for ADR 0042's shard-routing
+contract (`token(pk)` maps to exactly one shard by construction) in a way
+an ordinary table's tablet range is not, so this ADR's whole
+absorb-and-drain mechanism — designed for tablets whose range boundaries
+are incidental, operator- or auto-split-driven — simply never applies to
+one. Growing a stream's shard count is instead ADR 0042's own committed
+roadmap item: a generation-cut resharding that closes an entire shard
+generation and opens a fresh one, never a merge of two existing shards.
+
+**Update (2026-08-14, round-3 rewrite): there is no separate stream table
+to exempt.** Round 3 (ADR 0042/0043) seals a streamed table's own change
+log in place; a stream shard is a seal epoch of an *ordinary* base tablet,
+not a tablet of some other, fixed-range table. The guard this ADR's
+`MergeTablets` arm carries is instead a direct, explicit rejection of
+**merging a streamed base table's own tablets** (ADR 0042 §12's **F1
+stopgap**) — a shard's lineage (ADR 0043 §A4) assumes a tablet's own range
+only ever narrows via split, never widens via merge, and a real DynamoDB
+partition never merges either (the verified fact ADR 0042's Context cites:
+AWS's own `Shard` type has no `AdjacentParentShardId`). **This is
+explicitly a stopgap, not this ADR's permanent position on streamed
+tables**: Guillaume has separately decided tablet merge itself is being
+removed **globally** (split-only tablets), in its own ADR and deletion
+stack scheduled after this streams stack merges (decided 2026-08-14) — when
+that lands, this guard and the `MergeTablets` command it guards are deleted
+together, and this whole amendment becomes moot rather than needing its own
+follow-up removal. The workaround this ADR's own absorb-and-drain mechanism
+still offers a streamed table today is disable → merge → re-enable, which
+is honest under ADR 0042 §11's F12-b: it simply starts a genuinely new
+stream identity, exactly like a real DynamoDB customer resizing a table
+differently would also effectively get. There is no shard-count roadmap
+item to reconcile this against — round 3 has no fixed shard count at all
+(ADR 0043 §A4: stream parallelism is tablet count, full stop).

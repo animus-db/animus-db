@@ -73,7 +73,16 @@ const MAGIC: u8 = 0xCB;
 /// `ImageEntry` gained a leading **row-kind** byte, so one image carries every
 /// one of a tablet's per-kind storage scopes. Same house convention: a clean
 /// bump, no cross-version compatibility.
-const VERSION: u8 = 12;
+/// `13` (ADR 0042/0043): `ALL_KINDS` grows to admit the DynamoDB Streams row
+/// kinds — `KIND_CURSOR` (`0x04`, this PR) now, `KIND_STREAM`/
+/// `KIND_STREAM_META` (`0x05`/`0x06`) in a later PR. The `ImageEntry` layout
+/// itself is unchanged (the kind byte was already a generic `u8` since `12`,
+/// and an unknown kind is already dropped-with-warn on decode); this bump is
+/// the same house convention as every prior one — a version marker for a
+/// meaningful semantic change, not a wire-format one — and is deliberately
+/// **one bump covering all three new kinds** across the whole Streams PR
+/// stack, so the two later kinds land without a further bump.
+const VERSION: u8 = 13;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).

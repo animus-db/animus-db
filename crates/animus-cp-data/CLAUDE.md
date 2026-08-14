@@ -24,8 +24,6 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
 
 ## Entry points
 
-Three modules:
-
 - **`lib.rs`** — `RaftKvNode<E, S>` (the running tablet-group node) and its
   command/state types (`KvCommand`, `KvState`), `StorageScope`, the fenced
   commands, ReadIndex + CAS, the consensus-loop/apply-task split, and
@@ -34,6 +32,51 @@ Three modules:
   `plan()` decision, `Reconciler` executor, `MetadataView`/`TabletFacts`/
   `LocalState`, and the `HostAction` set (incl. `Absorb`/`WidenScope`). 34
   unit tests. See "The host module".
+- **`cluster_segment_store.rs`** (ADR 0043 §A7b, F5) — `ClusterSegmentStore<E,
+  S>`: the **default** `SegmentStore` for the stream-shard subsystem — K-way
+  replication of an immutable segment across `K` nodes' own local `S`-backed
+  directories (each backed by `FsSegmentStore` in production,
+  `SimSegmentStore` under sim), over `E`'s `Network` seam. `put_replicated`
+  returns `Ok` only once every chosen target has durably written the object
+  (all-or-error; a partial failure leaves harmless, idempotent-overwrite-
+  safe orphans on the replicas that *did* succeed); `get_from`/`delete_from`
+  take a catalog row's own recorded replica set (the load-bearing read/
+  reclaim path a later PR's sealer/janitor will call); the trait's own
+  `put`/`get`/`delete`/`list` are thinner, contract/testing-only paths (`get`/
+  `delete` fall back to the *current* `PlacementView` candidates rather than
+  a specific recorded set; `list` is local-only). One serving task per node
+  (`ClusterSegmentStore::start`, spawned via `env.spawn_task`) is the single
+  consumer of the reserved `SEGMENT_STREAM` (`u64::MAX`, ADR 0026 — chosen far
+  outside any `TabletId`'s realistic range) — request and reply variants of
+  its own `serde_json`'d `SegmentWire` enum share that one stream/inbox,
+  correlated by a `req_id` a caller's `env.sleep`-based poll loop watches (see
+  "What's non-obvious" and `docs/engineering-lessons.md`'s Testing section for
+  why this isn't a `tokio::sync::oneshot`). `PlacementView` (implemented by
+  `StaticPlacementView` for tests) hands back the current candidate node set;
+  `choose_targets` feeds it straight into `animus_placement::select_replicas`
+  with a plain, label-blind `PlacementPolicy::simple` — `K = min(default_k,
+  candidates.len())`, so a single-node cluster degrades to `K = 1` instead of
+  refusing to serve. **Wired into `animusd` since the round-3 sealer PR**
+  (`animusd::build_segment_store`/`ControlPlacementView`, `SegmentStoreHandle`
+  in that crate's `lib.rs`) — the DynamoDB Streams sealer's own
+  `SealStreamShard.replicas` field is exactly `put_replicated`'s returned
+  set; see that crate's `CLAUDE.md` for the wiring. **`put_to_targets`**
+  (round-3 PR7) is `put_replicated`'s own fan-out/wait body generalized to
+  an explicit target list instead of always calling `choose_targets`
+  itself; `put_replicated` is now a thin wrapper (`targets =
+  choose_targets()?`). **`repair`** (round-3 PR7, ADR 0043 §A9) is the
+  segment janitor's own replica-repair primitive: given `id`'s currently
+  **surviving** replica set and a live copy's bytes (the caller's own
+  `get_from(surviving, id)`), pushes that copy via `put_to_targets` to
+  enough freshly-chosen candidates — excluding every id already in
+  `surviving` — to reach `target_k`, returning the resulting sorted
+  replica set; degrades to `surviving` alone (no network I/O) if no spare
+  candidate exists, mirroring `choose_targets`'s own degraded-mode
+  philosophy. `animusd::SegmentStoreHandle::repair_replicas`/
+  `delete_sealed` are the thin per-variant dispatch wrappers (`Cluster`
+  delegates here/to `delete_from`; the single-directory `Fs` opt-in has no
+  per-replica concept to repair, so `repair_replicas` is a bare `Ok(
+  surviving.to_vec())` no-op there).
 - **`codec.rs`** — the crate's compact binary wire/image codec (ADR 0017 A.2):
   length-prefixed framing (like the storage manifest codec), magic/version
   checked. Carries `KvWire` messages and engine images; `serde_json`'s
@@ -51,6 +94,47 @@ Three modules:
   `debug_assert!` (a silent overflow would silently collapse two distinct
   timestamps to one version). See the Key invariants section for how this
   is wired into the apply path and the witnessing chain.
+- **`cursor.rs`** (ADR 0042/0043, `KIND_CURSOR = 0x04`) — consumer cursor
+  rows: the per-tablet, per-consumer HLC watermark the DynamoDB Streams
+  change-log lifecycle rework rests on (ADR 0042 §7/§8). `cursor_key(range_start,
+  consumer) -> Vec<u8>` builds `token(8 bytes, this tablet's own live
+  `range.start` truncated/zero-padded) || [0x00, CURSOR_TAG] ||
+  consumer.as_bytes()` — the identical `token || [0x00, TAG] || id` shape
+  `txn.rs`'s `record_key` already establishes, with `CURSOR_TAG = 0x03`
+  taking the next tag value after `txn.rs`'s own `RECORD_TAG = 0x02`;
+  `parse_cursor_key` is the fixed-offset dual, used by the min-over-rows
+  scan (below). `encode_watermark`/`decode_watermark` pack/unpack a
+  `HlcTimestamp` as the row's 8-byte-BE value, reusing `hlc::pack`/`unpack`.
+  Unlike a txn record, a cursor row lives in its **own** kind scope, so it
+  can never alias a real client key regardless of byte content — the
+  module's escape-disjointness proof (mirroring `txn.rs`'s) is stated
+  anyway, since it is what makes the *parser* unambiguous, not what keeps
+  cursor rows out of client data. A documented residual gap (mirroring
+  `txn.rs`'s own "split_key not token-aligned" note): the module doc spells
+  out a pathological `Binary`-key edge case where the truncated-token key
+  is not proven to stay strictly below a tablet's own `range.end`; left for
+  a future corpus to stress. `token_of(range_start) -> [u8; TOKEN_BYTES]` is
+  `cursor_key`'s own truncate/zero-pad step, split out (PR A2) so a caller
+  that already has a *parsed* row's own token can compute *this* tablet's
+  own token to compare against, without rebuilding a whole key — the
+  `animusd` trim janitor's merge-residue cleanup (below) is exactly this
+  caller. `RaftKvNode::cursor_watermark`/`cursor_rows`/`cursor_min_watermark`
+  (in `lib.rs`, next to `local_get_kind`/`local_scan_kind`) are the read-side
+  accessors — `cursor_min_watermark` implements ADR 0042 §7's min-over-rows
+  rule directly (the minimum watermark across every row of a tag in this
+  tablet's own, possibly merge-widened, `KIND_CURSOR` scope).
+  `cursor_rows_with_token` (PR A2) is `cursor_rows`'s token-keeping sibling —
+  `cursor_rows` itself is now a thin wrapper dropping the token, since none
+  of *its* callers need it, but the trim janitor's merge-residue cleanup
+  does (telling "this tablet's own row" from "a still-physically-present
+  absorbed sibling's row" needs the token, not just the tag). Write-side is
+  deliberately just `put_kind_batch(KIND_CURSOR, ..)` — no bespoke propose
+  method — since the existing `KvCommand::KindBatch` primitive already
+  covers it; the `animusd` GSI drain (`index_drain.rs`, cursor-based since PR
+  A2 — see that crate's own `CLAUDE.md`) is what actually calls it in
+  production today — the only production consumer. Round 3 has no separate
+  stream copier or `"copier"` cursor row: the eventual sealer reads a
+  table's own `KIND_CHANGE` change log directly (round-3 streams plan §A1).
 - **`seal.rs`** (ADR 0018 §2 amendment) — the **range seal**: the structural
   replacement for the retired `version_floor` cross-group-LWW fix.
   `KvCommand::Seal { range, ts }` is proposed by a range-handoff source (a
@@ -63,6 +147,29 @@ Three modules:
   lives under `animus_control::syskv::RESERVED_NAMESPACE` — engine-global,
   outside every `StorageScope` — see the module's own doc for the
   key-disjointness proof.
+- **`segment.rs`** (ADR 0042/0043) — the stream-shard **segment codec**: a
+  sealed shard's `SegmentStore` object format, pure and I/O-free (magic +
+  version header, `SegmentHeader` + `Vec<SegmentRecord>` body,
+  length-prefixed framing mirroring `codec.rs`'s own style but a separate
+  self-contained module). `encode`/`decode` — `encode` always derives the
+  wire `count` from `records.len()` (never trusts a caller-supplied
+  placeholder), `decode` validates magic/version (an unrecognized version
+  is a loud, named `Err`), every length-prefixed field's framing, the
+  stored `shard_id` against `shard_id(tablet, epoch)` (a mismatch is
+  corruption), and that the body holds **exactly** the declared record
+  count with no trailing bytes. `shard_id(tablet, epoch)` =
+  `shardId-<tablet>-<epoch>` (ADR 0042 §2); `segment_id(table, label,
+  tablet, epoch)` = `{table}/{label}/{tablet}/{epoch}` (ADR 0043 §A3/§A7,
+  matching `FsSegmentStore`'s own path-mapping/`ClusterSegmentStore`'s id
+  shape byte-for-byte). **The superset-slice rule (ADR 0042 §10)**:
+  `slice_to_hlc_range(records, (start_exclusive, end_inclusive))` keeps
+  exactly the records inside the catalog row's own committed range,
+  dropping a deposed leader's late-`put` superset's extra tail (and,
+  defensively, anything at or below the exclusive start); `decode_and_slice`
+  composes decode-then-slice in one call so a reader (the `GetRecords`
+  sealed-shard path) can't decode a segment and forget to slice it.
+  `change_record` bytes are opaque to this crate throughout (ADR 0043's
+  own layering rule) — only ever moved, never interpreted.
 - **`ts_cache.rs`** (ADR 0018 §2) — the per-tablet **read-timestamp cache**
   (`TsCache`): leader-local, in-memory, best-effort write-conflict push. A
   two-generation rotating map; every served read bumps the span it read at
@@ -110,7 +217,10 @@ trick, so a periodic byte estimate never degrades into a whole-engine scan.
 
 **A group owns a scope *set*, not one scope (ADR 0041 §3).** `with_kind(kind)`
 derives a sibling scope for one row kind — `KIND_BASE`/`KIND_LSI`/
-`KIND_CHANGE`/`KIND_FOOTPRINT` (`ALL_KINDS`) — over the *same*
+`KIND_CHANGE`/`KIND_FOOTPRINT`/`KIND_CURSOR` (ADR 0042/0043 — consumer
+cursor rows, see `cursor.rs` above; `KIND_STREAM`/`KIND_STREAM_META` land
+with a later PR), enumerated by `ALL_KINDS` (five entries as of this PR,
+codec `VERSION` 13) — over the *same*
 `Arc<Mutex<KeyRange>>`, so one `narrow`/`widen` moves every kind at once.
 **Why kinds are scopes, not a discriminator byte in the key**: a tablet is a
 `[start, end)` range over *token* space, so a kind above the token would
@@ -159,7 +269,14 @@ command*, stamped by the leader from its own `StorageScope.range` (see Key
 invariants for why this is load-bearing); `scope_range()` is the read-side
 snapshot used both to reject a key before proposing and to stamp the
 fence. `approx_bytes()` is the per-tablet cheap byte estimate
-`animusd::auto_split_loop` gates on. Batch put (`KvCommand::Batch` +
+`animusd::auto_split_loop` gates on — **deliberately pinned to the base
+kind scope** (measures only base data, the ADR 0034 fix that stops
+auto-split reacting to change-log churn). `approx_bytes_kind(kind)` (ADR
+0042/0043) is its kind-scoped sibling, over `self.kind_scopes[kind]`
+instead — the Streams sealer's size trigger needs `KIND_CHANGE`'s own
+bytes specifically, and reusing `approx_bytes` for that is exactly the
+trap this sibling exists to avoid (see `docs/engineering-lessons.md`'s
+Code-patterns entry). Batch put (`KvCommand::Batch` +
 `put_batch`) commits N keys as one Raft log entry. Linearizable CAS
 (`cas`/`cas_result`/`compare_and_swap`) is decided at apply time (see Key
 invariants); a current value covered by a `Pending`/unresolved intent
@@ -655,10 +772,32 @@ the same node-shared engine) and drains before halting (see Key invariants).
   "Leadership transfer" entry for the core mechanics; the regressions are
   `tests/leader_transfer_reconfigure.rs` and
   `tests/reconfigure_down_extra_priority.rs`.
+- **`ClusterSegmentStore`'s request/reply correlation (ADR 0043 §A7b) is a
+  shared `Mutex<BTreeMap<req_id, Option<Reply>>>` polled via `env.sleep`,
+  never a `tokio::sync::oneshot`** — the identical shape `RaftKvNode`'s own
+  `ReadProbe`/`ReadProbeAck` read-barrier confirmation already uses, for the
+  same reason: a `SimEnv` caller has no tokio runtime present to drive a
+  oneshot's waker. See `docs/engineering-lessons.md`'s Testing section for
+  the general rule (does the primitive come from `std`/`futures`, or a
+  specific async runtime crate). A request and its reply are two variants of
+  one `serde_json`'d wire enum sharing **one** stream/inbox
+  ([`SEGMENT_STREAM`] `= u64::MAX`, deliberately outside any `TabletId`'s
+  realistic range) — the same "one dedicated stream, one single-consumer
+  serving task" shape the per-tablet driver loop uses on its own `stream`,
+  generalized to a cluster-wide (not per-tablet) responsibility.
+- **A `put_replicated`/`delete_from` failure can leave harmless orphans on
+  whichever targets *did* succeed** — never cataloged (a later PR's sealer
+  only commits `SealStreamShard` after `put_replicated` itself returns `Ok`),
+  and `SegmentStore::put`/`delete` are idempotent overwrite/delete by
+  contract, so a retry to the same deterministic id always converges. Don't
+  "fix" a partial failure by trying to roll back the targets that already
+  succeeded — that would add a second distributed failure mode (the rollback
+  itself can partially fail) to clean up a case that is already safe to leave
+  alone.
 
 ## Tests
 
-`cargo test -p animus-cp-data`. All but one of the 25 test binaries drive
+`cargo test -p animus-cp-data`. All but one of the 26 test binaries drive
 `SimEnv` — use `run_for`/`run_until`, never `run()` (the driver has perpetual
 heartbeat/election timers). Linearizable reads are async (a read-barrier probe
 round), so drive them as spawned tasks + `run_for`, and never `block_on` a
@@ -679,11 +818,19 @@ crates/animus-cp-data/tests/`) — covering single-tablet Raft mechanics
 (election/replication/leader-kill, ReadIndex, CAS, batch, membership,
 snapshot catch-up), automatic reconfiguration and leadership-transfer
 cascades, the ADR 0026 stream-addressing/shared-engine primitives, the ADR
-0041 `KindBatch`/scope-set mechanics, the ADR 0018 HLC/MVCC/range-seal/
-transaction suites (single- and multi-participant, in-doubt recovery,
-write-key conditions, snapshot reads, the read-timestamp cache), the
-`host.rs` reconciler end to end, and the real-thread `ProdEnv` regression
-noted above.
+0041 `KindBatch`/scope-set mechanics, the ADR 0042/0043 `KIND_CURSOR`
+scope-isolation and min-over-rows suite (`cursor_scope.rs`), `segment.rs`'s
+own in-module `#[cfg(test)]` unit tests (`cargo test -p animus-cp-data --lib
+segment::` — round-trip, decode rejections, and the superset-slice rule),
+the ADR 0043 `§A7b` `ClusterSegmentStore` replication/fault suite
+(`cluster_segment_store.rs`, a 3-node cluster over `SimSegmentStore`,
+including round-3 PR7's `repair` cases — reaching `target_k` from a
+surviving pair, a no-op when nothing is missing, and degrading to
+`surviving` alone with no network I/O when no spare candidate exists), the
+ADR 0018 HLC/MVCC/range-seal/transaction suites (single- and
+multi-participant, in-doubt recovery, write-key conditions, snapshot
+reads, the read-timestamp cache), the `host.rs` reconciler end to end, and
+the real-thread `ProdEnv` regression noted above.
 
 ### Reconciler lifecycle corpus (`tests/reconciler_corpus.rs`)
 

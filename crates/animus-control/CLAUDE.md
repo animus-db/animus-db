@@ -50,11 +50,110 @@ per-tablet CP data plane (`animus-cp-data`).
   `SplitTablet`/`MergeTablets` — ADR 0028/0033, each the *entire* split/merge,
   epoch-CAS gated, no data-plane half; `SetTabletPolicy`); schema/keyspace
   (`Create/Drop/ReplaceTableSchema` — ADR 0013; `DropTableTablets` — ADR 0024
-  GC; `Create/DropTableIndex`; `SetTableMode`; `Create/DropKeyspace`);
+  GC; `Create/DropTableIndex`; `SetTableMode`; `SetTableStream` (ADR 0042
+  §2/§4/§9 — enable/disable a table's DynamoDB Streams config,
+  `schema::StreamSpec { view_type, label }` on `TableSchema.stream`; enable
+  is rejected if a stream is already enabled, since a fresh `label` is only
+  ever minted through an explicit disable → re-enable, never a
+  same-command relabel — what makes `(table, label)` a stable identity for
+  as long as the stream lives; the label itself is minted by the proposer,
+  `animusd`, through its own `env.now()`, never `Metadata::apply`, which
+  only ever records whatever `StreamSpec` it's handed); `SealStreamShard`/
+  `ExpireStreamShards` (ADR 0042 §3/§9, ADR 0043 §A3/§A8/§A9 — the segment
+  catalog, below); `Create/DropKeyspace`);
   addressing (`RegisterNodeAddrs` — update-only since ADR 0040, rejects if
   `node` is absent from both `members` and `node_addrs`; `RegisterCpAddr` —
   the predecessor, kept for WAL back-compat only); and `RegisterNode` (ADR
   0040 Decision C), below.
+
+  **`SealStreamShard`/`ExpireStreamShards` are the segment catalog**
+  (`Metadata::stream_shards: BTreeMap<(TabletId, u64), StreamShardRow>`).
+  **Keyed by `(tablet, epoch)` alone, never `(table, label, tablet,
+  epoch)`** — a tablet id already implies its table, and a tablet's own
+  epoch counter is a property of its physical seal history (counts up from
+  its first seal, never resetting across a disable/re-enable cycle), not
+  of any one stream generation; `table`/`label` live inside
+  `StreamShardRow` as descriptive fields. `SealStreamShard` is
+  **first-committer-wins on that key's content** (round-3 PR7 amendment):
+  a second proposal for an already-recorded identity whose content
+  (everything but `replicas`) matches exactly is a genuine `NoOp` if
+  `replicas` also matches (the sealer's own crash-retry racing itself, by
+  design), or an in-place **`Applied` replicas-only update** if `replicas`
+  differs — the shape the segment janitor's own replica-repair sweep
+  produces (ADR 0043 §A9): it re-proposes the identical committed shard
+  with a freshly-repaired `replicas` set, never touching any other field.
+  A proposal whose non-`replicas` content genuinely conflicts is still
+  rejected as a `NoOp`, exactly as originally designed — this is safe for
+  every reader because `GetRecords`/the janitor always re-fetch the row
+  fresh before consulting `replicas`, and repair is the only production
+  caller that ever proposes a different `replicas` for an existing
+  identity, so there is no other writer to race against. Validated
+  against **either** the table's current schema `StreamSpec.label` **or**
+  an existing catalog row already present for that `(table, label)`
+  (F12-b: a disabled stream's un-reaped rows still license a further seal
+  of the same generation, e.g. the disable-triggered final seal proposed
+  after `SetTableStream{None}` already cleared the schema), plus a
+  permissive-but-sane epoch-chain check (`epoch == 0` always accepted;
+  `epoch > 0` needs a local `epoch - 1` row or `split_parents` provenance
+  for this tablet). Relayable — a tablet leader proposing its own seal
+  may run on any data node, not necessarily one control-connected at
+  all. `ExpireStreamShards { rows: Vec<(TabletId, u64)>, remove: bool }`
+  is the segment janitor's (`animusd::segment_janitor`, round-3 PR7)
+  two-phase reclaim, reused directly for the drop-table cascade too
+  (that cascade has no dedicated code path of its own — see
+  `animusd/CLAUDE.md`'s `segment_janitor.rs` entry for the convergent
+  design): `remove: false` **marks** every named row `expired: true`
+  (idempotent; never a visibility gate — a marked-but-not-removed row is
+  still fully valid to serve), `remove: true` **physically removes** it
+  (idempotent). **Deliberately NOT relayable** — its only intended
+  caller (the segment janitor, a control-plane-leader-only background
+  loop like `detect_loop`/`orphan_sweep_loop`) always already holds a
+  live `RaftNode` handle when it decides to act, so it proposes directly
+  and has no structural need for a relay path; see `animusd`'s
+  `is_relayable_command` for the full access-restriction argument
+  (mirrors `RemoveMember`'s own exclusion). **The caller (never this pure
+  state machine) is responsible for never removing a tablet's own current
+  highest-epoch row while that tablet still exists** — `SealStreamShard`'s
+  own epoch derivation (mirrored in
+  `animusd::index_drain::seal_now`/`dynamo_streams::current_open_epoch`)
+  is "the chain's own highest existing row, plus one," so physically
+  removing that row out from under a still-live tablet would let a future
+  seal silently reuse the same epoch number; see `animusd/CLAUDE.md`'s
+  `segment_janitor.rs` entry for the guard that upholds this. `Metadata`
+  accessors:
+  `stream_shard_chain(table, label, tablet)` (one tablet's chain in
+  ascending epoch order), `stream_shard_watermark(tablet)` (the tablet's
+  own last-sealed end-HLC, regardless of label — restricted to *this*
+  tablet's own chain, `None` for a fresh split child with no rows of its
+  own yet), `effective_stream_shard_watermark(tablet)` (round-3 sealer PR,
+  ADR 0043 §A4/§A6 — the one the sealer/hot-trim arm actually calls: walks
+  `split_parents` provenance when the plain accessor above answers `None`,
+  so a fresh split child inherits its parent tablet's own last-sealed
+  end-HLC instead of reading as absent, transitively through a chain of
+  splits), `stream_shard_rows_for_label(table, label)` (every
+  row across every tablet), `stream_labels_with_rows(table)` (F12-b's
+  coexistence set), `stream_shard_parent_id(tablet, epoch)` (derived
+  `ParentShardId`, never stored redundantly),
+  `stream_view_type(table, label)` (PR6's `DescribeStream` catalog
+  amendment — the table's *current* `StreamSpec.view_type` when `label`
+  is still enabled, else the last-known value carried by any of the
+  label's own catalog rows; both `StreamShardRow` and `SealStreamShard`
+  grew a `view_type: StreamViewType` field, `#[serde(default)]`,
+  specifically so a `DISABLED`-but-unreaped stream's grace-window
+  `DescribeStream` — which has no live `StreamSpec` to read once
+  `SetTableStream{None}` commits — still has somewhere to read its
+  last-known view type from; a view type never changes mid-stream, so
+  every row of one label carries the identical value). **F1 merge stopgap** (ADR
+  0042 §12/ADR 0043 §A5): `MergeTablets`'s apply arm rejects outright when
+  the base table has either an enabled stream or any still-present
+  catalog row (marked-expired-but-not-yet-removed counts as still
+  present) — explicitly a v1 stopgap the text names as such, since tablet
+  merge itself is being removed globally in a forthcoming split-only ADR
+  that deletes this guard along with `MergeTablets`. Mirrored into
+  `syskv::EntityKind::StreamShard`, keyed by the raw 16-byte
+  `tablet.to_be_bytes() ++ epoch.to_be_bytes()` concatenation
+  (`syskv::stream_shard_key`/`decode_stream_shard_id` — fixed-width, so no
+  internal escaping is needed the way a variable-length id would).
 
   **`RegisterNode` is the sole claim path for a fresh node identity**,
   retiring ADR 0036's `AllocateNodeId` monotonic allocator entirely. `node`
@@ -221,12 +320,21 @@ per-tablet CP data plane (`animus-cp-data`).
   `RaftNode`.
 
 - **`schema.rs`** — the replicated **table-schema catalog** (ADR 0013), all
-  plain data (no I/O/clock/RNG): `TableSchema`, `ColumnType`, `SchemaCatalog`
-  (a `BTreeMap<TableName, TableSchema>` held in `Metadata`), and
+  plain data (no I/O/clock/RNG): `TableSchema` (now also carrying `stream:
+  Option<StreamSpec>`), `ColumnType`, `SchemaCatalog` (a
+  `BTreeMap<TableName, TableSchema>` held in `Metadata`), and
   `IndexDef`/`IndexKind`/`IndexProjection` (the replicated GSI/LSI *shape*,
   not its entry data). `TableSchema::validate` is the pure malformed-schema
   check the state machine applies (unique index names; an LSI requires a
-  sort attribute).
+  sort attribute) — `stream` has no validation of its own (any `StreamSpec`
+  a `MetaCommand::SetTableStream` hands it is already well-formed by
+  construction). `StreamSpec { view_type: StreamViewType, label: String }`
+  (ADR 0042 §2/§4) is a table's DynamoDB Streams configuration when
+  enabled; `StreamViewType` (`NewAndOldImages`/`NewImage`/`OldImage`/
+  `KeysOnly`) is a **read-time projection only** — a shard record always
+  stores both images regardless (ADR 0043), so a view-type change never
+  needs a backfill. `Metadata::table_stream(table) -> Option<&StreamSpec>`
+  is the read accessor, alongside `table_schema`/`table_indexes`.
 
 - **`persist.rs`** — `WalRecord`, `PersistedState` (durability/recovery; the
   write/compact/recover flow is diagrammed in `docs/wal.md`).

@@ -16,7 +16,38 @@ use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{IndexDef, SchemaCatalog, TableName, TableSchema};
+use crate::schema::{IndexDef, SchemaCatalog, StreamSpec, StreamViewType, TableName, TableSchema};
+
+/// The default a [`StreamShardRow`]/[`MetaCommand::SealStreamShard`]'s
+/// `view_type` field decodes to when loading a snapshot encoded before this
+/// field existed (round-3 sealer PR predates it) — never reached by any row
+/// this PR's own sealer writes (which always fills it from the table's
+/// current `StreamSpec.view_type` at seal time), so any placeholder is
+/// equally arbitrary; `NewAndOldImages` is chosen because it is the
+/// least-surprising fallback (over-delivers images rather than silently
+/// dropping one a real reader might have wanted).
+fn default_stream_view_type() -> StreamViewType {
+    StreamViewType::NewAndOldImages
+}
+
+/// Deliberate duplicate of `animus_dynamo::index::INDEX_TABLE_SEPARATOR` —
+/// this crate cannot depend on `animus-dynamo` (dependency direction: see
+/// `animus-tablet`'s `CLAUDE.md`, which documents the identical precedent for
+/// duplicating `escape` rather than adding a dependency edge). Must match
+/// byte-for-byte; used by `CreateTableSchema`'s apply-time rejection below.
+const RESERVED_TABLE_NAME_SEPARATOR: char = '$';
+
+/// A deliberate duplicate of `animus_cp_data::segment::shard_id`'s
+/// `ShardId` format (`shardId-<tablet>-<epoch>`, ADR 0042 §2) — this crate
+/// cannot depend on `animus-cp-data` (dependency direction: that crate
+/// depends on *this* one), mirroring the identical `RESERVED_TABLE_NAME_SEPARATOR`
+/// precedent just above. Must match byte-for-byte; used only by
+/// [`Metadata::stream_shard_parent_id`] to render a `ParentShardId` string
+/// without a second source of truth for the shard-id shape living in this
+/// crate's own catalog rows.
+fn shard_id_string(tablet: TabletId, epoch: u64) -> String {
+    format!("shardId-{}-{epoch}", tablet.0)
+}
 
 /// Lifecycle status of a cluster member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +271,85 @@ pub struct Metadata {
     /// snapshots loading (empty map).
     #[serde(default)]
     pub absorbed_by: BTreeMap<TabletId, TabletId>,
+    /// The stream-shard segment catalog (ADR 0042 §3, ADR 0043 §A8): every
+    /// sealed shard ever committed, keyed by `(tablet, epoch)` — globally
+    /// unique for a tablet's whole lifetime (a tablet's own epoch counter
+    /// counts up from its first seal and never resets across a disable/
+    /// re-enable cycle, ADR 0042 §2), so `table`/`label` live inside
+    /// [`StreamShardRow`] as descriptive fields rather than part of the
+    /// row's identity. Mutated only through [`MetaCommand::SealStreamShard`]
+    /// (first-committer-wins on this same key) and
+    /// [`MetaCommand::ExpireStreamShards`] (the janitor's mark-then-remove
+    /// reclaim, ADR 0043 §A9). `#[serde(default)]` keeps pre-streams
+    /// snapshots loading (empty map).
+    #[serde(default)]
+    pub stream_shards: BTreeMap<(TabletId, u64), StreamShardRow>,
+}
+
+/// A sealed stream shard's catalog row (ADR 0042 §3, ADR 0043 §A3/§A8) — the
+/// replicated record of one committed `SegmentStore` object.
+///
+/// **Identity note**: a row's key is `(tablet, epoch)`
+/// ([`Metadata::stream_shards`]), never `(table, label, tablet, epoch)` — a
+/// tablet id already implies its table, and a tablet's epoch counter is a
+/// property of the tablet's own physical seal history, not of any one
+/// stream generation (ADR 0042 §2's `ShardId = shardId-<tablet>-<epoch>` is
+/// scoped the same way). `table`/`label` are carried here purely as
+/// descriptive fields a reader needs (which stream this shard belongs to,
+/// and which base table), not as part of what makes two rows distinct.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamShardRow {
+    /// The base table this shard's tablet belongs to.
+    pub table: TableName,
+    /// The stream label active when this shard sealed (ADR 0042 §4) — the
+    /// label a `DescribeStream`/`GetRecords` request against this shard
+    /// must present to resolve it (F12-b's catalog-row-based resolution,
+    /// ADR 0042 §4/§11).
+    pub label: String,
+    /// The view type declared by the table's stream when this shard sealed
+    /// (ADR 0042 §3/§15, PR6's catalog amendment) — a shard's own copy of
+    /// what was, at seal time, `TableSchema.stream`'s `StreamViewType`.
+    /// Carried here (not re-derived from the current schema) because a
+    /// `DISABLED`-but-still-readable stream's F12-b grace window has
+    /// **no** live `StreamSpec` to read it from once `SetTableStream{None}`
+    /// commits — a `DescribeStream` against a draining label reports its
+    /// last-known view type from exactly this field. A view type never
+    /// changes mid-stream (only a disable + re-enable can pick a new one,
+    /// which mints a new label), so every row of one label carries the
+    /// identical value. `#[serde(default)]` keeps a row encoded before this
+    /// field existed loading (see [`default_stream_view_type`]'s own doc —
+    /// never reached by a row this PR's own sealer writes).
+    #[serde(default = "default_stream_view_type")]
+    pub view_type: StreamViewType,
+    /// `(start_exclusive, end_inclusive)` committed packed-HLC range — the
+    /// ground truth a reader slices a fetched segment object to
+    /// (`animus_cp_data::segment`'s superset-slice rule, ADR 0042 §10). A
+    /// shard's `EndingSequenceNumber` (ADR 0042 §5) is `hlc_range.1`.
+    pub hlc_range: (u64, u64),
+    /// The number of records the sealing leader's own scan counted.
+    pub count: u64,
+    /// The sealing leader's own `env.now()` at seal time (never a raw OS
+    /// clock, ADR 0003) — observability only, never load-bearing for a
+    /// correctness decision.
+    pub seal_wall_ms: u64,
+    /// The replica set the segment object was pushed to
+    /// (`ClusterSegmentStore::put_replicated`'s own returned set, ADR 0043
+    /// §A7b/§A3 step 3) — recorded so a future reader/repair sweep knows
+    /// exactly where to look without a discovery round.
+    pub replicas: Vec<NodeId>,
+    /// Set by [`MetaCommand::ExpireStreamShards`]'s **mark** phase
+    /// (`remove: false`): the janitor's own record that it has begun
+    /// reclaiming this row's segment object, so a crash-and-resume knows to
+    /// go straight to deleting objects rather than re-marking (harmless
+    /// either way — the mark is idempotent). **Never a visibility gate**: a
+    /// marked-but-not-yet-removed row is still fully valid to serve
+    /// (`DescribeStream`/`GetRecords`) — its segment object still exists
+    /// until the janitor's delete step actually completes, which is what
+    /// licenses removing the row itself, not this flag. `#[serde(default)]`
+    /// keeps a row encoded before this field existed loading as
+    /// not-yet-marked.
+    #[serde(default)]
+    pub expired: bool,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -367,6 +477,99 @@ pub enum MetaCommand {
     SetTableMode {
         table: TableName,
         mode: crate::ReplicationMode,
+    },
+    /// Enable or disable a table's **DynamoDB Streams** configuration (ADR
+    /// 0042 §2/§4/§9). Rejected if the table has no schema. Enabling
+    /// (`spec: Some(..)`) is rejected if a stream is already enabled — the
+    /// caller mints a fresh `label` only through an explicit disable →
+    /// re-enable (never a same-command relabel), so `(table, label)` stays a
+    /// stable identity for as long as the stream lives. Disabling
+    /// (`spec: None`) is a no-op if no stream is enabled. Because this is a
+    /// replicated `MetaCommand`, the stream configuration is durable and
+    /// agreed cluster-wide, like the rest of the catalog.
+    SetTableStream {
+        table: TableName,
+        spec: Option<StreamSpec>,
+    },
+    /// Record a sealed stream shard segment in the replicated catalog (ADR
+    /// 0042 §3/§9, ADR 0043 §A3/§A8) — the tablet leader's own commit of a
+    /// `SegmentStore::put` it has already durably completed.
+    ///
+    /// **First-committer-wins on `(tablet, epoch)`'s CONTENT** (round-3 PR7
+    /// amendment) — mirroring `CreateTablet`'s own race-safety shape,
+    /// generalized from "first tablet" to "first seal of this epoch": a
+    /// second proposal for an already-recorded `(tablet, epoch)` whose
+    /// content (everything but `replicas`) matches exactly is a **no-op**
+    /// if `replicas` also matches (the sealer's own crash-retry loop racing
+    /// itself by design, ADR 0043 §A3: a crash before this command commits
+    /// simply re-runs the whole seal, landing here again with the identical
+    /// `(tablet, epoch)`), or a **replicas-only update, still `Applied`**,
+    /// if `replicas` differs — the shape the segment janitor's own
+    /// replica-repair sweep produces (ADR 0043 §A9): it re-proposes the
+    /// identical committed shard with a freshly-repaired `replicas` set,
+    /// never touching any other field. A proposal whose non-`replicas`
+    /// content genuinely conflicts with what is already recorded is
+    /// rejected as a no-op, exactly as the original design. The proposer is
+    /// expected to log whichever outcome it gets itself, since this pure
+    /// state machine performs no I/O.
+    ///
+    /// **Label validation (F12-b)**: `label` must be licensed either by the
+    /// table's *current* schema `StreamSpec.label`, or by an existing
+    /// catalog row already present for this exact `(table, label)` pair (a
+    /// disabled stream's un-reaped rows still license a further seal of the
+    /// same generation — e.g. the disable-triggered final seal itself,
+    /// proposed after `SetTableStream{None}` has already cleared the
+    /// schema's own `stream` field). A label matching **neither** is
+    /// rejected — nothing ever licensed sealing under it.
+    ///
+    /// **Epoch-chain sanity**: `epoch == 0` is always accepted (a tablet's
+    /// genuine root, or a fresh split child's own first seal, ADR 0042
+    /// §2/ADR 0043 §A4). `epoch > 0` requires either this tablet's own
+    /// `epoch - 1` row to already exist, or (permissive escape hatch for a
+    /// tablet whose own chain start this state machine can't otherwise
+    /// explain) [`Metadata::split_parents`] naming a source tablet for it —
+    /// kept permissive rather than exact, since this guard's job is to
+    /// catch a genuinely nonsensical gap, not to re-derive the sealer's own
+    /// scheduling.
+    SealStreamShard {
+        table: TableName,
+        label: String,
+        tablet: TabletId,
+        epoch: u64,
+        /// This shard's own view type (PR6's catalog amendment) — see
+        /// [`StreamShardRow::view_type`]'s doc for why it rides the row
+        /// rather than being re-derived from the current schema.
+        /// `#[serde(default)]` for the same reason the row field has it.
+        #[serde(default = "default_stream_view_type")]
+        view_type: StreamViewType,
+        hlc_range: (u64, u64),
+        count: u64,
+        seal_wall_ms: u64,
+        replicas: Vec<NodeId>,
+    },
+    /// The segment-janitor's two-phase reclaim of already-sealed catalog
+    /// rows (ADR 0043 §A9), and the drop-table cascade's own removal path
+    /// — reused directly rather than a separate drop-specific command,
+    /// since "these rows should no longer exist" is the same fact whether
+    /// the reason is retention or a table drop.
+    ///
+    /// `remove: false` **marks** every named `(tablet, epoch)` row
+    /// `expired: true` (idempotent: a no-op for an absent row, or one
+    /// already marked) — the janitor's own record that it has begun
+    /// reclaiming that row's segment object, so a crash mid-sweep resumes
+    /// by going straight to deleting objects rather than re-marking.
+    /// `remove: true` **physically removes** every named row (idempotent: a
+    /// no-op for an absent row, regardless of its `expired` flag — a
+    /// drop-table cascade may remove a row that was never marked at all).
+    /// One command, proposed twice by the janitor (mark, then — once every
+    /// recorded replica has confirmed its segment object deleted — remove),
+    /// is ADR 0043 §A9's whole "two-phase: mark expired, delete objects,
+    /// drop rows" sequence; the object-deletion step in between is not
+    /// itself a `MetaCommand` (it is a `SegmentStore::delete` call against
+    /// each row's own recorded `replicas`, a later PR).
+    ExpireStreamShards {
+        rows: Vec<(TabletId, u64)>,
+        remove: bool,
     },
     /// Register a **keyspace** name (ADR 0013 / v1 A3). Idempotent: a no-op if the
     /// keyspace already exists. Replicated so a CQL `CREATE KEYSPACE` is durable +
@@ -864,6 +1067,40 @@ impl Metadata {
                 if l.table != r.table {
                     return ApplyOutcome::Rejected("tablets belong to different tables");
                 }
+                // ADR 0042 §12 / ADR 0043 §A5 (F1): **v1 stopgap** — reject
+                // `MergeTablets` outright on a base table with an *enabled*
+                // stream, or one with *any* still-draining catalog rows (a
+                // disabled-but-not-yet-reaped stream's shards still
+                // reference this tablet's own lineage, which a merge would
+                // corrupt by widening a range a shard's `ParentShardId`
+                // chain assumes only ever narrows). This is explicitly
+                // temporary: tablet merge is being removed globally
+                // (split-only tablets, its own forthcoming ADR + deletion
+                // stack) — this guard becomes dead code that ADR deletes
+                // along with `MergeTablets` itself, not a permanent
+                // position on merge. The disable → merge → re-enable
+                // workaround is honest under F12-b (a genuinely new stream
+                // identity).
+                if let Some(table_name) = &l.table {
+                    let has_enabled_stream = self
+                        .schemas
+                        .get(table_name)
+                        .is_some_and(|s| s.stream.is_some());
+                    let has_draining_rows = self
+                        .stream_shards
+                        .values()
+                        .any(|row| row.table == *table_name);
+                    if has_enabled_stream || has_draining_rows {
+                        return ApplyOutcome::Rejected(
+                            "merge rejected (v1 stopgap): base table has an enabled or \
+                             still-draining DynamoDB stream — tablet merge is being removed \
+                             globally in a forthcoming split-only ADR, which will delete this \
+                             guard along with MergeTablets itself; disable the stream (or wait \
+                             for its rows to drain) before merging, or merge then re-enable as \
+                             a new stream identity",
+                        );
+                    }
+                }
                 let new_end = r.range.end.clone();
                 let l = self.tablets.get_mut(left).expect("tablet present");
                 l.range.end = new_end;
@@ -903,6 +1140,23 @@ impl Metadata {
                 if crate::syskv::is_reserved_name(table) {
                     return ApplyOutcome::Rejected(
                         "table name collides with the reserved system namespace",
+                    );
+                }
+                // A hidden GSI/LSI index table (`<base>$<index>`, ADR 0041
+                // §1) can never collide with a user table's own name **only
+                // if** a user table name is itself forbidden from containing
+                // the separator that hidden-table convention builds on —
+                // checked here, at the one place a user table name is ever
+                // registered (a hidden table gets only a tablet-map row via
+                // `CreateTablet`, never a catalog schema entry of its own).
+                // `RESERVED_TABLE_NAME_SEPARATOR` is a deliberate duplicate of
+                // `animus_dynamo::index::INDEX_TABLE_SEPARATOR` — this crate
+                // cannot depend on `animus-dynamo` (dependency direction; see
+                // `animus-tablet`'s `CLAUDE.md` for the identical `escape`
+                // duplication precedent) — and must match it byte-for-byte.
+                if table.contains(RESERVED_TABLE_NAME_SEPARATOR) {
+                    return ApplyOutcome::Rejected(
+                        "table name may not contain the reserved `$` separator",
                     );
                 }
                 if self.schemas.contains(table) {
@@ -986,6 +1240,144 @@ impl Metadata {
                 }
                 schema.mode = *mode;
                 ApplyOutcome::Applied
+            }
+            MetaCommand::SetTableStream { table, spec } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                match spec {
+                    Some(new_spec) => {
+                        if schema.stream.is_some() {
+                            return ApplyOutcome::Rejected(
+                                "table stream already enabled (disable before re-enabling \
+                                 to mint a new label)",
+                            );
+                        }
+                        schema.stream = Some(new_spec.clone());
+                    }
+                    None => {
+                        if schema.stream.is_none() {
+                            return ApplyOutcome::NoOp;
+                        }
+                        schema.stream = None;
+                    }
+                }
+                ApplyOutcome::Applied
+            }
+            MetaCommand::SealStreamShard {
+                table,
+                label,
+                tablet,
+                epoch,
+                view_type,
+                hlc_range,
+                count,
+                seal_wall_ms,
+                replicas,
+            } => {
+                // First-committer-wins on CONTENT, not merely on identity
+                // (round-3 PR7 amendment, ADR 0043 §A3/§A9): a second
+                // proposal for an already-recorded (tablet, epoch) is
+                // evaluated against the existing row's own content fields
+                // (everything except `replicas`/`expired`). Two shapes are
+                // legitimate and must both apply cleanly:
+                //   - the sealer's own crash-retry loop racing itself
+                //     (identical content, including `replicas` — a true
+                //     no-op); and
+                //   - the segment janitor's replica-repair sweep (ADR 0043
+                //     §A9) re-proposing the *same* committed shard with an
+                //     updated `replicas` set, once it has re-replicated a
+                //     copy lost to a dead/removed member onto a fresh
+                //     target — everything else about the shard is, by
+                //     construction, unchanged (repair never re-derives
+                //     `hlc_range`/`count`/etc., it only moves bytes).
+                // A proposal whose non-`replicas` content genuinely
+                // differs from what is already recorded is rejected as a
+                // no-op exactly as before — this state machine never lets
+                // a second, conflicting seal silently overwrite a
+                // committed shard's own facts, only its replica location.
+                // Safe for every reader: `GetRecords`/the janitor always
+                // re-fetch the row fresh before consulting `replicas`, so
+                // an in-place update is observed atomically, never a torn
+                // read of a half-updated set.
+                if let Some(existing) = self.stream_shards.get_mut(&(*tablet, *epoch)) {
+                    let content_matches = existing.table == *table
+                        && existing.label == *label
+                        && existing.view_type == *view_type
+                        && existing.hlc_range == *hlc_range
+                        && existing.count == *count
+                        && existing.seal_wall_ms == *seal_wall_ms;
+                    if !content_matches || existing.replicas == *replicas {
+                        return ApplyOutcome::NoOp;
+                    }
+                    existing.replicas = replicas.clone();
+                    return ApplyOutcome::Applied;
+                }
+                // Label validation (F12-b): licensed by the table's
+                // *current* schema stream spec, or by an existing catalog
+                // row already present for this exact (table, label) pair
+                // (a disabled stream's un-reaped rows still license a
+                // further seal of the same generation).
+                let current_label_matches = self
+                    .schemas
+                    .get(table)
+                    .and_then(|s| s.stream.as_ref())
+                    .is_some_and(|spec| spec.label == *label);
+                let existing_row_for_label = self
+                    .stream_shards
+                    .values()
+                    .any(|row| row.table == *table && row.label == *label);
+                if !current_label_matches && !existing_row_for_label {
+                    return ApplyOutcome::Rejected(
+                        "stream label has no current schema entry and no existing catalog rows \
+                         to extend",
+                    );
+                }
+                // Epoch-chain sanity (permissive-but-sane, see this
+                // command's own doc): epoch 0 always accepted; epoch > 0
+                // needs either a local predecessor row or split-parent
+                // provenance explaining this tablet's own chain start.
+                if *epoch > 0
+                    && !self.stream_shards.contains_key(&(*tablet, *epoch - 1))
+                    && !self.split_parents.contains_key(tablet)
+                {
+                    return ApplyOutcome::Rejected(
+                        "epoch chain gap: no prior epoch row for this tablet and no \
+                         split-parent provenance to explain it",
+                    );
+                }
+                self.stream_shards.insert(
+                    (*tablet, *epoch),
+                    StreamShardRow {
+                        table: table.clone(),
+                        label: label.clone(),
+                        view_type: *view_type,
+                        hlc_range: *hlc_range,
+                        count: *count,
+                        seal_wall_ms: *seal_wall_ms,
+                        replicas: replicas.clone(),
+                        expired: false,
+                    },
+                );
+                ApplyOutcome::Applied
+            }
+            MetaCommand::ExpireStreamShards { rows, remove } => {
+                let mut changed = false;
+                for (tablet, epoch) in rows {
+                    if *remove {
+                        changed |= self.stream_shards.remove(&(*tablet, *epoch)).is_some();
+                    } else if let Some(row) = self.stream_shards.get_mut(&(*tablet, *epoch))
+                        && !row.expired
+                    {
+                        row.expired = true;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
             }
             MetaCommand::CreateKeyspace { keyspace } => {
                 if crate::syskv::is_reserved_name(keyspace) {
@@ -1257,6 +1649,145 @@ impl Metadata {
         self.schemas.get(table).map_or(&[], |s| &s.indexes)
     }
 
+    /// This table's DynamoDB Streams configuration (ADR 0042), if enabled.
+    /// `None` for an unknown table or one with no stream. A read accessor for
+    /// the wire adapters that consume the replicated catalog.
+    #[must_use]
+    pub fn table_stream(&self, table: &str) -> Option<&StreamSpec> {
+        self.schemas.get(table).and_then(|s| s.stream.as_ref())
+    }
+
+    /// `tablet`'s own catalog rows for `(table, label)`, in ascending epoch
+    /// order (ADR 0042 §2/§3) — the chain a `DescribeStream`/lineage-walk
+    /// consumer needs for one tablet. `BTreeMap<(TabletId, u64), _>`'s own
+    /// key order already sorts by tablet then epoch, so a bounded range
+    /// query over this one tablet's key space, filtered to the requested
+    /// `(table, label)`, comes back in the right order for free — no
+    /// separate sort.
+    pub fn stream_shard_chain<'a>(
+        &'a self,
+        table: &'a str,
+        label: &'a str,
+        tablet: TabletId,
+    ) -> impl Iterator<Item = (u64, &'a StreamShardRow)> {
+        self.stream_shards
+            .range((tablet, 0)..=(tablet, u64::MAX))
+            .filter(move |((_, _), row)| row.table == table && row.label == label)
+            .map(|((_, epoch), row)| (*epoch, row))
+    }
+
+    /// `tablet`'s effective stream watermark (ADR 0042 §8/ADR 0043 §A6,
+    /// F10): the tablet's own shard chain's **last sealed end-HLC** —
+    /// `None` if it has never sealed (the safe, trim-blocking default every
+    /// cold consumer already gets). Scoped to the tablet's own chain
+    /// **regardless of label** — a tablet's physical seal history is one
+    /// continuous sequence across however many stream generations
+    /// (enable/disable/re-enable cycles) it has lived through, so the
+    /// watermark the hot-trim arm needs is "how far has this tablet's own
+    /// log been sealed," not "how far has *this* label's log been sealed."
+    #[must_use]
+    pub fn stream_shard_watermark(&self, tablet: TabletId) -> Option<u64> {
+        self.stream_shards
+            .range((tablet, 0)..=(tablet, u64::MAX))
+            .next_back()
+            .map(|(_, row)| row.hlc_range.1)
+    }
+
+    /// `tablet`'s effective stream watermark **including split-parent
+    /// inheritance** (ADR 0043 §A4/§A6): [`stream_shard_watermark`]
+    /// restricted to `tablet`'s own chain is `None` for a fresh split child
+    /// that hasn't sealed a shard of its own yet — but ADR 0043 §A4 is
+    /// explicit that such a child's *initial* watermark is its parent
+    /// tablet's chain's own last-sealed end-HLC, not absent, since the
+    /// parent's sealed segments are shared history both children inherit.
+    /// This walks [`Metadata::split_parents`] (a tablet can itself be a
+    /// split child of a split child, so the walk continues until it finds a
+    /// tablet with a sealed row of its own, or runs out of provenance) and
+    /// is what the sealer/hot-trim arm (ADR 0043 §A3/§A6, `animusd::
+    /// index_drain`) actually calls — never the bare
+    /// [`stream_shard_watermark`], which only answers "this exact tablet's
+    /// own chain," a narrower question than the one a fresh child's watermark
+    /// computation needs answered.
+    #[must_use]
+    pub fn effective_stream_shard_watermark(&self, tablet: TabletId) -> Option<u64> {
+        let mut current = tablet;
+        loop {
+            if let Some(w) = self.stream_shard_watermark(current) {
+                return Some(w);
+            }
+            current = *self.split_parents.get(&current)?;
+        }
+    }
+
+    /// Every catalog row for `(table, label)`, across every tablet, in
+    /// ascending `(tablet, epoch)` order (ADR 0042 §3 — `DescribeStream`'s
+    /// own read, and a later PR's lineage-walk consumer).
+    pub fn stream_shard_rows_for_label<'a>(
+        &'a self,
+        table: &'a str,
+        label: &'a str,
+    ) -> impl Iterator<Item = (TabletId, u64, &'a StreamShardRow)> {
+        self.stream_shards
+            .iter()
+            .filter(move |((_, _), row)| row.table == table && row.label == label)
+            .map(|((tablet, epoch), row)| (*tablet, *epoch, row))
+    }
+
+    /// `(table, label)`'s view type (PR6's DescribeStream read, ADR 0042
+    /// §3/§15): the table's *current* `StreamSpec.view_type` when `label` is
+    /// still the enabled one, else the last-known value carried by any of
+    /// the label's own catalog rows (a view type never changes mid-stream —
+    /// every row of one label carries the identical value, see
+    /// [`StreamShardRow::view_type`]'s doc) — `None` only when `label` is
+    /// neither the current schema label nor has ever sealed a row (F12-b: a
+    /// caller should already have rejected such a label as
+    /// `ResourceNotFoundException` before asking this).
+    #[must_use]
+    pub fn stream_view_type(&self, table: &str, label: &str) -> Option<StreamViewType> {
+        if let Some(spec) = self.table_stream(table)
+            && spec.label == label
+        {
+            return Some(spec.view_type);
+        }
+        self.stream_shard_rows_for_label(table, label)
+            .next()
+            .map(|(_, _, row)| row.view_type)
+    }
+
+    /// Every distinct label of `table` that still has at least one catalog
+    /// row (F12-b coexistence, ADR 0042 §4/§11): a `DISABLED`-but-unreaped
+    /// stream's label stays in this set for as long as any of its rows
+    /// haven't been reaped, alongside the table's current (if any) enabled
+    /// label — this is what lets `ListStreams` show both during a disable
+    /// grace window.
+    #[must_use]
+    pub fn stream_labels_with_rows(&self, table: &str) -> BTreeSet<String> {
+        self.stream_shards
+            .values()
+            .filter(|row| row.table == table)
+            .map(|row| row.label.clone())
+            .collect()
+    }
+
+    /// `(tablet, epoch)`'s own `ParentShardId` (ADR 0042 §2/ADR 0043 §A4),
+    /// derived rather than stored — a routine seal's child names the same
+    /// tablet's own previous epoch; an epoch-0 shard names the *parent
+    /// tablet's* own last shard, if any (via [`Metadata::split_parents`]).
+    /// `None` for a genuine root (an epoch-0 shard whose tablet has no
+    /// split parent, or a split parent that itself never sealed).
+    #[must_use]
+    pub fn stream_shard_parent_id(&self, tablet: TabletId, epoch: u64) -> Option<String> {
+        if epoch > 0 {
+            return Some(shard_id_string(tablet, epoch - 1));
+        }
+        let parent_tablet = *self.split_parents.get(&tablet)?;
+        let ((_, parent_epoch), _) = self
+            .stream_shards
+            .range((parent_tablet, 0)..=(parent_tablet, u64::MAX))
+            .next_back()?;
+        Some(shard_id_string(parent_tablet, *parent_epoch))
+    }
+
     /// The tablets scoped to `table` (ADR 0023), in ascending tablet-id order.
     /// Empty if no table-scoped tablet exists for it yet (a freshly created table
     /// whose tablet has not committed, or a legacy cluster whose only tablet is the
@@ -1494,6 +2025,21 @@ mod tests {
                 schema,
             }),
             ApplyOutcome::Applied
+        );
+    }
+
+    /// `CreateTableSchema` rejects any user table name containing the
+    /// reserved `$` separator (the collision-safety argument ADR 0041's
+    /// hidden index-table naming convention depends on).
+    #[test]
+    fn create_table_schema_rejects_the_reserved_separator() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders$byCustomer".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Rejected("table name may not contain the reserved `$` separator")
         );
     }
 
@@ -2866,5 +3412,549 @@ mod tests {
             )
         );
         assert!(!m.node_addrs.contains_key(&nid(905)));
+    }
+
+    // --- ADR 0042/0043 stream-shard catalog ---------------------------
+
+    use crate::schema::StreamViewType;
+
+    fn stream_spec(label: &str) -> StreamSpec {
+        StreamSpec {
+            view_type: StreamViewType::NewAndOldImages,
+            label: label.to_owned(),
+        }
+    }
+
+    fn enable_stream(m: &mut Metadata, table: &str, label: &str) {
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: table.to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableStream {
+                table: table.to_owned(),
+                spec: Some(stream_spec(label)),
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
+    fn seal(table: &str, label: &str, tablet: u64, epoch: u64, end: u64) -> MetaCommand {
+        MetaCommand::SealStreamShard {
+            table: table.to_owned(),
+            label: label.to_owned(),
+            tablet: TabletId(tablet),
+            epoch,
+            view_type: StreamViewType::NewAndOldImages,
+            hlc_range: (end.saturating_sub(100), end),
+            count: 1,
+            seal_wall_ms: 1_700_000_000_000,
+            replicas: vec![nid(1), nid(2), nid(3)],
+        }
+    }
+
+    /// First-committer-wins on `(tablet, epoch)`'s **content** (ADR 0043
+    /// §A8, round-3 PR7 amendment): the first proposal for an identity
+    /// lands; a byte-identical re-propose (the sealer's own crash-retry) is
+    /// a no-op; a proposal whose non-`replicas` content genuinely differs
+    /// (a stale/duelling leader) is also a no-op that never overwrites the
+    /// winning row's own facts. The replicas-only-update case (the segment
+    /// janitor's repair sweep) is covered by its own test below.
+    #[test]
+    fn seal_stream_shard_first_committer_wins_on_tablet_epoch() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            ApplyOutcome::Applied
+        );
+        let first = m.stream_shards[&(TabletId(1), 0)].clone();
+        assert_eq!(first.hlc_range, (0, 100));
+
+        // Byte-identical re-propose (the sealer's own crash-retry).
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(m.stream_shards[&(TabletId(1), 0)], first);
+
+        // A genuinely differing proposal for the SAME (tablet, epoch) — a
+        // duelling/stale leader — must not overwrite the winner either.
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 1, 0, 999)),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(
+            m.stream_shards[&(TabletId(1), 0)],
+            first,
+            "the first committer's row must survive unchanged"
+        );
+    }
+
+    /// The segment janitor's replica-repair shape (ADR 0043 §A9, round-3
+    /// PR7): a second proposal for an already-committed `(tablet, epoch)`
+    /// whose content matches exactly but whose `replicas` differs is
+    /// `Applied` — a genuine in-place update — never a `NoOp`. A
+    /// content-conflicting proposal (a different `hlc_range`) with the
+    /// identical new `replicas` is still rejected as a `NoOp`, proving the
+    /// content check runs independently of whether `replicas` also
+    /// happens to differ.
+    #[test]
+    fn seal_stream_shard_replicas_only_update_applies() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            ApplyOutcome::Applied
+        );
+        let original = m.stream_shards[&(TabletId(1), 0)].clone();
+        assert_eq!(original.replicas, vec![nid(1), nid(2), nid(3)]);
+
+        // Repair: node 2 was lost and replaced by node 4 — identical
+        // content, a different replica set.
+        let mut repaired = seal("orders", "L1", 1, 0, 100);
+        if let MetaCommand::SealStreamShard { replicas, .. } = &mut repaired {
+            *replicas = vec![nid(1), nid(3), nid(4)];
+        }
+        assert_eq!(m.apply(&repaired), ApplyOutcome::Applied);
+        let row = &m.stream_shards[&(TabletId(1), 0)];
+        assert_eq!(row.replicas, vec![nid(1), nid(3), nid(4)]);
+        // Every other field is untouched.
+        assert_eq!(row.hlc_range, original.hlc_range);
+        assert_eq!(row.count, original.count);
+        assert_eq!(row.seal_wall_ms, original.seal_wall_ms);
+        assert_eq!(row.view_type, original.view_type);
+        assert!(!row.expired, "a replicas update never touches `expired`");
+
+        // Re-proposing the now-current (repaired) replicas is a genuine
+        // no-op — nothing left to change.
+        assert_eq!(m.apply(&repaired), ApplyOutcome::NoOp);
+
+        // But a proposal that ALSO changes real content (a different
+        // `hlc_range`) alongside a new replica set is still rejected,
+        // never applied — the content check is independent of whether
+        // `replicas` happens to differ too.
+        let mut conflicting = seal("orders", "L1", 1, 0, 999);
+        if let MetaCommand::SealStreamShard { replicas, .. } = &mut conflicting {
+            *replicas = vec![nid(5)];
+        }
+        assert_eq!(m.apply(&conflicting), ApplyOutcome::NoOp);
+        assert_eq!(
+            m.stream_shards[&(TabletId(1), 0)].replicas,
+            vec![nid(1), nid(3), nid(4)],
+            "a content-conflicting proposal must not sneak a replicas update through"
+        );
+    }
+
+    /// Label validation (F12-b): a label with a matching *current* schema
+    /// stream spec is accepted; a label matching neither the current spec
+    /// nor any existing row is rejected; and — the draining case — a label
+    /// with no current schema entry (disabled) but at least one existing
+    /// catalog row still licenses a further seal under it (e.g. the
+    /// disable-triggered final seal, proposed after `SetTableStream{None}`
+    /// already cleared the schema).
+    #[test]
+    fn seal_stream_shard_validates_label_against_schema_or_existing_rows() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+
+        // A label nobody has ever licensed: rejected.
+        assert_eq!(
+            m.apply(&seal("orders", "bogus", 1, 0, 100)),
+            ApplyOutcome::Rejected(
+                "stream label has no current schema entry and no existing catalog rows \
+                 to extend"
+            )
+        );
+        assert!(m.stream_shards.is_empty());
+
+        // The current schema's own label: accepted.
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            ApplyOutcome::Applied
+        );
+
+        // Disable the stream — the schema no longer names "L1" at all —
+        // then seal a further epoch under the SAME label (the
+        // disable-triggered final seal): still accepted, because an
+        // existing row for (orders, L1) already licenses it.
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableStream {
+                table: "orders".to_owned(),
+                spec: None,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.table_stream("orders").is_none(), "test premise");
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 1, 1, 200)),
+            ApplyOutcome::Applied,
+            "a disabled stream's un-reaped rows must still license a further seal \
+             of the same generation"
+        );
+
+        // A DIFFERENT label, still with no schema entry and no rows of its
+        // own, remains rejected even though the table has *some* rows.
+        assert_eq!(
+            m.apply(&seal("orders", "L2", 1, 2, 300)),
+            ApplyOutcome::Rejected(
+                "stream label has no current schema entry and no existing catalog rows \
+                 to extend"
+            )
+        );
+    }
+
+    /// Epoch-chain sanity: epoch 0 is always accepted; epoch > 0 needs
+    /// either a local predecessor row or `split_parents` provenance to
+    /// explain the tablet's own chain start (permissive-but-sane).
+    #[test]
+    fn seal_stream_shard_epoch_chain_guard() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+
+        // epoch 0 with no history at all: always fine.
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            ApplyOutcome::Applied
+        );
+
+        // epoch 2 with no epoch-1 row and no split-parent provenance for
+        // tablet 1: rejected — a genuine gap this state machine can't
+        // explain.
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 1, 2, 300)),
+            ApplyOutcome::Rejected(
+                "epoch chain gap: no prior epoch row for this tablet and no \
+                 split-parent provenance to explain it"
+            )
+        );
+
+        // Filling in epoch 1 makes epoch 2 acceptable.
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 1, 1, 200)),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 1, 2, 300)),
+            ApplyOutcome::Applied
+        );
+
+        // A fresh split child (tablet 2, split_parents[2] = 1) with NO
+        // local history at all may seal epoch 0 (the ordinary case)...
+        m.split_parents.insert(TabletId(2), TabletId(1));
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 2, 0, 350)),
+            ApplyOutcome::Applied
+        );
+        // ...and the permissive escape hatch: epoch 1 is also accepted for
+        // tablet 2 even without a local epoch-0 row of its own removed —
+        // wait, epoch 0 already exists for tablet 2 above, so exercise the
+        // escape hatch on a THIRD tablet that has split provenance but no
+        // local rows at all yet.
+        m.split_parents.insert(TabletId(3), TabletId(1));
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 3, 1, 400)),
+            ApplyOutcome::Applied,
+            "split-parent provenance must license a non-zero epoch with no local history"
+        );
+    }
+
+    /// `ExpireStreamShards`'s two-phase shape (ADR 0043 §A9): `remove:
+    /// false` marks a row `expired` in place (idempotent, never removes
+    /// it); `remove: true` physically removes it (idempotent, works
+    /// whether or not the row was ever marked). Absent rows are a no-op
+    /// either way.
+    #[test]
+    fn expire_stream_shards_mark_then_remove_is_idempotent() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        m.apply(&seal("orders", "L1", 1, 0, 100));
+        m.apply(&seal("orders", "L1", 1, 1, 200));
+
+        // Mark: row(s) present, not yet expired -> Applied, now expired.
+        assert_eq!(
+            m.apply(&MetaCommand::ExpireStreamShards {
+                rows: vec![(TabletId(1), 0)],
+                remove: false,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.stream_shards[&(TabletId(1), 0)].expired);
+        assert!(
+            !m.stream_shards[&(TabletId(1), 1)].expired,
+            "only the named row is marked"
+        );
+
+        // Re-marking the same row is idempotent (a no-op, not a re-Applied).
+        assert_eq!(
+            m.apply(&MetaCommand::ExpireStreamShards {
+                rows: vec![(TabletId(1), 0)],
+                remove: false,
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        // Marking an absent row is a no-op.
+        assert_eq!(
+            m.apply(&MetaCommand::ExpireStreamShards {
+                rows: vec![(TabletId(99), 0)],
+                remove: false,
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        // The marked-but-not-removed row is STILL present (never a
+        // visibility gate) until the janitor's remove phase.
+        assert!(m.stream_shards.contains_key(&(TabletId(1), 0)));
+
+        // Remove: physically deletes the row.
+        assert_eq!(
+            m.apply(&MetaCommand::ExpireStreamShards {
+                rows: vec![(TabletId(1), 0)],
+                remove: true,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m.stream_shards.contains_key(&(TabletId(1), 0)));
+
+        // Removing an already-removed (or never-marked, drop-table-cascade
+        // shape) row is idempotent.
+        assert_eq!(
+            m.apply(&MetaCommand::ExpireStreamShards {
+                rows: vec![(TabletId(1), 0)],
+                remove: true,
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::ExpireStreamShards {
+                rows: vec![(TabletId(1), 1)],
+                remove: true,
+            }),
+            ApplyOutcome::Applied,
+            "remove works directly on a never-marked row (the drop-table cascade shape)"
+        );
+    }
+
+    fn adjacent_tablets(m: &mut Metadata, table: &str) {
+        let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some(table.to_owned()),
+                range: KeyRange::new(Vec::new(), Some(mid.clone())),
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+        // A second direct `CreateTablet` for the same table is rejected
+        // (ADR 0023 — only `SplitTablet` may mint a table's further
+        // tablets), so construct the adjacent sibling by hand, mirroring
+        // `mirror.rs`'s own merge-scenario test helper.
+        m.tablets.insert(
+            TabletId(2),
+            Tablet::with_table(
+                TabletId(2),
+                Some(table.to_owned()),
+                KeyRange::new(mid, None),
+                vec![nid(1)],
+            ),
+        );
+    }
+
+    fn merge_orders(m: &Metadata) -> MetaCommand {
+        MetaCommand::MergeTablets {
+            left: TabletId(1),
+            expected_left_epoch: m.tablets[&TabletId(1)].epoch,
+            right: TabletId(2),
+            expected_right_epoch: m.tablets[&TabletId(2)].epoch,
+        }
+    }
+
+    /// F1 merge stopgap (ADR 0042 §12/ADR 0043 §A5): `MergeTablets` is
+    /// rejected outright on a base table with a currently **enabled**
+    /// stream.
+    #[test]
+    fn merge_rejected_when_base_table_has_an_enabled_stream() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        adjacent_tablets(&mut m, "orders");
+
+        let outcome = m.apply(&merge_orders(&m.clone()));
+        match outcome {
+            ApplyOutcome::Rejected(msg) => assert!(msg.contains("v1 stopgap"), "{msg}"),
+            other => panic!("expected a stopgap rejection, got {other:?}"),
+        }
+        assert!(
+            m.tablets.contains_key(&TabletId(2)),
+            "the merge must not have applied"
+        );
+    }
+
+    /// F1 merge stopgap: also rejected while the base table has any
+    /// still-**draining** catalog rows, even after the stream itself has
+    /// been disabled (the schema no longer names it at all) — a shard's
+    /// lineage still references this tablet, so widening it would corrupt
+    /// that lineage regardless of whether the stream is currently enabled.
+    #[test]
+    fn merge_rejected_when_base_table_has_undrained_catalog_rows() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        m.apply(&seal("orders", "L1", 1, 0, 100));
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableStream {
+                table: "orders".to_owned(),
+                spec: None,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.table_stream("orders").is_none(), "test premise: disabled");
+        adjacent_tablets(&mut m, "orders");
+
+        let outcome = m.apply(&merge_orders(&m.clone()));
+        match outcome {
+            ApplyOutcome::Rejected(msg) => assert!(msg.contains("v1 stopgap"), "{msg}"),
+            other => panic!("expected a stopgap rejection, got {other:?}"),
+        }
+        assert!(m.tablets.contains_key(&TabletId(2)));
+    }
+
+    /// A plain table with no stream ever enabled, and one whose stream's
+    /// rows have all fully drained, merges exactly as before (positive
+    /// control — the guard must not over-reject).
+    #[test]
+    fn merge_allowed_for_a_table_with_no_stream_or_fully_drained_rows() {
+        // No stream at all.
+        let mut m = Metadata::default();
+        adjacent_tablets(&mut m, "plain");
+        assert_eq!(m.apply(&merge_orders(&m.clone())), ApplyOutcome::Applied);
+
+        // A stream that existed, sealed, and fully drained (every row
+        // removed) — merge must be allowed again.
+        let mut m2 = Metadata::default();
+        enable_stream(&mut m2, "drained", "L1");
+        m2.apply(&seal("drained", "L1", 1, 0, 100));
+        assert_eq!(
+            m2.apply(&MetaCommand::SetTableStream {
+                table: "drained".to_owned(),
+                spec: None,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m2.apply(&MetaCommand::ExpireStreamShards {
+                rows: vec![(TabletId(1), 0)],
+                remove: true,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m2.stream_shards.is_empty(), "test premise: fully drained");
+        adjacent_tablets(&mut m2, "drained");
+        assert_eq!(m2.apply(&merge_orders(&m2.clone())), ApplyOutcome::Applied);
+    }
+
+    // --- accessors ------------------------------------------------------
+
+    /// `stream_shard_chain`/`stream_shard_watermark`/
+    /// `stream_shard_rows_for_label`/`stream_labels_with_rows` over a
+    /// multi-epoch, multi-tablet fixture (one tablet with a split child).
+    #[test]
+    fn stream_shard_accessors_over_a_multi_epoch_multi_tablet_fixture() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        m.apply(&seal("orders", "L1", 1, 0, 100));
+        m.apply(&seal("orders", "L1", 1, 1, 200));
+        m.apply(&seal("orders", "L1", 1, 2, 300));
+        m.split_parents.insert(TabletId(2), TabletId(1));
+        m.apply(&seal("orders", "L1", 2, 0, 350));
+
+        // Chain: ascending epoch order, scoped to this tablet + label.
+        let chain: Vec<u64> = m
+            .stream_shard_chain("orders", "L1", TabletId(1))
+            .map(|(epoch, _)| epoch)
+            .collect();
+        assert_eq!(chain, vec![0, 1, 2]);
+
+        // Watermark: the tablet's own last-sealed end-HLC, per tablet.
+        assert_eq!(m.stream_shard_watermark(TabletId(1)), Some(300));
+        assert_eq!(m.stream_shard_watermark(TabletId(2)), Some(350));
+        assert_eq!(m.stream_shard_watermark(TabletId(99)), None);
+
+        // Rows for a label: every tablet, ascending (tablet, epoch).
+        let all: Vec<(u64, u64)> = m
+            .stream_shard_rows_for_label("orders", "L1")
+            .map(|(t, e, _)| (t.0, e))
+            .collect();
+        assert_eq!(all, vec![(1, 0), (1, 1), (1, 2), (2, 0)]);
+
+        // Labels with rows: just "L1" here; disabling doesn't remove rows.
+        assert_eq!(
+            m.stream_labels_with_rows("orders"),
+            BTreeSet::from(["L1".to_owned()])
+        );
+        assert!(m.stream_labels_with_rows("nonexistent").is_empty());
+
+        // Parent shard id: epoch>0 names the same tablet's own previous
+        // epoch; a split child's epoch-0 names its parent's last shard.
+        assert_eq!(
+            m.stream_shard_parent_id(TabletId(1), 2),
+            Some("shardId-1-1".to_owned())
+        );
+        assert_eq!(m.stream_shard_parent_id(TabletId(1), 0), None);
+        assert_eq!(
+            m.stream_shard_parent_id(TabletId(2), 0),
+            Some("shardId-1-2".to_owned()),
+            "the split child's epoch-0 parent is tablet 1's own LAST shard"
+        );
+    }
+
+    /// `effective_stream_shard_watermark` (ADR 0043 §A4/§A6): a tablet with
+    /// its own sealed rows answers from its own chain (matching the plain
+    /// `stream_shard_watermark`); a fresh split child with NO rows of its
+    /// own inherits its parent's last-sealed end-HLC instead of reading as
+    /// absent; the inheritance walk continues through a **chain** of split
+    /// parents (a grandchild inherits from its grandparent's own last seal
+    /// when neither it nor its immediate parent has ever sealed); and a
+    /// tablet with no rows and no split-parent provenance at all is still
+    /// genuinely absent.
+    #[test]
+    fn effective_stream_shard_watermark_inherits_through_split_provenance() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        m.apply(&seal("orders", "L1", 1, 0, 100));
+        m.apply(&seal("orders", "L1", 1, 1, 200));
+
+        // Tablet 1 has its own rows: identical to the plain accessor.
+        assert_eq!(m.effective_stream_shard_watermark(TabletId(1)), Some(200));
+
+        // Tablet 2 is a split child of tablet 1 with no rows of its own yet:
+        // inherits tablet 1's last-sealed end-HLC.
+        m.split_parents.insert(TabletId(2), TabletId(1));
+        assert_eq!(
+            m.stream_shard_watermark(TabletId(2)),
+            None,
+            "test premise: tablet 2 has never sealed on its own"
+        );
+        assert_eq!(m.effective_stream_shard_watermark(TabletId(2)), Some(200));
+
+        // Tablet 3 is a split child of tablet 2 (itself a split child), with
+        // no rows anywhere in the chain: inherits transitively through both
+        // hops to tablet 1's watermark.
+        m.split_parents.insert(TabletId(3), TabletId(2));
+        assert_eq!(m.effective_stream_shard_watermark(TabletId(3)), Some(200));
+
+        // Once tablet 2 seals its own first shard, tablet 3 still has no
+        // rows of its own, but its immediate parent now does — the walk
+        // stops one hop earlier and answers from tablet 2 (350), not
+        // tablet 1's now-stale 200.
+        m.apply(&seal("orders", "L1", 2, 0, 350));
+        assert_eq!(m.effective_stream_shard_watermark(TabletId(3)), Some(350));
+
+        // No rows and no split-parent provenance at all: genuinely absent.
+        assert_eq!(m.effective_stream_shard_watermark(TabletId(99)), None);
     }
 }

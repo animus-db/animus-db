@@ -1001,6 +1001,18 @@ fn system_table_id_is_numeric(kind: syskv::EntityKind) -> bool {
 /// join nonce), rendered verbatim (lossy on malformed UTF-8, defensive only
 /// — this module never writes anything else there).
 fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
+    if kind == syskv::EntityKind::StreamShard {
+        // A composite (tablet, epoch) id (ADR 0042 §3) — not a single
+        // numeric field `system_table_id_is_numeric` handles, and not a
+        // UTF-8 string either (`key_str` would render it lossily); render
+        // as `"<tablet>-<epoch>"`, both decimal (mirroring every other
+        // `TabletId`'s decimal-string rendering here, e.g. `SplitParent`'s
+        // value).
+        return match syskv::decode_stream_shard_id(id) {
+            Some((tablet, epoch)) => json!(format!("{}-{epoch}", tablet.0)),
+            None => json!(key_str(id)),
+        };
+    }
     if system_table_id_is_numeric(kind) {
         match <[u8; 8]>::try_from(id) {
             Ok(bytes) => json!(u64::from_be_bytes(bytes).to_string()),
@@ -1030,7 +1042,10 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         | syskv::EntityKind::Schema
         | syskv::EntityKind::Policy
         | syskv::EntityKind::NodeAddrs
-        | syskv::EntityKind::CpMemberAddr => {
+        | syskv::EntityKind::CpMemberAddr
+        // A `StreamShardRow` (ADR 0042 §3) — `serde_json` passthrough like
+        // every other JSON-encoded entity kind above.
+        | syskv::EntityKind::StreamShard => {
             serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
         }
         syskv::EntityKind::Counter => match <[u8; 8]>::try_from(value) {

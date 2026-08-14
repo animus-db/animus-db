@@ -1383,8 +1383,452 @@ debugging anything that feels like it might have happened before.
   cleans up orphans left by every **pre-fix** drop, for free, since it
   depends on nothing the fix itself created. (`crates/animusd/src/lib.rs`,
   `ClientCtx::drop_table`, 2026-08-13.)
+- **A multi-consumer cursor bump must be gated on the WHOLE sweep succeeding,
+  never fused into each individual partition's own commit entry — even
+  though the two look interchangeable at first glance.** Reworking the GSI
+  drain from "consuming is trimming" to a cursor (ADR 0042 §7/§8), the
+  obvious design was: each `reconcile_partition` call writes its own
+  footprint update *and* bumps the tablet-wide "gsi" cursor to this tick's
+  overall max HLC, in the same atomic entry (mirroring the old design's
+  "footprint + delete the records it covers, one entry" shape). That is
+  unsound: the cursor is a **single row covering every partition in the
+  tablet**, not a per-partition value, so bumping it to the *tick-wide* max
+  the instant the *first* partition's entry lands would claim every
+  **other**, not-yet-reconciled partition's records (up to that same max) as
+  consumed too — a crash between the first and second partition's entries
+  then leaves the cursor over-claiming coverage the second partition never
+  got, and the trim janitor would delete its records regardless, silently
+  and permanently freezing that partition's GSI rows stale (no change record
+  survives to ever re-trigger it). The fix: compute the sweep's overall max
+  HLC once, reconcile every dirty partition sequentially (propagating any
+  error immediately, before the loop advances), and only *after* the whole
+  loop returns `Ok` does a single trailing write bump the cursor — by that
+  point every partition the max HLC could implicate has already had its own
+  footprint update independently confirmed durable, so a crash before the
+  trailing write just leaves the cursor wherever it was (safe, re-covers
+  everything on the next tick) and a crash after it is the fully-covered
+  case. The general form: a watermark that summarizes N independent
+  sub-operations is only safe to advance once *all* N have been individually
+  confirmed, not on the first one succeeding, even if advancing it earlier
+  would be "usually" correct. (`crates/animusd/src/index_drain.rs`,
+  `drain_tablet`, 2026-08-14.)
+- **A propose-and-poll confirmation helper that only knows how to probe one
+  specific write shape (here, "a `KIND_CHANGE` deletion in the batch") silently
+  stops confirming anything the instant a caller's batch stops containing that
+  shape.** `ClientCtx::cp_kind_write_raw`'s original probe searched the batch
+  for a `KIND_CHANGE` entry with `value: None` and, finding none, returned
+  `Ok` right after `Accepted` — correct for the old design (every reconcile
+  batch always deleted at least one record), silently wrong for the ADR 0042
+  cursor rework (a footprint-only or cursor-only batch has no such entry at
+  all), which would have left every reconciliation and cursor bump confirmed
+  by nothing more than "appended to the leader's log locally," reopening
+  exactly the fence-miss-looks-like-success gap the original probe existed to
+  close. Fixed by confirming the batch's **last** write generically (`local_get_kind(kind,
+  key) == expected_value`) instead of searching for one specific shape — sound
+  because the whole batch is one atomic, whole-or-nothing Raft entry, so any
+  single write's landed effect proves every other write in the same entry
+  landed too. The general form: when a confirmation mechanism special-cases
+  "the shape my one caller happens to produce," a new caller with a
+  differently-shaped (but equally atomic) batch silently degrades the
+  confirmation rather than failing loudly — prefer a probe that works for
+  *any* member of an atomic batch over one keyed to a specific write's
+  content. (`crates/animusd/src/lib.rs`, `ClientCtx::cp_kind_write_raw`,
+  2026-08-14.)
+- **In a real `ProdEnv` test, "the tablet map shows the tablet" and "this
+  node has actually started hosting its `CpGroup`" are two different,
+  separately-converging facts — polling only the first before reaching for
+  `ClusterEdgeState::local_cp` is a real (if usually narrow) race, not
+  paranoia.** A split or merge test that fetches a fresh child's/survivor's
+  `CpGroup` handle immediately after `Metadata` shows the new tablet count
+  can hit `local_cp` returning `None` — the per-node tablet-host reconciler
+  (ADR 0031) still needs its own tick to stand the group up locally.
+  Poll-for-`Some` (`local_cp(tablet).is_some()`) before ever unwrapping it,
+  the same way every other eventually-true fact in these tests is awaited,
+  rather than chaining an `.expect(..)` straight off a `Metadata` poll.
+  Separately: a merge survivor's *widened* `StorageScope` — needed before an
+  absorbed sibling's own physically-still-present rows (e.g. its own cursor
+  row, ADR 0042 §7) become visible through the survivor's scans — is
+  *also* a distinct, later-converging fact from "the tablet map shows one
+  tablet again"; assert on it with its own poll, not a single check right
+  after the merge's own convergence. (`crates/animusd/src/index_drain.rs`,
+  `gsi_drain_cursor_tests`, 2026-08-14.)
+- **There is no production-reachable way to relabel an already-`Active`
+  cluster member today — a real, small operational gap, not just a test
+  inconvenience.** `POST /admin/member/add`/a join's `labels` parameter
+  only ever *claim* a fresh identity; `ClientCtx::admin_drain`'s
+  local-leader-only `UpsertMember{Leaving}` preserves whatever labels are
+  already on file but never sets new ones; the generic wire path
+  (`ClientRequest::ProposeSchema(UpsertMember{..})`) is gated by
+  `is_relayable_command` to `status: NodeStatus::Down` only — proposing
+  `Active` with new labels through it is rejected outright, by design (the
+  gate that keeps `admin_drain`-class actions local-leader-only). Building
+  a sim test that needed to label 3 of 5 already-bootstrapped nodes (ADR
+  0043 §2's optional stream-shard isolation, PR B6) found the one
+  production-reachable workaround instead of adding new admin API surface
+  for a test-only need: propose `UpsertMember{labels: new, status: Down}`
+  (passes the gate) on a member that is genuinely still alive and
+  heartbeating — the very next `detect_loop` tick observes it alive and
+  re-promotes it to `Active` via `transition()`, which reads the label
+  *just committed* off `Metadata` and preserves it verbatim. The node
+  never actually goes anywhere; it just flaps through `Down` for one
+  detector tick. This is the general shape worth remembering: when a
+  cluster-state field has an update path gated to a narrower status than
+  the one you need, look for whether some *other* legitimate transition
+  already reads that field fresh and would carry your change through it —
+  cheaper and more honest than adding a new mutation path whose only real
+  caller would be a test. (`crates/animusd/tests/
+  stream_shard_label_isolation.rs::label_node`, 2026-08-14.) If a real
+  operator need for relabeling an active member ever surfaces, that's a
+  genuine follow-up (a dedicated admin action, not this flap trick).
+- **`animus-sim` has no `tokio` dependency at all — a new test file/module
+  in that crate cannot use `#[tokio::test]`, even though every other
+  async-heavy crate in the workspace does.** Writing the `SimSegmentStore`
+  fault-injection tests (ADR 0043 §A7, `animus-sim/src/segment_store.rs`)
+  as `#[tokio::test] async fn ...` compiled fine locally with `cargo check`
+  scoped to just that file mentally, but failed at `cargo build
+  --all-targets` with a missing-macro/missing-crate error — this crate's
+  own convention (`tests/disk_faults.rs`, `tests/determinism.rs`) is
+  `#[test] fn ...` (plain, sync) that spawns the async workload via
+  `env.spawn_task(async move { .. })` and drives it to completion with
+  `Simulator::run_for(dur)`/`run_until_quiescent(max_steps)`, reading the
+  result back out of a shared `Arc<Mutex<_>>` afterward. This isn't
+  cosmetic: the simulator's executor is the *only* thing that can resolve a
+  `Clock::sleep` (it needs the virtual timeline actually advanced), and a
+  panicking assertion inside the spawned block propagates out of the
+  `run_*` call exactly like any other panic, since polling happens
+  synchronously on the test's own thread — so the pattern costs nothing in
+  either determinism or assertion ergonomics versus a real `async fn` test,
+  it just has to be spelled differently. General check before writing a new
+  test in an unfamiliar crate: grep that crate's existing `tests/*.rs` for
+  its actual async-driving idiom before assuming `#[tokio::test]` — "this
+  crate is full of `.await`" does not imply "this crate depends on tokio."
+  (`crates/animus-sim/src/segment_store.rs`, ADR 0043 round-3 PR2,
+  2026-08-14.)
+- **A request/reply RPC over the `Network` seam cannot use `tokio::sync::
+  oneshot` (or any executor-specific channel) to correlate a reply with its
+  request — `SimEnv` callers have no tokio runtime present at all.** Building
+  `ClusterSegmentStore`'s K-replica `put`/`get`/`delete` fan-out (ADR 0043
+  §A7b), the natural shape — send a request, `await` a oneshot the reply
+  handler completes — compiles fine in a crate that already depends on
+  `tokio` (`animus-cp-data` does, for one real-thread test), but silently
+  never resolves under `SimEnv`: nothing in the simulator's own cooperative
+  executor drives a tokio channel's waker. The house pattern (already
+  established by `RaftKvNode`'s own `ReadProbe`/`ReadProbeAck` read-barrier
+  confirmation, `lib.rs`) is a **shared `Mutex<BTreeMap<req_id, Option<Reply>>>`
+  plus an `env.sleep`-based poll loop**: register a slot keyed by a
+  monotonically-increasing `req_id` before sending, have the single serving
+  task's dispatch loop `stash` the decoded reply into that slot by `req_id`
+  when it arrives (on the *same* stream the request went out on — a
+  request and its reply are just two variants of one wire enum, sharing one
+  inbox), and have the waiting call `peek` the slot in a bounded
+  `loop { check; if done break; if deadline break; env.sleep(POLL).await }`.
+  This is strictly more verbose than a oneshot but works identically under
+  both `SimEnv` and `ProdEnv` with no executor-specific primitive anywhere —
+  the same reason `AtomicWaker` (not a tokio-only waker) is what
+  `RaftKvNode`'s wake-on-propose signal uses. General check before reaching
+  for a channel/oneshot/notify primitive in a crate whose tests run under
+  `SimEnv`: does it come from `std`/`futures` (executor-agnostic) or a
+  specific async runtime crate? If the latter, it needs the poll-a-shared-
+  slot shape instead. (`crates/animus-cp-data/src/cluster_segment_store.rs`,
+  ADR 0043 round-3 PR3, 2026-08-14.)
+- **`Simulator::crash`'s crashed-check happens at *delivery* time, not send
+  time** (`fire_event`'s `Event::Deliver` arm, `animus-sim/src/lib.rs`) —
+  which makes "kill a node while a message to it is still in flight" a
+  deterministic, seed-reproducible scenario rather than a race to script by
+  hand: set a nonzero `NetConfig::base_delay`, send, sleep for less than
+  that delay, then `crash` the target — the message is guaranteed to still
+  be in the timeline (not yet delivered) at the moment of the crash, so it
+  is dropped exactly as if the node had died before the message arrived.
+  Used to test `ClusterSegmentStore`'s "node death mid-put" case
+  deterministically instead of accepting a flaky race or, worse, only ever
+  testing "target already down before the call starts" (a strictly weaker
+  scenario the two are easy to conflate). (`crates/animus-cp-data/tests/
+  cluster_segment_store.rs`, ADR 0043 round-3 PR3, 2026-08-14.)
+- **The `dynamo_index_scan` full-workspace flake signature, adjudicated
+  2026-08-14**: an intermittent `raftkv wal sync` expect-panic
+  (`animus-cp-data/src/lib.rs`, around the WAL-sync `.expect(..)` in the
+  apply task's `flush_wal`, roughly line 4098) surfacing on a tokio worker
+  thread only during `cargo test --workspace`-scale multi-node `ProdEnv`
+  teardown — the persist task racing the node's own shutdown for the same
+  disk handle, the same "`abort()` is a request, not a guarantee" family
+  already documented above (`ProdEnv::shutdown`/`Node::shutdown` abort
+  spawned tasks without waiting for them to actually stop, so a
+  still-in-flight `sync()` can observe a half-torn-down env). Confirmed 5/5
+  green solo (`cargo test -p animusd --test dynamo_index_scan`) — the panic
+  only reproduces under concurrent whole-workspace CPU/IO contention, never
+  in isolation. **Before suspecting the state machine (a real
+  `assert_ts_monotonic`-class bug) for a teardown-adjacent panic in any
+  `ProdEnv` integration test, run the one failing test binary solo first** —
+  if it's consistently green alone, the failure signature is almost
+  certainly this same shutdown-race family, not new logic in whatever this
+  session happens to be touching. Named here as its own entry (rather than
+  folded into the existing "abort() is a request" entry) so a future grep
+  for `dynamo_index_scan` or `raftkv wal sync` finds the adjudication
+  directly. (`crates/animus-cp-data/src/lib.rs`,
+  `crates/animusd/tests/dynamo_index_scan.rs`, adjudicated during ADR
+  0042/0043 round-3 PR4, 2026-08-14.)
+- **"Reachable only via a gate that widened for exactly this case" needs an
+  end-to-end test, not just a component-level one — the gate and the
+  function it feeds can each look locally correct while their *composition*
+  drops the very case the gate was widened for.** Building the DynamoDB
+  Streams sealer's hot-trim rework (F10/F12-b), the per-tablet loop's outer
+  gate (`gsis.is_empty() && !stream_enabled`, `index_drain.rs`) skips a
+  tablet once its stream disables and it has no GSI — correct for a table
+  that *never* streamed, wrong for one that just finished a disable's final
+  seal: skipping it forever means the hot-trim arm never runs again to
+  actually delete the now-fully-sealed hot tail, whose correctness had been
+  silently depending on a *race* (the periodic loop happening to tick, with
+  the schema not yet flipped, in the narrow window between the final seal's
+  own commit and `SetTableStream{None}`'s). One test
+  (`disabled_draining_stream_does_not_block_trim`, 2 writes) passed reliably
+  because that race happened to resolve in its favor every run; a materially
+  identical second test (`disable_final_seal_then_reenable_continues_the_
+  epoch_chain`, 3 writes) reproducibly timed out, because the tiny
+  extra work shifted the race the other way. Neither `trim_janitor` in
+  isolation (its own unit-shaped tests all passed — "no expected term ⇒
+  block" was internally consistent) nor the outer gate in isolation looked
+  wrong; only running the *disable-then-verify-convergence* sequence
+  end-to-end, twice, with slightly different timing, exposed that the gate
+  needed widening (`ever_streamed`, keep visiting a tablet that has ever
+  sealed) **and** `trim_janitor`'s own "no expected term" branch needed to
+  flip from "block" to "trim unconditionally" (the two fixes are a pair —
+  widening the gate alone would have reached the old "block" branch and
+  changed nothing). General rule: when a background loop's own top-level
+  gate decides "does this item still matter to me," and a later lifecycle
+  event (disable, drop, expire) can make the answer flip from yes to no,
+  write the test that drives *through* that transition and polls for the
+  eventual-consistency property on the other side — a gate widened for a
+  new terminal state, paired with a function whose fallback branch was
+  never re-examined for that same state, is exactly the shape that passes
+  every unit test and flakes (or silently stalls) in integration.
+  (`crates/animusd/src/index_drain.rs`, ADR 0042/0043 round-3 PR5,
+  2026-08-14.)
+- **A "bytes" accessor's own scope is part of its contract, not an
+  implementation detail — check which `StorageScope`/row-kind it measures
+  before reusing it for a new trigger.** `RaftKvNode::approx_bytes` was
+  deliberately narrowed to the **base** kind scope by ADR 0034's own fix
+  (so auto-split stops reacting to change-log churn) — a fact stated
+  plainly in that method's doc and this crate's own `CLAUDE.md`, and easy
+  to miss when reaching for "the byte estimate" to build a *different*
+  trigger. The Streams sealer's size trigger needs `KIND_CHANGE`'s own
+  bytes specifically (ADR 0043 §A3's "When": "`KIND_CHANGE` scope
+  `approx_bytes`") — calling the existing `approx_bytes()` compiled, ran,
+  and even passed several tests (small test tables happen to write base
+  rows and change records of comparable size, so the wrong scope's number
+  still crossed the same threshold at roughly the same time), until an
+  end-to-end auto-split test on a *streamed* table exposed the mismatch
+  indirectly. Fixed by adding a kind-scoped sibling
+  (`RaftKvNode::approx_bytes_kind(kind)`/`CpGroup::approx_bytes_kind`) that
+  takes the row-kind's own `StorageScope` instead of assuming the base one
+  — never widen an existing narrowly-scoped accessor back out, add a
+  sibling with the same shape over a different scope. General rule: before
+  wiring an existing "cheap estimate" accessor into a new caller, re-read
+  its own doc for *which* scope/kind/range it was deliberately narrowed to
+  and *why* — a byte/count estimator that looks generic by name can be
+  pinned to one specific scope for a reason that has nothing to do with
+  your new use case. (`crates/animus-cp-data/src/lib.rs`,
+  `crates/animusd/src/index_drain.rs`, ADR 0042/0043 round-3 PR5,
+  2026-08-14.)
+- **A relayed internal-only `ClientRequest` variant must be wrapped in
+  `Forwarded` at *every* call site that sends it across the wire, not just
+  handled correctly on receipt** — the receiving side's "refuse if sent
+  bare" gate exists precisely to reject exactly the mistake of sending it
+  unwrapped, so a caller that forgets the wrapper doesn't hang or corrupt
+  state, it fails **loudly and immediately** with the refusal's own error
+  message. Adding `ClientRequest::ForceSeal` (the DynamoDB Streams
+  disable-triggered final seal, round-3 sealer PR) initially called
+  `ClientCtx::relay(addr, ClientRequest::ForceSeal { .. })` directly instead
+  of `relay(addr, ClientRequest::Forwarded { request: Box::new(ForceSeal
+  {..}), .. })` — every unit test passed (they all happened to run on a
+  single node, where the *local* branch of `force_seal_tablet` never goes
+  through `relay` at all), and the gap was caught only by
+  `dynamo_streams.rs`'s existing `update_table_stream_enable_and_disable_
+  through_every_node` test, which specifically issues the disable from a
+  **non-leader** node and therefore exercises the forwarding branch. The
+  loud, specific error (`"...must be sent wrapped in Forwarded"`) made the
+  diagnosis immediate once a real multi-node path exercised it. General
+  rule: a new forwarded-command variant's own test coverage must include at
+  least one call from a node that is **not** the tablet's leader — a
+  same-node test suite can pass in full while every cross-node send is
+  broken, because the wrapping mistake only manifests on the wire, not
+  in-process. (`crates/animusd/src/lib.rs`, ADR 0042/0043 round-3 PR5,
+  2026-08-14.)
+- **An "every node" read-path test must wait for convergence on *every*
+  node, not just the one that drove the write** — a per-node `Metadata`
+  replica can lag its own control Raft's commit by a few milliseconds, and
+  a handler that reads `ClientCtx::effective_metadata()` (DynamoDB Streams'
+  `GetRecords`/`GetShardIterator`, ADR 0042 §3/§7 — resolved *fresh, per
+  call, per node*, by design, so an open-shard iterator can survive a seal)
+  resolves against *that node's own* snapshot. `dynamo_streams.rs`'s
+  `get_records_on_a_sealed_shard_works_from_every_node` originally polled
+  only `nodes[0]` for the seal to land, then queried all three nodes in a
+  tight loop — flaky roughly 1 run in 3 under `--test-threads=1`, always as
+  "node 1/2: shard must exhaust" failing (a genuinely sealed shard's
+  `GetRecords`, served by a node whose own catalog view hadn't caught up
+  yet, fell through to the open-shard branch instead, which never nulls).
+  Not a correctness bug in the handler — this is exactly the stream's own
+  documented eventually-consistent contract self-healing within
+  milliseconds — but a one-shot assertion right after the write is exactly
+  the "fixed-deadline one-shot assert on an eventual property" this
+  codebase's testing doctrine already warns against; the fix was polling
+  `nodes.iter().all(|n| ...)` before entering the per-node assertion loop,
+  not touching the handler. General rule: when a test's very *point* is "the
+  same operation must behave identically issued through every node," the
+  convergence wait that precedes the loop must also cover every node, or
+  the loop races the propagation it's supposed to be testing past, not the
+  behavior itself. (`crates/animusd/tests/dynamo_streams.rs`, ADR 0042/0043
+  round-3 PR6, 2026-08-14.)
+- **A test that exercises physical *removal* of a chained/derived-numbered
+  entity for the first time needs at least two generations in the chain,
+  not one — a single-entry test can pass for the wrong reason (or, worse,
+  hang) because the very row it means to reclaim is structurally
+  unreclaimable alone.** Building the DynamoDB Streams segment janitor
+  (ADR 0043 §A9, round-3 PR7), the first retention test wrote one item,
+  sealed it, waited for its row to be marked *and physically removed*, and
+  timed out — not a bug in the removal logic, but in the test's own
+  premise: `index_drain::seal_now`'s epoch numbering is "the chain's own
+  highest existing row, plus one" (a design that only holds while the
+  catalog never shrinks), so the janitor correctly refuses to ever
+  physically remove a tablet's *current* highest-epoch row while the
+  tablet still exists (removing it would let a future seal silently reuse
+  the same epoch number for different data). A single-write test's only
+  row is *always* the current max, so it can never be reclaimed by design
+  — the fix was two writes/seals in sequence, so the first stops being the
+  max once the second exists. General rule: before writing a test (or
+  reviewing PR-added retention/GC/reclaim code) for "the Nth generation of
+  a chained identity gets removed," check whether identity derivation for
+  that chain reads *only currently-present* entries (a count, a `max()`, a
+  `last()`) rather than an independent, ever-increasing counter — if so,
+  removing the wrong generation (or testing removal with too few
+  generations present) is a live correctness hazard, not just a
+  test-construction detail. (`crates/animusd/src/segment_janitor.rs`,
+  `crates/animusd/tests/stream_janitor.rs`, ADR 0043 §A9, round-3 PR7,
+  2026-08-14.)
+- **A pre-existing, timing-sensitive flake found incidentally while
+  running the full workspace gate — not caused by, or related to, the
+  change in flight — should be reported, not silently fixed or silently
+  ignored.** `animusd`'s `tests/dynamo_txn.rs::
+  transact_get_items_never_observes_a_torn_pair_under_concurrent_writes`
+  failed once under `cargo test --workspace`, then failed again roughly 1
+  in 4 *solo* re-runs (untouched by this PR's changes — a torn-snapshot
+  assertion in the ADR 0018 §2/PR7 `TransactGetItems` quiescence-retry
+  path, nothing to do with streams) — genuinely flaky on its own, not a
+  regression this PR introduced (confirmed by repeated solo runs both
+  passing and failing with identical code). Per this repo's own "separate
+  PRs for incidental bugs" convention, the fix belongs in its own change,
+  not folded into an unrelated PR's diff — but the *discovery* still
+  belongs in this log and in the reporting PR's own description, so the
+  next person who hits it doesn't have to re-derive "is this me?" from
+  scratch. (2026-08-14.)
+  **Baseline adjudication (round-3 PR8, so the eventual fix has numbers to
+  work against)**: solo re-runs of exactly this test — `main` 4/10, the
+  streams round-3 salvage boundary `064bbac` 4/10, `3b3c7ae` (PR7's tip,
+  also this PR's own base — no txn-path changes landed between them) 5/10.
+  Flat within noise across three points spanning the whole round-3 stack;
+  streams work never touched this path. Genuinely pre-existing, not
+  introduced or worsened by any PR in this stack.
+- **`RaftKvNode::start_scoped` pins every group to `PRIMARY_STREAM` — a
+  `SimEnv` test that starts more than one tablet group on the *same* set of
+  node ids (any split/merge scenario sharing physical nodes across tablets,
+  ADR 0026 Stage B) must use `start_hosted(.., stream = tablet_id.0)`
+  instead, or the two groups' Raft traffic cross-talks on one node's shared
+  inbox and corrupts both.** The DynamoDB Streams lineage-walk corpus's
+  `combined_chaos` scenario (a leader-kill *and* a split on the same 3 node
+  ids) initially livelocked leader election on the *parent* group the
+  instant a sibling group started — `elect()` never found a stable leader
+  even after 4 seconds of simulated time, because every `AppendEntries`/
+  vote message either group sent was being delivered into whichever
+  group's `RaftCore` happened to poll the shared inbox next, so both groups
+  saw a stream of messages that made no sense to their own `RaftCore`.
+  Every existing test that only ever runs ONE group per node id
+  (`raftkv_linearizable.rs`, `txn_serializable.rs`'s three *independent*
+  node-id sets) or that already knew to use `start_hosted`
+  (`cross_group_lww.rs`/`narrow_scope.rs`'s split fixtures) never hits
+  this; a new self-contained corpus copying the wrong sibling function is
+  an easy trap. Production code never has this bug (`animusd`'s own
+  `cp_join_host`/`host::Reconciler` always calls `start_hosted` with
+  `stream = tablet.0`) — this is purely a test-harness footgun, but a
+  silent, hard-to-diagnose one (the symptom is "election never converges,"
+  not an obvious "wrong stream" error). (`crates/animus-test/tests/
+  stream_lineage_corpus.rs`, ADR 0042/0043 round-3 PR8, 2026-08-14.)
 
 ### Code patterns
+- **Derived numbering from "the highest currently-present entry" is only
+  safe for an append-only collection — the moment anything in the system
+  starts physically *removing* old entries, that derivation can silently
+  collide.** ADR 0042/0043's stream-shard epoch (`seal_now`'s `next_epoch`,
+  `dynamo_streams::current_open_epoch`) was designed as "chain length,"
+  computed fresh each time from `stream_shards.range(..).next_back()` —
+  correct for two full rounds of PRs (4/5/6) because nothing ever removed
+  a row yet. The instant round-3 PR7 added retention (the *first* code
+  path that physically deletes a `stream_shards` entry), this became a
+  live hazard: reclaiming a tablet's own highest-epoch row would make the
+  very next seal recompute the *identical* epoch for genuinely different
+  data — two objects claiming the same identity at different points in
+  time, with nothing to tell them apart. The fix is a narrow, explicit
+  guard at the one call site that removes rows (`segment_janitor.rs`'s
+  `may_remove_row`: never remove a tablet's current max epoch while the
+  tablet still exists), not a redesign of the numbering scheme — but the
+  general lesson is the one to carry forward: **whenever a later PR adds
+  the first deletion/reclaim path over a collection some earlier, already-
+  shipped code derives an identity or ordering from via "count/max/last of
+  what currently exists," go back and re-audit every such derivation** —
+  the earlier code was correct when written, and the later PR's own review
+  has no reason to re-examine code it never touches, which is exactly how
+  this class of bug survives review. Grep for `.next_back()`/`.count()`/
+  `.len()` over the same collection a new deletion path touches as a
+  starting point. (`crates/animusd/src/segment_janitor.rs`, ADR 0043 §A9,
+  round-3 PR7, 2026-08-14.)
+- **A "does this write need the old value" gate and the "does this write
+  take the richer commit path" fast-path gate must be the *same*
+  predicate, expressed once — not two conditions that happen to agree
+  today.** Building ADR 0042's stream write-path gate (`kind_writes_for_item`'s
+  `None` fast path widening from `indexes.is_empty()` to `!indexes.is_empty()
+  || stream.is_some()`) surfaced a real, independent, pre-existing gap: the
+  DynamoDB edge's `PutItem`/`DeleteItem` handlers computed their own
+  `needs_old` (whether to pay for a pre-read of the item) from
+  `condition.is_some() || return_values == ReturnValues::AllOld` alone —
+  never from whether the write was actually about to route through the
+  kind-write path. An unconditional replace/delete on an *already-indexed*
+  table therefore silently skipped the read `kind_writes_for_item`'s own LSI
+  diff needs (to remove a stale row when the alt-sort attribute changes),
+  and — once streams could also pull a table onto that path — a stream's
+  `OLD_IMAGE`/`NEW_AND_OLD_IMAGES` change record would just as silently miss
+  its old image. `UpdateItem` and `BatchWriteItem`'s indexed branch had
+  independently, correctly always read old — only the two write paths
+  nobody had reason to touch since ADR 0041 shipped kept the narrower gate.
+  The fix factors both call sites' predicate into one function
+  (`table_takes_kind_write_path`) `kind_writes_for_item`'s own gate and every
+  write handler's `needs_old` both call — so the two structurally cannot
+  drift apart again. When a "do we need X" decision and a "does this path
+  apply" decision are supposed to always agree, don't let them be two
+  separately-maintained booleans; a passing test suite proves today's
+  agreement, not tomorrow's. (`crates/animusd/src/dynamo.rs`, ADR 0042 PR A3,
+  2026-08-14.)
+- **A marker key built by truncating a tablet's own `range.start` to a fixed
+  prefix is disjoint from real data (if it lives in its own kind scope) but
+  is *not* thereby proven to stay within `[range.start, range.end)` —
+  disjointness and containment are two different properties, and a `Vec<u8>
+  ++ suffix` construction only gets you the first for free.** ADR 0042/0043's
+  `KIND_CURSOR` cursor-row key (`animus-cp-data/src/cursor.rs`) mirrors
+  `txn.rs`'s `record_key` scheme (`token(8 bytes) || [0x00, TAG] ||
+  payload`) closely enough that the escape-disjointness proof transfers
+  verbatim — but `txn.rs`'s token is always the anchor write's *own*,
+  currently-being-written key (trivially in-range), while a cursor row's
+  token is a *tablet boundary value*, truncated to a fixed 8 bytes. Working
+  through whether `range.start[..8] ++ marker` can ever land at or past
+  `range.end` surfaces a genuine, if narrow, edge case (a `Binary`
+  partition key starting `0x00`, positioned exactly at a split boundary)
+  that the byte-comparison math does not rule out in general. The
+  house convention for this — `txn.rs`'s own "a residual, documented gap"
+  note about `split_key` not being token-aligned — is the right response:
+  state the gap explicitly in the code and defer it to a targeted corpus,
+  rather than either (a) assuming a structurally-disjoint key is also a
+  contained one, or (b) blocking a foundational PR on solving a rare edge
+  case a later fault-injection corpus is better positioned to stress
+  anyway. When adding any new marker/cursor key that must survive
+  `narrow_scope`/`widen_scope`/`engine_image`'s live-range bound, ask
+  disjointness and containment as two separate questions.
 - **When one member of a family of sibling primitives lacks the family's
   implicit behavior, a caller written from the family's reputation gets a
   structural, permanent failure — check the specific primitive's contract,
@@ -4182,6 +4626,30 @@ debugging anything that feels like it might have happened before.
   something only this file can tell a reader" — if `git log`, the ADR, or
   the source's own doc comment already says it, point there instead of
   restating it. (2026-08-13.)
+- **A doc comment that says a safety property is "enforced, not assumed" is
+  a claim about the code, not a substitute for grepping it.** Both ADR 0041
+  §1 and `animus-dynamo/src/index.rs`'s own doc for `INDEX_TABLE_SEPARATOR`
+  state that `$` is illegal in a user table name and that this is enforced
+  at `Metadata::apply`'s `CreateTableSchema` arm, "alongside the existing
+  `syskv::is_reserved_name` gate." Re-grounding the DynamoDB Streams work
+  (ADR 0042/0043) in what the tree actually enforces required grepping
+  every `is_reserved_name`/`$`/`INDEX_TABLE_SEPARATOR` call site — and
+  turned up that the `$` rejection the ADR and the code comment both
+  describe **did not exist anywhere in the codebase**. `CreateTableSchema`'s
+  apply arm only ever checked `is_reserved_name`; no code path rejected a
+  `$`-containing table name. The design had been sound in principle the
+  whole time (nothing had ever proposed a `$`-named table, so no real
+  collision had occurred), but "sound in principle, unenforced in practice"
+  is exactly the gap a design that leans on the same unverified assumption
+  could turn into a real, reachable, unenforced case. Fixed at the single
+  call site both docs already named. The general move: before building
+  anything whose own correctness argument leans on a property another
+  ADR/doc claims is "enforced," verify it holds *now*, at the call site the
+  doc names — "already enforced elsewhere" is a claim to check, not a fact
+  to inherit, even (especially) when it's stated confidently in the very
+  document you're extending. (`crates/animus-control/src/meta.rs::
+  CreateTableSchema`; ADR 0041 §1's as-built correction, ADR 0042/0043
+  round-3 streams salvage, 2026-08-14.)
 
 ### Parallel-agent orchestration
 - **A stacked series' final "docs/ADR finalization" PR must treat the stack's

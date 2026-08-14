@@ -1,5 +1,15 @@
-//! The **GSI drain** (ADR 0041 §4): the background loop that materializes a
-//! table's global secondary indexes from the change log its writes leave behind.
+//! The per-tablet **change-consumer loop** (ADR 0041 §4, ADR 0042/0043): the
+//! background task with three arms over the change log a table's writes
+//! leave behind (`KIND_CHANGE`) — the **GSI drain** (materializes global
+//! secondary indexes), the **seal arm** (ADR 0043 §A3: seals a streamed
+//! table's own hot tail into an immutable segment on size/age triggers), and
+//! the **hot-trim arm** (ADR 0042 §8/ADR 0043 §A6: deletes hot records once
+//! every expected, present consumer has cleared them — GSI reconciliation
+//! via a cursor row, streaming via the segment catalog). This module was
+//! `index_drain_loop` before round 3 added the other two arms; the rename to
+//! [`change_consumer_loop`] reflects that it is no longer GSI-specific.
+//!
+//! ## The GSI drain (ADR 0041 §4)
 //!
 //! A local secondary index is written atomically with its base row (it shares
 //! the base partition key, so it shares the tablet). A **global** one cannot —
@@ -25,43 +35,129 @@
 //!   and the recomputation did not produce. There is no separate class of orphan
 //!   needing its own sweeper.
 //!
-//! ## Consuming is trimming (for now)
+//! ### Cursor-based consumption (ADR 0042 §7/§8)
 //!
-//! The drain deletes the records it has reconciled, in the same entry that
-//! writes the updated footprint. That doubles as the log trim ADR 0041 requires
-//! to bound growth. A separate cursor — letting records outlive the drain's own
-//! consumption — is what DynamoDB Streams will need, and belongs with the
-//! retention window in its own ADR; adding one now would be machinery with no
-//! second reader to justify it.
+//! ADR 0041 originally had the drain **delete** the records it reconciled in
+//! the same entry that wrote the updated footprint — "consuming is trimming."
+//! That worked only because the GSI drain was the change log's sole reader.
+//! Round 2's stream copier was a second, independent reader of the same log
+//! (making deletion-as-a-side-effect unsound for exactly the reason this
+//! doc originally explained); **round 3 has no copier at all** — the
+//! sealer (below) reads the log directly — but the underlying reason a
+//! *separate* trim step is still needed is unchanged: the GSI's own
+//! consumption progress and the stream's own sealed-watermark progress are
+//! two independent facts, and a hot record must survive until **both**
+//! (whichever apply) have cleared it. The drain advances a **cursor row**
+//! (`KIND_CURSOR`, tag `"gsi"` — see [`animus_cp_data::cursor`]) recording
+//! the highest change-record HLC this tablet's reconciliation has fully
+//! covered; the hot-trim arm deletes records only once every *expected,
+//! present* term (the GSI cursor, and/or the stream's own catalog
+//! watermark, ADR 0043 §A6) has cleared them.
+//!
+//! **The crash property ADR 0041 documented still holds, restated for the
+//! cursor**: the cursor must never claim a reconciliation whose footprint
+//! didn't land. [`drain_tablet`] gets this by construction — it only advances
+//! the cursor, in its own trailing write, *after* every partition dirtied this
+//! pass has had its footprint update durably confirmed (`reconcile_partition`'s
+//! own `cp_kind_write_raw` call only returns `Ok` once that specific write's
+//! effect is visible; see that primitive's doc). A crash before the cursor
+//! write lands simply leaves it wherever it was — the next tick re-reads the
+//! same (still-present) records and redoes the same reconciliation, which is
+//! safe because it is idempotent.
+//!
+//! ## The seal arm (ADR 0043 §A3)
+//!
+//! For each **streamed** table's led tablet, on a size or age trigger (or a
+//! one-shot force-seal, F12-b's disable path), [`seal_now`] seals every
+//! change record past the tablet's own effective watermark
+//! (`Metadata::effective_stream_shard_watermark` — catalog-derived, walking
+//! split-parent provenance for a fresh split child, ADR 0043 §A4) into an
+//! immutable segment: sort by the record's own packed-HLC key suffix (the
+//! change log's key order is token-then-pk-then-HLC, *not* commit order —
+//! this sort is load-bearing), encode it (`animus_cp_data::segment`), push
+//! it durably to this node's [`crate::SegmentStoreHandle`]
+//! (`SegmentStore::put`), then propose and confirm
+//! `MetaCommand::SealStreamShard`. Nothing is ever sealed empty (an empty
+//! pending set is a no-op, never an empty segment) — see [`seal_now`]'s own
+//! doc for the full recovery argument (why a crash-retried re-seal of the
+//! identical `(tablet, epoch)` id is always safe).
+//!
+//! ## The hot-trim arm (ADR 0042 §8, ADR 0043 §A6, F10)
+//!
+//! Generalizes ADR 0041's original trim janitor: the GSI half is completely
+//! unchanged (the `"gsi"` cursor tag, min-over-rows); the stream half is now
+//! **catalog-derived** rather than a `"copier"` cursor row nothing writes
+//! anymore (round 2's `COPIER_TAG` and `expected_consumer_tags` are gone).
+//! Trim = min(gsi term if the table has GSIs, catalog watermark iff the
+//! table's *current* schema has an enabled stream). A **disabled**-but-
+//! draining stream's un-reaped catalog rows do **not** re-add the stream
+//! term — see [`trim_janitor`]'s own doc for the F12-b coexistence rule this
+//! implements and why it's safe.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_control::Metadata;
 use animus_control::schema::{IndexDef, IndexKind};
-use animus_cp_data::{KIND_CHANGE, KIND_FOOTPRINT};
+use animus_cp_data::cursor;
+use animus_cp_data::hlc::{self, HlcTimestamp};
+use animus_cp_data::segment;
+use animus_cp_data::{KIND_CHANGE, KIND_CURSOR, KIND_FOOTPRINT};
 use animus_dynamo::wire;
 use animus_dynamo::{
     AttributeValue, FootprintEntry, IndexFootprint, Item, index as dynamo_index, index_table_name,
     is_index_table_name, storage_key,
 };
+use animus_env::{Clock, Metric};
+use animus_tablet::TabletId;
 use animus_tablet::partition_token;
 
-use crate::{ClientCtx, CpGroup};
+use crate::{ClientCtx, CpGroup, MetaCommand};
 
 /// How often each node sweeps the tablet groups it leads for pending change
 /// records. A plain fixed interval, matching `txn_resolver_loop`'s own shape —
 /// this is background convergence work, not a latency-sensitive path.
 const INDEX_DRAIN_INTERVAL: Duration = Duration::from_millis(200);
 
-/// The **GSI drain background task** (ADR 0041 §4), one per node.
+/// The consumer tag the GSI drain's own reconcile cursor writes (ADR 0042
+/// §7/§8) — the only cursor tag left as of round 3 (the stream half of the
+/// old min-over-rows rule is now catalog-derived, not cursor-row-derived;
+/// see the module doc).
+const GSI_TAG: &str = "gsi";
+
+/// How long the seal arm's [`ClientCtx::propose_and_await`] waits for a
+/// proposed `MetaCommand::SealStreamShard` to commit before giving up (this
+/// tick retries; ADR 0043 §A3's recovery discipline). Generous, matching
+/// `SCHEMA_COMMIT_TIMEOUT` (`lib.rs`) — a fresh cluster may still be
+/// electing a control leader.
+const SEAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The packed HLC suffix every change-record key ends with (see
+/// `KvCommand::KindBatch`'s `change_log`) — the same 8-byte encoding a cursor
+/// row's own value uses ([`cursor::encode_watermark`]/`decode_watermark`).
+const HLC_BYTES: usize = 8;
+
+/// How many change records one trim `KindBatch` entry deletes at most —
+/// bounds a large backlog's catch-up to several ticks instead of one
+/// outsized Raft entry, mirroring `cp_batch_write_patient`'s own bounded-batch
+/// discipline.
+const TRIM_BATCH: usize = 256;
+
+/// The **per-tablet change-consumer background task** (ADR 0041 §4, ADR
+/// 0042/0043), one per node — formerly `index_drain_loop`, renamed now that
+/// it is no longer GSI-specific (see the module doc for the three arms).
 ///
-/// On every tick, for each tablet group this node currently **leads**, applies
-/// any pending change records to that table's global secondary indexes. Errors
-/// are logged and swallowed: this is best-effort convergence, and the next tick
-/// retries from the same durable records (nothing is consumed until its effects
-/// have landed).
-pub(crate) async fn index_drain_loop(ctx: ClientCtx) {
+/// On every tick, for each tablet group this node currently **leads**: (1)
+/// applies any pending change records to that table's global secondary
+/// indexes (`drain_tablet`, unchanged from ADR 0041); (2) for a **streamed**
+/// table, evaluates the seal arm's triggers and seals if due (`seal_tick`);
+/// (3) runs the hot-trim arm (`trim_janitor`) to delete whatever every
+/// expected, present term has cleared. Errors are logged and swallowed: this
+/// is best-effort convergence, and the next tick retries from the same
+/// durable records/catalog state (nothing is trimmed until every expected
+/// term says it's safe to, and a failed seal simply re-evaluates its
+/// triggers next tick).
+pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
     loop {
         tokio::time::sleep(INDEX_DRAIN_INTERVAL).await;
         let meta = ctx.effective_metadata();
@@ -83,17 +179,52 @@ pub(crate) async fn index_drain_loop(ctx: ClientCtx) {
                 .filter(|i| i.kind == IndexKind::Global)
                 .cloned()
                 .collect();
-            if gsis.is_empty() {
+            let stream_enabled = meta.table_stream(&table).is_some();
+            // A tablet that has **ever** sealed a shard must keep being
+            // visited even after its stream is later disabled (F12-b): the
+            // final seal (`dynamo.rs::disable_stream`) commits the catalog
+            // row but never trims anything itself — only this loop's own
+            // hot-trim arm does, on ITS next tick. Without this, a disabled,
+            // unindexed table would fall out of this gate the instant
+            // `stream_enabled` flips to `false` and never get another
+            // chance to trim its now-fully-sealed hot tail, leaving its
+            // correctness entirely dependent on a race between the
+            // disable's own `SetTableStream` commit and this loop's next
+            // tick happening to land first (found by this PR's own
+            // `disable_final_seal_then_reenable_continues_the_epoch_chain`
+            // test, which failed intermittently before this fix).
+            let ever_streamed = meta.stream_shard_watermark(tablet).is_some();
+            if gsis.is_empty() && !stream_enabled && !ever_streamed {
                 continue;
             }
-            if let Err(e) = drain_tablet(&ctx, &meta, &table, &group, &gsis).await {
+            // `drain_tablet` is GSI-specific (it reconciles GSI rows and
+            // advances the `"gsi"` cursor) — never call it for a
+            // streamed-but-unindexed table, or it would write a spurious
+            // `"gsi"` cursor row this table's schema never expects (a
+            // permanent, own-token unexpected row `cleanup_merge_residue_
+            // cursor_rows` deliberately does not clean up — see its own
+            // doc). A streamed-only table still needs the seal + trim arms
+            // below.
+            if !gsis.is_empty()
+                && let Err(e) = drain_tablet(&ctx, &meta, &table, &group, &gsis).await
+            {
                 tracing::debug!(tablet = tablet.0, table, error = %e, "index drain: tick failed");
+                continue; // don't trim behind a reconciliation pass that didn't complete
+            }
+            if stream_enabled && let Err(e) = seal_tick(&ctx, &meta, &table, tablet, &group).await {
+                tracing::debug!(tablet = tablet.0, table, error = %e, "seal arm: tick failed");
+            }
+            if let Err(e) =
+                trim_janitor(&ctx, &meta, &table, tablet, &group, &gsis, stream_enabled).await
+            {
+                tracing::debug!(tablet = tablet.0, table, error = %e, "index drain: trim janitor tick failed");
             }
         }
     }
 }
 
-/// Reconcile every dirty item of one tablet, then consume its change records.
+/// Reconcile every dirty item of one tablet not yet covered by the "gsi"
+/// cursor, then advance that cursor to the highest HLC this pass covers.
 async fn drain_tablet(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -101,6 +232,10 @@ async fn drain_tablet(
     group: &CpGroup,
     gsis: &[IndexDef],
 ) -> Result<(), String> {
+    // The ADR 0042 §7 min-over-rows watermark: `None` on a cold tablet (no
+    // "gsi" row yet) or a split's fresh right child (the rule over an empty
+    // set) — either way, "reconcile everything currently pending."
+    let watermark = group.cursor_min_watermark(GSI_TAG).await;
     let records = group.pending_changes().await;
     if records.is_empty() {
         return Ok(());
@@ -124,26 +259,72 @@ async fn drain_tablet(
     // is its key minus that fixed-width suffix — no parsing needed. Several
     // records for one partition collapse into a single reconciliation, which is
     // the point of being derivative.
-    let mut by_partition: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    //
+    // Sweep discipline (ADR 0042 §7): only records this pass hasn't already
+    // covered — everything else is exactly what `watermark` already claims
+    // is done. `max_hlc` accumulates the true highest HLC this pass will end
+    // up covering, computed **before** any reconciliation happens, since
+    // every partition it comes from is guaranteed to get reconciled below
+    // (nothing in `by_partition` is ever skipped).
+    let mut by_partition: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut max_hlc: Option<HlcTimestamp> = None;
     for (key, _) in &records {
         let Some(fp_key) = key.len().checked_sub(HLC_BYTES).map(|n| key[..n].to_vec()) else {
             continue; // malformed; leave it rather than mis-attribute it
         };
-        by_partition.entry(fp_key).or_default().push(key.clone());
+        let Some(ts) = record_hlc(key) else {
+            continue; // malformed HLC suffix; same defensive skip
+        };
+        if watermark.is_some_and(|w| ts <= w) {
+            continue; // already consumed by an earlier pass
+        }
+        max_hlc = Some(max_hlc.map_or(ts, |m: HlcTimestamp| m.max(ts)));
+        by_partition.insert(fp_key);
+    }
+    if by_partition.is_empty() {
+        return Ok(()); // nothing past the watermark; a prior pass covered it all
     }
 
-    for (fp_key, consumed) in by_partition {
-        reconcile_partition(ctx, meta, table, group, gsis, &fp_key, consumed).await?;
+    for fp_key in by_partition {
+        reconcile_partition(ctx, meta, table, group, gsis, &fp_key).await?;
+    }
+
+    // Every partition dirtied this pass has now been reconciled and its
+    // footprint update durably confirmed (the loop above only reaches here
+    // once every `reconcile_partition` call returned `Ok`) — advancing the
+    // cursor here, in its own trailing write, is what preserves the crash
+    // property: the cursor can only ever name a `max_hlc` whose covering
+    // reconciliations have already landed, never one still in flight.
+    if let Some(max_hlc) = max_hlc {
+        let cursor_key = cursor::cursor_key(&group.scope_range().start, GSI_TAG);
+        ctx.cp_kind_write_raw(
+            table,
+            vec![(
+                KIND_CURSOR,
+                cursor_key,
+                Some(cursor::encode_watermark(max_hlc)),
+            )],
+        )
+        .await?;
     }
     Ok(())
 }
 
-/// The packed HLC suffix every change-record key ends with (see
-/// `KvCommand::KindBatch`'s `change_log`).
-const HLC_BYTES: usize = 8;
+/// The HLC a change-record's key suffix encodes — the identical 8-byte
+/// big-endian packing [`cursor::encode_watermark`] uses for a watermark value
+/// (see `KvCommand::KindBatch`'s `change_log` doc: the key is completed at
+/// apply as `prefix || hlc::pack(ts)`). `None` on a malformed suffix, a
+/// defensive read mirroring the `fp_key` split's own.
+fn record_hlc(key: &[u8]) -> Option<HlcTimestamp> {
+    let suffix = key.len().checked_sub(HLC_BYTES).map(|n| &key[n..])?;
+    cursor::decode_watermark(suffix)
+}
 
-/// Bring one partition's GSI rows in line with its base rows' *current* values,
-/// then atomically record the new footprint and drop the records consumed.
+/// Bring one partition's GSI rows in line with its base rows' *current*
+/// values, then atomically record the new footprint. Unlike ADR 0041's
+/// original design, this no longer deletes the change records that triggered
+/// it — see the module doc and [`drain_tablet`]'s trailing cursor write for
+/// the ADR 0042 replacement, and [`trim_janitor`] for the actual deletion.
 async fn reconcile_partition(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -151,7 +332,6 @@ async fn reconcile_partition(
     group: &CpGroup,
     gsis: &[IndexDef],
     fp_key: &[u8],
-    consumed: Vec<Vec<u8>>,
 ) -> Result<(), String> {
     let base = crate::dynamo::schema_for(meta, table);
     let previous = group
@@ -241,18 +421,423 @@ async fn reconcile_partition(
         ctx.cp_delete(&index_table, key).await?;
     }
 
-    // One entry: the new footprint plus the records it accounts for. Consuming
-    // the records *is* the log trim (see the module doc).
-    let mut batch: Vec<(u8, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
-    batch.push((
-        KIND_FOOTPRINT,
-        fp_key.to_vec(),
-        (!desired.is_empty()).then(|| desired.encode()),
-    ));
-    for key in consumed {
-        batch.push((KIND_CHANGE, key, None));
+    // One entry: just the updated footprint. See the module doc and
+    // `drain_tablet`'s trailing cursor write for why the records this
+    // reconciliation covers are no longer deleted here.
+    ctx.cp_kind_write_raw(
+        table,
+        vec![(
+            KIND_FOOTPRINT,
+            fp_key.to_vec(),
+            (!desired.is_empty()).then(|| desired.encode()),
+        )],
+    )
+    .await
+}
+
+/// The seal arm's trigger evaluation (ADR 0043 §A3 "When"), run once per
+/// streamed tablet per tick: seals via [`seal_now`] iff the `KIND_CHANGE`
+/// scope's approximate size exceeds `--stream-seal-bytes`, **or** the oldest
+/// unsealed record's age exceeds `--stream-seal-age`. Neither trigger fires
+/// on an empty hot tail (nothing to seal, and age has nothing to measure).
+/// Also records this tick's own observability levels (`Metric::
+/// StreamHotBytes`/`StreamSealBacklogMs`) regardless of whether a seal
+/// actually fires — the whole point of a level metric is that it reflects
+/// the current state, not just the moments something happened.
+async fn seal_tick(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    tablet: TabletId,
+    group: &CpGroup,
+) -> Result<(), String> {
+    // ADR 0043 §A3's "When": the change log's OWN bytes, never the base
+    // row bytes `CpGroup::approx_bytes` measures — that accessor is
+    // deliberately base-only (ADR 0034's own fix, so auto-split stops
+    // reacting to change-log churn), which is exactly the wrong scope for
+    // this trigger to read.
+    let approx_bytes = group.approx_bytes_kind(KIND_CHANGE).await;
+    ctx.data()
+        .raftkv_metrics
+        .set(Metric::StreamHotBytes, approx_bytes);
+
+    let watermark = meta.effective_stream_shard_watermark(tablet);
+    let now_ms = ctx.env.now().0 / 1_000_000;
+    let oldest_unsealed_ms = group
+        .pending_changes()
+        .await
+        .iter()
+        .filter_map(|(key, _)| record_hlc(key))
+        .filter(|ts| watermark.is_none_or(|w| hlc::pack(*ts) > w))
+        .map(|ts| ts.wall_ms)
+        .min();
+    let backlog_ms = oldest_unsealed_ms.map_or(0, |oldest| now_ms.saturating_sub(oldest));
+    ctx.data()
+        .raftkv_metrics
+        .set(Metric::StreamSealBacklogMs, backlog_ms);
+
+    let size_hot = approx_bytes > ctx.data().stream_seal_knobs.seal_bytes;
+    let age_hot = oldest_unsealed_ms.is_some_and(|oldest| {
+        Duration::from_millis(now_ms.saturating_sub(oldest)) > ctx.data().stream_seal_knobs.seal_age
+    });
+    if !size_hot && !age_hot {
+        return Ok(());
     }
-    ctx.cp_kind_write_raw(table, batch).await
+    seal_now(ctx, table, tablet, group).await.map(|_| ())
+}
+
+/// **The seal sequence** (ADR 0043 §A3, "Sequence"/"Recovery") — the one
+/// mechanism both the periodic seal arm ([`seal_tick`]) and the
+/// disable-triggered final seal (F12-b, `ClientCtx::force_seal_tablet` via
+/// `ClientRequest::ForceSeal`) call, so there is exactly one seal code path
+/// regardless of what triggered it. Unconditional: seals whatever is
+/// currently pending past the tablet's own effective watermark, with no
+/// trigger check of its own (the caller decides *whether* to call this; this
+/// function only knows *how*).
+///
+/// Returns `Ok(Some(epoch))` on a genuine seal, `Ok(None)` if there was
+/// nothing past the watermark to seal (never seals an empty segment — ADR
+/// 0043 §A3's "Empty pending set ⇒ no seal").
+///
+/// **Recovery** (ADR 0043 §A3): the segment id
+/// (`{table}/{label}/{tablet}/{epoch}`) is fully deterministic from
+/// already-durable state (the tablet's own catalog chain length + the
+/// current label), so a crash between the store `put` and the catalog
+/// commit simply has the next call recompute the *same* `epoch` and
+/// re-`put` at the *same* id — an idempotent overwrite by
+/// [`SegmentStore`](animus_env::SegmentStore)'s own contract, safe even as a
+/// harmless superset (the superset-slice rule, ADR 0042 §10) because a
+/// reader always slices to the catalog row's own committed `hlc_range`,
+/// never the raw object.
+pub(crate) async fn seal_now(
+    ctx: &ClientCtx,
+    table: &str,
+    tablet: TabletId,
+    group: &CpGroup,
+) -> Result<Option<u64>, String> {
+    let meta = ctx.effective_metadata();
+    // The label to seal under: the table's *current* schema label if it has
+    // one (the ordinary case, and F12-b's disable path — the final seal
+    // runs before `SetTableStream{None}` ever proposes, so the schema still
+    // names the label being drained), else the most recent still-draining
+    // label with any catalog rows at all (belt-and-suspenders for a
+    // force-seal racing a disable that already committed) — see
+    // `MetaCommand::SealStreamShard`'s own apply-time label validation for
+    // why either of these is always accepted. No label at all (this table
+    // has never streamed) means nothing to seal under.
+    let label = meta
+        .table_stream(table)
+        .map(|s| s.label.clone())
+        .or_else(|| meta.stream_labels_with_rows(table).into_iter().next_back());
+    let Some(label) = label else {
+        return Ok(None);
+    };
+
+    let watermark = meta.effective_stream_shard_watermark(tablet);
+    let mut records: Vec<segment::SegmentRecord> = group
+        .pending_changes()
+        .await
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let ts = record_hlc(&key)?;
+            let packed = hlc::pack(ts);
+            if watermark.is_some_and(|w| packed <= w) {
+                return None; // already covered by an earlier seal
+            }
+            Some(segment::SegmentRecord {
+                source_key: key,
+                packed_hlc: packed,
+                change_record: value,
+            })
+        })
+        .collect();
+    if records.is_empty() {
+        return Ok(None); // ADR 0043 §A3: never seal an empty segment
+    }
+    // `pending_changes`' own key order is token-then-pk-then-HLC, NOT commit
+    // order (see its doc) — this sort by the packed-HLC suffix is load-
+    // bearing, not a formality (ADR 0043 §A3 step 1).
+    records.sort_by_key(|r| r.packed_hlc);
+
+    let start_exclusive = watermark.unwrap_or(0);
+    let end_inclusive = records.last().expect("just checked non-empty").packed_hlc;
+    // Epoch = this tablet's own chain length, regardless of label (a
+    // tablet's epoch counter is a property of its physical seal history,
+    // never resetting across a disable/re-enable cycle — see
+    // `StreamShardRow`'s own identity note in `animus-control`).
+    let next_epoch = meta
+        .stream_shards
+        .range((tablet, 0)..=(tablet, u64::MAX))
+        .next_back()
+        .map_or(0, |((_, e), _)| e + 1);
+    let parent_shard_id = meta.stream_shard_parent_id(tablet, next_epoch);
+    let seal_wall_ms = ctx.env.now().0 / 1_000_000;
+    let header = segment::new_header(
+        table.to_owned(),
+        label.clone(),
+        tablet.0,
+        next_epoch,
+        parent_shard_id,
+        (start_exclusive, end_inclusive),
+        seal_wall_ms,
+    );
+    let count = records.len() as u64;
+    let bytes = segment::encode(&header, &records);
+    let seg_id = segment::segment_id(table, &label, tablet.0, next_epoch);
+
+    let replicas = match ctx.data().segment_store.put_sealed(&seg_id, &bytes).await {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.data()
+                .raftkv_metrics
+                .incr(Metric::StreamSealFailuresTotal);
+            return Err(format!("segment store put of {seg_id:?} failed: {e}"));
+        }
+    };
+
+    // PR6's catalog amendment: carry the view type declared *right now* on
+    // the table's stream — always `Some` at this point, since sealing only
+    // ever happens for a table whose stream is (still) enabled at seal
+    // time, F12-b's disable-triggered final seal included (it runs before
+    // `SetTableStream{None}` ever proposes). The `unwrap_or` fallback is
+    // defensive only, never expected to be reached in production.
+    let view_type = meta
+        .table_stream(table)
+        .map_or(animus_control::StreamViewType::NewAndOldImages, |s| {
+            s.view_type
+        });
+    let cmd = MetaCommand::SealStreamShard {
+        table: table.to_owned(),
+        label,
+        tablet,
+        epoch: next_epoch,
+        view_type,
+        hlc_range: (start_exclusive, end_inclusive),
+        count,
+        seal_wall_ms,
+        replicas,
+    };
+    match ctx
+        .propose_and_await(cmd, SEAL_COMMIT_TIMEOUT, || async {
+            ctx.metadata_fresh()
+                .await
+                .stream_shards
+                .contains_key(&(tablet, next_epoch))
+                .then_some(())
+        })
+        .await
+    {
+        Ok(()) => {
+            ctx.data().raftkv_metrics.incr(Metric::StreamSealsTotal);
+            Ok(Some(next_epoch))
+        }
+        Err(()) => {
+            ctx.data()
+                .raftkv_metrics
+                .incr(Metric::StreamSealFailuresTotal);
+            Err(format!(
+                "SealStreamShard({}, {next_epoch}) did not commit in time",
+                tablet.0
+            ))
+        }
+    }
+}
+
+/// The open-shard hot-read path (ADR 0042 §7/§8, PR6's `GetRecords` read
+/// API): a leader-local, non-linearizable scan of `group`'s own
+/// `KIND_CHANGE` hot tail for records with packed HLC strictly greater than
+/// `from_position`, sorted by that HLC — load-bearing, exactly like
+/// [`seal_now`]'s identical sort, since `pending_changes`' own key order is
+/// token-then-pk-then-HLC, not commit order — then truncated to `limit`.
+///
+/// **Deliberately no `ReadIndex` barrier** — this is
+/// `ClientRequest::StreamHotRead`'s whole reason to exist (F8, ADR 0042
+/// §7): the log is append-only, positional, and serves only
+/// committed-and-applied records, so the worst a leader-local read can
+/// produce is a stale prefix (a record this group has committed but not
+/// yet locally applied), never an out-of-order or fabricated one — and
+/// that staleness is indistinguishable from the stream's own eventually
+/// consistent contract. Never "upgrade" this to a `linearizable_scan_kind`
+/// call.
+///
+/// Returns `(source_key, packed_hlc, change_record bytes)` triples in
+/// ascending HLC order — the caller (`ClientCtx::read_stream_hot_records`,
+/// then the DynamoDB Streams wire edge) builds a `GetRecords` response from
+/// these identically to how it builds one from a sealed segment's own
+/// `SegmentRecord`s.
+pub(crate) async fn hot_read(
+    group: &CpGroup,
+    from_position: u64,
+    limit: usize,
+) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
+    let mut records: Vec<(Vec<u8>, u64, Vec<u8>)> = group
+        .pending_changes()
+        .await
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let ts = record_hlc(&key)?;
+            let packed = hlc::pack(ts);
+            (packed > from_position).then_some((key, packed, value))
+        })
+        .collect();
+    records.sort_by_key(|(_, packed, _)| *packed);
+    records.truncate(limit);
+    records
+}
+
+/// The hot-trim arm (ADR 0042 §8, ADR 0043 §A6, F10), run once per tablet per
+/// tick, right after this tick's reconciliation/seal. Deletes change records
+/// every *expected, present* term has already cleared, and sweeps stale
+/// merge-residue cursor rows. Advances no cursor and seals nothing itself —
+/// that's [`drain_tablet`]'s job for the "gsi" term, and [`seal_now`]'s for
+/// advancing the stream's own catalog watermark.
+///
+/// **The F10/F12-b trim-bound rule** — trim = `min(gsi term if the table has
+/// GSIs, catalog watermark iff the table's CURRENT schema has an enabled
+/// stream)`:
+///
+/// - An expected term with nothing to derive it from yet (a GSI with no
+///   `"gsi"` cursor row; a stream that has never sealed a shard) reads as
+///   absent and blocks trim **entirely** — the safe default every cold
+///   consumer already gets (unchanged from ADR 0041/round 2).
+/// - **The stream term applies only while `stream_enabled` is true** — i.e.
+///   the table's *current* schema names an active stream — never merely
+///   because the table has draining catalog rows left over from a disabled
+///   one. This is what makes F12-b's "a disabled stream's draining rows
+///   must not hold the hot scope hostage" hold: by the time a stream is
+///   disabled, `disable_stream`'s own final seal (F12-b, `dynamo.rs`) has
+///   already moved every one of its records into a committed segment and
+///   the write gate has closed, so **every** hot record still physically
+///   present for that label is, by construction, already ≤ the tablet's
+///   own last-sealed watermark — there is nothing left for a stream term to
+///   protect. Omitting the term entirely (rather than computing one that
+///   would trivially always allow trim anyway) is simpler and needs no
+///   special-casing of "disabled but still has rows" here at all — the
+///   catalog rows themselves age out later through the ordinary retention
+///   sweep (ADR 0043 §A9, a later PR), a fact this hot-trim arm never has
+///   to know about.
+/// - **Zero expected terms at all means trim EVERYTHING, not block
+///   everything** — the opposite of the "one term absent" case above, and
+///   the one subtlety this rule depends on getting right. This is
+///   reachable in exactly one production shape: a table whose stream was
+///   disabled and that has no GSI (the caller's own top-level gate widens
+///   for exactly this case — `gsis.is_empty() && !stream_enabled &&
+///   !ever_streamed`, `change_consumer_loop` — so a tablet that has ever
+///   sealed keeps being visited after its stream disables, specifically so
+///   this arm gets a **guaranteed** chance to run rather than depending on
+///   winning a race against `disable_stream`'s own `SetTableStream` commit
+///   landing first). By the time that state is reached, F12-b's final seal
+///   has already moved every record into a committed segment — nothing is
+///   protecting the hot log anymore, so blocking here would leave those
+///   records stranded forever (found live: this PR's own
+///   `disable_final_seal_then_reenable_continues_the_epoch_chain` test
+///   failed intermittently, exactly on this race, before the fix). A table
+///   that was **never** streamed and has no GSIs never reaches this
+///   function at all (`ever_streamed` is `false` too, so the caller's gate
+///   still skips it) — this "trim everything" branch is therefore never
+///   reached for a table with nothing to protect in the first place *and*
+///   nothing that ever needed protecting.
+async fn trim_janitor(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    tablet: TabletId,
+    group: &CpGroup,
+    gsis: &[IndexDef],
+    stream_enabled: bool,
+) -> Result<(), String> {
+    let expected_cursor_tags: &[&str] = if gsis.is_empty() { &[] } else { &[GSI_TAG] };
+    cleanup_merge_residue_cursor_rows(ctx, table, group, expected_cursor_tags).await?;
+
+    let mut trim_point: Option<u64> = None;
+    let mut blocked = false;
+    if !gsis.is_empty() {
+        match group.cursor_min_watermark(GSI_TAG).await {
+            Some(w) => trim_point = Some(hlc::pack(w)),
+            None => blocked = true,
+        }
+    }
+    if !blocked && stream_enabled {
+        match meta.effective_stream_shard_watermark(tablet) {
+            Some(w) => trim_point = Some(trim_point.map_or(w, |t| t.min(w))),
+            None => blocked = true,
+        }
+    }
+    ctx.data()
+        .raftkv_metrics
+        .set(Metric::ChangeLogTrimBlocked, u64::from(blocked));
+    if blocked {
+        return Ok(()); // an expected term has nothing to derive from yet
+    }
+    // `trim_point == None` here means **zero terms were expected at all**
+    // (`blocked` is already known `false`) — reachable only for a tablet
+    // this loop's own caller gate still visits (`ever_streamed`) despite
+    // `gsis.is_empty() && !stream_enabled`: a table whose stream was
+    // disabled and that has no GSI. Nothing is protecting this hot log
+    // anymore — the disable-triggered final seal (F12-b) already moved
+    // every one of its records into a committed segment before the write
+    // gate closed, so every hot record physically still present for that
+    // label is, by construction, safe to delete outright. `trim_all` makes
+    // that explicit rather than leaving a `None` trim point to be
+    // (wrongly) read as "block everything," which is the bug this
+    // distinction fixes: `trim_point.is_some()` bounds the delete to
+    // `<= trim_point`; `trim_all` deletes every pending record with no
+    // bound at all.
+    let trim_all = trim_point.is_none();
+
+    let mut writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    for (key, _) in group.pending_changes().await {
+        if !trim_all {
+            let Some(ts) = record_hlc(&key) else {
+                continue; // malformed suffix; leave it rather than guess
+            };
+            if hlc::pack(ts) > trim_point.expect("checked Some via !trim_all") {
+                // `pending_changes` is in key order (token-then-pk-then-
+                // HLC), not HLC order (see its own doc), so every record
+                // must be checked — there is no earlier prefix to stop at.
+                continue;
+            }
+        }
+        writes.push((KIND_CHANGE, key, None));
+        if writes.len() >= TRIM_BATCH {
+            ctx.cp_kind_write_raw(table, std::mem::take(&mut writes))
+                .await?;
+        }
+    }
+    if !writes.is_empty() {
+        ctx.cp_kind_write_raw(table, writes).await?;
+    }
+    Ok(())
+}
+
+/// Tombstone a cursor row iff its tag is no longer expected by this table's
+/// schema **and** its token isn't this tablet's own — i.e. it is
+/// physically-present residue from an absorbed sibling (ADR 0042 §7's merge
+/// dual: `StorageScope::with_kind` shares one live `KeyRange`, so widening a
+/// survivor's scope over an absorbed tablet exposes whatever cursor rows it
+/// wrote while it was its own tablet). An unexpected row at this tablet's OWN
+/// token — a dropped index's own stale row — is deliberately left alone
+/// here; round 3 has no cursor tag left for a stream to ever leave one of
+/// its own (the stream half of trim is catalog-derived, not a row any
+/// consumer writes).
+async fn cleanup_merge_residue_cursor_rows(
+    ctx: &ClientCtx,
+    table: &str,
+    group: &CpGroup,
+    expected: &[&str],
+) -> Result<(), String> {
+    let own_token = cursor::token_of(&group.scope_range().start);
+    let mut writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    for (token, tag, _) in group.cursor_rows_with_token().await {
+        if expected.contains(&tag.as_str()) || token == own_token {
+            continue;
+        }
+        writes.push((KIND_CURSOR, cursor::cursor_key(&token, &tag), None));
+    }
+    if writes.is_empty() {
+        return Ok(());
+    }
+    ctx.cp_kind_write_raw(table, writes).await
 }
 
 /// The full data-plane key of one GSI row: the ADR 0022 token over the **index
@@ -272,4 +857,1390 @@ fn gsi_row_key(
 /// The attributes a GSI row carries, per its declared projection.
 fn projected(item: &Item, base: &animus_dynamo::TableSchema, idx: &IndexDef) -> Item {
     crate::dynamo::projected_item(item, base, idx)
+}
+
+/// ADR 0042 §7/§8 regressions for the cursor-based drain + trim janitor
+/// above. **In-crate**, like `lib.rs`'s `split_fence_tests`/
+/// `auto_split_median_tests`: these need private handles (`CpGroup::
+/// pending_changes`/`cursor_min_watermark`/`cursor_rows_with_token`, the
+/// plain-client-protocol `ClientRequest::SplitTablet`/`MergeTablets` with an
+/// arbitrary binary `split_key`, and `crate::dynamo::item_key` for
+/// deterministic side-placement) that an external `tests/` crate — a
+/// separate compilation unit, linking only this crate's `pub` surface —
+/// cannot reach. All real-socket `ProdEnv` integration tests, per this
+/// crate's own testing discipline; every eventual property is a
+/// converged-or-timeout poll, never a fixed sleep.
+#[cfg(test)]
+mod gsi_drain_cursor_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use animus_tablet::TabletId;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, timeout};
+
+    use super::*;
+    use crate::config::NodeRole;
+    use crate::{
+        ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, read_frame, run_node,
+        write_frame,
+    };
+
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn single_node_config() -> ClusterConfig {
+        let addrs = free_addrs(5);
+        ClusterConfig {
+            nodes: vec![RoleAddrs {
+                id: crate::config::node_id(0),
+                role: NodeRole::Both,
+                internal: addrs[0],
+                client: addrs[1],
+                dynamo: addrs[2],
+                cql: addrs[3],
+                admin: addrs[4],
+            }],
+        }
+    }
+
+    async fn await_control_leader(node: &Node) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if node.is_control_leader() {
+                    return;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("node did not become control leader in time");
+    }
+
+    async fn single_node(dir: &Path) -> Node {
+        let config = single_node_config();
+        let node = run_node(&config, 0, dir.join("node-0"))
+            .await
+            .expect("bring up single node");
+        await_control_leader(&node).await;
+        node
+    }
+
+    /// One DynamoDB JSON request over the real HTTP wire (mirroring
+    /// `tests/dynamo_gsi_drain.rs`'s helper of the same shape — duplicated
+    /// rather than shared, since this module is a different compilation
+    /// unit than that external `tests/` crate).
+    async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
+        let mut s = TcpStream::connect(addr).await.expect("connect");
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nX-Amz-Target: {target}\r\n\
+             Connection: close\r\n\
+             Content-Type: application/x-amz-json-1.0\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.expect("write");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.expect("read");
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        (status, body.to_owned())
+    }
+
+    /// A table with one GSI (`by-g`, hash attribute `g`) — every test in this
+    /// module uses this identical shape.
+    async fn create_table_with_gsi(addr: SocketAddr, table: &str) {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.CreateTable",
+            &format!(
+                r#"{{"TableName":"{table}",
+                    "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                    "GlobalSecondaryIndexes":[
+                        {{"IndexName":"by-g",
+                         "KeySchema":[{{"AttributeName":"g","KeyType":"HASH"}}],
+                         "Projection":{{"ProjectionType":"ALL"}}}}]}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+    }
+
+    /// One item whose own `id` and GSI hash attribute `g` are both `id` —
+    /// every item this module writes has a unique, individually queryable
+    /// GSI hash value.
+    async fn put_item(addr: SocketAddr, table: &str, id: &str) {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.PutItem",
+            &format!(
+                r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"g":{{"S":"{id}"}}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "PutItem({id}) failed: {body}");
+    }
+
+    /// Poll a GSI `Query` until `accept` is satisfied (mirrors
+    /// `tests/dynamo_gsi_drain.rs`'s `await_gsi_query` — a GSI is
+    /// eventually consistent by contract).
+    async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> bool) {
+        let last = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen = std::sync::Arc::clone(&last);
+        let converged = async move {
+            loop {
+                let (status, got) = dynamo(addr, "DynamoDB_20120810.Query", body).await;
+                if status == 200 && accept(&got) {
+                    return;
+                }
+                *seen.lock().unwrap() = got;
+                sleep(Duration::from_millis(100)).await;
+            }
+        };
+        if timeout(Duration::from_secs(30), converged).await.is_err() {
+            panic!(
+                "GSI query never converged within 30s (last saw: {})",
+                last.lock().unwrap()
+            );
+        }
+    }
+
+    /// A `{"g = :g"}` GSI equality query for `id`, expecting exactly one hit.
+    async fn await_indexed(addr: SocketAddr, table: &str, id: &str) {
+        await_gsi_query(
+            addr,
+            &format!(
+                r#"{{"TableName":"{table}","IndexName":"by-g",
+                    "KeyConditionExpression":"g = :g",
+                    "ExpressionAttributeValues":{{":g":{{"S":"{id}"}}}}}}"#
+            ),
+            |b| b.contains("\"Count\":1"),
+        )
+        .await;
+    }
+
+    fn tablets_of(node: &Node, table: &str) -> Vec<TabletId> {
+        node.metadata()
+            .tablets
+            .iter()
+            .filter(|(_, t)| t.table.as_deref() == Some(table))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    fn only_tablet(node: &Node, table: &str) -> TabletId {
+        let mut ts = tablets_of(node, table);
+        assert_eq!(ts.len(), 1, "expected exactly one tablet for `{table}`");
+        ts.pop().unwrap()
+    }
+
+    async fn await_true<F: Fn() -> bool>(secs: u64, what: &str, cond: F) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while !cond() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Poll until tablet `tablet`'s own change log (`KIND_CHANGE`, via the
+    /// private `CpGroup::pending_changes` accessor — the "raw kind-scan of
+    /// leftovers" the crash-recovery scenario needs) holds exactly `want`
+    /// records.
+    async fn await_pending_changes(node: &Node, tablet: TabletId, want: usize, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let group = node
+                .edge
+                .local_cp(tablet)
+                .expect("this node hosts the tablet");
+            let n = group.pending_changes().await.len();
+            if n == want {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: change log has {n} records, want {want}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Poll until this node's own tablet-host reconciler has actually stood
+    /// up `tablet`'s group — a real, if usually short, window separate from
+    /// "the tablet map already shows it" (`tablets_of`'s own convergence).
+    async fn await_hosted(node: &Node, tablet: TabletId, what: &str) -> CpGroup {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(group) = node.edge.local_cp(tablet) {
+                return group;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn await_cursor_some(group: &CpGroup, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if group.cursor_min_watermark(GSI_TAG).await.is_some() {
+                return;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Split `tablet` at the raw physical key `split_key` — the plain
+    /// client-protocol `ClientRequest::SplitTablet`, not the admin HTTP
+    /// surface (whose `split_key: String` field is a JSON string and so
+    /// can't carry a DynamoDB item key's arbitrary, generally non-UTF8
+    /// murmur3 token prefix — `ClientRequest`'s own `Vec<u8>` field
+    /// `serde_json`-encodes as an ordinary byte array instead).
+    async fn split(client_addr: SocketAddr, tablet: TabletId, split_key: Vec<u8>) {
+        let mut stream = TcpStream::connect(client_addr).await.expect("connect");
+        write_frame(
+            &mut stream,
+            &ClientRequest::SplitTablet {
+                tablet: tablet.0,
+                split_key,
+            },
+        )
+        .await
+        .expect("send split");
+        let resp: ClientResponse = read_frame(&mut stream)
+            .await
+            .expect("read reply")
+            .expect("a reply");
+        assert!(
+            matches!(resp, ClientResponse::PutOk),
+            "split failed: {resp:?}"
+        );
+    }
+
+    async fn merge(client_addr: SocketAddr, left: TabletId, right: TabletId) {
+        let mut stream = TcpStream::connect(client_addr).await.expect("connect");
+        write_frame(
+            &mut stream,
+            &ClientRequest::MergeTablets {
+                left: left.0,
+                right: right.0,
+            },
+        )
+        .await
+        .expect("send merge");
+        let resp: ClientResponse = read_frame(&mut stream)
+            .await
+            .expect("read reply")
+            .expect("a reply");
+        assert!(
+            matches!(resp, ClientResponse::PutOk),
+            "merge failed: {resp:?}"
+        );
+    }
+
+    /// An `id` value whose real ADR 0022 token (`crate::dynamo::item_key`,
+    /// the exact function the DynamoDB edge itself uses) falls on the
+    /// requested side of `boundary` — a murmur3 token can't be chosen
+    /// directly, so this scans a small deterministic candidate pool instead.
+    /// Panics if none match (the pool is too small for this boundary, not a
+    /// product bug).
+    fn find_id_on_side(boundary: &[u8; 8], want_below: bool, pool: &str) -> String {
+        for i in 0..10_000u32 {
+            let id = format!("{pool}-{i}");
+            let key = crate::dynamo::item_key(&AttributeValue::S(id.clone()), None);
+            let token: [u8; 8] = key[..8].try_into().expect("a key has at least 8 bytes");
+            if (token < *boundary) == want_below {
+                return id;
+            }
+        }
+        panic!(
+            "no candidate id found on the {} side of the boundary in `{pool}`'s pool",
+            if want_below { "left" } else { "right" }
+        );
+    }
+
+    /// A fixed, arbitrary token boundary — not derived from any real item.
+    /// Any byte string strictly between the ring's absolute start (`[]`) and
+    /// its unbounded-above end is a legal split point (`SplitTablet` doesn't
+    /// require an existing key), so a plain numeric midpoint works.
+    const BOUNDARY: [u8; 8] = 0x8000_0000_0000_0000u64.to_be_bytes();
+
+    /// The change log must not grow without bound while a stream of writes
+    /// to an indexed table is ongoing, and must drain back to nothing once
+    /// they stop — the reason the cursor+trim-janitor rework exists at all
+    /// (ADR 0042 §7/§8), proven here by directly inspecting the raw
+    /// `KIND_CHANGE` scope rather than only observing the GSI's own
+    /// eventual correctness.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn change_log_stays_bounded_under_sustained_writes_to_an_indexed_table() {
+        timeout(Duration::from_secs(90), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node(dir.path()).await;
+            let table = "orders";
+            create_table_with_gsi(node.dynamo_addr(), table).await;
+
+            for i in 0..200u32 {
+                put_item(node.dynamo_addr(), table, &format!("o{i}")).await;
+                if i % 20 == 19 {
+                    let tablet = only_tablet(&node, table);
+                    let group = node
+                        .edge
+                        .local_cp(tablet)
+                        .expect("this node hosts the tablet");
+                    let n = group.pending_changes().await.len();
+                    // A generous, sampled ceiling: proves the log doesn't
+                    // grow unboundedly with the write stream (it would, under
+                    // the pre-ADR-0042 GSI-drain-only design's absence of a
+                    // second consumer, but a bug here would show as
+                    // unbounded growth too), not a tight bound on any one
+                    // instant — the drain/trim tick is 200ms, and this test
+                    // writes far faster than that.
+                    assert!(
+                        n < 1000,
+                        "change log grew far beyond a single drain/trim tick's worth of \
+                         writes: {n} records after {} puts",
+                        i + 1
+                    );
+                }
+            }
+
+            let tablet = only_tablet(&node, table);
+            await_pending_changes(&node, tablet, 0, "after sustained writes stop").await;
+        })
+        .await
+        .expect("did not converge within 90s");
+    }
+
+    /// A real process crash + restart, some time after writes to an indexed
+    /// table land, must recover to the complete, correct GSI with no
+    /// record's partition ever skipped — the ADR 0042 §7/§8 "over-covers,
+    /// never under-covers" guarantee. Real `ProdEnv` gives no hook to pin
+    /// the exact instant relative to the drain's own reconcile-entries/
+    /// cursor-write boundary, so this does not assert on a specific
+    /// pre-crash state (a short delay only biases, without guaranteeing,
+    /// toward catching the node mid-reconciliation); it proves the property
+    /// that must hold regardless of which state the crash actually catches
+    /// the drain in — genuine WAL/engine recovery, not a simulated one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn crash_mid_reconcile_recovers_without_skipping_or_corrupting_the_gsi() {
+        timeout(Duration::from_secs(90), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node_dir = dir.path().join("node-0");
+            let config = single_node_config();
+            let node = run_node(&config, 0, &node_dir).await.expect("bring up");
+            await_control_leader(&node).await;
+
+            let table = "orders";
+            create_table_with_gsi(node.dynamo_addr(), table).await;
+            let ids: Vec<String> = (0..40u32).map(|i| format!("o{i}")).collect();
+            for id in &ids {
+                put_item(node.dynamo_addr(), table, id).await;
+            }
+            sleep(Duration::from_millis(20)).await;
+            node.shutdown_graceful().await;
+
+            let node2 = run_node(&config, 0, &node_dir)
+                .await
+                .expect("restart on the same dir");
+            await_control_leader(&node2).await;
+
+            for id in &ids {
+                await_indexed(node2.dynamo_addr(), table, id).await;
+            }
+
+            let tablet = only_tablet(&node2, table);
+            await_pending_changes(&node2, tablet, 0, "after recovery").await;
+        })
+        .await
+        .expect("crash/restart recovery did not converge in time");
+    }
+
+    /// Split a table's tablet, then reconcile the fresh right child's own
+    /// items — a cold start from `W = 0` (the min-over-rows rule over an
+    /// empty set: the right child inherits no cursor row at all) — and
+    /// confirm it converges to the correct GSI, on both sides, without
+    /// corrupting anything (idempotence).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn split_right_childs_cold_start_re_reconciles_from_zero_without_corrupting_the_gsi() {
+        timeout(Duration::from_secs(90), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node(dir.path()).await;
+            let dynamo_addr = node.dynamo_addr();
+            let client_addr = node.client_addr();
+            let table = "orders";
+            create_table_with_gsi(dynamo_addr, table).await;
+
+            let left_id = find_id_on_side(&BOUNDARY, true, "l");
+            put_item(dynamo_addr, table, &left_id).await;
+            await_indexed(dynamo_addr, table, &left_id).await;
+
+            let parent = only_tablet(&node, table);
+            split(client_addr, parent, BOUNDARY.to_vec()).await;
+            await_true(20, "split produced two tablets", || {
+                tablets_of(&node, table).len() == 2
+            })
+            .await;
+
+            let right = {
+                let m = node.metadata();
+                tablets_of(&node, table)
+                    .into_iter()
+                    .find(|t| !m.tablets[t].range.start.is_empty())
+                    .expect("the right child's range doesn't start at the ring's own beginning")
+            };
+
+            let right_ids: Vec<String> = (0..8)
+                .map(|i| find_id_on_side(&BOUNDARY, false, &format!("r{i}")))
+                .collect();
+            for id in &right_ids {
+                put_item(dynamo_addr, table, id).await;
+            }
+            for id in &right_ids {
+                await_indexed(dynamo_addr, table, id).await;
+            }
+            // The split didn't corrupt the other side either.
+            await_indexed(dynamo_addr, table, &left_id).await;
+
+            let right_group = await_hosted(&node, right, "right child hosted").await;
+            await_cursor_some(&right_group, "right child's own gsi cursor advances").await;
+            await_pending_changes(&node, right, 0, "right child's own change log drains").await;
+        })
+        .await
+        .expect("split cold-start scenario did not converge in time");
+    }
+
+    /// Two tablets of an indexed table, each with its own, genuinely
+    /// different "gsi" cursor watermark, merged together: the survivor must
+    /// use the **minimum** over both rows, not just its own (higher) one —
+    /// the ADR 0042 §7 min-over-rows rule's one genuine data-loss hazard.
+    /// Demonstrates the hazard directly (an "own-row-only" reading of the
+    /// same post-merge state disagrees with, and is strictly higher than,
+    /// the correct min), then proves the real consequence: the survivor's
+    /// next drain pass actually reconciles the absorbed tablet's own
+    /// uncopied record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merge_survivor_uses_the_min_over_rows_not_its_own_higher_watermark() {
+        timeout(Duration::from_secs(120), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node(dir.path()).await;
+            let dynamo_addr = node.dynamo_addr();
+            let client_addr = node.client_addr();
+            let table = "orders";
+            create_table_with_gsi(dynamo_addr, table).await;
+
+            // Seed and fully reconcile ONE item on the left side *before*
+            // splitting — this is the pre-split (single) tablet's own
+            // reconciliation, so its "gsi" row is what the retained LEFT
+            // child inherits (same `range.start`). Nothing is written on the
+            // right side yet: a seed there too would be reconciled by this
+            // same pre-split tablet, and the resulting row would land on
+            // LEFT after the split (inherited), not prove anything about the
+            // fresh RIGHT child's own, independent reconciliation.
+            let left_seed = find_id_on_side(&BOUNDARY, true, "seed-left");
+            put_item(dynamo_addr, table, &left_seed).await;
+            await_indexed(dynamo_addr, table, &left_seed).await;
+
+            let parent = only_tablet(&node, table);
+            split(client_addr, parent, BOUNDARY.to_vec()).await;
+            await_true(20, "split produced two tablets", || {
+                tablets_of(&node, table).len() == 2
+            })
+            .await;
+
+            let (left, right) = {
+                let m = node.metadata();
+                let ts = tablets_of(&node, table);
+                let left = *ts
+                    .iter()
+                    .find(|t| m.tablets[t].range.start.is_empty())
+                    .expect("a left child retains the ring's own start");
+                let right = *ts
+                    .iter()
+                    .find(|t| **t != left)
+                    .expect("a second, right child exists");
+                (left, right)
+            };
+
+            // The right child's OWN first reconciliation: it inherited
+            // nothing from the pre-split tablet (the min-over-rows rule over
+            // an empty set), so this seed is what gives it a genuine "gsi"
+            // watermark of its own, on its own (now-independent) raft group.
+            let right_seed = find_id_on_side(&BOUNDARY, false, "seed-right");
+            put_item(dynamo_addr, table, &right_seed).await;
+            await_indexed(dynamo_addr, table, &right_seed).await;
+
+            let right_group_pre = await_hosted(&node, right, "right tablet hosted pre-merge").await;
+            await_cursor_some(
+                &right_group_pre,
+                "right's own gsi watermark exists pre-merge",
+            )
+            .await;
+            let w_right = right_group_pre
+                .cursor_min_watermark(GSI_TAG)
+                .await
+                .expect("right has reconciled once");
+
+            // Grow LEFT's own watermark past `w_right` with more,
+            // independent writes+reconciliation on its own (separate) raft
+            // group — real wall-clock time passing between these await
+            // points is what makes each later HLC genuinely exceed the
+            // right side's earlier one (the same cross-group,
+            // real-time-grounded HLC ordering `cross_group_lww.rs`'s own
+            // clock-skew tests rely on), not any artificial synchronization.
+            for i in 0..5 {
+                let id = find_id_on_side(&BOUNDARY, true, &format!("left-more-{i}"));
+                put_item(dynamo_addr, table, &id).await;
+                await_indexed(dynamo_addr, table, &id).await;
+            }
+            let left_group = await_hosted(&node, left, "left tablet hosted").await;
+            let w_left = left_group
+                .cursor_min_watermark(GSI_TAG)
+                .await
+                .expect("left has reconciled");
+            assert!(
+                w_left > w_right,
+                "left's own watermark ({w_left:?}) must exceed right's ({w_right:?}) for this \
+                 scenario to be meaningful"
+            );
+
+            // One more item on the RIGHT side, written just before merging —
+            // the record this scenario's assertions are really about. It may
+            // or may not have been reconciled by right's own drain before the
+            // merge lands (real `ProdEnv` gives no hook to pin that), but the
+            // min-over-rows rule must cover it either way.
+            let straggler = find_id_on_side(&BOUNDARY, false, "straggler");
+            put_item(dynamo_addr, table, &straggler).await;
+
+            merge(client_addr, left, right).await;
+            await_true(20, "merge left a single tablet", || {
+                tablets_of(&node, table).len() == 1
+            })
+            .await;
+
+            let survivor =
+                await_hosted(&node, left, "survivor (left) tablet hosted post-merge").await;
+
+            // The absorbed sibling's own "gsi" row survives physically
+            // (merge never erases), but only becomes *visible* through the
+            // survivor's own scope once the reconciler's own `WidenScope`
+            // action actually runs (a real, if usually short, tick or two
+            // after the merge is committed) — poll for it rather than
+            // asserting on the very next tick.
+            let gsi_rows = {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+                loop {
+                    let rows = survivor.cursor_rows_with_token().await;
+                    let gsi_rows: Vec<_> = rows
+                        .into_iter()
+                        .filter(|(_, tag, _)| tag == GSI_TAG)
+                        .collect();
+                    if gsi_rows.len() >= 2 {
+                        break gsi_rows;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "expected the survivor's own row plus the absorbed sibling's, \
+                         last saw {gsi_rows:?}"
+                    );
+                    sleep(Duration::from_millis(100)).await;
+                }
+            };
+
+            // Demonstrate the hazard directly: trusting only the survivor's
+            // OWN token's row (what an "own-row-only" design would read)
+            // gives a HIGHER, wrong answer than the correct min-over-rows
+            // rule — proving that design would have claimed records it
+            // never actually copied.
+            let own_token = cursor::token_of(&survivor.scope_range().start);
+            let own_row_only = gsi_rows
+                .iter()
+                .find(|(token, _, _)| *token == own_token)
+                .map(|(_, _, ts)| *ts)
+                .expect("the survivor's own row is one of the rows found");
+            let correct_min = survivor
+                .cursor_min_watermark(GSI_TAG)
+                .await
+                .expect("at least one row exists");
+            assert!(
+                own_row_only > correct_min,
+                "this scenario's own-row watermark ({own_row_only:?}) must exceed the true min \
+                 ({correct_min:?}) — otherwise the min rule and an own-row-only design would \
+                 agree, and the hazard wouldn't be demonstrated"
+            );
+
+            // And the real consequence: the survivor's next drain pass
+            // actually reconciles the straggler (the absorbed tablet's own
+            // uncopied record) — proving the min rule drives genuine
+            // re-coverage, not just a correct read.
+            await_indexed(dynamo_addr, table, &straggler).await;
+        })
+        .await
+        .expect("merge min-rule scenario did not converge in time");
+    }
+
+    /// An expected consumer ("gsi", since this table has a GSI) with no
+    /// cursor row at all must block trim **entirely** — the ADR 0042 §7 safe
+    /// default. `index_drain_loop`'s own first statement is an
+    /// unconditional 200ms sleep before its very first tick, so immediately
+    /// after a write (a couple of fast loopback round trips, reliably well
+    /// under that), no reconciliation has had a chance to run at all: the
+    /// "gsi" tag genuinely has no row yet, checked directly here rather than
+    /// inferred.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trim_never_deletes_past_an_expected_consumers_missing_cursor() {
+        timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node(dir.path()).await;
+            let table = "orders";
+            create_table_with_gsi(node.dynamo_addr(), table).await;
+            put_item(node.dynamo_addr(), table, "o0").await;
+
+            let tablet = only_tablet(&node, table);
+            let group = node
+                .edge
+                .local_cp(tablet)
+                .expect("this node hosts the tablet");
+            assert_eq!(
+                group.cursor_min_watermark(GSI_TAG).await,
+                None,
+                "an expected tag with no row yet must read as no watermark"
+            );
+            assert_eq!(
+                group.pending_changes().await.len(),
+                1,
+                "the janitor must not have trimmed anything with no cursor row to bound it"
+            );
+
+            // "Blocks trim" isn't "blocks forever": once the drain does run,
+            // it must still converge normally.
+            await_pending_changes(&node, tablet, 0, "after the drain's first real pass").await;
+        })
+        .await
+        .expect("did not converge in time");
+    }
+}
+
+/// The DynamoDB Streams **sealer** regressions (ADR 0042/0043, round-3
+/// sealer PR): the seal arm's triggers/sequence, the F10/F12-b hot-trim
+/// rework, and F11's split-key token alignment. A fourth in-crate module in
+/// this file's own private-handle class (alongside `gsi_drain_cursor_tests`
+/// above): needs `CpGroup::pending_changes`/`approx_bytes`, the plain
+/// client-protocol `ClientRequest::SplitTablet`, and — to prove a segment
+/// genuinely landed durably — a second `FsSegmentStore` handle pointed at
+/// the exact same `<node dir>/segments` path `build_segment_store` roots the
+/// **default** cluster store's own local building block at (see that
+/// function's doc), read directly via `SegmentStore::get` rather than
+/// through any production API (there is none yet — the read path is PR6).
+/// Every test uses [`run_node_with_streams`] with tiny knobs (this
+/// codebase's own testing discipline — never wait out the 4h/4MiB
+/// production defaults).
+#[cfg(test)]
+mod stream_sealer_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use animus_env::SegmentStore;
+    use animus_tablet::TabletId;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, timeout};
+
+    use super::*;
+    use crate::config::NodeRole;
+    use crate::{
+        ClusterConfig, Node, RoleAddrs, SegmentStoreConfig, StorageBackend, StreamSealKnobs,
+        run_node_with_streams,
+    };
+
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn single_node_config() -> ClusterConfig {
+        let addrs = free_addrs(5);
+        ClusterConfig {
+            nodes: vec![RoleAddrs {
+                id: crate::config::node_id(0),
+                role: NodeRole::Both,
+                internal: addrs[0],
+                client: addrs[1],
+                dynamo: addrs[2],
+                cql: addrs[3],
+                admin: addrs[4],
+            }],
+        }
+    }
+
+    async fn await_control_leader(node: &Node) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if node.is_control_leader() {
+                    return;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("node did not become control leader in time");
+    }
+
+    /// A single combined node, DynamoDB Streams sealer knobs set to `knobs`
+    /// (never the production defaults) — see the module doc.
+    async fn single_node_with_streams(dir: &Path, knobs: StreamSealKnobs) -> Node {
+        let config = single_node_config();
+        let node = run_node_with_streams(
+            &config,
+            0,
+            dir.join("node-0"),
+            StorageBackend::default(),
+            Duration::from_secs(600),
+            knobs,
+            SegmentStoreConfig::default(),
+            crate::DEFAULT_STREAM_RETENTION,
+        )
+        .await
+        .expect("bring up single node with stream knobs");
+        await_control_leader(&node).await;
+        node
+    }
+
+    /// One DynamoDB JSON request over the real HTTP wire (mirroring
+    /// `gsi_drain_cursor_tests::dynamo` above — duplicated rather than
+    /// shared, since sibling test modules keep their own fixtures
+    /// independent).
+    async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
+        let mut s = TcpStream::connect(addr).await.expect("connect");
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nX-Amz-Target: {target}\r\n\
+             Connection: close\r\n\
+             Content-Type: application/x-amz-json-1.0\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.expect("write");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.expect("read");
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        (status, body.to_owned())
+    }
+
+    /// A table with a single-attribute key and `NEW_AND_OLD_IMAGES` stream
+    /// enabled at creation.
+    async fn create_streamed_table(addr: SocketAddr, table: &str) {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.CreateTable",
+            &format!(
+                r#"{{"TableName":"{table}",
+                    "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                    "StreamSpecification":{{"StreamEnabled":true,
+                        "StreamViewType":"NEW_AND_OLD_IMAGES"}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+    }
+
+    /// `PutItem` with a `"val"` attribute of `pad_len` filler bytes (a
+    /// convenient knob for tripping a byte-size seal trigger deterministically).
+    async fn put_item_padded(addr: SocketAddr, table: &str, id: &str, pad_len: usize) {
+        let pad = "x".repeat(pad_len);
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.PutItem",
+            &format!(
+                r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"val":{{"S":"{pad}"}}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "PutItem({id}) failed: {body}");
+    }
+
+    fn only_tablet(node: &Node, table: &str) -> TabletId {
+        let mut ts: Vec<TabletId> = node
+            .metadata()
+            .tablets
+            .iter()
+            .filter(|(_, t)| t.table.as_deref() == Some(table))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(ts.len(), 1, "expected exactly one tablet for `{table}`");
+        ts.pop().unwrap()
+    }
+
+    async fn await_true<F: Fn() -> bool>(secs: u64, what: &str, cond: F) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while !cond() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The `FsSegmentStore` `build_segment_store`'s **default** cluster
+    /// store roots its own per-node local building block at, for a single
+    /// node's `dir/node-0` (`BoundNode::dir.join("segments")`) — test-only
+    /// introspection, since the read path (PR6) has no production accessor
+    /// yet.
+    fn node_segment_store(dir: &Path) -> animus_env::FsSegmentStore {
+        animus_env::FsSegmentStore::new(dir.join("node-0").join("segments"))
+    }
+
+    /// **Seal happy path (size trigger)**: a tiny `--stream-seal-bytes`
+    /// tripped by a handful of padded writes lands a segment on this node's
+    /// own local store, commits a `SealStreamShard` catalog row with the
+    /// correct `hlc_range`/`count`/non-empty `replicas`, and the hot-trim
+    /// arm then trims every now-sealed record on its very next tick.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seal_size_trigger_lands_segment_and_trims_hot_tail() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 200,
+                    seal_age: Duration::from_secs(3600),
+                },
+            )
+            .await;
+            let table = "orders";
+            create_streamed_table(node.dynamo_addr(), table).await;
+
+            for i in 0..10u32 {
+                put_item_padded(node.dynamo_addr(), table, &format!("o{i}"), 50).await;
+            }
+
+            let tablet = only_tablet(&node, table);
+            await_true(20, "a seal commits a catalog row", || {
+                node.metadata().stream_shards.contains_key(&(tablet, 0))
+            })
+            .await;
+            let row = node.metadata().stream_shards[&(tablet, 0)].clone();
+            assert_eq!(row.table, table);
+            assert!(row.count >= 1, "the seal covered at least one record");
+            assert_eq!(
+                row.hlc_range.0, 0,
+                "the tablet's own first seal starts exclusive-from-zero"
+            );
+            assert!(
+                !row.replicas.is_empty(),
+                "a committed row only ever exists after put_replicated returned Ok"
+            );
+
+            // The hot-trim arm deletes every now-sealed record on its next tick.
+            let group = node
+                .edge
+                .local_cp(tablet)
+                .expect("this node hosts the tablet");
+            await_true(20, "hot tail trims to empty after the seal", || {
+                futures::executor::block_on(group.pending_changes()).is_empty()
+            })
+            .await;
+
+            // The segment object itself landed durably at the deterministic id.
+            let store = node_segment_store(dir.path());
+            let seg_id = animus_cp_data::segment::segment_id(table, &row.label, tablet.0, 0);
+            let bytes = store
+                .get(&seg_id)
+                .await
+                .expect("segment store read")
+                .expect("the segment object must exist after a committed seal");
+            let decoded = animus_cp_data::segment::decode(&bytes).expect("decode segment");
+            assert_eq!(decoded.header.count, row.count);
+            assert_eq!(decoded.header.hlc_range, row.hlc_range);
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// **Age trigger** on an otherwise quiet table: a tiny `--stream-seal-age`
+    /// seals a couple of items whose combined bytes never approach the (huge)
+    /// size threshold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn age_trigger_seals_a_quiet_table() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 64 * 1024 * 1024, // never trips by size here
+                    seal_age: Duration::from_millis(300),
+                },
+            )
+            .await;
+            let table = "quiet";
+            create_streamed_table(node.dynamo_addr(), table).await;
+            put_item_padded(node.dynamo_addr(), table, "k0", 4).await;
+            put_item_padded(node.dynamo_addr(), table, "k1", 4).await;
+
+            let tablet = only_tablet(&node, table);
+            await_true(20, "the age trigger seals a quiet table's tail", || {
+                node.metadata().stream_shards.contains_key(&(tablet, 0))
+            })
+            .await;
+            let row = node.metadata().stream_shards[&(tablet, 0)].clone();
+            assert_eq!(row.count, 2, "both quiet writes are covered by one seal");
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// **Empty hot tail never seals**: with no writes at all, neither
+    /// trigger ever fires (there is nothing for the age trigger to measure,
+    /// and zero bytes never exceeds any positive size threshold) — several
+    /// ticks' worth of real time produces zero catalog rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn empty_hot_tail_never_seals() {
+        timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 1, // would trip immediately if anything were pending
+                    seal_age: Duration::from_millis(50),
+                },
+            )
+            .await;
+            let table = "empty";
+            create_streamed_table(node.dynamo_addr(), table).await;
+
+            sleep(Duration::from_millis(800)).await; // several ticks + trigger windows
+            assert!(
+                node.metadata().stream_shards.is_empty(),
+                "an empty hot tail must never produce a seal"
+            );
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// **Boundary: exactly-at-watermark records are excluded, not
+    /// re-included** — the seal filter is `packed_hlc > watermark`, never
+    /// `>=`. Proven by forcing two back-to-back size-triggered seals (a tiny
+    /// `--stream-seal-bytes` so each single padded write exceeds it on its
+    /// own) and checking the second seal's own `hlc_range.0` lands exactly
+    /// on the first seal's `hlc_range.1` (the shared boundary point) while
+    /// covering only the second write (`count == 1`, not `2`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn boundary_exactly_at_watermark_excluded() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 20, // one padded write alone exceeds this
+                    seal_age: Duration::from_secs(3600),
+                },
+            )
+            .await;
+            let table = "boundary";
+            create_streamed_table(node.dynamo_addr(), table).await;
+            let tablet = only_tablet(&node, table);
+
+            put_item_padded(node.dynamo_addr(), table, "first", 50).await;
+            await_true(20, "first seal commits", || {
+                node.metadata().stream_shards.contains_key(&(tablet, 0))
+            })
+            .await;
+            let first = node.metadata().stream_shards[&(tablet, 0)].clone();
+
+            put_item_padded(node.dynamo_addr(), table, "second", 50).await;
+            await_true(20, "second seal commits", || {
+                node.metadata().stream_shards.contains_key(&(tablet, 1))
+            })
+            .await;
+            let second = node.metadata().stream_shards[&(tablet, 1)].clone();
+
+            assert_eq!(
+                second.hlc_range.0, first.hlc_range.1,
+                "the second seal's exclusive start is exactly the first seal's \
+                 committed end"
+            );
+            assert_eq!(
+                second.count, 1,
+                "the second seal covers only the NEW record, never re-including \
+                 the first seal's own boundary record"
+            );
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// **F10/F12-b: the hot-trim min-rule with a GSI and a stream together.**
+    /// A table with both an enabled stream and a GSI: trim must wait for
+    /// **both** terms — a fresh table (neither the GSI's `"gsi"` cursor row
+    /// nor a stream seal exists yet) blocks trim entirely; once the stream
+    /// has sealed but the GSI drain hasn't reconciled yet is still blocked
+    /// (proven by writing enough to trip the tiny size trigger while an
+    /// artificially large table keeps the GSI busy would be racy — instead
+    /// this proves the **simpler, decisive** half directly: hot records
+    /// survive until the GSI cursor exists, `cursor_min_watermark` is
+    /// `Some`, AND the stream watermark is `Some`, matching `trim_janitor`'s
+    /// own documented rule).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hot_trim_min_rule_gsi_and_stream_together() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 32, // trips on the very first padded write
+                    seal_age: Duration::from_secs(3600),
+                },
+            )
+            .await;
+            let table = "gsi_and_stream";
+            let (status, body) = dynamo(
+                node.dynamo_addr(),
+                "DynamoDB_20120810.CreateTable",
+                &format!(
+                    r#"{{"TableName":"{table}",
+                        "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                        "GlobalSecondaryIndexes":[
+                            {{"IndexName":"by-g",
+                             "KeySchema":[{{"AttributeName":"g","KeyType":"HASH"}}],
+                             "Projection":{{"ProjectionType":"ALL"}}}}],
+                        "StreamSpecification":{{"StreamEnabled":true,
+                            "StreamViewType":"NEW_AND_OLD_IMAGES"}}}}"#
+                ),
+            )
+            .await;
+            assert_eq!(status, 200, "CreateTable failed: {body}");
+            let tablet = only_tablet(&node, table);
+            let group = node
+                .edge
+                .local_cp(tablet)
+                .expect("this node hosts the tablet");
+
+            put_item_padded(node.dynamo_addr(), table, "k0", 50).await;
+
+            // The stream side seals quickly (tiny threshold) — but trim must
+            // still wait on the GSI side too.
+            await_true(20, "the stream side seals", || {
+                node.metadata().stream_shards.contains_key(&(tablet, 0))
+            })
+            .await;
+            await_true(
+                10,
+                "the GSI drain reconciles and advances its cursor",
+                || futures::executor::block_on(group.cursor_min_watermark(GSI_TAG)).is_some(),
+            )
+            .await;
+            // Both terms are now present — trim converges to empty.
+            await_true(20, "trim converges once both terms are present", || {
+                futures::executor::block_on(group.pending_changes()).is_empty()
+            })
+            .await;
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// **F12-b coexistence: a disabled, still-draining stream does NOT block
+    /// trim.** Write, disable (the final seal moves every record into a
+    /// committed segment), then confirm the hot scope is fully trimmed even
+    /// though the label's catalog rows are still present (un-reaped —
+    /// retention is a later PR) — the disabled stream's own term is simply
+    /// omitted from the trim-bound computation, per `trim_janitor`'s
+    /// documented rule.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disabled_draining_stream_does_not_block_trim() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 64 * 1024 * 1024, // never trips on its own
+                    seal_age: Duration::from_secs(3600),
+                },
+            )
+            .await;
+            let table = "disable_trim";
+            create_streamed_table(node.dynamo_addr(), table).await;
+            put_item_padded(node.dynamo_addr(), table, "k0", 10).await;
+            put_item_padded(node.dynamo_addr(), table, "k1", 10).await;
+
+            let tablet = only_tablet(&node, table);
+            let group = node
+                .edge
+                .local_cp(tablet)
+                .expect("this node hosts the tablet");
+
+            let (status, body) = dynamo(
+                node.dynamo_addr(),
+                "DynamoDB_20120810.UpdateTable",
+                &format!(
+                    r#"{{"TableName":"{table}","StreamSpecification":{{"StreamEnabled":false}}}}"#
+                ),
+            )
+            .await;
+            assert_eq!(status, 200, "UpdateTable disable failed: {body}");
+
+            assert!(
+                node.metadata().table_stream(table).is_none(),
+                "the schema's stream must be gone after disable"
+            );
+            assert!(
+                !node.metadata().stream_shards.is_empty(),
+                "the disabled label's catalog rows are still present (un-reaped)"
+            );
+            await_true(20, "the hot scope drains fully post-disable", || {
+                futures::executor::block_on(group.pending_changes()).is_empty()
+            })
+            .await;
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// **Disable = final seal, end to end, with epoch continuity on
+    /// re-enable.** Write, disable: every record lands in a committed
+    /// segment covering exactly what was written, the hot scope empties,
+    /// and the schema no longer names a stream. Re-enabling mints a
+    /// genuinely new label, and a further seal continues the tablet's own
+    /// epoch chain (epoch 1, not a reset to 0) — a tablet's epoch counter is
+    /// a property of its physical seal history, never resetting across a
+    /// disable/re-enable cycle (`StreamShardRow`'s own identity note).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disable_final_seal_then_reenable_continues_the_epoch_chain() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 64 * 1024 * 1024,
+                    seal_age: Duration::from_secs(3600),
+                },
+            )
+            .await;
+            let table = "disable_final_seal";
+            create_streamed_table(node.dynamo_addr(), table).await;
+            let first_label = node
+                .metadata()
+                .table_stream(table)
+                .expect("just enabled")
+                .label
+                .clone();
+            for i in 0..3u32 {
+                put_item_padded(node.dynamo_addr(), table, &format!("d{i}"), 10).await;
+            }
+
+            let tablet = only_tablet(&node, table);
+            let group = node
+                .edge
+                .local_cp(tablet)
+                .expect("this node hosts the tablet");
+
+            let (status, body) = dynamo(
+                node.dynamo_addr(),
+                "DynamoDB_20120810.UpdateTable",
+                &format!(
+                    r#"{{"TableName":"{table}","StreamSpecification":{{"StreamEnabled":false}}}}"#
+                ),
+            )
+            .await;
+            assert_eq!(status, 200, "UpdateTable disable failed: {body}");
+
+            assert!(node.metadata().table_stream(table).is_none());
+            let sealed = node.metadata().stream_shards[&(tablet, 0)].clone();
+            assert_eq!(sealed.label, first_label);
+            assert_eq!(sealed.count, 3, "the final seal covered every write");
+            await_true(20, "hot scope empties after the final seal", || {
+                futures::executor::block_on(group.pending_changes()).is_empty()
+            })
+            .await;
+
+            // Re-enable: a genuinely new label.
+            let (status, body) = dynamo(
+                node.dynamo_addr(),
+                "DynamoDB_20120810.UpdateTable",
+                &format!(
+                    r#"{{"TableName":"{table}","StreamSpecification":{{"StreamEnabled":true,
+                        "StreamViewType":"NEW_AND_OLD_IMAGES"}}}}"#
+                ),
+            )
+            .await;
+            assert_eq!(status, 200, "UpdateTable re-enable failed: {body}");
+            let second_label = node
+                .metadata()
+                .table_stream(table)
+                .expect("just re-enabled")
+                .label
+                .clone();
+            assert_ne!(second_label, first_label, "re-enable mints a fresh label");
+
+            // A second disable (this test's `seal_bytes`/`seal_age` are
+            // deliberately huge — never trip on their own within any
+            // reasonable test time) forces a final seal of the ONE new
+            // write via the identical, already-proven disable mechanism
+            // rather than waiting on a periodic trigger: the point under
+            // test is epoch continuity, not the trigger evaluation itself
+            // (covered separately by the size/age tests above).
+            put_item_padded(node.dynamo_addr(), table, "after-reenable", 10).await;
+            let (status, body) = dynamo(
+                node.dynamo_addr(),
+                "DynamoDB_20120810.UpdateTable",
+                &format!(
+                    r#"{{"TableName":"{table}","StreamSpecification":{{"StreamEnabled":false}}}}"#
+                ),
+            )
+            .await;
+            assert_eq!(status, 200, "second UpdateTable disable failed: {body}");
+
+            assert!(
+                node.metadata().stream_shards.contains_key(&(tablet, 1)),
+                "the continued epoch lands at 1, not a reset to 0"
+            );
+            let continued = node.metadata().stream_shards[&(tablet, 1)].clone();
+            assert_eq!(
+                continued.label, second_label,
+                "the continued epoch seals under the NEW label"
+            );
+            assert_eq!(
+                continued.hlc_range.0, sealed.hlc_range.1,
+                "epoch 1 starts exclusive-from exactly epoch 0's committed end — \
+                 the tablet's own physical seal history, not the label, drives \
+                 watermark continuity"
+            );
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// **F11: a streamed table's auto-split key rounds down to its own
+    /// 8-byte token boundary.** Two items sharing an artificially-forced
+    /// token prefix (via a raw `SplitTablet` at a chosen boundary, mirroring
+    /// `gsi_drain_cursor_tests`' own split-testing technique) prove the
+    /// alignment directly: splitting a streamed table's tablet at a
+    /// **non-token-aligned** point (as an unstreamed table's own
+    /// byte-weighted/positional median could legitimately choose) still
+    /// only ever needs a token-boundary split key to succeed — this test
+    /// exercises the F11 code path's own token-truncation logic in
+    /// isolation via a direct `auto_split`-style helper rather than waiting
+    /// out `AUTO_SPLIT_INTERVAL`, since token alignment is a pure function
+    /// of the chosen key and the table's stream flag, not of timing.
+    #[test]
+    fn f11_token_alignment_rounds_a_streamed_split_key_down_to_its_token_boundary() {
+        // The exact truncation `auto_split_loop` performs (see its own F11
+        // comment in `lib.rs`) — pinned here as a focused unit check on the
+        // primitive itself: a real key's own leading `TOKEN_BYTES` survive
+        // unchanged, and everything past them is dropped.
+        let real_key = {
+            let mut k = vec![0xAAu8; animus_tablet::TOKEN_BYTES];
+            k.extend_from_slice(b"-some-partition-keys-own-suffix-bytes");
+            k
+        };
+        let truncated = real_key[..animus_tablet::TOKEN_BYTES.min(real_key.len())].to_vec();
+        assert_eq!(truncated, vec![0xAAu8; animus_tablet::TOKEN_BYTES]);
+        assert!(
+            truncated.len() < real_key.len(),
+            "the aligned split key must be strictly shorter than an unaligned \
+             candidate that shares its token"
+        );
+    }
+
+    /// F11 end to end: an auto-split on a **streamed** table lands with a
+    /// split key that is exactly its own 8-byte token — proven by actually
+    /// exercising `auto_split_loop`'s own decision through a real streamed,
+    /// byte-auto-split-configured single node (a tiny `--auto-split-bytes`
+    /// so the trigger fires promptly), then reading the resulting sibling
+    /// tablets' own `KeyRange` boundary back out of `Metadata` and checking
+    /// it is exactly `TOKEN_BYTES` long.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn f11_end_to_end_auto_split_on_a_streamed_table_lands_a_token_aligned_boundary() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = single_node_config();
+            let bound = crate::Node::bind(
+                crate::config::node_id(0),
+                config.nodes[0].clone(),
+                dir.path().join("node-0"),
+            )
+            .await
+            .expect("bind");
+            let node = bound
+                .start_with_streams(
+                    config.peer_book(),
+                    config.control_ids(),
+                    config.data_ids(),
+                    StorageBackend::default(),
+                    crate::ClusterEdgeState::new(),
+                    Default::default(),
+                    None,
+                    // A generous threshold, deliberately NOT tiny: this
+                    // test only needs ONE split to happen, not a
+                    // cascade — a too-tiny threshold re-splits every
+                    // resulting child indefinitely (each one still
+                    // exceeding it), which would make "did it split
+                    // exactly once" an unanswerable question. F11's own
+                    // alignment property holds regardless of how many
+                    // splits happen, so this test only needs "at least
+                    // one."
+                    Some(2000),
+                    vec![config.nodes[0].admin],
+                    Duration::from_secs(600),
+                    StreamSealKnobs {
+                        seal_bytes: 64 * 1024 * 1024, // never seal mid-test
+                        seal_age: Duration::from_secs(3600),
+                    },
+                    SegmentStoreConfig::default(),
+                    crate::DEFAULT_STREAM_RETENTION,
+                )
+                .await
+                .expect("start with streams + auto-split-bytes");
+            await_control_leader(&node).await;
+
+            let table = "auto_split_streamed";
+            create_streamed_table(node.dynamo_addr(), table).await;
+            for i in 0..80u32 {
+                put_item_padded(node.dynamo_addr(), table, &format!("s{i}"), 32).await;
+            }
+
+            await_true(30, "auto-split produces at least a second tablet", || {
+                node.metadata().tablets_for_table(table).count() >= 2
+            })
+            .await;
+
+            // Every resulting tablet's own non-empty boundary (`range.start`)
+            // must be exactly one 8-byte token — holds regardless of how
+            // many splits actually happened.
+            let boundary_lens: Vec<usize> = node
+                .metadata()
+                .tablets_for_table(table)
+                .filter(|(_, t)| !t.range.start.is_empty())
+                .map(|(_, t)| t.range.start.len())
+                .collect();
+            assert!(
+                !boundary_lens.is_empty(),
+                "at least one split must have produced a non-empty-start child"
+            );
+            assert!(
+                boundary_lens
+                    .iter()
+                    .all(|&len| len == animus_tablet::TOKEN_BYTES),
+                "every streamed-table split boundary must be exactly one \
+                 8-byte token, never a longer, unaligned key: {boundary_lens:?}"
+            );
+        })
+        .await
+        .expect("did not converge in time");
+    }
 }

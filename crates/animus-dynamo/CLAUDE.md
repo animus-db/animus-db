@@ -142,17 +142,70 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   ADR 0018 §2/PR7**, via `animusd`'s `ClientCtx::cp_txn`, not merely decoded
   here; `TransactGetItems` (new, PR7) a list of `TransactGet` (table + key +
   optional projection) — a consistent multi-key read, `run_transact_get` in
-  `animusd`). The AttributeValue codec encodes/decodes the full type set incl.
+  `animusd`; **`UpdateTable`/`DescribeTable` (new, ADR 0042 §2)**, added
+  alongside `CreateTable`'s own new `StreamSpecification` decode (below).
+  The AttributeValue codec encodes/decodes the full type set incl.
   `M`/`L`/`SS`/`NS`/`BS`.
   `Projection` (with `apply` / the free `project`) is a pure **dotted document-path**
   filter (`a.b`, reconstructing nested maps); `ReturnValues` (`None`/`AllOld`)
   drives `write_response`, `UpdateReturnValues` drives `update_response`, and
   `apply_update` applies the `SET`/`REMOVE` actions. Plus `encode_item` /
   `get_item_response` / `empty_response` / `query_response` / `scan_response` /
-  `create_table_response` / `batch_write_response`, `WireError` (carries the
+  `create_table_response` / `describe_table_response` / `batch_write_response`,
+  `WireError` (carries the
   DynamoDB `__type` code, incl. `conditional_check_failed`), and
   `encode_stored_item` / `encode_tombstone` / `decode_stored_item` (the data-plane
   value encoding, with a tombstone for delete).
+
+  **DynamoDB Streams (ADR 0042 §2), pure-wire slice only — no label minting
+  here (`animusd` mints it, since it needs `env.now()`).**
+  `Operation::CreateTable` gained `stream_view_type:
+  Option<animus_control::StreamViewType>`, decoded from an optional
+  `StreamSpecification` (`decode_create_table_stream_spec`/
+  `decode_stream_view_type` — `StreamEnabled: true` requires
+  `StreamViewType`; absent or `false` decodes `None`). **`Operation::
+  UpdateTable`** is new and stream-spec-only in this adapter:
+  `decode_update_table` rejects a `GlobalSecondaryIndexUpdates` field
+  outright (`ValidationException` — the index-adding shape is still ADR
+  0041 §5's own deferred follow-up) and requires a `StreamSpecification`
+  (the only supported change), decoding to `wire::StreamUpdate::Enable(view_type)`
+  or `::Disable`. **`Operation::DescribeTable`** is new — just a table name,
+  everything else comes from the replicated catalog `animusd` holds.
+  `wire::StreamDescription { view_type, label }` is the tiny bridge type a
+  caller (which holds the full replicated `animus_control::StreamSpec`)
+  builds to hand `create_table_response`/`describe_table_response` the
+  stream fields to render (`StreamSpecification`/`LatestStreamArn`/
+  `LatestStreamLabel`); `wire::stream_arn(table, label)` is the synthetic
+  ARN builder (`arn:aws:dynamodb:animus:0:table/<table>/stream/<label>`).
+  `describe_table_response` also needs `AttributeDefinitions`, resolved from
+  the replicated catalog's typed key columns via the new `schema::
+  key_attribute_types`/`attribute_type_for` (the reverse of `schema::
+  column_type_for`'s existing decode direction).
+- `streams_wire` module (ADR 0042 §3/§5/§6/§7, PR6) — the sibling
+  `DynamoDBStreams_20120810` service's own pure wire layer, mirroring
+  `wire`'s conventions but kept in its own module (a distinct
+  `TARGET_PREFIX`, `decode_request(target, body) -> StreamsOperation`
+  for `ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords`).
+  `parse_shard_id`/`parse_stream_arn` are the inverses of
+  `animus_cp_data::segment::shard_id`/`wire::stream_arn` (duplicated
+  rather than depending on `animus-cp-data`, same precedent as this
+  crate's other cross-crate byte-shape duplications).
+  `encode_iterator`/`decode_iterator` mint/parse the stateless,
+  non-expiring shard-iterator token (`base64url({label, shard_id,
+  position})`, ADR 0042 §6) — `position` is always the **exclusive**
+  lower bound the next read filters on, the same convention
+  `animus_cp_data::segment::slice_to_hlc_range`'s `start_exclusive` and
+  `animusd::index_drain::hot_read`'s `from_position` already use, so a
+  token composes with either serve tier with no translation.
+  `project_view`/`keys_from_images`/`stream_record_json` build one
+  `Records[]` entry from a decoded `ChangeRecord` — the read-time view
+  projection (ADR 0042 §3/§15: a shard always stores both images
+  regardless of the declared type) and key recovery (from whichever
+  image is present, new preferred over old, since both always carry the
+  full item). `list_streams_response`/`describe_stream_response`/
+  `get_shard_iterator_response`/`get_records_response` are the response
+  encoders; `animusd::dynamo_streams` is the one caller, holding
+  `Metadata`/the segment store this module never touches.
 
 ## What's non-obvious
 
@@ -278,9 +331,11 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   nothing that ever needed a stale-write race guard. There is deliberately no
   backfill mechanism today because indexes are only declarable at
   `CreateTable` time, so a pre-existing item that predates an index can never
-  exist; `UpdateTable` (adding an index to a populated table) will need a real
-  backfill when it lands — a reuse of the GSI drain applied to every key
-  rather than one, not a new mechanism (ADR 0041 §5).
+  exist; **`UpdateTable` now exists (ADR 0042 §2) but is stream-spec-only** —
+  adding an index to a populated table is still rejected outright
+  (`GlobalSecondaryIndexUpdates`) and will need a real backfill when it
+  lands — a reuse of the GSI drain applied to every key rather than one,
+  not a new mechanism (ADR 0041 §5).
 - **Still deferred** (don't represent as a full adapter): `BatchGetItem`,
   list-index document paths (`a[0]`), `ADD`/`DELETE` `UpdateExpression`
   arithmetic, `TransactWriteItems`/`TransactGetItems` idempotency tokens
@@ -309,8 +364,8 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
 ## Tests
 
 `cargo test -p animus-dynamo` — `item_api.rs` over `MemoryEngine` (incl.
-`query_with` sort conditions), plus `wire`, `condition`, `registry`, and `schema`
-unit tests (JSON decode/encode incl. document/set types + document-path projection
+`query_with` sort conditions), plus `wire`, `streams_wire`, `condition`,
+`registry`, and `schema` unit tests (JSON decode/encode incl. document/set types + document-path projection
 + ReturnValues + UpdateItem/BatchWriteItem/TransactWriteItems/TransactGetItems
 decode + index projection types, base64 round-trip, tombstone, sort/condition
 predicates, `sync_indexes` adding/dropping index *definitions* (no entry data
@@ -333,6 +388,16 @@ The rejection itself (`true` against a GSI `Query`/`Scan` only) is
 `animusd`-only — this crate never sees the replicated catalog needed to know
 an index's kind — and is end-to-end tested in `tests/dynamo_consistent_read.rs`
 (`Query`) and `tests/dynamo_index_scan.rs` (`Scan`).
+`streams_wire` unit tests (PR6) cover every operation's decode (incl. the
+`AT_SEQUENCE_NUMBER`/`AFTER_SEQUENCE_NUMBER` `SequenceNumber`-required
+validation), shard-id/stream-ARN parsing, iterator-token round-trip +
+tampered/garbage rejection, view-type projection for all four
+`StreamViewType`s, `Keys` recovery favoring the new image over the old,
+and every response encoder's JSON shape (incl. a closed vs. open shard's
+`SequenceNumberRange`) — the label-resolution/routing decisions those
+shapes get plugged into (F12-b, the sealed-vs-open serve split) are
+`animusd`-only (`dynamo_streams::tests` + `tests/dynamo_streams.rs` — see
+that crate's `CLAUDE.md`).
 The wire protocol is exercised end-to-end over real HTTP in
 `animusd`'s `tests/dynamo_wire.rs` (Put/Get/Delete), `tests/dynamo_extended.rs`
 (CreateTable/Query/conditional writes), `tests/dynamo_indexes.rs` (Scan with

@@ -217,7 +217,11 @@ pub fn apply_and_derive_mirror(
         }
         MetaCommand::CreateTableIndex { table, .. }
         | MetaCommand::DropTableIndex { table, .. }
-        | MetaCommand::SetTableMode { table, .. } => {
+        | MetaCommand::SetTableMode { table, .. }
+        // ADR 0042: a stream (de)configuration is part of the table's schema
+        // entry, so it mirrors identically to an index/mode change — the
+        // whole (already-mutated) schema, re-serialized.
+        | MetaCommand::SetTableStream { table, .. } => {
             if let Some(schema) = meta.schemas.get(table) {
                 writes.push(put_json(syskv::schema_key(table), schema));
             }
@@ -261,6 +265,34 @@ pub fn apply_and_derive_mirror(
                 syskv::node_addrs_key(node),
                 &meta.node_addrs[node],
             ));
+        }
+        MetaCommand::SealStreamShard { tablet, epoch, .. } => {
+            writes.push(put_json(
+                syskv::stream_shard_key(*tablet, *epoch),
+                &meta.stream_shards[&(*tablet, *epoch)],
+            ));
+        }
+        MetaCommand::ExpireStreamShards { rows, .. } => {
+            // Both phases (mark and remove) only ever touch rows that are
+            // still present after `remove: false`'s mark, or that this
+            // apply's `remove: true` just deleted — `apply_and_derive_mirror`
+            // always derives from `meta`'s own post-apply state, so a row
+            // absent from `meta.stream_shards` (already removed, or the
+            // command named a row that was never present at all — both
+            // idempotent no-ops) mirrors as a tombstone rather than being
+            // silently skipped, matching every other idempotent-delete arm
+            // above (`DropTableSchema`, etc.) — a repeated delete of an
+            // already-absent key is a harmless no-op write, not an error.
+            for (tablet, epoch) in rows {
+                match meta.stream_shards.get(&(*tablet, *epoch)) {
+                    Some(row) => {
+                        writes.push(put_json(syskv::stream_shard_key(*tablet, *epoch), row));
+                    }
+                    None => {
+                        writes.push(KeyWrite::Delete(syskv::stream_shard_key(*tablet, *epoch)));
+                    }
+                }
+            }
         }
     }
     (outcome, writes)
@@ -435,6 +467,14 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             meta.absorbed_by
                 .insert(TabletId(decode_u64(&id)), TabletId(decode_u64(value)));
         }
+        EntityKind::StreamShard => {
+            let Some(key) = syskv::decode_stream_shard_id(&id) else {
+                return;
+            };
+            let row: crate::meta::StreamShardRow =
+                serde_json::from_slice(value).expect("mirrored stream-shard value decodes");
+            meta.stream_shards.insert(key, row);
+        }
     }
 }
 
@@ -490,6 +530,14 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // Never deleted in practice (`absorbed_by` is never pruned) —
             // listed for match exhaustiveness.
             meta.absorbed_by.remove(&TabletId(decode_u64(&id)));
+        }
+        EntityKind::StreamShard => {
+            // Reachable in practice, unlike the never-pruned markers above
+            // — `ExpireStreamShards { remove: true }` genuinely tombstones
+            // a row (retention/drop-table cascade, ADR 0043 §A9).
+            if let Some(key) = syskv::decode_stream_shard_id(&id) {
+                meta.stream_shards.remove(&key);
+            }
         }
     }
 }
@@ -1047,6 +1095,115 @@ mod tests {
         assert!(writes.is_empty());
     }
 
+    fn stream_spec(label: &str) -> crate::schema::StreamSpec {
+        crate::schema::StreamSpec {
+            view_type: crate::schema::StreamViewType::NewAndOldImages,
+            label: label.to_string(),
+        }
+    }
+
+    fn seal_cmd(tablet: TabletId, epoch: u64, end: u64) -> MetaCommand {
+        MetaCommand::SealStreamShard {
+            table: "orders".to_string(),
+            label: "L1".to_string(),
+            tablet,
+            epoch,
+            view_type: crate::schema::StreamViewType::NewAndOldImages,
+            hlc_range: (end.saturating_sub(100), end),
+            count: 1,
+            seal_wall_ms: 1_700_000_000_000,
+            replicas: vec![nid(1), nid(2)],
+        }
+    }
+
+    /// `SealStreamShard` mirrors as one `Put` of the freshly-inserted row
+    /// (ADR 0042 §3/ADR 0043 §A8) — and a first-committer-loses no-op
+    /// derives no writes, mirroring every other rejected/no-op command.
+    #[test]
+    fn seal_stream_shard_writes_the_row() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::SetTableStream {
+                table: "orders".to_string(),
+                spec: Some(stream_spec("L1")),
+            },
+        );
+        let command = seal_cmd(TabletId(1), 0, 100);
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![put_json(
+                syskv::stream_shard_key(TabletId(1), 0),
+                &meta.stream_shards[&(TabletId(1), 0)]
+            )]
+        );
+
+        // A second, first-committer-loses proposal for the same identity is
+        // a no-op — no writes derived, the row untouched.
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &seal_cmd(TabletId(1), 0, 999));
+        assert_eq!(outcome, ApplyOutcome::NoOp);
+        assert!(writes.is_empty());
+    }
+
+    /// `ExpireStreamShards`'s two derived shapes: marking a still-present
+    /// row mirrors as an updated `Put` (the row, now `expired: true`);
+    /// removing it mirrors as a `Delete`.
+    #[test]
+    fn expire_stream_shards_marks_as_put_and_removes_as_delete() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::SetTableStream {
+                table: "orders".to_string(),
+                spec: Some(stream_spec("L1")),
+            },
+        );
+        let _ = apply_and_derive_mirror(&mut meta, &seal_cmd(TabletId(1), 0, 100));
+
+        let mark = MetaCommand::ExpireStreamShards {
+            rows: vec![(TabletId(1), 0)],
+            remove: false,
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &mark);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![put_json(
+                syskv::stream_shard_key(TabletId(1), 0),
+                &meta.stream_shards[&(TabletId(1), 0)]
+            )]
+        );
+        assert!(meta.stream_shards[&(TabletId(1), 0)].expired);
+
+        let remove = MetaCommand::ExpireStreamShards {
+            rows: vec![(TabletId(1), 0)],
+            remove: true,
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &remove);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![KeyWrite::Delete(syskv::stream_shard_key(TabletId(1), 0))]
+        );
+        assert!(!meta.stream_shards.contains_key(&(TabletId(1), 0)));
+    }
+
     /// The read side: a `Metadata` rebuilt from a fresh [`MemoryEngine`] after
     /// mirroring a handful of commands equals a `Metadata` built by applying
     /// those same commands directly (no mirror involved) — the differential
@@ -1090,6 +1247,15 @@ mod tests {
                     role: "combined".to_string(),
                 },
                 labels: BTreeMap::new(),
+            },
+            MetaCommand::SetTableStream {
+                table: "orders".to_string(),
+                spec: Some(stream_spec("L1")),
+            },
+            seal_cmd(TabletId(1), 0, 100),
+            MetaCommand::ExpireStreamShards {
+                rows: vec![(TabletId(1), 0)],
+                remove: false,
             },
         ];
         for (index, command) in commands.iter().enumerate() {

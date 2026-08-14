@@ -98,6 +98,42 @@ pub enum IndexKind {
     Local,
 }
 
+/// A DynamoDB Streams **view type** (ADR 0042 §3): which image(s) a
+/// `GetRecords` response projects for this table's stream. This is a
+/// **read-time projection only** — a shard record always stores both the old
+/// and new item images regardless of the declared view type (ADR 0043's
+/// `KIND_STREAM` record), so changing it (disable + re-enable, since a live
+/// view-type change is not a real DynamoDB operation either) never needs a
+/// backfill or a different storage format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamViewType {
+    /// Both the old and new item images.
+    NewAndOldImages,
+    /// Only the new item image.
+    NewImage,
+    /// Only the old item image.
+    OldImage,
+    /// Only the modified item's key attributes.
+    KeysOnly,
+}
+
+/// A table's replicated DynamoDB Streams configuration (ADR 0042 §2/§4), when
+/// enabled. `label` is minted **once**, at enable time (including a
+/// re-enable after a disable), by the proposer — never reused — and is what
+/// makes a stream's identity `(table, label)`: a stale ARN from a
+/// disabled-then-re-enabled stream carries the *old* label, which a
+/// `DescribeStream`/`GetRecords`/`GetShardIterator` request against the
+/// *current* `StreamSpec.label` fails to match, surfacing as
+/// `ResourceNotFoundException` rather than silently serving the new stream
+/// (ADR 0042 §4/§9).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamSpec {
+    /// Which image(s) a read projects (read-time only, see [`StreamViewType`]).
+    pub view_type: StreamViewType,
+    /// This stream's identity component, minted fresh on every enable.
+    pub label: String,
+}
+
 /// A secondary-index **definition** as replicated in the schema catalog (ADR
 /// 0013): its name, kind, key attributes, and projection. This is the *shape* of
 /// the index — the cluster-wide, durable agreement on which indexes exist — not
@@ -197,6 +233,13 @@ pub struct TableSchema {
     /// `indexes`.
     #[serde(default)]
     pub mode: ReplicationMode,
+    /// This table's DynamoDB Streams configuration (ADR 0042), if enabled.
+    /// `None` for a table with no stream (the common case, and every schema
+    /// persisted before this field existed — `#[serde(default)]`, additive
+    /// like `indexes`/`mode`). Mutated only through
+    /// `MetaCommand::SetTableStream` (so it replicates).
+    #[serde(default)]
+    pub stream: Option<StreamSpec>,
 }
 
 /// Why a [`TableSchema`] was rejected as malformed.
@@ -232,6 +275,7 @@ impl TableSchema {
             clustering_keys: Vec::new(),
             indexes: Vec::new(),
             mode: ReplicationMode::default(),
+            stream: None,
         }
     }
 
@@ -255,6 +299,7 @@ impl TableSchema {
             clustering_keys: vec![sk],
             indexes: Vec::new(),
             mode: ReplicationMode::default(),
+            stream: None,
         }
     }
 
@@ -274,6 +319,7 @@ impl TableSchema {
             columns,
             indexes: Vec::new(),
             mode: ReplicationMode::default(),
+            stream: None,
         }
     }
 

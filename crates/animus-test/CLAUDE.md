@@ -32,6 +32,7 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_RAFTKV_SEEDS=K` | 1 | K seed variants per raftkv-corpus cell |
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
 | `ANIMUS_TXN_SEEDS=K` | 1 | K seed variants per multi-tablet transaction-corpus cell (ADR 0018) |
+| `ANIMUS_STREAM_SEEDS=K` | 1 | K seed variants per DynamoDB Streams lineage-walk cell (ADR 0042/0043) |
 
 ## What's non-obvious
 
@@ -248,6 +249,50 @@ The Accord-targeted suite exercises `check_cycles` under contention:
   the coordinator's own round trip is still genuinely in flight past
   `RECOVERY_GRACE`, and the apply path's "two different commit timestamps
   is impossible by construction" assert does not tolerate that.
+
+### Elle-adjacent, but not Elle: the DynamoDB Streams lineage-walk corpus (ADR 0042/0043, round-3 PR8)
+
+- `stream_lineage_corpus.rs` — a **self-contained** corpus (like
+  `raftkv_linearizable.rs`/`txn_serializable.rs`) reimplementing the ADR
+  0042/0043 **sealer** (`seal_now`, mirroring `animusd::index_drain::
+  seal_now`'s exact sequence) and a **model consumer**
+  (`collect_tablet_records`/`verify_lineage`, mirroring `DescribeStream`/
+  `GetShardIterator(TRIM_HORIZON)`/`GetRecords`'s exact decision tree)
+  directly over `animus-cp-data`'s `RaftKvNode`/`segment` module and a bare
+  `animus-control::Metadata` (mutated with plain `.apply()` calls — no live
+  control Raft, the same hand-scripted-catalog technique
+  `animus-cp-data/tests/reconciler_corpus.rs` uses) and `animus-sim`'s
+  `SimSegmentStore`. **Not built on the Elle `History`/`check_cycles`
+  machinery** — the property under test (exactly-once delivery, per-item
+  order, chain continuity across split lineage, segment-content fidelity)
+  is a shard-chain reconstruction claim, not a serializability claim, and a
+  bespoke write-journal-vs-delivered-stream diff (`verify_lineage`) states
+  it more directly than coercing it into a list-append history would. The
+  consumer is driven **once, to convergence, after each scenario's write/
+  seal/fault schedule finishes**, not as a live interleaved poll — a
+  documented delta from the real wire API's own live-poll shape; the
+  `ProdEnv` e2e (`animusd/tests/streams_e2e.rs`) and the existing
+  `animusd/tests/dynamo_streams.rs` cover "what does an in-flight poll see
+  mid-stream" instead.
+- **Seven frozen named cells** (`quiet_table_rollover`,
+  `hot_table_size_seals`, `split_mid_stream`, `kill_sealing_leader`,
+  `store_outage_then_heal`, `disable_grace_drain`, `combined_chaos`) plus a
+  dedicated `durability_invariant_holds_at_every_kill_point` scenario
+  (ADR 0042 §9, D9): a scripted seal lifecycle with a modeled crash between
+  the segment `put` and the catalog commit, asserting every acked write
+  stays recoverable (from hot Raft state or a committed segment) at every
+  kill point — this corpus never implements retention (that's `animusd::
+  segment_janitor`'s own `ProdEnv` suite, `stream_janitor.rs`), so nothing
+  here is ever expected to answer `TrimmedDataAccess`. Depth knob
+  `ANIMUS_STREAM_SEEDS` (default 1 = the frozen cells; held green at
+  `=40`, matching `corpus-deep.yml`'s nightly tier).
+- **A real bug this corpus found while being built** (not in the streams
+  subsystem — in the corpus's own test harness): `RaftKvNode::start_scoped`
+  pins every group to `PRIMARY_STREAM`, so two tablet groups sharing the
+  same 3 node ids (any split scenario) cross-talk their Raft traffic
+  unless started with `start_hosted(.., stream = tablet_id.0)` instead —
+  see `docs/engineering-lessons.md`'s Testing section for the full
+  livelock symptom and fix.
 
 ### Scaling coverage: the two env knobs + the topology split (ADR 0014)
 

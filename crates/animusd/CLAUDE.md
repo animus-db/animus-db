@@ -17,7 +17,9 @@ gone.
 **`lib.rs` is ~6800 lines** — grep for the symbol, don't scroll. It also holds
 two in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
 can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
-(lib.rs:6725).
+(lib.rs:6725). `index_drain.rs` has a third, `gsi_drain_cursor_tests`, and
+`dynamo.rs` a fourth, `stream_write_path_tests` (ADR 0042), for the same
+reason (see each file's own entry below).
 
 ## Module map (`src/`)
 
@@ -53,14 +55,183 @@ can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
   and `format_not_leader_refusal`/`parse_not_leader_refusal` (the leader-hint
   string suffix `cp_forward` chases). All `pub(crate)`.
 - **`dynamo.rs`** (~59 KB) — the DynamoDB JSON-over-HTTP edge; the `GET /metrics`
-  route (ADR 0015) shares this listener.
-- **`index_drain.rs`** (ADR 0041 §4) — the per-node **GSI drain** background
-  loop (`index_drain_loop`, spawned alongside `tablet_host_reconciler_loop`/
-  `auto_split_loop`): sweeps every tablet group this node leads for pending
-  change records and reconciles each dirty partition's GSI rows into the
-  index's own hidden table (`reconcile_partition`, derivative not
-  delta-based — see its module doc). No LSI involvement (LSI rows are
-  written atomically with the base row in `dynamo.rs::index_aware_write`).
+  route (ADR 0015) shares this listener. `dispatch` also forwards a
+  `DynamoDBStreams_20120810.*` target to `dynamo_streams::execute`
+  (below) — the two services share one listener/port.
+- **`dynamo_streams.rs`** (ADR 0042 §3/§5/§6/§7/§9/§10/§11, PR6) — the
+  DynamoDB Streams read API: `ListStreams`/`DescribeStream`/
+  `GetShardIterator`/`GetRecords`. See the "DynamoDB Streams" entry under
+  `dynamo.rs`'s own write-side section above for the full design (label
+  resolution, the sealed-vs-open serve split, `StreamHotRead`) — this
+  entry is just the module pointer.
+- **`segment_janitor.rs`** (ADR 0043 §A9, round-3 PR7) — the **segment
+  janitor**: a distinct, control-plane-**leader**-only background loop
+  (`segment_janitor_loop`, self-gated every tick on
+  `ctx.edge.leader_handle()`, the identical pattern
+  `detect_loop`/`orphan_sweep_loop` use one layer down in `animus-control`)
+  — retention two-phase reclaim and replica repair over the *whole*
+  `stream_shards` catalog, a cluster-wide concern distinct from any one
+  tablet's own per-node sealer/hot-trim arm (`index_drain.rs`). Spawned
+  unconditionally by both `BoundNode::start_with_streams` (combined) and
+  `BoundControlNode::start_control_with` (control-only, hardcoded to
+  `DEFAULT_STREAM_RETENTION` — no CLI knob for that node shape yet, the
+  same documented follow-up `StreamSealKnobs`/`SegmentStoreConfig`
+  already have); **never** spawned on `BoundDataNode` (a data-only node
+  never registers a local control `RaftNode`, so `leader_handle()` there
+  is permanently `None`).
+
+  **Phase 1, two-phase retention**: mark every unexpired row past
+  `--stream-retention` (age from its own `seal_wall_ms`) *or* whose table
+  has been dropped entirely (`Metadata::table_schema` no longer names it —
+  see "the convergent drop-table cascade" below) via
+  `ExpireStreamShards{remove: false}`; then, for every marked row, delete
+  the segment object at every recorded replica still present in the
+  cluster's own membership (`ClientCtx::data_opt().segment_store
+  .delete_sealed`) and, once that succeeds (or nothing reachable was left
+  to delete), physically remove the row (`ExpireStreamShards{remove:
+  true}`). **The dead-replica rule**: a replica counts as
+  confirmed-absent (no delete owed) only once **removed from membership
+  entirely** — a merely `Down` member still gets a genuine delete attempt
+  every tick (it might come back with its copy intact); a permanently
+  dead-but-never-decommissioned member therefore blocks that row's
+  physical removal forever (an accepted durability-over-availability
+  tradeoff, not a bug — the operational remedy is decommissioning it).
+
+  **The epoch-derivation guard (`may_remove_row` in the phase-1 loop) is
+  the one correctness-load-bearing exception to "mark past retention,
+  remove once deleted."** `index_drain::seal_now`'s `next_epoch` and
+  `dynamo_streams::current_open_epoch` both derive a tablet's epoch from
+  its own chain's **highest currently-existing row**, not an independent
+  counter (round-3's whole "epoch = the chain length" design, ADR 0042
+  §2) — a design that only holds while the catalog never *shrinks*.
+  Physically removing a tablet's own current highest-epoch row while that
+  tablet still exists (`meta.tablets.contains_key(tablet)`) would let a
+  future seal silently recompute the *identical* epoch number for
+  genuinely new data. So: only the **object** may ever be deleted for such
+  a row (safe unconditionally — epoch derivation never reads object
+  bytes); the **row** stays marked `expired` (already invisible to
+  `DescribeStream`'s own enumeration) until either the tablet seals past
+  it (no longer the max) or the tablet is dropped (`!meta.tablets
+  .contains_key(tablet)` — the drop-table cascade's own exception, since
+  nothing will ever derive an epoch for a gone tablet again). See
+  `docs/engineering-lessons.md` for the story of how testing surfaced
+  this — a corpus/integration gap the round-2/round-3 ADR text didn't
+  anticipate, since PR6 never physically removed a row at all.
+
+  **Phase 2, replica repair** (F5's own durability mandate): for every
+  live row with a non-empty `replicas` (a `ClusterSegmentStore`-backed
+  row — the `FsSegmentStore` opt-in always records an empty list and has
+  no per-replica concept to repair), verify each recorded replica is a
+  current `Active` member; for however many are not, `get_sealed` a live
+  copy from whichever recorded replicas *are* `Active`, then
+  `repair_replicas` (`animus_cp_data::cluster_segment_store::
+  ClusterSegmentStore::repair`) it onto enough fresh targets to restore
+  the row's own original replica count, and — if the resulting set
+  differs — commit it via a **content-preserving** `SealStreamShard`
+  re-proposal (round-3 PR7's amendment to that command's apply arm,
+  `animus-control`'s own doc): same `table`/`label`/`view_type`/
+  `hlc_range`/`count`/`seal_wall_ms`, only `replicas` updated. Never
+  touches an expired row.
+
+  **The convergent drop-table cascade**: `ExpireStreamShards` is
+  deliberately **not relayable** (`is_relayable_command`'s own doc, below)
+  — its only sanctioned caller is this control-plane-leader-only loop,
+  which already holds a live `RaftNode` handle; `ClientCtx::drop_table`
+  runs on whichever node a client happens to connect to, essentially never
+  guaranteed to be that leader. Rather than adding a leader-only special
+  case to `drop_table` itself (duplicating this loop's own two-phase
+  decision the rare time it *is* the leader), phase 1's own retention rule
+  already treats a row whose table has no schema at all as **immediately
+  due** — "retention `0`" for a table that no longer exists to protect.
+  `drop_table`'s existing cascade (unchanged: drop the schema, then the
+  tablets) is exactly what flips that condition; **no new code in
+  `drop_table` at all**. `ClientCtx::data_opt() -> Option<&DataRole>`
+  (alongside the pre-existing panicking `data()`) is what lets phase 1's
+  own marking/drop-rule run correctly even on a control-only leader with
+  no `SegmentStoreHandle` at all — see the module's own doc for the
+  documented control-only-leader scope gap this leaves (phases 2/3 skip
+  there; a **pure** split deployment never runs them).
+
+  **Metrics** (ADR 0015): `stream_segments_live`/`stream_repair_backlog`
+  are levels (`MetricsHandle::set`, recomputed fresh every tick from the
+  snapshot); `stream_segments_expired_total`/`stream_repairs_total` are
+  genuine counters (`incr`/`incr_by`) — the former on a confirmed row
+  removal, not the mark; the latter once per row whose replica-set update
+  actually committed, not per replica copied.
+- **`index_drain.rs`** (ADR 0041 §4 GSI drain; ADR 0042/0043 the seal arm +
+  hot-trim rework, round-3 sealer PR) — the per-node **change-consumer
+  loop** (`change_consumer_loop`, renamed from `index_drain_loop` since it
+  is no longer GSI-specific; spawned alongside
+  `tablet_host_reconciler_loop`/`auto_split_loop`), three arms per tick per
+  led tablet:
+  1. **GSI drain** (unchanged from ADR 0041): sweeps change records past the
+     "gsi" cursor's own watermark (`drain_tablet`), reconciles each dirty
+     partition's GSI rows into the index's own hidden table
+     (`reconcile_partition`, derivative not delta-based — see its module
+     doc), then advances the "gsi" `KIND_CURSOR` row
+     (`animus_cp_data::cursor`) to the sweep's own max HLC **only after
+     every dirtied partition's footprint update is durably confirmed**.
+  2. **The seal arm** (`seal_tick`/`seal_now`, streamed tables only): on a
+     size trigger (`CpGroup::approx_bytes_kind(KIND_CHANGE)` —
+     deliberately **not** `approx_bytes`, which is base-kind-only, ADR
+     0034; see the engineering-lessons entry on the bug this distinction
+     fixed) or age trigger (the oldest unsealed record's wall-ms, this
+     loop's own `env` clock), `seal_now` scans `pending_changes()` past the
+     tablet's effective watermark (`Metadata::
+     effective_stream_shard_watermark`, walking split-parent provenance),
+     sorts by the packed-HLC key suffix (load-bearing — key order is
+     token-then-pk-then-HLC, not commit order), builds a segment
+     (`animus_cp_data::segment`), pushes it to this node's
+     `SegmentStoreHandle` (`ClientCtx.data().segment_store`), then proposes
+     and confirms `MetaCommand::SealStreamShard`. Never seals an empty
+     pending set. `seal_now` is the **one** seal code path — also called,
+     unconditionally (trigger-independent), by the internal-only
+     `ClientRequest::ForceSeal` RPC (`lib.rs`, refused bare, handled only
+     inside `cp_serve_forwarded`) that `ClientCtx::force_seal_tablet`
+     drives — `dynamo.rs`'s `disable_stream` calls it for every tablet of a
+     table before ever proposing `SetTableStream{None}` (F12-b's
+     disable-triggered final seal).
+  3. **The hot-trim arm** (`trim_janitor`, generalized from ADR 0041's
+     original trim janitor): deletes change records every *expected,
+     present* term has cleared — the "gsi" cursor term (unchanged) and,
+     **iff the table's current schema has an enabled stream**, the
+     catalog-derived stream watermark (`Metadata::
+     effective_stream_shard_watermark`) — never a `"copier"` cursor row
+     (round 2's tag/row scheme; deleted, along with `COPIER_TAG`/
+     `expected_consumer_tags`, in round 3). **The F10/F12-b rule, reviewed
+     hard**: an expected term with nothing to derive it from yet (no "gsi"
+     row; a stream that has never sealed) blocks trim entirely (the safe
+     default); the stream term applies *only* while the schema's stream is
+     currently enabled — a disabled stream's un-reaped catalog rows do
+     **not** re-add it, because by the time disable commits, the final
+     seal has already moved every one of that label's records into a
+     committed segment, so there is nothing left for a stream term to
+     protect; and **zero expected terms at all means trim everything, not
+     block everything** — reachable only for a table whose stream was
+     disabled and has no GSI, which the loop's own outer gate
+     (`gsis.is_empty() && !stream_enabled && !ever_streamed`) keeps
+     visiting specifically so this arm gets a guaranteed chance to run,
+     rather than depending on winning a race against `disable_stream`'s
+     own commit landing first (a real bug this PR's own tests found and
+     fixed — see the engineering-lessons entry). And tombstones stale
+     **merge-residue** cursor rows (an absorbed sibling's own row,
+     physically surviving in the widened scope, for a tag no longer
+     expected) — deliberately *not* an unexpected row at this tablet's own
+     token (a dropped index's stale row is separate, out of scope here;
+     round 3 has no cursor tag left for a stream to ever leave one of its
+     own). `ClientCtx::cp_kind_write_raw`'s confirmation probe is generic
+     (any single write in the atomic batch) for exactly this reason.
+
+  Two `#[cfg(test)] mod`s at the bottom of this file (mirroring `lib.rs`'s
+  `split_fence_tests`): `gsi_drain_cursor_tests` (unchanged, ADR 0041/0042
+  §7/§8's own crash/split/merge/trim regressions) and `stream_sealer_tests`
+  (round-3 sealer PR) — the seal arm's triggers/sequence, the F10/F12-b
+  hot-trim rework, and F11's split-key token alignment, needing `CpGroup`'s
+  private `pending_changes`/`approx_bytes_kind`/`cursor_min_watermark`
+  accessors and, for durability introspection, a **second** `FsSegmentStore`
+  handle pointed at the same deterministic `<node dir>/segments` path
+  `build_segment_store` roots the default cluster store's local building
+  block at (there is no production read-path accessor yet — that's PR6).
 - **`cql.rs`** (~42 KB) — the CQL (Cassandra) v4 binary-protocol edge.
 - **`cql_client.rs`** — a minimal loopback CQL client the admin dashboard's CQL
   editor uses (`POST /admin/data/cql`) to drive this node's own CQL port.
@@ -520,7 +691,160 @@ route below the edge through the same `ClientCtx` CP primitives.
   multi-kind-write extension yet, so staging just the base row would
   silently never produce the LSI rows/change-log record. The real fix (a
   `cp_txn` analogue of `cp_kind_write`) is a named `animus-cp-data`
-  protocol follow-up in ADR 0041, not yet built.
+  protocol follow-up in ADR 0041, not yet built. **ADR 0042 extends this same rejection to a streamed table**
+  (`run_transact`'s per-action loop now checks `meta.table_stream`
+  alongside `meta.table_indexes`), for the identical reason: `TxnStage`
+  would silently never produce a streamed table's change-log record.
+
+  **DynamoDB Streams (ADR 0042 §1/§2/§4/§9).** `TableSchema.stream:
+  Option<StreamSpec>` (replicated, ADR 0013) rides through the identical
+  `CreateTable`/`UpdateTable` surface as the key schema/indexes:
+  `CreateTable`'s `StreamSpecification` (`StreamEnabled`/`StreamViewType`)
+  is decoded into `Operation::CreateTable.stream_view_type`
+  (`animus-dynamo`'s `wire` module, pure — no label minting there); when
+  `Some`, `create_table` (this crate) mints a fresh label
+  (`mint_stream_label`, below) and proposes `MetaCommand::SetTableStream`
+  the same commit-wait shape the index-definition loop already uses
+  (`enable_stream`, shared with `UpdateTable`'s enable path). **`UpdateTable`
+  is new and stream-spec-only**: `wire::decode_update_table` rejects any
+  `GlobalSecondaryIndexUpdates` up front (ADR 0041 §5's own deferred item)
+  and requires a `StreamSpecification` — `StreamEnabled: true` decodes to
+  `StreamUpdate::Enable(view_type)` (rejected by `update_table` if a stream
+  is already enabled — the caller must disable first, matching ADR 0042
+  §9's "no same-command relabel" contract), `false` to `StreamUpdate::
+  Disable`. **`DescribeTable` is also new**: a pure read
+  (`describe_table`) of the replicated catalog — key schema (+
+  `AttributeDefinitions`, recovered from the catalog's typed `ColumnDef`s
+  via `animus_dynamo::schema::key_attribute_types`, the reverse of
+  `CreateTable`'s own `key_types` decode), index definitions, and
+  `StreamSpecification`/`LatestStreamArn`/`LatestStreamLabel` when a stream
+  is enabled (`wire::describe_table_response`, sharing `create_table_response`'s
+  `TableDescription`-object builder). The synthetic ARN
+  (`wire::stream_arn`) is `arn:aws:dynamodb:animus:0:table/<table>/
+  stream/<label>` — fixed placeholder region/account, matching this
+  adapter's existing ARN conventions. Round 3 needs no shard provisioning at
+  all: the hot shard is just the table's own existing `KIND_CHANGE` change
+  log (round-3 streams plan §A1), not a separate hidden per-stream table.
+  **The sealer landed in the round-3 sealer PR** (see `index_drain.rs`'s
+  entry above): `update_table`'s disable path now performs the F12-b
+  final seal (`dynamo.rs::disable_stream`, forcing every tablet's own hot
+  tail into a committed segment via `ClientCtx::force_seal_tablet` before
+  ever proposing `SetTableStream{None}`).
+
+  **The read path landed in PR6(`dynamo_streams.rs`, new module):** the
+  four `DynamoDBStreams_20120810.*` operations, dispatched on the **same**
+  listener as the item API (`dynamo.rs::dispatch` checks the target's
+  prefix and routes to `dynamo_streams::execute` — the decided
+  same-listener fork; every JSON shape and the iterator-token/shard-id
+  codecs are pure, in `animus_dynamo::streams_wire`, this module is the
+  read path's only impure layer).
+  - **`ListStreams`/`DescribeStream`** are pure functions of `Metadata`
+    (F7 — the store is never load-bearing for a metadata read):
+    `ListStreams` enumerates the current enabled label per table plus
+    every `DISABLED`-but-unreaped label with a catalog row still present
+    (F12-b); `DescribeStream` builds the shard chain from
+    `stream_shard_rows_for_label` (closed, `EndingSequenceNumber` set)
+    plus, only while `enabled`, one open shard per `tablets_for_table`
+    entry at `current_open_epoch` (this tablet's own chain length —
+    mirrors `index_drain::seal_now`'s identical computation). `resolve_label`
+    is the one function every operation funnels through for F12-b's
+    label validity: the table's *current* schema label, or any label
+    with at least one still-present catalog row — neither ⇒
+    `ResourceNotFoundException`. `StreamShardRow`/`SealStreamShard` grew a
+    `view_type` field (a small `animus-control` catalog amendment,
+    `#[serde(default)]`) — a `DISABLED` stream's grace-window
+    `DescribeStream` has no live `StreamSpec` to read a view type from
+    once `SetTableStream{None}` commits, so a shard's own row carries the
+    view type declared *at seal time* instead (`Metadata::
+    stream_view_type`, the read accessor); a view type never changes
+    mid-stream, so every row of one label agrees.
+  - **`GetShardIterator`** mints a stateless `base64url({label, shard_id,
+    position})` token (`animus_dynamo::streams_wire::encode_iterator`) —
+    `position` is always the record HLC's own **exclusive** lower bound
+    the next read filters on (`packed_hlc > position`), the same
+    convention `segment::slice_to_hlc_range`'s `start_exclusive` and
+    `index_drain::hot_read`'s `from_position` already use, so a token
+    composes with either serve tier with no translation. `TRIM_HORIZON`/
+    `AT`/`AFTER_SEQUENCE_NUMBER` read straight off the catalog row (sealed)
+    or `effective_stream_shard_watermark` (open) with no round trip;
+    `LATEST` on a sealed shard collapses to `hlc_range.1` (the
+    immediate-null path); `LATEST` on a genuinely open shard needs one
+    hot read (`ClientCtx::read_stream_hot_records(tablet, watermark,
+    usize::MAX)`) to find the current max.
+  - **`GetRecords`** resolves the shard id against the catalog **fresh at
+    every call** (never cached from mint time) — this is what makes an
+    open-shard iterator survive a seal that happens between polls (ADR
+    0042 §2): a catalog row present ⇒ the **sealed** path (any node —
+    `SegmentStoreHandle::get_sealed(&row.replicas, seg_id)`, then
+    `segment::decode_and_slice(bytes, row.hlc_range)`, the superset-slice
+    rule, ADR 0042 §10 — filtered/paginated, nulling `NextShardIterator`
+    only once the sliced content is truly exhausted); absent ⇒ the
+    **open** path (`ClientCtx::read_stream_hot_records`, forwarded to the
+    tablet's own leader, no `ReadIndex` barrier, F8 — never nulls; an
+    empty poll returns the *same* iterator, F4/§7), gated on the shard
+    genuinely being the label's current live open epoch (else
+    `TrimmedDataAccessException`). `ChangeRecord::event_name()` +
+    `streams_wire::project_view`/`keys_from_images`/`stream_record_json`
+    build each `Records[]` entry; `Keys` is recovered from whichever
+    image is present (new preferred, old for a `REMOVE`) since both
+    images always carry the full item.
+  - **`ClientRequest::StreamHotRead { tablet, from_position, limit }`**
+    (new internal-only RPC, mirroring `ForceSeal`'s exact shape/doc
+    pattern) is the open-shard forwarding payload — refused bare (gating
+    sites: the `request_kind`/bare-refusal arms in `handle_request`, and
+    the real handling arm in `cp_serve_forwarded`, which calls
+    `index_drain::hot_read` — grepped per the house lesson on adding a
+    forwarded-command variant), answered with the existing
+    `ClientResponse::Pairs` shape (no new response variant — the packed
+    HLC rides each key's own trailing 8 bytes, the same suffix
+    `change_record_key` already appends, recovered by the caller).
+    `index_drain::hot_read` is `seal_now`'s read-only sibling: an
+    identical `pending_changes()` scan/HLC-suffix-sort, filtered by
+    `from_position` instead of the watermark, never sealing anything.
+  - **`SegmentStoreHandle::get_sealed`** (new, alongside the existing
+    `put_sealed`) is the sealed-tier read: `ClusterSegmentStore::get_from`
+    for the default `Cluster` variant (any recorded replica), or a plain
+    local `get` for the single-directory `Fs` opt-in (replicas ignored —
+    there is no per-node replica concept when every node already shares
+    the identical directory).
+
+  `mint_stream_label` (ADR 0042 §4) is the proposer-side label mint: an
+  ISO8601-shaped string derived from **this node's own `env.now()`**
+  (`ClientCtx.env: ProdEnv`, a new field every `spawn_common_tail` caller
+  now threads in — the *only* `Env`-seam access point `ClientCtx` exposes
+  to the wire edges) suffixed with this node's own id (so two different
+  nodes minting at a coincidentally identical elapsed time can never
+  collide) — never the wall clock directly (ADR 0003's determinism-rule
+  convention, even though this crate is production-only `ProdEnv` wiring).
+  **Not a genuine calendar timestamp**: `ProdEnv::now()` is monotonic since
+  **process start**, not wall-clock epoch, so the rendered date drifts from
+  real time the longer a process has been up — an accepted cosmetic gap
+  (a stream's identity is `(table, label)`, validated byte-for-byte, never
+  parsed as a date), documented on the function itself. `iso8601_ish`/
+  `civil_from_days` (Howard Hinnant's public-domain algorithm) are a small,
+  dependency-free Gregorian calendar conversion — this crate takes no
+  date/time crate dependency for one cosmetic label format.
+
+  **The write-path gate (`kind_writes_for_item`'s `None` fast path) becomes
+  `!table_takes_kind_write_path(meta, table)`** — a new shared predicate
+  (`!indexes.is_empty() || stream.is_some()`) both this function and every
+  write handler's `needs_old` computation call, kept as one function so the
+  two can never silently drift apart. **A streamed-but-unindexed table now
+  takes the `KindBatch` path too**: `indexes` is empty, so the LSI loop is
+  simply a no-op, and the entry commits exactly base row + change record —
+  this same change record *is* the round-3 hot shard the eventual sealer
+  reads directly (round-3 streams plan §A1), no separate copier involved.
+  **A real, independent correctness gap this surfaced**: `PutItem`/
+  `DeleteItem` only fetched the prior item (`needs_old`) when a
+  `ConditionExpression` or `ALL_OLD` was requested — an unconditional
+  replace/delete on an indexed *or* streamed table therefore silently
+  skipped the read `kind_writes_for_item`'s LSI diff (and now a stream's
+  `OLD_IMAGE`/`NEW_AND_OLD_IMAGES` fidelity) actually needs. Both handlers'
+  `needs_old` now also checks `table_takes_kind_write_path` (`UpdateItem`/
+  the indexed `BatchWriteItem` branch already read unconditionally — only
+  these two needed the fix). See `docs/engineering-lessons.md` for the
+  general lesson (a fast-path gate and a "do I need the old value" gate
+  must be the *same* predicate, not two that happen to agree today).
 
   `ClientRequest::KindWrite` is the forwarding payload — **internal-only,
   refused bare** (a client could otherwise write arbitrary bytes into a table's
@@ -642,6 +966,83 @@ route below the edge through the same `ClientCtx` CP primitives.
 
 ## Gotchas
 
+- **The DynamoDB Streams segment store + sealer knobs are wired via the
+  `_with_orphan_sweep_after`-style layered-wrapper convention (ADR
+  0042/0043, round-3 sealer PR)** — `BoundNode::start_with`/
+  `BoundDataNode::start_data_with`/`run_node_with*`/`start_cluster_with*`
+  all keep their exact pre-existing signatures, defaulting internally to
+  `StreamSealKnobs::default()` (4 MiB / 4h, the ADR's own production
+  defaults) and `SegmentStoreConfig::default()` (`Cluster`, the default
+  K-replicated store); a `_streams`-suffixed sibling
+  (`start_with_streams`/`start_data_with_streams`/`run_node_with_streams`/
+  `start_cluster_with_streams`) takes the two explicit params. `main.rs`'s
+  `--stream-seal-bytes B`/`--stream-seal-age SECS`/`--segment-store
+  dir:PATH` flags (`--config/--node` and `--cluster N` only, so far — the
+  split-deployment and data-only CLI paths are a named follow-up) call the
+  `_streams` variants; a test that needs tiny seal thresholds (never the
+  production defaults — see `index_drain.rs`'s `stream_sealer_tests`) does
+  too. **`--stream-retention SECS` (round-3 PR7, the segment janitor's own
+  knob) follows the identical convention** — `start_with_streams`/
+  `start_cluster_with_streams`/`run_node_with_streams`/`start_cluster_inner`
+  each gained one more trailing `Duration` parameter (defaulting to
+  `DEFAULT_STREAM_RETENTION`, 24h, at every non-`_streams` call site,
+  including every `start_cluster_with_auto_split*` wrapper), while
+  `BoundControlNode::start_control_with` (control-only) hardcodes the
+  default inline with no override yet — the same "split-deployment CLI
+  path is a named follow-up" precedent this bullet's own opening sentence
+  already established for the seal knobs/segment-store config. `main.rs`
+  parses it identically to `--stream-seal-age`. `SegmentStoreHandle`
+  (`Cluster(ClusterSegmentStore<ProdEnv,
+  FsSegmentStore>)` or a bare opt-in `Fs(FsSegmentStore)`) and
+  `StreamSealKnobs` live on `DataRole` (`ClientCtx.data()`), built by
+  `build_segment_store` at node-assembly time — the **default** cluster
+  variant roots its own per-node local `FsSegmentStore` at
+  `<node dir>/segments` (a sibling of the `internal/` subdirectory
+  `ProdEnv::bind` already owns; `BoundNode`/`BoundDataNode` gained a `dir`
+  field to carry that path forward, since neither previously kept it past
+  bind time) and is backed by a `ControlPlacementView` over this node's own
+  control handle (live `Active` members; label-blind, matching
+  `cluster_segment_store.rs`'s own current policy — a later PR that wants
+  failure-domain-aware segment placement would extend this view).
+- **`ClientRequest::ForceSeal { tablet }`** (round-3 sealer PR) is the
+  internal-only RPC behind F12-b's disable-triggered final seal — addressed
+  by tablet id directly (no client key to derive it from, unlike
+  `KindWrite`/`KindScan`), refused bare, handled only inside
+  `cp_serve_forwarded`. `ClientCtx::force_seal_tablet` is its caller-side
+  wrapper (`dynamo.rs::disable_stream`, one call per tablet of the table
+  being disabled) — a deliberately **simpler** retry shape than
+  `cp_forward`'s hint-chasing loop (re-resolves routing from scratch every
+  iteration rather than chasing a stale hint), acceptable for a rare,
+  human-initiated admin-ish operation with no hot-path latency budget to
+  protect. **Every send of an internal-only variant across the wire must
+  wrap it in `ClientRequest::Forwarded`, even when the caller already knows
+  it isn't the leader** — a first attempt called `ClientCtx::relay`
+  directly with the bare `ForceSeal`, which compiled and passed every
+  single-node test (the local branch never goes through `relay` at all)
+  but failed loudly the moment a real multi-node test exercised the
+  forwarding branch, exactly because the receiving side's bare-request
+  refusal is designed to catch precisely that mistake. See
+  `docs/engineering-lessons.md`'s Testing section for the general rule this
+  is now an instance of (a forwarded-command test suite needs at least one
+  non-leader-issued call).
+- **`ClientRequest::StreamHotRead { tablet, from_position, limit }`** (PR6)
+  is `ForceSeal`'s read-side sibling — the internal-only RPC behind
+  `GetRecords`'/`GetShardIterator`'s open-shard path (ADR 0042 §7/§8):
+  same addressing (by `tablet` directly), same bare refusal, same
+  "handled only inside `cp_serve_forwarded`" contract, same reason
+  (`is_relayable_command` doesn't apply — this is a data-plane RPC, not a
+  `MetaCommand`). `ClientCtx::read_stream_hot_records` is its caller-side
+  wrapper, copying `force_seal_tablet`'s exact retry shape (fresh
+  `resolve_cp_route` every iteration, no hint-chasing) rather than
+  `cp_forward`'s hot-path optimization — acceptable for a `GetRecords`
+  poll, which already tolerates "not there yet" as part of the stream's
+  own eventually consistent contract. Answered with the pre-existing
+  `ClientResponse::Pairs` shape (no new response variant): the filtered/
+  sorted/limited `(source_key, change_record bytes)` list, exactly what
+  `index_drain::hot_read` (the leader-local, **no-`ReadIndex`** scan this
+  RPC exists to reach — F8, never to be "upgraded" to a linearizable
+  scan) returns. See `dynamo.rs`'s "DynamoDB Streams" entry above for the
+  read path's own full design.
 - **A node runs one internal `ProdEnv`, on one id (ADR 0040)** — the control
   Raft rides `PRIMARY_STREAM` (stream 0, ADR 0026's default); every per-tablet
   Raft group this node hosts rides its own stream (`stream = tablet_id`, which
@@ -808,13 +1209,55 @@ below it). The restart tests run both incarnations in the same runtime,
 calling `Node::shutdown()` between them. Two in-crate `#[cfg(test)] mod`s
 (`split_fence_tests`, `auto_split_median_tests`) live in `lib.rs` itself
 because they need private handles (a raw `CpGroup`/the private
-`byte_weighted_median` helper) that no external `tests/` file can reach.
+`byte_weighted_median` helper) that no external `tests/` file can reach;
+`index_drain.rs`'s own `gsi_drain_cursor_tests` is a third (run via `cargo
+test -p animusd --lib`, not the `tests/` tree) — the ADR 0042 §7/§8
+cursor-based drain + trim janitor regressions, needing `CpGroup`'s private
+`pending_changes`/`cursor_min_watermark`/`cursor_rows_with_token` and the
+plain-client-protocol `ClientRequest::SplitTablet`/`MergeTablets` (an
+arbitrary binary `split_key`, unlike the admin HTTP surface's UTF8-string
+one); `dynamo.rs`'s own `stream_write_path_tests` is a fourth (ADR 0042
+§1), needing `CpGroup`'s private `pending_changes`/`local_scan_kind_bounded`
+(a new, non-linearizable bounded kind-scan wrapper, mirroring
+`local_get_kind`'s existing shape) to prove a streamed-unindexed table's
+write commits exactly base + change, no LSI/footprint row;
+`index_drain.rs`'s own `stream_sealer_tests` is a fifth (round-3 sealer PR)
+— the seal arm's triggers/sequence (size, age, empty-hot no-seal, the
+exactly-at-watermark boundary), the F10/F12-b hot-trim rework (the
+GSI+stream min-rule, and — reviewed hard — the
+disabled-draining-does-not-block-trim rule), disable-as-final-seal with
+epoch continuity across a disable/re-enable cycle, and F11's split-key
+token alignment, needing `CpGroup`'s private `pending_changes`/
+`approx_bytes_kind`/`cursor_min_watermark` and, to confirm a segment
+genuinely landed, a second `FsSegmentStore` handle at the exact
+`<node dir>/segments` path the default store roots its own local building
+block at.
 
 One binary per behavior; the file names describe them (`ls
 crates/animusd/tests/`) — covering combined/control-only/data-only/split
 deployment shapes and growth/decommission, control-plane and CP-data-plane
 membership change, the DynamoDB/CQL/admin/dashboard wire edges (including
-the ADR 0041 secondary-index and ADR 0018 transaction suites), restart/
-durability across every deployment shape, and the `WatchMetadata`/
-system-table/OTel/metrics support surfaces. `support/mod.rs` holds the
-shared bring-up helpers (port-TOCTOU retries, split-cluster bring-up).
+the ADR 0041 secondary-index suites, the ADR 0042 `SetTableStream`/
+`DescribeTable`/`UpdateTable` streams surface plus PR6's
+`ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords` read path
+(closed-shard chains, the iterator-survives-a-seal property, `Limit`
+pagination, cross-node reads of both sealed and open shards, and F12-b's
+disable grace window) in `dynamo_streams.rs`, and the ADR 0018 transaction
+suites), the ADR 0043 §A9 segment janitor end to end in `stream_janitor.rs`
+(two-phase retention with on-disk object deletion, a control-leader kill
+mid-sweep, no empty-success gap across expiry, replica repair onto a fresh
+target, the full disable-grace lifecycle, and the drop-table cascade
+converging via the janitor alone — every retention-focused test seals two
+epochs in sequence first, since the epoch-derivation guard never
+physically removes a tablet's own current last epoch), the round-3 PR8
+`streams_e2e.rs` suite (an auto-split mid-stream with a live consumer
+walking the lineage handover, a real `LsmEngine` restart surviving the
+catalog/segments/label, the `FsSegmentStore` opt-in, a GSI+stream table
+proving ADR 0042 §8's trim min-rule coexistence, and the merge stopgap
+rejected through the real admin API — using a `drain_tablet_lineage`
+helper that walks a tablet's *whole* epoch chain, since a fixed shard's
+`NextShardIterator` null only ends one epoch, not the whole stream),
+restart/durability across every deployment shape, and the
+`WatchMetadata`/system-table/OTel/metrics support surfaces.
+`support/mod.rs` holds the shared bring-up helpers (port-TOCTOU retries,
+split-cluster bring-up).

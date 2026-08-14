@@ -16,14 +16,18 @@ animus-env.workspace = true
 animus-control.workspace = true
 animus-storage.workspace = true
 animus-tablet.workspace = true
+# ClusterSegmentStore's K-replica placement selection (ADR 0043 §A7b) reuses
+# this crate's existing policy engine rather than a bespoke one — was a
+# dev-only test dependency until now.
+animus-placement.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
 tracing.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
 animus-sim.workspace = true
-animus-placement.workspace = true
 # Real-thread `ProdEnv` regression (`tests/prod_concurrent_ts_monotonic.rs`):
 # the mint/propose-ordering race this guards is provably unreachable under
 # `SimEnv`'s single-threaded cooperative scheduler (no `.await` point exists

@@ -37,6 +37,9 @@ use futures::task::ArcWake;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
+pub mod segment_store;
+pub use segment_store::{SegmentFaultConfig, SimSegmentStore};
+
 type TaskId = u64;
 type Seq = u64;
 type TimerId = u64;

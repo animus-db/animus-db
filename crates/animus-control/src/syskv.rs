@@ -140,6 +140,13 @@ pub enum EntityKind {
     /// 0018 §2 amendment), keyed by the absorbed tablet's [`TabletId`]; the
     /// value is the surviving tablet's id (big-endian `u64`).
     AbsorbedBy,
+    /// A stream-shard segment catalog row (`Metadata::stream_shards`, ADR
+    /// 0042 §3/ADR 0043 §A8), keyed by the composite `(TabletId, epoch)`
+    /// pair — 16 raw bytes (`tablet.to_be_bytes() ++ epoch.to_be_bytes()`,
+    /// [`stream_shard_key`]), unambiguous with no internal escaping needed
+    /// since both fields are fixed-width. The value is the JSON-encoded
+    /// `StreamShardRow`, same convention as `Tablet`/`Schema`/etc.
+    StreamShard,
 }
 
 impl EntityKind {
@@ -162,6 +169,7 @@ impl EntityKind {
             EntityKind::CpMemberAddr => "cp_member_addr",
             EntityKind::SplitParent => "split_parent",
             EntityKind::AbsorbedBy => "absorbed_by",
+            EntityKind::StreamShard => "stream_shard",
         }
     }
 
@@ -185,6 +193,7 @@ impl EntityKind {
             b"cp_member_addr" => EntityKind::CpMemberAddr,
             b"split_parent" => EntityKind::SplitParent,
             b"absorbed_by" => EntityKind::AbsorbedBy,
+            b"stream_shard" => EntityKind::StreamShard,
             _ => return None,
         })
     }
@@ -337,6 +346,32 @@ pub fn absorbed_by_key(absorbed: TabletId) -> Vec<u8> {
     entity_key(EntityKind::AbsorbedBy, &absorbed.0.to_be_bytes())
 }
 
+/// A `(tablet, epoch)` pair's key under [`EntityKind::StreamShard`] (ADR
+/// 0042 §3/ADR 0043 §A8): the raw 16-byte concatenation of both fixed-width
+/// fields, big-endian — unambiguous with no internal escaping needed, since
+/// [`decode_stream_shard_id`] always knows exactly where the boundary is.
+#[must_use]
+pub fn stream_shard_key(tablet: TabletId, epoch: u64) -> Vec<u8> {
+    let mut id = Vec::with_capacity(16);
+    id.extend_from_slice(&tablet.0.to_be_bytes());
+    id.extend_from_slice(&epoch.to_be_bytes());
+    entity_key(EntityKind::StreamShard, &id)
+}
+
+/// The inverse of [`stream_shard_key`]'s id half: split a decoded
+/// [`EntityKind::StreamShard`] id back into `(tablet, epoch)`. `None` if
+/// `id` isn't exactly 16 bytes — this module never writes anything else at
+/// this kind's keys, so a mismatch is an internal bug, not a data problem.
+#[must_use]
+pub fn decode_stream_shard_id(id: &[u8]) -> Option<(TabletId, u64)> {
+    if id.len() != 16 {
+        return None;
+    }
+    let tablet = u64::from_be_bytes(id[..8].try_into().expect("checked length"));
+    let epoch = u64::from_be_bytes(id[8..].try_into().expect("checked length"));
+    Some((TabletId(tablet), epoch))
+}
+
 /// The decoded form of a system-keyspace key ([`decode_key`]'s result).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecodedKey {
@@ -404,7 +439,7 @@ pub fn decode_key(key: &[u8]) -> Option<DecodedKey> {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [EntityKind; 11] = [
+    const ALL_KINDS: [EntityKind; 12] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
@@ -416,6 +451,7 @@ mod tests {
         EntityKind::CpMemberAddr,
         EntityKind::SplitParent,
         EntityKind::AbsorbedBy,
+        EntityKind::StreamShard,
     ];
 
     // --- reserved-name guard -------------------------------------------------
@@ -532,6 +568,50 @@ mod tests {
                 id: 5u64.to_be_bytes().to_vec(),
             })
         );
+    }
+
+    #[test]
+    fn stream_shard_key_round_trips() {
+        let key = stream_shard_key(TabletId(7), 3);
+        let Some(DecodedKey::Entity { kind, id }) = decode_key(&key) else {
+            panic!("expected a decodable entity key");
+        };
+        assert_eq!(kind, EntityKind::StreamShard);
+        assert_eq!(decode_stream_shard_id(&id), Some((TabletId(7), 3)));
+    }
+
+    #[test]
+    fn stream_shard_key_distinguishes_tablet_and_epoch() {
+        // (7, 3) and (3, 7) must not collide despite sharing the same two
+        // byte values, and neither must (7, 300) vs a hand-rolled variant
+        // that would collide under a naive non-fixed-width concatenation.
+        let a = stream_shard_key(TabletId(7), 3);
+        let b = stream_shard_key(TabletId(3), 7);
+        assert_ne!(a, b);
+        let c = stream_shard_key(TabletId(7), 300);
+        let d = stream_shard_key(TabletId(7), 3);
+        assert_ne!(c, d);
+    }
+
+    #[test]
+    fn decode_stream_shard_id_rejects_the_wrong_length() {
+        assert_eq!(decode_stream_shard_id(&[0u8; 15]), None);
+        assert_eq!(decode_stream_shard_id(&[0u8; 17]), None);
+        assert_eq!(decode_stream_shard_id(&[]), None);
+    }
+
+    #[test]
+    fn stream_shard_keys_order_by_tablet_then_epoch() {
+        let keys = [
+            stream_shard_key(TabletId(1), 0),
+            stream_shard_key(TabletId(1), 1),
+            stream_shard_key(TabletId(1), 255),
+            stream_shard_key(TabletId(1), 256),
+            stream_shard_key(TabletId(2), 0),
+        ];
+        let mut sorted = keys.to_vec();
+        sorted.sort();
+        assert_eq!(keys.to_vec(), sorted, "keys should already be in order");
     }
 
     #[test]
