@@ -58,11 +58,64 @@ per-tablet CP data plane (`animus-cp-data`).
   same-command relabel — what makes `(table, label)` a stable identity for
   as long as the stream lives; the label itself is minted by the proposer,
   `animusd`, through its own `env.now()`, never `Metadata::apply`, which
-  only ever records whatever `StreamSpec` it's handed); `Create/DropKeyspace`);
+  only ever records whatever `StreamSpec` it's handed); `SealStreamShard`/
+  `ExpireStreamShards` (ADR 0042 §3/§9, ADR 0043 §A3/§A8/§A9 — the segment
+  catalog, below); `Create/DropKeyspace`);
   addressing (`RegisterNodeAddrs` — update-only since ADR 0040, rejects if
   `node` is absent from both `members` and `node_addrs`; `RegisterCpAddr` —
   the predecessor, kept for WAL back-compat only); and `RegisterNode` (ADR
   0040 Decision C), below.
+
+  **`SealStreamShard`/`ExpireStreamShards` are the segment catalog**
+  (`Metadata::stream_shards: BTreeMap<(TabletId, u64), StreamShardRow>`).
+  **Keyed by `(tablet, epoch)` alone, never `(table, label, tablet,
+  epoch)`** — a tablet id already implies its table, and a tablet's own
+  epoch counter is a property of its physical seal history (counts up from
+  its first seal, never resetting across a disable/re-enable cycle), not
+  of any one stream generation; `table`/`label` live inside
+  `StreamShardRow` as descriptive fields. `SealStreamShard` is
+  **first-committer-wins** on that key (a second proposal for an
+  already-recorded identity is a `NoOp`, never a rejection — the sealer's
+  own crash-retry races itself by design), validated against **either**
+  the table's current schema `StreamSpec.label` **or** an existing catalog
+  row already present for that `(table, label)` (F12-b: a disabled
+  stream's un-reaped rows still license a further seal of the same
+  generation, e.g. the disable-triggered final seal proposed after
+  `SetTableStream{None}` already cleared the schema), plus a
+  permissive-but-sane epoch-chain check (`epoch == 0` always accepted;
+  `epoch > 0` needs a local `epoch - 1` row or `split_parents` provenance
+  for this tablet). Relayable — a tablet leader proposing its own seal may
+  run on any data node, not necessarily one control-connected at all.
+  `ExpireStreamShards { rows: Vec<(TabletId, u64)>, remove: bool }` is the
+  janitor's (a later PR) two-phase reclaim, reused directly for the
+  drop-table cascade too: `remove: false` **marks** every named row
+  `expired: true` (idempotent; never a visibility gate — a
+  marked-but-not-removed row is still fully valid to serve), `remove:
+  true` **physically removes** it (idempotent). **Deliberately NOT
+  relayable** — its only intended caller (the segment janitor, a
+  control-plane-leader-only background loop like
+  `detect_loop`/`orphan_sweep_loop`) always already holds a live
+  `RaftNode` handle when it decides to act, so it proposes directly and
+  has no structural need for a relay path; see `animusd`'s
+  `is_relayable_command` for the full access-restriction argument (mirrors
+  `RemoveMember`'s own exclusion). `Metadata` accessors:
+  `stream_shard_chain(table, label, tablet)` (one tablet's chain in
+  ascending epoch order), `stream_shard_watermark(tablet)` (the tablet's
+  own last-sealed end-HLC, regardless of label — the ADR 0042 §8/ADR 0043
+  §A6 F10 watermark), `stream_shard_rows_for_label(table, label)` (every
+  row across every tablet), `stream_labels_with_rows(table)` (F12-b's
+  coexistence set), `stream_shard_parent_id(tablet, epoch)` (derived
+  `ParentShardId`, never stored redundantly). **F1 merge stopgap** (ADR
+  0042 §12/ADR 0043 §A5): `MergeTablets`'s apply arm rejects outright when
+  the base table has either an enabled stream or any still-present
+  catalog row (marked-expired-but-not-yet-removed counts as still
+  present) — explicitly a v1 stopgap the text names as such, since tablet
+  merge itself is being removed globally in a forthcoming split-only ADR
+  that deletes this guard along with `MergeTablets`. Mirrored into
+  `syskv::EntityKind::StreamShard`, keyed by the raw 16-byte
+  `tablet.to_be_bytes() ++ epoch.to_be_bytes()` concatenation
+  (`syskv::stream_shard_key`/`decode_stream_shard_id` — fixed-width, so no
+  internal escaping is needed the way a variable-length id would).
 
   **`RegisterNode` is the sole claim path for a fresh node identity**,
   retiring ADR 0036's `AllocateNodeId` monotonic allocator entirely. `node`

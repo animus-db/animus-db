@@ -39,7 +39,9 @@ pub mod syskv;
 
 pub use delta_ring::DeltaRing;
 pub use detector::{FailureDetector, Liveness};
-pub use meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus};
+pub use meta::{
+    ApplyOutcome, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus, StreamShardRow,
+};
 pub use node::{DeltaReply, MetadataChanged, MetadataWatch, RaftNode};
 pub use schema::{
     ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection, ReplicationMode, SchemaCatalog,

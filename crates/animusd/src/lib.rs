@@ -1250,6 +1250,28 @@ pub enum ClientRequest {
 /// local-control-leader-only by design (an operator retries on the leader, the
 /// same UX `admin_drain` already has), so it must never reach the control
 /// leader through a relay chain from a node that may not even know who leads.
+///
+/// **[`MetaCommand::SealStreamShard`] (ADR 0042/0043) is relayable** — a
+/// tablet's own leader can be hosted on *any* data node, not necessarily one
+/// that also happens to be the control-plane leader (or even control-connected
+/// at all, on a split deployment), so the sealer (a later PR) needs the exact
+/// same follower-connected relay path `SplitTablet`/`CreateTablet` already
+/// use to reach the control leader from wherever it actually runs.
+///
+/// **[`MetaCommand::ExpireStreamShards`] is deliberately excluded** — unlike
+/// `SealStreamShard`, its only intended production caller (the segment
+/// janitor, ADR 0043 §A9, a later PR) is itself a **control-plane-leader-only**
+/// background loop (the same class as `detect_loop`/`orphan_sweep_loop`
+/// already are): it only ever runs — and only ever proposes — from inside a
+/// process that already holds a live `RaftNode` handle for the control group
+/// at the moment it decides to act, so it has no structural need for a relay
+/// path at all (it proposes directly, the same way those two loops do, never
+/// through [`ClientRequest::ProposeSchema`]). Leaving it off this allowlist is
+/// therefore not a missing feature — it is the same deliberate access
+/// restriction `RemoveMember` gets just above: a destructive-ish housekeeping
+/// action (marking rows expired, then physically deleting them) has no
+/// legitimate reason to be triggerable by an arbitrary relay chain from a
+/// node that isn't even running the janitor.
 fn is_relayable_command(command: &MetaCommand) -> bool {
     matches!(
         command,
@@ -1266,6 +1288,11 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // a follower-connected `CreateTable`/`UpdateTable` must reach the
             // control leader.
             | MetaCommand::SetTableStream { .. }
+            // Stream-shard catalog commit (ADR 0042/0043): a tablet leader's
+            // own seal proposal, from wherever that leader actually runs —
+            // see this function's own doc for why `ExpireStreamShards` is
+            // deliberately NOT included here.
+            | MetaCommand::SealStreamShard { .. }
             | MetaCommand::CreateKeyspace { .. }
             | MetaCommand::DropKeyspace { .. }
             | MetaCommand::RegisterCpAddr { .. }

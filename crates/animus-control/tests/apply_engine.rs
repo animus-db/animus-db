@@ -121,6 +121,30 @@ fn run_scenario(seed: u64) {
         sim.run_for(Duration::from_secs(2));
         assert_cache_matches_engine(&nodes, &engines, seed, "after initial commands").await;
 
+        // ADR 0042/0043: enable a stream and seal its first shard —
+        // proves `SealStreamShard`'s catalog row (and its own mirror arm)
+        // replicates and durably survives on every node's engine, like any
+        // other command in this scenario.
+        nodes[leader].propose(MetaCommand::SetTableStream {
+            table: "orders".to_string(),
+            spec: Some(animus_control::StreamSpec {
+                view_type: animus_control::StreamViewType::NewAndOldImages,
+                label: "seed-scenario-L1".to_string(),
+            }),
+        });
+        nodes[leader].propose(MetaCommand::SealStreamShard {
+            table: "orders".to_string(),
+            label: "seed-scenario-L1".to_string(),
+            tablet: TabletId(1),
+            epoch: 0,
+            hlc_range: (0, 100),
+            count: 1,
+            seal_wall_ms: 1_700_000_000_000,
+            replicas: vec![nid(10), nid(11)],
+        });
+        sim.run_for(Duration::from_secs(1));
+        assert_cache_matches_engine(&nodes, &engines, seed, "after SealStreamShard").await;
+
         // Split the tablet, then drop the table (removes every tablet + policy).
         let split_key = vec![128u8];
         nodes[leader].propose(MetaCommand::SplitTablet {
@@ -131,6 +155,51 @@ fn run_scenario(seed: u64) {
         });
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after split").await;
+
+        // Seal the narrowed source's next epoch, plus the split child's own
+        // epoch-0 (licensed by `split_parents` provenance the split itself
+        // just recorded — the escape hatch `SealStreamShard`'s epoch-chain
+        // guard grants a fresh child with no local history of its own).
+        nodes[leader].propose(MetaCommand::SealStreamShard {
+            table: "orders".to_string(),
+            label: "seed-scenario-L1".to_string(),
+            tablet: TabletId(1),
+            epoch: 1,
+            hlc_range: (100, 200),
+            count: 1,
+            seal_wall_ms: 1_700_000_000_001,
+            replicas: vec![nid(10), nid(11)],
+        });
+        nodes[leader].propose(MetaCommand::SealStreamShard {
+            table: "orders".to_string(),
+            label: "seed-scenario-L1".to_string(),
+            tablet: TabletId(2),
+            epoch: 0,
+            hlc_range: (200, 300),
+            count: 1,
+            seal_wall_ms: 1_700_000_000_002,
+            replicas: vec![nid(10), nid(11)],
+        });
+        sim.run_for(Duration::from_secs(1));
+        assert_cache_matches_engine(&nodes, &engines, seed, "after split-child seal").await;
+
+        // The janitor's two-phase reclaim (mark, then remove) — proves
+        // `ExpireStreamShards`'s own mirror arm derives a `Put` (the marked
+        // row) and then a `Delete` (the removed row), both durable.
+        nodes[leader].propose(MetaCommand::ExpireStreamShards {
+            rows: vec![(TabletId(1), 0)],
+            remove: false,
+        });
+        sim.run_for(Duration::from_millis(500));
+        assert_cache_matches_engine(&nodes, &engines, seed, "after ExpireStreamShards mark").await;
+
+        nodes[leader].propose(MetaCommand::ExpireStreamShards {
+            rows: vec![(TabletId(1), 0)],
+            remove: true,
+        });
+        sim.run_for(Duration::from_millis(500));
+        assert_cache_matches_engine(&nodes, &engines, seed, "after ExpireStreamShards remove")
+            .await;
 
         nodes[leader].propose(MetaCommand::DropTableTablets {
             table: "orders".to_string(),

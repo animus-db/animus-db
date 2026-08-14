@@ -61,6 +61,7 @@ pub mod cursor;
 pub mod hlc;
 pub mod host;
 mod seal;
+pub mod segment;
 mod ts_cache;
 mod txn;
 

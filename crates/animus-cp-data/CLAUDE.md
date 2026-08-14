@@ -130,6 +130,29 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   lives under `animus_control::syskv::RESERVED_NAMESPACE` — engine-global,
   outside every `StorageScope` — see the module's own doc for the
   key-disjointness proof.
+- **`segment.rs`** (ADR 0042/0043) — the stream-shard **segment codec**: a
+  sealed shard's `SegmentStore` object format, pure and I/O-free (magic +
+  version header, `SegmentHeader` + `Vec<SegmentRecord>` body,
+  length-prefixed framing mirroring `codec.rs`'s own style but a separate
+  self-contained module). `encode`/`decode` — `encode` always derives the
+  wire `count` from `records.len()` (never trusts a caller-supplied
+  placeholder), `decode` validates magic/version (an unrecognized version
+  is a loud, named `Err`), every length-prefixed field's framing, the
+  stored `shard_id` against `shard_id(tablet, epoch)` (a mismatch is
+  corruption), and that the body holds **exactly** the declared record
+  count with no trailing bytes. `shard_id(tablet, epoch)` =
+  `shardId-<tablet>-<epoch>` (ADR 0042 §2); `segment_id(table, label,
+  tablet, epoch)` = `{table}/{label}/{tablet}/{epoch}` (ADR 0043 §A3/§A7,
+  matching `FsSegmentStore`'s own path-mapping/`ClusterSegmentStore`'s id
+  shape byte-for-byte). **The superset-slice rule (ADR 0042 §10)**:
+  `slice_to_hlc_range(records, (start_exclusive, end_inclusive))` keeps
+  exactly the records inside the catalog row's own committed range,
+  dropping a deposed leader's late-`put` superset's extra tail (and,
+  defensively, anything at or below the exclusive start); `decode_and_slice`
+  composes decode-then-slice in one call so a reader (the `GetRecords`
+  sealed-shard path) can't decode a segment and forget to slice it.
+  `change_record` bytes are opaque to this crate throughout (ADR 0043's
+  own layering rule) — only ever moved, never interpreted.
 - **`ts_cache.rs`** (ADR 0018 §2) — the per-tablet **read-timestamp cache**
   (`TsCache`): leader-local, in-memory, best-effort write-conflict push. A
   two-generation rotating map; every served read bumps the span it read at
@@ -772,13 +795,15 @@ crates/animus-cp-data/tests/`) — covering single-tablet Raft mechanics
 snapshot catch-up), automatic reconfiguration and leadership-transfer
 cascades, the ADR 0026 stream-addressing/shared-engine primitives, the ADR
 0041 `KindBatch`/scope-set mechanics, the ADR 0042/0043 `KIND_CURSOR`
-scope-isolation and min-over-rows suite (`cursor_scope.rs`), the ADR 0043
-`§A7b` `ClusterSegmentStore` replication/fault suite (`cluster_segment_
-store.rs`, a 3-node cluster over `SimSegmentStore`), the ADR 0018
-HLC/MVCC/range-seal/transaction suites (single- and multi-participant,
-in-doubt recovery, write-key conditions, snapshot reads, the read-timestamp
-cache), the `host.rs` reconciler end to end, and the real-thread `ProdEnv`
-regression noted above.
+scope-isolation and min-over-rows suite (`cursor_scope.rs`), `segment.rs`'s
+own in-module `#[cfg(test)]` unit tests (`cargo test -p animus-cp-data --lib
+segment::` — round-trip, decode rejections, and the superset-slice rule),
+the ADR 0043 `§A7b` `ClusterSegmentStore` replication/fault suite
+(`cluster_segment_store.rs`, a 3-node cluster over `SimSegmentStore`), the
+ADR 0018 HLC/MVCC/range-seal/transaction suites (single- and
+multi-participant, in-doubt recovery, write-key conditions, snapshot
+reads, the read-timestamp cache), the `host.rs` reconciler end to end, and
+the real-thread `ProdEnv` regression noted above.
 
 ### Reconciler lifecycle corpus (`tests/reconciler_corpus.rs`)
 

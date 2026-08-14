@@ -219,3 +219,144 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
         n.shutdown();
     }
 }
+
+/// ADR 0042/0043's stream-shard catalog relay decision:
+/// `MetaCommand::SealStreamShard` (a tablet leader's own seal commit, which
+/// may run on any data node, not necessarily one connected to the control
+/// leader) is relayable — issued against a follower-connected node, it must
+/// still land and replicate. `MetaCommand::ExpireStreamShards` (the segment
+/// janitor's own reclaim, a control-plane-leader-only background loop with
+/// no structural need for a relay path) is deliberately **excluded** — the
+/// relay rejects it outright, even sent straight to the leader, mirroring
+/// the `RemoveMember` gate test above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
+    use animus_control::{StreamSpec, StreamViewType};
+    use animus_tablet::TabletId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(3, dir.path()).await;
+
+    let leader = nodes.iter().position(Node::is_control_leader).unwrap();
+    let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
+    let follower_client = config.nodes[follower].client;
+
+    // Register a table + enable a stream first (SealStreamShard's own label
+    // validation needs a schema entry to license the label) — through the
+    // SAME follower-connected node, exercising the relay for both.
+    let create = MetaCommand::CreateTableSchema {
+        table: "stream_relay_t".into(),
+        schema: TableSchema::simple("id", ColumnType::String),
+    };
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let _ = call(
+                follower_client,
+                ClientRequest::ProposeSchema(create.clone()),
+            )
+            .await;
+            if nodes[follower]
+                .metadata()
+                .has_table_schema("stream_relay_t")
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("follower-issued CreateTableSchema did not commit in 20s");
+
+    let enable = MetaCommand::SetTableStream {
+        table: "stream_relay_t".into(),
+        spec: Some(StreamSpec {
+            view_type: StreamViewType::NewAndOldImages,
+            label: "relay-L1".into(),
+        }),
+    };
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let _ = call(
+                follower_client,
+                ClientRequest::ProposeSchema(enable.clone()),
+            )
+            .await;
+            if nodes[follower]
+                .metadata()
+                .table_stream("stream_relay_t")
+                .is_some()
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("follower-issued SetTableStream did not commit in 20s");
+
+    // The regression: `SealStreamShard`, issued against the FOLLOWER, must
+    // relay to the leader and replicate everywhere — the exact bimodal-flake
+    // shape the house lesson on `is_relayable_command` warns about.
+    let seal = MetaCommand::SealStreamShard {
+        table: "stream_relay_t".into(),
+        label: "relay-L1".into(),
+        tablet: TabletId(1),
+        epoch: 0,
+        hlc_range: (0, 100),
+        count: 1,
+        seal_wall_ms: 1_700_000_000_000,
+        replicas: vec![nid(10), nid(11)],
+    };
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let _ = call(follower_client, ClientRequest::ProposeSchema(seal.clone())).await;
+            if nodes[follower]
+                .metadata()
+                .stream_shard_watermark(TabletId(1))
+                .is_some()
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("follower-issued SealStreamShard did not commit via relay in 20s");
+    for (i, n) in nodes.iter().enumerate() {
+        assert_eq!(
+            n.metadata().stream_shard_watermark(TabletId(1)),
+            Some(100),
+            "node {i}: SealStreamShard's catalog row did not replicate"
+        );
+    }
+
+    // `ExpireStreamShards` is deliberately NOT relayable — rejected by the
+    // gate even sent straight to the leader (mirroring `RemoveMember`'s own
+    // gate test above), since its only intended caller (the segment
+    // janitor) never needs a relay path at all.
+    let expire = call(
+        config.nodes[leader].client,
+        ClientRequest::ProposeSchema(MetaCommand::ExpireStreamShards {
+            rows: vec![(TabletId(1), 0)],
+            remove: false,
+        }),
+    )
+    .await;
+    assert!(
+        matches!(expire, ClientResponse::Error(_)),
+        "ExpireStreamShards must be rejected by the relay, got {expire:?}"
+    );
+    // And it really did not take effect (the row is still unmarked).
+    assert!(
+        !nodes[leader]
+            .metadata()
+            .stream_shard_chain("stream_relay_t", "relay-L1", TabletId(1))
+            .next()
+            .is_some_and(|(_, row)| row.expired),
+        "rejected ExpireStreamShards must not have marked the row"
+    );
+
+    for n in &nodes {
+        n.shutdown();
+    }
+}
