@@ -438,3 +438,16 @@ segregation reuses the existing label/residency policy machinery
 need to account for — a streams-role node is simply labeled at startup, the
 same primitive that already keeps a data-only node's tablets off a
 control-only node in the two-role case.
+
+**Superseded (2026-08-14, round-3 rewrite): this whole amendment is
+retracted — round 3 introduces no third role at all.** ADR 0042/0043's
+round-3 architecture seals a streamed table's own change log **in place**,
+on that table's own (ordinary, already-placed) tablets, rather than
+copying records into the tablets of a separate hidden per-stream table.
+There is therefore no distinct payload profile to isolate onto a dedicated
+node class, no `animusd streams` invocation mode, and no streams-role
+placement label — every deployment shape this ADR actually established
+(combined / control-only / data-only) is unaffected and unchanged by
+Streams. This paragraph is kept, struck through in spirit if not in
+Markdown, purely so a reader who remembers the round-2 design can find the
+explicit retraction rather than wondering whether it silently rotted.

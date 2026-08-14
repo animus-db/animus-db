@@ -577,11 +577,19 @@ mechanism.
 watermark) and a **min-over-rows** rule for split/merge convergence, in
 place of §4's as-built "no cursor, consumption is trim" design, which only
 ever had to reason about one consumer (the GSI drain). The GSI drain itself
-is reworked to write its own cursor row (tag `"gsi"`) atomically with its
-footprint update — preserving exactly the crash property §4's as-built note
-already relied on (the cursor only ever covers reconciliations whose
-footprint actually landed) — rather than trimming on consumption directly.
-Trim becomes "the minimum watermark over every *expected, present*
+is reworked to write its own cursor row (tag `"gsi"`) in its own **separate,
+trailing** write — never fused into any one partition's own footprint-update
+entry — issued only once *every* partition a pass dirtied has had its
+footprint update independently confirmed durable. This is what actually
+preserves the crash property §4's as-built note relied on (the cursor only
+ever covers reconciliations whose footprint actually landed): fusing the
+cursor bump into a single partition's own commit would be sound for a tick
+that reconciles exactly one partition, but unsound the moment one tick
+dirties more than one (the ordinary case under sustained writes) — a crash
+between two partitions' own footprint-confirming writes would still leave
+the cursor naming the tick's max HLC, over-claiming a partition whose
+footprint never landed. Trim becomes "the minimum watermark over every
+*expected, present*
 consumer tag," generalizing §4a's "trimmed behind the slowest consumer"
 language from "the GSI drain alone" to any combination of a GSI and/or a
 stream. §4a's own prediction — *"Streams becomes a second consumer of the

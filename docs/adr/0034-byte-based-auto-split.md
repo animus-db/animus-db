@@ -236,3 +236,22 @@ which no byte threshold could ever justify trading against. Growing a
 stream's shard count is ADR 0042's own committed roadmap item (generation-
 cut resharding, grow-by-doubling only), a control-plane-triggered event
 entirely distinct from this ADR's byte-driven auto-split.
+
+**Update (2026-08-14, round-3 rewrite): reversed — there is no stream
+table to exempt, and this ADR's auto-split is now what *drives* stream
+shard lineage.** Round 3 (ADR 0042/0043) seals a streamed table's own
+change log in place; a stream shard is a seal epoch of an ordinary base
+tablet, and a shard-lineage branch is created **only** when this ADR's
+own auto-split creates a new tablet (ADR 0043 §A4: "auto-scaling is tablet
+topology, full stop" — stream parallelism is tablet count, with no
+separate resharding mechanism at all). Far from being exempted, a streamed
+table's tablets are auto-split exactly like any other table's, with one
+addition: **the split key is rounded down to its own 8-byte token boundary**
+when the source table is streamed (ADR 0042 §14's **F11**) — this
+`byte_weighted_median`-chosen key would otherwise land mid-token, which
+would risk separating one partition key's change records (and hence one
+shard's lineage) across the split boundary; token-alignment preserves the
+partition-key/shard affinity a change record's own token-leading key
+already assumes. This also narrows a pre-existing residual `txn.rs` noted
+in ADR 0018's PR3 amendment about a non-token-aligned split racing an
+in-flight transaction's own token, for every streamed table.

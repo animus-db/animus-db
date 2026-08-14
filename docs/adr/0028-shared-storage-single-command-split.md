@@ -284,21 +284,28 @@ replacement for it. See ADR 0018's PR2 amendment for the full design.
 ## Amendment (2026-08-14, ADR 0042/0043)
 
 The kind-scope set every tablet group owns (ADR 0041 §3's extension of this
-ADR's "one engine, many independently-versioned writers" mechanism) grows
-again: `KIND_CURSOR` (`0x04`, on a GSI'd/streamed table's own base tablets)
-plus `KIND_STREAM`/`KIND_STREAM_META` (`0x05`/`0x06`, on a stream's shard
-tablets) — seven kinds total, snapshot codec `VERSION` 13. Nothing about
-this ADR's own mechanism changes: a kind is still a `StorageScope` sibling
-sharing the group's one live `KeyRange`, `ALL_KINDS` is still the single
-registration point, and `engine_image`/`erase_scope` still iterate it
-generically with no per-kind special-casing required.
+ADR's "one engine, many independently-versioned writers" mechanism) grew by
+one for the consumer-cursor rework: `KIND_CURSOR` (`0x04`, on a
+GSI'd/streamed table's own base tablets) — five kinds total, snapshot codec
+`VERSION` 13.
 
-A stream's shard tablets are also the first tablets this shared-storage
-model hosts that are **structurally exempt from ever splitting** (ADR 0043
-§1) — their ranges are fixed at provisioning and guarded against
-`SplitTablet`/`MergeTablets` at the state-machine level. This ADR's own
-"tablet is the unit of placement/hosting/snapshot" contract needed no
-change to accommodate that: nothing here assumed every tablet must
-eventually split, only that a tablet's range can *change* (narrow/widen)
-when one does. A tablet that never exercises that path is simply the
-degenerate case.
+**Update (2026-08-14, round-3 rewrite): DynamoDB Streams adds no further
+kind at all.** Round 2's design would have added `KIND_STREAM`/
+`KIND_STREAM_META` (`0x05`/`0x06`) on a separate stream-shard tablet; round
+3 replaces that whole tier with in-place sealing of a table's own existing
+`KIND_CHANGE` scope (ADR 0043) — a stream's hot shard is literally the same
+change log ADR 0041 already scoped here, and a *sealed* shard's bytes live
+in an external `SegmentStore` (ADR 0043 §A7), never in this shared engine at
+all. **The kind set therefore stays at five, and `VERSION` stays 13** —
+nothing about this ADR's own mechanism needed to change a second time: a
+kind is still a `StorageScope` sibling sharing the group's one live
+`KeyRange`, `ALL_KINDS` is still the single registration point, and
+`engine_image`/`erase_scope` still iterate it generically with no per-kind
+special-casing required. `MergeTablets` is rejected on a streamed **base**
+table (ADR 0042 §12's F1 stopgap, itself a stopgap superseded once tablet
+merge is removed globally) — an apply-time guard on an *ordinary* tablet,
+not a new "structurally exempt" tablet class this ADR's own "tablet is the
+unit of placement/hosting/snapshot" contract needed any change to
+accommodate: nothing here assumed every tablet must eventually merge, only
+that a tablet's range can *change* (narrow/widen) when one does. A tablet
+that never exercises that path is simply the degenerate case.

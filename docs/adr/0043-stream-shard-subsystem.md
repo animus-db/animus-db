@@ -1,417 +1,503 @@
-# ADR 0043 — The stream-shard subsystem
+# ADR 0043 — In-place stream sealing and the `SegmentStore`
 
 - **Status:** Proposed
-- **Date:** 2026-08-14
-- **Amends:** [ADR 0028](0028-shared-storage-single-command-split.md) (the
-  kind-scope set a tablet group owns grows to seven: `KIND_CURSOR` (base
-  tablets, this ADR's foundation PR) plus `KIND_STREAM`/`KIND_STREAM_META`
-  (shard tablets); the tablet map now also hosts groups that are
-  structurally exempt from ever splitting), [ADR 0033](0033-tablet-merge.md)
-  and [ADR 0034](0034-byte-based-auto-split.md) (a stream table's tablets
-  are exempt from merge and auto-split — their ranges are fixed at
-  provisioning), [ADR 0024](0024-drop-table-data-gc.md) (drop cascade
-  extends to a table's hidden stream table), [ADR 0013](0013-replicated-schemas.md)
-  (`StreamSpec` replicates in the catalog), [ADR 0035](0035-control-plane-separate-deployment.md)
-  (a third **streams** role assembly joins the control/data pair).
+- **Date:** 2026-08-14 (round-3 rewrite, retitled from "The stream-shard
+  subsystem" — that title described round 2's separate shard-tablet design,
+  which this text replaces in place. Round 1/2 text is retrievable from git
+  history and the `adr-0042/5`/`adr-0042/6` archive branches, kept for
+  exactly that reason.)
+- **Amends:** [ADR 0028](0028-shared-storage-single-command-split.md) (no new
+  kind scope: the hot shard is the existing `KIND_CHANGE` scope, unchanged;
+  the kind set stays at five), [ADR 0033](0033-tablet-merge.md) and
+  [ADR 0034](0034-byte-based-auto-split.md) (a streamed base table's own
+  tablets are ordinary tablets — merge is rejected outright (v1 stopgap, ADR
+  0042 §12), auto-split is what drives shard lineage, token-aligned per ADR
+  0042 §14), [ADR 0024](0024-drop-table-data-gc.md) (drop cascade removes a
+  streamed table's segment catalog rows and objects, not a hidden table's
+  tablets), [ADR 0013](0013-replicated-schemas.md) (`StreamSpec` replicates
+  in the catalog; this ADR adds the segment catalog rows alongside it),
+  [ADR 0035](0035-control-plane-separate-deployment.md) (round 3 needs **no**
+  dedicated streams node role — superseded, see that ADR's amendment).
 - **Depends on:** [ADR 0042](0042-dynamo-streams.md) (the contract this
   subsystem serves), [ADR 0018](0018-cross-tablet-transactions.md) (HLC
-  timestamps, apply-time monotonicity), [ADR 0031](0031-tablet-host-reconciler.md)
-  (the per-node tablet-host reconciler this subsystem needs zero new code
-  from, by construction — see §1).
+  timestamps, apply-time monotonicity, the packed-HLC MVCC version), [ADR
+  0031](0031-tablet-host-reconciler.md) (the per-node tablet-host reconciler
+  this subsystem still needs zero new code from — nothing here is a new
+  kind of tablet), [ADR 0041](0041-materialized-secondary-indexes.md) (the
+  `KIND_CHANGE` log and the unified per-node change-consumer loop this ADR's
+  seal arm joins).
 
-## Context
+## Context: three rounds, each one closer to what AWS actually built
 
-ADR 0042 specifies *what* DynamoDB Streams means for this adapter: per-item
-ordering, eventual consistency via copier lag, exactly-once in the log,
-leader-local reads, and a multi-consumer change-log lifecycle. This ADR
-specifies *how* it is built: where stream records physically live, how they
-get there from a table's own change log, and how the whole thing inherits
-this codebase's existing distributed machinery — placement, replication,
-snapshotting, membership change, drop-GC — rather than reinventing any of
-it.
+**Round 1** (the original plan, never fully built) and **round 2** (shipped,
+then deliberately dropped) both modeled a DynamoDB stream shard as the
+tablet of a **separate, hidden per-stream table** — `T$streams$<label>`, a
+fixed number of equal token-range tablets, placed on a dedicated **streams**
+node role, populated by a **stream copier**: a third arm alongside the ADR
+0041 GSI drain that read a source tablet's change log and forwarded batches
+into the shard tablets via two new `KvCommand`s
+(`StreamAppend`/`StreamTrim`), three new row kinds, and a per-partition-key
+dedupe row guarding the copier's own retries. This was a coherent design —
+every one of those pieces is preserved, commits intact, on the
+`adr-0042/5`/`adr-0042/6` archive branches — and it inherited a lot for
+free (placement, snapshotting, membership change, drop-GC all "just tablet
+machinery"). But it was also **a bigger structural departure from what
+DynamoDB itself does than the feature needed**: real DynamoDB Streams has no
+separate copying tier at all — a table partition (and hence its shard)
+*splits* under exactly the same trigger that grows the base table, and a
+shard closes and reopens in place, not by forwarding records somewhere else.
 
-Verified against `main` at the time of writing:
+**Round 2's own committed roadmap item (a)** — "automatic shard growth via
+generation-cut resharding" — was already trying to reproduce, by hand, the
+exact lineage behavior a tablet's own auto-split already gives for free.
+That was the tell. The owner's round-3 pivot (2026-08-14/06, this ADR's own
+decisions) collapses the copying tier entirely: **a stream shard is not a
+separate thing the data plane copies records *into* — it is what the data
+plane's own change log *becomes* once sealed.** The transactional data plane
+creates shards (by writing to `KIND_CHANGE`, which it already does); a
+per-tablet seal arm, triggered on size or age, closes the current epoch in
+place and ships it to an external store; the tablet's own leader just keeps
+writing to a fresh epoch. No copier, no second Raft group, no dedupe row —
+because there is no second write path for any of those to guard.
 
-- `KvCommand::KindBatch` (`crates/animus-cp-data/src/lib.rs`) is the
-  existing multi-kind atomic batch primitive ADR 0041 introduced; its apply
-  arm completes a change-log record's key with `hlc::pack(ts)` at apply
-  time, from the entry's own commit timestamp — the "structural,
-  apply-assigned suffix" pattern this ADR's shard position assignment
-  (§5) mirrors exactly.
-- `ALL_KINDS` (`crates/animus-cp-data/src/lib.rs`) is the single place a row
-  kind is registered — a group derives one `StorageScope` sibling per entry,
-  the snapshot image iterates it, drop-table GC erases each in turn. `KIND_CURSOR
-  = 0x04` already exists there (landed alongside ADR 0042; see that ADR's
-  foundation PR and `crates/animus-cp-data/src/cursor.rs`).
-- `pending_changes` (`crates/animus-cp-data/src/lib.rs`) is a whole-
-  `KIND_CHANGE`-scope sweep whose key order is per-partition-key commit
-  order, **not** global commit order (token-then-pk-then-HLC) — the fact
-  that shapes both the cursor design (ADR 0042 §8) and why shard positions
-  cannot be source-HLC-keyed (§5 below).
-- `MetaCommand::CreateTablet` (`crates/animus-control/src/meta.rs`) carries
-  a `range` but its apply arm **rejects a second tablet for a table that
-  already has one** — "one `CreateTablet` per table" is a deliberate
-  race-safety property of ADR 0023's provision-at-create design. Provisioning
-  *N* shard tablets atomically therefore needs a genuinely new command
-  (§6), not a loop of `CreateTablet` calls.
-- `host.rs` (the ADR 0031 per-node tablet-host reconciler) is table-agnostic
-  over the tablet map: it hosts, repairs, absorbs, and reclaims whatever
-  tablets `Metadata` names, with zero awareness of what table a tablet
-  belongs to. Modeling a stream shard as an ordinary (if permanently
-  unsplittable) tablet means this subsystem needs **no new reconciler
-  code** — the single largest structural win this design rests on.
+This also changes *where* sealed records live: round 2 kept everything,
+hot and sealed, in the same `StorageEngine`-backed kind scopes every other
+row lives in (rejected a "bespoke segment store" explicitly, in its own
+Rejected Alternatives). **Round 3 reverses that specific call for sealed
+data only** — a real, versioned segment format behind a new `SegmentStore`
+trait, with a cluster-replicated default implementation that upholds this
+database's own durability bar (K-way replication, not "however durable the
+object store happens to be"). Hot data stays exactly where ADR 0041 already
+put it: the tablet's own Raft-replicated `KIND_CHANGE` scope, untouched.
+
+Verified against `main` at `65cd9d8` (the round-3 salvage boundary — round
+2's `36884c1`/`3a7e0ac` were reset out, keeping only the `$`-name-rejection
+guard they also touched, `RESERVED_TABLE_NAME_SEPARATOR` in
+`animus-control/src/meta.rs`):
+
+- `KvCommand::KindBatch` (`animus-cp-data/src/lib.rs`) already completes a
+  change-record's key with `hlc::pack(ts)` **at apply**, from the entry's
+  own commit timestamp — "structural, apply-assigned suffix" is not new
+  machinery this ADR introduces; it is the existing mechanism this ADR's
+  seal step simply reads back out in bulk.
+- `assert_ts_monotonic` (same file) is the hard invariant that makes a
+  tablet's own `KIND_CHANGE` scope a genuinely ordered log in the first
+  place — every apply strictly increases the group's own `ts`, so "sort by
+  the log's own key order" and "sort by commit order" already agree within
+  one partition (not across partitions — `pending_changes`' own doc is
+  explicit that its key order is token-then-pk-then-HLC, not global commit
+  order, which is exactly why a seal must re-sort by the HLC suffix, §A3).
+- `table_takes_kind_write_path` (`animusd/src/dynamo.rs`) already routes a
+  streamed-but-unindexed table's writes through `KindBatch`, producing
+  exactly base row + change record — the round-3 hot shard's content, with
+  no code left to write for that half.
+- `cursor.rs`'s own module doc (`animus-cp-data`) already states the plan
+  this ADR executes: *"Round 3 has no separate stream copier or `"copier"`
+  cursor row: the eventual sealer reads a table's own `KIND_CHANGE` change
+  log directly."* `index_drain.rs`'s `expected_consumer_tags` carries a
+  `// round-3 sealer PR:` marker at the exact line this ADR's sealer PR
+  (PR 5) replaces.
+- `host.rs` (the ADR 0031 per-node tablet-host reconciler) needs **zero new
+  code** from this ADR — unlike round 2, there is no new kind of tablet at
+  all. A streamed table's tablets are ordinary tablets; the only new
+  mechanism is what a tablet's own leader does with its own `KIND_CHANGE`
+  scope on a background tick.
 
 ## Decision
 
-**A DynamoDB stream's shards are the tablets of a hidden, per-stream table
-with a fixed number of equal token-range tablets, placed only on a new
-dedicated **streams** node role. Two new `KvCommand` variants
-(`StreamAppend`/`StreamTrim`) and three new row kinds carry the actual
-records; a unified per-node change-consumer loop (the existing GSI drain,
-a new stream copier, and a log janitor) moves data from a source table's
-change log into the shard tablets.**
+**A stream shard is a seal epoch of its source tablet's own `KIND_CHANGE`
+scope — sealed in place by that tablet's leader, on size/age triggers,
+shipped to a `SegmentStore` and recorded in the replicated segment catalog.
+No new row kind, no new tablet, no copier. Auto-split is the only mechanism
+that ever creates a new tablet, and hence a new shard lineage branch; the
+per-tablet change-consumer loop (ADR 0041's GSI drain) gains a second arm,
+the **sealer**, and its existing hot-log trim arm is generalized to derive
+a streamed table's watermark from the segment catalog instead of the
+retired `"copier"` cursor tag (ADR 0042 §8). A separate, control-plane-
+leader **segment-janitor** loop (§A9) handles already-sealed data —
+retention and replica repair — a cluster-wide catalog concern distinct from
+any one tablet's own hot-log housekeeping.**
 
-### 1. Shards are tablets of a hidden per-stream table
+### A1. Hot shard = the source tablet's change log
 
-A streamed table `T` gets a hidden table `T$streams$<label>` (two `$`s —
-illegal in a DynamoDB/CQL identifier, so it can never collide with a real
-table name, the same enforcement ADR 0041 §1 already added for
-`CreateTableSchema`; `is_stream_table_name`/`split_stream_table_name`
-join the existing `is_index_table_name`/`split_index_table_name` pair, and
-every `$`-classifier call site enumerated in the implementing PR). Its
-tablets partition token space into `N` **fixed, equal** ranges — fixed at
-`CreateStreamShards` time (§3, §6), never split or merged afterward. Which
-range contains `token(pk)` **is** the shard identity (`shardId-<i>` on the
-wire for the `i`-th range, plus a reserved generation field so a future
-resharding — ADR 0042 roadmap item (a) — is additive to the identity scheme
-rather than a breaking change to it) — the ordinary `cp_route(stream_table,
-key)` already resolves an append to the right shard leader, hinted retry
-included, with no new routing primitive.
+The ADR 0041 change log *is* the hot stream: `KvCommand::KindBatch` writes
+one non-collapsing record per mutation into `KIND_CHANGE`, key
+`token || escape(pk) || hlc::pack(ts)`, `ts` completed at apply from the
+entry's own commit timestamp, both images (`ChangeRecord`).
+`assert_ts_monotonic` guarantees per-tablet HLC order equals arrival order
+equals per-item order. `table_takes_kind_write_path` already routes every
+streamed table here, indexed or not. No copier, no second Raft group, no
+dedupe rows — exactly-once is structural, inherited straight from the
+apply-time atomicity `KindBatch` already provides. A hot poll's cost is
+O(the tablet's own hot scope), bounded by the seal knobs (ADR 0042 §13).
 
-Because a stream shard is *just a tablet of a table*, it inherits, with
-zero new distributed machinery: hosting and repair (the ADR 0031
-reconciler), placement and rebalancing (`animus-placement`'s pure
-`replan`/`rebalance_step`, constrained by §2 below), snapshot catch-up
-(`engine_image`/`InstallSnapshot`), single-server membership change, and
-drop-table GC (ADR 0024). Split and merge are explicitly **guarded off** at
-the state-machine level (every replica agrees, not merely convention):
-`Metadata::apply`'s `SplitTablet`/`MergeTablets` arms reject a stream
-table's tablets outright, `animusd::auto_split_loop` skips them the same
-way it already skips a GSI's hidden table, and the GSI drain's own
-table-classification logic gains the stream case alongside the index one.
+### A2. Shard = seal epoch
 
-### 2. Placement: a dedicated streams role
+Epoch is the chain length — catalog-derived, so a crash mid-seal that
+retries recomputes the identical epoch rather than skipping or duplicating
+one. `ParentShardId`: a routine seal's child names the same tablet's own
+previous epoch; a split child's epoch-0 shard names the *parent tablet's*
+last shard (§A4). Sealing does not invalidate an open-shard iterator:
+`GetRecords` resolves the shard id against the catalog at serve time — a
+sealed shard is fetched from the store, an open one is scanned hot; an
+iterator that was open when minted simply drains the resulting segment and
+nulls, and the consumer walks to the child per the ordinary lineage
+discipline (ADR 0042 §2).
 
-**Stream tablets are placed only on nodes running a new, dedicated
-**streams** role — never colocated on ordinary data nodes.** This is an
-explicit departure from the plan's original recommendation (colocation, on
-the reasoning that a stream shard is "just another tablet"); the owner's
-rationale is payload-profile separation: a data node's tablets see mixed
-point reads/writes, while a stream shard sees pure sequential
-append-then-scan traffic plus periodic retention-trim churn — different
-enough access patterns that sharing a node's engine and its LSM compaction
-schedule with ordinary table data is undesirable at any real scale, even
-though nothing here would be *incorrect* about colocating them.
+### A3. Seal mechanics
 
-Mechanically, this is a third role assembly in the shape ADR 0035 already
-established for the control/data split: `animusd streams --config FILE
---node I` runs a node hosting only stream-shard tablets (no control
-`RaftCore`, `Metadata` from a mirror exactly like a data-only node); a
-**combined** node (`animusd --cluster N`, or `--config FILE --node I` with
-no explicit role) carries all three roles, so single-process dev clusters
-keep working unmodified. Placement enforcement reuses the **existing**
-label/residency policy machinery (`animus-placement`'s `required_labels`,
-ADR 0005) — a streams-role node is labeled accordingly at startup, and
-`CreateStreamShards`'s own replica selection (§6) is constrained to nodes
-carrying that label, the identical mechanism that already keeps
-failure-domain-spread residency rules working for ordinary tables. Default
-replication factor is 3, same policy machinery as any other tablet — a
-stream shard is not special-cased in the placement *engine*, only
-*labeled* into a disjoint node pool.
+**Who**: the source tablet's own leader, via a second arm of the per-node
+`change_consumer_loop` (the renamed `index_drain_loop`): ADR 0041's GSI
+drain arm is unchanged, joined by this ADR's **seal arm**; that same loop's
+existing **hot-trim arm** is generalized to derive a streamed table's
+watermark from the segment catalog instead of the retired `"copier"`
+cursor-tag row (ADR 0042 §8). The **segment-janitor** (§A9) is a distinct,
+control-plane-leader loop — retention and repair of already-*sealed*
+segments are cluster-wide catalog concerns, not any one tablet's own
+hot-log housekeeping, and are never performed by this per-tablet loop.
 
-`host.rs`'s reconciler needs **no new code** for this — a streams-role node
-simply never runs `host.rs`'s per-tablet logic for anything but the tablets
-`Metadata` places on it, and `Metadata` never places a stream tablet on a
-node lacking the label in the first place (the placement engine's own
-constraint, enforced before a tablet ever reaches a reconciler at all).
+**When**: `KIND_CHANGE` scope `approx_bytes` exceeds `--stream-seal-bytes`,
+**or** the oldest unsealed record's age exceeds `--stream-seal-age` (the
+loop's own `env` clock, never wall-clock directly — ADR 0003), **or** a
+disable-triggered final seal fires (ADR 0042 §11's F12-b grace).
 
-### 3. Shard count: fixed at enable, growth-compatible by construction
+**Sequence (durable-before-visible, mirroring every other apply-then-durable
+discipline in this crate):**
 
-`--stream-shards` (default **1**) fixes a stream's shard count at
-`CreateStreamShards` time; there is no elastic shard count in v1. The
-number is deliberately small by default because per-item ordering (ADR 0042
-§1) already caps how much a single hot partition key benefits from more
-shards, and because ADR 0042's roadmap item (a) — generation-cut,
-doubling-only resharding — is designed to be the actual scaling lever, not
-a same-generation shard-count edit.
+1. Let `W` be the tablet's current effective watermark (ADR 0042 §8: its
+   own shard chain's last sealed end-HLC, or its parent chain's for a fresh
+   split child, or absent). Scan `pending_changes()`, keep every record with
+   `hlc > W`, and **sort by the 8-byte HLC key suffix** — `pending_changes`'
+   own key order is token-then-pk-then-HLC, *not* commit order, so this sort
+   is load-bearing, not a formality. Encode the segment (§"Segment format,"
+   below).
+2. `SegmentStore::put(id)` at the deterministic id
+   `{table}/{label}/{tablet}/{epoch}`. With the default `ClusterSegmentStore`
+   (§A5) this is the K-replica push; `Ok` means every replica fsynced.
+3. Propose `MetaCommand::SealStreamShard { table, label, tablet, epoch,
+   hlc_range, count, wall_ms, replicas }` — apply-guarded
+   **first-committer-wins on `(tablet, epoch)`** (mirroring `CreateTablet`'s
+   own race-safety shape, generalized from "first tablet" to "first seal of
+   this epoch"). Commit is what makes the shard visible and advances the
+   trim watermark — never the `put` alone (ADR 0042 §9).
+4. Hot records `≤` the new watermark are deleted **later**, by the segment
+   janitor (§A6/A9), never by the seal step itself.
 
-**Growth-compatibility is a first-class constraint on this PR's design,
-not an afterthought deferred entirely to the roadmap item:** the shard
-identity scheme (§1) reserves a generation component from day one; iterator
-tokens (ADR 0042 §6) carry that identity so a token minted against
-generation 0 remains meaningful (or cleanly rejected) once generation 1
-exists; and `CreateStreamShards`'s own apply guard (§6) is written to be
-**generation-aware** — "this table already has shard tablets" rejects a
-second `CreateStreamShards` for the *same* generation, but a future
-generation-cut command is an **extension**, not a violation of that guard,
-so the roadmap item needs no rework of this PR's state-machine contract
-when it lands.
+**Recovery**: a crash before step 3 simply re-runs steps 1–3 on the next
+tick — the id is deterministic, so the retried `put` overwrites the same
+object; a **superset** overwrite (the retried scan sees a couple more
+records than the first attempt did) is safe precisely because readers slice
+to the *committed* `hlc_range`, never the raw object (ADR 0042 §10, and see
+"the superset-slice rule" test scenario below). A crash after step 3 simply
+means the janitor is what trims, on its own next tick. If the store is
+unavailable, the hot scope keeps growing (bounded by disk, metered loudly)
+until it heals, then seals normally — never a stuck or lost write, per the
+durability invariant (ADR 0042 §9).
 
-### 4. Storage: three new kinds, one version bump
+**Segment format** (`animus-cp-data/src/segment.rs`, new in the sealer PR):
+a versioned header — `{version, table, label, shard id, tablet, epoch,
+parent shard id, hlc_range, count, seal wall-ms}` — followed by a body of
+length-prefixed `{source_key, packed hlc, change_record bytes}` triples in
+HLC order. `change_record` stays opaque to `animus-cp-data` (the same
+`ChangeRecord` type `animus-dynamo`/`animusd` already own); this crate only
+ever moves its bytes.
 
-| Kind | Selector | Where | Holds |
-|---|---|---|---|
-| `KIND_CURSOR` | `0x04` | base tablets of a GSI'd/streamed table | Consumer cursor rows (ADR 0042 §8) — landed with ADR 0042's foundation PR. |
-| `KIND_STREAM` | `0x05` | stream-shard tablets | Records: key = position (`u64`, big-endian), value = `{source_key, source_hlc, ChangeRecord}`. |
-| `KIND_STREAM_META` | `0x06` | stream-shard tablets | Per-partition-key dedupe rows (`token || escape(pk) → last-admitted packed HLC`) plus two engine-wide markers, `next_position` and `trim_horizon`, under a `[0x00, tag]` lead pair mirroring `txn.rs`'s own escape-disjointness proof. |
+### A4. Split lineage — records never move
 
-`ALL_KINDS` grows to seven; the snapshot codec's `VERSION` bump to 13
-(landed with the `KIND_CURSOR` foundation PR) is deliberately **one bump
-covering all three new kinds** across this whole stack, since the
-`ImageEntry` layout itself does not change again for `KIND_STREAM`/
-`KIND_STREAM_META` — only a new, already-generic kind byte.
+Kind scopes share the tablet's live `KeyRange`: after `SplitTablet`, the
+left child's narrowed `KIND_CHANGE` scope keeps left-range records in
+place; the right sibling exposes right-range ones, likewise in place. ADR
+0018's range seal guarantees no late write lands through the old group
+after handoff. The parent tablet's open shard **closes at its last sealed
+position** (`EndingSequenceNumber` = that segment's own max HLC); whatever
+was still unsealed in its hot tail becomes the two children's own earliest
+hot records, split by range exactly as the base rows already are. Each
+child's **epoch-0** shard carries `ParentShardId` = the parent's last
+shard; each child's **initial watermark** is the parent chain's own last
+sealed end-HLC (catalog-derived, mirroring exactly how the GSI cursor's
+min-over-rows rule already treats a fresh split child at `W = 0` over an
+empty row set — here it's `W = parent's last sealed end-HLC`, not zero,
+because the parent's own sealed segments are shared history both children
+inherit, not each child's own to re-derive).
 
-**Why `StorageEngine`-under-scopes and not a bespoke append-only segment
-store**, which would be the more obviously "log-shaped" choice for
-something this sequential:
+**Cross-group HLC safety**: a child group's start witnesses the shared
+engine's own `latest_version()` (the pre-existing witnessing chain ADR
+0018 §2's amendment already establishes) — nothing stream-specific to add
+here. **Auto-scaling is tablet topology, full stop**: auto-split is the
+only event that ever creates a new shard-lineage branch; stream
+parallelism *is* tablet count, with no separate resharding mechanism, knob,
+or command. ADR 0042 §14's F11 rounds a streamed table's split key down to
+its own token boundary, preserving the partition-key/shard affinity a
+change record's own token-leading key already assumes.
 
-- **Durability and crash recovery come for free.** The engine's own
-  WAL/apply path is already sim-tested for crash recovery through the `Env`
-  disk seam (ADR 0003); a bespoke segment file format would need its own
-  from-scratch recovery story.
-- **Snapshot shipping comes for free.** `engine_image`/`InstallSnapshot`
-  already iterate `ALL_KINDS`; a new kind is carried with no new wire
-  format and no new catch-up code path for a slow or replaced shard
-  replica.
-- **Scope-bounded erasure for GC and retention.** Drop-table GC
-  (`erase_scope`) and this ADR's own retention trim both need "delete
-  everything in this range, in this kind, on this tablet" — exactly what a
-  `StorageScope` already gives for free.
-- **Physical separation from other kinds means retention churn never
-  touches unrelated bytes.** `KIND_STREAM`'s LSM tombstone churn from
-  routine trim is an accepted cost, but it stays confined to its own scope
-  — it can never force a compaction rewrite of, say, a co-hosted stream
-  shard's own dedupe rows (a different kind, different scope, same
-  argument ADR 0041 §3 already made for keeping the change log physically
-  separate from base rows).
+### A5. Merge
 
-### 5. The two new `KvCommand`s
+Rejected on a streamed base table in v1 (ADR 0042 §12's F1 stopgap) — the
+same class of apply-time guard `MergeTablets`'s own state-machine arm
+already gets for other invariants it must protect. The disable → merge →
+re-enable workaround is honest (a genuinely new stream identity, ADR 0042
+§11). If tablet merge is ever revived under an active stream after the
+forthcoming split-only ADR removes and later reconsiders it: the shape
+would be an `AdjacentParentShardId`-style lineage extension plus a
+range-aware survivor watermark — documented here as the escape hatch, not
+built, since nothing today needs it.
 
-Both are **fence-less**, like `Seal`/`ReadCeiling` — a shard tablet's range
-never changes (§1's split/merge exemption), and positions are not token
-keys, so there is no crossover window for a fence to guard.
+### A6. Watermark + trim (F10)
 
-**`StreamAppend { records: Vec<EncodedRecord>, ts }`** — proposed by the
-copier, applied on the shard leader (and every replica, identically):
-flush any pending merge work (the same precedent `Cas`'s apply arm already
-establishes for ordering merges before deciding), then per record, in
-order: read the dedupe row for the record's own partition key; **admit iff
-`record.source_hlc` strictly exceeds the last-admitted HLC there**; on
-admission, write the record at the shard's current `next_position`,
-increment it, and update the dedupe row to this record's `source_hlc`. Every
-step is deterministic and replica-agnostic — no clock, no RNG, so every
-replica reaches the identical decision for the identical entry. The
-assigned positions are recorded in a driver-side outcomes map keyed by
-Raft log index, exactly the shape `CasResults`/`StageOutcomes` already use
-elsewhere in this crate. **The copier polls this outcomes map directly,
-never "wait until applied, then assume the outcome"** — the ADR 0018 §4
-corpus already found and fixed this exact gotcha once (`stage_outcome`): a
-snapshot install can advance a replica's `engine_applied` past a given log
-index without that replica ever individually applying (hence recording an
-outcome for) the entry at that index, so a wait-then-fetch two-step is
-unsound and a direct poll is the only correct shape.
+The stream half of the trim computation (ADR 0042 §8) is entirely
+catalog-derived: a tablet's watermark is its own chain's last sealed
+end-HLC, or its parent chain's for a fresh split child, or absent if it has
+never sealed. The GSI half (`"gsi"` cursor tag, min-over-rows) is
+**completely unchanged** — ADR 0041's drain still owns it, still advances
+it in its own trailing write, still generalizes correctly across a
+split/merge. `expected_consumer_tags` drops `"copier"` and the row it used
+to gate on; nothing ever writes a `"copier"` `KIND_CURSOR` row again. A
+`DISABLED`-but-not-yet-reaped stream (ADR 0042 §11's F12-b grace) does
+**not** block hot-scope trim on the table's still-live records — its own
+records are already sealed by the final-seal step, so the only term left
+for the hot-trim arm to honor on that table is the GSI's, if any. Sealing
+itself never deletes hot records; the same per-tablet loop's **hot-trim
+arm** (generalized from ADR 0041's own trim janitor) is the only deleter of
+hot records, and only once the segment + catalog row it trims behind are
+both durably committed — a distinct action from the control-leader
+**segment-janitor** (§A9), which only ever touches already-sealed segment
+objects and rows, never a tablet's own hot `KIND_CHANGE` scope.
 
-**`StreamTrim { before_position: u64, ts }`** — proposed by the shard
-leader's own periodic retention tick, carrying an **already-computed**
-bound: the leader scans forward from its durable `trim_horizon` while
-`record.source_hlc.wall_ms < now - retention`, and the resulting position
-is what the command carries — apply itself touches no wall clock at all,
-keeping the actual decision deterministic and replica-agnostic exactly like
-every other apply arm in this crate. Apply deletes every record below
-`before_position`, advances `trim_horizon` to it, and prunes any dedupe row
-whose last-admitted wall time has aged out of the retention window.
-**Dedupe-row trim safety**: a duplicate can only ever arrive from a copier
-re-reading behind its own *durable* cursor, and that cursor regresses by at
-most one unacknowledged batch — a window of seconds, not hours — so
-trimming a dedupe row on the same multi-hour-to-day retention window
-leaves an enormous, asserted-in-the-corpus safety margin before a
-resurrected duplicate could ever be wrongly re-admitted.
+### A7. The `SegmentStore` trait
 
-### 6. New `MetaCommand`s
+```rust
+#[async_trait] pub trait SegmentStore: Send + Sync {
+    async fn put(&self, id: &str, bytes: &[u8]) -> io::Result<()>; // durable per impl contract on Ok; idempotent overwrite
+    async fn get(&self, id: &str) -> io::Result<Option<Vec<u8>>>;  // None = deleted → TrimmedDataAccess
+    async fn delete(&self, id: &str) -> io::Result<()>;            // idempotent
+    async fn list(&self, prefix: &str) -> io::Result<Vec<String>>; // debug/sweep only, never load-bearing for reads
+}
+```
 
-Each needs an `mirror.rs::apply_and_derive_mirror` arm, an
-`is_relayable_command` decision, and no new `syskv::EntityKind` (a
-`StreamSpec` rides inside the existing table schema catalog entry, §4's
-`KIND_CURSOR` and this section's shard tablets are ordinary tablet-map
-rows).
+Lives in `animus-env` beside the other seams (`Clock`/`Rng`/`Network`/
+`Disk`/`Spawner`), but is **not** folded into the `Env` supertrait — every
+call site threads an explicit handle, the same way a `StorageEngine`
+handle is threaded rather than made part of `Env` itself. **Consistency
+contract**: read-after-put for every reader once `put` returns `Ok`;
+immutable once cataloged, modulo the superset-slice rule (ADR 0042 §10);
+`get` returning `None` after a `delete` is a defined, expected outcome
+(`TrimmedDataAccess` to a client), never an error.
 
-**`SetTableStream { table, spec: Option<StreamSpec> }`** — enable (mints a
-fresh `label`, see ADR 0042 §4) or disable a table's stream. Relayable —
-same class as any other schema-catalog mutation.
+**Implementations**:
 
-**`CreateStreamShards { table, shards: Vec<(TabletId, KeyRange,
-Vec<NodeId>)> }`** — one atomic apply minting all `N` shard tablets for a
-table's stream at once. **Why this can't just be `N` calls to the existing
-`MetaCommand::CreateTablet`**: `CreateTablet`'s own apply arm (`meta.rs`)
-rejects a second tablet for a table that already has one — a deliberate
-race-safety property (two nodes racing differently-allocated tablet ids for
-the *first* tablet of a table both propose `CreateTablet`, and only the
-first commits) that would make every shard after the first for the *same*
-table a guaranteed rejection if reused naively. `CreateStreamShards`
-therefore needs its own apply-time guard: **rejected if the table already
-has any shard tablets** (first-committer-wins, mirroring `CreateTablet`'s
-own race-safety argument, just generalized to "the first N-tablet batch
-wins" instead of "the first one tablet wins") — and, per §3's
-growth-compatibility requirement, this guard is written **generation-aware**
-so a future generation-cut command extends rather than violates it.
+- **`SimSegmentStore`** (`animus-sim`) — seeded, fault-injectable (ack-lost
+  puts, unavailability windows, partial-K delivery for the cluster variant
+  below) — the corpus's own store.
+- **`ClusterSegmentStore`** — **the default** (§ below).
+- **`FsSegmentStore`** — a single local directory, temp-write + rename +
+  fsync; demoted to explicit opt-in (`--segment-store=dir:...`) for dev or a
+  shared mount, and reused internally as `ClusterSegmentStore`'s own
+  per-node local building block.
 
-The proposer is the DynamoDB edge's `SetTableStream`-enable handler, with
-the copier acting as a **lazy backstop** exactly mirroring the GSI drain's
-own lazy hidden-table provisioning (ADR 0041 §4's as-built note) — a crash
-between `SetTableStream` and `CreateStreamShards` committing is repaired by
-the copier idempotently re-proposing on its next tick, never left stuck.
-Replica selection picks ids and replica sets the same way
-`provision_tablet` already does for an ordinary table, recording the
-**target** RF policy per the existing lesson about not baking a
-point-in-time replica count into a tablet's own record (`animusd/src/
-lib.rs`); per §2, selection is additionally constrained to nodes carrying
-the streams-role label.
+### A7b. The default store must uphold this database's own durability bar (F5)
 
-### 7. The unified change-consumer loop
+**`ClusterSegmentStore` is the default, deliberately, because a stream's
+sealed records are exactly as much "the database's own data" as anything
+else it holds — a default store any less durable than the rest of this
+system would be a durability *regression* for users who enable Streams,
+not a neutral convenience.** Concretely:
 
-ADR 0041's GSI drain and this ADR's stream copier are **two arms of one
-per-node loop**, replacing the standalone `index_drain_loop` — the "one
-event-driven loop" philosophy ADR 0031 already established for the tablet
-host reconciler, applied to change-log consumption. Per tick, per source
-tablet this node leads:
+- **K-way replication**, `K = RF` (default 3) — an immutable segment is
+  pushed to K nodes' own local segment directories (each backed by the same
+  `FsSegmentStore` building block).
+- **Placement** is chosen via the *existing* placement policy machinery
+  (`animus-placement`'s failure-domain spread, ADR 0005) — no new policy
+  engine — and the chosen replica set is **recorded in the `SealStreamShard`
+  catalog row itself** (the `replicas` field, §A3 step 3), so any future
+  reader or repair sweep knows exactly where to look without a discovery
+  round.
+- **`put` returns `Ok` only once all K nodes have fsynced** (temp-write +
+  rename, the same discipline `FsSegmentStore` already uses per-node) — this
+  is what makes the durability invariant (ADR 0042 §9) actually hold, not
+  merely a documented aspiration.
+- **`get`** serves from any recorded replica, preferring a local fetch when
+  the requesting node happens to be one.
+- **Repair** is a control-leader sweep re-replicating an under-replicated
+  segment from a surviving replica — "a dumb copy," since a segment is
+  immutable once cataloged; it folds into the same segment-janitor loop
+  retention already needs (§A9, F9's own merge).
+- **Delete is idempotent** and reaped by the same sweep, never a
+  synchronous part of the retention decision itself.
+- **`ClusterSegmentStore` is cluster code written over the `Env`
+  network/disk seams** (ADR 0003) — like every other distributed mechanism
+  in this codebase, it is fully `SimEnv`-fault-injectable (partial-K
+  delivery, node death mid-put, network partition during repair), not a
+  production-only integration surface tested by hand.
+- **S3 is a future trait swap, not a requirement** — a durability
+  *upgrade* over the cluster-replicated default for an operator who wants
+  it, never a dependency this ADR's own correctness relies on.
 
-1. Read the tablet's cursor rows (`KIND_CURSOR`, both tags present), and
-   compute each consumer's effective watermark by the min-over-rows rule
-   (ADR 0042 §8).
-2. `pending = pending_changes()` filtered to records above the copier's own
-   watermark, grouped by destination shard (the fixed range containing the
-   record's own token) — within one group, the change log's own key order
-   already gives per-partition-key HLC order, so no separate sort is
-   needed.
-3. For each destination shard, forward a bounded `StreamAppend` batch to
-   the shard leader over the ordinary `cp_route` on the stream table (ADR
-   0043 §1's routing inheritance). **An append counts only once the
-   outcomes map confirms the applied positions** (§5) — an `Accepted`
-   propose result is never treated as "committed," the same
-   `ProposeResult` doctrine this codebase applies everywhere durability
-   matters.
-4. Only after **every** destination shard for this tick's batch has
-   confirmed: propose the copier's own cursor-row advance (an ordinary
-   `KindBatch` write into `KIND_CURSOR`) to the new watermark.
-   **Advance-only-on-full-confirmation is what makes this
-   durable-before-visible**: a crash anywhere in steps 2–4 leaves the
-   cursor at its old value, so the next tick simply re-reads from there —
-   any records a partially-completed tick already forwarded are silently
-   absorbed by the shard's own dedupe row (§5), never double-counted or
-   lost.
+### A8. The segment catalog lives in replicated `Metadata` (F3/F7)
 
-Failure modes, each converging without operator intervention: a
-destination shard group without quorum fails step 3, so the cursor never
-advances and records simply accumulate in the (bounded, still-trimming-for-
-other-consumers) change log until the shard recovers; a source tablet's
-leadership moving mid-tick means the new leader's own next tick resumes
-from the last *durable* cursor row, re-sending anything the old leader
-hadn't yet confirmed; a copier process crash mid-batch is indistinguishable
-from the leadership-move case from the shard's point of view. Observability
-(metrics seam, ADR 0015, plus an `/admin/streams` surface) lands **with**
-this same PR: `copier_backlog_records`, `copier_lag_ms`,
-`change_log_bytes`, `stream_append_dup_rejected`, `shard_trim_horizon`.
+`MetaCommand::SealStreamShard` (the seal's own commit, §A3 step 3) and
+`MetaCommand::ExpireStreamShards` (the janitor's own reclaim, §A9) are the
+only two new `MetaCommand`s this whole subsystem needs — no new
+`syskv::EntityKind`, since a `StreamSpec` already rides inside the existing
+table-schema catalog entry (ADR 0013) and a segment row is a small,
+self-contained addition beside it. `SealStreamShard` is
+**first-committer-wins on `(tablet, epoch)`** — the same race-safety shape
+`CreateTablet`'s own apply arm already established for "the first proposal
+for this identity wins," generalized from a tablet id to a
+`(tablet, epoch)` pair. `DescribeStream`/`ListStreams` (ADR 0042 §3) are
+pure functions of this catalog plus the tablet map — **the store is never
+load-bearing for a metadata read** (F7), matching how `ListStreams` never
+touched a shard tablet's own state even in round 2.
 
-The **janitor** is the loop's third arm: once every *expected, present*
-consumer's watermark is known (step 1's own computation, generalized across
-both tags), it deletes change-log records at or below the minimum in
-bounded `KindBatch` batches — the trim policy ADR 0042 §8 specifies,
-folded into the same tick rather than a fourth standalone loop.
+**Why the catalog, and not a per-tablet manifest object or the store's own
+`list()`**: a manifest living *in* the store would make metadata reads pay
+a store round trip for something `Metadata`'s replicated, always-consistent
+state already answers for free, and would need its own separate consistency
+story across K replicas. `list()` is explicitly documented as "debug/sweep
+only, never load-bearing" (§A7) precisely so no code path is ever tempted to
+treat an object listing as authoritative over what the catalog says exists —
+an object store's listing consistency is, in general, weaker than a
+replicated Raft log's, and this design never needs to lean on it.
 
-### 8. Rejected alternatives
+### A9. The segment-janitor loop (F9, merging retention with replica repair)
 
-**Source-HLC-keyed shard positions**, instead of an apply-assigned
-monotonic counter. Rejected: source tablets copy toward a shard at
-independent lags, so a briefly-behind source's record would need to insert
-*below* a position an iterator has already consumed past under this
-scheme — a silent, unrecoverable loss. See ADR 0042 §5 for the full
-argument; this alternative is unsound, not merely inconvenient.
+A **distinct loop, run on the control-plane leader** — not an arm of the
+per-tablet `change_consumer_loop` (§A3), since retention and repair are
+cluster-wide concerns over the catalog as a whole, not per-source-tablet
+ones: for every catalog row past
+`--stream-retention`, a **two-phase** expire — mark expired, delete the
+segment object at every recorded replica, then drop the row — every step
+idempotent, so a crash mid-sweep simply resumes on the next tick with no
+special recovery logic. The **same loop also repairs** any segment whose
+recorded replica set has fallen under-replicated (a node death, a slow
+rebuild) by re-copying from a surviving replica — immutability is what
+makes this "a dumb copy," never a merge or reconciliation. F9's original
+plan (retention alone) and F5's own repair mandate turn out to be the same
+loop once the catalog exists to drive both from one snapshot, so they ship
+together rather than as two competing background tasks.
 
-**Slot-indirection for an elastic shard count** (a level of indirection
-mapping "logical slot" to "current shard," so `N` could change without a
-lineage event). Rejected on both branches of its own trade-off: either the
-indirection is itself versioned per-item (in which case it silently
-reintroduces exactly the migration machinery a fixed generation-cut
-resharding was meant to avoid), or it is coarser than per-item (in which
-case it breaks the per-item ordering guarantee ADR 0042 §1 exists to
-preserve). Neither shape is actually simpler than the generation-cut design
-this ADR commits to as roadmap item (a).
+**Disable (F12-b, ADR 0042 §11) needs no dedicated janitor path** — the
+disable-triggered final seal (§A3) already moves every record to the
+sealed tier before the write gate closes, so a `DISABLED` stream's rows and
+objects simply age out through this same ordinary sweep, on the same
+timeline as any other stream's retention.
 
-**Kafka-style add-only partitions** (grow the partition count without ever
-closing an old one, relying on a hash-mod-N reassignment). Rejected for the
-same reason as slot indirection: changing `N` changes which partition a
-given key hashes to for *every* existing key, which breaks per-item
-ordering across the boundary of the count change — exactly the property
-DynamoDB Streams (and this ADR) guarantee never breaks except through an
-explicit, documented lineage event.
+**Drop table**: the cascade removes a streamed label's segment catalog rows
+and objects (both labels, if a grace-window pair currently exists) —
+`ExpireStreamShards` reused directly rather than a separate drop-specific
+command, since "these rows/objects should no longer exist" is the same
+fact whether the reason is retention or a table drop.
 
-**A bespoke append-only segment store**, instead of `StorageEngine` under
-new kind scopes. Rejected per §4's argument: it would forgo durability,
-crash recovery, and snapshot shipping this codebase already has fully
-sim-tested, in exchange for marginally more "log-shaped" storage this
-system's actual access pattern (bounded per-shard throughput, not a
-firehose) does not need.
+### Rejected alternatives
 
-**A new crate for the shard subsystem.** Rejected: the two new
-`KvCommand`s, the row kinds, and the pure key-codec helpers are a small,
-tightly-coupled extension of `animus-cp-data`'s existing apply path (the
-exact shape `txn.rs`/`seal.rs` already establish for a self-contained
-module inside this crate) — a new crate would only add a dependency edge
-with nothing to show for it.
+**Round 2's whole architecture** (a separate hidden per-stream table, a
+dedicated streams node role, a copier, per-partition dedupe rows,
+`StreamAppend`/`StreamTrim`, `KIND_STREAM`/`KIND_STREAM_META`). Not wrong,
+exactly — it worked, and its code is preserved on the `adr-0042/5`/
+`adr-0042/6` archive branches precisely because it was a genuine, tested
+design. Superseded because it was **more distributed-systems machinery than
+the feature actually needs**, once seen through the lens of what DynamoDB
+Streams itself is: not a separate service with its own copying tier, but a
+view of the table's own replication log that seals in place. Round 2's own
+committed growth roadmap (generation-cut resharding, reproducing
+auto-split's lineage by hand) was the concrete symptom that motivated
+revisiting the whole shape rather than patching that one item.
 
-**Colocated placement on ordinary data nodes** (the plan's original
-recommendation). Superseded by owner decision: see §2 for the
-payload-profile-separation rationale. Structurally, colocation would have
-been strictly *less* work (no third role assembly); it was declined
-anyway because the operational argument — isolating a stream's sequential
-append/retention-trim churn from a data node's mixed point-read/write
-workload — was judged to matter more than saving that implementation
-effort.
+**Keeping sealed data in `StorageEngine` kind scopes** (round 2's own
+choice, and this ADR's one deliberate reversal of it). Round 2 rejected a
+bespoke segment store because durability/crash-recovery/snapshot-shipping
+"come for free" from the engine. That argument is sound for **hot** data —
+and this ADR keeps it there, unchanged. It is a worse fit for **sealed,
+immutable, potentially-large, rarely-read** data: an engine's compaction
+and snapshot-shipping machinery is built for mutable, actively-read state,
+not a write-once object a retention sweep eventually deletes wholesale — a
+real segment store's replication/repair model (§A5) is a better-fitting
+tool for exactly that shape, and the durability mandate (F5) means "simpler
+to implement" was never on the table as the deciding factor either way.
+
+**A dedicated streams node role** (round 2's own placement decision, ADR
+0035's amendment). No longer needed: there is no separate shard tablet to
+place at all, so the whole payload-profile-separation argument that
+motivated it is moot. See ADR 0035's own amendment for the retraction.
+
+**Slot-indirection / Kafka-style add-only partitions for growth** (round
+2's own rejected alternatives to its generation-cut design). Both are now
+moot for the same reason round 2's whole architecture is superseded — there
+is no fixed shard count to grow at all, since a shard is simply a seal
+epoch of whatever tablet exists at the time.
 
 ## Consequences
 
 **Easier.**
 
-- A stream shard is an ordinary tablet-map row: it is hosted, repaired,
-  placed, rebalanced, snapshotted, and reclaimed with **zero new
-  reconciler code** — the single largest simplification this design rests
-  on, inherited directly from ADR 0031's table-agnostic reconciler.
-- Growth (ADR 0042 roadmap item (a)) is additive to this PR's own
-  contracts (the shard identity scheme, the iterator token shape, and
-  `CreateStreamShards`'s own guard are all written generation-aware from
-  day one), so it does not require reopening this ADR's core design when it
-  ships.
-- The streams role reuses the exact placement/residency/config-assembly
-  machinery ADR 0035 already built for control/data separation — a third
-  role is a data point proving that machinery generalizes, not a one-off.
+- **No new distributed machinery of any kind.** A streamed table's tablets
+  are ordinary tablets — hosted, split, placed, snapshotted, and reclaimed
+  by mechanisms this codebase already has fully tested. The only genuinely
+  new code is a background loop arm and a segment codec/store.
+- **Growth is free and automatic**, inherited entirely from auto-split —
+  no resharding command, no shard-count knob, no generation-cut lineage
+  rule to design or test separately from the tablet lifecycle itself.
+- **Exactly-once needs no dedupe state** — it was never really a stream
+  property to enforce; it was always the underlying `KindBatch` atomicity
+  ADR 0041 already built and tested.
 
 **Harder, and knowingly accepted.**
 
-- **A third role assembly** is more deployment-shape surface area
-  (`animusd streams`, config parsing, `gen-config` updates, combined-mode
-  carrying all three roles) for operators and for this codebase's own test
-  matrix to cover.
-- **Two new `KvCommand` variants** mean two more gating call sites to keep
-  in the relay/forwarding allowlist (`is_relayable_command`,
-  `cp_serve_forwarded`, admin filters) — the exact class of mistake this
-  codebase's own engineering-lessons log already warns is a silent,
-  compiler-invisible bimodal flake if missed.
-- **Retention trim adds real LSM tombstone churn** to every shard tablet,
-  on top of what ADR 0041 already accepted for the base change log; this is
-  the second tier of that same accepted cost, now paid by nodes running the
-  dedicated streams role instead of ordinary data nodes.
-- **The min-over-rows rule (ADR 0042 §8) is shared, load-bearing state**
-  between this ADR's copier and ADR 0041's GSI drain — a bug in one
-  consumer's cursor discipline can, in principle, affect the other's trim
-  safety on a table that has both. The corpus (§8's completeness/ordering
-  checker, ADR 0042 roadmap) is what keeps this honest across releases.
+- **A real external store is now a load-bearing dependency for a stream's
+  sealed data** — `ClusterSegmentStore`'s own K-replica put/repair
+  machinery is genuinely new distributed code, fault-injection-tested from
+  scratch (PR 3), not inherited from an existing primitive the way
+  everything else in this ADR is.
+- **The durability invariant and the superset-slice rule are subtle,
+  cross-cutting properties** (ADR 0042 §9/§10) that a future change to the
+  seal sequence, the catalog apply arm, or a reader's slicing logic could
+  silently violate — the corpus (the Testing plan below) exists because this
+  class of bug is a genuine data-loss or torn-read hazard, not a cosmetic one.
+- **Two background loops now run on different roles** — the per-tablet
+  change-consumer loop (GSI drain + seal arm + hot-trim arm, unchanged
+  leader-per-tablet placement) and the control-leader segment-janitor
+  (retention + repair,
+  a new *cluster-wide* responsibility for whichever node currently leads
+  the control group) — a new class of "which node is responsible for this"
+  reasoning this codebase's admin surface and dashboard will need to
+  surface honestly.
+
+## Testing plan
+
+House corpus discipline throughout (ADR 0014's doctrine: a frozen,
+seed-reproducible scenario list, a depth knob, `ANIMUS_STREAM_SEEDS`,
+corpus-deep nightly):
+
+1. **Seal crash-safety**: crash between the segment `put` and the catalog
+   commit, re-seal to the same id, assert no loss/duplication against the
+   write journal; a leader kill mid-seal; an old, deposed leader's late
+   superset put racing the winning leader's committed row, asserting a
+   reader's slice is still correct.
+2. **Store fault injection**: an acknowledged-but-lost put; a window of
+   store unavailability (hot scope grows, trim blocks, sealing/draining
+   resumes on heal); `ClusterSegmentStore`-specific partial-K delivery,
+   node death mid-put, and repair convergence after a replica loss.
+3. **Lineage walk**: a model consumer (`DescribeStream` → parent-before-
+   child → iterate → null-advance) driven under concurrent seals,
+   auto-splits, leader kills, and restarts, asserting exactly-once and
+   per-item order against the generating write history.
+4. **Retention vs. in-flight reads**: `TrimmedDataAccess` on a reclaimed
+   shard is a defined outcome, never silently treated as an empty success;
+   an iterator straddling the retention horizon at the moment of a sweep.
+5. **GSI coexistence**: GSI + stream trim min-rule; GSI-only; stream-only;
+   a split child's watermark inheritance for the stream side vs. the GSI's
+   own `W = 0` — proving the two halves of ADR 0042 §8 genuinely coexist.
+6. **Merge stopgap**: a unit-level apply-arm rejection plus an end-to-end
+   check through the client relay path.
+7. **Disable grace (F12-b)**: write → disable (final seal) → read
+   through the grace window → ordinary retention reaps → `ResourceNotFound`;
+   a re-enable during the grace window listing two coexisting streams, the
+   new one accumulating independently.
+8. **`ProdEnv` end-to-end**: a real multi-process cluster, the default
+   `ClusterSegmentStore`, small knobs; an auto-split mid-stream with a live
+   consumer; a full restart's recovery; every-node-in-turn reads (the house
+   forwarded-command regression pattern); an `FsSegmentStore` opt-in smoke
+   test.
+9. **The durability invariant, directly**: at arbitrary kill points across
+   the whole scenario space, assert every acknowledged write is recoverable
+   from either hot Raft state or a committed, K-replicated segment — never
+   from neither.

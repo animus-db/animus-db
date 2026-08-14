@@ -224,7 +224,21 @@ already live in, mutated by `MetaCommand::SetTableStream` in exactly the
 shape `MetaCommand::CreateTableSchema`/`ReplaceTableSchema` already
 establish: idempotent apply, relayable, durable via `Metadata`'s own
 apply-task mirror (ADR 0038). No new `syskv::EntityKind` and no separate
-replicated map — `ListStreams`/`DescribeStream` (ADR 0042 §2) are pure
-functions of this one field plus the tablet map, matching how an index
+replicated map — `ListStreams`/`DescribeStream` (ADR 0042 §3) are pure
+functions of this field plus the tablet map, matching how an index
 `Query`'s shape is already a pure function of a table's replicated
 `IndexDef`s.
+
+**Update (2026-08-14, round-3 rewrite): still true, plus one sibling
+addition.** `StreamSpec`'s own shape (`view_type` + a fresh-minted `label`)
+and `SetTableStream`'s replication discipline are unchanged from round 2.
+Round 3 adds two more `MetaCommand`s beside it in the same `Metadata` apply
+path — `SealStreamShard`/`ExpireStreamShards` (ADR 0043 §A8), the segment
+catalog a stream's sealed shards are recorded in — still with **no new
+`syskv::EntityKind`**, the same "durable schema-catalog-shaped extension,
+not a new replicated structure" argument this section already makes for
+`StreamSpec` itself. `DescribeStream`'s own pure-function claim now also
+reads those catalog rows alongside `StreamSpec` and the tablet map (a
+sealed shard's `SequenceNumberRange`/`ParentShardId` live there, not in the
+tablet map) — the read stays a pure function of replicated `Metadata`,
+just over one more of its fields.

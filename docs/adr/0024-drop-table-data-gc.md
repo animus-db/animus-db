@@ -169,3 +169,27 @@ mechanism, not a new one. `KIND_STREAM`/`KIND_STREAM_META`/`KIND_CURSOR`
 rows need no separate reclaim step: they live in `kind_scopes` exactly like
 an LSI row or a change-log record, and `erase_scope` already iterates every
 entry, not just the base one.
+
+**Update (2026-08-14, round-3 rewrite): there is no hidden stream table to
+drop at all.** ADR 0043's round-3 architecture seals a streamed table's own
+`KIND_CHANGE` log in place — a stream shard is never a separate table's
+tablet, so the hidden-table half of the paragraph above (the
+`$streams$<label>` naming shape, the `is_stream_table_name` sweep) is
+retired along with the tables it named. `KIND_CURSOR` rows still need no
+separate reclaim step, unchanged from above (`erase_scope` still iterates
+every kind scope of the base tablet, cursor rows included). What a streamed
+table's drop **does** need to remove, that a plain GSI-only table's drop
+never did: every **segment catalog row** (`MetaCommand::SealStreamShard`)
+and its corresponding **segment object** (`SegmentStore::delete`) for the
+table's label — both labels, if a disable-grace window (ADR 0042 §11's
+F12-b) currently has two coexisting. This reuses the same
+`ExpireStreamShards` command the ordinary retention sweep already proposes
+(ADR 0043 §A9) rather than inventing a drop-specific variant: "these rows
+and objects should no longer exist" is the identical fact whether the
+reason is a table drop or ordinary retention, so drop simply asks for it
+immediately instead of waiting out the retention window. A crash between
+dropping the base schema and this cleanup is repaired the same way every
+other step in this cascade already is — idempotently, by the ordinary
+retention sweep eventually reaping whatever the interrupted drop left
+behind, since a schema-less table's label is by definition no longer
+anyone's *current* stream.
