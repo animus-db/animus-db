@@ -32,22 +32,17 @@ can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
 - **`main.rs`** — thin CLI wrapper; dispatches the invocation modes (below) and
   wires `otel::init_tracing` + the Ctrl-C graceful-shutdown path.
 - **`config.rs`** — `ClusterConfig` (per-process deployment config), `RoleAddrs`
-  (a node's five addresses + `role: NodeRole` = `Control`/`Data`/`Both` +,
-  since ADR 0040 PR3, an explicit **`id: NodeId`** field — every config entry
-  now names its own identity rather than it being purely re-derived from
-  position; `ClusterConfig::from_json` hard-errors on a duplicate `id`
-  across entries), role-filtered accessors (`control_ids`/`data_ids`/
-  `peer_book`, which read each entry's own `id` field, not an index
-  re-derivation), `generate`/`generate_split`, and the **five-port stride**
-  (`base_port + 5*i + {internal,client,dynamo,cql,admin}`). `generate`/
-  `generate_split` mint `"n{i}"` (`config::node_id(i)`, still the
-  free-function convention `nid(u64)` mirrors for tests), **zero-padded**
-  once the cluster has ≥ 10 nodes (`minted_id`) so lexicographic id order
-  stays == numeric index order (`"n10" < "n2"` otherwise) — below that
-  threshold ids stay the plain unpadded `"n{i}"` every existing test already
-  assumes. ADR 0040 PR1 merged the pre-existing `control i` / `raftkv 300+i`
-  pair into one identity per node; PR3 made that identity a validated
-  string, not a `u64`.
+  (a node's five addresses + `role: NodeRole` = `Control`/`Data`/`Both` + an
+  explicit **`id: NodeId`** field — every config entry names its own
+  identity rather than it being re-derived from position;
+  `ClusterConfig::from_json` hard-errors on a duplicate `id`), role-filtered
+  accessors (`control_ids`/`data_ids`/`peer_book`), `generate`/
+  `generate_split`, and the **five-port stride** (`base_port + 5*i +
+  {internal,client,dynamo,cql,admin}`). `generate`/`generate_split` mint
+  `"n{i}"`, **zero-padded** once the cluster has ≥ 10 nodes so
+  lexicographic id order stays == numeric index order (`"n10" < "n2"`
+  otherwise) — below that threshold ids stay the plain unpadded `"n{i}"`
+  every existing test already assumes.
 - **`control_handle.rs`** — the `ControlHandle` seam (ADR 0035 PR1):
   `Local(RaftNode<ProdEnv>)` for a node with real control Raft, vs.
   `Remote(RemoteControlClient)` for a data-only node reaching a separate control
@@ -93,30 +88,24 @@ can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
 | `--config FILE --node I [--dir DIR] [--ephemeral]` | run node I of a config, combined mode (one process per node) |
 | `--cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]` | run an N-node combined cluster in one process (dev) |
 | `--cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B]` | run a whole split deployment in one process (dev, ADR 0035) |
-| `join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]` | combined-mode seed/join startup (ADR 0032 PR2; ADR 0040 PR4: `--id` proposes a durable identity, omitted self-mints one) |
-| `control --config FILE --node I [--dir DIR] [--ephemeral]` | run node I as a control-only node (ADR 0035 PR3); `--ephemeral` (ADR 0038) selects a volatile in-memory system-keyspace engine instead of the durable on-disk default — `Metadata` does NOT survive a restart |
-| `data --config FILE --node I [--dir DIR] [--ephemeral]` | run node I as a data-only node (ADR 0035 PR4) |
-| `data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]` | data-only seed/join (ADR 0035 PR5; ADR 0040 PR4: `--id` proposes a durable identity, omitted self-mints one) |
+| `join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]` | combined-mode seed/join startup; `--id` proposes a durable identity, omitted self-mints one |
+| `control --config FILE --node I [--dir DIR] [--ephemeral]` | run node I as a control-only node; `--ephemeral` (ADR 0038) selects a volatile in-memory system-keyspace engine instead of the durable on-disk default — `Metadata` does NOT survive a restart |
+| `data --config FILE --node I [--dir DIR] [--ephemeral]` | run node I as a data-only node |
+| `data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]` | data-only seed/join; `--id` proposes a durable identity, omitted self-mints one |
 
 `--auto-split K` (key count) and `--auto-split-bytes B` (byte size) are
 independent OR-gated triggers — either, both, or neither. **`--node I` is
-gone from `join`/`data --seed` entirely — a clean break (ADR 0040 PR4)**:
-there is no more index to derive a default port range from, so `--base-port`
-is **required** on both. `--id NAME` proposes a durable identity
-(`NodeId::propose` validates it at the CLI boundary); omitted, the node
-**self-mints** one (`NodeId::mint`, ADR 0040 Decision B) and claims it via
-`MetaCommand::RegisterNode`'s registration CAS (Decision C) — closing ADR
-0032's own documented residual race (two simultaneous joiners choosing the
-same identity) structurally, not just by convention. A self-minted join is
-**ephemeral-identity**: a restart with a fresh dir mints a *new* id, and the
-old id's `Member` entry lingers `Down`/address-less forever (never reused,
-prunable later via the existing `RemoveMember`/decommission path). `--id
-NAME`'s durable, restart-stable identity is unaffected. One unified entry
-point per role now (`run_node_join`/`run_node_data_join` in `lib.rs`, both
-taking `id: Option<NodeId>`) — the old `run_node_join_allocated`/
-`run_node_data_join_allocated` split is gone, along with
-`check_join_collision`/`generate_join_nonce` (superseded by the CAS and by
-`animus_env::prod::PreBindRng`, respectively).
+gone from `join`/`data --seed` entirely** — there is no index to derive a
+default port range from, so `--base-port` is **required** on both. `--id
+NAME` proposes a durable identity (`NodeId::propose` validates it at the
+CLI boundary); omitted, the node **self-mints** one (`NodeId::mint`) and
+claims it via `MetaCommand::RegisterNode`'s registration CAS — closing ADR
+0032's documented residual race (two simultaneous joiners choosing the same
+identity) structurally, not just by convention. A self-minted join is
+**ephemeral-identity**: a restart with a fresh dir mints a *new* id, and
+the old id's `Member` entry lingers `Down`/address-less forever (never
+reused, prunable via the existing `RemoveMember`/decommission path). `--id
+NAME`'s durable, restart-stable identity is unaffected.
 
 ## Deployment shapes (ADR 0035)
 
@@ -128,15 +117,13 @@ Three shapes, all built from the same role assemblies:
 - **Control-only** — a small static metadata quorum, no CP **data** storage
   engine, no data role. `animusd control --config FILE --node I`.
   `Node::bind_control` → `BoundControlNode::start_control_with(.., backend)` —
-  **fallible** (`io::Result<Node>`) and takes a `StorageBackend` since ADR
-  0038: it now **unconditionally** provisions one small **dedicated** system-
-  keyspace engine (`StorageBackend::Lsm` by default, `::Memory` under
-  `--ephemeral`) — see `animus-control/CLAUDE.md`'s `node.rs`/`mirror.rs`
-  entries. This is no longer an optional shadow-mode mirror (ADR 0038 PR2's
-  original shape): `Metadata` is `StateMachine::DRIVER_APPLIED`, so this
-  engine is the durable home of the control plane's async apply task's
-  published cache — there is no more engine-less control-plane deployment
-  shape.
+  **fallible** (`io::Result<Node>`) and takes a `StorageBackend` (ADR 0038):
+  it **unconditionally** provisions one small **dedicated** system-keyspace
+  engine (`StorageBackend::Lsm` by default, `::Memory` under `--ephemeral`)
+  — see `animus-control/CLAUDE.md`'s `node.rs`/`mirror.rs` entries. `Metadata`
+  is `StateMachine::DRIVER_APPLIED`, so this engine is the durable home of
+  the control plane's async apply task's published cache — there is no
+  engine-less control-plane deployment shape.
 - **Data-only** — no local control `RaftCore` at all; `Metadata` comes from a
   polled/long-polled mirror of a separately-deployed control plane via
   `ControlHandle::Remote`. `animusd data --config FILE --node I` (or `data
@@ -163,21 +150,19 @@ ReadIndex), `cp_write`/`cp_delete` (Raft-committed, waited to durable+applied),
 commits each group as one `KvCommand::Batch` entry — atomic within a tablet, not
 across; backs DynamoDB `BatchWriteItem` and the admin seeder).
 
-**`cp_scan_kind` (ADR 0041 §5)** is `cp_scan`'s single-tablet, kind-scoped
+**`cp_scan_kind` (ADR 0041)** is `cp_scan`'s single-tablet, kind-scoped
 sibling — the LSI `Query` read primitive: unlike `cp_scan`'s per-table
 fan-out, `start`/`end` must resolve to the *same* tablet (an LSI query is
 scoped to one base partition, hence one tablet, checked rather than assumed),
 served locally via `RaftKvNode::linearizable_scan_kind` or forwarded via the
 internal-only `ClientRequest::KindScan` (refused bare, exactly like
-`KindWrite`; handled only inside `cp_serve_forwarded`). **`cp_scan_kind_table`
-(ADR 0041 §5, 2026-08-13)** is its table-wide fan-out sibling — the LSI
-`Scan` read primitive — mirroring `cp_scan`'s per-table tablet fan-out
-exactly, but issuing a kind-scoped `cp_scan_kind_one`/`KindScan` per
-overlapping tablet instead of a base one; `end: None` (unbounded above) is
-now legal on `KindScan` too, resolved inside `RaftKvNode::
-linearizable_scan_kind` itself for the one tablet whose own range is
-open-ended, never computed by the caller (see `dynamo.rs`'s DynamoDB-wire
-edge entry above for why no finite byte string could do that job here).
+`KindWrite`; handled only inside `cp_serve_forwarded`). `cp_scan_kind_table`
+is its table-wide fan-out sibling — the LSI `Scan` read primitive — issuing a
+kind-scoped `KindScan` per overlapping tablet instead of a base one; `end:
+None` (unbounded above) is legal on `KindScan` too, resolved inside
+`RaftKvNode::linearizable_scan_kind` itself for the one tablet whose own
+range is open-ended, never computed by the caller (no finite byte string
+could do that job — see the DynamoDB wire-edge entry above).
 
 **`cp_write`/`cp_delete` do NOT auto-provision a table's first tablet** —
 unlike most of their write-side siblings (`cp_put`, `cp_kind_write`,
@@ -223,173 +208,94 @@ between pre-check and apply. `cp_get_local`/`cp_scan_local` run the read-side du
 request errors retryably rather than serving a false "absent" (for scans, avoids a
 silent truncation). See the in-crate `split_fence_tests`.
 
-## Multi-participant transactions (ADR 0018 §2/PR4, recovery in PR5)
+## Multi-participant transactions (ADR 0018 §2)
 
 `ClientCtx::cp_txn(writes, preconditions, write_conditions) ->
 Result<HlcTimestamp, String>` is the coordinator for a cross-tablet
-(possibly cross-table) atomic transaction, reachable via `ClientRequest::
-Txn`. **`write_conditions`** (ADR 0018 §2's 2026-08-12 follow-up amendment)
-is `(table, key, expected)` own-key byte-level OCC conditions — `key` MUST
-be one of `writes`' own keys (validated; `Err` otherwise) — grouped by
-`(table, tablet)` alongside `writes` and threaded straight to the owning
-tablet's own `TxnStage.conditions` (`animus_cp_data::KvCommand::TxnStage`),
-checked at apply, not re-read: this is a **structurally distinct**
-mechanism from `preconditions` below, not an overload of it — see
-`TxnWriteCondition`'s doc for why conflating the two is exactly the
-self-referential-stall bug the PR7 amendment documented and this one
-closes. It groups `writes`
-(`(table, key, Option<value>)`) by owning tablet; the **first** write's
-tablet is the **anchor** (mints the `TxnId`/record key, via
-`RaftKvNode::txn_stage_anchor` — passed every *other* participant's
-`(table, span)` list up front, ADR 0018 §2/PR5, so the record's own
+(possibly cross-table) atomic transaction, reachable via
+`ClientRequest::Txn`. It groups `writes` `(table, key, Option<value>)` by
+owning tablet; the **first** write's tablet is the **anchor** (mints the
+`TxnId`/record key, via `RaftKvNode::txn_stage_anchor` — passed every
+*other* participant's `(table, span)` list up front, so the record's own
 `intent_spans` names every participant, not just the anchor's own writes),
 every other tablet is a **participant** (`txn_stage_participant`).
+`write_conditions` is `(table, key, expected)` own-key byte-level OCC —
+`key` MUST be one of `writes`' own keys — threaded to the owning tablet's
+`TxnStage.conditions`, checked at apply, not re-read; this is a
+**structurally distinct** mechanism from `preconditions`, not an overload
+of it (conflating the two caused a self-referential-stall bug — see ADR
+0018's own follow-up amendment).
 
-**This is now genuinely true — it was not, from PR5 through PR7 (task #18,
-2026-08-12 fix)**: `cp_txn`'s anchor-stage call site actually went through
-`RaftKvNode::txn_stage` (an empty participant list) the whole time, so
-`intent_spans` only ever named the anchor's own keys in production. That was
-a real recovery-path atomicity violation, not just an observability gap —
-see ADR 0018's corrective note on its own §2 for the full mechanism, the
-confirming wire-level test, and why the existing PR5 coordinator-crash
-regressions never caught it. `cp_txn` now computes the full participant
-`(table, span)` list from its own `groups` map (populated right after
-removing the anchor's own entry) and threads it through `txn_prepare`/
-`txn_prepare_pushing` — `CpGroup::txn_stage` calls `txn_stage_anchor`
-directly now, and `ClientRequest::TxnPrepare` gained a `participant_spans`
-field for the forwarded case.
-
-Prepare
-runs the anchor first, then every participant **concurrently**
-(`futures::future::join_all`) — both through `ClientCtx::
-txn_prepare_pushing` (ADR 0018 §2/PR6, task #16), not `txn_prepare`
-directly: a stage call returning `Ok(..)` only means its entry *applied*,
-never that it genuinely wrote an intent — `KvCommand::TxnStage`'s
-apply-time writer-push-intents guard rejects (whole-or-nothing) a target
-key already holding a *different* transaction's unresolved intent, exactly
-like a fence/seal miss (and, since the 2026-08-12 amendment, its own-key
-`conditions` can reject it too). **Since that amendment**,
-`txn_prepare_pushing` branches directly on `txn_prepare`'s own returned
-`animus_cp_data::StageOutcome` instead of a separate post-hoc
-`ClientCtx::txn_verify` round trip (the apply arm already knows
-definitively whether — and why — a stage no-op'd, so a second read to
-re-derive the same fact is redundant): `Staged` succeeds; `IntentBlocked`
-retries (bounded, `TXN_STAGE_PUSH_ATTEMPTS`/`TXN_STAGE_PUSH_BACKOFF`,
-unchanged behavior — without this, a blocked stage would look identical to
-a genuine one, and the transaction would go on to commit without that
-key's write ever having happened, a worse atomicity violation than the
-durability hole PR6 closed); `ConditionFailed`/`Fenced` fail immediately,
-never retried (retrying an identical stage cannot change either outcome).
-`staged` tracks every participant that needs resolving, the anchor's own
-keys included (PR5: `txn_decide_anchor` no
-longer resolves anything inline — see below). Any prepare failure, or a
-failed pre-commit precondition re-check, proposes an abort on the anchor. On
-success, `commit_ts` is the anchor's own `txn_commit_at_least` result,
-floored at the max of every participant's acked stage ts — the **single
-Raft commit on the anchor's record is the atomic commit point**.
-
-**Every decide attempt reports the record's ACTUAL outcome, never what was
-asked for (ADR 0018 §2/PR5 decision-semantics amendment)**:
-`txn_decide_anchor` proposes commit or abort, then always re-reads
-`txn_status_local` and returns a `TxnOutcome` — recovery makes duelling
-deciders legal (a still-live coordinator's commit can lose to a concurrent
-recovery abort, or vice versa; the anchor's own Raft log position is the
-sole arbiter, never who proposed first), so `cp_txn` branches on the actual
-outcome at every decide point (an abort attempt that turns out to have
-raced a recovery commit reports success, not the original failure; a
-commit attempt that lost to a recovery abort reports the abort, not a false
-success).
-
-**Resolve is asynchronous, post-ack, on the successful-commit path (ADR
-0018 §2/PR5 — the PR4 amendment's own flagged deviation, now lifted)**:
-once the anchor's commit is durable, `cp_txn` returns immediately and
-spawns (`tokio::spawn`) a best-effort resolve of every participant, the
-anchor's own keys included, in the background — safe now that
-`txn_resolver_loop` exists as the safety net for whatever this spawn
-doesn't get to. The abort paths still resolve synchronously before
-returning (no successful ack to speed up on an error return).
+Prepare runs the anchor first, then every participant **concurrently**
+(`futures::future::join_all`), through `ClientCtx::txn_prepare_pushing`:
+a stage call returning `Ok(..)` only means its entry *applied*, never that
+it genuinely wrote an intent, so this branches on `txn_prepare`'s returned
+`animus_cp_data::StageOutcome` — `Staged` succeeds; `IntentBlocked` retries
+(bounded, `TXN_STAGE_PUSH_ATTEMPTS`/`_BACKOFF`); `ConditionFailed`/`Fenced`
+fail immediately. Any prepare failure, or a failed pre-commit precondition
+re-check, proposes an abort on the anchor. On success, `commit_ts` is the
+anchor's own `txn_commit_at_least` result, floored at the max of every
+participant's acked stage ts — the **single Raft commit on the anchor's
+record is the atomic commit point**. Every decide attempt (`txn_decide_
+anchor`) re-reads `txn_status_local` and reports the record's **actual**
+outcome, never what was asked for — recovery makes duelling deciders legal
+(a still-live coordinator's commit can lose to a concurrent recovery
+abort, or vice versa; the anchor's Raft log position is the sole arbiter).
+Resolve is asynchronous and post-ack on the commit path: once the anchor's
+commit is durable, `cp_txn` returns immediately and spawns a best-effort
+resolve of every participant in the background, safe because
+`txn_resolver_loop` (below) is the safety net for whatever that spawn
+doesn't get to; the abort path resolves synchronously before returning.
 
 **Internal-only `ClientRequest` variants — `TxnPrepare`/`TxnDecide`/
 `TxnResolve`/`TxnStatus`/`TxnRecordView`/`TxnVerify` — are never sent
 bare**, only wrapped in `Forwarded` (the top-level `handle_request`
 dispatcher rejects a bare one with an error); their real handling lives in
-`cp_serve_forwarded`'s match only. Routed by the **actual data key** being
+`cp_serve_forwarded`'s match only. **Routed by the actual data key** being
 staged/resolved/verified (`table` + `writes[0]`/`keys[0]`/`span.start`),
-never `record_key` for `TxnPrepare`/`TxnResolve` — a non-anchor
+**never `record_key`** for `TxnPrepare`/`TxnResolve` — a non-anchor
 participant's `record_key` names the anchor's record, which lives in a
-*different* tablet's (possibly a different table's) keyspace entirely (see
-`RaftKvNode::txn.rs`'s `record_table` doc). `TxnDecide`/`TxnStatus`/
-`TxnRecordView` always target the anchor's own tablet, so routing by
-`record_key` there is correct. These are data-plane RPCs, not
-`MetaCommand`s — `is_relayable_command` (control-plane schema-DDL relay
-gating) does not apply to them; grepped and confirmed per the house lesson
-on adding a variant to a forwarded command enum. **`TxnDecide` no longer
-resolves anything and its reply carries the record's actual `TxnOutcome`**,
-not a bare ts (see above) — an internal-only wire shape change, no
-back-compat concern.
+*different* tablet's (possibly a different table's) keyspace entirely.
+`TxnDecide`/`TxnStatus`/`TxnRecordView` always target the anchor's own
+tablet, so routing by `record_key` there is correct. These are data-plane
+RPCs, not `MetaCommand`s — `is_relayable_command` does not apply to them.
 
 **Foreign-intent read resolution** (`ClientCtx::cp_get_local_resolving`,
 used by `cp_read`'s `Local` arm and `cp_serve_forwarded`'s `Get` arm — the
 original `cp_get_local` stays test-only, used by the in-crate
-`split_fence_tests`, which drives a raw `CpGroup` handle with no
-`ClientCtx` around it): tries `RaftKvNode::linearizable_get_served_fast`
+`split_fence_tests`): tries `RaftKvNode::linearizable_get_served_fast`
 first; on `FastRead::Foreign`, routes a `TxnStatus` query to the intent's
-actual record owner and finishes the read via
-`RaftKvNode::resolve_intent_given_status` once decided. **ADR 0018 §2/PR5
-(lifting the PR4 amendment's flagged deferral)**: a still-`Pending` (or
-failed) status query now calls `ClientCtx::txn_recover` before giving up,
-rather than immediately reporting "retry" — `txn_recover`'s own grace check
-means an ordinary in-flight transaction is never disturbed by this. A
-locally-`Pending` intent (the single-participant/anchor case) still falls
-back to the bounded internal wait, unchanged from PR3 — `txn_resolver_loop`
-is what eventually pushes a stale local record instead.
+actual record owner and finishes via `RaftKvNode::resolve_intent_given_
+status` once decided. A still-`Pending`/failed status query calls
+`ClientCtx::txn_recover` before giving up rather than immediately
+reporting "retry."
 
-**In-doubt recovery (ADR 0018 §2/PR5)**: `ClientCtx::txn_recover(
-record_table, record_key, txn_id, intent_ts_hint) ->
-Result<TxnDecisionStatus, String>` is the "push" — any actor holding a
-foreign-or-local `Pending` intent past `animus_cp_data::RECOVERY_GRACE`
-(5s, liveness-only) may call it. Reads the record (`txn_record_view`, the
-`TxnRecordView` recovery-view dual of `txn_status_local`); already decided
-→ resolve and return; `Pending` and not yet stale → decline (`Pending`,
-propose nothing); `Pending` and stale → verify every `(table, span)` in
-`intent_spans` (`txn_verify`, does the owning tablet still hold a live
-intent — `RaftKvNode::txn_verify_staged` over the wire); all staged →
-propose `TxnCommit`, any missing → propose `TxnAbort`; re-read the actual
-outcome (never trust the proposal) and resolve every participant
-(`recovery_resolve`, grouping `intent_spans` by table). See the ADR's PR5
-amendment for the full safety argument (why a recovery commit and a
-coordinator's own commit are always the same decision, and why a recovery
-abort racing a live coordinator is a legitimate, safe outcome, never data
-loss).
-
-**No record at all (ADR 0018 §2/PR5's orphan-record fix, §2b)**: a real,
-already-acknowledged possibility — the anchor's own `TxnStage` can silently
-no-op on a fence/seal miss, exactly like a participant's already could
-(PR4's own documented gap, now applying to the anchor's own stage too), so
-a pusher's `txn_record_view` query can come back empty even though a
-participant genuinely staged. `intent_ts_hint` (the foreign-intent read
-path's own `FastRead::Foreign`/`IntentInfo::version` — the orphaned
-intent's applied timestamp) is the only trustworthy grace-clock substitute
-in that case; with none supplied (the resolver loop's own sweep never has
-one, since `pending_txns()` only ever tracks a genuine local record), the
-call declines. Past grace on that substitute, `txn_recover` proposes an
-**orphan-abort tombstone** (`txn_decide_anchor`'s `orphan_created_ts`
-parameter → `RaftKvNode::txn_abort_orphan`) — always an abort, never a
-commit (an absent record gives no participant list to verify "all staged"
-against). A **late-arriving** genuine anchor `TxnStage` for that same
-`txn_id` then finds the tombstone and no-ops instead of resurrecting it to
-`Pending` — `apply_and_compact`'s own resurrection guard, not anything
-`animusd` has to arrange.
+**In-doubt recovery**: `ClientCtx::txn_recover(record_table, record_key,
+txn_id, intent_ts_hint) -> Result<TxnDecisionStatus, String>` is the
+"push" — any actor holding a foreign-or-local `Pending` intent past
+`animus_cp_data::RECOVERY_GRACE` (5s, liveness-only) may call it. Reads
+the record (`txn_record_view`); already decided → resolve and return;
+`Pending` and not stale → decline; `Pending` and stale → verify every
+`(table, span)` in `intent_spans` (`txn_verify`) — all staged → propose
+`TxnCommit`, any missing → propose `TxnAbort`; re-read the actual outcome
+and resolve every participant. **No record at all** is a real,
+acknowledged possibility (the anchor's own `TxnStage` can silently no-op
+on a fence/seal miss, just like a participant's); `intent_ts_hint` (the
+orphaned intent's applied timestamp) is the grace-clock substitute for
+that case, and past grace `txn_recover` proposes an **orphan-abort
+tombstone** (`RaftKvNode::txn_abort_orphan`) — always an abort, never a
+commit. A late-arriving genuine anchor `TxnStage` for that `txn_id` then
+finds the tombstone and no-ops instead of resurrecting it to `Pending`.
+See ADR 0018 §2 (and its follow-up amendments) for the full protocol and
+safety argument.
 
 `txn_resolver_loop` (`lib.rs`, data-role-gated, spawned alongside the
-tablet-host reconciler and `auto_split_loop` in both `BoundNode::start_with`
-and `BoundDataNode::start_data_with`, `TXN_RESOLVER_INTERVAL` = 1s, plain
-fixed interval): for each tablet group this node currently **leads**, pushes
-every `RaftKvNode::pending_txns()` entry via `txn_recover` and fans a
-resolve out for every `unresolved_decided()` entry — the proactive half of
-recovery, and what makes `cp_txn`'s async resolve (above) safe to leave
-un-awaited. Three new metrics: `CpTxnRecoveredCommitted`/
-`CpTxnRecoveredAborted`/`CpTxnResolverRuns`.
+tablet-host reconciler and `auto_split_loop`, `TXN_RESOLVER_INTERVAL` =
+1s): for each tablet group this node currently **leads**, pushes every
+`RaftKvNode::pending_txns()` entry via `txn_recover` and fans a resolve
+out for every `unresolved_decided()` entry — the proactive half of
+recovery. Metrics: `CpTxnRecoveredCommitted`/`CpTxnRecoveredAborted`/
+`CpTxnResolverRuns`.
 
 **A wire-reachable panic found (and fixed) while testing this**:
 `RaftKvNode::txn_stage`'s anchor-key-length assert (ADR 0022, `TOKEN_BYTES`)
@@ -401,29 +307,16 @@ lessons.md` for the general lesson.
 
 Tests: `tests/cp_txn.rs` (real 3-process cluster + a genuine pre-split
 table) — multi-tablet atomicity, the follower-connected forwarding
-regression (the identical transaction issued from every node in turn),
-concurrent transactions each individually atomic, a violated precondition
-aborting the whole transaction, and (ADR 0018 §2/PR5) a coordinator crash
-between prepare and decide — driven by sending the internal `TxnPrepare`
-wire requests directly (mirroring exactly what `cp_txn` does over the
-network) and then simply never sending `TxnDecide`/`TxnResolve`, since
-`cp_txn` runs synchronously inside one request handler with no separate
-long-lived coordinator process to literally kill — converging to a
-committed read from an uninvolved node within grace + resolver margin, plus
-its dual (a commit already applied but never resolved, converging via
-ordinary reads with no grace wait needed at all). The 2PC mechanics
-themselves, and PR5's recovery/decision-semantics fix, are proven
-deterministically at the primitive level in `animus-cp-data`'s
-`tests/txn_multi.rs`/`tests/txn_recovery.rs`.
-
-`tests/txn_recovery_participant_spans.rs` (task #18, 2026-08-12) is the
-regression for the `participant_spans` wiring fix above: stages the anchor
-with the participant's span correctly declared (matching what the fixed
-coordinator now sends), never stages the participant at all, and confirms
-`/admin/txns`'s `intent_spans` names both keys and that recovery decides
-`Aborted` — the anchor's own key must never become visible. See ADR 0018's
-corrective note for the full mechanism and the confirming pre-fix failing
-run.
+regression, concurrent transactions each individually atomic, a violated
+precondition aborting the whole transaction, and a coordinator crash
+between prepare and decide, converging via grace + resolver margin. The
+2PC mechanics themselves, and the recovery/decision-semantics design, are
+proven deterministically at the primitive level in `animus-cp-data`'s
+`tests/txn_multi.rs`/`tests/txn_recovery.rs`. `tests/
+txn_recovery_participant_spans.rs` regresses the participant-spans wiring
+specifically: stages the anchor with the participant's span declared but
+never stages the participant, confirming recovery decides `Aborted` and
+the anchor's own key never becomes visible.
 
 ## Control-plane access
 
@@ -443,132 +336,93 @@ For `Local` the two are identical (`raft.metadata()`); `Remote` genuinely differ
 goes through `ControlHandle`; `Remote` returns inert honest values for
 `is_leader()`/`term()`/etc.
 
-**`config()` returns `Option<BTreeSet<NodeId>>`, not a bare set (ADR 0037 PR2).**
-`Local` is always `Some(raft.config())` — a genuine control-group replica reading
-its own live `RaftCore` config. `Remote` has no local `RaftCore`, so it answers
-the last control-voter set it has *observed on the wire* (`RemoteControlClient::
-control_voters`, fed by `observe()` under the same freshness gate as the metadata
-mirror) — `None` until the first `Status`/`WatchMetadata` reply lands. This is
-deliberately an `Option`, not an always-populated `BTreeSet::new()` default as it
-used to be: "never fetched yet" and "the control group genuinely has zero
-voters" must stay distinguishable to any caller that cares (see the
-engineering-lessons "handle has no local authority" entry) — most callers don't
-and just `.unwrap_or_default()` it (`/admin/raft`'s `voters` field, the
-`ClientResponse::Status::control_voters` wire field below).
-
-**`ClientResponse::Status` carries `control_voters: BTreeSet<NodeId>`
-(`#[serde(default)]`, ADR 0037 PR2)** — the answering node's own
-`ctx.control.config().unwrap_or_default()` at reply time. This is the wire echo
-of the *live* Raft config that actually governs control-plane quorum, distinct
-from `Metadata.node_addrs`' `role: "control"` bookkeeping (a discovery hint: a
-node can be registered with the control role and not currently be a live voter —
-before its membership change lands, or after it's been removed). It rides the
-same `Status`/`WatchMetadata` round trip `metadata_fresh()`/the mirror sync loop
-already make, so a `Remote` node's own `RemoteControlClient` picks it up for
-free — no new request type. A future control-plane membership-change admin
-surface (later PR in the ADR 0037 stack) is the intended reader of this on a
-`Remote`/CLI/dashboard caller that needs "who can I even try talking to."
+**`config()` returns `Option<BTreeSet<NodeId>>`, not a bare set (ADR 0037).**
+`Local` is always `Some(raft.config())`. `Remote` has no local `RaftCore`,
+so it answers the last control-voter set it has *observed on the wire*
+(`RemoteControlClient::control_voters`) — `None` until the first
+`Status`/`WatchMetadata` reply lands. Deliberately an `Option`, not an
+always-populated `BTreeSet::new()` default: "never fetched yet" and "the
+control group genuinely has zero voters" must stay distinguishable to any
+caller that cares (see the engineering-lessons "handle has no local
+authority" entry) — most callers just `.unwrap_or_default()` it.
+`ClientResponse::Status` carries `control_voters` — the wire echo of the
+*live* Raft config that actually governs quorum, distinct from
+`Metadata.node_addrs`' `role: "control"` bookkeeping (a node can be
+registered with the control role and not currently be a live voter). It
+rides the same round trip `metadata_fresh()` already makes, so `Remote`
+picks it up for free — the intended reader is a caller that needs "who can
+I even try talking to."
 
 **Discipline**: a read feeding a *non-retried, permanent* decision must use
-`metadata_fresh()`, not `metadata_cached()`/`effective_metadata()` — a data-only
-node's routinely-stale mirror makes that window wide. The type system can't catch
-this (`Remote` and `Local` both compile). Grep every `metadata_cached()` call
-site when adding a `ControlHandle` consumer. `provision_tablet` was fixed for
-exactly this (RF silently pinned at 1); see the root `CLAUDE.md`
-engineering-lessons log. **That fix only closed the READ side (a stale
-`Remote` mirror) — it did not close the deeper hazard, which recurred later
-under heavy concurrent load and got its own fix**: `provision_tablet`'s
-`SetTabletPolicy` no longer derives a tablet's RF from `t.replicas.len()` (the
-observed size of its *initial* replica set) at all, even off a maximally
-fresh read — it always records the fixed target `MAX_REPLICATION_FACTOR`, so
-a best-effort under-sized initial set self-heals via `reconcile_placement`
-the moment enough candidates are `Active`, rather than the observed size
-becoming a silently-permanent policy. See the engineering-lessons entry on
-this recurrence and `tests/tablet_rf_self_heals.rs`.
+`metadata_fresh()`, not `metadata_cached()`/`effective_metadata()` — a
+data-only node's routinely-stale mirror makes that window wide. The type
+system can't catch this (`Remote` and `Local` both compile). Grep every
+`metadata_cached()` call site when adding a `ControlHandle` consumer.
+`provision_tablet` was fixed for exactly this (RF silently pinned at 1);
+see the root `CLAUDE.md` engineering-lessons log. **That fix only closed
+the READ side — a deeper hazard recurred later under heavy concurrent
+load**: `provision_tablet`'s `SetTabletPolicy` no longer derives a
+tablet's RF from `t.replicas.len()` (the observed size of its *initial*
+replica set) at all — it always records the fixed target
+`MAX_REPLICATION_FACTOR`, so a best-effort under-sized initial set
+self-heals via `reconcile_placement` rather than the observed size
+becoming a silently-permanent policy. See `tests/tablet_rf_self_heals.rs`.
 
 **`Remote` internals** (`RemoteControlClient`): `seeds` (the control deployment's
 client-API addresses), a polled `mirror`, and a `leader_hint`. `metadata_fresh()`
 tries the hint first, else scans every seed. `ClientResponse::Status` carries
 `leader_hint` and a `watermark: u64`; the long-poll `ClientRequest::WatchMetadata
-{ last_seen }` (ADR 0035 PR5) gives a `Remote` node a real wake-on-commit signal
-via `remote_metadata_watch_loop` (a genuine `Local` replica serves it, parking on
+{ last_seen }` gives a `Remote` node a real wake-on-commit signal via
+`remote_metadata_watch_loop` (a genuine `Local` replica serves it, parking on
 `metadata_watch().changed(last_seen)` up to an 8s server bound; a `Remote` node
-rejects it outright). `RemoteControlClient` owns its own driven `MetadataWatch`
-(this required making `animus_control::MetadataWatch::bump` `pub`).
-
-**The ADR 0030 growth-node branch of `remote_metadata_sync_loop` uses the same
-long-poll mechanism**, not the original fixed-200ms `Status` poll — a growth
-node's `ClientCtx.control` stays `ControlHandle::Local` (a real, permanently
+rejects it outright). `RemoteControlClient` owns its own driven `MetadataWatch`.
+The ADR 0030 growth-node branch of `remote_metadata_sync_loop` uses this same
+long-poll mechanism rather than a fixed poll — a growth node's
+`ClientCtx.control` stays `ControlHandle::Local` (a real, permanently
 non-voting control-group member, not `Remote`), so it constructs a standalone
-`RemoteControlClient::with_mirror(seeds, ctx.remote_metadata.clone())` sharing
-`ClientCtx.remote_metadata`'s existing `Arc<Mutex<Option<Metadata>>>` directly
-as its mirror, then drives it through the same `remote_metadata_watch_loop`.
-Pure latency improvement — the reconciler's own wake source is unaffected (a
-growth node's local raft never advances, so its `metadata_watch()` still never
-fires; `RECONCILE_FALLBACK_INTERVAL` still drives its ticks, just off a
-fresher mirror). Regression: `tests/cluster_growth.rs::
-growth_node_observes_metadata_promptly_via_watch`. **Gotcha surfaced by this
-port**: a `WatchMetadata` request already in flight to a node at the instant
-it's killed via `Node::shutdown()` doesn't fail over quickly — `shutdown()`
-can't abort an already-spawned `serve_clients` per-connection handler task
-(fire-and-forget, no tracked `JoinHandle`), so the zombie handler's
-`select! { changed(..), sleep(8s) }` always falls through to the timeout arm
-(its watch can never advance once the driver is dead) and replies with
-stale-but-plausible cached data up to 8s late. A fixed-sleep assertion right
-after a test's node-kill can be outrun by this; poll to convergence instead
-(see the engineering-lessons log).
+`RemoteControlClient::with_mirror` sharing `ClientCtx.remote_metadata`'s
+`Arc<Mutex<Option<Metadata>>>` directly, then drives it through the same loop.
 
-**`WatchMetadata`'s reply is incremental (ADR 0038 PR5).** `ClientCtx::
-watch_metadata` — after the long-poll resolves (wake-on-commit or the
-`WATCH_METADATA_SERVER_TIMEOUT` bound) — tries the serving node's own
+**Gotcha**: a `WatchMetadata` request already in flight to a node at the
+instant it's killed via `Node::shutdown()` doesn't fail over quickly —
+`shutdown()` can't abort an already-spawned `serve_clients` per-connection
+handler task (fire-and-forget, no tracked `JoinHandle`), so the zombie
+handler's `select! { changed(..), sleep(8s) }` always falls through to the
+timeout arm and replies with stale-but-plausible cached data up to 8s late.
+A fixed-sleep assertion right after a test's node-kill can be outrun by
+this; poll to convergence instead (see the engineering-lessons log).
+
+**`WatchMetadata`'s reply is incremental (ADR 0038).** After the long-poll
+resolves, `ClientCtx::watch_metadata` tries the serving node's own
 `RaftNode::watch_delta_since(last_seen)` first: if its bounded delta ring
 (`animus_control::DeltaRing`) contiguously covers `(last_seen, watermark]`,
 the reply is a cheap `ClientResponse::MetadataDelta { writes, watermark,
-leader_hint, control_voters }` instead of a full `Status` clone — `writes` is
-a `Vec<animus_control::mirror::KeyWrite>`, empty exactly when nothing changed
-(the timeout-elapsed case, still cheaper than cloning `Metadata`). Falls back
-to the original full `ClientResponse::Status` reply whenever the ring doesn't
-cover the range (a fresh/lagging/just-recovered replica) **or** while this
-node's own ADR 0030 growth-node mirror overlay is active
-(`ClientCtx.remote_metadata` populated) — that overlay serves
-`effective_metadata()` from a different source than this node's own
-(permanently inert, on a growth node) local ring, so a delta off that ring
-would answer the wrong question. A plain `ClientRequest::Status` request is
-untouched — always the full reply, unconditionally; only `WatchMetadata`
-gained the incremental option.
-
-`RemoteControlClient::observe_delta` is the **single shared consumer** for
-both `Remote` (a genuine ADR 0035 PR4 data-only node) and the ADR 0030
-growth-node branch above — both drive it through the identical
-`remote_metadata_watch_loop`, which now matches on both
-`ClientResponse::{Status, MetadataDelta}`. `observe_delta` installs each
-`KeyWrite` onto the cached `Metadata` via `animus_control::mirror::
-apply_key_write` (never replaying a `MetaCommand` — this crate carries no
-control-plane business logic to do that correctly). **Race guard**: since
-`RemoteControlClient` is `Arc`-shared between the background watch loop and
-any concurrent `metadata_fresh()` caller, a delta is only applied if the
-mirror's *current* watermark exactly equals the delta's own `last_seen`
-basis (checked and mutated under one lock, alongside the same tightening
-applied to `observe`'s pre-existing `watermark >= watch.latest()` check) — a
-concurrent full `observe()` moving the mirror in the meantime makes the
-delta's sequential application unsafe to apply blindly (unlike a full
-replace, which is order-independent modulo the monotonic watermark guard); a
-stale delta is dropped, not mis-applied, and self-heals on the loop's next
-iteration with a corrected `last_seen`. Regression:
-`tests/watch_metadata.rs` (the wire server side, incl. a real control-only
-process restart resetting the ring and forcing the correct fallback) and
-`tests/cluster_growth.rs::growth_node_observes_metadata_promptly_via_watch`
-(the growth-node path, proven via the shared call site).
+leader_hint, control_voters }` instead of a full `Status` clone. Falls back
+to a full `ClientResponse::Status` whenever the ring doesn't cover the
+range **or** while this node's own ADR 0030 growth-node mirror overlay is
+active (that overlay serves `effective_metadata()` from a different source
+than this node's own local ring). `RemoteControlClient::observe_delta` is
+the **single shared consumer** for both a genuine data-only `Remote` node
+and the growth-node branch above, installing each `KeyWrite` onto the
+cached `Metadata` via `animus_control::mirror::apply_key_write`. **Race
+guard**: since `RemoteControlClient` is `Arc`-shared between the background
+watch loop and any concurrent `metadata_fresh()` caller, a delta is only
+applied if the mirror's *current* watermark exactly equals the delta's own
+`last_seen` basis — a concurrent full `observe()` moving the mirror in the
+meantime makes sequential delta application unsafe; a stale delta is
+dropped, not mis-applied, and self-heals on the loop's next iteration.
+Regression: `tests/watch_metadata.rs` and `tests/cluster_growth.rs::
+growth_node_observes_metadata_promptly_via_watch`.
 
 ## Tablet lifecycle
 
-**The per-node tablet-host reconciler (ADR 0031 PR4) is the single owner of this
-node's tablet lifecycle** — it replaced three separate loops (`cp_join_host_loop`,
-`cp_gc_loop`, `cp_reconfigure_loop`) and their state. The pure `plan` +
-`Reconciler` executor live in `animus_cp_data::host` (read that crate's
-`CLAUDE.md`); `plan` decides every action from one `MetadataView` snapshot per
-tick and executes them in fixed order (`NarrowScope` → `Host` → `Reconfigure` →
-`Release`/`Reclaim`; merge adds `WidenScope`/`Absorb`). What stays in `animusd`
+**The per-node tablet-host reconciler (ADR 0031) is the single owner of this
+node's tablet lifecycle** — it replaced three separate loops and their
+state. The pure `plan` + `Reconciler` executor live in
+`animus_cp_data::host` (read that crate's `CLAUDE.md`); `plan` decides
+every action from one `MetadataView` snapshot per tick and executes them in
+fixed order (`NarrowScope` → `Host` → `Reconfigure` → `Release`/`Reclaim`;
+merge adds `WidenScope`/`Absorb`). What stays in `animusd`
 (`tablet_host_reconciler_loop`):
 
 - **Trigger**: one task per node racing `ctx.control.metadata_watch().changed(..)`
@@ -620,33 +474,23 @@ states) — test post-restart state with a poll, never a fixed sleep. A new
 `MetaCommand` that must commit from a follower-connected node must be added to
 `is_relayable_command` (missing there is a bimodal per-process flake).
 
-**`ClientCtx::drop_table` cascades to every GSI's hidden table (ADR 0041 §5,
-2026-08-13 fix).** A GSI's rows live in a *separate* table
-(`animus_dynamo::index_table_name`, ADR 0041 §1) with its own tablets — dropping
-only the base table's schema + tablets left that hidden table orphaned forever
-(its `IndexDef` died with the base schema, so a retry after a mid-drop crash
-couldn't even enumerate what to clean up). The fix's three steps run in a
-specific, load-bearing order: (1) read `metadata_fresh` (this feeds a
-permanent decision — once the base schema is gone, so are its `IndexDef`s) and
-drop each **global** index's hidden table's tablets via the same
-`MetaCommand::DropTableTablets` the base table itself uses (it needs no schema
-entry — its apply is keyed on the tablet map, not the catalog); (2) drop the
-base schema; (3) drop the base table's own tablets (base + colocated **LSI**
-rows + change log + footprints — all four `StorageScope` kinds share one
-tablet group, so `CpGroup::erase_scope` iterating `kind_scopes` reclaims every
-one; an LSI needs no separate cascade step). A crash between any two steps
-leaves a state a re-run of `drop_table` completes, because every step is
-independently idempotent. **Belt-and-suspenders second sweep**: the GSI drain
-(`index_drain.rs`) provisions a hidden table's first tablet lazily and can do
-so *concurrently* with a drop (a change record draining mid-drop, racing step
-1's enumeration) — after step 3, `drop_table` re-scans the tablet map itself
-(not the now-gone `IndexDef`s) for any tablet named `<table>$<index>`
-(`animus_dynamo::split_index_table_name`) and drops those too, which also
-mops up any orphan a **pre-fix** drop left behind. The drain's own
-provisioning/write errors during this race stay logged-and-swallowed by
-`index_drain_loop` (best-effort convergence, unchanged by this fix); once the
-base table's groups leave `hosted_groups()` (the reconciler's `Reclaim`
-teardown), the drain simply stops sweeping them. Regression:
+**`ClientCtx::drop_table` cascades to every GSI's hidden table (ADR 0041).**
+A GSI's rows live in a *separate* table (`animus_dynamo::index_table_name`)
+with its own tablets, so dropping only the base table's schema + tablets
+would orphan it forever. The three steps run in a load-bearing order: (1)
+read `metadata_fresh` and drop each **global** index's hidden table's
+tablets via the same `MetaCommand::DropTableTablets` the base table itself
+uses; (2) drop the base schema; (3) drop the base table's own tablets (base
++ colocated **LSI** rows + change log + footprints — all four
+`StorageScope` kinds share one tablet group, so `CpGroup::erase_scope`
+iterating `kind_scopes` reclaims every one; an LSI needs no separate
+cascade step). A crash between any two steps leaves a state a re-run of
+`drop_table` completes, since every step is independently idempotent.
+**Belt-and-suspenders second sweep**: the GSI drain (`index_drain.rs`)
+provisions a hidden table's first tablet lazily and can race a drop, so
+after step 3 `drop_table` re-scans the tablet map itself (not the now-gone
+`IndexDef`s) for any tablet named `<table>$<index>` and drops those too —
+which also mops up any orphan a pre-fix drop left behind. Regression:
 `tests/drop_table_index_cascade.rs`.
 
 ## Wire edges
@@ -655,44 +499,29 @@ All edges are production-only I/O (real tokio sockets, hand-rolled framing) and
 route below the edge through the same `ClientCtx` CP primitives.
 
 - **DynamoDB** (`dynamo.rs`, `RoleAddrs.dynamo`) — decodes `X-Amz-Target` +
-  AttributeValue-JSON via `animus_dynamo::wire`. `CreateTable` proposes its key
-  schema **and** GSI/LSI *definitions* into the replicated catalog (ADR 0013) and
-  waits for commit (survives restart); a node reconciles its local registry from
-  `Metadata::table_indexes` via `mirror_catalog_schema`/`sync_indexes` — the
-  registry now holds only that *definition* bookkeeping (key schema +
-  hash/sort attribute names + projection), never index entries (ADR 0041 §5
-  deleted the in-memory index entirely, along with `note_put`/`note_delete`/
-  `backfill_index_if_needed`). An indexed table's `PutItem`/`DeleteItem` goes
-  through `index_aware_write` → `ClientCtx::cp_kind_write`, committing the base
-  row, this item's **LSI rows** (adding the new, removing whatever the previous
-  value occupied) and a **change-log record** as one `KvCommand::KindBatch`
+  AttributeValue-JSON via `animus_dynamo::wire`. `CreateTable` proposes its
+  key schema **and** GSI/LSI *definitions* into the replicated catalog (ADR
+  0013) and waits for commit; a node reconciles its local registry from
+  `Metadata::table_indexes` — the registry holds only *definition*
+  bookkeeping, never index entries (there is no in-memory index at all). An
+  indexed table's `PutItem`/`DeleteItem`/`UpdateItem` goes through
+  `index_aware_write` → `ClientCtx::cp_kind_write`, committing the base row,
+  its **LSI rows** and a **change-log record** as one `KvCommand::KindBatch`
   Raft entry. An LSI can ride that entry because it hashes by the base
-  partition key; a **GSI cannot** (its rows live in their own hidden table's
-  tablets) and is materialized asynchronously by the drain (`index_drain.rs`)
-  from those change records. A table with no indexes keeps the plain
-  single-key write path, paying nothing. **Every write op that lands on an
-  indexed table now maintains it (ADR 0041, 2026-08-13 fix)** —
-  `UpdateItem` routes its single final write through `index_aware_write`
-  exactly like `PutItem`/`DeleteItem` (passing the RMW's own before/after
-  images); `BatchWriteItem` keeps the fast `cp_batch_write` path for an
-  **unindexed** table but routes each `Put`/`Delete` through
-  `index_aware_write` individually for an **indexed** one (reading the old
-  item first — the LSI diff needs it — under the RMW lock per request, so
-  atomicity stays per-item, matching `BatchWriteItem`'s own pre-existing
-  non-atomic contract). **`TransactWriteItems` is the one op that still
-  can't participate**: a write action (`Put`/`Delete`/`Update`, not a bare
-  `ConditionCheck`) against a table with at least one secondary index makes
-  `run_transact` reject the **whole transaction** up front with a
+  partition key; a **GSI cannot** (its rows live in their own hidden
+  table's tablets) and is materialized asynchronously by the drain
+  (`index_drain.rs`) from those change records. `BatchWriteItem` keeps the
+  fast `cp_batch_write` path for an **unindexed** table but routes each
+  `Put`/`Delete` through `index_aware_write` individually for an
+  **indexed** one, atomic per-item only. **`TransactWriteItems` is the one
+  op that can't participate**: a write action against an indexed table
+  makes `run_transact` reject the **whole transaction** with a
   `ValidationException` — `cp_txn`'s `KvCommand::TxnStage` has no
-  multi-kind-write extension yet, so staging just the base row inside a
-  transaction would commit the item while permanently never producing its
-  LSI rows or change-log record, a silent-wrong-index outcome strictly
-  worse than a loud unsupported-combination error. The real fix (extending
-  `TxnStage` with a transactional multi-kind write, the `cp_txn` analogue of
-  `cp_kind_write`) is a real `animus-cp-data` protocol change, named as a
-  follow-up in ADR 0041's as-built note under §2 rather than folded into
-  this fix. See `docs/engineering-lessons.md` for the original gap and its
-  resolution.
+  multi-kind-write extension yet, so staging just the base row would
+  silently never produce the LSI rows/change-log record. The real fix (a
+  `cp_txn` analogue of `cp_kind_write`) is a named `animus-cp-data`
+  protocol follow-up in ADR 0041, not yet built.
+
   `ClientRequest::KindWrite` is the forwarding payload — **internal-only,
   refused bare** (a client could otherwise write arbitrary bytes into a table's
   LSI/change scopes and desynchronise its indexes), handled only inside
@@ -701,243 +530,109 @@ route below the edge through the same `ClientCtx` CP primitives.
   maps to one tablet** rather than assuming it: a batch straddling two tablets
   cannot be atomic, and committing only the first tablet's share is exactly the
   torn base-row-without-its-index-row state the mechanism exists to prevent.
-  **A `Query` — base or index (ADR 0041 §5) — is always a native CP range
-  scan, never an in-memory lookup**: a base `Query`/`Scan` use `cp_scan`; a
-  GSI `Query` (`dynamo.rs::run_gsi_query`) scans the index's own hidden table
-  (`index_table_name`) over its token-prefixed hash-value range, narrowed to
-  the sort sub-prefix for an `Equals` condition and filtered for every other
-  shape — decoding each row's already-projected stored value directly (no
-  per-key base-table read-back, and no backfill: indexes are only declarable
-  at `CreateTable`, so a pre-index item can't exist); a hidden table with no
-  tablet yet (nothing has drained) reads as **empty**, the same gate
-  `ClientCtx::cp_get` uses. An LSI `Query` (`run_lsi_query`) is a
-  **linearizable** scan of the *base table's own tablet* over its `KIND_LSI`
-  scope, via `ClientCtx::cp_scan_kind` (routes by the scan's start key — an
-  LSI query is scoped to one base partition, hence one tablet, verified rather
-  than assumed) and `RaftKvNode::linearizable_scan_kind` (the ReadIndex-barrier
-  dual of `local_scan_kind`; no intent resolution needed, since a non-base
-  scope only ever holds committed values). `ClientRequest::KindScan` is the
-  new forwarding payload for the LSI path — **internal-only, refused bare**,
-  the read-side dual of `KindWrite`, handled only inside `cp_serve_forwarded`.
-  **A GSI `Query` is eventually consistent** (DynamoDB's own contract — the
-  drain materializes asynchronously); an LSI `Query` stays strongly
-  consistent (written atomically with the base row). **`ConsistentRead`
-  fidelity (ADR 0041 §5, 2026-08-13 fix)**: `wire::decode_request` now decodes
-  an optional `ConsistentRead` boolean on `GetItem`/`Query`/`Scan` (default
-  `false`) — accept-and-ignore everywhere except `run_index_query`, which
-  rejects it (`ValidationException`) when the queried index's replicated
-  `kind` is `Global`, matching DynamoDB's own contract exactly (an LSI or the
-  base table is already linearizable here, so the flag is simply dropped on
-  those branches). The decode has no way to know an index's kind (that lives
-  in the replicated catalog, not the wire), so `Operation::Query` always
-  carries the field through undecided; only `animusd` — with `Metadata` in
-  hand — makes the accept/reject call.
 
-  **`Scan` with `IndexName` (ADR 0041 §5, 2026-08-13, closing the last
-  functional gap in the stack).** `Operation::Scan` gained an `index: Option<
-  String>` decoded from `IndexName` (`animus-dynamo`), and `dynamo.rs::run_scan`
-  dispatches exactly like `run_query`: base table when absent, else
-  `run_index_scan` → `run_gsi_scan`/`run_lsi_scan` by the index's replicated
-  kind, with the identical `ConsistentRead`-against-a-GSI rejection
-  (`run_index_scan`, mirroring `run_index_query`'s enforcement point).
-  - **GSI `Scan`** reuses the base-`Scan` pagination discipline
-    (`paginated_table_examine`, factored out of `run_base_scan`'s own loop) but
-    scans the index's own hidden table directly, fanned across *its* tablets
-    in token order by the ordinary `cp_scan`/`native_scan` — no new CP
-    primitive needed, since a GSI's hidden table is an ordinary table. The
-    pagination cursor is **not** the base `Query`'s `{pk, sk}` shape: a GSI
-    cursor is `{index hash attr, index sort attr?, base pk, base sk?}`
-    (`gsi_key_item_of`/`gsi_resume_key`) — real DynamoDB's own GSI cursor
-    shape, needed because the hidden table's *engine key* is
-    `escape(ihash)||escape(isort)?||escape(base_pk)||base_sk`
-    (`dynamo_index::gsi_row_key`), not the base table's key, so resuming
-    needs the full row key, not just the index's own. Both attribute sets
-    are always present in the stored row regardless of the index's declared
-    projection (`projected_item` always keeps the key attributes), so no
-    base-table read-back is needed to build the cursor either. A hidden
-    table with no tablet yet reads as empty, the same gate `run_gsi_query`
-    uses.
-  - **LSI `Scan`** is genuinely new machinery: a table-wide, linearizable fan-
-    out over the base table's `KIND_LSI` scope, since (unlike an LSI `Query`,
-    scoped to one partition/tablet) a `Scan` must sweep every tablet of the
-    table's own ring. `ClientCtx::cp_scan_kind_table` is `cp_scan`'s
-    kind-scoped sibling — same per-tablet range math, but calling
-    `cp_scan_kind_one`/`ClientRequest::KindScan` per overlapping tablet
-    instead of the base `Scan` request. **`end: None` (unbounded above) now
-    means something new for a kind-scoped scan**: `RaftKvNode::
-    local_scan_kind`/`linearizable_scan_kind` (`animus-cp-data`) changed from
-    `end: &[u8]` (mandatory) to `end: Option<&[u8]>`, mirroring
-    `local_scan`/`linearizable_scan`'s identical unbounded-above handling for
-    the base scope — deriving the bound from the kind scope's *own* physical
-    prefix (`StorageScope::physical_bounds`) when the caller has none to
-    give. This was necessary, not a convenience: no finite byte string can
-    bound an LSI row's keyspace in general (a trailing base-sort-key segment
-    has no length limit), so the tail tablet of a table-wide fan-out
-    genuinely cannot be bounded by anything the `animusd` caller could
-    construct itself — the same reason `RaftKvNode::pending_changes` derives
-    its own bound internally rather than taking one. One partition's rows
-    across *every* declared LSI interleave within `KIND_LSI`
-    (`lsi_index_prefix`'s layout — sorted by index name ahead of the alt-sort
-    value), so `run_lsi_scan`'s `keep` closure (via the kind-scoped pagination
-    twin `paginated_kind_examine`) filters each raw row to the requested
-    index by its own key (`parse_lsi_row_key`) — a different index's row is
-    skipped **without consuming a `Limit` slot**, the exact same
-    windowed-continuation trick the base `Scan` already uses to skip a
-    DynamoDB delete tombstone. The LSI cursor shape is `{alt-sort attr, base
-    pk, base sk?}` (`lsi_key_item_of`/`lsi_resume_key`). `ConsistentRead:
-    true` is accepted (already true — an LSI row commits atomically with its
-    base row).
-  - **Deliberate simplification, not yet closed**: `cp_scan_kind_table`
-    doesn't push a `limit` down into a single tablet's own kind-scan call
-    (`linearizable_scan_kind` has no limit parameter at all — every existing
-    caller fetches a whole bounded range) — it fetches one tablet's *entire*
-    matching sub-range, then truncates the fan-out's accumulated result. Fine
-    at the scale every test here exercises; a very LSI-heavy single tablet
-    would need a `limit` parameter added to the `animus-cp-data` primitive
-    itself to bound that one tablet's own read cost precisely, the way base
-    `Scan`'s `cp_scan`/`native_scan` already do.
+  **A `Query`/`Scan` — base or index — is always a native CP range scan,
+  never an in-memory lookup.** A base `Query`/`Scan` uses `cp_scan`; a GSI
+  `Query`/`Scan` scans the index's own hidden table (`index_table_name`)
+  directly, fanned across its tablets by ordinary `cp_scan` (its own
+  GSI-shaped pagination cursor, since the hidden table's engine key isn't
+  the base table's key). An LSI `Query` is a **linearizable** scan of the
+  *base table's own tablet* over its `KIND_LSI` scope (scoped to one base
+  partition/tablet); an LSI `Scan` is table-wide, via `ClientCtx::
+  cp_scan_kind_table` (`cp_scan`'s kind-scoped sibling, fanning a
+  `KindScan` per overlapping tablet — its tail tablet needs a genuinely
+  unbounded-above scan, since no finite byte string can bound an LSI row's
+  keyspace, so the primitive derives the bound from the kind scope's own
+  physical prefix). `ClientRequest::KindScan` is the LSI path's forwarding
+  payload — **internal-only, refused bare**, the read-side dual of
+  `KindWrite`. A hidden table with no tablet yet reads as **empty**, the
+  same gate `ClientCtx::cp_get` uses. A **GSI** query/scan is eventually
+  consistent (DynamoDB's own contract — the drain materializes
+  asynchronously); an **LSI** one stays strongly consistent.
+  `ConsistentRead: true` is accepted everywhere except a GSI `Query`/`Scan`,
+  which rejects it (`ValidationException` — only `animusd`, with `Metadata`
+  in hand, knows an index's kind).
 
-  Regression (wire decode): `animus-dynamo`'s `wire` unit tests
-  (`decodes_scan_against_an_index`). Regression (end to end):
-  `tests/dynamo_index_scan.rs` — GSI `Scan` pagination draining every row
-  across `LastEvaluatedKey` pages (converged-or-timeout first, since the
-  drain is async), `ConsistentRead: true` rejection against a GSI `Scan`
-  (and acceptance against the base table's/an LSI's), an LSI `Scan` returning
-  exactly the requested index's rows with no cross-index/cross-partition
-  leakage — issued through **every** node of the cluster in turn (the
-  `kind_scan.rs` forwarding-regression pattern, exercising
-  `cp_scan_kind_table`'s forwarded `KindScan` per tablet), and a
-  `FilterExpression` over LSI-scanned rows (both unpaginated and walked
-  across pages).
+  Regression: `animus-dynamo`'s `wire` unit tests plus `tests/
+  dynamo_index_scan.rs`/`kind_scan.rs` end to end.
 
-  Surface also covers
-  `UpdateItem`/`BatchWriteItem` (condition-gated, per-request/per-tablet
-  atomicity only) and, since ADR 0018 §2/PR7, **atomic** `TransactWriteItems`
-  (whole-or-nothing across however many tablets/tables it spans, via
-  `ClientCtx::cp_txn`) and `TransactGetItems` (a quiescence-confirmed
-  consistent multi-key read) — see that ADR's PR7 amendment for the
-  condition-evaluation layering. **Since the ADR 0018 §2 2026-08-12
-  follow-up amendment**, a write action's own `ConditionExpression` has
-  full **cross-node** OCC (apply-time `write_conditions`, not just
-  same-node `rmw_lock` protection) — the PR7 amendment's own documented
-  limitation is closed; see that later amendment and `dynamo.rs::
-  run_transact`'s doc for the layered design. `DeleteItem` writes a
-  tombstone *value*.
+  Surface also covers `UpdateItem`/`BatchWriteItem` (condition-gated,
+  per-request/per-tablet atomicity only) and **atomic** `TransactWriteItems`/
+  `TransactGetItems` (via `ClientCtx::cp_txn`) — see ADR 0018 §2 for the
+  condition-evaluation layering, including the follow-up amendment that
+  gave a write action's own `ConditionExpression` full **cross-node** OCC
+  (apply-time `write_conditions`, not just same-node `rmw_lock`
+  protection). `DeleteItem` writes a tombstone *value*.
 - **CQL v4** (`cql.rs`, `RoleAddrs.cql`) — `STARTUP`/`OPTIONS` handshake +
   `QUERY`/`PREPARE`/`EXECUTE` via the pure `animus_cql` crate. `CREATE TABLE`
-  proposes a typed schema into the replicated catalog (incl. clustering/compound
-  keys). A partition is one CP value, so `INSERT`/`UPDATE`/`DELETE` are RMW under
-  `rmw_lock`; the requested consistency level is accepted but moot (CP).
-  Keyspaces are **replicated** (`CREATE KEYSPACE` proposes
-  `MetaCommand::CreateKeyspace` into the control plane's `Metadata`, ADR 0013;
-  `USE`/qualifier validation reads the replicated set via `keyspace_exists`,
-  with a `ks.table`-prefix fallback). Only the **prepared-statement store**
-  (`CqlState`) is per-node edge state (shared across connections *to the same
-  node*, isolated between nodes, lost on restart); prepared ids are
+  proposes a typed schema into the replicated catalog (incl. clustering/
+  compound keys). A partition is one CP value, so `INSERT`/`UPDATE`/`DELETE`
+  are RMW under `rmw_lock`; the requested consistency level is accepted but
+  moot (CP). Keyspaces are **replicated** (`CREATE KEYSPACE` proposes
+  `MetaCommand::CreateKeyspace`; `USE`/qualifier validation reads the
+  replicated set via `keyspace_exists`, with a `ks.table`-prefix fallback).
+  Only the **prepared-statement store** (`CqlState`) is per-node edge state
+  (shared across connections *to the same node*, isolated between nodes,
+  lost on restart); prepared ids are
   content-addressed (FNV-1a of the text).
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only `GET`
   views (`/admin/{config,status,peers,raft,raftkv,txns,storage/*,metrics,metrics/
-  history,member/drain-status,health,control/members}`) + gated `POST` actions
-  (`/admin/{tablet/split,tablet/merge,storage/flush,storage/compact,raftkv/
-  reconfigure,drain,member/add,member/remove,control/member/add,control/
-  member/remove}`) + data writes (`/admin/data/{dynamo,cql,drop-table,
-  seed}`). Below the edge it only reads node state (aggregated live per request) or
-  drives a gated action. **No auth — bind to a trusted interface.** The `animus
-  admin` CLI consumes it. The bulk seeder (`action_data_seed`) writes real
-  **DynamoDB items** — key attributes resolved from the replicated catalog
-  schema (ADR 0013), key/value bytes built exactly as the DynamoDB edge's
-  `PutItem` would (`dynamo::item_key` + `wire::encode_stored_item`, ADR 0022),
-  so seeded rows read back through `GetItem`/`Query`/`Scan` — in
-  `cp_batch_write_patient` batches, wrapped in its own `admin_seed` span (it
-  bypasses `handle_client`, so it needs one to emit any trace). `key_display`/`parse_key_display` render a binary partition
-  token as unpadded base64url; a plain-client key is verbatim/printable.
-  `/admin/peers`'s `peers: [{admin, role}, ...]` field (ADR 0035 residual
-  follow-up, `admin.rs::peers_view`) carries each node's deployment role
-  straight off replicated `Metadata.node_addrs[*].role` — closing the gap
-  where role was only knowable by fetching that specific node's own
-  `/admin/config` first; `admin_addrs` itself is unchanged.
-  **`GET /admin/txns` (ADR 0018 §2/PR7)** mirrors `/admin/raftkv`'s own
-  node-local, one-entry-per-hosted-tablet shape (`CpGroup::txn_view`): each
-  entry's `pending` lists this group's still-`Pending` anchored transaction
-  records (record key, created timestamp, age vs. `RECOVERY_GRACE`, and a
-  best-effort `intent_spans` summary — the one field costing a real
-  `ReadIndex` round trip per pending entry, via `RaftKvNode::
-  txn_record_view`, since a tablet anchors only a handful of these at once);
-  `unresolved_decided` lists decided-but-not-yet-locally-resolved records.
-  Pure observer, no gated action — the existing `txn_resolver_loop`/
-  `ClientCtx::txn_recover` machinery already drives every record listed here
-  to resolution with no operator action; manual resolution is deferred, and
-  so is a dedicated dashboard tab (ADR 0021/0035 scope discipline).
-  **`GET /admin/storage/control` (ADR 0038 PR4)** surfaces the
-  **control-plane's own system-keyspace engine** stats (LSM levels/SSTables/
-  memtable + WAL segments/durable_seq/rotations) — the control-plane
-  analogue of `/admin/storage/lsm`+`/admin/storage/wal`, but keyed on
-  `ctx.control_storage` (a second, read-only clone of exactly the engine
-  handle passed to `RaftNode::start_with_metrics`) rather than a hosted CP
-  tablet group, since a control-only node hosts none. `{"available": false}`
-  on a data-only node (no local control role at all); on a **combined** node
-  the numbers legitimately coincide with a hosted tablet's own
-  `/admin/storage/lsm` — it's the exact same physical shared engine,
-  `Metadata` just lives at a reserved key prefix within it.
-  **`GET /admin/system-table?kind=&after=&limit=` (plan-syskv-ui, an ADR 0038
-  addendum) browses this same engine's live rows**, one decoded system-
-  keyspace entity at a time — the read-only counterpart to
-  `/admin/storage/control`'s aggregate stats. Same `{"available": false}`
-  shape on a data-only node. **Load-bearing**: scans
+  history,member/drain-status,health,control/members,system-table}`) + gated
+  `POST` actions (`/admin/{tablet/split,tablet/merge,storage/flush,storage/
+  compact,raftkv/reconfigure,drain,member/add,member/remove,control/member/
+  add,control/member/remove}`) + data writes (`/admin/data/{dynamo,cql,
+  drop-table,seed}`). Below the edge it only reads node state (aggregated
+  live per request) or drives a gated action. **No auth — bind to a trusted
+  interface.** The `animus admin` CLI consumes it. The bulk seeder
+  (`action_data_seed`) writes real **DynamoDB items** — key/value bytes
+  built exactly as the DynamoDB edge's `PutItem` would, so seeded rows read
+  back through `GetItem`/`Query`/`Scan`. `key_display`/`parse_key_display`
+  render a binary partition token as unpadded base64url; a plain-client key
+  is verbatim/printable. `/admin/peers`'s `peers: [{admin, role}, ...]`
+  field carries each node's deployment role straight off replicated
+  `Metadata.node_addrs[*].role`, so the dashboard never has to fetch a
+  specific node's own `/admin/config` just to learn it.
+
+  `GET /admin/txns` mirrors `/admin/raftkv`'s node-local,
+  one-entry-per-hosted-tablet shape: `pending` lists this group's still-
+  `Pending` anchored transaction records (record key, created timestamp,
+  age vs. `RECOVERY_GRACE`, `intent_spans`); `unresolved_decided` lists
+  decided-but-not-yet-locally-resolved ones. Pure observer — the existing
+  `txn_resolver_loop`/`ClientCtx::txn_recover` machinery already drives
+  every record listed here to resolution with no operator action.
+
+  `GET /admin/storage/control` surfaces the **control-plane's own
+  system-keyspace engine** stats, keyed on `ctx.control_storage` rather
+  than a hosted CP tablet group, since a control-only node hosts none —
+  `{"available": false}` on a data-only node; on a combined node the
+  numbers legitimately coincide with a hosted tablet's own
+  `/admin/storage/lsm` (same physical shared engine, `Metadata` at a
+  reserved key prefix within it).
+
+  `GET /admin/system-table?kind=&after=&limit=` browses that same engine's
+  live rows. **Load-bearing**: scans
   `animus_control::syskv::reserved_scan_bounds()`'s `[start, end)` via one
-  `StorageEngine::scan`, filtering by `kind` in memory afterward — never
+  `StorageEngine::scan`, filtering by `kind` in memory — **never**
   `StorageEngine::entries()`, which would scan the *whole* engine (every
   user table's data too, on a combined node sharing it with the CP data
   plane, ADR 0028); see the engineering-lessons entry before ever
-  "simplifying" this to `entries()`. `applied_index` is a **dedicated point
-  read** of the `_applied_index` watermark key, never derived from the
-  (possibly empty/filtered/paginated) scan window. The `after`/`next_after`
-  cursor is the base64url (`animus_dynamo::wire`, not `key_display` — a
-  system key isn't a data-plane key) of the last item's raw engine key; the
-  next page's lower bound is that key plus one `0x00` byte — exact and
-  gap-free because `syskv` keys are provably prefix-free. Value decode
-  mirrors `animus_control::mirror::apply_put` exactly (JSON passthrough for
-  six kinds; `Counter` as a raw `u64`; `Keyspace`/`Merged`
-  presence-only, always `null`); a numeric kind's `id` renders as a decimal
-  string, not a JSON number. Every `EntityKind` is browsable, including the
-  internal/legacy ones — full transparency by design, see
-  `animus-control/CLAUDE.md`'s `syskv.rs` PR6 entry.
+  "simplifying" this to `entries()`. `applied_index` is a dedicated point
+  read of the watermark key, never derived from the scan window. Every
+  `EntityKind` is browsable, including internal/legacy ones.
 - **Web console** (`dashboard.rs` + assets, ADR 0021) — a self-contained
-  vanilla-JS SPA, a pure client of `/admin/*` JSON (so responses carry CORS). Six
-  views seeded by a `/admin/peers` fan-out; tabs are **role-gated client-side**
-  (`applyRoleGating`, ADR 0035 PR7) — a data-only node shows a dedicated **Node**
-  view (`dashboard_node.js`) instead of the cluster-wide tabs. The **Storage**
-  tab (shown to control-only and combined nodes) carries a distinct "Control
-  system keyspace" card (ADR 0038 PR4, `dashboard_storage.js`'s
-  `loadControlStorage`/`updateControlStorageNodeOptions`) — its own node
-  selector, filtered to nodes with a control role (`n.role === "control" ||
-  "combined"`), independent of the per-tablet `st-tablet`/`st-node`
-  selectors' hosting-based filter (which would otherwise always be empty for
-  a control-only node, since it hosts no CP tablet group at all). That same
-  card grew a **browse section** nested directly inside it (plan-syskv-ui,
-  ADR 0038 addendum) — `dashboard_storage.js`'s `loadSystemTable`/
-  `renderSystemTableKindOptions` against `GET /admin/system-table`: a kind
-  filter (every kind, internal/legacy ones labeled `(internal)`/`(legacy)`),
-  an "as of index N" watermark label, a table with `<details>`-based
-  expand-to-full-JSON per row, and a forward-only "Next page" pager
-  (`systemTableAfter`, reset on every fresh "Browse"/node-change). No new
-  tab, no `ROLE_TABS` change — rides the same control-role node selector and
-  gating the card already had. `loadSelf()`
-  resolves this node's own role from a self-only fetch, kept separate from the
-  slower cluster-wide fan-out. `/admin/config` carries a derived `role` string;
-  `/admin/raft` carries a `control_mirror` object for the Node view. The
-  Overview groups nodes as "Control plane" / "Data nodes" when any
-  control-only node exists (a combined cluster keeps the flat list), and every
-  reachable node's row — plus the Placement view's selected-node header —
-  carries a `consoleLink()` (`dashboard_core.js`) to that node's OWN admin
-  console, built from the origin the `/admin/peers` fan-out already resolved
-  (empty for this page's own origin — a self-link is noise). **Cluster health
-  means "is the data at risk," not "is anything in transition"** (ADR 0021 §7):
+  vanilla-JS SPA, a pure client of `/admin/*` JSON. Tabs are **role-gated
+  client-side** — a data-only node shows a dedicated **Node** view instead
+  of the cluster-wide tabs. The **Storage** tab (control-only and combined
+  nodes) carries a "Control system keyspace" card with its own
+  control-role node selector and a nested browse section against `GET
+  /admin/system-table`. The Overview groups nodes as "Control plane" /
+  "Data nodes" when any control-only node exists. **Cluster health means
+  "is the data at risk," not "is anything in transition"** (ADR 0021 §7):
   `tabletStatus`'s ladder (`quorum-lost` → `under-replicated` → `healthy` →
-  `forming`) only degrades on an actual redundancy/quorum loss; a split-child
-  or freshly-provisioned tablet forming its Raft group with every assigned
-  replica's node alive renders as a neutral `forming` pill, escalating to
-  degraded only if stuck past 60s (`computeHealth`'s `overdueFormingCount`).
+  `forming`) only degrades on an actual redundancy/quorum loss; a
+  split-child or freshly-provisioned tablet forming its Raft group with
+  every assigned replica's node alive renders as a neutral `forming` pill,
+  escalating to degraded only if stuck past 60s.
 - **OTel** (`otel.rs`, ADR 0027) — `init_tracing(instance_id)` from `main.rs`;
   `current_traceparent`/`set_parent_traceparent` carry W3C trace context across a
   forwarded hop (`cp_forward` injects, the receiver's `handle_client`
@@ -947,16 +642,14 @@ route below the edge through the same `ClientCtx` CP primitives.
 
 ## Gotchas
 
-- **A node runs one internal `ProdEnv`, on one id (ADR 0040 PR1)** — the control
+- **A node runs one internal `ProdEnv`, on one id (ADR 0040)** — the control
   Raft rides `PRIMARY_STREAM` (stream 0, ADR 0026's default); every per-tablet
   Raft group this node hosts rides its own stream (`stream = tablet_id`, which
-  floors at 1), so the two never collide on the one shared inbox. Before ADR
-  0040, a combined node bound *two* `ProdEnv`s on two distinct ids (`control
-  i` / `raftkv 300+i`) purely because one inbox was single-consumer — ADR 0026
-  made that unnecessary by letting one id host several protocol instances,
-  and ADR 0040 PR1 is "actually stop paying for the second id." The client API
-  is a plain TCP server, *not* on the `Network` — a non-leader forwards over a
-  fresh client connection.
+  floors at 1), so the two never collide on the one shared inbox (a combined
+  node used to bind *two* `ProdEnv`s on two distinct ids purely because one
+  inbox was single-consumer, before ADR 0026 let one id host several
+  protocol instances). The client API is a plain TCP server, *not* on the
+  `Network` — a non-leader forwards over a fresh client connection.
 - **`ClusterEdgeState` is scoped to one NODE** (ADR 0031 PR2), created fresh per
   node — even in `--cluster N`, which previously shared one instance across the
   cluster and masked cross-process bugs. Holds this node's own control handle, its
@@ -971,296 +664,108 @@ route below the edge through the same `ClientCtx` CP primitives.
   `--ephemeral` does NOT make the control/raftkv WALs ephemeral (it only selects
   the CP-data `StorageBackend`). Two concurrent `--cluster N` runs contend on the
   same on-disk WALs — always pass a fresh explicit `--dir` for a throwaway run.
-- **The cluster's members are node ids** (ADR 0040 PR1 — before this, "the
-  raftkv ids, not the control ids"; the two are now the same id space) —
-  `bootstrap` (leader-only, idempotent) registers each data-role node's own id
-  as `Active`. Failure detection runs over `ProdEnv`: each node's
-  `heartbeat_loop_live` heartbeats the control group *as its own member id*,
-  so the control leader's `detect_loop` marks a crashed node `Down`.
-  **`heartbeat_loop_live`'s destination list is now live (ADR 0037
-  hardening PR1, PR #134 — closing the ADR 0037 PR4 audit's deferred gap)**: it
-  re-derives the control-group target list from `ctx.control.config()` every
-  tick, instead of the bring-up-time `control_ids` snapshot the older
-  `animus_control::node::heartbeat_loop` was pinned to forever (that function
-  itself, and its `SimEnv` call sites, are unchanged — only `animusd`'s two
-  real-node call sites moved to the new wrapper). A `ControlHandle::Remote`
-  data-only node falls back to the static list until its first live
-  `Status`/`WatchMetadata` reply lands. **Closing this needed a second,
-  previously-undocumented fix the original deferral text never named**:
-  `peer_sync_loop` (`lib.rs`) also merges `Metadata.node_addrs[*].internal`
-  (ADR 0040 PR1 — was `.control`/`.raftkv`, now one field; this loop is also
-  the sole survivor of what used to be a `peer_sync_loop`/
-  `control_peer_sync_loop` pair, collapsed into one loop over one shared env's
-  peer book) into the node's own peer book — without it, a live destination
-  list alone is still inert, since `ProdEnv::send` silently drops a heartbeat
-  aimed at an address-less peer.
-  See `docs/engineering-lessons.md`'s entry on this PR for the
-  two-staleness-axes mini-lesson (a static-destination-list audit must also
-  check the transport address book) and ADR 0037's "Known deferrals" section
-  for the full "Update: closed by PR #134" note.
-- **Online growth (ADR 0030) is data-plane only** — the control group stays static;
-  a grown node's control role is a permanent non-voter and mirrors `Metadata` via
-  `remote_metadata_sync_loop` into `effective_metadata()` — long-polling
-  `ClientRequest::WatchMetadata` (ADR 0035 PR5's mechanism, ported onto this
-  branch too — see the `ControlHandle` section above), not a fixed-200ms
-  `Status` poll. A replicated node
-  address book (ADR 0032 PR1, `Metadata.node_addrs` + `route_sync_loop`) keeps
-  `client_route`/`/admin/peers` live so forwarding reaches nodes grown in later.
+- **The cluster's members are node ids** (ADR 0040 unified the control and
+  raftkv id spaces into one) — `bootstrap` (leader-only, idempotent)
+  registers each data-role node's own id as `Active`. Failure detection
+  runs over `ProdEnv`: each node's `heartbeat_loop_live` heartbeats the
+  control group *as its own member id*, so the control leader's
+  `detect_loop` marks a crashed node `Down`. **`heartbeat_loop_live`'s
+  destination list is live** — it re-derives the control-group target list
+  from `ctx.control.config()` every tick rather than a bring-up-time
+  snapshot (a `ControlHandle::Remote` data-only node falls back to a static
+  list until its first live reply lands); `peer_sync_loop` (`lib.rs`) must
+  independently keep merging `Metadata.node_addrs[*].internal` into the
+  node's own peer book, since a live destination list alone is still inert
+  if `ProdEnv::send` has no address to send to — see the engineering-lessons
+  "two staleness axes" entry (a live-destination-list audit must also check
+  the transport address book).
+- **Online growth (ADR 0030) is data-plane only** — the control group stays
+  static; a grown node's control role is a permanent non-voter and mirrors
+  `Metadata` via `remote_metadata_sync_loop` into `effective_metadata()` —
+  long-polling `ClientRequest::WatchMetadata` (see the `ControlHandle`
+  section above), not a fixed-poll. A replicated node address book
+  (`Metadata.node_addrs` + `route_sync_loop`) keeps `client_route`/
+  `/admin/peers` live so forwarding reaches nodes grown in later.
 - **A node's deployment role rides that same replicated address book**
-  (`NodeAddrs.role: String`, ADR 0035 residual follow-up) — each of
-  `BoundNode::start_with`/`BoundControlNode::start_control_with`/
-  `BoundDataNode::start_data_with` stamps its own literal role
-  (`"combined"`/`"control"`/`"data"`) at its `NodeAddrs` construction site, so
-  `/admin/peers` can report every OTHER node's role straight from
-  `Metadata.node_addrs` instead of the dashboard fanning out to each node's
-  own `/admin/config` just to learn it. `#[serde(default = "combined")]` for
-  WAL back-compat (every pre-ADR-0035 registration was combined-mode).
-- **Decommission (ADR 0032 PR3)** = `drain` + `MetaCommand::RemoveMember`; check
-  leadership *before* any metadata-dependent refusal (a follower's replica lags).
-  Not a fence — a restarted process at the same raftkv id rejoins like a fresh
-  join. **`admin_remove_member`'s control-voter refusal is now dynamic (ADR
-  0037 PR4)**: it reads `self.control.config()` (the live Raft config), not
-  the static `self.admin.control_ids` snapshot ADR 0030/0032 read — a node
-  that *used to be* a control-core voter but has since been control-removed
-  decommissions normally; a node that is still a *live* voter (even one
-  added at runtime, an id the static list never knew about) is still
-  correctly refused, now pointing the operator at the two-phase fix: `animus
-  admin decommission --force-control-remove` (`animus-cli`) checks
-  `GET /admin/control/members` up front and, if the target is a live voter,
-  runs `control-remove` + polls to convergence *before* the ordinary
-  drain → drain-status → remove flow (unchanged) even starts — without the
-  flag it refuses immediately with the same message, before wasting a drain
-  cycle on a target the final step would refuse anyway. Regression:
+  (`NodeAddrs.role: String`, `#[serde(default = "combined")]` for WAL
+  back-compat) — each of `BoundNode::start_with`/`BoundControlNode::
+  start_control_with`/`BoundDataNode::start_data_with` stamps its own
+  literal role (`"combined"`/`"control"`/`"data"`) at its `NodeAddrs`
+  construction site, so `/admin/peers` can report every OTHER node's role
+  straight from `Metadata.node_addrs` instead of the dashboard fanning out
+  to each node's own `/admin/config`.
+- **Decommission (ADR 0032)** = `drain` + `MetaCommand::RemoveMember`; check
+  leadership *before* any metadata-dependent refusal (a follower's replica
+  lags). Not a fence — a restarted process at the same id rejoins like a
+  fresh join. `admin_remove_member`'s control-voter refusal reads
+  `self.control.config()` (the live Raft config, not a static snapshot) —
+  a node that is still a *live* control voter is refused, pointing the
+  operator at `animus admin decommission --force-control-remove`, which
+  checks `GET /admin/control/members` up front and, if the target is a
+  live voter, runs `control-remove` + polls to convergence *before* the
+  ordinary drain → drain-status → remove flow even starts. Regression:
   `tests/decommission.rs::
   decommission_refuses_live_control_voter_then_succeeds_after_control_remove`.
-  See the full `control_ids`/`admin.control_ids` static-vs-live audit in the
-  ADR 0037 PR4 PR description (every other read is a legitimate seed/
-  bootstrap use, left static on purpose).
-- **Self-minted member ids (ADR 0040 Decision B/C, PR4) replace ADR 0036's
-  monotonic allocator entirely** — `AllocateNodeId`, `ALLOC_ID_BASE`, the
-  `next_alloc_id`/`node_id_allocations` ledger, `syskv::EntityKind::
-  NodeIdAlloc`, `generate_join_nonce`, and `check_join_collision` are all
-  **deleted**. A joining node self-mints (`NodeId::mint`, 22-char base64url
-  off `animus_env::prod::PreBindRng` at the pre-bind CLI boundary — the
-  narrow, reusable replacement for `generate_join_nonce`'s old bespoke
-  OS-randomness exception) or proposes an explicit `--id`, then claims it
-  via `MetaCommand::RegisterNode`'s registration CAS
-  (`register_node_over_wire`/`claim_join_identity` in `lib.rs`, reached over
-  the same `ClientRequest::ProposeSchema`/`Status` wire primitives every
-  other join round trip already uses — no new wire type needed) **before
-  ever binding a listener**: a minted collision (astronomically unlikely)
+- **Self-minted member ids (ADR 0040) replace ADR 0036's monotonic
+  allocator entirely.** A joining node self-mints (`NodeId::mint`, off
+  `animus_env::prod::PreBindRng` at the pre-bind CLI boundary) or proposes
+  an explicit `--id`, then claims it via `MetaCommand::RegisterNode`'s
+  registration CAS **before ever binding a listener**: a minted collision
   re-mints and retries; a proposed-id collision fails loudly
-  (`AlreadyExists`, naming the conflict). `is_relayable_command` (below) must
-  allow `RegisterNode` — a joining process has no local control role at all
-  yet, so relaying it is that process's *only* way to reach the real leader.
-  **ADR 0040 PR1 simplification carries forward unchanged**: since a node
-  has exactly one id (no more separate control/raftkv id pair), a
-  self-minted join's id *is* its one identity, full stop — the discovered
-  `original_control_ids` set simply doesn't contain it, which is what makes
-  it a structurally-safe permanent non-voter.
-  **`MetaCommand::RegisterNode` is also the *sole* self-registration
-  mechanism now** — `spawn_common_tail`'s one-shot startup task (every node
-  shape: a fresh bootstrap node, a growth node, or a permanently-non-voter
-  control-only growth node with no other claim path at all) proposes it
-  instead of the old address-only `RegisterNodeAddrs`, which is now
-  **update-only** (rejects an id absent from both `members` and
-  `node_addrs` — nothing to update yet). `RegisterNode`'s own CAS is keyed
-  on `node_addrs` alone (not `members`/`labels` — see its doc in
-  `animus-control` for why an equality check on those would race
-  destructively against `UpsertMember`'s bootstrap insert or
-  `admin_add_member`'s operator-labeled row) and **never claims a `members`
-  row for a control-only registration** (`NodeAddrs.role == "control"`) — a
-  control-only node has no `raftkv` role or storage engine and can never
-  host a tablet, so appearing in `members` at all would make it a placement
-  candidate and silently corrupt tablet placement the moment it's picked
-  (caught by `tests/control_only.rs` going bimodal during this PR — see
-  `docs/engineering-lessons.md`).
-- **Orphan-member auto-reclaim sweep (ADR 0040 PR6)**: the mechanism itself
-  (`Member.has_activated`, `Metadata::orphan_sweep_candidates`, the
-  `RemoveMember` claim-without-member extension, the leader-side volatile
-  `orphan_sweep_loop`) lives entirely in `animus-control` — see that
-  crate's `CLAUDE.md`. This crate's whole contribution is plumbing the
-  `orphan_sweep_after: Duration` knob from a config file/CLI flag down to
+  (`AlreadyExists`). `is_relayable_command` must allow `RegisterNode` — a
+  joining process has no local control role yet, so relaying it is its
+  *only* way to reach the real leader. It **never claims a `members` row
+  for a control-only registration** (`NodeAddrs.role == "control"`) — a
+  control-only node can never host a tablet, so appearing in `members`
+  would make it a placement candidate and silently corrupt tablet
+  placement the moment it's picked (caught by `tests/control_only.rs`
+  going bimodal — see `docs/engineering-lessons.md`).
+- **Orphan-member auto-reclaim sweep (ADR 0040)**: the mechanism itself
+  lives entirely in `animus-control` — see that crate's `CLAUDE.md`. This
+  crate's whole contribution is plumbing the `orphan_sweep_after: Duration`
+  knob from a config/CLI flag (`--orphan-sweep-after SECS`) down to
   `RaftNode::start_with_orphan_sweep_after` — `Duration::ZERO` disables the
-  sweep outright. To avoid a wide, unrelated blast radius (touching the
-  many existing test call sites of `run_node_with`/`run_node_control`/
-  `start_cluster_with_auto_split*`/`start_split_cluster_with`, none of
-  which care about this knob), **every existing public entry point keeps
-  its exact signature**, defaulting internally to
-  `animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER` (10 minutes); a
-  parallel `_with_orphan_sweep_after`-suffixed (or, for the two
-  `start_*cluster*` functions, `_and_orphan_sweep_after`/
-  `_orphan_sweep_after`-suffixed) sibling function takes the explicit
-  `Duration` and is what `main.rs`'s new `--orphan-sweep-after SECS` flag
-  actually calls — mirroring the existing `auto_split_threshold`/
-  `auto_split_bytes_threshold` layered-wrapper convention this file already
-  uses, rather than introducing a `ClusterConfig` struct field (which would
-  have required updating the struct literal at every one of that config's
-  ~20 existing test call sites for one niche knob — a disproportionate
-  sweep for what the CLI flag already covers for every real deployment
-  shape). `run_node_growth`/`run_node_join` (`finish_combined_join`) are
-  deliberately **not** given their own `_with_orphan_sweep_after` variant —
-  a growth/join node always takes the default; wiring the flag through
-  those two entry points as well is future work if ever needed, not
-  required by this PR's scope. Only meaningful on a mode that runs a local
-  control `RaftNode` (every mode except `data`, which has none).
-  `/admin/raft`'s per-member view grew a `has_activated` field alongside
-  the existing `believes_alive` one (same signal the sweep gates on); the
-  Overview dashboard's node-row status text appends "(never activated)"
-  for a `Down` member with `has_activated: false` — the one minimal,
-  non-redesigning dashboard touch this PR makes.
-- **Control-plane membership change (ADR 0037 PR3)**: `ClientCtx::
-  admin_add_control_member`/`admin_remove_control_member` (`lib.rs`, near
-  `admin_add_member`/`admin_remove_member`) grow/shrink the control group's
-  *live* `RaftCore` config at runtime — local-control-leader-only, **not**
-  relayed, **not** in `is_relayable_command` (the underlying primitive is
-  `RaftNode::change_membership`, not a `MetaCommand` proposal, so there is no
-  meaningful "relay" shape for it — only a genuine control-group voter's own
-  in-process handle can call it). `POST /admin/control/member/{add,remove}` +
-  `GET /admin/control/members` in `admin.rs`; `animus admin
-  control-{add,remove,grow}` in `animus-cli`. Add takes an **operator-
-  supplied** id (originally: below `animus_control::meta::ALLOC_ID_BASE`, a
-  numeric range that no longer exists — see the later "Update" notes below
-  for the self-minted omitted-`node` form and ADR 0040 PR4's full retirement
-  of that range) and the new voter's **internal control-Raft** address
-  (distinct from its
-  admin/client/raftkv ports — `animus admin control-add` resolves it from the
-  new node's own `/admin/config` so the operator only ever deals in admin
-  addresses). **The PR3 known scope limit was closed by ADR 0037 PR4, since
-  superseded by ADR 0040 PR1 (below is now historical — see the "Update"
-  paragraph after it for the current mechanism)**: PR3 shipped with the
-  freshly-added voter's address known only via `ProdEnv::merge_peer` called
-  on **whichever node happened to be leader** at add time — a *later* leader
-  (after a subsequent transfer or crash) had no path to independently
-  rediscover it. PR4 added `NodeAddrs.control: Option<SocketAddr>`
-  (`animus-control`'s `meta.rs`, `#[serde(default)]`, `None` for every
-  statically-configured voter) — `admin_add_control_member` proposed it via
-  `RegisterNodeAddrs` (replicated to every voter, same as the
-  `raftkv`/`client`/`admin` axes always were), and every control-role node
-  ran its own `control_peer_sync_loop` (near `peer_sync_loop`/
-  `route_sync_loop`, same `PEER_SYNC_INTERVAL` cadence) to merge
-  `Metadata.node_addrs[*].control` into its own control env via
-  `ControlHandle::merge_control_peer` — so *any* node that might later become
-  leader already knew every runtime-added voter's address, not just the one
-  that added it. `admin_remove_control_member` pruned the field back to
-  `None` on removal. Regression at the time:
-  `tests/control_membership_admin.rs::
-  runtime_added_voter_survives_leadership_change_to_a_different_original_voter`
-  (self-removes the adder to force a transfer to a *different* original
-  voter, then proves a fresh proposal still replicates to the runtime-added
-  voter — this regression test itself is unaffected by the update below,
-  since it exercises the *outcome*, not this mechanism's internals). See
-  `docs/engineering-lessons.md` for the full war story (including a real
-  self-registration/admin-action clobber race the regression test's
-  bring-up had to sequence around).
-
-  **Update (ADR 0040 PR1, one identity per node): `NodeAddrs.control`,
-  `control_peer_sync_loop`, and `ControlHandle::merge_control_peer` are all
-  gone outright**, not merely superseded — the two-id split
-  (`control`/`raftkv`) this whole mechanism existed to bridge no longer
-  exists, so there is no second control-only address left to separately
-  replicate/sync at all. A runtime-added control voter's one `internal`
-  address is either already known (an existing node self-registered via
-  `NodeAddrs.internal` before being promoted) or supplied directly by the
-  admin action, and the single unified `peer_sync_loop` (merging
-  `Metadata.node_addrs[*].internal`, see the gotcha above) is what every
-  node — control, data, or combined — already keeps current. See
-  `animus-env/CLAUDE.md`'s `merge_peer` entry for the primitive that
-  outlived the mechanism above, and ADR 0040's own amendment stanza on ADR
-  0037 for the ADR-level pointer.
-  Remove's original quorum-loss warning (down to 1 voter) was the only
-  implemented trigger — the plan's second trigger ("every other voter
-  believed Down") was originally dropped: pre-ADR-0040,
-  `ControlHandle::believes_alive` was keyed to a distinct **raftkv** id space
-  the control ids didn't share, so calling it with a control id was always
-  `false`, not "unknown" — see the engineering-lessons "id-space mismatch"
-  entry. ADR 0040 PR1 has since dissolved that mismatch structurally (one id
-  per node), but the dedicated signal below remains the more precise one.
-
-  **Update (ADR 0037 hardening PR2, PR #136, the quorum-guard liveness fix): a real
-  survivor-liveness trigger now exists**, via a genuinely control-id-native
-  signal instead of bridging `believes_alive`'s raftkv-keyed one:
-  `RaftCore::peer_last_contact` (`animus-control/src/raft.rs`) tracks, per
-  peer, the `now` of the leader's last `AppendEntriesResp` — success or
-  reject, either proves reachability — in a volatile `last_contact:
-  BTreeMap<NodeId, Nanos>` seeded at `become_leader` and never
-  persisted/snapshotted (same lifetime discipline as `next_index`/
-  `match_index`). `RaftNode::control_peer_believed_alive` (`node.rs`, its
-  own `CONTROL_PEER_LIVENESS_TIMEOUT = 500ms`, deliberately not a reuse of
-  `DETECT_TIMEOUT`) turns that into a bool: always `true` for self, `true`
-  for a peer never yet contacted this leadership stint (grace for a
-  just-added voter), else gated on the timeout.
-  `admin_remove_control_member` now computes `live` = how many of the
-  *resulting* voters (after this removal) pass that check, and refuses if
-  `live` is below a majority of `remaining.len()` — naming the
-  apparently-dead voter(s) and pointing at a new `force: bool` parameter
-  (`POST /admin/control/member/remove {node, force}`, `#[serde(default)]`;
-  CLI: `animus admin control-remove <leader> <id> [--force]`). **`force` is
-  deliberately independent of `decommission --force-control-remove`** — the
-  latter only means "run `control-remove` as part of decommission," never
-  "and skip `control-remove`'s own safety checks"; `run_decommission`'s
-  internal call always passes `force: false`. Removing the node that is
-  itself the dead one needs no `--force` (it's excluded from `remaining` by
-  construction — the guard only ever counts *other* survivors). Regression:
-  `tests/control_membership_admin.rs`'s
-  `removing_a_live_voter_while_another_is_already_dead_is_refused_without_
-  force`/`..._succeeds_with_force`/`removing_the_actually_dead_voter_itself_
-  needs_no_force`/`removing_a_voter_when_every_remaining_voter_is_alive_is_
-  never_refused`, plus a `SimEnv` proof at the `RaftNode` level in
-  `animus-control/tests/control_membership.rs::
-  last_contact_ages_out_a_partitioned_peer_but_not_a_healthy_one`. The
-  core-level `RaftCore::change_membership` still has no survivor-liveness
-  guard by design (unchanged, still a pure single-server-delta mechanism) —
-  the guard lives one layer up, in this crate's admin action, the only layer
-  with a `RaftNode` handle to ask.
-  Removing the current leader's own slot arms a `transfer_leadership` and
-  returns the same not-leader refusal every other case here uses (never a
-  silent success) rather than trying to complete the removal itself once it
-  has stepped down.
-
-  **Update (ADR 0037 hardening trio's PR3, re-based onto ADR 0040 Decision
-  B/C in PR4): `control-add`'s omitted-`node` form now self-mints instead of
-  drawing from an allocator**, closing the original "Coordination with ADR
-  0036" deferral for good (the allocator it once wired in is deleted).
-  `AddControlMemberReq.node` (`admin.rs`) is `Option<NodeId>`
-  (`#[serde(default)]`); `admin_add_control_member`'s signature is `(node:
-  Option<NodeId>, addr, labels) -> Result<NodeId, String>` — `Some(id)` is
-  re-validated via `NodeId::propose` (the old "at/above `ALLOC_ID_BASE`"
-  refusal is **deleted**, no ranges exist anymore); `None` mints via
-  `NodeId::mint(leader.env())` (**not** `animus_env::prod::PreBindRng`'s
-  pre-bind exception — this method runs in-process on a live leader a
-  `SimEnv` test can and does drive, so the `Env`-seam rule applies here with
-  no exception to invoke), re-minting up to `MAX_MINT_ATTEMPTS` times on a
-  (practically unreachable) collision. Either way, if `node` isn't already a
-  live voter: an **existing member** (already self-registered, e.g. a
-  combined node being promoted) just gets its `internal` address updated
-  (`RegisterNodeAddrs`, merged into whatever address book it already
-  published — never blindly replaced with an empty one, which would look
-  like a collision to a *different* node's earlier self-registration); an
-  **unclaimed** id goes through `register_node`'s `RegisterNode` CAS — the
-  old "already exists as a cluster member" refusal is **deleted** too
-  (promoting an existing data-plane member to a control voter is the common
-  case now, not a conflict — ADR 0040 PR1 already unified the id space, so
-  there is no separate control-id range left to collide with). The
-  response's `"node"` is the effective id either way. CLI: `control-add`
-  disambiguates by **arity** (locked decision, no `--auto` flag) —
-  `control-add <leader-admin-addr> <new-node-admin-addr>` (2 args,
-  self-minted, `run_control_add_allocated`) alongside the unchanged
-  `control-add <leader-admin-addr> <node-id> <new-node-admin-addr>` (3 args,
-  operator-supplied, `run_control_add`) — see `animus-cli/CLAUDE.md`'s own
-  entry for why the 2-arg form's single positional is a raw control-Raft
-  address, not an admin address to resolve. Regression:
-  `tests/control_membership_admin.rs::
-  omitted_node_add_mints_an_id_and_converges_to_a_live_voter` +
-  `concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters` (two
-  concurrent omitted-node adds each mint without colliding — a 128-bit mint
-  colliding is astronomically unlikely, and the registration CAS would catch
-  it structurally even if it happened — but their `change_membership` calls
-  race like any other pair; the loser's own minted id is left as an
-  orphaned/abandoned `Down` member, accepted ADR 0040 semantics, while a
-  retried omitted-node call mints a second, distinct id that becomes a
-  voter) + `add_control_member_collision_shapes` (an id that already names an
-  existing data-plane member now *succeeds*, promotion not a conflict).
+  sweep outright; every existing entry point keeps its exact signature,
+  defaulting internally to `animus_control::node::DEFAULT_ORPHAN_SWEEP_
+  AFTER` (10 minutes). Only meaningful on a mode that runs a local control
+  `RaftNode` (every mode except `data`). `/admin/raft`'s per-member view
+  carries a `has_activated` field alongside `believes_alive`; the Overview
+  dashboard appends "(never activated)" for a `Down` member with
+  `has_activated: false`.
+- **Control-plane membership change (ADR 0037)**: `ClientCtx::
+  admin_add_control_member`/`admin_remove_control_member` (`lib.rs`) grow/
+  shrink the control group's *live* `RaftCore` config at runtime — local-
+  control-leader-only, **not** relayed, **not** in `is_relayable_command`
+  (the underlying primitive is `RaftNode::change_membership`, not a
+  `MetaCommand` proposal, so only a genuine control-group voter's own
+  in-process handle can call it). `POST /admin/control/member/{add,remove}`
+  + `GET /admin/control/members`; `animus admin control-{add,remove,grow}`.
+  **Add** takes either an operator-supplied id or, if omitted, self-mints
+  one (`NodeId::mint`); if `node` isn't already a live voter, an existing
+  member gets its `internal` address updated (`RegisterNodeAddrs`), else an
+  unclaimed id goes through `register_node`'s `RegisterNode` CAS — no
+  separate address-replication path is needed since the single unified
+  `peer_sync_loop` (see the gotcha above) already keeps every node current.
+  CLI `control-add` disambiguates by **arity** (2 args = self-minted, 3 args
+  = operator-supplied id) — see `animus-cli/CLAUDE.md`. **Remove** has a
+  genuine survivor-liveness guard: `RaftNode::control_peer_believed_alive`
+  (`animus-control`, `CONTROL_PEER_LIVENESS_TIMEOUT = 500ms`) answers "is
+  this control voter alive" without bridging the raftkv-keyed failure
+  detector; `admin_remove_control_member` refuses if the *resulting* live
+  voter count would fall below a majority, naming the dead voter(s) and
+  pointing at a `force: bool` parameter (`--force`) — deliberately
+  independent of `decommission --force-control-remove`, which only means
+  "run `control-remove` as part of decommission," never "skip its safety
+  checks." The core-level `RaftCore::change_membership` still has no
+  survivor-liveness guard by design — that guard lives one layer up, in
+  this crate's admin action, the only layer with a `RaftNode` handle to
+  ask. Removing the current leader's own slot arms a `transfer_leadership`
+  and returns the same not-leader refusal every other case here uses.
+  Regression: `tests/control_membership_admin.rs`'s full add/remove/force
+  matrix plus a `SimEnv` proof in `animus-control/tests/
+  control_membership.rs`. See ADR 0037 (and ADR 0040's amendment on it) for
+  the full design, and `docs/engineering-lessons.md` for the id-space-
+  mismatch and self-registration/admin-action-clobber war stories.
 - **The CP group is durable by default** — one shared `LsmEngine` over the node's
   one internal env (ADR 0040 PR1), cloned into every tablet's `RaftKvNode`; acked
   writes survive restart. Files use a flat filename prefix (`LSM_PREFIX = "db-"`),
@@ -1296,210 +801,20 @@ route below the edge through the same `ClientCtx` CP primitives.
 
 ## Tests
 
-`cargo test -p animusd` — all tests are real-socket `ProdEnv` integration tests
-that poll with timeouts, not deterministic assertions. The restart tests run both
-incarnations in the same runtime, calling `Node::shutdown()` between them. Two
-in-crate `#[cfg(test)] mod`s (`split_fence_tests`, `auto_split_median_tests`) live
-in `lib.rs` because they need private handles. The ADR 0040 PR6 orphan-member
-sweep has **no dedicated test file here** — its mechanism is entirely
-`animus-control`'s (see that crate's `tests/orphan_sweep.rs`, the seeded
-`SimEnv` fault-injection suite), mirroring how the ADR 0012 failure detector
-it's patterned on is likewise tested there and not duplicated in this crate
-beyond the general `self_heal.rs` smoke test; this crate's own contribution
-(the config/CLI knob) is exercised implicitly by every existing test that
-starts a node through the now-defaulted `run_node_with`/`run_node_control`/
-`start_cluster_*` entry points.
+`cargo test -p animusd` — all tests are real-socket `ProdEnv` integration
+tests that poll with timeouts, not deterministic assertions (this crate has
+no `SimEnv` — it is the assembly/wire layer over the two sim-tested crates
+below it). The restart tests run both incarnations in the same runtime,
+calling `Node::shutdown()` between them. Two in-crate `#[cfg(test)] mod`s
+(`split_fence_tests`, `auto_split_median_tests`) live in `lib.rs` itself
+because they need private handles (a raw `CpGroup`/the private
+`byte_weighted_median` helper) that no external `tests/` file can reach.
 
-Test-file map (`tests/`):
-
-- `cluster.rs` / `per_process.rs` — in-process cluster / independently-started
-  nodes from a shared config.
-- `cluster_split.rs` — in-process split deployment (`start_split_cluster_with`):
-  `in_process_split_cluster_serves_writes_and_reports_roles`,
-  `fixed_control_node_write_read_is_deterministic` (20 keys through one fixed
-  control node, no round-robin), `single_shot_first_write_through_control_node_
-  succeeds` (the PR #106 election-wait regression).
-- `control_only.rs` — bare control-only cluster + schema DDL relay + a mixed
-  cluster (ADR 0035 PR3).
-- `data_only.rs` — genuine split cluster, 3 control-only + 2 data-only (PR4).
-- `data_join.rs` — `animusd data --seed` joining a split cluster (PR5).
-- `watch_metadata.rs` — the `WatchMetadata` long-poll wire primitive (ADR 0035
-  PR5) and, since ADR 0038 PR5, its incremental `MetadataDelta` reply: a
-  fresh cluster's wake-on-commit reply is specifically asserted to be a
-  `MetadataDelta` (not a full `Status`), and a real control-only process
-  restart resets that node's ring, forcing a pre-restart watcher's
-  `last_seen` to correctly fall back to a full `Status` while a caught-up
-  watcher still gets the cheap trivial delta.
-- `split_cluster.rs` — genuine multi-process split deployment scenarios: control
-  failover, split+merge, failure repair, decommission, full restart (PR6).
-- `cluster_growth.rs` — 3→5 online growth without restarting the original 3.
-- `tablet_rf_self_heals.rs` — regression for the placement-policy fix above:
-  provisions a table on a genuinely 2-node cluster (so the tablet's *initial*
-  replica set is structurally sized 2, no timing race needed), grows to 3
-  nodes, and asserts the tablet's replica set grows to 3 — only possible if
-  `provision_tablet` recorded the policy's RF as the target
-  (`MAX_REPLICATION_FACTOR`) rather than the initial observed replica count.
-- `seed_join.rs` — combined-mode seed/join with an explicit `--id` (happy/
-  collision/rejoin — the collision case now asserts `AlreadyExists` from
-  `claim_join_identity`'s loud proposed-id-collision failure, ADR 0040 PR4).
-- `seed_join_allocated.rs` (ADR 0040 PR4, superseding the ADR 0036 name/
-  contents) — the self-minted-id counterpart: happy path, two concurrent
-  minted joins get distinct ids (both become `Active`), the data-only dual,
-  the ephemeral-identity restart semantics (a fresh join after the old
-  process goes away mints a *new* id; the old one settles `Down` and is
-  prunable via `RemoveMember` — the crash-mid-join orphan shape), and the
-  `is_relayable_command` regression for `RegisterNode` through a
-  follower-connected seed.
-- `decommission.rs` — full drain → remove flow + refusal shapes.
-- `control_membership_admin.rs` — control-plane membership-change admin API
-  (ADR 0037 PR3): grow a control voter end to end (quiet non-voter →
-  `POST /admin/control/member/add` → converges everywhere incl. a data-only
-  node's `Remote` mirror); add collision shapes (existing voter is
-  idempotent; existing data-plane member now *succeeds*, a promotion, ADR
-  0040 PR4); remove's full
-  refusal/warning matrix (idempotent unknown-node no-op, non-leader voter
-  removes cleanly, leader self-removal arms a transfer and refuses rather
-  than silently completing, down-to-1-voter warns, down-to-0 is refused);
-  both mutating actions refuse on a follower (not relayable); a runtime-added
-  voter survives a leadership change to a different original voter (PR4);
-  plus a PR5 addition — two concurrent `control/member/add` calls race
-  cleanly (loser gets a retryable `409`, its retry succeeds once the winner
-  commits). **The hardening trio's PR2 (quorum-guard liveness fix) replaced
-  the original PR5 §9 test that documented "removing a live voter while
-  another is already dead succeeds with no warning" as an *accepted* risk**:
-  the liveness-aware guard now refuses that removal outright
-  (`removing_a_live_voter_while_another_is_already_dead_is_refused_without_
-  force`), with a `--force` sibling proving the same operationally-risky
-  removal (and its stranding consequence) is still reachable as an explicit
-  escape hatch (`..._succeeds_with_force`), plus the dead-voter-removes-
-  itself-needs-no-force and every-remaining-voter-alive-is-never-refused
-  cases — see `animusd/CLAUDE.md`'s "Control-plane membership change" gotcha
-  for the mechanism.
-- `control_membership_split.rs` (ADR 0037 PR5) — the `split_cluster.rs`-style
-  multi-process scenario: over a genuine split deployment (control-only +
-  data-only processes), grow the control quorum by one at runtime, then
-  replace an ORIGINAL voter (kill it for good, remove it, add a fresh
-  replacement) via the real admin HTTP surface, with continuous data-plane
-  writes spanning the whole scenario — proving runtime control-plane
-  membership change composes with a real split deployment, not just the
-  single-action coverage in `control_membership_admin.rs`.
-- `cp_plane.rs` — CP round-trip (write one node, read another) + write latency.
-- `cp_cross_process.rs` — cross-process forwarding to the leader's node.
-- `cp_reconfigure.rs` — failure detection, group-follows-replica-set, auto-repair.
-- `cp_rebalance.rs` / `cp_rebalance_gc.rs` — healthy rebalance + removed-replica GC
-  (release, erase-bound, split-then-release).
-- `drop_table_gc.rs` — drop-table `Reclaim` (incl. the relay bimodal case).
-- `drop_table_index_cascade.rs` (ADR 0041 §5) — the GSI drop cascade: create a
-  table with a GSI, write items, wait for the drain to provision + materialize
-  the hidden table (`await_row_count`, the same converged-or-timeout idiom
-  `dynamo_gsi_drain.rs` uses), drop the base table via the admin sink, then
-  poll that **both** the base table's and the hidden index table's tablets
-  leave the replicated map and that every tablet's WAL file is reclaimed on
-  disk — verified to fail without the cascade fix by running it against the
-  pre-fix `drop_table` (only the base table's tablet ever disappeared).
-- `tablet_merge.rs` — end-to-end split → merge → read through the survivor.
-- `batch_write.rs` — `cp_batch_write` / `PutBatch` forwarding.
-- `durable_restart.rs` — write survives restart on LSM, lost on `--ephemeral`
-  (data plane).
-- `control_mirror_restart.rs` (ADR 0038) — a control-only node's real process
-  restart over its **dedicated** system-keyspace engine: membership
-  (original PR2/PR3 test) and, since PR4, the fuller schema-catalog +
-  tablet-map shape too, both via the restarted node's own `metadata()` and an
-  independently-reopened `LsmEngine` handle.
-- `control_metadata_restart.rs` (ADR 0038 PR4) — rounds out the control-plane
-  restart matrix: a **combined** node's restart recovers the schema catalog +
-  members + tablet map via the exact same physical **shared** CP-data engine
-  a hosted tablet's own data lives on; an **`--ephemeral`** control-only
-  restart on a *fresh* directory does not inherit the previous incarnation's
-  `Metadata` and re-bootstraps cleanly (see the engineering-lessons entry on
-  why a same-dir `--ephemeral` restart is a different, not equivalent, claim
-  — the control Raft's own WAL is real disk regardless of engine backend).
-- `self_heal.rs` — concurrent-load smoke test (no deadlock).
-- `dynamo_wire.rs` / `dynamo_extended.rs` / `dynamo_documents.rs` /
-  `dynamo_indexes.rs` / `dynamo_schema.rs` — the DynamoDB edge (wire round-trip,
-  conditional writes, document paths, GSI/LSI, replicated+restart-surviving
-  schema/index). Since ADR 0041 §5 (the native index read path), every GSI
-  query assertion in these files is a **converged-or-timeout poll**
-  (`await_gsi_query`, each file's own copy) — a GSI is eventually consistent
-  by DynamoDB's own contract, materialized asynchronously by the drain; an
-  LSI query stays a plain immediate assertion (written atomically with the
-  base row).
-- `dynamo_gsi_drain.rs` (ADR 0041 §4) — the GSI drain end to end: materialize
-  + prune a GSI's hidden-table rows through plain client-protocol scans
-  (`row_count`/`await_row_count`), then (§5) the acceptance the whole
-  mechanism exists for — a real DynamoDB `Query` against the drained index
-  returns the expected items, including after a delete prunes one away
-  (`await_gsi_query`).
-- `kind_scan.rs` (ADR 0041 §5) — the LSI `Query` native read path: the
-  identical query issued through every node of a 3-node cluster in turn
-  (the house pattern for a forwarded-command bimodal flake, mirroring
-  `dynamo_txn.rs`), proving the new internal-only `ClientRequest::KindScan`
-  forwards correctly when the receiving node isn't the base tablet's leader;
-  plus a bare (non-`Forwarded`) `KindScan` refusal over the plain client
-  protocol, mirroring `KindWrite`'s identical contract.
-- `dynamo_consistent_read.rs` (ADR 0041 §5) — `ConsistentRead` fidelity end to
-  end: `true` against a GSI `Query` is a `ValidationException` (after waiting
-  for the GSI to actually converge, so the rejection is proven not to be an
-  accident of an as-yet-empty hidden table); `true` against the same table's
-  LSI `Query`, its base `Query`, and a base `GetItem` are all accepted
-  (accept-and-ignore, since every one of those reads is already
-  linearizable here).
-- `dynamo_index_scan.rs` (ADR 0041 §5) — `Scan` with `IndexName` end to end,
-  the last functional gap in the secondary-index stack: a GSI `Scan`'s
-  `LastEvaluatedKey` pagination walk drains every row exactly once
-  (converged-or-timeout first); `ConsistentRead: true` rejected against a GSI
-  `Scan` and accepted against the base table's/an LSI's; an LSI `Scan`
-  returns exactly the requested index's rows with no leakage from a sibling
-  LSI's interleaved rows or duplication across partitions, issued through
-  every node of the cluster in turn (proving `cp_scan_kind_table`'s forwarded
-  `KindScan` path per tablet); a `FilterExpression` over LSI-scanned rows,
-  unpaginated and walked across pages.
-- `dynamo_txn.rs` (ADR 0018 §2/PR7) — atomic `TransactWriteItems`/
-  `TransactGetItems` over a genuine multi-process, pre-split-table cluster:
-  cross-tablet atomic visibility through a follower-connected client, a
-  failing `ConditionCheck` cancelling the whole transaction (the old
-  serial-loop implementation's exact counter-example), `TransactGetItems`
-  never observing a torn pair under a concurrent writer, same-node
-  concurrent transactions racing a shared conditioned key resolving to one
-  winner, and `/admin/txns` showing a pending record during a simulated
-  coordinator stall (driven via the internal `TxnPrepare` wire request
-  directly, mirroring `cp_txn.rs`) then clearing once recovery decides it.
-  **Since the ADR 0018 §2 2026-08-12 follow-up amendment**:
-  `cross_node_racing_own_key_conditional_writes_resolve_exactly_one_winner`
-  — the test the PR7 amendment's own limitation made impossible to write —
-  two clients issuing through **different** nodes' Dynamo listeners race a
-  `Put` with an own-key condition on the same key; exactly one commits, the
-  loser gets a genuine `TransactionCanceledException`, proving the OCC is
-  now cross-node, not merely same-node (the pre-existing
-  `concurrent_transact_write_items_on_a_shared_key_resolve_one_winner`
-  above stays green, unchanged — same-node races were always correctly
-  serialized); `own_key_condition_failure_cancels_a_multi_tablet_
-  transaction_wholly` — an own-key condition failing on one tablet leaves
-  no partial state on the other; `own_key_condition_completes_quickly_
-  with_no_recovery_grace_stall` — the PR7 stall-bug's exact shape (a
-  condition on a write's own key) now completes in well under
-  `RECOVERY_GRACE`, proving that regression stays dead.
-- `cql_wire.rs` / `cql_clustering.rs` / `cql_durable_schema.rs` — the CQL edge
-  (typed round-trip, compound keys, durable replicated schema).
-- `admin_endpoint.rs` — admin views + gated actions + data writes + bulk seed.
-- `system_table.rs` (plan-syskv-ui, an ADR 0038 addendum) — `GET
-  /admin/system-table` end to end: seeds every `EntityKind` via the client
-  protocol (a plain `Put` auto-provisions a `Tablet`+bumps its `Counter`,
-  `ProposeSchema` reaches `Schema`/`Policy`/`Keyspace`/the legacy
-  `CpMemberAddr`, a real split+merge produces a `Merged` marker; `Member`/
-  `NodeAddrs` come from the bootstrapped node's own self-registration — ADR
-  0040 PR4 retired the ADR 0036 allocator's dedicated `NodeIdAlloc` kind
-  along with the allocator itself) and asserts every kind's exact
-  value shape, the `kind` filter, and an unrecognized-kind 400; a separate
-  test seeds many `tablet` rows and diffs a small-`limit` forward-only
-  pager walk against one unlimited scan for gaplessness/no-duplicates.
-  `control_only.rs`/`data_only.rs` cover the available-`true`-with-rows /
-  available-`false` shapes on genuine control-only and data-only processes;
-  `dashboard_endpoint.rs` covers the served asset/markup check.
-- `dashboard_endpoint.rs` — SPA serve + CORS + deep links + peers + role gating.
-- `metrics_endpoint.rs` — `GET /metrics` (leader-only counters per node).
-- `otel_tracing.rs` — OTLP span export (decodes the protobuf payload).
-- `schema_ddl_relay.rs` — schema DDL relay through a follower-connected node.
-- `frame_cap.rs` — client-protocol frame-size cap.
-- `support/mod.rs` — shared bring-up helpers (`#![allow(dead_code)]`;
-  `restart_same_addrs`, `bring_up_split`, port-TOCTOU retries).
+One binary per behavior; the file names describe them (`ls
+crates/animusd/tests/`) — covering combined/control-only/data-only/split
+deployment shapes and growth/decommission, control-plane and CP-data-plane
+membership change, the DynamoDB/CQL/admin/dashboard wire edges (including
+the ADR 0041 secondary-index and ADR 0018 transaction suites), restart/
+durability across every deployment shape, and the `WatchMetadata`/
+system-table/OTel/metrics support surfaces. `support/mod.rs` holds the
+shared bring-up helpers (port-TOCTOU retries, split-cluster bring-up).

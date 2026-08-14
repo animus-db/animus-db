@@ -14,102 +14,66 @@ per-tablet CP data plane (`animus-cp-data`).
 
 ## Entry points
 
-- **`lib.rs`** — the public surface. Re-exports `SharedWal`, `RaftCore`,
-  `RaftNode`, `Metadata`/`MetaCommand`, the schema types, `FailureDetector`,
-  and `animus_placement::PlacementPolicy` (so a downstream assembler can
-  `SetTabletPolicy` without a direct `animus-placement` dependency — the policy
-  is part of this plane's public metadata surface).
+- **`lib.rs`** — the public surface: re-exports the core types (`SharedWal`,
+  `RaftCore`, `RaftNode`, `Metadata`/`MetaCommand`, the schema types,
+  `FailureDetector`) plus `animus_placement::PlacementPolicy` (so a downstream
+  assembler can `SetTabletPolicy` without a direct `animus-placement`
+  dependency — the policy is part of this plane's public metadata surface).
 
 - **`meta.rs`** — the `Metadata` state machine and its command enum.
   `Metadata::apply` is the deterministic state machine; `Metadata::reconcile`
   and `Metadata::rebalance` are the *pure* placement decisions (see Invariants).
   `Metadata` holds members, the tablet map, placement policies, the table-schema
   catalog, keyspaces, `node_addrs` (member id → full `NodeAddrs { internal,
-  client, admin, role }`, ADR 0032 PR1) and the legacy
-  `cp_member_addrs` (kept for WAL back-compat). **ADR 0040 PR1** merged the
-  pre-existing `raftkv`/`control` address pair into one `internal` field —
-  one identity per node, one internal env, means there is only one address
-  to replicate per node now; the old `control: Option<SocketAddr>` field
-  (ADR 0037 PR4, populated only for a control voter added at runtime, since
-  that address had no other replication path) is gone too — a runtime-added
-  voter's `internal` address is either already registered by its own
-  ordinary self-registration, or supplied directly by the admin action, so
-  there is no more separate gap to close there. `NodeAddrs.role: String` (ADR
-  0035 residual follow-up, `#[serde(default = "combined")]` for WAL
-  back-compat) is a member's own deployment role (`"control"`/`"data"`/
-  `"combined"`) — a plain string, not an `animusd`-side enum, since this
-  crate has no dependency on `animusd` and every other field here is already
-  an opaque wire-format string this crate never interprets. A node only ever
-  authoritatively knows its own role, so it is stamped once at
-  self-registration time like the other fields; `animusd`'s
-  `/admin/peers` reads every *other* node's role straight off this field
-  instead of fanning out to each node's own `/admin/config`.
-  `PlacementView` is the narrow (members + tablets + policies, no
-  schema) clone that `RaftCore::placement_view()` hands the driver loops so they
-  evaluate off the core lock instead of cloning the whole `Metadata` every tick.
-  `MetaCommand` variants (all applied in log order):
-  - `NoOp` — the election no-op a fresh leader commits.
-  - `UpsertMember` — insert/update a member (labels + status).
-  - `CreateTablet` / `CasTabletReplicas` — create a tablet; CAS its replica set
-    (applies only if the epoch matches, then bumps it).
-  - `SplitTablet` (ADR 0028) — the *entire* split: epoch-CAS gated, narrows the
-    source range and mints a new sibling over the same node-shared engine. No
-    data-plane half, no possible orphan.
-  - `MergeTablets` (ADR 0033) — split's dual: epoch-CAS gated on *both* sides,
-    rejects a cross-table merge, widens `left` to absorb `right`, and records
-    `right` in `merged_tablets`.
-  - `SetTabletPolicy` — set/clear a tablet's placement policy.
-  - `CreateTableSchema` / `DropTableSchema` / `ReplaceTableSchema` — register /
-    drop / atomically replace a table's schema (ADR 0013; `ReplaceTableSchema`
-    is the atomic `ALTER TABLE … ADD`, no drop-then-recreate window).
-  - `DropTableTablets` (ADR 0024) — remove every tablet scoped to a table + its
-    policies in one apply (the metadata half of drop-table GC; `NoOp` if none).
-  - `CreateTableIndex` / `DropTableIndex` — create/drop a secondary-index
-    *definition* (ADR 0013).
-  - `SetTableMode` — set a table's serving mode.
-  - `CreateKeyspace` / `DropKeyspace` — keyspace lifecycle.
-  - `RegisterNodeAddrs` (ADR 0032 PR1) — **update-only since ADR 0040 PR4**:
-    idempotent register/overwrite of an *already-claimed* member's full
-    `NodeAddrs` — rejects outright if `node` is absent from both `members`
-    and `node_addrs` (nothing to update yet; see `RegisterNode` below, the
-    sole path that creates a fresh claim).
-  - `RegisterCpAddr` — the predecessor of `RegisterNodeAddrs`, carrying an
-    optional `tablet` association (ADR 0024 GC). **Kept for WAL back-compat
-    only — no longer proposed by `animusd`'s startup path.**
-  - `RemoveMember` (ADR 0032 PR3 decommission) — prune a member from `members`
-    plus its address entries; gated at apply on the member being absent
-    already (idempotent), `Leaving`/`Down` (never `Active`/`Joining`), and
-    unreferenced by any tablet (`Metadata::tablets_referencing`, also the
-    drain-complete predicate `/admin/member/drain-status` reports).
-    **ADR 0040 PR6 extension**: when `node` has no `members` row at all, this
-    no longer treats it as a bare no-op — it prunes an orphaned
-    **claim-without-member** `node_addrs` entry too (the shape a
-    control-role `RegisterNode` produces, by design), so this command is a
-    complete removal for every claim shape `RegisterNode` can leave behind,
-    not just the data-plane one. This is what the orphan-member sweep
-    (below) proposes once a claim has gone unactivated past
-    `orphan_sweep_after`.
-  - `RegisterNode` (ADR 0040 Decision C, PR4) — the **sole claim path** for a
-    fresh node identity, retiring ADR 0036's `AllocateNodeId` monotonic
-    allocator entirely (and the one-PR `alloc_node_id`/`parse_alloc_id`/
-    `ALLOC_ID_BASE` string-mint shim PR3 shipped in its place). `node` may be
-    self-minted (`NodeId::mint`) or operator-/config-proposed
-    (`NodeId::propose`) — this command treats both identically. The CAS key
-    is **`Metadata::node_addrs` alone, not `members`**: an id absent from
-    `node_addrs` claims the address slot (inserting a `Down` `Member` with
-    `labels` too, but *only* if `members` doesn't already have an entry —
-    membership can be independently pre-established by `UpsertMember`'s
-    bootstrap insert or `admin_add_member`'s operator-labeled row, both of
-    which carry no address for this apply to compare against); a
-    byte-identical re-registration is `NoOp` (the idempotent-retry and ADR
-    0032 rejoin cases); a *different* `NodeAddrs` already on file is
-    `Rejected` — the real collision. See `MetaCommand::RegisterNode`'s own
-    doc for why keying on `node_addrs` rather than the full
-    `NodeAddrs`+`labels` pair is load-bearing, not an oversight (a
-    labels-inclusive CAS breaks the moment two *independent* commands can
-    each partially establish the same identity, which several call sites in
-    `animusd` do) — and `docs/engineering-lessons.md`'s entry for the
-    integration-test failure that caught the naive design.
+  client, admin, role }`, ADR 0032 PR1) and the legacy `cp_member_addrs` (kept
+  for WAL back-compat). ADR 0040 PR1 merged the pre-existing `raftkv`/`control`
+  address pair into one `internal` field — one identity per node, one internal
+  env, one address to replicate per node. `NodeAddrs.role: String` (ADR 0035
+  residual follow-up, `#[serde(default = "combined")]` for WAL back-compat) is
+  a member's own deployment role (`"control"`/`"data"`/`"combined"`) — a plain
+  string, not an `animusd`-side enum, since this crate has no dependency on
+  `animusd`; a node only ever authoritatively knows its own role, so it is
+  stamped once at self-registration time; `animusd`'s `/admin/peers` reads
+  every *other* node's role straight off this field instead of fanning out to
+  each node's own `/admin/config`. `PlacementView` is the narrow (members +
+  tablets + policies, no schema) clone that `RaftCore::placement_view()` hands
+  the driver loops so they evaluate off the core lock instead of cloning the
+  whole `Metadata` every tick.
+
+  `MetaCommand` variants (all applied in log order, see the enum's own doc
+  comments for the exact per-variant contract): membership (`NoOp`,
+  `UpsertMember`, `RemoveMember` — ADR 0032 decommission, gated on the
+  member being absent already, `Leaving`/`Down`, and unreferenced by any
+  tablet; extended by ADR 0040 to also prune an orphaned
+  claim-without-member `node_addrs` entry, the shape the orphan-member sweep
+  below proposes); tablets (`CreateTablet`/`CasTabletReplicas`, epoch-CAS;
+  `SplitTablet`/`MergeTablets` — ADR 0028/0033, each the *entire* split/merge,
+  epoch-CAS gated, no data-plane half; `SetTabletPolicy`); schema/keyspace
+  (`Create/Drop/ReplaceTableSchema` — ADR 0013; `DropTableTablets` — ADR 0024
+  GC; `Create/DropTableIndex`; `SetTableMode`; `Create/DropKeyspace`);
+  addressing (`RegisterNodeAddrs` — update-only since ADR 0040, rejects if
+  `node` is absent from both `members` and `node_addrs`; `RegisterCpAddr` —
+  the predecessor, kept for WAL back-compat only); and `RegisterNode` (ADR
+  0040 Decision C), below.
+
+  **`RegisterNode` is the sole claim path for a fresh node identity**,
+  retiring ADR 0036's `AllocateNodeId` monotonic allocator entirely. `node`
+  may be self-minted (`NodeId::mint`) or operator-/config-proposed
+  (`NodeId::propose`) — treated identically. **The CAS key is
+  `Metadata::node_addrs` alone, not `members`**: an id absent from
+  `node_addrs` claims the address slot (inserting a `Down` `Member` too, but
+  *only* if `members` doesn't already have an entry — membership can be
+  independently pre-established by `UpsertMember`'s bootstrap insert or
+  `admin_add_member`'s operator-labeled row); a byte-identical
+  re-registration is `NoOp` (idempotent retry / ADR 0032 rejoin); a
+  *different* `NodeAddrs` already on file is `Rejected` — the real
+  collision. **Keying on `node_addrs` rather than the full
+  `NodeAddrs`+`labels` pair is load-bearing, not an oversight**: a
+  labels-inclusive CAS breaks the moment two *independent* commands can each
+  partially establish the same identity, which several call sites in
+  `animusd` do — see `MetaCommand::RegisterNode`'s own doc and
+  `docs/engineering-lessons.md`'s entry for the integration-test failure
+  that caught the naive design.
 
   `Member.has_activated: bool` (ADR 0040 PR6, `#[serde(default)]`) is
   **sticky**: `Metadata::apply`'s `UpsertMember` arm sets it the moment a
@@ -159,71 +123,45 @@ per-tablet CP data plane (`animus-cp-data`).
   `start_with_metrics` lets a sim test supply the sink. Read-only state
   accessors (`role`/`term`/`leader`/`is_leader`/`commit_index`/`last_applied`/
   `durable_index`/`snapshot_index`/`log_len`/`last_log_index`/`config`) back the
-  `animusd` admin interface (ADR 0020). **`change_membership`/
-  `transfer_leadership`** (ADR 0037 PR1, `tests/control_membership.rs`) are
-  thin wrappers over the identical-shaped `RaftCore` methods `animus-cp-data`
-  already drives for a per-tablet group — the control plane's *own* Raft
-  group can now grow/shrink/replace a voter one server at a time, recorded
-  under their own `ControlReconfigureAccepted`/`Rejected` metric family
-  (kept separate from cp-data's per-tablet `CpReconfigureAccepted`/
-  `Rejected`). Unlike cp-data's `propose_and_wake`, there is no propose-side
-  wake seam here — `RaftNode`'s plain `propose` has never had one either, so
-  a control-plane proposal (including a membership change) is always
-  serviced on the driver's next heartbeat tick; no seam was added to keep
-  this PR a pure thin-wrapper addition. **PR3 adds the admin/CLI surface**
-  (`animusd`'s `admin_add_control_member`/`admin_remove_control_member` +
-  `POST /admin/control/member/{add,remove}` + `animus admin
+  `animusd` admin interface (ADR 0020). `metadata_watch() -> MetadataWatch`
+  (ADR 0031) is the executor-agnostic "applied index advanced" notification
+  the per-node CP reconciler uses to react to a `Metadata` change without
+  polling.
+
+  **Runtime control-group membership change (ADR 0037).**
+  `change_membership`/`transfer_leadership` are thin wrappers over the
+  identical-shaped `RaftCore` methods `animus-cp-data` already drives for a
+  per-tablet group — the control plane's *own* Raft group can grow/shrink/
+  replace a voter one server at a time, recorded under their own
+  `ControlReconfigureAccepted`/`Rejected` metric family (kept separate from
+  cp-data's per-tablet ones). Unlike cp-data's `propose_and_wake`, there is
+  no propose-side wake seam here — a proposal is always serviced on the
+  driver's next heartbeat tick. The admin/CLI surface lives in `animusd`
+  (`admin_add_control_member`/`admin_remove_control_member`,
+  `POST /admin/control/member/{add,remove}`, `animus admin
   control-{add,remove,grow}` — see that crate's `CLAUDE.md`); this crate's
-  own tests stay core-level only. **PR4 closes PR3's address-replication gap
-  and the static-vs-live `control_ids` audit** — the address-replication half
-  was `NodeAddrs.control` + `animusd`'s `control_peer_sync_loop` (both since
-  superseded by ADR 0040 PR1's `internal` merge and single `peer_sync_loop`
-  — see that ADR); `admin_remove_member`'s control-voter refusal moving to
-  `self.control.config()` (the live Raft config) instead of a static
-  original-members list is unaffected — see `animusd`'s `CLAUDE.md` for
-  both. `metadata_watch() -> MetadataWatch` (ADR
-  0031) is the executor-agnostic "applied index advanced" notification the
-  per-node CP reconciler uses to react to a `Metadata` change without polling.
+  own tests stay core/driver-level only.
 
-  **ADR 0037 hardening PR2 (PR #136, the quorum-guard liveness fix) adds a genuinely
-  control-id-native liveness signal**, closing the gap PR3's own doc and
-  `docs/engineering-lessons.md`'s "id-space mismatch" entry flagged:
-  `ControlHandle::believes_alive` is keyed to **raftkv** ids (the failure
-  detector only ever observes heartbeats on the data role, ADR 0012), so it
-  can't answer "is this control voter alive" — calling it with a control id
-  is always `false`, not "unknown". Rather than bridging that id space, this
-  reads a fact the leader's own control-Raft traffic already carries:
-  `RaftCore::peer_last_contact(node) -> Option<Nanos>` (`raft.rs`) is the
-  `now` of the last `AppendEntriesResp` (success **or** reject — either
-  proves reachability) from `node`, backed by a volatile `last_contact:
-  BTreeMap<NodeId, Nanos>` seeded for every peer in `become_leader` and
-  stamped in `handle_append_resp` — deliberately **never persisted or
-  snapshotted**, exactly like `next_index`/`match_index` (meaningless across
-  a leadership change, rebuilt empty on recovery; a freshly-added peer via
-  `change_membership` gets no explicit entry either, relying on the read
-  side's "never contacted yet ⇒ alive" grace rather than an explicit write
-  at peer-add time — see the field's own doc for why). `RaftNode::
-  control_peer_believed_alive(node) -> bool` (`node.rs`) turns the raw fact
-  into policy: always `true` for self; `true` if `node` has never been
-  contacted this leadership stint (grace for a just-added voter, or any peer
-  right after this node won an election); otherwise gated on its own
-  `CONTROL_PEER_LIVENESS_TIMEOUT = 500ms` (deliberately **not** a reuse of
-  `DETECT_TIMEOUT`: ADR 0040 PR1 has since put both signals in the *same* id
-  space — a node has exactly one id now — but they still answer different
-  questions, general network reachability (ADR 0012's heartbeat detector)
-  versus control-Raft-traffic reachability specifically, so sharing one
-  timeout constant would conflate two independently-tunable signals rather
-  than reflect that they now happen to key on the same space).
-  `animusd`'s `admin_remove_control_member` is the consumer — see that
-  crate's `CLAUDE.md`. Regression: `tests/control_membership.rs::
-  last_contact_ages_out_a_partitioned_peer_but_not_a_healthy_one` (a
-  `SimEnv` proof at the `RaftNode` level, mirroring `pre_vote.rs`'s
-  partition idiom) — this crate's own tests stay core/driver-level only,
-  same discipline as PR1/PR3.
+  **Control-id-native liveness signal.** `ControlHandle::believes_alive` is
+  keyed to **raftkv** ids (the failure detector only observes heartbeats on
+  the data role, ADR 0012), so it can't answer "is this control voter
+  alive." Instead, `RaftCore::peer_last_contact(node) -> Option<Nanos>`
+  (`raft.rs`) is the `now` of the last `AppendEntriesResp` (success **or**
+  reject — either proves reachability), backed by a volatile map seeded per
+  peer in `become_leader` — deliberately **never persisted or snapshotted**,
+  like `next_index`/`match_index`. `RaftNode::control_peer_believed_alive`
+  turns that into policy: always `true` for self or a peer never yet
+  contacted this leadership stint (grace for a just-added voter), else
+  gated on `CONTROL_PEER_LIVENESS_TIMEOUT = 500ms` (a separate constant
+  from ADR 0012's `DETECT_TIMEOUT` — general network reachability and
+  control-Raft-traffic reachability are independently tunable questions).
+  `animusd`'s `admin_remove_control_member` is the consumer. Regression:
+  `tests/control_membership.rs::
+  last_contact_ages_out_a_partitioned_peer_but_not_a_healthy_one`.
 
-  **ADR 0038 PR3 (the cutover): `Metadata` is `DRIVER_APPLIED`, so `RaftNode`'s
-  single driver is now split into a consensus loop and an async apply task**,
-  mirroring `animus-cp-data`'s proven shape exactly:
+  **`Metadata` is `DRIVER_APPLIED` (ADR 0038): the driver is split into a
+  consensus loop and an async apply task**, mirroring `animus-cp-data`'s
+  proven shape exactly:
   - `drive()` (the **consensus loop**) recovers from the WAL, spawns the apply
     task, then only persists (`persist_wal`), steps the core, and ships
     outbound messages — **no engine I/O**, so it always services
@@ -233,251 +171,166 @@ per-tablet CP data plane (`animus-cp-data`).
   - `meta_apply_loop`/`meta_apply_and_compact` (the **apply task**, spawned by
     `drive` right after WAL recovery) owns the *only* mutable `Metadata`
     (a private `shadow`, never shared with the core). It rebuilds `shadow`
-    from the engine (`mirror::rebuild_metadata_from_engine`) and seeds its
+    from the engine (`mirror::rebuild_metadata_from_engine`), seeds its
     watermark from the engine's own `_applied_index` key (**not**
-    `core.last_applied()`, which after recovery only reflects the last
-    *compacted* base and can understate what the engine already durably
-    holds); drains `RaftCore::drain_apply()`, **skipping any command whose
-    index the watermark already covers** (the robust, index-based restart-tail
-    filter — not reliance on incidental command idempotency); applies
-    survivors via the real, unchanged `Metadata::apply` (through
-    `mirror::apply_and_derive_mirror`); merge-batches the derived writes into
-    the engine; and publishes the refreshed `Metadata` into `cache:
-    Arc<Mutex<Metadata>>`, gated by `engine_applied: Arc<AtomicU64>` — bumping
+    `core.last_applied()`, which can understate what the engine already
+    durably holds), drains `RaftCore::drain_apply()` **skipping any command
+    whose index the watermark already covers** (the robust, index-based
+    restart-tail filter — not reliance on incidental command idempotency),
+    applies survivors via the real `Metadata::apply` (through
+    `mirror::apply_and_derive_mirror`), merges the derived writes into the
+    engine, and publishes into `cache: Arc<Mutex<Metadata>>` — bumping
     `MetadataWatch` only *after* that publish, so a watcher never observes a
-    change before it is both durable and visible.
-  - **Every reader now reads `cache`, never the core.** `RaftNode::metadata()`/
-    `members()`/`placement_view()` (the latter two promoted from
-    `RaftCore<MetaCommand, Metadata>` inherent methods, which are gone —
-    `self.metadata` on a `DRIVER_APPLIED` core is an unused default, mirroring
-    `KvState`'s placeholder) all lock `cache` directly; `reconcile_loop`/
-    `detect_loop` still read leadership/term off the core (a consensus-level
-    fact, unaffected) but the placement view / membership map off `cache`.
-  - Snapshotting reuses the same `take_snapshot_needed`/`set_snapshot_blob`
-    lazy-image machinery `animus-cp-data` uses, retargeted at
-    `syskv_image`/`install_syskv_image` (a scan/encode of the system keyspace,
-    filtered by `syskv::decode_key`) instead of `engine_image`/
-    `install_engine_image`'s per-tablet range.
-  - `start`/`start_with_metrics` now **require** a `StorageEngine` (an added
-    3rd/4th parameter) — there is no more engine-less control-plane
-    deployment shape. `start_with_mirror` (PR2's shadow-mode attach point) and
-    `RaftCore`'s `mirror_capture`/`mirror_log`/`enable_mirror_capture`/
-    `drain_mirror_log` are **removed**: the generic `pending_apply`/
-    `drain_apply` machinery this PR wires up for real already does the
-    identical job, so keeping both would have been two write paths for one
-    fact.
-  - `RaftNode::applied()` (a bounded, `Vec<MetaCommand>` window for tests) is
-    also removed — `core.applied()` is always empty once `DRIVER_APPLIED`
-    (nothing pushes to it); tests that used it now compare converged
-    `metadata()` across nodes instead (a strictly stronger convergence proof).
+    change before it is both durable and visible. **Every reader now reads
+    `cache`, never the core** (`metadata()`/`members()`/`placement_view()`);
+    `reconcile_loop`/`detect_loop` still read leadership/term off the core (a
+    consensus-level fact) but the placement view off `cache`. Snapshotting
+    reuses the same lazy-image machinery `animus-cp-data` uses, retargeted
+    at `syskv_image`/`install_syskv_image`. `start`/`start_with_metrics`
+    **require** a `StorageEngine` — there is no engine-less control-plane
+    deployment shape.
 
-  **ADR 0038 PR5 ("Phase 2"): incremental `WatchMetadata` deltas.**
-  `meta_apply_and_compact` now also pushes one [`delta_ring::DeltaRing`] entry
-  per drained command (index → its derived `KeyWrite`s, possibly empty) in
-  the same pass that publishes `cache`/bumps `engine_applied` — *before*
-  bumping `MetadataWatch`, so a watcher woken by that bump always finds the
-  ring already populated. `RaftNode::watch_delta_since(last_seen) ->
-  Option<DeltaReply>` is the new public read side `animusd`'s
-  `ClientCtx::watch_metadata` calls: `Some` (a cheap `DeltaReply { writes,
-  watermark }`) when the ring contiguously covers `(last_seen,
-  engine_applied_index()]`, `None` otherwise (the caller falls back to a full
-  `metadata()` clone). The ring is cleared whenever `cache` is rebuilt from a
-  jump it didn't witness (a received `InstallSnapshot`, mid-loop in
-  `meta_apply_and_compact`) — **not** on `meta_apply_loop`'s own
-  startup/restart rebuild, since a fresh `RaftNode`/ring is already empty by
-  construction at that point. `RaftNode::start_with_ring_bounds` (bounds
-  default via `DeltaRing::default`, 1024 entries / 4 MiB) is the
-  "configurable" knob the design asked for — a code-level constructor
-  parameter, not (yet) CLI-exposed, since no deployment-time need for a
-  different bound exists today.
+  **Incremental `WatchMetadata` deltas (ADR 0038 "Phase 2").**
+  `meta_apply_and_compact` also pushes one [`delta_ring::DeltaRing`] entry
+  per drained command in the same pass that publishes `cache`/bumps
+  `engine_applied` — *before* bumping `MetadataWatch`, so a watcher woken by
+  that bump always finds the ring already populated. `RaftNode::
+  watch_delta_since(last_seen) -> Option<DeltaReply>` is the public read
+  side `animusd`'s `ClientCtx::watch_metadata` calls: `Some` when the ring
+  contiguously covers `(last_seen, engine_applied_index()]`, `None`
+  otherwise (the caller falls back to a full `metadata()` clone). The ring
+  is cleared whenever `cache` is rebuilt from a jump it didn't witness (a
+  received `InstallSnapshot`) — **not** on the apply task's own
+  startup/restart rebuild, since a fresh ring is already empty by
+  construction there.
 
-- **`delta_ring.rs`** (ADR 0038 PR5) — the apply task's bounded, per-node,
+- **`delta_ring.rs`** (ADR 0038) — the apply task's bounded, per-node,
   best-effort in-memory ring of [`mirror::KeyWrite`] deltas keyed by Raft log
   index. Pure (no `Env`, no I/O); `push`/`clear`/`writes_since(last_seen,
   upto)` are its whole surface. Bounded by **both** `max_entries` and
-  `max_bytes` (`DeltaRing::with_bounds`; `DeltaRing::default` uses
-  `DEFAULT_MAX_ENTRIES = 1024`/`DEFAULT_MAX_BYTES = 4 MiB`), oldest evicted
-  first — except a push never evicts the entry it just inserted, even if that
-  single entry alone exceeds `max_bytes` (there's nothing smaller left to
-  evict down to, and discarding your own freshest entry would defeat the
-  ring's purpose). `writes_since(last_seen, upto)`'s contiguity check is
-  subtle at the boundary: `last_seen + 1 == front().index` is *not* a gap
-  (the caller's very next needed index is exactly the ring's oldest retained
-  entry) — only `last_seen + 1 < front().index` is (see the unit tests'
-  `byte_bound_eviction_from_one_huge_entry` for the case this distinction
-  matters: an evicted middle entry doesn't create a gap for a caller who
-  never needed it). Unit-tested directly (no `Env`); `node.rs`'s own
-  white-box apply-task tests and `tests/watch_deltas.rs` prove it wired up
-  correctly against a real `RaftNode`.
+  `max_bytes` (`DeltaRing::default` uses 1024 entries / 4 MiB), oldest
+  evicted first — except a push never evicts the entry it just inserted,
+  even if that single entry alone exceeds `max_bytes` (discarding your own
+  freshest entry would defeat the ring's purpose). **`writes_since`'s
+  contiguity check is subtle at the boundary: `last_seen + 1 ==
+  front().index` is *not* a gap** (the caller's very next needed index is
+  exactly the ring's oldest retained entry) — only `last_seen + 1 <
+  front().index` is (see the unit tests' `byte_bound_eviction_from_one_huge_
+  entry`). Unit-tested directly; `node.rs`'s own white-box apply-task tests
+  and `tests/watch_deltas.rs` prove it wired up correctly against a real
+  `RaftNode`.
 
 - **`schema.rs`** — the replicated **table-schema catalog** (ADR 0013), all
-  plain data (no I/O/clock/RNG). `TableSchema` (partition key + ordered
-  clustering keys + typed `ColumnDef`s + `indexes: Vec<IndexDef>`), `ColumnType`
-  (union of CQL scalars + DynamoDB key families), `SchemaCatalog` (a
-  `BTreeMap<TableName, TableSchema>` held in `Metadata`), and
-  `IndexDef`/`IndexKind`/`IndexProjection` (the replicated GSI/LSI *shape*, not
-  its entry data). `TableSchema::validate` is the pure malformed-schema check
-  the state machine applies (unique index names; an LSI requires a sort
-  attribute).
+  plain data (no I/O/clock/RNG): `TableSchema`, `ColumnType`, `SchemaCatalog`
+  (a `BTreeMap<TableName, TableSchema>` held in `Metadata`), and
+  `IndexDef`/`IndexKind`/`IndexProjection` (the replicated GSI/LSI *shape*,
+  not its entry data). `TableSchema::validate` is the pure malformed-schema
+  check the state machine applies (unique index names; an LSI requires a
+  sort attribute).
 
 - **`persist.rs`** — `WalRecord`, `PersistedState` (durability/recovery; the
   write/compact/recover flow is diagrammed in `docs/wal.md`).
   `encode_snapshot_record_from_blob` encodes the WAL `Snapshot` line **reusing
   the core's cached serialized image** (`snapshot_blob`, via `serde_json`
   `RawValue`) — for an in-core state machine this serializes its whole state
-  once per compaction, not twice, byte-identical to the plain encode, guarded
-  by `snapshot_record_blob_reuse_round_trips`. **Since ADR 0038 PR3,
-  `Metadata` is `DRIVER_APPLIED`, so its WAL `Snapshot` record's `metadata`
-  field is always the meaningless `Metadata::default()`** (the real durable
-  state lives in the system-keyspace engine, not this record) — this
-  reuse path is exercised by this crate's other `DRIVER_APPLIED` uses
-  (`driver_applied_sm.rs`'s toy state machine) and by `animus-cp-data`'s
-  identical-shaped `KvState`, not by `Metadata` anymore.
+  once per compaction, not twice, guarded by
+  `snapshot_record_blob_reuse_round_trips`. **`Metadata` is `DRIVER_APPLIED`
+  (ADR 0038), so its WAL `Snapshot` record's `metadata` field is always the
+  meaningless `Metadata::default()`** (the real durable state lives in the
+  system-keyspace engine) — this reuse path is exercised by this crate's
+  other `DRIVER_APPLIED` uses (`driver_applied_sm.rs`'s toy state machine)
+  and by `animus-cp-data`'s identical-shaped `KvState`, not by `Metadata`.
 
 - **`detector.rs`** — `FailureDetector` (ADR 0012): a pure, unit-tested
-  interval+timeout liveness detector (last-heartbeat instants + `now` +
-  `timeout` decide alive/dead). No clock, no RNG.
+  interval+timeout liveness detector. No clock, no RNG.
 
-- **`shared_wal.rs`** — `SharedWal` (ADR 0028 PR1): a multi-tenant WAL I/O
-  coordinator that serializes concurrent tablet WAL writers into one file with
-  coalesced `append`+`sync`. **Built and unit-tested but UNWIRED** — no
-  `animusd`/`animus-cp-data` code constructs one; every tablet still writes its
-  own WAL file. Wire-in-or-delete is an open decision (see ADR 0028).
+- **`shared_wal.rs`** — `SharedWal` (ADR 0028): a multi-tenant WAL I/O
+  coordinator that serializes concurrent tablet WAL writers into one file
+  with coalesced `append`+`sync`. **Built and unit-tested but UNWIRED** — no
+  `animusd`/`animus-cp-data` code constructs one; every tablet still writes
+  its own WAL file. Wire-in-or-delete is an open decision (see ADR 0028).
 
-- **`syskv.rs`** (ADR 0038 PR1, extended PR2; wired for real by PR3) — the control plane's reserved
-  **system keyspace** key encoding: pure functions, no I/O. `RESERVED_NAMESPACE
-  = "__animus_system"` is the top-level namespace no user table/keyspace may
+- **`syskv.rs`** (ADR 0038) — the control plane's reserved **system keyspace**
+  key encoding: pure functions, no I/O. `RESERVED_NAMESPACE =
+  "__animus_system"` is the top-level namespace no user table/keyspace may
   claim; `entity_key(EntityKind, id)` encodes `escape(RESERVED_NAMESPACE) ||
   escape(kind) || escape(id)` reusing `animus_tablet::escape` byte-for-byte
-  (this crate already depends on `animus-tablet`, so no new dependency edge —
-  unlike the wire adapters, which deliberately *duplicate* `escape` to stay
-  dependency-light of this crate, there's no such constraint here). One
-  `EntityKind` per `Metadata` collection: the PR1 set
-  (`Tablet`/`Member`/`Schema`/`Policy`/`NodeAddrs`/`Keyspace`/`Merged`) plus
-  PR2's `Counter` (the monotonic tablet-id allocator, `next_tablet_id`, keyed
-  by a fixed counter name — its ADR 0036 sibling counter, `next_alloc_id`,
-  was removed in ADR 0040 PR4 along with the allocator itself),
-  `CpMemberAddr` (the legacy `cp_member_addrs`/`cp_member_tablets` pair,
-  combined into one value per `NodeId`) — added so the mirror can reconstruct
-  a **byte-identical** `Metadata`, not one with a documented gap. A third PR2
-  variant, `NodeIdAlloc` (the ADR 0036 `AllocateNodeId` idempotency ledger,
-  `node_id_allocations`, keyed by nonce), was **removed in ADR 0040 PR4**
-  along with the allocator it mirrored — `RegisterNode`'s claim lives
-  entirely in the already-mirrored `Member`/`NodeAddrs` kinds, no separate
-  ledger needed. Two more variants, `SplitParent`/`AbsorbedBy` (ADR 0018 §2
-  amendment, unrelated to this ADR's own PR numbering), mirror
-  `Metadata::split_parents`/`absorbed_by` — each keyed by a `TabletId` with
-  a raw big-endian-`u64` `TabletId` value (the same primitive-value shape
-  `Counter` uses, not a JSON entity). Plus typed `tablet_key`/`member_key`/`schema_key`/
-  `policy_key`/`node_addrs_key`/`keyspace_key`/`merged_key`/`counter_key`/
-  `cp_member_addr_key`/`split_parent_key`/`absorbed_by_key` helpers and a
-  dedicated `applied_index_key()`
-  watermark (a sibling of the
-  entity-kind segment, not under one — mirrors `animus-cp-data`'s
+  (this crate already depends on `animus-tablet`, unlike the wire adapters,
+  which deliberately *duplicate* `escape` to stay dependency-light). One
+  `EntityKind` per `Metadata` collection (`Tablet`/`Member`/`Schema`/
+  `Policy`/`NodeAddrs`/`Keyspace`/`Merged`/`Counter`/`CpMemberAddr`/
+  `SplitParent`/`AbsorbedBy`), each with a typed `*_key` helper, plus a
+  dedicated `applied_index_key()` watermark (a sibling of the entity-kind
+  segment, not under one — mirrors `animus-cp-data`'s
   `engine_applied_index`). `decode_key` inverts every `*_key` helper for the
   mirror's own engine-scan path (`mirror::rebuild_metadata_from_engine`) and
-  this module's round-trip tests. **`is_reserved_name`** (wired since PR1):
-  called from `Metadata::apply`'s `CreateTableSchema`/`CreateKeyspace` arms
-  (the state-machine-level, every-replica-agrees gate) and from both wire
-  edges' `CreateTable`/`CREATE KEYSPACE`/`CREATE TABLE` paths (client-side,
-  so a reserved-name collision surfaces as an immediate
-  `ValidationException`/`ERR_INVALID` instead of an opaque commit-wait
-  timeout) — same two-layer idiom the existing duplicate-table check already
-  uses. Matching is a case-sensitive prefix test (exact match *or* merely
-  prefixed, e.g. `__animus_system_backup`) — a combined node's mirror writes
-  directly through this same already-globally-namespaced engine with no
-  further `StorageScope` wrapper (see `mirror.rs`'s doc for why), and a
-  prefix match is the collision that scheme cannot tell apart from a real
-  system key. **PR6 additions** (`animusd`'s read-only `GET
-  /admin/system-table` browse surface): `EntityKind::as_str`/
-  `EntityKind::from_segment` are now `pub` — the admin endpoint parses/
-  renders a `?kind=` filter through them directly rather than re-deriving
-  the segment table a third time. `prefix_successor(prefix) ->
-  Option<Vec<u8>>` is a general byte-lexicographic-successor helper
-  (increment the last non-`0xFF` byte, dropping trailing `0xFF`s first;
-  `None` only for an empty or all-`0xFF` prefix — unit-tested including that
-  edge case, even though the one real caller below never hits it).
-  `reserved_scan_bounds() -> (Vec<u8>, Vec<u8>)` is the `[start, end)` pair
-  covering the **entire** reserved namespace (every `EntityKind` plus the
-  `_applied_index` watermark), built from it — **the load-bearing bound the
-  admin endpoint scans with instead of `StorageEngine::entries()`**, which
-  would scan the whole engine (every user table's data too, on a combined
-  node sharing it with the CP data plane, ADR 0028). See
-  `docs/engineering-lessons.md` for why this must never be "simplified" to
-  `entries()`.
+  this module's round-trip tests. ADR 0036's allocator-era `NodeIdAlloc`
+  kind was removed along with the allocator itself in ADR 0040 PR4 —
+  `RegisterNode`'s claim lives entirely in the already-mirrored
+  `Member`/`NodeAddrs` kinds, no separate ledger needed.
 
-- **`mirror.rs`** (ADR 0038 PR2, promoted to the real apply path's core by
-  PR3) — no longer a shadow: this module's two halves are now the apply
-  task's actual write-derivation and restart-rebuild logic, not a dual-write
-  mirror of a separate in-core copy.
+  **`is_reserved_name`**: called from `Metadata::apply`'s
+  `CreateTableSchema`/`CreateKeyspace` arms (the state-machine-level,
+  every-replica-agrees gate) and from both wire edges' `CreateTable`/`CREATE
+  KEYSPACE`/`CREATE TABLE` paths (client-side, so a collision surfaces as an
+  immediate `ValidationException`/`ERR_INVALID` instead of an opaque
+  commit-wait timeout) — same two-layer idiom the existing duplicate-table
+  check uses. Matching is a case-sensitive prefix test (exact match *or*
+  merely prefixed, e.g. `__animus_system_backup`) — a combined node's
+  mirror writes directly through this same already-globally-namespaced
+  engine with no further `StorageScope` wrapper, and a prefix match is the
+  collision that scheme cannot tell apart from a real system key.
+
+  `EntityKind::as_str`/`from_segment` are `pub` for `animusd`'s read-only
+  `GET /admin/system-table` browse endpoint. `reserved_scan_bounds() ->
+  (Vec<u8>, Vec<u8>)` is the `[start, end)` pair covering the **entire**
+  reserved namespace — **the load-bearing bound the admin endpoint scans
+  with instead of `StorageEngine::entries()`**, which would scan the whole
+  engine (every user table's data too, on a combined node sharing it with
+  the CP data plane, ADR 0028). See `docs/engineering-lessons.md` for why
+  this must never be "simplified" to `entries()`.
+
+- **`mirror.rs`** (ADR 0038) — this module's two halves are the apply task's
+  actual write-derivation and restart-rebuild logic (not a dual-write mirror
+  of a separate in-core copy — that shadow-mode design was superseded once
+  `Metadata` became `DRIVER_APPLIED`).
   - **Write derivation**: `apply_and_derive_mirror(meta: &mut Metadata,
     command: &MetaCommand) -> (ApplyOutcome, Vec<KeyWrite>)` delegates to the
     real `Metadata::apply` and derives the `syskv` writes that command
-    implies. Every `MetaCommand` variant has an **explicit match arm, no
+    implies. **Every `MetaCommand` variant has an explicit match arm, no
     wildcard** — a future variant fails to compile here until its mirror
-    behavior is a deliberate decision. Deliberately takes `&mut Metadata`
-    (not just post-apply state) and captures a small, targeted slice of
-    *pre*-apply state for the two commands whose derived *deletions* depend
-    on identities gone by the time `apply` returns: `DropTableTablets`'s
-    dropped-tablet-id set (`Metadata::tablets_for_table`, read before
-    removal) and both `DropTableTablets`/`MergeTablets`'s legacy
-    `cp_member_addrs` prune (a `cp_member_tablets` clone taken before, diffed
-    against post-apply `tablets` absence) — diffing this way, rather than
+    behavior is a deliberate decision. Takes `&mut Metadata` (not just
+    post-apply state) to capture a small, targeted slice of *pre*-apply
+    state for the two commands whose derived *deletions* depend on
+    identities gone by the time `apply` returns (`DropTableTablets`'s
+    dropped-tablet-id set, and both `DropTableTablets`/`MergeTablets`'s
+    legacy `cp_member_addrs` prune) — diffing this way, rather than
     re-deriving `Metadata::prune_cp_member_addrs`'s predicate a second time,
     avoids the exact "two places must agree on a gating rule" hazard this
     crate's engineering practices warn about. `node.rs`'s
     `meta_apply_and_compact` calls this directly, once per drained command.
   - **Read side**: `rebuild_metadata_from_engine(engine: &S) ->
     Result<Metadata, StorageError>` scans a `StorageEngine`'s live entries and
-    reconstructs a `Metadata` — used by `meta_apply_loop`'s own
-    startup/restart rebuild, and by the differential-oracle tests
-    (`apply_engine.rs`). **Since ADR 0038 PR5** it's built from
-    `apply_key_write(meta: &mut Metadata, write: &KeyWrite)` (one `Put` per
-    live entry — `entries()` never yields a tombstone, so this bulk path only
-    ever exercises that half) instead of its own separate decode match, so
-    the bulk-rebuild and incremental-delta paths share one decode
-    implementation and can't drift. `apply_key_write` is also the
-    incremental-delta consumer's whole job: `animusd`'s
-    `RemoteControlClient::observe_delta` calls it once per `KeyWrite` in a
-    `WatchMetadata` reply, installing them onto its own cached `Metadata`
-    with no engine of its own — see `delta_ring.rs`'s entry above and ADR
-    0038's "Phase 2" section.
+    reconstructs a `Metadata` — used by the apply task's own startup/restart
+    rebuild, and by the differential-oracle tests (`apply_engine.rs`). Built
+    from `apply_key_write(meta: &mut Metadata, write: &KeyWrite)` so the
+    bulk-rebuild and incremental-delta paths share one decode implementation
+    and can't drift. `apply_key_write` is also the incremental-delta
+    consumer's whole job: `animusd`'s `RemoteControlClient::observe_delta`
+    calls it once per `KeyWrite` in a `WatchMetadata` reply — see
+    `delta_ring.rs`'s entry above.
 
   `node.rs`'s `meta_apply_loop`/`meta_apply_and_compact` are the sole
-  writer/reader pair now — see that module's `CLAUDE.md` entry above for the
-  full consensus-loop/apply-task split. PR2's shadow-only plumbing
-  (`RaftCore::mirror_capture`/`mirror_log`, `RaftNode::start_with_mirror`, the
-  `mirror_capture`-across-recovery-swap race its own crash test caught — see
-  `docs/engineering-lessons.md`'s ADR 0038 PR2 entry, still recorded as a
-  generalizable lesson even though its specific mechanism is now gone) is
-  **removed**: the generic `RaftCore::pending_apply`/`drain_apply` machinery
-  every `DRIVER_APPLIED` state machine already has does the identical job
-  with no separate flag/queue to keep in sync across a recovery swap.
-
-  **Deployment wiring** (`animusd`): a **combined** node's `RaftNode::start`/
-  `start_with_metrics` call site passes the node's already-open **shared**
-  CP-data engine directly (no `StorageScope` wrapper — `syskv` keys are
-  already globally namespaced under `RESERVED_NAMESPACE`, and PR1's
-  reserved-name rejection guarantees no user table can ever collide with it).
-  A **control-only** node (`BoundControlNode::start_control_with`, which now
-  **always** opens an engine — the `mirror_backend: Option<..>` PR2 shipped
-  is gone, since there is no more engine-less shape) opens a small
-  **dedicated** engine on its own `control` `ProdEnv` directory
-  (`SYSKV_LSM_PREFIX`, distinct from the fixed `raft.wal` filename it shares
-  that directory with) — `StorageBackend::Lsm` by default, `::Memory` under
-  `--ephemeral`. A **data-only** node still gets nothing (no local control
-  `RaftCore` at all).
-
-  **Tests**: `mirror.rs`'s own unit tests cover every `MetaCommand` variant's
-  derivation (including the pre-apply-diff cases) plus a unit-scale
-  engine-rebuild round trip; `tests/apply_engine.rs` is the real
-  `SimEnv`-driven differential oracle (see the Tests section below);
-  `animusd`'s `tests/control_mirror_restart.rs` (file name kept from PR2 —
-  what it proves is no longer about a shadow mirror, but the exact same
-  real-disk assertion now applies to the actual source of truth) proves the
-  same durability claim over a **real** `ProdEnv` process restart (real disk,
-  real TCP) for a control-only node, reopening the engine from an entirely
-  separate handle after the node that wrote it has been shut down.
+  writer/reader pair (see that entry above). The generic
+  `RaftCore::pending_apply`/`drain_apply` machinery every `DRIVER_APPLIED`
+  state machine has does this job with no separate flag/queue to keep in
+  sync across a recovery swap — see `docs/engineering-lessons.md`'s ADR
+  0038 entry for the recovery-swap race that motivated it. Deployment
+  wiring lives in `animusd` (a combined node shares its CP-data engine; a
+  control-only node opens its own small dedicated one; a data-only node
+  gets none — see that crate's `CLAUDE.md`). Tested by `mirror.rs`'s own
+  unit tests, `tests/apply_engine.rs`'s `SimEnv` differential oracle, and
+  `animusd`'s `tests/control_mirror_restart.rs` (a real `ProdEnv` restart).
 
 ## Key invariants
 
@@ -749,182 +602,12 @@ per-tablet CP data plane (`animus-cp-data`).
 ## Tests
 
 `cargo test -p animus-control` (use `run_for`, never `run()` — perpetual
-heartbeats). The 25 binaries:
-
-- **`control_raft.rs`** — election/replication/leader-kill + multi-seed
-  convergence.
-- **`persistence.rs`** — durability/recovery; the hand-driven leader `persist`
-  helper (drain + `mark_durable_through`) plus (ADR 0038 PR3) `drain_and_apply`
-  — since `Metadata` is `DRIVER_APPLIED`, "is this entry visible" is now "does
-  `drain_apply()` yield it", drained onto a local oracle `Metadata` via
-  `mirror::apply_and_derive_mirror` — the porting idiom every hand-driven
-  `RaftCore<MetaCommand, Metadata>` test in this crate now uses.
-- **`follower_visibility.rs`** — the role-aware apply gate (ADR 0009): a
-  hand-driven follower's committed entry becomes drainable with
-  `durable_index == 0`, a leader stays gated on its own proposal, a
-  follower→leader transition keeps the drained entry and gates new proposals,
-  and both `SimEnv` followers reflect the leader's committed command.
-- **`membership_commit_gate.rs`** — core-level `change_membership`: the
-  current-term-commit gate (`commit_index >= first_term_index`, leader-only) plus
-  the single-server rules, driven at message granularity.
-- **`generic_state_machine.rs`** — proves `RaftCore<C, S>` genericity (ADR 0016):
-  drives the same core with a toy KV state machine (non-control-plane command +
-  image) through propose → durable-apply → snapshot → WAL recovery.
-- **`driver_applied_sm.rs`** — the `DRIVER_APPLIED` core mechanism (ADR 0017
-  Stage A.1): effects are exactly the committed-durable commands in commit order,
-  the in-core path is bypassed, durability still gates hand-out; plus the
-  two-hop non-empty-reship regression.
-- **`tablet_split_merge.rs`** — split and merge through Raft: racing splits at
-  the same epoch (only the first applies), and merge rejecting a stale epoch
-  racing a replica change / tablets from different tables.
-- **`wal_compaction.rs`** (ADR 0038 PR3) — engine-backed WAL compaction: a real
-  `RaftNode` + `MemoryEngine` under sustained load truncates the WAL and the
-  engine stays the source of truth (`mirror::rebuild_metadata_from_engine`
-  agrees with the live cache); a crash during sustained compaction-triggering
-  load recovers to the same state a same-seed uninterrupted run reaches. The
-  precise, deterministic unit-level proof of watermark-gated tail replay
-  (never re-deriving writes for an already-engine-covered command) is a
-  white-box `#[cfg(test)]` in `src/node.rs` itself (drives the private
-  `meta_apply_and_compact` directly), not here.
-- **`install_snapshot.rs`** — a partitioned follower catching up via
-  `InstallSnapshot` (`RaftNode`-level, real apply task), a far-behind follower
-  via a *multi-chunk* one, non-empty reship, and the wall-clock-timed
-  O(chunk)-not-O(state) liveness test — the last three are hand-driven
-  `RaftCore`-level tests that supply a synthetic image via `set_snapshot_blob`
-  right after `snapshot()` (ADR 0038 PR3: `Metadata`'s image is now built
-  lazily by an external driver, so these tests stand in for it directly,
-  decoupling them from `Metadata`'s own serialization — the real engine-backed
-  image path is `wal_compaction.rs`'s job).
-- **`apply_engine.rs`** (ADR 0038 PR3) — the differential oracle succeeding
-  PR2's `mirror_engine.rs`: no more shadow side to diff against a separate
-  real side — `cache` *is* the real side. Asserts every node's published cache
-  agrees with its own engine's independent rebuild through a mixed scenario
-  (membership, schema, tablet create/split/drop-table, keyspace,
-  node-id-allocation) and across a genuine crash + restart, seed-swept.
-- **`watch_deltas.rs`** (ADR 0038 PR5) — the incremental `WatchMetadata`
-  delta path's differential oracle: applying `RaftNode::watch_delta_since`'s
-  writes onto a scratch `Metadata` (via `mirror::apply_key_write`) stays
-  byte-identical to a full `metadata()` fetch at every checkpoint through the
-  same kind of mixed scenario `apply_engine.rs` drives, including a
-  `MergeTablets` step specifically to exercise a derived `Delete` (a live
-  engine scan never yields one, so the bulk-rebuild oracle alone can't); plus
-  the ring's own restart-reset contract (a pre-restart watcher's `last_seen`
-  correctly falls back to `None`, a caught-up one still gets the trivial
-  reply) and a small-bounded ring's eviction-driven fallback, proven against
-  a real `RaftNode` (not just `delta_ring.rs`'s own unit tests).
-- **`restart.rs`** — process restart-and-rejoin (via `Simulator::stop`); each
-  node's `MemoryEngine` handle is created once and re-cloned at restart (ADR
-  0038 PR3 gotcha — see `docs/engineering-lessons.md`: a restart must reuse
-  the same engine handle, not construct a fresh one, or it silently loses
-  everything the (real, disk-backed in production) engine would have kept).
-- **`placement_reconcile.rs`** — caller-driven placement reconcile through Raft
-  under a replica death + follower crash (drives `animus-placement`).
-- **`placement_auto_reconcile.rs`** — leader-driven automatic reconcile from a
-  replicated policy (no test-side `replan`/CAS).
-- **`placement_rebalance.rs`** — leader-driven automatic load rebalancing (ADR
-  0029, no test-side placement math): grow the cluster, only advance virtual
-  time; spreads existing tablets to max−min ≤ 1 then goes quiet, repair defers to
-  rebalance, residency + strict spread hold at every intermediate state, and it
-  converges after killing the leader mid-flight; seed-swept.
-- **`leadership_transfer.rs`** — core-level transfer (ADR 0029): arms only a
-  caught-up current voter, retries `TimeoutNow` every heartbeat once the target
-  reaches `last_log_index`, freezes `propose`/`change_membership` while armed,
-  aborts and resumes if the target never catches up, an idempotent re-arm
-  doesn't extend the deadline, a stale transfer doesn't survive a fresh election,
-  `TimeoutNow` bypasses pre-vote, a departing peer keeps receiving the removal
-  entry until it acks.
-- **`failure_detection.rs`** — heartbeat-based failure detection end to end (ADR
-  0012): a member crashes, the leader auto-commits `Down`, placement reconciles
-  off it, the member restarts and returns to `Active`; plus detector +
-  grace-gate unit tests.
-- **`schema_catalog.rs`** — the replicated table-schema catalog end to end (ADR
-  0013): propose, reject a duplicate + malformed on the state machine, kill the
-  leader and assert survival + agreement, drop and see it replicate; plus
-  `schema.rs` unit tests.
-- **`schema_indexes.rs`** — replicated secondary-index definitions end to end
-  (ADR 0013): create a GSI a second node sees, reject an index on a phantom
-  table + a malformed LSI, restart and see the definition survive, drop
-  cluster-wide; seed-reproducible.
-- **`metrics.rs`** — control-plane metrics moving under known events (ADR 0015):
-  a forced election bumps the election counters + leadership gauge, a crashed
-  heartbeating member bumps `failure_detector_down` and its recovery `_up`; plus
-  a same-seed byte-identical-snapshot reproducibility check.
-- **`pre_vote.rs`** — pre-vote (ADR 0009): core-level (a live-leader lease
-  rejects and never changes the term, an expired lease grants, a timeout makes a
-  `PreCandidate` without bumping the term) + end-to-end (an isolated follower's
-  pre-vote rounds don't move the stable leader's term and it rejoins on heal with
-  no election; a genuine crash still elects at a higher term).
-- **`metadata_watch.rs`** — the applied-index watch (ADR 0031): a watcher parked
-  on `changed` wakes with the new index once a proposal commits and applies,
-  stays parked across steady-state traffic with nothing proposed, and resolves
-  on its first poll when the advance already happened (the wake-before-park case,
-  safe by construction).
-- **`prod_liveness.rs`** — real-thread `ProdEnv` smoke tests guarding the
-  liveness properties `SimEnv`'s virtual clock can't see: a freshly-joined
-  follower catches a large, compacted `Metadata` cluster up quickly without
-  running leadership away (`large_metadata_catch_up_stays_live`); and (ADR
-  0038 PR3) `sustained_metadata_churn_over_a_real_engine_stays_live` —
-  hundreds of `MetaCommand`s at a steady drip through a 3-node group backed
-  by a **real on-disk `LsmEngine`** (not `MemoryEngine`, whose I/O is
-  synchronous/trivial and so can't exercise this), asserting both a bounded
-  term delta *and* a bounded count of leadership transitions actually
-  observed during the churn, plus bounded-deadline convergence — the direct
-  real-thread proof that the apply task's real engine I/O (now on a separate
-  task from consensus) never blocks heartbeat/`AppendEntries` processing
-  long enough to trip the election timeout.
-- **`register_node_cas.rs`** (ADR 0040 PR4, supersedes the deleted
-  `node_id_allocation.rs`) — `MetaCommand::RegisterNode`'s registration CAS:
-  two concurrent registrations with distinct ids both land and every
-  replica agrees; a leader killed mid-registration converges to the one
-  claim on an identical retry (never a second entry); a follower-connected
-  proposer relays via the leader hint (the `is_relayable_command`
-  regression); a *different* registration for an already-claimed id is
-  rejected outright, never silently overwritten.
-- **`orphan_sweep.rs`** (ADR 0040 PR6) — the auto-reclaim sweep's full
-  seeded fault-injection suite, mirroring `failure_detection.rs`'s style
-  for its ADR-0012 sibling: crash-mid-join swept after
-  `orphan_sweep_after`; the losing racer of two concurrent omitted-id
-  `control-add`s swept while the winner (now a live control voter) is
-  protected; the control-role claim-without-member shape swept on its own;
-  its dual — a `members`-row-only claim with no `node_addrs` entry
-  (`admin_add_member`'s bare growth registration) — swept too; a
-  slow-but-legit joiner that activates before the grace period elapses
-  never swept; a member that was genuinely `Active` once and later went
-  `Down` never swept (`has_activated` guard); a leader failover
-  mid-countdown still converges, later, on the new leader's own timer; and
-  the sweep disabled (`Duration::ZERO`) keeps an orphan indefinitely. The
-  interleaving safety argument itself is proven separately, as a pure
-  state-machine/decision-function property (not timing-dependent), by
-  `meta.rs`'s and `node.rs`'s own in-crate unit tests — see this file's
-  `node.rs` entry above.
-- **`control_membership.rs`** — `RaftNode::change_membership`/
-  `transfer_leadership` (ADR 0037 PR1): add/remove a voter and catch it up,
-  reject a multi-server delta / leader self-removal / a second change while
-  one is in flight, transfer-then-remove the leader, crash-mid-change
-  converges either way (single-seed + a 200-seed sweep), byte-reproducible
-  from a seed; plus two PR5 additions — a freshly-added voter's process
-  restarting before it's caught up recovers from whatever WAL/snapshot it had
-  and resumes, and removing a live voter while a different one is already
-  dead is accepted **at the core level** (`RaftCore::change_membership` has
-  no survivor-liveness guard, by design — that guard lives one layer up, in
-  `animusd`'s admin action; see below) and demonstrably strands the group (a
-  stranded 2-voter config with one dead never commits anything again) — the
-  risk ADR 0037's Consequences section documents as knowingly accepted at
-  the core level specifically. Plus (ADR 0037 hardening PR2, the
-  quorum-guard liveness fix): `last_contact_ages_out_a_partitioned_peer_
-  but_not_a_healthy_one` proves the new control-id-native liveness signal
-  itself (`RaftCore::peer_last_contact`/`RaftNode::
-  control_peer_believed_alive`) — partitioning one follower ages it out past
-  `CONTROL_PEER_LIVENESS_TIMEOUT` while a never-partitioned one stays fresh,
-  and it ages back in on heal.
-- **`control_membership_prod.rs`** (ADR 0037 PR5) — the real-thread `ProdEnv`
-  liveness counterpart to `control_membership.rs`: grows a real 3-node
-  control group to 5 (two sequential single-server `change_membership`
-  calls, exactly as `animus admin control-grow`'s client-side loop
-  sequences them) under real sockets/time/threads, asserting both prompt
-  catch-up and that leadership stays bounded and settles to one stable
-  leader afterward — no election storm from real-thread scheduling around a
-  runtime membership change.
-  (PR2's shadow-mode `mirror_engine.rs`, which drove this same differential
-  oracle against `RaftNode::start_with_mirror`, is superseded by
-  `apply_engine.rs` above — ADR 0038 PR3.)
+heartbeats). One binary per behavior; the file names describe them
+(`ls crates/animus-control/tests/`) — covering Raft core mechanics
+(election/replication/leader-kill, the DRIVER_APPLIED apply gate, pre-vote,
+leadership transfer, snapshot/InstallSnapshot), the ADR 0038 mirror/delta
+differential oracles, runtime control-membership change (ADR 0037) and its
+liveness guard, the ADR 0040 registration CAS and orphan sweep, placement/
+failure-detection/schema-catalog/metrics end-to-end scenarios, and
+`prod_liveness.rs`'s real-thread `ProdEnv` smoke tests for properties
+`SimEnv`'s virtual clock can't see.
