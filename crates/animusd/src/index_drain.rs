@@ -595,11 +595,23 @@ pub(crate) async fn seal_now(
         }
     };
 
+    // PR6's catalog amendment: carry the view type declared *right now* on
+    // the table's stream — always `Some` at this point, since sealing only
+    // ever happens for a table whose stream is (still) enabled at seal
+    // time, F12-b's disable-triggered final seal included (it runs before
+    // `SetTableStream{None}` ever proposes). The `unwrap_or` fallback is
+    // defensive only, never expected to be reached in production.
+    let view_type = meta
+        .table_stream(table)
+        .map_or(animus_control::StreamViewType::NewAndOldImages, |s| {
+            s.view_type
+        });
     let cmd = MetaCommand::SealStreamShard {
         table: table.to_owned(),
         label,
         tablet,
         epoch: next_epoch,
+        view_type,
         hlc_range: (start_exclusive, end_inclusive),
         count,
         seal_wall_ms,
@@ -629,6 +641,48 @@ pub(crate) async fn seal_now(
             ))
         }
     }
+}
+
+/// The open-shard hot-read path (ADR 0042 §7/§8, PR6's `GetRecords` read
+/// API): a leader-local, non-linearizable scan of `group`'s own
+/// `KIND_CHANGE` hot tail for records with packed HLC strictly greater than
+/// `from_position`, sorted by that HLC — load-bearing, exactly like
+/// [`seal_now`]'s identical sort, since `pending_changes`' own key order is
+/// token-then-pk-then-HLC, not commit order — then truncated to `limit`.
+///
+/// **Deliberately no `ReadIndex` barrier** — this is
+/// `ClientRequest::StreamHotRead`'s whole reason to exist (F8, ADR 0042
+/// §7): the log is append-only, positional, and serves only
+/// committed-and-applied records, so the worst a leader-local read can
+/// produce is a stale prefix (a record this group has committed but not
+/// yet locally applied), never an out-of-order or fabricated one — and
+/// that staleness is indistinguishable from the stream's own eventually
+/// consistent contract. Never "upgrade" this to a `linearizable_scan_kind`
+/// call.
+///
+/// Returns `(source_key, packed_hlc, change_record bytes)` triples in
+/// ascending HLC order — the caller (`ClientCtx::read_stream_hot_records`,
+/// then the DynamoDB Streams wire edge) builds a `GetRecords` response from
+/// these identically to how it builds one from a sealed segment's own
+/// `SegmentRecord`s.
+pub(crate) async fn hot_read(
+    group: &CpGroup,
+    from_position: u64,
+    limit: usize,
+) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
+    let mut records: Vec<(Vec<u8>, u64, Vec<u8>)> = group
+        .pending_changes()
+        .await
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let ts = record_hlc(&key)?;
+            let packed = hlc::pack(ts);
+            (packed > from_position).then_some((key, packed, value))
+        })
+        .collect();
+    records.sort_by_key(|(_, packed, _)| *packed);
+    records.truncate(limit);
+    records
 }
 
 /// The hot-trim arm (ADR 0042 §8, ADR 0043 §A6, F10), run once per tablet per

@@ -48,6 +48,7 @@ mod cql;
 mod cql_client;
 mod dashboard;
 mod dynamo;
+mod dynamo_streams;
 mod http;
 mod topology;
 
@@ -1037,6 +1038,37 @@ pub enum ClientRequest {
     /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
     /// only through the `Forwarded` arm.
     ForceSeal { tablet: u64 },
+    /// **Internal open-shard hot-read RPC — never sent bare, only wrapped in
+    /// [`Forwarded`](Self::Forwarded)** (ADR 0042 §7/§8, PR6's `GetRecords`
+    /// read API): a leader-local, non-linearizable scan of `tablet`'s own
+    /// `KIND_CHANGE` hot tail for records with packed HLC strictly greater
+    /// than `from_position`, up to `limit`, sorted by HLC —
+    /// `index_drain::hot_read`'s own wire payload. **Deliberately no
+    /// `ReadIndex` barrier** (F8: the worst this can produce is a stale
+    /// prefix, never a fabricated record — see that function's doc; this
+    /// must never be "upgraded" to a linearizable read). The **one**
+    /// production use is `ClientCtx::read_stream_hot_records`, called by the
+    /// DynamoDB Streams `GetRecords` handler's open-shard path — a shard's
+    /// tablet can be led on any node, not necessarily the one that received
+    /// the `GetRecords` request, so this needs the identical one-hop
+    /// forward/leader-resolution machinery every other CP op already has.
+    /// Addressed by `tablet` directly, mirroring [`ForceSeal`](Self::ForceSeal)
+    /// (there is no client key to derive it from). Bare delivery is refused
+    /// for the same reason `ForceSeal`/`KindScan` are: an arbitrary caller
+    /// must not be able to read a tablet's own change-log bytes by kind
+    /// number, bypassing the DynamoDB Streams surface that interprets them.
+    /// Not a `MetaCommand`, so `is_relayable_command` does not apply; real
+    /// handling lives in `cp_serve_forwarded`'s match, reached only through
+    /// the `Forwarded` arm. Answered with `ClientResponse::Pairs` (the
+    /// filtered/sorted/limited `(source_key, change_record bytes)` list —
+    /// the same shape `Scan`/`KindScan` already use for a raw key/value
+    /// list; the packed HLC each key's own trailing 8 bytes encode is
+    /// recovered by the caller, not carried out-of-band).
+    StreamHotRead {
+        tablet: u64,
+        from_position: u64,
+        limit: usize,
+    },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
     Get { key: Vec<u8>, table: String },
@@ -3478,6 +3510,29 @@ impl SegmentStoreHandle {
                 fs.put(id, bytes).await?;
                 Ok(Vec::new())
             }
+        }
+    }
+
+    /// Fetch a sealed segment's bytes (PR6's `GetRecords` sealed-shard read
+    /// path, ADR 0042/0043 §A7b) — served by **any** node, no forwarding,
+    /// since the segment store's own `get`/`get_from` already fan out to a
+    /// live replica. `replicas` is the catalog row's own recorded set
+    /// (`StreamShardRow::replicas`); for the single-directory
+    /// `FsSegmentStore` opt-in there is no per-node replica concept (every
+    /// node already reads the identical shared directory), so `replicas` is
+    /// ignored there — the empty list `put_sealed` records for that variant
+    /// is exactly this "ask any node" signal. `Ok(None)` means the object is
+    /// genuinely gone (deleted by the retention sweep) — a `TrimmedDataAccess`
+    /// outcome to the client, never an error.
+    pub(crate) async fn get_sealed(
+        &self,
+        replicas: &[NodeId],
+        id: &str,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        use animus_env::SegmentStore;
+        match self {
+            SegmentStoreHandle::Cluster(c) => c.get_from(replicas, id).await,
+            SegmentStoreHandle::Fs(fs) => fs.get(id).await,
         }
     }
 }
@@ -6649,6 +6704,27 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
+            // ADR 0042 §7/§8, PR6: the open-shard hot-read RPC — addressed
+            // by `tablet` directly, mirroring `ForceSeal` just above (see
+            // this variant's own doc for why). Leader-local, no ReadIndex
+            // barrier (F8) — `index_drain::hot_read` is the one function
+            // that knows how to filter/sort/limit the tablet's own hot tail.
+            ClientRequest::StreamHotRead {
+                tablet,
+                from_position,
+                limit,
+            } => {
+                let tablet = TabletId(tablet);
+                let Some(leader) = self.edge.cp_leader(tablet) else {
+                    return self.not_leader_refusal(Some(tablet));
+                };
+                let pairs = index_drain::hot_read(&leader, from_position, limit)
+                    .await
+                    .into_iter()
+                    .map(|(key, _, value)| (key, value))
+                    .collect();
+                ClientResponse::Pairs(pairs)
+            }
             // ADR 0018 §2/PR4: the four internal 2PC coordinator RPCs.
             // Routed by the first write key (`TxnPrepare`) or one of `keys`
             // (`TxnResolve`) — **never** `record_key` for a non-anchor
@@ -8462,6 +8538,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::KindWrite { .. } => "kind_write",
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
+        ClientRequest::StreamHotRead { .. } => "stream_hot_read",
         ClientRequest::Get { .. } => "get",
         ClientRequest::Scan { .. } => "scan",
         ClientRequest::Delete { .. } => "delete",
@@ -8613,6 +8690,11 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         ),
         ClientRequest::ForceSeal { .. } => ClientResponse::Error(
             "this request is an internal seal-trigger RPC and must be sent wrapped in \
+             `Forwarded`"
+                .into(),
+        ),
+        ClientRequest::StreamHotRead { .. } => ClientResponse::Error(
+            "this request is an internal open-shard hot-read RPC and must be sent wrapped in \
              `Forwarded`"
                 .into(),
         ),
@@ -9294,6 +9376,63 @@ impl ClientCtx {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err("force-seal did not reach a tablet leader in time".into());
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Fetch up to `limit` of `tablet`'s own open-shard hot records with
+    /// packed HLC strictly greater than `from_position` (ADR 0042 §7/§8,
+    /// PR6's `GetRecords` open-shard path) — the internal `ClientRequest::
+    /// StreamHotRead` RPC, forwarded to whichever node currently leads
+    /// `tablet`. Mirrors [`force_seal_tablet`](Self::force_seal_tablet)'s
+    /// retry shape exactly (there is no client key to derive routing from,
+    /// so this re-resolves [`resolve_cp_route`](Self::resolve_cp_route) fresh
+    /// every attempt) — acceptable for a `GetRecords` poll, which already
+    /// tolerates "not there yet, poll again" as part of the stream's own
+    /// eventually consistent contract.
+    pub(crate) async fn read_stream_hot_records(
+        &self,
+        tablet: TabletId,
+        from_position: u64,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            match self.resolve_cp_route(tablet) {
+                Some(CpRoute::Local(leader)) => {
+                    return Ok(index_drain::hot_read(&leader, from_position, limit)
+                        .await
+                        .into_iter()
+                        .map(|(key, _, value)| (key, value))
+                        .collect());
+                }
+                Some(CpRoute::Forward(addr)) => {
+                    let request = ClientRequest::Forwarded {
+                        request: Box::new(ClientRequest::StreamHotRead {
+                            tablet: tablet.0,
+                            from_position,
+                            limit,
+                        }),
+                        traceparent: otel::current_traceparent(),
+                    };
+                    match self.relay(addr, request).await {
+                        ClientResponse::Pairs(pairs) => return Ok(pairs),
+                        ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
+                            return Err(e);
+                        }
+                        ClientResponse::Error(_) => {} // retry below
+                        other => {
+                            return Err(format!(
+                                "unexpected reply to forwarded stream hot read: {other:?}"
+                            ));
+                        }
+                    }
+                }
+                Some(CpRoute::None) | None => {} // not settled yet, retry
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("stream hot read did not reach a tablet leader in time".into());
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }

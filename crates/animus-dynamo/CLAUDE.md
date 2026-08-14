@@ -181,6 +181,31 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
   the replicated catalog's typed key columns via the new `schema::
   key_attribute_types`/`attribute_type_for` (the reverse of `schema::
   column_type_for`'s existing decode direction).
+- `streams_wire` module (ADR 0042 §3/§5/§6/§7, PR6) — the sibling
+  `DynamoDBStreams_20120810` service's own pure wire layer, mirroring
+  `wire`'s conventions but kept in its own module (a distinct
+  `TARGET_PREFIX`, `decode_request(target, body) -> StreamsOperation`
+  for `ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords`).
+  `parse_shard_id`/`parse_stream_arn` are the inverses of
+  `animus_cp_data::segment::shard_id`/`wire::stream_arn` (duplicated
+  rather than depending on `animus-cp-data`, same precedent as this
+  crate's other cross-crate byte-shape duplications).
+  `encode_iterator`/`decode_iterator` mint/parse the stateless,
+  non-expiring shard-iterator token (`base64url({label, shard_id,
+  position})`, ADR 0042 §6) — `position` is always the **exclusive**
+  lower bound the next read filters on, the same convention
+  `animus_cp_data::segment::slice_to_hlc_range`'s `start_exclusive` and
+  `animusd::index_drain::hot_read`'s `from_position` already use, so a
+  token composes with either serve tier with no translation.
+  `project_view`/`keys_from_images`/`stream_record_json` build one
+  `Records[]` entry from a decoded `ChangeRecord` — the read-time view
+  projection (ADR 0042 §3/§15: a shard always stores both images
+  regardless of the declared type) and key recovery (from whichever
+  image is present, new preferred over old, since both always carry the
+  full item). `list_streams_response`/`describe_stream_response`/
+  `get_shard_iterator_response`/`get_records_response` are the response
+  encoders; `animusd::dynamo_streams` is the one caller, holding
+  `Metadata`/the segment store this module never touches.
 
 ## What's non-obvious
 
@@ -339,8 +364,8 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
 ## Tests
 
 `cargo test -p animus-dynamo` — `item_api.rs` over `MemoryEngine` (incl.
-`query_with` sort conditions), plus `wire`, `condition`, `registry`, and `schema`
-unit tests (JSON decode/encode incl. document/set types + document-path projection
+`query_with` sort conditions), plus `wire`, `streams_wire`, `condition`,
+`registry`, and `schema` unit tests (JSON decode/encode incl. document/set types + document-path projection
 + ReturnValues + UpdateItem/BatchWriteItem/TransactWriteItems/TransactGetItems
 decode + index projection types, base64 round-trip, tombstone, sort/condition
 predicates, `sync_indexes` adding/dropping index *definitions* (no entry data
@@ -363,6 +388,16 @@ The rejection itself (`true` against a GSI `Query`/`Scan` only) is
 `animusd`-only — this crate never sees the replicated catalog needed to know
 an index's kind — and is end-to-end tested in `tests/dynamo_consistent_read.rs`
 (`Query`) and `tests/dynamo_index_scan.rs` (`Scan`).
+`streams_wire` unit tests (PR6) cover every operation's decode (incl. the
+`AT_SEQUENCE_NUMBER`/`AFTER_SEQUENCE_NUMBER` `SequenceNumber`-required
+validation), shard-id/stream-ARN parsing, iterator-token round-trip +
+tampered/garbage rejection, view-type projection for all four
+`StreamViewType`s, `Keys` recovery favoring the new image over the old,
+and every response encoder's JSON shape (incl. a closed vs. open shard's
+`SequenceNumberRange`) — the label-resolution/routing decisions those
+shapes get plugged into (F12-b, the sealed-vs-open serve split) are
+`animusd`-only (`dynamo_streams::tests` + `tests/dynamo_streams.rs` — see
+that crate's `CLAUDE.md`).
 The wire protocol is exercised end-to-end over real HTTP in
 `animusd`'s `tests/dynamo_wire.rs` (Put/Get/Delete), `tests/dynamo_extended.rs`
 (CreateTable/Query/conditional writes), `tests/dynamo_indexes.rs` (Scan with

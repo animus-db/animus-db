@@ -346,8 +346,20 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
 }
 
 /// Dispatch a decoded request, returning the HTTP status code and JSON body.
+///
+/// **Same listener, two services (ADR 0042 §3's decided same-listener
+/// F-fork)**: a `DynamoDBStreams_20120810.*` target routes to
+/// `dynamo_streams::execute`; everything else (the `DynamoDB_20120810.*`
+/// item API this module owns) goes through [`execute`] unchanged.
 async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String) {
-    execute(ctx, &request.target, &request.body).await
+    if request
+        .target
+        .starts_with(animus_dynamo::streams_wire::TARGET_PREFIX)
+    {
+        crate::dynamo_streams::execute(ctx, &request.target, &request.body).await
+    } else {
+        execute(ctx, &request.target, &request.body).await
+    }
 }
 
 /// Decode + run a DynamoDB operation from its `X-Amz-Target` value and JSON body,
@@ -2627,7 +2639,7 @@ async fn quorum_read(
     }
 }
 
-fn internal(message: &str) -> WireError {
+pub(crate) fn internal(message: &str) -> WireError {
     WireError {
         code: "InternalServerError",
         message: message.to_owned(),

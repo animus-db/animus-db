@@ -16,7 +16,19 @@ use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{IndexDef, SchemaCatalog, StreamSpec, TableName, TableSchema};
+use crate::schema::{IndexDef, SchemaCatalog, StreamSpec, StreamViewType, TableName, TableSchema};
+
+/// The default a [`StreamShardRow`]/[`MetaCommand::SealStreamShard`]'s
+/// `view_type` field decodes to when loading a snapshot encoded before this
+/// field existed (round-3 sealer PR predates it) — never reached by any row
+/// this PR's own sealer writes (which always fills it from the table's
+/// current `StreamSpec.view_type` at seal time), so any placeholder is
+/// equally arbitrary; `NewAndOldImages` is chosen because it is the
+/// least-surprising fallback (over-delivers images rather than silently
+/// dropping one a real reader might have wanted).
+fn default_stream_view_type() -> StreamViewType {
+    StreamViewType::NewAndOldImages
+}
 
 /// Deliberate duplicate of `animus_dynamo::index::INDEX_TABLE_SEPARATOR` —
 /// this crate cannot depend on `animus-dynamo` (dependency direction: see
@@ -294,6 +306,21 @@ pub struct StreamShardRow {
     /// must present to resolve it (F12-b's catalog-row-based resolution,
     /// ADR 0042 §4/§11).
     pub label: String,
+    /// The view type declared by the table's stream when this shard sealed
+    /// (ADR 0042 §3/§15, PR6's catalog amendment) — a shard's own copy of
+    /// what was, at seal time, `TableSchema.stream`'s `StreamViewType`.
+    /// Carried here (not re-derived from the current schema) because a
+    /// `DISABLED`-but-still-readable stream's F12-b grace window has
+    /// **no** live `StreamSpec` to read it from once `SetTableStream{None}`
+    /// commits — a `DescribeStream` against a draining label reports its
+    /// last-known view type from exactly this field. A view type never
+    /// changes mid-stream (only a disable + re-enable can pick a new one,
+    /// which mints a new label), so every row of one label carries the
+    /// identical value. `#[serde(default)]` keeps a row encoded before this
+    /// field existed loading (see [`default_stream_view_type`]'s own doc —
+    /// never reached by a row this PR's own sealer writes).
+    #[serde(default = "default_stream_view_type")]
+    pub view_type: StreamViewType,
     /// `(start_exclusive, end_inclusive)` committed packed-HLC range — the
     /// ground truth a reader slices a fetched segment object to
     /// (`animus_cp_data::segment`'s superset-slice rule, ADR 0042 §10). A
@@ -501,6 +528,12 @@ pub enum MetaCommand {
         label: String,
         tablet: TabletId,
         epoch: u64,
+        /// This shard's own view type (PR6's catalog amendment) — see
+        /// [`StreamShardRow::view_type`]'s doc for why it rides the row
+        /// rather than being re-derived from the current schema.
+        /// `#[serde(default)]` for the same reason the row field has it.
+        #[serde(default = "default_stream_view_type")]
+        view_type: StreamViewType,
         hlc_range: (u64, u64),
         count: u64,
         seal_wall_ms: u64,
@@ -1228,6 +1261,7 @@ impl Metadata {
                 label,
                 tablet,
                 epoch,
+                view_type,
                 hlc_range,
                 count,
                 seal_wall_ms,
@@ -1280,6 +1314,7 @@ impl Metadata {
                     StreamShardRow {
                         table: table.clone(),
                         label: label.clone(),
+                        view_type: *view_type,
                         hlc_range: *hlc_range,
                         count: *count,
                         seal_wall_ms: *seal_wall_ms,
@@ -1659,6 +1694,27 @@ impl Metadata {
             .iter()
             .filter(move |((_, _), row)| row.table == table && row.label == label)
             .map(|((tablet, epoch), row)| (*tablet, *epoch, row))
+    }
+
+    /// `(table, label)`'s view type (PR6's DescribeStream read, ADR 0042
+    /// §3/§15): the table's *current* `StreamSpec.view_type` when `label` is
+    /// still the enabled one, else the last-known value carried by any of
+    /// the label's own catalog rows (a view type never changes mid-stream —
+    /// every row of one label carries the identical value, see
+    /// [`StreamShardRow::view_type`]'s doc) — `None` only when `label` is
+    /// neither the current schema label nor has ever sealed a row (F12-b: a
+    /// caller should already have rejected such a label as
+    /// `ResourceNotFoundException` before asking this).
+    #[must_use]
+    pub fn stream_view_type(&self, table: &str, label: &str) -> Option<StreamViewType> {
+        if let Some(spec) = self.table_stream(table)
+            && spec.label == label
+        {
+            return Some(spec.view_type);
+        }
+        self.stream_shard_rows_for_label(table, label)
+            .next()
+            .map(|(_, _, row)| row.view_type)
     }
 
     /// Every distinct label of `table` that still has at least one catalog
@@ -3355,6 +3411,7 @@ mod tests {
             label: label.to_owned(),
             tablet: TabletId(tablet),
             epoch,
+            view_type: StreamViewType::NewAndOldImages,
             hlc_range: (end.saturating_sub(100), end),
             count: 1,
             seal_wall_ms: 1_700_000_000_000,

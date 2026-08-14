@@ -26,6 +26,7 @@ pub mod condition;
 pub mod index;
 pub mod registry;
 pub mod schema;
+pub mod streams_wire;
 pub mod wire;
 
 pub use condition::{ConditionExpression, SortKeyCondition};

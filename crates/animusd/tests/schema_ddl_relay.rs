@@ -302,6 +302,7 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
         label: "relay-L1".into(),
         tablet: TabletId(1),
         epoch: 0,
+        view_type: StreamViewType::NewAndOldImages,
         hlc_range: (0, 100),
         count: 1,
         seal_wall_ms: 1_700_000_000_000,

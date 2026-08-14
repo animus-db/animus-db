@@ -55,7 +55,15 @@ reason (see each file's own entry below).
   and `format_not_leader_refusal`/`parse_not_leader_refusal` (the leader-hint
   string suffix `cp_forward` chases). All `pub(crate)`.
 - **`dynamo.rs`** (~59 KB) — the DynamoDB JSON-over-HTTP edge; the `GET /metrics`
-  route (ADR 0015) shares this listener.
+  route (ADR 0015) shares this listener. `dispatch` also forwards a
+  `DynamoDBStreams_20120810.*` target to `dynamo_streams::execute`
+  (below) — the two services share one listener/port.
+- **`dynamo_streams.rs`** (ADR 0042 §3/§5/§6/§7/§9/§10/§11, PR6) — the
+  DynamoDB Streams read API: `ListStreams`/`DescribeStream`/
+  `GetShardIterator`/`GetRecords`. See the "DynamoDB Streams" entry under
+  `dynamo.rs`'s own write-side section above for the full design (label
+  resolution, the sealed-vs-open serve split, `StreamHotRead`) — this
+  entry is just the module pointer.
 - **`index_drain.rs`** (ADR 0041 §4 GSI drain; ADR 0042/0043 the seal arm +
   hot-trim rework, round-3 sealer PR) — the per-node **change-consumer
   loop** (`change_consumer_loop`, renamed from `index_drain_loop` since it
@@ -627,9 +635,84 @@ route below the edge through the same `ClientCtx` CP primitives.
   entry above): `update_table`'s disable path now performs the F12-b
   final seal (`dynamo.rs::disable_stream`, forcing every tablet's own hot
   tail into a committed segment via `ClientCtx::force_seal_tablet` before
-  ever proposing `SetTableStream{None}`) — **the read path is still a later
-  PR (PR6)**, so nothing is actually readable via `GetRecords` yet, even
-  though every record is durably sealed once written.
+  ever proposing `SetTableStream{None}`).
+
+  **The read path landed in PR6(`dynamo_streams.rs`, new module):** the
+  four `DynamoDBStreams_20120810.*` operations, dispatched on the **same**
+  listener as the item API (`dynamo.rs::dispatch` checks the target's
+  prefix and routes to `dynamo_streams::execute` — the decided
+  same-listener fork; every JSON shape and the iterator-token/shard-id
+  codecs are pure, in `animus_dynamo::streams_wire`, this module is the
+  read path's only impure layer).
+  - **`ListStreams`/`DescribeStream`** are pure functions of `Metadata`
+    (F7 — the store is never load-bearing for a metadata read):
+    `ListStreams` enumerates the current enabled label per table plus
+    every `DISABLED`-but-unreaped label with a catalog row still present
+    (F12-b); `DescribeStream` builds the shard chain from
+    `stream_shard_rows_for_label` (closed, `EndingSequenceNumber` set)
+    plus, only while `enabled`, one open shard per `tablets_for_table`
+    entry at `current_open_epoch` (this tablet's own chain length —
+    mirrors `index_drain::seal_now`'s identical computation). `resolve_label`
+    is the one function every operation funnels through for F12-b's
+    label validity: the table's *current* schema label, or any label
+    with at least one still-present catalog row — neither ⇒
+    `ResourceNotFoundException`. `StreamShardRow`/`SealStreamShard` grew a
+    `view_type` field (a small `animus-control` catalog amendment,
+    `#[serde(default)]`) — a `DISABLED` stream's grace-window
+    `DescribeStream` has no live `StreamSpec` to read a view type from
+    once `SetTableStream{None}` commits, so a shard's own row carries the
+    view type declared *at seal time* instead (`Metadata::
+    stream_view_type`, the read accessor); a view type never changes
+    mid-stream, so every row of one label agrees.
+  - **`GetShardIterator`** mints a stateless `base64url({label, shard_id,
+    position})` token (`animus_dynamo::streams_wire::encode_iterator`) —
+    `position` is always the record HLC's own **exclusive** lower bound
+    the next read filters on (`packed_hlc > position`), the same
+    convention `segment::slice_to_hlc_range`'s `start_exclusive` and
+    `index_drain::hot_read`'s `from_position` already use, so a token
+    composes with either serve tier with no translation. `TRIM_HORIZON`/
+    `AT`/`AFTER_SEQUENCE_NUMBER` read straight off the catalog row (sealed)
+    or `effective_stream_shard_watermark` (open) with no round trip;
+    `LATEST` on a sealed shard collapses to `hlc_range.1` (the
+    immediate-null path); `LATEST` on a genuinely open shard needs one
+    hot read (`ClientCtx::read_stream_hot_records(tablet, watermark,
+    usize::MAX)`) to find the current max.
+  - **`GetRecords`** resolves the shard id against the catalog **fresh at
+    every call** (never cached from mint time) — this is what makes an
+    open-shard iterator survive a seal that happens between polls (ADR
+    0042 §2): a catalog row present ⇒ the **sealed** path (any node —
+    `SegmentStoreHandle::get_sealed(&row.replicas, seg_id)`, then
+    `segment::decode_and_slice(bytes, row.hlc_range)`, the superset-slice
+    rule, ADR 0042 §10 — filtered/paginated, nulling `NextShardIterator`
+    only once the sliced content is truly exhausted); absent ⇒ the
+    **open** path (`ClientCtx::read_stream_hot_records`, forwarded to the
+    tablet's own leader, no `ReadIndex` barrier, F8 — never nulls; an
+    empty poll returns the *same* iterator, F4/§7), gated on the shard
+    genuinely being the label's current live open epoch (else
+    `TrimmedDataAccessException`). `ChangeRecord::event_name()` +
+    `streams_wire::project_view`/`keys_from_images`/`stream_record_json`
+    build each `Records[]` entry; `Keys` is recovered from whichever
+    image is present (new preferred, old for a `REMOVE`) since both
+    images always carry the full item.
+  - **`ClientRequest::StreamHotRead { tablet, from_position, limit }`**
+    (new internal-only RPC, mirroring `ForceSeal`'s exact shape/doc
+    pattern) is the open-shard forwarding payload — refused bare (gating
+    sites: the `request_kind`/bare-refusal arms in `handle_request`, and
+    the real handling arm in `cp_serve_forwarded`, which calls
+    `index_drain::hot_read` — grepped per the house lesson on adding a
+    forwarded-command variant), answered with the existing
+    `ClientResponse::Pairs` shape (no new response variant — the packed
+    HLC rides each key's own trailing 8 bytes, the same suffix
+    `change_record_key` already appends, recovered by the caller).
+    `index_drain::hot_read` is `seal_now`'s read-only sibling: an
+    identical `pending_changes()` scan/HLC-suffix-sort, filtered by
+    `from_position` instead of the watermark, never sealing anything.
+  - **`SegmentStoreHandle::get_sealed`** (new, alongside the existing
+    `put_sealed`) is the sealed-tier read: `ClusterSegmentStore::get_from`
+    for the default `Cluster` variant (any recorded replica), or a plain
+    local `get` for the single-directory `Fs` opt-in (replicas ignored —
+    there is no per-node replica concept when every node already shares
+    the identical directory).
 
   `mint_stream_label` (ADR 0042 §4) is the proposer-side label mint: an
   ISO8601-shaped string derived from **this node's own `env.now()`**
@@ -837,6 +920,24 @@ route below the edge through the same `ClientCtx` CP primitives.
   `docs/engineering-lessons.md`'s Testing section for the general rule this
   is now an instance of (a forwarded-command test suite needs at least one
   non-leader-issued call).
+- **`ClientRequest::StreamHotRead { tablet, from_position, limit }`** (PR6)
+  is `ForceSeal`'s read-side sibling — the internal-only RPC behind
+  `GetRecords`'/`GetShardIterator`'s open-shard path (ADR 0042 §7/§8):
+  same addressing (by `tablet` directly), same bare refusal, same
+  "handled only inside `cp_serve_forwarded`" contract, same reason
+  (`is_relayable_command` doesn't apply — this is a data-plane RPC, not a
+  `MetaCommand`). `ClientCtx::read_stream_hot_records` is its caller-side
+  wrapper, copying `force_seal_tablet`'s exact retry shape (fresh
+  `resolve_cp_route` every iteration, no hint-chasing) rather than
+  `cp_forward`'s hot-path optimization — acceptable for a `GetRecords`
+  poll, which already tolerates "not there yet" as part of the stream's
+  own eventually consistent contract. Answered with the pre-existing
+  `ClientResponse::Pairs` shape (no new response variant): the filtered/
+  sorted/limited `(source_key, change_record bytes)` list, exactly what
+  `index_drain::hot_read` (the leader-local, **no-`ReadIndex`** scan this
+  RPC exists to reach — F8, never to be "upgraded" to a linearizable
+  scan) returns. See `dynamo.rs`'s "DynamoDB Streams" entry above for the
+  read path's own full design.
 - **A node runs one internal `ProdEnv`, on one id (ADR 0040)** — the control
   Raft rides `PRIMARY_STREAM` (stream 0, ADR 0026's default); every per-tablet
   Raft group this node hosts rides its own stream (`stream = tablet_id`, which
@@ -1032,8 +1133,12 @@ crates/animusd/tests/`) — covering combined/control-only/data-only/split
 deployment shapes and growth/decommission, control-plane and CP-data-plane
 membership change, the DynamoDB/CQL/admin/dashboard wire edges (including
 the ADR 0041 secondary-index suites, the ADR 0042 `SetTableStream`/
-`DescribeTable`/`UpdateTable` streams surface in `dynamo_streams.rs`, and
-the ADR 0018 transaction suites), restart/durability across every
-deployment shape, and the `WatchMetadata`/system-table/OTel/metrics support
-surfaces. `support/mod.rs` holds the shared bring-up helpers (port-TOCTOU
-retries, split-cluster bring-up).
+`DescribeTable`/`UpdateTable` streams surface plus PR6's
+`ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords` read path
+(closed-shard chains, the iterator-survives-a-seal property, `Limit`
+pagination, cross-node reads of both sealed and open shards, and F12-b's
+disable grace window) in `dynamo_streams.rs`, and the ADR 0018 transaction
+suites), restart/durability across every deployment shape, and the
+`WatchMetadata`/system-table/OTel/metrics support surfaces. `support/mod.rs`
+holds the shared bring-up helpers (port-TOCTOU retries, split-cluster
+bring-up).

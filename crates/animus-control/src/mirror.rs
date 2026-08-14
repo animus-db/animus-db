@@ -1108,6 +1108,7 @@ mod tests {
             label: "L1".to_string(),
             tablet,
             epoch,
+            view_type: crate::schema::StreamViewType::NewAndOldImages,
             hlc_range: (end.saturating_sub(100), end),
             count: 1,
             seal_wall_ms: 1_700_000_000_000,

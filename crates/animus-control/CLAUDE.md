@@ -111,7 +111,17 @@ per-tablet CP data plane (`animus-cp-data`).
   splits), `stream_shard_rows_for_label(table, label)` (every
   row across every tablet), `stream_labels_with_rows(table)` (F12-b's
   coexistence set), `stream_shard_parent_id(tablet, epoch)` (derived
-  `ParentShardId`, never stored redundantly). **F1 merge stopgap** (ADR
+  `ParentShardId`, never stored redundantly),
+  `stream_view_type(table, label)` (PR6's `DescribeStream` catalog
+  amendment — the table's *current* `StreamSpec.view_type` when `label`
+  is still enabled, else the last-known value carried by any of the
+  label's own catalog rows; both `StreamShardRow` and `SealStreamShard`
+  grew a `view_type: StreamViewType` field, `#[serde(default)]`,
+  specifically so a `DISABLED`-but-unreaped stream's grace-window
+  `DescribeStream` — which has no live `StreamSpec` to read once
+  `SetTableStream{None}` commits — still has somewhere to read its
+  last-known view type from; a view type never changes mid-stream, so
+  every row of one label carries the identical value). **F1 merge stopgap** (ADR
   0042 §12/ADR 0043 §A5): `MergeTablets`'s apply arm rejects outright when
   the base table has either an enabled stream or any still-present
   catalog row (marked-expired-but-not-yet-removed counts as still

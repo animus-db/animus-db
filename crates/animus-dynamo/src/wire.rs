@@ -1092,8 +1092,11 @@ fn decode_stream_view_type(spec: &Map<String, Value>) -> Result<StreamViewType, 
     }
 }
 
-/// The wire string for a [`StreamViewType`], for response encoding.
-fn stream_view_type_str(vt: StreamViewType) -> &'static str {
+/// The wire string for a [`StreamViewType`], for response encoding. `pub(crate)`
+/// so `streams_wire` (the DynamoDB Streams service's own wire module) can
+/// render the identical string for `DescribeStream`'s `StreamViewType`
+/// field without a second source of truth for the mapping.
+pub(crate) fn stream_view_type_str(vt: StreamViewType) -> &'static str {
     match vt {
         StreamViewType::NewAndOldImages => "NEW_AND_OLD_IMAGES",
         StreamViewType::NewImage => "NEW_IMAGE",
