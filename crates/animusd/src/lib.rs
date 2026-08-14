@@ -219,6 +219,27 @@ impl CpGroup {
         }
     }
 
+    /// This tablet's own ADR 0042 §7 min-over-rows cursor watermark for
+    /// `consumer`. See [`RaftKvNode::cursor_min_watermark`].
+    pub(crate) async fn cursor_min_watermark(&self, consumer: &str) -> Option<HlcTimestamp> {
+        match self {
+            CpGroup::Lsm(n) => n.cursor_min_watermark(consumer).await,
+            CpGroup::Mem(n) => n.cursor_min_watermark(consumer).await,
+        }
+    }
+
+    /// Every cursor row currently visible in this tablet's own `KIND_CURSOR`
+    /// scope, alongside the token each row's own key names. See
+    /// [`RaftKvNode::cursor_rows_with_token`].
+    pub(crate) async fn cursor_rows_with_token(
+        &self,
+    ) -> Vec<([u8; TOKEN_BYTES], String, HlcTimestamp)> {
+        match self {
+            CpGroup::Lsm(n) => n.cursor_rows_with_token().await,
+            CpGroup::Mem(n) => n.cursor_rows_with_token().await,
+        }
+    }
+
     /// Linearizable ReadIndex range scan of a non-base row-kind scope (ADR
     /// 0041 §3) — the LSI `Query`/`Scan` read primitive. `end: None` is
     /// unbounded above. See [`RaftKvNode::linearizable_scan_kind`].
@@ -3905,15 +3926,24 @@ impl ClientCtx {
     }
 
     /// As [`cp_kind_write`](Self::cp_kind_write), but for a batch with **no
-    /// base-kind write** — the GSI drain's footprint update plus the change
-    /// records it consumes, which touch no client-visible row.
+    /// base-kind write** — a GSI reconciliation's footprint/cursor-row
+    /// update, the trim janitor's change-record deletions, or a
+    /// merge-residue cursor-row cleanup (ADR 0042 §7/§8) — none of which
+    /// touch a client-visible row.
     ///
-    /// Confirmation therefore cannot probe a base row; this waits on the
-    /// proposal being accepted and applied instead. That is weaker than
-    /// `cp_kind_write`'s value-equality probe, and safe only because the
-    /// drain is idempotent: a batch that silently no-ops (a fence miss) leaves
-    /// the change records in place, so the next tick simply redoes the same
-    /// reconciliation.
+    /// Confirmation therefore cannot probe a base row; it instead confirms
+    /// the batch's **last** write actually landed (`local_get_kind`
+    /// returning exactly what was asked for — `Some(value)` for a put,
+    /// `None` for a tombstone) rather than stopping at `Accepted`, which only
+    /// means "appended to the leader's log". A fenced-out entry commits as a
+    /// no-op, so acking on acceptance alone would report an effect that
+    /// never landed — and since the whole batch is **one** atomic Raft entry
+    /// (`KvCommand::KindBatch`'s own whole-or-nothing apply gate), any single
+    /// write's landed effect proves every other write in the same entry
+    /// landed too; the last one is picked so a caller that orders its own
+    /// "this batch is durable" signal last (the GSI drain's cursor-row bump,
+    /// the trim janitor's final deletion) gets it confirmed, not merely an
+    /// earlier entry in the same batch.
     pub(crate) async fn cp_kind_write_raw(
         &self,
         table: &str,
@@ -3930,30 +3960,17 @@ impl ClientCtx {
                         return Err("kind write outside this group's live range; retry".into());
                     }
                 }
-                // Confirm on the batch's *intended effect* — the first record
-                // it consumes being gone — rather than on `Accepted`, which only
-                // means "appended to the leader's log". A fenced-out entry
-                // commits as a no-op, so acking on acceptance alone would report
-                // a reconciliation that never landed; the drain would then never
-                // revisit it, since it believes the records are consumed.
-                let probe = writes
-                    .iter()
-                    .find(|(kind, _, v)| *kind == animus_cp_data::KIND_CHANGE && v.is_none())
-                    .map(|(_, k, _)| k.clone());
+                let (probe_kind, probe_key, probe_value) = writes
+                    .last()
+                    .map(|(kind, key, value)| (*kind, key.clone(), value.clone()))
+                    .expect("writes is non-empty — checked via `first` above");
                 match leader.put_kind_batch_fenced(writes, None, fence) {
                     ProposeResult::Accepted { .. } => {}
                     other => return Err(format!("kind write not accepted: {other:?}")),
                 }
-                let Some(probe) = probe else {
-                    return Ok(()); // nothing consumed; nothing to confirm
-                };
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
                 while tokio::time::Instant::now() < deadline {
-                    if leader
-                        .local_get_kind(animus_cp_data::KIND_CHANGE, &probe)
-                        .await
-                        .is_none()
-                    {
+                    if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
                         return Ok(());
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;

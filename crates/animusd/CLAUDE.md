@@ -17,7 +17,8 @@ gone.
 **`lib.rs` is ~6800 lines** — grep for the symbol, don't scroll. It also holds
 two in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
 can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
-(lib.rs:6725).
+(lib.rs:6725). `index_drain.rs` has a third, `gsi_drain_cursor_tests`, for the
+same reason (see that file's own entry below).
 
 ## Module map (`src/`)
 
@@ -54,13 +55,37 @@ can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
   string suffix `cp_forward` chases). All `pub(crate)`.
 - **`dynamo.rs`** (~59 KB) — the DynamoDB JSON-over-HTTP edge; the `GET /metrics`
   route (ADR 0015) shares this listener.
-- **`index_drain.rs`** (ADR 0041 §4) — the per-node **GSI drain** background
-  loop (`index_drain_loop`, spawned alongside `tablet_host_reconciler_loop`/
-  `auto_split_loop`): sweeps every tablet group this node leads for pending
-  change records and reconciles each dirty partition's GSI rows into the
-  index's own hidden table (`reconcile_partition`, derivative not
-  delta-based — see its module doc). No LSI involvement (LSI rows are
-  written atomically with the base row in `dynamo.rs::index_aware_write`).
+- **`index_drain.rs`** (ADR 0041 §4, cursor rework + trim janitor ADR 0042
+  §7/§8) — the per-node **GSI drain** background loop (`index_drain_loop`,
+  spawned alongside `tablet_host_reconciler_loop`/`auto_split_loop`): sweeps
+  every tablet group this node leads for change records past the "gsi"
+  cursor's own watermark (`drain_tablet`), reconciles each dirty partition's
+  GSI rows into the index's own hidden table (`reconcile_partition`,
+  derivative not delta-based — see its module doc), then advances the "gsi"
+  `KIND_CURSOR` row (`animus_cp_data::cursor`) to the sweep's own max HLC
+  **only after every dirtied partition's footprint update is durably
+  confirmed** — never fused into any one partition's own commit entry (see
+  the engineering-lessons entry on why that shortcut is unsound). No LSI
+  involvement (LSI rows are written atomically with the base row in
+  `dynamo.rs::index_aware_write`). `reconcile_partition` itself no longer
+  deletes the records it consumes — that's `trim_janitor`'s job, run right
+  after each tick's reconciliation: deletes change records `hlc ≤ min(every
+  *expected, present* consumer's watermark)` in bounded `KIND_CHANGE` batches
+  (`expected_consumer_tags`, "gsi" today; a `// PR A3/B8:` marker names where
+  a stream's "copier" tag joins it), blocking trim entirely if an expected
+  tag has no row yet (the ADR 0042 §7 safe default), and tombstones stale
+  **merge-residue** cursor rows (an absorbed sibling's own row, physically
+  surviving in the widened scope, for a tag no longer expected) —
+  deliberately *not* an unexpected row at this tablet's own token (a
+  disabled stream's/dropped index's stale row is separate, later-PR
+  territory). `ClientCtx::cp_kind_write_raw`'s confirmation probe is generic
+  now (any single write in the atomic batch, not a `KIND_CHANGE`-deletion
+  search) for exactly this reason — see that method's doc and the
+  engineering-lessons entry. A `#[cfg(test)] mod gsi_drain_cursor_tests` at
+  the bottom of this file (mirroring `lib.rs`'s `split_fence_tests`) holds
+  the crash/split/merge/trim regressions that need `CpGroup`'s private
+  `pending_changes`/`cursor_min_watermark`/`cursor_rows_with_token`
+  accessors an external `tests/` crate can't reach.
 - **`cql.rs`** (~42 KB) — the CQL (Cassandra) v4 binary-protocol edge.
 - **`cql_client.rs`** — a minimal loopback CQL client the admin dashboard's CQL
   editor uses (`POST /admin/data/cql`) to drive this node's own CQL port.
@@ -808,7 +833,14 @@ below it). The restart tests run both incarnations in the same runtime,
 calling `Node::shutdown()` between them. Two in-crate `#[cfg(test)] mod`s
 (`split_fence_tests`, `auto_split_median_tests`) live in `lib.rs` itself
 because they need private handles (a raw `CpGroup`/the private
-`byte_weighted_median` helper) that no external `tests/` file can reach.
+`byte_weighted_median` helper) that no external `tests/` file can reach;
+`index_drain.rs`'s own `gsi_drain_cursor_tests` is a third (run via `cargo
+test -p animusd --lib`, not the `tests/` tree) — the ADR 0042 §7/§8
+cursor-based drain + trim janitor regressions, needing `CpGroup`'s private
+`pending_changes`/`cursor_min_watermark`/`cursor_rows_with_token` and the
+plain-client-protocol `ClientRequest::SplitTablet`/`MergeTablets` (an
+arbitrary binary `split_key`, unlike the admin HTTP surface's UTF8-string
+one).
 
 One binary per behavior; the file names describe them (`ls
 crates/animusd/tests/`) — covering combined/control-only/data-only/split

@@ -70,15 +70,26 @@ Three modules:
   `txn.rs`'s own "split_key not token-aligned" note): the module doc spells
   out a pathological `Binary`-key edge case where the truncated-token key
   is not proven to stay strictly below a tablet's own `range.end`; left for
-  a future corpus to stress. `RaftKvNode::cursor_watermark`/`cursor_rows`/
-  `cursor_min_watermark` (in `lib.rs`, next to `local_get_kind`/
-  `local_scan_kind`) are the read-side accessors — `cursor_min_watermark`
-  implements ADR 0042 §7's min-over-rows rule directly (the minimum
-  watermark across every row of a tag in this tablet's own, possibly
-  merge-widened, `KIND_CURSOR` scope). Write-side is deliberately just
-  `put_kind_batch(KIND_CURSOR, ..)` — no bespoke propose method — since the
-  existing `KvCommand::KindBatch` primitive already covers it; the GSI
-  drain/stream copier PRs are what actually call it in production.
+  a future corpus to stress. `token_of(range_start) -> [u8; TOKEN_BYTES]` is
+  `cursor_key`'s own truncate/zero-pad step, split out (PR A2) so a caller
+  that already has a *parsed* row's own token can compute *this* tablet's
+  own token to compare against, without rebuilding a whole key — the
+  `animusd` trim janitor's merge-residue cleanup (below) is exactly this
+  caller. `RaftKvNode::cursor_watermark`/`cursor_rows`/`cursor_min_watermark`
+  (in `lib.rs`, next to `local_get_kind`/`local_scan_kind`) are the read-side
+  accessors — `cursor_min_watermark` implements ADR 0042 §7's min-over-rows
+  rule directly (the minimum watermark across every row of a tag in this
+  tablet's own, possibly merge-widened, `KIND_CURSOR` scope).
+  `cursor_rows_with_token` (PR A2) is `cursor_rows`'s token-keeping sibling —
+  `cursor_rows` itself is now a thin wrapper dropping the token, since none
+  of *its* callers need it, but the trim janitor's merge-residue cleanup
+  does (telling "this tablet's own row" from "a still-physically-present
+  absorbed sibling's row" needs the token, not just the tag). Write-side is
+  deliberately just `put_kind_batch(KIND_CURSOR, ..)` — no bespoke propose
+  method — since the existing `KvCommand::KindBatch` primitive already
+  covers it; the `animusd` GSI drain (`index_drain.rs`, cursor-based since PR
+  A2 — see that crate's own `CLAUDE.md`) is what actually calls it in
+  production today, the stream copier once it lands.
 - **`seal.rs`** (ADR 0018 §2 amendment) — the **range seal**: the structural
   replacement for the retired `version_floor` cross-group-LWW fix.
   `KvCommand::Seal { range, ts }` is proposed by a range-handoff source (a

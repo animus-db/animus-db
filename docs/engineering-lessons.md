@@ -1383,6 +1383,75 @@ debugging anything that feels like it might have happened before.
   cleans up orphans left by every **pre-fix** drop, for free, since it
   depends on nothing the fix itself created. (`crates/animusd/src/lib.rs`,
   `ClientCtx::drop_table`, 2026-08-13.)
+- **A multi-consumer cursor bump must be gated on the WHOLE sweep succeeding,
+  never fused into each individual partition's own commit entry — even
+  though the two look interchangeable at first glance.** Reworking the GSI
+  drain from "consuming is trimming" to a cursor (ADR 0042 §7/§8), the
+  obvious design was: each `reconcile_partition` call writes its own
+  footprint update *and* bumps the tablet-wide "gsi" cursor to this tick's
+  overall max HLC, in the same atomic entry (mirroring the old design's
+  "footprint + delete the records it covers, one entry" shape). That is
+  unsound: the cursor is a **single row covering every partition in the
+  tablet**, not a per-partition value, so bumping it to the *tick-wide* max
+  the instant the *first* partition's entry lands would claim every
+  **other**, not-yet-reconciled partition's records (up to that same max) as
+  consumed too — a crash between the first and second partition's entries
+  then leaves the cursor over-claiming coverage the second partition never
+  got, and the trim janitor would delete its records regardless, silently
+  and permanently freezing that partition's GSI rows stale (no change record
+  survives to ever re-trigger it). The fix: compute the sweep's overall max
+  HLC once, reconcile every dirty partition sequentially (propagating any
+  error immediately, before the loop advances), and only *after* the whole
+  loop returns `Ok` does a single trailing write bump the cursor — by that
+  point every partition the max HLC could implicate has already had its own
+  footprint update independently confirmed durable, so a crash before the
+  trailing write just leaves the cursor wherever it was (safe, re-covers
+  everything on the next tick) and a crash after it is the fully-covered
+  case. The general form: a watermark that summarizes N independent
+  sub-operations is only safe to advance once *all* N have been individually
+  confirmed, not on the first one succeeding, even if advancing it earlier
+  would be "usually" correct. (`crates/animusd/src/index_drain.rs`,
+  `drain_tablet`, 2026-08-14.)
+- **A propose-and-poll confirmation helper that only knows how to probe one
+  specific write shape (here, "a `KIND_CHANGE` deletion in the batch") silently
+  stops confirming anything the instant a caller's batch stops containing that
+  shape.** `ClientCtx::cp_kind_write_raw`'s original probe searched the batch
+  for a `KIND_CHANGE` entry with `value: None` and, finding none, returned
+  `Ok` right after `Accepted` — correct for the old design (every reconcile
+  batch always deleted at least one record), silently wrong for the ADR 0042
+  cursor rework (a footprint-only or cursor-only batch has no such entry at
+  all), which would have left every reconciliation and cursor bump confirmed
+  by nothing more than "appended to the leader's log locally," reopening
+  exactly the fence-miss-looks-like-success gap the original probe existed to
+  close. Fixed by confirming the batch's **last** write generically (`local_get_kind(kind,
+  key) == expected_value`) instead of searching for one specific shape — sound
+  because the whole batch is one atomic, whole-or-nothing Raft entry, so any
+  single write's landed effect proves every other write in the same entry
+  landed too. The general form: when a confirmation mechanism special-cases
+  "the shape my one caller happens to produce," a new caller with a
+  differently-shaped (but equally atomic) batch silently degrades the
+  confirmation rather than failing loudly — prefer a probe that works for
+  *any* member of an atomic batch over one keyed to a specific write's
+  content. (`crates/animusd/src/lib.rs`, `ClientCtx::cp_kind_write_raw`,
+  2026-08-14.)
+- **In a real `ProdEnv` test, "the tablet map shows the tablet" and "this
+  node has actually started hosting its `CpGroup`" are two different,
+  separately-converging facts — polling only the first before reaching for
+  `ClusterEdgeState::local_cp` is a real (if usually narrow) race, not
+  paranoia.** A split or merge test that fetches a fresh child's/survivor's
+  `CpGroup` handle immediately after `Metadata` shows the new tablet count
+  can hit `local_cp` returning `None` — the per-node tablet-host reconciler
+  (ADR 0031) still needs its own tick to stand the group up locally.
+  Poll-for-`Some` (`local_cp(tablet).is_some()`) before ever unwrapping it,
+  the same way every other eventually-true fact in these tests is awaited,
+  rather than chaining an `.expect(..)` straight off a `Metadata` poll.
+  Separately: a merge survivor's *widened* `StorageScope` — needed before an
+  absorbed sibling's own physically-still-present rows (e.g. its own cursor
+  row, ADR 0042 §7) become visible through the survivor's scans — is
+  *also* a distinct, later-converging fact from "the tablet map shows one
+  tablet again"; assert on it with its own poll, not a single check right
+  after the merge's own convergence. (`crates/animusd/src/index_drain.rs`,
+  `gsi_drain_cursor_tests`, 2026-08-14.)
 
 ### Code patterns
 - **A marker key built by truncating a tablet's own `range.start` to a fixed

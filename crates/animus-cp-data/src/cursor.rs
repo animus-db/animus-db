@@ -88,17 +88,30 @@ use crate::hlc::{self, HlcTimestamp};
 /// `StorageScope` entirely, so they never share this numbering.
 const CURSOR_TAG: u8 = 0x03;
 
+/// The tablet-token component of [`cursor_key`]: `range_start` truncated
+/// (zero-padded if shorter) to [`TOKEN_BYTES`]. Split out of `cursor_key`
+/// so a caller that already has a *parsed* row's own token (from
+/// [`parse_cursor_key`]) can compute *this* tablet's own token to compare
+/// against, without rebuilding a whole key — the ADR 0042 §7 trim
+/// janitor's merge-residue cleanup (`animusd::index_drain`) is exactly this
+/// caller: "is this row this tablet's own, or a still-physically-present
+/// absorbed sibling's."
+#[must_use]
+pub fn token_of(range_start: &[u8]) -> [u8; TOKEN_BYTES] {
+    let mut token = [0u8; TOKEN_BYTES];
+    let n = range_start.len().min(TOKEN_BYTES);
+    token[..n].copy_from_slice(&range_start[..n]);
+    token
+}
+
 /// This tablet's own cursor-row key for `consumer` (see the module doc for
 /// the full scheme + disjointness proof). `range_start` is the tablet's
 /// live `KeyRange::start` at the moment of the call (`RaftKvNode::
 /// scope_range().start`) — truncated (zero-padded if shorter) to
-/// [`TOKEN_BYTES`].
+/// [`TOKEN_BYTES`] by [`token_of`].
 #[must_use]
 pub fn cursor_key(range_start: &[u8], consumer: &str) -> Vec<u8> {
-    let mut token = [0u8; TOKEN_BYTES];
-    let n = range_start.len().min(TOKEN_BYTES);
-    token[..n].copy_from_slice(&range_start[..n]);
-
+    let token = token_of(range_start);
     let mut out = Vec::with_capacity(TOKEN_BYTES + 2 + consumer.len());
     out.extend_from_slice(&token);
     out.push(0x00);

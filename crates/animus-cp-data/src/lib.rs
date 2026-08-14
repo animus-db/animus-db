@@ -3073,6 +3073,24 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// bytes fail to decode is dropped rather than surfaced, mirroring
     /// [`cursor_watermark`](Self::cursor_watermark)'s own defensive read.
     pub async fn cursor_rows(&self) -> Vec<(String, HlcTimestamp)> {
+        self.cursor_rows_with_token()
+            .await
+            .into_iter()
+            .map(|(_, tag, ts)| (tag, ts))
+            .collect()
+    }
+
+    /// As [`cursor_rows`](Self::cursor_rows), but keeping the **token** each
+    /// row's own key names alongside its tag. `cursor_rows` drops it (none of
+    /// its own callers need it); the ADR 0042 §7 trim janitor's merge-residue
+    /// cleanup (`animusd::index_drain`) does — it needs to tell "this
+    /// tablet's own row" (`token == cursor::token_of(self.scope_range().start)`)
+    /// from "a still-physically-present absorbed sibling's row" (any other
+    /// token, surfaced only because a merge widened this tablet's scope over
+    /// it).
+    pub async fn cursor_rows_with_token(
+        &self,
+    ) -> Vec<([u8; animus_tablet::TOKEN_BYTES], String, HlcTimestamp)> {
         let scope = &self.kind_scopes[KIND_CURSOR as usize];
         let (start, end) = scope.physical_bounds();
         let Some(end) = end else {
@@ -3086,12 +3104,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .flatten()
             .filter_map(|(k, vv)| {
                 let logical = scope.strip_in_range(&k)?;
-                let (_, tag) = cursor::parse_cursor_key(logical)?;
+                let (token, tag) = cursor::parse_cursor_key(logical)?;
                 let ts = match txn::decode_envelope(&vv.value) {
                     txn::Envelope::Committed(v) => cursor::decode_watermark(&v)?,
                     txn::Envelope::Intent { .. } => return None,
                 };
-                Some((tag.to_string(), ts))
+                let mut tok = [0u8; animus_tablet::TOKEN_BYTES];
+                tok.copy_from_slice(token);
+                Some((tok, tag.to_string(), ts))
             })
             .collect()
     }
