@@ -688,10 +688,16 @@ async fn fs_segment_store_opt_in_smoke() {
     .await;
 
     let tablet = tablets_for(&nodes[0].metadata(), "t")[0];
-    let seg_path = store_dir.join(segment::segment_id("t", &label, tablet.0, 0));
+    let meta = nodes[0].metadata();
+    let row = &meta.stream_shards[&(tablet, 0)];
+    // Ledger-named-object amendment: the object lands at the row's own
+    // unique `object_id`, never the bare deterministic `segment_id` (which
+    // is now only a directory prefix several attempts could share).
+    let seg_path = store_dir.join(&row.object_id);
     assert!(
-        seg_path.exists(),
-        "the sealed segment must land at the configured Fs directory: {seg_path:?}"
+        seg_path.is_file(),
+        "the sealed segment must land at the configured Fs directory, at the row's own \
+         object_id: {seg_path:?}"
     );
 
     let shard0 = segment::shard_id(tablet.0, 0);

@@ -201,6 +201,20 @@ impl CpGroup {
         }
     }
 
+    /// This group's current Raft term — one axis of the ledger-named-object
+    /// amendment's per-attempt segment id (ADR 0042 §10/ADR 0043 §A3,
+    /// `index_drain::seal_now`): a node that crashes and later resumes
+    /// leading this same group again does so at a strictly higher term
+    /// (Raft's own guarantee), so folding it into the id disambiguates a
+    /// same-node restart even against an RNG stream that happened to
+    /// replay identically. See [`RaftKvNode::term`].
+    pub(crate) fn term(&self) -> u64 {
+        match self {
+            CpGroup::Lsm(n) => n.term(),
+            CpGroup::Mem(n) => n.term(),
+        }
+    }
+
     /// A bounded base-scope scan over `[start, end)` in key order — the
     /// partition-range read the GSI drain recomputes an item's index rows from.
     pub(crate) async fn local_scan_bounded(
@@ -3732,6 +3746,50 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.repair(id, bytes, surviving, target_k).await,
             SegmentStoreHandle::Fs(_) => Ok(surviving.to_vec()),
+        }
+    }
+
+    /// List every id starting with `prefix` on **this node's own local**
+    /// segment directory (the segment janitor's orphan sweep, ADR 0042
+    /// §10/ADR 0043 §A3 as-built amendment) — never cluster-wide, mirroring
+    /// [`SegmentStore::list`](animus_env::SegmentStore::list)'s own
+    /// documented "local-only, debug/sweep-only" contract. For the
+    /// `Cluster` variant this deliberately bypasses replication/placement
+    /// entirely (`ClusterSegmentStore::local()`), so a single tick only
+    /// ever discovers this one node's own copies — see the orphan sweep's
+    /// own doc for why that is an accepted, honestly-documented limitation
+    /// rather than a bug.
+    pub(crate) async fn list_local(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        use animus_env::SegmentStore;
+        match self {
+            SegmentStoreHandle::Cluster(c) => c.local().list(prefix).await,
+            SegmentStoreHandle::Fs(fs) => fs.list(prefix).await,
+        }
+    }
+
+    /// Fetch `id` from **this node's own local** segment directory — the
+    /// orphan sweep's own read, paired with [`list_local`](Self::list_local)
+    /// (an id `list_local` just returned is, by construction, already local
+    /// to this same store).
+    pub(crate) async fn get_local(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
+        use animus_env::SegmentStore;
+        match self {
+            SegmentStoreHandle::Cluster(c) => c.local().get(id).await,
+            SegmentStoreHandle::Fs(fs) => fs.get(id).await,
+        }
+    }
+
+    /// Delete `id` from **this node's own local** segment directory only —
+    /// the orphan sweep's own reclaim step. Deliberately not a
+    /// cluster-replicated delete (`delete_from`): an orphan was never
+    /// cataloged, so there is no `replicas` set to consult, and each node
+    /// that ever becomes the control leader sweeps its own local copies as
+    /// leadership rotates (see [`list_local`](Self::list_local)'s doc).
+    pub(crate) async fn delete_local(&self, id: &str) -> std::io::Result<()> {
+        use animus_env::SegmentStore;
+        match self {
+            SegmentStoreHandle::Cluster(c) => c.local().delete(id).await,
+            SegmentStoreHandle::Fs(fs) => fs.delete(id).await,
         }
     }
 }

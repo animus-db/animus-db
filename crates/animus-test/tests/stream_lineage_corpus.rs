@@ -60,7 +60,7 @@ use animus_control::{
     ApplyOutcome, ColumnType, MetaCommand, Metadata, StreamSpec, StreamViewType, TableSchema,
 };
 use animus_cp_data::{KIND_BASE, RaftKvNode, StorageScope, segment};
-use animus_env::{Nanos, SegmentStore, nid};
+use animus_env::{Env, Nanos, Rng, SegmentStore, nid};
 use animus_sim::{SimEnv, SimSegmentStore, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TabletId};
@@ -287,7 +287,20 @@ fn seal_now(
         seal_wall_ms: wall_ms,
     };
     let bytes = segment::encode(&header, &records);
-    let seg_id = segment::segment_id(TABLE, LABEL, group.id.0, epoch);
+    // Ledger-named-object amendment: a fresh, attempt-unique id every call —
+    // mirrors `index_drain::seal_now`'s own scheme exactly (proposer node id
+    // + this group's own current term + a fresh RNG draw), never the bare
+    // deterministic `segment_id`.
+    let env = group.nodes[leader].env();
+    let seg_id = segment::segment_object_id(
+        TABLE,
+        LABEL,
+        group.id.0,
+        epoch,
+        env.node_id().as_str(),
+        group.nodes[leader].term(),
+        env.next_u64(),
+    );
     block_on(store.put(&seg_id, &bytes)).ok()?;
 
     if skip_commit {
@@ -303,6 +316,7 @@ fn seal_now(
         count,
         seal_wall_ms: wall_ms,
         replicas: Vec::new(),
+        object_id: seg_id,
     });
     matches!(outcome, ApplyOutcome::Applied).then_some(epoch)
 }
@@ -322,9 +336,12 @@ fn collect_tablet_records(
     leader: usize,
 ) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
     let mut all = Vec::new();
-    for (epoch, row) in meta.stream_shard_chain(TABLE, LABEL, group.id) {
-        let seg_id = segment::segment_id(TABLE, LABEL, group.id.0, epoch);
-        let bytes = block_on(store.get(&seg_id))
+    for (_epoch, row) in meta.stream_shard_chain(TABLE, LABEL, group.id) {
+        // Ledger-named-object amendment: resolve from the row, never
+        // recompute `segment_id` — mirrors `dynamo_streams::get_records_
+        // sealed`'s own fix.
+        let seg_id = row.object_id.as_str();
+        let bytes = block_on(store.get(seg_id))
             .unwrap_or_else(|e| panic!("segment store get of {seg_id}: {e}"));
         let bytes = bytes.unwrap_or_else(|| {
             panic!(
@@ -1004,6 +1021,7 @@ fn scenario_disable_grace_drain(seed: u64) {
         count: 0,
         seal_wall_ms: 3_000,
         replicas: Vec::new(),
+        object_id: format!("{TABLE}/{LABEL2}/{}/test", group.id.0),
     });
     // An empty shard is never sealed in production (`seal_now` never calls
     // `SealStreamShard` for an empty scan) — this hand-built row exists only
@@ -1271,5 +1289,236 @@ fn durability_invariant_holds_at_every_kill_point() {
     for_each_seed(
         "durability_invariant_holds_at_every_kill_point",
         scenario_durability_kill_points,
+    );
+}
+
+// --- regression: dueling seals for the same epoch (ledger-named-object
+// amendment, ADR 0042 §10/ADR 0043 §A3, 2026-08-15) ----------------------
+//
+// **Root-cause repro, not a frozen corpus cell** — ported from
+// `investigate/stream-seal-loss` (seed 849844469346351525, "delivered 5 !=
+// journal 10" on unmodified main), which found the byte-seal record-loss
+// bug this amendment fixes. Deliberately NOT wired into
+// `for_each_seed`/the frozen scenario set — it is a hand-scripted proof of
+// one exact interleaving, not a fault-injection cell a seed sweep discovers
+// on its own (this harness's own `seal_now` helper reads and applies
+// against the *same* `&mut Metadata` reference every call, so no seed of
+// *that* harness can express "two attempts computed from two different
+// metadata snapshots").
+//
+// **The mechanism**: two independent seal attempts for the tablet's SAME
+// open epoch — exactly what a brief dual-leadership window would produce
+// (a re-election triggered by write-burst backpressure on the very node
+// driving the seal; see `animus-cp-data/CLAUDE.md`'s "leader-election
+// storm" driver-liveness entry for why heavy write load is exactly what
+// induces this). `Metadata::apply`'s `SealStreamShard` arm always correctly
+// protected the **catalog**: a second proposal for an already-recorded
+// `(tablet, epoch)` whose content differs from what's already committed is
+// rejected outright as `ApplyOutcome::NoOp` — first-committer-wins.
+//
+// **What used to protect nothing, before this amendment**: the *segment
+// object* physically stored at the deterministic `segment_id(table, label,
+// tablet, epoch)` — `SegmentStore::put`/`put_sealed` was an unconditional,
+// un-ordered overwrite, so whichever attempt's `put` landed chronologically
+// LAST won the physical bytes, independent of which attempt's *proposal*
+// won the catalog's first-committer-wins rule. When the later-landing `put`
+// carried a SMALLER range than the catalog's own committed one, the gap was
+// silently, permanently lost. **The fix**: every attempt now writes at its
+// own unique id ([`segment::segment_object_id`]), so the two attempts'
+// physical writes can never collide at all — the store enforces write-once
+// per id, and a losing attempt's own object simply becomes a harmless,
+// uncataloged orphan rather than physically overwriting the winner.
+//
+// Below: attempt "slow" computes its own record set from a metadata/
+// pending-changes snapshot taken BEFORE a second batch of writes lands
+// (mirroring a leader whose own `put_sealed` — a real K-way replicated
+// write — takes long enough for a second, independent leader to fully
+// seal, catalog-commit, and move on before the first's `put` physically
+// arrives) and mints its OWN unique object id right then, exactly as a real
+// `seal_now` call would. Attempt "fast" runs the ordinary, complete
+// `seal_now` sequence against the live metadata (sees both batches), wins
+// the catalog with its OWN unique id. "Slow"'s own (late) `put` now lands
+// at its own distinct id — never touching the winner's object — and its
+// own catalog proposal is (correctly) rejected as a `NoOp` (its `object_id`
+// alone already differs from what's committed, on top of the differing
+// `hlc_range`). `verify_lineage` (the same decision tree
+// `DescribeStream`/`GetShardIterator(TRIM_HORIZON)`/`GetRecords` walks in
+// production) now finds **zero** loss — all 10 journaled records delivered
+// — proving the fix: this is the identical interleaving that produced
+// "delivered 5 != journal 10" before the amendment.
+fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    let group = start_group(&sim, &engines, TabletId(20), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    // Batch 1: what the "slow" (about-to-lose-leadership) attempt sees.
+    for i in 0..5 {
+        write_and_journal(
+            &mut sim,
+            &group,
+            &live,
+            &mut journal,
+            &key(i),
+            b"batch1",
+            seed,
+        );
+    }
+    let slow_leader = elect(&mut sim, &group, &live, seed);
+
+    // The slow attempt's own snapshot, taken now — mirrors
+    // `index_drain::seal_now`'s own sequence up through its `pending_
+    // changes()` read (`animusd/src/index_drain.rs:944-960`), before its
+    // (real, K-way replicated, hence slow) `put_sealed` call.
+    let watermark_slow = meta.effective_stream_shard_watermark(group.id).unwrap_or(0);
+    let mut slow_records: Vec<(Vec<u8>, u64, Vec<u8>)> =
+        block_on(group.nodes[slow_leader].pending_changes())
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let hlc = record_hlc_suffix(&k)?;
+                (hlc > watermark_slow).then_some((k, hlc, v))
+            })
+            .collect();
+    slow_records.sort_by_key(|(_, hlc, _)| *hlc);
+    assert_eq!(
+        slow_records.len(),
+        5,
+        "[seed={seed}] the slow attempt's own snapshot must see exactly batch 1"
+    );
+    // The slow attempt mints its OWN unique object id right now, exactly as
+    // a real `seal_now` call would (ledger-named-object amendment) —
+    // captured before the fast attempt's later election, so a term read
+    // later would no longer reflect this moment.
+    let slow_epoch = 0u64;
+    let slow_env = group.nodes[slow_leader].env();
+    let slow_term = group.nodes[slow_leader].term();
+    let slow_seg_id = segment::segment_object_id(
+        TABLE,
+        LABEL,
+        group.id.0,
+        slow_epoch,
+        slow_env.node_id().as_str(),
+        slow_term,
+        slow_env.next_u64(),
+    );
+
+    // Batch 2 lands while the slow attempt's `put_sealed` is modeled as
+    // still in flight (its own snapshot above is already taken and won't
+    // change) — a second leader takes over and drives a genuinely
+    // independent, complete seal.
+    for i in 5..10 {
+        write_and_journal(
+            &mut sim,
+            &group,
+            &live,
+            &mut journal,
+            &key(i),
+            b"batch2",
+            seed,
+        );
+    }
+
+    // The "fast" attempt: an ordinary, complete `seal_now` against live
+    // metadata — sees both batches, and is the only proposal that has
+    // landed when the catalog resolves this epoch, so it wins outright.
+    let fast_leader = elect(&mut sim, &group, &live, seed);
+    let sealed_fast = seal_now(&mut meta, &store, &group, fast_leader, 1_000, false);
+    assert_eq!(
+        sealed_fast,
+        Some(0),
+        "[seed={seed}] the fast attempt seals epoch 0 covering both batches"
+    );
+    let fast_watermark = meta
+        .effective_stream_shard_watermark(group.id)
+        .expect("fast attempt just committed a watermark");
+    let fast_seg_id = meta.stream_shards[&(group.id, 0)].object_id.clone();
+
+    // The slow attempt's `put_sealed` finally lands — using the bytes it
+    // computed BEFORE batch 2 ever existed — landing at its OWN unique id
+    // (minted above), never the winner's (the ledger-named-object
+    // amendment: no two attempts ever share a storage key, so there is
+    // nothing for this late `put` to overwrite).
+    let epoch = slow_epoch;
+    let hlc_range_slow = (watermark_slow, slow_records.last().unwrap().1);
+    let count = slow_records.len() as u64;
+    let seg_records: Vec<segment::SegmentRecord> = slow_records
+        .iter()
+        .map(|(k, hlc, v)| segment::SegmentRecord {
+            source_key: k.clone(),
+            packed_hlc: *hlc,
+            change_record: v.clone(),
+        })
+        .collect();
+    let header = segment::SegmentHeader {
+        table: TABLE.into(),
+        label: LABEL.into(),
+        shard_id: segment::shard_id(group.id.0, epoch),
+        tablet: group.id.0,
+        epoch,
+        parent_shard_id: meta.stream_shard_parent_id(group.id, epoch),
+        hlc_range: hlc_range_slow,
+        count,
+        seal_wall_ms: 900, // the slow attempt started first, in wall-clock terms
+    };
+    let bytes = segment::encode(&header, &seg_records);
+    block_on(store.put(&slow_seg_id, &bytes))
+        .expect("the slow attempt's late put still succeeds, at its own unique id");
+    assert_ne!(
+        slow_seg_id, fast_seg_id,
+        "[seed={seed}] the two independently-computed attempts must never share a storage id"
+    );
+
+    // The slow attempt's own catalog proposal, now that it finally gets
+    // around to it: its OWN `object_id` alone already differs from what's
+    // committed (on top of the differing `hlc_range`), so `Metadata::
+    // apply`'s first-committer-wins rule correctly rejects it as a `NoOp`
+    // — the catalog itself is proven intact here, exactly as before the
+    // amendment.
+    let slow_outcome = meta.apply(&MetaCommand::SealStreamShard {
+        table: TABLE.into(),
+        label: LABEL.into(),
+        tablet: group.id,
+        epoch,
+        view_type: StreamViewType::NewAndOldImages,
+        hlc_range: hlc_range_slow,
+        count,
+        seal_wall_ms: 900,
+        replicas: Vec::new(),
+        object_id: slow_seg_id,
+    });
+    assert_eq!(
+        slow_outcome,
+        ApplyOutcome::NoOp,
+        "[seed={seed}] the catalog must reject the slow attempt's differing content"
+    );
+    assert_eq!(
+        meta.effective_stream_shard_watermark(group.id),
+        Some(fast_watermark),
+        "[seed={seed}] the catalog's committed watermark must be untouched by the rejected proposal"
+    );
+
+    // The fix: `verify_lineage` now finds ZERO loss. Before the
+    // ledger-named-object amendment, the slow attempt's late `put` landed
+    // at the SAME deterministic id the fast attempt had just won,
+    // physically overwriting it with a smaller record set — batch 2's 5
+    // records ended up claimed by the catalog's own committed range but
+    // absent from the (now too-small) segment object, and excluded from the
+    // open tail by the advanced watermark: "delivered 5 != journal 10" on
+    // unmodified main. With unique per-attempt ids there is nothing left
+    // for the slow attempt's write to overwrite — its object is a harmless,
+    // permanent orphan the segment janitor's own sweep reclaims — and every
+    // one of the 10 journaled records is delivered.
+    verify_lineage(&meta, &store, &[(&group, fast_leader)], &journal, seed);
+}
+
+#[test]
+fn dueling_seals_orphan_hot_range() {
+    for_each_seed(
+        "dueling_seals_orphan_hot_range",
+        scenario_dueling_seals_orphan_hot_range,
     );
 }

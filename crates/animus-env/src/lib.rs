@@ -429,22 +429,44 @@ pub trait Disk: Send + Sync {
 /// **Consistency contract** (binding on every implementation):
 /// - **Read-after-put**: once [`put`](SegmentStore::put) returns `Ok`, every
 ///   reader's subsequent [`get`](SegmentStore::get) of that `id` sees the
-///   bytes just written (or a later overwrite of the same id) — never a
-///   value older than the last acknowledged put.
-/// - **Idempotent overwrite**: putting the same `id` again — with the same
-///   bytes or different ones — is `Ok`; the store does not enforce
-///   write-once, and overwrite is last-write-wins from the store's own
-///   point of view. Callers own any "first write wins" policy on top.
-/// - **Immutability once cataloged, modulo the superset-slice rule**: an id
-///   recorded in the replicated segment catalog
-///   (`MetaCommand::SealStreamShard`) is treated as immutable by every
-///   reader, *except* for the deliberate race a crash-retried seal can
-///   produce — a retried `put` may overwrite an id with a strict *superset*
-///   of the previously written records (ADR 0043 §A3's recovery path).
-///   Readers MUST slice a fetched object down to the catalog row's
-///   committed range rather than trusting the raw object's extent (the
-///   "superset-slice rule," ADR 0042 §10 / ADR 0043 §A3). This trait cannot
-///   enforce that on its own — it is a reader-side obligation.
+///   bytes just written — never a value older than the last acknowledged
+///   put.
+/// - **Write-once (as-built amendment — this was originally "idempotent
+///   overwrite, last-write-wins"; see below for why that changed).**
+///   Putting an id that already holds **byte-identical** content is `Ok`, a
+///   safe no-op (a same-attempt retry after a lost ack, or a repair sweep
+///   copying the exact same bytes to a fresh replica that lacks them, land
+///   here). Putting an id that already holds **different** content is a
+///   hard `Err` — this trait now enforces write-once itself, rather than
+///   leaving "first write wins" as a caller-owned policy on top of a
+///   last-write-wins store. **Why this changed**: two independently-computed
+///   seal attempts for the same catalog `(tablet, epoch)` used to derive the
+///   identical deterministic id and race their physical `put`s — the
+///   replicated catalog's own `SealStreamShard` apply arm correctly picked
+///   one winner (first-committer-wins on content), but this store had no
+///   matching adjudication, so whichever `put` physically landed *last* won
+///   the bytes, independent of which attempt's *catalog proposal* won. When
+///   the chronologically-later `put` carried a *smaller* range than the
+///   catalog's own committed one, the gap was silently, permanently lost —
+///   a real bug that shipped undetected (see
+///   `docs/engineering-lessons.md` and `animus_cp_data::segment`'s own doc
+///   for the full incident). The structural fix is upstream of this trait
+///   (every caller now writes each attempt at its own unique id,
+///   `animus_cp_data::segment::segment_object_id` — no two attempts can ever
+///   collide on the same id again), but this trait's own contract is
+///   tightened too: a caller that *does* accidentally reuse an id for
+///   genuinely different content now gets a loud `Err` instead of a silent
+///   overwrite, closing the hazard by construction rather than by every
+///   caller's continued discipline.
+/// - **Immutability once cataloged, as defense-in-depth.** An id recorded in
+///   the replicated segment catalog (`MetaCommand::SealStreamShard`) is
+///   treated as immutable by every reader. With write-once enforced by this
+///   trait, a cataloged id's bytes can now never change at all after the
+///   fact — the "superset-slice rule" (ADR 0042 §10 / ADR 0043 §A3, a reader
+///   slicing a fetched object down to the catalog row's own committed
+///   range) predates this amendment and is no longer load-bearing for the
+///   race it was written for, but stays in place as cheap, harmless
+///   defense-in-depth (see `animus_cp_data::segment`'s own module doc).
 /// - **`get` returning `None` after a [`delete`](SegmentStore::delete)** is
 ///   a defined, expected outcome (surfaces to a stream consumer as
 ///   `TrimmedDataAccess`), never an error. `None` is also the answer for an
@@ -464,8 +486,13 @@ pub trait Disk: Send + Sync {
 #[async_trait::async_trait]
 pub trait SegmentStore: Send + Sync {
     /// Write `bytes` at `id`. Durable, per this implementation's own
-    /// durability contract, once this returns `Ok`. Idempotent: overwriting
-    /// an existing `id` is `Ok`, last-write-wins.
+    /// durability contract, once this returns `Ok`. **Write-once**: `Ok` if
+    /// `id` is unwritten or already holds byte-identical content (a safe
+    /// no-op); `Err` if `id` already holds *different* content — see the
+    /// trait's own doc for why. Every real caller should be writing each
+    /// attempt at its own unique id (`animus_cp_data::segment::
+    /// segment_object_id`) and never actually hit the `Err` case in
+    /// practice.
     async fn put(&self, id: &str, bytes: &[u8]) -> io::Result<()>;
 
     /// Fetch the bytes at `id`, or `None` if `id` was never written or has

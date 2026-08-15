@@ -597,10 +597,20 @@ resolve is now moot).
   generalized to a cluster-wide (not per-tablet) responsibility.
 - **A `put_replicated`/`delete_from` failure can leave harmless orphans on
   whichever targets *did* succeed** — never cataloged (the segment janitor
-  only commits `SealStreamShard` after `put_replicated` itself returns `Ok`),
-  and `SegmentStore::put`/`delete` are idempotent overwrite/delete by
-  contract, so a retry to the same deterministic id always converges. Don't
-  "fix" a partial failure by trying to roll back the targets that already
+  only commits `SealStreamShard` after `put_replicated` itself returns `Ok`).
+  **As-built amendment**: this used to say a retry "converges" onto the same
+  deterministic id because `SegmentStore::put`/`delete` were idempotent
+  overwrite/delete by contract — that contract caused a real data-loss bug
+  (two independently-computed seal attempts for the same `(tablet, epoch)`
+  raced their `put`s at the identical id; see `segment.rs`'s own module doc
+  for the full incident) and no longer holds. `put` is now **write-once**:
+  identical-content re-puts (a genuine same-attempt retry) still converge
+  safely, but every real attempt writes at its own unique id
+  (`segment::segment_object_id`), so a *different* attempt's partial-K
+  copies at the *old* id are permanent orphans, not something a later retry
+  ever revisits — reclaimed by the segment janitor's own orphan sweep
+  (`animusd::segment_janitor::reap_orphans`), not by overwrite. Don't "fix"
+  a partial failure by trying to roll back the targets that already
   succeeded — that would add a second distributed failure mode (the rollback
   itself can partially fail) to clean up a case that is already safe to leave
   alone.
