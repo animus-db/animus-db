@@ -910,7 +910,16 @@ route below the edge through the same `ClientCtx` CP primitives.
   interface.** The `animus admin` CLI consumes it. The bulk seeder
   (`action_data_seed`) writes real **DynamoDB items** — key/value bytes
   built exactly as the DynamoDB edge's `PutItem` would, so seeded rows read
-  back through `GetItem`/`Query`/`Scan`. `key_display`/`parse_key_display`
+  back through `GetItem`/`Query`/`Scan`. `POST /admin/data/dynamo`
+  (`action_data_dynamo`) reaches **both** services on the DynamoDB
+  listener — the item API and, for `ListStreams`/`DescribeStream`/
+  `GetShardIterator`/`GetRecords` (bare op name or `DynamoDBStreams_
+  20120810.`-qualified), the Streams read API (ADR 0042 §3) — by resolving
+  `op` to a target and calling `dynamo::execute_routed`, the same
+  prefix-fork function `dynamo::dispatch` itself uses; **never** call
+  `dynamo::execute` from here directly, which skips that fork entirely
+  (see `docs/engineering-lessons.md`'s "same-listener dispatch fork" entry
+  for the bug this shortcut caused before the fix). `key_display`/`parse_key_display`
   render a binary partition token as unpadded base64url; a plain-client key
   is verbatim/printable. `/admin/peers`'s `peers: [{admin, role}, ...]`
   field carries each node's deployment role straight off replicated

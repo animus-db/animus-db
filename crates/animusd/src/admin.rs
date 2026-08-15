@@ -48,7 +48,7 @@
 //! - `GET  /admin/control/members`     — live control-plane voters + address book (ADR 0037 PR3)
 //! - `POST /admin/control/member/add`    — `{node?, addr}` — grow the control group (ADR 0037 PR3; `node` optional since the ADR 0037 hardening trio's PR3, allocator-minted)
 //! - `POST /admin/control/member/remove` — `{node}` — shrink the control group (ADR 0037 PR3)
-//! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021)
+//! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021), item API or Streams read API alike (ADR 0042)
 //! - `POST /admin/data/cql`            — run CQL `{query, keyspace?}` (ADR 0021)
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
 //! - `POST /admin/data/seed`           — bulk-write synthetic DynamoDB items `{count, …}` (ADR 0021)
@@ -1457,10 +1457,28 @@ struct CqlDataReq {
     keyspace: Option<String>,
 }
 
+/// The `DynamoDB Streams` op names (ADR 0042 §3) — used to resolve a bare
+/// `op` (no target-prefix dot) to the Streams read API rather than the item
+/// API. Unambiguous: the item API has no op sharing any of these names, so a
+/// bare op needs no further disambiguation.
+const STREAMS_OPS: &[&str] = &[
+    "ListStreams",
+    "DescribeStream",
+    "GetShardIterator",
+    "GetRecords",
+];
+
 /// `POST /admin/data/dynamo` — run a DynamoDB operation from the dashboard, by
-/// reusing the DynamoDB edge's decode + execute path in-process (ADR 0021). The
-/// response is the operation's own JSON (or a DynamoDB error object), with the
-/// edge's status code.
+/// reusing the DynamoDB edge's decode + execute path in-process (ADR 0021).
+/// Reaches **both** services on that edge (ADR 0042 §3's same-listener fork):
+/// a fully-qualified `op` (containing a `.`) passes through unchanged and is
+/// routed by its own prefix; a bare `op` is resolved by name — one of
+/// [`STREAMS_OPS`] gets the `DynamoDBStreams_20120810.` prefix, anything else
+/// the item API's `DynamoDB_20120810.` prefix (the pre-existing default) —
+/// then both go through [`crate::dynamo::execute_routed`], the identical fork
+/// the real edge's `dispatch` uses, so a dashboard client and a genuine wire
+/// client resolve a target the same way. The response is the operation's own
+/// JSON (or a DynamoDB error object), with the edge's status code.
 async fn action_data_dynamo(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let req: DynamoDataReq = match parse_body(body) {
         Ok(r) => r,
@@ -1468,11 +1486,13 @@ async fn action_data_dynamo(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     };
     let target = if req.op.contains('.') {
         req.op.clone()
+    } else if STREAMS_OPS.contains(&req.op.as_str()) {
+        format!("DynamoDBStreams_20120810.{}", req.op)
     } else {
         format!("DynamoDB_20120810.{}", req.op)
     };
     let payload = serde_json::to_vec(&req.payload).unwrap_or_default();
-    let (status, json_body) = crate::dynamo::execute(ctx, &target, &payload).await;
+    let (status, json_body) = crate::dynamo::execute_routed(ctx, &target, &payload).await;
     let value = serde_json::from_str::<Value>(&json_body).unwrap_or(Value::String(json_body));
     (status, value)
 }

@@ -1061,3 +1061,163 @@ async fn client_protocol_status_survives_a_populated_stream_shard_catalog() {
         other => panic!("unexpected reply to Status: {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// The admin dashboard's data proxy (`POST /admin/data/dynamo`) reaching the
+// DynamoDB Streams read API (dash/1-streams-proxy).
+// ---------------------------------------------------------------------------
+
+/// Before this fix, `action_data_dynamo` always built a `DynamoDB_20120810.*`
+/// target for a bare `op` and called `dynamo::execute` directly — bypassing
+/// `dynamo::dispatch`'s own target-prefix fork entirely, so the admin proxy
+/// could never reach `ListStreams`/`DescribeStream`/`GetShardIterator`/
+/// `GetRecords` no matter how `op` was spelled. This drives the full round
+/// trip — create a streamed table, write an item, then walk all four Streams
+/// ops through the admin proxy — and asserts a real record comes back,
+/// mixing bare op names with one fully-qualified (dot) passthrough to cover
+/// both `op` shapes the route accepts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_data_dynamo_proxy_reaches_streams_read_api() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
+    await_bootstrap(&nodes).await;
+    let admin_addr = nodes[0].admin_addr();
+
+    // Set up a streamed table and one item entirely through the admin proxy
+    // — exercising the item-API half of the same route too.
+    let (status, body) = admin(
+        admin_addr,
+        "POST",
+        "/admin/data/dynamo",
+        Some(
+            r#"{"op":"CreateTable","payload":{"TableName":"t",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                "StreamSpecification":{"StreamEnabled":true,
+                    "StreamViewType":"NEW_AND_OLD_IMAGES"}}}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable via admin proxy: {body:?}");
+    let label = body["TableDescription"]["LatestStreamLabel"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no LatestStreamLabel in CreateTable response: {body:?}"))
+        .to_owned();
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/t/stream/{label}");
+
+    let (status, body) = admin(
+        admin_addr,
+        "POST",
+        "/admin/data/dynamo",
+        Some(r#"{"op":"PutItem","payload":{"TableName":"t","Item":{"id":{"S":"a"}}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "PutItem via admin proxy: {body:?}");
+
+    // `tiny_seal_knobs()` (`seal_bytes: 1`) makes the one write its own
+    // sealed shard shortly after commit.
+    await_true(20, "the write never sealed into a catalog row", || {
+        !nodes[0].metadata().stream_shards.is_empty()
+    })
+    .await;
+
+    // ---- ListStreams (bare op) --------------------------------------------
+    let (status, body) = admin(
+        admin_addr,
+        "POST",
+        "/admin/data/dynamo",
+        Some(r#"{"op":"ListStreams","payload":{}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "ListStreams via admin proxy: {body:?}");
+    let streams = body["Streams"]
+        .as_array()
+        .unwrap_or_else(|| panic!("Streams must be an array: {body:?}"));
+    assert!(
+        streams
+            .iter()
+            .any(|s| s["TableName"] == "t" && s["StreamArn"] == stream_arn),
+        "ListStreams via admin proxy must list the table's own stream: {body:?}"
+    );
+
+    // ---- DescribeStream (bare op) ------------------------------------------
+    let (status, body) = admin(
+        admin_addr,
+        "POST",
+        "/admin/data/dynamo",
+        Some(&format!(
+            r#"{{"op":"DescribeStream","payload":{{"StreamArn":"{stream_arn}"}}}}"#
+        )),
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeStream via admin proxy: {body:?}");
+    let shard_id = body["StreamDescription"]["Shards"][0]["ShardId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no shard in DescribeStream response: {body:?}"))
+        .to_owned();
+
+    // ---- GetShardIterator (fully-qualified `op` — the dot-passthrough shape) --
+    let (status, body) = admin(
+        admin_addr,
+        "POST",
+        "/admin/data/dynamo",
+        Some(&format!(
+            r#"{{"op":"DynamoDBStreams_20120810.GetShardIterator","payload":{{"StreamArn":"{stream_arn}","ShardId":"{shard_id}","ShardIteratorType":"TRIM_HORIZON"}}}}"#
+        )),
+    )
+    .await;
+    assert_eq!(status, 200, "GetShardIterator via admin proxy: {body:?}");
+    let iterator = body["ShardIterator"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no ShardIterator in response: {body:?}"))
+        .to_owned();
+
+    // ---- GetRecords (bare op) — the actual payoff: a real record ----------
+    let (status, body) = admin(
+        admin_addr,
+        "POST",
+        "/admin/data/dynamo",
+        Some(&format!(
+            r#"{{"op":"GetRecords","payload":{{"ShardIterator":"{iterator}"}}}}"#
+        )),
+    )
+    .await;
+    assert_eq!(status, 200, "GetRecords via admin proxy: {body:?}");
+    let records = body["Records"]
+        .as_array()
+        .unwrap_or_else(|| panic!("Records must be an array: {body:?}"));
+    assert_eq!(records.len(), 1, "one record for the one write: {body:?}");
+    assert_eq!(
+        records[0]["dynamodb"]["Keys"]["id"]["S"], "a",
+        "the returned record must be the item actually written: {body:?}"
+    );
+}
+
+/// A negative case for the same route: an `op` that belongs to neither the
+/// item API nor the Streams API must still fail cleanly (a client-error
+/// status with a well-formed error body), never a panic or a hang — a
+/// routing change here must not weaken that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_data_dynamo_proxy_rejects_unknown_op_cleanly() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
+    await_bootstrap(&nodes).await;
+    let admin_addr = nodes[0].admin_addr();
+
+    let (status, body) = admin(
+        admin_addr,
+        "POST",
+        "/admin/data/dynamo",
+        Some(r#"{"op":"TotallyNotARealOperation","payload":{}}"#),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an unknown op must error cleanly (400), not panic or hang: {body:?}"
+    );
+    assert!(
+        body["__type"]
+            .as_str()
+            .is_some_and(|t| t.ends_with("UnknownOperationException")),
+        "must be the standard unknown-operation error shape: {body:?}"
+    );
+}
