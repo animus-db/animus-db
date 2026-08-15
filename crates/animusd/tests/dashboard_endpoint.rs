@@ -99,6 +99,40 @@ async fn raw(addr: SocketAddr, method: &str, path: &str) -> (u16, String, String
     (status, head.to_string(), body.to_string())
 }
 
+/// Like [`raw`], but a `POST` carrying a body and one extra header line
+/// (e.g. `X-Amz-Target: ...` for the DynamoDB edge, or none for the plain-JSON
+/// admin proxy) — needed for the streams-on-control-node regression below,
+/// which drives both the DynamoDB item edge (to create a streamed table and
+/// force a seal) and the admin `/admin/data/dynamo` Streams proxy.
+async fn raw_post(addr: SocketAddr, path: &str, extra_header: &str, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let header = if extra_header.is_empty() {
+        String::new()
+    } else {
+        format!("{extra_header}\r\n")
+    };
+    let request = format!(
+        "POST {path} HTTP/1.0\r\nHost: animus\r\nConnection: close\r\n{header}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send request");
+    stream.flush().await.expect("flush");
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).await.expect("read response");
+    let text = String::from_utf8(bytes).expect("utf8 response");
+    let (head, resp_body) = text.split_once("\r\n\r\n").expect("response has a body");
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    (status, resp_body.to_string())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn dashboard_serves_spa_with_cors_and_peers() {
     timeout(Duration::from_secs(60), async {
@@ -352,6 +386,14 @@ async fn dashboard_role_gating_split_deployment() {
             "dashboard_core.js defines the per-role tab gating, including the \
              data role's node-first tab list (now with Streams, ADR 0042/0043): {core_js}"
         );
+        assert!(
+            core_js.contains(
+                r#"control: ["overview", "placement", "tablets", "browser", "streams", "storage"]"#
+            ),
+            "the control role's own tab list now includes Streams too (a control-only \
+             node holds the full replicated Metadata, so the stream list + shard-chain \
+             detail render truthfully there; only the live-tail poller degrades): {core_js}"
+        );
 
         // ---- /admin/config's role differs across the split -----------------
         let (s, _, body) = raw(control_admin, "GET", "/admin/config").await;
@@ -451,6 +493,201 @@ async fn dashboard_role_gating_split_deployment() {
         })
         .await
         .expect("peers did not report both nodes' roles in 20s");
+
+        for node in control_nodes.iter().chain(data_nodes.iter()) {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Dashboard follow-up (this PR): the Streams tab now also shows on a
+/// control-only node's console (`ROLE_TABS`, `dashboard_core.js`) — verified
+/// here against a **real** split deployment that a control-only node's
+/// `/admin/status` genuinely carries the replicated stream catalog
+/// (`schemas.tables[t].stream` + `stream_shards`), and that the metadata-only
+/// half of the Streams read API the view calls through `/admin/data/dynamo`
+/// (`ListStreams`/`DescribeStream`) answers truthfully there for both an
+/// still-open stream and one force-sealed via `UpdateTable{StreamEnabled:
+/// false}` (F12-b's final seal — no small `--stream-seal-bytes` knob is
+/// needed to exercise a genuine sealed shard this way).
+///
+/// **Deliberately does not call `GetShardIterator`/`GetRecords` here.**
+/// Verified manually against a live cluster while building the dashboard
+/// change: `GetRecords` on a sealed shard from a control-only node panics
+/// inside `ClientCtx::data()` (an empty/dropped HTTP reply, not a JSON
+/// error — `ClientCtx::data()`'s own doc says exactly this must never be
+/// reachable from a client-dispatch path, but `dynamo_streams::
+/// get_records_sealed` calls it unconditionally), and the open-shard path
+/// (`GetShardIterator{LATEST}`/`GetRecords`) stalls for the full
+/// `SCHEMA_COMMIT_TIMEOUT` (~10s) before failing, since a control-only
+/// node's blind-forward routing fallback has no leader-hint to chase. Both
+/// are pre-existing backend gaps this PR's dashboard change works around
+/// (the Streams view never dials either op from a control-only console) but
+/// deliberately does not fix — see `docs/engineering-lessons.md` and
+/// `dashboard_streams.js`'s own doc. Pinning down the panic's exact HTTP
+/// behavior in an automated test is left to whichever follow-up PR fixes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn control_node_streams_read_path_is_ground_truth() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (control_nodes, data_nodes, _config) = support::bring_up_split(1, 1, dir.path()).await;
+        support::await_leader(&control_nodes).await;
+        let data_raftkv_ids: Vec<animus_env::NodeId> =
+            (1..2).map(animusd::config::node_id).collect();
+        support::await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
+
+        let control_admin = control_nodes[0].admin_addr();
+        let data_dynamo = data_nodes[0].dynamo_addr();
+
+        // An ENABLED stream (stays open — no seal).
+        let (s, body) = raw_post(
+            data_dynamo,
+            "/",
+            "X-Amz-Target: DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"OpenT","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+                "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "{body}");
+        let (s, body) = raw_post(
+            data_dynamo,
+            "/",
+            "X-Amz-Target: DynamoDB_20120810.PutItem",
+            r#"{"TableName":"OpenT","Item":{"pk":{"S":"k1"}}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "{body}");
+
+        // A stream forced sealed via disable (F12-b's final seal) — a real
+        // sealed catalog row with no small seal-threshold knob needed.
+        let (s, body) = raw_post(
+            data_dynamo,
+            "/",
+            "X-Amz-Target: DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"SealedT","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+                "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "{body}");
+        let (s, body) = raw_post(
+            data_dynamo,
+            "/",
+            "X-Amz-Target: DynamoDB_20120810.PutItem",
+            r#"{"TableName":"SealedT","Item":{"pk":{"S":"k1"}}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "{body}");
+        let (s, body) = raw_post(
+            data_dynamo,
+            "/",
+            "X-Amz-Target: DynamoDB_20120810.UpdateTable",
+            r#"{"TableName":"SealedT","StreamSpecification":{"StreamEnabled":false}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "{body}");
+
+        // ---- ground truth on the CONTROL-ONLY node's own admin port -------
+
+        // `/admin/status` mirrors the full replicated catalog: both streams'
+        // specs/rows, converged-or-timeout (the seal is itself async).
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let (s, _, body) = raw(control_admin, "GET", "/admin/status").await;
+                assert_eq!(s, 200);
+                let status: Value = serde_json::from_str(&body).expect("status is JSON");
+                let tables = &status["schemas"]["tables"];
+                let open_ok = tables["OpenT"]["stream"]["label"].is_string();
+                let sealed_row_present = status["stream_shards"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|r| r["table"].as_str() == Some("SealedT") && !r["expired"].as_bool().unwrap_or(true));
+                if open_ok && sealed_row_present {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("control node's /admin/status never converged to the sealed row in 20s");
+
+        // `ListStreams` through the admin proxy (`/admin/data/dynamo`) —
+        // metadata-only, so it must be exact, not eventually-consistent.
+        let (s, body) = raw_post(
+            control_admin,
+            "/admin/data/dynamo",
+            "",
+            r#"{"op":"ListStreams","payload":{}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "{body}");
+        let list: Value = serde_json::from_str(&body).expect("ListStreams body is JSON");
+        let streams = list["Streams"].as_array().expect("Streams array");
+        let names: Vec<&str> = streams
+            .iter()
+            .filter_map(|s| s["TableName"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"OpenT") && names.contains(&"SealedT"),
+            "ListStreams from the control-only node's admin proxy lists both \
+             streams: {body}"
+        );
+
+        // `DescribeStream` on each — open stream has exactly one shard with
+        // no `EndingSequenceNumber`; the sealed one has exactly one shard
+        // WITH an `EndingSequenceNumber` and `StreamStatus: DISABLED`.
+        let open_arn = streams
+            .iter()
+            .find(|s| s["TableName"].as_str() == Some("OpenT"))
+            .and_then(|s| s["StreamArn"].as_str())
+            .expect("OpenT's stream ARN")
+            .to_string();
+        let sealed_arn = streams
+            .iter()
+            .find(|s| s["TableName"].as_str() == Some("SealedT"))
+            .and_then(|s| s["StreamArn"].as_str())
+            .expect("SealedT's stream ARN")
+            .to_string();
+
+        let (s, body) = raw_post(
+            control_admin,
+            "/admin/data/dynamo",
+            "",
+            &format!(r#"{{"op":"DescribeStream","payload":{{"StreamArn":"{open_arn}"}}}}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "{body}");
+        let desc: Value = serde_json::from_str(&body).expect("DescribeStream body is JSON");
+        let sd = &desc["StreamDescription"];
+        assert_eq!(sd["StreamStatus"], "ENABLED", "{body}");
+        let shards = sd["Shards"].as_array().expect("Shards array");
+        assert_eq!(shards.len(), 1, "{body}");
+        assert!(
+            shards[0]["SequenceNumberRange"]["EndingSequenceNumber"].is_null(),
+            "OpenT's own shard is genuinely open (no EndingSequenceNumber): {body}"
+        );
+
+        let (s, body) = raw_post(
+            control_admin,
+            "/admin/data/dynamo",
+            "",
+            &format!(r#"{{"op":"DescribeStream","payload":{{"StreamArn":"{sealed_arn}"}}}}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "{body}");
+        let desc: Value = serde_json::from_str(&body).expect("DescribeStream body is JSON");
+        let sd = &desc["StreamDescription"];
+        assert_eq!(sd["StreamStatus"], "DISABLED", "{body}");
+        let shards = sd["Shards"].as_array().expect("Shards array");
+        assert_eq!(shards.len(), 1, "{body}");
+        assert!(
+            shards[0]["SequenceNumberRange"]["EndingSequenceNumber"].is_string(),
+            "SealedT's own shard is genuinely sealed (has an EndingSequenceNumber): {body}"
+        );
 
         for node in control_nodes.iter().chain(data_nodes.iter()) {
             node.shutdown_graceful().await;

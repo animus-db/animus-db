@@ -136,8 +136,12 @@ reason (see each file's own entry below).
   "AnimusDB Console" SPA (ADR 0021): `include_str!`'d and served as
   distinct static assets, vanilla JS, no bundler/CDN/build step — edit,
   `cargo build`, reload. Tabs are role-gated client-side (ADR 0035 PR7). The
-  Streams tab's design (label resolution, live-tail poller, the
-  `/admin/data/dynamo` proxy it rides) is in `docs/streams-notes.md`.
+  Streams tab — shown on **every** role now, including control-only; only
+  its live-tail poller degrades there, a real backend gap
+  (`ClientCtx::data()` panics / a routing timeout) documented rather than
+  fixed — design (label resolution, live-tail poller, the
+  `/admin/data/dynamo` proxy it rides, and the control-only role-gating
+  details) is in `docs/streams-notes.md`.
 
 ## CLI reference
 
@@ -634,7 +638,8 @@ route below the edge through the same `ClientCtx` CP primitives.
   naturally already excludes it, and code that needs to know about it must
   scan the tablet map instead (`splitHiddenTable`, `dashboard_core.js`,
   groups it under its base table in the Tablets/Overview views). The
-  Streams tab's design is in `docs/streams-notes.md`.
+  Streams tab's design (including its control-only role-gating, ADR 0021
+  #10) is in `docs/streams-notes.md`.
 - **OTel** (`otel.rs`, ADR 0027) — `init_tracing(instance_id)` from `main.rs`;
   `current_traceparent`/`set_parent_traceparent` carry W3C trace context across a
   forwarded hop (`cp_forward` injects, the receiver's `handle_client`

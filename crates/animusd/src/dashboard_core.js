@@ -512,13 +512,17 @@ function render() {
 // role's default tab (`tabFromPath`'s fallback, `activateTab`'s
 // role-mismatch fallback below) — control/combined default to "overview"
 // (unchanged), data defaults to "node".
-// "streams" is data-plane UI (a stream's hot tail is a tablet's own
-// KIND_CHANGE log, ADR 0042 §1) — shown for combined and data roles, never
-// control: a control-only node hosts no CP data plane at all, so it has no
-// stream state to show (the segment janitor still runs there, ADR 0043 §A9,
-// but that's a background reclaim loop, not something to browse per-stream).
+// "streams" now shows on **every** role, including control-only (follow-up
+// to ADR 0042/0043's original data/combined-only gating). A control-only
+// node holds the full replicated `Metadata` — schemas (incl. stream specs)
+// and the `stream_shards` segment catalog — so the stream list and its
+// shard-chain detail (both pure functions of `Metadata`/`DescribeStream`,
+// verified against a live split cluster) render there truthfully; only the
+// live-tail poller (`GetShardIterator`/`GetRecords`'s open-shard path, and
+// `GetRecords`' sealed path) needs a genuine local CP data plane to serve —
+// `dashboard_streams.js`'s own doc covers exactly what degrades and why.
 const ROLE_TABS = {
-  control: ["overview", "placement", "tablets", "browser", "storage"],
+  control: ["overview", "placement", "tablets", "browser", "streams", "storage"],
   combined: ["overview", "placement", "tablets", "browser", "streams", "storage", "node"],
   data: ["node", "browser", "streams"],
 };
