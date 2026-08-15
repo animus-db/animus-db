@@ -834,6 +834,161 @@ fn split_then_parent_seals_first() {
     );
 }
 
+// --- cell 3c: split_then_parent_reseals_before_scope_narrows (DUPLICATION,
+// INVESTIGATION ONLY — proves the mechanism, not yet a fix) ----------------
+
+/// Reproduces a DISTINCT bug from `scenario_split_then_parent_seals_first`'s
+/// PR1 loss fix above — the **mirror-image DUPLICATION direction**, found
+/// 2026-08-15 by the D8 e2e diagnostic
+/// (`animusd/tests/streams_e2e.rs::auto_split_mid_stream_with_live_consumer_across_every_node`).
+///
+/// Every existing split cell in this file (`scenario_split_mid_stream`,
+/// `scenario_split_then_parent_seals_first`) calls `n.narrow_scope(..)` on
+/// the parent's own nodes **synchronously with, in fact strictly before,**
+/// applying `MetaCommand::SplitTablet` to `meta` — modelling the reconciler's
+/// local scope-narrow action as if it always lands atomically with the
+/// control-plane split commit. **In production it does not**: `SplitTablet`
+/// commits only to the control Raft (`Metadata`); each node's own
+/// `RaftKvNode::narrow_scope` is a *separate*, purely local, un-replicated
+/// action (`animus_cp_data::host::HostAction::NarrowScope`, `host.rs`'s
+/// `plan()`), applied only when that node's own tablet-host reconciler next
+/// notices the metadata change (event-driven watch or a 500ms fallback
+/// tick). Nothing synchronizes that against the parent's own seal arm's next
+/// tick (`animusd::index_drain::seal_tick`, every 200ms) — this cell drives
+/// exactly that window.
+///
+/// Setup mirrors `scenario_split_then_parent_seals_first` (unsealed backlog
+/// on both sides of the future boundary, parent never seals before
+/// splitting) but after applying `SplitTablet` — freezing
+/// `stream_split_basis` for the sibling, per PR1/#216 — the parent's own
+/// nodes' live `StorageScope` is left WIDE across its own next seal.
+/// `RaftKvNode::pending_changes` (mirrored here by this file's own
+/// `seal_now`/`Group::nodes[..]`) is a raw scan bounded by that live scope
+/// alone, not by anything metadata-aware (`animus-cp-data/src/lib.rs`'s
+/// `pending_changes`/`StorageScope::physical_bounds`) — so the parent's seal
+/// physically picks up the right-side backlog that, per the split just
+/// committed, already belongs to the sibling's range. Only *afterward* does
+/// this cell narrow the parent's scope (modelling the reconciler catching
+/// up) and start the sibling.
+///
+/// The sibling's own first seal reads its frozen `stream_split_basis`
+/// watermark — frozen at the instant of the split, strictly BEFORE the
+/// parent's racing seal above ever ran, so it has no way to know that seal
+/// already covered part of the backlog the sibling physically inherited
+/// (ADR 0028: no data movement, same shared engine). Its own
+/// `pending_changes` scan finds those same physical records still present
+/// (sealing never deletes — only `trim_janitor` does, gated on the
+/// **sibling's own** watermark, which hasn't advanced yet) and re-seals them
+/// into its own epoch 0: the same packed HLC delivered by both the parent's
+/// epoch **and** the sibling's epoch 0. `verify_lineage`'s `seen_hlcs` set
+/// catches this directly ("delivered more than once — violates
+/// exactly-once").
+///
+/// **This cell is expected to FAIL on current `main` (post-#216) — that is
+/// the point.** See `docs/engineering-lessons.md`'s and the
+/// `split-seal-duplication-bug` investigation memory for the root-cause
+/// writeup; no fix has landed yet, so this stays a `#[should_panic]`-free
+/// regression-in-waiting rather than a `#[test]` the gates run green today.
+/// A fix should make this pass by construction, not by loosening the
+/// assertion.
+#[allow(clippy::too_many_lines)]
+fn scenario_split_then_parent_reseals_before_scope_narrows(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(21), KeyRange::whole());
+    let parent = start_group(&sim, &engines, TabletId(21), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    // Left- and right-side backlog, still unsealed at split time — like
+    // `scenario_split_then_parent_seals_first`, the parent never seals
+    // before splitting.
+    for i in 0..4 {
+        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"L", seed);
+    }
+    for i in 600..604 {
+        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"R", seed);
+    }
+
+    // The control-plane split commits — freezing the sibling's
+    // `stream_split_basis` from the parent's pre-mutation state (`None`,
+    // since the parent has never sealed) — but the parent's own nodes' live
+    // scope is deliberately left WIDE here: the reconciler hasn't caught up
+    // yet, the real-world window this cell exists to prove.
+    let parent_epoch = meta
+        .tablets
+        .get(&parent.id)
+        .map_or(animus_tablet::Epoch::INITIAL, |t| t.epoch);
+    let sibling_id = TabletId(22);
+    let outcome = meta.apply(&MetaCommand::SplitTablet {
+        tablet: parent.id,
+        expected_epoch: parent_epoch,
+        split_key: BOUNDARY.to_vec(),
+        new_id: sibling_id,
+    });
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied,
+        "[seed={seed}] split must apply"
+    );
+
+    // The parent's seal arm races the (not-yet-run) reconciler: it seals
+    // NOW, before its own scope has narrowed, so `pending_changes()` still
+    // returns the right-side (600..603) backlog too — records that, per the
+    // split metadata already committed above, belong to the sibling.
+    let parent_leader = elect(&mut sim, &parent, &live, seed);
+    let sealed = seal_now(&mut meta, &store, &parent, parent_leader, 2_000, false);
+    assert_eq!(
+        sealed,
+        Some(0),
+        "[seed={seed}] the parent's racing seal (still on its wide scope) must apply"
+    );
+
+    // Only NOW does the reconciler catch up: narrow the parent's own nodes
+    // and start the sibling with its correctly narrow scope from birth —
+    // exactly like every other split cell does, just too late to matter.
+    for n in &parent.nodes {
+        n.narrow_scope(KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec())));
+    }
+    let sibling = start_group(
+        &sim,
+        &engines,
+        sibling_id,
+        KeyRange::new(BOUNDARY.to_vec(), None),
+    );
+    sim.run_for(Duration::from_secs(2));
+
+    // The sibling seals its own epoch 0 — its frozen watermark predates the
+    // parent's racing seal above, so it can't know that seal already
+    // covered part of what it's about to re-discover on the shared engine.
+    let sibling_leader = elect(&mut sim, &sibling, &live, seed);
+    let _ = seal_now(&mut meta, &store, &sibling, sibling_leader, 2_100, false);
+
+    // Parent-before-child, exactly as every other cell in this file checks
+    // it: this is where the duplication surfaces as a `seen_hlcs` collision
+    // ("delivered more than once"), not as a count mismatch — the total
+    // count would actually look inflated (over, not under), the D8 e2e
+    // symptom's own signature.
+    verify_lineage(
+        &meta,
+        &store,
+        &[(&parent, parent_leader), (&sibling, sibling_leader)],
+        &journal,
+        seed,
+    );
+}
+
+#[test]
+fn split_then_parent_reseals_before_scope_narrows() {
+    for_each_seed(
+        "split_then_parent_reseals_before_scope_narrows",
+        scenario_split_then_parent_reseals_before_scope_narrows,
+    );
+}
+
 // --- cell 4: kill_sealing_leader ------------------------------------------
 
 fn scenario_kill_sealing_leader(seed: u64) {
