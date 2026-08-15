@@ -1956,6 +1956,91 @@ mod tests {
         assert_eq!(m.schemas.get("ks.users"), Some(&extended));
     }
 
+    /// `SetIndexStatus` (ADR 0045): rejects an absent table, rejects an
+    /// absent index on a table that does exist, is a no-op when the index is
+    /// already at the target status, and otherwise transitions the status
+    /// visibly through `table_indexes` (leaving every other field of the
+    /// index definition untouched).
+    #[test]
+    fn set_index_status_apply_arm() {
+        let mut m = Metadata::default();
+
+        // No such table at all.
+        assert_eq!(
+            m.apply(&MetaCommand::SetIndexStatus {
+                table: "ghost".to_owned(),
+                index: "by-email".to_owned(),
+                status: IndexStatus::Active,
+            }),
+            ApplyOutcome::Rejected("no such table schema")
+        );
+
+        let base = TableSchema::simple("id", ColumnType::String);
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "users".to_owned(),
+                schema: base,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // Table exists, but the named index does not.
+        assert_eq!(
+            m.apply(&MetaCommand::SetIndexStatus {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                status: IndexStatus::Active,
+            }),
+            ApplyOutcome::Rejected("no such table index")
+        );
+
+        let index = IndexDef {
+            name: "by-email".to_owned(),
+            kind: crate::schema::IndexKind::Global,
+            hash_attribute: "email".to_owned(),
+            sort_attribute: None,
+            projection: crate::schema::IndexProjection::All,
+            status: IndexStatus::Creating,
+        };
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableIndex {
+                table: "users".to_owned(),
+                index,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.table_indexes("users")[0].status,
+            IndexStatus::Creating,
+            "test premise: index starts Creating"
+        );
+
+        // Already at the target status: a no-op, and the definition is
+        // otherwise untouched.
+        assert_eq!(
+            m.apply(&MetaCommand::SetIndexStatus {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                status: IndexStatus::Creating,
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        // A genuine transition applies and is visible via `table_indexes`.
+        assert_eq!(
+            m.apply(&MetaCommand::SetIndexStatus {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                status: IndexStatus::Active,
+            }),
+            ApplyOutcome::Applied
+        );
+        let idx = &m.table_indexes("users")[0];
+        assert_eq!(idx.status, IndexStatus::Active);
+        assert_eq!(idx.name, "by-email");
+        assert_eq!(idx.hash_attribute, "email");
+    }
+
     /// `CreateTableSchema` rejects a table name that collides with the
     /// reserved system-keyspace namespace (ADR 0038), both an exact match and
     /// a name merely prefixed by it, and leaves the catalog untouched.

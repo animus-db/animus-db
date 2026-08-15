@@ -683,6 +683,41 @@ mod tests {
     }
 
     #[test]
+    fn set_index_status_on_an_unknown_index_returns_false() {
+        let mut s = TableSchema::simple("id", ColumnType::String);
+        assert!(!s.set_index_status("ghost", IndexStatus::Active));
+    }
+
+    #[test]
+    fn set_index_status_transitions_a_real_index_leaving_other_fields_untouched() {
+        let mut s = TableSchema::simple("id", ColumnType::String);
+        s.upsert_index(gsi("by-email", "email"));
+        assert_eq!(s.index("by-email").unwrap().status, IndexStatus::Active);
+
+        assert!(s.set_index_status("by-email", IndexStatus::Creating));
+        let idx = s.index("by-email").unwrap();
+        assert_eq!(idx.status, IndexStatus::Creating);
+        // Every other field is exactly what `gsi()` built — only `status` moved.
+        assert_eq!(idx.name, "by-email");
+        assert_eq!(idx.kind, IndexKind::Global);
+        assert_eq!(idx.hash_attribute, "email");
+        assert_eq!(idx.sort_attribute, None);
+        assert_eq!(idx.projection, IndexProjection::All);
+    }
+
+    #[test]
+    fn set_index_status_to_the_same_status_is_reported_as_found_and_is_a_no_op() {
+        let mut s = TableSchema::simple("id", ColumnType::String);
+        s.upsert_index(gsi("by-email", "email"));
+        // Already `Active` (the constructed default) — setting it again still
+        // reports "found" (`true`); the apply-arm's own no-op detection (a
+        // separate concern, tested at the `MetaCommand::SetIndexStatus` level)
+        // is what turns this into `ApplyOutcome::NoOp`, not this method.
+        assert!(s.set_index_status("by-email", IndexStatus::Active));
+        assert_eq!(s.index("by-email").unwrap().status, IndexStatus::Active);
+    }
+
+    #[test]
     fn rejects_duplicate_index_name() {
         let mut s = TableSchema::simple("id", ColumnType::String);
         // Bypass `upsert_index`'s dedup to construct a malformed schema directly.
@@ -731,5 +766,33 @@ mod tests {
         assert!(cat.remove("t"));
         assert!(!cat.remove("t"));
         assert!(cat.is_empty());
+    }
+
+    /// A status-less `IndexDef` (the JSON shape every pre-ADR-0045 fixture/
+    /// persisted record has) deserializes with `status: Active` via
+    /// `#[serde(default = "IndexStatus::active")]` — never `Creating`, since a
+    /// record predating the field can never genuinely be mid-backfill (see
+    /// `IndexStatus`'s own doc). A round-trip through a *populated* status
+    /// also proves the field rides the wire at all once present.
+    #[test]
+    fn index_def_without_a_status_field_deserializes_as_active() {
+        let json = r#"{
+            "name": "by-email",
+            "kind": "Global",
+            "hash_attribute": "email",
+            "sort_attribute": null,
+            "projection": "All"
+        }"#;
+        let def: IndexDef = serde_json::from_str(json).expect("status-less IndexDef decodes");
+        assert_eq!(def.status, IndexStatus::Active);
+        assert_eq!(def, gsi("by-email", "email"));
+
+        // And a populated status rides the wire unchanged, round-tripping.
+        let mut creating = gsi("by-a", "a");
+        creating.status = IndexStatus::Creating;
+        let encoded = serde_json::to_string(&creating).unwrap();
+        let decoded: IndexDef = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.status, IndexStatus::Creating);
+        assert_eq!(decoded, creating);
     }
 }
