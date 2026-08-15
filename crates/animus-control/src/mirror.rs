@@ -144,6 +144,31 @@ pub fn apply_and_derive_mirror(
         MetaCommand::DropTableTablets { .. } => meta.cp_member_tablets.clone(),
         _ => BTreeMap::new(),
     };
+    // ADR 0045: `DropTableTablets`/`DropTableIndex` both prune
+    // `Metadata::index_backfill` rows as a side effect of their own apply —
+    // exactly the same "identities gone by the time `apply` returns" hazard
+    // the module doc above describes for `dropped_tablets`, so the rows each
+    // command is *about* to prune are captured here, pre-apply, the same way.
+    let pruned_index_backfill: Vec<(TabletId, String)> = match command {
+        MetaCommand::DropTableTablets { table } => {
+            let dropped: Vec<TabletId> = meta.tablets_for_table(table).map(|(&id, _)| id).collect();
+            meta.index_backfill
+                .keys()
+                .filter(|(tablet, _)| dropped.contains(tablet))
+                .cloned()
+                .collect()
+        }
+        MetaCommand::DropTableIndex { table, index } => {
+            let table_tablets: Vec<TabletId> =
+                meta.tablets_for_table(table).map(|(&id, _)| id).collect();
+            meta.index_backfill
+                .keys()
+                .filter(|(tablet, idx)| idx == index && table_tablets.contains(tablet))
+                .cloned()
+                .collect()
+        }
+        _ => Vec::new(),
+    };
 
     let outcome = meta.apply(command);
     if outcome != ApplyOutcome::Applied {
@@ -195,12 +220,25 @@ pub fn apply_and_derive_mirror(
                 writes.push(KeyWrite::Delete(syskv::tablet_key(*id)));
                 writes.push(KeyWrite::Delete(syskv::policy_key(*id)));
             }
+            for (tablet, index) in &pruned_index_backfill {
+                writes.push(KeyWrite::Delete(syskv::index_backfill_key(*tablet, index)));
+            }
             for id in dead_cp_member_ids(&pre_cp_member_tablets, meta) {
                 writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(&id)));
             }
         }
+        MetaCommand::DropTableIndex { table, .. } => {
+            if let Some(schema) = meta.schemas.get(table) {
+                writes.push(put_json(syskv::schema_key(table), schema));
+            }
+            // ADR 0045: this index's own backfill-completion rows are gone
+            // the moment its definition is — see `pruned_index_backfill`'s
+            // own pre-apply capture above.
+            for (tablet, index) in &pruned_index_backfill {
+                writes.push(KeyWrite::Delete(syskv::index_backfill_key(*tablet, index)));
+            }
+        }
         MetaCommand::CreateTableIndex { table, .. }
-        | MetaCommand::DropTableIndex { table, .. }
         | MetaCommand::SetIndexStatus { table, .. }
         | MetaCommand::SetTableMode { table, .. }
         // ADR 0042: a stream (de)configuration is part of the table's schema
@@ -210,6 +248,14 @@ pub fn apply_and_derive_mirror(
             if let Some(schema) = meta.schemas.get(table) {
                 writes.push(put_json(syskv::schema_key(table), schema));
             }
+        }
+        MetaCommand::MarkIndexBackfilled { tablet, index, .. } => {
+            // The value is always empty (presence alone is the fact) —
+            // mirrors `CreateKeyspace`'s identical empty-`Put` convention.
+            writes.push(KeyWrite::Put(
+                syskv::index_backfill_key(*tablet, index),
+                Vec::new(),
+            ));
         }
         MetaCommand::CreateKeyspace { keyspace } => {
             writes.push(KeyWrite::Put(syskv::keyspace_key(keyspace), Vec::new()));
@@ -453,6 +499,11 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
                 serde_json::from_slice(value).expect("mirrored stream-shard value decodes");
             meta.stream_shards.insert(key, row);
         }
+        EntityKind::IndexBackfill => {
+            if let Some(key) = syskv::decode_index_backfill_id(&id) {
+                meta.index_backfill.insert(key, ());
+            }
+        }
     }
 }
 
@@ -504,6 +555,13 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // a row (retention/drop-table cascade, ADR 0043 §A9).
             if let Some(key) = syskv::decode_stream_shard_id(&id) {
                 meta.stream_shards.remove(&key);
+            }
+        }
+        EntityKind::IndexBackfill => {
+            // Reachable in practice — `DropTableTablets`/`DropTableIndex`
+            // both prune rows as a side effect of their own apply (ADR 0045).
+            if let Some(key) = syskv::decode_index_backfill_id(&id) {
+                meta.index_backfill.remove(&key);
             }
         }
     }
@@ -846,6 +904,170 @@ mod tests {
                 syskv::schema_key("orders"),
                 meta.schemas.get("orders").unwrap()
             )]
+        );
+    }
+
+    /// A fixture for the `index_backfill` derivation tests below: a table
+    /// with one `Creating` GSI and one tablet scoped to it, driven through
+    /// `apply_and_derive_mirror` (not bare `Metadata::apply`) so the mirror
+    /// writes each setup step derives are exercised too, even though this
+    /// fixture itself doesn't assert on them.
+    fn mirror_table_with_index_and_tablet(
+        meta: &mut Metadata,
+        table: &str,
+        index: &str,
+        tablet: TabletId,
+    ) {
+        let _ = apply_and_derive_mirror(
+            meta,
+            &MetaCommand::CreateTableSchema {
+                table: table.to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            meta,
+            &MetaCommand::CreateTableIndex {
+                table: table.to_string(),
+                index: crate::schema::IndexDef {
+                    name: index.to_string(),
+                    kind: crate::schema::IndexKind::Global,
+                    hash_attribute: "id".to_string(),
+                    sort_attribute: None,
+                    projection: crate::schema::IndexProjection::All,
+                    status: crate::schema::IndexStatus::Creating,
+                },
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            meta,
+            &MetaCommand::CreateTablet {
+                tablet,
+                table: Some(table.to_string()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            },
+        );
+    }
+
+    /// `MarkIndexBackfilled` (ADR 0045 §4) mirrors as a single empty `Put`
+    /// at the row's `index_backfill_key` — mirroring `CreateKeyspace`'s own
+    /// empty-value convention — and a repeat proposal is a `NoOp` that
+    /// derives no further writes.
+    #[test]
+    fn mark_index_backfilled_writes_the_row_and_is_idempotent() {
+        let mut meta = Metadata::default();
+        mirror_table_with_index_and_tablet(&mut meta, "users", "by_email", TabletId(1));
+
+        let command = MetaCommand::MarkIndexBackfilled {
+            table: "users".to_string(),
+            index: "by_email".to_string(),
+            tablet: TabletId(1),
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![KeyWrite::Put(
+                syskv::index_backfill_key(TabletId(1), "by_email"),
+                Vec::new()
+            )]
+        );
+
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::NoOp);
+        assert!(writes.is_empty());
+    }
+
+    /// `DropTableTablets` (ADR 0045) mirrors its `index_backfill` prune as a
+    /// `Delete` per pruned row, alongside its existing tablet/policy
+    /// deletes — a same-named index's row on a different, undropped table
+    /// must not appear among the derived deletes.
+    #[test]
+    fn drop_table_tablets_also_deletes_index_backfill_rows() {
+        let mut meta = Metadata::default();
+        mirror_table_with_index_and_tablet(&mut meta, "users", "by_email", TabletId(1));
+        mirror_table_with_index_and_tablet(&mut meta, "orders", "by_email", TabletId(2));
+        for (table, tablet) in [("users", TabletId(1)), ("orders", TabletId(2))] {
+            let (outcome, _) = apply_and_derive_mirror(
+                &mut meta,
+                &MetaCommand::MarkIndexBackfilled {
+                    table: table.to_string(),
+                    index: "by_email".to_string(),
+                    tablet,
+                },
+            );
+            assert_eq!(outcome, ApplyOutcome::Applied);
+        }
+
+        let command = MetaCommand::DropTableTablets {
+            table: "users".to_string(),
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert!(
+            writes.contains(&KeyWrite::Delete(syskv::index_backfill_key(
+                TabletId(1),
+                "by_email"
+            ))),
+            "the dropped table's row must be among the derived deletes: {writes:?}"
+        );
+        assert!(
+            !writes.contains(&KeyWrite::Delete(syskv::index_backfill_key(
+                TabletId(2),
+                "by_email"
+            ))),
+            "the other table's same-named-index row must be untouched: {writes:?}"
+        );
+    }
+
+    /// `DropTableIndex` (ADR 0045) mirrors its `index_backfill` prune as a
+    /// `Delete` per pruned row, alongside the re-serialized schema — scoped
+    /// to the owning table's own tablets, so a distinct table's row for a
+    /// same-named index is untouched.
+    #[test]
+    fn drop_table_index_also_deletes_index_backfill_rows() {
+        let mut meta = Metadata::default();
+        mirror_table_with_index_and_tablet(&mut meta, "users", "by_email", TabletId(1));
+        mirror_table_with_index_and_tablet(&mut meta, "orders", "by_email", TabletId(2));
+        for (table, tablet) in [("users", TabletId(1)), ("orders", TabletId(2))] {
+            let (outcome, _) = apply_and_derive_mirror(
+                &mut meta,
+                &MetaCommand::MarkIndexBackfilled {
+                    table: table.to_string(),
+                    index: "by_email".to_string(),
+                    tablet,
+                },
+            );
+            assert_eq!(outcome, ApplyOutcome::Applied);
+        }
+
+        let command = MetaCommand::DropTableIndex {
+            table: "users".to_string(),
+            index: "by_email".to_string(),
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert!(
+            writes.contains(&put_json(
+                syskv::schema_key("users"),
+                meta.schemas.get("users").unwrap()
+            )),
+            "the updated schema must still be re-serialized: {writes:?}"
+        );
+        assert!(
+            writes.contains(&KeyWrite::Delete(syskv::index_backfill_key(
+                TabletId(1),
+                "by_email"
+            ))),
+            "the dropped index's row must be among the derived deletes: {writes:?}"
+        );
+        assert!(
+            !writes.contains(&KeyWrite::Delete(syskv::index_backfill_key(
+                TabletId(2),
+                "by_email"
+            ))),
+            "the other table's same-named index must be untouched: {writes:?}"
         );
     }
 

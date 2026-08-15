@@ -38,8 +38,8 @@ pub use config::ClusterConfig;
 // cluster metadata — membership status and the tablet map — without depending on
 // `animus-control` directly.
 pub use animus_control::{
-    ColumnDef, ColumnType, MetaCommand, Metadata, NodeAddrs, NodeStatus, ReplicationMode,
-    TableSchema,
+    ColumnDef, ColumnType, IndexStatus, MetaCommand, Metadata, NodeAddrs, NodeStatus,
+    ReplicationMode, TableSchema,
 };
 
 mod admin;
@@ -50,6 +50,7 @@ mod dashboard;
 mod dynamo;
 mod dynamo_streams;
 mod http;
+mod index_backfill;
 mod segment_janitor;
 mod topology;
 
@@ -1330,6 +1331,15 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // seeder/aggregator (this crate) may propose it from wherever the
             // relevant tablet/control leader actually runs.
             | MetaCommand::SetIndexStatus { .. }
+            // Backfill-completion catalog commit (ADR 0045 §4): a tablet
+            // leader's own "I finished seeding this index" proposal, from
+            // wherever that leader actually runs — same relay reasoning as
+            // `SealStreamShard` just below. `index_backfill_loop` (the
+            // aggregator that reads this catalog and flips a table's index
+            // to `Active`) is control-plane-leader-only and proposes
+            // `SetIndexStatus` directly, exactly like `SealStreamShard`'s own
+            // aggregator does, so it needs no relay path of its own.
+            | MetaCommand::MarkIndexBackfilled { .. }
             | MetaCommand::SetTableMode { .. }
             // DynamoDB Streams enable/disable (ADR 0042): schema-catalog
             // class, same relay reason as `CreateTableIndex`/`SetTableMode` —
@@ -2297,6 +2307,16 @@ impl BoundNode {
             stream_retention,
         )));
 
+        // The secondary-index backfill-completion aggregator (ADR 0045 §4):
+        // flips a table's index from `Creating` to `Active` once every one
+        // of its tablets has reported a finished backfill scan.
+        // Control-plane-leader-only (self-gated every tick,
+        // `index_backfill.rs`'s own doc) — spawned unconditionally here,
+        // exactly like the segment janitor just above.
+        tasks.push(tokio::spawn(index_backfill::index_backfill_loop(
+            ctx.clone(),
+        )));
+
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
         // it leads once it exceeds **either** configured threshold (it checks
         // leadership per tablet, so running it on every node is harmless).
@@ -2894,6 +2914,15 @@ impl BoundControlNode {
         tasks.push(tokio::spawn(segment_janitor::segment_janitor_loop(
             ctx.clone(),
             DEFAULT_STREAM_RETENTION,
+        )));
+
+        // The secondary-index backfill-completion aggregator (ADR 0045 §4):
+        // a control-only node can genuinely become the control-plane leader
+        // (ADR 0035 split deployment), and — unlike the segment janitor —
+        // this loop has no data-role dependency at all, so it needs no
+        // documented scope gap here.
+        tasks.push(tokio::spawn(index_backfill::index_backfill_loop(
+            ctx.clone(),
         )));
 
         Ok(Node {

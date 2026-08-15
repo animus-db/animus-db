@@ -61,6 +61,23 @@ reason (see each file's own entry below).
   `stream_shards` catalog. The module's own 80-line `//!` doc has the full
   design (including the load-bearing epoch-derivation guard and the
   convergent drop-table cascade); see also `docs/streams-notes.md`.
+- **`index_backfill.rs`** (ADR 0045 §4) — the secondary-index
+  **backfill-completion aggregator**: another control-plane-**leader**-only
+  background loop (`index_backfill_loop`), same self-gating idiom as
+  `segment_janitor_loop` just above, but its own distinct loop rather than a
+  fourth arm of that one — one convergent concern per loop. Each tick, for
+  every table with an index currently `Creating`, flips it to `Active` once
+  every tablet **currently** in that table's live tablet map (a fresh read
+  every tick, never cached) has a matching row in `Metadata::index_backfill`
+  — the per-tablet catalog the backfill seeder populates (a later PR).
+  Touches only replicated `Metadata` (no `SegmentStoreHandle`/data role),
+  so unlike the segment janitor it has **no** control-only-leader scope
+  gap: a pure control-only leader drives the flip too. See the module's own
+  doc for the full design; `tests/index_backfill.rs` proves convergence,
+  the no-premature-flip property against a hand-driven `MarkIndexBackfilled`
+  sequence (the seeder doesn't exist yet), a tablet that appears mid-backfill
+  (a real `SplitTablet`) blocking the flip until it too reports, and the
+  control-only-leader regression.
   hot-trim rework) — the per-node **change-consumer loop**
   (`change_consumer_loop`, renamed from `index_drain_loop` since it is no
   longer GSI-specific), three arms per tick per led tablet: GSI drain, the

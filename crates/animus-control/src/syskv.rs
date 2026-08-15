@@ -140,6 +140,19 @@ pub enum EntityKind {
     /// since both fields are fixed-width. The value is the JSON-encoded
     /// `StreamShardRow`, same convention as `Tablet`/`Schema`/etc.
     StreamShard,
+    /// A secondary-index backfill-completion row (`Metadata::index_backfill`,
+    /// ADR 0045 §4), keyed by the composite `(TabletId, index name)` pair —
+    /// the tablet's 8 big-endian bytes followed by the index name's raw UTF-8
+    /// bytes ([`index_backfill_key`]). Unlike [`StreamShard`](Self::StreamShard)
+    /// this id is **not** fixed-width (the index name is arbitrary length),
+    /// but it needs no internal escaping either: [`decode_index_backfill_id`]
+    /// always knows the tablet occupies exactly the first 8 bytes, and
+    /// `entity_key` has already escaped the whole id blob as one opaque
+    /// segment, so there is nothing for a variable-length suffix to
+    /// ambiguously merge into. The value is always empty (presence alone is
+    /// the fact — mirrors [`Keyspace`](Self::Keyspace)'s empty-value
+    /// convention).
+    IndexBackfill,
 }
 
 impl EntityKind {
@@ -161,6 +174,7 @@ impl EntityKind {
             EntityKind::CpMemberAddr => "cp_member_addr",
             EntityKind::SplitParent => "split_parent",
             EntityKind::StreamShard => "stream_shard",
+            EntityKind::IndexBackfill => "index_backfill",
         }
     }
 
@@ -183,6 +197,7 @@ impl EntityKind {
             b"cp_member_addr" => EntityKind::CpMemberAddr,
             b"split_parent" => EntityKind::SplitParent,
             b"stream_shard" => EntityKind::StreamShard,
+            b"index_backfill" => EntityKind::IndexBackfill,
             _ => return None,
         })
     }
@@ -348,6 +363,37 @@ pub fn decode_stream_shard_id(id: &[u8]) -> Option<(TabletId, u64)> {
     Some((TabletId(tablet), epoch))
 }
 
+/// A `(tablet, index name)` pair's key under [`EntityKind::IndexBackfill`]
+/// (ADR 0045 §4): the tablet's 8 big-endian bytes followed by the index
+/// name's raw UTF-8 bytes. Unlike [`stream_shard_key`] this id is variable
+/// length (the index name isn't fixed-width), but that's safe here: the
+/// tablet always occupies exactly the first 8 bytes, and [`entity_key`] has
+/// already escaped the whole blob as one opaque segment before this key
+/// leaves this function, so a longer or shorter index name can never make one
+/// entity's key collide with, or become a prefix of, another's.
+#[must_use]
+pub fn index_backfill_key(tablet: TabletId, index: &str) -> Vec<u8> {
+    let mut id = Vec::with_capacity(8 + index.len());
+    id.extend_from_slice(&tablet.0.to_be_bytes());
+    id.extend_from_slice(index.as_bytes());
+    entity_key(EntityKind::IndexBackfill, &id)
+}
+
+/// The inverse of [`index_backfill_key`]'s id half: split a decoded
+/// [`EntityKind::IndexBackfill`] id back into `(tablet, index name)`. `None`
+/// if `id` is shorter than the 8-byte tablet prefix, or if the remaining
+/// bytes aren't valid UTF-8 — this module never writes anything else at this
+/// kind's keys, so either is an internal bug, not a data problem.
+#[must_use]
+pub fn decode_index_backfill_id(id: &[u8]) -> Option<(TabletId, String)> {
+    if id.len() < 8 {
+        return None;
+    }
+    let tablet = u64::from_be_bytes(id[..8].try_into().expect("checked length"));
+    let index = String::from_utf8(id[8..].to_vec()).ok()?;
+    Some((TabletId(tablet), index))
+}
+
 /// The decoded form of a system-keyspace key ([`decode_key`]'s result).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecodedKey {
@@ -415,7 +461,7 @@ pub fn decode_key(key: &[u8]) -> Option<DecodedKey> {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [EntityKind; 10] = [
+    const ALL_KINDS: [EntityKind; 11] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
@@ -426,6 +472,7 @@ mod tests {
         EntityKind::CpMemberAddr,
         EntityKind::SplitParent,
         EntityKind::StreamShard,
+        EntityKind::IndexBackfill,
     ];
 
     // --- reserved-name guard -------------------------------------------------
@@ -560,6 +607,55 @@ mod tests {
         assert_eq!(decode_stream_shard_id(&[0u8; 15]), None);
         assert_eq!(decode_stream_shard_id(&[0u8; 17]), None);
         assert_eq!(decode_stream_shard_id(&[]), None);
+    }
+
+    #[test]
+    fn index_backfill_key_round_trips() {
+        let key = index_backfill_key(TabletId(7), "by-email");
+        let Some(DecodedKey::Entity { kind, id }) = decode_key(&key) else {
+            panic!("expected a decodable entity key");
+        };
+        assert_eq!(kind, EntityKind::IndexBackfill);
+        assert_eq!(
+            decode_index_backfill_id(&id),
+            Some((TabletId(7), "by-email".to_owned()))
+        );
+    }
+
+    #[test]
+    fn index_backfill_key_distinguishes_tablet_and_index_name() {
+        // Two different tablets with the same index name, and the same
+        // tablet with two different index names, must not collide.
+        let a = index_backfill_key(TabletId(1), "by-email");
+        let b = index_backfill_key(TabletId(2), "by-email");
+        assert_ne!(a, b);
+        let c = index_backfill_key(TabletId(1), "by-status");
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn index_backfill_key_handles_varying_index_name_lengths_without_collision() {
+        // A variable-length suffix (unlike `stream_shard_key`'s fixed-width
+        // epoch) is the one new hazard this key shape introduces — check a
+        // short name is never a prefix-confusable match for a longer one
+        // sharing the same tablet.
+        let short = index_backfill_key(TabletId(1), "a");
+        let long = index_backfill_key(TabletId(1), "ab");
+        assert_ne!(short, long);
+        assert!(!long.starts_with(short.as_slice()) || short == long);
+    }
+
+    #[test]
+    fn decode_index_backfill_id_rejects_a_too_short_id() {
+        assert_eq!(decode_index_backfill_id(&[0u8; 7]), None);
+        assert_eq!(decode_index_backfill_id(&[]), None);
+    }
+
+    #[test]
+    fn decode_index_backfill_id_rejects_invalid_utf8() {
+        let mut id = 1u64.to_be_bytes().to_vec();
+        id.push(0xff); // not valid UTF-8 on its own
+        assert_eq!(decode_index_backfill_id(&id), None);
     }
 
     #[test]
