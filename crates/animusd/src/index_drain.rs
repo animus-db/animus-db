@@ -198,7 +198,7 @@ use animus_dynamo::{
     AttributeValue, ChangeRecord, FootprintEntry, IndexFootprint, Item, index as dynamo_index,
     index_table_name, is_index_table_name, storage_key,
 };
-use animus_env::{Clock, Metric};
+use animus_env::{Clock, Env, Metric, Rng};
 use animus_tablet::KeyRange;
 use animus_tablet::TOKEN_BYTES;
 use animus_tablet::TabletId;
@@ -906,16 +906,27 @@ async fn seal_tick(
 /// nothing past the watermark to seal (never seals an empty segment — ADR
 /// 0043 §A3's "Empty pending set ⇒ no seal").
 ///
-/// **Recovery** (ADR 0043 §A3): the segment id
-/// (`{table}/{label}/{tablet}/{epoch}`) is fully deterministic from
-/// already-durable state (the tablet's own catalog chain length + the
-/// current label), so a crash between the store `put` and the catalog
-/// commit simply has the next call recompute the *same* `epoch` and
-/// re-`put` at the *same* id — an idempotent overwrite by
-/// [`SegmentStore`](animus_env::SegmentStore)'s own contract, safe even as a
-/// harmless superset (the superset-slice rule, ADR 0042 §10) because a
-/// reader always slices to the catalog row's own committed `hlc_range`,
-/// never the raw object.
+/// **Recovery (ledger-named-object amendment, ADR 0042 §10/ADR 0043 §A3).**
+/// The segment's storage id is no longer the bare deterministic
+/// `{table}/{label}/{tablet}/{epoch}` — it is
+/// [`segment::segment_object_id`], a fresh, attempt-unique id minted every
+/// single call (see that function's own doc for the exact scheme). A crash
+/// between the store `put` and the catalog commit has the next call
+/// recompute the *same* `epoch` but mint a **fresh** id and `put` there
+/// instead of overwriting the first attempt's object — the two attempts'
+/// bytes can never collide, so there is no overwrite (idempotent or
+/// otherwise) to reason about at the store layer at all. If the *first*
+/// attempt's own proposal actually committed despite the caller never
+/// seeing the ack (the retry's own proposal then hits a genuine content
+/// conflict — its own fresh `object_id` never matches the already-committed
+/// row's), the surrounding `propose_and_await` poll (below) already treats
+/// "the row now exists" as success regardless of which attempt's proposal
+/// is the one that landed — so the retry still reports success, and its own
+/// freshly-written (never cataloged) object becomes a permanent orphan,
+/// reclaimed by the segment janitor's own orphan sweep
+/// (`segment_janitor::reap_orphans`), never overwritten. This is exactly
+/// what closes the data-loss bug the old shared-deterministic-id scheme had
+/// — see `animus_cp_data::segment`'s own module doc for the full incident.
 pub(crate) async fn seal_now(
     ctx: &ClientCtx,
     table: &str,
@@ -990,7 +1001,19 @@ pub(crate) async fn seal_now(
     );
     let count = records.len() as u64;
     let bytes = segment::encode(&header, &records);
-    let seg_id = segment::segment_id(table, &label, tablet.0, next_epoch);
+    // Ledger-named-object amendment (ADR 0042 §10/ADR 0043 §A3): a fresh,
+    // attempt-unique id every call — see `segment::segment_object_id`'s own
+    // doc for why `(proposer, term, nonce)` never repeats, even across a
+    // same-node restart whose RNG stream replays identically.
+    let seg_id = segment::segment_object_id(
+        table,
+        &label,
+        tablet.0,
+        next_epoch,
+        ctx.env.node_id().as_str(),
+        group.term(),
+        ctx.env.next_u64(),
+    );
 
     let replicas = match ctx.data().segment_store.put_sealed(&seg_id, &bytes).await {
         Ok(r) => r,
@@ -1023,7 +1046,20 @@ pub(crate) async fn seal_now(
         count,
         seal_wall_ms,
         replicas,
+        object_id: seg_id,
     };
+    // Retry-after-lost-ack semantics (ledger-named-object amendment): this
+    // check function already treats "the row now exists" as success
+    // regardless of whose proposal actually committed it — a genuine
+    // content-conflict `NoOp`/`Rejected` for THIS attempt's own proposal
+    // (its fresh `object_id` can never match an already-committed row's) is
+    // therefore not distinguished from an ordinary "still waiting to
+    // commit" here. Either the original attempt's proposal committed (lost
+    // ack) or a genuinely different, independently-computed attempt won the
+    // race — both cases converge to the identical outcome from this
+    // caller's point of view: the epoch is sealed, report success, and this
+    // attempt's own now-uncataloged object is a permanent orphan for the
+    // segment janitor's sweep to reclaim.
     match ctx
         .propose_and_await(cmd, SEAL_COMMIT_TIMEOUT, || async {
             ctx.metadata_fresh()
@@ -1939,11 +1975,12 @@ mod stream_sealer_tests {
             })
             .await;
 
-            // The segment object itself landed durably at the deterministic id.
+            // The segment object itself landed durably at the row's own
+            // ledger-named id (never the bare deterministic `segment_id`).
             let store = node_segment_store(dir.path());
-            let seg_id = animus_cp_data::segment::segment_id(table, &row.label, tablet.0, 0);
+            let seg_id = &row.object_id;
             let bytes = store
-                .get(&seg_id)
+                .get(seg_id)
                 .await
                 .expect("segment store read")
                 .expect("the segment object must exist after a committed seal");
