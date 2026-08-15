@@ -934,7 +934,15 @@ async fn read_resolving_once(
     let node = leader_of(nodes)?.clone();
     match node.linearizable_get_served_fast(key).await? {
         FastRead::Value(v) => Some(v),
-        FastRead::Pending => None,
+        // The local-`Pending` case now carries the same `IntentInfo`
+        // payload `Foreign` does (torn-pair-fix stack's ADR 0018 §2
+        // amendment), but `read_resolving_once` deliberately keeps its
+        // pre-existing behavior here (immediate give-up, no push attempt)
+        // — it backs `run_point_read`'s own single-key retry discipline,
+        // untouched by that amendment. See `snapshot_read_uniform` below
+        // for the fixed design's own reader, which *does* merge this arm
+        // with `Foreign`'s.
+        FastRead::Pending(_) => None,
         FastRead::Foreign(info) => {
             let record_nodes = topo.for_table(&info.record_table);
             let status = match leader_of(record_nodes) {
@@ -2239,3 +2247,266 @@ fn txn_run_is_deterministic() {
 // negative control that keeps proving the checker itself can reject a
 // non-serializable history stays `negative_control.rs` (same checkers) —
 // deliberately not duplicated here.
+
+// ---------------------------------------------------------------------------
+// Tight-pair torn-snapshot regression (torn-pair-fix stack, PR2 of the ADR
+// 0018 §2 amendment) — see `animusd::dynamo::run_transact_get`'s doc (and
+// the ADR amendment itself) for the production bug this proves closed at
+// the protocol level. `animusd/tests/dynamo_txn.rs::
+// transact_get_items_never_observes_a_torn_pair_under_concurrent_writes` is
+// the real wire-level acceptance test; this is its SimEnv-driven,
+// seed-reproducible analog over the raw 2PC primitives — deliberately its
+// own small scenario, following this file's naming/depth conventions
+// (`name_seed`, `ANIMUS_TXN_SEEDS`/`seeds_per_cell`) rather than the
+// `Scenario`/`run_scenario`/Elle-history machinery above, because the
+// property under test (a numeric sum invariant across one contended key
+// pair, sampled by a round-agreement reader) is not a `Mop::Append`/`Read`
+// serializability claim `check_cycles` is built to check.
+// ---------------------------------------------------------------------------
+
+/// Back-to-back sum-to-zero transaction count — mirrors `animusd/tests/
+/// dynamo_txn.rs`'s own `1..=15` step count, rounded up for a bit more
+/// contention window.
+const TIGHT_PAIR_STEPS: i64 = 20;
+
+fn encode_i64(v: i64) -> Vec<u8> {
+    v.to_be_bytes().to_vec()
+}
+
+/// `0` for anything that isn't exactly 8 bytes — covers "never written yet"
+/// (before the writer's first transaction commits).
+fn decode_i64(bytes: &[u8]) -> i64 {
+    <[u8; 8]>::try_from(bytes)
+        .map(i64::from_be_bytes)
+        .unwrap_or(0)
+}
+
+/// One non-blocking, single-shot resolution attempt — the uniform design
+/// `animusd::ClientCtx::cp_get_local_snapshot` gives every key of a
+/// `TransactGetItems` round (ADR 0018 §2 amendment): a `Pending`/`Foreign`
+/// intent (both carry the identical `IntentInfo` payload since that same
+/// amendment) gets exactly one status query plus, if still pending, one
+/// push attempt — **never** a further per-key wait. `None` means "did not
+/// sample cleanly this instant" (a routing failure, or the intent stayed
+/// undecided even after the push) — only the caller's own ROUND loop may
+/// retry on that, never this function. Deliberately a separate function
+/// from `read_resolving_once` above: that one backs `run_point_read`'s own,
+/// intentionally different, single-key retry discipline (immediate give-up
+/// on a local `Pending`, unchanged by this amendment).
+async fn snapshot_read_uniform(
+    env: &SimEnv,
+    topo: &Topology,
+    table: &str,
+    key: &[u8],
+) -> Option<Option<Vec<u8>>> {
+    let nodes = topo.for_table(table);
+    let node = leader_of(nodes)?.clone();
+    match node.linearizable_get_served_fast(key).await? {
+        FastRead::Value(v) => Some(v),
+        FastRead::Pending(info) | FastRead::Foreign(info) => {
+            let record_nodes = topo.for_table(&info.record_table);
+            let status = match leader_of(record_nodes) {
+                Some(leader) => leader.txn_status_local(&info.record_key).await,
+                None => None,
+            };
+            match status {
+                Some(TxnDecisionStatus::Pending) | None => {
+                    push(
+                        env,
+                        topo,
+                        record_nodes,
+                        info.record_key.clone(),
+                        info.txn_id.clone(),
+                    )
+                    .await;
+                    // Uniform, single-shot: never re-query after the push —
+                    // a still-pending outcome is the round loop's to retry,
+                    // exactly the asymmetry fix this scenario proves.
+                    None
+                }
+                Some(decided) => {
+                    node.resolve_intent_given_status(key, None, &info.txn_id, decided)
+                        .await
+                }
+            }
+        }
+    }
+}
+
+/// Round-agreement reader over a fixed key pair, uniform-single-shot per
+/// key (see `snapshot_read_uniform`) — the SimEnv analog of
+/// `animusd::dynamo::quiescent_multi_get`'s fixed design: both keys are read
+/// **concurrently** (`futures::future::join_all`, never sequential), and a
+/// round where *either* key is unresolved is discarded outright (`previous`
+/// resets to `None`, never compared) — the exact discipline that closes the
+/// torn-pair bug.
+async fn quiescent_pair_read_uniform(
+    env: &SimEnv,
+    topo: &Topology,
+    pair: &[(&'static str, Vec<u8>); 2],
+) -> Option<[Vec<u8>; 2]> {
+    let deadline = env.now().0 + OP_BUDGET.as_nanos() as u64;
+    let mut previous: Option<[Vec<u8>; 2]> = None;
+    loop {
+        let futs = pair
+            .iter()
+            .map(|(table, key)| snapshot_read_uniform(env, topo, table, key));
+        let round: Vec<Option<Option<Vec<u8>>>> = futures::future::join_all(futs).await;
+        let sampled: Option<[Vec<u8>; 2]> = if round.iter().all(Option::is_some) {
+            let mut it = round.into_iter().map(|r| r.unwrap().unwrap_or_default());
+            Some([it.next().unwrap(), it.next().unwrap()])
+        } else {
+            None
+        };
+        if let (Some(r), Some(p)) = (&sampled, &previous)
+            && r == p
+        {
+            return sampled;
+        }
+        previous = sampled;
+        if env.now().0 >= deadline {
+            return None;
+        }
+        env.sleep(POLL).await;
+    }
+}
+
+/// The writer half of the tight-pair scenario: `TIGHT_PAIR_STEPS`
+/// back-to-back sum-to-zero 2-key cross-tablet transactions on a FIXED key
+/// pair — step `i` writes `key_a = i`, `key_b = -i`, mirroring `animusd/
+/// tests/dynamo_txn.rs::transact_get_items_never_observes_a_torn_pair_under_concurrent_writes`'s
+/// exact invariant, back-to-back with no pacing (the tight-loop shape that
+/// reproduced the production bug).
+async fn tight_pair_writer(
+    env: SimEnv,
+    topo: Arc<Topology>,
+    table_a: &'static str,
+    bytes_a: Vec<u8>,
+    table_b: &'static str,
+    bytes_b: Vec<u8>,
+    done: Arc<Mutex<bool>>,
+) {
+    for step in 1..=TIGHT_PAIR_STEPS {
+        let writes = vec![
+            (table_a, bytes_a.clone(), Some(encode_i64(step))),
+            (table_b, bytes_b.clone(), Some(encode_i64(-step))),
+        ];
+        let _ = run_txn(&env, &topo, writes, None, false, false).await;
+    }
+    *done.lock().unwrap() = true;
+}
+
+/// The reader half: polls the same fixed pair via
+/// `quiescent_pair_read_uniform` until the writer finishes, recording every
+/// completed round's decoded `(a, b)` pair — asserted against in the test
+/// itself (kept out of this function so a `#[test]` failure message names
+/// the seed directly, not a panic from inside a spawned task).
+#[allow(clippy::too_many_arguments)]
+async fn tight_pair_reader(
+    env: SimEnv,
+    topo: Arc<Topology>,
+    table_a: &'static str,
+    bytes_a: Vec<u8>,
+    table_b: &'static str,
+    bytes_b: Vec<u8>,
+    done: Arc<Mutex<bool>>,
+    rounds: Arc<Mutex<Vec<(i64, i64)>>>,
+) {
+    loop {
+        let pair = [(table_a, bytes_a.clone()), (table_b, bytes_b.clone())];
+        if let Some([av, bv]) = quiescent_pair_read_uniform(&env, &topo, &pair).await {
+            rounds
+                .lock()
+                .unwrap()
+                .push((decode_i64(&av), decode_i64(&bv)));
+        }
+        if *done.lock().unwrap() {
+            return;
+        }
+        env.sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// One seed's run of the tight-pair scenario (no fault injection — the
+/// property under test is purely about read/write timing under a tight
+/// writer, the exact shape that reproduced the production bug).
+fn run_tight_pair_scenario(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let topo = Arc::new(Topology::start(&sim));
+    sim.run_for(ELECT);
+
+    let key_a = owned_key(0, 0);
+    let key_b = owned_key(0, 1);
+    let table_a = table_of_key(key_a);
+    let table_b = table_of_key(key_b);
+    let bytes_a = key_bytes(key_a);
+    let bytes_b = key_bytes(key_b);
+
+    let resolver_env = sim.env(nid(RESOLVER_ID));
+    {
+        let topo = Arc::clone(&topo);
+        resolver_env.clone().spawn_task(async move {
+            resolver_loop(resolver_env, topo).await;
+        });
+    }
+
+    let done = Arc::new(Mutex::new(false));
+    let rounds: Arc<Mutex<Vec<(i64, i64)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let writer_env = sim.env(nid(CLIENT_IDS[0]));
+    {
+        let topo = Arc::clone(&topo);
+        let done = Arc::clone(&done);
+        let bytes_a = bytes_a.clone();
+        let bytes_b = bytes_b.clone();
+        writer_env.clone().spawn_task(async move {
+            tight_pair_writer(writer_env, topo, table_a, bytes_a, table_b, bytes_b, done).await;
+        });
+    }
+
+    let reader_env = sim.env(nid(CLIENT_IDS[1]));
+    {
+        let topo = Arc::clone(&topo);
+        let done = Arc::clone(&done);
+        let rounds = Arc::clone(&rounds);
+        reader_env.clone().spawn_task(async move {
+            tight_pair_reader(
+                reader_env, topo, table_a, bytes_a, table_b, bytes_b, done, rounds,
+            )
+            .await;
+        });
+    }
+
+    sim.run_for(DRAIN);
+
+    let rounds = rounds.lock().unwrap();
+    assert!(
+        !rounds.is_empty(),
+        "seed {seed}: reader never completed a single quiesced round"
+    );
+    let torn: Vec<&(i64, i64)> = rounds.iter().filter(|(a, b)| a + b != 0).collect();
+    assert!(
+        torn.is_empty(),
+        "seed {seed}: observed {} torn pair(s) out of {} round(s) (e.g. {:?}) — a quiesced \
+         round must never see a+b != 0",
+        torn.len(),
+        rounds.len(),
+        torn.first()
+    );
+}
+
+/// Depth via `ANIMUS_TXN_SEEDS` (default 1), following `seed_expand`'s own
+/// variant-0-keeps-the-canonical-seed convention: variant 0 is the frozen
+/// `tight_pair_never_torn` seed; `ANIMUS_TXN_SEEDS=K` runs `K` independent
+/// seed variants.
+#[test]
+fn tight_pair_transactions_never_observe_a_torn_snapshot() {
+    for variant in 0..seeds_per_cell() {
+        let name = if variant == 0 {
+            "tight_pair_never_torn".to_string()
+        } else {
+            format!("tight_pair_never_torn_s{variant:02}")
+        };
+        run_tight_pair_scenario(name_seed(&name));
+    }
+}

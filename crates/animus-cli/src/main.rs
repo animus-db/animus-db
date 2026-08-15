@@ -631,6 +631,11 @@ fn print_response(response: &ClientResponse) {
         ClientResponse::PutOk => println!("OK"),
         ClientResponse::Value(Some(v)) => println!("{}", show(v)),
         ClientResponse::Value(None) => println!("(not found)"),
+        // Reply to the internal `GetSnapshot` RPC (ADR 0018 §2, torn-pair-fix
+        // stack PR2) — never requested by any CLI subcommand (`get` only
+        // ever sends a bare `Get`); printed raw if one ever surfaces here,
+        // mirroring `JoinInfo`/`MetadataDelta` below.
+        ClientResponse::Unresolved => println!("(unresolved: transaction in flight)"),
         ClientResponse::Pairs(pairs) => {
             for (k, v) in pairs {
                 println!("{}\t{}", show(k), show(v));

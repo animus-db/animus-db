@@ -938,32 +938,49 @@ async fn rebuild_txn_tracker<S: StorageEngine>(storage: &S, scope: &StorageScope
 }
 
 /// The outcome of resolving one raw, envelope-tagged stored value against a
-/// read (ADR 0018 §2/PR3, extended PR4): either a value has been determined
-/// (`Value`, `Some` present / `None` absent); the covering transaction's
-/// **local** record is `Pending` (this same tablet holds the record — the
+/// read (ADR 0018 §2/PR3, extended PR4, unified PR2 of the
+/// torn-pair-fix stack): either a value has been determined (`Value`,
+/// `Some` present / `None` absent); the covering transaction's **local**
+/// record is `Pending` (this same tablet holds the record — the
 /// single-participant/anchor case — but it hasn't decided yet); or the
 /// record could not be found in this tablet's own scope at all (`Foreign`
 /// — either it genuinely lives on another tablet, ADR 0018 §2/PR4's
 /// multi-participant case, or the anchor's own stage just hasn't applied
 /// here yet) — see `RaftKvNode::resolve_once_step`'s doc for the exact
-/// per-status rules. A caller with no cross-tablet resolver treats `Pending`
-/// and `Foreign` identically (both are "can't resolve locally, retry");
-/// [`linearizable_get_served_fast`](RaftKvNode::linearizable_get_served_fast)
-/// is the one caller that acts on `Foreign` differently.
+/// per-status rules.
+///
+/// **`Pending` and `Foreign` carry the identical [`IntentInfo`] payload**
+/// (the torn-pair-fix stack's ADR 0018 §2 amendment) — a caller with no
+/// cross-tablet resolver treats them identically (both are "can't resolve
+/// locally, retry"), but a caller that *can* chase an intent down (a status
+/// query + push, ADR 0018 §2/PR4 §3) now runs the exact same recipe for
+/// either outcome: `record_table`/`record_key` route to the record's actual
+/// owner transparently, whether that happens to be this same tablet (the
+/// `Pending` case) or a different one (`Foreign`). See
+/// [`linearizable_get_served_fast`](RaftKvNode::linearizable_get_served_fast)'s
+/// doc and `animusd::ClientCtx::cp_get_local_resolving`/
+/// `cp_get_local_snapshot`, the two callers that act on this.
 enum ResolveStep {
     Value(Option<Vec<u8>>),
-    Pending,
+    Pending(IntentInfo),
     Foreign(IntentInfo),
 }
 
 /// Everything a caller needs to chase down an intent's covering transaction
-/// on another tablet (ADR 0018 §2/PR4): the transaction's identity, its
-/// record's logical key, and the **table** whose tablet ring owns that key
-/// (a record key alone doesn't identify a table — see `txn::Envelope::Intent`'s
-/// doc). Returned by [`RaftKvNode::peek_intent`]/exposed via
-/// [`ResolveStep::Foreign`]; consumed by a coordinator (`animusd`) that
-/// routes a `ClientRequest::TxnStatus` to `record_table`/`record_key`'s
-/// owning tablet, then calls
+/// (ADR 0018 §2/PR4, generalized to the local case by the torn-pair-fix
+/// stack's ADR 0018 §2 amendment): the transaction's identity, its record's
+/// logical key, and the **table** whose tablet ring owns that key (a record
+/// key alone doesn't identify a table — see `txn::Envelope::Intent`'s doc).
+/// **Not always "another tablet"** despite the historical name of the
+/// `Foreign` variant that first introduced this struct — [`ResolveStep::
+/// Pending`] carries the identical shape for a record this *same* tablet
+/// already holds (the single-participant/anchor case), so a caller can
+/// route `record_table`/`record_key` through its ordinary cross-tablet
+/// lookup (e.g. `animusd`'s `ClientCtx::cp_route`) uniformly either way —
+/// it transparently resolves back to this tablet when the record happens to
+/// be local. Consumed by a coordinator (`animusd`) that routes a
+/// `ClientRequest::TxnStatus` to `record_table`/`record_key`'s owning
+/// tablet, then calls
 /// [`RaftKvNode::resolve_intent_given_status`](RaftKvNode::resolve_intent_given_status)
 /// with the reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1008,10 +1025,17 @@ pub enum FastRead {
     Value(Option<Vec<u8>>),
     /// A **local** record covers this key and is still `Pending` — the
     /// caller may fall back to the bounded local wait
-    /// ([`RaftKvNode::linearizable_get_served`]) or retry later.
-    Pending,
+    /// ([`RaftKvNode::linearizable_get_served`], correct for a genuinely
+    /// single-key read), or — since the torn-pair-fix stack's ADR 0018 §2
+    /// amendment gave this variant the same [`IntentInfo`] payload
+    /// `Foreign` carries — treat it identically to `Foreign` via a status
+    /// query + push + resolve, never blocking (the design a
+    /// `TransactGetItems` quiescent round needs: see
+    /// `animusd::ClientCtx::cp_get_local_snapshot`).
+    Pending(IntentInfo),
     /// The intent's record could not be found in this tablet's own scope —
-    /// see [`IntentInfo`]'s doc for how a caller resolves it.
+    /// see [`IntentInfo`]'s doc for how a caller resolves it. Carries the
+    /// same payload shape as `Pending` above, by design.
     Foreign(IntentInfo),
 }
 
@@ -2814,12 +2838,15 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// [`resolve_once_step`](Self::resolve_once_step) (the local-record
     /// path) and [`resolve_intent_given_status`](Self::resolve_intent_given_status)
     /// (the cross-tablet, externally-supplied-status path): `Pending`
-    /// can't resolve yet; `Committed` at or before `read_ts` (`None` =
-    /// "latest") serves `staged_value`; `Committed` strictly after
-    /// `read_ts`, or `Aborted`, serves whatever `physical_key` held
-    /// immediately before this intent (rewinding to `vv_version - 1` —
-    /// never a tombstone, which would incorrectly shadow an older,
-    /// still-live committed value — see `txn.rs`'s module doc).
+    /// can't resolve yet (returns [`ResolveStep::Pending`] carrying
+    /// `pending`, the caller-supplied [`IntentInfo`] for *this* intent — see
+    /// that variant's doc for why callers need it even in the local case);
+    /// `Committed` at or before `read_ts` (`None` = "latest") serves
+    /// `staged_value`; `Committed` strictly after `read_ts`, or `Aborted`,
+    /// serves whatever `physical_key` held immediately before this intent
+    /// (rewinding to `vv_version - 1` — never a tombstone, which would
+    /// incorrectly shadow an older, still-live committed value — see
+    /// `txn.rs`'s module doc).
     async fn resolve_decided(
         &self,
         physical_key: &[u8],
@@ -2827,6 +2854,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         staged_value: Option<Vec<u8>>,
         read_ts: Option<HlcTimestamp>,
         status: &txn::TxnDecisionStatus,
+        pending: IntentInfo,
     ) -> ResolveStep {
         match status {
             txn::TxnDecisionStatus::Committed { commit_ts }
@@ -2865,7 +2893,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     }),
                 )
             }
-            txn::TxnDecisionStatus::Pending => ResolveStep::Pending,
+            txn::TxnDecisionStatus::Pending => ResolveStep::Pending(pending),
         }
     }
 
@@ -2906,12 +2934,27 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     .and_then(|r| txn::decode_record(&r.value));
                 match record {
                     Some(r) if r.txn_id == txn_id => {
+                        // Built up front (not just inside the `Pending`
+                        // branch `resolve_decided` might take) since the
+                        // fields below are about to be moved into that
+                        // call — cheap relative to the storage round trip
+                        // just above, and keeps `Pending` symmetric with
+                        // `Foreign`'s own `IntentInfo` (torn-pair-fix
+                        // stack's ADR 0018 §2 amendment).
+                        let pending = IntentInfo {
+                            txn_id: txn_id.clone(),
+                            record_key: record_key.clone(),
+                            record_table: record_table.clone(),
+                            staged_value: staged_value.clone(),
+                            version: hlc::unpack(vv.version),
+                        };
                         self.resolve_decided(
                             physical_key,
                             vv.version,
                             staged_value,
                             read_ts,
                             &r.status.to_public(),
+                            pending,
                         )
                         .await
                     }
@@ -2963,7 +3006,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 // doc; a caller that *can* chase a foreign record down uses
                 // `linearizable_get_served_fast` instead of this bounded
                 // internal retry.
-                ResolveStep::Pending | ResolveStep::Foreign(_) => {
+                ResolveStep::Pending(_) | ResolveStep::Foreign(_) => {
                     if self.env.now().0 >= deadline {
                         return None;
                     }
@@ -3017,7 +3060,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let vv = self.storage.get(&physical).await.ok().flatten()?;
         match self.resolve_once_step(&physical, vv, None).await {
             ResolveStep::Value(v) => v,
-            ResolveStep::Pending | ResolveStep::Foreign(_) => None,
+            ResolveStep::Pending(_) | ResolveStep::Foreign(_) => None,
         }
     }
 
@@ -3373,7 +3416,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
         Some(match step {
             ResolveStep::Value(v) => FastRead::Value(v),
-            ResolveStep::Pending => FastRead::Pending,
+            ResolveStep::Pending(info) => FastRead::Pending(info),
             ResolveStep::Foreign(info) => FastRead::Foreign(info),
         })
     }
@@ -3412,22 +3455,42 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             txn::Envelope::Committed(v) => Some(Some(v)),
             txn::Envelope::Intent {
                 txn_id: found,
+                record_key,
+                record_table,
                 staged_value,
-                ..
             } if &found == txn_id => {
+                // Built for parity with `resolve_once_step`'s own call —
+                // unused here whenever `status` isn't `Pending` (the only
+                // caller, `animusd`, only ever supplies an
+                // already-decided status), but `resolve_decided` needs one
+                // value of this shape regardless of which branch it takes.
+                let pending = IntentInfo {
+                    txn_id: found.clone(),
+                    record_key,
+                    record_table,
+                    staged_value: staged_value.clone(),
+                    version: hlc::unpack(vv.version),
+                };
                 match self
-                    .resolve_decided(&physical, vv.version, staged_value, read_ts, &status)
+                    .resolve_decided(
+                        &physical,
+                        vv.version,
+                        staged_value,
+                        read_ts,
+                        &status,
+                        pending,
+                    )
                     .await
                 {
                     ResolveStep::Value(v) => Some(v),
-                    ResolveStep::Pending | ResolveStep::Foreign(_) => None,
+                    ResolveStep::Pending(_) | ResolveStep::Foreign(_) => None,
                 }
             }
             // No longer our intent (already resolved, or superseded) —
             // resolve whatever is actually there now instead.
             _ => match self.resolve_once_step(&physical, vv, read_ts).await {
                 ResolveStep::Value(v) => Some(v),
-                ResolveStep::Pending | ResolveStep::Foreign(_) => None,
+                ResolveStep::Pending(_) | ResolveStep::Foreign(_) => None,
             },
         }
     }

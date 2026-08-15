@@ -61,7 +61,8 @@ use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::host::{MetadataView, Reconciler};
 use animus_cp_data::{
-    FastRead, RaftKvNode, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
+    FastRead, IntentInfo, RaftKvNode, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome,
+    TxnRecordView,
 };
 use animus_env::{Clock, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{
@@ -898,6 +899,27 @@ enum CpRoute {
     None,
 }
 
+/// The point-in-time outcome of
+/// [`ClientCtx::cp_get_local_snapshot`]/[`ClientCtx::cp_read_snapshot`] (ADR
+/// 0018 §2, the torn-pair-fix stack's PR2 amendment) — see those methods'
+/// docs, and `dynamo::quiescent_multi_get`'s module-level rationale, for why
+/// `TransactGetItems`'s quiescent-round reader needs a third outcome
+/// alongside "resolved" and "routing failed."
+pub(crate) enum SnapshotRead {
+    /// The value is already resolved (present, or genuinely absent) — the
+    /// identical shape [`ClientResponse::Value`] carries.
+    Value(Option<Vec<u8>>),
+    /// This key's covering transaction did not resolve within one single,
+    /// point-in-time attempt (a local-`Pending` or `Foreign` intent, still
+    /// `Pending` after one `confirm_or_push` attempt, or racing another
+    /// resolver) — the round this read belongs to must be discarded, never
+    /// fed into the two-round agreement check: the whole point of a
+    /// quiescent round is that every key samples *the same instant*, which
+    /// an unresolved key cannot promise. Only the caller's own ROUND-level
+    /// retry may act on this, never a per-key wait.
+    Unresolved,
+}
+
 /// How long a CP op (`cp_route` + forward) waits for the tablet's group to be
 /// reachable before giving up. Generous because a table's group now forms **in
 /// band** on the first access (ADR 0023) — the first op after a `CreateTable`/
@@ -1111,6 +1133,27 @@ pub enum ClientRequest {
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
     Get { key: Vec<u8>, table: String },
+    /// **Internal non-blocking single-shot read RPC — never sent bare, only
+    /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0018 §2, the
+    /// torn-pair-fix stack's PR2 amendment): the point-in-time analog of
+    /// [`Get`](Self::Get) — one [`RaftKvNode::linearizable_get_served_fast`]
+    /// attempt plus, on a `Pending`/`Foreign` intent, one status-query +
+    /// push, **never** the bounded local wait `Get`'s own forwarding path
+    /// gets. The forwarding payload behind
+    /// [`ClientCtx::cp_read_snapshot`], itself the read primitive backing
+    /// `TransactGetItems`'s quiescent round (`dynamo::quiescent_multi_get`)
+    /// — see that function's doc for why every key of a round needs this
+    /// uniform shape instead of `Get`'s.
+    ///
+    /// Bare delivery is refused for the same reason `KindWrite`/`KindScan`
+    /// are: this is the DynamoDB edge's own internal read-shape primitive,
+    /// not a client operation — a bare client asking for it would get
+    /// exactly `Get`'s own blocking semantics silently ignored instead of a
+    /// clear refusal, which is worse than refusing outright. Real handling
+    /// lives in `ClientCtx::cp_serve_forwarded`'s match, reached only
+    /// through the `Forwarded` arm; not a `MetaCommand`, so
+    /// `is_relayable_command` does not apply.
+    GetSnapshot { key: Vec<u8>, table: String },
     /// Delete `key` of `table` from the **CP** plane (a Raft-committed tombstone) —
     /// the CQL edge's whole-partition delete. `table` is **required** (ADR 0023).
     Delete { key: Vec<u8>, table: String },
@@ -1502,6 +1545,15 @@ pub enum ClientResponse {
     PutOk,
     /// A read reached its quorum; the value (or `None` if absent).
     Value(Option<Vec<u8>>),
+    /// Reply to [`GetSnapshot`](ClientRequest::GetSnapshot): the queried
+    /// key's covering transaction did not resolve within one single,
+    /// point-in-time attempt (ADR 0018 §2, torn-pair-fix stack PR2) — see
+    /// [`SnapshotRead::Unresolved`]'s doc. Distinguishable on the
+    /// wire from [`Error`](Self::Error) so the caller's round-level retry
+    /// (never a per-key one) is the only thing that acts on it — an
+    /// ordinary transient routing/leadership failure still comes back as
+    /// `Error` and is retried exactly like any other CP op.
+    Unresolved,
     /// A range scan's live `(key, value)` pairs in key order (reply to
     /// [`Scan`](ClientRequest::Scan)).
     Pairs(Vec<(Vec<u8>, Vec<u8>)>),
@@ -4302,35 +4354,21 @@ impl ClientCtx {
         }
         match leader.linearizable_get_served_fast(key).await {
             Some(FastRead::Value(v)) => Ok(v),
-            Some(FastRead::Pending) => match leader.linearizable_get_served(key).await {
+            // Deliberately still the *blocking* chase, unchanged from PR3
+            // (ADR 0018 §2, torn-pair-fix stack PR2's own doc): correct for
+            // a genuinely single-key read (`cp_read`/plain `GetItem`), where
+            // waiting out a contended local intent is the right behavior —
+            // never for a `TransactGetItems` round, which uses
+            // `cp_get_local_snapshot` below instead. `info` (now carried by
+            // this variant, ADR 0018 §2 amendment) is unused on this arm;
+            // see `cp_get_local_snapshot` for the single-shot alternative
+            // that *does* need it.
+            Some(FastRead::Pending(_)) => match leader.linearizable_get_served(key).await {
                 Some(v) => Ok(v),
                 None => Err("CP group leader moved; retry".into()),
             },
             Some(FastRead::Foreign(info)) => {
-                let status = match self.txn_status(&info.record_table, &info.record_key).await {
-                    Ok(TxnDecisionStatus::Pending) | Err(_) => {
-                        // ADR 0018 §2/PR5 (lifting PR4's deferral): rather
-                        // than immediately reporting "still pending, retry",
-                        // push it — the record may just be stale (its
-                        // coordinator crashed) rather than genuinely
-                        // in-flight. `txn_recover` itself declines (returns
-                        // `Pending`) if grace hasn't elapsed yet, so this is
-                        // never premature.
-                        match self
-                            .txn_recover(
-                                &info.record_table,
-                                &info.record_key,
-                                &info.txn_id,
-                                Some(info.version),
-                            )
-                            .await
-                        {
-                            Ok(s) => s,
-                            Err(_) => TxnDecisionStatus::Pending,
-                        }
-                    }
-                    Ok(s) => s,
-                };
+                let status = self.confirm_or_push(&info).await;
                 match status {
                     TxnDecisionStatus::Committed { .. } | TxnDecisionStatus::Aborted => {
                         match leader
@@ -4347,6 +4385,158 @@ impl ClientCtx {
                 }
             }
             None => Err("CP group leader moved; retry".into()),
+        }
+    }
+
+    /// The shared "confirm-or-push" step behind both
+    /// [`cp_get_local_resolving`](Self::cp_get_local_resolving)'s
+    /// foreign-intent arm and [`cp_get_local_snapshot`](Self::cp_get_local_snapshot)
+    /// (ADR 0018 §2, torn-pair-fix stack PR2): a single status query for
+    /// the transaction `info` describes, routed to its actual owner
+    /// (`ClientCtx::txn_status`, transparently local when `info.record_key`
+    /// happens to resolve back to this same tablet — see [`IntentInfo`]'s
+    /// updated doc). A still-`Pending` status (or a failed query — the same
+    /// "can't confirm, treat conservatively" posture) pushes it once via
+    /// [`txn_recover`](Self::txn_recover) before giving up (`txn_recover`
+    /// itself declines, returning `Pending` unchanged, while the record
+    /// hasn't sat `Pending` past [`animus_cp_data::RECOVERY_GRACE`] yet — a
+    /// still-live coordinator's ordinary in-flight commit is never
+    /// disturbed). Never retries past that single push — the two callers
+    /// differ only in what they do with a still-`Pending` result
+    /// afterwards (one reports a retryable error for `cp_read`'s own outer
+    /// loop to chase; the other reports "unresolved this instant" for a
+    /// quiescent round to discard).
+    async fn confirm_or_push(&self, info: &IntentInfo) -> TxnDecisionStatus {
+        match self.txn_status(&info.record_table, &info.record_key).await {
+            Ok(TxnDecisionStatus::Pending) | Err(_) => match self
+                .txn_recover(
+                    &info.record_table,
+                    &info.record_key,
+                    &info.txn_id,
+                    Some(info.version),
+                )
+                .await
+            {
+                Ok(s) => s,
+                Err(_) => TxnDecisionStatus::Pending,
+            },
+            Ok(s) => s,
+        }
+    }
+
+    /// Non-blocking, single-shot analog of
+    /// [`cp_get_local_resolving`](Self::cp_get_local_resolving) — the read
+    /// primitive `TransactGetItems`'s quiescent round needs (ADR 0018 §2,
+    /// torn-pair-fix stack PR2): every branch below makes **exactly one**
+    /// resolution attempt, never a per-key wait/retry, so every key of a
+    /// round samples at approximately the same instant regardless of
+    /// whether its own intent happened to be local or foreign — the
+    /// asymmetry `cp_get_local_resolving` deliberately keeps (a correct,
+    /// intentional design for a genuinely single-key read) is exactly what
+    /// let a `TransactGetItems` round accept a torn snapshot: seed
+    /// `[`FastRead::Pending`]'s bounded *blocking* chase against
+    /// `[`FastRead::Foreign`]'s *immediate*-give-up-and-outer-retry shape,
+    /// and under a tight back-to-back writer the two keys of one round
+    /// systematically sample different instants — a corpus/production
+    /// reproduction that stabilized as a genuine, repeatable failure (see
+    /// `docs/engineering-lessons.md`'s Testing entries on this
+    /// investigation, and the ADR 0018 §2 amendment for the full account).
+    ///
+    /// Both `Pending` and `Foreign` now carry the identical [`IntentInfo`]
+    /// shape (this same amendment), so [`confirm_or_push`](Self::confirm_or_push)
+    /// handles them in one arm: one status query (transparently local or
+    /// cross-tablet) plus, if still `Pending`, one push attempt — never a
+    /// second query, never a sleep-and-retry. A still-undecided outcome, or
+    /// a resolve landing on a race (something else already resolved this
+    /// exact key underneath), maps to [`SnapshotRead::Unresolved`] rather
+    /// than the retryable `"; retry"` error `cp_get_local_resolving` would
+    /// report — this function's caller (the round loop, not this call)
+    /// decides what "unresolved" means.
+    async fn cp_get_local_snapshot(
+        &self,
+        leader: &CpGroup,
+        key: &[u8],
+    ) -> Result<SnapshotRead, String> {
+        if !leader.scope_range().contains(key) {
+            return Err(format!(
+                "key {key:?} outside tablet's current range (stale routing, likely a split crossover); retry"
+            ));
+        }
+        match leader.linearizable_get_served_fast(key).await {
+            Some(FastRead::Value(v)) => Ok(SnapshotRead::Value(v)),
+            Some(FastRead::Pending(info)) | Some(FastRead::Foreign(info)) => {
+                let status = self.confirm_or_push(&info).await;
+                match status {
+                    TxnDecisionStatus::Committed { .. } | TxnDecisionStatus::Aborted => {
+                        match leader
+                            .resolve_intent_given_status(key, &info.txn_id, status)
+                            .await
+                        {
+                            Some(v) => Ok(SnapshotRead::Value(v)),
+                            // A resolution race (something else resolved or
+                            // overwrote this key between the status query
+                            // and here) — not sampled cleanly this instant,
+                            // never a hard error; the round loop retries.
+                            None => Ok(SnapshotRead::Unresolved),
+                        }
+                    }
+                    TxnDecisionStatus::Pending => Ok(SnapshotRead::Unresolved),
+                }
+            }
+            None => Err("CP group leader moved; retry".into()),
+        }
+    }
+
+    /// Non-blocking analog of [`cp_read`](Self::cp_read), backing
+    /// `TransactGetItems`'s quiescent round (`dynamo::quiescent_multi_get`,
+    /// ADR 0018 §2, torn-pair-fix stack PR2): routing/leadership failures
+    /// ("leader moved", stale scope) are retried internally exactly like
+    /// `cp_read` — bounded by [`CLIENT_TIMEOUT`], the same routing
+    /// discipline every CP primitive shares — since those are never a
+    /// meaningful round-level signal; only an unresolved intent
+    /// ([`SnapshotRead::Unresolved`]) is surfaced to the caller, since only
+    /// the round loop (never this per-key call) may retry on that.
+    pub(crate) async fn cp_read_snapshot(
+        &self,
+        table: &str,
+        key: Vec<u8>,
+    ) -> Result<SnapshotRead, String> {
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            let err = match self.cp_route(table, &key).await {
+                CpRoute::Local(leader) => match self.cp_get_local_snapshot(&leader, &key).await {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(e) => e,
+                },
+                CpRoute::Forward(addr) => {
+                    match self
+                        .cp_forward(
+                            table,
+                            &key,
+                            addr,
+                            ClientRequest::GetSnapshot {
+                                key: key.clone(),
+                                table: table.to_owned(),
+                            },
+                        )
+                        .await
+                    {
+                        ClientResponse::Value(v) => return Ok(SnapshotRead::Value(v)),
+                        ClientResponse::Unresolved => return Ok(SnapshotRead::Unresolved),
+                        ClientResponse::Error(e) => e,
+                        other => {
+                            return Err(format!(
+                                "unexpected reply to forwarded CP snapshot read: {other:?}"
+                            ));
+                        }
+                    }
+                }
+                CpRoute::None => return Err("no CP group leader reachable".into()),
+            };
+            if !Self::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+                return Err(err);
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -6795,6 +6985,25 @@ impl ClientCtx {
                     None => self.not_leader_refusal(tablet),
                 }
             }
+            // ADR 0018 §2, torn-pair-fix stack PR2: the non-blocking
+            // single-shot analog of `Get` just above, the forwarding
+            // payload behind `ClientCtx::cp_read_snapshot` — see
+            // `GetSnapshot`'s own doc. Same serve-or-error discipline as
+            // `Get` (never re-forward, never wait) — a still-`Pending`
+            // outcome maps to `ClientResponse::Unresolved`, distinct from
+            // `Get`'s own `"; retry"` `Error`, since the two callers'
+            // outer loops act on those differently.
+            ClientRequest::GetSnapshot { key, table } => {
+                let tablet = self.tablet_for(&table, &key);
+                match tablet.and_then(|t| self.edge.cp_leader(t)) {
+                    Some(leader) => match self.cp_get_local_snapshot(&leader, &key).await {
+                        Ok(SnapshotRead::Value(v)) => ClientResponse::Value(v),
+                        Ok(SnapshotRead::Unresolved) => ClientResponse::Unresolved,
+                        Err(e) => ClientResponse::Error(e),
+                    },
+                    None => self.not_leader_refusal(tablet),
+                }
+            }
             ClientRequest::Delete { key, table } => {
                 let tablet = self.tablet_for(&table, &key);
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
@@ -8712,6 +8921,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
         ClientRequest::ClearBackfillCursor { .. } => "clear_backfill_cursor",
         ClientRequest::Get { .. } => "get",
+        ClientRequest::GetSnapshot { .. } => "get_snapshot",
         ClientRequest::Scan { .. } => "scan",
         ClientRequest::Delete { .. } => "delete",
         ClientRequest::Forwarded { .. } => "forwarded",
@@ -8852,6 +9062,17 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         // `cp_serve_forwarded`'s match, reached only through `Forwarded`.
         ClientRequest::KindScan { .. } => ClientResponse::Error(
             "this request is an internal index-read RPC and must be sent wrapped in `Forwarded`"
+                .into(),
+        ),
+        // ADR 0018 §2, torn-pair-fix stack PR2: the `TransactGetItems`
+        // quiescent-round non-blocking read primitive — refused bare for
+        // the same reason `KindWrite`/`KindScan` are (see `GetSnapshot`'s
+        // own doc). Real handling lives in `cp_serve_forwarded`'s match,
+        // reached only through `Forwarded`; not a `MetaCommand`, so
+        // `is_relayable_command` does not apply.
+        ClientRequest::GetSnapshot { .. } => ClientResponse::Error(
+            "this request is an internal non-blocking read RPC and must be sent wrapped in \
+             `Forwarded`"
                 .into(),
         ),
         ClientRequest::ForceSeal { .. } => ClientResponse::Error(

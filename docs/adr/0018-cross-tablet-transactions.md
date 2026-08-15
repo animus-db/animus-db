@@ -2021,3 +2021,144 @@ lesson this incident is an instance of.
 No codec change (no `KvCommand`/wire-image field touched) and no change to
 `ensure_ceiling_above`/`next_ceiling_candidate` beyond factoring out the
 shared bump helper.
+
+## Amendment (2026-08-15, quiescent-round uniform-single-shot reads — PR2 of
+the torn-pair-fix stack)
+
+`TransactGetItems`'s quiescent-round reader (`animusd::dynamo::
+quiescent_multi_get`, §2's own "Amendment 2026-08-12, PR7" above) had a
+second, independent bug in the same family as this file's `mint_pushed`
+amendment just above: both are cases where a mechanism proven correct in
+isolation broke once combined with an asymmetry in how its inputs actually
+behave.
+
+### 1. The bug
+
+`quiescent_multi_get` reads every key of a round via `ClientCtx::cp_read`,
+which resolves an unresolved intent via `ClientCtx::cp_get_local_resolving`
+— and that function is **deliberately asymmetric** by design, correctly so
+for its real job (serving a plain `GetItem`, a genuinely single-key read):
+
+- `FastRead::Pending` (a **local** intent — the record lives in this same
+  tablet, the anchor case) falls through to the **bounded blocking chase**
+  (`RaftKvNode::linearizable_get_served`, up to `INTENT_WAIT_TIMEOUT` = 5s):
+  correct for a lone reader, since waiting out a contended intent is the
+  right behavior when there is nothing else to compare the read against.
+- `FastRead::Foreign` (a **cross-tablet** intent — the participant case)
+  gets a single status query + push attempt and, if still undecided,
+  reports a retryable `"; retry"` error immediately — `cp_read`'s own
+  *outer* loop (a 50ms poll) is the retrier, not this call.
+
+For a `TransactGetItems` round, this asymmetry is fatal: the round's own
+correctness argument ("accept once two consecutive rounds agree
+byte-for-byte") implicitly assumes every key in a round samples
+*approximately the same instant*. Under a tight, back-to-back writer
+alternating two keys of the *same* repeatedly-re-run transaction, the local
+key's blocking chase and the foreign key's immediate-give-up-then-50ms-retry
+have systematically different latencies, so the two keys of one round
+sample two different, unrelated instants — and because the skew is
+*systematic* (not random per round), two consecutive rounds can agree
+byte-for-byte on the exact same torn pair, satisfying the quiescence check
+while reporting a snapshot that was never true at any single instant.
+Reproduced directly by `animusd/tests/dynamo_txn.rs::
+transact_get_items_never_observes_a_torn_pair_under_concurrent_writes`
+(two keys, sum-to-zero writes, `a + b == 0` asserted on every accepted
+round).
+
+### 2. The fix: every key of a round is a uniform, non-blocking, single-shot sample
+
+The invariant a quiescent round actually needs: **one round samples one
+instant for every key** — not "every key eventually converges," which is
+what `cp_get_local_resolving` gives a lone `GetItem` and exactly what broke
+here. `quiescent_multi_get` now calls a new primitive,
+`ClientCtx::cp_read_snapshot` (→ `cp_get_local_snapshot`), instead of
+`cp_read`:
+
+- **`FastRead::Pending` and `FastRead::Foreign` now carry the identical
+  `IntentInfo` payload** (`animus_cp_data::ResolveStep`/`FastRead`, both
+  variants) — the local-anchor case used to carry nothing (there was no
+  cross-tablet resolver to hand it to), but the *record* itself is always
+  addressable by `(record_table, record_key)` regardless of whether it
+  happens to live in this same tablet or a different one:
+  `ClientCtx::txn_status`'s existing `cp_route`-based routing resolves back
+  to a local, in-process call transparently when it does.
+- Both variants now route through one shared function, `confirm_or_push`: a
+  single status query, and — only if still `Pending` — a single
+  `txn_recover` push attempt (same `RECOVERY_GRACE` liveness gate as
+  before: a young, still-live transaction is never disturbed). **Never a
+  second query, never a sleep-and-retry** inside this function.
+- A still-undecided outcome (or a resolve landing on a race — something
+  else resolved the key between the status query and the resolve call)
+  maps to a new `SnapshotRead::Unresolved` outcome, wire-distinguishable
+  via a new `ClientResponse::Unresolved` (the internal-only
+  `ClientRequest::GetSnapshot`/`cp_serve_forwarded` forwarding path mirrors
+  `KindWrite`/`KindScan`'s existing refused-bare convention) — **never**
+  `cp_get_local_resolving`'s retryable `"; retry"` `Error`, since the two
+  callers' outer loops act on the two outcomes differently.
+- `quiescent_multi_get`'s round loop: if *any* key of a round comes back
+  `Unresolved`, the whole round is discarded — `previous` resets to `None`,
+  never compared — since a round with one unresolved key proves nothing
+  about whether the *other* keys' values are stale (this is exactly the
+  case the old design let slip through as a false-positive "quiesced"
+  accept).
+
+`cp_get_local_resolving` itself, and hence plain `GetItem`/`cp_read`, is
+**unchanged** — the local-`Pending` blocking chase stays exactly as PR3
+built it, since it remains the correct behavior for a genuinely single-key
+read. Only `TransactGetItems`'s own round primitive moved to the uniform
+shape.
+
+### 3. Composition with the `mint_pushed` fix (this file's amendment just above)
+
+The two fixes are independent but compounding: the `mint_pushed` fix closes
+a *clock*-side hazard (a leader's own minted timestamps runaway-diverging
+from real time under interleaved reads/writes on one group); this amendment
+closes a *read-shape*-side hazard (one multi-key round sampling
+different instants across groups). Either alone leaves a path to a torn
+`TransactGetItems` snapshot under sustained concurrent writes to the same
+key pair; both together close every mechanism this stack's investigation
+found.
+
+### 4. A third, pre-existing, unrelated bug found during acceptance testing — explicitly out of scope here
+
+Solo re-runs of `transact_get_items_never_observes_a_torn_pair_under_
+concurrent_writes` against this PR (10 runs on the `mint_pushed`-only
+baseline, 20 runs with this amendment applied) show the test still failing
+at a similar, high rate (baseline 7/10 failed; with this fix, 17/20 failed)
+— **not** because either torn-pair mechanism above still fires (a dedicated
+new `SimEnv` regression proves the fixed round design itself sound at
+depth — see §5 below and `animus-test/tests/txn_serializable.rs::
+tight_pair_transactions_never_observe_a_torn_snapshot`, 0 failures across
+30+ seeds) — but because of a **third, distinct, already-documented
+pre-existing bug**: `docs/engineering-lessons.md`'s 2026-08-14 entry
+("A pre-existing, timing-sensitive flake found incidentally...") already
+adjudicated this exact test as genuinely flaky on `main`, unrelated to the
+PR it was found alongside, with its own baseline numbers (4/10, 4/10, 5/10
+failures across three points in history). Debugging this PR's own solo
+runs traced the *mechanism*, not just the symptom: the participant key
+("b") stops receiving any further writes partway through the writer's
+loop (observed stuck anywhere from step 4 to step 14 out of 15) while the
+anchor key ("a") continues committing correctly all the way to the end,
+and the writer's own `TransactWriteItems` calls never observe a failure —
+i.e., this is a **write-side 2PC participant-write-loss** bug (the
+participant's own intent silently stops advancing while the coordinator
+keeps reporting success), not a read-side snapshot-timing one, so it sits
+entirely outside what either torn-pair-fix PR targets. Per this repo's
+"separate PRs for incidental bugs" convention (and the engineering-lessons
+entry's own explicit instruction), this is left for its own, dedicated
+root-cause delivery — see `docs/engineering-lessons.md`'s updated entry for
+the refreshed baseline numbers and the mechanism-level lead this
+investigation leaves behind.
+
+### 5. Tests
+
+New: the SimEnv regression proving the *fixed* uniform-single-shot design
+sound at the protocol level, `animus-test/tests/txn_serializable.rs::
+tight_pair_transactions_never_observe_a_torn_snapshot` (a dedicated
+scenario, not part of the `Scenario`/`run_scenario` Elle-history corpus
+above — the property under test is a numeric sum invariant across one
+contended key pair, not a `Mop::Append`/`Read` serializability claim).
+Existing acceptance test unchanged: `animusd/tests/dynamo_txn.rs::
+transact_get_items_never_observes_a_torn_pair_under_concurrent_writes` —
+still the real wire-level check, now also the regression for §4's residual
+bug once that gets its own fix.

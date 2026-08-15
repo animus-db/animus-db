@@ -159,8 +159,8 @@ use animus_env::{Clock, Env, Metric};
 use animus_tablet::{TOKEN_BYTES, TabletId, partition_token};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::ClientCtx;
 use crate::http;
+use crate::{ClientCtx, SnapshotRead};
 
 /// How long `CreateTable` waits for its `CreateTableSchema` proposal to commit in
 /// the replicated catalog before giving up.
@@ -1653,29 +1653,67 @@ async fn run_transact(
 /// prior non-atomic implementation to replace).
 ///
 /// **Semantics, precisely — a serializable snapshot via
-/// quiescence-confirmation, not a wait-free one.** The ADR 0018 §2/PR6
-/// multi-tablet Elle corpus needed three redesigns of this exact problem
-/// before it stopped producing false-positive torn reads (see
-/// `animus-test/tests/txn_serializable.rs`'s `quiescent_multi_read` doc for
-/// the full account): a single coordinator-minted `read_at` snapshot
-/// timestamp is **structurally unsound** — `RaftKvNode::mint_pushed`'s
-/// write-conflict floor stamps a write *above* whatever ceiling a prior
-/// future-padded read already pushed that group's committed ceiling to, and
-/// since a group's `Hlc` only ever ratchets forward, that becomes a
-/// **permanent** floor no fixed or dynamically-sampled margin can close;
-/// force-resolving once then reading sequentially is undermined by a slow
-/// key observing a much later moment than a fast one. The design that
-/// actually closes it: read every key **at latest, concurrently**
-/// (`ClientCtx::cp_read`, which already gives ReadIndex linearizability +
-/// intent resolution + cross-process forwarding), and accept the round only
-/// once **two consecutive concurrent rounds agree byte-for-byte on every
-/// key** — if nothing changed between two independent observations, no
-/// transaction was in flight touching any involved key during that whole
-/// window, so the read is genuinely consistent, not merely probably so.
-/// Bounded to [`TRANSACT_GET_MAX_ROUNDS`] rounds; a snapshot that never
-/// quiesces (sustained contention on one of the requested keys) reports a
-/// retryable `TransactionCanceledException` rather than ever returning a
-/// possibly-torn result.
+/// quiescence-confirmation, not a wait-free one.** This design went through
+/// **four** redesigns of the same underlying problem before it stopped
+/// producing false-positive torn reads — three at the pure-protocol level
+/// (see `animus-test/tests/txn_serializable.rs`'s `quiescent_multi_read` doc
+/// for that full account) and a fourth, **live in production**, found by
+/// this exact function after the first three had already landed (the
+/// torn-pair-fix stack's ADR 0018 §2 amendment — read that amendment for
+/// the full incident):
+///
+/// 1. A single coordinator-minted `read_at` snapshot timestamp is
+///    **structurally unsound** — `RaftKvNode::mint_pushed`'s write-conflict
+///    floor stamps a write *above* whatever ceiling a prior future-padded
+///    read already pushed that group's committed ceiling to, and since a
+///    group's `Hlc` only ever ratchets forward, that becomes a **permanent**
+///    floor no fixed or dynamically-sampled margin can close.
+/// 2. Force-resolving once then reading sequentially is undermined by a
+///    slow key observing a much later moment than a fast one.
+/// 3. Reading every key **at latest, concurrently**
+///    (`futures::future::join_all`, never a sequential per-key loop) closes
+///    (1) and (2), but is still only sound if **every key's own per-call
+///    read is itself a single point-in-time sample** — which the third
+///    redesign assumed without enforcing.
+/// 4. **It wasn't.** `ClientCtx::cp_read` (what this function used to call
+///    per key) is deliberately *asymmetric* by design for its real job
+///    (serving `GetItem`, a genuinely single-key op): a locally-`Pending`
+///    intent gets a **bounded blocking chase** (`RaftKvNode::
+///    linearizable_get_served`, correct there — waiting out a contended
+///    intent is the right behavior for a lone reader), while a **foreign**
+///    intent gets one status query + push and, if still undecided, an
+///    immediate `"; retry"` this function's own per-key `join_all` call
+///    re-issues on the *next* round rather than waiting inline. Under a
+///    tight, back-to-back writer alternating two keys of the *same*
+///    transaction, this made the two calls inside one round systematically
+///    sample **different instants** — the blocking-chase key kept
+///    fast-forwarding to whatever the writer had most recently committed by
+///    the time its own wait finished, while the give-up-immediately key
+///    lagged by however many extra 50ms outer-loop passes its own retries
+///    needed. Two consecutive rounds could then agree byte-for-byte on the
+///    exact same torn `[key_a: N, key_b: N-1]` pair, satisfying the
+///    two-round check while reporting a snapshot that was never true at any
+///    single instant.
+///
+/// **The fix — every key's read is a uniform, non-blocking, single-shot
+/// sample; only the ROUND loop retries.** [`quiescent_multi_get`] now calls
+/// [`ClientCtx::cp_read_snapshot`] instead of `cp_read`: `Value` if resolved,
+/// `Unresolved` if the key's intent (local or foreign — both now carry the
+/// identical `IntentInfo` shape, see `animus_cp_data::FastRead`'s doc) did
+/// not resolve within one status-query-plus-push attempt. A round where
+/// *any* key comes back `Unresolved` is discarded outright — `previous`
+/// resets to `None` rather than comparing a partial round — since a round
+/// with an unresolved key proves nothing about whether the *other* keys'
+/// values are stale. This removes the latency asymmetry (1)–(4) needed:
+/// every key in a round now costs the same one-or-two round trips, so no
+/// systematic per-key skew survives round to round. Bounded to
+/// [`TRANSACT_GET_MAX_ROUNDS`] rounds; a snapshot that never quiesces
+/// (sustained contention on one of the requested keys) reports a retryable
+/// `TransactionCanceledException` rather than ever returning a possibly-torn
+/// result. Regression: `animusd/tests/dynamo_txn.rs::
+/// transact_get_items_never_observes_a_torn_pair_under_concurrent_writes`
+/// (0/20 solo runs after this fix, vs. a reproducible ~15–30% failure rate
+/// before it — see the ADR amendment for the exact before/after numbers).
 async fn run_transact_get(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -1725,17 +1763,26 @@ async fn run_transact_get(
     Ok(wire::transact_get_response(&items))
 }
 
-/// The quiescence-confirmation read loop backing [`run_transact_get`]: read
-/// every `(table, key)` concurrently (`futures::future::join_all` — never a
-/// sequential per-key loop, which would let a slow key observe a much later
-/// moment than a fast one) via the ordinary [`ClientCtx::cp_read`] machinery
-/// (works from any node — routes/forwards to each key's own tablet leader,
-/// resolves any intent it meets), retried as a whole until two consecutive
-/// rounds agree byte-for-byte on every key, bounded by
-/// [`TRANSACT_GET_MAX_ROUNDS`]. See [`run_transact_get`]'s doc for why this
-/// two-round-agreement shape is what actually gives a multi-key read joint
-/// consistency, and why the two single-round designs it replaced were each
-/// found unsound by the ADR 0018 §2/PR6 corpus.
+/// The quiescence-confirmation read loop backing [`run_transact_get`]
+/// (ADR 0018 §2, uniform-single-shot rounds per the torn-pair-fix stack's
+/// amendment — see [`run_transact_get`]'s doc for the full incident this
+/// design closes): read every `(table, key)` concurrently
+/// (`futures::future::join_all` — never a sequential per-key loop, which
+/// would let a slow key observe a much later moment than a fast one) via
+/// [`ClientCtx::cp_read_snapshot`] (works from any node — routes/forwards to
+/// each key's own tablet leader, resolves any intent it meets with exactly
+/// one status-query-plus-push attempt, **never** a per-key wait).
+///
+/// **Invariant: one round samples one instant for every key.** A round
+/// where *every* key resolves is compared against the previous round for
+/// byte-for-byte agreement, exactly like before; a round where *any* key
+/// comes back [`SnapshotRead::Unresolved`] is discarded outright —
+/// `previous` resets to `None`, never compared, since a partial round
+/// proves nothing about whether the *other* keys' values are stale (this is
+/// the exact case the fourth abandoned design, documented on
+/// [`run_transact_get`], let slip through as a false-positive quiesced
+/// snapshot). Retried as a whole until two consecutive **complete** rounds
+/// agree on every key, bounded by [`TRANSACT_GET_MAX_ROUNDS`].
 async fn quiescent_multi_get(
     ctx: &ClientCtx,
     keys: &[(String, Vec<u8>)],
@@ -1744,13 +1791,29 @@ async fn quiescent_multi_get(
     for round_idx in 0..TRANSACT_GET_MAX_ROUNDS {
         let futs = keys
             .iter()
-            .map(|(table, key)| ctx.cp_read(table, key.clone()));
-        let round: Vec<Result<Option<Vec<u8>>, String>> = futures::future::join_all(futs).await;
+            .map(|(table, key)| ctx.cp_read_snapshot(table, key.clone()));
+        let round: Vec<Result<SnapshotRead, String>> = futures::future::join_all(futs).await;
+
         let mut values = Vec::with_capacity(round.len());
+        let mut unresolved = false;
         for r in round {
-            values.push(r.map_err(|e| internal(&e))?);
+            match r.map_err(|e| internal(&e))? {
+                SnapshotRead::Value(v) => values.push(v),
+                SnapshotRead::Unresolved => {
+                    unresolved = true;
+                    break;
+                }
+            }
         }
-        if previous.as_ref() == Some(&values) {
+
+        if unresolved {
+            // Never feed a partial/unresolved round into the two-round
+            // agreement check, and never let it stand as `previous` either
+            // — both would let a torn instant slip through as one half of
+            // a "matching" pair (exactly the production bug this design
+            // closes; see `run_transact_get`'s doc).
+            previous = None;
+        } else if previous.as_ref() == Some(&values) {
             if round_idx > 1 {
                 ctx.data()
                     .raftkv_metrics
@@ -1759,8 +1822,10 @@ async fn quiescent_multi_get(
                 ctx.data().raftkv_metrics.incr(Metric::DynamoTransactGetsOk);
             }
             return Ok(values);
+        } else {
+            previous = Some(values);
         }
-        previous = Some(values);
+
         if round_idx + 1 < TRANSACT_GET_MAX_ROUNDS {
             tokio::time::sleep(TRANSACT_GET_POLL).await;
         }

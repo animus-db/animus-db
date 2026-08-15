@@ -588,6 +588,20 @@ route below the edge through the same `ClientCtx` CP primitives.
   gave a write action's own `ConditionExpression` full **cross-node** OCC
   (apply-time `write_conditions`, not just same-node `rmw_lock`
   protection). `DeleteItem` writes a tombstone *value*.
+
+  **`TransactGetItems` (`dynamo::quiescent_multi_get`) reads every key via
+  `ClientCtx::cp_read_snapshot`, never plain `cp_read`** (ADR 0018 §2's
+  newest amendment, torn-pair-fix stack PR2): a quiescent round's own
+  correctness argument needs every key sampled at *the same instant*,
+  which `cp_read`'s deliberately asymmetric intent resolution (a bounded
+  blocking chase for a local intent, an immediate give-up for a foreign
+  one — correct for plain `GetItem`, which this leaves untouched) breaks
+  under a tight concurrent writer. `cp_read_snapshot` makes exactly one
+  non-blocking attempt per key regardless of locality; any key that
+  doesn't resolve reports `SnapshotRead::Unresolved` and the **whole
+  round** is discarded, never partially compared. See the ADR amendment
+  for the full incident and `docs/engineering-lessons.md` for a residual,
+  unrelated write-side bug this investigation surfaced but did not fix.
 - **CQL v4** (`cql.rs`, `RoleAddrs.cql`) — `STARTUP`/`OPTIONS` handshake +
   `QUERY`/`PREPARE`/`EXECUTE` via the pure `animus_cql` crate. `CREATE TABLE`
   proposes a typed schema into the replicated catalog (incl. clustering/

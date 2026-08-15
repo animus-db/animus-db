@@ -1727,6 +1727,36 @@ debugging anything that feels like it might have happened before.
   Flat within noise across three points spanning the whole round-3 stack;
   streams work never touched this path. Genuinely pre-existing, not
   introduced or worsened by any PR in this stack.
+  **Update (2026-08-15, torn-pair-fix stack PR2) — the mechanism, and a
+  worse baseline that still isn't this PR's fault.** The torn-pair-fix
+  stack (PR1: `mint_pushed` clock-witnessing-runaway fix; PR2: this file's
+  `run_transact_get`/`quiescent_multi_get` uniform-single-shot-round fix,
+  ADR 0018 §2's newest amendment) targeted two *read-timing* mechanisms
+  that can produce a torn `TransactGetItems` snapshot. Both are fixed and
+  independently verified (a dedicated `SimEnv` regression,
+  `txn_serializable.rs::tight_pair_transactions_never_observe_a_torn_
+  snapshot`, 0 failures across 30+ seeds). Yet solo re-runs of *this* wire-
+  level test against the fixed stack still fail at a rate at least as high
+  as ever (PR1-only baseline: 7/10; PR1+PR2: 17/20) — debugging traced *why*,
+  not just confirmed *that*: the participant key ("b" in the test) simply
+  **stops receiving any further writes partway through the writer's loop**
+  (observed stuck anywhere from step 4 to step 14 of 15) while the anchor
+  key ("a") keeps committing correctly to the very end, and the writer's
+  own `TransactWriteItems` calls never see a failure throughout — i.e. this
+  is a **write-side 2PC participant-write-loss** bug (the participant's
+  own intent silently stops advancing while the coordinator keeps
+  reporting success on every subsequent step), structurally unrelated to
+  either read-side mechanism the torn-pair-fix stack closes. It reproduces
+  identically with zero of this stack's code present, confirming (again)
+  it is pre-existing, not introduced by either PR. **Still needs its own
+  root-cause delivery** (a "Bug 3," in the participant-stage/recovery-push
+  interaction, likely a duelling-decider-class race given how aggressively
+  a live reader's own recovery pushes can now fire — worth checking first
+  whether `ClientCtx::txn_prepare_pushing`'s `IntentBlocked` retry ever
+  itself pushes the blocking transaction, since today it only waits and
+  hopes something else clears it). Do not fold it into a future PR's diff
+  without its own investigation and acceptance evidence — same convention
+  as the entry above.
 - **`RaftKvNode::start_scoped` pins every group to `PRIMARY_STREAM` — a
   `SimEnv` test that starts more than one tablet group on the *same* set of
   node ids (any split/merge scenario sharing physical nodes across tablets,
@@ -1907,6 +1937,42 @@ debugging anything that feels like it might have happened before.
   monotonic/permanent (existence, a monotonic counter, a specific id) —
   never on a value a *different* proposer can race past.
   (`animusd/src/dynamo.rs::create_index`, 2026-08-15.)
+- **Heisenbug instrumentation: even lock-free/buffered hot-path logging can
+  suppress the very race it's meant to observe — verify the failure rate is
+  unchanged before trusting the captured timeline.** Investigating the
+  torn-pair-fix stack's root cause (a `TransactGetItems` snapshot going
+  torn under a tight, back-to-back writer), the first instinct was to add
+  logging directly to the per-key read path (`ClientCtx::cp_get_local_
+  resolving`/the new `cp_get_local_snapshot`) to capture exactly what each
+  key observed at the moment of failure. Even a buffered `tracing`/
+  `eprintln!` call on that hot path measurably changed the race's timing
+  enough to suppress it in some runs — the fix was to instrument the
+  *lowest-frequency* call site that still gives the needed signal (here,
+  the point where a status query resolves to a decided outcome, not every
+  single fast-path read attempt), and — the load-bearing check — to
+  explicitly re-run the *un-instrumented* failure rate immediately after
+  adding logging and confirm it's still statistically the same before
+  trusting anything the captured timeline claims. A logging change that
+  quietly halves a reproduction's failure rate is itself evidence the
+  logging is perturbing the very thing under investigation, not
+  confirmation the bug got rarer. (Torn-pair-fix stack, PR2, 2026-08-15.)
+- **Multi-log-source clock anchoring: when correlating several log streams
+  from one process for a timing bug, log one shared absolute-clock anchor
+  event across all of them up front, before the race window opens.**
+  Debugging the same torn-pair investigation meant correlating the
+  writer's own step-by-step timeline against the reader's per-round
+  observations against the coordinator/recovery internals' own traces —
+  three log sources from the same test process, but on different clock
+  bases (some `std::time::Instant`-relative, some `SimEnv`/`HlcTimestamp`
+  wall-clock-derived). Without a single shared absolute-time anchor emitted
+  by all three at the very start, aligning "what did the reader see at the
+  exact moment the writer's step N committed" after the fact was
+  genuinely ambiguous — a real gap in the evidence that better
+  instrumentation design would have closed for free. Emit one anchor event
+  (the same wall-clock read, or the same monotonic counter value) from
+  every log source before anything interesting happens, not just whichever
+  timestamp format was most convenient at each individual call site. (Same
+  investigation, 2026-08-15.)
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
