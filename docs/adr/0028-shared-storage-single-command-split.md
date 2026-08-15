@@ -301,11 +301,13 @@ nothing about this ADR's own mechanism needed to change a second time: a
 kind is still a `StorageScope` sibling sharing the group's one live
 `KeyRange`, `ALL_KINDS` is still the single registration point, and
 `engine_image`/`erase_scope` still iterate it generically with no per-kind
-special-casing required. `MergeTablets` is rejected on a streamed **base**
-table (ADR 0042 §12's F1 stopgap, itself a stopgap superseded once tablet
-merge is removed globally) — an apply-time guard on an *ordinary* tablet,
-not a new "structurally exempt" tablet class this ADR's own "tablet is the
-unit of placement/hosting/snapshot" contract needed any change to
-accommodate: nothing here assumed every tablet must eventually merge, only
-that a tablet's range can *change* (narrow/widen) when one does. A tablet
-that never exercises that path is simply the degenerate case.
+special-casing required. `MergeTablets` was rejected on a streamed **base**
+table (ADR 0042 §12's F1 stopgap) — an apply-time guard on an *ordinary*
+tablet, never a new "structurally exempt" tablet class this ADR's own
+"tablet is the unit of placement/hosting/snapshot" contract needed any
+change to accommodate: nothing here assumed every tablet must eventually
+merge, only that a tablet's range could *change* (narrow/widen) when one
+did. **Update (2026-08-14, ADR 0044): tablet merge, `MergeTablets`, and
+the F1 stopgap guarding it are all removed entirely — tablets are
+split-only.** A tablet's range only ever narrows now; "widen" no longer
+describes anything a tablet's range does.

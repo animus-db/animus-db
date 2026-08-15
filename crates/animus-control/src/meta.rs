@@ -16,7 +16,9 @@ use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{IndexDef, SchemaCatalog, StreamSpec, StreamViewType, TableName, TableSchema};
+use crate::schema::{
+    IndexDef, IndexStatus, SchemaCatalog, StreamSpec, StreamViewType, TableName, TableSchema,
+};
 
 /// The default a [`StreamShardRow`]/[`MetaCommand::SealStreamShard`]'s
 /// `view_type` field decodes to when loading a snapshot encoded before this
@@ -220,57 +222,19 @@ pub struct Metadata {
     /// keeps pre-ADR-0032 snapshots loading (empty map).
     #[serde(default)]
     pub node_addrs: BTreeMap<NodeId, NodeAddrs>,
-    /// Tablet ids that have been **merged away** (ADR 0033): a
-    /// [`MetaCommand::MergeTablets`] apply inserts `right` here (never
-    /// pruned — tablet ids are never reused, by the same monotonic-allocator
-    /// invariant [`Metadata::next_tablet_id`] already enforces, so an entry
-    /// can never resurrect a wrong decision for a later, unrelated tablet
-    /// reusing the id). This is what lets a per-node tablet-host reconciler
-    /// tell "this hosted tablet vanished from `tablets` because it was
-    /// **merged into a sibling** — tear its group down but never touch its
-    /// data, a survivor now owns that range on the same shared engine" apart
-    /// from "vanished because its **whole table was dropped**
-    /// ([`MetaCommand::DropTableTablets`]) — tear down **and** erase."
-    /// Inferring this purely from the tablet map (e.g. "does some other
-    /// tablet's range now cover mine") is unsound: two different tables'
-    /// still-unsplit tablets can have byte-identical default ranges
-    /// ([`animus_tablet::KeyRange::whole`]), so a range-containment check
-    /// with no table identity to disambiguate would misattribute an
-    /// unrelated table's tablet as "the merge survivor" and silently skip a
-    /// real drop's erase. A tiny, permanently-retained marker per merge ever
-    /// performed (bounded by the total number of splits ever performed,
-    /// since a tablet cannot be merged unless it was first split off from
-    /// something) is far cheaper than getting that inference wrong. See ADR
-    /// 0033. `#[serde(default)]` keeps pre-ADR-0033 snapshots loading (empty
-    /// set).
-    #[serde(default)]
-    pub merged_tablets: BTreeSet<TabletId>,
     /// Split provenance (ADR 0018 PR2, the range-seal design): every split
     /// child's id mapped to its source tablet's id, recorded by
     /// [`MetaCommand::SplitTablet`]'s apply. Never pruned (tablet ids are
-    /// never reused, same discipline as [`Metadata::merged_tablets`]). This is
-    /// what lets a per-node tablet-host reconciler know **whose** seal marker
-    /// a fresh split child must observe before it may host
-    /// (`animus-cp-data`'s `host::HostAction::Host`) — the marker itself
-    /// lives in the (possibly shared) `StorageEngine`, keyed by the source's
-    /// tablet id, and this map is the only way to learn which source that is
-    /// once the source's own row may have narrowed (or, after further
-    /// splits/merges, changed shape) since the child was minted.
+    /// never reused). This is what lets a per-node tablet-host reconciler
+    /// know **whose** seal marker a fresh split child must observe before it
+    /// may host (`animus-cp-data`'s `host::HostAction::Host`) — the marker
+    /// itself lives in the (possibly shared) `StorageEngine`, keyed by the
+    /// source's tablet id, and this map is the only way to learn which
+    /// source that is once the source's own row may have narrowed (or,
+    /// after further splits, changed shape) since the child was minted.
     /// `#[serde(default)]` keeps pre-ADR-0018 snapshots loading (empty map).
     #[serde(default)]
     pub split_parents: BTreeMap<TabletId, TabletId>,
-    /// Merge provenance (ADR 0018 PR2, the range-seal design): every absorbed
-    /// tablet's id mapped to the surviving (`left`) tablet's id it was merged
-    /// into, recorded by [`MetaCommand::MergeTablets`]'s apply — the reverse
-    /// direction from [`Metadata::merged_tablets`] (which only records *that*
-    /// a tablet was absorbed, not *into whom*). Never pruned, same discipline
-    /// as `merged_tablets`/`split_parents`. Lets a survivor's reconciler find
-    /// every tablet id it has ever absorbed, to look up each one's seal
-    /// marker before widening past the range it handed off (the merge dual of
-    /// `split_parents`' gating). `#[serde(default)]` keeps pre-ADR-0018
-    /// snapshots loading (empty map).
-    #[serde(default)]
-    pub absorbed_by: BTreeMap<TabletId, TabletId>,
     /// The stream-shard segment catalog (ADR 0042 §3, ADR 0043 §A8): every
     /// sealed shard ever committed, keyed by `(tablet, epoch)` — globally
     /// unique for a tablet's whole lifetime (a tablet's own epoch counter
@@ -299,6 +263,24 @@ pub struct Metadata {
     /// directly, so it doubles as that.
     #[serde(default, with = "stream_shards_codec")]
     pub stream_shards: BTreeMap<(TabletId, u64), StreamShardRow>,
+    /// Per-tablet secondary-index **backfill completion** catalog (ADR 0045
+    /// §4): "this tablet has finished seeding change-log coverage for this
+    /// index's `Creating` scan" (the backfill seeder's own forward sweep of
+    /// its `KIND_BASE` scope, a later PR). Keyed `(tablet, index name)` —
+    /// same identity convention as [`stream_shards`](Self::stream_shards): a
+    /// tablet id already implies its table, so `table` is not part of the
+    /// key. The value is always `()` (presence alone is the fact); mutated
+    /// only through [`MetaCommand::MarkIndexBackfilled`] (idempotent insert)
+    /// and pruned by [`MetaCommand::DropTableTablets`]/
+    /// [`MetaCommand::DropTableIndex`]'s own apply arms. `#[serde(default)]`
+    /// keeps pre-backfill snapshots loading (empty map).
+    ///
+    /// **Wire shape (`#[serde(with = "index_backfill_codec")]`)**: same
+    /// `serde_json` tuple-map-key hazard as `stream_shards` above (a
+    /// `(TabletId, String)` key cannot serialize as a JSON object key either)
+    /// — encoded as a flat JSON array of `{tablet, index}` objects instead.
+    #[serde(default, with = "index_backfill_codec")]
+    pub index_backfill: BTreeMap<(TabletId, String), ()>,
 }
 
 /// Gives [`Metadata::stream_shards`] a `serde_json`-safe wire shape — see
@@ -355,6 +337,48 @@ mod stream_shards_codec {
         Ok(entries
             .into_iter()
             .map(|entry| ((entry.tablet, entry.epoch), entry.row))
+            .collect())
+    }
+}
+
+/// Gives [`Metadata::index_backfill`] a `serde_json`-safe wire shape — the
+/// same rationale as [`stream_shards_codec`] just above (a `(TabletId,
+/// String)` tuple key cannot serialize as a JSON object key either). The
+/// value is always `()`, so there is nothing else to carry: a flat `Vec<{
+/// tablet, index}>` of just the keys.
+mod index_backfill_codec {
+    use std::collections::BTreeMap;
+
+    use animus_tablet::TabletId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    struct Entry {
+        tablet: TabletId,
+        index: String,
+    }
+
+    pub fn serialize<S: Serializer>(
+        map: &BTreeMap<(TabletId, String), ()>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let entries: Vec<Entry> = map
+            .keys()
+            .map(|(tablet, index)| Entry {
+                tablet: *tablet,
+                index: index.clone(),
+            })
+            .collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<(TabletId, String), ()>, D::Error> {
+        let entries = Vec::<Entry>::deserialize(deserializer)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| ((entry.tablet, entry.index), ()))
             .collect())
     }
 }
@@ -471,23 +495,6 @@ pub enum MetaCommand {
         split_key: Vec<u8>,
         new_id: TabletId,
     },
-    /// Merge adjacent tablets `left` and `right` (where `left.end == right.start`,
-    /// they share a replica set, and they are scoped to the same table) into
-    /// `left`, extended to cover both ranges with a bumped epoch; `right` is
-    /// removed and recorded in [`Metadata::merged_tablets`] (ADR 0033) so a
-    /// per-node reconciler can tell this apart from a table drop. **Compare-and-swap
-    /// on both `expected_left_epoch` and `expected_right_epoch`** (mirroring
-    /// `SplitTablet`/`CasTabletReplicas`): rejected if either tablet's epoch has
-    /// moved since the caller read it, so a merge proposal computed from a stale
-    /// view (e.g. racing a concurrent rebalance/repair CAS or another split/merge
-    /// touching either tablet) is cleanly rejected instead of applying against
-    /// state the proposer never actually observed.
-    MergeTablets {
-        left: TabletId,
-        expected_left_epoch: Epoch,
-        right: TabletId,
-        expected_right_epoch: Epoch,
-    },
     /// Set (or clear) a tablet's placement policy (ADR 0005). Once a tablet has
     /// a policy, the leader's reconciler keeps its replica set satisfying it;
     /// `policy: None` removes the policy and stops automatic reconciliation. The
@@ -542,6 +549,38 @@ pub enum MetaCommand {
     /// Remove a secondary index definition from a table's schema (ADR 0013).
     /// Idempotent: a no-op if the table or the named index does not exist.
     DropTableIndex { table: TableName, index: String },
+    /// Set a secondary index's lifecycle **status** (ADR 0045):
+    /// `Creating`/`Active`/`Deleting`. Mirrors `SetTableMode`'s minimal shape.
+    /// Rejected if the table or the named index does not exist; a no-op if the
+    /// index is already at `status`. In-place mutation via
+    /// `TableSchema::set_index_status` — deliberately **not**
+    /// `upsert_index`'s whole-struct replace, so a status transition never
+    /// clobbers a concurrently-updated copy of the rest of the definition.
+    SetIndexStatus {
+        table: TableName,
+        index: String,
+        status: IndexStatus,
+    },
+    /// One tablet's completion signal for one index's backfill scan (ADR
+    /// 0045 §4): "this tablet has finished seeding change-log coverage for
+    /// this index." Proposed by the backfill seeder (a later PR, ADR 0045
+    /// §2 step 5) once its forward sweep of `KIND_BASE` reaches the end of
+    /// the tablet's current range. Idempotent insert into
+    /// `Metadata::index_backfill`, keyed `(tablet, index)` — a repeat
+    /// proposal (the seeder's own crash-retry) is a genuine `NoOp`. Rejected
+    /// if `table` has no schema, if `index` does not name one of its current
+    /// indexes, or if `tablet` is not currently scoped to `table` (a cheap
+    /// `Metadata::tablets` lookup, unlike `DropTableTablets`'s own O(table's
+    /// tablets) scan — see this variant's apply arm). That last check is not
+    /// merely defensive: without it, a command that lands *after* its own
+    /// tablet has already been dropped (a table/tablet-drop race with an
+    /// in-flight seeder proposal) would insert a permanent orphan row that
+    /// `DropTableTablets`'s own prune already ran past and will never revisit.
+    MarkIndexBackfilled {
+        table: TableName,
+        index: String,
+        tablet: TabletId,
+    },
     /// Set a table's **replication mode** (ADR 0016 / ADR 0017): `Ap` (leaderless
     /// data plane) or `Cp` (leaderful per-tablet Raft). Rejected if the table has
     /// no schema; a no-op if the mode is already set. Replicated like the rest of
@@ -1094,7 +1133,7 @@ impl Metadata {
                 self.tablets.insert(*new_id, new_tablet);
                 self.next_tablet_id = self.next_tablet_id.max(new_id.0 + 1);
                 // ADR 0018 PR2 (range-seal design): record split provenance —
-                // never pruned, same discipline as `merged_tablets`. This is how
+                // never pruned (tablet ids are never reused). This is how
                 // the child's per-node reconciler later learns whose seal
                 // marker (keyed by the *source's* tablet id) it must observe in
                 // the shared engine before it may host — see
@@ -1107,92 +1146,6 @@ impl Metadata {
                 if let Some(policy) = self.policies.get(tablet).cloned() {
                     self.policies.insert(*new_id, policy);
                 }
-                ApplyOutcome::Applied
-            }
-            MetaCommand::MergeTablets {
-                left,
-                expected_left_epoch,
-                right,
-                expected_right_epoch,
-            } => {
-                let (Some(l), Some(r)) = (self.tablets.get(left), self.tablets.get(right)) else {
-                    return ApplyOutcome::Rejected("no such tablet");
-                };
-                // CAS on both epochs (mirroring `SplitTablet`/`CasTabletReplicas`,
-                // ADR 0033): a merge proposal is computed from one metadata
-                // snapshot of both tablets, so either one drifting since — a
-                // racing rebalance/repair CAS, or another split/merge touching
-                // either side — must reject cleanly rather than apply against
-                // stale assumptions the proposer never actually observed.
-                if l.epoch != *expected_left_epoch || r.epoch != *expected_right_epoch {
-                    return ApplyOutcome::Rejected("epoch mismatch");
-                }
-                if !l.range.abuts(&r.range) {
-                    return ApplyOutcome::Rejected("tablets are not adjacent");
-                }
-                if l.replicas != r.replicas {
-                    return ApplyOutcome::Rejected("tablets have different replica sets");
-                }
-                // A merge never crosses a table boundary: both halves' physical
-                // keys live under the same table's `StorageScope` prefix on the
-                // node-shared engine (ADR 0026/0028), which only makes sense if
-                // they were always the same table to begin with.
-                if l.table != r.table {
-                    return ApplyOutcome::Rejected("tablets belong to different tables");
-                }
-                // ADR 0042 §12 / ADR 0043 §A5 (F1): **v1 stopgap** — reject
-                // `MergeTablets` outright on a base table with an *enabled*
-                // stream, or one with *any* still-draining catalog rows (a
-                // disabled-but-not-yet-reaped stream's shards still
-                // reference this tablet's own lineage, which a merge would
-                // corrupt by widening a range a shard's `ParentShardId`
-                // chain assumes only ever narrows). This is explicitly
-                // temporary: tablet merge is being removed globally
-                // (split-only tablets, its own forthcoming ADR + deletion
-                // stack) — this guard becomes dead code that ADR deletes
-                // along with `MergeTablets` itself, not a permanent
-                // position on merge. The disable → merge → re-enable
-                // workaround is honest under F12-b (a genuinely new stream
-                // identity).
-                if let Some(table_name) = &l.table {
-                    let has_enabled_stream = self
-                        .schemas
-                        .get(table_name)
-                        .is_some_and(|s| s.stream.is_some());
-                    let has_draining_rows = self
-                        .stream_shards
-                        .values()
-                        .any(|row| row.table == *table_name);
-                    if has_enabled_stream || has_draining_rows {
-                        return ApplyOutcome::Rejected(
-                            "merge rejected (v1 stopgap): base table has an enabled or \
-                             still-draining DynamoDB stream — tablet merge is being removed \
-                             globally in a forthcoming split-only ADR, which will delete this \
-                             guard along with MergeTablets itself; disable the stream (or wait \
-                             for its rows to drain) before merging, or merge then re-enable as \
-                             a new stream identity",
-                        );
-                    }
-                }
-                let new_end = r.range.end.clone();
-                let l = self.tablets.get_mut(left).expect("tablet present");
-                l.range.end = new_end;
-                l.epoch = l.epoch.next();
-                self.tablets.remove(right);
-                // The merged-away tablet can no longer be reconciled.
-                self.policies.remove(right);
-                // Recorded so a per-node reconciler can tell "merged into a
-                // sibling" apart from "table dropped" (ADR 0033) — see
-                // `Metadata::merged_tablets`'s doc. Never pruned.
-                self.merged_tablets.insert(*right);
-                // ADR 0018 PR2 (range-seal design): record merge provenance —
-                // the reverse direction, never pruned. Lets `left`'s
-                // reconciler find every tablet id it has ever absorbed, to
-                // look up each one's seal marker before widening past the
-                // range it handed off — see `Metadata::absorbed_by`'s doc.
-                self.absorbed_by.insert(*right, *left);
-                // …and its CP members' addresses are dead (ADR 0024 GC).
-                self.prune_cp_member_addrs();
                 ApplyOutcome::Applied
             }
             MetaCommand::SetTabletPolicy { tablet, policy } => {
@@ -1267,12 +1220,16 @@ impl Metadata {
                 if dropped.is_empty() {
                     return ApplyOutcome::NoOp;
                 }
-                for id in dropped {
-                    self.tablets.remove(&id);
-                    // A dropped tablet can no longer be reconciled (mirrors the
-                    // `MergeTablets` cleanup).
-                    self.policies.remove(&id);
+                for id in &dropped {
+                    self.tablets.remove(id);
+                    // A dropped tablet can no longer be reconciled.
+                    self.policies.remove(id);
                 }
+                // ADR 0045: a dropped tablet can no longer be backfilled either
+                // — prune its rows so a gone tablet id never lingers in the
+                // catalog forever (nothing will ever prune it otherwise).
+                self.index_backfill
+                    .retain(|(tablet, _), ()| !dropped.contains(tablet));
                 // Reclaim the dropped tablets' CP member addresses (ADR 0024 GC —
                 // the address-book counterpart of the hosting nodes' file GC).
                 self.prune_cp_member_addrs();
@@ -1299,10 +1256,61 @@ impl Metadata {
                     .get_mut(table)
                     .is_some_and(|schema| schema.remove_index(index));
                 if removed {
+                    // ADR 0045: prune every backfill-completion row for this
+                    // index, scoped to `table`'s own tablets (never a bare
+                    // "match on index name alone" — a distinct table could
+                    // happen to declare a same-named index, and its own rows
+                    // must not be swept up by this table's drop).
+                    let table_tablets: Vec<TabletId> =
+                        self.tablets_for_table(table).map(|(&id, _)| id).collect();
+                    self.index_backfill.retain(|(tablet, idx), ()| {
+                        !(idx == index && table_tablets.contains(tablet))
+                    });
                     ApplyOutcome::Applied
                 } else {
                     ApplyOutcome::NoOp
                 }
+            }
+            MetaCommand::SetIndexStatus {
+                table,
+                index,
+                status,
+            } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let Some(current) = schema.index(index) else {
+                    return ApplyOutcome::Rejected("no such table index");
+                };
+                if current.status == *status {
+                    return ApplyOutcome::NoOp;
+                }
+                schema.set_index_status(index, *status);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::MarkIndexBackfilled {
+                table,
+                index,
+                tablet,
+            } => {
+                let Some(schema) = self.schemas.get(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                if schema.index(index).is_none() {
+                    return ApplyOutcome::Rejected("no such table index");
+                }
+                let belongs_to_table = self
+                    .tablets
+                    .get(tablet)
+                    .is_some_and(|t| t.table.as_deref() == Some(table.as_str()));
+                if !belongs_to_table {
+                    return ApplyOutcome::Rejected("tablet is not scoped to this table");
+                }
+                if self.index_backfill.contains_key(&(*tablet, index.clone())) {
+                    return ApplyOutcome::NoOp;
+                }
+                self.index_backfill.insert((*tablet, index.clone()), ());
+                ApplyOutcome::Applied
             }
             MetaCommand::SetTableMode { table, mode } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
@@ -1658,8 +1666,8 @@ impl Metadata {
 
     /// Drop every CP member-addr entry recorded against a tablet that is **no
     /// longer in the map** (ADR 0024 — the address-book half of drop-table GC,
-    /// closing the designed `cp_member_addrs` leak). Called from the apply arms
-    /// that remove tablets (`DropTableTablets`, `MergeTablets`); keyed purely on
+    /// closing the designed `cp_member_addrs` leak). Called from the apply arm
+    /// that removes tablets (`DropTableTablets`); keyed purely on
     /// current absence, so it is deterministic on every replica and **convergent
     /// under replay**: a re-applied historical sequence re-registers and then
     /// re-prunes in the same order, never leaving a resurrected entry. Members
@@ -2067,6 +2075,347 @@ mod tests {
         assert_eq!(m.schemas.get("ks.users"), Some(&extended));
     }
 
+    /// `SetIndexStatus` (ADR 0045): rejects an absent table, rejects an
+    /// absent index on a table that does exist, is a no-op when the index is
+    /// already at the target status, and otherwise transitions the status
+    /// visibly through `table_indexes` (leaving every other field of the
+    /// index definition untouched).
+    #[test]
+    fn set_index_status_apply_arm() {
+        let mut m = Metadata::default();
+
+        // No such table at all.
+        assert_eq!(
+            m.apply(&MetaCommand::SetIndexStatus {
+                table: "ghost".to_owned(),
+                index: "by-email".to_owned(),
+                status: IndexStatus::Active,
+            }),
+            ApplyOutcome::Rejected("no such table schema")
+        );
+
+        let base = TableSchema::simple("id", ColumnType::String);
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "users".to_owned(),
+                schema: base,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // Table exists, but the named index does not.
+        assert_eq!(
+            m.apply(&MetaCommand::SetIndexStatus {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                status: IndexStatus::Active,
+            }),
+            ApplyOutcome::Rejected("no such table index")
+        );
+
+        let index = IndexDef {
+            name: "by-email".to_owned(),
+            kind: crate::schema::IndexKind::Global,
+            hash_attribute: "email".to_owned(),
+            sort_attribute: None,
+            projection: crate::schema::IndexProjection::All,
+            status: IndexStatus::Creating,
+        };
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableIndex {
+                table: "users".to_owned(),
+                index,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.table_indexes("users")[0].status,
+            IndexStatus::Creating,
+            "test premise: index starts Creating"
+        );
+
+        // Already at the target status: a no-op, and the definition is
+        // otherwise untouched.
+        assert_eq!(
+            m.apply(&MetaCommand::SetIndexStatus {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                status: IndexStatus::Creating,
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        // A genuine transition applies and is visible via `table_indexes`.
+        assert_eq!(
+            m.apply(&MetaCommand::SetIndexStatus {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                status: IndexStatus::Active,
+            }),
+            ApplyOutcome::Applied
+        );
+        let idx = &m.table_indexes("users")[0];
+        assert_eq!(idx.status, IndexStatus::Active);
+        assert_eq!(idx.name, "by-email");
+        assert_eq!(idx.hash_attribute, "email");
+    }
+
+    /// A fixture for the `MarkIndexBackfilled` tests below: a table with one
+    /// `Creating` GSI and one tablet actually scoped to it.
+    fn table_with_index_and_tablet(m: &mut Metadata, table: &str, index: &str, tablet: TabletId) {
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: table.to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableIndex {
+                table: table.to_owned(),
+                index: IndexDef {
+                    name: index.to_owned(),
+                    kind: crate::schema::IndexKind::Global,
+                    hash_attribute: "email".to_owned(),
+                    sort_attribute: None,
+                    projection: crate::schema::IndexProjection::All,
+                    status: IndexStatus::Creating,
+                },
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet,
+                table: Some(table.to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
+    /// `MarkIndexBackfilled` (ADR 0045 §4): rejects an absent table, rejects
+    /// an absent index on a table that does exist, is idempotent on a repeat
+    /// proposal for the same `(tablet, index)`, and otherwise records a
+    /// visible row in `Metadata::index_backfill`.
+    #[test]
+    fn mark_index_backfilled_apply_arm() {
+        let mut m = Metadata::default();
+
+        // No such table at all.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "ghost".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(1),
+            }),
+            ApplyOutcome::Rejected("no such table schema")
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "users".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // Table exists, but the named index does not.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(1),
+            }),
+            ApplyOutcome::Rejected("no such table index")
+        );
+
+        // Add the index and a tablet scoped to it (the schema already
+        // exists from just above, so drive `CreateTableIndex`/`CreateTablet`
+        // directly here instead of the shared fixture, which would try to
+        // recreate the schema).
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableIndex {
+                table: "users".to_owned(),
+                index: IndexDef {
+                    name: "by-email".to_owned(),
+                    kind: crate::schema::IndexKind::Global,
+                    hash_attribute: "email".to_owned(),
+                    sort_attribute: None,
+                    projection: crate::schema::IndexProjection::All,
+                    status: IndexStatus::Creating,
+                },
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // A genuine mark applies and is visible.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(1),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            m.index_backfill
+                .contains_key(&(TabletId(1), "by-email".to_owned()))
+        );
+
+        // A repeat proposal (the seeder's own crash-retry) is idempotent.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(1),
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(m.index_backfill.len(), 1);
+    }
+
+    /// `MarkIndexBackfilled` rejects a tablet that does not currently belong
+    /// to the named table — either because it belongs to a different table,
+    /// or because it has never existed at all.
+    #[test]
+    fn mark_index_backfilled_rejects_a_tablet_not_scoped_to_the_table() {
+        let mut m = Metadata::default();
+        table_with_index_and_tablet(&mut m, "users", "by-email", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("orders".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // A tablet that belongs to a different table.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(2),
+            }),
+            ApplyOutcome::Rejected("tablet is not scoped to this table")
+        );
+
+        // A tablet id that has never existed at all.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(999),
+            }),
+            ApplyOutcome::Rejected("tablet is not scoped to this table")
+        );
+        assert!(m.index_backfill.is_empty());
+    }
+
+    /// `DropTableTablets` (ADR 0045): pruning a table's tablets also prunes
+    /// every `index_backfill` row keyed to one of those tablet ids, whatever
+    /// index it names — a gone tablet id can never be reported against
+    /// again — while leaving another table's rows (even a same-named index
+    /// on a different table) untouched.
+    #[test]
+    fn drop_table_tablets_prunes_index_backfill_rows_for_the_dropped_tablets() {
+        let mut m = Metadata::default();
+        table_with_index_and_tablet(&mut m, "users", "by-email", TabletId(1));
+        table_with_index_and_tablet(&mut m, "orders", "by-email", TabletId(2));
+        for (table, tablet) in [("users", TabletId(1)), ("orders", TabletId(2))] {
+            assert_eq!(
+                m.apply(&MetaCommand::MarkIndexBackfilled {
+                    table: table.to_owned(),
+                    index: "by-email".to_owned(),
+                    tablet,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(m.index_backfill.len(), 2);
+
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableTablets {
+                table: "users".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert!(
+            !m.index_backfill
+                .contains_key(&(TabletId(1), "by-email".to_owned())),
+            "the dropped table's row must be pruned"
+        );
+        assert!(
+            m.index_backfill
+                .contains_key(&(TabletId(2), "by-email".to_owned())),
+            "the other table's same-named-index row must survive"
+        );
+    }
+
+    /// `DropTableIndex` (ADR 0045): dropping an index prunes every
+    /// `index_backfill` row for that index name, scoped to the owning
+    /// table's own tablets — a distinct table's row for a same-named index
+    /// must survive untouched.
+    #[test]
+    fn drop_table_index_prunes_index_backfill_rows_for_that_index() {
+        let mut m = Metadata::default();
+        table_with_index_and_tablet(&mut m, "users", "by-email", TabletId(1));
+        table_with_index_and_tablet(&mut m, "orders", "by-email", TabletId(2));
+        for (table, tablet) in [("users", TabletId(1)), ("orders", TabletId(2))] {
+            assert_eq!(
+                m.apply(&MetaCommand::MarkIndexBackfilled {
+                    table: table.to_owned(),
+                    index: "by-email".to_owned(),
+                    tablet,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(m.index_backfill.len(), 2);
+
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableIndex {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert!(
+            !m.index_backfill
+                .contains_key(&(TabletId(1), "by-email".to_owned())),
+            "the dropped index's row must be pruned"
+        );
+        assert!(
+            m.index_backfill
+                .contains_key(&(TabletId(2), "by-email".to_owned())),
+            "the other table's same-named index must be untouched"
+        );
+
+        // Idempotent: a repeat drop is a no-op that prunes nothing further
+        // (there is nothing left to prune).
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableIndex {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+            }),
+            ApplyOutcome::NoOp
+        );
+    }
+
     /// `CreateTableSchema` rejects a table name that collides with the
     /// reserved system-keyspace namespace (ADR 0038), both an exact match and
     /// a name merely prefixed by it, and leaves the catalog untouched.
@@ -2422,8 +2771,8 @@ mod tests {
     }
 
     /// ADR 0024 address GC: a tablet-scoped `RegisterCpAddr` entry is pruned from
-    /// both maps when its tablet leaves the map (`DropTableTablets` /
-    /// `MergeTablets`); a registration for an absent tablet is rejected (the
+    /// both maps when its tablet leaves the map (`DropTableTablets`);
+    /// a registration for an absent tablet is rejected (the
     /// registrar retries); legacy tablet-less entries are never pruned; and the
     /// whole thing is **convergent under replay** — re-applying the same command
     /// sequence to a fresh state machine reaches the identical pruned state, so a
@@ -2495,61 +2844,6 @@ mod tests {
         assert!(!m.cp_member_addrs.contains_key(&nid(1301)));
     }
 
-    /// The `MergeTablets` removal path prunes the merged-away tablet's CP member
-    /// addresses exactly like a drop (ADR 0024 GC).
-    #[test]
-    fn merge_prunes_the_removed_tablets_cp_addrs() {
-        let mut m = Metadata::default();
-        let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: None,
-                range: KeyRange::new(Vec::new(), Some(mid.clone())),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(2),
-                table: None,
-                range: KeyRange::new(mid, None),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            }),
-            ApplyOutcome::Applied
-        );
-        for (id, tablet) in [(1301, 1u64), (2301, 2u64)] {
-            assert_eq!(
-                m.apply(&MetaCommand::RegisterCpAddr {
-                    id: nid(id),
-                    addr: format!("127.0.0.1:{id}"),
-                    tablet: Some(TabletId(tablet)),
-                }),
-                ApplyOutcome::Applied
-            );
-        }
-
-        assert_eq!(
-            m.apply(&MetaCommand::MergeTablets {
-                left: TabletId(1),
-                expected_left_epoch: Epoch::INITIAL,
-                right: TabletId(2),
-                expected_right_epoch: Epoch::INITIAL,
-            }),
-            ApplyOutcome::Applied
-        );
-        // The merged-away right tablet's member is reclaimed; the survivor's stays.
-        assert!(!m.cp_member_addrs.contains_key(&nid(2301)));
-        assert!(!m.cp_member_tablets.contains_key(&nid(2301)));
-        assert!(m.cp_member_addrs.contains_key(&nid(1301)));
-        assert_eq!(m.cp_member_tablets.get(&nid(1301)), Some(&TabletId(1)));
-        assert!(
-            m.merged_tablets.contains(&TabletId(2)),
-            "the merged-away tablet must be recorded (ADR 0033)"
-        );
-    }
-
     /// ADR 0018 PR2 (range-seal design, replacing the retired `version_floor`
     /// cross-group-LWW fix): `SplitTablet` records split provenance
     /// (`Metadata::split_parents`) so a child's reconciler can find its
@@ -2595,70 +2889,6 @@ mod tests {
         assert_eq!(m.split_parents.get(&TabletId(3)), Some(&TabletId(2)));
         // Provenance is permanent (never pruned).
         assert_eq!(m.split_parents.get(&TabletId(2)), Some(&TabletId(1)));
-    }
-
-    /// `MergeTablets` records the reverse-direction provenance
-    /// (`Metadata::absorbed_by`) — the merge dual of the split-provenance fix
-    /// above — so the survivor's reconciler can find every tablet id it has
-    /// ever absorbed.
-    #[test]
-    fn merge_tablets_records_absorbed_by_provenance() {
-        let mut m = Metadata::default();
-        let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: None,
-                range: KeyRange::new(Vec::new(), Some(mid.clone())),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(2),
-                table: None,
-                range: KeyRange::new(mid.clone(), None),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.apply(&MetaCommand::MergeTablets {
-                left: TabletId(1),
-                expected_left_epoch: m.tablets[&TabletId(1)].epoch,
-                right: TabletId(2),
-                expected_right_epoch: m.tablets[&TabletId(2)].epoch,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert!(!m.tablets.contains_key(&TabletId(2)));
-        assert_eq!(m.absorbed_by.get(&TabletId(2)), Some(&TabletId(1)));
-
-        // Split a fresh sibling off tablet 1 and merge it back in too — a
-        // survivor can accumulate more than one absorbed id over its
-        // lifetime, and each must resolve to it independently.
-        assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(1),
-                expected_epoch: m.tablets[&TabletId(1)].epoch,
-                split_key: 0xC000_0000_0000_0000u64.to_be_bytes().to_vec(),
-                new_id: TabletId(3),
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.apply(&MetaCommand::MergeTablets {
-                left: TabletId(1),
-                expected_left_epoch: m.tablets[&TabletId(1)].epoch,
-                right: TabletId(3),
-                expected_right_epoch: m.tablets[&TabletId(3)].epoch,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(m.absorbed_by.get(&TabletId(3)), Some(&TabletId(1)));
-        // The first absorption's provenance is permanent (never pruned).
-        assert_eq!(m.absorbed_by.get(&TabletId(2)), Some(&TabletId(1)));
     }
 
     /// `DropTableTablets` (ADR 0024): removes every tablet scoped to the table —
@@ -3242,6 +3472,56 @@ mod tests {
         );
 
         let value = serde_json::to_value(&m).expect("metadata serializes with stream_shards");
+        let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
+        assert_eq!(decoded, m);
+    }
+
+    /// The identical hazard as
+    /// `metadata_round_trips_through_json_with_populated_stream_shards`
+    /// above, for `Metadata::index_backfill` (ADR 0045 §4) — its key is also
+    /// a non-string tuple (`(TabletId, String)`), so this must be proven
+    /// against a genuinely populated map, not an empty one (per the
+    /// engineering-lessons "an empty collection can't prove a map-key
+    /// encoding rule" lesson). Written before any other backfill-catalog
+    /// wiring, per that same lesson.
+    #[test]
+    fn metadata_round_trips_through_json_with_populated_index_backfill() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::CreateTableSchema {
+            table: "users".to_owned(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        });
+        m.apply(&MetaCommand::CreateTableIndex {
+            table: "users".to_owned(),
+            index: IndexDef {
+                name: "by-email".to_owned(),
+                kind: crate::schema::IndexKind::Global,
+                hash_attribute: "email".to_owned(),
+                sort_attribute: None,
+                projection: crate::schema::IndexProjection::All,
+                status: IndexStatus::Creating,
+            },
+        });
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(1),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            !m.index_backfill.is_empty(),
+            "test premise: the catalog must actually be populated"
+        );
+
+        let value = serde_json::to_value(&m).expect("metadata serializes with index_backfill");
         let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
         assert_eq!(decoded, m);
     }
@@ -3838,123 +4118,6 @@ mod tests {
             ApplyOutcome::Applied,
             "remove works directly on a never-marked row (the drop-table cascade shape)"
         );
-    }
-
-    fn adjacent_tablets(m: &mut Metadata, table: &str) {
-        let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some(table.to_owned()),
-                range: KeyRange::new(Vec::new(), Some(mid.clone())),
-                replicas: vec![nid(1)],
-            }),
-            ApplyOutcome::Applied
-        );
-        // A second direct `CreateTablet` for the same table is rejected
-        // (ADR 0023 — only `SplitTablet` may mint a table's further
-        // tablets), so construct the adjacent sibling by hand, mirroring
-        // `mirror.rs`'s own merge-scenario test helper.
-        m.tablets.insert(
-            TabletId(2),
-            Tablet::with_table(
-                TabletId(2),
-                Some(table.to_owned()),
-                KeyRange::new(mid, None),
-                vec![nid(1)],
-            ),
-        );
-    }
-
-    fn merge_orders(m: &Metadata) -> MetaCommand {
-        MetaCommand::MergeTablets {
-            left: TabletId(1),
-            expected_left_epoch: m.tablets[&TabletId(1)].epoch,
-            right: TabletId(2),
-            expected_right_epoch: m.tablets[&TabletId(2)].epoch,
-        }
-    }
-
-    /// F1 merge stopgap (ADR 0042 §12/ADR 0043 §A5): `MergeTablets` is
-    /// rejected outright on a base table with a currently **enabled**
-    /// stream.
-    #[test]
-    fn merge_rejected_when_base_table_has_an_enabled_stream() {
-        let mut m = Metadata::default();
-        enable_stream(&mut m, "orders", "L1");
-        adjacent_tablets(&mut m, "orders");
-
-        let outcome = m.apply(&merge_orders(&m.clone()));
-        match outcome {
-            ApplyOutcome::Rejected(msg) => assert!(msg.contains("v1 stopgap"), "{msg}"),
-            other => panic!("expected a stopgap rejection, got {other:?}"),
-        }
-        assert!(
-            m.tablets.contains_key(&TabletId(2)),
-            "the merge must not have applied"
-        );
-    }
-
-    /// F1 merge stopgap: also rejected while the base table has any
-    /// still-**draining** catalog rows, even after the stream itself has
-    /// been disabled (the schema no longer names it at all) — a shard's
-    /// lineage still references this tablet, so widening it would corrupt
-    /// that lineage regardless of whether the stream is currently enabled.
-    #[test]
-    fn merge_rejected_when_base_table_has_undrained_catalog_rows() {
-        let mut m = Metadata::default();
-        enable_stream(&mut m, "orders", "L1");
-        m.apply(&seal("orders", "L1", 1, 0, 100));
-        assert_eq!(
-            m.apply(&MetaCommand::SetTableStream {
-                table: "orders".to_owned(),
-                spec: None,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert!(m.table_stream("orders").is_none(), "test premise: disabled");
-        adjacent_tablets(&mut m, "orders");
-
-        let outcome = m.apply(&merge_orders(&m.clone()));
-        match outcome {
-            ApplyOutcome::Rejected(msg) => assert!(msg.contains("v1 stopgap"), "{msg}"),
-            other => panic!("expected a stopgap rejection, got {other:?}"),
-        }
-        assert!(m.tablets.contains_key(&TabletId(2)));
-    }
-
-    /// A plain table with no stream ever enabled, and one whose stream's
-    /// rows have all fully drained, merges exactly as before (positive
-    /// control — the guard must not over-reject).
-    #[test]
-    fn merge_allowed_for_a_table_with_no_stream_or_fully_drained_rows() {
-        // No stream at all.
-        let mut m = Metadata::default();
-        adjacent_tablets(&mut m, "plain");
-        assert_eq!(m.apply(&merge_orders(&m.clone())), ApplyOutcome::Applied);
-
-        // A stream that existed, sealed, and fully drained (every row
-        // removed) — merge must be allowed again.
-        let mut m2 = Metadata::default();
-        enable_stream(&mut m2, "drained", "L1");
-        m2.apply(&seal("drained", "L1", 1, 0, 100));
-        assert_eq!(
-            m2.apply(&MetaCommand::SetTableStream {
-                table: "drained".to_owned(),
-                spec: None,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m2.apply(&MetaCommand::ExpireStreamShards {
-                rows: vec![(TabletId(1), 0)],
-                remove: true,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert!(m2.stream_shards.is_empty(), "test premise: fully drained");
-        adjacent_tablets(&mut m2, "drained");
-        assert_eq!(m2.apply(&merge_orders(&m2.clone())), ApplyOutcome::Applied);
     }
 
     // --- accessors ------------------------------------------------------

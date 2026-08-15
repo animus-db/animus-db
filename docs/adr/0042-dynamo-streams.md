@@ -16,10 +16,12 @@
   table's segment catalog rows and objects — there is no hidden stream table
   to drop), [ADR 0028](0028-shared-storage-single-command-split.md) (the
   kind-scope set stays at five; streams add **no** new kind — the hot shard
-  *is* the existing `KIND_CHANGE` scope), [ADR 0033](0033-tablet-merge.md)
-  (`MergeTablets` is rejected on a streamed **base** table — an explicit v1
-  stopgap, not a permanent exemption for a separate shard table, since no
-  such table exists), [ADR 0034](0034-byte-based-auto-split.md) (auto-split
+  *is* the existing `KIND_CHANGE` scope), [ADR 0033](0033-tablet-merge.md)/
+  [ADR 0044](0044-split-only-tablets.md) (`MergeTablets` was rejected on a
+  streamed **base** table as an explicit v1 stopgap, not a permanent
+  exemption for a separate shard table, since no such table exists —
+  ADR 0044 then removed merge globally, retiring the stopgap along with it),
+  [ADR 0034](0034-byte-based-auto-split.md) (auto-split
   is what creates every stream shard boundary past epoch 0 — token-aligned
   split keys on a streamed table, F11), [ADR 0035](0035-control-plane-separate-deployment.md)
   (round 3 needs no dedicated streams node role — see that ADR's amendment,
@@ -370,31 +372,31 @@ the mechanism and a dedicated corpus scenario.
   there is no hidden table's tablets to enumerate and drop, unlike ADR 0041
   §5's GSI cascade or round 2's own stream-table cascade.
 
-### 12. Merge stopgap (F1)
+### 12. Merge stopgap (F1) — removed, ADR 0044
 
-**v1 rejects `MergeTablets` on a base table with an enabled stream, at
-apply time, on every replica.** This is an explicit **stopgap**, not a
-permanent design choice: Guillaume has separately decided that tablet merge
-is being removed **globally** (split-only tablets), in its own ADR and
-deletion stack, scheduled to land **after** this streams stack merges
-(decided 2026-08-14). When that ADR ships, this guard becomes dead code the
-split-only ADR deletes along with `MergeTablets` itself — this ADR's text
-should be read as bridging until then, not as this feature's permanent
-position on merge.
+**v1 rejected `MergeTablets` on a base table with an enabled stream, at
+apply time, on every replica.** This was always an explicit **stopgap**,
+not a permanent design choice — Guillaume had separately decided that
+tablet merge would be removed **globally** (split-only tablets, decided
+2026-08-14), in its own ADR and deletion stack, scheduled to land after
+this streams stack merged. That ADR ([0044](0044-split-only-tablets.md))
+has since shipped (2026-08-14) and deleted `MergeTablets` itself, taking
+this guard with it as dead code. There is no merge to reject on a streamed
+table, or any other table, anymore.
 
-The guard exists because a shard's lineage (§2, ADR 0043 §A4) assumes a
+The guard existed because a shard's lineage (§2, ADR 0043 §A4) assumes a
 tablet's own range only ever *narrows* (split) — a merge widening two
-tablets' ranges back together would require inventing exactly the
+tablets' ranges back together would have required inventing exactly the
 adjacent-parent lineage AWS itself never had to build (§Context's verified
-fact above). A workaround — disable, merge, re-enable — is honest under
-F12-b: it simply starts a genuinely new stream identity, which is what a
-real DynamoDB customer resizing a table differently would also effectively
-get.
+fact above). The workaround this ADR offered while the stopgap stood —
+disable, merge, re-enable — is now moot along with merge itself.
 
-**This makes the adapter, in this one respect, more capable than real
-DynamoDB, not less**: AWS can *never* merge a table partition, streamed or
-not. This adapter merely matches that for as long as merge exists at all,
-and will exceed it once merge is removed and the guard along with it.
+**This made the adapter, in this one respect, more capable than real
+DynamoDB, not less, for as long as the comparison was live**: AWS can
+*never* merge a table partition, streamed or not; this adapter matched
+that only while merge existed at all. Now that merge is gone (ADR 0044),
+the comparison itself no longer applies — both systems simply have no
+merge.
 
 ### 13. Knob defaults (F6)
 
@@ -423,7 +425,7 @@ amendment about a split racing an in-flight transaction's own token.
 | Shard iterators | Expire after 15 minutes | Never expire | No session-store capacity to protect; see §6 |
 | `GetRecords` consistency | Documented eventually consistent | Leader-local (open) / store-served-and-sliced (closed), no barrier | Same observable contract, cheaper — see §7/§9/§10 |
 | Post-disable readability | Records remain readable ~24h | Records remain readable until ordinary retention reaps them (F12-b) | Now AWS-faithful, not a v1 gap — see §11 |
-| Tablet/partition merge | Never happens, ever | Rejected on a streamed table (v1 stopgap; global removal scheduled) | Matches AWS's own never-merge invariant; see §12 |
+| Tablet/partition merge | Never happens, ever | Removed globally (ADR 0044) — never happens, on a streamed table or any other | Matches AWS's own never-merge invariant; see §12 |
 | `StartingSequenceNumber` | The first record's own actual sequence number (inclusive) | A shard's `hlc_range.0` — the record HLC's own **exclusive** lower bound (round-3 PR6) | Kept for internal position-convention consistency: every position this adapter carries (an iterator's own `position`, a segment's `slice_to_hlc_range` bound, `index_drain::hot_read`'s `from_position`) is uniformly "the exclusive floor the next read filters `hlc > position` against" — giving `StartingSequenceNumber` its own, inclusive convention would be the one position value in the whole subsystem that meant something different, a correctness trap for exactly the kind of code (a corpus checker, a future maintainer) that greps for "position" and assumes one meaning |
 | `GetShardIterator` on an unknown/stale shard id | Documented as `ResourceNotFoundException` in some cases | `TrimmedDataAccessException`, matching `GetRecords`'s own outcome for the identical condition (round-3 PR6) | One error mapping for "this shard id doesn't currently resolve to anything live," shared by both operations that can hit it, rather than two different exceptions for what is, from this adapter's own state, the same fact |
 
@@ -442,9 +444,12 @@ amendment about a split racing an in-flight transaction's own token.
   backend, swapped in as a pure durability *upgrade* over the default
   cluster-replicated store (ADR 0043 §A7/§A7b) — never required for
   correctness.
-- **`AdjacentParentShardId`-style extension**: only needed if tablet merge
-  is ever revived *under* an active stream after the split-only ADR lands —
-  documented as a shape, not built (ADR 0043 §A5).
+- **`AdjacentParentShardId`-style extension**: no longer a live roadmap
+  item. It was only ever needed if tablet merge were revived under an
+  active stream; ADR 0044 removed merge globally and explicitly closed the
+  door on reviving it (any future tablet-count-reduction story is a
+  from-scratch redesign, never a merge revival), so this shape (ADR 0043
+  §A5) has nothing left to become relevant to.
 - **CLI threading for the split-deployment/data-only argv paths (PR5
   deferral)**: `--stream-seal-bytes`/`--stream-seal-age`/`--stream-retention`/
   `--segment-store` are wired for `--cluster N`/`--config FILE --node I`
@@ -493,10 +498,12 @@ were considered and declined as out of scope for this adapter.
   future change could silently violate — the corpus (ADR 0043's Testing
   plan) exists specifically because getting this wrong is a real data-loss
   or torn-read hazard, not a cosmetic one.
-- **The merge stopgap (§12) is a real, if temporary, capability
-  restriction** — an operator cannot merge a streamed base table's tablets
-  today, full stop, even though the workaround (disable/merge/re-enable) is
-  honest about what it costs.
+- **The merge stopgap (§12) was a real, if temporary, capability
+  restriction while it stood** — an operator could not merge a streamed
+  base table's tablets, even though the workaround (disable/merge/
+  re-enable) was honest about what it cost. Moot since ADR 0044 removed
+  merge globally: there is no merge capability to restrict, for a streamed
+  table or any other.
 - **Catalog-row-based label resolution (§4/§11) is more state to reason
   about at read time** than round 2's simple schema-label equality check —
   a `DescribeStream`/`GetRecords` request's validity now depends on

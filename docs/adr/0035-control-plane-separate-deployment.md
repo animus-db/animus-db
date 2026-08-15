@@ -189,14 +189,16 @@ behind a seam so the data-node mode never needs a local `RaftCore` at all.
    observes it" without a new push mechanism, exactly as originally
    sketched — only the wire shape (a dedicated long-poll request/reply
    pair, not a bare push) differs from the one-line description above.
-5. **The ADR 0028/0033 write fence and read-side scope check become
+5. **The ADR 0028 write fence and read-side scope check (extended by ADR
+   0033 for merge, at the time; that half removed by ADR 0044) become
    load-bearing for every node, not just a crossover-window edge case.**
    Today every node's own `Metadata` view can only ever be *slightly* behind
    the control leader's (same cluster, tight replication or a bounded growth-
    node poll). Once **every** data node routes off a polled mirror as a
    matter of course, the routing decision a client op is dispatched on is
-   *routinely* one poll interval stale, not just during a rare split/merge/
-   rebalance crossover — so the pre-propose range check
+   *routinely* one poll interval stale, not just during a rare split/
+   rebalance crossover (merge existed under ADR 0033 at this ADR's writing;
+   removed entirely by ADR 0044) — so the pre-propose range check
    (`cp_put_local`/`cp_delete_local`/`cp_batch_propose`), the embedded
    per-command fence, and the read-side `scope_range()` pre-check
    (`cp_get_local`/`cp_scan_local`) are what keep a stale-routed op safe
@@ -283,13 +285,17 @@ low-risk mechanical piece first (ADR 0031/0032's PR stacks):
    `trigger_merge`'s *epoch*-staleness tolerance, distinct from the
    permanently-empty-view bug fixed alongside it). See `crates/animusd/
    CLAUDE.md`'s "What's non-obvious" entries for the full detail.
+   (`trigger_merge` itself no longer exists — ADR 0044 removed tablet merge
+   entirely; `trigger_split`'s half of this staleness fix is what remains
+   live.)
 7. **PR6 (implemented): per-process split-cluster integration tests +
    docs/dashboard.** End-to-end tests running real `animusd control`
    processes alongside real `animusd data` processes (not combined mode,
    `tests/split_cluster.rs` plus the PR3/PR4/PR5 coverage already in
    `control_only.rs`/`data_only.rs`/`data_join.rs`/`watch_metadata.rs`):
-   control-leader failover under live data traffic, tablet split + merge
-   triggered against the data fleet's own admin port, a data-node failure
+   control-leader failover under live data traffic, tablet split (and, at
+   the time, merge — since removed, ADR 0044) triggered against the data
+   fleet's own admin port, a data-node failure
    detected and repaired onto a spare, decommission of a data node gated to
    the control leader's admin port (a data node's own admin port refuses
    with a leader-routing hint — it never registers a local control handle

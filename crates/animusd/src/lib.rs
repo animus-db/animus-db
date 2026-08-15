@@ -38,8 +38,8 @@ pub use config::ClusterConfig;
 // cluster metadata — membership status and the tablet map — without depending on
 // `animus-control` directly.
 pub use animus_control::{
-    ColumnDef, ColumnType, MetaCommand, Metadata, NodeAddrs, NodeStatus, ReplicationMode,
-    TableSchema,
+    ColumnDef, ColumnType, IndexStatus, MetaCommand, Metadata, NodeAddrs, NodeStatus,
+    ReplicationMode, TableSchema,
 };
 
 mod admin;
@@ -50,6 +50,7 @@ mod dashboard;
 mod dynamo;
 mod dynamo_streams;
 mod http;
+mod index_backfill;
 mod segment_janitor;
 mod topology;
 
@@ -212,6 +213,23 @@ impl CpGroup {
         }
     }
 
+    /// An unbounded-above base-scope scan starting at `start`, truncated to
+    /// `limit` rows — the backfill seeder's own "peek ahead one partition at
+    /// a time" primitive (ADR 0045 §2), unlike [`local_scan_bounded`](
+    /// Self::local_scan_bounded)'s single-partition-width bound. `end: None`
+    /// is still bounded to *this tablet's own live range*, never a
+    /// whole-engine scan — see [`RaftKvNode::local_scan`]'s own doc.
+    pub(crate) async fn local_scan_from(
+        &self,
+        start: &[u8],
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self {
+            CpGroup::Lsm(n) => n.local_scan(start, None, Some(limit)).await,
+            CpGroup::Mem(n) => n.local_scan(start, None, Some(limit)).await,
+        }
+    }
+
     /// Read one key of a non-base row-kind scope (ADR 0041 §3). See
     /// [`RaftKvNode::local_get_kind`].
     pub(crate) async fn local_get_kind(&self, kind: u8, key: &[u8]) -> Option<Vec<u8>> {
@@ -251,18 +269,6 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.cursor_min_watermark(consumer).await,
             CpGroup::Mem(n) => n.cursor_min_watermark(consumer).await,
-        }
-    }
-
-    /// Every cursor row currently visible in this tablet's own `KIND_CURSOR`
-    /// scope, alongside the token each row's own key names. See
-    /// [`RaftKvNode::cursor_rows_with_token`].
-    pub(crate) async fn cursor_rows_with_token(
-        &self,
-    ) -> Vec<([u8; TOKEN_BYTES], String, HlcTimestamp)> {
-        match self {
-            CpGroup::Lsm(n) => n.cursor_rows_with_token().await,
-            CpGroup::Mem(n) => n.cursor_rows_with_token().await,
         }
     }
 
@@ -335,6 +341,20 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.is_leader(),
             CpGroup::Mem(n) => n.is_leader(),
+        }
+    }
+
+    /// This replica's `engine_applied_index()` — the confirm-by-index
+    /// primitive linearizable reads themselves gate on. See
+    /// [`RaftKvNode::engine_applied_index`]. Used by the backfill seeder
+    /// (`index_drain.rs`) to confirm a change-log-only `KindBatch` (no base/
+    /// kind write to probe a value on, unlike every other confirm path in
+    /// this file) actually landed, without needing to know the entry's
+    /// leader-minted `ts` up front.
+    pub(crate) fn engine_applied_index(&self) -> u64 {
+        match self {
+            CpGroup::Lsm(n) => n.engine_applied_index(),
+            CpGroup::Mem(n) => n.engine_applied_index(),
         }
     }
 
@@ -1070,6 +1090,24 @@ pub enum ClientRequest {
         from_position: u64,
         limit: usize,
     },
+    /// **Internal backfill-cursor-cleanup RPC — never sent bare, only
+    /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0045 §5 step 3):
+    /// delete `tablet`'s own backfill cursor row for `index` (`KIND_CURSOR`,
+    /// tag `backfill:{index}`) — an idempotent tombstone write, a no-op if
+    /// already absent. The **one** production use is `ClientCtx::
+    /// clear_backfill_cursor_for_table`, called by the DynamoDB `UpdateTable`
+    /// index-delete cascade (`dynamo.rs::drop_index`) for every one of the
+    /// base table's *current* tablets, so a later `CreateTableIndex` of the
+    /// exact same name never silently resumes from a stale position the
+    /// deleted index's own backfill sweep left behind (see
+    /// `index_drain::clear_backfill_cursor`'s doc for the full argument).
+    /// Addressed by `tablet` directly, mirroring [`ForceSeal`](Self::ForceSeal)/
+    /// [`StreamHotRead`](Self::StreamHotRead) (there is no client key to
+    /// derive it from). Bare delivery is refused for the same reason those
+    /// two are. Not a `MetaCommand`, so `is_relayable_command` does not
+    /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
+    /// only through the `Forwarded` arm.
+    ClearBackfillCursor { tablet: u64, index: String },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
     Get { key: Vec<u8>, table: String },
@@ -1123,16 +1161,6 @@ pub enum ClientRequest {
     /// gone; see the root `CLAUDE.md`). The interim manual trigger; an automatic
     /// size-telemetry trigger is `auto_split_loop`.
     SplitTablet { tablet: u64, split_key: Vec<u8> },
-    /// **Admin: merge two adjacent CP tablets** (ADR 0033). A single, atomic
-    /// control-plane command (`MetaCommand::MergeTablets`, epoch-CAS gated on
-    /// both tablets): `left`'s range widens to absorb `right`'s (which is
-    /// removed from the tablet map), both served by the *same* replicas'
-    /// existing per-node shared engine — no data moves, and there is no
-    /// second, data-plane step that can fail independently (the dual of
-    /// `SplitTablet` above). The interim manual trigger; an automatic
-    /// size-based merge trigger is out of scope for this increment (see ADR
-    /// 0033's "Future work").
-    MergeTablets { left: u64, right: u64 },
     /// **Join discovery** (ADR 0032 PR2, `animusd join`): a node that knows only
     /// a *seed* address (any already-running node's client address — old or
     /// newly grown, PR1 made every node's address book equally current) asks
@@ -1347,6 +1375,20 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             | MetaCommand::ReplaceTableSchema { .. }
             | MetaCommand::CreateTableIndex { .. }
             | MetaCommand::DropTableIndex { .. }
+            // Index status transition (ADR 0045): same schema-catalog class as
+            // `CreateTableIndex`/`DropTableIndex`/`SetTableMode` — the backfill
+            // seeder/aggregator (this crate) may propose it from wherever the
+            // relevant tablet/control leader actually runs.
+            | MetaCommand::SetIndexStatus { .. }
+            // Backfill-completion catalog commit (ADR 0045 §4): a tablet
+            // leader's own "I finished seeding this index" proposal, from
+            // wherever that leader actually runs — same relay reasoning as
+            // `SealStreamShard` just below. `index_backfill_loop` (the
+            // aggregator that reads this catalog and flips a table's index
+            // to `Active`) is control-plane-leader-only and proposes
+            // `SetIndexStatus` directly, exactly like `SealStreamShard`'s own
+            // aggregator does, so it needs no relay path of its own.
+            | MetaCommand::MarkIndexBackfilled { .. }
             | MetaCommand::SetTableMode { .. }
             // DynamoDB Streams enable/disable (ADR 0042): schema-catalog
             // class, same relay reason as `CreateTableIndex`/`SetTableMode` —
@@ -1368,12 +1410,6 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // reach the control leader).
             | MetaCommand::RegisterNodeAddrs { .. }
             | MetaCommand::SplitTablet { .. }
-            // Tablet merge (ADR 0033): the same relay reason as `SplitTablet` —
-            // already client-exposed via `ClientRequest::MergeTablets`, so
-            // relaying it adds no new authority, it just lets the trigger
-            // reach the control leader cross-process when driven from a
-            // follower.
-            | MetaCommand::MergeTablets { .. }
             // Provision-at-create (ADR 0023): a `CreateTable` on a follower-connected
             // client relays the table's tablet creation + RF policy to the control
             // leader. Scoped to one tablet per table by the state machine's guard.
@@ -2320,6 +2356,16 @@ impl BoundNode {
             stream_retention,
         )));
 
+        // The secondary-index backfill-completion aggregator (ADR 0045 §4):
+        // flips a table's index from `Creating` to `Active` once every one
+        // of its tablets has reported a finished backfill scan.
+        // Control-plane-leader-only (self-gated every tick,
+        // `index_backfill.rs`'s own doc) — spawned unconditionally here,
+        // exactly like the segment janitor just above.
+        tasks.push(tokio::spawn(index_backfill::index_backfill_loop(
+            ctx.clone(),
+        )));
+
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
         // it leads once it exceeds **either** configured threshold (it checks
         // leadership per tablet, so running it on every node is harmless).
@@ -2764,7 +2810,7 @@ impl BoundControlNode {
     /// sync or heartbeat from), the tablet-host reconciler / `auto_split_loop`
     /// (nothing to host, no engine to sample), or the dynamo/cql listeners
     /// (never bound here). Every client-request dispatch path this node *can*
-    /// reach (`Status`/`ProposeSchema`/`JoinInfo`/`SplitTablet`/`MergeTablets`,
+    /// reach (`Status`/`ProposeSchema`/`JoinInfo`/`SplitTablet`,
     /// and the data ops `Put`/`Get`/`Scan`/`Delete`/`PutBatch`) already works
     /// correctly with `ClientCtx.data == None`: the schema/admin ops only ever
     /// touch control `Metadata`, and a data op degrades exactly like any other
@@ -2917,6 +2963,15 @@ impl BoundControlNode {
         tasks.push(tokio::spawn(segment_janitor::segment_janitor_loop(
             ctx.clone(),
             DEFAULT_STREAM_RETENTION,
+        )));
+
+        // The secondary-index backfill-completion aggregator (ADR 0045 §4):
+        // a control-only node can genuinely become the control-plane leader
+        // (ADR 0035 split deployment), and — unlike the segment janitor —
+        // this loop has no data-role dependency at all, so it needs no
+        // documented scope gap here.
+        tasks.push(tokio::spawn(index_backfill::index_backfill_loop(
+            ctx.clone(),
         )));
 
         Ok(Node {
@@ -3862,7 +3917,7 @@ impl ClientCtx {
     /// that must work on a growth node**: CP routing (`tablet_for`/
     /// `resolve_cp_route`/`cp_scan`), the per-node join-host/reconfigure loops,
     /// this node's own address-registration commit check, the raftkv peer-sync
-    /// loop, the split/merge triggers' precondition reads, and (ADR 0035 PR1)
+    /// loop, the split trigger's precondition reads, and (ADR 0035 PR1)
     /// the general-purpose schema-catalog reads (`table_schema`/
     /// `has_table_schema`, and — since the PR5 staleness audit closed the gap
     /// PR1 flagged — `has_keyspace` too) the CQL/DynamoDB wire edges use for
@@ -3889,8 +3944,8 @@ impl ClientCtx {
     /// this seam existed.
     ///
     /// Used by the schema commit-wait polls (`create_table_schema`/
-    /// `replace_table_schema`/`drop_table_schema`/`trigger_split`/
-    /// `trigger_merge` below) and the DynamoDB conditional-write existence
+    /// `replace_table_schema`/`drop_table_schema`/`trigger_split`
+    /// below) and the DynamoDB conditional-write existence
     /// gate (`dynamo.rs::quorum_read`'s live re-check on a snapshot miss) —
     /// each must observe its own just-proposed command (or a concurrent
     /// writer's) landing in the authoritative state, not a possibly-stale
@@ -4178,14 +4233,15 @@ impl ClientCtx {
     /// `Ok(None)` is a genuinely **served** absent. `Err("…; retry")` covers
     /// the two conditions that must never be reported as absence: (1) the
     /// group's live `scope_range()` does not contain `key` — this routing
-    /// resolution raced a split's narrow or a merge's widen, so this group
+    /// resolution raced a split's narrow, so this group
     /// does not (or does not *yet*) own the key, and serving from its engine
-    /// could return absent-or-stale for data another group (or a
-    /// not-yet-drained absorbed sibling) is authoritative for; (2) the
-    /// ReadIndex barrier failed (deposed / mid-election leader) — nothing can
-    /// be concluded about the key at all. Both were previously collapsed into
-    /// "absent" (`Value(None)`), which read exactly like data loss from the
-    /// outside — the ADR 0033 regression `tests/tablet_merge.rs` caught.
+    /// could return absent-or-stale for data another group is authoritative
+    /// for; (2) the ReadIndex barrier failed (deposed / mid-election leader)
+    /// — nothing can be concluded about the key at all. Both were previously
+    /// collapsed into "absent" (`Value(None)`), which read exactly like data
+    /// loss from the outside — a regression caught under a real
+    /// multi-process deployment, before tablet merge was removed entirely
+    /// (split-only tablets).
     ///
     /// **Test-only since ADR 0018 §2/PR4** (`split_fence_tests`'s stale-scope
     /// regression, which drives a raw `CpGroup` handle with no `ClientCtx`
@@ -4198,7 +4254,7 @@ impl ClientCtx {
     async fn cp_get_local(leader: &CpGroup, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
         if !leader.scope_range().contains(key) {
             return Err(format!(
-                "key {key:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
+                "key {key:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
         match leader.linearizable_get_served(key).await {
@@ -4241,7 +4297,7 @@ impl ClientCtx {
     ) -> Result<Option<Vec<u8>>, String> {
         if !leader.scope_range().contains(key) {
             return Err(format!(
-                "key {key:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
+                "key {key:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
         match leader.linearizable_get_served_fast(key).await {
@@ -4298,9 +4354,10 @@ impl ClientCtx {
     /// the read-side scope pre-check — the scan flavor of
     /// [`cp_get_local`](Self::cp_get_local): `linearizable_scan` filters every
     /// row through the group's live scope (`strip_in_range`), so a scope that
-    /// has not yet caught up to the metadata-derived request window (a merge's
-    /// widen in flight) would **silently truncate** the results rather than
-    /// error. Shared by [`cp_scan_one`] and `cp_serve_forwarded`'s `Scan` arm.
+    /// has not yet caught up to the metadata-derived request window (a
+    /// split's narrow in flight) would **silently truncate** the results
+    /// rather than error. Shared by [`cp_scan_one`] and `cp_serve_forwarded`'s
+    /// `Scan` arm.
     async fn cp_scan_local(
         leader: &CpGroup,
         start: &[u8],
@@ -4310,7 +4367,7 @@ impl ClientCtx {
         let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
         if !leader.scope_range().contains_range(&requested) {
             return Err(format!(
-                "scan window {requested:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
+                "scan window {requested:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
         match leader.linearizable_scan(start, end, limit).await {
@@ -4325,7 +4382,7 @@ impl ClientCtx {
     /// fix): a read-barrier failure (deposed/mid-election leader) is a
     /// retryable condition, never reported as absence, and a leader whose live
     /// `scope_range()` does not contain `key` (this node's routing raced a
-    /// split's narrow or a merge's widen — metadata says the group owns the
+    /// split's narrow — metadata says the group owns the
     /// key, its scope hasn't caught up) is likewise retried until routing and
     /// scope agree, mirroring the write side's pre-propose range check. `Err`
     /// is "no leader reachable / did not become serveable in time". The CP
@@ -4465,9 +4522,8 @@ impl ClientCtx {
 
     /// As [`cp_kind_write`](Self::cp_kind_write), but for a batch with **no
     /// base-kind write** — a GSI reconciliation's footprint/cursor-row
-    /// update, the trim janitor's change-record deletions, or a
-    /// merge-residue cursor-row cleanup (ADR 0042 §7/§8) — none of which
-    /// touch a client-visible row.
+    /// update, or the trim janitor's change-record deletions (ADR 0042 §7/§8)
+    /// — none of which touch a client-visible row.
     ///
     /// Confirmation therefore cannot probe a base row; it instead confirms
     /// the batch's **last** write actually landed (`local_get_kind`
@@ -6181,8 +6237,8 @@ impl ClientCtx {
     /// handle, enforcing the read-side scope pre-check (ADR 0033) — the
     /// kind-scan dual of [`cp_scan_local`](Self::cp_scan_local): a scope that
     /// has not yet caught up to the metadata-derived request window (a
-    /// merge's widen in flight) would otherwise silently truncate the results
-    /// rather than error. `end == None` is unbounded above.
+    /// split's narrow in flight) would otherwise silently truncate the
+    /// results rather than error. `end == None` is unbounded above.
     async fn cp_scan_kind_local(
         leader: &CpGroup,
         kind: u8,
@@ -6192,7 +6248,7 @@ impl ClientCtx {
         let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
         if !leader.scope_range().contains_range(&requested) {
             return Err(format!(
-                "scan window {requested:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
+                "scan window {requested:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
         match leader.linearizable_scan_kind(kind, start, end).await {
@@ -6828,6 +6884,19 @@ impl ClientCtx {
                     .map(|(key, _, value)| (key, value))
                     .collect();
                 ClientResponse::Pairs(pairs)
+            }
+            // ADR 0045 §5 step 3: the backfill-cursor-cleanup RPC —
+            // addressed by `tablet` directly, mirroring `ForceSeal`/
+            // `StreamHotRead` above (see this variant's own doc for why).
+            ClientRequest::ClearBackfillCursor { tablet, index } => {
+                let tablet = TabletId(tablet);
+                let Some(leader) = self.edge.cp_leader(tablet) else {
+                    return self.not_leader_refusal(Some(tablet));
+                };
+                match index_drain::clear_backfill_cursor(&leader, &index).await {
+                    Ok(()) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
             }
             // ADR 0018 §2/PR4: the four internal 2PC coordinator RPCs.
             // Routed by the first write key (`TxnPrepare`) or one of `keys`
@@ -8249,9 +8318,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
         let view = MetadataView {
             tablets: meta.tablets,
             down,
-            merged: meta.merged_tablets,
             split_parent: meta.split_parents,
-            absorbed_by: meta.absorbed_by,
         };
         reconciler.tick(&view).await;
     }
@@ -8643,13 +8710,13 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
+        ClientRequest::ClearBackfillCursor { .. } => "clear_backfill_cursor",
         ClientRequest::Get { .. } => "get",
         ClientRequest::Scan { .. } => "scan",
         ClientRequest::Delete { .. } => "delete",
         ClientRequest::Forwarded { .. } => "forwarded",
         ClientRequest::ProposeSchema(_) => "propose_schema",
         ClientRequest::SplitTablet { .. } => "split_tablet",
-        ClientRequest::MergeTablets { .. } => "merge_tablets",
         ClientRequest::JoinInfo => "join_info",
         ClientRequest::WatchMetadata { .. } => "watch_metadata",
         ClientRequest::Txn { .. } => "txn",
@@ -8706,11 +8773,6 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         // Admin: split a CP tablet — a single atomic control-plane command.
         ClientRequest::SplitTablet { tablet, split_key } => {
             ctx.trigger_split(TabletId(tablet), split_key).await
-        }
-        // Admin: merge two adjacent CP tablets (ADR 0033) — a single atomic
-        // control-plane command, the dual of split above.
-        ClientRequest::MergeTablets { left, right } => {
-            ctx.trigger_merge(TabletId(left), TabletId(right)).await
         }
         // A CP op forwarded from another node (cross-process routing, ADR 0017
         // #3b): serve locally iff we are the leader; never re-forward. The
@@ -8800,6 +8862,11 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         ClientRequest::StreamHotRead { .. } => ClientResponse::Error(
             "this request is an internal open-shard hot-read RPC and must be sent wrapped in \
              `Forwarded`"
+                .into(),
+        ),
+        ClientRequest::ClearBackfillCursor { .. } => ClientResponse::Error(
+            "this request is an internal backfill-cursor-cleanup RPC and must be sent wrapped \
+             in `Forwarded`"
                 .into(),
         ),
         ClientRequest::TxnPrepare { .. }
@@ -8930,61 +8997,6 @@ impl ClientCtx {
         {
             Ok(()) => ClientResponse::PutOk,
             Err(()) => ClientResponse::Error("split did not commit in time".into()),
-        }
-    }
-
-    /// Merge adjacent CP tablets `left` and `right` (ADR 0033): a **single,
-    /// atomic** control-plane command (`MetaCommand::MergeTablets`,
-    /// epoch-CAS gated on both tablets — the dual of `trigger_split` above).
-    /// `left`'s range widens to `[left.start, right.end)` and `right` is
-    /// removed from the tablet map — both served by the **same** replicas'
-    /// existing per-node shared engine (ADR 0026/0028: one LSM tree per node,
-    /// confined by `StorageScope`), so no data moves and there is no second,
-    /// data-plane step that can fail independently. The per-node tablet-host
-    /// reconciler (ADR 0031 PR4, extended by ADR 0033) then widens `left`'s
-    /// live scope and tears down `right`'s group on every replica **without
-    /// erasing its data** — a sibling now owns that range on the same shared
-    /// engine.
-    ///
-    /// Routed to the control leader (relayable, [`is_relayable_command`]), so
-    /// this works from any node the client happens to be connected to.
-    #[tracing::instrument(name = "merge_tablets", skip(self), fields(left = left.0, right = right.0))]
-    async fn trigger_merge(&self, left: TabletId, right: TabletId) -> ClientResponse {
-        // Both epochs come from the **same** metadata snapshot, so the CAS
-        // reflects exactly what this call saw (mirroring `trigger_split`'s
-        // `new_id`/`expected_epoch` pairing). `effective_metadata()` for the
-        // same reason as `trigger_split` — see that method's comment.
-        let meta = self.effective_metadata();
-        let Some(expected_left_epoch) = meta.tablets.get(&left).map(|t| t.epoch) else {
-            return ClientResponse::Error("no such tablet".into());
-        };
-        let Some(expected_right_epoch) = meta.tablets.get(&right).map(|t| t.epoch) else {
-            return ClientResponse::Error("no such tablet".into());
-        };
-        let cmd = MetaCommand::MergeTablets {
-            left,
-            expected_left_epoch,
-            right,
-            expected_right_epoch,
-        };
-        // Confirm by a signal robust against `right` vanishing for an
-        // unrelated reason (e.g. a concurrent table drop): `left`'s epoch
-        // must have advanced past what this call read AND `right` must be
-        // gone — the exact pair `MergeTablets`'s apply produces together,
-        // atomically, and nothing else in this state machine produces.
-        match self
-            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
-                let m = self.effective_metadata();
-                let left_bumped = m
-                    .tablets
-                    .get(&left)
-                    .is_some_and(|t| t.epoch > expected_left_epoch);
-                (left_bumped && !m.tablets.contains_key(&right)).then_some(())
-            })
-            .await
-        {
-            Ok(()) => ClientResponse::PutOk,
-            Err(()) => ClientResponse::Error("merge did not commit in time".into()),
         }
     }
 
@@ -9308,13 +9320,15 @@ impl ClientCtx {
 
     /// Propose `MetaCommand::DropTableTablets` for `table` and wait until every
     /// tablet scoped to it has left this node's replicated metadata (ADR 0024).
-    /// Shared by [`drop_table`](Self::drop_table)'s base-table drop and its
-    /// GSI-hidden-table cascade (ADR 0041 §5) — same command, same
-    /// commit-wait discipline either way. `table` need not have a schema
-    /// entry: a hidden index table never has one, and `DropTableTablets`'s
-    /// apply is keyed purely on the tablet map (`tablets_for_table`), not the
-    /// schema catalog.
-    async fn drop_table_tablets(&self, table: String) -> Result<(), String> {
+    /// Shared by [`drop_table`](Self::drop_table)'s base-table drop, its
+    /// GSI-hidden-table cascade (ADR 0041 §5), and `dynamo.rs`'s single-index
+    /// drop cascade (ADR 0045 §5, `drop_index`) — same command, same
+    /// commit-wait discipline in all three. `pub(crate)` (not module-private)
+    /// for exactly that last caller, a sibling module. `table` need not have
+    /// a schema entry: a hidden index table never has one, and
+    /// `DropTableTablets`'s apply is keyed purely on the tablet map
+    /// (`tablets_for_table`), not the schema catalog.
+    pub(crate) async fn drop_table_tablets(&self, table: String) -> Result<(), String> {
         let command = MetaCommand::DropTableTablets {
             table: table.clone(),
         };
@@ -9480,6 +9494,79 @@ impl ClientCtx {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err("force-seal did not reach a tablet leader in time".into());
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Delete `index`'s own backfill cursor row (ADR 0045 §5 step 3) on
+    /// **every** tablet currently scoped to `table`, wherever each one's
+    /// own leader actually runs — the table-wide sibling of
+    /// [`clear_backfill_cursor_tablet`](Self::clear_backfill_cursor_tablet),
+    /// called once per tablet since each tablet is its own Raft group with
+    /// its own cursor row. See `dynamo.rs::drop_index`'s own doc for why
+    /// this step exists (a stale cursor row would otherwise silently
+    /// poison a later same-named `CreateTableIndex`'s fresh backfill) and
+    /// exactly when it runs.
+    pub(crate) async fn clear_backfill_cursor_for_table(
+        &self,
+        table: &str,
+        index: &str,
+    ) -> Result<(), String> {
+        let tablets: Vec<TabletId> = self
+            .effective_metadata()
+            .tablets_for_table(table)
+            .map(|(&id, _)| id)
+            .collect();
+        for tablet in tablets {
+            self.clear_backfill_cursor_tablet(tablet, index).await?;
+        }
+        Ok(())
+    }
+
+    /// Delete `index`'s own backfill cursor row on one `tablet`, wherever
+    /// its leader actually runs — mirrors
+    /// [`force_seal_tablet`](Self::force_seal_tablet)'s per-tablet
+    /// forward/retry shape exactly (re-resolves
+    /// [`resolve_cp_route`](Self::resolve_cp_route) fresh every attempt;
+    /// this is a rare, human-request-driven action with no latency budget
+    /// to protect).
+    async fn clear_backfill_cursor_tablet(
+        &self,
+        tablet: TabletId,
+        index: &str,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            match self.resolve_cp_route(tablet) {
+                Some(CpRoute::Local(leader)) => {
+                    return index_drain::clear_backfill_cursor(&leader, index).await;
+                }
+                Some(CpRoute::Forward(addr)) => {
+                    let request = ClientRequest::Forwarded {
+                        request: Box::new(ClientRequest::ClearBackfillCursor {
+                            tablet: tablet.0,
+                            index: index.to_owned(),
+                        }),
+                        traceparent: otel::current_traceparent(),
+                    };
+                    match self.relay(addr, request).await {
+                        ClientResponse::PutOk => return Ok(()),
+                        ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
+                            return Err(e);
+                        }
+                        ClientResponse::Error(_) => {} // retry below
+                        other => {
+                            return Err(format!(
+                                "unexpected reply to forwarded cursor-clear: {other:?}"
+                            ));
+                        }
+                    }
+                }
+                Some(CpRoute::None) | None => {} // not settled yet, retry
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("backfill-cursor clear did not reach a tablet leader in time".into());
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
@@ -11095,9 +11182,8 @@ mod split_fence_tests {
             // child), never as a served answer. Serving it would return a
             // value NOT linearized against the child group's writes (the
             // child's leader may be on another node whose writes this engine
-            // hasn't applied yet) — or, in the merge crossover's dual (a
-            // survivor not yet widened over a not-yet-drained absorbed
-            // sibling), a false "absent" indistinguishable from data loss.
+            // hasn't applied yet) — a false "absent" indistinguishable from
+            // data loss.
             let read = ClientCtx::cp_get_local(&parent, &child_key).await;
             match read {
                 Err(e) => assert!(

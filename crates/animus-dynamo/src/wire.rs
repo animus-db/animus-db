@@ -11,7 +11,8 @@
 //!
 //! ## Supported subset
 //!
-//! Operations: `CreateTable`, `UpdateTable` (stream-spec-only, ADR 0042 §2),
+//! Operations: `CreateTable`, `UpdateTable` (a `StreamSpecification` change,
+//! or — ADR 0045 §6 — a single `GlobalSecondaryIndexUpdates` element),
 //! `DescribeTable` (ADR 0042 §2), `PutItem`, `GetItem`, `DeleteItem`, `Query`,
 //! `Scan`, `UpdateItem`, `BatchWriteItem`, `TransactWriteItems` (atomic, ADR
 //! 0018 §2/PR7), `TransactGetItems` (a consistent multi-key read, ADR 0018 §2/
@@ -27,18 +28,25 @@
 //! `GlobalSecondaryIndexes` (hash-only or composite), `LocalSecondaryIndexes`
 //! declarations, and an optional `StreamSpecification` (ADR 0042 §2 — the
 //! label itself is minted by `animusd`, not decoded here). `UpdateTable`
-//! accepts *only* a `StreamSpecification` change (any index/key/throughput
-//! field is rejected up front — ADR 0041 §5's own deferred item). `Scan`
-//! reads a whole table with `Limit` / `ExclusiveStartKey`
-//! pagination and an optional `FilterExpression` (the same predicate subset as
-//! `ConditionExpression`). GetItem/Query/Scan accept a `ProjectionExpression` /
-//! `AttributesToGet` (top-level attribute names only). Deferred (rejected with a
-//! clear error): document-path projections (`a.b`), per-index projection lists,
-//! `UpdateItem`-only `ReturnValues` modes, and an index-adding `UpdateTable`.
+//! accepts **either** a `StreamSpecification` change **or** exactly one
+//! `GlobalSecondaryIndexUpdates` element (a `Create` or a `Delete` — no
+//! `Update`/throughput shape), never both in the same call (ADR 0045 §6 Fork
+//! C — a deliberate AWS deviation, documented in ADR 0045's deviations
+//! table); `animusd` dispatches both halves — `Create` adds a live-backfilling
+//! GSI to a populated table (ADR 0045 §2/§6) and `Delete` runs the four-step
+//! convergent drop cascade (ADR 0045 §5). Any other index/key/throughput
+//! change is rejected up front. `Scan` reads a whole table with `Limit` /
+//! `ExclusiveStartKey` pagination and an optional `FilterExpression` (the
+//! same predicate subset as `ConditionExpression`). GetItem/Query/Scan accept
+//! a `ProjectionExpression` / `AttributesToGet` (top-level attribute names
+//! only). Deferred (rejected with a clear error): document-path projections
+//! (`a.b`), per-index projection lists, `UpdateItem`-only `ReturnValues`
+//! modes, and adding an LSI to an existing table (LSIs are create-time-only
+//! in real DynamoDB).
 
 use std::collections::BTreeMap;
 
-use animus_control::StreamViewType;
+use animus_control::{IndexStatus, StreamViewType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -47,9 +55,8 @@ use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex
 use crate::{AttributeValue, Item, TableSchema};
 
 /// A stream (de)configuration decoded from an `UpdateTable`'s
-/// `StreamSpecification` (ADR 0042 §2) — the only shape of `UpdateTable` this
-/// adapter accepts (any key/index/throughput change is rejected up front,
-/// ADR 0041 §5's own deferred item).
+/// `StreamSpecification` (ADR 0042 §2) — mutually exclusive with
+/// [`IndexUpdate`] on the same call (ADR 0045 §6 Fork C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamUpdate {
     /// Enable the stream (or change its view type) — `animusd` mints a fresh
@@ -57,6 +64,33 @@ pub enum StreamUpdate {
     Enable(StreamViewType),
     /// Disable the stream.
     Disable,
+}
+
+/// A secondary-index change decoded from an `UpdateTable`'s
+/// `GlobalSecondaryIndexUpdates` (ADR 0045 §6) — mutually exclusive with
+/// [`StreamUpdate`] on the same call (Fork C). Exactly one element is
+/// accepted per call, matching AWS's own "each `UpdateTable` may add or
+/// remove at most one GSI" contract; a `Create`/`Delete` element that also
+/// carries the other key, or an `Update` (throughput) element, is rejected at
+/// decode time. Whether a *named* `Delete` targets an LSI (create-time-only
+/// in real DynamoDB, so never deletable) can't be decided here — this layer
+/// never sees the replicated catalog — so that check is `animusd`'s, same
+/// division of labor as the `ConsistentRead`-against-a-GSI rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexUpdate {
+    /// Add a new global secondary index to a (possibly populated) table —
+    /// decoded like a `CreateTable` GSI declaration (this decoder only ever
+    /// produces [`SecondaryIndex::Global`]; there is no
+    /// `LocalSecondaryIndexUpdates` in the real API, and `animusd` rejects a
+    /// directly-constructed `Local` variant defensively). `animusd` bridges
+    /// it to a `Creating`-status `IndexDef` and proposes `CreateTableIndex`
+    /// (ADR 0045 §2/§6) — the backfill seeder + completion aggregator (ADR
+    /// 0045 §2/§4) do the rest, converging to `Active` with no further wire
+    /// action.
+    Create(SecondaryIndex),
+    /// Remove the named secondary index (ADR 0045 §5's four-step convergent
+    /// drop cascade).
+    Delete(String),
 }
 
 /// A stream's description for a response (`CreateTable`'s echoed
@@ -289,14 +323,20 @@ pub enum Operation {
         /// `animusd`, not decoded here — this is a pure wire layer.
         stream_view_type: Option<StreamViewType>,
     },
-    /// `UpdateTable` (ADR 0042 §2): stream-spec-only in this adapter — any
-    /// index/key/throughput change is rejected up front at decode time (ADR
-    /// 0041 §5's own deferred item, orthogonal to streams).
+    /// `UpdateTable`: either a `StreamSpecification` change (ADR 0042 §2) or
+    /// a single secondary-index change (ADR 0045 §6) — never both in one
+    /// call (decode-time rejected, Fork C). Exactly one of `stream`/
+    /// `index_update` is `Some`; any other index/key/throughput change is
+    /// rejected up front at decode time.
     UpdateTable {
         /// Target table name.
         table: String,
-        /// The requested stream (de)configuration.
-        stream: StreamUpdate,
+        /// The requested stream (de)configuration, if this call changes the
+        /// stream rather than an index.
+        stream: Option<StreamUpdate>,
+        /// The requested secondary-index change, if this call changes an
+        /// index rather than the stream (ADR 0045 §6).
+        index_update: Option<IndexUpdate>,
     },
     /// `DescribeTable` (ADR 0042 §2): a pure read of the replicated catalog
     /// (key schema, secondary-index definitions, stream configuration).
@@ -1105,24 +1145,36 @@ pub(crate) fn stream_view_type_str(vt: StreamViewType) -> &'static str {
     }
 }
 
-/// Decode an `UpdateTable` request (ADR 0042 §2): stream-spec-only in this
-/// adapter. Rejects `GlobalSecondaryIndexUpdates` outright (the one
-/// AWS-recognized field name for an index-adding/removing `UpdateTable`,
-/// still a named follow-up per ADR 0041 §5) and requires a
-/// `StreamSpecification` (the only supported shape) — `StreamEnabled: true`
+/// Decode an `UpdateTable` request: either a `StreamSpecification` change
+/// (ADR 0042 §2) or a single `GlobalSecondaryIndexUpdates` element (ADR 0045
+/// §6) — rejected up front if **both** are present in the same call (Fork
+/// C, kept as "exactly one supported change per call"). `StreamEnabled: true`
 /// decodes to [`StreamUpdate::Enable`] (requiring `StreamViewType`),
-/// `StreamEnabled: false` to [`StreamUpdate::Disable`].
+/// `StreamEnabled: false` to [`StreamUpdate::Disable`]; index-update decoding
+/// is [`decode_index_updates`]. Any other shape (neither field present) is
+/// rejected — this adapter models no throughput/key/billing-mode change.
 fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let table = table_name(obj)?;
-    if obj.contains_key("GlobalSecondaryIndexUpdates") {
+    let has_index_updates = obj.contains_key("GlobalSecondaryIndexUpdates");
+    let has_stream_spec = obj.contains_key("StreamSpecification");
+    if has_index_updates && has_stream_spec {
         return Err(WireError::validation(
-            "UpdateTable does not yet support GlobalSecondaryIndexUpdates \
-             (ADR 0041 §5: index-adding UpdateTable is a named follow-up)",
+            "UpdateTable supports either a GlobalSecondaryIndexUpdates change or a \
+             StreamSpecification change in one call, not both (ADR 0045 §6)",
         ));
+    }
+    if has_index_updates {
+        let index_update = decode_index_updates(obj)?;
+        return Ok(Operation::UpdateTable {
+            table,
+            stream: None,
+            index_update: Some(index_update),
+        });
     }
     let Some(spec) = obj.get("StreamSpecification") else {
         return Err(WireError::validation(
-            "UpdateTable only supports a StreamSpecification change in this adapter",
+            "UpdateTable requires either a StreamSpecification or a \
+             GlobalSecondaryIndexUpdates change in this adapter",
         ));
     };
     let spec = spec
@@ -1137,7 +1189,60 @@ fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError>
     } else {
         StreamUpdate::Disable
     };
-    Ok(Operation::UpdateTable { table, stream })
+    Ok(Operation::UpdateTable {
+        table,
+        stream: Some(stream),
+        index_update: None,
+    })
+}
+
+/// Decode `GlobalSecondaryIndexUpdates` (ADR 0045 §6) into a single
+/// [`IndexUpdate`]. AWS accepts an array here (nominally one `Create`/
+/// `Update`/`Delete` element per changed index, several per call); this
+/// adapter accepts **exactly one** element, and that element must be exactly
+/// one of `Create` or `Delete` (no `Update` — no throughput model at all,
+/// and no combined-key object — each is its own decode error).
+fn decode_index_updates(obj: &Map<String, Value>) -> Result<IndexUpdate, WireError> {
+    let updates = obj
+        .get("GlobalSecondaryIndexUpdates")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WireError::validation("`GlobalSecondaryIndexUpdates` must be an array"))?;
+    if updates.len() != 1 {
+        return Err(WireError::validation(
+            "UpdateTable supports exactly one GlobalSecondaryIndexUpdates element per call",
+        ));
+    }
+    let entry = updates[0].as_object().ok_or_else(|| {
+        WireError::validation("each GlobalSecondaryIndexUpdates element must be an object")
+    })?;
+    match (entry.get("Create"), entry.get("Delete"), entry.len()) {
+        (Some(create), None, 1) => {
+            let (name, schema, projection) = decode_index_entry(create, "GSI")?;
+            Ok(IndexUpdate::Create(SecondaryIndex::Global(
+                GlobalSecondaryIndex {
+                    name,
+                    key_attribute: schema.partition_key,
+                    sort_attribute: schema.sort_key,
+                    projection,
+                },
+            )))
+        }
+        (None, Some(delete), 1) => {
+            let delete = delete
+                .as_object()
+                .ok_or_else(|| WireError::validation("`Delete` must be an object"))?;
+            let name = delete
+                .get("IndexName")
+                .and_then(Value::as_str)
+                .ok_or_else(|| WireError::validation("`Delete` missing `IndexName`"))?
+                .to_owned();
+            Ok(IndexUpdate::Delete(name))
+        }
+        _ => Err(WireError::validation(
+            "each GlobalSecondaryIndexUpdates element must be exactly one of `Create` or \
+             `Delete` (no `Update` — no throughput model)",
+        )),
+    }
 }
 
 /// Decode the optional `ConditionExpression` + `ExpressionAttributeValues` of a
@@ -1808,13 +1913,28 @@ pub fn stream_arn(table: &str, label: &str) -> String {
 
 /// Build the shared `TableDescription`/`Table` object both
 /// [`create_table_response`] and [`describe_table_response`] wrap: name, key
-/// schema, `ACTIVE` status, any secondary indexes, and — when `stream` is
-/// `Some` — `StreamSpecification`/`LatestStreamArn`/`LatestStreamLabel` (ADR
+/// schema, `ACTIVE` status, any secondary indexes — each carrying its own
+/// real `IndexStatus` (`CREATING`/`ACTIVE`/`DELETING`, ADR 0045 §6 Fork D)
+/// plus, while `Creating`, `Backfilling: true` — and, when `stream` is
+/// `Some`, `StreamSpecification`/`LatestStreamArn`/`LatestStreamLabel` (ADR
 /// 0042 §2/§4).
+///
+/// **`Backfilling` is placed *per-index*, inside each `GlobalSecondaryIndexes[]`
+/// entry** — matching real DynamoDB's `DescribeTable` shape exactly. (ADR
+/// 0045 §6 originally sketched this as a table-level flag; that wording was
+/// looser than AWS reality and is corrected here, not carried forward.)
+///
+/// `index_statuses` is the Fork-D side channel (a `(name, IndexStatus)`
+/// list) rather than a field on [`SecondaryIndex`] itself, which stays a pure
+/// `CreateTable`-*input* shape — mirroring [`StreamDescription`]'s own
+/// separate-bridge precedent. An index absent from it (every index
+/// [`create_table_response`] ever renders, and every LSI, which is `Active`
+/// by construction — LSIs are create-time-only) renders as `Active`.
 fn table_description_object(
     table: &str,
     schema: &TableSchema,
     indexes: &[SecondaryIndex],
+    index_statuses: &[(String, IndexStatus)],
     stream: Option<&StreamDescription>,
 ) -> Map<String, Value> {
     let mut key_schema = vec![key_schema_entry(&schema.partition_key, "HASH")];
@@ -1835,14 +1955,21 @@ fn table_description_object(
                 if let Some(sort) = &g.sort_attribute {
                     ks.push(key_schema_entry(sort, "RANGE"));
                 }
-                gsis.push(index_desc(&g.name, ks));
+                gsis.push(index_desc(
+                    &g.name,
+                    ks,
+                    index_status_for(&g.name, index_statuses),
+                ));
             }
             SecondaryIndex::Local(l) => {
                 let ks = vec![
                     key_schema_entry(&schema.partition_key, "HASH"),
                     key_schema_entry(&l.sort_attribute, "RANGE"),
                 ];
-                lsis.push(index_desc(&l.name, ks));
+                // LSIs are always `Active` by construction (create-time-only,
+                // never touched by `SetIndexStatus`) — never consulted from
+                // `index_statuses`.
+                lsis.push(index_desc(&l.name, ks, IndexStatus::Active));
             }
         }
     }
@@ -1882,7 +2009,9 @@ pub fn create_table_response(
     indexes: &[SecondaryIndex],
     stream: Option<&StreamDescription>,
 ) -> String {
-    let desc = table_description_object(table, schema, indexes, stream);
+    // Every index a `CreateTable` declares is `Active` by construction (ADR
+    // 0041 §5: an empty, just-created table) — no status side channel needed.
+    let desc = table_description_object(table, schema, indexes, &[], stream);
     let mut obj = Map::new();
     obj.insert("TableDescription".into(), Value::Object(desc));
     serde_json::to_string(&Value::Object(obj)).expect("create-table response serializes")
@@ -1892,16 +2021,20 @@ pub fn create_table_response(
 /// shape as [`create_table_response`], plus `AttributeDefinitions` (derived
 /// from `key_types`, mirroring `CreateTable`'s own decode), wrapped under
 /// `Table` (DynamoDB's own `DescribeTable` response shape, distinct from
-/// `CreateTable`/`UpdateTable`'s `TableDescription`).
+/// `CreateTable`/`UpdateTable`'s `TableDescription`). `index_statuses` is the
+/// caller's Fork-D side channel of each index's *real* replicated-catalog
+/// status (`animusd::dynamo::describe_table` reads it off `Metadata`) — see
+/// [`table_description_object`]'s doc.
 #[must_use]
 pub fn describe_table_response(
     table: &str,
     schema: &TableSchema,
     key_types: &[(String, String)],
     indexes: &[SecondaryIndex],
+    index_statuses: &[(String, IndexStatus)],
     stream: Option<&StreamDescription>,
 ) -> String {
-    let mut desc = table_description_object(table, schema, indexes, stream);
+    let mut desc = table_description_object(table, schema, indexes, index_statuses, stream);
     let mut attrs = vec![attribute_definition(&schema.partition_key, key_types)];
     if let Some(sk) = &schema.sort_key {
         attrs.push(attribute_definition(sk, key_types));
@@ -1923,13 +2056,42 @@ fn attribute_definition(name: &str, key_types: &[(String, String)]) -> Value {
     Value::Object(e)
 }
 
-/// One index entry in a `TableDescription`: name, key schema, `ACTIVE` status.
-fn index_desc(name: &str, key_schema: Vec<Value>) -> Value {
+/// One index entry in a `TableDescription`/`Table`: name, key schema, and its
+/// real `IndexStatus` (`CREATING`/`ACTIVE`/`DELETING`, DynamoDB's own
+/// `SCREAMING_SNAKE_CASE`). `Backfilling: true` is added only while
+/// `Creating` — matching AWS, which omits the attribute entirely once a GSI
+/// has finished backfilling (never renders it as `false`).
+fn index_desc(name: &str, key_schema: Vec<Value>, status: IndexStatus) -> Value {
     let mut g = Map::new();
     g.insert("IndexName".into(), Value::String(name.to_owned()));
     g.insert("KeySchema".into(), Value::Array(key_schema));
-    g.insert("IndexStatus".into(), Value::String("ACTIVE".into()));
+    g.insert(
+        "IndexStatus".into(),
+        Value::String(index_status_str(status).into()),
+    );
+    if status == IndexStatus::Creating {
+        g.insert("Backfilling".into(), Value::Bool(true));
+    }
     Value::Object(g)
+}
+
+/// DynamoDB's own `SCREAMING_SNAKE_CASE` rendering of an [`IndexStatus`].
+fn index_status_str(status: IndexStatus) -> &'static str {
+    match status {
+        IndexStatus::Creating => "CREATING",
+        IndexStatus::Active => "ACTIVE",
+        IndexStatus::Deleting => "DELETING",
+    }
+}
+
+/// Resolve `name`'s real status from the Fork-D side channel, defaulting to
+/// `Active` for an index absent from it (see [`table_description_object`]'s
+/// doc for why that default is correct, not merely convenient).
+fn index_status_for(name: &str, statuses: &[(String, IndexStatus)]) -> IndexStatus {
+    statuses
+        .iter()
+        .find(|(n, _)| n == name)
+        .map_or(IndexStatus::Active, |(_, s)| *s)
 }
 
 fn key_schema_entry(name: &str, role: &str) -> Value {
@@ -2658,6 +2820,7 @@ mod tests {
             &TableSchema::composite("pk", "sk"),
             &[("pk".into(), "S".into()), ("sk".into(), "N".into())],
             &[],
+            &[],
             Some(&stream),
         );
         assert!(body.contains("\"Table\""));
@@ -2666,14 +2829,80 @@ mod tests {
         assert!(body.contains("\"StreamViewType\":\"KEYS_ONLY\""));
     }
 
+    /// `DescribeTable`'s per-index `IndexStatus` (ADR 0045 §6 Fork D): each of
+    /// the three real statuses renders in DynamoDB's own
+    /// `SCREAMING_SNAKE_CASE`, and `Backfilling: true` appears **only**
+    /// alongside `CREATING` — never `false`, and never for `ACTIVE`/
+    /// `DELETING` (matching AWS, which omits the attribute once backfilling
+    /// finishes).
+    #[test]
+    fn describe_table_response_reports_real_index_status_and_backfilling() {
+        let gsi = SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-email".into(),
+            key_attribute: "email".into(),
+            sort_attribute: None,
+            projection: IndexProjection::All,
+        });
+
+        for (status, want_status_str, want_backfilling) in [
+            (IndexStatus::Creating, "CREATING", true),
+            (IndexStatus::Active, "ACTIVE", false),
+            (IndexStatus::Deleting, "DELETING", false),
+        ] {
+            let body = describe_table_response(
+                "t",
+                &TableSchema::simple("id"),
+                &[],
+                std::slice::from_ref(&gsi),
+                &[("by-email".into(), status)],
+                None,
+            );
+            assert!(
+                body.contains(&format!("\"IndexStatus\":\"{want_status_str}\"")),
+                "status {status:?}: expected IndexStatus {want_status_str} in {body}"
+            );
+            assert_eq!(
+                body.contains("\"Backfilling\":true"),
+                want_backfilling,
+                "status {status:?}: unexpected Backfilling presence in {body}"
+            );
+            assert!(
+                !body.contains("\"Backfilling\":false"),
+                "Backfilling must never render as false (AWS omits the attribute instead): {body}"
+            );
+        }
+    }
+
+    /// An index absent from the `index_statuses` side channel — the shape
+    /// [`create_table_response`] always passes — defaults to `ACTIVE` with no
+    /// `Backfilling`, matching a just-created, empty-by-construction table's
+    /// indexes (ADR 0041 §5).
+    #[test]
+    fn create_table_response_reports_indexes_as_active() {
+        let gsi = SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-email".into(),
+            key_attribute: "email".into(),
+            sort_attribute: None,
+            projection: IndexProjection::All,
+        });
+        let body = create_table_response("t", &TableSchema::simple("id"), &[gsi], None);
+        assert!(body.contains("\"IndexStatus\":\"ACTIVE\""));
+        assert!(!body.contains("Backfilling"));
+    }
+
     #[test]
     fn decodes_update_table_stream_enable_and_disable() {
         let enable = br#"{"TableName":"t","StreamSpecification":
             {"StreamEnabled":true,"StreamViewType":"NEW_IMAGE"}}"#;
         match decode_request("DynamoDB_20120810.UpdateTable", enable).unwrap() {
-            Operation::UpdateTable { table, stream } => {
+            Operation::UpdateTable {
+                table,
+                stream,
+                index_update,
+            } => {
                 assert_eq!(table, "t");
-                assert_eq!(stream, StreamUpdate::Enable(StreamViewType::NewImage));
+                assert_eq!(stream, Some(StreamUpdate::Enable(StreamViewType::NewImage)));
+                assert_eq!(index_update, None);
             }
             other => panic!("expected UpdateTable, got {other:?}"),
         }
@@ -2681,21 +2910,92 @@ mod tests {
         let disable = br#"{"TableName":"t","StreamSpecification":{"StreamEnabled":false}}"#;
         match decode_request("DynamoDB_20120810.UpdateTable", disable).unwrap() {
             Operation::UpdateTable { stream, .. } => {
-                assert_eq!(stream, StreamUpdate::Disable);
+                assert_eq!(stream, Some(StreamUpdate::Disable));
             }
             other => panic!("expected UpdateTable, got {other:?}"),
         }
     }
 
     #[test]
-    fn update_table_rejects_index_updates() {
+    fn update_table_rejects_an_empty_index_updates_array() {
         let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[]}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
-    fn update_table_requires_stream_specification() {
+    fn update_table_rejects_more_than_one_index_updates_element() {
+        let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[
+            {"Delete":{"IndexName":"a"}},{"Delete":{"IndexName":"b"}}]}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn update_table_decodes_a_delete_index_update() {
+        let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[
+            {"Delete":{"IndexName":"by-email"}}]}"#;
+        match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
+            Operation::UpdateTable {
+                table,
+                stream,
+                index_update,
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(stream, None);
+                assert_eq!(
+                    index_update,
+                    Some(IndexUpdate::Delete("by-email".to_owned()))
+                );
+            }
+            other => panic!("expected UpdateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_table_decodes_a_create_index_update() {
+        let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[
+            {"Create":{"IndexName":"by-email",
+                "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
+                "Projection":{"ProjectionType":"ALL"}}}]}"#;
+        match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
+            Operation::UpdateTable {
+                table,
+                index_update,
+                ..
+            } => {
+                assert_eq!(table, "t");
+                match index_update {
+                    Some(IndexUpdate::Create(SecondaryIndex::Global(gsi))) => {
+                        assert_eq!(gsi.name, "by-email");
+                        assert_eq!(gsi.key_attribute, "email");
+                    }
+                    other => panic!("expected Create(Global(..)), got {other:?}"),
+                }
+            }
+            other => panic!("expected UpdateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_table_rejects_an_update_shaped_index_element() {
+        let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[
+            {"Update":{"IndexName":"by-email"}}]}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn update_table_rejects_index_and_stream_change_together() {
+        let body = br#"{"TableName":"t",
+            "GlobalSecondaryIndexUpdates":[{"Delete":{"IndexName":"by-email"}}],
+            "StreamSpecification":{"StreamEnabled":false}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn update_table_requires_stream_specification_or_index_updates() {
         let body = br#"{"TableName":"t"}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");

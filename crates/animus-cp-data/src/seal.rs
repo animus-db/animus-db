@@ -10,8 +10,8 @@
 //! a timing bound is forbidden as a *correctness* mechanism (ADR 0017 §3).
 //!
 //! The replacement is **ordering-based**: when a source tablet hands off a
-//! range (a split's `NarrowScope`, or a merge's `Absorb`), its own leader
-//! proposes a [`KvCommand::Seal`](crate::KvCommand::Seal) for exactly that
+//! range (a split's `NarrowScope`), its own leader proposes a
+//! [`KvCommand::Seal`](crate::KvCommand::Seal) for exactly that
 //! range through its **own** Raft log. Every replica of that group applies
 //! its log in the same order, so every replica agrees on the exact log
 //! position the range became sealed — and any mutating entry ordered *after*
@@ -24,10 +24,10 @@
 //! residual: a leader that hasn't yet learned about the split can still only
 //! append to the *same* log the seal already occupies a position in.
 //!
-//! The seal's durable witness for a **successor** group (a split child, or a
-//! merge survivor) is a **marker key written directly into the shared
-//! engine**, deliberately **outside every `StorageScope`** (ADR 0026/0028) so
-//! a co-hosted successor can observe it with no scope machinery of its own.
+//! The seal's durable witness for a **successor** group (a split child) is a
+//! **marker key written directly into the shared engine**, deliberately
+//! **outside every `StorageScope`** (ADR 0026/0028) so a co-hosted successor
+//! can observe it with no scope machinery of its own.
 
 use animus_control::syskv::RESERVED_NAMESPACE;
 use animus_tablet::{KeyRange, escape};
@@ -85,9 +85,9 @@ pub(crate) fn seal_marker_key(tablet: u64, range: &KeyRange) -> Vec<u8> {
 
 /// The scan-bound prefix covering every seal marker `tablet`'s group has
 /// ever proposed (any range) — lets a successor enumerate a specific
-/// parent/absorbed tablet's markers without knowing the exact range up
-/// front (it only knows its *own* range, which the marker's range must
-/// **contain**, not necessarily equal — see the module doc).
+/// parent tablet's markers without knowing the exact range up front (it
+/// only knows its *own* range, which the marker's range must **contain**,
+/// not necessarily equal — see the module doc).
 fn seal_marker_prefix(tablet: u64) -> Vec<u8> {
     let mut out = escape(RESERVED_NAMESPACE.as_bytes());
     out.extend_from_slice(&escape(SEAL_TAG));

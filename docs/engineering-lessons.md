@@ -1843,8 +1843,161 @@ debugging anything that feels like it might have happened before.
   UI-scoped change; see "separate PRs for incidental bugs") but are now
   documented in `animusd/CLAUDE.md` and ADR 0021 #10 for whoever picks that
   up. (2026-08-15.)
+- **A commit message's claim that a test helper is "now dead" must be
+  verified by grepping the helper's name across its whole file, not
+  inferred from "the one test that motivated the deletion is gone."**
+  148b3ac (ADR 0044, removing tablet merge) deleted `streams_e2e.rs`'s
+  local `admin()` helper alongside the one merge-stopgap test that called
+  it, reasoning it was now unused — but three *other* tests already in
+  that file (`admin_status_survives_a_populated_stream_shard_catalog`,
+  `admin_data_dynamo_proxy_reaches_streams_read_api`,
+  `admin_data_dynamo_proxy_rejects_unknown_op_cleanly`) also called it,
+  so the deletion broke `cargo build --workspace --all-targets`/`cargo
+  test -p animusd` outright — silently, since this repo's CI billing is
+  broken (see the `docs/engineering-lessons-archive.md`/root `CLAUDE.md`
+  history) and no automated gate ever ran it after merge. Sat unnoticed on
+  `main` until the next agent to touch `animusd` hit it cold. Found and
+  fixed while building ADR 0045 PR1 (index-status catalog plumbing,
+  unrelated) — restored the helper verbatim from before the deletion
+  commit. General form: when deleting a symbol because "its only caller is
+  going away," grep the symbol's own name (not just its caller) across the
+  file/crate before deleting it, exactly the same discipline this log
+  already prescribes for gating `match` sites on a command enum.
+  (2026-08-15.)
+- **An internal design doc's paraphrase of a real external API's response
+  shape is not the API — verify against the real shape before wiring a
+  field, even when the doc sounds precise.** ADR 0045 §6 sketched
+  `DescribeTable`'s new `Backfilling: bool` as a **table-level** flag ("any
+  index `Creating`"); real DynamoDB places `Backfilling` **inside each
+  `GlobalSecondaryIndexes[]` entry**, and only while that specific index is
+  backfilling (the attribute is *absent*, never `false`, once finished).
+  Building PR6 to the doc's wording as written would have shipped a
+  plausible-looking but wrong wire shape no test would have caught, since
+  every test in the same PR would have been written against the same wrong
+  premise. Caught only because the task brief explicitly flagged the
+  wording as "looser than AWS reality" and asked for the real shape to be
+  checked — worth generalizing: **a design doc is a plan, not a spec of an
+  external contract it merely describes; re-derive the actual third-party
+  shape independently (from real API docs/behavior) rather than trusting a
+  plan's summary of it**, the same way this codebase already insists on
+  reading ADR text as *rationale*, not as the mechanism's ground truth.
+  (`animus-dynamo/src/wire.rs`'s `index_desc`/`table_description_object`,
+  2026-08-15.)
+- **A commit-wait poll for a command that puts an object into a *transient*
+  status must check the object's presence, not that it still holds the
+  exact status value just proposed** — a concurrent convergent loop can
+  legitimately advance past that status before the proposer's own next
+  poll, especially on a small/fast-converging fixture in a test. `UpdateTable`
+  Create (ADR 0045 §6) proposes `CreateTableIndex{status: Creating}` and
+  waits for it to commit exactly like `create_table`'s own index-definition
+  loop (presence-by-name only, `dynamo.rs::create_table`); the completion
+  aggregator (`index_backfill_loop`, ADR 0045 §4) can flip that same index
+  to `Active` within one tick of a tiny table's backfill finishing, which on
+  a single-node test can race the proposer's very next `metadata_fresh`
+  read. Polling for `status == Creating` specifically would then spuriously
+  time out despite the create having fully succeeded. The already-shipped
+  `set_index_status` (used by the drop cascade's `Deleting` transition)
+  gets away with checking the exact target status only because nothing in
+  this codebase ever proposes a *further* transition away from `Deleting`
+  before `DropTableIndex` removes the definition outright — that is a
+  narrower invariant than "commit-wait polls are safe to pin to an exact
+  status," not a counterexample to this lesson. General rule: when a
+  commit-wait's target value can itself be mutated again by some other
+  loop before the waiter's next poll, wait on the mutation that is
+  monotonic/permanent (existence, a monotonic counter, a specific id) —
+  never on a value a *different* proposer can race past.
+  (`animusd/src/dynamo.rs::create_index`, 2026-08-15.)
 
 ### Code patterns
+- **A cross-crate deletion stack must be grouped by MECHANISM (producer
+  symbol + every consumer + every test asserting the behavior), not by
+  crate — a crate-scoped rung of one logical deletion is structurally
+  incapable of staying green, at both gates that matter.** Removing tablet
+  merge (ADR 0044, split-only tablets) was first planned as "PR1:
+  animus-cp-data deletes the reconciler's Absorb/WidenScope, PR2:
+  animus-control deletes `MergeTablets`, PR3: animusd/CLI deletes the wire
+  surface" — a clean-looking crate-by-crate split that turned out to be
+  unbuildable/untestable at every intermediate rung, for two independent
+  reasons discovered in sequence:
+  1. **Compile-time**: deleting `animus_cp_data::host::MetadataView`'s
+     `merged`/`absorbed_by` fields is invisible to `cargo build -p
+     animus-cp-data` (a pub field with no internal reader triggers no
+     dead-code lint — the crate can't see whether some *other* crate reads
+     it) and passes `cargo test -p animus-cp-data` fully green, then breaks
+     `animusd::lib.rs`'s `MetadataView { merged: .., absorbed_by: .., .. }`
+     struct literal with `E0560` the moment `cargo build --workspace` runs
+     — the same failure shape the "grep every gating match site when adding
+     a variant to a replicated/forwarded command enum" lesson (below)
+     already warns about for *enum* variants, generalized to plain *struct
+     fields*, and to *deletion* rather than addition.
+  2. **Run-time, and much easier to miss**: even after fixing the struct
+     literal so the workspace *builds*, `cargo test --workspace` still
+     failed — on real end-to-end `animusd` integration tests
+     (`tests/tablet_merge.rs` in full, one test in `tests/split_cluster.rs`,
+     one in-crate test in `index_drain.rs`) that call the *admin/wire*
+     surface (`POST /admin/tablet/merge`, still fully present and
+     functional) to commit a real `MetaCommand::MergeTablets`, then assert
+     on the *data-plane* consequence (`HostAction::WidenScope`/`Absorb`
+     actually widening the survivor's scope) that PR1 had just deleted. The
+     command's own admin/CLI/wire plumbing compiles and runs fine in
+     isolation — it is a specific downstream *test's assertion*, not a
+     symbol reference, that silently depends on a mechanism owned by a
+     different crate. No `grep`-for-a-symbol technique catches this class;
+     only actually running the test suite does, and the failure reads
+     exactly like an unrelated flake (a `"key .. outside tablet's current
+     range; retry"` or "expected the absorbed sibling's own row" panic)
+     until traced back to the deleted mechanism.
+  A `cargo build -p <this-crate>` / `cargo test -p <this-crate>` pair going
+  green is evidence the crate's *own* logic is internally consistent —
+  **it is not evidence the deletion is safe**, for either compile-time or
+  run-time consumers, whenever the mechanism being deleted has callers
+  outside the crate. **The fix**: plan (and land) a cross-crate deletion as
+  one rung per *mechanism* — producer symbol, every downstream construction
+  site, and every test anywhere in the workspace that asserts the deleted
+  behavior, all in one change — not one rung per crate. `cargo build
+  --workspace --all-targets` **and** `cargo test --workspace` are the two
+  gates that actually prove it, and both must run (and their output
+  actually read, not just "exit code 0 assumed") even when a task's stated
+  scope is "one crate only" — a green `-p` run proves nothing about a
+  sibling crate's literals or its test assertions. When a genuine
+  intermediate red state seems unavoidable, that is itself the signal the
+  rung boundary is wrong (regroup by mechanism), not a cost to accept and
+  document around.
+- **A rustdoc comment naming a deleted *file* or *function* by string is
+  invisible to every compiler gate — `grep` for the deleted symbol's bare
+  name, not just its `Rust`-identifier occurrences, after any deletion.**
+  While deleting `MergeTablets` (ADR 0044 PR2), `grep -rn "MergeTablets\|
+  merged_tablets\|absorbed_by"` cleanly found every real reference, but a
+  separate case-insensitive sweep for the bare word `merge` turned up doc
+  comments in `animusd/src/lib.rs` still naming `tests/tablet_merge.rs` (a
+  file PR1 had already deleted) and describing a "merge crossover"/
+  "merge-residue cursor-row cleanup" that a *different*, already-deleted
+  function used to handle — none of it a compile error, since `rustc` never
+  parses doc-comment prose for symbol references. The fix is procedural:
+  after grepping for and fixing every exact-symbol match, do one more
+  broad, case-insensitive grep for the deleted mechanism's plain-English
+  name across every file actually touched (not the whole workspace, which
+  turns up too many unrelated senses of a common word like "merge" — LSM
+  merge, git merge, `StorageEngine::merge`) and read each hit for staleness,
+  not just symbol presence.
+- **A doc comment naming its own caller by name goes stale the moment that
+  caller is deleted — even in a completely different crate, in a PR that
+  never touches the file carrying the comment.** Deleting `MergeTablets`
+  and its wire surface (PR2, `animusd::index_drain::
+  cleanup_merge_residue_cursor_rows`) silently orphaned doc comments one
+  crate away, in `animus-cp-data` — a crate PR2's own diff never touched —
+  naming that exact function as "the caller" of `cursor::token_of` and
+  `RaftKvNode::cursor_rows_with_token` (`cursor.rs`/`lib.rs`). Both
+  primitives still compiled, still had a unit-test caller
+  (`tests/cursor_scope.rs`), and their own crate's build/clippy/test gates
+  all stayed green — nothing about deleting a caller in one crate makes a
+  *different* crate's doc comment describing that caller fail any gate.
+  **General check for any deletion PR: grep every file the deletion
+  touches for "no longer exists" callers of its own, but also grep the
+  *deleted symbol's own name* workspace-wide one more time after the PR
+  — a hit outside the files you touched is a doc comment describing a
+  caller that is now fiction, in a crate the deletion diff never had a
+  reason to open.**
 - **Derived numbering from "the highest currently-present entry" is only
   safe for an append-only collection — the moment anything in the system
   starts physically *removing* old entries, that derivation can silently
@@ -3156,82 +3309,19 @@ debugging anything that feels like it might have happened before.
   independent tables (`tests/decommission.rs` uses three, mirroring
   `tests/seed_join.rs`'s `TABLES`), so the pre-growth distribution is
   imbalanced enough to guarantee at least one move onto the new node.
-- **When two different root causes produce the identical observable absence,
-  don't try to reconstruct which one happened from the remaining state —
-  record an explicit signal at the moment the distinction is still known.**
-  Wiring tablet merge (ADR 0033, the data-plane dual of ADR 0028's split), a
-  per-node reconciler observing "a tablet I used to host vanished from the
-  replicated tablet map" must react completely differently depending on
-  *why*: merged into a sibling (tear the group down, but the data is still
-  live — a survivor now serves it on the same shared engine, so **never
-  erase**) vs. the whole table dropped (tear down **and erase** — nothing is
-  left to serve that range). Both produce the exact same absence from
-  `Metadata.tablets`, and the tempting inference — "does some other tablet's
-  range now cover mine, so it must be a merge survivor" — is unsound: two
-  different tables' still-unsplit tablets can have byte-identical default
-  ranges (`KeyRange::whole()`), and by the time the reconciler is deciding
-  what to do, the vanished tablet's own table identity is gone from view too
-  (it's not in the map anymore), so there's no way to disambiguate a
-  same-table survivor from an unrelated table's coincidentally-matching
-  tablet. The fix was a tiny, explicit, **permanently-retained** replicated
-  marker (`Metadata::merged_tablets: BTreeSet<TabletId>`, ADR 0033) set at
-  the one moment the distinction is unambiguous (the `MergeTablets` apply
-  itself, which knows exactly which tablet it just absorbed) — cheap because
-  tablet ids are never reused (so the marker never needs pruning and can
-  never resurrect a wrong decision for a later id), and correct by
-  construction instead of by inference. **General check when a planner reacts
-  to "X disappeared" from a coarser view: are there multiple legitimate
-  reasons X can disappear that demand different actions, and if so, is there
-  actually enough information left in the coarser view at decision time to
-  tell them apart — or does the distinguishing fact need to be captured
-  explicitly, closer to where it was still known, even at the cost of a
-  small permanent marker?** (`animus-control::Metadata::merged_tablets`;
-  `animus-cp-data::host::{HostAction::Absorb, MetadataView::merged}`.)
-- **Tearing down a Raft group whose data will keep being SERVED (not erased)
-  must drain the group's committed log into the engine first — `shutdown()`
-  halts the async apply task at its next loop-top check WITHOUT draining, and
-  deleting the group's WAL then destroys the only local copy of the
-  committed-but-unapplied tail.** Found via ADR 0033's own 3-node merge
-  integration test flaking ~1-in-5 *in isolation* (per the standing rule, a
-  flaky `ProdEnv` test is a real bug): a write acked by the absorbed group's
-  leader right before the merge was applied to *that leader's* engine (ack
-  requires leader-local apply) but not yet to a follower's — commit-index
-  propagation runs up to one heartbeat behind, while the reconciler's
-  event-driven `metadata_watch` fires the `Absorb` teardown on the very
-  commit that made the merge visible, i.e. *designed* to race that window.
-  The follower's engine then permanently lacked the acked key, and if that
-  node hosted the merge survivor's leader, linearizable reads answered a
-  definitive "key absent" forever — indistinguishable from data loss. The
-  same non-draining shutdown is **harmless for `Release`/`Reclaim`** (their
-  teardowns erase the data anyway; other replicas serve) — which is exactly
-  why it was never noticed: the invariant "a torn-down group's unapplied
-  tail doesn't matter" was true for every teardown that existed before merge
-  added one whose data lives on. Three-part fix, each load-bearing: the
-  `Absorb` teardown drains (commit covers the local log, engine-applied
-  covers commit) while the driver is still live; `plan` defers the
-  survivor's `WidenScope` until the absorb confirms (drain-before-widen —
-  the planner's fixed emission order alone would have widened *first*); and
-  the read path stopped conflating two "None"s — a ReadIndex barrier
-  failure and a genuinely-served absent — plus gained the read-side dual of
-  ADR 0028's pre-propose range check (a get/scan whose group's live
-  `scope_range()` doesn't contain the request errors retryably; for scans
-  the un-widened scope was otherwise a *silent truncation*, since
-  `linearizable_scan` filters rows through the live scope). **Two general
-  checks: (1) when a new feature makes a previously-universal teardown
-  invariant ("this group's data dies with it") false for one new path, audit
-  the teardown's every step against the new path — the WAL delete that was
-  cleanup before is data loss now; (2) grep read paths for `Option`-collapse
-  points where "couldn't serve" and "served: absent" merge into one value —
-  the Get/Scan arm asymmetry (Get mapped `None` to absent, Scan mapped it to
-  an error) was the tell.** The deterministic regression drives the write →
-  merge-view tick with zero intervening sim time, so the apply task provably
-  hasn't run — no wall-clock race needed.
-  (`animus-cp-data::host::Reconciler::teardown`'s Absorb drain + `plan`'s
-  `absorbing` gate; `RaftKvNode::linearizable_get_served`; `animusd`
-  `cp_get_local`/`cp_scan_local`; regressions:
-  `reconciler_corpus.rs::scenario_merge_widens_and_absorbs`,
-  `host::tests::widen_is_deferred_while_the_absorbed_sibling_is_still_hosted`,
-  `animusd` `split_fence_tests`' read/scan duals.)
+- **Superseded by ADR 0044** (tablet merge removed entirely —
+  `Metadata::merged_tablets`, `HostAction::Absorb`/`MetadataView::merged`
+  no longer exist). Archived verbatim in
+  `docs/engineering-lessons-archive.md`'s "Superseded by ADR 0044" section;
+  the still-general lesson: **distinguish two structurally-identical
+  vanish-reasons with an explicit marker, never infer one from the
+  remaining state.**
+- **Superseded by ADR 0044** (tablet merge removed entirely — the `Absorb`
+  teardown this entry's drain-before-halt fix lived in no longer exists).
+  Archived verbatim in `docs/engineering-lessons-archive.md`'s "Superseded
+  by ADR 0044" section; the still-general lesson: **a teardown that
+  deletes local state must drain first if that state is about to be served
+  elsewhere.**
 - **A "weighted median via one accumulate-and-threshold pass" is only correct
   when no single item can dominate half the total weight — once one can,
   scan every achievable cut point and pick the closest to half, don't commit
@@ -3451,83 +3541,14 @@ debugging anything that feels like it might have happened before.
   already exist" rule: before trusting a doc's "X uses this," grep for the
   consumers, not the definition. A doc-staleness audit is cheapest done per
   mechanism ("who calls this?") rather than per claim.
-- **CONFIRMED and fixed: a suspected latent cross-group LWW version hazard on
-  split/merge (flagged in a PR #90 review comment) was real** — every tablet
-  a node hosts shares one physical `StorageEngine` (ADR 0026/0028), and
-  `animus-cp-data` stamps each write's MVCC version as its **own** group's
-  local Raft log index, which restarts low/independent for a fresh group. A
-  split's new sibling could carry a version no higher than what the *source*
-  group already stamped for a key now in the sibling's range; a merge
-  survivor's group keeps running but starts serving keys the absorbed
-  sibling's group versioned under a different, unrelated sequence. Either
-  way `StorageEngine::merge`'s per-key LWW silently no-ops the write (loud,
-  not silent corruption — the confirm loop's poll-for-exact-value-equality
-  times out — but the write never lands). Reproduced directly at the
-  `RaftKvNode` level with no control-plane machinery needed: write a key
-  through a whole-keyspace group at a high index, narrow it away, start a
-  **fresh** sibling group over the *same* shared engine scoped to that key's
-  range, write the key again — silently dropped
-  (`animus-cp-data/tests/cross_group_lww.rs`).
-  **Design space explored, and why the obvious-looking alternatives don't
-  work**: (1) seeding a fresh/widened group's floor from a **live,
-  per-replica** read (`storage.latest_version()`, or "whichever
-  `next_tablet_id` counter value happens to be current when this replica's
-  own tick fires") looks tempting since it needs no schema change, but two
-  *different replicas of the same group* can observe different values at
-  slightly different real-world moments — and since the group's `RaftCore`
-  log-index numbering (Host) or an already-running group's live floor
-  (merge's widen) must be **byte-identical across every replica** applying
-  the same command, a per-replica-timing-dependent floor either breaks Raft
-  log-matching outright (Host: divergent `snapshot_index` bases before any
-  election) or makes two replicas stamp *different* versions for the
-  identical committed write (merge: a bare local read has no cross-replica
-  agreement at all). (2) Using the **tablet's own id** as the floor works
-  cleanly for split (a fresh sibling's id is always allocated *after*, hence
-  numerically greater than, the source's) but not for merge in general: `left`
-  and `right` are chosen by **key-range adjacency**, not id order — a tablet
-  re-split from the *middle* of an existing chain mints a new id that can be
-  *numerically larger* than an unrelated tablet further right in key-range
-  order, so a later merge of that pair can have `right.id > left.id`, and
-  "bump past `right`'s id" would then either be a no-op or, worse, could
-  someday design itself into `left` permanently unable to out-version
-  `right`'s history. **The fix that actually holds**: a `version_floor: u64`
-  field on `animus_tablet::Tablet` itself (shared by both planes' `Tablet`
-  type, so no projection duplication needed) — `0` by default (byte-identical
-  to today, `#[serde(default)]` for back-compat), bumped **once, by the
-  control plane's own deterministic `apply`** at exactly the two moments a
-  cross-group version collision can occur: `SplitTablet` sets the new
-  sibling's floor to `source.version_floor + 1` (always exceeds anything the
-  source could have stamped, since a group's own local index realistically
-  never approaches the scale factor between rescopes — auto-split already
-  caps a tablet's key/byte count long before that); `MergeTablets` bumps the
-  surviving `left`'s floor to `max(left, right) + 1` (exceeds *both* sides,
-  closing the "which id is bigger" trap the id-based scheme fell into). Every
-  data replica reads this **already-agreed, replicated** value from
-  `Metadata`/`MetadataView` at `Host`/`WidenScope` time — never computes it
-  locally — so it is identical across replicas by construction, the same
-  discipline as every other epoch-CAS'd placement fact in this codebase.
-  `RaftKvNode`'s actual stamped version is `floor * SCALE + local_index`
-  (`effective_version`, `SCALE = 2^40`) — a group's own log index is
-  completely untouched (no Raft log-matching risk at all; `engine_applied`
-  still tracks the raw index), only the *storage-layer version number it
-  stamps* changes, and only for a tablet that has actually been through a
-  split/merge. **General lesson: when a per-group monotonic counter (a Raft
-  log index, a local sequence number) is reused as a version/ordering token
-  that must compare correctly *across* groups whose identities can change
-  over time (a split/merge/rebalance lineage), the floor that keeps groups
-  from colliding must be a value every replica reads identically from
-  already-replicated state — never derived from a live per-replica read (even
-  a "conservative always-safe upper bound" one), and the exact arithmetic
-  direction (which side's id/floor can legitimately end up numerically larger)
-  needs checking against the *actual* pairing rule (adjacency, not allocation
-  order) before trusting an id-based shortcut.** (`animus_tablet::Tablet::
-  version_floor`; `animus-control::meta.rs`'s `SplitTablet`/`MergeTablets`
-  apply; `animus-cp-data::RaftKvNode::start_hosted_with_floor`/
-  `bump_version_floor`/`effective_version`; regressions in both crates —
-  `animus-cp-data/tests/cross_group_lww.rs`,
-  `animus-control::meta::tests::{split_tablet_seeds_the_new_siblings_version_
-  floor_past_the_sources, merge_tablets_bumps_the_survivors_version_floor_
-  past_both_sides}`.)
+- **Superseded twice over** — `version_floor`, the cross-group LWW-version
+  fix this entry documents, was retired by ADR 0018 PR2's range-seal design
+  (an ordering-based fence replaced the version-space separation it relied
+  on) independently of tablet merge, and the `MergeTablets` half of it was
+  then deleted outright by ADR 0044. Archived verbatim in
+  `docs/engineering-lessons-archive.md`'s "Superseded by ADR 0044" section;
+  no still-general lesson pointer needed — the mechanism is retired, not
+  just merge's half of it.
 - **A one-pass ADR-vs-code drift audit needs to check three distinct places for
   each "future work"/"deferred" claim, not just the ADR line the grep hit —
   and a claim can go stale for two structurally different reasons.** Sweeping
@@ -4097,75 +4118,14 @@ debugging anything that feels like it might have happened before.
   causes the leak.** (`RaftKvNode::next_ceiling_candidate`,
   `crates/animus-cp-data/src/lib.rs`; regression in
   `tests/ts_cache.rs`'s amortization test.)
-- **`animusd/tests/split_cluster.rs`'s two failures (`split_and_merge_over_a_
-  split_deployment`, `decommission_racing_a_tablet_split_converges_with_no_
-  data_loss`) were both 100%-deterministic in a genuine multi-process
-  control-only + data-only deployment, tracing to one design gap in the ADR
-  0018 §2 amendment's range-seal handoff (`animus-cp-data/src/host.rs`).**
-  The seal proposal (`propose_seal`) used to be a **one-shot side effect
-  bundled into the same tick as the local, irreversible action it was
-  supposed to precede** — `NarrowScope`'s local scope mutation (leader-gated
-  propose inline) or `Absorb`'s teardown (leader-gated propose, then a
-  drain-wait gated only on "nothing pending locally"). Two related bugs
-  followed from that one shape:
-  1. **A one-shot side effect hung off a self-erasing trigger never
-     retries — make the trigger a persistent, re-derived condition
-     instead.** `NarrowScope`'s local `narrow_scope()` call ran
-     unconditionally, regardless of leadership; the paired seal-propose call
-     only fired if this same replica *also* happened to be leader at that
-     exact tick. Since narrowing immediately makes the triggering mismatch
-     (`t.range != current`) vanish on that replica, a replica that narrowed
-     while a *follower* and was only *later* promoted to leader had no
-     second chance — the condition that would have re-triggered the attempt
-     was already gone, permanently, even though the actual precondition
-     ("does a covering seal exist yet") hadn't changed at all. Fixed by
-     computing the seal-pending condition fresh every tick
-     (`TabletFacts::pending_seals`, an async engine scan independent of
-     local scope/teardown state) and turning it into its own action
-     (`HostAction::ProposeSeal`), so whichever replica eventually holds
-     leadership gets its chance regardless of when leadership shuffles
-     relative to the local mutation.
-  2. **An irreversible local action ordered after a distributed action must
-     gate on committed evidence of that action, not on local progress.**
-     `Absorb`'s teardown considered itself free to tear down (delete the
-     only local copy of the group's Raft WAL) once "nothing pending
-     locally" — a check a quiescent follower satisfies trivially *before
-     the leader has even proposed the seal*. A fast follower could
-     therefore destroy its own voter before the seal ever committed,
-     dropping the group below quorum and permanently stranding the
-     leader's own, now-orphaned proposal (accepted locally, never able to
-     commit again). Fixed by additionally requiring a **locally-observed
-     committed** seal (the same `seal_covers` engine scan) before a replica
-     may tear down — not "distributed progress inferred from local state,"
-     the actual distributed fact itself. This gate is self-supporting, not
-     a deadlock: requiring every absorbed replica to stay up until it
-     observes the seal is exactly what keeps the quorum needed to commit
-     that seal alive in the first place; a genuinely quorum-dead group (an
-     unrelated double failure) correctly stalls loudly instead of tearing
-     down early — the same correctness-over-liveness call this system makes
-     everywhere else a durability/visibility gate is at stake.
-  **Diagnostic method**: reproduced deterministically (3/3 identical
-  failures, not contention-gated) in isolation first, then added temporary
-  `eprintln!`s directly at the two decision points (`Reconciler::teardown`'s
-  Absorb `fully_drained` check and propose-seal call; `gather_facts`'s
-  `parent_seal_observed` computation and `NarrowScope`'s propose-seal call)
-  and re-ran each failing test once — the trace immediately showed a
-  follower reaching "fully drained" with `commit == log_end` (nothing to
-  wait for) *before* any "leader proposing seal" line ever printed for test
-  1, and zero "leader proposing narrow-seal" lines across the entire ~150-
-  tick run for test 2 — the same per-call-site `eprintln!` idiom the prior
-  HLC witnessing-chain bug's entry above used, applied to a completely
-  different subsystem. Confirmed the fix by reverting just the source file
-  (keeping the new tests) and re-running: both new `reconciler_corpus.rs`
-  scenarios fail against the unfixed code, pass against the fixed code.
-  Regression: `animusd/tests/split_cluster.rs`'s original pair (the
-  real-world acceptance) plus two new deterministic `SimEnv` scenarios in
-  `animus-cp-data/tests/reconciler_corpus.rs` that force the exact
-  interleaving by hand (`absorb_follower_waits_for_committed_seal_before_
-  tearing_down`, `narrow_seal_survives_a_late_promotion_after_narrowing_
-  as_a_follower`) — see `animus-cp-data/CLAUDE.md`'s range-seal and
-  Absorb-drain invariant entries, and ADR 0018's PR2 amendment corrective
-  note #2, for the full mechanism.
+- **Superseded by ADR 0044** (tablet merge removed entirely — the
+  `split_and_merge_over_a_split_deployment` test and the `Absorb` teardown
+  half of this postmortem no longer exist). Archived verbatim in
+  `docs/engineering-lessons-archive.md`'s "Superseded by ADR 0044" section;
+  the still-general lesson: **the seal-ordering fix generalizes to split's
+  `NarrowScope` gating, which is still live** — see `crates/animus-cp-data/
+  CLAUDE.md`'s range-seal invariant entry for the mechanism as it stands
+  today.
 - **A marker key that must live *inside* an existing `StorageScope` (not
   engine-global) needs a different disjointness proof than "reserve a
   name no user schema may claim"** (ADR 0018 §2/PR3, the txn record). The
@@ -4766,6 +4726,119 @@ debugging anything that feels like it might have happened before.
   execute_routed`, then pointing both the edge and the admin proxy at it.
   (`crates/animusd/src/dynamo.rs::execute_routed`; `crates/animusd/src/
   admin.rs::action_data_dynamo`; ADR 0042 §3, 2026-08-14.)
+- **A "confirm by re-reading the value I just wrote" helper silently assumes
+  the caller can predict that value's key ahead of the propose call — check
+  that before reusing it for a new write shape.** `animusd::index_drain`'s
+  existing confirm helpers (`cp_kind_write_raw`'s last-write probe,
+  `cp_kind_local`'s base-row probe) all poll `local_get_kind`/`local_get`
+  for an exact `(kind, key, expected value)` the *caller* chose before
+  proposing. The ADR 0045 §2 backfill seeder needed to propose a
+  `KvCommand::KindBatch` carrying **only** a change-log entry (no base/kind
+  write at all) — and a change-log key's trailing HLC suffix is minted
+  *inside* the propose call, under the group's own lock
+  (`RaftKvNode::propose_ordered`), specifically so it agrees with the
+  entry's log position. There is structurally nothing for the caller to
+  predict and poll for. Reusing either existing helper here would have
+  meant either faking a probe key (wrong — it wouldn't be the real
+  change-log key) or skipping confirmation and acking on `Accepted` alone
+  (wrong — ADR 0009's own "`Accepted` means appended, not committed" rule).
+  The fix was a new confirm shape: `engine_applied_index() >= index` after
+  a genuine `ProposeResult::Accepted { index }` — the same confirm-by-index
+  primitive linearizable reads themselves already gate on, not a new
+  invention. General rule: a confirm-by-probe helper's soundness depends on
+  the caller being able to name the exact key/value the write produces
+  *before* proposing it; a write whose own content is decided inside the
+  propose call (a minted timestamp, a server-assigned id) needs
+  confirm-by-index instead, and the two are not interchangeable by
+  accident — check which one the write actually needs, don't default to
+  copying the nearest existing helper's shape. (`crates/animusd/src/
+  index_drain.rs::seed_change_log_record`; ADR 0045 §2, 2026-08-15.)
+- **A generic "one fence covers every kind in this batch" rule is only sound
+  for keys whose byte value actually falls inside the tablet's own live
+  range — a kind-scoped *bookkeeping* key (not real user data) can silently
+  violate that assumption even though it structurally belongs to this
+  tablet.** ADR 0045 §2's backfill-seeder cursor advance
+  (`ctx.cp_kind_write_raw`, whose fence is always `leader.scope_range()`,
+  the tablet's *current live* range) was rejected as "outside this group's
+  live range" on *every* real split, at every seed, with no fault injection
+  needed — found by `animus-test/tests/backfill_fault_corpus.rs`'s very
+  first run of its split cells (`concurrent_split_during_backfill`/
+  `split_after_tablet_already_reported_done`), which hung forever ("backfill
+  sweep never reached its end after 10,000 ticks") rather than failing
+  loudly, because the *data* seed writes (keyed by real base keys, which do
+  satisfy the fence) kept silently succeeding while only the *cursor's own
+  persistence* failed — restarting the sweep from scratch every tick instead
+  of resuming, masked in every prior test by tables small enough that one
+  tick's `BACKFILL_SEED_BATCH` (256) covers a whole side in one pass
+  regardless. Root cause: `cursor::cursor_key` truncates its `range_start`
+  argument to a bare `TOKEN_BYTES`-wide token (`cursor::token_of`) — sound
+  for the key's own *disjointness* proof (never collides with a real
+  client key) but **not** for range-*containment*: a split's own
+  `split_key` is essentially never token-aligned (chosen from real row
+  content, never the hash ring), so the truncated cursor key sorts *below*
+  the child's own (longer) `range.start` the instant the byte right after
+  the token is non-zero — true of `escape(pk)`'s leading byte for
+  essentially any real partition key. Fixed by giving the cursor's own
+  advance write a dedicated path (`advance_backfill_cursor`, a direct
+  `group.put_kind_batch_fenced(.., KeyRange::whole())`, bypassing
+  `cp_kind_write_raw`'s auto-derived narrow fence entirely) — a cursor
+  row's identity is already fully captured by its own token (disjoint from
+  base data by row-kind, ADR 0041 §3) and immutable across a narrowing, so
+  it needs no range-fencing at all, the same reasoning `seal.rs`/
+  `ceiling.rs`'s engine-global markers already rely on for a *different*
+  flavor of range-independent bookkeeping key. **General check: before
+  reusing a "fence every key in this batch against the tablet's live
+  range" primitive for a *new* kind of key, ask whether that key's own byte
+  value is guaranteed to satisfy `range.contains` — a bookkeeping key
+  derived from a truncated/hashed/otherwise-transformed version of the
+  range boundary is not automatically safe just because it lives in a
+  disjoint row-kind scope.** Also worth naming: the pre-existing `"gsi"`
+  cursor tag has the *identical* underlying gap (its own cursor write goes
+  through the same `cp_kind_write_raw` path) but it is harmless there only
+  because that caller already tolerates a perpetually-`None` cursor as "just
+  reconcile everything, always correct" — a latent bug can be real for one
+  caller and merely a masked inefficiency for another, so "it works today"
+  is not evidence a shared primitive is fencing correctly for a new use.
+  (`crates/animusd/src/index_drain.rs::advance_backfill_cursor`; ADR 0045
+  §2/§3, 2026-08-15.)
+- **A convergent per-name cursor/checkpoint row that survives its owner's
+  deletion can silently poison a same-named recreation — audit every
+  "resume from where I left off" row for whether its *key* is unique to one
+  lifetime of the thing it tracks, not just to its current name.** The
+  backfill seeder's cursor row (`KIND_CURSOR`, tag `backfill:{index_name}`,
+  ADR 0045 §2) is keyed purely by index *name*. Dropping an index (ADR 0045
+  §5) removes its catalog entry and hidden table but, absent an explicit
+  fix, leaves that cursor row exactly where it was — harmless in isolation
+  (the row just describes a scan position for an index that no longer
+  exists), until a *later* `CreateTableIndex` proposes a **new** index
+  under the **same name**: its fresh seeder reads the old row, believes it
+  has "already scanned" up to the deleted index's old position, and skips
+  every partition before that point — the recreated index can flip
+  `Active` having backfilled *nothing*, a silent, non-crashing correctness
+  bug (the row is bytes-valid, just semantically stale). Two considered
+  fixes: (1) make the cursor's key incorporate something that changes
+  across a delete/recreate of the same name — not chosen here, since it
+  would touch the already-shipped `IndexDef` wire shape for a problem step
+  (2) closes with zero schema change; (2) **actively delete the row when
+  the owner is deleted**, chosen — but a *single* delete pass raced a
+  seeder tick that had already read the schema (as still-`Creating`) a
+  moment before the owner's deletion committed and could still write a
+  fresh, stale value *after* the delete. Closed the practical window by
+  running the delete twice (immediately after the status-`Deleting`
+  transition commits — after which the seeder's own gate excludes the
+  index from every *new* tick — and again at the very end of the drop
+  cascade), which is not a full formal proof but is the same
+  documented-residual-gap posture `cursor.rs`'s own module doc already
+  takes for a different byte-alignment gap; the create-drop-recreate
+  regression (`tests/update_table_drop_index.rs::create_drop_recreate_
+  same_index_name_backfills_from_scratch`) is the test that would catch a
+  regression here. **General rule: whenever a delete path removes the
+  *thing* a checkpoint row tracks but the checkpoint's own key could be
+  reused by a future recreation of the same name, either scope the key to
+  a value that can't repeat, or make deletion of the thing also delete the
+  checkpoint — "the row is harmless garbage" is only true until the name
+  comes back.** (`crates/animusd/src/index_drain.rs::clear_backfill_cursor`,
+  `crates/animusd/src/dynamo.rs::drop_index`; ADR 0045 §5, 2026-08-15.)
 
 ### Parallel-agent orchestration
 - **A stacked series' final "docs/ADR finalization" PR must treat the stack's
@@ -5035,7 +5108,8 @@ debugging anything that feels like it might have happened before.
     caller can depend on the guarantee via completely different code with no
     lexical connection to the mechanism providing it.
   - **A new field on a replicated state machine (`Metadata`) is not complete
-    until it's mirrored.** Adding `split_parents`/`absorbed_by` to
+    until it's mirrored.** Adding `split_parents` (and, at the time, its
+    merge-side counterpart `absorbed_by` — since removed, ADR 0044) to
     `Metadata` and updating `apply` was not enough — `animus-control`'s
     system-keyspace mirror (`syskv.rs`'s `EntityKind`, `mirror.rs`'s
     `apply_and_derive_mirror`/`apply_key_write`) has to independently learn
@@ -5254,3 +5328,37 @@ debugging anything that feels like it might have happened before.
   second caller's "compute X" from running between those two steps — if
   the answer is "nothing, but it's fine because X's own source is
   monotonic," that reasoning is the bug.
+- **Per-crate `CLAUDE.md` guides re-drifted past the 40K-char memory-file
+  warning by 2026-08-15, five days after the 2026-08-13 PR-changelog/
+  test-roster trim above — this time the dominant offender was a different
+  failure mode: restating a module's own `//!`/rustdoc doc comment**, not
+  narrating PRs. `animus-control`/`animusd`/`animus-cp-data` had each grown
+  a bullet (`meta.rs`, `segment_janitor.rs`/`index_drain.rs`,
+  `cluster_segment_store.rs`/`cursor.rs`) that duplicated, near-verbatim, an
+  80–95-line module `//!` doc the source already carried — and `animus-dynamo`
+  had grown a full method/type inventory per module that `cargo doc` already
+  renders. The doc comment and the guide bullet then drift independently the
+  next time either is edited, and a reader can no longer tell which one is
+  current. Fix, same shape as the 2026-08-13 trim: cut a duplicated
+  inventory/essay to a one-or-two-line pointer bullet ("what it is + see its
+  `//!` doc + ADR ref"), while keeping every gotcha/failure-contract/
+  prohibition verbatim (compressing surrounding prose is fine; dropping the
+  claim itself is not). Where a genuinely non-derivable contract lived
+  buried inside an otherwise-duplicative section (`animusd`'s DynamoDB
+  Streams wire-edge contracts and sealer-knob call-site detail — real
+  content, just misfiled under a module that also duplicated its own doc
+  comment), it was moved verbatim to a dedicated companion doc
+  (`docs/streams-notes.md`) rather than deleted, with the guide left holding
+  only a pointer. Trimmed `animus-control` 48.6K→29.6K, `animusd`
+  87.3K→52.5K (plus the new companion doc), `animus-cp-data` 60.1K→40.5K,
+  `animus-dynamo` 30.1K→15.6K, `animus-storage` 31.5K→26.4K (only its
+  test-narration section, per the 2026-08-13 lesson's own pattern) — several
+  landed above their aspirational target because the crate's actual
+  gotcha/invariant content, kept in full per the rule above, is simply
+  larger than the target for that crate. **General rule for review**: a
+  guide addition that could be produced by pasting a module's own doc
+  comment, or that `cargo doc`/`ls` already renders, is a sign to point at
+  that source instead of copying it — reject it the same way a
+  PR-changelog paragraph already gets rejected. A doc comment and a guide
+  bullet describing the same mechanism are not two independent sources of
+  truth; only one of them can be current. (2026-08-15.)

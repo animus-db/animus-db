@@ -219,8 +219,10 @@ the data at risk**, not **is anything in transition**. A tablet mid-formation �
 a split-child standing up its Raft group, a freshly-provisioned table's first
 election, a rebalance/repair move catching up, or plain reconciler/admin-fan-out
 lag — is not a data-risk state as long as every replica assigned to it is on a
-live node: per ADR 0028, split/merge/provision are each a single control-plane
-command with no data-plane half, so the data already sits safely in the source
+live node: per ADR 0028, split/provision are each a single control-plane
+command with no data-plane half (tablets are split-only, ADR 0044 — merge
+briefly existed under this same shape, ADR 0033, before being removed), so
+the data already sits safely in the source
 replicas' shared storage engines the whole time the new group is forming. That
 state renders as a neutral **`forming`** pill and does **not** degrade health —
 otherwise every routine split would read as an outage.
@@ -378,13 +380,14 @@ client-side SPA).
     (`GetShardIterator`/`GetRecords`) genuinely needs a local CP data plane;
     it degrades in-view instead (a note + a `consoleLink` to a live
     data/combined node), rather than hiding the whole tab. See
-    `animusd/CLAUDE.md`'s Streams-tab entries and `dashboard_streams.js`'s
-    own doc for exactly which ops work from a control-only node's admin
-    port and which don't (including a pre-existing backend gap this
-    surfaced but left unfixed: `GetRecords` on a sealed shard panics via
-    `ClientCtx::data()` there, and the open-shard path stalls ~10s before
-    failing — both because that path assumes a local CP data plane a
-    control-only node structurally never has).
+    `docs/streams-notes.md`'s Console Streams tab section and
+    `dashboard_streams.js`'s own doc for exactly which ops work from a
+    control-only node's admin port and which don't (including a
+    pre-existing backend gap this surfaced but left unfixed: `GetRecords`
+    on a sealed shard panics via `ClientCtx::data()` there, and the
+    open-shard path stalls ~10s before failing — both because that path
+    assumes a local CP data plane a control-only node structurally never
+    has).
 
 This ADR builds directly on ADR 0020 (the admin JSON surface it renders and the
 follow-up it fulfils), ADR 0018 (the transaction state it will visualize), ADR

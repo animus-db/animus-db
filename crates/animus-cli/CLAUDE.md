@@ -61,7 +61,6 @@ Mutating actions:
 
 ```
 split <admin-addr> <tablet> <split-key>        # ADR 0028 single-command split
-merge <admin-addr> <left> <right>              # ADR 0033 tablet merge
 flush|compact <admin-addr> <tablet>
 reconfigure <admin-addr> <tablet> <voter,voter,...>
 drain <admin-addr> <node-id>                   # ADR 0029/0032 release replicas

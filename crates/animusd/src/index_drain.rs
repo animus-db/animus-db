@@ -82,6 +82,95 @@
 //! doc for the full recovery argument (why a crash-retried re-seal of the
 //! identical `(tablet, epoch)` id is always safe).
 //!
+//! ## The backfill seeder (ADR 0045 §2)
+//!
+//! A fourth arm, run per led tablet for any table with at least one index
+//! currently `Creating`: **backfill is the GSI drain applied to every
+//! pre-existing key.** The moment `CreateTableIndex{status: Creating}`
+//! commits, `table_takes_kind_write_path` already flips to `true` for that
+//! table regardless of the new index's own status, so every write from that
+//! instant forward already leaves a genuine `KIND_CHANGE` record — no write
+//! *after* the index's declaration can ever be missed. The seeder's only job
+//! is covering rows that existed *before* that instant, by manufacturing the
+//! same kind of dirty marker a live write would have left.
+//!
+//! [`backfill_seed_tick`] sweeps this tablet's own `KIND_BASE` scope forward
+//! from a **backfill cursor** — a `KIND_CURSOR` row under the tag
+//! `format!("backfill:{index_name}")`, storing the raw last-seeded base-key
+//! prefix rather than a packed HLC (see [`animus_cp_data::cursor`]'s module
+//! doc for the two value conventions side by side) — enumerating **distinct
+//! partitions**, not items, via the same "bump the last byte" skip-ahead
+//! trick [`reconcile_partition`] already uses. For each newly-discovered
+//! partition (bounded to [`BACKFILL_SEED_BATCH`] per tick) it proposes a
+//! `KvCommand::KindBatch` carrying **only** a change-log entry for that
+//! partition's prefix — no base-row write — so apply stamps a fresh
+//! `hlc::pack(ts)` exactly like a live write's own change record, landing
+//! ahead of the `"gsi"` cursor watermark with **zero changes to
+//! [`drain_tablet`]/[`reconcile_partition`]**: a seeded record is, by
+//! construction, indistinguishable from one a live write would have
+//! produced. When a tick's sweep reaches the end of the tablet's *current*
+//! range, it (re-)proposes `MetaCommand::MarkIndexBackfilled` — a persistent
+//! condition re-derived every tick (mirroring the seal arm's own
+//! `ProposeSeal` discipline), not a one-shot side effect — which
+//! `animusd::index_backfill_loop` (a distinct control-leader-only loop, ADR
+//! 0045 §4) aggregates across every one of the table's current tablets to
+//! flip the index `Creating` → `Active`.
+//!
+//! **Why no record is lost or double-applied**: every partition that ever
+//! held a row gets at least one dirty-marker after `Creating` commits — from
+//! a live write (unconditional on status) or from the seeder's forward
+//! sweep, or (harmlessly) both. `reconcile_partition` never reads a change
+//! record's *content*; it re-derives desired index rows from a live scan of
+//! the partition's current base rows every time, so N dirty-markers collapse
+//! into "reconcile once more against current state" — backfill's only
+//! contribution is *coverage*, not a new correctness mechanism.
+//!
+//! **Per-index cursor, not one shared scan**: a table with two indexes
+//! simultaneously `Creating` runs this arm once per index, each against its
+//! own cursor row. A single shared scan marking every `Creating` index done
+//! together would need a separate stop condition per index anyway once they
+//! inevitably reach `Active` at different times (e.g. a later `UpdateTable`
+//! adds a second index while the first is still backfilling) — the per-index
+//! shape is simpler to reason about at the cost of re-scanning the same base
+//! rows once per concurrently-backfilling index, expected to be rare and
+//! short-lived.
+//!
+//! **Split-during-backfill (ADR 0044 split-only world, ADR 0045 §3 Fork A)**:
+//! deliberately **no** split-lineage cursor inheritance. A split's
+//! `narrow_scope` moves every kind scope (cursor rows included) together, so
+//! the *left* child keeps `range.start` and its cursor is found unchanged;
+//! the *right* child's own `cursor_key(new_start, tag)` reads empty and its
+//! sweep simply restarts from the beginning of its own (strictly narrower)
+//! range — unconditionally correct by the idempotence argument above, and
+//! geometrically bounded since children only ever get narrower. `plan()`'s
+//! completion detection is evaluated per-tablet against each tablet's
+//! *current* range (`animusd::index_backfill_loop`, reading `Metadata`
+//! fresh every tick), so a split after a tablet reports "done" simply
+//! reintroduces two not-yet-done children into the aggregator's next check —
+//! never a premature `Active` flip.
+//!
+//! **Leadership loss mid-scan**: the cursor row lives in the tablet's own
+//! `KIND_CURSOR` scope, replicated like any other write, so a newly elected
+//! leader resumes seeding from wherever the cursor was last durably
+//! advanced — nothing here assumes stable leadership across ticks, the same
+//! discipline every other arm in this loop already follows.
+//!
+//! **A known, deliberately out-of-scope interaction with Streams**: the
+//! synthetic change-log record a seeded partition gets carries no old/new
+//! image (`ChangeRecord { old_image: None, new_image: None, .. }`) — it
+//! exists purely as a dirty marker for the GSI drain, which never reads a
+//! record's content. If a table's stream happens to be enabled *while* a
+//! new GSI backfills against it (allowed — the two are orthogonal; see ADR
+//! 0045 §6 Fork C, which only rejects changing *both* in one `UpdateTable`
+//! call), that image-less record is a legitimate, decodable
+//! [`animus_dynamo::ChangeRecord`] that the seal arm will happily seal
+//! alongside real ones — a low-fidelity, no-image "phantom" event surfaces
+//! in `GetRecords` for exactly one row per pre-existing partition being
+//! backfilled. This is a documented limitation, not a crash risk (the
+//! record decodes fine); a follow-up could give the seeder's own marker a
+//! distinguishable shape so a Streams reader can filter it, if this proves
+//! disruptive in practice — named here rather than silently accepted.
+//!
 //! ## The hot-trim arm (ADR 0042 §8, ADR 0043 §A6, F10)
 //!
 //! Generalizes ADR 0041's original trim janitor: the GSI half is completely
@@ -98,6 +187,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_control::Metadata;
+use animus_control::ProposeResult;
 use animus_control::schema::{IndexDef, IndexKind};
 use animus_cp_data::cursor;
 use animus_cp_data::hlc::{self, HlcTimestamp};
@@ -105,14 +195,16 @@ use animus_cp_data::segment;
 use animus_cp_data::{KIND_CHANGE, KIND_CURSOR, KIND_FOOTPRINT};
 use animus_dynamo::wire;
 use animus_dynamo::{
-    AttributeValue, FootprintEntry, IndexFootprint, Item, index as dynamo_index, index_table_name,
-    is_index_table_name, storage_key,
+    AttributeValue, ChangeRecord, FootprintEntry, IndexFootprint, Item, index as dynamo_index,
+    index_table_name, is_index_table_name, storage_key,
 };
 use animus_env::{Clock, Metric};
+use animus_tablet::KeyRange;
+use animus_tablet::TOKEN_BYTES;
 use animus_tablet::TabletId;
 use animus_tablet::partition_token;
 
-use crate::{ClientCtx, CpGroup, MetaCommand};
+use crate::{ClientCtx, CpGroup, IndexStatus, MetaCommand};
 
 /// How often each node sweeps the tablet groups it leads for pending change
 /// records. A plain fixed interval, matching `txn_resolver_loop`'s own shape —
@@ -142,6 +234,19 @@ const HLC_BYTES: usize = 8;
 /// outsized Raft entry, mirroring `cp_batch_write_patient`'s own bounded-batch
 /// discipline.
 const TRIM_BATCH: usize = 256;
+
+/// How many newly-discovered partitions [`backfill_seed_tick`] seeds in one
+/// call (ADR 0045 §2) — bounds one tick's own worth of work, mirroring
+/// [`TRIM_BATCH`]'s discipline: a large pre-existing table's backfill catches
+/// up over many ticks, never one outsized burst.
+const BACKFILL_SEED_BATCH: usize = 256;
+
+/// How long [`seed_change_log_record`] waits for a proposed change-log-only
+/// `KindBatch` to apply before giving up (the caller's own seeding loop
+/// stops early and retries next tick) — matches [`SEAL_COMMIT_TIMEOUT`]'s
+/// generous budget for the same reason (a fresh cluster may still be
+/// electing a leader).
+const BACKFILL_SEED_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The **per-tablet change-consumer background task** (ADR 0041 §4, ADR
 /// 0042/0043), one per node — formerly `index_drain_loop`, renamed now that
@@ -173,10 +278,19 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             if is_index_table_name(&table) {
                 continue;
             }
+            // ADR 0045 §2: a `Creating` index already needs live-write
+            // materialization (no write after `CreateTableIndex` commits can
+            // ever be missed, regardless of the new index's own status) —
+            // widened from `Active`-only so `drain_tablet` maintains it too.
+            // `Deleting` stays excluded: that status is PR5's own signal for
+            // the drain/seeder to stop touching an index being torn down.
             let gsis: Vec<IndexDef> = meta
                 .table_indexes(&table)
                 .iter()
-                .filter(|i| i.kind == IndexKind::Global)
+                .filter(|i| {
+                    i.kind == IndexKind::Global
+                        && matches!(i.status, IndexStatus::Creating | IndexStatus::Active)
+                })
                 .cloned()
                 .collect();
             let stream_enabled = meta.table_stream(&table).is_some();
@@ -200,16 +314,31 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             // `drain_tablet` is GSI-specific (it reconciles GSI rows and
             // advances the `"gsi"` cursor) — never call it for a
             // streamed-but-unindexed table, or it would write a spurious
-            // `"gsi"` cursor row this table's schema never expects (a
-            // permanent, own-token unexpected row `cleanup_merge_residue_
-            // cursor_rows` deliberately does not clean up — see its own
-            // doc). A streamed-only table still needs the seal + trim arms
-            // below.
+            // `"gsi"` cursor row this table's schema never expects. A
+            // streamed-only table still needs the seal + trim arms below.
             if !gsis.is_empty()
                 && let Err(e) = drain_tablet(&ctx, &meta, &table, &group, &gsis).await
             {
                 tracing::debug!(tablet = tablet.0, table, error = %e, "index drain: tick failed");
                 continue; // don't trim behind a reconciliation pass that didn't complete
+            }
+            // The backfill seeder (ADR 0045 §2): one independent sweep per
+            // index currently `Creating` on this table, seeding dirty
+            // markers for its pre-existing rows. Run after `drain_tablet`
+            // so a partition this very tick just seeded already stands a
+            // chance of being reconciled in the same pass (not required for
+            // correctness — the next tick would pick it up regardless — but
+            // it converges an initial backfill measurably faster).
+            for idx in gsis.iter().filter(|i| i.status == IndexStatus::Creating) {
+                if let Err(e) = backfill_seed_tick(&ctx, &group, tablet, &table, idx).await {
+                    tracing::debug!(
+                        tablet = tablet.0,
+                        table,
+                        index = idx.name,
+                        error = %e,
+                        "backfill seeder: tick failed"
+                    );
+                }
             }
             if stream_enabled && let Err(e) = seal_tick(&ctx, &meta, &table, tablet, &group).await {
                 tracing::debug!(tablet = tablet.0, table, error = %e, "seal arm: tick failed");
@@ -433,6 +562,284 @@ async fn reconcile_partition(
         )],
     )
     .await
+}
+
+/// The consumer-tag convention for a backfill cursor row (ADR 0045 §2): one
+/// per index currently being seeded — see the module doc's "The backfill
+/// seeder" section for why a per-index cursor was chosen over one shared
+/// scan.
+fn backfill_tag(index_name: &str) -> String {
+    format!("backfill:{index_name}")
+}
+
+/// One backfill-seeder tick for one `Creating` index on one led tablet (ADR
+/// 0045 §2) — see the module doc for the full mechanism. Sweeps this
+/// tablet's own `KIND_BASE` scope forward from `idx`'s own backfill cursor,
+/// one iteration per **partition** (peeking exactly one row past the
+/// current scan position, rather than materializing a whole partition, to
+/// find the next partition boundary — the "bump the last byte" skip-ahead
+/// trick [`reconcile_partition`] already uses, applied one row at a time),
+/// seeding up to [`BACKFILL_SEED_BATCH`] newly-discovered partitions this
+/// call. When the sweep reaches the end of the tablet's *current* range,
+/// (re-)proposes `MetaCommand::MarkIndexBackfilled` — a persistent
+/// condition re-derived every tick, not a one-shot side effect: a
+/// crash-retried or not-yet-committed proposal is simply re-sent next tick,
+/// harmlessly (the apply arm's own insert is idempotent), and the caller
+/// keeps calling this until `idx`'s status itself flips away from
+/// `Creating` (this loop's own `gsis` filter stops selecting it the moment
+/// `animusd::index_backfill_loop` flips it `Active`).
+async fn backfill_seed_tick(
+    ctx: &ClientCtx,
+    group: &CpGroup,
+    tablet: TabletId,
+    table: &str,
+    idx: &IndexDef,
+) -> Result<(), String> {
+    let tag = backfill_tag(&idx.name);
+    let cursor_key_bytes = cursor::cursor_key(&group.scope_range().start, &tag);
+    let mut last_seeded: Option<Vec<u8>> = group
+        .local_get_kind(KIND_CURSOR, &cursor_key_bytes)
+        .await
+        .map(|bytes| cursor::decode_backfill_cursor(&bytes));
+    let mut scan_start: Vec<u8> = match &last_seeded {
+        Some(prefix) => dynamo_index::range_end(prefix),
+        None => Vec::new(),
+    };
+    let mut seeded = 0usize;
+    let mut reached_end = false;
+    while seeded < BACKFILL_SEED_BATCH {
+        let Some((key, _)) = group
+            .local_scan_from(&scan_start, 1)
+            .await
+            .into_iter()
+            .next()
+        else {
+            reached_end = true;
+            break;
+        };
+        let Some(prefix_len) = base_partition_prefix_end(&key) else {
+            // Malformed/truncated (defensive only — every `KIND_BASE` key
+            // here was written by `animusd::dynamo::item_key`): skip past
+            // this exact key via the standard immediate-successor trick
+            // (appending the smallest possible byte) rather than looping
+            // forever on it, and don't count it as a seeded partition.
+            scan_start = {
+                let mut next = key;
+                next.push(0x00);
+                next
+            };
+            continue;
+        };
+        let prefix = key[..prefix_len].to_vec();
+        let base_sk = key[prefix_len..].to_vec();
+        // No image content at all — see the module doc's "known interaction
+        // with Streams" note for why this is deliberate: the GSI drain
+        // never reads a change record's content (it re-derives from a live
+        // base-row scan), so this is purely a dirty marker.
+        let record = ChangeRecord {
+            base_sk,
+            old_image: None,
+            new_image: None,
+        }
+        .encode();
+        seed_change_log_record(group, prefix.clone(), record).await?;
+        scan_start = dynamo_index::range_end(&prefix);
+        last_seeded = Some(prefix);
+        seeded += 1;
+    }
+    if seeded > 0 {
+        let prefix = last_seeded
+            .as_ref()
+            .expect("seeded > 0 implies last_seeded was set in the loop above");
+        advance_backfill_cursor(group, cursor_key_bytes, prefix).await?;
+    }
+    if reached_end {
+        ctx.propose_schema(&MetaCommand::MarkIndexBackfilled {
+            table: table.to_owned(),
+            index: idx.name.clone(),
+            tablet,
+        })
+        .await;
+    }
+    Ok(())
+}
+
+/// Durably advance the backfill cursor for one index's tag to `prefix` — a
+/// direct, local propose+confirm against `group` (mirroring
+/// [`seed_change_log_record`]'s own shape), never `ctx.cp_kind_write_raw`,
+/// whose auto-derived fence is always this tablet's *current live* range.
+///
+/// **Why the cursor write must NOT be range-fenced** (a real bug this
+/// tablet-split/fault-injection corpus found, seed-reproducible at *every*
+/// seed, not just under fault injection — see `docs/engineering-
+/// lessons.md`): [`cursor::cursor_key`] truncates its `range_start`
+/// argument to a bare [`TOKEN_BYTES`]-wide token ([`cursor::token_of`]) —
+/// but a split's own `split_key` is essentially never token-aligned (it is
+/// chosen from real row content via the byte-weighted-median split point,
+/// never the hash ring), so a split child's own `range.start` is almost
+/// always *longer* than `TOKEN_BYTES`. Comparing the two lexicographically,
+/// the cursor key (`token || 0x00 || tag_byte || tag`) sorts *below* that
+/// child's own `range.start` the instant `range.start`'s own byte
+/// immediately past the token is non-zero — true of `escape(pk)`'s leading
+/// byte for essentially any real partition key — so `ctx.
+/// cp_kind_write_raw`'s ordinary fence-check (`fence.contains(cursor_key)`)
+/// rejected the cursor's own advance write as "outside this group's live
+/// range," silently, every single tick, forever (the error is logged and
+/// swallowed by `change_consumer_loop`'s own top-level `Err` handling).
+/// Data coverage itself was never at risk — the change-log seed writes
+/// above are keyed by a *real* base key that genuinely does fall inside
+/// the live range — only the cursor's own persistence was, so a split
+/// child's sweep silently restarted from scratch every tick instead of
+/// resuming from where it left off. The `"gsi"` cursor tag's own callers
+/// already tolerate this same underlying gap as a pure efficiency loss
+/// (`drain_tablet`'s watermark just stays `None`, meaning "reconcile
+/// everything," always correct, just not optimally incremental) — but for
+/// backfill specifically this was a **liveness** bug, not merely an
+/// efficiency one: a child with more than [`BACKFILL_SEED_BATCH`]
+/// partitions on its own side could never advance past that one batch's
+/// worth, restarting from position zero every tick forever, so it never
+/// reached its own end and the index never flipped `Active`. A cursor
+/// row's identity is already fully captured by its own *token* — disjoint
+/// from base data by row-kind (ADR 0041 §3) and immutable across a
+/// narrowing, since the token a tablet anchors never changes once minted —
+/// it needs no range-fencing at all, the same reasoning `seal.rs`/
+/// `ceiling.rs`'s engine-global markers already rely on for a *different*
+/// flavor of range-independent bookkeeping key.
+async fn advance_backfill_cursor(
+    group: &CpGroup,
+    cursor_key_bytes: Vec<u8>,
+    prefix: &[u8],
+) -> Result<(), String> {
+    let index = match group.put_kind_batch_fenced(
+        vec![(
+            KIND_CURSOR,
+            cursor_key_bytes,
+            Some(cursor::encode_backfill_cursor(prefix)),
+        )],
+        None,
+        KeyRange::whole(),
+    ) {
+        ProposeResult::Accepted { index } => index,
+        other => return Err(format!("backfill cursor advance not accepted: {other:?}")),
+    };
+    let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if group.engine_applied_index() >= index {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("backfill cursor advance did not apply in time".into())
+}
+
+/// Delete `index`'s own backfill cursor row on `group`'s tablet (ADR 0045
+/// §5 step 3 of the drop-index cascade) — a tombstone write via the same
+/// [`put_kind_batch_fenced`](CpGroup::put_kind_batch_fenced) primitive
+/// [`advance_backfill_cursor`] uses to advance the row, unfenced
+/// (`KeyRange::whole()`) for the identical reason documented on that
+/// function: a cursor row's identity is its own token, independent of this
+/// tablet's *current* live range. Idempotent — deleting an already-absent
+/// row is a harmless no-op tombstone (the same committed-order guarantee
+/// every other apply-time delete in this codebase relies on).
+///
+/// **Why this exists at all**: `change_consumer_loop`'s `gsis` filter
+/// excludes `Deleting`, so once an index's `SetIndexStatus{Deleting}`
+/// commits, [`backfill_seed_tick`] never runs for it again — but the last
+/// value it wrote under `backfill:{index}` survives in `KIND_CURSOR`
+/// forever unless something explicitly removes it. Left alone, a *later*
+/// `CreateTableIndex` proposing the exact same index name would have its
+/// own fresh seeder read that stale row and silently resume "scanning" from
+/// the deleted index's own old position — skipping every partition before
+/// it for a backfill that is supposed to start from scratch. Called (via
+/// `ClientCtx::clear_backfill_cursor_for_table`, forwarded per tablet like
+/// [`seal_now`]) from `dynamo.rs::drop_index`'s own cascade — see that
+/// function's doc for exactly when and why twice.
+pub(crate) async fn clear_backfill_cursor(group: &CpGroup, index: &str) -> Result<(), String> {
+    let tag = backfill_tag(index);
+    let cursor_key_bytes = cursor::cursor_key(&group.scope_range().start, &tag);
+    let propose_index = match group.put_kind_batch_fenced(
+        vec![(KIND_CURSOR, cursor_key_bytes, None)],
+        None,
+        KeyRange::whole(),
+    ) {
+        ProposeResult::Accepted { index } => index,
+        other => return Err(format!("backfill cursor clear not accepted: {other:?}")),
+    };
+    let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if group.engine_applied_index() >= propose_index {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("backfill cursor clear did not apply in time".into())
+}
+
+/// Find the length of `token || escape(pk)` at the front of a raw
+/// `KIND_BASE` key — this tablet's own partition-prefix boundary, given only
+/// that the key's first `TOKEN_BYTES` are the ADR 0022 token and
+/// [`animus_dynamo::escape`]'s encoding starts right after: every literal
+/// `0x00` byte in `pk` is doubled to `0x00 0x01`, and the whole segment
+/// terminates `0x00 0x00`. Mirrors `animus_dynamo::index`'s private
+/// `peel_escaped` (not reusable across the crate boundary) but only tracks
+/// the boundary position, never decoding the segment's content — the
+/// seeder only needs to know *where* a partition's rows stop, not what its
+/// key actually was.
+///
+/// `None` on a malformed/truncated key (defensive only — every key this
+/// scans came from this tablet's own `KIND_BASE` scope, written by
+/// `animusd::dynamo::item_key`).
+fn base_partition_prefix_end(key: &[u8]) -> Option<usize> {
+    let mut i = TOKEN_BYTES;
+    while i < key.len() {
+        if key[i] != 0x00 {
+            i += 1;
+            continue;
+        }
+        match key.get(i + 1)? {
+            0x01 => i += 2,
+            0x00 => return Some(i + 2),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Propose (and confirm) a single synthetic change-log record for the
+/// backfill seeder ([`backfill_seed_tick`]) — a `KvCommand::KindBatch`
+/// carrying **no base-kind write**, only the change-log entry, so apply
+/// stamps a fresh `hlc::pack(ts)` exactly like a live write's own
+/// `KindBatch` would.
+///
+/// Unlike every other confirm path in this module (which probes a value it
+/// itself chose), there is nothing to poll back here: the change-log key's
+/// own trailing HLC suffix is minted *inside* the propose call, under the
+/// group's own lock (`RaftKvNode::propose_ordered`), so the caller can't
+/// construct it ahead of time to look for. Confirms by index instead
+/// (`engine_applied_index() >= index`) — the same confirm-by-index primitive
+/// linearizable reads themselves gate on.
+async fn seed_change_log_record(
+    group: &CpGroup,
+    change_log_prefix: Vec<u8>,
+    record: Vec<u8>,
+) -> Result<(), String> {
+    let fence = group.scope_range();
+    if !fence.contains(&change_log_prefix) {
+        return Err("backfill seed target outside this group's live range; retry".into());
+    }
+    let index =
+        match group.put_kind_batch_fenced(Vec::new(), Some((change_log_prefix, record)), fence) {
+            ProposeResult::Accepted { index } => index,
+            other => return Err(format!("backfill seed not accepted: {other:?}")),
+        };
+    let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if group.engine_applied_index() >= index {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("backfill seed batch did not apply in time".into())
 }
 
 /// The seal arm's trigger evaluation (ADR 0043 §A3 "When"), run once per
@@ -687,10 +1094,10 @@ pub(crate) async fn hot_read(
 
 /// The hot-trim arm (ADR 0042 §8, ADR 0043 §A6, F10), run once per tablet per
 /// tick, right after this tick's reconciliation/seal. Deletes change records
-/// every *expected, present* term has already cleared, and sweeps stale
-/// merge-residue cursor rows. Advances no cursor and seals nothing itself —
-/// that's [`drain_tablet`]'s job for the "gsi" term, and [`seal_now`]'s for
-/// advancing the stream's own catalog watermark.
+/// every *expected, present* term has already cleared. Advances no cursor
+/// and seals nothing itself — that's [`drain_tablet`]'s job for the "gsi"
+/// term, and [`seal_now`]'s for advancing the stream's own catalog
+/// watermark.
 ///
 /// **The F10/F12-b trim-bound rule** — trim = `min(gsi term if the table has
 /// GSIs, catalog watermark iff the table's CURRENT schema has an enabled
@@ -746,9 +1153,6 @@ async fn trim_janitor(
     gsis: &[IndexDef],
     stream_enabled: bool,
 ) -> Result<(), String> {
-    let expected_cursor_tags: &[&str] = if gsis.is_empty() { &[] } else { &[GSI_TAG] };
-    cleanup_merge_residue_cursor_rows(ctx, table, group, expected_cursor_tags).await?;
-
     let mut trim_point: Option<u64> = None;
     let mut blocked = false;
     if !gsis.is_empty() {
@@ -810,36 +1214,6 @@ async fn trim_janitor(
     Ok(())
 }
 
-/// Tombstone a cursor row iff its tag is no longer expected by this table's
-/// schema **and** its token isn't this tablet's own — i.e. it is
-/// physically-present residue from an absorbed sibling (ADR 0042 §7's merge
-/// dual: `StorageScope::with_kind` shares one live `KeyRange`, so widening a
-/// survivor's scope over an absorbed tablet exposes whatever cursor rows it
-/// wrote while it was its own tablet). An unexpected row at this tablet's OWN
-/// token — a dropped index's own stale row — is deliberately left alone
-/// here; round 3 has no cursor tag left for a stream to ever leave one of
-/// its own (the stream half of trim is catalog-derived, not a row any
-/// consumer writes).
-async fn cleanup_merge_residue_cursor_rows(
-    ctx: &ClientCtx,
-    table: &str,
-    group: &CpGroup,
-    expected: &[&str],
-) -> Result<(), String> {
-    let own_token = cursor::token_of(&group.scope_range().start);
-    let mut writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
-    for (token, tag, _) in group.cursor_rows_with_token().await {
-        if expected.contains(&tag.as_str()) || token == own_token {
-            continue;
-        }
-        writes.push((KIND_CURSOR, cursor::cursor_key(&token, &tag), None));
-    }
-    if writes.is_empty() {
-        return Ok(());
-    }
-    ctx.cp_kind_write_raw(table, writes).await
-}
-
 /// The full data-plane key of one GSI row: the ADR 0022 token over the **index
 /// hash value** (not the base partition key — that difference is exactly why a
 /// GSI lives in its own tablets and is maintained here rather than inline).
@@ -862,8 +1236,8 @@ fn projected(item: &Item, base: &animus_dynamo::TableSchema, idx: &IndexDef) -> 
 /// ADR 0042 §7/§8 regressions for the cursor-based drain + trim janitor
 /// above. **In-crate**, like `lib.rs`'s `split_fence_tests`/
 /// `auto_split_median_tests`: these need private handles (`CpGroup::
-/// pending_changes`/`cursor_min_watermark`/`cursor_rows_with_token`, the
-/// plain-client-protocol `ClientRequest::SplitTablet`/`MergeTablets` with an
+/// pending_changes`/`cursor_min_watermark`, the
+/// plain-client-protocol `ClientRequest::SplitTablet` with an
 /// arbitrary binary `split_key`, and `crate::dynamo::item_key` for
 /// deterministic side-placement) that an external `tests/` crate — a
 /// separate compilation unit, linking only this crate's `pub` surface —
@@ -1127,27 +1501,6 @@ mod gsi_drain_cursor_tests {
         );
     }
 
-    async fn merge(client_addr: SocketAddr, left: TabletId, right: TabletId) {
-        let mut stream = TcpStream::connect(client_addr).await.expect("connect");
-        write_frame(
-            &mut stream,
-            &ClientRequest::MergeTablets {
-                left: left.0,
-                right: right.0,
-            },
-        )
-        .await
-        .expect("send merge");
-        let resp: ClientResponse = read_frame(&mut stream)
-            .await
-            .expect("read reply")
-            .expect("a reply");
-        assert!(
-            matches!(resp, ClientResponse::PutOk),
-            "merge failed: {resp:?}"
-        );
-    }
-
     /// An `id` value whose real ADR 0022 token (`crate::dynamo::item_key`,
     /// the exact function the DynamoDB edge itself uses) falls on the
     /// requested side of `boundary` — a murmur3 token can't be chosen
@@ -1317,175 +1670,6 @@ mod gsi_drain_cursor_tests {
         })
         .await
         .expect("split cold-start scenario did not converge in time");
-    }
-
-    /// Two tablets of an indexed table, each with its own, genuinely
-    /// different "gsi" cursor watermark, merged together: the survivor must
-    /// use the **minimum** over both rows, not just its own (higher) one —
-    /// the ADR 0042 §7 min-over-rows rule's one genuine data-loss hazard.
-    /// Demonstrates the hazard directly (an "own-row-only" reading of the
-    /// same post-merge state disagrees with, and is strictly higher than,
-    /// the correct min), then proves the real consequence: the survivor's
-    /// next drain pass actually reconciles the absorbed tablet's own
-    /// uncopied record.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn merge_survivor_uses_the_min_over_rows_not_its_own_higher_watermark() {
-        timeout(Duration::from_secs(120), async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let node = single_node(dir.path()).await;
-            let dynamo_addr = node.dynamo_addr();
-            let client_addr = node.client_addr();
-            let table = "orders";
-            create_table_with_gsi(dynamo_addr, table).await;
-
-            // Seed and fully reconcile ONE item on the left side *before*
-            // splitting — this is the pre-split (single) tablet's own
-            // reconciliation, so its "gsi" row is what the retained LEFT
-            // child inherits (same `range.start`). Nothing is written on the
-            // right side yet: a seed there too would be reconciled by this
-            // same pre-split tablet, and the resulting row would land on
-            // LEFT after the split (inherited), not prove anything about the
-            // fresh RIGHT child's own, independent reconciliation.
-            let left_seed = find_id_on_side(&BOUNDARY, true, "seed-left");
-            put_item(dynamo_addr, table, &left_seed).await;
-            await_indexed(dynamo_addr, table, &left_seed).await;
-
-            let parent = only_tablet(&node, table);
-            split(client_addr, parent, BOUNDARY.to_vec()).await;
-            await_true(20, "split produced two tablets", || {
-                tablets_of(&node, table).len() == 2
-            })
-            .await;
-
-            let (left, right) = {
-                let m = node.metadata();
-                let ts = tablets_of(&node, table);
-                let left = *ts
-                    .iter()
-                    .find(|t| m.tablets[t].range.start.is_empty())
-                    .expect("a left child retains the ring's own start");
-                let right = *ts
-                    .iter()
-                    .find(|t| **t != left)
-                    .expect("a second, right child exists");
-                (left, right)
-            };
-
-            // The right child's OWN first reconciliation: it inherited
-            // nothing from the pre-split tablet (the min-over-rows rule over
-            // an empty set), so this seed is what gives it a genuine "gsi"
-            // watermark of its own, on its own (now-independent) raft group.
-            let right_seed = find_id_on_side(&BOUNDARY, false, "seed-right");
-            put_item(dynamo_addr, table, &right_seed).await;
-            await_indexed(dynamo_addr, table, &right_seed).await;
-
-            let right_group_pre = await_hosted(&node, right, "right tablet hosted pre-merge").await;
-            await_cursor_some(
-                &right_group_pre,
-                "right's own gsi watermark exists pre-merge",
-            )
-            .await;
-            let w_right = right_group_pre
-                .cursor_min_watermark(GSI_TAG)
-                .await
-                .expect("right has reconciled once");
-
-            // Grow LEFT's own watermark past `w_right` with more,
-            // independent writes+reconciliation on its own (separate) raft
-            // group — real wall-clock time passing between these await
-            // points is what makes each later HLC genuinely exceed the
-            // right side's earlier one (the same cross-group,
-            // real-time-grounded HLC ordering `cross_group_lww.rs`'s own
-            // clock-skew tests rely on), not any artificial synchronization.
-            for i in 0..5 {
-                let id = find_id_on_side(&BOUNDARY, true, &format!("left-more-{i}"));
-                put_item(dynamo_addr, table, &id).await;
-                await_indexed(dynamo_addr, table, &id).await;
-            }
-            let left_group = await_hosted(&node, left, "left tablet hosted").await;
-            let w_left = left_group
-                .cursor_min_watermark(GSI_TAG)
-                .await
-                .expect("left has reconciled");
-            assert!(
-                w_left > w_right,
-                "left's own watermark ({w_left:?}) must exceed right's ({w_right:?}) for this \
-                 scenario to be meaningful"
-            );
-
-            // One more item on the RIGHT side, written just before merging —
-            // the record this scenario's assertions are really about. It may
-            // or may not have been reconciled by right's own drain before the
-            // merge lands (real `ProdEnv` gives no hook to pin that), but the
-            // min-over-rows rule must cover it either way.
-            let straggler = find_id_on_side(&BOUNDARY, false, "straggler");
-            put_item(dynamo_addr, table, &straggler).await;
-
-            merge(client_addr, left, right).await;
-            await_true(20, "merge left a single tablet", || {
-                tablets_of(&node, table).len() == 1
-            })
-            .await;
-
-            let survivor =
-                await_hosted(&node, left, "survivor (left) tablet hosted post-merge").await;
-
-            // The absorbed sibling's own "gsi" row survives physically
-            // (merge never erases), but only becomes *visible* through the
-            // survivor's own scope once the reconciler's own `WidenScope`
-            // action actually runs (a real, if usually short, tick or two
-            // after the merge is committed) — poll for it rather than
-            // asserting on the very next tick.
-            let gsi_rows = {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-                loop {
-                    let rows = survivor.cursor_rows_with_token().await;
-                    let gsi_rows: Vec<_> = rows
-                        .into_iter()
-                        .filter(|(_, tag, _)| tag == GSI_TAG)
-                        .collect();
-                    if gsi_rows.len() >= 2 {
-                        break gsi_rows;
-                    }
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "expected the survivor's own row plus the absorbed sibling's, \
-                         last saw {gsi_rows:?}"
-                    );
-                    sleep(Duration::from_millis(100)).await;
-                }
-            };
-
-            // Demonstrate the hazard directly: trusting only the survivor's
-            // OWN token's row (what an "own-row-only" design would read)
-            // gives a HIGHER, wrong answer than the correct min-over-rows
-            // rule — proving that design would have claimed records it
-            // never actually copied.
-            let own_token = cursor::token_of(&survivor.scope_range().start);
-            let own_row_only = gsi_rows
-                .iter()
-                .find(|(token, _, _)| *token == own_token)
-                .map(|(_, _, ts)| *ts)
-                .expect("the survivor's own row is one of the rows found");
-            let correct_min = survivor
-                .cursor_min_watermark(GSI_TAG)
-                .await
-                .expect("at least one row exists");
-            assert!(
-                own_row_only > correct_min,
-                "this scenario's own-row watermark ({own_row_only:?}) must exceed the true min \
-                 ({correct_min:?}) — otherwise the min rule and an own-row-only design would \
-                 agree, and the hazard wouldn't be demonstrated"
-            );
-
-            // And the real consequence: the survivor's next drain pass
-            // actually reconciles the straggler (the absorbed tablet's own
-            // uncopied record) — proving the min rule drives genuine
-            // re-coverage, not just a correct read.
-            await_indexed(dynamo_addr, table, &straggler).await;
-        })
-        .await
-        .expect("merge min-rule scenario did not converge in time");
     }
 
     /// An expected consumer ("gsi", since this table has a GSI) with no

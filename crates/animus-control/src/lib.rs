@@ -44,8 +44,8 @@ pub use meta::{
 };
 pub use node::{DeltaReply, MetadataChanged, MetadataWatch, RaftNode};
 pub use schema::{
-    ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection, ReplicationMode, SchemaCatalog,
-    SchemaError, StreamSpec, StreamViewType, TableName, TableSchema,
+    ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection, IndexStatus, ReplicationMode,
+    SchemaCatalog, SchemaError, StreamSpec, StreamViewType, TableName, TableSchema,
 };
 // Re-exported so downstream assemblers (e.g. `animusd`) can set a tablet's
 // placement policy via `SetTabletPolicy` without taking a direct

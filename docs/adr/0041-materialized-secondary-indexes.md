@@ -40,8 +40,10 @@ load-bearing:
 - **Only base keys are stored**, never projected attributes, so every index hit
   costs a base-table read per matched item.
 - **The index is invisible to the rest of the system**: it does not split
-  (ADR 0028/0034), does not merge (ADR 0033), is not reclaimed on drop (ADR 0024),
-  is not scoped (ADR 0028), and does not appear in the dashboard.
+  (ADR 0028/0034), is not reclaimed on drop (ADR 0024), is not scoped (ADR
+  0028), and does not appear in the dashboard. (It also didn't merge, under
+  ADR 0033, at this ADR's writing — moot since ADR 0044 removed merge
+  entirely.)
 
 The surface is faithful; the substrate is a per-process cache. This ADR makes
 index entries first-class replicated data-plane rows and deletes the in-memory
@@ -94,8 +96,10 @@ change log — the same log DynamoDB Streams will later consume.**
 Each global secondary index gets its own table in the tablet map, named
 `"<base>$<index>"`. It therefore inherits, with no new distributed machinery: its
 own per-table hash ring (ADR 0023), per-tablet Raft (ADR 0017), byte-based
-auto-split (ADR 0034), merge (ADR 0033), drop-table GC (ADR 0024), `StorageScope`
+auto-split (ADR 0034), drop-table GC (ADR 0024), `StorageScope`
 isolation (ADR 0028), the native linearizable range scan, and the dashboard.
+(It also inherited merge, under ADR 0033, at this ADR's writing; tablets are
+split-only now, ADR 0044.)
 
 Its tablets are provisioned by the existing lazy path
 (`ClientCtx::provision_tablet`), on the same terms as any user table.
@@ -187,7 +191,9 @@ KIND 0x03  footprints       logical: token || escape(pk)
 
 All four scopes belong to **one tablet's Raft group** and share **one
 `KeyRange`** — literally the same `Arc<Mutex<KeyRange>>`, so a split's
-`narrow_scope` and a merge's `widen_scope` move every kind in one call. One
+`narrow_scope` moves every kind in one call (as would a merge's
+`widen_scope`, were merge not removed entirely — ADR 0044, tablets are
+split-only). One
 `PutBatch` to that group therefore still writes base + LSI + change record +
 footprint as a single Raft entry, which is what §2 and §4 rest on. This is the
 column-family shape Cockroach and TiKV use for the same reason.
@@ -525,9 +531,10 @@ mechanism.
 
 **Easier.**
 
-- Index data becomes ordinary replicated data: it splits, merges, is reclaimed,
-  is scoped, is observable, and survives restarts, with no bespoke code for any
-  of it.
+- Index data becomes ordinary replicated data: it splits, is reclaimed, is
+  scoped, is observable, and survives restarts, with no bespoke code for any
+  of it. (It also merged, under ADR 0033, at this ADR's writing; tablets are
+  split-only now, ADR 0044.)
 - An index query stops costing a base-table read per match, and stops ever
   costing a full base-table scan.
 - Because the kinds are physically separated (§3), base reads never traverse
@@ -574,7 +581,8 @@ mechanism.
 §4/§4a's "cursor deferred to Streams" language is now made concrete by ADR
 0042/0043: the change log gains a genuine multi-consumer cursor (a
 `KIND_CURSOR` row per `(tablet, consumer tag)`, holding a packed-HLC
-watermark) and a **min-over-rows** rule for split/merge convergence, in
+watermark) and a **min-over-rows** rule for split (and, at the time,
+merge) convergence — merge has since been removed entirely, ADR 0044 — in
 place of §4's as-built "no cursor, consumption is trim" design, which only
 ever had to reason about one consumer (the GSI drain). The GSI drain itself
 is reworked to write its own cursor row (tag `"gsi"`) in its own **separate,
@@ -597,3 +605,24 @@ same log"* — is exactly what ships: no change to the record format, the
 per-partition HLC ordering, or the atomic co-write this ADR established:
 ADR 0042/0043 only had to add the multi-consumer cursor/trim machinery on
 top.
+
+## Amendment (2026-08-15, ADR 0045)
+
+§5's own deferral — "Adding or dropping an index on a **populated** table
+… is deferred to a follow-up … The backfill is the drain applied to every
+key rather than one, so it is a reuse of §4, not a new mechanism" — is now
+closed, and closed exactly as predicted. ADR 0045 adds an `IndexStatus`
+lifecycle (`Creating`/`Active`/`Deleting`) to `IndexDef`, a leader-local
+**backfill seeder** arm of the same `change_consumer_loop` this ADR's §4
+drain already runs in, and a control-leader completion aggregator copying
+`stream_shards`' per-tablet-catalog-row shape (ADR 0042/0043). The seeder
+seeds one synthetic, no-content change-log record per pre-existing
+partition so §4's drain reconciles it exactly as it would a live write's —
+no new write path into `reconcile_partition`, confirming §4a's own framing
+that Streams and now backfill are both "another consumer/producer of the
+same log," never a parallel mechanism. `UpdateTable`'s
+`GlobalSecondaryIndexUpdates` is the wire surface; the four-step drop
+cascade is `drop_table`'s own GSI cascade (this ADR's "as-built corrective
+note" above) generalized to one index instead of every one. See ADR 0045
+for the full design, its Fork A/B/C/D decisions, and its own deviations-from-
+AWS table.

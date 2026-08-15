@@ -134,6 +134,40 @@ pub struct StreamSpec {
     pub label: String,
 }
 
+/// The lifecycle status of a secondary index (ADR 0045): whether it is still
+/// being backfilled, fully materialized and queryable, or being torn down.
+///
+/// A just-created table's indexes start `Active` directly (they are empty by
+/// construction, ADR 0041 §5) — only `UpdateTable`-added indexes on an already
+/// populated table pass through `Creating` first. `#[serde(default =
+/// "IndexStatus::active")]` on [`IndexDef::status`] means this only matters for
+/// deserializing a status-less fixture/pre-existing record (no live deployments
+/// exist to migrate, root `CLAUDE.md`); a status-less record is never actually
+/// mid-backfill, so `Active` is the correct default, not merely a convenient one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexStatus {
+    /// Declared but not yet fully backfilled — writes since declaration are
+    /// already covered (`table_takes_kind_write_path` gates on presence, not
+    /// status), but rows that predate declaration may not be materialized yet.
+    /// The drain still maintains it (see `IndexKind`'s consumers) so it is not
+    /// left further behind while backfill catches up.
+    Creating,
+    /// Fully backfilled and queryable.
+    Active,
+    /// Being torn down — the drain/backfill stop touching it; its hidden table
+    /// is being reclaimed. Never observed by a query (rejected at the wire edge).
+    Deleting,
+}
+
+impl IndexStatus {
+    /// The default for a status-less (pre-ADR-0045) `IndexDef` — see the type's
+    /// own doc for why `Active`, not `Creating`, is correct here.
+    #[must_use]
+    pub fn active() -> Self {
+        IndexStatus::Active
+    }
+}
+
 /// A secondary-index **definition** as replicated in the schema catalog (ADR
 /// 0013): its name, kind, key attributes, and projection. This is the *shape* of
 /// the index — the cluster-wide, durable agreement on which indexes exist — not
@@ -154,6 +188,10 @@ pub struct IndexDef {
     pub sort_attribute: Option<String>,
     /// What attributes a query against this index returns.
     pub projection: IndexProjection,
+    /// This index's lifecycle status (ADR 0045). Mutated only through
+    /// `MetaCommand::SetIndexStatus` (so it replicates); see [`IndexStatus`].
+    #[serde(default = "IndexStatus::active")]
+    pub status: IndexStatus,
 }
 
 /// One column's declared name and type. The name is stored as written
@@ -428,6 +466,23 @@ impl TableSchema {
         self.indexes.retain(|i| i.name != name);
         self.indexes.len() != before
     }
+
+    /// Set a secondary index's status in place, leaving every other field
+    /// untouched (deliberately **not** `upsert_index`'s whole-struct replace —
+    /// a status transition must not resurrect a stale copy of the rest of the
+    /// definition a racing proposer read before this one committed). Returns
+    /// whether the index exists at all; a no-op (but still `true`) if it is
+    /// already at `status`. Used by the state machine; callers go through
+    /// `MetaCommand::SetIndexStatus`.
+    pub(crate) fn set_index_status(&mut self, name: &str, status: IndexStatus) -> bool {
+        match self.indexes.iter_mut().find(|i| i.name == name) {
+            Some(idx) => {
+                idx.status = status;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// The replicated catalog of table schemas, keyed by table name.
@@ -595,6 +650,7 @@ mod tests {
             hash_attribute: hash.into(),
             sort_attribute: None,
             projection: IndexProjection::All,
+            status: IndexStatus::Active,
         }
     }
 
@@ -627,6 +683,41 @@ mod tests {
     }
 
     #[test]
+    fn set_index_status_on_an_unknown_index_returns_false() {
+        let mut s = TableSchema::simple("id", ColumnType::String);
+        assert!(!s.set_index_status("ghost", IndexStatus::Active));
+    }
+
+    #[test]
+    fn set_index_status_transitions_a_real_index_leaving_other_fields_untouched() {
+        let mut s = TableSchema::simple("id", ColumnType::String);
+        s.upsert_index(gsi("by-email", "email"));
+        assert_eq!(s.index("by-email").unwrap().status, IndexStatus::Active);
+
+        assert!(s.set_index_status("by-email", IndexStatus::Creating));
+        let idx = s.index("by-email").unwrap();
+        assert_eq!(idx.status, IndexStatus::Creating);
+        // Every other field is exactly what `gsi()` built — only `status` moved.
+        assert_eq!(idx.name, "by-email");
+        assert_eq!(idx.kind, IndexKind::Global);
+        assert_eq!(idx.hash_attribute, "email");
+        assert_eq!(idx.sort_attribute, None);
+        assert_eq!(idx.projection, IndexProjection::All);
+    }
+
+    #[test]
+    fn set_index_status_to_the_same_status_is_reported_as_found_and_is_a_no_op() {
+        let mut s = TableSchema::simple("id", ColumnType::String);
+        s.upsert_index(gsi("by-email", "email"));
+        // Already `Active` (the constructed default) — setting it again still
+        // reports "found" (`true`); the apply-arm's own no-op detection (a
+        // separate concern, tested at the `MetaCommand::SetIndexStatus` level)
+        // is what turns this into `ApplyOutcome::NoOp`, not this method.
+        assert!(s.set_index_status("by-email", IndexStatus::Active));
+        assert_eq!(s.index("by-email").unwrap().status, IndexStatus::Active);
+    }
+
+    #[test]
     fn rejects_duplicate_index_name() {
         let mut s = TableSchema::simple("id", ColumnType::String);
         // Bypass `upsert_index`'s dedup to construct a malformed schema directly.
@@ -643,6 +734,7 @@ mod tests {
             hash_attribute: "pk".into(),
             sort_attribute: None,
             projection: IndexProjection::All,
+            status: IndexStatus::Active,
         }];
         assert_eq!(s.validate(), Err(SchemaError::LocalIndexMissingSort));
     }
@@ -657,6 +749,7 @@ mod tests {
             hash_attribute: "id".into(),
             sort_attribute: Some("ts".into()),
             projection: IndexProjection::KeysOnly,
+            status: IndexStatus::Active,
         });
         assert!(s.validate().is_ok());
     }
@@ -673,5 +766,33 @@ mod tests {
         assert!(cat.remove("t"));
         assert!(!cat.remove("t"));
         assert!(cat.is_empty());
+    }
+
+    /// A status-less `IndexDef` (the JSON shape every pre-ADR-0045 fixture/
+    /// persisted record has) deserializes with `status: Active` via
+    /// `#[serde(default = "IndexStatus::active")]` — never `Creating`, since a
+    /// record predating the field can never genuinely be mid-backfill (see
+    /// `IndexStatus`'s own doc). A round-trip through a *populated* status
+    /// also proves the field rides the wire at all once present.
+    #[test]
+    fn index_def_without_a_status_field_deserializes_as_active() {
+        let json = r#"{
+            "name": "by-email",
+            "kind": "Global",
+            "hash_attribute": "email",
+            "sort_attribute": null,
+            "projection": "All"
+        }"#;
+        let def: IndexDef = serde_json::from_str(json).expect("status-less IndexDef decodes");
+        assert_eq!(def.status, IndexStatus::Active);
+        assert_eq!(def, gsi("by-email", "email"));
+
+        // And a populated status rides the wire unchanged, round-tripping.
+        let mut creating = gsi("by-a", "a");
+        creating.status = IndexStatus::Creating;
+        let encoded = serde_json::to_string(&creating).unwrap();
+        let decoded: IndexDef = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.status, IndexStatus::Creating);
+        assert_eq!(decoded, creating);
     }
 }

@@ -24,7 +24,9 @@ use std::time::Duration;
 
 use animus_control::ColumnType;
 use animus_control::raft::ProposeResult;
-use animus_control::{IndexDef, IndexKind, IndexProjection, MetaCommand, RaftNode, TableSchema};
+use animus_control::{
+    IndexDef, IndexKind, IndexProjection, IndexStatus, MetaCommand, RaftNode, TableSchema,
+};
 use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
@@ -78,6 +80,7 @@ fn email_index() -> IndexDef {
         hash_attribute: "email".into(),
         sort_attribute: None,
         projection: IndexProjection::All,
+        status: IndexStatus::Active,
     }
 }
 
@@ -140,6 +143,7 @@ fn run(seed: u64) {
             hash_attribute: "id".into(),
             sort_attribute: None, // an LSI must have a sort attribute
             projection: IndexProjection::All,
+            status: IndexStatus::Active,
         },
     });
     sim.run_for(Duration::from_secs(1));

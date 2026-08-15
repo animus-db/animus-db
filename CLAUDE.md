@@ -83,6 +83,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_RECONCILER_SEEDS=K` | 1 | reconciler-corpus depth (`animus-cp-data`) |
 | `ANIMUS_TXN_SEEDS=K` | 1 | multi-tablet cross-transaction corpus depth (`animus-test`, ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | DynamoDB Streams lineage-walk corpus depth (`animus-test`, ADR 0042/0043) |
+| `ANIMUS_BACKFILL_SEEDS=K` | 1 | secondary-index backfill fault-injection corpus depth (`animus-test`, ADR 0045) |
 | `ANIMUS_BENCH_{KEYS,GETS,SCAN,VALUE_BYTES,APPLY_BATCH}` | — | `engine_bench` workload tuning |
 
 The deep corpus tier (`ANIMUS_CORPUS_SEEDS=40 ANIMUS_CORPUS_FULL=1`) runs
@@ -164,9 +165,10 @@ truth; this map is just for navigation.
   wire edges byte-for-byte.
 - **Tablet lifecycle** — split is a **single control-plane command** with
   apply-time fences, no data-plane half (ADR 0028); auto-split triggers on
-  **bytes** (ADR 0034, `animusd`); **merge** is its dual with an
-  absorb-and-drain teardown (ADR 0033); dropped tables' data is reclaimed by a
-  convergent **GC** (ADR 0024). Tablet ids are never reused.
+  **bytes** (ADR 0034, `animusd`); **tablets are split-only** — merge has
+  been removed entirely (ADR 0044, supersedes ADR 0033); dropped tables'
+  data is reclaimed by a convergent **GC** (ADR 0024). Tablet ids are never
+  reused.
 - **Placement, rebalancing & growth** — `animus-placement` (ADR 0005): pure
   policy engine (RF + residency labels + failure-domain spread), `replan`
   (failure repair) + `rebalance_step` (ADR 0029: one balance-driven move per
@@ -186,7 +188,10 @@ truth; this map is just for navigation.
 - **Wire adapters** — `animus-dynamo`, `animus-cql` (ADR 0006). DynamoDB JSON/HTTP
   and CQL v4, served by `animusd`, routed through the **CP data plane** (v1,
   ADR 0019); both consume the replicated schema catalog (ADR 0013) and build
-  ADR 0022 token-prefixed keys.
+  ADR 0022 token-prefixed keys. `UpdateTable` can add/drop a GSI on an
+  already-populated table (ADR 0045): the new index goes through a
+  `Creating`/`Active`/`Deleting` lifecycle, backfilled by reusing the ADR
+  0041 drain over the table's pre-existing rows.
 - **Observability & operations** — metrics seam (`animus-env`, ADR 0015,
   additive/no-op under sim); OTLP tracing (`animusd::otel`, ADR 0027, opt-in);
   the admin/debug HTTP-JSON interface (`animusd::admin`, ADR 0020, pure

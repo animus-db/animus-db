@@ -29,7 +29,7 @@
 //!   tablet ids it just removed is computed internally
 //!   (`Metadata::tablets_for_table`) from state that is gone by the time
 //!   `apply` returns.
-//! - Both [`MetaCommand::MergeTablets`] and `DropTableTablets` also prune the
+//! - [`MetaCommand::DropTableTablets`] also prunes the
 //!   legacy `Metadata::cp_member_addrs`/`cp_member_tablets` address book
 //!   (`Metadata::prune_cp_member_addrs`) for any CP member registered against
 //!   a tablet that just left the map — again, only knowable by comparing
@@ -133,7 +133,7 @@ pub fn apply_and_derive_mirror(
 ) -> (ApplyOutcome, Vec<KeyWrite>) {
     // Capture whatever pre-apply state this command's derivation needs —
     // see the module doc for why post-apply state alone isn't enough for
-    // `DropTableTablets`/`MergeTablets`. Cheap/no-op for every other command.
+    // `DropTableTablets`. Cheap/no-op for every other command.
     let dropped_tablets: Vec<TabletId> = match command {
         MetaCommand::DropTableTablets { table } => {
             meta.tablets_for_table(table).map(|(&id, _)| id).collect()
@@ -141,10 +141,33 @@ pub fn apply_and_derive_mirror(
         _ => Vec::new(),
     };
     let pre_cp_member_tablets: BTreeMap<NodeId, TabletId> = match command {
-        MetaCommand::MergeTablets { .. } | MetaCommand::DropTableTablets { .. } => {
-            meta.cp_member_tablets.clone()
-        }
+        MetaCommand::DropTableTablets { .. } => meta.cp_member_tablets.clone(),
         _ => BTreeMap::new(),
+    };
+    // ADR 0045: `DropTableTablets`/`DropTableIndex` both prune
+    // `Metadata::index_backfill` rows as a side effect of their own apply —
+    // exactly the same "identities gone by the time `apply` returns" hazard
+    // the module doc above describes for `dropped_tablets`, so the rows each
+    // command is *about* to prune are captured here, pre-apply, the same way.
+    let pruned_index_backfill: Vec<(TabletId, String)> = match command {
+        MetaCommand::DropTableTablets { table } => {
+            let dropped: Vec<TabletId> = meta.tablets_for_table(table).map(|(&id, _)| id).collect();
+            meta.index_backfill
+                .keys()
+                .filter(|(tablet, _)| dropped.contains(tablet))
+                .cloned()
+                .collect()
+        }
+        MetaCommand::DropTableIndex { table, index } => {
+            let table_tablets: Vec<TabletId> =
+                meta.tablets_for_table(table).map(|(&id, _)| id).collect();
+            meta.index_backfill
+                .keys()
+                .filter(|(tablet, idx)| idx == index && table_tablets.contains(tablet))
+                .cloned()
+                .collect()
+        }
+        _ => Vec::new(),
     };
 
     let outcome = meta.apply(command);
@@ -176,22 +199,8 @@ pub fn apply_and_derive_mirror(
                 writes.push(put_json(syskv::policy_key(*new_id), policy));
             }
             // ADR 0018 §2 amendment: mirror the split-provenance marker
-            // (`Metadata::split_parents`) the same way `merged_key` mirrors
-            // `merged_tablets` below.
+            // (`Metadata::split_parents`).
             writes.push(put_tablet_id(syskv::split_parent_key(*new_id), *tablet));
-        }
-        MetaCommand::MergeTablets { left, right, .. } => {
-            writes.push(put_json(syskv::tablet_key(*left), &meta.tablets[left]));
-            writes.push(KeyWrite::Delete(syskv::tablet_key(*right)));
-            writes.push(KeyWrite::Delete(syskv::policy_key(*right)));
-            writes.push(KeyWrite::Put(syskv::merged_key(*right), Vec::new()));
-            // ADR 0018 §2 amendment: mirror the merge-provenance marker
-            // (`Metadata::absorbed_by`) — the reverse-direction dual of
-            // `split_parent_key` above.
-            writes.push(put_tablet_id(syskv::absorbed_by_key(*right), *left));
-            for id in dead_cp_member_ids(&pre_cp_member_tablets, meta) {
-                writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(&id)));
-            }
         }
         MetaCommand::SetTabletPolicy { tablet, policy } => match policy {
             Some(p) => writes.push(put_json(syskv::policy_key(*tablet), p)),
@@ -211,12 +220,26 @@ pub fn apply_and_derive_mirror(
                 writes.push(KeyWrite::Delete(syskv::tablet_key(*id)));
                 writes.push(KeyWrite::Delete(syskv::policy_key(*id)));
             }
+            for (tablet, index) in &pruned_index_backfill {
+                writes.push(KeyWrite::Delete(syskv::index_backfill_key(*tablet, index)));
+            }
             for id in dead_cp_member_ids(&pre_cp_member_tablets, meta) {
                 writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(&id)));
             }
         }
+        MetaCommand::DropTableIndex { table, .. } => {
+            if let Some(schema) = meta.schemas.get(table) {
+                writes.push(put_json(syskv::schema_key(table), schema));
+            }
+            // ADR 0045: this index's own backfill-completion rows are gone
+            // the moment its definition is — see `pruned_index_backfill`'s
+            // own pre-apply capture above.
+            for (tablet, index) in &pruned_index_backfill {
+                writes.push(KeyWrite::Delete(syskv::index_backfill_key(*tablet, index)));
+            }
+        }
         MetaCommand::CreateTableIndex { table, .. }
-        | MetaCommand::DropTableIndex { table, .. }
+        | MetaCommand::SetIndexStatus { table, .. }
         | MetaCommand::SetTableMode { table, .. }
         // ADR 0042: a stream (de)configuration is part of the table's schema
         // entry, so it mirrors identically to an index/mode change — the
@@ -225,6 +248,14 @@ pub fn apply_and_derive_mirror(
             if let Some(schema) = meta.schemas.get(table) {
                 writes.push(put_json(syskv::schema_key(table), schema));
             }
+        }
+        MetaCommand::MarkIndexBackfilled { tablet, index, .. } => {
+            // The value is always empty (presence alone is the fact) —
+            // mirrors `CreateKeyspace`'s identical empty-`Put` convention.
+            writes.push(KeyWrite::Put(
+                syskv::index_backfill_key(*tablet, index),
+                Vec::new(),
+            ));
         }
         MetaCommand::CreateKeyspace { keyspace } => {
             writes.push(KeyWrite::Put(syskv::keyspace_key(keyspace), Vec::new()));
@@ -327,9 +358,9 @@ fn put_counter(name: &str, value: u64) -> KeyWrite {
 }
 
 /// A [`KeyWrite::Put`] of a raw [`TabletId`] value (big-endian `u64`) at
-/// `key` — the value shape [`syskv::split_parent_key`]/
-/// [`syskv::absorbed_by_key`] use (ADR 0018 §2 amendment): a tablet id, not a
-/// JSON entity, mirroring [`put_counter`]'s primitive-value convention.
+/// `key` — the value shape [`syskv::split_parent_key`] uses (ADR 0018 §2
+/// amendment): a tablet id, not a JSON entity, mirroring [`put_counter`]'s
+/// primitive-value convention.
 fn put_tablet_id(key: Vec<u8>, id: TabletId) -> KeyWrite {
     KeyWrite::Put(key, id.0.to_be_bytes().to_vec())
 }
@@ -441,9 +472,6 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             let name = String::from_utf8(id).expect("keyspace id is UTF-8");
             meta.keyspaces.insert(name);
         }
-        EntityKind::Merged => {
-            meta.merged_tablets.insert(TabletId(decode_u64(&id)));
-        }
         EntityKind::Counter => {
             let value = decode_u64(value);
             if id == NEXT_TABLET_ID_COUNTER.as_bytes() {
@@ -463,10 +491,6 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             meta.split_parents
                 .insert(TabletId(decode_u64(&id)), TabletId(decode_u64(value)));
         }
-        EntityKind::AbsorbedBy => {
-            meta.absorbed_by
-                .insert(TabletId(decode_u64(&id)), TabletId(decode_u64(value)));
-        }
         EntityKind::StreamShard => {
             let Some(key) = syskv::decode_stream_shard_id(&id) else {
                 return;
@@ -474,6 +498,11 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             let row: crate::meta::StreamShardRow =
                 serde_json::from_slice(value).expect("mirrored stream-shard value decodes");
             meta.stream_shards.insert(key, row);
+        }
+        EntityKind::IndexBackfill => {
+            if let Some(key) = syskv::decode_index_backfill_id(&id) {
+                meta.index_backfill.insert(key, ());
+            }
         }
     }
 }
@@ -506,11 +535,6 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             let name = String::from_utf8(id).expect("keyspace id is UTF-8");
             meta.keyspaces.remove(&name);
         }
-        EntityKind::Merged => {
-            // Never deleted in practice (`merged_tablets` is never pruned —
-            // see this crate's CLAUDE.md) — listed for match exhaustiveness.
-            meta.merged_tablets.remove(&TabletId(decode_u64(&id)));
-        }
         EntityKind::Counter => {
             // Never deleted in practice (a monotonic counter is only ever
             // `Put`) — listed for match exhaustiveness.
@@ -521,15 +545,9 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             meta.cp_member_tablets.remove(&node);
         }
         EntityKind::SplitParent => {
-            // Never deleted in practice (`split_parents` is never pruned —
-            // same discipline as `merged_tablets`) — listed for match
-            // exhaustiveness.
-            meta.split_parents.remove(&TabletId(decode_u64(&id)));
-        }
-        EntityKind::AbsorbedBy => {
-            // Never deleted in practice (`absorbed_by` is never pruned) —
+            // Never deleted in practice (`split_parents` is never pruned) —
             // listed for match exhaustiveness.
-            meta.absorbed_by.remove(&TabletId(decode_u64(&id)));
+            meta.split_parents.remove(&TabletId(decode_u64(&id)));
         }
         EntityKind::StreamShard => {
             // Reachable in practice, unlike the never-pruned markers above
@@ -537,6 +555,13 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // a row (retention/drop-table cascade, ADR 0043 §A9).
             if let Some(key) = syskv::decode_stream_shard_id(&id) {
                 meta.stream_shards.remove(&key);
+            }
+        }
+        EntityKind::IndexBackfill => {
+            // Reachable in practice — `DropTableTablets`/`DropTableIndex`
+            // both prune rows as a side effect of their own apply (ADR 0045).
+            if let Some(key) = syskv::decode_index_backfill_id(&id) {
+                meta.index_backfill.remove(&key);
             }
         }
     }
@@ -687,59 +712,6 @@ mod tests {
         );
     }
 
-    /// `MergeTablets` also prunes any legacy `cp_member_addrs`/`cp_member_tablets`
-    /// entry registered against the absorbed tablet — the pre/post-diff case
-    /// this module's doc explains.
-    #[test]
-    fn merge_tablets_removes_the_right_tablet_and_prunes_its_cp_member_addr() {
-        let mut meta = Metadata::default();
-        let _ = apply_and_derive_mirror(
-            &mut meta,
-            &MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("t".to_string()),
-                range: KeyRange::whole().split_at(&[5]).unwrap().0,
-                replicas: vec![nid(1)],
-            },
-        );
-        // Directly seed the second tablet + the legacy address-book entry
-        // (there's no public command that creates an adjacent second tablet
-        // without a split; construct the merge scenario by hand instead).
-        let right_range = KeyRange::whole().split_at(&[5]).unwrap().1;
-        meta.tablets.insert(
-            TabletId(2),
-            Tablet::with_table(
-                TabletId(2),
-                Some("t".to_string()),
-                right_range,
-                vec![nid(1)],
-            ),
-        );
-        meta.cp_member_addrs.insert(nid(99), "addr:1".to_string());
-        meta.cp_member_tablets.insert(nid(99), TabletId(2));
-
-        let command = MetaCommand::MergeTablets {
-            left: TabletId(1),
-            expected_left_epoch: Epoch::INITIAL,
-            right: TabletId(2),
-            expected_right_epoch: Epoch::INITIAL,
-        };
-        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
-        assert_eq!(outcome, ApplyOutcome::Applied);
-        assert_eq!(
-            writes,
-            vec![
-                put_json(syskv::tablet_key(TabletId(1)), &meta.tablets[&TabletId(1)]),
-                KeyWrite::Delete(syskv::tablet_key(TabletId(2))),
-                KeyWrite::Delete(syskv::policy_key(TabletId(2))),
-                KeyWrite::Put(syskv::merged_key(TabletId(2)), Vec::new()),
-                put_tablet_id(syskv::absorbed_by_key(TabletId(2)), TabletId(1)),
-                KeyWrite::Delete(syskv::cp_member_addr_key(&nid(99))),
-            ]
-        );
-        assert!(meta.cp_member_addrs.is_empty());
-    }
-
     #[test]
     fn set_tablet_policy_some_writes_none_deletes() {
         let mut meta = Metadata::default();
@@ -832,6 +804,7 @@ mod tests {
             hash_attribute: "id".to_string(),
             sort_attribute: None,
             projection: crate::schema::IndexProjection::All,
+            status: crate::schema::IndexStatus::Active,
         });
         let command = MetaCommand::ReplaceTableSchema {
             table: "orders".to_string(),
@@ -903,6 +876,7 @@ mod tests {
             hash_attribute: "id".to_string(),
             sort_attribute: None,
             projection: crate::schema::IndexProjection::All,
+            status: crate::schema::IndexStatus::Active,
         };
         let create = MetaCommand::CreateTableIndex {
             table: "orders".to_string(),
@@ -930,6 +904,170 @@ mod tests {
                 syskv::schema_key("orders"),
                 meta.schemas.get("orders").unwrap()
             )]
+        );
+    }
+
+    /// A fixture for the `index_backfill` derivation tests below: a table
+    /// with one `Creating` GSI and one tablet scoped to it, driven through
+    /// `apply_and_derive_mirror` (not bare `Metadata::apply`) so the mirror
+    /// writes each setup step derives are exercised too, even though this
+    /// fixture itself doesn't assert on them.
+    fn mirror_table_with_index_and_tablet(
+        meta: &mut Metadata,
+        table: &str,
+        index: &str,
+        tablet: TabletId,
+    ) {
+        let _ = apply_and_derive_mirror(
+            meta,
+            &MetaCommand::CreateTableSchema {
+                table: table.to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            meta,
+            &MetaCommand::CreateTableIndex {
+                table: table.to_string(),
+                index: crate::schema::IndexDef {
+                    name: index.to_string(),
+                    kind: crate::schema::IndexKind::Global,
+                    hash_attribute: "id".to_string(),
+                    sort_attribute: None,
+                    projection: crate::schema::IndexProjection::All,
+                    status: crate::schema::IndexStatus::Creating,
+                },
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            meta,
+            &MetaCommand::CreateTablet {
+                tablet,
+                table: Some(table.to_string()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            },
+        );
+    }
+
+    /// `MarkIndexBackfilled` (ADR 0045 §4) mirrors as a single empty `Put`
+    /// at the row's `index_backfill_key` — mirroring `CreateKeyspace`'s own
+    /// empty-value convention — and a repeat proposal is a `NoOp` that
+    /// derives no further writes.
+    #[test]
+    fn mark_index_backfilled_writes_the_row_and_is_idempotent() {
+        let mut meta = Metadata::default();
+        mirror_table_with_index_and_tablet(&mut meta, "users", "by_email", TabletId(1));
+
+        let command = MetaCommand::MarkIndexBackfilled {
+            table: "users".to_string(),
+            index: "by_email".to_string(),
+            tablet: TabletId(1),
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![KeyWrite::Put(
+                syskv::index_backfill_key(TabletId(1), "by_email"),
+                Vec::new()
+            )]
+        );
+
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::NoOp);
+        assert!(writes.is_empty());
+    }
+
+    /// `DropTableTablets` (ADR 0045) mirrors its `index_backfill` prune as a
+    /// `Delete` per pruned row, alongside its existing tablet/policy
+    /// deletes — a same-named index's row on a different, undropped table
+    /// must not appear among the derived deletes.
+    #[test]
+    fn drop_table_tablets_also_deletes_index_backfill_rows() {
+        let mut meta = Metadata::default();
+        mirror_table_with_index_and_tablet(&mut meta, "users", "by_email", TabletId(1));
+        mirror_table_with_index_and_tablet(&mut meta, "orders", "by_email", TabletId(2));
+        for (table, tablet) in [("users", TabletId(1)), ("orders", TabletId(2))] {
+            let (outcome, _) = apply_and_derive_mirror(
+                &mut meta,
+                &MetaCommand::MarkIndexBackfilled {
+                    table: table.to_string(),
+                    index: "by_email".to_string(),
+                    tablet,
+                },
+            );
+            assert_eq!(outcome, ApplyOutcome::Applied);
+        }
+
+        let command = MetaCommand::DropTableTablets {
+            table: "users".to_string(),
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert!(
+            writes.contains(&KeyWrite::Delete(syskv::index_backfill_key(
+                TabletId(1),
+                "by_email"
+            ))),
+            "the dropped table's row must be among the derived deletes: {writes:?}"
+        );
+        assert!(
+            !writes.contains(&KeyWrite::Delete(syskv::index_backfill_key(
+                TabletId(2),
+                "by_email"
+            ))),
+            "the other table's same-named-index row must be untouched: {writes:?}"
+        );
+    }
+
+    /// `DropTableIndex` (ADR 0045) mirrors its `index_backfill` prune as a
+    /// `Delete` per pruned row, alongside the re-serialized schema — scoped
+    /// to the owning table's own tablets, so a distinct table's row for a
+    /// same-named index is untouched.
+    #[test]
+    fn drop_table_index_also_deletes_index_backfill_rows() {
+        let mut meta = Metadata::default();
+        mirror_table_with_index_and_tablet(&mut meta, "users", "by_email", TabletId(1));
+        mirror_table_with_index_and_tablet(&mut meta, "orders", "by_email", TabletId(2));
+        for (table, tablet) in [("users", TabletId(1)), ("orders", TabletId(2))] {
+            let (outcome, _) = apply_and_derive_mirror(
+                &mut meta,
+                &MetaCommand::MarkIndexBackfilled {
+                    table: table.to_string(),
+                    index: "by_email".to_string(),
+                    tablet,
+                },
+            );
+            assert_eq!(outcome, ApplyOutcome::Applied);
+        }
+
+        let command = MetaCommand::DropTableIndex {
+            table: "users".to_string(),
+            index: "by_email".to_string(),
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert!(
+            writes.contains(&put_json(
+                syskv::schema_key("users"),
+                meta.schemas.get("users").unwrap()
+            )),
+            "the updated schema must still be re-serialized: {writes:?}"
+        );
+        assert!(
+            writes.contains(&KeyWrite::Delete(syskv::index_backfill_key(
+                TabletId(1),
+                "by_email"
+            ))),
+            "the dropped index's row must be among the derived deletes: {writes:?}"
+        );
+        assert!(
+            !writes.contains(&KeyWrite::Delete(syskv::index_backfill_key(
+                TabletId(2),
+                "by_email"
+            ))),
+            "the other table's same-named index must be untouched: {writes:?}"
         );
     }
 
@@ -1285,7 +1423,7 @@ mod tests {
     /// a `WatchMetadata` delta reply's consumer
     /// (`animusd::control_handle::RemoteControlClient::observe_delta`) does —
     /// reaches the identical state a direct `Metadata::apply` does. Uses
-    /// `MergeTablets` specifically because it derives `Delete`s, the half
+    /// `DropTableTablets` specifically because it derives `Delete`s, the half
     /// [`rebuild_from_engine_matches_direct_apply`] above never exercises
     /// (a live engine scan never yields a tombstone).
     #[test]
@@ -1310,11 +1448,8 @@ mod tests {
         base.cp_member_addrs.insert(nid(99), "addr:1".to_string());
         base.cp_member_tablets.insert(nid(99), TabletId(2));
 
-        let command = MetaCommand::MergeTablets {
-            left: TabletId(1),
-            expected_left_epoch: Epoch::INITIAL,
-            right: TabletId(2),
-            expected_right_epoch: Epoch::INITIAL,
+        let command = MetaCommand::DropTableTablets {
+            table: "t".to_string(),
         };
 
         let mut shadow = base.clone();
@@ -1322,7 +1457,7 @@ mod tests {
         assert_eq!(outcome, ApplyOutcome::Applied);
         assert!(
             writes.iter().any(|w| matches!(w, KeyWrite::Delete(_))),
-            "expected MergeTablets to derive at least one delete"
+            "expected DropTableTablets to derive at least one delete"
         );
 
         let mut direct = base.clone();

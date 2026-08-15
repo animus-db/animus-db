@@ -24,65 +24,26 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
 
 ## Entry points
 
-- **`lib.rs`** — `RaftKvNode<E, S>` (the running tablet-group node) and its
-  command/state types (`KvCommand`, `KvState`), `StorageScope`, the fenced
-  commands, ReadIndex + CAS, the consensus-loop/apply-task split, and
-  `ProposeSignal`. See the API bullets below.
-- **`host.rs`** — the per-node tablet-host reconciler (ADR 0031): the pure
-  `plan()` decision, `Reconciler` executor, `MetadataView`/`TabletFacts`/
-  `LocalState`, and the `HostAction` set (incl. `Absorb`/`WidenScope`). 34
-  unit tests. See "The host module".
-- **`cluster_segment_store.rs`** (ADR 0043 §A7b, F5) — `ClusterSegmentStore<E,
-  S>`: the **default** `SegmentStore` for the stream-shard subsystem — K-way
-  replication of an immutable segment across `K` nodes' own local `S`-backed
-  directories (each backed by `FsSegmentStore` in production,
-  `SimSegmentStore` under sim), over `E`'s `Network` seam. `put_replicated`
-  returns `Ok` only once every chosen target has durably written the object
-  (all-or-error; a partial failure leaves harmless, idempotent-overwrite-
-  safe orphans on the replicas that *did* succeed); `get_from`/`delete_from`
-  take a catalog row's own recorded replica set (the load-bearing read/
-  reclaim path a later PR's sealer/janitor will call); the trait's own
-  `put`/`get`/`delete`/`list` are thinner, contract/testing-only paths (`get`/
-  `delete` fall back to the *current* `PlacementView` candidates rather than
-  a specific recorded set; `list` is local-only). One serving task per node
-  (`ClusterSegmentStore::start`, spawned via `env.spawn_task`) is the single
-  consumer of the reserved `SEGMENT_STREAM` (`u64::MAX`, ADR 0026 — chosen far
-  outside any `TabletId`'s realistic range) — request and reply variants of
-  its own `serde_json`'d `SegmentWire` enum share that one stream/inbox,
-  correlated by a `req_id` a caller's `env.sleep`-based poll loop watches (see
-  "What's non-obvious" and `docs/engineering-lessons.md`'s Testing section for
-  why this isn't a `tokio::sync::oneshot`). `PlacementView` (implemented by
-  `StaticPlacementView` for tests) hands back the current candidate node set;
-  `choose_targets` feeds it straight into `animus_placement::select_replicas`
-  with a plain, label-blind `PlacementPolicy::simple` — `K = min(default_k,
-  candidates.len())`, so a single-node cluster degrades to `K = 1` instead of
-  refusing to serve. **Wired into `animusd` since the round-3 sealer PR**
-  (`animusd::build_segment_store`/`ControlPlacementView`, `SegmentStoreHandle`
-  in that crate's `lib.rs`) — the DynamoDB Streams sealer's own
-  `SealStreamShard.replicas` field is exactly `put_replicated`'s returned
-  set; see that crate's `CLAUDE.md` for the wiring. **`put_to_targets`**
-  (round-3 PR7) is `put_replicated`'s own fan-out/wait body generalized to
-  an explicit target list instead of always calling `choose_targets`
-  itself; `put_replicated` is now a thin wrapper (`targets =
-  choose_targets()?`). **`repair`** (round-3 PR7, ADR 0043 §A9) is the
-  segment janitor's own replica-repair primitive: given `id`'s currently
-  **surviving** replica set and a live copy's bytes (the caller's own
-  `get_from(surviving, id)`), pushes that copy via `put_to_targets` to
-  enough freshly-chosen candidates — excluding every id already in
-  `surviving` — to reach `target_k`, returning the resulting sorted
-  replica set; degrades to `surviving` alone (no network I/O) if no spare
-  candidate exists, mirroring `choose_targets`'s own degraded-mode
-  philosophy. `animusd::SegmentStoreHandle::repair_replicas`/
-  `delete_sealed` are the thin per-variant dispatch wrappers (`Cluster`
-  delegates here/to `delete_from`; the single-directory `Fs` opt-in has no
-  per-replica concept to repair, so `repair_replicas` is a bare `Ok(
-  surviving.to_vec())` no-op there).
-- **`codec.rs`** — the crate's compact binary wire/image codec (ADR 0017 A.2):
-  length-prefixed framing (like the storage manifest codec), magic/version
-  checked. Carries `KvWire` messages and engine images; `serde_json`'s
-  decimal-array `Vec<u8>` rendering cost ~3–4x. Decode failures are loud (a
-  logged `Err` before the message is dropped). The Raft WAL keeps the shared
-  control-plane serde_json `PersistedState` format.
+- **`lib.rs`** — `RaftKvNode<E, S>` (the running tablet-group node), its
+  command/state types, `StorageScope`, the fenced commands, ReadIndex + CAS,
+  and the consensus-loop/apply-task split. See the API bullets below.
+- **`host.rs`** — the per-node tablet-host reconciler (ADR 0031): `plan()`,
+  `Reconciler`, and the `HostAction` set (`ProposeSeal`/`NarrowScope`/
+  `Host`/`Reconfigure`/`Release`/`Reclaim` — tablets are split-only, ADR
+  0044; the merge-dual `Absorb`/`WidenScope` actions were removed). 31 unit
+  tests. See "The host module".
+- **`cluster_segment_store.rs`** (ADR 0043 §A7b) — `ClusterSegmentStore<E,
+  S>`: the **default** `SegmentStore` for the stream-shard subsystem, K-way
+  replication of an immutable segment over `E`'s `Network` seam. The
+  module's own 69-line `//!` doc has the full design (replica selection,
+  the request/reply correlation, `repair`); wired into `animusd`
+  (`animusd::build_segment_store`, `SegmentStoreHandle` — see that crate's
+  `CLAUDE.md`).
+- **`codec.rs`** — the crate's compact binary wire/image codec (ADR 0017
+  A.2): length-prefixed, magic/version-checked framing for `KvWire`
+  messages and engine images (`serde_json`'s decimal-array `Vec<u8>`
+  rendering cost ~3–4x). Decode failures are loud. The Raft WAL keeps the
+  shared control-plane serde_json `PersistedState` format.
 - **`hlc.rs`** (ADR 0018 §2) — a pure, I/O-free Hybrid Logical Clock:
   `HlcTimestamp { wall_ms, logical }` and the per-node `Hlc` (`mint`/
   `witness`, both take the caller-sampled `Nanos` — `Hlc` never touches an
@@ -96,49 +57,20 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   is wired into the apply path and the witnessing chain.
 - **`cursor.rs`** (ADR 0042/0043, `KIND_CURSOR = 0x04`) — consumer cursor
   rows: the per-tablet, per-consumer HLC watermark the DynamoDB Streams
-  change-log lifecycle rework rests on (ADR 0042 §7/§8). `cursor_key(range_start,
-  consumer) -> Vec<u8>` builds `token(8 bytes, this tablet's own live
-  `range.start` truncated/zero-padded) || [0x00, CURSOR_TAG] ||
-  consumer.as_bytes()` — the identical `token || [0x00, TAG] || id` shape
-  `txn.rs`'s `record_key` already establishes, with `CURSOR_TAG = 0x03`
-  taking the next tag value after `txn.rs`'s own `RECORD_TAG = 0x02`;
-  `parse_cursor_key` is the fixed-offset dual, used by the min-over-rows
-  scan (below). `encode_watermark`/`decode_watermark` pack/unpack a
-  `HlcTimestamp` as the row's 8-byte-BE value, reusing `hlc::pack`/`unpack`.
-  Unlike a txn record, a cursor row lives in its **own** kind scope, so it
-  can never alias a real client key regardless of byte content — the
-  module's escape-disjointness proof (mirroring `txn.rs`'s) is stated
-  anyway, since it is what makes the *parser* unambiguous, not what keeps
-  cursor rows out of client data. A documented residual gap (mirroring
-  `txn.rs`'s own "split_key not token-aligned" note): the module doc spells
-  out a pathological `Binary`-key edge case where the truncated-token key
-  is not proven to stay strictly below a tablet's own `range.end`; left for
-  a future corpus to stress. `token_of(range_start) -> [u8; TOKEN_BYTES]` is
-  `cursor_key`'s own truncate/zero-pad step, split out (PR A2) so a caller
-  that already has a *parsed* row's own token can compute *this* tablet's
-  own token to compare against, without rebuilding a whole key — the
-  `animusd` trim janitor's merge-residue cleanup (below) is exactly this
-  caller. `RaftKvNode::cursor_watermark`/`cursor_rows`/`cursor_min_watermark`
-  (in `lib.rs`, next to `local_get_kind`/`local_scan_kind`) are the read-side
-  accessors — `cursor_min_watermark` implements ADR 0042 §7's min-over-rows
-  rule directly (the minimum watermark across every row of a tag in this
-  tablet's own, possibly merge-widened, `KIND_CURSOR` scope).
-  `cursor_rows_with_token` (PR A2) is `cursor_rows`'s token-keeping sibling —
-  `cursor_rows` itself is now a thin wrapper dropping the token, since none
-  of *its* callers need it, but the trim janitor's merge-residue cleanup
-  does (telling "this tablet's own row" from "a still-physically-present
-  absorbed sibling's row" needs the token, not just the tag). Write-side is
-  deliberately just `put_kind_batch(KIND_CURSOR, ..)` — no bespoke propose
-  method — since the existing `KvCommand::KindBatch` primitive already
-  covers it; the `animusd` GSI drain (`index_drain.rs`, cursor-based since PR
-  A2 — see that crate's own `CLAUDE.md`) is what actually calls it in
-  production today — the only production consumer. Round 3 has no separate
-  stream copier or `"copier"` cursor row: the eventual sealer reads a
-  table's own `KIND_CHANGE` change log directly (round-3 streams plan §A1).
+  change-log lifecycle rework rests on. The module's own 79-line `//!` doc
+  has the key layout, the escape-disjointness proof, and a documented
+  residual gap; `RaftKvNode::cursor_watermark`/`cursor_rows`/
+  `cursor_min_watermark` (`lib.rs`) are the read-side accessors, called in
+  production only by `animusd`'s GSI drain (`index_drain.rs`).
+  **`cursor_rows_with_token`/`token_of` have no production caller today** —
+  their original caller, the trim janitor's merge-residue cleanup, was
+  deleted along with `MergeTablets` (ADR 0044, tablets are now split-only);
+  kept in case a future consumer needs the same token-vs-physical-presence
+  disambiguation.
 - **`seal.rs`** (ADR 0018 §2 amendment) — the **range seal**: the structural
   replacement for the retired `version_floor` cross-group-LWW fix.
   `KvCommand::Seal { range, ts }` is proposed by a range-handoff source (a
-  split's `NarrowScope`, or a merge's `Absorb`) through its own Raft log; a
+  split's `NarrowScope`) through its own Raft log; a
   later-ordered mutating entry for a key inside a sealed range is rejected
   at apply, checked against a per-group in-memory set rebuilt at group
   start from a durable **engine marker key** (deliberately from the
@@ -148,28 +80,17 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   outside every `StorageScope` — see the module's own doc for the
   key-disjointness proof.
 - **`segment.rs`** (ADR 0042/0043) — the stream-shard **segment codec**: a
-  sealed shard's `SegmentStore` object format, pure and I/O-free (magic +
-  version header, `SegmentHeader` + `Vec<SegmentRecord>` body,
-  length-prefixed framing mirroring `codec.rs`'s own style but a separate
-  self-contained module). `encode`/`decode` — `encode` always derives the
-  wire `count` from `records.len()` (never trusts a caller-supplied
-  placeholder), `decode` validates magic/version (an unrecognized version
-  is a loud, named `Err`), every length-prefixed field's framing, the
-  stored `shard_id` against `shard_id(tablet, epoch)` (a mismatch is
-  corruption), and that the body holds **exactly** the declared record
-  count with no trailing bytes. `shard_id(tablet, epoch)` =
-  `shardId-<tablet>-<epoch>` (ADR 0042 §2); `segment_id(table, label,
-  tablet, epoch)` = `{table}/{label}/{tablet}/{epoch}` (ADR 0043 §A3/§A7,
-  matching `FsSegmentStore`'s own path-mapping/`ClusterSegmentStore`'s id
-  shape byte-for-byte). **The superset-slice rule (ADR 0042 §10)**:
+  sealed shard's `SegmentStore` object format, pure and I/O-free. The
+  module's own 50-line `//!` doc has the codec/validation list
+  (`encode`/`decode`, `shard_id`/`segment_id` formats). **The superset-slice
+  rule (ADR 0042 §10)** is the one contract worth naming here:
   `slice_to_hlc_range(records, (start_exclusive, end_inclusive))` keeps
   exactly the records inside the catalog row's own committed range,
-  dropping a deposed leader's late-`put` superset's extra tail (and,
-  defensively, anything at or below the exclusive start); `decode_and_slice`
-  composes decode-then-slice in one call so a reader (the `GetRecords`
-  sealed-shard path) can't decode a segment and forget to slice it.
-  `change_record` bytes are opaque to this crate throughout (ADR 0043's
-  own layering rule) — only ever moved, never interpreted.
+  dropping a deposed leader's late-`put` superset's extra tail;
+  `decode_and_slice` composes decode-then-slice in one call so a reader
+  (the `GetRecords` sealed-shard path) can't decode a segment and forget to
+  slice it. `change_record` bytes are opaque to this crate throughout (ADR
+  0043's own layering rule) — only ever moved, never interpreted.
 - **`ts_cache.rs`** (ADR 0018 §2) — the per-tablet **read-timestamp cache**
   (`TsCache`): leader-local, in-memory, best-effort write-conflict push. A
   two-generation rotating map; every served read bumps the span it read at
@@ -202,112 +123,43 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
 
 ### lib.rs API
 
-`RaftKvNode<E, S>` is the running tablet-group node: `start`/`start_scoped`/
-`start_hosted` (an explicit `StorageScope`); `put`/`put_batch`/`delete`
-propose via Raft; `is_leader`; `linearizable_get` (ReadIndex); `local_get`
-(a replica's raw, non-linearizable engine read, test/observability only).
-`StorageScope` (ADR 0026/0028) confines a node's physical key access within
-a possibly node-shared `StorageEngine`: a `prefix` (the owning table's
-identity) plus a live-narrowable `range` (an `Arc<Mutex<KeyRange>>`, so a
-split narrows it without restarting the group); `physical(key)` maps a
-logical key to its on-engine key. `has_data(&storage)` lets `animusd` tell
-"re-forming after a restart" from "brand-new spare joining"; `physical_bounds()`
-computes a genuinely bounded physical upper bound via the prefix-upper-bound
-trick, so a periodic byte estimate never degrades into a whole-engine scan.
+`RaftKvNode<E, S>` is the running tablet-group node (start/propose/read
+methods); `StorageScope` (ADR 0026/0028) confines a node's physical key
+access within a possibly node-shared `StorageEngine` (a `prefix` plus a
+live-narrowable `range`); `KvCommand::KindBatch` (ADR 0041 §3) is the
+multi-kind atomic batch backing materialized secondary indexes and the
+change log; **transactions** (ADR 0018 §2) are covered in Key invariants
+below. See the crate's rustdoc for the full method/accessor inventory.
+Four rules that aren't derivable from a doc comment:
 
-**A group owns a scope *set*, not one scope (ADR 0041 §3).** `with_kind(kind)`
-derives a sibling scope for one row kind — `KIND_BASE`/`KIND_LSI`/
-`KIND_CHANGE`/`KIND_FOOTPRINT`/`KIND_CURSOR` (ADR 0042/0043 — consumer
-cursor rows, see `cursor.rs` above; `KIND_STREAM`/`KIND_STREAM_META` land
-with a later PR), enumerated by `ALL_KINDS` (five entries as of this PR,
-codec `VERSION` 13) — over the *same*
-`Arc<Mutex<KeyRange>>`, so one `narrow`/`widen` moves every kind at once.
-**Why kinds are scopes, not a discriminator byte in the key**: a tablet is a
-`[start, end)` range over *token* space, so a kind above the token would
-break that contiguity; and `txn_stage` asserts a logical key leads with the
-ADR 0022 token, deriving every `TxnRecord::intent_span` from it, so a kind
-byte in the logical key would have forced a rewrite of every span/fence/
-record-key/seal-marker in the ADR 0018 2PC machinery. `start_*` takes the
-tablet's parent scope and derives `kind_scopes` from it; `self.scope` stays
-bound to the base kind (why pre-existing read/write/fence/txn-record code
-needed no edit, and why `approx_bytes` measures only base data). Only
-genuinely whole-tablet operations iterate the set: `engine_image`/
-`install_engine_image` (every `ImageEntry` gained a leading kind byte) and
-`erase_scope` (drop-table GC must reclaim LSI rows/change log/footprints
-too). **`StorageScope::whole()` is no longer an identity transform** — its
-base-kind scope prefixes one `KIND_BASE` byte, so *any* group's physical key
-is `prefix || kind || logical`. **Anything reading a group's bytes straight
-off the engine must go through `RaftKvNode::physical_key(kind, key)` rather
-than assembling `prefix || key` itself** — hard-coding the layout was
-correct only while a group had exactly one scope, and four tests broke on
-exactly that assumption.
-
-`KvCommand::KindBatch` (codec tag 12) is the multi-kind atomic batch:
-`put_kind_batch`/`put_kind_batch_fenced` commit `(kind, logical key,
-Option<value>)` writes spanning several row-kind scopes as **one** Raft log
-entry — the primitive materialized secondary indexes rest on (an LSI is
-strongly consistent because its rows commit in the same entry as the base
-row). One `fence` gates the whole entry. The optional `change_log:
-Option<(prefix, record)>` completes its key at **apply** as `prefix ||
-hlc::pack(ts)` — the proposer deliberately cannot supply that suffix, since
-`ts` is minted inside `propose_ordered` and is the only timestamp that
-agrees with the entry's log position. `local_get_kind`/`local_scan_kind` are
-the read side (an LSI `Query`/`Scan`, the GSI drain's change-record sweep):
-simpler than the base reads since a non-base scope only ever holds
-**committed** values. **`end: Option<&[u8]>`** mirrors `local_scan`/
-`linearizable_scan`'s unbounded-above handling for the base scope — **when
-`end` is `None`, the bound is derived from this kind scope's own
-`physical_bounds()`, never the caller's**, because no finite byte string can
-bound an LSI row's keyspace in general (a trailing base-sort-key segment has
-no length limit); the bound still comes from the kind scope's own prefix,
-never `entries()`, so it can only ever read this one scope on this one
-tablet.
-
-Fenced commands (`put_fenced`/`delete_fenced`/`cas_fenced`/
-`put_batch_fenced`) carry a `fence: KeyRange` *inside the proposed
-command*, stamped by the leader from its own `StorageScope.range` (see Key
-invariants for why this is load-bearing); `scope_range()` is the read-side
-snapshot used both to reject a key before proposing and to stamp the
-fence. `approx_bytes()` is the per-tablet cheap byte estimate
-`animusd::auto_split_loop` gates on — **deliberately pinned to the base
-kind scope** (measures only base data, the ADR 0034 fix that stops
-auto-split reacting to change-log churn). `approx_bytes_kind(kind)` (ADR
-0042/0043) is its kind-scoped sibling, over `self.kind_scopes[kind]`
-instead — the Streams sealer's size trigger needs `KIND_CHANGE`'s own
-bytes specifically, and reusing `approx_bytes` for that is exactly the
-trap this sibling exists to avoid (see `docs/engineering-lessons.md`'s
-Code-patterns entry). Batch put (`KvCommand::Batch` +
-`put_batch`) commits N keys as one Raft log entry. Linearizable CAS
-(`cas`/`cas_result`/`compare_and_swap`) is decided at apply time (see Key
-invariants); a current value covered by a `Pending`/unresolved intent
-deterministically fails the swap.
-
-**Transactions** (ADR 0018 §2, mechanics proven in Key invariants below):
-`txn_stage`/`txn_decide`/`txn_write` are the single-Raft-group (anchor-only)
-convenience; `txn_stage_anchor`/`txn_stage_participant` are the general
-multi-participant entry points; `txn_commit_at_least`/`txn_abort`/
-`txn_resolve` decide and resolve; `txn_status_local`/`txn_record_view`/
-`txn_verify_staged`/`txn_abort_orphan` are the recovery primitives a pusher
-composes; `linearizable_get_served_fast`/`resolve_intent_given_status` are
-the foreign-intent read path; `pending_txns()`/`unresolved_decided()`
-expose the per-group `TxnTracker` snapshot. `KvCommand::TxnStage`'s
-`conditions` (own-key byte-level OCC, `Cas`-shaped) feeds `StageOutcome`
-(`Staged`/`ConditionFailed`/`IntentBlocked`/`Fenced`) — this crate speaks
-bytes only; a richer caller (`animusd::dynamo::run_transact`) compiles its
-own expression down to this exact byte-equality shape.
-
-Admin/debug accessors: `role`/`term`/`commit_index`/`last_applied`/
-`durable_index`/`snapshot_index`/`log_len`/`storage()`.
-**`engine_applied_index()`** is the confirm-by-index primitive linearizable
-reads gate on, so a proposer confirms a specific `Accepted { index }`
-applied instead of polling value equality. `read_at`/`scan_at` (MVCC
-snapshot reads) take the same ReadIndex barrier then read at version `≤
-hlc::pack(ts)`, refusing a `ts` not yet strictly below
-`committed_ceiling()` (the write-push/ceiling invariant below). `KvWire`
-wraps `RaftMsg` plus the ReadIndex read-barrier probes, driver-only.
-Stream addressing (ADR 0026 Stage B): `start_hosted(.., stream)` addresses
-a tablet's Raft traffic by `(node, stream)` instead of a distinct
-`NodeId`/env per tablet, so every tablet a node hosts shares one env/port.
+- **A group owns a scope *set*, not one scope.** `with_kind(kind)` derives a
+  sibling scope per row kind (`KIND_BASE`/`KIND_LSI`/`KIND_CHANGE`/
+  `KIND_FOOTPRINT`/`KIND_CURSOR`) over the *same* `Arc<Mutex<KeyRange>>`, so
+  one `narrow`/`widen` moves every kind at once. **`StorageScope::whole()`
+  is no longer an identity transform** — its base-kind scope prefixes one
+  `KIND_BASE` byte, so *any* group's physical key is `prefix || kind ||
+  logical`. **Anything reading a group's bytes straight off the engine must
+  go through `RaftKvNode::physical_key(kind, key)` rather than assembling
+  `prefix || key` itself** — hard-coding the layout was correct only while
+  a group had exactly one scope, and four tests broke on exactly that
+  assumption.
+- **`local_get_kind`/`local_scan_kind`'s `end: Option<&[u8]>` mirrors
+  `local_scan`'s unbounded-above handling for the base scope — when `end`
+  is `None`, the bound is derived from this kind scope's own
+  `physical_bounds()`, never the caller's**, because no finite byte string
+  can bound an LSI row's keyspace in general; the bound still comes from
+  the kind scope's own prefix, never `entries()`, so it can only ever read
+  this one scope on this one tablet.
+- **`approx_bytes()` is deliberately pinned to the base kind scope**
+  (measures only base data, the ADR 0034 fix that stops auto-split
+  reacting to change-log churn). `approx_bytes_kind(kind)` is its
+  kind-scoped sibling — the Streams sealer's size trigger needs
+  `KIND_CHANGE`'s own bytes specifically, and reusing `approx_bytes` for
+  that is exactly the trap this sibling exists to avoid (see
+  `docs/engineering-lessons.md`'s Code-patterns entry).
+- **`engine_applied_index()`** is the confirm-by-index primitive
+  linearizable reads gate on, so a proposer confirms a specific
+  `Accepted { index }` applied instead of polling value equality.
 
 ## Key invariants
 
@@ -334,44 +186,45 @@ State once here; cross-referenced from the sections below.
     sibling's already-present data).
   - **The range seal** (`seal.rs`) closes the one residual witnessing alone
     cannot: an in-flight write from a source-group leader that hasn't yet
-    observed a split/merge, still in its own commit pipeline when the
-    handoff happens. A source proposes `KvCommand::Seal { range, ts }`
-    through its own log at handoff time (`host.rs`'s `Reconciler`, on a
-    split's `NarrowScope` and a merge's `Absorb`); apply rejects any
-    later-ordered mutating entry whose key falls in an already-sealed
-    range, regardless of that entry's own `ts`, because within one group
-    log order and HLC order coincide, so it is the **log position** that
-    is authoritative. The reconciler gates a split child's `Host` / a
-    merge survivor's `WidenScope` on observing the relevant seal marker
-    locally first (`TabletFacts::parent_seal_observed`/`widen_seal_observed`,
-    `Metadata::split_parents`/`absorbed_by` provenance) — see `host.rs`'s
-    entry below and `seal.rs`'s module doc for the key-disjointness proof.
-  - **Proposing (and, on the absorbed side, waiting out) the seal is a
-    persistent condition, re-derived every tick — never a one-shot side
-    effect of the tick that performs the local irreversible action it
-    precedes.** A replica that narrows its scope while a follower must
-    still propose the seal once later promoted to leader; an absorbed
-    replica must wait for a locally-*committed* seal, never "nothing
-    pending locally" alone (a quiescent replica satisfies that trivially
-    before the seal has even been proposed, letting a fast follower tear
-    down and strand the seal below quorum forever). `host.rs`'s
-    `gather_facts` computes `TabletFacts::pending_seals` fresh every tick
-    (via `seal_covers`), and `plan` turns each into `HostAction::
-    ProposeSeal`, replanned until observed; `Reconciler::teardown`'s
-    Absorb drain requires `seal_covers` locally before proceeding. This
-    gate is self-supporting, not a deadlock: it keeps the quorum needed to
-    commit the seal alive for as long as it takes; a genuinely quorum-dead
-    group correctly stalls loudly instead of tearing down early. See ADR
-    0018's §2 amendment and `docs/engineering-lessons.md` for the full
-    story. Regression: `tests/reconciler_corpus.rs`'s
-    `absorb_follower_waits_for_committed_seal_before_tearing_down`/
+    observed a split, still in its own commit pipeline when the handoff
+    happens. A source proposes `KvCommand::Seal { range, ts }` through its
+    own log at handoff time (`host.rs`'s `Reconciler`, on a split's
+    `NarrowScope`); apply rejects any later-ordered mutating entry whose key
+    falls in an already-sealed range, regardless of that entry's own `ts`,
+    because within one group log order and HLC order coincide, so it is the
+    **log position** that is authoritative. The reconciler gates a split
+    child's `Host` on observing the relevant seal marker locally first
+    (`TabletFacts::parent_seal_observed`, `Metadata::split_parents`
+    provenance) — see `host.rs`'s entry below and `seal.rs`'s module doc for
+    the key-disjointness proof. (Tablet merge had a mirror-image gate here —
+    a survivor's `WidenScope` on `widen_seal_observed`/`Metadata::
+    absorbed_by` — until ADR 0044 removed merge and this half of the
+    mechanism along with it.)
+  - **Proposing the seal is a persistent condition, re-derived every tick —
+    never a one-shot side effect of the tick that performs the local
+    irreversible action it precedes.** A replica that narrows its scope
+    while a follower must still propose the seal once later promoted to
+    leader. `host.rs`'s `gather_facts` computes `TabletFacts::pending_seals`
+    fresh every tick (via `seal_covers`), and `plan` turns each into
+    `HostAction::ProposeSeal`, replanned until observed. This gate is
+    self-supporting, not a deadlock: it keeps the quorum needed to commit
+    the seal alive for as long as it takes; a genuinely quorum-dead group
+    correctly stalls loudly instead of proceeding early. See ADR 0018's §2
+    amendment and `docs/engineering-lessons.md` for the full story.
+    Regression: `tests/reconciler_corpus.rs`'s
     `narrow_seal_survives_a_late_promotion_after_narrowing_as_a_follower`.
+    (Tablet merge had a mirror-image waiting-side gate here — an absorbed
+    replica's `Reconciler::teardown` requiring a locally-*committed* seal,
+    never "nothing pending locally" alone, before tearing down — until ADR
+    0044 removed merge and this half of the mechanism along with it; its
+    own regression, `absorb_follower_waits_for_committed_seal_before_
+    tearing_down`, went with it.)
   - **A hard, non-`debug` assert** (`assert_ts_monotonic`, at apply) checks
     every applied entry's `ts` strictly exceeds the previous one this group
     applied — the load-bearing invariant the whole witnessing chain exists
     to guarantee; a failure means the chain itself is broken, not a
     recoverable condition. Regression: `tests/cross_group_lww.rs`
-    (split/merge/seal-rejection/in-flight-race/clock-skew shapes) and
+    (split/seal-rejection/in-flight-race/clock-skew shapes) and
     `tests/witnessing.rs` (leader-change and restart-recovery
     monotonicity).
   - **`propose_ordered`: minting a proposal's `ts` and appending it to the
@@ -419,24 +272,19 @@ State once here; cross-referenced from the sections below.
   follows), `1` = an intent naming the staging `TxnId`, its record's
   logical key, and the staged value (`None` = a staged delete). Every read
   path unwraps it before a value reaches a caller: point reads resolve via
-  `RaftKvNode::read_resolved` (a bounded retry while the covering
-  transaction is `Pending` — `INTENT_WAIT_TIMEOUT`/`_POLL`); scans resolve
+  `RaftKvNode::read_resolved` (bounded retry while `Pending`); scans resolve
   via `resolve_scan_rows`, **non-blocking** — a still-`Pending` row is
-  silently omitted. Resolution: `Committed{commit_ts}` at or before the
-  read's own timestamp serves the staged value; `Aborted` (or a later
-  `Committed`) serves the value the key held immediately before the
-  intent, restored by rewinding to `get_at(key, intent_version - 1)` —
-  **never** a tombstone, which would incorrectly shadow that older,
-  still-live committed value.
-  - **The txn record lives *inside* the anchor tablet's own `StorageScope`**
-    — an ordinary in-scope logical key, not an engine-global marker like
-    `seal.rs`/`ceiling.rs` — so it replicates/snapshots/splits like real
-    data. Its key (`txn::record_key`) is `token(8 bytes) || [0x00, 0x02]
-    || encode(txn_id)`; disjointness from every real key sharing that
-    token is proved structurally from `animus_tablet::escape`'s own
-    encoding rule, not a reserved-name convention — see `txn.rs`'s module
-    doc. `txn::is_record_key` is what every scan path (and `has_data`)
-    filters on so this internal key never leaks to a client.
+  silently omitted. See ADR 0018 §2 for the full 2PC protocol, and
+  `txn.rs`'s own doc for the txn-record-key structural disjointness proof
+  (`record_key` lives *inside* the anchor tablet's own `StorageScope`, an
+  ordinary in-scope logical key, not an engine-global marker like
+  `seal.rs`/`ceiling.rs`). The prohibitions below are load-bearing
+  regardless of caller:
+
+  - `Aborted` (or a later `Committed`) resolution serves the value the key
+    held immediately before the intent, restored by rewinding to
+    `get_at(key, intent_version - 1)` — **never** a tombstone, which would
+    incorrectly shadow that older, still-live committed value.
   - **`erase_scope` deliberately does NOT go through `local_scan`** (which
     filters record keys and resolves values) — it uses `raw_scoped_keys`,
     since drop-table GC must physically erase everything this scope ever
@@ -454,95 +302,30 @@ State once here; cross-referenced from the sections below.
     version), so if the overwriting transaction later aborts, its
     one-hop-back restore could land on the stale intent instead of a
     genuinely committed value — a chain a later correct resolve can never
-    repair. Chasing the version chain back multiple hops on the read side
-    was considered and rejected as unsound; rejecting the overwrite at
-    apply time makes the corrupt chain structurally unrepresentable — see
-    `KvCommand::TxnStage`'s own doc for why a plain `Put`/`Batch`/`Cas`
-    over a foreign intent stays legal (analyzed safe: it serializes
-    strictly after the intent's own transaction). **The proposer side
-    matters just as much**: a stage call returning `Some(ts)` only ever
-    means "this entry applied," never "my content landed" — so
-    `animusd::ClientCtx::txn_prepare_pushing` verifies every staged key
-    via `txn_verify_staged` after each attempt, retrying before reporting
-    a client-facing conflict. Regression: `tests/txn_recovery.rs`'s
+    repair. Rejecting the overwrite at apply time makes the corrupt chain
+    structurally unrepresentable. **The proposer side matters just as
+    much**: a stage call returning `Some(ts)` only ever means "this entry
+    applied," never "my content landed" — so `animusd::ClientCtx::
+    txn_prepare_pushing` verifies every staged key via `txn_verify_staged`
+    after each attempt. Regression: `tests/txn_recovery.rs`'s
     `stage_over_a_foreign_pending_intent_no_ops_then_a_pushed_retry_succeeds`
     and `abort_restore_never_meets_another_transactions_intent`.
-  - **A residual, documented gap**: a tablet split's `split_key` is an
-    arbitrary existing row's key, not token-aligned, so a split racing an
-    in-flight transaction could in principle separate a token's rows (and
-    its txn record) across two sibling tablets. Deferred, per `txn.rs`'s
-    module doc.
-  - **Multi-participant 2PC**: a non-anchor participant's stage merges
-    intents only (`record_key`/`record_table` name the **anchor's**
-    record, a different tablet's — possibly a different table's —
-    keyspace entirely, never checked against or written into this
-    group's own fence/engine). `KvCommand::TxnResolve` carries an explicit
-    `outcome: TxnOutcome` field — the decision travels with the command
-    rather than being re-derived locally, since a non-anchor participant's
-    tablet never holds a local copy to read. A reader that can't resolve
-    an intent locally (`ResolveStep::Foreign`) is a distinct outcome from
-    `Pending`; `linearizable_get_served_fast` hands routing info to
-    `animusd`'s cross-tablet `TxnStatus` query. Regression:
-    `tests/txn_multi.rs`.
-  - **In-doubt recovery + decision semantics.** Recovery makes a **second,
-    independent decider** on an already-decided record legal — a
-    still-live coordinator's commit can race a recovery pusher's abort, or
-    vice versa. `apply_and_compact`'s `TxnCommit`/`TxnAbort` arms let the
-    **first**-applied decision win (log position is the ballot); any later
-    conflicting proposal is a logged no-op, never a panic — including two
-    `Committed` decisions at two genuinely **different** `commit_ts`
-    values (`mint_at_least` mints a fresh ts every call, so a live
-    coordinator and an independent post-grace recovery push can each
-    legitimately conclude "commit" with different timestamps — reachable
-    under nothing more exotic than an ordinary leader election). The
-    *only* remaining hard assert is two genuinely **conflicting**
-    decisions racing the same log position. `RaftKvNode::txn_abort` (the
-    abort-only dual of `txn_commit_at_least`) lets a caller decide without
-    resolving — every decider must re-read the record's actual status
-    afterward, never assume its own proposal won.
-  - **`TxnRecord::intent_spans`/`KvCommand::TxnStage.spans` is
-    `Vec<(String, KeyRange)>`**, not a bare `Vec<KeyRange>` — a non-anchor
-    stage never populated it at all in an earlier shape, leaving a record
-    with zero visibility into other participants. `animusd`'s coordinator
-    now hands the anchor's stage the complete cross-participant `(table,
-    span)` list up front (`RaftKvNode::txn_stage_anchor`, the general
-    entry point; `txn_stage` is a thin single-participant wrapper).
-  - **Orphan records + the resurrection guard**: prepare stages every
-    participant concurrently, so a participant's stage can succeed while
-    the *anchor's* own `TxnStage` — which would create the record — never
-    lands (the same fence/seal-miss gap a participant's stage already has).
-    `KvCommand::TxnAbort`'s `orphan_created_ts: Option<HlcTimestamp>` means
-    "no record exists at all; synthesize a fresh `Aborted` tombstone
-    directly" (`RaftKvNode::txn_abort_orphan`) — an absent record can only
-    ever decide abort (committing needs a participant list only the
-    record would have provided). `apply_and_compact`'s `TxnStage` arm also
-    checks, for `is_anchor: true` only, whether a **decided** record for
-    this exact `txn_id` already exists; if so the entry no-ops, never
-    resurrecting it to `Pending`. Regression: the in-crate
-    `pr5_orphan_and_resurrection_tests` module (`lib.rs`) — needs
-    `pub(crate)` access the public API can't express.
-  - **`TxnTracker`** (per-group): `pending` (records this group anchors,
-    still `Pending`) and `unresolved_decided` (decided but not yet locally
-    resolved — deliberately approximate but still safe: a resolver that
-    stops tracking slightly early never loses correctness, since a
-    straggling remote intent is resolved on demand the moment any reader
-    hits it). Rebuilt at group start via a bounded scope scan for
-    `txn::is_record_key` markers, deliberately not log replay (mirroring
-    `sealed`/`committed_ceiling`'s engine-marker-survives-compaction
-    reasoning).
-  - **Read-path push, scoped to the foreign-intent path** — `animusd`'s
-    `cp_get_local_resolving` calls `ClientCtx::txn_recover` on a
-    still-`Pending`/failed `TxnStatus` query instead of immediately
-    reporting "retry." The **locally**-`Pending` case (this crate's own
-    bounded `read_resolved` retry) and scans stay unchanged — the resolver
-    loop eventually pushes those. Regression: `tests/txn_recovery.rs`;
-    `animusd/tests/cp_txn.rs`'s coordinator-crash pair.
-  Regression (whole txn suite): `tests/txn_single.rs` (commit/abort paths,
-  tombstones, a pending read blocking then serving, crash/restart
-  idempotency, a sealed-range stage rejected wholesale);
-  `tests/snapshot_catchup.rs`'s `snapshot_catchup_carries_txn_records_and_intents`;
-  `tests/prod_concurrent_ts_monotonic.rs`'s
-  `concurrent_txn_writes_and_reads_never_violate_ts_monotonicity`.
+
+  Other invariants, one line each: a tablet split's `split_key` is not
+  token-aligned, so a split racing an in-flight transaction could in
+  principle separate a token's rows across siblings (deferred, per
+  `txn.rs`'s doc); a non-anchor participant's stage merges intents only,
+  never touching this group's own fence/engine (`tests/txn_multi.rs`);
+  in-doubt recovery lets a **first-applied** decision win on an
+  already-decided record, with a hard assert only on two genuinely
+  **conflicting** decisions racing the same log position; an orphan record
+  (anchor `TxnStage` never landed) can only ever decide abort, via
+  `KvCommand::TxnAbort`'s `orphan_created_ts`; `TxnTracker`'s
+  `unresolved_decided` is deliberately approximate but safe (a straggling
+  remote intent resolves on demand the moment any reader hits it).
+  Regression (whole txn suite): `tests/txn_single.rs`,
+  `tests/snapshot_catchup.rs`, `tests/prod_concurrent_ts_monotonic.rs`, the
+  in-crate `pr5_orphan_and_resurrection_tests` module.
 - **`engine_applied` vs `last_applied`.** The two-task split (below) means the
   core's `last_applied` (a buffer cursor the consensus loop advances) *leads*
   the engine. Linearizable reads therefore gate on the separate
@@ -598,54 +381,27 @@ State once here; cross-referenced from the sections below.
   the entry's actual apply; the pre-propose reject is load-bearing, not
   redundant (see `animusd/CLAUDE.md` and the root `CLAUDE.md` entry on a
   safety mechanism with zero production callers).
-- **An `Absorb` teardown DRAINS the committed log into the engine BEFORE
-  halting, and the survivor's `WidenScope` is deferred until the absorb
-  confirms.** The apply task exits on `shutdown()` at its next loop-top
-  check **without** draining committed-but-unapplied entries, and teardown
-  then deletes the group's Raft WAL — the only local copy. Harmless for
-  `Release`/`Reclaim` (they erase the data anyway) but fatal for `Absorb`:
-  the absorbed range is about to be served from this same engine through
-  the survivor's widened scope, so an acked write still in the commit
-  pipeline would silently never reach the engine. The drain
-  (`ABSORB_DRAIN_TIMEOUT`) waits — while the driver is live — for commit to
-  cover the full local log, engine-applied to cover that commit, **and**
-  for this replica's own engine to locally observe a *committed*
-  range-seal covering this tablet's scope — never proceeding on "nothing
-  pending locally" alone, which a quiescent replica satisfies trivially
-  before the seal has even been proposed. On timeout, the stuck-apply
-  escape hatch (proceed with a loud warning) fires only when the seal is
-  already locally observed and it's purely the engine-merge watermark
-  lagging; a stuck seal *commit* retries next tick instead, logging
-  loudly so a genuinely quorum-dead absorbed group is visible to
-  operators rather than silently torn down. `plan`'s `absorbing` gate
-  sequences drain-before-widen. ADR 0033 post-merge hardening — a 1-in-5
-  `ProdEnv` flake in `animusd`'s `tablet_merge.rs` was a real, permanent
-  false-"absent," caught only once a genuine multi-process split
-  deployment exposed it. The read-side halves live in this crate's
-  `RaftKvNode` + `animusd` — see the root `CLAUDE.md` and ADR 0033.
+- **Superseded by ADR 0044**: an `Absorb` teardown's drain-before-halt
+  mechanism (a merge survivor's `WidenScope` deferred on the absorbed
+  group's own committed-log drain, closing a data-loss window
+  `shutdown()`'s non-draining halt otherwise left open) no longer exists —
+  tablet merge, `HostAction::Absorb`/`WidenScope`, and `TeardownKind::Absorb`
+  were all removed (tablets are split-only). `Release`/`Reclaim`'s teardown
+  remains non-draining, safely, since both erase the data anyway. The full
+  original postmortem (the `ProdEnv` flake that found the gap, the
+  three-part fix) is archived verbatim in
+  `docs/engineering-lessons-archive.md`'s "Superseded by ADR 0044" section —
+  the still-general lesson: a teardown that deletes local state must drain
+  first if that state is about to be served elsewhere. See ADR 0033/0044.
 
 ## The host module
 
-**Wired into production (ADR 0031).** `animusd` used to scatter "which
-tablets does this node host, and what should it do about each" across
-several independent `ProdEnv` loops, each re-deriving its own slice of
-`Metadata` and its own bookkeeping. `host::plan` unifies the **decision**
-into one pure, synchronous function (mirroring this crate's own
-sync-core/async-driver split — unit-tested directly); `host::Reconciler<E,
-S>` is the **execute** half, also in this crate so it owns the whole
-lifecycle's invariants and is directly `SimEnv`-testable.
+**Wired into production (ADR 0031).** `host::plan` is the pure, synchronous
+per-tick **decision** function (no `Env`/clock/RNG/I/O — see `host.rs`'s
+own doc for its signature and field shapes); `host::Reconciler<E, S>` is
+the **execute** half, in this crate so it owns the lifecycle's invariants
+and is directly `SimEnv`-testable.
 
-- **`plan(view: &MetadataView, facts: &BTreeMap<TabletId, TabletFacts>,
-  state: &LocalState, base_id: NodeId) -> (Vec<HostAction>, LocalState)`**.
-  Pure and synchronous — no `Env`, clock, RNG, or I/O. `MetadataView` is a
-  small owned projection (`tablets`, `down`, `merged`, `split_parent`/
-  `absorbed_by`), deliberately *not* the whole `animus_control::Metadata`,
-  keeping the crate decoupled from the control plane's state shape.
-  `TabletFacts` bundles the impure per-tablet inputs the caller gathers
-  first (`hosted`, `is_leader`, `config_excludes_me`, `scope_range`,
-  `has_data`, `parent_seal_observed`/`widen_seal_observed`). `LocalState`
-  is the pure mirror of `animusd`'s `minted` claim set + `pending_release`
-  epoch dampener, threaded call to call.
 - **`plan` never removes a tablet from `LocalState::hosted` on its own**
   when emitting a fallible teardown (`Reclaim`/`Release`) — real teardown
   is async and can time out. The caller calls
@@ -667,35 +423,27 @@ lifecycle's invariants and is directly `SimEnv`-testable.
 
 ### HostAction
 
-**Emitted in this fixed order: `ProposeSeal` → `NarrowScope`/`WidenScope` →
-`Host` → `Reconfigure` → `Release`/`Reclaim`/`Absorb`.** Briefly: `ProposeSeal`
-(re-)proposes a still-owed range-seal (persistent, re-derived every tick, a
-no-op unless leading); `NarrowScope`/`WidenScope` move an already-hosted
-tablet's scope to match its current metadata range (provably one-directional
-each — `is_subrange`/its widen dual); `Host` stands up a fresh/joining/
-restarting tablet, deferred for a split child until its parent's range-seal
-is locally observed; `Reconfigure` is one `reconfigure_step` toward the
-desired replica set; `Release`/`Reclaim`/`Absorb` tear down a tablet moved
-off, dropped, or merged away respectively.
+**Emitted in this fixed order: `ProposeSeal` → `NarrowScope` → `Host` →
+`Reconfigure` → `Release`/`Reclaim`.** `ProposeSeal` (re-)proposes a
+still-owed range-seal (persistent, no-op unless leading); `Host` is
+deferred for a split child until its parent's range-seal is locally
+observed; `Release`/`Reclaim` tear down a tablet moved off or dropped,
+respectively. Tablets are split-only (ADR 0044): merge's dual actions,
+`WidenScope` and `Absorb`, no longer exist — a hosted-but-now-absent
+tablet is unconditionally `Reclaim`ed, with no second case to
+disambiguate (the `Reclaim`-vs-`Absorb` ambiguity this section used to
+resolve is now moot).
 
-**`Reclaim` vs `Absorb` cannot be told apart from `tablets` alone.** A hosted
-tablet vanishing looks identical whether its table was dropped or it was
-merged; inferring "merge" from "some other tablet's range now covers mine" is
-unsound (two tables' still-unsplit tablets can have byte-identical
-`KeyRange::whole()` ranges, with no table identity in scope). `merged` is the
-explicit signal (a tiny, never-pruned marker — tablet ids are never reused).
-`Reclaim` erases; `Absorb` never erases (the survivor now owns the range on
-the same node-shared engine) and drains before halting (see Key invariants).
-- **`Reconciler` teardown** (`Release`/`Reclaim`): call `on_teardown`
-  (unregister from routing *before* touching the driver), `shutdown()`, poll
-  `is_stopped()` bounded by `RECLAIM_STOP_TIMEOUT` (10s, via `env.sleep` — no
-  tokio-only primitive), re-register via `on_host` and leave `LocalState`
+- **`Reconciler` teardown** (`Release`/`Reclaim`): unregister from routing
+  *before* touching the driver, `shutdown()`, poll `is_stopped()` bounded
+  by `RECLAIM_STOP_TIMEOUT` (10s), re-register and leave `LocalState`
   untouched on timeout (so `plan` re-emits the same action next tick), else
-  narrow to `erase_bound` (Release only), `erase_scope()`, delete the WAL, and
-  only then `confirm_torn_down`. `Absorb`'s teardown (`TeardownKind::Absorb`)
-  skips both the narrow and the `erase_scope()` — only the driver stops and its
-  WAL is removed. Timeouts: `ABSORB_DRAIN_TIMEOUT`, `RELEASE_CONFIRM_TICKS`,
-  `RECLAIM_STOP_TIMEOUT`.
+  narrow to `erase_bound` (Release only), `erase_scope()`, delete the WAL,
+  and only then `confirm_torn_down`. (Merge's `Absorb` teardown — which
+  skipped the narrow/`erase_scope()` and drained the committed log before
+  halting, since the absorbed data was about to be served elsewhere — was
+  removed along with `TeardownKind::Absorb`; see the Key invariants entry
+  above for what remains of that mechanism's lesson.)
 
 ## What's non-obvious
 
@@ -786,7 +534,7 @@ the same node-shared engine) and drains before halting (see Key invariants).
   serving task" shape the per-tablet driver loop uses on its own `stream`,
   generalized to a cluster-wide (not per-tablet) responsibility.
 - **A `put_replicated`/`delete_from` failure can leave harmless orphans on
-  whichever targets *did* succeed** — never cataloged (a later PR's sealer
+  whichever targets *did* succeed** — never cataloged (the segment janitor
   only commits `SealStreamShard` after `put_replicated` itself returns `Ok`),
   and `SegmentStore::put`/`delete` are idempotent overwrite/delete by
   contract, so a retry to the same deterministic id always converges. Don't
@@ -806,78 +554,37 @@ round), so drive them as spawned tasks + `run_for`, and never `block_on` a
 (below) — a real-thread `ProdEnv` test, deliberately, because the race it
 guards is provably unreachable under `SimEnv`'s single-threaded scheduler.
 There is also one **in-crate** `#[cfg(test)] mod` at the bottom of `lib.rs`
-itself (`pr5_orphan_and_resurrection_tests`, ADR 0018 §2/PR5's §2b) —
-`cargo test -p animus-cp-data --lib` runs it; it needs `pub(crate)` access
-(`txn::record_key`, a direct `KvCommand::TxnStage` construction,
-`propose_ordered_aux`/`mint_pushed`) no external `tests/` file can reach, to
-build a "late `TxnStage` for an already-known `txn_id`" scenario the public
-API (which always mints a *fresh* id) cannot express.
+(`pr5_orphan_and_resurrection_tests`, ADR 0018 §2) — `cargo test
+-p animus-cp-data --lib` runs it; it needs `pub(crate)` access
+(`txn::record_key`, a direct `KvCommand::TxnStage` construction) no
+external `tests/` file can reach, to build a "late `TxnStage` for an
+already-known `txn_id`" scenario the public API (which always mints a
+*fresh* id) cannot express.
 
 One binary per behavior; the file names describe them (`ls
-crates/animus-cp-data/tests/`) — covering single-tablet Raft mechanics
-(election/replication/leader-kill, ReadIndex, CAS, batch, membership,
-snapshot catch-up), automatic reconfiguration and leadership-transfer
-cascades, the ADR 0026 stream-addressing/shared-engine primitives, the ADR
-0041 `KindBatch`/scope-set mechanics, the ADR 0042/0043 `KIND_CURSOR`
-scope-isolation and min-over-rows suite (`cursor_scope.rs`), `segment.rs`'s
-own in-module `#[cfg(test)]` unit tests (`cargo test -p animus-cp-data --lib
-segment::` — round-trip, decode rejections, and the superset-slice rule),
-the ADR 0043 `§A7b` `ClusterSegmentStore` replication/fault suite
-(`cluster_segment_store.rs`, a 3-node cluster over `SimSegmentStore`,
-including round-3 PR7's `repair` cases — reaching `target_k` from a
-surviving pair, a no-op when nothing is missing, and degrading to
-`surviving` alone with no network I/O when no spare candidate exists), the
-ADR 0018 HLC/MVCC/range-seal/transaction suites (single- and
-multi-participant, in-doubt recovery, write-key conditions, snapshot
-reads, the read-timestamp cache), the `host.rs` reconciler end to end, and
-the real-thread `ProdEnv` regression noted above.
+crates/animus-cp-data/tests/`) — covering single-tablet Raft mechanics,
+automatic reconfiguration/leadership-transfer, the ADR 0026/0041/0042/0043
+stream-addressing/`KindBatch`/`KIND_CURSOR`/`ClusterSegmentStore` suites,
+the ADR 0018 HLC/MVCC/range-seal/transaction suites, the `host.rs`
+reconciler end to end, and the real-thread `ProdEnv` regression noted
+above.
 
 ### Reconciler lifecycle corpus (`tests/reconciler_corpus.rs`)
 
-The 34 `host.rs` unit tests prove `plan` correct as a pure function; the entry
-above proves ONE end-to-end sequence; this corpus is the first
-**seed-reproducible fault-injection** suite for the whole tablet lifecycle. It
-follows the house corpus doctrine (ADR 0014): a frozen, name-seeded scenario
-list (`scenario_cells()`), a depth knob, and coverage/seed-expansion guards.
+The 31 `host.rs` unit tests prove `plan` correct as a pure function; this
+corpus is the **seed-reproducible fault-injection** suite for the whole
+tablet lifecycle, following the house corpus doctrine (ADR 0014): a frozen,
+name-seeded scenario list, a depth knob, and coverage/seed-expansion
+guards. See the test file for the 18 frozen scenarios and the generic
+invariant checks (hosting convergence, data safety, no zombie groups,
+idempotence) — two merge-lifecycle scenarios (the absorb-drain regression
+and its livelock-fix twin) were removed along with the reconciler actions
+they exercised (ADR 0044, tablets are split-only).
 
-- **Harness**: each scenario builds a small `Cluster` of real
-  `Reconciler<SimEnv, MemoryEngine>`s and drives it via `tick(node, &view)`
-  with hand-scripted `MetadataView`s standing in for the control plane (no
-  live control-plane `RaftNode` needed); real `RaftKvNode` groups form/
-  elect/replicate underneath. Every scenario runs as a **spawned task**
-  driven by `Simulator::run_for`, which can call `&self` fault methods
-  (`stop`/`crash`/`partition_pair`/`heal`) since `Simulator` derives
-  `Clone` (cloning just hands out another reference to the same
-  `Arc`-backed world).
-- **~20 frozen scenarios** (`ANIMUS_RECONCILER_SEEDS`, default 1 =
-  byte-identical), covering the tablet lifecycle end to end: fresh-host,
-  split-narrows-source, rebalance-off-releases (sparing a sibling),
-  drop-table-reclaims, spare-join-then-promoted, reconfigure-removes-a-
-  down-replica-first, merge-widens-survivor-and-absorbs-sibling-unerased
-  (the deterministic absorb-drain regression, zero sim time before the
-  merge view ticks), crash-restart shapes (single-replica upgrade via
-  `has_data`, follower rejoin), a deliberate **contract-boundary** test
-  proving *why* the `last_applied == 0` guard is load-bearing (bypassing
-  it genuinely erases-then-rehosts empty), partition/release interplay,
-  and two scenarios (`absorb_follower_waits_for_committed_seal_before_
-  tearing_down`/`narrow_seal_survives_a_late_promotion_after_narrowing_
-  as_a_follower`) that make the range-seal livelock fix (see Key
-  invariants) deterministic under `SimEnv` by controlling per-node tick
-  order and a real Raft membership change by hand.
-- **Invariant checks, generic across scenarios**: (a) hosting convergence
-  (`assert_hosted_converged`); (b) data safety (`assert_present`/
-  `assert_absent`, raw physical-key reads — survivors readable, released/
-  reclaimed erased, a co-hosted sibling never touched); (c) no zombie groups
-  (`assert_all_stopped`); (d) idempotence (`assert_idempotent`) — meaning the
-  observable *state* doesn't drift (hosted set, hook call counts, live scope
-  ranges, Raft configs), **not** "the second tick emits zero actions"
-  (`Reconfigure` is replanned every tick a node leads a group).
-- **Depth found a test-robustness gap, not a reconciler bug**: two
-  hand-rolled "force a real membership removal" helpers could hit a
-  `NotLeader` right after confirming `is_leader()` — the documented
-  proposal-freeze-while-transfer-armed behavior a single-shot assert can't
-  tell from a real failure. Fixed by retrying the whole sequence each poll
-  tick. Held green through `ANIMUS_RECONCILER_SEEDS=300` (5,400 runs).
+- **Idempotence (`assert_idempotent`) means the observable *state* doesn't
+  drift** (hosted set, hook call counts, live scope ranges, Raft configs)
+  — **not** "the second tick emits zero actions" (`Reconfigure` is
+  replanned every tick a node leads a group).
 - **To add a scenario**: write `fn scenario_my_thing(seed: u64)` in the
   existing shape (`run(seed, |sim| async move { .. })`), add a
   `scenario!("my_thing_name", scenario_my_thing)` to `scenario_cells()`, and

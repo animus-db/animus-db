@@ -220,8 +220,8 @@ impl StorageScope {
     /// A **sibling scope of the same tablet group**, holding a different row
     /// kind (ADR 0041 §3): the prefix extended by `kind`, over **the very same
     /// live `KeyRange`** — literally the same `Arc`, so one
-    /// [`narrow`](Self::narrow) moves every kind at once and a split or merge
-    /// can never leave two kinds disagreeing about what this tablet owns.
+    /// [`narrow`](Self::narrow) moves every kind at once and a split can
+    /// never leave two kinds disagreeing about what this tablet owns.
     ///
     /// Every kind of one tablet is `prefix || [kind]`, so two kinds differ in
     /// their final byte at equal length and neither prefixes the other; two
@@ -244,12 +244,12 @@ impl StorageScope {
     /// this `StorageScope` observes the change immediately. A raw setter: the
     /// caller (which watches `Metadata` for this tablet's current range) is
     /// trusted to only call this when the new range is actually correct for
-    /// this tablet right now — which is *usually* a narrowing (a split
-    /// source, `RaftKvNode::narrow_scope`) but is a legitimate **widening**
-    /// when this tablet just absorbed a merged-away sibling's range (ADR
-    /// 0033, `RaftKvNode::widen_scope`). Both call through this one setter;
-    /// the direction is enforced (or intentionally not enforced) by the
-    /// caller, not here.
+    /// this tablet right now — a narrowing (a split source,
+    /// `RaftKvNode::narrow_scope`) in every production path; a **widening**
+    /// (`RaftKvNode::widen_scope`) has no production caller now that tablets
+    /// are split-only, but both call through this one setter, and the
+    /// direction is enforced (or intentionally not enforced) by the caller,
+    /// not here.
     pub fn narrow(&self, new_range: KeyRange) {
         *self.range.lock().expect("storage scope range poisoned") = new_range;
     }
@@ -511,8 +511,8 @@ pub enum KvCommand {
     },
     /// **Range seal** (ADR 0018 §2 amendment, PR2 — see `seal.rs`'s module
     /// doc for the full design): the leader of a range-handoff source (a
-    /// split's `NarrowScope`, or a merge's `Absorb`) commits this through its
-    /// **own** Raft log to mark `range` closed to any further mutation
+    /// split's `NarrowScope`) commits this through its **own** Raft log to
+    /// mark `range` closed to any further mutation
     /// ordered after it. Every replica applies its log in the same order, so
     /// every replica agrees on exactly which entries are "after the seal" —
     /// unlike `fence`, this is not itself gated by a fence (a seal IS a fence
@@ -1760,8 +1760,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// module doc): mark `range` closed to any further mutation ordered after
     /// this entry in this group's own Raft log. Leader-only (else a leader
     /// hint, like every other propose method). Called by the tablet-host
-    /// reconciler (`host::Reconciler`) when executing a split source's
-    /// `NarrowScope` or an absorbed tablet's `Absorb` teardown — never by any
+    /// reconciler (`host::Reconciler`) when executing a split source's own
+    /// `ProposeSeal` action for a still-owed handoff — never by any
     /// data-plane client. Idempotent to re-propose the identical `range`
     /// (the marker key is keyed by `(tablet, range)`, so a repeat simply
     /// refreshes it with a newer `ts` — see `seal.rs`).
@@ -2713,19 +2713,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.scope.narrow(new_range);
     }
 
-    /// Update this group's live [`StorageScope`] range to a **wider** range
-    /// (ADR 0033 tablet merge — the dual of [`narrow_scope`](Self::narrow_scope)):
-    /// called when this tablet was the **surviving (`left`) side** of a
-    /// `MetaCommand::MergeTablets` commit, whose replicated range now covers
-    /// what used to be the merged-away sibling's range too. Safe precisely
-    /// because `MergeTablets` only merges two tablets that already shared a
-    /// replica set on the same node's shared engine (ADR 0026/0028) — the
-    /// absorbed range's data was always physically present under the same
-    /// table prefix, nothing needs to move. The mechanism underneath is the
-    /// same raw setter `narrow_scope` uses; this is a distinctly-named,
-    /// distinctly-documented entry point so a reader auditing every
-    /// `StorageScope` mutation site doesn't have to re-derive "is this
-    /// specific call safe to widen" from context each time.
+    /// Update this group's live [`StorageScope`] range to a **wider** range —
+    /// the dual of [`narrow_scope`](Self::narrow_scope). Tablets are
+    /// split-only (merge, the only production caller of this setter, was
+    /// removed by ADR 0044, which supersedes ADR 0033): no live reconciler
+    /// action calls this today, but the raw mechanism — widening a group's
+    /// scope over data already physically present on the same node-shared
+    /// engine under the same table prefix, exactly as `narrow_scope` does in
+    /// the other direction — stays a distinctly-named, distinctly-documented
+    /// entry point rather than folded into `narrow_scope` itself, so a
+    /// reader auditing every `StorageScope` mutation site doesn't have to
+    /// re-derive "is this specific call safe to widen" from context each
+    /// time. Kept exercised directly by `tests/cursor_scope.rs` as a raw
+    /// primitive, with no production caller.
     pub fn widen_scope(&self, new_range: KeyRange) {
         self.scope.narrow(new_range);
     }
@@ -3064,13 +3064,18 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     }
 
     /// Every cursor row currently visible in this tablet's own `KIND_CURSOR`
-    /// scope, as `(tag, watermark)` pairs. After a merge, a survivor's
-    /// widened scope can hold more than one row for the same tag — one per
-    /// absorbed tablet's own lineage, still physically present on the shared
-    /// engine (`StorageScope::with_kind` shares one live `KeyRange` across
-    /// every kind, so widening exposes rows a sibling wrote while it was its
-    /// own tablet) — which is exactly the shape the ADR 0042 §7 min-over-rows
-    /// rule exists to resolve; see
+    /// scope, as `(tag, watermark)` pairs. `cursor_min_watermark`'s
+    /// min-over-rows rule (ADR 0042 §7) tolerates more than one row per tag
+    /// showing up here — historically the shape a merge survivor's widened
+    /// scope could produce (one row per absorbed tablet's own lineage, still
+    /// physically present on the shared engine, since `StorageScope::
+    /// with_kind` shares one live `KeyRange` across every kind, so widening
+    /// exposed rows a sibling wrote while it was its own tablet). Tablet
+    /// merge no longer exists (ADR 0044, tablets are split-only), so a
+    /// tablet's own scope only ever narrows now — the scenario that produced
+    /// more than one row per tag doesn't structurally arise under split
+    /// alone. `cursor_min_watermark`'s multi-row tolerance is kept anyway
+    /// (defensive, unproven-unreachable rather than proven-dead); see
     /// [`cursor_min_watermark`](Self::cursor_min_watermark). A row whose raw
     /// bytes fail to decode is dropped rather than surfaced, mirroring
     /// [`cursor_watermark`](Self::cursor_watermark)'s own defensive read.
@@ -3084,12 +3089,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
 
     /// As [`cursor_rows`](Self::cursor_rows), but keeping the **token** each
     /// row's own key names alongside its tag. `cursor_rows` drops it (none of
-    /// its own callers need it); the ADR 0042 §7 trim janitor's merge-residue
-    /// cleanup (`animusd::index_drain`) does — it needs to tell "this
-    /// tablet's own row" (`token == cursor::token_of(self.scope_range().start)`)
-    /// from "a still-physically-present absorbed sibling's row" (any other
-    /// token, surfaced only because a merge widened this tablet's scope over
-    /// it).
+    /// its own callers need it). Its original caller — the ADR 0042 §7 trim
+    /// janitor's merge-residue cleanup (`animusd::index_drain`), which told
+    /// "this tablet's own row" (`token ==
+    /// cursor::token_of(self.scope_range().start)`) from "a
+    /// still-physically-present absorbed sibling's row" — no longer exists:
+    /// tablet merge was removed entirely (ADR 0044). This method (and
+    /// [`cursor::token_of`]) currently has **no production caller**; kept for
+    /// the same reason `token_of`'s own doc gives.
     pub async fn cursor_rows_with_token(
         &self,
     ) -> Vec<([u8; animus_tablet::TOKEN_BYTES], String, HlcTimestamp)> {
@@ -3120,8 +3127,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
 
     /// The ADR 0042 §7 **min-over-rows** watermark for `consumer`: the
     /// minimum watermark among every `KIND_CURSOR` row tagged `consumer` in
-    /// this tablet's own (possibly merge-widened) scope, or `None` if no such
-    /// row exists at all — the "expected tag with no row ⇒ `W = 0`, no trim"
+    /// this tablet's own scope (historically, possibly a merge survivor's
+    /// widened scope — tablets are split-only now, ADR 0044), or `None` if
+    /// no such row exists at all — the "expected tag with no row ⇒ `W = 0`,
+    /// no trim"
     /// case, deliberately returned as `None` rather than a zero timestamp so
     /// a caller conflating "never copied anything" with "copied everything
     /// up to the epoch" is a compile-time-visible `Option`, not a silent

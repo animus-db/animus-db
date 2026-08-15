@@ -33,6 +33,7 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
 | `ANIMUS_TXN_SEEDS=K` | 1 | K seed variants per multi-tablet transaction-corpus cell (ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | K seed variants per DynamoDB Streams lineage-walk cell (ADR 0042/0043) |
+| `ANIMUS_BACKFILL_SEEDS=K` | 1 | K seed variants per secondary-index backfill fault-injection cell (ADR 0045) |
 
 ## What's non-obvious
 
@@ -293,6 +294,65 @@ The Accord-targeted suite exercises `check_cycles` under contention:
   unless started with `start_hosted(.., stream = tablet_id.0)` instead —
   see `docs/engineering-lessons.md`'s Testing section for the full
   livelock symptom and fix.
+
+### Elle-adjacent, but not Elle: the secondary-index backfill fault corpus (ADR 0045, PR4)
+
+- `backfill_fault_corpus.rs` — the identical layering fix `stream_lineage_
+  corpus.rs` set for the backfill seeder (`animusd::index_drain::
+  backfill_seed_tick`) and completion aggregator (`animusd::
+  index_backfill::index_backfill_tick`), both `animusd`-only and thus with
+  no `SimEnv` of their own: a self-contained reimplementation of both
+  functions' exact algorithms directly over `RaftKvNode` and a bare
+  `Metadata` (`.apply()` calls, no live control Raft). **Deliberately
+  narrower than a full GSI-materialization proof** — it never reimplements
+  `reconcile_partition`'s cross-table row diffing (out of scope by design;
+  see the file's own doc for why that's sound) — instead proving exactly
+  the seeder's own claim: every partition that ever held a row gets at
+  least one dirty marker, checked directly by diffing `KIND_BASE` against
+  `KIND_CHANGE` partition sets, plus the aggregator's convergence decision.
+  The full-stack, exact-GSI-content counterpart is the deterministic
+  `ProdEnv` test `animusd/tests/backfill_seeder.rs::
+  split_during_backfill_converges_with_correct_final_gsi`.
+- **Seven frozen named cells**: `single_tablet_backfill_converges`,
+  `concurrent_split_during_backfill` (checks Fork A directly — the left
+  child's cursor row is byte-identical across the split, the right child's
+  reads empty), `split_after_tablet_already_reported_done` (a tablet
+  splits *after* reporting done; the aggregator's fresh-tablet-map-read
+  discipline still blocks the flip until the new child reports too, via
+  the real seeder mirror, not a hand-driven mark), `live_writes_race_the_
+  sweep`, `leader_kill_mid_sweep`, `two_indexes_creating_independently`,
+  `drop_table_mid_backfill`. Depth knob `ANIMUS_BACKFILL_SEEDS` (default
+  1 = the frozen cells; held green at `=40` in well under a second,
+  matching `corpus-deep.yml`'s nightly tier).
+- **A real, previously-undetected bug this corpus found on its very first
+  run, at every seed** (not just under fault injection — a structural
+  defect, reproducible without any injected fault at all): the backfill
+  cursor's own advance write (`ctx.cp_kind_write_raw`, whose fence is
+  always the tablet's *current live* range) silently rejected every
+  cursor-persist attempt for a split child whose `range.start` is not
+  itself a bare `TOKEN_BYTES`-wide token — true of essentially every real
+  split, since a split key is chosen from real row content, never the
+  hash ring. `cursor::cursor_key` truncates `range.start` to its own
+  8-byte token, which then sorts *below* the child's own (longer)
+  `range.start` the instant the byte right after the token is non-zero
+  (true for any real `escape(pk)`). Data coverage itself was never at
+  risk (the change-log seed writes are keyed by real base keys, which
+  correctly satisfy the fence) — only the cursor's own persistence was,
+  so a split child's sweep silently restarted from scratch every tick
+  instead of resuming. Harmless for the pre-existing `"gsi"` cursor tag
+  (whose caller already tolerates a perpetually-absent cursor as "just
+  reconcile everything, always correct") but a genuine **liveness** bug
+  for backfill: a child with more than `BACKFILL_SEED_BATCH` (256)
+  partitions on its own side could never advance past that one batch's
+  worth and never reached its own end. Fixed in `animusd::index_drain`
+  by giving the cursor's own advance write a dedicated helper
+  (`advance_backfill_cursor`) that fences with `KeyRange::whole()`
+  instead of the tablet's live range — a cursor row's identity is already
+  fully captured by its own token (disjoint from base data by row kind)
+  and needs no range-fencing, the same reasoning `seal.rs`/`ceiling.rs`'s
+  engine-global markers already rely on. See
+  `docs/engineering-lessons.md` for the general lesson and
+  `advance_backfill_cursor`'s own doc for the full account.
 
 ### Scaling coverage: the two env knobs + the topology split (ADR 0014)
 
