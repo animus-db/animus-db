@@ -605,3 +605,24 @@ same log"* — is exactly what ships: no change to the record format, the
 per-partition HLC ordering, or the atomic co-write this ADR established:
 ADR 0042/0043 only had to add the multi-consumer cursor/trim machinery on
 top.
+
+## Amendment (2026-08-15, ADR 0045)
+
+§5's own deferral — "Adding or dropping an index on a **populated** table
+… is deferred to a follow-up … The backfill is the drain applied to every
+key rather than one, so it is a reuse of §4, not a new mechanism" — is now
+closed, and closed exactly as predicted. ADR 0045 adds an `IndexStatus`
+lifecycle (`Creating`/`Active`/`Deleting`) to `IndexDef`, a leader-local
+**backfill seeder** arm of the same `change_consumer_loop` this ADR's §4
+drain already runs in, and a control-leader completion aggregator copying
+`stream_shards`' per-tablet-catalog-row shape (ADR 0042/0043). The seeder
+seeds one synthetic, no-content change-log record per pre-existing
+partition so §4's drain reconciles it exactly as it would a live write's —
+no new write path into `reconcile_partition`, confirming §4a's own framing
+that Streams and now backfill are both "another consumer/producer of the
+same log," never a parallel mechanism. `UpdateTable`'s
+`GlobalSecondaryIndexUpdates` is the wire surface; the four-step drop
+cascade is `drop_table`'s own GSI cascade (this ADR's "as-built corrective
+note" above) generalized to one index instead of every one. See ADR 0045
+for the full design, its Fork A/B/C/D decisions, and its own deviations-from-
+AWS table.

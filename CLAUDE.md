@@ -188,7 +188,10 @@ truth; this map is just for navigation.
 - **Wire adapters** — `animus-dynamo`, `animus-cql` (ADR 0006). DynamoDB JSON/HTTP
   and CQL v4, served by `animusd`, routed through the **CP data plane** (v1,
   ADR 0019); both consume the replicated schema catalog (ADR 0013) and build
-  ADR 0022 token-prefixed keys.
+  ADR 0022 token-prefixed keys. `UpdateTable` can add/drop a GSI on an
+  already-populated table (ADR 0045): the new index goes through a
+  `Creating`/`Active`/`Deleting` lifecycle, backfilled by reusing the ADR
+  0041 drain over the table's pre-existing rows.
 - **Observability & operations** — metrics seam (`animus-env`, ADR 0015,
   additive/no-op under sim); OTLP tracing (`animusd::otel`, ADR 0027, opt-in);
   the admin/debug HTTP-JSON interface (`animusd::admin`, ADR 0020, pure
