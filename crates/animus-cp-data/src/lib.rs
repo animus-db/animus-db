@@ -47,7 +47,7 @@ use std::time::Duration;
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
 use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId, PRIMARY_STREAM};
-use animus_storage::{MergeOp, StorageEngine};
+use animus_storage::{MergeOp, StorageEngine, Version};
 use animus_tablet::KeyRange;
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
@@ -65,7 +65,7 @@ pub mod segment;
 mod ts_cache;
 mod txn;
 
-use hlc::{Hlc, HlcTimestamp};
+use hlc::{Hlc, HlcTimestamp, bump_strictly_above};
 use ts_cache::TsCache;
 pub use txn::{StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome};
 
@@ -694,10 +694,35 @@ pub enum KvCommand {
     /// incorrectly shadow that older value — see `txn.rs`'s module doc). A
     /// key whose stored value is no longer that exact intent (already
     /// resolved, or overwritten by something newer) is left untouched —
-    /// idempotent on WAL replay. No `fence`: every key here was already
-    /// fence-checked at `TxnStage` time; resolve only ever converts an
-    /// already-staged intent, never introduces new data outside that
-    /// prior fence.
+    /// idempotent on WAL replay.
+    ///
+    /// **`fence` (ADR 0018 §2 write-loss amendment — Bug 3).** Originally
+    /// this variant carried none, on the theory that "every key here was
+    /// already fence-checked at `TxnStage` time." That reasoning has a
+    /// gap: it assumes `keys` can only ever be a set this exact tablet
+    /// already staged — true for every *in-crate* caller, but not
+    /// something this type enforces, and `animusd`'s own coordinator
+    /// found the counterexample. `ClientCtx::recovery_resolve` used to
+    /// group a transaction's participants by table name alone (no tablet
+    /// dimension), so a split table's two different tablets' keys could
+    /// end up bundled into one `TxnResolve` proposed against whichever
+    /// tablet the *first* key in the bundle belonged to. With no fence
+    /// here, that tablet applied the resolve for a key it doesn't own —
+    /// onto the *same physical key* another tablet of the same table
+    /// separately maintains (ADR 0028: a table's tablets share one
+    /// `StorageScope` prefix) — stamped with the wrong tablet's own clock.
+    /// The owning tablet's own clock never learns of that foreign version
+    /// and can never mint above it again: every future write to that key
+    /// silently loses the per-key LWW race in `StorageEngine::merge`,
+    /// forever (the acked-write-loss symptom this amendment fixes). The
+    /// coordinator-side grouping bug is fixed at the source, but `fence`
+    /// here is the structural seatbelt: **identical semantics to
+    /// `TxnStage`'s own fence** (stamped from the proposing group's live
+    /// `scope_range()`, checked whole-or-nothing against every key in
+    /// `keys` at apply, rejecting the whole entry rather than partially
+    /// applying it) — so a caller that makes the identical mistake again,
+    /// today or in the future, is rejected here instead of silently
+    /// corrupting a foreign key.
     ///
     /// **`outcome` is carried explicitly (ADR 0018 §2/PR4), not
     /// re-derived by reading `record_key` locally** (PR3's original
@@ -716,6 +741,7 @@ pub enum KvCommand {
         record_key: Vec<u8>,
         keys: Vec<Vec<u8>>,
         outcome: txn::TxnOutcome,
+        fence: KeyRange,
         ts: HlcTimestamp,
     },
     /// The leader's no-op-on-election (Raft); applies nothing.
@@ -938,32 +964,49 @@ async fn rebuild_txn_tracker<S: StorageEngine>(storage: &S, scope: &StorageScope
 }
 
 /// The outcome of resolving one raw, envelope-tagged stored value against a
-/// read (ADR 0018 §2/PR3, extended PR4): either a value has been determined
-/// (`Value`, `Some` present / `None` absent); the covering transaction's
-/// **local** record is `Pending` (this same tablet holds the record — the
+/// read (ADR 0018 §2/PR3, extended PR4, unified PR2 of the
+/// torn-pair-fix stack): either a value has been determined (`Value`,
+/// `Some` present / `None` absent); the covering transaction's **local**
+/// record is `Pending` (this same tablet holds the record — the
 /// single-participant/anchor case — but it hasn't decided yet); or the
 /// record could not be found in this tablet's own scope at all (`Foreign`
 /// — either it genuinely lives on another tablet, ADR 0018 §2/PR4's
 /// multi-participant case, or the anchor's own stage just hasn't applied
 /// here yet) — see `RaftKvNode::resolve_once_step`'s doc for the exact
-/// per-status rules. A caller with no cross-tablet resolver treats `Pending`
-/// and `Foreign` identically (both are "can't resolve locally, retry");
-/// [`linearizable_get_served_fast`](RaftKvNode::linearizable_get_served_fast)
-/// is the one caller that acts on `Foreign` differently.
+/// per-status rules.
+///
+/// **`Pending` and `Foreign` carry the identical [`IntentInfo`] payload**
+/// (the torn-pair-fix stack's ADR 0018 §2 amendment) — a caller with no
+/// cross-tablet resolver treats them identically (both are "can't resolve
+/// locally, retry"), but a caller that *can* chase an intent down (a status
+/// query + push, ADR 0018 §2/PR4 §3) now runs the exact same recipe for
+/// either outcome: `record_table`/`record_key` route to the record's actual
+/// owner transparently, whether that happens to be this same tablet (the
+/// `Pending` case) or a different one (`Foreign`). See
+/// [`linearizable_get_served_fast`](RaftKvNode::linearizable_get_served_fast)'s
+/// doc and `animusd::ClientCtx::cp_get_local_resolving`/
+/// `cp_get_local_snapshot`, the two callers that act on this.
 enum ResolveStep {
     Value(Option<Vec<u8>>),
-    Pending,
+    Pending(IntentInfo),
     Foreign(IntentInfo),
 }
 
 /// Everything a caller needs to chase down an intent's covering transaction
-/// on another tablet (ADR 0018 §2/PR4): the transaction's identity, its
-/// record's logical key, and the **table** whose tablet ring owns that key
-/// (a record key alone doesn't identify a table — see `txn::Envelope::Intent`'s
-/// doc). Returned by [`RaftKvNode::peek_intent`]/exposed via
-/// [`ResolveStep::Foreign`]; consumed by a coordinator (`animusd`) that
-/// routes a `ClientRequest::TxnStatus` to `record_table`/`record_key`'s
-/// owning tablet, then calls
+/// (ADR 0018 §2/PR4, generalized to the local case by the torn-pair-fix
+/// stack's ADR 0018 §2 amendment): the transaction's identity, its record's
+/// logical key, and the **table** whose tablet ring owns that key (a record
+/// key alone doesn't identify a table — see `txn::Envelope::Intent`'s doc).
+/// **Not always "another tablet"** despite the historical name of the
+/// `Foreign` variant that first introduced this struct — [`ResolveStep::
+/// Pending`] carries the identical shape for a record this *same* tablet
+/// already holds (the single-participant/anchor case), so a caller can
+/// route `record_table`/`record_key` through its ordinary cross-tablet
+/// lookup (e.g. `animusd`'s `ClientCtx::cp_route`) uniformly either way —
+/// it transparently resolves back to this tablet when the record happens to
+/// be local. Consumed by a coordinator (`animusd`) that routes a
+/// `ClientRequest::TxnStatus` to `record_table`/`record_key`'s owning
+/// tablet, then calls
 /// [`RaftKvNode::resolve_intent_given_status`](RaftKvNode::resolve_intent_given_status)
 /// with the reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1008,10 +1051,17 @@ pub enum FastRead {
     Value(Option<Vec<u8>>),
     /// A **local** record covers this key and is still `Pending` — the
     /// caller may fall back to the bounded local wait
-    /// ([`RaftKvNode::linearizable_get_served`]) or retry later.
-    Pending,
+    /// ([`RaftKvNode::linearizable_get_served`], correct for a genuinely
+    /// single-key read), or — since the torn-pair-fix stack's ADR 0018 §2
+    /// amendment gave this variant the same [`IntentInfo`] payload
+    /// `Foreign` carries — treat it identically to `Foreign` via a status
+    /// query + push + resolve, never blocking (the design a
+    /// `TransactGetItems` quiescent round needs: see
+    /// `animusd::ClientCtx::cp_get_local_snapshot`).
+    Pending(IntentInfo),
     /// The intent's record could not be found in this tablet's own scope —
-    /// see [`IntentInfo`]'s doc for how a caller resolves it.
+    /// see [`IntentInfo`]'s doc for how a caller resolves it. Carries the
+    /// same payload shape as `Pending` above, by design.
     Foreign(IntentInfo),
 }
 
@@ -1150,6 +1200,18 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// split), so "already logged" and "already applied" are never the same
     /// instant. See `propose_ordered`'s doc and `docs/engineering-lessons.md`.
     last_proposed_ts: Arc<AtomicU64>,
+    /// The Raft **term** at which [`mint_pushed`](Self::mint_pushed) last
+    /// absorbed `committed_ceiling()` into [`ts_cache`](Self::ts_cache)'s
+    /// `low_water` (ADR 0018 §2 amendment — the `mint_pushed`
+    /// clock-witnessing-runaway fix's per-term absorption). Initialized to
+    /// `u64::MAX`, a sentinel no real Raft term ever reaches, so the very
+    /// first mint on a fresh group (term 0 or otherwise) always absorbs.
+    /// Read-then-written only from inside `mint_pushed`, which itself only
+    /// ever runs while `propose_ordered`/`propose_ordered_aux` hold the
+    /// `core` lock — so despite the plain (non-CAS) swap, there is never a
+    /// concurrent writer to race. See `mint_pushed`'s doc for the safety
+    /// argument this absorb-once-per-term schedule rests on.
+    last_absorbed_term: Arc<AtomicU64>,
     /// This group's transaction-record tracker (ADR 0018 §2/PR5) —
     /// `animusd`'s `txn_resolver_loop` reads it via
     /// [`pending_txns`](Self::pending_txns)/
@@ -1278,6 +1340,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let committed_ceiling = Arc::new(AtomicU64::new(0));
         let last_ceiling_candidate = Arc::new(AtomicU64::new(0));
         let last_proposed_ts = Arc::new(AtomicU64::new(0));
+        // Sentinel (never a real term) so the very first mint on this group
+        // always absorbs the committed ceiling — see the field's own doc.
+        let last_absorbed_term = Arc::new(AtomicU64::new(u64::MAX));
         // Rebuilt asynchronously inside `drive` (a scoped engine scan needs
         // `.await`, unlike every other piece of group-start state here) —
         // starts empty and is populated before the apply task's first pass,
@@ -1305,6 +1370,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             committed_ceiling: Arc::clone(&committed_ceiling),
             last_ceiling_candidate,
             last_proposed_ts,
+            last_absorbed_term,
             txn_tracker: Arc::clone(&txn_tracker),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
@@ -1418,10 +1484,15 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// as before. `build` must not itself try to lock `core` (deadlock — it is
     /// already held) — every current caller only touches `hlc`/`ts_cache`/
     /// `last_ceiling_candidate`/`last_proposed_ts`, none of which anything else
-    /// locks `core` while holding.
-    fn propose_ordered<F: FnOnce() -> KvCommand>(&self, build: F) -> ProposeResult {
+    /// locks `core` while holding. `build` is handed this group's current Raft
+    /// `term`, read off the already-held `core` — the seam [`mint_pushed`]
+    /// (Self::mint_pushed)'s per-term ceiling absorption uses, since
+    /// `mint_pushed` itself cannot call [`term`](Self::term) (it would try to
+    /// lock `core` a second time from inside this same held lock).
+    fn propose_ordered<F: FnOnce(u64) -> KvCommand>(&self, build: F) -> ProposeResult {
         let mut core = self.lock();
-        let command = build();
+        let term = core.term();
+        let command = build(term);
         let ts = command_ts(&command);
         let result = record_propose(&self.metrics, core.propose(command));
         if matches!(result, ProposeResult::Accepted { .. })
@@ -1443,13 +1514,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// minted for the *next* step of the flow (stage -> commit/abort ->
     /// resolve), not just the bare [`ProposeResult`]. `aux` is returned
     /// regardless of whether the propose was accepted — every caller here
-    /// only trusts it once it has confirmed `Accepted`.
-    fn propose_ordered_aux<T, F: FnOnce() -> (KvCommand, T)>(
+    /// only trusts it once it has confirmed `Accepted`. As
+    /// [`propose_ordered`](Self::propose_ordered), `build` is handed this
+    /// group's current Raft `term`.
+    fn propose_ordered_aux<T, F: FnOnce(u64) -> (KvCommand, T)>(
         &self,
         build: F,
     ) -> (ProposeResult, T) {
         let mut core = self.lock();
-        let (command, aux) = build();
+        let term = core.term();
+        let (command, aux) = build(term);
         let ts = command_ts(&command);
         let result = record_propose(&self.metrics, core.propose(command));
         if matches!(result, ProposeResult::Accepted { .. })
@@ -1523,24 +1597,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             // ever act as a floor to strictly exceed.
             let last = hlc::unpack(last_packed)
                 .max(hlc::unpack(self.last_proposed_ts.load(Ordering::SeqCst)));
+            // This is a monotonic ratchet, not a wraparound — the
+            // (astronomically unlikely) overflow carries into `wall_ms` via
+            // `bump_strictly_above`'s own rule (shared with `mint_pushed`'s
+            // identical-shape no-witness push, see that function's doc).
             let candidate = if margin > last {
                 margin
             } else {
-                // Bump the logical component; carry into wall_ms on the
-                // (astronomically unlikely) overflow, mirroring `Hlc`'s own
-                // carry rule — this is a monotonic ratchet, not a wraparound.
-                let bumped_logical = last.logical.wrapping_add(1);
-                if bumped_logical >= (1 << hlc::LOGICAL_BITS) {
-                    HlcTimestamp {
-                        wall_ms: last.wall_ms + 1,
-                        logical: 0,
-                    }
-                } else {
-                    HlcTimestamp {
-                        wall_ms: last.wall_ms,
-                        logical: bumped_logical,
-                    }
-                }
+                bump_strictly_above(last)
             };
             if self
                 .last_ceiling_candidate
@@ -1559,31 +1623,79 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
 
     /// Mint a write's `ts`, **pushed** above any read this group's
     /// [`ts_cache`](Self::ts_cache) or committed read ceiling has already
-    /// served for `keys` (ADR 0018 §2/PR2b — the write-conflict-push half of
+    /// served for `keys` (ADR 0018 §2/PR2b, amended by the `mint_pushed`
+    /// clock-witnessing-runaway fix below — the write-conflict-push half of
     /// serializability): a write must never land at or below a timestamp
-    /// `keys` were already read at. Folds the committed ceiling in as an
-    /// additional floor (mirrors `ts_cache.rs::raise_low_water`'s doc): every
-    /// past read, by this leader or a predecessor, was served below *some*
-    /// committed ceiling, so pushing above the ceiling pushes above every
-    /// read anyone could have served, even one this leader-local cache has
-    /// no per-span record of.
+    /// `keys` were already read at. `term` is this group's current Raft
+    /// term, handed down by [`propose_ordered`](Self::propose_ordered)/
+    /// [`propose_ordered_aux`](Self::propose_ordered_aux) off the `core`
+    /// lock they already hold — `mint_pushed` cannot read it itself via
+    /// [`term`](Self::term) without deadlocking on that same lock.
     ///
-    /// One retry always suffices: [`Hlc::witness`]'s own contract guarantees
-    /// the re-mint strictly exceeds the witnessed floor — asserted here,
-    /// not just assumed, since a failure would mean `Hlc::witness` itself
-    /// stopped upholding that contract (a correctness bug, not a
-    /// recoverable condition, matching `assert_ts_monotonic`'s doctrine).
-    fn mint_pushed<K: AsRef<[u8]>>(&self, keys: &[K]) -> HlcTimestamp {
+    /// **Per-term ceiling absorption (the safety invariant this rests on).**
+    /// The committed ceiling is folded into [`ts_cache`](Self::ts_cache)'s
+    /// `low_water` **at most once per term**, the first time this leader
+    /// mints in a given term — never on every mint. This is strictly
+    /// sufficient: during one stable leadership stint, every read this
+    /// leader itself serves already bumps `ts_cache` at its own real serve
+    /// `ts` (never a future-shifted value), so the per-key cache alone
+    /// floors every subsequent write above every read *this* leader served.
+    /// The ceiling's write-floor role is only needed to additionally cover
+    /// a **predecessor's** reads — its own per-key `ts_cache` entries died
+    /// with it — and a predecessor's ceiling is fixed as of this leader's
+    /// own takeover: absorbing it once, at the first mint of the new term,
+    /// covers every read the predecessor could ever have served (Raft
+    /// leader completeness — the new leader already witnessed the prior
+    /// ceiling's `ts` via ordinary `AppendEntries` receipt before it could
+    /// ever campaign, and a deposed leader cannot commit a fresher one
+    /// after being deposed: its own `ReadCeiling`/write proposals fail once
+    /// it loses the leadership its `ensure_ceiling_above`/`propose_ordered`
+    /// calls require). Absorbing it again on every later mint in the same
+    /// term added nothing to safety — every read since takeover is already
+    /// covered by the per-key cache — while feeding a live feedback loop:
+    /// the ceiling is deliberately minted `HLC_MAX_OFFSET` in the future
+    /// (`ensure_ceiling_above`'s `Hlc::uncertainty_upper`), so an ordinary
+    /// mint almost always fell short of it, triggering the no-witness push
+    /// below on *every* write, which (before this fix, see next) advanced
+    /// this leader's own clock toward that future value, which made the
+    /// *next* read's serve `ts` approach and exceed the ceiling almost
+    /// immediately, forcing `ensure_ceiling_above` to propose a fresh one
+    /// — a k×`HLC_MAX_OFFSET` runaway lattice roughly 10x faster than real
+    /// time, probe-verified, that also starved genuine log entries behind
+    /// the manufactured `ReadCeiling` churn on the propose path. The
+    /// sentinel initial value of [`last_absorbed_term`](Self::last_absorbed_term)
+    /// (`u64::MAX`, never a real term) ensures the very first mint on a
+    /// fresh group still absorbs.
+    ///
+    /// **No-witness push (defense in depth).** When the honest mint falls
+    /// at or below the floor, the pushed replacement is computed as pure
+    /// arithmetic strictly above the floor
+    /// ([`bump_strictly_above`]) — **never** via [`Hlc::witness`], unlike
+    /// this function's pre-fix behavior. `next_ceiling_candidate`'s own doc
+    /// already named this exact hazard (witnessing a deliberately
+    /// future-shifted value poisons every later ordinary mint) and avoided
+    /// it with a separate CAS ratchet; this was the second, independent
+    /// route to the same `Hlc::witness` sink that fix never covered.
+    /// Monotonicity across proposes still holds without witnessing: the
+    /// floor already includes [`last_proposed_ts`](Self::last_proposed_ts)
+    /// (this leader's own last-*logged* ts), so each pushed write's ts
+    /// strictly exceeds every ts this leader has minted or proposed so far
+    /// — the same property `Hlc::witness` would have provided, without any
+    /// of its side effect on `self.hlc`'s own persistent state. See
+    /// `docs/engineering-lessons.md` and this crate's ADR 0018 §2 amendment
+    /// for the full incident.
+    fn mint_pushed<K: AsRef<[u8]>>(&self, term: u64, keys: &[K]) -> HlcTimestamp {
         let ts = self.hlc.mint(self.env.now());
         let cache_floor = {
-            // Opportunistically ratchet the cache's own `low_water` up to the
-            // current committed ceiling before querying it (never regresses —
-            // see `TsCache::raise_low_water`'s doc) — the mechanism that lets
-            // a freshly-elected leader's cache catch up to what its
-            // predecessor's ceiling already covered, with no separate
-            // "on leader change" event to detect.
             let mut cache = self.ts_cache.lock().expect("ts cache poisoned");
-            cache.raise_low_water(self.committed_ceiling());
+            // Absorb the committed ceiling into `low_water` only on this
+            // leader's first mint of `term` (see the doc above) — `swap`
+            // both reads the previously-absorbed term and records `term` in
+            // one step; no CAS is needed since every `mint_pushed` call is
+            // already serialized by the `core` lock its caller holds.
+            if self.last_absorbed_term.swap(term, Ordering::SeqCst) != term {
+                cache.raise_low_water(self.committed_ceiling());
+            }
             cache.max_overlapping(keys)
         };
         // Also floored by this leader's own last-*logged* ts (`propose_
@@ -1596,11 +1708,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if ts > floor {
             return ts;
         }
-        let pushed = self.hlc.witness(floor, self.env.now());
+        let pushed = bump_strictly_above(floor);
         assert!(
             pushed > floor,
-            "raftkv write-push: witnessing the floor must strictly exceed it \
-             (floor={floor:?}, got={pushed:?}) — Hlc::witness's own contract is broken"
+            "raftkv write-push: the no-witness bump must strictly exceed the floor \
+             (floor={floor:?}, got={pushed:?}) — bump_strictly_above's own contract is broken"
         );
         pushed
     }
@@ -1617,8 +1729,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// As [`put`](Self::put), but the leader stamps its own `fence` into the
     /// entry instead of the unconstrained default (see [`KvCommand`]'s doc).
     pub fn put_fenced(&self, key: Vec<u8>, value: Vec<u8>, fence: KeyRange) -> ProposeResult {
-        self.propose_ordered(|| {
-            let ts = self.mint_pushed(std::slice::from_ref(&key));
+        self.propose_ordered(|term| {
+            let ts = self.mint_pushed(term, std::slice::from_ref(&key));
             KvCommand::Put {
                 key,
                 value,
@@ -1651,9 +1763,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         fence: KeyRange,
     ) -> ProposeResult {
-        self.propose_ordered(|| {
+        self.propose_ordered(|term| {
             let keys: Vec<&[u8]> = puts.iter().map(|(k, _)| k.as_slice()).collect();
-            let ts = self.mint_pushed(&keys);
+            let ts = self.mint_pushed(term, &keys);
             KvCommand::Batch { puts, fence, ts }
         })
     }
@@ -1691,9 +1803,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         change_log: Option<(Vec<u8>, Vec<u8>)>,
         fence: KeyRange,
     ) -> ProposeResult {
-        self.propose_ordered(|| {
+        self.propose_ordered(|term| {
             let keys: Vec<&[u8]> = writes.iter().map(|(_, k, _)| k.as_slice()).collect();
-            let ts = self.mint_pushed(&keys);
+            let ts = self.mint_pushed(term, &keys);
             KvCommand::KindBatch {
                 writes,
                 change_log,
@@ -1713,8 +1825,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// As [`delete`](Self::delete), but the leader stamps its own `fence` into
     /// the entry instead of the unconstrained default (see [`KvCommand`]'s doc).
     pub fn delete_fenced(&self, key: Vec<u8>, fence: KeyRange) -> ProposeResult {
-        self.propose_ordered(|| {
-            let ts = self.mint_pushed(std::slice::from_ref(&key));
+        self.propose_ordered(|term| {
+            let ts = self.mint_pushed(term, std::slice::from_ref(&key));
             KvCommand::Delete { key, fence, ts }
         })
     }
@@ -1744,8 +1856,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         value: Vec<u8>,
         fence: KeyRange,
     ) -> ProposeResult {
-        self.propose_ordered(|| {
-            let ts = self.mint_pushed(std::slice::from_ref(&key));
+        self.propose_ordered(|term| {
+            let ts = self.mint_pushed(term, std::slice::from_ref(&key));
             KvCommand::Cas {
                 key,
                 expected,
@@ -1766,7 +1878,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// (the marker key is keyed by `(tablet, range)`, so a repeat simply
     /// refreshes it with a newer `ts` — see `seal.rs`).
     pub fn propose_seal(&self, range: KeyRange) -> ProposeResult {
-        self.propose_ordered(|| {
+        self.propose_ordered(|_term| {
             let ts = self.hlc.mint(self.env.now());
             // Same `last_proposed_ts` floor as `mint_pushed` (see
             // `propose_ordered`'s doc) — a seal is a mutating log entry like
@@ -1875,8 +1987,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
         let fence = self.scope_range();
         let record_table = table.to_owned();
-        let (result, (txn_id, record_key)) = self.propose_ordered_aux(|| {
-            let ts = self.mint_pushed(&keys);
+        let (result, (txn_id, record_key)) = self.propose_ordered_aux(|term| {
+            let ts = self.mint_pushed(term, &keys);
             let txn_id = TxnId {
                 ts,
                 node: self.env.node_id(),
@@ -1943,8 +2055,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         );
         let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
         let fence = self.scope_range();
-        let (result, ts) = self.propose_ordered_aux(|| {
-            let ts = self.mint_pushed(&keys);
+        let (result, ts) = self.propose_ordered_aux(|term| {
+            let ts = self.mint_pushed(term, &keys);
             let cmd = KvCommand::TxnStage {
                 txn_id: txn_id.clone(),
                 record_key: record_key.clone(),
@@ -1979,11 +2091,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if ts > floor {
             return ts;
         }
-        let pushed = self.hlc.witness(floor, self.env.now());
+        let pushed = bump_strictly_above(floor);
         assert!(
             pushed > floor,
-            "raftkv mint_at_least: witnessing the floor must strictly exceed it \
-             (floor={floor:?}, got={pushed:?}) — Hlc::witness's own contract is broken"
+            "raftkv mint_at_least: the no-witness bump must strictly exceed the floor \
+             (floor={floor:?}, got={pushed:?}) — bump_strictly_above's own contract is broken"
         );
         pushed
     }
@@ -2035,7 +2147,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         record_key: Vec<u8>,
         min_ts: HlcTimestamp,
     ) -> Option<HlcTimestamp> {
-        let (result, ts) = self.propose_ordered_aux(|| {
+        let (result, ts) = self.propose_ordered_aux(|_term| {
             let ts = self.mint_at_least(min_ts);
             let cmd = KvCommand::TxnCommit {
                 txn_id: txn_id.clone(),
@@ -2068,8 +2180,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// status (e.g. [`txn_status_local`](Self::txn_status_local)) to report
     /// honestly, never assume its own proposal won.
     pub async fn txn_abort(&self, txn_id: TxnId, record_key: Vec<u8>) -> Option<HlcTimestamp> {
-        let (result, ts) = self.propose_ordered_aux(|| {
-            let ts = self.mint_pushed(std::slice::from_ref(&record_key));
+        let (result, ts) = self.propose_ordered_aux(|term| {
+            let ts = self.mint_pushed(term, std::slice::from_ref(&record_key));
             let cmd = KvCommand::TxnAbort {
                 txn_id: txn_id.clone(),
                 record_key: record_key.clone(),
@@ -2114,8 +2226,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         record_key: Vec<u8>,
         created_ts: HlcTimestamp,
     ) -> Option<HlcTimestamp> {
-        let (result, ts) = self.propose_ordered_aux(|| {
-            let ts = self.mint_pushed(std::slice::from_ref(&record_key));
+        let (result, ts) = self.propose_ordered_aux(|term| {
+            let ts = self.mint_pushed(term, std::slice::from_ref(&record_key));
             let cmd = KvCommand::TxnAbort {
                 txn_id: txn_id.clone(),
                 record_key: record_key.clone(),
@@ -2154,13 +2266,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         keys: Vec<Vec<u8>>,
         outcome: txn::TxnOutcome,
     ) -> Option<HlcTimestamp> {
-        let (result, ts) = self.propose_ordered_aux(|| {
-            let ts = self.mint_pushed(&keys);
+        // ADR 0018 §2 write-loss amendment: stamped from this group's own
+        // live scope, exactly like `TxnStage`'s `fence` above — see
+        // `KvCommand::TxnResolve`'s doc for why this is no longer safe to
+        // omit.
+        let fence = self.scope_range();
+        let (result, ts) = self.propose_ordered_aux(|term| {
+            let ts = self.mint_pushed(term, &keys);
             let cmd = KvCommand::TxnResolve {
                 txn_id: txn_id.clone(),
                 record_key: record_key.clone(),
                 keys: keys.clone(),
                 outcome: outcome.clone(),
+                fence: fence.clone(),
                 ts,
             };
             (cmd, ts)
@@ -2198,8 +2316,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         keys: Vec<Vec<u8>>,
         commit: bool,
     ) -> Option<HlcTimestamp> {
-        let (decide_result, decision_ts) = self.propose_ordered_aux(|| {
-            let ts = self.mint_pushed(std::slice::from_ref(&record_key));
+        let (decide_result, decision_ts) = self.propose_ordered_aux(|term| {
+            let ts = self.mint_pushed(term, std::slice::from_ref(&record_key));
             let cmd = if commit {
                 KvCommand::TxnCommit {
                     txn_id: txn_id.clone(),
@@ -2752,12 +2870,15 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// [`resolve_once_step`](Self::resolve_once_step) (the local-record
     /// path) and [`resolve_intent_given_status`](Self::resolve_intent_given_status)
     /// (the cross-tablet, externally-supplied-status path): `Pending`
-    /// can't resolve yet; `Committed` at or before `read_ts` (`None` =
-    /// "latest") serves `staged_value`; `Committed` strictly after
-    /// `read_ts`, or `Aborted`, serves whatever `physical_key` held
-    /// immediately before this intent (rewinding to `vv_version - 1` —
-    /// never a tombstone, which would incorrectly shadow an older,
-    /// still-live committed value — see `txn.rs`'s module doc).
+    /// can't resolve yet (returns [`ResolveStep::Pending`] carrying
+    /// `pending`, the caller-supplied [`IntentInfo`] for *this* intent — see
+    /// that variant's doc for why callers need it even in the local case);
+    /// `Committed` at or before `read_ts` (`None` = "latest") serves
+    /// `staged_value`; `Committed` strictly after `read_ts`, or `Aborted`,
+    /// serves whatever `physical_key` held immediately before this intent
+    /// (rewinding to `vv_version - 1` — never a tombstone, which would
+    /// incorrectly shadow an older, still-live committed value — see
+    /// `txn.rs`'s module doc).
     async fn resolve_decided(
         &self,
         physical_key: &[u8],
@@ -2765,6 +2886,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         staged_value: Option<Vec<u8>>,
         read_ts: Option<HlcTimestamp>,
         status: &txn::TxnDecisionStatus,
+        pending: IntentInfo,
     ) -> ResolveStep {
         match status {
             txn::TxnDecisionStatus::Committed { commit_ts }
@@ -2803,7 +2925,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     }),
                 )
             }
-            txn::TxnDecisionStatus::Pending => ResolveStep::Pending,
+            txn::TxnDecisionStatus::Pending => ResolveStep::Pending(pending),
         }
     }
 
@@ -2844,12 +2966,27 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     .and_then(|r| txn::decode_record(&r.value));
                 match record {
                     Some(r) if r.txn_id == txn_id => {
+                        // Built up front (not just inside the `Pending`
+                        // branch `resolve_decided` might take) since the
+                        // fields below are about to be moved into that
+                        // call — cheap relative to the storage round trip
+                        // just above, and keeps `Pending` symmetric with
+                        // `Foreign`'s own `IntentInfo` (torn-pair-fix
+                        // stack's ADR 0018 §2 amendment).
+                        let pending = IntentInfo {
+                            txn_id: txn_id.clone(),
+                            record_key: record_key.clone(),
+                            record_table: record_table.clone(),
+                            staged_value: staged_value.clone(),
+                            version: hlc::unpack(vv.version),
+                        };
                         self.resolve_decided(
                             physical_key,
                             vv.version,
                             staged_value,
                             read_ts,
                             &r.status.to_public(),
+                            pending,
                         )
                         .await
                     }
@@ -2901,7 +3038,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 // doc; a caller that *can* chase a foreign record down uses
                 // `linearizable_get_served_fast` instead of this bounded
                 // internal retry.
-                ResolveStep::Pending | ResolveStep::Foreign(_) => {
+                ResolveStep::Pending(_) | ResolveStep::Foreign(_) => {
                     if self.env.now().0 >= deadline {
                         return None;
                     }
@@ -2955,7 +3092,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let vv = self.storage.get(&physical).await.ok().flatten()?;
         match self.resolve_once_step(&physical, vv, None).await {
             ResolveStep::Value(v) => v,
-            ResolveStep::Pending | ResolveStep::Foreign(_) => None,
+            ResolveStep::Pending(_) | ResolveStep::Foreign(_) => None,
         }
     }
 
@@ -3311,7 +3448,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
         Some(match step {
             ResolveStep::Value(v) => FastRead::Value(v),
-            ResolveStep::Pending => FastRead::Pending,
+            ResolveStep::Pending(info) => FastRead::Pending(info),
             ResolveStep::Foreign(info) => FastRead::Foreign(info),
         })
     }
@@ -3350,22 +3487,42 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             txn::Envelope::Committed(v) => Some(Some(v)),
             txn::Envelope::Intent {
                 txn_id: found,
+                record_key,
+                record_table,
                 staged_value,
-                ..
             } if &found == txn_id => {
+                // Built for parity with `resolve_once_step`'s own call —
+                // unused here whenever `status` isn't `Pending` (the only
+                // caller, `animusd`, only ever supplies an
+                // already-decided status), but `resolve_decided` needs one
+                // value of this shape regardless of which branch it takes.
+                let pending = IntentInfo {
+                    txn_id: found.clone(),
+                    record_key,
+                    record_table,
+                    staged_value: staged_value.clone(),
+                    version: hlc::unpack(vv.version),
+                };
                 match self
-                    .resolve_decided(&physical, vv.version, staged_value, read_ts, &status)
+                    .resolve_decided(
+                        &physical,
+                        vv.version,
+                        staged_value,
+                        read_ts,
+                        &status,
+                        pending,
+                    )
                     .await
                 {
                     ResolveStep::Value(v) => Some(v),
-                    ResolveStep::Pending | ResolveStep::Foreign(_) => None,
+                    ResolveStep::Pending(_) | ResolveStep::Foreign(_) => None,
                 }
             }
             // No longer our intent (already resolved, or superseded) —
             // resolve whatever is actually there now instead.
             _ => match self.resolve_once_step(&physical, vv, read_ts).await {
                 ResolveStep::Value(v) => Some(v),
-                ResolveStep::Pending | ResolveStep::Foreign(_) => None,
+                ResolveStep::Pending(_) | ResolveStep::Foreign(_) => None,
             },
         }
     }
@@ -3933,7 +4090,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // `candidate` inside `propose_ordered` (which now also wraps every
         // write proposer) is what closes that residual: see the doc on
         // `propose_ordered` for the shared root cause both fixes address.
-        match self.propose_ordered(|| {
+        match self.propose_ordered(|_term| {
             let margin = self.hlc.uncertainty_upper(ts);
             let candidate = self.next_ceiling_candidate(margin);
             KvCommand::ReadCeiling { ts: candidate }
@@ -4167,6 +4324,101 @@ fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimesta
     *max_applied_ts = Some(ts);
 }
 
+/// Logged-warning cap for [`surface_suspicious_merge_noop`] (below): the
+/// [`Metric`] counters there are always incremented (cheap, unconditional),
+/// but a genuinely-reoccurring bug logging one line per applied entry would
+/// flood the log with no signal past the first handful — capped so the
+/// first occurrences are loud without a live incident drowning everything
+/// else out. Threaded per apply task, like `max_applied_ts`/`sealed` — this
+/// task is this group's sole writer, so a plain `&mut u32` needs no atomic.
+const SUSPICIOUS_MERGE_NOOP_LOG_CAP: u32 = 20;
+
+/// **Part B of the ADR 0018 §2 write-loss amendment (the seatbelt).**
+/// Surface a `storage.merge`/`merge_tombstone` call that returned
+/// `Ok(false)` ("did not take effect") at one of the three apply-arm sites
+/// that used to discard that bool outright via `.expect(..)`
+/// (`TxnStage`'s intent write, `TxnResolve`'s commit/abort-restore writes,
+/// `Cas`'s swap) — sites whose *caller-visible* outcome
+/// (`StageOutcome::Staged`, a resolved commit/abort, a decided CAS) is
+/// computed independently of whether the merge itself actually landed.
+/// `StorageEngine::merge`'s silent per-key-LWW no-op contract was designed
+/// for the deleted leaderless-AP plane's stale-replay tolerance (ADR 0001,
+/// gone under ADR 0019); every one of this CP plane's callers instead
+/// assumes a write its own gating logic accepted genuinely lands, so a
+/// silent `false` here is exactly the class of failure Bug 3 (acked
+/// participant writes silently lost) hid in — see the amendment for the
+/// full mechanism (the real root cause was `ClientCtx::recovery_resolve`'s
+/// table-only grouping misrouting a resolve to the wrong tablet, closed at
+/// the source in `animusd`, with `KvCommand::TxnResolve`'s own `fence` as
+/// the structural seatbelt against a repeat — see that variant's doc; this
+/// function closes the class so the *next* bug shaped like it can't hide
+/// the same way).
+///
+/// **Why this can't be a bare, unconditional panic/hard-assert.** Apply
+/// arms can legitimately re-run after a crash: WAL recovery replays this
+/// group's log tail unconditionally (`drive`'s doc), and the *engine*'s own
+/// durability can lead the *driver*'s in-memory bookkeeping — `max_applied_
+/// ts`/`engine_applied` both start fresh "each time this task starts,
+/// including after a restart" (`apply_loop`'s doc) — so re-applying an
+/// entry the engine already durably reflects from before this process
+/// started is expected, and `merge` correctly no-ops on it (the identical
+/// value, at the identical version, is already there). A bare assert here
+/// would turn every ordinary restart-and-replay into a crash loop.
+///
+/// **The replay-safe distinguisher.** `recovered_baseline_version` is
+/// `storage.latest_version()` captured **once**, at this apply task's own
+/// start, before it has applied (or this process has minted) anything —
+/// the engine-durable high-water mark a WAL replay can explain a no-op
+/// against. `entry_version` (this specific merge's own version — the same
+/// value [`assert_ts_monotonic`] already checked strictly increases in log
+/// order) at or below that baseline is structurally indistinguishable from
+/// an ordinary post-crash replay and is *not* surfaced loudly. Strictly
+/// above it, a no-op is **provable**, not merely suspicious: this group's
+/// own witnessing chain guarantees a fresh mint already exceeds
+/// `storage.latest_version()` as observed at group start (`start_inner`'s
+/// group-start witness, `drive`'s doc), so nothing this process could
+/// legitimately mint after that point should ever collide with — let alone
+/// lose to — a version already sitting in the engine, unless the value that
+/// beat it got there via exactly Bug 3's mechanism (or a sibling of it this
+/// seatbelt exists to also catch, present or future).
+fn surface_suspicious_merge_noop(
+    metrics: &MetricsHandle,
+    log_budget: &mut u32,
+    site: &'static str,
+    key: &[u8],
+    entry_version: Version,
+    recovered_baseline_version: Version,
+) {
+    metrics.incr(Metric::CpMergeTookNoEffect);
+    if entry_version <= recovered_baseline_version {
+        return; // explainable by an ordinary WAL-replay re-application
+    }
+    metrics.incr(Metric::CpMergeTookNoEffectUnexplained);
+    if *log_budget > 0 {
+        *log_budget -= 1;
+        tracing::warn!(
+            site,
+            key = ?key,
+            entry_version,
+            recovered_baseline_version,
+            "raftkv: apply-time merge silently took no effect on a write this apply arm's own \
+             control flow already treated as landed — not explainable by WAL replay (this \
+             entry's own version exceeds the engine-durable watermark recovered at this apply \
+             task's start), so this is a provable, live invariant violation — see ADR 0018 §2's \
+             write-loss amendment"
+        );
+    }
+    // FIXME(PR3 WIP): a `debug_assert!` here was found to fire on legitimate,
+    // documented scenarios this design didn't account for (e.g. same-txn
+    // re-staging / an application-level client retry landing an identical
+    // entry a second time within the *same* process lifetime, well after
+    // `recovered_baseline_version` — not a node restart at all) — see the
+    // in-progress investigation notes. Metrics + a capped warn log only,
+    // until the fresh-vs-replay distinguisher is redesigned to also
+    // recognize an idempotent identical-value re-application, not just a
+    // post-restart one.
+}
+
 /// Install any received snapshot, apply committed-and-durable commands to the
 /// engine in commit order, and compact when the engine has merged enough past the
 /// snapshot base. **Runs on the apply task only** — off the consensus loop, so a
@@ -4204,6 +4456,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     max_applied_ts: &mut Option<HlcTimestamp>,
     committed_ceiling: &AtomicU64,
     txn_tracker: &Mutex<TxnTracker>,
+    // ADR 0018 §2 write-loss amendment (Part B): the engine-durable version
+    // watermark recovered once at this apply task's own start, and this
+    // task's own remaining `tracing::warn!` budget for a suspicious no-op —
+    // see `surface_suspicious_merge_noop`'s doc. Threaded like `sealed`/
+    // `max_applied_ts`: this apply task's own sequential, single-writer
+    // bookkeeping, never touched by any other task.
+    recovered_baseline_version: Version,
+    suspicious_noop_log_budget: &mut u32,
 ) -> bool {
     let mut did_work = false;
 
@@ -4428,10 +4688,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         // Same write path as `Put`: `hlc::pack(ts)` is the MVCC
                         // version, so re-applying on recovery is idempotent
                         // (per-key LWW).
-                        storage
-                            .merge(&physical_key, &txn::encode_committed(&value), hlc::pack(ts))
+                        let cas_version = hlc::pack(ts);
+                        let took_effect = storage
+                            .merge(&physical_key, &txn::encode_committed(&value), cas_version)
                             .await
                             .expect("raftkv apply cas");
+                        // ADR 0018 §2 write-loss amendment (Part B): this arm
+                        // already decided "swapped" from the *read* above,
+                        // independently of whether the merge itself lands —
+                        // see `surface_suspicious_merge_noop`'s doc.
+                        if !took_effect {
+                            surface_suspicious_merge_noop(
+                                metrics,
+                                suspicious_noop_log_budget,
+                                "Cas",
+                                &physical_key,
+                                cas_version,
+                                recovered_baseline_version,
+                            );
+                        }
                     }
                     swapped
                 } else {
@@ -4638,16 +4913,32 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     flush_pending(storage, &mut pending, metrics).await;
                     let version = hlc::pack(ts);
                     for (key, staged_value) in &writes {
-                        let env = txn::encode_intent(
+                        let intent_env = txn::encode_intent(
                             &txn_id,
                             &record_key,
                             &record_table,
                             staged_value.as_deref(),
                         );
-                        storage
-                            .merge(&scope.physical(key), &env, version)
+                        let physical_key = scope.physical(key);
+                        let took_effect = storage
+                            .merge(&physical_key, &intent_env, version)
                             .await
                             .expect("raftkv apply txn stage intent");
+                        // ADR 0018 §2 write-loss amendment (Part B): `outcome`
+                        // below is computed from the fence/seal/foreign-intent/
+                        // condition gates above, independently of whether this
+                        // specific key's intent merge actually lands — see
+                        // `surface_suspicious_merge_noop`'s doc.
+                        if !took_effect {
+                            surface_suspicious_merge_noop(
+                                metrics,
+                                suspicious_noop_log_budget,
+                                "TxnStage intent",
+                                &physical_key,
+                                version,
+                                recovered_baseline_version,
+                            );
+                        }
                     }
                     if is_anchor {
                         let record = txn::TxnRecord {
@@ -4944,6 +5235,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 record_key,
                 keys,
                 outcome,
+                fence,
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
@@ -4970,6 +5262,45 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         txn::TxnOutcome::Committed { commit_ts } => Some(*commit_ts),
                         txn::TxnOutcome::Aborted => None,
                     };
+                    // `Some(record) if record.txn_id == txn_id` means *this*
+                    // group holds `txn_id`'s own record, i.e. this group
+                    // **is** the anchor for this transaction (only an
+                    // anchor's own `TxnStage` ever writes it — see
+                    // `KvCommand::TxnStage`'s `is_anchor` doc) — never a
+                    // non-anchor participant, and never a different
+                    // transaction's own coincidentally colliding key
+                    // (`record_key` is derived from `txn_id` itself).
+                    //
+                    // (An earlier PR3 draft also witnessed `outcome`'s
+                    // `commit_ts` into a non-anchor participant's clock here,
+                    // to let a lagging participant catch up to the anchor's
+                    // pace. Abandoned: even gated to a genuine non-anchor
+                    // participant, that witness reignited a clock-witnessing
+                    // runaway under sustained cross-group transaction + read
+                    // load — confirmed super-linear in round count by
+                    // `tests/ts_cache.rs`'s `cross_group_txn_traffic_never_
+                    // lets_either_groups_clock_run_away`, which stays as a
+                    // permanent regression against re-introducing it. See
+                    // ADR 0018 §2's write-loss amendment for the full story
+                    // and why the real fix is the fence below instead.)
+                    let local_record = storage
+                        .get(&scope.physical(&record_key))
+                        .await
+                        .expect("raftkv txn resolve record read")
+                        .and_then(|vv| txn::decode_record(&vv.value));
+                    // ADR 0018 §2 write-loss amendment (Bug 3): every key in
+                    // `keys` must fall inside this entry's own `fence` (and
+                    // not a range this group has since sealed off) — the
+                    // structural seatbelt against a caller (present or
+                    // future) that misroutes a resolve to the wrong tablet,
+                    // exactly like `TxnStage`'s own fence check above and
+                    // `KvCommand::TxnResolve`'s doc. Whole-or-nothing, not
+                    // per-key: a partial reject would leave some of this
+                    // transaction's keys resolved and others not, the same
+                    // torn state a fence exists to prevent elsewhere.
+                    let all_in_fence = keys
+                        .iter()
+                        .all(|k| fence.contains(k) && !is_sealed(sealed, k));
                     // ADR 0018 §2/PR6 hardening (defense-in-depth, not a
                     // reproduced bug): every current decider
                     // (`animusd`'s ordinary `cp_txn` commit path and its
@@ -4989,8 +5320,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // refuse to resolve on a mismatch, whole-or-nothing,
                     // rather than silently applying the wrong outcome.
                     // **No known live violator as of PR6; guards a class,
-                    // not a reproduced bug** (see the PR6 audit recorded
-                    // in `docs/engineering-lessons.md` and ADR 0018's PR5
+                    // not a reproduced bug** (see the PR6 audit recorded in
+                    // `docs/engineering-lessons.md` and ADR 0018's PR5
                     // amendment §1's corrective note).
                     //
                     // A non-anchor participant's own apply cannot run this
@@ -5003,12 +5334,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // `ts` so a participant could at least reject an
                     // outcome inconsistent with it, which is left for a
                     // future PR if the cost proves worth it.
-                    let outcome_mismatch = match storage
-                        .get(&scope.physical(&record_key))
-                        .await
-                        .expect("raftkv txn resolve record read")
-                        .and_then(|vv| txn::decode_record(&vv.value))
-                    {
+                    let outcome_mismatch = match &local_record {
                         Some(record) if record.txn_id == txn_id => match (&record.status, &outcome)
                         {
                             (
@@ -5044,7 +5370,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     }
                     let version = hlc::pack(ts);
                     for key in &keys {
-                        if outcome_mismatch {
+                        if outcome_mismatch || !all_in_fence {
                             continue; // whole-or-nothing: skip every key, not just this one
                         }
                         let physical_key = scope.physical(key);
@@ -5069,25 +5395,57 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         let Some(staged_value) = intent else {
                             continue;
                         };
+                        // ADR 0018 §2 write-loss amendment (Part B): every
+                        // branch below already treated this key as resolved
+                        // (it is removed from `TxnTracker`, and the
+                        // coordinator's own client-facing ack was computed
+                        // independently) before this fix started checking
+                        // whether the merge that's supposed to *make* it so
+                        // actually landed — see
+                        // `surface_suspicious_merge_noop`'s doc, and this
+                        // variant's own `fence` (above, in `KvCommand::
+                        // TxnResolve`'s doc) for why a misrouted resolve
+                        // used to leave a foreign tablet's key permanently
+                        // unable to land correctly.
                         match outcome_commit_ts {
                             Some(_commit_ts) => match staged_value {
                                 // Committed: the staged value becomes the
                                 // committed value.
                                 Some(v) => {
-                                    storage
+                                    let took_effect = storage
                                         .merge(&physical_key, &txn::encode_committed(&v), version)
                                         .await
                                         .expect("raftkv apply txn resolve commit");
+                                    if !took_effect {
+                                        surface_suspicious_merge_noop(
+                                            metrics,
+                                            suspicious_noop_log_budget,
+                                            "TxnResolve commit",
+                                            &physical_key,
+                                            version,
+                                            recovered_baseline_version,
+                                        );
+                                    }
                                 }
                                 // A staged delete resolves to an actual
                                 // tombstone — the only place `TxnResolve`
                                 // writes one, since it's finalizing an
                                 // already-decided delete, not guessing.
                                 None => {
-                                    storage
+                                    let took_effect = storage
                                         .merge_tombstone(&physical_key, version)
                                         .await
                                         .expect("raftkv apply txn resolve commit delete");
+                                    if !took_effect {
+                                        surface_suspicious_merge_noop(
+                                            metrics,
+                                            suspicious_noop_log_budget,
+                                            "TxnResolve commit delete",
+                                            &physical_key,
+                                            version,
+                                            recovered_baseline_version,
+                                        );
+                                    }
                                 }
                             },
                             None => {
@@ -5124,16 +5482,34 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     .get_at(&physical_key, vv.version.saturating_sub(1))
                                     .await
                                     .expect("raftkv txn resolve prior read");
-                                match prior {
-                                    Some(pvv) => storage
-                                        .merge(&physical_key, &pvv.value, version)
-                                        .await
-                                        .expect("raftkv apply txn resolve abort restore"),
-                                    None => storage
-                                        .merge_tombstone(&physical_key, version)
-                                        .await
-                                        .expect("raftkv apply txn resolve abort restore tombstone"),
+                                let (took_effect, site) = match prior {
+                                    Some(pvv) => (
+                                        storage
+                                            .merge(&physical_key, &pvv.value, version)
+                                            .await
+                                            .expect("raftkv apply txn resolve abort restore"),
+                                        "TxnResolve abort restore",
+                                    ),
+                                    None => (
+                                        storage
+                                            .merge_tombstone(&physical_key, version)
+                                            .await
+                                            .expect(
+                                                "raftkv apply txn resolve abort restore tombstone",
+                                            ),
+                                        "TxnResolve abort restore tombstone",
+                                    ),
                                 };
+                                if !took_effect {
+                                    surface_suspicious_merge_noop(
+                                        metrics,
+                                        suspicious_noop_log_budget,
+                                        site,
+                                        &physical_key,
+                                        version,
+                                        recovered_baseline_version,
+                                    );
+                                }
                             }
                         }
                     }
@@ -5736,6 +6112,17 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     // qualifying entry it processes is unconditionally accepted (see
     // `assert_ts_monotonic`'s doc for why that boundary case is safe).
     let mut max_applied_ts: Option<HlcTimestamp> = None;
+    // ADR 0018 §2 write-loss amendment (Part B): the engine-durable version
+    // watermark, captured once, right here, before this task (or this
+    // process) has applied or minted anything this lifetime — the
+    // replay-safe baseline `surface_suspicious_merge_noop` compares a
+    // no-op's own entry version against. `drive`'s own recovery has already
+    // run by the time this task is spawned (its doc: "after recovery seeded
+    // the core + `engine_applied` + `sealed` + ..."), so this genuinely
+    // reflects every write durable before this restart, not a half-recovered
+    // snapshot.
+    let recovered_baseline_version = storage.latest_version();
+    let mut suspicious_noop_log_budget = SUSPICIOUS_MERGE_NOOP_LOG_CAP;
     loop {
         if halted.load(Ordering::SeqCst) {
             apply_stopped.store(true, Ordering::SeqCst);
@@ -5760,6 +6147,8 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &mut max_applied_ts,
             &committed_ceiling,
             &txn_tracker,
+            recovered_baseline_version,
+            &mut suspicious_noop_log_budget,
         )
         .await;
         if !did_work {
@@ -6005,8 +6394,8 @@ mod pr5_orphan_and_resurrection_tests {
         let anchor_writes = vec![(ka.clone(), Some(b"placed".to_vec()))];
         let fence = node_a.scope_range();
         let participant_span_end = txn::immediate_successor(&kb);
-        let (result, late_ts) = node_a.propose_ordered_aux(|| {
-            let ts = node_a.mint_pushed(std::slice::from_ref(&ka));
+        let (result, late_ts) = node_a.propose_ordered_aux(|term| {
+            let ts = node_a.mint_pushed(term, std::slice::from_ref(&ka));
             let cmd = KvCommand::TxnStage {
                 txn_id: txn_id.clone(),
                 record_key: record_key.clone(),

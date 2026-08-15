@@ -416,3 +416,150 @@ async fn anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_
         node.shutdown();
     }
 }
+
+/// **ADR 0018 §2 write-loss amendment (Bug 3) regression.** A genuine
+/// two-tablet, two-participant transaction — anchor and participant BOTH
+/// staged, on a real pre-split table — whose coordinator then does nothing
+/// else at all: no `TxnDecide`, no `TxnResolve`. The **only** path that ever
+/// commits and resolves this transaction is `txn_resolver_loop`'s automatic
+/// background sweep, past `RECOVERY_GRACE`: `txn_recover` decides Committed
+/// (`all_staged` is genuinely true this time), then `ClientCtx::
+/// recovery_resolve` must resolve BOTH keys.
+///
+/// **This is exactly the shape `ClientCtx::recovery_resolve`'s pre-fix
+/// table-only grouping mishandled**: the anchor's own span is always first
+/// in `TxnRecord::intent_spans` (`txn_stage_anchor` puts its own span before
+/// `participant_spans`), so the old `by_table` grouping bundled BOTH keys
+/// into one `txn_resolve_participant` call routed by `keys[0]` — the
+/// anchor's own key — landing the WHOLE bundle on the anchor's tablet. With
+/// `KvCommand::TxnResolve`'s fence now in place, that misrouted entry is
+/// rejected **whole-or-nothing** (the participant's key falls outside the
+/// anchor tablet's fence), so neither key would ever resolve — not even the
+/// anchor's own, despite it being on the "right" tablet, because it rode
+/// the same bundled entry as the participant's foreign key. Both keys would
+/// stay `Pending` forever (nothing else ever calls resolve on this
+/// transaction). Post-fix, `recovery_resolve` re-resolves each key's own
+/// current tablet and issues one call per `(table, tablet)`, so both land
+/// correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn recovery_resolve_correctly_commits_both_tablets_of_a_two_tablet_transaction() {
+    let n = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(n, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let addr0 = config.nodes[0].client;
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+
+    put_until_ok(addr0, "txn_group_fix", b"k1", b"seed-lower").await;
+    put_until_ok(addr0, "txn_group_fix", b"k9", b"seed-upper").await;
+    split_and_settle(&nodes, addr0, "txn_group_fix", b"k5").await;
+
+    let lower_key = txn_key("k2", "-groupfix");
+    let upper_key = txn_key("k8", "-groupfix");
+    let mut upper_span_end = upper_key.clone();
+    upper_span_end.push(0);
+    let participant_spans = vec![(
+        "txn_group_fix".to_string(),
+        KeyRange::new(upper_key.clone(), Some(upper_span_end)),
+    )];
+
+    let (txn_id, record_key, record_table, _ts) = prepare_via_any_node(
+        &all_addrs,
+        ClientRequest::TxnPrepare {
+            table: "txn_group_fix".to_string(),
+            anchor: None,
+            writes: vec![(lower_key.clone(), Some(b"lower-committed".to_vec()))],
+            conditions: Vec::new(),
+            participant_spans,
+        },
+    )
+    .await;
+
+    // Actually stage the participant this time (unlike the sibling
+    // abort-recovery test above) — both halves genuinely land, so recovery
+    // must decide Committed, not Aborted.
+    let (_txn_id2, _record_key2, _record_table2, _ts2) = prepare_via_any_node(
+        &all_addrs,
+        ClientRequest::TxnPrepare {
+            table: "txn_group_fix".to_string(),
+            anchor: Some((txn_id, record_key, record_table)),
+            writes: vec![(upper_key.clone(), Some(b"upper-committed".to_vec()))],
+            conditions: Vec::new(),
+            participant_spans: Vec::new(),
+        },
+    )
+    .await;
+
+    // Never send TxnDecide/TxnResolve — `txn_resolver_loop`'s automatic
+    // background sweep (past RECOVERY_GRACE, 5s) is the only thing that
+    // will ever commit and resolve this record.
+    //
+    // **A plain `Get` is the wrong probe here**: a point read resolves a
+    // still-`Pending` intent it hits *on demand*, purely at read time
+    // (`resolve_once_step`/`resolve_decided` — see `RaftKvNode::local_get`'s
+    // doc), the moment it can determine the covering transaction's decided
+    // status — which it already can here, since `TxnDecide` (unaffected by
+    // this bug) committed the record regardless of whether the per-key
+    // resolve itself ever physically landed. That on-demand resolution
+    // would mask exactly the bug this test exists to catch. A **`Scan`**
+    // is the discriminating probe instead: scan resolution is
+    // non-blocking and silently **omits** a still-`Pending` row rather
+    // than resolving it on the fly (`resolve_scan_rows`'s doc) — so a
+    // physically-unresolved intent is genuinely invisible to it, exactly
+    // the residual correctness gap the pre-fix grouping bug leaves behind
+    // even with `KvCommand::TxnResolve`'s fence protecting the physical
+    // key from corruption.
+    // Bounded to just below the split's own probe key (`split_and_settle`
+    // seeds `[split_key]zzz-probe`, which also falls in this window) —
+    // rather than count pairs, just check the two keys this test cares
+    // about are both present, so an unrelated third key in-range doesn't
+    // change this test's pass/fail signal.
+    let mut scan_end = upper_key.clone();
+    scan_end.push(0);
+    let by_key = timeout(Duration::from_secs(30), async {
+        loop {
+            if let ClientResponse::Pairs(pairs) = call(
+                addr0,
+                ClientRequest::Scan {
+                    start: lower_key.clone(),
+                    end: Some(scan_end.clone()),
+                    limit: None,
+                    table: "txn_group_fix".to_string(),
+                },
+            )
+            .await
+            {
+                let by_key: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+                    pairs.into_iter().collect();
+                if by_key.contains_key(&lower_key) && by_key.contains_key(&upper_key) {
+                    return by_key;
+                }
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "both keys never became visible to a Scan within 30s — recovery_resolve must \
+             resolve every tablet of a multi-tablet transaction, not just the one its \
+             bundled keys[0] happens to route to (ADR 0018 §2 write-loss amendment); a \
+             physically-unresolved intent is silently omitted from a scan even once its \
+             transaction is known-committed"
+        )
+    });
+    assert_eq!(
+        by_key.get(&lower_key).map(Vec::as_slice),
+        Some(b"lower-committed".as_slice()),
+        "lower_key must scan back as committed"
+    );
+    assert_eq!(
+        by_key.get(&upper_key).map(Vec::as_slice),
+        Some(b"upper-committed".as_slice()),
+        "upper_key must scan back as committed"
+    );
+
+    for node in &nodes {
+        node.shutdown();
+    }
+}

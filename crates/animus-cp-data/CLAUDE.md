@@ -54,7 +54,13 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   `LOGICAL_BITS` budget is hard-`assert!`-checked in `pack`, never
   `debug_assert!` (a silent overflow would silently collapse two distinct
   timestamps to one version). See the Key invariants section for how this
-  is wired into the apply path and the witnessing chain.
+  is wired into the apply path and the witnessing chain. `bump_strictly_
+  above(ts)` (ADR 0018 §2 amendment, the `mint_pushed`
+  clock-witnessing-runaway fix) is the pure "next value that strictly
+  exceeds `ts`" step shared by `next_ceiling_candidate`'s CAS-ratchet bump
+  and `mint_pushed`'s no-witness write-push — the safe alternative to
+  `Hlc::witness` at both call sites, neither of which may drag `self.hlc`'s
+  own persistent state toward a deliberately future-shifted value.
 - **`cursor.rs`** (ADR 0042/0043, `KIND_CURSOR = 0x04`) — consumer cursor
   rows: the per-tablet, per-consumer HLC watermark the DynamoDB Streams
   change-log lifecycle rework rests on. The module's own 79-line `//!` doc
@@ -340,10 +346,11 @@ State once here; cross-referenced from the sections below.
   - **`ts_cache.rs`'s `TsCache`** is leader-local, in-memory, best-effort —
     every served read bumps the span it read at its serve `ts`; every
     mutating propose (`mint_pushed`) checks its minted `ts` against the
-    highest overlapping bump (plus the committed ceiling) and, if not
-    strictly above, witnesses that floor and re-mints (one retry always
-    suffices). Losing this cache is always **safe**: over-conservative
-    pushes are still correct writes, just marginally later-timestamped.
+    highest overlapping bump (plus the committed ceiling, folded in — see
+    the per-term note below) and, if not strictly above, bumps past it as
+    pure arithmetic and re-mints (one retry always suffices). Losing this
+    cache is always **safe**: over-conservative pushes are still correct
+    writes, just marginally later-timestamped.
   - **The logged read ceiling** (`ceiling.rs`, `KvCommand::ReadCeiling`) is
     the actual safety net a leader-local cache alone can't be, across a
     leader change: a leader may only serve a read at a `ts` strictly below
@@ -365,6 +372,48 @@ State once here; cross-referenced from the sections below.
     seed-driven test caught); `next_ceiling_candidate` is a **separate**
     CAS ratchet for exactly this reason. Regression: `tests/ts_cache.rs`,
     `tests/snapshot_reads.rs`.
+  - **`mint_pushed` folds the committed ceiling in at most once per Raft
+    term, never on every mint (ADR 0018 §2 amendment, the
+    `mint_pushed` clock-witnessing-runaway fix).** The ceiling's write-floor
+    role only exists to cover a *predecessor* leader's reads — reads
+    *this* leader itself served are already covered by `ts_cache`'s
+    per-span entries, bumped at their real serve `ts`; a predecessor's
+    ceiling is fixed as of this leader's own takeover (it already
+    witnessed it via `AppendEntries` before it could campaign, and a
+    deposed leader cannot commit a fresher one). Absorbing it again on
+    every later mint in the same term fed a real, self-sustaining feedback
+    loop instead: since the ceiling is deliberately `HLC_MAX_OFFSET` ahead
+    of real time, an ordinary mint almost always fell short of it,
+    triggering a push on *every* write that — via the old
+    `Hlc::witness`-based push — dragged this leader's clock toward that
+    future value, which made the *next* read approach and exceed the
+    ceiling almost immediately, forcing a fresh `ReadCeiling` proposal
+    almost every round: a k×`HLC_MAX_OFFSET` runaway lattice, independent
+    of real elapsed time, that also starved genuine log entries behind the
+    manufactured ceiling churn. `RaftKvNode::last_absorbed_term` (an
+    `AtomicU64`, sentinel `u64::MAX`) tracks the last term absorbed;
+    `mint_pushed` cannot read `term()` itself (it always runs inside
+    `propose_ordered`/`propose_ordered_aux`'s already-held `core` lock, so
+    a second `lock()` would deadlock) — those two methods read
+    `core.term()` once and hand it to their `build` closure instead. **The
+    push itself is also no longer a `Hlc::witness` call** — `mint_pushed`
+    computes the pushed replacement as pure arithmetic
+    (`hlc::bump_strictly_above`, the same bump rule
+    `next_ceiling_candidate`'s own CAS ratchet uses, factored out so both
+    stay identical by construction), leaving `self.hlc`'s persistent state
+    untouched; monotonicity across a leader's own proposes still holds via
+    the pre-existing `last_proposed_ts` floor. Regression:
+    `tests/ts_cache.rs::interleaved_reads_and_writes_never_let_minted_
+    timestamps_outrun_real_time` (interleaved reads-and-writes on a tight
+    loop, asserting the group's clock never diverges from real elapsed
+    time by more than a small bounded multiple of `HLC_MAX_OFFSET` —
+    proven to fail pre-fix); the pre-existing leader-change safety test
+    (`leader_change_never_lets_a_write_undercut_a_served_read_even_
+    under_extreme_clock_skew`) stays green, since it is exactly the
+    property the once-per-term absorption preserves. See the ADR 0018 §2
+    amendment and `docs/engineering-lessons.md`'s Code-patterns entry
+    ("a fix must cover every path to a dangerous primitive's sink") for
+    the full incident.
 - **Uncertainty-interval read restarts.** `RaftKvNode::read_at` restarts
   **once** at `Hlc::uncertainty_upper(ts)` when it observes no value at
   `ts` but a version exists in `(ts, uncertainty_upper(ts)]` — a bounded
@@ -380,7 +429,20 @@ State once here; cross-referenced from the sections below.
   residual race between a caller's pre-propose `scope_range()` check and
   the entry's actual apply; the pre-propose reject is load-bearing, not
   redundant (see `animusd/CLAUDE.md` and the root `CLAUDE.md` entry on a
-  safety mechanism with zero production callers).
+  safety mechanism with zero production callers). **Every key-writing
+  `KvCommand` variant carries one** (`Put`/`Batch`/`Delete`/`Cas`/
+  `TxnStage`/`TxnResolve` — `TxnCommit`/`TxnAbort`/`Seal`/`ReadCeiling`
+  deliberately don't, since they never touch user data). `TxnResolve`
+  gained its `fence` last (ADR 0018 §2 write-loss amendment, Bug 3): it
+  was originally reasoned to need none ("every key here was already
+  fence-checked at `TxnStage` time"), which held for every in-crate caller
+  but not for `animusd`'s own coordinator, whose pre-fix `recovery_resolve`
+  could misroute a resolve to the wrong tablet of a split table — with no
+  fence, that landed directly on the wrong tablet's shared physical key
+  (ADR 0028), permanently breaking the owning tablet's future LWW. See
+  the amendment and `docs/engineering-lessons.md`'s "every key-writing
+  command variant must carry AND enforce the apply-time fence" entry for
+  the general lesson.
 - **Superseded by ADR 0044**: an `Absorb` teardown's drain-before-halt
   mechanism (a merge survivor's `WidenScope` deferred on the absorbed
   group's own committed-log drain, closing a data-loss window

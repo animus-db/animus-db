@@ -364,12 +364,46 @@ pub enum Metric {
     /// to) zero, and the signal an operator watches to tell "membership
     /// churn the repair sweep is still catching up on" from "stuck."
     StreamRepairBacklog,
+
+    // --- Apply-time merge write-loss seatbelt (ADR 0018 §2 write-loss
+    // amendment) --- Appended after the stream-repair-backlog variant;
+    // every earlier variant's slot and the text-export order stay stable,
+    // so the snapshot remains byte-reproducible. Recorded by
+    // `animus-cp-data`'s apply arms that already treat a `storage.merge`/
+    // `merge_tombstone` outcome as "landed" before this fix started
+    // checking it (`TxnStage`'s intent write, `TxnResolve`'s commit/
+    // abort-restore writes, `Cas`'s swap) — see `surface_suspicious_merge_
+    // noop`'s doc for the replay-vs-fresh-apply distinction these two
+    // metrics exist to separate.
+    /// A `merge`/`merge_tombstone` call at one of the three audited
+    /// apply-arm sites returned `Ok(false)` ("did not take effect")
+    /// where the caller's own control flow had already treated the write
+    /// as landed — recorded unconditionally, including the common benign
+    /// case (an ordinary post-crash WAL replay re-applying an entry the
+    /// engine already durably reflects from before this process started).
+    CpMergeTookNoEffect,
+    /// The strict subset of [`CpMergeTookNoEffect`] this process can
+    /// **prove** is not explainable by replay (the entry's own version
+    /// strictly exceeds the engine-durable watermark recovered at this
+    /// apply task's own start) — a genuine, live invariant violation, not
+    /// a startup artifact. Every increment here pairs with a capped
+    /// `tracing::warn!`. **Deliberately not a hard assert (or even a
+    /// `debug_assert!`)**: an earlier draft tried one and it fired on
+    /// legitimate, already-tested scenarios this replay-vs-fresh
+    /// distinguisher doesn't yet account for (e.g. an application-level
+    /// retry landing an identical entry a second time within one process
+    /// lifetime, not a restart at all) — see `surface_suspicious_merge_
+    /// noop`'s doc for the open FIXME. Metric + log only until a
+    /// same-value-idempotent-reapply check exists; this is exactly the
+    /// signal that would have caught the write-loss bug (ADR 0018 §2's
+    /// amendment) had it existed then.
+    CpMergeTookNoEffectUnexplained,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 62] = [
+    pub const ALL: [Metric; 64] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -432,6 +466,8 @@ impl Metric {
         Metric::StreamSegmentsExpiredTotal,
         Metric::StreamRepairsTotal,
         Metric::StreamRepairBacklog,
+        Metric::CpMergeTookNoEffect,
+        Metric::CpMergeTookNoEffectUnexplained,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -501,6 +537,8 @@ impl Metric {
             Metric::StreamSegmentsExpiredTotal => "stream_segments_expired_total",
             Metric::StreamRepairsTotal => "stream_repairs_total",
             Metric::StreamRepairBacklog => "stream_repair_backlog",
+            Metric::CpMergeTookNoEffect => "cp_merge_took_no_effect",
+            Metric::CpMergeTookNoEffectUnexplained => "cp_merge_took_no_effect_unexplained",
         }
     }
 

@@ -1910,3 +1910,416 @@ GC remains out of scope (ADR 0018 §2/PR5's own note).
 Codec: `animus-cp-data`'s wire/image `VERSION` bumped 10 → 11
 (`TxnStage.conditions`) — internal format only, no cross-version
 compatibility required (no live deployments, house convention).
+
+## Amendment (2026-08-15, `mint_pushed` clock-witnessing-runaway fix)
+
+This amendment fixes a live bug in PR2b's write-conflict push (§2/§3 above):
+`RaftKvNode::mint_pushed` had its own, independent route to the exact
+`Hlc::witness`-poisoning hazard the PR2b amendment's own §3 already named and
+fixed for `ensure_ceiling_above`/`next_ceiling_candidate`. It does not change
+any wire-facing behavior or the codec version — the fix is entirely internal
+to how a write's timestamp is computed.
+
+### 1. The bug
+
+`mint_pushed` folded the **live** `committed_ceiling()` into `ts_cache`'s
+`low_water` on **every** mint (`cache.raise_low_water(self.committed_ceiling())`,
+previously unconditional), then, whenever the honest mint fell at or below
+the resulting floor (the ceiling is deliberately `Hlc::uncertainty_upper`
+— `HLC_MAX_OFFSET` (500ms) — ahead of real time, so this was the *common*
+case, not an edge one), called `self.hlc.witness(floor, ..)` to push past
+it. Witnessing a value `HLC_MAX_OFFSET` in the future permanently ratchets
+the group's shared `Hlc` into that fiction — exactly the hazard §3's own
+`next_ceiling_candidate` doc already described and built a separate CAS
+ratchet to avoid. `mint_pushed` was PR2b's *other* caller of the identical
+unsafe pattern, never covered by that fix.
+
+The result is a self-sustaining feedback loop under interleaved reads and
+writes: a write's `mint_pushed` witnesses the ceiling forward → the next
+read mints near that poisoned clock and almost immediately exceeds the
+(now merely 500ms old) ceiling → `ensure_ceiling_above` proposes a fresh
+`ReadCeiling` another `HLC_MAX_OFFSET` further out → the next write folds
+*that* in as its floor and witnesses it too. Each round adds roughly one
+`HLC_MAX_OFFSET`, **independent of how much real (virtual) time actually
+elapses** — probe-verified as a k×`HLC_MAX_OFFSET` runaway lattice, and
+reproduced deterministically by `tests/ts_cache.rs`'s
+`interleaved_reads_and_writes_never_let_minted_timestamps_outrun_real_time`
+(pre-fix: committed ceiling reached 102s of manufactured time after only
+20s of real elapsed simulated time). The manufactured `ReadCeiling` churn
+this produces on the propose path also starves genuine log entries behind
+it.
+
+### 2. The fix, part A: per-term ceiling absorption
+
+The unconditional per-mint fold is strictly stronger than the safety
+property needs. **The committed ceiling's write-floor role only exists to
+cover a *predecessor* leader's reads** — reads served by *this* leader are
+already covered by its own `ts_cache` entries, bumped at their real serve
+`ts` by every `linearizable_get`/`_scan`/`read_at`/`scan_at` call. A
+predecessor's ceiling, meanwhile, is fixed as of this leader's own
+takeover: Raft leader completeness means the new leader already witnessed
+the prior ceiling's `ts` via ordinary `AppendEntries` receipt before it
+could ever campaign, and a deposed leader cannot commit a fresher ceiling
+after losing leadership (its own `ensure_ceiling_above`/`propose_ordered`
+calls require it). So absorbing `committed_ceiling()` into `ts_cache`'s
+`low_water` **once per term** — the first time this leader mints in a
+given term — is exactly as safe as absorbing it on every mint, while
+breaking the feedback loop: every mint after the first in a term is
+floored only by the per-key `ts_cache`/`last_proposed_ts`, both of which
+reflect *real* served/proposed timestamps, never a manufactured
+future-shifted one.
+
+**New invariant, replacing the unconditional-fold reading of §2 above**: a
+write's floor covers (a) every read *this* leader has itself served
+(`ts_cache`'s per-span entries, bumped at real serve `ts`), and (b) every
+read any *predecessor* could have served, via the ceiling absorbed once at
+this leader's first mint of its current term. `RaftKvNode::mint_pushed`
+tracks the absorption via a new field, `last_absorbed_term` (an
+`AtomicU64`, sentinel `u64::MAX` so the very first mint on a fresh group
+still absorbs), compared against the Raft `term` — which `mint_pushed`
+cannot read via `term()` itself (it always runs inside `propose_ordered`/
+`propose_ordered_aux`'s already-held `core` lock, so a second `lock()`
+call would deadlock); `propose_ordered`/`propose_ordered_aux` now read
+`core.term()` once and hand it down to their `build` closure for exactly
+this reason.
+
+### 3. The fix, part B: no-witness push
+
+Independent of part A (defense in depth: even a floor that is occasionally
+still ceiling-derived must not poison the clock), `mint_pushed`'s
+witness-and-retry branch is replaced with pure arithmetic: a new
+`hlc::bump_strictly_above(ts)` computes the next value that strictly
+exceeds `ts` (bump `logical` by one, carrying into `wall_ms` on
+`LOGICAL_BITS` overflow) with **no** `Hlc::witness` call and no mutation of
+`Hlc`'s own persistent state — the identical bump rule
+`next_ceiling_candidate`'s own CAS-ratchet branch already used inline,
+factored out into this shared, unit-tested function so both call sites
+stay byte-for-byte identical by construction rather than by discipline.
+Monotonicity across a leader's own successive proposes still holds without
+witnessing: the floor `mint_pushed` bumps above already includes
+`last_proposed_ts` (this leader's own last-*logged* ts, from
+`propose_ordered`'s existing floor-tracking — unchanged by this
+amendment), so each pushed write's ts strictly exceeds every ts this
+leader has minted or proposed so far, the same property `Hlc::witness`
+would have provided, without its side effect on `self.hlc`.
+
+### 4. What this closes, what stays true
+
+`next_ceiling_candidate`'s own doc already named the "never witness a
+future-shifted value" rule; this amendment is the fix for the second,
+independent path to the same `Hlc::witness` sink that rule never covered.
+Regression: `tests/ts_cache.rs`'s
+`interleaved_reads_and_writes_never_let_minted_timestamps_outrun_real_time`
+(new — proven to fail against the pre-fix code, per above) and the
+pre-existing `leader_change_never_lets_a_write_undercut_a_served_read_even_
+under_extreme_clock_skew` (unchanged, still green — the safety argument in
+§3 above that this amendment's new invariant rests on). See
+`docs/engineering-lessons.md` for the general "a fix must cover every path
+to a dangerous primitive's sink, not just the caller that surfaced it"
+lesson this incident is an instance of.
+
+No codec change (no `KvCommand`/wire-image field touched) and no change to
+`ensure_ceiling_above`/`next_ceiling_candidate` beyond factoring out the
+shared bump helper.
+
+## Amendment (2026-08-15, quiescent-round uniform-single-shot reads — PR2 of
+the torn-pair-fix stack)
+
+`TransactGetItems`'s quiescent-round reader (`animusd::dynamo::
+quiescent_multi_get`, §2's own "Amendment 2026-08-12, PR7" above) had a
+second, independent bug in the same family as this file's `mint_pushed`
+amendment just above: both are cases where a mechanism proven correct in
+isolation broke once combined with an asymmetry in how its inputs actually
+behave.
+
+### 1. The bug
+
+`quiescent_multi_get` reads every key of a round via `ClientCtx::cp_read`,
+which resolves an unresolved intent via `ClientCtx::cp_get_local_resolving`
+— and that function is **deliberately asymmetric** by design, correctly so
+for its real job (serving a plain `GetItem`, a genuinely single-key read):
+
+- `FastRead::Pending` (a **local** intent — the record lives in this same
+  tablet, the anchor case) falls through to the **bounded blocking chase**
+  (`RaftKvNode::linearizable_get_served`, up to `INTENT_WAIT_TIMEOUT` = 5s):
+  correct for a lone reader, since waiting out a contended intent is the
+  right behavior when there is nothing else to compare the read against.
+- `FastRead::Foreign` (a **cross-tablet** intent — the participant case)
+  gets a single status query + push attempt and, if still undecided,
+  reports a retryable `"; retry"` error immediately — `cp_read`'s own
+  *outer* loop (a 50ms poll) is the retrier, not this call.
+
+For a `TransactGetItems` round, this asymmetry is fatal: the round's own
+correctness argument ("accept once two consecutive rounds agree
+byte-for-byte") implicitly assumes every key in a round samples
+*approximately the same instant*. Under a tight, back-to-back writer
+alternating two keys of the *same* repeatedly-re-run transaction, the local
+key's blocking chase and the foreign key's immediate-give-up-then-50ms-retry
+have systematically different latencies, so the two keys of one round
+sample two different, unrelated instants — and because the skew is
+*systematic* (not random per round), two consecutive rounds can agree
+byte-for-byte on the exact same torn pair, satisfying the quiescence check
+while reporting a snapshot that was never true at any single instant.
+Reproduced directly by `animusd/tests/dynamo_txn.rs::
+transact_get_items_never_observes_a_torn_pair_under_concurrent_writes`
+(two keys, sum-to-zero writes, `a + b == 0` asserted on every accepted
+round).
+
+### 2. The fix: every key of a round is a uniform, non-blocking, single-shot sample
+
+The invariant a quiescent round actually needs: **one round samples one
+instant for every key** — not "every key eventually converges," which is
+what `cp_get_local_resolving` gives a lone `GetItem` and exactly what broke
+here. `quiescent_multi_get` now calls a new primitive,
+`ClientCtx::cp_read_snapshot` (→ `cp_get_local_snapshot`), instead of
+`cp_read`:
+
+- **`FastRead::Pending` and `FastRead::Foreign` now carry the identical
+  `IntentInfo` payload** (`animus_cp_data::ResolveStep`/`FastRead`, both
+  variants) — the local-anchor case used to carry nothing (there was no
+  cross-tablet resolver to hand it to), but the *record* itself is always
+  addressable by `(record_table, record_key)` regardless of whether it
+  happens to live in this same tablet or a different one:
+  `ClientCtx::txn_status`'s existing `cp_route`-based routing resolves back
+  to a local, in-process call transparently when it does.
+- Both variants now route through one shared function, `confirm_or_push`: a
+  single status query, and — only if still `Pending` — a single
+  `txn_recover` push attempt (same `RECOVERY_GRACE` liveness gate as
+  before: a young, still-live transaction is never disturbed). **Never a
+  second query, never a sleep-and-retry** inside this function.
+- A still-undecided outcome (or a resolve landing on a race — something
+  else resolved the key between the status query and the resolve call)
+  maps to a new `SnapshotRead::Unresolved` outcome, wire-distinguishable
+  via a new `ClientResponse::Unresolved` (the internal-only
+  `ClientRequest::GetSnapshot`/`cp_serve_forwarded` forwarding path mirrors
+  `KindWrite`/`KindScan`'s existing refused-bare convention) — **never**
+  `cp_get_local_resolving`'s retryable `"; retry"` `Error`, since the two
+  callers' outer loops act on the two outcomes differently.
+- `quiescent_multi_get`'s round loop: if *any* key of a round comes back
+  `Unresolved`, the whole round is discarded — `previous` resets to `None`,
+  never compared — since a round with one unresolved key proves nothing
+  about whether the *other* keys' values are stale (this is exactly the
+  case the old design let slip through as a false-positive "quiesced"
+  accept).
+
+`cp_get_local_resolving` itself, and hence plain `GetItem`/`cp_read`, is
+**unchanged** — the local-`Pending` blocking chase stays exactly as PR3
+built it, since it remains the correct behavior for a genuinely single-key
+read. Only `TransactGetItems`'s own round primitive moved to the uniform
+shape.
+
+### 3. Composition with the `mint_pushed` fix (this file's amendment just above)
+
+The two fixes are independent but compounding: the `mint_pushed` fix closes
+a *clock*-side hazard (a leader's own minted timestamps runaway-diverging
+from real time under interleaved reads/writes on one group); this amendment
+closes a *read-shape*-side hazard (one multi-key round sampling
+different instants across groups). Either alone leaves a path to a torn
+`TransactGetItems` snapshot under sustained concurrent writes to the same
+key pair; both together close every mechanism this stack's investigation
+found.
+
+### 4. A third, pre-existing, unrelated bug found during acceptance testing — explicitly out of scope here
+
+Solo re-runs of `transact_get_items_never_observes_a_torn_pair_under_
+concurrent_writes` against this PR (10 runs on the `mint_pushed`-only
+baseline, 20 runs with this amendment applied) show the test still failing
+at a similar, high rate (baseline 7/10 failed; with this fix, 17/20 failed)
+— **not** because either torn-pair mechanism above still fires (a dedicated
+new `SimEnv` regression proves the fixed round design itself sound at
+depth — see §5 below and `animus-test/tests/txn_serializable.rs::
+tight_pair_transactions_never_observe_a_torn_snapshot`, 0 failures across
+30+ seeds) — but because of a **third, distinct, already-documented
+pre-existing bug**: `docs/engineering-lessons.md`'s 2026-08-14 entry
+("A pre-existing, timing-sensitive flake found incidentally...") already
+adjudicated this exact test as genuinely flaky on `main`, unrelated to the
+PR it was found alongside, with its own baseline numbers (4/10, 4/10, 5/10
+failures across three points in history). Debugging this PR's own solo
+runs traced the *mechanism*, not just the symptom: the participant key
+("b") stops receiving any further writes partway through the writer's
+loop (observed stuck anywhere from step 4 to step 14 out of 15) while the
+anchor key ("a") continues committing correctly all the way to the end,
+and the writer's own `TransactWriteItems` calls never observe a failure —
+i.e., this is a **write-side 2PC participant-write-loss** bug (the
+participant's own intent silently stops advancing while the coordinator
+keeps reporting success), not a read-side snapshot-timing one, so it sits
+entirely outside what either torn-pair-fix PR targets. Per this repo's
+"separate PRs for incidental bugs" convention (and the engineering-lessons
+entry's own explicit instruction), this is left for its own, dedicated
+root-cause delivery — see `docs/engineering-lessons.md`'s updated entry for
+the refreshed baseline numbers and the mechanism-level lead this
+investigation leaves behind.
+
+### 5. Tests
+
+New: the SimEnv regression proving the *fixed* uniform-single-shot design
+sound at the protocol level, `animus-test/tests/txn_serializable.rs::
+tight_pair_transactions_never_observe_a_torn_snapshot` (a dedicated
+scenario, not part of the `Scenario`/`run_scenario` Elle-history corpus
+above — the property under test is a numeric sum invariant across one
+contended key pair, not a `Mop::Append`/`Read` serializability claim).
+Existing acceptance test unchanged: `animusd/tests/dynamo_txn.rs::
+transact_get_items_never_observes_a_torn_pair_under_concurrent_writes` —
+still the real wire-level check, now also the regression for §4's residual
+bug once that gets its own fix.
+
+## Amendment (2026-08-15, write-loss fix — PR3 of the torn-pair-fix stack)
+
+This amendment closes the §4 residual bug the PR2 amendment above left
+explicitly out of scope: a **participant-write-loss** bug on a split
+table's cross-tablet transaction, root-caused as a coordinator-side
+routing defect with no apply-time guard against it, not an HLC/clock issue
+(the PR1/PR2 fixes above remain independently correct and unaffected).
+
+### 1. The bug
+
+`ClientCtx::recovery_resolve` (the resolve half of both `txn_recover`'s
+in-doubt push and `txn_resolver_loop`'s periodic sweep — see §3/§5 of the
+PR5 amendment) grouped a transaction's `intent_spans` by **table name
+alone**, with no tablet dimension, before issuing one `txn_resolve_
+participant` call per group. A table with more than one tablet (any split
+table) can have two participants' keys share one table name but live on
+two different Raft groups; grouping by table name alone bundles both into
+one call, and that call's own `cp_route(table, &keys[0])` resolves a
+single leader from the *first* key alone — so the rest of the bundle rides
+along to whichever tablet the first key happens to belong to, not
+necessarily its own.
+
+Before this fix, `KvCommand::TxnResolve` carried no `fence` at all — every
+*other* key-writing variant (`Put`/`Batch`/`Delete`/`Cas`/`TxnStage`)
+already had one (ADR 0028), but `TxnResolve` was reasoned, incorrectly, to
+need none: "every key here was already fence-checked at `TxnStage` time."
+That reasoning silently assumed `keys` could only ever be a set the
+*applying* tablet itself had staged — true for every in-crate caller, but
+not something the type enforced, and the coordinator-side grouping bug is
+exactly the counterexample. With no fence, the misrouted tablet applied
+the resolve for a key it doesn't own, directly onto the *same physical
+key* the owning tablet separately maintains (ADR 0028: a table's tablets
+share one `StorageScope` prefix on a shared engine — only the logical
+`KeyRange` differs) — stamped with the wrong tablet's own clock. The
+owning tablet's own clock never learns of that foreign version and can
+never mint above it again: every future write to that key silently loses
+the per-key LWW race in `StorageEngine::merge` (whose `Result<bool>`
+"took effect" outcome was discarded via `.expect(..)` at every apply arm
+that merges a value), while the coordinator's own client-facing ack is
+computed independently of whether the merge that's supposed to back it up
+actually landed — an acked write silently and permanently lost, with the
+transaction's own record correctly `Committed` throughout. `txn_resolver_
+loop`'s 1s `unresolved_decided` sweep (not grace-gated, unlike the
+in-doubt `txn_recover` path) races the coordinator's own `resolve_all` on
+essentially every transaction against a split table, so this fired on
+most fast transactions, not just a rare crash-recovery window.
+
+### 2. The fix: correct grouping at the source, a fence as the structural seatbelt
+
+Two independent, complementary changes:
+
+- **`ClientCtx::recovery_resolve` now groups by `(table, tablet)`**, not
+  table alone: each key's *own current* tablet is re-resolved right before
+  grouping (`tablet_for`, the same primitive `cp_route` itself uses),
+  mirroring the same discipline `cp_txn`'s own stage-time key grouping
+  already used (that path was never affected by this bug, and the audit
+  below explains why). A key whose tablet can't be resolved *right now* (a
+  genuinely transient routing gap) is skipped, not fatal to the rest of
+  this best-effort resolve — unchanged from before. Every other
+  `recovery_resolve`/`txn_resolve_participant` caller in the crate
+  (`cp_txn`'s own `resolve_all`, `txn_recover`, `txn_resolver_loop`) was
+  audited and found to already route correctly: `resolve_all` builds its
+  own `(table, tablet)`-keyed `staged` map directly from the *same*
+  per-participant stage calls it just issued, never regrouping through
+  `intent_spans` at all, so it was never exposed to this defect.
+- **`KvCommand::TxnResolve` gains a `fence: KeyRange`**, stamped at
+  propose time from the routed group's own live `scope_range()` — byte-
+  for-byte the same discipline `TxnStage`'s own `fence` already uses — and
+  enforced at apply exactly like `TxnStage`'s: **whole-or-nothing**, every
+  key in `keys` must fall inside `fence` (and not a since-sealed range) or
+  the entire entry is a no-op, never a partial resolve. This is the
+  structural seatbelt: even if a caller (present or, more importantly,
+  future) makes the identical grouping mistake again, the wrong tablet
+  now safely **rejects** the resolve instead of silently corrupting the
+  other tablet's physical key. Fail-before/pass-after (`animus-cp-data/
+  tests/fenced_commands.rs::txn_resolve_misrouted_to_the_wrong_tablet_is_
+  rejected_by_its_own_fence`): with the `!all_in_fence` gate temporarily
+  removed, this same test reproduces the corruption directly — group B's
+  physical intent for its own key gets silently rewritten `Committed`
+  under group A's clock by a resolve proposed on group A's own log, purely
+  from A having been handed a foreign key with no fence to catch it.
+  Restoring the gate makes the resolve a clean no-op instead, leaving the
+  intent physically untouched; a subsequent correctly-routed resolve from
+  B's own group still resolves it normally. Codec version bumped 13 → 14
+  for the new field (pre-alpha, no cross-version wire/disk compatibility
+  required).
+
+An earlier design considered **witnessing** `TxnResolve`'s carried
+`commit_ts` into a non-anchor participant's clock at apply — folding the
+anchor-minted commit timestamp into the participant's own `Hlc` so its
+future mints would provably exceed it, the same "witness a just-observed
+timestamp" pattern the crate's four existing witnessing points already
+use (see this file's Key invariants entry in `animus-cp-data/CLAUDE.md`).
+It was **abandoned**: even gated to a genuine non-anchor participant (never
+the anchor re-witnessing its own already-folded value), it reignited a
+clock-witnessing runaway under sustained cross-group transaction + read
+load — confirmed super-linear in round count by a dedicated regression,
+`animus-cp-data/tests/ts_cache.rs::cross_group_txn_traffic_never_lets_
+either_groups_clock_run_away` (kept as a permanent guard against
+reintroducing this design: green at ~10.6s of ceiling drift over a 30s run
+without the witness, vs. 37.5s/82s at 80/160 rounds with it — the
+runaway's growth tracked round count, not real elapsed time, exactly PR1's
+own outlawed pattern relocated to a new call site). The real fix needed no
+new witnessing chain at all — closing the routing bug at the source, with
+the fence as a structural backstop, is sufficient and does not touch
+`Hlc` in any new way.
+
+### 3. Kept from the investigation, unrelated to the fix above
+
+- **`mint_at_least`'s witness → `bump_strictly_above` swap**: a *second*,
+  independent, previously-unfixed route to the exact `Hlc::witness`
+  poisoning sink the PR1 amendment (`mint_pushed`) closed — same pattern,
+  same fix, found opportunistically while investigating this bug (see
+  `hlc.rs`'s `bump_strictly_above` doc in `animus-cp-data/CLAUDE.md`).
+  Worth keeping regardless of this amendment's own fix.
+- **The merge-took-no-effect seatbelt** (`surface_suspicious_merge_noop`,
+  `Metric::CpMergeTookNoEffect`/`CpMergeTookNoEffectUnexplained`): surfaces
+  a `storage.merge`/`merge_tombstone` call returning `Ok(false)` at the
+  three apply-arm sites that used to discard it via `.expect(..)`
+  (`TxnStage`'s intent write, `TxnResolve`'s commit/abort-restore writes,
+  `Cas`'s swap) — metric + a capped `tracing::warn!` only, **deliberately
+  not a hard assert (not even `debug_assert!`)**: an earlier draft's assert
+  fired on legitimate, already-tested scenarios (an application-level
+  retry landing an identical entry a second time within one process
+  lifetime) the replay-vs-fresh distinguisher doesn't yet account for. This
+  is exactly the signal that would have caught this bug directly (a
+  provable, live "the write I just decided upon didn't actually land")
+  had it existed before this investigation; kept as a permanent, if
+  currently soft, guard against the next bug shaped like it.
+
+### 4. What this closes, what stays true
+
+Closes the acked-participant-write-loss mechanism at its root
+(coordinator-side misrouting) and structurally (the fence), for every
+current and future `TxnResolve` caller. Does not change wire-facing
+behavior beyond the codec version bump; does not touch `Hlc`/witnessing at
+all. The full three-bug torn-pair-fix stack (PR1: `mint_pushed` clock
+runaway; PR2: quiescent-round read-shape; PR3: this write-loss fix) is
+required together for `transact_get_items_never_observes_a_torn_pair_
+under_concurrent_writes` to pass reliably solo — see `docs/engineering-
+lessons.md` for the acceptance numbers at each layer and the general
+lessons this incident leaves behind.
+
+### 5. Tests
+
+New: `animus-cp-data/tests/fenced_commands.rs::txn_resolve_misrouted_to_
+the_wrong_tablet_is_rejected_by_its_own_fence` (the fence, proven
+fail-before/pass-after per §2 above) and `animusd/tests/txn_recovery_
+participant_spans.rs::recovery_resolve_correctly_commits_both_tablets_of_
+a_two_tablet_transaction` (a genuine two-tablet transaction resolved only
+by the automatic recovery sweep, asserted via a table `Scan` rather than a
+point `Get` — a point read resolves a still-`Pending` intent on demand at
+read time regardless of whether the physical resolve landed, which would
+mask this exact bug; a `Scan` does not). The cross-group clock-runaway
+regression from §2 above (`cross_group_txn_traffic_never_lets_either_
+groups_clock_run_away`) stays green as a permanent guard against
+reintroducing the abandoned witnessing design. Existing acceptance test
+unchanged: `animusd/tests/dynamo_txn.rs::transact_get_items_never_
+observes_a_torn_pair_under_concurrent_writes` — the real wire-level check
+this whole three-PR stack exists to make pass reliably.

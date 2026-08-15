@@ -82,7 +82,12 @@ const MAGIC: u8 = 0xCB;
 /// meaningful semantic change, not a wire-format one — and is deliberately
 /// **one bump covering all three new kinds** across the whole Streams PR
 /// stack, so the two later kinds land without a further bump.
-const VERSION: u8 = 13;
+/// `14` (ADR 0018 §2 write-loss amendment — Bug 3): `TxnResolve` gained a
+/// `fence: KeyRange` field, closing the one key-writing `KvCommand` variant
+/// that used to carry no apply-time fence check at all — see
+/// `KvCommand::TxnResolve`'s doc. Same house convention: a clean bump, no
+/// cross-version compatibility.
+const VERSION: u8 = 14;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -462,6 +467,7 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             record_key,
             keys,
             outcome,
+            fence,
             ts,
         } => {
             put_u8(out, 11);
@@ -472,6 +478,7 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
                 put_bytes(out, k);
             }
             put_txn_outcome(out, outcome);
+            put_key_range(out, fence);
             put_ts(out, *ts);
         }
     }
@@ -593,6 +600,7 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 record_key,
                 keys,
                 outcome,
+                fence: read_key_range(c)?,
                 ts: read_ts(c)?,
             }
         }
@@ -1070,6 +1078,7 @@ mod tests {
                     outcome: crate::txn::TxnOutcome::Committed {
                         commit_ts: ts(9, 0),
                     },
+                    fence: KeyRange::whole(),
                     ts: ts(9, 2),
                 },
                 config: None,

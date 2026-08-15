@@ -103,6 +103,39 @@ pub fn unpack(v: u64) -> HlcTimestamp {
     }
 }
 
+/// Bump `ts`'s `logical` component by one, carrying into `wall_ms` (and
+/// resetting `logical` to `0`) on [`LOGICAL_BITS`] overflow — a pure "the
+/// next value that strictly exceeds `ts`" step, with no clock state and no
+/// [`Nanos`] involved at all.
+///
+/// Shared by two independent call sites in `animus-cp-data::lib` that each
+/// need to strictly exceed a floor **without** going through [`Hlc::witness`]:
+/// `next_ceiling_candidate`'s CAS-ratchet bump branch, and `mint_pushed`'s
+/// no-witness write-push (ADR 0018 §2 amendment, the `mint_pushed`
+/// clock-witnessing-runaway fix). Both avoid `Hlc::witness` for the identical
+/// reason — the floor they must exceed is a value **deliberately shifted
+/// into the future** (a `ReadCeiling` margin, or the committed ceiling
+/// folded into a write's floor), and witnessing a future value would drag
+/// the group's own shared clock forward to match it, poisoning every
+/// ordinary `mint` right after. This function is the safe alternative: it
+/// computes a value that strictly exceeds `ts` as pure arithmetic, leaving
+/// `Hlc`'s own persistent `(wall_ms, logical)` state untouched.
+#[must_use]
+pub fn bump_strictly_above(ts: HlcTimestamp) -> HlcTimestamp {
+    let bumped_logical = ts.logical.wrapping_add(1);
+    if bumped_logical >= (1 << LOGICAL_BITS) {
+        HlcTimestamp {
+            wall_ms: ts.wall_ms + 1,
+            logical: 0,
+        }
+    } else {
+        HlcTimestamp {
+            wall_ms: ts.wall_ms,
+            logical: bumped_logical,
+        }
+    }
+}
+
 /// The mutable `(wall_ms, logical)` pair a [`Hlc`] advances.
 #[derive(Clone, Copy, Debug)]
 struct HlcState {
@@ -450,6 +483,30 @@ mod tests {
         let upper = clock.uncertainty_upper(ts);
         assert_eq!(upper.wall_ms, 1_250);
         assert_eq!(upper.logical, 0);
+    }
+
+    #[test]
+    fn bump_strictly_above_ticks_logical_without_touching_wall() {
+        let ts = HlcTimestamp {
+            wall_ms: 12,
+            logical: 3,
+        };
+        let bumped = bump_strictly_above(ts);
+        assert!(bumped > ts);
+        assert_eq!(bumped.wall_ms, 12);
+        assert_eq!(bumped.logical, 4);
+    }
+
+    #[test]
+    fn bump_strictly_above_carries_into_wall_on_logical_overflow() {
+        let ts = HlcTimestamp {
+            wall_ms: 7,
+            logical: (1 << LOGICAL_BITS) - 1,
+        };
+        let bumped = bump_strictly_above(ts);
+        assert!(bumped > ts);
+        assert_eq!(bumped.wall_ms, 8);
+        assert_eq!(bumped.logical, 0);
     }
 
     #[test]
