@@ -15,14 +15,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # `cargo build --workspace --all-targets` (every crate x every test/bench
+      # binary) plus the restored cargo cache no longer fit in the ~14 GB free
+      # on a stock ubuntu-latest runner. Clear preinstalled toolchains this job
+      # never uses (.NET, Android SDK, GHC, CodeQL bundles) before doing
+      # anything else, so there's headroom before the cache is even restored.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          df -h /
+
       # Pin to the workspace rust-version (Cargo.toml [workspace.package]).
       - name: Install Rust toolchain (1.96)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
 
+      # `--all-targets` builds every test/bench binary in every crate, so this
+      # job's target/ dir is much larger than corpus-deep's (which builds only
+      # 4 test binaries). Cache just the registry + git deps, not target/, so
+      # cache restore doesn't itself eat the disk headroom freed above.
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
 
       # The five required gates (see CLAUDE.md "Commands"), each a separate,
       # clearly-named step so a failure points straight at the offending gate.
