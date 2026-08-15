@@ -243,9 +243,27 @@ reason (see each file's own entry below).
 - **`otel.rs`** — OTLP/HTTP distributed-tracing seam (ADR 0027); opt-in, no-op
   unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Scoped to this crate only.
 - **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_{core,overview,
-  placement,tablets,browser,storage,node}.js`** — the "AnimusDB Console" SPA
-  (ADR 0021), `include_str!`'d and served as distinct static assets. Vanilla JS,
-  no bundler/CDN. Tabs are role-gated client-side (ADR 0035 PR7).
+  placement,tablets,streams,browser,storage,node}.js`** — the "AnimusDB Console"
+  SPA (ADR 0021), `include_str!`'d and served as distinct static assets. Vanilla
+  JS, no bundler/CDN. Tabs are role-gated client-side (ADR 0035 PR7).
+  `dashboard_streams.js` (ADR 0042/0043) is the Streams view: a list of
+  currently-`ENABLED` streams (`status.schemas.tables[t].stream`) plus any
+  `DISABLED`-but-in-grace-window one (a `status.stream_shards` row whose
+  `(table, label)` no longer matches the table's current schema stream,
+  F12-b), per-node stream metric tiles (the Console's first `/admin/metrics`
+  consumer — `dashboard_core.js`'s `loadAll()` fans it out alongside
+  `config`/`raft`/`raftkv`/`health`), and a detail panel merging the segment
+  catalog with a live `DescribeStream` call into a per-tablet shard chain,
+  plus a live-tail poller (`GetShardIterator`/`GetRecords`, following
+  `NextShardIterator`) — all through `POST /admin/data/dynamo`'s existing
+  proxy (bare `ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords`
+  op names, `action_data_dynamo`'s `STREAMS_OPS` resolution). Enabling/
+  disabling a table's stream is a `dashboard_browser.js` Data Browser
+  action instead (a per-table `UpdateTable{StreamSpecification}` toggle,
+  next to that table's Indexes card), not a Streams-tab one — the same
+  reasoning that already puts create/drop table there. Shown for
+  combined/data roles, never control-only (`ROLE_TABS`) — a control-only
+  node hosts no CP data plane, so it has no stream state to show.
 
 ## CLI reference
 
@@ -977,7 +995,11 @@ route below the edge through the same `ClientCtx` CP primitives.
   drain lazily provisions its first tablet, i.e. after the first write to
   an indexed attribute) — so any dashboard code deriving "which tables
   exist" from the schema catalog naturally already excludes it, and code
-  that needs to know about it must scan the tablet map instead.
+  that needs to know about it must scan the tablet map instead. **A
+  Streams tab (ADR 0042/0043)** lists every currently-`ENABLED` stream plus
+  any `DISABLED`-but-in-grace-window one, with a shard-chain detail panel
+  and a live-tail poller (see `dashboard.rs`'s own entry above for the full
+  design) — shown for combined/data roles, never control-only.
 - **OTel** (`otel.rs`, ADR 0027) — `init_tracing(instance_id)` from `main.rs`;
   `current_traceparent`/`set_parent_traceparent` carry W3C trace context across a
   forwarded hop (`cp_forward` injects, the receiver's `handle_client`

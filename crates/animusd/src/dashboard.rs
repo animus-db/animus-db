@@ -1,9 +1,12 @@
 //! The AnimusDB Console (ADR 0021): a self-contained single-page app served
 //! from the admin port for manual cluster testing and operation — Overview,
 //! Placement, Tablets, Data Browser, and Storage. ADR 0035 PR7 adds a sixth
-//! view, Node, and gates which views are shown on this node's own role
-//! (control/data/combined, `admin.rs::config_view`'s `role` field) — see
-//! `dashboard_core.js`'s `ROLE_TABS`.
+//! view, Node; a Streams view (ADR 0042/0043) is a seventh — DynamoDB Streams'
+//! shard chains and a live-tail poller. Which views are shown is gated on
+//! this node's own role (control/data/combined,
+//! `admin.rs::config_view`'s `role` field) — see `dashboard_core.js`'s
+//! `ROLE_TABS`; Streams is shown for combined/data, never control-only (a
+//! control-only node hosts no CP data plane, so it has no stream state).
 //!
 //! It is embedded in the binary (`include_str!`) and served verbatim as
 //! `text/html`/`text/css`/`text/javascript` by [`crate::admin`]; it is a pure
@@ -20,13 +23,16 @@
 //! (`admin.rs::static_asset`) instead of inlined in one document. `CORE_JS`
 //! holds shared state/fetch/routing/theme/data-derivation utilities every
 //! other module depends on; `OVERVIEW_JS`/`PLACEMENT_JS`/`TABLETS_JS`/
-//! `BROWSER_JS`/`STORAGE_JS`/`NODE_JS` are the six views' own render logic,
-//! loaded in that order (each may call functions defined earlier, since
-//! plain `<script src>` tags share one global scope).
+//! `STREAMS_JS`/`BROWSER_JS`/`STORAGE_JS`/`NODE_JS` are the seven views' own
+//! render logic, loaded in that order (each may call functions defined
+//! earlier, since plain `<script src>` tags share one global scope) —
+//! `STREAMS_JS` loads before `BROWSER_JS` because the Data Browser's
+//! per-table Stream row (enable/disable) reuses its `viewTypeLabel` helper.
 //!
-//! Read-only mostly — the Data Browser (item CRUD, table DDL, and the
-//! bulk-seed tool, which writes real DynamoDB items) carries the real
-//! mutations; the ADR 0020 gated operator actions (split/flush/compact/
+//! Read-only mostly — the Data Browser (item CRUD, table DDL, the per-table
+//! stream enable/disable toggle, and the bulk-seed tool, which writes real
+//! DynamoDB items) and the Streams tab's live-tail poller carry the real
+//! mutations/reads; the ADR 0020 gated operator actions (split/flush/compact/
 //! reconfigure/drain) and the ADR 0018 transaction view are not yet surfaced.
 
 /// The console's page shell, embedded at compile time.
@@ -43,9 +49,15 @@ pub(crate) const OVERVIEW_JS: &str = include_str!("dashboard_overview.js");
 pub(crate) const PLACEMENT_JS: &str = include_str!("dashboard_placement.js");
 /// The Tablets view: filterable list + raft-group/storage detail panel.
 pub(crate) const TABLETS_JS: &str = include_str!("dashboard_tablets.js");
+/// The Streams view (ADR 0042/0043): a list of currently-enabled and
+/// disabled-but-in-grace-window DynamoDB Streams, per-node stream metric
+/// tiles (the console's first `/admin/metrics` consumer), and a detail panel
+/// with the shard chain (segment catalog merged with a live `DescribeStream`)
+/// and a live-tail poller (`GetShardIterator`/`GetRecords`).
+pub(crate) const STREAMS_JS: &str = include_str!("dashboard_streams.js");
 /// The Data Browser view: CQL + real DynamoDB Scan/Query/item CRUD/table DDL,
-/// plus the bulk-seed tool (it writes real DynamoDB items, so it lives in the
-/// DynamoDB panel).
+/// a per-table Stream enable/disable row, plus the bulk-seed tool (it writes
+/// real DynamoDB items, so it lives in the DynamoDB panel).
 pub(crate) const BROWSER_JS: &str = include_str!("dashboard_browser.js");
 /// The Storage view: folded-in WAL/LSM/key-inspector/browse-keys debug tools
 /// (not part of the source design, preserved from the pre-redesign dashboard

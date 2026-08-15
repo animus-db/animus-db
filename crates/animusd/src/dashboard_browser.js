@@ -6,7 +6,9 @@
 // against the real /admin/data/{cql,dynamo,drop-table,seed} endpoints, not
 // the design mockup's fake in-memory item store. Depends on
 // `dashboard_core.js` (STATE, $, esc, pill, getJSON, postJSON, loadAll,
-// splitHiddenTable).
+// splitHiddenTable) and `dashboard_streams.js` (viewTypeLabel — the Stream
+// row's enable/disable UI below lives here per ADR 0021, since a table's
+// stream toggle is a table-panel action, not a Streams-tab one).
 
 let brProtocol = "cql";
 
@@ -161,6 +163,75 @@ function renderDynamoFields() {
   $("br-dy-query-sk-group").style.display = sortName ? "flex" : "none";
   renderIndexSelector(schema);
   renderIndexesSection(schema);
+  renderStreamRow(schema);
+}
+
+// ---- DynamoDB Streams: enable/disable (ADR 0042/0043) ----
+// A table's stream toggle lives here, in the Data Browser's own table panel,
+// not the Streams tab (`dashboard_streams.js`) — the Streams tab is a
+// cluster-wide *observability* view over every stream; enabling/disabling
+// one is a per-table action, the same reasoning that already puts
+// create/drop table here rather than there.
+const STREAM_VIEW_TYPES = ["NEW_AND_OLD_IMAGES", "NEW_IMAGE", "OLD_IMAGE", "KEYS_ONLY"];
+
+function renderStreamRow(schema) {
+  const el = $("br-dy-stream");
+  if (!schema) { el.innerHTML = ""; return; }
+  const stream = schema.stream;
+  if (stream) {
+    el.innerHTML = `<div class="card scroll" style="margin-top:2px">
+      <h2>Stream</h2>
+      <div class="row" style="justify-content:space-between">
+        <div class="row">${pill("ok", "ENABLED")}<span class="mono">${esc(viewTypeLabel(stream.view_type))}</span></div>
+        <div class="row"><span class="muted" id="br-dy-stream-msg"></span><button class="danger-text" id="br-dy-stream-disable">Disable</button></div>
+      </div>
+    </div>`;
+    $("br-dy-stream-disable").addEventListener("click", disableStream);
+  } else {
+    el.innerHTML = `<div class="card scroll" style="margin-top:2px">
+      <h2>Stream</h2>
+      <div class="row" style="justify-content:space-between">
+        <span class="muted">no stream enabled</span>
+        <div class="row">
+          <span class="muted" id="br-dy-stream-msg"></span>
+          <select id="br-dy-stream-vt">${STREAM_VIEW_TYPES.map((v) => `<option value="${v}">${v}</option>`).join("")}</select>
+          <button id="br-dy-stream-enable">Enable</button>
+        </div>
+      </div>
+    </div>`;
+    $("br-dy-stream-enable").addEventListener("click", enableStream);
+  }
+}
+
+async function enableStream() {
+  const table = dyTable;
+  const viewType = $("br-dy-stream-vt").value;
+  if (!window.confirm(`Enable a DynamoDB Stream on “${table}” (view type ${viewType})? Only writes made after this point will appear in it.`)) return;
+  const { status, body } = await postJSON(SEED, "/admin/data/dynamo", {
+    op: "UpdateTable",
+    payload: { TableName: table, StreamSpecification: { StreamEnabled: true, StreamViewType: viewType } },
+  });
+  if (status >= 300) {
+    const msg = $("br-dy-stream-msg");
+    if (msg) msg.innerHTML = `<span class="err-line">${esc((body && body.message) || `HTTP ${status}`)}</span>`;
+    return;
+  }
+  await loadAll();
+}
+
+async function disableStream() {
+  const table = dyTable;
+  if (!window.confirm(`Disable “${table}”'s stream? It stays listed and readable until its retention window expires (F12-b's grace window) — this does not delete it immediately.`)) return;
+  const { status, body } = await postJSON(SEED, "/admin/data/dynamo", {
+    op: "UpdateTable",
+    payload: { TableName: table, StreamSpecification: { StreamEnabled: false } },
+  });
+  if (status >= 300) {
+    const msg = $("br-dy-stream-msg");
+    if (msg) msg.innerHTML = `<span class="err-line">${esc((body && body.message) || `HTTP ${status}`)}</span>`;
+    return;
+  }
+  await loadAll();
 }
 
 // The Scan/Query Index selector (ADR 0041) — "— base table —" plus one

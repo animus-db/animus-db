@@ -298,6 +298,7 @@ fn static_asset(path: &str) -> Option<(&'static str, &'static str)> {
         "/admin/ui/dashboard_overview.js" => Some((JS, crate::dashboard::OVERVIEW_JS)),
         "/admin/ui/dashboard_placement.js" => Some((JS, crate::dashboard::PLACEMENT_JS)),
         "/admin/ui/dashboard_tablets.js" => Some((JS, crate::dashboard::TABLETS_JS)),
+        "/admin/ui/dashboard_streams.js" => Some((JS, crate::dashboard::STREAMS_JS)),
         "/admin/ui/dashboard_browser.js" => Some((JS, crate::dashboard::BROWSER_JS)),
         "/admin/ui/dashboard_storage.js" => Some((JS, crate::dashboard::STORAGE_JS)),
         "/admin/ui/dashboard_node.js" => Some((JS, crate::dashboard::NODE_JS)),
