@@ -61,12 +61,14 @@ reason (see each file's own entry below).
   `stream_shards` catalog. The module's own 80-line `//!` doc has the full
   design (including the load-bearing epoch-derivation guard and the
   convergent drop-table cascade); see also `docs/streams-notes.md`.
-- **`index_drain.rs`** (ADR 0041 §4 GSI drain; ADR 0042/0043 the seal arm +
   hot-trim rework) — the per-node **change-consumer loop**
   (`change_consumer_loop`, renamed from `index_drain_loop` since it is no
   longer GSI-specific), three arms per tick per led tablet: GSI drain, the
   seal arm, and the hot-trim arm. The module's own 95-line `//!` doc has
-  the full per-arm design; see also `docs/streams-notes.md`.
+  the full per-arm design; see also `docs/streams-notes.md`. **The
+  hot-trim arm's merge-residue cursor-row cleanup was removed** (tablets
+  are split-only, ADR 0044) — `trim_janitor` only ever touches
+  `KIND_CHANGE` rows now, never `KIND_CURSOR`.
 - **`cql.rs`** (~42 KB) — the CQL (Cassandra) v4 binary-protocol edge.
 - **`cql_client.rs`** — a minimal loopback CQL client the admin dashboard's CQL
   editor uses (`POST /admin/data/cql`) to drive this node's own CQL port.
@@ -318,7 +320,9 @@ growth_node_observes_metadata_promptly_via_watch`.
 **The per-node tablet-host reconciler (ADR 0031) is the single owner of
 this node's tablet lifecycle.** The pure `plan` decision + `Reconciler`
 executor live in `animus_cp_data::host` (read that crate's `CLAUDE.md` for
-the mechanism). What stays in `animusd` (`tablet_host_reconciler_loop`):
+the mechanism, including the fixed action order — tablets are split-only,
+ADR 0044; merge's dual `WidenScope`/`Absorb` actions were removed). What
+stays in `animusd` (`tablet_host_reconciler_loop`):
 
 - **Trigger**: one task per node racing `ctx.control.metadata_watch().changed(..)`
   (event-driven — observes a change on the commit that made it) against a
@@ -342,19 +346,25 @@ backend). The split point matches the metric: a byte-configured cluster splits a
 `auto_split_median_tests`) — which scans every achievable key-boundary cut for the
 one closest to half the bytes, not a single accumulate-and-threshold pass (subtly
 wrong when one key dominates; see the root log). Key-count clusters keep the plain
-positional median. Auto-merge triggering is out of scope — merge is
-operator-driven.
+positional median. **Tablets are split-only (ADR 0044)** — there is no
+merge, automatic or operator-driven, to trigger; a tablet's count only ever
+grows, and reversing an over-eager split is no longer possible (see that
+ADR's "shrink-in-place" note).
 
-**Split/merge** (ADR 0028/0033, `MetaCommand::SplitTablet`/`MergeTablets`,
-epoch-CAS gated) and **drop-table/removed-replica GC** (ADR 0024/0029, the
-reconciler's `Reclaim`/`Release` actions) are each a single atomic
-control-plane command with no data-plane half — see those ADRs and
+**Split** (ADR 0028, `MetaCommand::SplitTablet`, epoch-CAS gated) is a
+single atomic control-plane command with no data-plane half — narrows the
+source's range and mints a sibling on the same shared engine. Exposed via
+`POST /admin/tablet/split` + `ClientRequest::SplitTablet` (relayable).
+(Merge — `MetaCommand::MergeTablets` and the reconciler's `WidenScope`/
+`Absorb` reaction — was removed entirely by ADR 0044, superseding ADR
+0033.)
+
+**Drop-table GC** (ADR 0024) is the reconciler's `Reclaim` action;
+**removed-replica GC** (ADR 0029) is its `Release` dual — see
 `animus-cp-data`'s `host.rs`/`CLAUDE.md` for the mechanics
-(`WidenScope`/`Absorb`/`erase_scope`/`erase_bound`). Exposed via `POST
-/admin/tablet/{split,merge}` + `ClientRequest::{SplitTablet,MergeTablets}`
-(relayable). Drop + GC are convergent (a restart replays through
-historical map states) — test post-restart state with a poll, never a
-fixed sleep. A new `MetaCommand` that must commit from a
+(`erase_scope`/`erase_bound`). Drop + GC are convergent (a restart replays
+through historical map states) — test post-restart state with a poll,
+never a fixed sleep. A new `MetaCommand` that must commit from a
 follower-connected node must be added to `is_relayable_command` (missing
 there is a bimodal per-process flake).
 
@@ -725,10 +735,10 @@ because they need private handles (a raw `CpGroup`/the private
 `index_drain.rs`'s own `gsi_drain_cursor_tests` is a third (run via `cargo
 test -p animusd --lib`, not the `tests/` tree) — the ADR 0042 §7/§8
 cursor-based drain + trim janitor regressions, needing `CpGroup`'s private
-`pending_changes`/`cursor_min_watermark`/`cursor_rows_with_token` and the
-plain-client-protocol `ClientRequest::SplitTablet`/`MergeTablets` (an
-arbitrary binary `split_key`, unlike the admin HTTP surface's UTF8-string
-one); `dynamo.rs`'s own `stream_write_path_tests` is a fourth (ADR 0042
+`pending_changes`/`cursor_min_watermark` and the plain-client-protocol
+`ClientRequest::SplitTablet` (an arbitrary binary `split_key`, unlike the
+admin HTTP surface's UTF8-string one); `dynamo.rs`'s own
+`stream_write_path_tests` is a fourth (ADR 0042
 §1), needing `CpGroup`'s private `pending_changes`/`local_scan_kind_bounded`
 (a new, non-linearizable bounded kind-scan wrapper, mirroring
 `local_get_kind`'s existing shape) to prove a streamed-unindexed table's

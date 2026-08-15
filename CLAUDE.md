@@ -164,9 +164,10 @@ truth; this map is just for navigation.
   wire edges byte-for-byte.
 - **Tablet lifecycle** — split is a **single control-plane command** with
   apply-time fences, no data-plane half (ADR 0028); auto-split triggers on
-  **bytes** (ADR 0034, `animusd`); **merge** is its dual with an
-  absorb-and-drain teardown (ADR 0033); dropped tables' data is reclaimed by a
-  convergent **GC** (ADR 0024). Tablet ids are never reused.
+  **bytes** (ADR 0034, `animusd`); **tablets are split-only** — merge has
+  been removed entirely (ADR 0044, supersedes ADR 0033); dropped tables'
+  data is reclaimed by a convergent **GC** (ADR 0024). Tablet ids are never
+  reused.
 - **Placement, rebalancing & growth** — `animus-placement` (ADR 0005): pure
   policy engine (RF + residency labels + failure-domain spread), `replan`
   (failure repair) + `rebalance_step` (ADR 0029: one balance-driven move per

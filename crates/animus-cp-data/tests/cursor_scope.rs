@@ -1,9 +1,13 @@
 //! `KIND_CURSOR` (ADR 0042/0043 foundation): consumer cursor rows get their
 //! own row-kind scope (ADR 0041 §3's mechanism, extended), and the ADR 0042
 //! §7 min-over-rows rule's read-side primitives (`cursor_watermark`/
-//! `cursor_rows`/`cursor_min_watermark`) behave correctly across the two
-//! tablet-lifecycle events that rule exists for: a source tablet's split
-//! (`narrow_scope`) and a merge survivor's widen (`widen_scope`).
+//! `cursor_rows`/`cursor_min_watermark`) behave correctly across the
+//! tablet-lifecycle event that rule exists for: a source tablet's split
+//! (`narrow_scope`). One test also exercises the raw `widen_scope`
+//! `StorageScope` setter directly (no reconciler action calls it in
+//! production today — tablets are split-only, ADR 0044) to prove the
+//! min-over-rows primitive itself, not any specific lifecycle event, is
+//! what's actually under test there.
 //!
 //! Mirrors `tests/kind_batch.rs`'s scope-isolation style, `tests/
 //! snapshot_catchup.rs`'s InstallSnapshot-forcing technique, and `tests/
@@ -257,34 +261,36 @@ fn split_narrow_keeps_the_left_childs_cursor_row_visible_and_a_fresh_right_child
     }
 }
 
-/// Merge (ADR 0033's dual, `widen_scope`): the survivor and the
-/// merged-away sibling are co-hosted tablets of the **same table**, sharing
-/// one physical engine under one `StorageScope` prefix (ADR 0026/0028) —
-/// each wrote its own cursor row while it was still its own tablet, keyed
-/// off its own `range.start`. Once the survivor's scope widens to cover the
-/// absorbed range, both physically-present rows become visible in its one
-/// `KIND_CURSOR` scope, and the ADR 0042 §7 min-over-rows rule
-/// (`cursor_min_watermark`) must report the **minimum** of the two — never
-/// just the survivor's own, higher watermark (the one genuine loss hazard
-/// the rule exists to close: silently claiming records the absorbed sibling
-/// never actually copied).
+/// Exercises the raw `widen_scope` `StorageScope` setter directly (no
+/// reconciler action calls it in production today — tablets are split-only,
+/// ADR 0044) to prove the ADR 0042 §7 min-over-rows rule itself, independent
+/// of any specific lifecycle event that might trigger a scope change: two
+/// co-hosted tablets of the **same table** share one physical engine under
+/// one `StorageScope` prefix (ADR 0026/0028) — each wrote its own cursor row
+/// while scoped to its own, disjoint range, keyed off its own `range.start`.
+/// Once one tablet's scope is widened (by whatever means) to cover the
+/// other's range, both physically-present rows become visible in its one
+/// `KIND_CURSOR` scope, and `cursor_min_watermark` must report the
+/// **minimum** of the two — never just its own, higher watermark (the one
+/// genuine loss hazard the rule exists to close: silently claiming records a
+/// row it never itself wrote).
 #[test]
-fn merge_widen_exposes_the_absorbed_tablets_row_and_min_over_rows_picks_the_lower_watermark() {
+fn widened_scope_exposes_a_co_hosted_row_and_min_over_rows_picks_the_lower_watermark() {
     let seed = 0x0042_0004;
     let sim = Simulator::new(seed);
     let engine = MemoryEngine::new();
 
-    // The eventual survivor: starts scoped to [.., "m") — the pre-merge left
-    // tablet.
+    // The eventual widener: starts scoped to [.., "m").
     let left = scoped_group(
         &sim,
         &GROUP_A,
         engine.clone(),
         KeyRange::new(Vec::new(), Some(b"m".to_vec())),
     );
-    // The eventual absorbed sibling: [ "m", ..) — same engine, same prefix,
-    // a distinct Raft group (own node ids), exactly as two co-hosted tablets
-    // of one table share a node's engine.
+    // The other co-hosted tablet whose row will become visible once `left`
+    // widens: [ "m", ..) — same engine, same prefix, a distinct Raft group
+    // (own node ids), exactly as two co-hosted tablets of one table share a
+    // node's engine.
     let right = scoped_group(&sim, &GROUP_B, engine, KeyRange::new(b"m".to_vec(), None));
 
     let mut sim = sim;
@@ -293,7 +299,7 @@ fn merge_widen_exposes_the_absorbed_tablets_row_and_min_over_rows_picks_the_lowe
     let l_right = leader(&right, seed);
 
     let left_watermark = ts(500);
-    let right_watermark = ts(100); // lower — the absorbed sibling copied less
+    let right_watermark = ts(100); // lower — the other tablet's own row
     assert!(matches!(
         left[l_left].put_kind_batch(
             vec![(
@@ -318,10 +324,11 @@ fn merge_widen_exposes_the_absorbed_tablets_row_and_min_over_rows_picks_the_lowe
     ));
     sim.run_for(Duration::from_secs(2));
 
-    // The merge: the survivor's scope widens to cover the absorbed range.
-    // (The real `Reconciler` also tears the absorbed group down without
-    // erasing — irrelevant here, since this test only exercises the
-    // survivor's own read primitives against the now-shared engine.)
+    // The raw widen: `left`'s scope grows to cover `right`'s range too — no
+    // reconciler action drives this in production (tablets are split-only,
+    // ADR 0044); this test exercises `widen_scope` directly to prove the
+    // read-side primitive, not any specific lifecycle event that might one
+    // day call it.
     for node in &left {
         node.widen_scope(KeyRange::whole());
     }
@@ -337,13 +344,13 @@ fn merge_widen_exposes_the_absorbed_tablets_row_and_min_over_rows_picks_the_lowe
         rows.sort();
         assert_eq!(
             rows, expected,
-            "survivor {i} must see both rows post-widen (seed={seed})"
+            "widened node {i} must see both rows post-widen (seed={seed})"
         );
         assert_eq!(
             block_on(node.cursor_min_watermark("copier")),
             Some(right_watermark),
-            "survivor {i}: min-over-rows must pick the lower (absorbed) watermark, \
-             never just its own higher one (seed={seed})"
+            "widened node {i}: min-over-rows must pick the lower (other tablet's) \
+             watermark, never just its own higher one (seed={seed})"
         );
     }
 }

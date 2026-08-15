@@ -10,17 +10,18 @@
 //! start off the shared engine's `latest_version()`, among other points —
 //! see `hlc.rs`) plus, for the residual race witnessing alone cannot close
 //! (an in-flight write from a source leader that hasn't yet observed a
-//! split/merge), the **range seal** (`KvCommand::Seal`, `seal.rs`).
+//! split), the **range seal** (`KvCommand::Seal`, `seal.rs`).
 //!
-//! Kept the original two shapes (split, merge) — updated to the new
-//! mechanism — plus the scenario the seal specifically exists for: an
-//! in-flight write racing the handoff with **zero** intervening sim time
-//! (mirroring `reconciler_corpus.rs`'s zero-tick absorb-drain regression
-//! technique), and the "wide fence, un-ticked leader" case (a write proposed
-//! well after the seal has landed must still be rejected). A final test
-//! proves the design does not secretly depend on synchronized clocks: the
-//! successor's node can read *behind* the source's the entire time and still
-//! win, because it witnesses via the shared engine, never wall time.
+//! Kept the original split shape (its merge dual was deleted along with
+//! tablet merge — split-only tablets) — updated to the new mechanism — plus
+//! the scenario the seal specifically exists for: an in-flight write racing
+//! the handoff with **zero** intervening sim time (mirroring
+//! `reconciler_corpus.rs`'s zero-tick drain-regression technique), and the
+//! "wide fence, un-ticked leader" case (a write proposed well after the seal
+//! has landed must still be rejected). A final test proves the design does
+//! not secretly depend on synchronized clocks: the successor's node can read
+//! *behind* the source's the entire time and still win, because it witnesses
+//! via the shared engine, never wall time.
 //!
 //! Deterministic and seed-reproducible (ADR 0003): drive with `run_for`,
 //! never `run()` (the driver has perpetual heartbeat/election timers).
@@ -47,10 +48,10 @@ type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
 /// engine.
 const NODE: u64 = 0;
 const TABLE: &str = "t";
-/// The split/merge boundary: keys `< BOUNDARY` are the "kept"/`left` range,
-/// `>= BOUNDARY` are the "handed off"/`right`/absorbed range.
+/// The split boundary: keys `< BOUNDARY` are the kept (source) range,
+/// `>= BOUNDARY` are the handed-off (successor) range.
 const BOUNDARY: &[u8] = b"m";
-/// A key in the handed-off/absorbed (upper) range, so it exercises the exact
+/// A key in the handed-off (upper) range, so it exercises the exact
 /// crossover this file is about.
 const KEY: &[u8] = b"m0";
 
@@ -137,72 +138,6 @@ fn split_successor_wins_after_seal_lands() {
         Some(b"sibling-value".to_vec()),
         "the source's own (now-irrelevant) read of the same physical key must \
          also see the successor's value (seed={seed})"
-    );
-}
-
-// ============================================================================
-// (b) Merge shape: the dual — an absorbed group seals its own full range
-// before teardown; the survivor widens and its write must win.
-// ============================================================================
-
-#[test]
-fn merge_survivor_wins_after_absorbed_seal_lands() {
-    let seed = 0xC0_5E19_u64;
-    let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-
-    // `right`: owns the upper range, writes KEY.
-    let right: KvNode = RaftKvNode::start_hosted(
-        sim.env(nid(NODE)),
-        vec![nid(NODE)],
-        engine.clone(),
-        scope(KeyRange::new(BOUNDARY.to_vec(), None)),
-        2,
-    );
-    sim.run_for(ELECT);
-    put(&right, KEY, b"right-value");
-    sim.run_for(ELECT);
-    assert_eq!(
-        block_on(right.local_get(KEY)),
-        Some(b"right-value".to_vec())
-    );
-
-    // `left`: owns the lower range, unrelated writes.
-    let left: KvNode = RaftKvNode::start_hosted(
-        sim.env(nid(NODE)),
-        vec![nid(NODE)],
-        engine.clone(),
-        scope(KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec()))),
-        1,
-    );
-    sim.run_for(ELECT);
-    put(&left, b"a0", b"unrelated");
-    sim.run_for(ELECT);
-
-    // The merge's Absorb teardown: `right` seals its own full range through
-    // its own Raft log BEFORE its driver stops (mirroring
-    // `host::Reconciler::teardown`'s Absorb arm), then shuts down. Its
-    // physical data — including KEY at its own version — stays on the
-    // shared engine, now to be served by `left`.
-    let sealed = right.propose_seal(right.scope_range());
-    assert!(matches!(sealed, ProposeResult::Accepted { .. }));
-    sim.run_for(ELECT); // let the seal apply before tearing the group down
-    right.shutdown();
-    sim.run_for(ELECT);
-
-    // `left` widens its scope to cover the whole (now-merged) range — only
-    // once the absorbed seal has landed, per `TabletFacts::
-    // widen_seal_observed`'s gate in production.
-    left.widen_scope(KeyRange::whole());
-
-    put(&left, KEY, b"left-value");
-    sim.run_for(ELECT);
-
-    assert_eq!(
-        block_on(left.local_get(KEY)),
-        Some(b"left-value".to_vec()),
-        "the survivor's overwrite must land — the absorbed seal's marker \
-         proves the widen is safe (seed={seed})"
     );
 }
 

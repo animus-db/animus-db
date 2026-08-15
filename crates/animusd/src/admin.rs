@@ -37,7 +37,6 @@
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — liveness/readiness
 //! - `POST /admin/tablet/split`        — `{tablet, split_key}`
-//! - `POST /admin/tablet/merge`        — `{left, right}` (ADR 0033)
 //! - `POST /admin/storage/flush`       — `{tablet}`
 //! - `POST /admin/storage/compact`     — `{tablet}`
 //! - `POST /admin/raftkv/reconfigure`  — `{tablet, voters}`
@@ -337,7 +336,6 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("GET", "/admin/member/drain-status") => member_drain_status(ctx, q),
         ("GET", "/admin/health") => health(ctx),
         ("POST", "/admin/tablet/split") => action_split(ctx, &request.body).await,
-        ("POST", "/admin/tablet/merge") => action_merge(ctx, &request.body).await,
         ("POST", "/admin/storage/flush") => action_flush(ctx, &request.body).await,
         ("POST", "/admin/storage/compact") => action_compact(ctx, &request.body).await,
         ("POST", "/admin/raftkv/reconfigure") => action_reconfigure(ctx, &request.body),
@@ -839,7 +837,7 @@ async fn storage_scan(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 /// addendum) — a read-only browse of this node's own control-plane **system
 /// keyspace** (`animus_control::syskv::RESERVED_NAMESPACE`): every mirrored
 /// `Metadata` entity (tablets, members, schemas, policies, the node address
-/// book, keyspaces, merge markers) **plus** the internal/legacy bookkeeping
+/// book, keyspaces, split provenance) **plus** the internal/legacy bookkeeping
 /// kinds (the monotonic tablet-id-allocator counter, the legacy CP-member
 /// address book) — full transparency by default, no kind hidden here; only
 /// the dashboard labels the internal/legacy ones for an operator's benefit.
@@ -986,11 +984,7 @@ async fn system_table(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 fn system_table_id_is_numeric(kind: syskv::EntityKind) -> bool {
     matches!(
         kind,
-        syskv::EntityKind::Tablet
-            | syskv::EntityKind::Policy
-            | syskv::EntityKind::Merged
-            | syskv::EntityKind::SplitParent
-            | syskv::EntityKind::AbsorbedBy
+        syskv::EntityKind::Tablet | syskv::EntityKind::Policy | syskv::EntityKind::SplitParent
     )
 }
 
@@ -1029,9 +1023,9 @@ fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
 /// `Schema`/`Policy`/`NodeAddrs`/`CpMemberAddr` are `serde_json` passthrough
 /// (`null` on a malformed value — defensive only, every real writer produces
 /// valid JSON here); `Counter` is a raw big-endian `u64` (`null` if not
-/// exactly 8 bytes); `Keyspace`/`Merged` are presence-only (their value is
+/// exactly 8 bytes); `Keyspace` is presence-only (its value is
 /// always empty) — always `null`, regardless of the actual bytes.
-/// `SplitParent`/`AbsorbedBy` (ADR 0018 §2 amendment) store the other
+/// `SplitParent` (ADR 0018 §2 amendment) stores the other
 /// tablet's id as a raw big-endian `u64`, same shape as `Counter` but
 /// rendered as a decimal **string** (like a numeric entity id,
 /// [`system_table_id_display`]) since it too is a `TabletId`, not a scalar
@@ -1053,13 +1047,11 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
             Ok(bytes) => json!(u64::from_be_bytes(bytes)),
             Err(_) => Value::Null,
         },
-        syskv::EntityKind::Keyspace | syskv::EntityKind::Merged => Value::Null,
-        syskv::EntityKind::SplitParent | syskv::EntityKind::AbsorbedBy => {
-            match <[u8; 8]>::try_from(value) {
-                Ok(bytes) => json!(u64::from_be_bytes(bytes).to_string()),
-                Err(_) => Value::Null,
-            }
-        }
+        syskv::EntityKind::Keyspace => Value::Null,
+        syskv::EntityKind::SplitParent => match <[u8; 8]>::try_from(value) {
+            Ok(bytes) => json!(u64::from_be_bytes(bytes).to_string()),
+            Err(_) => Value::Null,
+        },
     }
 }
 
@@ -1185,28 +1177,6 @@ async fn action_split(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         .trigger_split(TabletId(req.tablet), req.split_key.into_bytes())
         .await;
     client_response_to_json(resp, json!({"ok": true, "tablet": req.tablet}))
-}
-
-/// `POST /admin/tablet/merge` request body (ADR 0033): `left`/`right` are
-/// adjacent tablet ids — `left` survives (widened), `right` is absorbed.
-#[derive(Deserialize)]
-struct MergeReq {
-    left: u64,
-    right: u64,
-}
-
-async fn action_merge(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
-    let req: MergeReq = match parse_body(body) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-    let resp = ctx
-        .trigger_merge(TabletId(req.left), TabletId(req.right))
-        .await;
-    client_response_to_json(
-        resp,
-        json!({"ok": true, "left": req.left, "right": req.right}),
-    )
 }
 
 async fn action_flush(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {

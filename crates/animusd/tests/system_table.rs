@@ -7,12 +7,12 @@
 //! voter self-elects immediately, so bring-up is fast and this file doesn't
 //! need `support::free_addrs`'s multi-node port-TOCTOU retry dance):
 //!
-//! - `system_table_lists_every_seeded_entity_kind` — seeds all eleven
-//!   [`animus_control::syskv::EntityKind`]s via the client protocol (a plain
+//! - `system_table_lists_every_seeded_entity_kind` — seeds every
+//!   [`animus_control::syskv::EntityKind`] via the client protocol (a plain
 //!   `Put` auto-provisions a tablet, `ProposeSchema` reaches every other
-//!   `MetaCommand` this plane can mirror, a real split+merge produces a
-//!   `Merged` marker plus (ADR 0018 §2 amendment) `SplitParent`/
-//!   `AbsorbedBy` provenance markers; `member`/`node_addrs` come from the
+//!   `MetaCommand` this plane can mirror, a real split produces a
+//!   (ADR 0018 §2 amendment) `SplitParent` provenance marker; `member`/
+//!   `node_addrs` come from the
 //!   bootstrapped node's own self-registration — ADR 0040 PR4 retired the
 //!   ADR 0036 allocator's dedicated `NodeIdAlloc` ledger kind along with the
 //!   allocator itself, since `MetaCommand::RegisterNode`'s claim lives
@@ -242,7 +242,7 @@ async fn system_table_lists_every_seeded_entity_kind() {
         )
         .await;
 
-        // ---- Merged: a real split, then merge the sibling back in ------------
+        // ---- SplitParent: a real split ---------------------------------------
         let resp = call(
             client,
             ClientRequest::SplitTablet {
@@ -266,42 +266,19 @@ async fn system_table_lists_every_seeded_entity_kind() {
             .find(|&id| id != 1)
             .expect("a sibling tablet exists after split");
 
-        let resp = call(
-            client,
-            ClientRequest::MergeTablets {
-                left: 1,
-                right: sibling_id,
-            },
-        )
-        .await;
-        assert!(matches!(resp, ClientResponse::PutOk), "{resp:?}");
-        await_status(
-            admin,
-            |s| {
-                !s["tablets"]
-                    .as_object()
-                    .expect("tablets map")
-                    .contains_key(&sibling_id.to_string())
-            },
-            "merge committed",
-        )
-        .await;
-
         // ---- every seeded kind eventually shows up in the browse surface ----
-        const EXPECT_KINDS: [&str; 11] = [
+        const EXPECT_KINDS: [&str; 9] = [
             "tablet",
             "member",
             "schema",
             "policy",
             "node_addrs",
             "keyspace",
-            "merged",
             "counter",
             "cp_member_addr",
-            // ADR 0018 §2 amendment: the same split+merge below now also
-            // produces these two provenance markers.
+            // ADR 0018 §2 amendment: the split above also produces this
+            // provenance marker.
             "split_parent",
-            "absorbed_by",
         ];
         let full = timeout(Duration::from_secs(15), async {
             loop {
@@ -383,28 +360,15 @@ async fn system_table_lists_every_seeded_entity_kind() {
             "keyspace is presence-only: {keyspace_item}"
         );
 
-        let merged_item = find("merged", &sibling_id.to_string());
-        assert_eq!(
-            merged_item["value"],
-            Value::Null,
-            "merged is presence-only: {merged_item}"
-        );
-
-        // ADR 0018 §2 amendment: the same split minted `split_parents[sibling_id]
-        // = 1`, and the merge minted `absorbed_by[sibling_id] = 1` — both render
-        // as a decimal-string TabletId value (like a numeric id, never a raw JSON
-        // number, since the value is itself a TabletId, not a scalar counter).
+        // ADR 0018 §2 amendment: the split above minted `split_parents[sibling_id]
+        // = 1`, rendered as a decimal-string TabletId value (like a numeric id,
+        // never a raw JSON number, since the value is itself a TabletId, not a
+        // scalar counter).
         let split_parent_item = find("split_parent", &sibling_id.to_string());
         assert_eq!(
             split_parent_item["value"], "1",
             "split_parent's value is the source tablet id, rendered as a decimal \
              string: {split_parent_item}"
-        );
-        let absorbed_by_item = find("absorbed_by", &sibling_id.to_string());
-        assert_eq!(
-            absorbed_by_item["value"], "1",
-            "absorbed_by's value is the surviving tablet id, rendered as a \
-             decimal string: {absorbed_by_item}"
         );
 
         let counter_item = find("counter", "next_tablet_id");

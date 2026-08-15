@@ -92,10 +92,16 @@ const CURSOR_TAG: u8 = 0x03;
 /// (zero-padded if shorter) to [`TOKEN_BYTES`]. Split out of `cursor_key`
 /// so a caller that already has a *parsed* row's own token (from
 /// [`parse_cursor_key`]) can compute *this* tablet's own token to compare
-/// against, without rebuilding a whole key — the ADR 0042 §7 trim
-/// janitor's merge-residue cleanup (`animusd::index_drain`) is exactly this
-/// caller: "is this row this tablet's own, or a still-physically-present
-/// absorbed sibling's."
+/// against, without rebuilding a whole key. Its original caller — the ADR
+/// 0042 §7 trim janitor's merge-residue cleanup (`animusd::index_drain`),
+/// which told "this row is this tablet's own" from "a
+/// still-physically-present absorbed sibling's" after a merge widened a
+/// survivor's scope over it — no longer exists: tablet merge was removed
+/// entirely (ADR 0044, tablets are split-only). This function (and its
+/// `lib.rs` consumer, [`RaftKvNode::cursor_rows_with_token`]) currently has
+/// **no production caller**; kept because a future consumer needing the
+/// same token-vs-physical-presence disambiguation would otherwise have to
+/// reinvent it.
 #[must_use]
 pub fn token_of(range_start: &[u8]) -> [u8; TOKEN_BYTES] {
     let mut token = [0u8; TOKEN_BYTES];

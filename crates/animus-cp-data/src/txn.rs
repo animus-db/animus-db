@@ -30,8 +30,9 @@
 //! of that one flip. Per the PR1 amendment (§3), the record lives **inside**
 //! the first (anchor) participant's own tablet — not a separate always-on
 //! system tablet — so it replicates through that tablet's own Raft log,
-//! ships with its `engine_image` snapshots, and moves with a split/merge
-//! exactly like the anchor's own data would. This is the opposite locality
+//! ships with its `engine_image` snapshots, and moves with a split exactly
+//! like the anchor's own data would (tablets are split-only, ADR 0044).
+//! This is the opposite locality
 //! choice from the range-seal/read-ceiling markers (`seal.rs`/`ceiling.rs`),
 //! which are deliberately **engine-global** (outside every `StorageScope`) —
 //! a txn record instead has to be an ordinary **in-scope logical key** of
@@ -46,8 +47,8 @@
 //! Living inside the anchor's own token range is what makes this key both
 //! (a) always within the tablet's own range at stage time (the anchor's own
 //! write is itself in-range, so this token is live) and (b) move correctly
-//! across a split/merge that keeps the anchor's own token together with the
-//! rest of that tablet.
+//! across a split that keeps the anchor's own token together with the rest
+//! of that tablet.
 //!
 //! **Disjointness from every real data-plane key sharing that same
 //! token**, proved structurally rather than assumed: a real key's logical

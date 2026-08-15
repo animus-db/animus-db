@@ -61,7 +61,6 @@ const SYSTEM_TABLE_KINDS = [
   ["policy", "policy"],
   ["node_addrs", "node_addrs"],
   ["keyspace", "keyspace"],
-  ["merged", "merged"],
   ["counter", "counter (internal)"],
   ["cp_member_addr", "cp_member_addr (legacy)"],
 ];

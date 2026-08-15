@@ -40,8 +40,10 @@ load-bearing:
 - **Only base keys are stored**, never projected attributes, so every index hit
   costs a base-table read per matched item.
 - **The index is invisible to the rest of the system**: it does not split
-  (ADR 0028/0034), does not merge (ADR 0033), is not reclaimed on drop (ADR 0024),
-  is not scoped (ADR 0028), and does not appear in the dashboard.
+  (ADR 0028/0034), is not reclaimed on drop (ADR 0024), is not scoped (ADR
+  0028), and does not appear in the dashboard. (It also didn't merge, under
+  ADR 0033, at this ADR's writing — moot since ADR 0044 removed merge
+  entirely.)
 
 The surface is faithful; the substrate is a per-process cache. This ADR makes
 index entries first-class replicated data-plane rows and deletes the in-memory
@@ -94,8 +96,10 @@ change log — the same log DynamoDB Streams will later consume.**
 Each global secondary index gets its own table in the tablet map, named
 `"<base>$<index>"`. It therefore inherits, with no new distributed machinery: its
 own per-table hash ring (ADR 0023), per-tablet Raft (ADR 0017), byte-based
-auto-split (ADR 0034), merge (ADR 0033), drop-table GC (ADR 0024), `StorageScope`
+auto-split (ADR 0034), drop-table GC (ADR 0024), `StorageScope`
 isolation (ADR 0028), the native linearizable range scan, and the dashboard.
+(It also inherited merge, under ADR 0033, at this ADR's writing; tablets are
+split-only now, ADR 0044.)
 
 Its tablets are provisioned by the existing lazy path
 (`ClientCtx::provision_tablet`), on the same terms as any user table.
@@ -187,7 +191,9 @@ KIND 0x03  footprints       logical: token || escape(pk)
 
 All four scopes belong to **one tablet's Raft group** and share **one
 `KeyRange`** — literally the same `Arc<Mutex<KeyRange>>`, so a split's
-`narrow_scope` and a merge's `widen_scope` move every kind in one call. One
+`narrow_scope` moves every kind in one call (as would a merge's
+`widen_scope`, were merge not removed entirely — ADR 0044, tablets are
+split-only). One
 `PutBatch` to that group therefore still writes base + LSI + change record +
 footprint as a single Raft entry, which is what §2 and §4 rest on. This is the
 column-family shape Cockroach and TiKV use for the same reason.
@@ -525,9 +531,10 @@ mechanism.
 
 **Easier.**
 
-- Index data becomes ordinary replicated data: it splits, merges, is reclaimed,
-  is scoped, is observable, and survives restarts, with no bespoke code for any
-  of it.
+- Index data becomes ordinary replicated data: it splits, is reclaimed, is
+  scoped, is observable, and survives restarts, with no bespoke code for any
+  of it. (It also merged, under ADR 0033, at this ADR's writing; tablets are
+  split-only now, ADR 0044.)
 - An index query stops costing a base-table read per match, and stops ever
   costing a full base-table scan.
 - Because the kinds are physically separated (§3), base reads never traverse
@@ -574,7 +581,8 @@ mechanism.
 §4/§4a's "cursor deferred to Streams" language is now made concrete by ADR
 0042/0043: the change log gains a genuine multi-consumer cursor (a
 `KIND_CURSOR` row per `(tablet, consumer tag)`, holding a packed-HLC
-watermark) and a **min-over-rows** rule for split/merge convergence, in
+watermark) and a **min-over-rows** rule for split (and, at the time,
+merge) convergence — merge has since been removed entirely, ADR 0044 — in
 place of §4's as-built "no cursor, consumption is trim" design, which only
 ever had to reason about one consumer (the GSI drain). The GSI drain itself
 is reworked to write its own cursor row (tag `"gsi"`) in its own **separate,

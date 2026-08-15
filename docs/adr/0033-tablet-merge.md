@@ -1,9 +1,15 @@
 # ADR 0033 — Tablet merge: an operator-driven, control-plane-only dual of split
 
-- **Status:** Accepted — implemented in `animus-control`, `animus-cp-data`,
-  `animusd`. Amends ADR 0029 (which flagged merge as "deferred/operator-driven"
-  and left `MetaCommand::MergeTablets` unwired) and extends ADR 0031's
-  per-node tablet-host reconciler with two new planned actions.
+- **Status:** Superseded by [ADR 0044](0044-split-only-tablets.md) (2026-08-14,
+  tablets are split-only). **The whole mechanism this ADR describes is now
+  gone**: `MetaCommand::MergeTablets`, `Metadata::merged_tablets`/
+  `absorbed_by`, `HostAction::WidenScope`/`Absorb`, and every wire/admin/CLI
+  surface that reached them are deleted. Kept verbatim below as a
+  historical record — as originally shipped: Accepted — implemented in
+  `animus-control`, `animus-cp-data`, `animusd`. Amends ADR 0029 (which
+  flagged merge as "deferred/operator-driven" and left
+  `MetaCommand::MergeTablets` unwired) and extends ADR 0031's per-node
+  tablet-host reconciler with two new planned actions.
 - **Date:** 2026-08-07
 
 ## Context

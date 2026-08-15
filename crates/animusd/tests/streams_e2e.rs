@@ -9,10 +9,8 @@
 //! exercising every node of the cluster in turn — the "every node can drive
 //! this" regression pattern, D8's own "every-node issuance sweep"); a real
 //! LSM-backed restart's stream durability; the `FsSegmentStore` opt-in
-//! smoke test; a GSI+stream table proving the two halves of ADR 0042 §8's
-//! trim min-rule genuinely coexist (D5); and the merge stopgap (F1)
-//! rejected through the real admin wire path, with a plain table unaffected
-//! (D6).
+//! smoke test; and a GSI+stream table proving the two halves of ADR 0042
+//! §8's trim min-rule genuinely coexist (D5).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -115,29 +113,6 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
         .and_then(|code| code.parse().ok())
         .expect("status line");
     (status, payload.to_string())
-}
-
-async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
-    let body = body.unwrap_or("");
-    let request = format!(
-        "{method} {path} HTTP/1.0\r\nHost: animus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len(),
-    );
-    stream.write_all(request.as_bytes()).await.expect("send");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await.expect("read response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    let value: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
-    (status, value)
 }
 
 fn json(body: &str) -> Value {
@@ -354,111 +329,6 @@ async fn await_true(secs: u64, msg: &str, mut check: impl FnMut() -> bool) {
         }
         sleep(Duration::from_millis(50)).await;
     }
-}
-
-// ---------------------------------------------------------------------------
-// D6: the merge stopgap (F1), through the real admin wire path.
-// ---------------------------------------------------------------------------
-
-/// A base table with an enabled stream rejects `MergeTablets`, at apply
-/// time, through the genuine `POST /admin/tablet/merge` path (not just the
-/// unit-level apply-arm guard `animus-control`'s own tests exercise); a
-/// plain table's split-then-merge round trip still works unaffected.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn merge_stopgap_rejected_on_streamed_table_but_not_plain_e2e() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
-    await_bootstrap(&nodes).await;
-    let dynamo_addr = nodes[0].dynamo_addr();
-    let admin_addr = nodes[0].admin_addr();
-
-    // A streamed table, split so there are two adjacent tablets to try
-    // merging back together.
-    let (status, body) = dynamo(
-        dynamo_addr,
-        "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"streamed",
-            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
-            "StreamSpecification":{"StreamEnabled":true,
-                "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "CreateTable(streamed) failed: {body}");
-    await_true(20, "streamed table's tablet never appeared", || {
-        !tablets_for(&nodes[0].metadata(), "streamed").is_empty()
-    })
-    .await;
-    let left = tablets_for(&nodes[0].metadata(), "streamed")[0];
-    let (status, body) = admin(
-        admin_addr,
-        "POST",
-        "/admin/tablet/split",
-        Some(&format!(r#"{{"tablet":{},"split_key":"m"}}"#, left.0)),
-    )
-    .await;
-    assert_eq!(status, 200, "split(streamed) failed: {body:?}");
-    await_true(20, "streamed table never split into two tablets", || {
-        tablets_for(&nodes[0].metadata(), "streamed").len() >= 2
-    })
-    .await;
-    let ids = tablets_for(&nodes[0].metadata(), "streamed");
-    let (status, body) = admin(
-        admin_addr,
-        "POST",
-        "/admin/tablet/merge",
-        Some(&format!(r#"{{"left":{},"right":{}}}"#, ids[0].0, ids[1].0)),
-    )
-    .await;
-    assert_ne!(
-        status, 200,
-        "MergeTablets must be rejected on a streamed base table: {body:?}"
-    );
-    // Nothing merged: still two tablets.
-    assert_eq!(
-        tablets_for(&nodes[0].metadata(), "streamed").len(),
-        2,
-        "a rejected merge must not have widened anything"
-    );
-
-    // A plain (unstreamed) table's identical split-then-merge round trip is
-    // unaffected — the stopgap is scoped to streamed tables only.
-    let (status, body) = dynamo(
-        dynamo_addr,
-        "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"plain","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "CreateTable(plain) failed: {body}");
-    await_true(20, "plain table's tablet never appeared", || {
-        !tablets_for(&nodes[0].metadata(), "plain").is_empty()
-    })
-    .await;
-    let left = tablets_for(&nodes[0].metadata(), "plain")[0];
-    let (status, body) = admin(
-        admin_addr,
-        "POST",
-        "/admin/tablet/split",
-        Some(&format!(r#"{{"tablet":{},"split_key":"m"}}"#, left.0)),
-    )
-    .await;
-    assert_eq!(status, 200, "split(plain) failed: {body:?}");
-    await_true(20, "plain table never split into two tablets", || {
-        tablets_for(&nodes[0].metadata(), "plain").len() >= 2
-    })
-    .await;
-    let ids = tablets_for(&nodes[0].metadata(), "plain");
-    let (status, body) = admin(
-        admin_addr,
-        "POST",
-        "/admin/tablet/merge",
-        Some(&format!(r#"{{"left":{},"right":{}}}"#, ids[0].0, ids[1].0)),
-    )
-    .await;
-    assert_eq!(status, 200, "merge(plain) must succeed: {body:?}");
-    await_true(20, "plain table never merged back to one tablet", || {
-        tablets_for(&nodes[0].metadata(), "plain").len() == 1
-    })
-    .await;
 }
 
 // ---------------------------------------------------------------------------

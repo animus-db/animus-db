@@ -14,7 +14,12 @@
   (control-plane membership change, reused here as the meta-tablet's own
   reconfiguration primitive); depends on ADR 0018 (cross-tablet transactions,
   still Proposed) for its actual scaling payoff, per the finding below; touches
-  one boundary of ADR 0035 (a control-only node's storage shape).
+  one boundary of ADR 0035 (a control-only node's storage shape). **Note
+  (2026-08-14, ADR 0044):** this design-only ADR's `MergeTablets` mentions
+  below describe a command that has since been removed entirely (tablets
+  are split-only) — read them as historical design context from this ADR's
+  writing, not as a currently-existing mechanism; nothing below depended on
+  merge specifically continuing to exist.
 
 ## Context
 

@@ -36,10 +36,13 @@ and the wire edges. One file: `src/lib.rs`.
   `new_for_table` / `with_table` (all normalize — sort/dedup — the replica
   set); predicates `serves_table`, `has_replica`.
 - `KeyRange`: `whole()`, `contains`, `contains_range` (subset containment —
-  the shared primitive behind the reconciler's narrow-only/widen-only checks
-  and `animusd`'s read-path scope pre-checks, ADR 0031/0033), `split_at`
-  (strictly-inside split into two half-open ranges), `abuts` (contiguity test
-  — the primitives behind split/merge).
+  the shared primitive behind the reconciler's narrow-only check and
+  `animusd`'s read-path scope pre-checks, ADR 0031/0028), `split_at`
+  (strictly-inside split into two half-open ranges), `abuts` (contiguity
+  test — originally the adjacency check `MergeTablets` required of its two
+  tablets; tablets are split-only now (ADR 0044), so `abuts` has **no
+  production caller today**, exercised only by this crate's own unit
+  tests).
 
 ## What's non-obvious
 
@@ -47,17 +50,17 @@ and the wire edges. One file: `src/lib.rs`.
   (`whole()` is `start = []`, `end = None`). `abuts` is false for an
   unbounded-above range (nothing follows it).
 - `Epoch` is the **data-plane fencing token**: every placement change bumps it.
-  The actual split/merge *state transitions* live in `animus-control`'s
-  `Metadata::apply`; this crate provides the range primitives.
+  The actual split *state transitions* live in `animus-control`'s
+  `Metadata::apply`; this crate provides the range primitives. (Tablets are
+  split-only, ADR 0044 — there is no merge state transition anymore.)
 - **`Tablet::version_floor` (the cross-group LWW version-floor fix) is
   retired (ADR 0018 §2 amendment, PR2)**, replaced by HLC witnessing plus a
   range seal in `animus-cp-data` — see that crate's `CLAUDE.md` and
   `docs/engineering-lessons.md` for the design and the full writeup of the
-  hazard it used to close. `Tablet` no longer carries this field. The
-  split/merge provenance the seal design's reconciler gating needs
-  (`split_parents`/`absorbed_by`) lives entirely in `animus-control`'s
-  `Metadata`, not on `Tablet` itself — this crate has nothing to say about
-  it.
+  hazard it used to close. `Tablet` no longer carries this field. The split
+  provenance the seal design's reconciler gating needs (`split_parents`)
+  lives entirely in `animus-control`'s `Metadata`, not on `Tablet` itself —
+  this crate has nothing to say about it.
 - Serializable (`serde`) because tablets travel inside control-plane Raft log
   entries and data-plane routing views.
 - Dependency direction: `animus-control`, `animus-cql`, `animus-cp-data`, and

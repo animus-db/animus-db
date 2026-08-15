@@ -270,7 +270,7 @@ function autoSplitThresholds() {
 //      than configured). This is a transition — split-child formation, first
 //      election on a freshly-provisioned table, rebalance/repair catch-up,
 //      reconciler lag, or an admin-port fan-out gap — never a data-risk
-//      state (ADR 0028: split/merge/provision are a single control-plane
+//      state (ADR 0028: split/provision are a single control-plane
 //      command with no data-plane half; the data already sits safely on the
 //      source replicas' shared storage engines while the new group stands
 //      itself up). Does NOT degrade health by itself; see the
@@ -330,7 +330,7 @@ const FORMING_OVERDUE_MS = 60_000;
 // A tablet mid-formation — a split-child forming its Raft group, a freshly
 // created table's first election, a rebalance/repair move catching up, or a
 // reconciler/admin-fan-out lag — is not a data-risk state as long as every
-// replica assigned to it is on a live node: ADR 0028 makes split/merge/
+// replica assigned to it is on a live node: ADR 0028 makes split/
 // provision a single control-plane command with no data-plane half, so the
 // data already sits safely in the source replicas' shared storage engines
 // the whole time the new group is standing itself up. That is exactly what
@@ -376,7 +376,7 @@ function computeHealth() {
     }
   }
   // Forget any tablet no longer forming — recovered, or gone entirely
-  // (split/merge/drop) — so a later re-entry into forming starts a fresh
+  // (split/drop) — so a later re-entry into forming starts a fresh
   // clock instead of reusing a stale timestamp from a previous episode.
   for (const id of FORMING_SINCE.keys()) {
     if (!stillForming.has(id)) FORMING_SINCE.delete(id);

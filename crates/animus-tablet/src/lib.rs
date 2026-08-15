@@ -3,9 +3,10 @@
 //! `docs/adr/0002-tablets-unit-of-placement.md`).
 //!
 //! Ranges support [`KeyRange::split_at`] and [`KeyRange::abuts`] (the
-//! primitives behind control-plane tablet split/merge); the epoch is the
-//! fencing token used by the data plane (ADR 0001). Automatic split-point
-//! selection and replica rebalancing on split/merge remain future work.
+//! primitives behind control-plane tablet split — tablets are split-only,
+//! ADR 0044; `abuts` was originally merge's own adjacency check and has no
+//! production caller now); the epoch is the fencing token used by the data
+//! plane (ADR 0001).
 //!
 //! Each table is its own **hash ring** (ADR 0022/0023): a data-plane key is
 //! `partition_token(pk) || escape(pk) || rk` — **no table prefix**; the table is
@@ -14,7 +15,7 @@
 //! partition key). A tablet is
 //! **scoped to one table** (`Tablet::table`) and owns a contiguous `[start, end)`
 //! sub-range of that table's keyspace — a token sub-range — so the whole
-//! range/epoch/split-merge machinery is reused unchanged while load spreads
+//! range/epoch/split machinery is reused unchanged while load spreads
 //! evenly and one partition's rows stay contiguous + sort-ordered (the token is
 //! over the partition key only, so all of a partition's keys share a prefix). A
 //! table starts as one tablet and **splits on demand** as it grows.

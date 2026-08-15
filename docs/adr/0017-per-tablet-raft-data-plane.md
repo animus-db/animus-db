@@ -58,8 +58,9 @@ Load-bearing constraints and prior decisions that shape it:
   time is *not* simulation-verifiable.
 - The control plane (`animus-control`) already owns the **tablet map**,
   **placement** (ADR 0005), **failure detection** (ADR 0012), and the **schema
-  catalog** (ADR 0013), and has `SplitTablet`/`MergeTablets`/`CasTabletReplicas`
-  `MetaCommand`s.
+  catalog** (ADR 0013), and has `SplitTablet`/`CasTabletReplicas`
+  `MetaCommand`s (tablets are split-only, ADR 0044 — `MergeTablets` existed
+  under ADR 0033 and was removed).
 - The **`ShardedOwner`/`ShardRouter`** precedent (`animus-consensus`) shows how a
   physical node hosts one consensus group per local tablet, each on its own `Env`
   id, routed from the existing tablet map.
@@ -218,7 +219,9 @@ the mechanics.
   command** that atomically divides the key range and hands the right-hand state
   off to a **new group bootstrapped at the split point**. Splitting a *live
   consensus group's data* is the most intricate operation here and is sequenced
-  last. (Merge — the inverse — is deferred with cross-tablet work.) **"The
+  last. (Merge — the inverse — was deferred at this ADR's writing, later
+  shipped as ADR 0033, and has since been removed entirely — ADR 0044,
+  tablets are split-only.) **"The
   rebalancer" here is now `Metadata::rebalance` (ADR 0029)** — it moves
   *existing* replicas onto newly-added nodes rather than splitting; a size
   threshold remains the actual split trigger.
