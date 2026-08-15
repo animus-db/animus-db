@@ -32,21 +32,21 @@
 //! `GlobalSecondaryIndexUpdates` element (a `Create` or a `Delete` — no
 //! `Update`/throughput shape), never both in the same call (ADR 0045 §6 Fork
 //! C — a deliberate AWS deviation, documented in ADR 0045's deviations
-//! table); `animusd` dispatches the `Create` half (still rejected with a
-//! clear error today — a named PR6 follow-up) and the `Delete` half (the
-//! four-step convergent drop cascade, ADR 0045 §5). Any other index/key/
-//! throughput change is rejected up front. `Scan` reads a whole table with
-//! `Limit` / `ExclusiveStartKey` pagination and an optional
-//! `FilterExpression` (the same predicate subset as `ConditionExpression`).
-//! GetItem/Query/Scan accept a `ProjectionExpression` / `AttributesToGet`
-//! (top-level attribute names only). Deferred (rejected with a clear error):
-//! document-path projections (`a.b`), per-index projection lists,
-//! `UpdateItem`-only `ReturnValues` modes, and an index-*creating*
-//! `UpdateTable` (PR6).
+//! table); `animusd` dispatches both halves — `Create` adds a live-backfilling
+//! GSI to a populated table (ADR 0045 §2/§6) and `Delete` runs the four-step
+//! convergent drop cascade (ADR 0045 §5). Any other index/key/throughput
+//! change is rejected up front. `Scan` reads a whole table with `Limit` /
+//! `ExclusiveStartKey` pagination and an optional `FilterExpression` (the
+//! same predicate subset as `ConditionExpression`). GetItem/Query/Scan accept
+//! a `ProjectionExpression` / `AttributesToGet` (top-level attribute names
+//! only). Deferred (rejected with a clear error): document-path projections
+//! (`a.b`), per-index projection lists, `UpdateItem`-only `ReturnValues`
+//! modes, and adding an LSI to an existing table (LSIs are create-time-only
+//! in real DynamoDB).
 
 use std::collections::BTreeMap;
 
-use animus_control::StreamViewType;
+use animus_control::{IndexStatus, StreamViewType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -79,9 +79,14 @@ pub enum StreamUpdate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexUpdate {
     /// Add a new global secondary index to a (possibly populated) table —
-    /// decoded like a `CreateTable` GSI declaration. **Not yet dispatched**:
-    /// `animusd` rejects this arm with a clear error today (PR6 is the named
-    /// follow-up that wires the backfill-driven add path, ADR 0045 §2).
+    /// decoded like a `CreateTable` GSI declaration (this decoder only ever
+    /// produces [`SecondaryIndex::Global`]; there is no
+    /// `LocalSecondaryIndexUpdates` in the real API, and `animusd` rejects a
+    /// directly-constructed `Local` variant defensively). `animusd` bridges
+    /// it to a `Creating`-status `IndexDef` and proposes `CreateTableIndex`
+    /// (ADR 0045 §2/§6) — the backfill seeder + completion aggregator (ADR
+    /// 0045 §2/§4) do the rest, converging to `Active` with no further wire
+    /// action.
     Create(SecondaryIndex),
     /// Remove the named secondary index (ADR 0045 §5's four-step convergent
     /// drop cascade).
@@ -1908,13 +1913,28 @@ pub fn stream_arn(table: &str, label: &str) -> String {
 
 /// Build the shared `TableDescription`/`Table` object both
 /// [`create_table_response`] and [`describe_table_response`] wrap: name, key
-/// schema, `ACTIVE` status, any secondary indexes, and — when `stream` is
-/// `Some` — `StreamSpecification`/`LatestStreamArn`/`LatestStreamLabel` (ADR
+/// schema, `ACTIVE` status, any secondary indexes — each carrying its own
+/// real `IndexStatus` (`CREATING`/`ACTIVE`/`DELETING`, ADR 0045 §6 Fork D)
+/// plus, while `Creating`, `Backfilling: true` — and, when `stream` is
+/// `Some`, `StreamSpecification`/`LatestStreamArn`/`LatestStreamLabel` (ADR
 /// 0042 §2/§4).
+///
+/// **`Backfilling` is placed *per-index*, inside each `GlobalSecondaryIndexes[]`
+/// entry** — matching real DynamoDB's `DescribeTable` shape exactly. (ADR
+/// 0045 §6 originally sketched this as a table-level flag; that wording was
+/// looser than AWS reality and is corrected here, not carried forward.)
+///
+/// `index_statuses` is the Fork-D side channel (a `(name, IndexStatus)`
+/// list) rather than a field on [`SecondaryIndex`] itself, which stays a pure
+/// `CreateTable`-*input* shape — mirroring [`StreamDescription`]'s own
+/// separate-bridge precedent. An index absent from it (every index
+/// [`create_table_response`] ever renders, and every LSI, which is `Active`
+/// by construction — LSIs are create-time-only) renders as `Active`.
 fn table_description_object(
     table: &str,
     schema: &TableSchema,
     indexes: &[SecondaryIndex],
+    index_statuses: &[(String, IndexStatus)],
     stream: Option<&StreamDescription>,
 ) -> Map<String, Value> {
     let mut key_schema = vec![key_schema_entry(&schema.partition_key, "HASH")];
@@ -1935,14 +1955,21 @@ fn table_description_object(
                 if let Some(sort) = &g.sort_attribute {
                     ks.push(key_schema_entry(sort, "RANGE"));
                 }
-                gsis.push(index_desc(&g.name, ks));
+                gsis.push(index_desc(
+                    &g.name,
+                    ks,
+                    index_status_for(&g.name, index_statuses),
+                ));
             }
             SecondaryIndex::Local(l) => {
                 let ks = vec![
                     key_schema_entry(&schema.partition_key, "HASH"),
                     key_schema_entry(&l.sort_attribute, "RANGE"),
                 ];
-                lsis.push(index_desc(&l.name, ks));
+                // LSIs are always `Active` by construction (create-time-only,
+                // never touched by `SetIndexStatus`) — never consulted from
+                // `index_statuses`.
+                lsis.push(index_desc(&l.name, ks, IndexStatus::Active));
             }
         }
     }
@@ -1982,7 +2009,9 @@ pub fn create_table_response(
     indexes: &[SecondaryIndex],
     stream: Option<&StreamDescription>,
 ) -> String {
-    let desc = table_description_object(table, schema, indexes, stream);
+    // Every index a `CreateTable` declares is `Active` by construction (ADR
+    // 0041 §5: an empty, just-created table) — no status side channel needed.
+    let desc = table_description_object(table, schema, indexes, &[], stream);
     let mut obj = Map::new();
     obj.insert("TableDescription".into(), Value::Object(desc));
     serde_json::to_string(&Value::Object(obj)).expect("create-table response serializes")
@@ -1992,16 +2021,20 @@ pub fn create_table_response(
 /// shape as [`create_table_response`], plus `AttributeDefinitions` (derived
 /// from `key_types`, mirroring `CreateTable`'s own decode), wrapped under
 /// `Table` (DynamoDB's own `DescribeTable` response shape, distinct from
-/// `CreateTable`/`UpdateTable`'s `TableDescription`).
+/// `CreateTable`/`UpdateTable`'s `TableDescription`). `index_statuses` is the
+/// caller's Fork-D side channel of each index's *real* replicated-catalog
+/// status (`animusd::dynamo::describe_table` reads it off `Metadata`) — see
+/// [`table_description_object`]'s doc.
 #[must_use]
 pub fn describe_table_response(
     table: &str,
     schema: &TableSchema,
     key_types: &[(String, String)],
     indexes: &[SecondaryIndex],
+    index_statuses: &[(String, IndexStatus)],
     stream: Option<&StreamDescription>,
 ) -> String {
-    let mut desc = table_description_object(table, schema, indexes, stream);
+    let mut desc = table_description_object(table, schema, indexes, index_statuses, stream);
     let mut attrs = vec![attribute_definition(&schema.partition_key, key_types)];
     if let Some(sk) = &schema.sort_key {
         attrs.push(attribute_definition(sk, key_types));
@@ -2023,13 +2056,42 @@ fn attribute_definition(name: &str, key_types: &[(String, String)]) -> Value {
     Value::Object(e)
 }
 
-/// One index entry in a `TableDescription`: name, key schema, `ACTIVE` status.
-fn index_desc(name: &str, key_schema: Vec<Value>) -> Value {
+/// One index entry in a `TableDescription`/`Table`: name, key schema, and its
+/// real `IndexStatus` (`CREATING`/`ACTIVE`/`DELETING`, DynamoDB's own
+/// `SCREAMING_SNAKE_CASE`). `Backfilling: true` is added only while
+/// `Creating` — matching AWS, which omits the attribute entirely once a GSI
+/// has finished backfilling (never renders it as `false`).
+fn index_desc(name: &str, key_schema: Vec<Value>, status: IndexStatus) -> Value {
     let mut g = Map::new();
     g.insert("IndexName".into(), Value::String(name.to_owned()));
     g.insert("KeySchema".into(), Value::Array(key_schema));
-    g.insert("IndexStatus".into(), Value::String("ACTIVE".into()));
+    g.insert(
+        "IndexStatus".into(),
+        Value::String(index_status_str(status).into()),
+    );
+    if status == IndexStatus::Creating {
+        g.insert("Backfilling".into(), Value::Bool(true));
+    }
     Value::Object(g)
+}
+
+/// DynamoDB's own `SCREAMING_SNAKE_CASE` rendering of an [`IndexStatus`].
+fn index_status_str(status: IndexStatus) -> &'static str {
+    match status {
+        IndexStatus::Creating => "CREATING",
+        IndexStatus::Active => "ACTIVE",
+        IndexStatus::Deleting => "DELETING",
+    }
+}
+
+/// Resolve `name`'s real status from the Fork-D side channel, defaulting to
+/// `Active` for an index absent from it (see [`table_description_object`]'s
+/// doc for why that default is correct, not merely convenient).
+fn index_status_for(name: &str, statuses: &[(String, IndexStatus)]) -> IndexStatus {
+    statuses
+        .iter()
+        .find(|(n, _)| n == name)
+        .map_or(IndexStatus::Active, |(_, s)| *s)
 }
 
 fn key_schema_entry(name: &str, role: &str) -> Value {
@@ -2758,12 +2820,74 @@ mod tests {
             &TableSchema::composite("pk", "sk"),
             &[("pk".into(), "S".into()), ("sk".into(), "N".into())],
             &[],
+            &[],
             Some(&stream),
         );
         assert!(body.contains("\"Table\""));
         assert!(body.contains("\"AttributeDefinitions\""));
         assert!(body.contains("\"AttributeType\":\"N\""));
         assert!(body.contains("\"StreamViewType\":\"KEYS_ONLY\""));
+    }
+
+    /// `DescribeTable`'s per-index `IndexStatus` (ADR 0045 §6 Fork D): each of
+    /// the three real statuses renders in DynamoDB's own
+    /// `SCREAMING_SNAKE_CASE`, and `Backfilling: true` appears **only**
+    /// alongside `CREATING` — never `false`, and never for `ACTIVE`/
+    /// `DELETING` (matching AWS, which omits the attribute once backfilling
+    /// finishes).
+    #[test]
+    fn describe_table_response_reports_real_index_status_and_backfilling() {
+        let gsi = SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-email".into(),
+            key_attribute: "email".into(),
+            sort_attribute: None,
+            projection: IndexProjection::All,
+        });
+
+        for (status, want_status_str, want_backfilling) in [
+            (IndexStatus::Creating, "CREATING", true),
+            (IndexStatus::Active, "ACTIVE", false),
+            (IndexStatus::Deleting, "DELETING", false),
+        ] {
+            let body = describe_table_response(
+                "t",
+                &TableSchema::simple("id"),
+                &[],
+                std::slice::from_ref(&gsi),
+                &[("by-email".into(), status)],
+                None,
+            );
+            assert!(
+                body.contains(&format!("\"IndexStatus\":\"{want_status_str}\"")),
+                "status {status:?}: expected IndexStatus {want_status_str} in {body}"
+            );
+            assert_eq!(
+                body.contains("\"Backfilling\":true"),
+                want_backfilling,
+                "status {status:?}: unexpected Backfilling presence in {body}"
+            );
+            assert!(
+                !body.contains("\"Backfilling\":false"),
+                "Backfilling must never render as false (AWS omits the attribute instead): {body}"
+            );
+        }
+    }
+
+    /// An index absent from the `index_statuses` side channel — the shape
+    /// [`create_table_response`] always passes — defaults to `ACTIVE` with no
+    /// `Backfilling`, matching a just-created, empty-by-construction table's
+    /// indexes (ADR 0041 §5).
+    #[test]
+    fn create_table_response_reports_indexes_as_active() {
+        let gsi = SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-email".into(),
+            key_attribute: "email".into(),
+            sort_attribute: None,
+            projection: IndexProjection::All,
+        });
+        let body = create_table_response("t", &TableSchema::simple("id"), &[gsi], None);
+        assert!(body.contains("\"IndexStatus\":\"ACTIVE\""));
+        assert!(!body.contains("Backfilling"));
     }
 
     #[test]

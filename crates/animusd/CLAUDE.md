@@ -453,6 +453,31 @@ Regression: `tests/update_table_drop_index.rs` (a populated `Active`
 index, an in-flight-cancellation of a still-`Creating` one, a
 create-drop-recreate of the same name, and a crash/retry mid-cascade).
 
+**`dynamo.rs::create_index` (ADR 0045 §2/§6) is `drop_index`'s add-half
+sibling** — `UpdateTable`'s `GlobalSecondaryIndexUpdates` `Create` path.
+Validates client-side (duplicate name; a name colliding with the reserved
+namespace or containing `$`, since it becomes half of the hidden index
+table's own name; `Local` kind rejected, defense-in-depth since the wire
+decoder never actually produces one), then bridges via
+`schema_bridge::index_to_control` **overriding `status` to `Creating`**
+and proposes `CreateTableIndex` with a **presence-by-name** commit-wait
+(not "status == Creating" — the completion aggregator can flip a small
+table's index to `Active` before the caller's own next poll; see
+`docs/engineering-lessons.md`'s entry on why a commit-wait must never pin a
+transient status value). No `provision_tablet` call: the drain lazily
+provisions the hidden table. `describe_table` threads each index's real
+status through a side channel (`wire::describe_table_response`'s new
+`index_statuses` param — kept off `SecondaryIndex` itself, mirroring
+`StreamDescription`'s own separate-bridge precedent) so `DescribeTable`
+reports real `CREATING`/`ACTIVE`/`DELETING` plus a per-index
+`Backfilling: true` while `Creating` (AWS places it inside each
+`GlobalSecondaryIndexes[]` entry, not table-level). `run_index_query`/
+`run_index_scan` reject a non-`Active` index with `ValidationException`,
+beside their existing `ConsistentRead`-against-a-GSI check. Regression:
+`tests/update_table_create_index.rs` (populated-table backfill with a
+concurrent write racing it, client-side validation, and a non-leader-node
+relay convergence check).
+
 ## Wire edges
 
 All edges are production-only I/O (real tokio sockets, hand-rolled framing) and

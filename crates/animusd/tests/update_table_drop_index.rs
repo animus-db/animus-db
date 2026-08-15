@@ -4,8 +4,8 @@
 //! hidden table, `DropTableIndex`, and the belt-and-suspenders re-scan —
 //! reached via the real DynamoDB `UpdateTable` wire request, not a
 //! hand-driven `MetaCommand` (unlike `tests/backfill_seeder.rs`, which still
-//! hand-drives `CreateTableIndex` since `UpdateTable`'s own index-*creating*
-//! half is PR6's job).
+//! hand-drives `CreateTableIndex` — `UpdateTable`'s own index-*creating*
+//! half now exists too, ADR 0045 §2/§6, see `tests/update_table_create_index.rs`).
 //!
 //! Three scenarios: dropping a fully `Active` index on a populated table
 //! (the common case), dropping an index that is still mid-backfill
@@ -316,11 +316,11 @@ async fn await_row_count(addr: SocketAddr, table: &str, want: usize, what: &str)
 /// and their data is genuinely reclaimed (not merely orphaned), the catalog
 /// entry disappears, the base table is completely unaffected, and a
 /// subsequent `Query` naming the now-gone index errors cleanly (the same
-/// `NoSuchIndex` `ValidationException` an always-unknown index gets —
-/// PR6 is what would give this a `ResourceNotFoundException`-flavored
-/// index-specific code if DynamoDB itself distinguished one; this adapter
-/// doesn't, and this test asserts today's truthful behavior, not a promise
-/// PR6 hasn't made yet).
+/// `NoSuchIndex` `ValidationException` an always-unknown index gets — this
+/// adapter never distinguishes "never existed" from "existed and was
+/// dropped" with a different error code, matching the fact that real
+/// DynamoDB doesn't either; this test asserts that today's behavior, not a
+/// promise of a future distinction).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn drop_of_an_active_index_on_a_populated_table_reclaims_everything() {
     timeout(Duration::from_secs(120), async {

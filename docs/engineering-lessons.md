@@ -1820,6 +1820,49 @@ debugging anything that feels like it might have happened before.
   file/crate before deleting it, exactly the same discipline this log
   already prescribes for gating `match` sites on a command enum.
   (2026-08-15.)
+- **An internal design doc's paraphrase of a real external API's response
+  shape is not the API — verify against the real shape before wiring a
+  field, even when the doc sounds precise.** ADR 0045 §6 sketched
+  `DescribeTable`'s new `Backfilling: bool` as a **table-level** flag ("any
+  index `Creating`"); real DynamoDB places `Backfilling` **inside each
+  `GlobalSecondaryIndexes[]` entry**, and only while that specific index is
+  backfilling (the attribute is *absent*, never `false`, once finished).
+  Building PR6 to the doc's wording as written would have shipped a
+  plausible-looking but wrong wire shape no test would have caught, since
+  every test in the same PR would have been written against the same wrong
+  premise. Caught only because the task brief explicitly flagged the
+  wording as "looser than AWS reality" and asked for the real shape to be
+  checked — worth generalizing: **a design doc is a plan, not a spec of an
+  external contract it merely describes; re-derive the actual third-party
+  shape independently (from real API docs/behavior) rather than trusting a
+  plan's summary of it**, the same way this codebase already insists on
+  reading ADR text as *rationale*, not as the mechanism's ground truth.
+  (`animus-dynamo/src/wire.rs`'s `index_desc`/`table_description_object`,
+  2026-08-15.)
+- **A commit-wait poll for a command that puts an object into a *transient*
+  status must check the object's presence, not that it still holds the
+  exact status value just proposed** — a concurrent convergent loop can
+  legitimately advance past that status before the proposer's own next
+  poll, especially on a small/fast-converging fixture in a test. `UpdateTable`
+  Create (ADR 0045 §6) proposes `CreateTableIndex{status: Creating}` and
+  waits for it to commit exactly like `create_table`'s own index-definition
+  loop (presence-by-name only, `dynamo.rs::create_table`); the completion
+  aggregator (`index_backfill_loop`, ADR 0045 §4) can flip that same index
+  to `Active` within one tick of a tiny table's backfill finishing, which on
+  a single-node test can race the proposer's very next `metadata_fresh`
+  read. Polling for `status == Creating` specifically would then spuriously
+  time out despite the create having fully succeeded. The already-shipped
+  `set_index_status` (used by the drop cascade's `Deleting` transition)
+  gets away with checking the exact target status only because nothing in
+  this codebase ever proposes a *further* transition away from `Deleting`
+  before `DropTableIndex` removes the definition outright — that is a
+  narrower invariant than "commit-wait polls are safe to pin to an exact
+  status," not a counterexample to this lesson. General rule: when a
+  commit-wait's target value can itself be mutated again by some other
+  loop before the waiter's next poll, wait on the mutation that is
+  monotonic/permanent (existence, a monotonic counter, a specific id) —
+  never on a value a *different* proposer can race past.
+  (`animusd/src/dynamo.rs::create_index`, 2026-08-15.)
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer

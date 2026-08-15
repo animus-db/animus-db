@@ -279,6 +279,12 @@ mod tests {
         assert_eq!(def.hash_attribute, "pk");
         assert_eq!(def.sort_attribute.as_deref(), Some("ts"));
         assert_eq!(index_to_dynamo(&def), dynamo);
+        // LSIs are always `Active` by construction (ADR 0045 §6): they are
+        // create-time-only in real DynamoDB, so nothing in this codebase ever
+        // proposes `SetIndexStatus` for one (`drop_index` rejects a `Local`
+        // kind outright) — the wire-response and read-gating logic both rely
+        // on this invariant holding unconditionally.
+        assert_eq!(def.status, IndexStatus::Active);
     }
 
     #[test]
