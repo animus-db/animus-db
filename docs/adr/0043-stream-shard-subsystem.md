@@ -173,7 +173,10 @@ discipline in this crate):**
 1. Let `W` be the tablet's current effective watermark (ADR 0042 §8: its
    own shard chain's last sealed end-HLC, or its parent chain's for a fresh
    split child, or absent). Scan `pending_changes()`, keep every record with
-   `hlc > W`, and **sort by the 8-byte HLC key suffix** — `pending_changes`'
+   `hlc > W` **and inside this tablet's current metadata-declared range**
+   (the split-seal range-fence amendment, §A4 below — `pending_changes()`
+   alone is bounded only by the tablet's *physical* scope, which can lag a
+   split), and **sort by the 8-byte HLC key suffix** — `pending_changes`'
    own key order is token-then-pk-then-HLC, *not* commit order, so this sort
    is load-bearing, not a formality. Encode the segment (§"Segment format,"
    below).
@@ -276,6 +279,43 @@ tablet-host reconciler still consume it). No new `MetaCommand` (§A8's
 reproduce the loss on the unfixed code) and `animusd`'s `streams_e2e.rs::
 manual_split_with_unsealed_backlog_under_production_seal_knobs`.
 
+**Split-seal range-fence amendment, 2026-08-15 (as-built — the
+DUPLICATION mirror of PR1's loss bug above, found by the D8 e2e
+diagnostic).** PR1 froze `stream_split_basis` so a *later* parent seal can
+never retroactively raise a child's watermark — but freezing the basis
+does nothing about the *physical* boundary a seal actually reads from.
+`MetaCommand::SplitTablet` commits the new range to the control Raft
+immediately; the *local* effect — narrowing that tablet's `RaftKvNode`'s
+live `StorageScope` (`narrow_scope`) — is a separate, un-replicated,
+per-node action the tablet-host reconciler (ADR 0031) applies only once it
+next notices the metadata change (event-driven watch or a fallback tick).
+Nothing synchronizes that against a *different* background loop's own
+tick (`change_consumer_loop`'s seal arm, §A3 above). In the window between
+the two, the parent's `pending_changes()` scan — bounded only by the
+still-wide physical scope — can still return records that, per `Metadata`,
+already belong to the split-off sibling; sealing them there produces a
+real, committed `SealStreamShard` for the parent covering them. The
+sibling's own first seal then reads its `stream_split_basis` watermark —
+frozen *before* that racing parent seal ever ran (by construction: the
+basis is captured at `SplitTablet`'s own apply, which precedes it) — has
+no way to know they were already sealed, and re-seals the *same physical
+records* (never deleted by a seal, only by trim, §A6) into its own epoch
+0: the same packed HLC in two different `(tablet, epoch)` catalog rows.
+**Fix**: `seal_now` (§A3 step 1), the hot-trim arm (§A6), and the
+open-shard hot-read path (§A7's "Deliberately no `ReadIndex` barrier"
+serve path) all now additionally fence their `pending_changes()` candidate
+set to the tablet's *current metadata-declared* range
+(`Metadata.tablets[tablet].range`, `animusd::index_drain::
+in_declared_range`) — the identical authority the ADR 0028 write fence
+already trusts, applied here to the seal arm's read side, closing the gap
+regardless of how long the local scope takes to converge. A record outside
+the declared range is simply left for the sibling; nothing here waits on
+or accelerates `narrow_scope` itself. Regression:
+`animus-test`'s `stream_lineage_corpus.rs::
+split_then_parent_reseals_before_scope_narrows` (red on the unfixed
+sealer, drives the exact ordering PR1's own inverse-order regression above
+does not: the parent seals *before* its local scope narrows, not after).
+
 **Cross-group HLC safety**: a child group's start witnesses the shared
 engine's own `latest_version()` (the pre-existing witnessing chain ADR
 0018 §2's amendment already establishes) — nothing stream-specific to add
@@ -321,7 +361,12 @@ arm** (generalized from ADR 0041's own trim janitor) is the only deleter of
 hot records, and only once the segment + catalog row it trims behind are
 both durably committed — a distinct action from the control-leader
 **segment-janitor** (§A9), which only ever touches already-sealed segment
-objects and rows, never a tablet's own hot `KIND_CHANGE` scope.
+objects and rows, never a tablet's own hot `KIND_CHANGE` scope. **The
+hot-trim arm never deletes a record outside this tablet's current
+metadata-declared range** (§A4's split-seal range-fence amendment) — even
+under the "zero expected terms, trim everything" rule above, a record
+already belonging to a split-off sibling is left for that sibling, never
+deleted out from under it.
 
 ### A7. The `SegmentStore` trait
 

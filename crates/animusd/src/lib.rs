@@ -7182,7 +7182,8 @@ impl ClientCtx {
                 let Some(leader) = self.edge.cp_leader(tablet) else {
                     return self.not_leader_refusal(Some(tablet));
                 };
-                let pairs = index_drain::hot_read(&leader, from_position, limit)
+                let meta = self.effective_metadata();
+                let pairs = index_drain::hot_read(&meta, tablet, &leader, from_position, limit)
                     .await
                     .into_iter()
                     .map(|(key, _, value)| (key, value))
@@ -9908,11 +9909,18 @@ impl ClientCtx {
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
-                    return Ok(index_drain::hot_read(&leader, from_position, limit)
-                        .await
-                        .into_iter()
-                        .map(|(key, _, value)| (key, value))
-                        .collect());
+                    let meta = self.effective_metadata();
+                    return Ok(index_drain::hot_read(
+                        &meta,
+                        tablet,
+                        &leader,
+                        from_position,
+                        limit,
+                    )
+                    .await
+                    .into_iter()
+                    .map(|(key, _, value)| (key, value))
+                    .collect());
                 }
                 Some(CpRoute::Forward(addr)) => {
                     let request = ClientRequest::Forwarded {
