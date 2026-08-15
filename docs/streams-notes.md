@@ -257,9 +257,9 @@ date/time crate dependency for one cosmetic label format.
   guard never physically removes a tablet's own current last epoch.
 - The round-3 PR8 `streams_e2e.rs` suite: an auto-split mid-stream with a
   live consumer walking the lineage handover, a real `LsmEngine` restart
-  surviving the catalog/segments/label, the `FsSegmentStore` opt-in, a
-  GSI+stream table proving ADR 0042 §8's trim min-rule coexistence, and
-  the merge stopgap rejected through the real admin API — using a
-  `drain_tablet_lineage` helper that walks a tablet's *whole* epoch chain,
-  since a fixed shard's `NextShardIterator` null only ends one epoch, not
-  the whole stream.
+  surviving the catalog/segments/label, the `FsSegmentStore` opt-in, and a
+  GSI+stream table proving ADR 0042 §8's trim min-rule coexistence — using
+  a `drain_tablet_lineage` helper that walks a tablet's *whole* epoch
+  chain, since a fixed shard's `NextShardIterator` null only ends one
+  epoch, not the whole stream. (The suite's merge-stopgap-rejection case
+  was removed along with `MergeTablets`, ADR 0044.)
