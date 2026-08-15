@@ -69,22 +69,48 @@ reason (see each file's own entry below).
   every table with an index currently `Creating`, flips it to `Active` once
   every tablet **currently** in that table's live tablet map (a fresh read
   every tick, never cached) has a matching row in `Metadata::index_backfill`
-  — the per-tablet catalog the backfill seeder populates (a later PR).
-  Touches only replicated `Metadata` (no `SegmentStoreHandle`/data role),
-  so unlike the segment janitor it has **no** control-only-leader scope
-  gap: a pure control-only leader drives the flip too. See the module's own
-  doc for the full design; `tests/index_backfill.rs` proves convergence,
-  the no-premature-flip property against a hand-driven `MarkIndexBackfilled`
-  sequence (the seeder doesn't exist yet), a tablet that appears mid-backfill
-  (a real `SplitTablet`) blocking the flip until it too reports, and the
-  control-only-leader regression.
-  hot-trim rework) — the per-node **change-consumer loop**
-  (`change_consumer_loop`, renamed from `index_drain_loop` since it is no
-  longer GSI-specific), three arms per tick per led tablet: GSI drain, the
-  seal arm, and the hot-trim arm. The module's own 95-line `//!` doc has
-  the full per-arm design; see also `docs/streams-notes.md`. **The
-  hot-trim arm's merge-residue cursor-row cleanup was removed** (tablets
-  are split-only, ADR 0044) — `trim_janitor` only ever touches
+  — the per-tablet catalog the backfill seeder (`index_drain.rs`, below)
+  populates. Touches only replicated `Metadata` (no `SegmentStoreHandle`/
+  data role), so unlike the segment janitor it has **no** control-only-leader
+  scope gap: a pure control-only leader drives the flip too. See the
+  module's own doc for the full design; `tests/index_backfill.rs` proves
+  convergence, the no-premature-flip property against a hand-driven
+  `MarkIndexBackfilled` sequence (this file's own suite predates the
+  seeder and stays hand-driven, by design — it proves the aggregator in
+  isolation), a tablet that appears mid-backfill (a real `SplitTablet`)
+  blocking the flip until it too reports, and the control-only-leader
+  regression.
+- **`index_drain.rs`** (ADR 0041 §4, ADR 0042/0043 cursor/seal/
+  hot-trim rework, ADR 0045 §2 backfill seeder) — the per-node
+  **change-consumer loop** (`change_consumer_loop`, renamed from
+  `index_drain_loop` since it is no longer GSI-specific), four arms per
+  tick per led tablet: the GSI drain, the seal arm, the **backfill
+  seeder**, and the hot-trim arm. The backfill seeder runs once per index
+  currently `Creating` on a led tablet's table: it sweeps that tablet's own
+  `KIND_BASE` scope forward from a per-index backfill cursor (a
+  `KIND_CURSOR` row, tag `backfill:{index_name}`, storing a raw last-seeded
+  base-key prefix rather than a packed HLC — see `animus_cp_data::cursor`'s
+  module doc for the two value conventions side by side), seeding a
+  synthetic change-log record per newly-discovered partition so the
+  ordinary GSI drain materializes it with **zero changes to
+  `drain_tablet`/`reconcile_partition`** — a seeded record is, by
+  construction, indistinguishable from one a live write would have
+  produced. Proposes `MetaCommand::MarkIndexBackfilled` once a tick's sweep
+  reaches the tablet's *current* range end, re-derived (and re-proposed)
+  every tick rather than as a one-shot side effect. Deliberately **no**
+  split-lineage cursor inheritance (ADR 0045 §3 Fork A): a post-split
+  right child simply restarts its own narrower sweep from scratch,
+  unconditionally correct by the drain's own idempotence. See the module's
+  own doc for the full per-arm design (including a documented, deliberate
+  low-fidelity interaction with a table streamed while backfilling) and
+  `tests/backfill_seeder.rs` for the end-to-end suite (materialization +
+  `Active` flip, live writes racing the sweep, two indexes backfilling
+  independently, and a crash/restart mid-backfill); see also
+  `docs/streams-notes.md`. The module's own 95-line `//!` doc predates the
+  seeder section — read the doc comment in the source, not this summary,
+  for the authoritative design. **The hot-trim arm's merge-residue
+  cursor-row cleanup was removed** (tablets are split-only, ADR 0044) —
+  `trim_janitor` only ever touches
   `KIND_CHANGE` rows now, never `KIND_CURSOR`.
 - **`cql.rs`** (~42 KB) — the CQL (Cassandra) v4 binary-protocol edge.
 - **`cql_client.rs`** — a minimal loopback CQL client the admin dashboard's CQL

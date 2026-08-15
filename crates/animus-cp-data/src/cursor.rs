@@ -58,6 +58,35 @@
 //! byte offset [`TOKEN_BYTES`] — the same argument `txn.rs`'s
 //! `RECORD_TAG` (`0x02`) relies on, transplanted to this scope.
 //!
+//! ## Two value conventions, side by side
+//!
+//! A cursor row's **key** ([`cursor_key`]) is one scheme shared by every
+//! consumer; its **value** is not — two conventions exist today, chosen
+//! per-tag by what that consumer needs to express:
+//!
+//! - **The packed-HLC watermark** ([`encode_watermark`]/[`decode_watermark`]):
+//!   "every change-log record this tablet has applied with `hlc <= W` is
+//!   fully consumed by this tag." Used by the `"gsi"` tag (the GSI drain's
+//!   own reconcile cursor, ADR 0042 §7) — sound there because
+//!   `assert_ts_monotonic` makes a single scalar ts a complete, unambiguous
+//!   position in one tablet's own applied sequence (see this module's own
+//!   argument above).
+//! - **The raw last-scanned-base-key** ([`encode_backfill_cursor`]/
+//!   [`decode_backfill_cursor`], ADR 0045 §2): "this is the last `KIND_BASE`
+//!   partition prefix this tag's forward sweep has seeded." The backfill
+//!   seeder (`animusd::index_drain`) walks `KIND_BASE`, not `KIND_CHANGE` —
+//!   it has no HLC to record at all until it *writes* one (the very
+//!   change-log record it seeds), so a watermark convention doesn't fit;
+//!   the position that names "where the sweep left off" is a physical base
+//!   key, not a timestamp. Tag convention: `format!("backfill:{index_name}")`,
+//!   one row per index currently `Creating`/being seeded (see that module's
+//!   own doc for why per-index rather than one shared cursor).
+//!
+//! Both conventions share one `KIND_CURSOR` row-kind scope and the one
+//! [`cursor_key`] builder — only the 8-vs-variable-length **value** bytes
+//! differ, and a reader always knows which convention applies from its own
+//! tag, never from inspecting the bytes.
+//!
 //! **A residual, documented gap** (mirroring `txn.rs`'s own "not closed
 //! here" note about `split_key` not being token-aligned): `cursor_key`
 //! truncates the tablet's live `range.start` to its leading [`TOKEN_BYTES`]
@@ -162,9 +191,34 @@ pub fn decode_watermark(bytes: &[u8]) -> Option<HlcTimestamp> {
     Some(hlc::unpack(u64::from_be_bytes(arr)))
 }
 
+/// A backfill cursor row's stored value (ADR 0045 §2) — the raw last-seeded
+/// `KIND_BASE` partition prefix, verbatim, **not** a packed HLC (see the
+/// module doc's "Two value conventions" section for why this tag needs a
+/// different shape than [`encode_watermark`]). Identity today (there is
+/// nothing to encode — the bytes already are the value), kept as a named
+/// function rather than writing the raw `Vec<u8>` inline at each call site,
+/// so the convention has one place to document and one place to change if
+/// it ever needs a header.
+#[must_use]
+pub fn encode_backfill_cursor(last_seeded_prefix: &[u8]) -> Vec<u8> {
+    last_seeded_prefix.to_vec()
+}
+
+/// The dual of [`encode_backfill_cursor`] — currently just an owned copy of
+/// the stored bytes; see that function's doc for why there is no decode
+/// failure mode to report (unlike [`decode_watermark`], which validates an
+/// 8-byte packed HLC, this convention has no fixed shape to validate against).
+#[must_use]
+pub fn decode_backfill_cursor(bytes: &[u8]) -> Vec<u8> {
+    bytes.to_vec()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CURSOR_TAG, cursor_key, decode_watermark, encode_watermark, parse_cursor_key};
+    use super::{
+        CURSOR_TAG, cursor_key, decode_backfill_cursor, decode_watermark, encode_backfill_cursor,
+        encode_watermark, parse_cursor_key,
+    };
     use crate::hlc::HlcTimestamp;
     use animus_tablet::TOKEN_BYTES;
 
@@ -243,5 +297,24 @@ mod tests {
         assert_eq!(decode_watermark(&[0u8; 7]), None);
         assert_eq!(decode_watermark(&[0u8; 9]), None);
         assert_eq!(decode_watermark(&[]), None);
+    }
+
+    #[test]
+    fn backfill_cursor_round_trips_an_arbitrary_length_prefix() {
+        let prefix = b"\x01\x02\x03\x04\x05\x06\x07\x08some-partition-prefix\x00\x00";
+        let bytes = encode_backfill_cursor(prefix);
+        assert_eq!(bytes, prefix);
+        assert_eq!(decode_backfill_cursor(&bytes), prefix);
+    }
+
+    #[test]
+    fn backfill_cursor_and_watermark_use_the_same_key_scheme_under_distinct_tags() {
+        let range_start = b"same-tablet-boundary";
+        let watermark_row = cursor_key(range_start, "gsi");
+        let backfill_row = cursor_key(range_start, "backfill:by-status");
+        assert_ne!(watermark_row, backfill_row);
+        let (token, tag) = parse_cursor_key(&backfill_row).expect("must parse");
+        assert_eq!(token, &range_start[..TOKEN_BYTES]);
+        assert_eq!(tag, "backfill:by-status");
     }
 }

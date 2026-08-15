@@ -213,6 +213,23 @@ impl CpGroup {
         }
     }
 
+    /// An unbounded-above base-scope scan starting at `start`, truncated to
+    /// `limit` rows — the backfill seeder's own "peek ahead one partition at
+    /// a time" primitive (ADR 0045 §2), unlike [`local_scan_bounded`](
+    /// Self::local_scan_bounded)'s single-partition-width bound. `end: None`
+    /// is still bounded to *this tablet's own live range*, never a
+    /// whole-engine scan — see [`RaftKvNode::local_scan`]'s own doc.
+    pub(crate) async fn local_scan_from(
+        &self,
+        start: &[u8],
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self {
+            CpGroup::Lsm(n) => n.local_scan(start, None, Some(limit)).await,
+            CpGroup::Mem(n) => n.local_scan(start, None, Some(limit)).await,
+        }
+    }
+
     /// Read one key of a non-base row-kind scope (ADR 0041 §3). See
     /// [`RaftKvNode::local_get_kind`].
     pub(crate) async fn local_get_kind(&self, kind: u8, key: &[u8]) -> Option<Vec<u8>> {
@@ -324,6 +341,20 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.is_leader(),
             CpGroup::Mem(n) => n.is_leader(),
+        }
+    }
+
+    /// This replica's `engine_applied_index()` — the confirm-by-index
+    /// primitive linearizable reads themselves gate on. See
+    /// [`RaftKvNode::engine_applied_index`]. Used by the backfill seeder
+    /// (`index_drain.rs`) to confirm a change-log-only `KindBatch` (no base/
+    /// kind write to probe a value on, unlike every other confirm path in
+    /// this file) actually landed, without needing to know the entry's
+    /// leader-minted `ts` up front.
+    pub(crate) fn engine_applied_index(&self) -> u64 {
+        match self {
+            CpGroup::Lsm(n) => n.engine_applied_index(),
+            CpGroup::Mem(n) => n.engine_applied_index(),
         }
     }
 
