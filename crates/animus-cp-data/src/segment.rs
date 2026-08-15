@@ -17,18 +17,55 @@
 //! by the caller before this module ever sees it. This module only ever
 //! moves its bytes.
 //!
-//! ## The superset-slice rule
+//! ## Object identity: ledger-named, write-once (as-built amendment)
 //!
-//! A deposed leader's late `put` can overwrite a segment object with a
-//! **superset** of the content the catalog row actually committed (ADR 0042
-//! §10) — the seal id is deterministic, so a retried put from a stale leader
-//! lands at the same object key, potentially carrying a few extra tail
-//! records the winning leader's own put didn't (both leaders scanned the
-//! same watermark-to-now range at slightly different "now"s). **A reader
-//! must slice a fetched segment's content to the catalog row's own committed
-//! `hlc_range` and never serve the object's raw tail** — [`decode_and_slice`]
-//! (and its lower-level sibling [`slice_to_hlc_range`]) is that discipline
-//! made structural: a caller that decodes a segment and slices it can never
+//! Every seal **attempt** writes its encoded bytes at a unique
+//! [`segment_object_id`], not the shard's own deterministic [`segment_id`]
+//! directly — the id rides as a new field on the catalog row
+//! (`animus_control::StreamShardRow::object_id`) and every reader/sweep
+//! resolves it from there rather than recomputing `segment_id` and assuming
+//! that is where the winning bytes live. This closes a data-loss bug the
+//! original (pre-amendment) deterministic-shared-id design had: two
+//! independently-computed seal attempts for the tablet's **same** open
+//! epoch (the realistic trigger is a brief dual-leadership window during a
+//! write-burst-induced re-election) both derived the identical
+//! `segment_id(table, label, tablet, epoch)` and raced to physically `put`
+//! there — the catalog's own `SealStreamShard` apply arm correctly picked a
+//! single winner (first-committer-wins on content), but the **store** had
+//! no such adjudication, so whichever attempt's `put` landed chronologically
+//! *last* won the physical bytes, independent of which attempt's *proposal*
+//! won the catalog. When the loser's `put` landed after the winner's and
+//! carried a *smaller* range (the realistic shape: a deposed attempt's own
+//! snapshot was taken earlier), the object on disk ended up covering less
+//! than the catalog's own committed `hlc_range` claimed — a silent,
+//! permanent loss of exactly the gap. See `docs/engineering-lessons.md` and
+//! ADR 0042 §10/ADR 0043 §A3's as-built amendment for the full incident.
+//! With a unique id per attempt, two racing attempts' physical writes can
+//! never collide in the first place — no adjudication needed at the store
+//! layer at all. The store itself is now **write-once** per id (identical
+//! bytes rewritten to the same id is a safe no-op; *different* bytes at an
+//! already-written id is a hard error — see [`animus_env::SegmentStore`]'s
+//! own doc), and a losing attempt's own object becomes a permanent orphan,
+//! reaped by the segment janitor's own sweep (`animusd::segment_janitor`)
+//! rather than ever being physically overwritten.
+//!
+//! ## The superset-slice rule (historical; retained as defense-in-depth)
+//!
+//! Before the amendment above, a deposed *same-attempt* leader's late `put`
+//! could overwrite a segment object with a **superset** of the content the
+//! catalog row actually committed (ADR 0042 §10) — the seal id was
+//! deterministic, so a retried put from a stale leader landed at the same
+//! object key, potentially carrying a few extra tail records the winning
+//! leader's own put didn't (both leaders scanned the same watermark-to-now
+//! range at slightly different "now"s). With ledger-named write-once ids
+//! this specific race can no longer happen (each attempt's own object, at
+//! its own id, is never overwritten by a *different* attempt's bytes) — but
+//! **a reader still slices a fetched segment's content to the catalog row's
+//! own committed `hlc_range` rather than trusting the object's raw extent**,
+//! kept as cheap, harmless defense-in-depth against a future bug in this
+//! class rather than removed outright. [`decode_and_slice`] (and its
+//! lower-level sibling [`slice_to_hlc_range`]) is that discipline made
+//! structural: a caller that decodes a segment and slices it can never
 //! forget to, and can never slice against the wrong bound by hand.
 //!
 //! `hlc_range` is `(start_exclusive, end_inclusive)`: `start_exclusive` is
@@ -136,13 +173,67 @@ pub fn shard_id(tablet: u64, epoch: u64) -> String {
     format!("shardId-{tablet}-{epoch}")
 }
 
-/// The deterministic `SegmentStore` id a shard's segment object lives at
-/// (ADR 0043 §A3/§A7): `{table}/{label}/{tablet}/{epoch}` — matches
-/// `FsSegmentStore`'s own `/`-separated-subdirectory path mapping and
-/// `ClusterSegmentStore`'s documented id shape byte-for-byte.
+/// This shard's deterministic **prefix** (ADR 0043 §A3/§A7):
+/// `{table}/{label}/{tablet}/{epoch}` — matches `FsSegmentStore`'s own
+/// `/`-separated-subdirectory path mapping and `ClusterSegmentStore`'s
+/// documented id shape byte-for-byte. **This is no longer, by itself, the id
+/// any segment object is actually stored at** (the ledger-named-object
+/// amendment above) — every real attempt's object lives at
+/// [`segment_object_id`], which extends this prefix with an attempt-unique
+/// suffix. Still useful on its own for a debug/list sweep (`SegmentStore::
+/// list(segment_id(..))` finds every attempt — winning or orphaned — ever
+/// written for this exact shard) and for a human grepping storage directly;
+/// no production reader should build a full object id from this function
+/// alone anymore — resolve `StreamShardRow::object_id` from the catalog
+/// instead.
 #[must_use]
 pub fn segment_id(table: &str, label: &str, tablet: u64, epoch: u64) -> String {
     format!("{table}/{label}/{tablet}/{epoch}")
+}
+
+/// The unique **per-attempt** `SegmentStore` id one seal attempt's encoded
+/// bytes are actually written at (the ledger-named-object amendment, see the
+/// module doc): [`segment_id`]'s own deterministic prefix — kept for
+/// greppability, and so every attempt for one shard still lists/sorts
+/// together — plus a `/`-separated suffix unique to *this* attempt, never
+/// reused even by a second attempt for the exact same `(tablet, epoch)`.
+///
+/// The suffix is `{proposer}-{term:x}-{nonce:016x}`, entirely Env-seamed
+/// (deterministic under `SimEnv`, no wall clock/`OsRng`):
+/// - `proposer` (the attempting leader's own [`NodeId`](animus_env::NodeId))
+///   disambiguates across nodes — cluster-wide unique by construction (ADR
+///   0040: one identity per node, enforced by the `RegisterNode`
+///   registration CAS), and contains no `/` (every sanctioned `NodeId`
+///   charset excludes it), so it never fractures the path shape.
+/// - `term` (the proposer's own current Raft term for this tablet's group at
+///   attempt time) disambiguates the SAME node's own re-elections/restarts —
+///   a node that crashes and comes back up leading the same group again
+///   does so at a strictly higher term (Raft's own guarantee), so even a
+///   restart whose RNG stream happens to replay identically (a `SimEnv` node
+///   reconstructed against the same seed) can never repeat a prior attempt's
+///   suffix.
+/// - `nonce` (a single fresh draw off the proposer's own `Rng`, ADR 0003) is
+///   the within-term disambiguator — two attempts by the same node in the
+///   same term (e.g. `ForceSeal` racing the ordinary seal tick) draw two
+///   different values, since the RNG stream advances deterministically on
+///   every draw and never repeats within one run.
+///
+/// No two attempts, anywhere, ever produce the same id — the write-once
+/// store's whole safety argument rests on this.
+#[must_use]
+pub fn segment_object_id(
+    table: &str,
+    label: &str,
+    tablet: u64,
+    epoch: u64,
+    proposer: &str,
+    term: u64,
+    nonce: u64,
+) -> String {
+    format!(
+        "{}/{proposer}-{term:x}-{nonce:016x}",
+        segment_id(table, label, tablet, epoch)
+    )
 }
 
 // --- encode -----------------------------------------------------------
@@ -615,5 +706,29 @@ mod tests {
             logical: 1,
         };
         assert_eq!(pack(ts), crate::hlc::pack(ts));
+    }
+
+    /// The ledger-named-object amendment's own id: extends [`segment_id`]'s
+    /// prefix byte-for-byte (so a debug `list(segment_id(..))` sweep still
+    /// finds it) and two attempts differing in any one of proposer/term/
+    /// nonce never collide.
+    #[test]
+    fn segment_object_id_extends_the_shard_prefix_and_disambiguates_every_axis() {
+        let base = segment_id("orders", "L1", 7, 3);
+        let a = segment_object_id("orders", "L1", 7, 3, "n1", 5, 42);
+        assert!(
+            a.starts_with(&format!("{base}/")),
+            "object id must extend the shard's own deterministic prefix: {a:?}"
+        );
+
+        let different_proposer = segment_object_id("orders", "L1", 7, 3, "n2", 5, 42);
+        let different_term = segment_object_id("orders", "L1", 7, 3, "n1", 6, 42);
+        let different_nonce = segment_object_id("orders", "L1", 7, 3, "n1", 5, 43);
+        let identical = segment_object_id("orders", "L1", 7, 3, "n1", 5, 42);
+
+        assert_eq!(a, identical, "identical inputs must be a pure function");
+        assert_ne!(a, different_proposer);
+        assert_ne!(a, different_term);
+        assert_ne!(a, different_nonce);
     }
 }

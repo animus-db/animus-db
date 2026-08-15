@@ -258,11 +258,13 @@ fn first_sealed(meta: &Metadata, table: &str) -> (TabletId, u64) {
 
 /// Where `node_dir`'s own local `FsSegmentStore` building block (the default
 /// `ClusterSegmentStore`'s per-node store, rooted at `<node dir>/segments`)
-/// would keep `(table, label, tablet, epoch)`'s object, if it has one.
-fn segment_path(node_dir: &Path, table: &str, label: &str, tablet: u64, epoch: u64) -> PathBuf {
-    node_dir
-        .join("segments")
-        .join(segment::segment_id(table, label, tablet, epoch))
+/// would keep an object at `object_id` — the ledger-named-object amendment
+/// means that's always a catalog row's own `StreamShardRow::object_id`, a
+/// unique per-attempt id, never the bare deterministic `segment::segment_id`
+/// (which is now only a shared directory prefix several attempts' ids could
+/// nest under, not a file path itself).
+fn segment_path(node_dir: &Path, object_id: &str) -> PathBuf {
+    node_dir.join("segments").join(object_id)
 }
 
 async fn get_metrics_text(addr: SocketAddr) -> String {
@@ -346,13 +348,7 @@ async fn two_phase_expiry_removes_the_row_and_every_replicas_object() {
     // Confirm the object genuinely landed on every recorded replica before
     // asserting it's later gone — otherwise "gone" would be trivially true.
     for i in 0..3 {
-        let path = segment_path(
-            &dir.path().join(format!("node-{i}")),
-            "t",
-            &row.label,
-            tablet.0,
-            epoch,
-        );
+        let path = segment_path(&dir.path().join(format!("node-{i}")), &row.object_id);
         assert!(
             tokio::fs::metadata(&path).await.is_ok(),
             "node {i}'s own segment file must exist before expiry: {path:?}"
@@ -373,13 +369,7 @@ async fn two_phase_expiry_removes_the_row_and_every_replicas_object() {
 
     // ...and its object is genuinely gone from every replica's own disk.
     for i in 0..3 {
-        let path = segment_path(
-            &dir.path().join(format!("node-{i}")),
-            "t",
-            &row.label,
-            tablet.0,
-            epoch,
-        );
+        let path = segment_path(&dir.path().join(format!("node-{i}")), &row.object_id);
         await_true_async(
             10,
             &format!("node {i}'s segment file was never reclaimed"),
@@ -679,15 +669,12 @@ async fn repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies() {
         .unwrap()
         .replicas
         .clone();
+    let object_id = survivors[0].metadata().stream_shards[&(tablet, epoch)]
+        .object_id
+        .clone();
     for r in &new_replicas {
         let idx = all_ids.iter().position(|id| id == r).unwrap();
-        let path = segment_path(
-            &dir.path().join(format!("node-{idx}")),
-            "t",
-            &survivors[0].metadata().stream_shards[&(tablet, epoch)].label,
-            tablet.0,
-            epoch,
-        );
+        let path = segment_path(&dir.path().join(format!("node-{idx}")), &object_id);
         assert!(
             tokio::fs::metadata(&path).await.is_ok(),
             "repaired replica {r} must actually hold the object locally: {path:?}"

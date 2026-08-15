@@ -218,15 +218,22 @@ the production implementation; the deterministic implementation lives in
   production pairs `ProdEnv` with the cluster-replicated default). The
   trait is four methods — `put`/`get`/`delete`/`list`, all `io::Result`,
   `#[async_trait]` like `Disk` — over an opaque string `id` (production ids
-  are `{table}/{label}/{tablet}/{epoch}`, ADR 0043 §A3). Its **consistency
-  contract** (read-after-put, idempotent overwrite, `get` after `delete` is
-  a defined `None` not an error, `list` is debug/sweep-only and never
-  load-bearing for a read) is spelled out on the trait's own doc, including
-  the one deliberate exception: a crash-retried `put` may overwrite a
-  cataloged id with a *superset* of its previous content (same
-  deterministic id, more records) — the "superset-slice rule" — which is a
-  **reader**-side obligation this trait cannot enforce itself (see ADR 0043
-  §A3, ADR 0042 §10).
+  are `{table}/{label}/{tablet}/{epoch}/{attempt-suffix}`, ADR 0043 §A3's
+  ledger-named-object amendment — a per-*attempt* unique id, not the bare
+  per-*shard* `{table}/{label}/{tablet}/{epoch}` prefix a reader/sweep
+  resolves from the catalog row instead of recomputing). Its **consistency
+  contract** (read-after-put, **write-once** — an identical-content re-put
+  is a safe no-op, a differing-content re-put is a hard `Err` — `get` after
+  `delete` is a defined `None` not an error, `list` is debug/sweep-only and
+  never load-bearing for a read) is spelled out on the trait's own doc.
+  **As-built amendment**: this used to say "idempotent overwrite,
+  last-write-wins," with a documented "superset-slice rule" reader-side
+  exception for a crash-retried `put`'s late arrival — that design let two
+  independently-computed seal attempts for the same shard silently
+  overwrite each other's bytes at the shared deterministic id, a real
+  data-loss bug (see `animus_cp_data::segment`'s own module doc for the
+  incident). Write-once, unique-per-attempt ids close it structurally: two
+  attempts can no longer share a storage key at all.
 - **`FsSegmentStore` (single directory) is `ProdEnv`'s `SegmentStore`
   sibling, opt-in** (`--segment-store=dir:...`, wired by a later PR) for dev
   use or a shared mount, and doubles as the default

@@ -142,6 +142,7 @@ fn run_scenario(seed: u64) {
             count: 1,
             seal_wall_ms: 1_700_000_000_000,
             replicas: vec![nid(10), nid(11)],
+            object_id: "orders/seed-scenario-L1/1/0/test".to_owned(),
         });
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after SealStreamShard").await;
@@ -171,6 +172,7 @@ fn run_scenario(seed: u64) {
             count: 1,
             seal_wall_ms: 1_700_000_000_001,
             replicas: vec![nid(10), nid(11)],
+            object_id: "orders/seed-scenario-L1/1/1/test".to_owned(),
         });
         nodes[leader].propose(MetaCommand::SealStreamShard {
             table: "orders".to_string(),
@@ -182,6 +184,7 @@ fn run_scenario(seed: u64) {
             count: 1,
             seal_wall_ms: 1_700_000_000_002,
             replicas: vec![nid(10), nid(11)],
+            object_id: "orders/seed-scenario-L1/2/0/test".to_owned(),
         });
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after split-child seal").await;

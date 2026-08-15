@@ -190,15 +190,39 @@ discipline in this crate):**
    janitor (§A6/A9), never by the seal step itself.
 
 **Recovery**: a crash before step 3 simply re-runs steps 1–3 on the next
-tick — the id is deterministic, so the retried `put` overwrites the same
-object; a **superset** overwrite (the retried scan sees a couple more
-records than the first attempt did) is safe precisely because readers slice
-to the *committed* `hlc_range`, never the raw object (ADR 0042 §10, and see
-"the superset-slice rule" test scenario below). A crash after step 3 simply
-means the janitor is what trims, on its own next tick. If the store is
-unavailable, the hot scope keeps growing (bounded by disk, metered loudly)
-until it heals, then seals normally — never a stuck or lost write, per the
-durability invariant (ADR 0042 §9).
+tick. A crash after step 3 simply means the janitor is what trims, on its
+own next tick. If the store is unavailable, the hot scope keeps growing
+(bounded by disk, metered loudly) until it heals, then seals normally —
+never a stuck or lost write, per the durability invariant (ADR 0042 §9).
+
+**Ledger-named-object amendment, 2026-08-15 (as-built — supersedes the
+previous paragraph's "the id is deterministic, so the retried `put`
+overwrites the same object" recovery story).** The deterministic id
+described above (`{table}/{label}/{tablet}/{epoch}`) is no longer the id
+step 2 actually writes at. That scheme let two *independently-computed*
+seal attempts for the same `(tablet, epoch)` — a brief dual-leadership
+window during a write-burst-induced re-election, not merely a same-leader
+retry — race their physical `put`s at one shared key: whichever landed
+*last* won the bytes, independent of which attempt's *proposal* won
+`SealStreamShard`'s first-committer-wins rule, and when the later `put`
+happened to carry a *smaller* range than the catalog's own committed one,
+the gap was silently, permanently lost. **Fix**: step 2 now writes at a
+fresh, attempt-unique id (`segment::segment_object_id` — the deterministic
+prefix above plus a suffix from the proposer's node id, its current Raft
+term, and a fresh RNG draw), carried through step 3 as a new
+`SealStreamShard`/`StreamShardRow` field (`object_id`) that every
+reader/sweep resolves from the committed row rather than ever recomputing.
+`SegmentStore::put` is now **write-once** (an identical-content re-put —
+the genuine same-attempt-retry case this section originally described — is
+still a safe no-op; a *differing*-content re-put is a hard error), so two
+attempts can no longer share a storage key at all: a crash before step 3
+now retries at a **fresh** id rather than overwriting the first attempt's
+object, and that first object becomes a permanent, uncataloged orphan the
+segment janitor's own sweep reclaims (§A9 amendment below) — never
+something a later `put` revisits. The superset-slice rule (ADR 0042 §10)
+is no longer load-bearing for this race (kept as harmless
+defense-in-depth, since an attempt's own object and its own catalog
+proposal are always derived from the identical local computation now).
 
 **Segment format** (`animus-cp-data/src/segment.rs`, new in the sealer PR):
 a versioned header — `{version, table, label, shard id, tablet, epoch,
@@ -303,7 +327,7 @@ objects and rows, never a tablet's own hot `KIND_CHANGE` scope.
 
 ```rust
 #[async_trait] pub trait SegmentStore: Send + Sync {
-    async fn put(&self, id: &str, bytes: &[u8]) -> io::Result<()>; // durable per impl contract on Ok; idempotent overwrite
+    async fn put(&self, id: &str, bytes: &[u8]) -> io::Result<()>; // durable per impl contract on Ok; WRITE-ONCE (as-built amendment: was "idempotent overwrite")
     async fn get(&self, id: &str) -> io::Result<Option<Vec<u8>>>;  // None = deleted → TrimmedDataAccess
     async fn delete(&self, id: &str) -> io::Result<()>;            // idempotent
     async fn list(&self, prefix: &str) -> io::Result<Vec<String>>; // debug/sweep only, never load-bearing for reads
@@ -315,9 +339,15 @@ Lives in `animus-env` beside the other seams (`Clock`/`Rng`/`Network`/
 call site threads an explicit handle, the same way a `StorageEngine`
 handle is threaded rather than made part of `Env` itself. **Consistency
 contract**: read-after-put for every reader once `put` returns `Ok`;
-immutable once cataloged, modulo the superset-slice rule (ADR 0042 §10);
-`get` returning `None` after a `delete` is a defined, expected outcome
-(`TrimmedDataAccess` to a client), never an error.
+immutable once cataloged (the superset-slice rule, ADR 0042 §10, is no
+longer load-bearing for the race it was originally written for — see the
+ledger-named-object amendment in §A3 above — but is kept as harmless
+defense-in-depth); `get` returning `None` after a `delete` is a defined,
+expected outcome (`TrimmedDataAccess` to a client), never an error.
+**As-built amendment, 2026-08-15**: `put` is now write-once — an
+identical-content re-put is a safe no-op, a differing-content re-put is a
+hard `Err` — not "idempotent overwrite, last-write-wins" as originally
+specified; see §A3's own amendment for why.
 
 **Implementations**:
 
@@ -481,6 +511,34 @@ as two competing background tasks. Repair never touches an expired row
 (reclaimed by this same loop anyway) and never resurrects a genuinely
 deleted object.
 
+**Orphan reap, 2026-08-15 (as-built — a third phase added by the
+ledger-named-object amendment, §A3 above).** Every seal attempt now writes
+its object at a fresh, unique id rather than the shard's own bare
+deterministic prefix, so a losing or abandoned attempt's object is never
+overwritten away — it becomes a permanent orphan unless something reaps
+it, a case that could not arise under the old shared-id design (a later
+attempt's `put` simply overwrote it there). `segment_janitor::
+reap_orphans` adds this as the loop's third phase, over the same
+per-tick snapshot: (a) for every `(tablet, epoch)` that already has a
+committed row, every OTHER object at that shard's own deterministic
+prefix is a **proven** orphan (`SealStreamShard`'s first-committer-wins
+apply arm guarantees no future proposal can ever commit a *different*
+row for that exact identity again) — reaped immediately, no age check,
+typically within one tick of the winner committing; (b) for a live,
+streamed tablet's own **current open** epoch (no row yet), an orphan
+candidate might still be genuinely in flight, so this sub-case gates on
+the object's own encoded `seal_wall_ms` against a conservative
+`ORPHAN_GRACE` (5 minutes, generous relative to the sealer's own commit
+timeout) before ever deleting it. **Deliberately local-only**
+(`SegmentStoreHandle::list_local`'s own documented scope, mirroring
+`SegmentStore::list`'s "debug/sweep-only, never load-bearing" contract) —
+a single tick only discovers this node's own local segment directory, so
+a K-way replicated orphan's other copies are swept as control leadership
+later rotates through whichever nodes hold them: an accepted
+eventual-convergence property, not an immediate one, the same tradeoff
+this loop already makes elsewhere (e.g. the dead-replica deletion rule
+above).
+
 **The replicas-update decision (round-3 PR7 amendment to §A8's
 `SealStreamShard` apply arm).** Repair needs to commit an updated
 `replicas` set for an *already-committed* `(tablet, epoch)` — a shape
@@ -610,6 +668,12 @@ epoch of whatever tablet exists at the time.
   seal sequence, the catalog apply arm, or a reader's slicing logic could
   silently violate — the corpus (the Testing plan below) exists because this
   class of bug is a genuine data-loss or torn-read hazard, not a cosmetic one.
+  **Proven true in practice, not just in principle**: the shared-
+  deterministic-id design's own safety argument for the superset-slice rule
+  (§A3's ledger-named-object amendment) shipped exactly this class of bug —
+  a silent, permanent loss — undetected until a hand-scripted repro
+  targeted the specific race the frozen corpus's own seed sweep structurally
+  could not express.
 - **Two background loops now run on different roles** — the per-tablet
   change-consumer loop (GSI drain + seal arm + hot-trim arm, unchanged
   leader-per-tablet placement) and the control-leader segment-janitor

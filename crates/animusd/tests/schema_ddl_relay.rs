@@ -307,6 +307,7 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
         count: 1,
         seal_wall_ms: 1_700_000_000_000,
         replicas: vec![nid(10), nid(11)],
+        object_id: "stream_relay_t/relay-L1/1/0/test".to_owned(),
     };
     timeout(Duration::from_secs(20), async {
         loop {

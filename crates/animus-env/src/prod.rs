@@ -873,10 +873,37 @@ fn invalid_segment_id(id: &str) -> std::io::Error {
     )
 }
 
+/// [`SegmentStore::put`](crate::SegmentStore::put)'s write-once violation:
+/// `id` already holds content that differs from what this call is trying to
+/// write. See the trait's own doc for why this is a hard error rather than
+/// the last-write-wins overwrite this store used to allow.
+fn write_once_violation(id: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "segment store write-once violation: {id:?} already holds different content \
+             (every attempt must write its own unique id — see \
+             animus_cp_data::segment::segment_object_id)"
+        ),
+    )
+}
+
 #[async_trait::async_trait]
 impl crate::SegmentStore for FsSegmentStore {
     async fn put(&self, id: &str, bytes: &[u8]) -> std::io::Result<()> {
         let target = self.resolve(id)?;
+        // Write-once (`SegmentStore::put`'s own amended contract): a
+        // differing-content rewrite of an existing id is a hard error; an
+        // identical-content rewrite is a safe no-op that skips the
+        // temp-write/fsync/rename dance entirely.
+        match tokio::fs::read(&target).await {
+            Ok(existing) if existing == bytes => return Ok(()),
+            Ok(_) => {
+                return Err(write_once_violation(id));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         // Safe to `expect` a file name: `resolve` rejects an empty id and
         // every non-`..`/`.` relative path has one.
         let mut tmp_name = target
@@ -1445,6 +1472,38 @@ mod tests {
         );
         // No stray `.tmp` sibling left behind after a successful put.
         assert!(!dir.join("orders/label-1/17/3.tmp").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write-once (the ledger-named-object amendment): a second `put` to the
+    /// same id with different bytes is a hard error and leaves the file on
+    /// disk untouched; a second `put` with byte-identical content is a safe
+    /// no-op (skips the temp-write/fsync/rename dance entirely).
+    #[tokio::test]
+    async fn fs_segment_store_put_is_write_once_except_for_identical_content() {
+        let dir = unique_tmp_dir();
+        let store = FsSegmentStore::new(&dir);
+        let id = "orders/label-1/17/3";
+
+        store.put(id, b"first").await.expect("first put");
+
+        store
+            .put(id, b"first")
+            .await
+            .expect("identical-content put must succeed");
+        assert_eq!(store.get(id).await.expect("get"), Some(b"first".to_vec()));
+
+        let err = store
+            .put(id, b"second")
+            .await
+            .expect_err("a write-once violation must be rejected");
+        drop(err);
+        assert_eq!(
+            store.get(id).await.expect("get"),
+            Some(b"first".to_vec()),
+            "a rejected write-once violation must not change the file on disk"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

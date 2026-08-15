@@ -151,6 +151,22 @@ impl SimSegmentStore {
 impl SegmentStore for SimSegmentStore {
     async fn put(&self, id: &str, bytes: &[u8]) -> io::Result<()> {
         self.check_unavailable()?;
+        // Write-once (`SegmentStore::put`'s own amended contract): a
+        // differing-content rewrite of an existing id is a hard error,
+        // checked before any fault sampling — a write-once violation is a
+        // caller bug, not a fault this store injects.
+        if let Some(existing) = self.lock().objects.get(id) {
+            if existing != bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "sim segment store write-once violation: {id:?} already holds \
+                         different content"
+                    ),
+                ));
+            }
+            return Ok(()); // identical content: safe no-op, no fault sampling
+        }
         let ack_lost = self.roll(self.lock().fault.put_ack_lost_threshold);
         self.lock().objects.insert(id.to_string(), bytes.to_vec());
         if ack_lost {
@@ -277,6 +293,53 @@ mod tests {
                 None,
                 "the object must actually be gone despite the caller seeing an error"
             );
+        });
+        assert!(sim.run_until_quiescent(MAX_STEPS), "must settle");
+    }
+
+    /// Write-once (the ledger-named-object amendment): a second `put` to the
+    /// same id with different bytes is a hard error and leaves the stored
+    /// content untouched; a second `put` with byte-identical content is a
+    /// safe no-op (the "same-attempt retry after a lost ack" and "repair
+    /// sweep copies the same bytes to a fresh replica" cases).
+    #[test]
+    fn put_is_write_once_except_for_identical_content() {
+        let mut sim = Simulator::new(6);
+        let store = SimSegmentStore::new(sim.env(nid(0)));
+        let store_for_task = store.clone();
+        sim.env(nid(0)).spawn_task(async move {
+            store_for_task
+                .put("t/label/1/0", b"first")
+                .await
+                .expect("first put");
+
+            // Identical bytes: safe no-op.
+            store_for_task
+                .put("t/label/1/0", b"first")
+                .await
+                .expect("identical-content put must succeed");
+            assert_eq!(
+                store_for_task.get("t/label/1/0").await.expect("get"),
+                Some(b"first".to_vec())
+            );
+
+            // Different bytes: hard error, no state change.
+            let err = store_for_task
+                .put("t/label/1/0", b"second")
+                .await
+                .expect_err("a write-once violation must be rejected");
+            drop(err);
+            assert_eq!(
+                store_for_task.get("t/label/1/0").await.expect("get"),
+                Some(b"first".to_vec()),
+                "a rejected write-once violation must not change the stored bytes"
+            );
+
+            // A genuinely fresh id is unaffected.
+            store_for_task
+                .put("t/label/1/1", b"second")
+                .await
+                .expect("a different id is a plain first write");
         });
         assert!(sim.run_until_quiescent(MAX_STEPS), "must settle");
     }

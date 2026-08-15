@@ -408,8 +408,7 @@ async fn get_records(
 
     if let Some(row) = meta.stream_shards.get(&(tablet, epoch)).cloned() {
         resolve_label(&meta, &row.table, &label)?;
-        return get_records_sealed(ctx, &meta, &shard_id, tablet, epoch, &row, position, limit)
-            .await;
+        return get_records_sealed(ctx, &meta, &shard_id, &row, position, limit).await;
     }
 
     let table = meta
@@ -437,17 +436,19 @@ async fn get_records_sealed(
     ctx: &ClientCtx,
     meta: &Metadata,
     shard_id: &str,
-    tablet: TabletId,
-    epoch: u64,
     row: &StreamShardRow,
     position: u64,
     limit: usize,
 ) -> Result<String, WireError> {
-    let seg_id = segment::segment_id(&row.table, &row.label, tablet.0, epoch);
+    // Ledger-named-object amendment (ADR 0042 §10/ADR 0043 §A3): resolve
+    // the id from the row itself, never recompute `segment_id` — the
+    // row's `object_id` is the only id this shard's winning bytes ever
+    // actually lived at.
+    let seg_id = row.object_id.as_str();
     let bytes = ctx
         .data()
         .segment_store
-        .get_sealed(&row.replicas, &seg_id)
+        .get_sealed(&row.replicas, seg_id)
         .await
         .map_err(|e| internal(&format!("segment store get of {seg_id:?}: {e}")))?;
     let Some(bytes) = bytes else {
@@ -592,6 +593,7 @@ mod tests {
             count: 1,
             seal_wall_ms: 0,
             replicas: Vec::new(),
+            object_id: format!("t/{label}/{}/{epoch}/test", tablet.0),
         });
     }
 
