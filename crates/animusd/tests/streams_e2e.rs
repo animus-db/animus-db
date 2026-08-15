@@ -242,7 +242,20 @@ async fn describe_stream(addr: SocketAddr, stream_arn: &str) -> String {
 /// found while building a production-shaped-seal-knobs regression cell:
 /// under `tiny_seal_knobs` the open tail is always empty the instant it's
 /// polled, so this double-count path was never exercised until a cell left
-/// more than one record in it.
+/// more than one record in it. **A second, distinct interleaving of the same
+/// race**: when the open-tail poll's *own* call is the one that witnesses
+/// the seal (the fresh open-vs-sealed check inside that single call flips to
+/// the sealed path and returns the epoch's last records with a null
+/// `NextShardIterator` in one response, rather than the epoch being
+/// discovered already-closed on a *later* pass's `chain_len` read first),
+/// the poll must advance past that epoch immediately instead of leaving
+/// `open_epoch` pointed at the now-exhausted iterator — otherwise the next
+/// pass's "resume" branch re-issues that same spent iterator and
+/// re-delivers the records it already returned. Only exercised at any real
+/// rate by a cascading multi-tablet split under sustained write pressure
+/// (`auto_split_mid_stream_with_live_consumer_across_every_node`, D8) — a
+/// single controlled split leaves little chance of a poll racing the seal
+/// this precisely.
 async fn drain_tablet_lineage(
     dynamo_addr: SocketAddr,
     stream_arn: &str,
@@ -307,7 +320,29 @@ async fn drain_tablet_lineage(
         }
         let (records, next) = get_records(dynamo_addr, open_iterator.as_ref().unwrap()).await;
         collected.extend(records);
-        open_iterator = next;
+        match next {
+            Some(n) => open_iterator = Some(n),
+            None => {
+                // The shard sealed between this outstanding iterator's mint
+                // (or its last poll) and *this* call — ADR 0042 §2's fresh
+                // open-vs-sealed check means this one call transparently
+                // switched to serving the sealed path and returned that
+                // epoch's final, fully-exhausted read in the same response
+                // (`records` already holds everything up to the seal).
+                // Advance past this epoch now, without re-reading: leaving
+                // `open_epoch` pointed at an iterator with nothing left to
+                // give would make the closed-epoch loop above "resume" it
+                // next pass and re-deliver exactly what was just collected
+                // — a genuine double-count under any interleaving where the
+                // open-tail poll itself is the one that witnesses the seal,
+                // as opposed to discovering an already-sealed epoch via a
+                // fresh `chain_len` read first (the case the loop above
+                // already handles by resuming a *non-exhausted* iterator).
+                next_epoch += 1;
+                open_epoch = None;
+                open_iterator = None;
+            }
+        }
         if collected.len() >= want {
             return collected;
         }
@@ -324,7 +359,12 @@ async fn drain_tablet_lineage(
 /// [`drain_tablet_lineage`]'s multi-tablet sibling: drains every closed
 /// epoch of every tablet in `tablets`, then polls every tablet's open tail
 /// once per pass, summing across all of them, until `want_total` records
-/// have been collected in total or `deadline` elapses.
+/// have been collected in total or `deadline` elapses. Carries the identical
+/// fix documented on [`drain_tablet_lineage`] for the poll-witnesses-its-own-
+/// seal race, applied **per tablet independently** — each tablet in a
+/// cascading multi-generation split (D8) hits this race on its own
+/// schedule, so the fix must self-correct one tablet at a time rather than
+/// assume the whole set transitions in lockstep.
 async fn drain_all_tablets_lineage(
     dynamo_addr: SocketAddr,
     stream_arn: &str,
@@ -386,8 +426,27 @@ async fn drain_all_tablets_lineage(
             let iterator = open_iterator.get(&tablet).expect("just ensured").clone();
             let (records, next) = get_records(dynamo_addr, &iterator).await;
             collected.extend(records);
-            if let Some(next) = next {
-                open_iterator.insert(tablet, next);
+            match next {
+                Some(next) => {
+                    open_iterator.insert(tablet, next);
+                }
+                None => {
+                    // Identical race to `drain_tablet_lineage`'s fix above:
+                    // this tablet's epoch sealed between mint/last-poll and
+                    // this call, so this response is that epoch's final,
+                    // fully-exhausted read, already folded into `records`.
+                    // Advance this tablet's own cursor past it now and drop
+                    // the now-spent iterator, rather than leaving
+                    // `open_epoch`/`open_iterator` pointed at it — the next
+                    // pass's closed-epoch loop would otherwise "resume" an
+                    // iterator with nothing left to give and re-deliver
+                    // exactly what was just collected. Each tablet's own
+                    // cascade of splits/seals hits this independently, so
+                    // this must self-correct per tablet, not just once.
+                    *next_epoch.get_mut(&tablet).expect("tracked tablet") += 1;
+                    open_epoch.remove(&tablet);
+                    open_iterator.remove(&tablet);
+                }
             }
         }
         if collected.len() >= want_total {
