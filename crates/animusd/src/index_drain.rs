@@ -199,6 +199,7 @@ use animus_dynamo::{
     index_table_name, is_index_table_name, storage_key,
 };
 use animus_env::{Clock, Metric};
+use animus_tablet::KeyRange;
 use animus_tablet::TOKEN_BYTES;
 use animus_tablet::TabletId;
 use animus_tablet::partition_token;
@@ -650,15 +651,7 @@ async fn backfill_seed_tick(
         let prefix = last_seeded
             .as_ref()
             .expect("seeded > 0 implies last_seeded was set in the loop above");
-        ctx.cp_kind_write_raw(
-            table,
-            vec![(
-                KIND_CURSOR,
-                cursor_key_bytes,
-                Some(cursor::encode_backfill_cursor(prefix)),
-            )],
-        )
-        .await?;
+        advance_backfill_cursor(group, cursor_key_bytes, prefix).await?;
     }
     if reached_end {
         ctx.propose_schema(&MetaCommand::MarkIndexBackfilled {
@@ -669,6 +662,74 @@ async fn backfill_seed_tick(
         .await;
     }
     Ok(())
+}
+
+/// Durably advance the backfill cursor for one index's tag to `prefix` — a
+/// direct, local propose+confirm against `group` (mirroring
+/// [`seed_change_log_record`]'s own shape), never `ctx.cp_kind_write_raw`,
+/// whose auto-derived fence is always this tablet's *current live* range.
+///
+/// **Why the cursor write must NOT be range-fenced** (a real bug this
+/// tablet-split/fault-injection corpus found, seed-reproducible at *every*
+/// seed, not just under fault injection — see `docs/engineering-
+/// lessons.md`): [`cursor::cursor_key`] truncates its `range_start`
+/// argument to a bare [`TOKEN_BYTES`]-wide token ([`cursor::token_of`]) —
+/// but a split's own `split_key` is essentially never token-aligned (it is
+/// chosen from real row content via the byte-weighted-median split point,
+/// never the hash ring), so a split child's own `range.start` is almost
+/// always *longer* than `TOKEN_BYTES`. Comparing the two lexicographically,
+/// the cursor key (`token || 0x00 || tag_byte || tag`) sorts *below* that
+/// child's own `range.start` the instant `range.start`'s own byte
+/// immediately past the token is non-zero — true of `escape(pk)`'s leading
+/// byte for essentially any real partition key — so `ctx.
+/// cp_kind_write_raw`'s ordinary fence-check (`fence.contains(cursor_key)`)
+/// rejected the cursor's own advance write as "outside this group's live
+/// range," silently, every single tick, forever (the error is logged and
+/// swallowed by `change_consumer_loop`'s own top-level `Err` handling).
+/// Data coverage itself was never at risk — the change-log seed writes
+/// above are keyed by a *real* base key that genuinely does fall inside
+/// the live range — only the cursor's own persistence was, so a split
+/// child's sweep silently restarted from scratch every tick instead of
+/// resuming from where it left off. The `"gsi"` cursor tag's own callers
+/// already tolerate this same underlying gap as a pure efficiency loss
+/// (`drain_tablet`'s watermark just stays `None`, meaning "reconcile
+/// everything," always correct, just not optimally incremental) — but for
+/// backfill specifically this was a **liveness** bug, not merely an
+/// efficiency one: a child with more than [`BACKFILL_SEED_BATCH`]
+/// partitions on its own side could never advance past that one batch's
+/// worth, restarting from position zero every tick forever, so it never
+/// reached its own end and the index never flipped `Active`. A cursor
+/// row's identity is already fully captured by its own *token* — disjoint
+/// from base data by row-kind (ADR 0041 §3) and immutable across a
+/// narrowing, since the token a tablet anchors never changes once minted —
+/// it needs no range-fencing at all, the same reasoning `seal.rs`/
+/// `ceiling.rs`'s engine-global markers already rely on for a *different*
+/// flavor of range-independent bookkeeping key.
+async fn advance_backfill_cursor(
+    group: &CpGroup,
+    cursor_key_bytes: Vec<u8>,
+    prefix: &[u8],
+) -> Result<(), String> {
+    let index = match group.put_kind_batch_fenced(
+        vec![(
+            KIND_CURSOR,
+            cursor_key_bytes,
+            Some(cursor::encode_backfill_cursor(prefix)),
+        )],
+        None,
+        KeyRange::whole(),
+    ) {
+        ProposeResult::Accepted { index } => index,
+        other => return Err(format!("backfill cursor advance not accepted: {other:?}")),
+    };
+    let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if group.engine_applied_index() >= index {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("backfill cursor advance did not apply in time".into())
 }
 
 /// Find the length of `token || escape(pk)` at the front of a raw
