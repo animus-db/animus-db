@@ -213,18 +213,21 @@ reason (see each file's own entry below).
      visiting specifically so this arm gets a guaranteed chance to run,
      rather than depending on winning a race against `disable_stream`'s
      own commit landing first (a real bug this PR's own tests found and
-     fixed — see the engineering-lessons entry). And tombstones stale
-     **merge-residue** cursor rows (an absorbed sibling's own row,
-     physically surviving in the widened scope, for a tag no longer
-     expected) — deliberately *not* an unexpected row at this tablet's own
-     token (a dropped index's stale row is separate, out of scope here;
-     round 3 has no cursor tag left for a stream to ever leave one of its
-     own). `ClientCtx::cp_kind_write_raw`'s confirmation probe is generic
-     (any single write in the atomic batch) for exactly this reason.
+     fixed — see the engineering-lessons entry). `ClientCtx::
+     cp_kind_write_raw`'s confirmation probe is generic (any single write
+     in the atomic batch) for exactly this reason. (A prior version of this
+     janitor also tombstoned stale **merge-residue** cursor rows — an
+     absorbed sibling's own row, physically surviving in a merge survivor's
+     widened scope, for a tag no longer expected. Tablet merge no longer
+     exists — ADR 0044, tablets are split-only — so
+     `cleanup_merge_residue_cursor_rows` and its one call site were deleted
+     along with it; `trim_janitor` only ever touches `KIND_CHANGE` rows
+     now, never `KIND_CURSOR`.)
 
   Two `#[cfg(test)] mod`s at the bottom of this file (mirroring `lib.rs`'s
   `split_fence_tests`): `gsi_drain_cursor_tests` (unchanged, ADR 0041/0042
-  §7/§8's own crash/split/merge/trim regressions) and `stream_sealer_tests`
+  §7/§8's own crash/split/trim regressions — its merge-residue-cleanup case
+  was deleted along with the mechanism, ADR 0044) and `stream_sealer_tests`
   (round-3 sealer PR) — the seal arm's triggers/sequence, the F10/F12-b
   hot-trim rework, and F11's split-key token alignment, needing `CpGroup`'s
   private `pending_changes`/`approx_bytes_kind`/`cursor_min_watermark`
@@ -610,8 +613,9 @@ node's tablet lifecycle** — it replaced three separate loops and their
 state. The pure `plan` + `Reconciler` executor live in
 `animus_cp_data::host` (read that crate's `CLAUDE.md`); `plan` decides
 every action from one `MetadataView` snapshot per tick and executes them in
-fixed order (`NarrowScope` → `Host` → `Reconfigure` → `Release`/`Reclaim`;
-merge adds `WidenScope`/`Absorb`). What stays in `animusd`
+fixed order (`ProposeSeal` → `NarrowScope` → `Host` → `Reconfigure` →
+`Release`/`Reclaim` — tablets are split-only, ADR 0044; merge's dual
+`WidenScope`/`Absorb` actions were removed). What stays in `animusd`
 (`tablet_host_reconciler_loop`):
 
 - **Trigger**: one task per node racing `ctx.control.metadata_watch().changed(..)`
@@ -636,19 +640,19 @@ backend). The split point matches the metric: a byte-configured cluster splits a
 `auto_split_median_tests`) — which scans every achievable key-boundary cut for the
 one closest to half the bytes, not a single accumulate-and-threshold pass (subtly
 wrong when one key dominates; see the root log). Key-count clusters keep the plain
-positional median. Auto-merge triggering is out of scope — merge is
-operator-driven.
+positional median. **Tablets are split-only (ADR 0044)** — there is no
+merge, automatic or operator-driven, to trigger; a tablet's count only ever
+grows, and reversing an over-eager split is no longer possible (see that
+ADR's "shrink-in-place" note).
 
-**Split / merge** (ADR 0028 / 0033) are each a single atomic control-plane command
-(`MetaCommand::SplitTablet`/`MergeTablets`, epoch-CAS gated) — there is no
-data-plane half. Split narrows the source's range and mints a sibling on the same
-shared engine; merge widens `left` to absorb `right`, recording `right` in the
-never-pruned `Metadata::merged_tablets` marker (needed because a
-hosted-but-vanished tablet looks identical whether merged or its table dropped).
-The reconciler reacts with `WidenScope`/`Absorb` (absorb tears down **without
-erasing** — a sibling now serves the range). `trigger_split`/`trigger_merge`
-propose and poll for the exact effect. Exposed via `POST /admin/tablet/{split,
-merge}` + `ClientRequest::{SplitTablet,MergeTablets}` (relayable).
+**Split** (ADR 0028) is a single atomic control-plane command
+(`MetaCommand::SplitTablet`, epoch-CAS gated) — there is no data-plane half.
+It narrows the source's range and mints a sibling on the same shared engine.
+`trigger_split` proposes and polls for the exact effect. Exposed via `POST
+/admin/tablet/split` + `ClientRequest::SplitTablet` (relayable). (Merge —
+`MetaCommand::MergeTablets`, `trigger_merge`, `POST /admin/tablet/merge`,
+`ClientRequest::MergeTablets`, and the reconciler's `WidenScope`/`Absorb`
+reaction — was removed entirely by ADR 0044, superseding ADR 0033.)
 
 **Drop-table GC** (ADR 0024) is the reconciler's `Reclaim` action;
 **removed-replica GC** (ADR 0029) is its `Release` dual (moved off this node while
@@ -920,7 +924,7 @@ route below the edge through the same `ClientCtx` CP primitives.
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only `GET`
   views (`/admin/{config,status,peers,raft,raftkv,txns,storage/*,metrics,metrics/
   history,member/drain-status,health,control/members,system-table}`) + gated
-  `POST` actions (`/admin/{tablet/split,tablet/merge,storage/flush,storage/
+  `POST` actions (`/admin/{tablet/split,storage/flush,storage/
   compact,raftkv/reconfigure,drain,member/add,member/remove,control/member/
   add,control/member/remove}`) + data writes (`/admin/data/{dynamo,cql,
   drop-table,seed}`). Below the edge it only reads node state (aggregated
@@ -1256,10 +1260,10 @@ because they need private handles (a raw `CpGroup`/the private
 `index_drain.rs`'s own `gsi_drain_cursor_tests` is a third (run via `cargo
 test -p animusd --lib`, not the `tests/` tree) — the ADR 0042 §7/§8
 cursor-based drain + trim janitor regressions, needing `CpGroup`'s private
-`pending_changes`/`cursor_min_watermark`/`cursor_rows_with_token` and the
-plain-client-protocol `ClientRequest::SplitTablet`/`MergeTablets` (an
-arbitrary binary `split_key`, unlike the admin HTTP surface's UTF8-string
-one); `dynamo.rs`'s own `stream_write_path_tests` is a fourth (ADR 0042
+`pending_changes`/`cursor_min_watermark` and the plain-client-protocol
+`ClientRequest::SplitTablet` (an arbitrary binary `split_key`, unlike the
+admin HTTP surface's UTF8-string one); `dynamo.rs`'s own
+`stream_write_path_tests` is a fourth (ADR 0042
 §1), needing `CpGroup`'s private `pending_changes`/`local_scan_kind_bounded`
 (a new, non-linearizable bounded kind-scan wrapper, mirroring
 `local_get_kind`'s existing shape) to prove a streamed-unindexed table's
@@ -1295,10 +1299,10 @@ epochs in sequence first, since the epoch-derivation guard never
 physically removes a tablet's own current last epoch), the round-3 PR8
 `streams_e2e.rs` suite (an auto-split mid-stream with a live consumer
 walking the lineage handover, a real `LsmEngine` restart surviving the
-catalog/segments/label, the `FsSegmentStore` opt-in, a GSI+stream table
-proving ADR 0042 §8's trim min-rule coexistence, and the merge stopgap
-rejected through the real admin API — using a `drain_tablet_lineage`
-helper that walks a tablet's *whole* epoch chain, since a fixed shard's
+catalog/segments/label, the `FsSegmentStore` opt-in, and a GSI+stream table
+proving ADR 0042 §8's trim min-rule coexistence — using a
+`drain_tablet_lineage` helper that walks a tablet's *whole* epoch chain,
+since a fixed shard's
 `NextShardIterator` null only ends one epoch, not the whole stream),
 restart/durability across every deployment shape, and the
 `WatchMetadata`/system-table/OTel/metrics support surfaces.

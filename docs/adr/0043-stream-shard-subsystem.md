@@ -12,11 +12,13 @@
   exactly that reason.)
 - **Amends:** [ADR 0028](0028-shared-storage-single-command-split.md) (no new
   kind scope: the hot shard is the existing `KIND_CHANGE` scope, unchanged;
-  the kind set stays at five), [ADR 0033](0033-tablet-merge.md) and
+  the kind set stays at five), [ADR 0033](0033-tablet-merge.md)/
+  [ADR 0044](0044-split-only-tablets.md) and
   [ADR 0034](0034-byte-based-auto-split.md) (a streamed base table's own
-  tablets are ordinary tablets — merge is rejected outright (v1 stopgap, ADR
-  0042 §12), auto-split is what drives shard lineage, token-aligned per ADR
-  0042 §14), [ADR 0024](0024-drop-table-data-gc.md) (drop cascade removes a
+  tablets are ordinary tablets — merge was rejected outright as a v1 stopgap
+  (ADR 0042 §12), then removed entirely by ADR 0044; auto-split is what
+  drives shard lineage, token-aligned per ADR 0042 §14),
+  [ADR 0024](0024-drop-table-data-gc.md) (drop cascade removes a
   streamed table's segment catalog rows and objects, not a hidden table's
   tablets), [ADR 0013](0013-replicated-schemas.md) (`StreamSpec` replicates
   in the catalog; this ADR adds the segment catalog rows alongside it),
@@ -234,17 +236,19 @@ or command. ADR 0042 §14's F11 rounds a streamed table's split key down to
 its own token boundary, preserving the partition-key/shard affinity a
 change record's own token-leading key already assumes.
 
-### A5. Merge
+### A5. Merge (removed, ADR 0044)
 
 Rejected on a streamed base table in v1 (ADR 0042 §12's F1 stopgap) — the
-same class of apply-time guard `MergeTablets`'s own state-machine arm
-already gets for other invariants it must protect. The disable → merge →
-re-enable workaround is honest (a genuinely new stream identity, ADR 0042
-§11). If tablet merge is ever revived under an active stream after the
-forthcoming split-only ADR removes and later reconsiders it: the shape
-would be an `AdjacentParentShardId`-style lineage extension plus a
-range-aware survivor watermark — documented here as the escape hatch, not
-built, since nothing today needs it.
+same class of apply-time guard `MergeTablets`'s own state-machine arm got
+for other invariants it protected. Tablet merge — `MergeTablets` and this
+guard along with it — was then removed entirely (ADR 0044, tablets are
+split-only, decided 2026-08-14, shipped 2026-08-14): there is no merge to
+reject anymore, on a streamed table or any other. ADR 0044 also closes the
+door on reviving it: any future count-reduction story for a streamed (or
+any) table is a from-scratch redesign, never a merge revival, so the
+escape hatch this section used to sketch (an `AdjacentParentShardId`-style
+lineage extension plus a range-aware survivor watermark, "if merge is ever
+revived") is moot and not carried forward.
 
 ### A6. Watermark + trim (F10)
 
@@ -612,8 +616,9 @@ corpus-deep nightly):
 5. **GSI coexistence**: GSI + stream trim min-rule; GSI-only; stream-only;
    a split child's watermark inheritance for the stream side vs. the GSI's
    own `W = 0` — proving the two halves of ADR 0042 §8 genuinely coexist.
-6. **Merge stopgap**: a unit-level apply-arm rejection plus an end-to-end
-   check through the client relay path.
+6. **Merge stopgap** (removed, ADR 0044): a unit-level apply-arm rejection
+   plus an end-to-end check through the client relay path — both deleted
+   along with `MergeTablets` itself once tablet merge was removed globally.
 7. **Disable grace (F12-b)**: write → disable (final seal) → read
    through the grace window → ordinary retention reaps → `ResourceNotFound`;
    a re-enable during the grace window listing two coexisting streams, the

@@ -38,8 +38,9 @@ established *decision-in-replicated-state, timing-in-a-per-node-loop* shape:
 
 - **The metadata half — `MetaCommand::DropTableTablets { table }`**
   (`animus-control`): removes **every** tablet scoped to `table` from
-  `Metadata.tablets`, along with its placement policy (mirroring the
-  `MergeTablets` cleanup), in **one apply** so no replica ever observes a table
+  `Metadata.tablets`, along with its placement policy (a cleanup shape
+  `MergeTablets` — since removed, ADR 0044, tablets are split-only — used to
+  mirror), in **one apply** so no replica ever observes a table
   half-dropped. Idempotent (`NoOp` when the table has no tablets). The real drop
   sink, `ClientCtx::drop_table`, proposes `DropTableSchema` then
   `DropTableTablets` and waits for both to leave replicated metadata.

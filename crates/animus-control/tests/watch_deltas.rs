@@ -157,8 +157,8 @@ fn run_scenario(seed: u64) {
             "after split",
         );
 
-        // MergeTablets' cp-member-addr prune exercises a `Delete` — the half
-        // `rebuild_metadata_from_engine`'s bulk path never exercises.
+        // `DropTableTablets`' cp-member-addr prune exercises a `Delete` — the
+        // half `rebuild_metadata_from_engine`'s bulk path never exercises.
         nodes[leader].propose(MetaCommand::RegisterCpAddr {
             id: nid(999),
             addr: "127.0.0.1:9".to_string(),
@@ -171,21 +171,6 @@ fn run_scenario(seed: u64) {
             last_seen,
             seed,
             "after register-cp-addr",
-        );
-
-        nodes[leader].propose(MetaCommand::MergeTablets {
-            left: TabletId(1),
-            expected_left_epoch: Epoch::INITIAL.next(),
-            right: TabletId(2),
-            expected_right_epoch: Epoch::INITIAL,
-        });
-        sim.run_for(Duration::from_secs(1));
-        last_seen = assert_delta_matches_full_fetch(
-            &nodes[leader],
-            &mut mirror_state,
-            last_seen,
-            seed,
-            "after merge",
         );
 
         nodes[leader].propose(MetaCommand::DropTableTablets {

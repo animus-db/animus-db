@@ -254,18 +254,6 @@ impl CpGroup {
         }
     }
 
-    /// Every cursor row currently visible in this tablet's own `KIND_CURSOR`
-    /// scope, alongside the token each row's own key names. See
-    /// [`RaftKvNode::cursor_rows_with_token`].
-    pub(crate) async fn cursor_rows_with_token(
-        &self,
-    ) -> Vec<([u8; TOKEN_BYTES], String, HlcTimestamp)> {
-        match self {
-            CpGroup::Lsm(n) => n.cursor_rows_with_token().await,
-            CpGroup::Mem(n) => n.cursor_rows_with_token().await,
-        }
-    }
-
     /// Linearizable ReadIndex range scan of a non-base row-kind scope (ADR
     /// 0041 §3) — the LSI `Query`/`Scan` read primitive. `end: None` is
     /// unbounded above. See [`RaftKvNode::linearizable_scan_kind`].
@@ -1123,16 +1111,6 @@ pub enum ClientRequest {
     /// gone; see the root `CLAUDE.md`). The interim manual trigger; an automatic
     /// size-telemetry trigger is `auto_split_loop`.
     SplitTablet { tablet: u64, split_key: Vec<u8> },
-    /// **Admin: merge two adjacent CP tablets** (ADR 0033). A single, atomic
-    /// control-plane command (`MetaCommand::MergeTablets`, epoch-CAS gated on
-    /// both tablets): `left`'s range widens to absorb `right`'s (which is
-    /// removed from the tablet map), both served by the *same* replicas'
-    /// existing per-node shared engine — no data moves, and there is no
-    /// second, data-plane step that can fail independently (the dual of
-    /// `SplitTablet` above). The interim manual trigger; an automatic
-    /// size-based merge trigger is out of scope for this increment (see ADR
-    /// 0033's "Future work").
-    MergeTablets { left: u64, right: u64 },
     /// **Join discovery** (ADR 0032 PR2, `animusd join`): a node that knows only
     /// a *seed* address (any already-running node's client address — old or
     /// newly grown, PR1 made every node's address book equally current) asks
@@ -1368,12 +1346,6 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // reach the control leader).
             | MetaCommand::RegisterNodeAddrs { .. }
             | MetaCommand::SplitTablet { .. }
-            // Tablet merge (ADR 0033): the same relay reason as `SplitTablet` —
-            // already client-exposed via `ClientRequest::MergeTablets`, so
-            // relaying it adds no new authority, it just lets the trigger
-            // reach the control leader cross-process when driven from a
-            // follower.
-            | MetaCommand::MergeTablets { .. }
             // Provision-at-create (ADR 0023): a `CreateTable` on a follower-connected
             // client relays the table's tablet creation + RF policy to the control
             // leader. Scoped to one tablet per table by the state machine's guard.
@@ -2764,7 +2736,7 @@ impl BoundControlNode {
     /// sync or heartbeat from), the tablet-host reconciler / `auto_split_loop`
     /// (nothing to host, no engine to sample), or the dynamo/cql listeners
     /// (never bound here). Every client-request dispatch path this node *can*
-    /// reach (`Status`/`ProposeSchema`/`JoinInfo`/`SplitTablet`/`MergeTablets`,
+    /// reach (`Status`/`ProposeSchema`/`JoinInfo`/`SplitTablet`,
     /// and the data ops `Put`/`Get`/`Scan`/`Delete`/`PutBatch`) already works
     /// correctly with `ClientCtx.data == None`: the schema/admin ops only ever
     /// touch control `Metadata`, and a data op degrades exactly like any other
@@ -3862,7 +3834,7 @@ impl ClientCtx {
     /// that must work on a growth node**: CP routing (`tablet_for`/
     /// `resolve_cp_route`/`cp_scan`), the per-node join-host/reconfigure loops,
     /// this node's own address-registration commit check, the raftkv peer-sync
-    /// loop, the split/merge triggers' precondition reads, and (ADR 0035 PR1)
+    /// loop, the split trigger's precondition reads, and (ADR 0035 PR1)
     /// the general-purpose schema-catalog reads (`table_schema`/
     /// `has_table_schema`, and — since the PR5 staleness audit closed the gap
     /// PR1 flagged — `has_keyspace` too) the CQL/DynamoDB wire edges use for
@@ -3889,8 +3861,8 @@ impl ClientCtx {
     /// this seam existed.
     ///
     /// Used by the schema commit-wait polls (`create_table_schema`/
-    /// `replace_table_schema`/`drop_table_schema`/`trigger_split`/
-    /// `trigger_merge` below) and the DynamoDB conditional-write existence
+    /// `replace_table_schema`/`drop_table_schema`/`trigger_split`
+    /// below) and the DynamoDB conditional-write existence
     /// gate (`dynamo.rs::quorum_read`'s live re-check on a snapshot miss) —
     /// each must observe its own just-proposed command (or a concurrent
     /// writer's) landing in the authoritative state, not a possibly-stale
@@ -4178,14 +4150,15 @@ impl ClientCtx {
     /// `Ok(None)` is a genuinely **served** absent. `Err("…; retry")` covers
     /// the two conditions that must never be reported as absence: (1) the
     /// group's live `scope_range()` does not contain `key` — this routing
-    /// resolution raced a split's narrow or a merge's widen, so this group
+    /// resolution raced a split's narrow, so this group
     /// does not (or does not *yet*) own the key, and serving from its engine
-    /// could return absent-or-stale for data another group (or a
-    /// not-yet-drained absorbed sibling) is authoritative for; (2) the
-    /// ReadIndex barrier failed (deposed / mid-election leader) — nothing can
-    /// be concluded about the key at all. Both were previously collapsed into
-    /// "absent" (`Value(None)`), which read exactly like data loss from the
-    /// outside — the ADR 0033 regression `tests/tablet_merge.rs` caught.
+    /// could return absent-or-stale for data another group is authoritative
+    /// for; (2) the ReadIndex barrier failed (deposed / mid-election leader)
+    /// — nothing can be concluded about the key at all. Both were previously
+    /// collapsed into "absent" (`Value(None)`), which read exactly like data
+    /// loss from the outside — a regression caught under a real
+    /// multi-process deployment, before tablet merge was removed entirely
+    /// (split-only tablets).
     ///
     /// **Test-only since ADR 0018 §2/PR4** (`split_fence_tests`'s stale-scope
     /// regression, which drives a raw `CpGroup` handle with no `ClientCtx`
@@ -4198,7 +4171,7 @@ impl ClientCtx {
     async fn cp_get_local(leader: &CpGroup, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
         if !leader.scope_range().contains(key) {
             return Err(format!(
-                "key {key:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
+                "key {key:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
         match leader.linearizable_get_served(key).await {
@@ -4241,7 +4214,7 @@ impl ClientCtx {
     ) -> Result<Option<Vec<u8>>, String> {
         if !leader.scope_range().contains(key) {
             return Err(format!(
-                "key {key:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
+                "key {key:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
         match leader.linearizable_get_served_fast(key).await {
@@ -4298,9 +4271,10 @@ impl ClientCtx {
     /// the read-side scope pre-check — the scan flavor of
     /// [`cp_get_local`](Self::cp_get_local): `linearizable_scan` filters every
     /// row through the group's live scope (`strip_in_range`), so a scope that
-    /// has not yet caught up to the metadata-derived request window (a merge's
-    /// widen in flight) would **silently truncate** the results rather than
-    /// error. Shared by [`cp_scan_one`] and `cp_serve_forwarded`'s `Scan` arm.
+    /// has not yet caught up to the metadata-derived request window (a
+    /// split's narrow in flight) would **silently truncate** the results
+    /// rather than error. Shared by [`cp_scan_one`] and `cp_serve_forwarded`'s
+    /// `Scan` arm.
     async fn cp_scan_local(
         leader: &CpGroup,
         start: &[u8],
@@ -4310,7 +4284,7 @@ impl ClientCtx {
         let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
         if !leader.scope_range().contains_range(&requested) {
             return Err(format!(
-                "scan window {requested:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
+                "scan window {requested:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
         match leader.linearizable_scan(start, end, limit).await {
@@ -4325,7 +4299,7 @@ impl ClientCtx {
     /// fix): a read-barrier failure (deposed/mid-election leader) is a
     /// retryable condition, never reported as absence, and a leader whose live
     /// `scope_range()` does not contain `key` (this node's routing raced a
-    /// split's narrow or a merge's widen — metadata says the group owns the
+    /// split's narrow — metadata says the group owns the
     /// key, its scope hasn't caught up) is likewise retried until routing and
     /// scope agree, mirroring the write side's pre-propose range check. `Err`
     /// is "no leader reachable / did not become serveable in time". The CP
@@ -4465,9 +4439,8 @@ impl ClientCtx {
 
     /// As [`cp_kind_write`](Self::cp_kind_write), but for a batch with **no
     /// base-kind write** — a GSI reconciliation's footprint/cursor-row
-    /// update, the trim janitor's change-record deletions, or a
-    /// merge-residue cursor-row cleanup (ADR 0042 §7/§8) — none of which
-    /// touch a client-visible row.
+    /// update, or the trim janitor's change-record deletions (ADR 0042 §7/§8)
+    /// — none of which touch a client-visible row.
     ///
     /// Confirmation therefore cannot probe a base row; it instead confirms
     /// the batch's **last** write actually landed (`local_get_kind`
@@ -6181,8 +6154,8 @@ impl ClientCtx {
     /// handle, enforcing the read-side scope pre-check (ADR 0033) — the
     /// kind-scan dual of [`cp_scan_local`](Self::cp_scan_local): a scope that
     /// has not yet caught up to the metadata-derived request window (a
-    /// merge's widen in flight) would otherwise silently truncate the results
-    /// rather than error. `end == None` is unbounded above.
+    /// split's narrow in flight) would otherwise silently truncate the
+    /// results rather than error. `end == None` is unbounded above.
     async fn cp_scan_kind_local(
         leader: &CpGroup,
         kind: u8,
@@ -6192,7 +6165,7 @@ impl ClientCtx {
         let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
         if !leader.scope_range().contains_range(&requested) {
             return Err(format!(
-                "scan window {requested:?} outside tablet's current range (stale routing, likely a split/merge crossover); retry"
+                "scan window {requested:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
         match leader.linearizable_scan_kind(kind, start, end).await {
@@ -8249,9 +8222,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
         let view = MetadataView {
             tablets: meta.tablets,
             down,
-            merged: meta.merged_tablets,
             split_parent: meta.split_parents,
-            absorbed_by: meta.absorbed_by,
         };
         reconciler.tick(&view).await;
     }
@@ -8649,7 +8620,6 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::Forwarded { .. } => "forwarded",
         ClientRequest::ProposeSchema(_) => "propose_schema",
         ClientRequest::SplitTablet { .. } => "split_tablet",
-        ClientRequest::MergeTablets { .. } => "merge_tablets",
         ClientRequest::JoinInfo => "join_info",
         ClientRequest::WatchMetadata { .. } => "watch_metadata",
         ClientRequest::Txn { .. } => "txn",
@@ -8706,11 +8676,6 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         // Admin: split a CP tablet — a single atomic control-plane command.
         ClientRequest::SplitTablet { tablet, split_key } => {
             ctx.trigger_split(TabletId(tablet), split_key).await
-        }
-        // Admin: merge two adjacent CP tablets (ADR 0033) — a single atomic
-        // control-plane command, the dual of split above.
-        ClientRequest::MergeTablets { left, right } => {
-            ctx.trigger_merge(TabletId(left), TabletId(right)).await
         }
         // A CP op forwarded from another node (cross-process routing, ADR 0017
         // #3b): serve locally iff we are the leader; never re-forward. The
@@ -8930,61 +8895,6 @@ impl ClientCtx {
         {
             Ok(()) => ClientResponse::PutOk,
             Err(()) => ClientResponse::Error("split did not commit in time".into()),
-        }
-    }
-
-    /// Merge adjacent CP tablets `left` and `right` (ADR 0033): a **single,
-    /// atomic** control-plane command (`MetaCommand::MergeTablets`,
-    /// epoch-CAS gated on both tablets — the dual of `trigger_split` above).
-    /// `left`'s range widens to `[left.start, right.end)` and `right` is
-    /// removed from the tablet map — both served by the **same** replicas'
-    /// existing per-node shared engine (ADR 0026/0028: one LSM tree per node,
-    /// confined by `StorageScope`), so no data moves and there is no second,
-    /// data-plane step that can fail independently. The per-node tablet-host
-    /// reconciler (ADR 0031 PR4, extended by ADR 0033) then widens `left`'s
-    /// live scope and tears down `right`'s group on every replica **without
-    /// erasing its data** — a sibling now owns that range on the same shared
-    /// engine.
-    ///
-    /// Routed to the control leader (relayable, [`is_relayable_command`]), so
-    /// this works from any node the client happens to be connected to.
-    #[tracing::instrument(name = "merge_tablets", skip(self), fields(left = left.0, right = right.0))]
-    async fn trigger_merge(&self, left: TabletId, right: TabletId) -> ClientResponse {
-        // Both epochs come from the **same** metadata snapshot, so the CAS
-        // reflects exactly what this call saw (mirroring `trigger_split`'s
-        // `new_id`/`expected_epoch` pairing). `effective_metadata()` for the
-        // same reason as `trigger_split` — see that method's comment.
-        let meta = self.effective_metadata();
-        let Some(expected_left_epoch) = meta.tablets.get(&left).map(|t| t.epoch) else {
-            return ClientResponse::Error("no such tablet".into());
-        };
-        let Some(expected_right_epoch) = meta.tablets.get(&right).map(|t| t.epoch) else {
-            return ClientResponse::Error("no such tablet".into());
-        };
-        let cmd = MetaCommand::MergeTablets {
-            left,
-            expected_left_epoch,
-            right,
-            expected_right_epoch,
-        };
-        // Confirm by a signal robust against `right` vanishing for an
-        // unrelated reason (e.g. a concurrent table drop): `left`'s epoch
-        // must have advanced past what this call read AND `right` must be
-        // gone — the exact pair `MergeTablets`'s apply produces together,
-        // atomically, and nothing else in this state machine produces.
-        match self
-            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
-                let m = self.effective_metadata();
-                let left_bumped = m
-                    .tablets
-                    .get(&left)
-                    .is_some_and(|t| t.epoch > expected_left_epoch);
-                (left_bumped && !m.tablets.contains_key(&right)).then_some(())
-            })
-            .await
-        {
-            Ok(()) => ClientResponse::PutOk,
-            Err(()) => ClientResponse::Error("merge did not commit in time".into()),
         }
     }
 
@@ -11095,9 +11005,8 @@ mod split_fence_tests {
             // child), never as a served answer. Serving it would return a
             // value NOT linearized against the child group's writes (the
             // child's leader may be on another node whose writes this engine
-            // hasn't applied yet) — or, in the merge crossover's dual (a
-            // survivor not yet widened over a not-yet-drained absorbed
-            // sibling), a false "absent" indistinguishable from data loss.
+            // hasn't applied yet) — a false "absent" indistinguishable from
+            // data loss.
             let read = ClientCtx::cp_get_local(&parent, &child_key).await;
             match read {
                 Err(e) => assert!(

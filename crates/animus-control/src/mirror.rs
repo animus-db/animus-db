@@ -29,7 +29,7 @@
 //!   tablet ids it just removed is computed internally
 //!   (`Metadata::tablets_for_table`) from state that is gone by the time
 //!   `apply` returns.
-//! - Both [`MetaCommand::MergeTablets`] and `DropTableTablets` also prune the
+//! - [`MetaCommand::DropTableTablets`] also prunes the
 //!   legacy `Metadata::cp_member_addrs`/`cp_member_tablets` address book
 //!   (`Metadata::prune_cp_member_addrs`) for any CP member registered against
 //!   a tablet that just left the map — again, only knowable by comparing
@@ -133,7 +133,7 @@ pub fn apply_and_derive_mirror(
 ) -> (ApplyOutcome, Vec<KeyWrite>) {
     // Capture whatever pre-apply state this command's derivation needs —
     // see the module doc for why post-apply state alone isn't enough for
-    // `DropTableTablets`/`MergeTablets`. Cheap/no-op for every other command.
+    // `DropTableTablets`. Cheap/no-op for every other command.
     let dropped_tablets: Vec<TabletId> = match command {
         MetaCommand::DropTableTablets { table } => {
             meta.tablets_for_table(table).map(|(&id, _)| id).collect()
@@ -141,9 +141,7 @@ pub fn apply_and_derive_mirror(
         _ => Vec::new(),
     };
     let pre_cp_member_tablets: BTreeMap<NodeId, TabletId> = match command {
-        MetaCommand::MergeTablets { .. } | MetaCommand::DropTableTablets { .. } => {
-            meta.cp_member_tablets.clone()
-        }
+        MetaCommand::DropTableTablets { .. } => meta.cp_member_tablets.clone(),
         _ => BTreeMap::new(),
     };
 
@@ -176,22 +174,8 @@ pub fn apply_and_derive_mirror(
                 writes.push(put_json(syskv::policy_key(*new_id), policy));
             }
             // ADR 0018 §2 amendment: mirror the split-provenance marker
-            // (`Metadata::split_parents`) the same way `merged_key` mirrors
-            // `merged_tablets` below.
+            // (`Metadata::split_parents`).
             writes.push(put_tablet_id(syskv::split_parent_key(*new_id), *tablet));
-        }
-        MetaCommand::MergeTablets { left, right, .. } => {
-            writes.push(put_json(syskv::tablet_key(*left), &meta.tablets[left]));
-            writes.push(KeyWrite::Delete(syskv::tablet_key(*right)));
-            writes.push(KeyWrite::Delete(syskv::policy_key(*right)));
-            writes.push(KeyWrite::Put(syskv::merged_key(*right), Vec::new()));
-            // ADR 0018 §2 amendment: mirror the merge-provenance marker
-            // (`Metadata::absorbed_by`) — the reverse-direction dual of
-            // `split_parent_key` above.
-            writes.push(put_tablet_id(syskv::absorbed_by_key(*right), *left));
-            for id in dead_cp_member_ids(&pre_cp_member_tablets, meta) {
-                writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(&id)));
-            }
         }
         MetaCommand::SetTabletPolicy { tablet, policy } => match policy {
             Some(p) => writes.push(put_json(syskv::policy_key(*tablet), p)),
@@ -327,9 +311,9 @@ fn put_counter(name: &str, value: u64) -> KeyWrite {
 }
 
 /// A [`KeyWrite::Put`] of a raw [`TabletId`] value (big-endian `u64`) at
-/// `key` — the value shape [`syskv::split_parent_key`]/
-/// [`syskv::absorbed_by_key`] use (ADR 0018 §2 amendment): a tablet id, not a
-/// JSON entity, mirroring [`put_counter`]'s primitive-value convention.
+/// `key` — the value shape [`syskv::split_parent_key`] uses (ADR 0018 §2
+/// amendment): a tablet id, not a JSON entity, mirroring [`put_counter`]'s
+/// primitive-value convention.
 fn put_tablet_id(key: Vec<u8>, id: TabletId) -> KeyWrite {
     KeyWrite::Put(key, id.0.to_be_bytes().to_vec())
 }
@@ -441,9 +425,6 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             let name = String::from_utf8(id).expect("keyspace id is UTF-8");
             meta.keyspaces.insert(name);
         }
-        EntityKind::Merged => {
-            meta.merged_tablets.insert(TabletId(decode_u64(&id)));
-        }
         EntityKind::Counter => {
             let value = decode_u64(value);
             if id == NEXT_TABLET_ID_COUNTER.as_bytes() {
@@ -461,10 +442,6 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
         }
         EntityKind::SplitParent => {
             meta.split_parents
-                .insert(TabletId(decode_u64(&id)), TabletId(decode_u64(value)));
-        }
-        EntityKind::AbsorbedBy => {
-            meta.absorbed_by
                 .insert(TabletId(decode_u64(&id)), TabletId(decode_u64(value)));
         }
         EntityKind::StreamShard => {
@@ -506,11 +483,6 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             let name = String::from_utf8(id).expect("keyspace id is UTF-8");
             meta.keyspaces.remove(&name);
         }
-        EntityKind::Merged => {
-            // Never deleted in practice (`merged_tablets` is never pruned —
-            // see this crate's CLAUDE.md) — listed for match exhaustiveness.
-            meta.merged_tablets.remove(&TabletId(decode_u64(&id)));
-        }
         EntityKind::Counter => {
             // Never deleted in practice (a monotonic counter is only ever
             // `Put`) — listed for match exhaustiveness.
@@ -521,15 +493,9 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             meta.cp_member_tablets.remove(&node);
         }
         EntityKind::SplitParent => {
-            // Never deleted in practice (`split_parents` is never pruned —
-            // same discipline as `merged_tablets`) — listed for match
-            // exhaustiveness.
-            meta.split_parents.remove(&TabletId(decode_u64(&id)));
-        }
-        EntityKind::AbsorbedBy => {
-            // Never deleted in practice (`absorbed_by` is never pruned) —
+            // Never deleted in practice (`split_parents` is never pruned) —
             // listed for match exhaustiveness.
-            meta.absorbed_by.remove(&TabletId(decode_u64(&id)));
+            meta.split_parents.remove(&TabletId(decode_u64(&id)));
         }
         EntityKind::StreamShard => {
             // Reachable in practice, unlike the never-pruned markers above
@@ -685,59 +651,6 @@ mod tests {
                 put_tablet_id(syskv::split_parent_key(TabletId(2)), TabletId(1)),
             ]
         );
-    }
-
-    /// `MergeTablets` also prunes any legacy `cp_member_addrs`/`cp_member_tablets`
-    /// entry registered against the absorbed tablet — the pre/post-diff case
-    /// this module's doc explains.
-    #[test]
-    fn merge_tablets_removes_the_right_tablet_and_prunes_its_cp_member_addr() {
-        let mut meta = Metadata::default();
-        let _ = apply_and_derive_mirror(
-            &mut meta,
-            &MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("t".to_string()),
-                range: KeyRange::whole().split_at(&[5]).unwrap().0,
-                replicas: vec![nid(1)],
-            },
-        );
-        // Directly seed the second tablet + the legacy address-book entry
-        // (there's no public command that creates an adjacent second tablet
-        // without a split; construct the merge scenario by hand instead).
-        let right_range = KeyRange::whole().split_at(&[5]).unwrap().1;
-        meta.tablets.insert(
-            TabletId(2),
-            Tablet::with_table(
-                TabletId(2),
-                Some("t".to_string()),
-                right_range,
-                vec![nid(1)],
-            ),
-        );
-        meta.cp_member_addrs.insert(nid(99), "addr:1".to_string());
-        meta.cp_member_tablets.insert(nid(99), TabletId(2));
-
-        let command = MetaCommand::MergeTablets {
-            left: TabletId(1),
-            expected_left_epoch: Epoch::INITIAL,
-            right: TabletId(2),
-            expected_right_epoch: Epoch::INITIAL,
-        };
-        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
-        assert_eq!(outcome, ApplyOutcome::Applied);
-        assert_eq!(
-            writes,
-            vec![
-                put_json(syskv::tablet_key(TabletId(1)), &meta.tablets[&TabletId(1)]),
-                KeyWrite::Delete(syskv::tablet_key(TabletId(2))),
-                KeyWrite::Delete(syskv::policy_key(TabletId(2))),
-                KeyWrite::Put(syskv::merged_key(TabletId(2)), Vec::new()),
-                put_tablet_id(syskv::absorbed_by_key(TabletId(2)), TabletId(1)),
-                KeyWrite::Delete(syskv::cp_member_addr_key(&nid(99))),
-            ]
-        );
-        assert!(meta.cp_member_addrs.is_empty());
     }
 
     #[test]
@@ -1285,7 +1198,7 @@ mod tests {
     /// a `WatchMetadata` delta reply's consumer
     /// (`animusd::control_handle::RemoteControlClient::observe_delta`) does —
     /// reaches the identical state a direct `Metadata::apply` does. Uses
-    /// `MergeTablets` specifically because it derives `Delete`s, the half
+    /// `DropTableTablets` specifically because it derives `Delete`s, the half
     /// [`rebuild_from_engine_matches_direct_apply`] above never exercises
     /// (a live engine scan never yields a tombstone).
     #[test]
@@ -1310,11 +1223,8 @@ mod tests {
         base.cp_member_addrs.insert(nid(99), "addr:1".to_string());
         base.cp_member_tablets.insert(nid(99), TabletId(2));
 
-        let command = MetaCommand::MergeTablets {
-            left: TabletId(1),
-            expected_left_epoch: Epoch::INITIAL,
-            right: TabletId(2),
-            expected_right_epoch: Epoch::INITIAL,
+        let command = MetaCommand::DropTableTablets {
+            table: "t".to_string(),
         };
 
         let mut shadow = base.clone();
@@ -1322,7 +1232,7 @@ mod tests {
         assert_eq!(outcome, ApplyOutcome::Applied);
         assert!(
             writes.iter().any(|w| matches!(w, KeyWrite::Delete(_))),
-            "expected MergeTablets to derive at least one delete"
+            "expected DropTableTablets to derive at least one delete"
         );
 
         let mut direct = base.clone();

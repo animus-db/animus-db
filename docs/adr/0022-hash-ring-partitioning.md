@@ -81,5 +81,7 @@ ADR 0006 audit note.)*
   a data migration, not a code tweak. The empty-input Murmur3 vector `(0, 0)` is
   pinned by a unit test as a spec anchor.
 - **ADR 0002 is amended, not replaced.** Tablets are still the unit of placement;
-  the epoch is still the fencing token; split/merge still work. Only the *space
-  the ranges partition* changed (raw keyspace → hashed token space).
+  the epoch is still the fencing token; split still works (merge did too,
+  under ADR 0033, until ADR 0044 removed it — tablets are split-only). Only
+  the *space the ranges partition* changed (raw keyspace → hashed token
+  space).

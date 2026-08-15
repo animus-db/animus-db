@@ -329,11 +329,12 @@ read-only, additive, no change to the write/apply path above:
 - **Value decode mirrors `mirror::apply_put` exactly**: `Tablet`/`Member`/
   `Schema`/`Policy`/`NodeAddrs`/`CpMemberAddr` are `serde_json` passthrough;
   `Counter`/`NodeIdAlloc` are a raw big-endian `u64` rendered as a JSON
-  number; `Keyspace`/`Merged` are presence-only (always `null`). A numeric
-  kind's `id` (`Tablet`/`Member`/`Policy`/`NodeAddrs`/`Merged`/
-  `CpMemberAddr`) renders as a decimal **string**, not a JSON number (a
-  `u64` can exceed what JSON/JS represents exactly); every other kind's `id`
-  is its UTF-8 name verbatim.
+  number; `Keyspace` is presence-only (always `null`). A numeric kind's `id`
+  (`Tablet`/`Member`/`Policy`/`NodeAddrs`/`CpMemberAddr`) renders as a
+  decimal **string**, not a JSON number (a `u64` can exceed what JSON/JS
+  represents exactly); every other kind's `id` is its UTF-8 name verbatim.
+  (`Merged`/`AbsorbedBy` — tablet merge's own presence-only/numeric kinds —
+  were removed entirely along with `MergeTablets`, ADR 0044.)
 - **Dashboard**: the Storage tab's existing "Control system keyspace" card
   (PR4) grew a browse section directly inside it — the same control-role
   node selector, a kind filter (every kind, internal/legacy ones labeled),
@@ -344,9 +345,10 @@ read-only, additive, no change to the write/apply path above:
 **Tests**: `animus-control`'s `syskv.rs` unit tests cover `prefix_successor`/
 `reserved_scan_bounds` directly; `animusd/tests/system_table.rs` seeds every
 `EntityKind` through the client protocol (a plain `Put` auto-provisions a
-tablet, `ProposeSchema` reaches every other mirrored `MetaCommand`, a real
-split+merge produces a `Merged` marker, `AllocateNodeId` produces the
-`NodeIdAlloc` entry) and asserts every kind's exact value shape, the `kind`
+tablet, `ProposeSchema` reaches every other mirrored `MetaCommand`,
+`AllocateNodeId` produces the `NodeIdAlloc` entry — the `Merged`/`AbsorbedBy`
+scenario a real split+merge used to produce was removed along with the
+kinds themselves, ADR 0044) and asserts every kind's exact value shape, the `kind`
 filter, and gapless duplicate-free pagination against a differential oracle
 (one unlimited scan); `control_only.rs`/`data_only.rs` cover the
 available-`true`-with-rows / available-`false` shapes on genuine

@@ -47,8 +47,10 @@ per-tablet CP data plane (`animus-cp-data`).
   tablet; extended by ADR 0040 to also prune an orphaned
   claim-without-member `node_addrs` entry, the shape the orphan-member sweep
   below proposes); tablets (`CreateTablet`/`CasTabletReplicas`, epoch-CAS;
-  `SplitTablet`/`MergeTablets` — ADR 0028/0033, each the *entire* split/merge,
-  epoch-CAS gated, no data-plane half; `SetTabletPolicy`); schema/keyspace
+  `SplitTablet` — ADR 0028, the *entire* split, epoch-CAS gated, no
+  data-plane half; tablets are **split-only** — `MergeTablets` and its dual
+  reaction existed under ADR 0033 and were removed entirely by ADR 0044;
+  `SetTabletPolicy`); schema/keyspace
   (`Create/Drop/ReplaceTableSchema` — ADR 0013; `DropTableTablets` — ADR 0024
   GC; `Create/DropTableIndex`; `SetTableMode`; `SetTableStream` (ADR 0042
   §2/§4/§9 — enable/disable a table's DynamoDB Streams config,
@@ -143,14 +145,11 @@ per-tablet CP data plane (`animus-cp-data`).
   `DescribeStream` — which has no live `StreamSpec` to read once
   `SetTableStream{None}` commits — still has somewhere to read its
   last-known view type from; a view type never changes mid-stream, so
-  every row of one label carries the identical value). **F1 merge stopgap** (ADR
-  0042 §12/ADR 0043 §A5): `MergeTablets`'s apply arm rejects outright when
-  the base table has either an enabled stream or any still-present
-  catalog row (marked-expired-but-not-yet-removed counts as still
-  present) — explicitly a v1 stopgap the text names as such, since tablet
-  merge itself is being removed globally in a forthcoming split-only ADR
-  that deletes this guard along with `MergeTablets`. Mirrored into
-  `syskv::EntityKind::StreamShard`, keyed by the raw 16-byte
+  every row of one label carries the identical value). The ADR 0042 §12/ADR
+  0043 §A5 "F1" stopgap — `MergeTablets`'s apply arm rejecting outright on a
+  streamed base table — is now moot: ADR 0044 removed `MergeTablets` and
+  tablet merge entirely (tablets are split-only), taking the guard with it.
+  Mirrored into `syskv::EntityKind::StreamShard`, keyed by the raw 16-byte
   `tablet.to_be_bytes() ++ epoch.to_be_bytes()` concatenation
   (`syskv::stream_shard_key`/`decode_stream_shard_id` — fixed-width, so no
   internal escaping is needed the way a variable-length id would).
@@ -384,8 +383,8 @@ per-tablet CP data plane (`animus-cp-data`).
   (this crate already depends on `animus-tablet`, unlike the wire adapters,
   which deliberately *duplicate* `escape` to stay dependency-light). One
   `EntityKind` per `Metadata` collection (`Tablet`/`Member`/`Schema`/
-  `Policy`/`NodeAddrs`/`Keyspace`/`Merged`/`Counter`/`CpMemberAddr`/
-  `SplitParent`/`AbsorbedBy`), each with a typed `*_key` helper, plus a
+  `Policy`/`NodeAddrs`/`Keyspace`/`Counter`/`CpMemberAddr`/`SplitParent`/
+  `StreamShard`), each with a typed `*_key` helper, plus a
   dedicated `applied_index_key()` watermark (a sibling of the entity-kind
   segment, not under one — mirrors `animus-cp-data`'s
   `engine_applied_index`). `decode_key` inverts every `*_key` helper for the
@@ -427,10 +426,10 @@ per-tablet CP data plane (`animus-cp-data`).
     wildcard** — a future variant fails to compile here until its mirror
     behavior is a deliberate decision. Takes `&mut Metadata` (not just
     post-apply state) to capture a small, targeted slice of *pre*-apply
-    state for the two commands whose derived *deletions* depend on
-    identities gone by the time `apply` returns (`DropTableTablets`'s
-    dropped-tablet-id set, and both `DropTableTablets`/`MergeTablets`'s
-    legacy `cp_member_addrs` prune) — diffing this way, rather than
+    state for the one command whose derived *deletions* depend on
+    identities gone by the time `apply` returns (`DropTableTablets`: both
+    its dropped-tablet-id set and its legacy `cp_member_addrs` prune) —
+    diffing this way, rather than
     re-deriving `Metadata::prune_cp_member_addrs`'s predicate a second time,
     avoids the exact "two places must agree on a gating rule" hazard this
     crate's engineering practices warn about. `node.rs`'s
@@ -489,41 +488,35 @@ per-tablet CP data plane (`animus-cp-data`).
   read-visibility lag. See "What's non-obvious" for the driver mechanics and
   hand-driven gotchas.
 
-- **Epoch-CAS discipline on `Split`/`Merge`/`CasTabletReplicas`.** Every
+- **Epoch-CAS discipline on `SplitTablet`/`CasTabletReplicas`.** Every
   tablet-mutating command is a compare-and-swap on the tablet's epoch, evaluated
   identically on every replica, so accept/reject is consistent and racing
-  proposers can't both commit. `MergeTablets` carries *two* expected epochs
-  (it reads two tablets from one snapshot). Any new tablet-mutating command must
+  proposers can't both commit. (`MergeTablets` — ADR 0033, carrying *two*
+  expected epochs since it read two tablets from one snapshot — was removed
+  by ADR 0044; tablets are split-only.) Any new tablet-mutating command must
   adopt the same guard.
 
-- **`SplitTablet`/`MergeTablets` record split/merge provenance
-  (`Metadata::split_parents`/`absorbed_by`, ADR 0018 §2 amendment) —
-  replaces the retired `Tablet::version_floor` cross-group-LWW fix.**
-  `SplitTablet` records `split_parents[new_id] = tablet` (the fresh sibling's
-  immediate source); `MergeTablets` records `absorbed_by[right] = left` (the
-  reverse direction from `merged_tablets`, which only records *that* `right`
-  was absorbed, not *into whom*). Neither is ever pruned — same discipline as
-  `merged_tablets` (tablet ids are never reused). Both are pure functions of
-  already-agreed `Metadata` state, computed once here so every data replica
-  reads the identical value instead of deriving it locally. Consumed by
-  `animus-cp-data`'s tablet-host reconciler to know **whose** range-seal
-  marker a split child/merge survivor must observe locally before hosting/
-  widening — see that crate's `CLAUDE.md` and ADR 0018's PR2 amendment for
-  the full design these replace `version_floor` with. Regressions:
-  `meta::tests::{split_tablet_records_provenance_of_the_immediate_parent,
-  merge_tablets_records_absorbed_by_provenance}`. Both fields are also
-  mirrored into the system keyspace (`syskv::EntityKind::{SplitParent,
-  AbsorbedBy}`, `mirror.rs`'s `apply_and_derive_mirror`/`apply_key_write`) so
-  the incremental delta-consumer path (ADR 0038 PR5) stays byte-identical to
-  a full `Metadata` fetch.
-
-- **`merged_tablets` is never pruned.** Tablet ids are never reused, so a
-  recorded merge marker can never resurrect a wrong decision for a later id.
-  It is the only sound way a per-node reconciler tells "this hosted tablet
-  vanished because it was merged into a sibling" (data still served — never
-  erase) from "vanished because its table was dropped" (erase) — range
-  containment alone is unsound, since two tables' unsplit tablets share a
-  byte-identical default `KeyRange::whole()`. See ADR 0033.
+- **`SplitTablet` records split provenance (`Metadata::split_parents`, ADR
+  0018 §2 amendment) — replaces the retired `Tablet::version_floor`
+  cross-group-LWW fix.** `SplitTablet` records `split_parents[new_id] =
+  tablet` (the fresh sibling's immediate source). Never pruned — tablet ids
+  are never reused, so an entry can never resurrect a wrong decision for a
+  later id. It is a pure function of already-agreed `Metadata` state,
+  computed once here so every data replica reads the identical value instead
+  of deriving it locally. Consumed by `animus-cp-data`'s tablet-host
+  reconciler to know **whose** range-seal marker a split child must observe
+  locally before hosting — see that crate's `CLAUDE.md` and ADR 0018's PR2
+  amendment for the full design this replaces `version_floor` with.
+  Regression: `meta::tests::split_tablet_records_provenance_of_the_immediate_
+  parent`. Also mirrored into the system keyspace
+  (`syskv::EntityKind::SplitParent`, `mirror.rs`'s
+  `apply_and_derive_mirror`/`apply_key_write`) so the incremental
+  delta-consumer path (ADR 0038 PR5) stays byte-identical to a full
+  `Metadata` fetch. (`Metadata::absorbed_by`, merge's mirror-image provenance
+  field, and `Metadata::merged_tablets`, the never-pruned "this tablet was
+  merged away" marker a per-node reconciler needed to tell "merged" apart
+  from "table dropped" — see ADR 0033/ADR 0044 — were both removed along
+  with `MergeTablets`.)
 
 ## What's non-obvious
 

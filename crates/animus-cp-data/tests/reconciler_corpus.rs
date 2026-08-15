@@ -132,30 +132,6 @@ fn view_with_down(
     }
 }
 
-/// [`view`], but also marks `merged` tablet ids as merged-away (ADR 0033) —
-/// standing in for a `MetaCommand::MergeTablets` commit's effect on
-/// `Metadata::merged_tablets` — and records `absorbed_by` provenance (ADR
-/// 0018 §2 amendment): every `merged` id mapped to `survivor`, standing in
-/// for the same commit's effect on `Metadata::absorbed_by`. Needed wherever
-/// a scenario expects a real `WidenScope` to fire: `plan`'s
-/// `widen_seal_observed` gate looks the absorbed id up via this map to find
-/// whose seal marker to check.
-fn view_with_merged_and_absorbed_by(
-    tablets: impl IntoIterator<Item = Tablet>,
-    merged: impl IntoIterator<Item = u64>,
-    survivor: u64,
-) -> MetadataView {
-    let merged: BTreeSet<TabletId> = merged.into_iter().map(TabletId).collect();
-    MetadataView {
-        absorbed_by: merged
-            .iter()
-            .map(|&absorbed| (absorbed, TabletId(survivor)))
-            .collect(),
-        merged,
-        ..view(tablets)
-    }
-}
-
 /// FNV-1a over a scenario's name — the frozen, name-derived seed (ADR 0014
 /// style; identical algorithm to `raftkv_linearizable.rs::name_seed`).
 fn name_seed(name: &str) -> u64 {
@@ -607,10 +583,6 @@ fn scenario_cells() -> Vec<Scenario> {
             scenario_reconfigure_down_replica
         ),
         scenario!(
-            "merge_widens_survivor_and_absorbs_sibling_unerased",
-            scenario_merge_widens_and_absorbs
-        ),
-        scenario!(
             "idempotent_tick_on_converged_multi_tablet_state",
             scenario_idempotent_multi_tablet
         ),
@@ -648,10 +620,6 @@ fn scenario_cells() -> Vec<Scenario> {
             scenario_re_add_cancels_release
         ),
         // --- ADR 0018 §2 amendment fix (the split_cluster.rs livelock) ---------
-        scenario!(
-            "absorb_follower_waits_for_committed_seal_before_tearing_down",
-            scenario_absorb_follower_waits_for_committed_seal
-        ),
         scenario!(
             "narrow_seal_survives_a_late_promotion_after_narrowing_as_a_follower",
             scenario_narrow_seal_survives_a_late_promotion
@@ -1063,105 +1031,6 @@ fn scenario_reconfigure_down_replica(seed: u64) {
             [a(), b()].into_iter().collect::<BTreeSet<_>>(),
             "the down replica was never removed from b()'s view of the group"
         );
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Scenario 9: a merge widens the survivor's scope and absorbs the merged-away
-// sibling WITHOUT erasing its data (ADR 0033).
-// ---------------------------------------------------------------------------
-
-fn scenario_merge_widens_and_absorbs(seed: u64) {
-    run(seed, |sim| async move {
-        let env = sim.env(a());
-        let mut c = Cluster::new(sim);
-        c.add_node(a());
-
-        // Two adjacent tablets — `MergeTablets` requires an identical
-        // replica set, trivially true here (both on the sole node a()), and
-        // both share one node-shared `MemoryEngine` (`Cluster::add_node`),
-        // exactly like `animusd`'s one-LSM-per-node design (ADR 0026/0028).
-        let v1 = view([
-            tablet(1, b"", Some(BOUNDARY), vec![a()]),
-            tablet(2, BOUNDARY, None, vec![a()]),
-        ]);
-        c.tick(a(), &v1).await;
-        env.sleep(Duration::from_secs(2)).await;
-
-        let h1 = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
-        let h2 = c.node(a()).hosted_node(TabletId(2)).unwrap().clone();
-        assert!(
-            h1.is_leader() && h2.is_leader(),
-            "both lone voters self-elect"
-        );
-        for i in 0..5u64 {
-            h1.put(
-                format!("a{i:02}").into_bytes(),
-                format!("lo{i}").into_bytes(),
-            );
-            h2.put(
-                format!("z{i:02}").into_bytes(),
-                format!("hi{i}").into_bytes(),
-            );
-        }
-        env.sleep(Duration::from_secs(1)).await;
-
-        // One more write through the absorbed group, followed by the merge
-        // view with ZERO intervening sim time — the deterministic ADR 0033
-        // drain regression: the entry is proposed (and, for a sole voter,
-        // committed) but the async apply task has NOT yet merged it into the
-        // shared engine when the Absorb teardown begins. Pre-fix, `shutdown()`
-        // killed the apply task at its next loop-top check without draining,
-        // then deleted the group's Raft WAL — the only local copy — so the
-        // acked write silently never reached the engine and read back as a
-        // definitive "absent" through the widened survivor (the exact 1-in-5
-        // `ProdEnv` flake `animusd/tests/tablet_merge.rs` caught, reproduced
-        // here deterministically). The fix drains the group (commit covers the
-        // local log, engine-applied covers commit) before halting.
-        h2.put(b"zlast".to_vec(), b"hi-last".to_vec());
-
-        // The merge commits: tablet 1 (`left`) widens to cover the whole
-        // range, tablet 2 (`right`) vanishes from the map and is recorded as
-        // merged-away — the exact `Metadata` shape `MergeTablets`'s apply
-        // produces. The widen is deferred one tick behind the absorb
-        // (drain-before-widen, ADR 0033), so tick twice.
-        let v2 = view_with_merged_and_absorbed_by([tablet(1, b"", None, vec![a()])], [2], 1);
-        c.tick(a(), &v2).await;
-        c.tick(a(), &v2).await;
-        env.sleep(Duration::from_secs(1)).await;
-
-        assert_eq!(
-            h1.scope_range(),
-            KeyRange::whole(),
-            "the survivor must widen to cover the absorbed sibling's range"
-        );
-        assert_eq!(
-            h1.local_get(b"zlast").await,
-            Some(b"hi-last".to_vec()),
-            "a write acked by the absorbed group right before the merge must be \
-             drained into the engine before its group (and Raft WAL) are torn down"
-        );
-        for i in 0..5u64 {
-            assert_eq!(
-                h1.local_get(format!("a{i:02}").as_bytes()).await,
-                Some(format!("lo{i}").into_bytes()),
-                "survivor must still see its own pre-merge data"
-            );
-            assert_eq!(
-                h1.local_get(format!("z{i:02}").as_bytes()).await,
-                Some(format!("hi{i}").into_bytes()),
-                "survivor must now serve the absorbed sibling's data — never erased"
-            );
-        }
-
-        // The absorbed sibling's own group is torn down…
-        assert_all_stopped(&[h2]);
-        // …but its data was never erased: a raw physical-key read against the
-        // shared engine (independent of any group's scope) still finds it.
-        assert_present(c.storage(a()), &physical(b"z00"), b"hi0").await;
-
-        assert_hosted_converged(&c, a(), [TabletId(1)]);
-        assert_idempotent(&mut c, a(), &v2).await;
     });
 }
 
@@ -1774,99 +1643,8 @@ fn scenario_re_add_cancels_release(seed: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 18: ADR 0018 §2 amendment fix (the split_cluster.rs livelock) —
-// a follower's Absorb teardown must never race ahead of a COMMITTED
-// range-seal covering it. Ticking the follower alone, before the leader has
-// ever been ticked with the merge view (so no seal has been proposed at
-// all), must stall rather than tear down; the whole merge must still
-// converge once the leader gets its own turn.
-// ---------------------------------------------------------------------------
-
-fn scenario_absorb_follower_waits_for_committed_seal(seed: u64) {
-    run(seed, |sim| async move {
-        let env = sim.env(a());
-        let mut c = Cluster::new(sim);
-        c.add_node(a());
-        c.add_node(b());
-
-        // Two adjacent tablets, both replicated on {a, b} — tablet 1 the
-        // eventual merge survivor, tablet 2 the tablet about to be absorbed.
-        let v1 = view([
-            tablet(1, b"", Some(BOUNDARY), vec![a(), b()]),
-            tablet(2, BOUNDARY, None, vec![a(), b()]),
-        ]);
-        c.tick_all(&[a(), b()], &v1).await;
-        env.sleep(Duration::from_secs(2)).await; // elect both groups
-
-        let h2a = c.node(a()).hosted_node(TabletId(2)).unwrap().clone();
-        let h2b = c.node(b()).hosted_node(TabletId(2)).unwrap().clone();
-        let (leader2_id, follower2_id) = if h2a.is_leader() {
-            (a(), b())
-        } else {
-            assert!(h2b.is_leader(), "tablet 2 must have elected some leader");
-            (b(), a())
-        };
-
-        let v2 = view_with_merged_and_absorbed_by([tablet(1, b"", None, vec![a(), b()])], [2], 1);
-
-        // Tick ONLY the follower of tablet 2 — the leader has not been
-        // ticked with the merge view at all yet, so no seal has been
-        // proposed anywhere. Before the fix, a replica's own "nothing
-        // pending locally" drain check was satisfied trivially on the very
-        // first check (there was never anything to wait for — the seal
-        // simply didn't exist yet), so this single tick alone tore the
-        // group down immediately: exactly the regression a real
-        // multi-process deployment exposed deterministically
-        // (`split_cluster.rs`, see `docs/engineering-lessons.md`) — a fast
-        // follower destroying its own copy before the seal could ever
-        // commit, permanently stranding a 2-voter group below quorum.
-        c.tick(follower2_id.clone(), &v2).await;
-
-        assert!(
-            c.node(follower2_id.clone())
-                .hosted_node(TabletId(2))
-                .is_some(),
-            "the follower must NOT tear down tablet 2 before observing a locally-committed \
-             seal covering it — tearing down here is the exact split_cluster.rs regression"
-        );
-
-        // Give the leader its turn: `plan`'s `HostAction::ProposeSeal` is a
-        // persistent, re-derived-every-tick condition (not a one-shot side
-        // effect), so the leader proposes and (as sole-ish, fast-committing
-        // 2-voter group) commits the seal on this tick.
-        c.tick(leader2_id.clone(), &v2).await;
-        env.sleep(Duration::from_secs(1)).await;
-
-        // Both replicas' own subsequent retries now observe the committed
-        // seal and converge: tablet 2 torn down everywhere, tablet 1 widened
-        // to cover the whole range on both nodes.
-        let mut converged = false;
-        for _ in 0..20 {
-            c.tick(follower2_id.clone(), &v2).await;
-            c.tick(leader2_id.clone(), &v2).await;
-            env.sleep(Duration::from_millis(200)).await;
-            if c.node(a()).hosted_node(TabletId(2)).is_none()
-                && c.node(b()).hosted_node(TabletId(2)).is_none()
-                && c.node(a()).hosted_node(TabletId(1)).unwrap().scope_range() == KeyRange::whole()
-                && c.node(b()).hosted_node(TabletId(1)).unwrap().scope_range() == KeyRange::whole()
-            {
-                converged = true;
-                break;
-            }
-        }
-        assert!(
-            converged,
-            "the merge never converged after the leader got a chance to propose the seal"
-        );
-
-        assert_hosted_converged(&c, a(), [TabletId(1)]);
-        assert_hosted_converged(&c, b(), [TabletId(1)]);
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Scenario 19: ADR 0018 §2 amendment fix (the split_cluster.rs livelock),
-// split side — the replica that first narrows its own scope while a
+// Scenario 19: ADR 0018 §2 amendment fix (the split_cluster.rs livelock) —
+// the replica that first narrows its own scope while a
 // FOLLOWER, and is only LATER promoted to sole leader (its own leadership
 // transfer having removed the original leader outright), must still
 // eventually propose the split's range-seal. A one-shot design — propose

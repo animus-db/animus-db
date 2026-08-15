@@ -28,8 +28,8 @@
 //! ```
 //!
 //! e.g. `.../tablet/<tablet_id>`, `.../member/<node_id>`, `.../schema/<table>`,
-//! `.../policy/<tablet_id>`, `.../node_addrs/<node_id>`, `.../keyspace/<name>`,
-//! `.../merged/<tablet_id>`. A dedicated watermark key,
+//! `.../policy/<tablet_id>`, `.../node_addrs/<node_id>`, `.../keyspace/<name>`.
+//! A dedicated watermark key,
 //! `escape(RESERVED_NAMESPACE) || escape("_applied_index")`
 //! ([`applied_index_key`]), sits alongside the entity-kind segment (not under
 //! one) — it records the async apply task's durable applied index (wired in a
@@ -37,7 +37,7 @@
 //!
 //! Every command a later PR's apply task drains touches only the keys for the
 //! entities it actually mutates (`SplitTablet` two-to-three tablet keys,
-//! `CasTabletReplicas` one, `MergeTablets` two, …) — this is the actual
+//! `CasTabletReplicas` one, …) — this is the actual
 //! scalability fix over today's whole-`Metadata`-image snapshot/compaction
 //! cost (see the design doc this PR implements the first slice of).
 //!
@@ -113,9 +113,6 @@ pub enum EntityKind {
     NodeAddrs,
     /// A registered keyspace (`Metadata::keyspaces`), keyed by its name.
     Keyspace,
-    /// A never-pruned merge marker (`Metadata::merged_tablets`), keyed by the
-    /// merged-away [`TabletId`].
-    Merged,
     /// A monotonic id-allocator counter (`Metadata::next_tablet_id`), keyed
     /// by a fixed ASCII counter name (PR2: `mirror::NEXT_TABLET_ID_COUNTER`;
     /// the ADR 0036 allocator's sibling counter, `next_alloc_id` /
@@ -136,10 +133,6 @@ pub enum EntityKind {
     /// value is the source tablet's id (big-endian `u64`, mirroring
     /// [`Counter`](Self::Counter)'s value shape).
     SplitParent,
-    /// A never-pruned merge-provenance marker (`Metadata::absorbed_by`, ADR
-    /// 0018 §2 amendment), keyed by the absorbed tablet's [`TabletId`]; the
-    /// value is the surviving tablet's id (big-endian `u64`).
-    AbsorbedBy,
     /// A stream-shard segment catalog row (`Metadata::stream_shards`, ADR
     /// 0042 §3/ADR 0043 §A8), keyed by the composite `(TabletId, epoch)`
     /// pair — 16 raw bytes (`tablet.to_be_bytes() ++ epoch.to_be_bytes()`,
@@ -164,11 +157,9 @@ impl EntityKind {
             EntityKind::Policy => "policy",
             EntityKind::NodeAddrs => "node_addrs",
             EntityKind::Keyspace => "keyspace",
-            EntityKind::Merged => "merged",
             EntityKind::Counter => "counter",
             EntityKind::CpMemberAddr => "cp_member_addr",
             EntityKind::SplitParent => "split_parent",
-            EntityKind::AbsorbedBy => "absorbed_by",
             EntityKind::StreamShard => "stream_shard",
         }
     }
@@ -188,11 +179,9 @@ impl EntityKind {
             b"policy" => EntityKind::Policy,
             b"node_addrs" => EntityKind::NodeAddrs,
             b"keyspace" => EntityKind::Keyspace,
-            b"merged" => EntityKind::Merged,
             b"counter" => EntityKind::Counter,
             b"cp_member_addr" => EntityKind::CpMemberAddr,
             b"split_parent" => EntityKind::SplitParent,
-            b"absorbed_by" => EntityKind::AbsorbedBy,
             b"stream_shard" => EntityKind::StreamShard,
             _ => return None,
         })
@@ -311,12 +300,6 @@ pub fn keyspace_key(name: &str) -> Vec<u8> {
     entity_key(EntityKind::Keyspace, name.as_bytes())
 }
 
-/// A merged-away [`TabletId`]'s key under [`EntityKind::Merged`].
-#[must_use]
-pub fn merged_key(id: TabletId) -> Vec<u8> {
-    entity_key(EntityKind::Merged, &id.0.to_be_bytes())
-}
-
 /// A named counter's key under [`EntityKind::Counter`] (PR2). `name` is a
 /// fixed ASCII constant (`mirror::NEXT_TABLET_ID_COUNTER`), not user input.
 #[must_use]
@@ -337,13 +320,6 @@ pub fn cp_member_addr_key(id: &NodeId) -> Vec<u8> {
 #[must_use]
 pub fn split_parent_key(child: TabletId) -> Vec<u8> {
     entity_key(EntityKind::SplitParent, &child.0.to_be_bytes())
-}
-
-/// An absorbed [`TabletId`]'s key under [`EntityKind::AbsorbedBy`] (ADR 0018
-/// §2 amendment).
-#[must_use]
-pub fn absorbed_by_key(absorbed: TabletId) -> Vec<u8> {
-    entity_key(EntityKind::AbsorbedBy, &absorbed.0.to_be_bytes())
 }
 
 /// A `(tablet, epoch)` pair's key under [`EntityKind::StreamShard`] (ADR
@@ -439,18 +415,16 @@ pub fn decode_key(key: &[u8]) -> Option<DecodedKey> {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [EntityKind; 12] = [
+    const ALL_KINDS: [EntityKind; 10] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
         EntityKind::Policy,
         EntityKind::NodeAddrs,
         EntityKind::Keyspace,
-        EntityKind::Merged,
         EntityKind::Counter,
         EntityKind::CpMemberAddr,
         EntityKind::SplitParent,
-        EntityKind::AbsorbedBy,
         EntityKind::StreamShard,
     ];
 
@@ -554,18 +528,6 @@ mod tests {
             Some(DecodedKey::Entity {
                 kind: EntityKind::Keyspace,
                 id: b"my_ks".to_vec(),
-            })
-        );
-    }
-
-    #[test]
-    fn merged_key_round_trips() {
-        let key = merged_key(TabletId(5));
-        assert_eq!(
-            decode_key(&key),
-            Some(DecodedKey::Entity {
-                kind: EntityKind::Merged,
-                id: 5u64.to_be_bytes().to_vec(),
             })
         );
     }
