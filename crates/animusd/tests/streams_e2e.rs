@@ -778,6 +778,23 @@ async fn fs_segment_store_opt_in_smoke() {
 /// tablet survives as the left child with its own open shard continuing
 /// uninterrupted) is observable through the real wire API from any node,
 /// not just whichever one happened to host the split.
+///
+/// **Known open failure modes — adjudicate against these, don't
+/// re-investigate from scratch.** (1) An **over-count** (`delivered >
+/// expected`) is an open, *production* cross-tablet duplication at a split
+/// boundary: the same write's change-log record gets independently sealed
+/// into both the parent tablet's own stream and the freshly-split child's
+/// epoch 0. The final `assert_eq!` below prints a diagnostic on any
+/// mismatch (grouping by `eventID` vs. by item id) that confirms this is
+/// the shape every time — distinct `eventID`s, same trailing packed-HLC
+/// digits, different `shardId-<tablet>-<epoch>` prefixes — as opposed to a
+/// harness double-read (which would show a *repeated* `eventID`). Tracked
+/// in `docs/engineering-lessons.md`, not fixed here (this file is test-only
+/// by convention/scope). (2) A rarer **deficit** (a timeout short of
+/// `expected`) is a separate, already-documented pre-existing timing
+/// sensitivity in the byte-triggered seal arm under a real write burst (see
+/// `manual_split_with_unsealed_backlog_under_production_seal_knobs`'s own
+/// doc comment below) — unrelated to (1), no known interaction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -928,6 +945,38 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
         deadline,
     )
     .await;
+    if delivered.len() != expected {
+        // Self-adjudicating failure diagnostic: distinguish "same shard+HLC
+        // re-read twice" (a harness double-poll — duplicate `eventID`s)
+        // from "two different shards produced a record for the same item"
+        // (a genuine cross-tablet production duplication — duplicate item
+        // ids under *distinct* `eventID`s, same trailing packed-HLC digits
+        // but a different `shardId-<tablet>-<epoch>` prefix). A run against
+        // `c37995d` found the latter: the *same* write shows up sealed into
+        // both the parent tablet's own epoch and the freshly-split child's
+        // epoch 0 — an open production bug in the split-time change-log
+        // drain (not this file's own iterator bookkeeping), tracked
+        // separately (see this function's own doc comment and
+        // `docs/engineering-lessons.md`) rather than re-investigated here
+        // every time this test goes red.
+        let mut by_event_id: BTreeMap<String, usize> = BTreeMap::new();
+        let mut by_item_id: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for r in &delivered {
+            let event_id = r["eventID"].as_str().unwrap_or("?").to_owned();
+            *by_event_id.entry(event_id.clone()).or_insert(0) += 1;
+            let item_id = r["dynamodb"]["Keys"]["id"]["S"]
+                .as_str()
+                .unwrap_or("?")
+                .to_owned();
+            by_item_id.entry(item_id).or_default().push(event_id);
+        }
+        let dup_events: Vec<_> = by_event_id.iter().filter(|&(_, &c)| c > 1).collect();
+        let dup_items: Vec<_> = by_item_id.iter().filter(|(_, v)| v.len() > 1).collect();
+        eprintln!(
+            "DIAGNOSTIC delivered={} expected={expected} dup_event_ids={dup_events:?} dup_item_ids={dup_items:?}",
+            delivered.len(),
+        );
+    }
     assert_eq!(
         delivered.len(),
         expected,
