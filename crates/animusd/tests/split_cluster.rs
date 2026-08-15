@@ -1,6 +1,6 @@
 //! Split-deployment scenarios beyond what `data_only.rs` / `control_only.rs` /
 //! `data_join.rs` / `watch_metadata.rs` already cover: control-leader
-//! failover under live data traffic, split + merge, failure-driven replica
+//! failover under live data traffic, split, failure-driven replica
 //! repair onto a spare, decommission of a data node via the control leader,
 //! a full-cluster stop/restart, a **simultaneous** control-leader + data-node
 //! failure, and a decommission racing a tablet-split crossover — all against
@@ -272,9 +272,21 @@ async fn control_leader_failover_under_live_data_traffic() {
     .expect("control_leader_failover_under_live_data_traffic timed out");
 }
 
-// ---- 2. Split + merge over a split deployment -------------------------------
+// ---- 2. Split over a split deployment ---------------------------------------
+//
+// Was `split_and_merge_over_a_split_deployment` (ADR 0033): the merge half
+// (trigger via a control node's admin port, survivor serving both halves) is
+// deleted along with tablet merge itself (split-only tablets, ADR 0044) — its
+// data-plane reaction (`HostAction::WidenScope`/`Absorb`) no longer exists, so
+// the merge trigger left the survivor's scope un-widened and every
+// post-merge read failing. The split half is kept and isolated into its own
+// test: `decommission_racing_a_tablet_split_converges_with_no_data_loss`
+// (below) also splits over a split deployment, but always *combined* with a
+// simultaneous decommission — this is the one place a bare split, no other
+// fault in flight, is proven to converge and serve both halves' data on a
+// genuine (non-combined-mode) split deployment.
 
-const MERGE_KEYS: [(&str, &str); 5] = [
+const SPLIT_KEYS: [(&str, &str); 5] = [
     ("a", "v-a"),
     ("g", "v-g"),
     ("m", "v-m"),
@@ -283,7 +295,7 @@ const MERGE_KEYS: [(&str, &str); 5] = [
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn split_and_merge_over_a_split_deployment() {
+async fn split_over_a_split_deployment() {
     timeout(Duration::from_secs(120), async {
         let dir = tempfile::tempdir().unwrap();
         let (control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
@@ -293,7 +305,7 @@ async fn split_and_merge_over_a_split_deployment() {
         await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
 
         let data_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();
-        for (k, v) in MERGE_KEYS {
+        for (k, v) in SPLIT_KEYS {
             put(
                 &data_clients,
                 "split_merge_t",
@@ -325,36 +337,14 @@ async fn split_and_merge_over_a_split_deployment() {
             table_tablets(&data_nodes[0], "split_merge_t").len() == 2
         })
         .await;
-        let child = table_tablets(&data_nodes[0], "split_merge_t")
-            .into_iter()
-            .find(|&t| t != parent)
-            .expect("a child tablet exists");
 
-        // Both halves independently writable/servable post-split.
+        // Both halves independently writable/servable post-split, and every
+        // pre-split key survives the crossover.
         put(&data_clients, "split_merge_t", b"b", b"v-b2", 20).await;
         put(&data_clients, "split_merge_t", b"y", b"v-y2", 20).await;
         await_value(&data_clients, "split_merge_t", b"b", b"v-b2", 20).await;
         await_value(&data_clients, "split_merge_t", b"y", b"v-y2", 20).await;
-
-        // Merge back — trigger against a CONTROL node's admin port this
-        // time, exercising the admin surface from the other deployment half.
-        let (status, body) = admin(
-            control_nodes[0].admin_addr(),
-            "POST",
-            "/admin/tablet/merge",
-            Some(&format!(r#"{{"left":{parent},"right":{child}}}"#)),
-        )
-        .await;
-        assert_eq!(status, 200, "merge trigger: {body}");
-
-        await_true(30, "merge collapsed back to one tablet", || {
-            table_tablets(&data_nodes[0], "split_merge_t").len() == 1
-        })
-        .await;
-
-        // The survivor serves every key, both from before AND after the
-        // split — through the control-plane metadata the whole way.
-        for (k, v) in MERGE_KEYS {
+        for (k, v) in SPLIT_KEYS {
             await_value(
                 &data_clients,
                 "split_merge_t",
@@ -364,15 +354,13 @@ async fn split_and_merge_over_a_split_deployment() {
             )
             .await;
         }
-        await_value(&data_clients, "split_merge_t", b"b", b"v-b2", 20).await;
-        await_value(&data_clients, "split_merge_t", b"y", b"v-y2", 20).await;
 
         for n in control_nodes.iter().chain(data_nodes.iter()) {
             n.shutdown_graceful().await;
         }
     })
     .await
-    .expect("split_and_merge_over_a_split_deployment timed out");
+    .expect("split_over_a_split_deployment timed out");
 }
 
 // ---- 3. Data-node failure -> detect -> repair onto a spare -----------------

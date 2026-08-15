@@ -1127,6 +1127,12 @@ mod gsi_drain_cursor_tests {
         );
     }
 
+    // Unused since `merge_survivor_uses_the_min_over_rows_not_its_own_higher_
+    // watermark` (ADR 0033's data-plane reaction removed, split-only
+    // tablets) was deleted — kept anyway, per plan, since `MergeTablets`
+    // itself (and this helper along with it) dies in the next rung when the
+    // control-plane command and wire surface go.
+    #[allow(dead_code)]
     async fn merge(client_addr: SocketAddr, left: TabletId, right: TabletId) {
         let mut stream = TcpStream::connect(client_addr).await.expect("connect");
         write_frame(
@@ -1317,175 +1323,6 @@ mod gsi_drain_cursor_tests {
         })
         .await
         .expect("split cold-start scenario did not converge in time");
-    }
-
-    /// Two tablets of an indexed table, each with its own, genuinely
-    /// different "gsi" cursor watermark, merged together: the survivor must
-    /// use the **minimum** over both rows, not just its own (higher) one —
-    /// the ADR 0042 §7 min-over-rows rule's one genuine data-loss hazard.
-    /// Demonstrates the hazard directly (an "own-row-only" reading of the
-    /// same post-merge state disagrees with, and is strictly higher than,
-    /// the correct min), then proves the real consequence: the survivor's
-    /// next drain pass actually reconciles the absorbed tablet's own
-    /// uncopied record.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn merge_survivor_uses_the_min_over_rows_not_its_own_higher_watermark() {
-        timeout(Duration::from_secs(120), async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let node = single_node(dir.path()).await;
-            let dynamo_addr = node.dynamo_addr();
-            let client_addr = node.client_addr();
-            let table = "orders";
-            create_table_with_gsi(dynamo_addr, table).await;
-
-            // Seed and fully reconcile ONE item on the left side *before*
-            // splitting — this is the pre-split (single) tablet's own
-            // reconciliation, so its "gsi" row is what the retained LEFT
-            // child inherits (same `range.start`). Nothing is written on the
-            // right side yet: a seed there too would be reconciled by this
-            // same pre-split tablet, and the resulting row would land on
-            // LEFT after the split (inherited), not prove anything about the
-            // fresh RIGHT child's own, independent reconciliation.
-            let left_seed = find_id_on_side(&BOUNDARY, true, "seed-left");
-            put_item(dynamo_addr, table, &left_seed).await;
-            await_indexed(dynamo_addr, table, &left_seed).await;
-
-            let parent = only_tablet(&node, table);
-            split(client_addr, parent, BOUNDARY.to_vec()).await;
-            await_true(20, "split produced two tablets", || {
-                tablets_of(&node, table).len() == 2
-            })
-            .await;
-
-            let (left, right) = {
-                let m = node.metadata();
-                let ts = tablets_of(&node, table);
-                let left = *ts
-                    .iter()
-                    .find(|t| m.tablets[t].range.start.is_empty())
-                    .expect("a left child retains the ring's own start");
-                let right = *ts
-                    .iter()
-                    .find(|t| **t != left)
-                    .expect("a second, right child exists");
-                (left, right)
-            };
-
-            // The right child's OWN first reconciliation: it inherited
-            // nothing from the pre-split tablet (the min-over-rows rule over
-            // an empty set), so this seed is what gives it a genuine "gsi"
-            // watermark of its own, on its own (now-independent) raft group.
-            let right_seed = find_id_on_side(&BOUNDARY, false, "seed-right");
-            put_item(dynamo_addr, table, &right_seed).await;
-            await_indexed(dynamo_addr, table, &right_seed).await;
-
-            let right_group_pre = await_hosted(&node, right, "right tablet hosted pre-merge").await;
-            await_cursor_some(
-                &right_group_pre,
-                "right's own gsi watermark exists pre-merge",
-            )
-            .await;
-            let w_right = right_group_pre
-                .cursor_min_watermark(GSI_TAG)
-                .await
-                .expect("right has reconciled once");
-
-            // Grow LEFT's own watermark past `w_right` with more,
-            // independent writes+reconciliation on its own (separate) raft
-            // group — real wall-clock time passing between these await
-            // points is what makes each later HLC genuinely exceed the
-            // right side's earlier one (the same cross-group,
-            // real-time-grounded HLC ordering `cross_group_lww.rs`'s own
-            // clock-skew tests rely on), not any artificial synchronization.
-            for i in 0..5 {
-                let id = find_id_on_side(&BOUNDARY, true, &format!("left-more-{i}"));
-                put_item(dynamo_addr, table, &id).await;
-                await_indexed(dynamo_addr, table, &id).await;
-            }
-            let left_group = await_hosted(&node, left, "left tablet hosted").await;
-            let w_left = left_group
-                .cursor_min_watermark(GSI_TAG)
-                .await
-                .expect("left has reconciled");
-            assert!(
-                w_left > w_right,
-                "left's own watermark ({w_left:?}) must exceed right's ({w_right:?}) for this \
-                 scenario to be meaningful"
-            );
-
-            // One more item on the RIGHT side, written just before merging —
-            // the record this scenario's assertions are really about. It may
-            // or may not have been reconciled by right's own drain before the
-            // merge lands (real `ProdEnv` gives no hook to pin that), but the
-            // min-over-rows rule must cover it either way.
-            let straggler = find_id_on_side(&BOUNDARY, false, "straggler");
-            put_item(dynamo_addr, table, &straggler).await;
-
-            merge(client_addr, left, right).await;
-            await_true(20, "merge left a single tablet", || {
-                tablets_of(&node, table).len() == 1
-            })
-            .await;
-
-            let survivor =
-                await_hosted(&node, left, "survivor (left) tablet hosted post-merge").await;
-
-            // The absorbed sibling's own "gsi" row survives physically
-            // (merge never erases), but only becomes *visible* through the
-            // survivor's own scope once the reconciler's own `WidenScope`
-            // action actually runs (a real, if usually short, tick or two
-            // after the merge is committed) — poll for it rather than
-            // asserting on the very next tick.
-            let gsi_rows = {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-                loop {
-                    let rows = survivor.cursor_rows_with_token().await;
-                    let gsi_rows: Vec<_> = rows
-                        .into_iter()
-                        .filter(|(_, tag, _)| tag == GSI_TAG)
-                        .collect();
-                    if gsi_rows.len() >= 2 {
-                        break gsi_rows;
-                    }
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "expected the survivor's own row plus the absorbed sibling's, \
-                         last saw {gsi_rows:?}"
-                    );
-                    sleep(Duration::from_millis(100)).await;
-                }
-            };
-
-            // Demonstrate the hazard directly: trusting only the survivor's
-            // OWN token's row (what an "own-row-only" design would read)
-            // gives a HIGHER, wrong answer than the correct min-over-rows
-            // rule — proving that design would have claimed records it
-            // never actually copied.
-            let own_token = cursor::token_of(&survivor.scope_range().start);
-            let own_row_only = gsi_rows
-                .iter()
-                .find(|(token, _, _)| *token == own_token)
-                .map(|(_, _, ts)| *ts)
-                .expect("the survivor's own row is one of the rows found");
-            let correct_min = survivor
-                .cursor_min_watermark(GSI_TAG)
-                .await
-                .expect("at least one row exists");
-            assert!(
-                own_row_only > correct_min,
-                "this scenario's own-row watermark ({own_row_only:?}) must exceed the true min \
-                 ({correct_min:?}) — otherwise the min rule and an own-row-only design would \
-                 agree, and the hazard wouldn't be demonstrated"
-            );
-
-            // And the real consequence: the survivor's next drain pass
-            // actually reconciles the straggler (the absorbed tablet's own
-            // uncopied record) — proving the min rule drives genuine
-            // re-coverage, not just a correct read.
-            await_indexed(dynamo_addr, table, &straggler).await;
-        })
-        .await
-        .expect("merge min-rule scenario did not converge in time");
     }
 
     /// An expected consumer ("gsi", since this table has a GSI) with no

@@ -220,8 +220,8 @@ impl StorageScope {
     /// A **sibling scope of the same tablet group**, holding a different row
     /// kind (ADR 0041 §3): the prefix extended by `kind`, over **the very same
     /// live `KeyRange`** — literally the same `Arc`, so one
-    /// [`narrow`](Self::narrow) moves every kind at once and a split or merge
-    /// can never leave two kinds disagreeing about what this tablet owns.
+    /// [`narrow`](Self::narrow) moves every kind at once and a split can
+    /// never leave two kinds disagreeing about what this tablet owns.
     ///
     /// Every kind of one tablet is `prefix || [kind]`, so two kinds differ in
     /// their final byte at equal length and neither prefixes the other; two
@@ -244,12 +244,12 @@ impl StorageScope {
     /// this `StorageScope` observes the change immediately. A raw setter: the
     /// caller (which watches `Metadata` for this tablet's current range) is
     /// trusted to only call this when the new range is actually correct for
-    /// this tablet right now — which is *usually* a narrowing (a split
-    /// source, `RaftKvNode::narrow_scope`) but is a legitimate **widening**
-    /// when this tablet just absorbed a merged-away sibling's range (ADR
-    /// 0033, `RaftKvNode::widen_scope`). Both call through this one setter;
-    /// the direction is enforced (or intentionally not enforced) by the
-    /// caller, not here.
+    /// this tablet right now — a narrowing (a split source,
+    /// `RaftKvNode::narrow_scope`) in every production path; a **widening**
+    /// (`RaftKvNode::widen_scope`) has no production caller now that tablets
+    /// are split-only, but both call through this one setter, and the
+    /// direction is enforced (or intentionally not enforced) by the caller,
+    /// not here.
     pub fn narrow(&self, new_range: KeyRange) {
         *self.range.lock().expect("storage scope range poisoned") = new_range;
     }
@@ -511,8 +511,8 @@ pub enum KvCommand {
     },
     /// **Range seal** (ADR 0018 §2 amendment, PR2 — see `seal.rs`'s module
     /// doc for the full design): the leader of a range-handoff source (a
-    /// split's `NarrowScope`, or a merge's `Absorb`) commits this through its
-    /// **own** Raft log to mark `range` closed to any further mutation
+    /// split's `NarrowScope`) commits this through its **own** Raft log to
+    /// mark `range` closed to any further mutation
     /// ordered after it. Every replica applies its log in the same order, so
     /// every replica agrees on exactly which entries are "after the seal" —
     /// unlike `fence`, this is not itself gated by a fence (a seal IS a fence
@@ -1760,8 +1760,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// module doc): mark `range` closed to any further mutation ordered after
     /// this entry in this group's own Raft log. Leader-only (else a leader
     /// hint, like every other propose method). Called by the tablet-host
-    /// reconciler (`host::Reconciler`) when executing a split source's
-    /// `NarrowScope` or an absorbed tablet's `Absorb` teardown — never by any
+    /// reconciler (`host::Reconciler`) when executing a split source's own
+    /// `ProposeSeal` action for a still-owed handoff — never by any
     /// data-plane client. Idempotent to re-propose the identical `range`
     /// (the marker key is keyed by `(tablet, range)`, so a repeat simply
     /// refreshes it with a newer `ts` — see `seal.rs`).
@@ -2713,19 +2713,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.scope.narrow(new_range);
     }
 
-    /// Update this group's live [`StorageScope`] range to a **wider** range
-    /// (ADR 0033 tablet merge — the dual of [`narrow_scope`](Self::narrow_scope)):
-    /// called when this tablet was the **surviving (`left`) side** of a
-    /// `MetaCommand::MergeTablets` commit, whose replicated range now covers
-    /// what used to be the merged-away sibling's range too. Safe precisely
-    /// because `MergeTablets` only merges two tablets that already shared a
-    /// replica set on the same node's shared engine (ADR 0026/0028) — the
-    /// absorbed range's data was always physically present under the same
-    /// table prefix, nothing needs to move. The mechanism underneath is the
-    /// same raw setter `narrow_scope` uses; this is a distinctly-named,
-    /// distinctly-documented entry point so a reader auditing every
-    /// `StorageScope` mutation site doesn't have to re-derive "is this
-    /// specific call safe to widen" from context each time.
+    /// Update this group's live [`StorageScope`] range to a **wider** range —
+    /// the dual of [`narrow_scope`](Self::narrow_scope). Tablets are
+    /// split-only (merge, the only production caller of this setter, was
+    /// removed — see the deleted ADR 0033): no live reconciler action calls
+    /// this today, but the raw mechanism — widening a group's scope over
+    /// data already physically present on the same node-shared engine under
+    /// the same table prefix, exactly as `narrow_scope` does in the other
+    /// direction — stays a distinctly-named, distinctly-documented entry
+    /// point rather than folded into `narrow_scope` itself, so a reader
+    /// auditing every `StorageScope` mutation site doesn't have to re-derive
+    /// "is this specific call safe to widen" from context each time. Kept
+    /// exercised directly by `tests/cursor_scope.rs`/`tests/
+    /// cross_group_lww.rs`.
     pub fn widen_scope(&self, new_range: KeyRange) {
         self.scope.narrow(new_range);
     }
