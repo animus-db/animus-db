@@ -186,11 +186,26 @@ comment for its full type/method inventory.
   nothing that ever needed a stale-write race guard. There is deliberately no
   backfill mechanism today because indexes are only declarable at
   `CreateTable` time, so a pre-existing item that predates an index can never
-  exist; **`UpdateTable` now exists (ADR 0042 §2) but is stream-spec-only** —
-  adding an index to a populated table is still rejected outright
-  (`GlobalSecondaryIndexUpdates`) and will need a real backfill when it
-  lands — a reuse of the GSI drain applied to every key rather than one,
-  not a new mechanism (ADR 0041 §5).
+  exist. **`UpdateTable` now backfills for real (ADR 0045)**: a real
+  backfill mechanism exists (`animusd::index_drain`'s seeder arm — the GSI
+  drain applied to every pre-existing key, not a new mechanism, ADR 0041
+  §5's own prediction) and `GlobalSecondaryIndexUpdates` decodes both
+  `Create` and `Delete` (`wire::IndexUpdate`, ADR 0045 §6), and `animusd`
+  dispatches both: `Create` (`animusd::dynamo::create_index`) adds a
+  `Creating`-status `IndexDef` to a possibly-populated table and lets the
+  backfill seeder + completion aggregator converge it to `Active`; `Delete`
+  runs the four-step convergent drop cascade (ADR 0045 §5). `DescribeTable`
+  reports each index's real status (`CREATING`/`ACTIVE`/`DELETING`) plus a
+  per-index `Backfilling: true` while `Creating` — matching real DynamoDB's
+  own shape (the attribute lives inside each `GlobalSecondaryIndexes[]`
+  entry, not at the table level), via a side channel kept separate from
+  `SecondaryIndex` itself (mirroring `StreamDescription`'s own precedent) —
+  and `Query`/`Scan` reject a non-`Active` GSI with `ValidationException`.
+  `GlobalSecondaryIndexUpdates` and `StreamSpecification` are mutually
+  exclusive in one `UpdateTable` call (ADR 0045 §6 Fork C, a deliberate AWS
+  deviation) and exactly one `GlobalSecondaryIndexUpdates` element is
+  accepted per call; adding an LSI this way stays rejected (LSIs are
+  create-time-only in real DynamoDB too).
 - **Still deferred** (don't represent as a full adapter): `BatchGetItem`,
   list-index document paths (`a[0]`), `ADD`/`DELETE` `UpdateExpression`
   arithmetic, `TransactWriteItems`/`TransactGetItems` idempotency tokens

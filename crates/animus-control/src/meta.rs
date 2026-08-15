@@ -16,7 +16,9 @@ use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{IndexDef, SchemaCatalog, StreamSpec, StreamViewType, TableName, TableSchema};
+use crate::schema::{
+    IndexDef, IndexStatus, SchemaCatalog, StreamSpec, StreamViewType, TableName, TableSchema,
+};
 
 /// The default a [`StreamShardRow`]/[`MetaCommand::SealStreamShard`]'s
 /// `view_type` field decodes to when loading a snapshot encoded before this
@@ -261,6 +263,24 @@ pub struct Metadata {
     /// directly, so it doubles as that.
     #[serde(default, with = "stream_shards_codec")]
     pub stream_shards: BTreeMap<(TabletId, u64), StreamShardRow>,
+    /// Per-tablet secondary-index **backfill completion** catalog (ADR 0045
+    /// §4): "this tablet has finished seeding change-log coverage for this
+    /// index's `Creating` scan" (the backfill seeder's own forward sweep of
+    /// its `KIND_BASE` scope, a later PR). Keyed `(tablet, index name)` —
+    /// same identity convention as [`stream_shards`](Self::stream_shards): a
+    /// tablet id already implies its table, so `table` is not part of the
+    /// key. The value is always `()` (presence alone is the fact); mutated
+    /// only through [`MetaCommand::MarkIndexBackfilled`] (idempotent insert)
+    /// and pruned by [`MetaCommand::DropTableTablets`]/
+    /// [`MetaCommand::DropTableIndex`]'s own apply arms. `#[serde(default)]`
+    /// keeps pre-backfill snapshots loading (empty map).
+    ///
+    /// **Wire shape (`#[serde(with = "index_backfill_codec")]`)**: same
+    /// `serde_json` tuple-map-key hazard as `stream_shards` above (a
+    /// `(TabletId, String)` key cannot serialize as a JSON object key either)
+    /// — encoded as a flat JSON array of `{tablet, index}` objects instead.
+    #[serde(default, with = "index_backfill_codec")]
+    pub index_backfill: BTreeMap<(TabletId, String), ()>,
 }
 
 /// Gives [`Metadata::stream_shards`] a `serde_json`-safe wire shape — see
@@ -317,6 +337,48 @@ mod stream_shards_codec {
         Ok(entries
             .into_iter()
             .map(|entry| ((entry.tablet, entry.epoch), entry.row))
+            .collect())
+    }
+}
+
+/// Gives [`Metadata::index_backfill`] a `serde_json`-safe wire shape — the
+/// same rationale as [`stream_shards_codec`] just above (a `(TabletId,
+/// String)` tuple key cannot serialize as a JSON object key either). The
+/// value is always `()`, so there is nothing else to carry: a flat `Vec<{
+/// tablet, index}>` of just the keys.
+mod index_backfill_codec {
+    use std::collections::BTreeMap;
+
+    use animus_tablet::TabletId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    struct Entry {
+        tablet: TabletId,
+        index: String,
+    }
+
+    pub fn serialize<S: Serializer>(
+        map: &BTreeMap<(TabletId, String), ()>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let entries: Vec<Entry> = map
+            .keys()
+            .map(|(tablet, index)| Entry {
+                tablet: *tablet,
+                index: index.clone(),
+            })
+            .collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<(TabletId, String), ()>, D::Error> {
+        let entries = Vec::<Entry>::deserialize(deserializer)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| ((entry.tablet, entry.index), ()))
             .collect())
     }
 }
@@ -487,6 +549,38 @@ pub enum MetaCommand {
     /// Remove a secondary index definition from a table's schema (ADR 0013).
     /// Idempotent: a no-op if the table or the named index does not exist.
     DropTableIndex { table: TableName, index: String },
+    /// Set a secondary index's lifecycle **status** (ADR 0045):
+    /// `Creating`/`Active`/`Deleting`. Mirrors `SetTableMode`'s minimal shape.
+    /// Rejected if the table or the named index does not exist; a no-op if the
+    /// index is already at `status`. In-place mutation via
+    /// `TableSchema::set_index_status` — deliberately **not**
+    /// `upsert_index`'s whole-struct replace, so a status transition never
+    /// clobbers a concurrently-updated copy of the rest of the definition.
+    SetIndexStatus {
+        table: TableName,
+        index: String,
+        status: IndexStatus,
+    },
+    /// One tablet's completion signal for one index's backfill scan (ADR
+    /// 0045 §4): "this tablet has finished seeding change-log coverage for
+    /// this index." Proposed by the backfill seeder (a later PR, ADR 0045
+    /// §2 step 5) once its forward sweep of `KIND_BASE` reaches the end of
+    /// the tablet's current range. Idempotent insert into
+    /// `Metadata::index_backfill`, keyed `(tablet, index)` — a repeat
+    /// proposal (the seeder's own crash-retry) is a genuine `NoOp`. Rejected
+    /// if `table` has no schema, if `index` does not name one of its current
+    /// indexes, or if `tablet` is not currently scoped to `table` (a cheap
+    /// `Metadata::tablets` lookup, unlike `DropTableTablets`'s own O(table's
+    /// tablets) scan — see this variant's apply arm). That last check is not
+    /// merely defensive: without it, a command that lands *after* its own
+    /// tablet has already been dropped (a table/tablet-drop race with an
+    /// in-flight seeder proposal) would insert a permanent orphan row that
+    /// `DropTableTablets`'s own prune already ran past and will never revisit.
+    MarkIndexBackfilled {
+        table: TableName,
+        index: String,
+        tablet: TabletId,
+    },
     /// Set a table's **replication mode** (ADR 0016 / ADR 0017): `Ap` (leaderless
     /// data plane) or `Cp` (leaderful per-tablet Raft). Rejected if the table has
     /// no schema; a no-op if the mode is already set. Replicated like the rest of
@@ -1126,11 +1220,16 @@ impl Metadata {
                 if dropped.is_empty() {
                     return ApplyOutcome::NoOp;
                 }
-                for id in dropped {
-                    self.tablets.remove(&id);
+                for id in &dropped {
+                    self.tablets.remove(id);
                     // A dropped tablet can no longer be reconciled.
-                    self.policies.remove(&id);
+                    self.policies.remove(id);
                 }
+                // ADR 0045: a dropped tablet can no longer be backfilled either
+                // — prune its rows so a gone tablet id never lingers in the
+                // catalog forever (nothing will ever prune it otherwise).
+                self.index_backfill
+                    .retain(|(tablet, _), ()| !dropped.contains(tablet));
                 // Reclaim the dropped tablets' CP member addresses (ADR 0024 GC —
                 // the address-book counterpart of the hosting nodes' file GC).
                 self.prune_cp_member_addrs();
@@ -1157,10 +1256,61 @@ impl Metadata {
                     .get_mut(table)
                     .is_some_and(|schema| schema.remove_index(index));
                 if removed {
+                    // ADR 0045: prune every backfill-completion row for this
+                    // index, scoped to `table`'s own tablets (never a bare
+                    // "match on index name alone" — a distinct table could
+                    // happen to declare a same-named index, and its own rows
+                    // must not be swept up by this table's drop).
+                    let table_tablets: Vec<TabletId> =
+                        self.tablets_for_table(table).map(|(&id, _)| id).collect();
+                    self.index_backfill.retain(|(tablet, idx), ()| {
+                        !(idx == index && table_tablets.contains(tablet))
+                    });
                     ApplyOutcome::Applied
                 } else {
                     ApplyOutcome::NoOp
                 }
+            }
+            MetaCommand::SetIndexStatus {
+                table,
+                index,
+                status,
+            } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let Some(current) = schema.index(index) else {
+                    return ApplyOutcome::Rejected("no such table index");
+                };
+                if current.status == *status {
+                    return ApplyOutcome::NoOp;
+                }
+                schema.set_index_status(index, *status);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::MarkIndexBackfilled {
+                table,
+                index,
+                tablet,
+            } => {
+                let Some(schema) = self.schemas.get(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                if schema.index(index).is_none() {
+                    return ApplyOutcome::Rejected("no such table index");
+                }
+                let belongs_to_table = self
+                    .tablets
+                    .get(tablet)
+                    .is_some_and(|t| t.table.as_deref() == Some(table.as_str()));
+                if !belongs_to_table {
+                    return ApplyOutcome::Rejected("tablet is not scoped to this table");
+                }
+                if self.index_backfill.contains_key(&(*tablet, index.clone())) {
+                    return ApplyOutcome::NoOp;
+                }
+                self.index_backfill.insert((*tablet, index.clone()), ());
+                ApplyOutcome::Applied
             }
             MetaCommand::SetTableMode { table, mode } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
@@ -1923,6 +2073,347 @@ mod tests {
             ApplyOutcome::Rejected("malformed table schema")
         );
         assert_eq!(m.schemas.get("ks.users"), Some(&extended));
+    }
+
+    /// `SetIndexStatus` (ADR 0045): rejects an absent table, rejects an
+    /// absent index on a table that does exist, is a no-op when the index is
+    /// already at the target status, and otherwise transitions the status
+    /// visibly through `table_indexes` (leaving every other field of the
+    /// index definition untouched).
+    #[test]
+    fn set_index_status_apply_arm() {
+        let mut m = Metadata::default();
+
+        // No such table at all.
+        assert_eq!(
+            m.apply(&MetaCommand::SetIndexStatus {
+                table: "ghost".to_owned(),
+                index: "by-email".to_owned(),
+                status: IndexStatus::Active,
+            }),
+            ApplyOutcome::Rejected("no such table schema")
+        );
+
+        let base = TableSchema::simple("id", ColumnType::String);
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "users".to_owned(),
+                schema: base,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // Table exists, but the named index does not.
+        assert_eq!(
+            m.apply(&MetaCommand::SetIndexStatus {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                status: IndexStatus::Active,
+            }),
+            ApplyOutcome::Rejected("no such table index")
+        );
+
+        let index = IndexDef {
+            name: "by-email".to_owned(),
+            kind: crate::schema::IndexKind::Global,
+            hash_attribute: "email".to_owned(),
+            sort_attribute: None,
+            projection: crate::schema::IndexProjection::All,
+            status: IndexStatus::Creating,
+        };
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableIndex {
+                table: "users".to_owned(),
+                index,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.table_indexes("users")[0].status,
+            IndexStatus::Creating,
+            "test premise: index starts Creating"
+        );
+
+        // Already at the target status: a no-op, and the definition is
+        // otherwise untouched.
+        assert_eq!(
+            m.apply(&MetaCommand::SetIndexStatus {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                status: IndexStatus::Creating,
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        // A genuine transition applies and is visible via `table_indexes`.
+        assert_eq!(
+            m.apply(&MetaCommand::SetIndexStatus {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                status: IndexStatus::Active,
+            }),
+            ApplyOutcome::Applied
+        );
+        let idx = &m.table_indexes("users")[0];
+        assert_eq!(idx.status, IndexStatus::Active);
+        assert_eq!(idx.name, "by-email");
+        assert_eq!(idx.hash_attribute, "email");
+    }
+
+    /// A fixture for the `MarkIndexBackfilled` tests below: a table with one
+    /// `Creating` GSI and one tablet actually scoped to it.
+    fn table_with_index_and_tablet(m: &mut Metadata, table: &str, index: &str, tablet: TabletId) {
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: table.to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableIndex {
+                table: table.to_owned(),
+                index: IndexDef {
+                    name: index.to_owned(),
+                    kind: crate::schema::IndexKind::Global,
+                    hash_attribute: "email".to_owned(),
+                    sort_attribute: None,
+                    projection: crate::schema::IndexProjection::All,
+                    status: IndexStatus::Creating,
+                },
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet,
+                table: Some(table.to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
+    /// `MarkIndexBackfilled` (ADR 0045 §4): rejects an absent table, rejects
+    /// an absent index on a table that does exist, is idempotent on a repeat
+    /// proposal for the same `(tablet, index)`, and otherwise records a
+    /// visible row in `Metadata::index_backfill`.
+    #[test]
+    fn mark_index_backfilled_apply_arm() {
+        let mut m = Metadata::default();
+
+        // No such table at all.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "ghost".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(1),
+            }),
+            ApplyOutcome::Rejected("no such table schema")
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "users".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // Table exists, but the named index does not.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(1),
+            }),
+            ApplyOutcome::Rejected("no such table index")
+        );
+
+        // Add the index and a tablet scoped to it (the schema already
+        // exists from just above, so drive `CreateTableIndex`/`CreateTablet`
+        // directly here instead of the shared fixture, which would try to
+        // recreate the schema).
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableIndex {
+                table: "users".to_owned(),
+                index: IndexDef {
+                    name: "by-email".to_owned(),
+                    kind: crate::schema::IndexKind::Global,
+                    hash_attribute: "email".to_owned(),
+                    sort_attribute: None,
+                    projection: crate::schema::IndexProjection::All,
+                    status: IndexStatus::Creating,
+                },
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // A genuine mark applies and is visible.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(1),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            m.index_backfill
+                .contains_key(&(TabletId(1), "by-email".to_owned()))
+        );
+
+        // A repeat proposal (the seeder's own crash-retry) is idempotent.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(1),
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(m.index_backfill.len(), 1);
+    }
+
+    /// `MarkIndexBackfilled` rejects a tablet that does not currently belong
+    /// to the named table — either because it belongs to a different table,
+    /// or because it has never existed at all.
+    #[test]
+    fn mark_index_backfilled_rejects_a_tablet_not_scoped_to_the_table() {
+        let mut m = Metadata::default();
+        table_with_index_and_tablet(&mut m, "users", "by-email", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("orders".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // A tablet that belongs to a different table.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(2),
+            }),
+            ApplyOutcome::Rejected("tablet is not scoped to this table")
+        );
+
+        // A tablet id that has never existed at all.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(999),
+            }),
+            ApplyOutcome::Rejected("tablet is not scoped to this table")
+        );
+        assert!(m.index_backfill.is_empty());
+    }
+
+    /// `DropTableTablets` (ADR 0045): pruning a table's tablets also prunes
+    /// every `index_backfill` row keyed to one of those tablet ids, whatever
+    /// index it names — a gone tablet id can never be reported against
+    /// again — while leaving another table's rows (even a same-named index
+    /// on a different table) untouched.
+    #[test]
+    fn drop_table_tablets_prunes_index_backfill_rows_for_the_dropped_tablets() {
+        let mut m = Metadata::default();
+        table_with_index_and_tablet(&mut m, "users", "by-email", TabletId(1));
+        table_with_index_and_tablet(&mut m, "orders", "by-email", TabletId(2));
+        for (table, tablet) in [("users", TabletId(1)), ("orders", TabletId(2))] {
+            assert_eq!(
+                m.apply(&MetaCommand::MarkIndexBackfilled {
+                    table: table.to_owned(),
+                    index: "by-email".to_owned(),
+                    tablet,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(m.index_backfill.len(), 2);
+
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableTablets {
+                table: "users".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert!(
+            !m.index_backfill
+                .contains_key(&(TabletId(1), "by-email".to_owned())),
+            "the dropped table's row must be pruned"
+        );
+        assert!(
+            m.index_backfill
+                .contains_key(&(TabletId(2), "by-email".to_owned())),
+            "the other table's same-named-index row must survive"
+        );
+    }
+
+    /// `DropTableIndex` (ADR 0045): dropping an index prunes every
+    /// `index_backfill` row for that index name, scoped to the owning
+    /// table's own tablets — a distinct table's row for a same-named index
+    /// must survive untouched.
+    #[test]
+    fn drop_table_index_prunes_index_backfill_rows_for_that_index() {
+        let mut m = Metadata::default();
+        table_with_index_and_tablet(&mut m, "users", "by-email", TabletId(1));
+        table_with_index_and_tablet(&mut m, "orders", "by-email", TabletId(2));
+        for (table, tablet) in [("users", TabletId(1)), ("orders", TabletId(2))] {
+            assert_eq!(
+                m.apply(&MetaCommand::MarkIndexBackfilled {
+                    table: table.to_owned(),
+                    index: "by-email".to_owned(),
+                    tablet,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(m.index_backfill.len(), 2);
+
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableIndex {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert!(
+            !m.index_backfill
+                .contains_key(&(TabletId(1), "by-email".to_owned())),
+            "the dropped index's row must be pruned"
+        );
+        assert!(
+            m.index_backfill
+                .contains_key(&(TabletId(2), "by-email".to_owned())),
+            "the other table's same-named index must be untouched"
+        );
+
+        // Idempotent: a repeat drop is a no-op that prunes nothing further
+        // (there is nothing left to prune).
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableIndex {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+            }),
+            ApplyOutcome::NoOp
+        );
     }
 
     /// `CreateTableSchema` rejects a table name that collides with the
@@ -2981,6 +3472,56 @@ mod tests {
         );
 
         let value = serde_json::to_value(&m).expect("metadata serializes with stream_shards");
+        let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
+        assert_eq!(decoded, m);
+    }
+
+    /// The identical hazard as
+    /// `metadata_round_trips_through_json_with_populated_stream_shards`
+    /// above, for `Metadata::index_backfill` (ADR 0045 §4) — its key is also
+    /// a non-string tuple (`(TabletId, String)`), so this must be proven
+    /// against a genuinely populated map, not an empty one (per the
+    /// engineering-lessons "an empty collection can't prove a map-key
+    /// encoding rule" lesson). Written before any other backfill-catalog
+    /// wiring, per that same lesson.
+    #[test]
+    fn metadata_round_trips_through_json_with_populated_index_backfill() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::CreateTableSchema {
+            table: "users".to_owned(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        });
+        m.apply(&MetaCommand::CreateTableIndex {
+            table: "users".to_owned(),
+            index: IndexDef {
+                name: "by-email".to_owned(),
+                kind: crate::schema::IndexKind::Global,
+                hash_attribute: "email".to_owned(),
+                sort_attribute: None,
+                projection: crate::schema::IndexProjection::All,
+                status: IndexStatus::Creating,
+            },
+        });
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::MarkIndexBackfilled {
+                table: "users".to_owned(),
+                index: "by-email".to_owned(),
+                tablet: TabletId(1),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            !m.index_backfill.is_empty(),
+            "test premise: the catalog must actually be populated"
+        );
+
+        let value = serde_json::to_value(&m).expect("metadata serializes with index_backfill");
         let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
         assert_eq!(decoded, m);
     }

@@ -1799,6 +1799,70 @@ debugging anything that feels like it might have happened before.
   gate-failure diff against a change that touches one of these string
   literals: check whether the assertion's own expected string needs
   updating before assuming the change broke something. (2026-08-14.)
+- **A commit message's claim that a test helper is "now dead" must be
+  verified by grepping the helper's name across its whole file, not
+  inferred from "the one test that motivated the deletion is gone."**
+  148b3ac (ADR 0044, removing tablet merge) deleted `streams_e2e.rs`'s
+  local `admin()` helper alongside the one merge-stopgap test that called
+  it, reasoning it was now unused — but three *other* tests already in
+  that file (`admin_status_survives_a_populated_stream_shard_catalog`,
+  `admin_data_dynamo_proxy_reaches_streams_read_api`,
+  `admin_data_dynamo_proxy_rejects_unknown_op_cleanly`) also called it,
+  so the deletion broke `cargo build --workspace --all-targets`/`cargo
+  test -p animusd` outright — silently, since this repo's CI billing is
+  broken (see the `docs/engineering-lessons-archive.md`/root `CLAUDE.md`
+  history) and no automated gate ever ran it after merge. Sat unnoticed on
+  `main` until the next agent to touch `animusd` hit it cold. Found and
+  fixed while building ADR 0045 PR1 (index-status catalog plumbing,
+  unrelated) — restored the helper verbatim from before the deletion
+  commit. General form: when deleting a symbol because "its only caller is
+  going away," grep the symbol's own name (not just its caller) across the
+  file/crate before deleting it, exactly the same discipline this log
+  already prescribes for gating `match` sites on a command enum.
+  (2026-08-15.)
+- **An internal design doc's paraphrase of a real external API's response
+  shape is not the API — verify against the real shape before wiring a
+  field, even when the doc sounds precise.** ADR 0045 §6 sketched
+  `DescribeTable`'s new `Backfilling: bool` as a **table-level** flag ("any
+  index `Creating`"); real DynamoDB places `Backfilling` **inside each
+  `GlobalSecondaryIndexes[]` entry**, and only while that specific index is
+  backfilling (the attribute is *absent*, never `false`, once finished).
+  Building PR6 to the doc's wording as written would have shipped a
+  plausible-looking but wrong wire shape no test would have caught, since
+  every test in the same PR would have been written against the same wrong
+  premise. Caught only because the task brief explicitly flagged the
+  wording as "looser than AWS reality" and asked for the real shape to be
+  checked — worth generalizing: **a design doc is a plan, not a spec of an
+  external contract it merely describes; re-derive the actual third-party
+  shape independently (from real API docs/behavior) rather than trusting a
+  plan's summary of it**, the same way this codebase already insists on
+  reading ADR text as *rationale*, not as the mechanism's ground truth.
+  (`animus-dynamo/src/wire.rs`'s `index_desc`/`table_description_object`,
+  2026-08-15.)
+- **A commit-wait poll for a command that puts an object into a *transient*
+  status must check the object's presence, not that it still holds the
+  exact status value just proposed** — a concurrent convergent loop can
+  legitimately advance past that status before the proposer's own next
+  poll, especially on a small/fast-converging fixture in a test. `UpdateTable`
+  Create (ADR 0045 §6) proposes `CreateTableIndex{status: Creating}` and
+  waits for it to commit exactly like `create_table`'s own index-definition
+  loop (presence-by-name only, `dynamo.rs::create_table`); the completion
+  aggregator (`index_backfill_loop`, ADR 0045 §4) can flip that same index
+  to `Active` within one tick of a tiny table's backfill finishing, which on
+  a single-node test can race the proposer's very next `metadata_fresh`
+  read. Polling for `status == Creating` specifically would then spuriously
+  time out despite the create having fully succeeded. The already-shipped
+  `set_index_status` (used by the drop cascade's `Deleting` transition)
+  gets away with checking the exact target status only because nothing in
+  this codebase ever proposes a *further* transition away from `Deleting`
+  before `DropTableIndex` removes the definition outright — that is a
+  narrower invariant than "commit-wait polls are safe to pin to an exact
+  status," not a counterexample to this lesson. General rule: when a
+  commit-wait's target value can itself be mutated again by some other
+  loop before the waiter's next poll, wait on the mutation that is
+  monotonic/permanent (existence, a monotonic counter, a specific id) —
+  never on a value a *different* proposer can race past.
+  (`animusd/src/dynamo.rs::create_index`, 2026-08-15.)
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
@@ -4618,6 +4682,119 @@ debugging anything that feels like it might have happened before.
   execute_routed`, then pointing both the edge and the admin proxy at it.
   (`crates/animusd/src/dynamo.rs::execute_routed`; `crates/animusd/src/
   admin.rs::action_data_dynamo`; ADR 0042 §3, 2026-08-14.)
+- **A "confirm by re-reading the value I just wrote" helper silently assumes
+  the caller can predict that value's key ahead of the propose call — check
+  that before reusing it for a new write shape.** `animusd::index_drain`'s
+  existing confirm helpers (`cp_kind_write_raw`'s last-write probe,
+  `cp_kind_local`'s base-row probe) all poll `local_get_kind`/`local_get`
+  for an exact `(kind, key, expected value)` the *caller* chose before
+  proposing. The ADR 0045 §2 backfill seeder needed to propose a
+  `KvCommand::KindBatch` carrying **only** a change-log entry (no base/kind
+  write at all) — and a change-log key's trailing HLC suffix is minted
+  *inside* the propose call, under the group's own lock
+  (`RaftKvNode::propose_ordered`), specifically so it agrees with the
+  entry's log position. There is structurally nothing for the caller to
+  predict and poll for. Reusing either existing helper here would have
+  meant either faking a probe key (wrong — it wouldn't be the real
+  change-log key) or skipping confirmation and acking on `Accepted` alone
+  (wrong — ADR 0009's own "`Accepted` means appended, not committed" rule).
+  The fix was a new confirm shape: `engine_applied_index() >= index` after
+  a genuine `ProposeResult::Accepted { index }` — the same confirm-by-index
+  primitive linearizable reads themselves already gate on, not a new
+  invention. General rule: a confirm-by-probe helper's soundness depends on
+  the caller being able to name the exact key/value the write produces
+  *before* proposing it; a write whose own content is decided inside the
+  propose call (a minted timestamp, a server-assigned id) needs
+  confirm-by-index instead, and the two are not interchangeable by
+  accident — check which one the write actually needs, don't default to
+  copying the nearest existing helper's shape. (`crates/animusd/src/
+  index_drain.rs::seed_change_log_record`; ADR 0045 §2, 2026-08-15.)
+- **A generic "one fence covers every kind in this batch" rule is only sound
+  for keys whose byte value actually falls inside the tablet's own live
+  range — a kind-scoped *bookkeeping* key (not real user data) can silently
+  violate that assumption even though it structurally belongs to this
+  tablet.** ADR 0045 §2's backfill-seeder cursor advance
+  (`ctx.cp_kind_write_raw`, whose fence is always `leader.scope_range()`,
+  the tablet's *current live* range) was rejected as "outside this group's
+  live range" on *every* real split, at every seed, with no fault injection
+  needed — found by `animus-test/tests/backfill_fault_corpus.rs`'s very
+  first run of its split cells (`concurrent_split_during_backfill`/
+  `split_after_tablet_already_reported_done`), which hung forever ("backfill
+  sweep never reached its end after 10,000 ticks") rather than failing
+  loudly, because the *data* seed writes (keyed by real base keys, which do
+  satisfy the fence) kept silently succeeding while only the *cursor's own
+  persistence* failed — restarting the sweep from scratch every tick instead
+  of resuming, masked in every prior test by tables small enough that one
+  tick's `BACKFILL_SEED_BATCH` (256) covers a whole side in one pass
+  regardless. Root cause: `cursor::cursor_key` truncates its `range_start`
+  argument to a bare `TOKEN_BYTES`-wide token (`cursor::token_of`) — sound
+  for the key's own *disjointness* proof (never collides with a real
+  client key) but **not** for range-*containment*: a split's own
+  `split_key` is essentially never token-aligned (chosen from real row
+  content, never the hash ring), so the truncated cursor key sorts *below*
+  the child's own (longer) `range.start` the instant the byte right after
+  the token is non-zero — true of `escape(pk)`'s leading byte for
+  essentially any real partition key. Fixed by giving the cursor's own
+  advance write a dedicated path (`advance_backfill_cursor`, a direct
+  `group.put_kind_batch_fenced(.., KeyRange::whole())`, bypassing
+  `cp_kind_write_raw`'s auto-derived narrow fence entirely) — a cursor
+  row's identity is already fully captured by its own token (disjoint from
+  base data by row-kind, ADR 0041 §3) and immutable across a narrowing, so
+  it needs no range-fencing at all, the same reasoning `seal.rs`/
+  `ceiling.rs`'s engine-global markers already rely on for a *different*
+  flavor of range-independent bookkeeping key. **General check: before
+  reusing a "fence every key in this batch against the tablet's live
+  range" primitive for a *new* kind of key, ask whether that key's own byte
+  value is guaranteed to satisfy `range.contains` — a bookkeeping key
+  derived from a truncated/hashed/otherwise-transformed version of the
+  range boundary is not automatically safe just because it lives in a
+  disjoint row-kind scope.** Also worth naming: the pre-existing `"gsi"`
+  cursor tag has the *identical* underlying gap (its own cursor write goes
+  through the same `cp_kind_write_raw` path) but it is harmless there only
+  because that caller already tolerates a perpetually-`None` cursor as "just
+  reconcile everything, always correct" — a latent bug can be real for one
+  caller and merely a masked inefficiency for another, so "it works today"
+  is not evidence a shared primitive is fencing correctly for a new use.
+  (`crates/animusd/src/index_drain.rs::advance_backfill_cursor`; ADR 0045
+  §2/§3, 2026-08-15.)
+- **A convergent per-name cursor/checkpoint row that survives its owner's
+  deletion can silently poison a same-named recreation — audit every
+  "resume from where I left off" row for whether its *key* is unique to one
+  lifetime of the thing it tracks, not just to its current name.** The
+  backfill seeder's cursor row (`KIND_CURSOR`, tag `backfill:{index_name}`,
+  ADR 0045 §2) is keyed purely by index *name*. Dropping an index (ADR 0045
+  §5) removes its catalog entry and hidden table but, absent an explicit
+  fix, leaves that cursor row exactly where it was — harmless in isolation
+  (the row just describes a scan position for an index that no longer
+  exists), until a *later* `CreateTableIndex` proposes a **new** index
+  under the **same name**: its fresh seeder reads the old row, believes it
+  has "already scanned" up to the deleted index's old position, and skips
+  every partition before that point — the recreated index can flip
+  `Active` having backfilled *nothing*, a silent, non-crashing correctness
+  bug (the row is bytes-valid, just semantically stale). Two considered
+  fixes: (1) make the cursor's key incorporate something that changes
+  across a delete/recreate of the same name — not chosen here, since it
+  would touch the already-shipped `IndexDef` wire shape for a problem step
+  (2) closes with zero schema change; (2) **actively delete the row when
+  the owner is deleted**, chosen — but a *single* delete pass raced a
+  seeder tick that had already read the schema (as still-`Creating`) a
+  moment before the owner's deletion committed and could still write a
+  fresh, stale value *after* the delete. Closed the practical window by
+  running the delete twice (immediately after the status-`Deleting`
+  transition commits — after which the seeder's own gate excludes the
+  index from every *new* tick — and again at the very end of the drop
+  cascade), which is not a full formal proof but is the same
+  documented-residual-gap posture `cursor.rs`'s own module doc already
+  takes for a different byte-alignment gap; the create-drop-recreate
+  regression (`tests/update_table_drop_index.rs::create_drop_recreate_
+  same_index_name_backfills_from_scratch`) is the test that would catch a
+  regression here. **General rule: whenever a delete path removes the
+  *thing* a checkpoint row tracks but the checkpoint's own key could be
+  reused by a future recreation of the same name, either scope the key to
+  a value that can't repeat, or make deletion of the thing also delete the
+  checkpoint — "the row is harmless garbage" is only true until the name
+  comes back.** (`crates/animusd/src/index_drain.rs::clear_backfill_cursor`,
+  `crates/animusd/src/dynamo.rs::drop_index`; ADR 0045 §5, 2026-08-15.)
 
 ### Parallel-agent orchestration
 - **A stacked series' final "docs/ADR finalization" PR must treat the stack's

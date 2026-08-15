@@ -1008,6 +1008,15 @@ fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
             None => json!(key_str(id)),
         };
     }
+    if kind == syskv::EntityKind::IndexBackfill {
+        // A composite (tablet, index name) id (ADR 0045 §4) — same "not a
+        // single numeric field, not cleanly a UTF-8 string either" shape as
+        // `StreamShard` just above; render as `"<tablet>-<index name>"`.
+        return match syskv::decode_index_backfill_id(id) {
+            Some((tablet, index)) => json!(format!("{}-{index}", tablet.0)),
+            None => json!(key_str(id)),
+        };
+    }
     if system_table_id_is_numeric(kind) {
         match <[u8; 8]>::try_from(id) {
             Ok(bytes) => json!(u64::from_be_bytes(bytes).to_string()),
@@ -1023,8 +1032,9 @@ fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
 /// `Schema`/`Policy`/`NodeAddrs`/`CpMemberAddr` are `serde_json` passthrough
 /// (`null` on a malformed value — defensive only, every real writer produces
 /// valid JSON here); `Counter` is a raw big-endian `u64` (`null` if not
-/// exactly 8 bytes); `Keyspace` is presence-only (its value is
-/// always empty) — always `null`, regardless of the actual bytes.
+/// exactly 8 bytes); `Keyspace`/`IndexBackfill` (ADR 0045 §4) are
+/// presence-only (their value is always empty) — always `null`, regardless
+/// of the actual bytes.
 /// `SplitParent` (ADR 0018 §2 amendment) stores the other
 /// tablet's id as a raw big-endian `u64`, same shape as `Counter` but
 /// rendered as a decimal **string** (like a numeric entity id,
@@ -1047,7 +1057,9 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
             Ok(bytes) => json!(u64::from_be_bytes(bytes)),
             Err(_) => Value::Null,
         },
-        syskv::EntityKind::Keyspace => Value::Null,
+        // Presence-only, like `Keyspace` (ADR 0045 §4: the value is always
+        // empty — the row's existence is the fact).
+        syskv::EntityKind::Keyspace | syskv::EntityKind::IndexBackfill => Value::Null,
         syskv::EntityKind::SplitParent => match <[u8; 8]>::try_from(value) {
             Ok(bytes) => json!(u64::from_be_bytes(bytes).to_string()),
             Err(_) => Value::Null,

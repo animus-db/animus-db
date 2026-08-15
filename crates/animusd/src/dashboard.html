@@ -153,6 +153,25 @@
         <div class="browser-panel" style="margin-bottom:14px">
           <div class="browser-fields" id="br-dy-fields"></div>
           <div id="br-dy-indexes"></div>
+          <div class="card" id="br-dy-ix-form" style="display:none;margin-bottom:14px">
+            <h2>Add index (GSI)</h2>
+            <div class="form-grid">
+              <div class="form-field"><label>Index name</label><input type="text" id="br-dy-ix-name" placeholder="index_name"></div>
+              <div class="form-field"><label>Hash attribute</label><input type="text" id="br-dy-ix-hash" placeholder="attribute"></div>
+              <label class="row" style="font-size:11.5px;color:var(--text2)"><input type="checkbox" id="br-dy-ix-has-sort"> Add sort attribute</label>
+              <div class="form-field" id="br-dy-ix-sort-wrap" style="display:none"><label>Sort attribute</label><input type="text" id="br-dy-ix-sort" placeholder="attribute"></div>
+              <div class="form-field"><label>Projection</label>
+                <select id="br-dy-ix-proj"><option value="ALL">ALL</option><option value="KEYS_ONLY">KEYS_ONLY</option><option value="INCLUDE">INCLUDE</option></select>
+              </div>
+              <div class="form-field" id="br-dy-ix-include-wrap" style="display:none"><label>Non-key attributes (comma-separated)</label><input type="text" id="br-dy-ix-include" placeholder="a,b,c"></div>
+            </div>
+            <div class="muted" style="margin-top:6px">GSI only — LSIs can only be declared at table creation.</div>
+            <div class="row" style="justify-content:flex-end;margin-top:12px">
+              <span class="muted" id="br-dy-ix-msg"></span>
+              <button id="br-dy-ix-cancel">Cancel</button>
+              <button class="primary" id="br-dy-ix-submit">Add index</button>
+            </div>
+          </div>
           <div id="br-dy-stream"></div>
           <div class="row" style="gap:16px">
             <div class="seg-group">
@@ -401,6 +420,14 @@ $("br-dy-ct-submit").addEventListener("click", submitTableForm);
 $("br-dy-op-scan").addEventListener("click", () => setDynamoOp("scan"));
 $("br-dy-op-query").addEventListener("click", () => setDynamoOp("query"));
 $("br-dy-index").addEventListener("change", onDyIndexChange);
+$("br-dy-ix-has-sort").addEventListener("change", () => {
+  $("br-dy-ix-sort-wrap").style.display = $("br-dy-ix-has-sort").checked ? "" : "none";
+});
+$("br-dy-ix-proj").addEventListener("change", () => {
+  $("br-dy-ix-include-wrap").style.display = $("br-dy-ix-proj").value === "INCLUDE" ? "" : "none";
+});
+$("br-dy-ix-cancel").addEventListener("click", closeAddIndexForm);
+$("br-dy-ix-submit").addEventListener("click", submitAddIndexForm);
 $("br-dy-pk-value").addEventListener("input", () => { dyPkValue = $("br-dy-pk-value").value; });
 $("br-dy-sk-op").addEventListener("change", () => { dySkOp = $("br-dy-sk-op").value; });
 $("br-dy-sk-value").addEventListener("input", () => { dySkValue = $("br-dy-sk-value").value; });

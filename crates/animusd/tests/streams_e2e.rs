@@ -115,6 +115,29 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     (status, payload.to_string())
 }
 
+async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
+    let body = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.0\r\nHost: animus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    stream.write_all(request.as_bytes()).await.expect("send");
+    stream.flush().await.expect("flush");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read response");
+    let text = String::from_utf8(raw).expect("utf8 response");
+    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    let value: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    (status, value)
+}
+
 fn json(body: &str) -> Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
 }

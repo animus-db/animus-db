@@ -22,8 +22,16 @@ per-tablet CP data plane (`animus-cp-data`).
 
   and `Metadata::rebalance` are the *pure* placement decisions (see
   Invariants). Holds members, the tablet map, placement policies, the
-  table-schema catalog, keyspaces, node addressing (`node_addrs`), and the
-  DynamoDB Streams segment catalog (`stream_shards`). Tablets are
+  table-schema catalog, keyspaces, node addressing (`node_addrs`), the
+  DynamoDB Streams segment catalog (`stream_shards`), and the secondary-index
+  backfill-completion catalog (`index_backfill`, ADR 0045 §4 — per-`(tablet,
+  index)` "this tablet finished seeding change-log coverage for this index",
+  populated by `MetaCommand::MarkIndexBackfilled` and consumed by `animusd`'s
+  `index_backfill_loop`, the control-leader-only aggregator that flips an
+  index from `Creating` to `Active` once every one of its table's *current*
+  tablets has reported; same `(tablet, name)`-not-`(table, name, tablet)`
+  identity convention as `stream_shards`, and the same
+  `#[serde(with = "..._codec")]` tuple-key JSON workaround). Tablets are
   **split-only** (ADR 0044) — `MergeTablets` and its dual `absorbed_by`/
   `merged_tablets` provenance (ADR 0033) were removed entirely, taking
   with them the ADR 0042 §12/ADR 0043 §A5 "F1" merge-vs-streamed-table
