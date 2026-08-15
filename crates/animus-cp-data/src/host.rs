@@ -305,10 +305,9 @@ async fn seal_covers<S: StorageEngine>(storage: &S, tablet: u64, needed: &KeyRan
 /// `plan` itself performs no I/O.
 ///
 /// Emitted in a fixed overall order — every [`ProposeSeal`](Self::ProposeSeal)
-/// action, then every [`NarrowScope`](Self::NarrowScope)/
-/// [`NarrowScope`](Self::NarrowScope) action, then every [`Host`](Self::Host),
-/// then every [`Reconfigure`](Self::Reconfigure), then every
-/// [`Release`](Self::Release)/[`Reclaim`](Self::Reclaim)
+/// action, then every [`NarrowScope`](Self::NarrowScope) action, then every
+/// [`Host`](Self::Host), then every [`Reconfigure`](Self::Reconfigure), then
+/// every [`Release`](Self::Release)/[`Reclaim`](Self::Reclaim)
 /// — mirroring the existing loops' relative priority (give a pending seal a
 /// chance to land before anything that gates on it; adjust a still-hosted
 /// tablet's scope before deciding anything else about it; stand up a

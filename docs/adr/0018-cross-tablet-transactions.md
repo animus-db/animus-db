@@ -312,41 +312,30 @@ Mint order **is** log order — enforced, not assumed.)*
 below) also had an unretried one-shot proposal bug, independent of the
 mint-order bug above — caught deterministically by a genuine multi-process
 split-cluster deployment (control-only + data-only roles, ADR 0035), where it
-permanently stalled both a split's child hosting and a merge's survivor
-widening. The seal proposal used to be bundled as a side effect of the same
-tick that performed the local, irreversible action it was supposed to
-precede — `NarrowScope`'s local scope mutation (leader-gated propose inline),
-or `Absorb`'s teardown (leader-gated propose, then a drain-wait gated only on
-"nothing pending locally", not on the seal itself). Both are one-shot: the
-local mutation happens unconditionally regardless of leadership, and once it
-has happened the condition that would re-trigger the proposal attempt is
-gone — so if leadership isn't held by the replica processing that exact tick
-(a leadership change mid-handoff; an independent per-node reconcile timer in
-a genuine multi-process deployment, not a combined node's synchronized
-loops), the seal is never proposed by anyone, ever. Worse on the absorb side:
-a follower's "nothing pending locally" drain check is satisfied trivially
-before the leader has even proposed the seal, so a fast follower could tear
-its own copy down first — destroying quorum before the leader's own,
-now-orphaned proposal could ever commit.
-Fixed two ways: (1) the seal proposal is now `plan`'s
+permanently stalled a split's child hosting. The seal proposal used to be
+bundled as a side effect of the same tick that performed `NarrowScope`'s
+local scope mutation (leader-gated propose inline) — one-shot: the local
+mutation happens unconditionally regardless of leadership, and once it has
+happened the condition that would re-trigger the proposal attempt is gone —
+so if leadership isn't held by the replica processing that exact tick (a
+leadership change mid-handoff; an independent per-node reconcile timer in a
+genuine multi-process deployment, not a combined node's synchronized loops),
+the seal is never proposed by anyone, ever.
+Fixed: the seal proposal is now `plan`'s
 `HostAction::ProposeSeal`, derived from a **persistent condition**
 (`TabletFacts::pending_seals`) re-checked from scratch every tick — "does a
 covering seal marker exist in my own engine yet" — independent of whether
-this replica's local scope/teardown state has already changed, so whichever
-replica eventually holds leadership gets its chance, however leadership
-shuffles relative to the local mutation. (2) `Reconciler::teardown`'s Absorb
-drain now additionally requires a **locally-observed committed** seal
-covering this tablet's own scope before proceeding — never "nothing pending
-locally" alone. This gate is self-supporting, not a deadlock risk: requiring
-every absorbed replica to observe the seal before tearing down is exactly
-what keeps every replica — hence the quorum needed to commit the seal in the
-first place — alive for as long as it takes the seal to actually commit; a
-genuinely quorum-dead group (an unrelated double failure) correctly stalls
-loudly instead of tearing down early, per this system's usual
-correctness-over-liveness doctrine for a durability/visibility gate. See
-`crates/animus-cp-data/CLAUDE.md`'s Key Invariants entry and
-`docs/engineering-lessons.md` for the full mechanism and the diagnostic
-story.)*
+this replica's local scope state has already changed, so whichever replica
+eventually holds leadership gets its chance, however leadership shuffles
+relative to the local mutation. See `crates/animus-cp-data/CLAUDE.md`'s Key
+Invariants entry for the mechanism as it stands today. The original
+diagnostic story also covered tablet merge's mirror-image half
+(`Reconciler::teardown`'s Absorb drain gated on a **locally-observed
+committed** seal, not merely "nothing pending locally") — merge and that
+half of the fix were removed by [ADR 0044](0044-split-only-tablets.md); the
+full original text is archived verbatim in
+`docs/engineering-lessons-archive.md`, since the seal-ordering lesson itself
+generalizes to split's still-live `NarrowScope` gating.)*
 
 ### 1. Why `version_floor` had to go, and why witnessing alone isn't enough
 
@@ -370,7 +359,7 @@ that gap is exactly what ADR 0017 §3 forbids as a *correctness* mechanism.
 
 The replacement is structural in a different sense: instead of separating
 version *numbers*, it separates **log positions**. When a source tablet hands
-off a range (a split's `NarrowScope`, or a merge's `Absorb`), its leader
+off a range (a split's `NarrowScope`), its leader
 proposes a **`KvCommand::Seal { range, ts }`** through its own Raft log before
 the range is considered handed off. Every replica of that group applies its
 log in the same total order, so every replica agrees on the exact position
@@ -386,8 +375,8 @@ reject a write whose *proposer* simply hadn't learned about the split yet (the
 "wide fence, un-ticked leader" case) even though that write's own timestamp,
 minted after the fact, would otherwise look perfectly legitimate.
 
-The seal's durable witness for a co-hosted **successor** (a split child, or a
-merge survivor) is a **marker key written directly into the shared engine**,
+The seal's durable witness for a co-hosted **successor** (a split child) is
+a **marker key written directly into the shared engine**,
 deliberately outside every `StorageScope` (ADR 0026/0028) so a successor can
 observe it with no scope machinery — keyed by `(source tablet id, sealed
 range)` rather than tablet id alone (a tablet can seal more than once over its
@@ -416,24 +405,24 @@ matching obligation is that a **successor must not start serving that range
 until it can see the seal**. The tablet-host reconciler (`animus-cp-data`'s
 `host` module) gates on exactly this: a split child's `HostAction::Host` is
 deferred until this node's own engine contains the parent's seal marker
-covering the child's range (`Metadata::split_parents`, new provenance,
-mirroring `merged_tablets`'s never-pruned discipline); a merge survivor's
-`HostAction::WidenScope` is deferred until the absorbed tablet's seal marker
-covers the widened portion (`Metadata::absorbed_by`, the reverse-direction
-provenance). Both facts are gathered as bounded, tablet-scoped engine scans
-(`gather_facts`), keeping `plan` itself pure.
+covering the child's range (`Metadata::split_parents`, provenance that is
+never pruned — tablet ids are never reused, so an entry can never resurrect
+a wrong decision for some later tablet reusing the id). This fact is
+gathered as a bounded, tablet-scoped engine scan (`gather_facts`), keeping
+`plan` itself pure. (Tablet merge had a mirror-image gate here — a merge
+survivor's `HostAction::WidenScope` deferred on the absorbed tablet's seal
+via `Metadata::absorbed_by` — until [ADR 0044](0044-split-only-tablets.md)
+removed merge and this half of the reconciler along with it;
+`parent_seal_observed`/`split_parents` are what remains.)
 
 *(As shipped, the seal proposal itself was a one-shot side effect bundled
-into the same tick as the local `NarrowScope` mutation or the `Absorb`
-drain-wait — see Corrective note #2 above for the bug this produced and its
-fix: proposing the seal is now `plan`'s own `HostAction::ProposeSeal`, a
-persistent condition re-derived every tick, decoupled entirely from the
-local scope mutation / teardown timing; and the absorbed side's drain-wait
-additionally requires the seal to be locally observed as **committed**, not
-merely "nothing pending locally", before a replica may tear itself down.)*
+into the same tick as the local `NarrowScope` mutation — see Corrective note
+#2 above for the bug this produced and its fix: proposing the seal is now
+`plan`'s own `HostAction::ProposeSeal`, a persistent condition re-derived
+every tick, decoupled entirely from the local scope mutation timing.)*
 
 **Liveness, not correctness, is what a stalled source jeopardizes**: a
-split/merge successor waiting for a source-group leader to seal stalls if that
+split successor waiting for a source-group leader to seal stalls if that
 source group has no live quorum — but this is exactly the same liveness
 dependency every other cross-group handoff in this system already has (the
 data the successor would serve is owned by that same quorum), never a
@@ -659,8 +648,8 @@ Per the PR1 amendment's decision 3, the record lives **inside** the first
 which are deliberately **engine-global** (outside every `StorageScope`),
 a txn record has to be an ordinary in-scope logical key of one specific
 tablet, so it replicates through that tablet's own Raft log, ships with
-`engine_image` snapshots, and moves with a split/merge exactly like the
-anchor's own data would.
+`engine_image` snapshots, and moves with a split exactly like the anchor's
+own data would.
 
 That locality choice means the seal/ceiling markers' disjointness trick
 (reserve a name — `RESERVED_NAMESPACE` — no user table may ever claim,

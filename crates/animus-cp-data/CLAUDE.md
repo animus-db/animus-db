@@ -30,8 +30,10 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   `ProposeSignal`. See the API bullets below.
 - **`host.rs`** — the per-node tablet-host reconciler (ADR 0031): the pure
   `plan()` decision, `Reconciler` executor, `MetadataView`/`TabletFacts`/
-  `LocalState`, and the `HostAction` set (incl. `Absorb`/`WidenScope`). 34
-  unit tests. See "The host module".
+  `LocalState`, and the `HostAction` set (`ProposeSeal`/`NarrowScope`/`Host`/
+  `Reconfigure`/`Release`/`Reclaim` — tablets are split-only, ADR 0044; the
+  merge-dual `Absorb`/`WidenScope` actions were removed). 31 unit tests. See
+  "The host module".
 - **`cluster_segment_store.rs`** (ADR 0043 §A7b, F5) — `ClusterSegmentStore<E,
   S>`: the **default** `SegmentStore` for the stream-shard subsystem — K-way
   replication of an immutable segment across `K` nodes' own local `S`-backed
@@ -116,18 +118,24 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   a future corpus to stress. `token_of(range_start) -> [u8; TOKEN_BYTES]` is
   `cursor_key`'s own truncate/zero-pad step, split out (PR A2) so a caller
   that already has a *parsed* row's own token can compute *this* tablet's
-  own token to compare against, without rebuilding a whole key — the
-  `animusd` trim janitor's merge-residue cleanup (below) is exactly this
-  caller. `RaftKvNode::cursor_watermark`/`cursor_rows`/`cursor_min_watermark`
+  own token to compare against, without rebuilding a whole key.
+  `RaftKvNode::cursor_watermark`/`cursor_rows`/`cursor_min_watermark`
   (in `lib.rs`, next to `local_get_kind`/`local_scan_kind`) are the read-side
   accessors — `cursor_min_watermark` implements ADR 0042 §7's min-over-rows
   rule directly (the minimum watermark across every row of a tag in this
-  tablet's own, possibly merge-widened, `KIND_CURSOR` scope).
-  `cursor_rows_with_token` (PR A2) is `cursor_rows`'s token-keeping sibling —
-  `cursor_rows` itself is now a thin wrapper dropping the token, since none
-  of *its* callers need it, but the trim janitor's merge-residue cleanup
-  does (telling "this tablet's own row" from "a still-physically-present
-  absorbed sibling's row" needs the token, not just the tag). Write-side is
+  tablet's own `KIND_CURSOR` scope; the multi-row-per-tag case it exists to
+  resolve was historically a merge survivor's widened scope, now removed
+  entirely by ADR 0044 — kept anyway as defensive, unproven-unreachable
+  tolerance under split alone, a named simplification follow-up, not done in
+  the split-only-tablets stack). `cursor_rows_with_token` (PR A2) is
+  `cursor_rows`'s token-keeping sibling — `cursor_rows` itself is now a thin
+  wrapper dropping the token, since none of *its* callers need it.
+  `cursor_rows_with_token`/`token_of` have **no production caller today**:
+  their original caller, the ADR 0042 §7 trim janitor's merge-residue
+  cleanup (`animusd::index_drain`, telling "this tablet's own row" from "a
+  still-physically-present absorbed sibling's row"), was deleted along with
+  `MergeTablets` (ADR 0044); kept in case a future consumer needs the same
+  token-vs-physical-presence disambiguation. Write-side is
   deliberately just `put_kind_batch(KIND_CURSOR, ..)` — no bespoke propose
   method — since the existing `KvCommand::KindBatch` primitive already
   covers it; the `animusd` GSI drain (`index_drain.rs`, cursor-based since PR
@@ -138,7 +146,7 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
 - **`seal.rs`** (ADR 0018 §2 amendment) — the **range seal**: the structural
   replacement for the retired `version_floor` cross-group-LWW fix.
   `KvCommand::Seal { range, ts }` is proposed by a range-handoff source (a
-  split's `NarrowScope`, or a merge's `Absorb`) through its own Raft log; a
+  split's `NarrowScope`) through its own Raft log; a
   later-ordered mutating entry for a key inside a sealed range is rejected
   at apply, checked against a per-group in-memory set rebuilt at group
   start from a durable **engine marker key** (deliberately from the
@@ -334,44 +342,45 @@ State once here; cross-referenced from the sections below.
     sibling's already-present data).
   - **The range seal** (`seal.rs`) closes the one residual witnessing alone
     cannot: an in-flight write from a source-group leader that hasn't yet
-    observed a split/merge, still in its own commit pipeline when the
-    handoff happens. A source proposes `KvCommand::Seal { range, ts }`
-    through its own log at handoff time (`host.rs`'s `Reconciler`, on a
-    split's `NarrowScope` and a merge's `Absorb`); apply rejects any
-    later-ordered mutating entry whose key falls in an already-sealed
-    range, regardless of that entry's own `ts`, because within one group
-    log order and HLC order coincide, so it is the **log position** that
-    is authoritative. The reconciler gates a split child's `Host` / a
-    merge survivor's `WidenScope` on observing the relevant seal marker
-    locally first (`TabletFacts::parent_seal_observed`/`widen_seal_observed`,
-    `Metadata::split_parents`/`absorbed_by` provenance) — see `host.rs`'s
-    entry below and `seal.rs`'s module doc for the key-disjointness proof.
-  - **Proposing (and, on the absorbed side, waiting out) the seal is a
-    persistent condition, re-derived every tick — never a one-shot side
-    effect of the tick that performs the local irreversible action it
-    precedes.** A replica that narrows its scope while a follower must
-    still propose the seal once later promoted to leader; an absorbed
-    replica must wait for a locally-*committed* seal, never "nothing
-    pending locally" alone (a quiescent replica satisfies that trivially
-    before the seal has even been proposed, letting a fast follower tear
-    down and strand the seal below quorum forever). `host.rs`'s
-    `gather_facts` computes `TabletFacts::pending_seals` fresh every tick
-    (via `seal_covers`), and `plan` turns each into `HostAction::
-    ProposeSeal`, replanned until observed; `Reconciler::teardown`'s
-    Absorb drain requires `seal_covers` locally before proceeding. This
-    gate is self-supporting, not a deadlock: it keeps the quorum needed to
-    commit the seal alive for as long as it takes; a genuinely quorum-dead
-    group correctly stalls loudly instead of tearing down early. See ADR
-    0018's §2 amendment and `docs/engineering-lessons.md` for the full
-    story. Regression: `tests/reconciler_corpus.rs`'s
-    `absorb_follower_waits_for_committed_seal_before_tearing_down`/
+    observed a split, still in its own commit pipeline when the handoff
+    happens. A source proposes `KvCommand::Seal { range, ts }` through its
+    own log at handoff time (`host.rs`'s `Reconciler`, on a split's
+    `NarrowScope`); apply rejects any later-ordered mutating entry whose key
+    falls in an already-sealed range, regardless of that entry's own `ts`,
+    because within one group log order and HLC order coincide, so it is the
+    **log position** that is authoritative. The reconciler gates a split
+    child's `Host` on observing the relevant seal marker locally first
+    (`TabletFacts::parent_seal_observed`, `Metadata::split_parents`
+    provenance) — see `host.rs`'s entry below and `seal.rs`'s module doc for
+    the key-disjointness proof. (Tablet merge had a mirror-image gate here —
+    a survivor's `WidenScope` on `widen_seal_observed`/`Metadata::
+    absorbed_by` — until ADR 0044 removed merge and this half of the
+    mechanism along with it.)
+  - **Proposing the seal is a persistent condition, re-derived every tick —
+    never a one-shot side effect of the tick that performs the local
+    irreversible action it precedes.** A replica that narrows its scope
+    while a follower must still propose the seal once later promoted to
+    leader. `host.rs`'s `gather_facts` computes `TabletFacts::pending_seals`
+    fresh every tick (via `seal_covers`), and `plan` turns each into
+    `HostAction::ProposeSeal`, replanned until observed. This gate is
+    self-supporting, not a deadlock: it keeps the quorum needed to commit
+    the seal alive for as long as it takes; a genuinely quorum-dead group
+    correctly stalls loudly instead of proceeding early. See ADR 0018's §2
+    amendment and `docs/engineering-lessons.md` for the full story.
+    Regression: `tests/reconciler_corpus.rs`'s
     `narrow_seal_survives_a_late_promotion_after_narrowing_as_a_follower`.
+    (Tablet merge had a mirror-image waiting-side gate here — an absorbed
+    replica's `Reconciler::teardown` requiring a locally-*committed* seal,
+    never "nothing pending locally" alone, before tearing down — until ADR
+    0044 removed merge and this half of the mechanism along with it; its
+    own regression, `absorb_follower_waits_for_committed_seal_before_
+    tearing_down`, went with it.)
   - **A hard, non-`debug` assert** (`assert_ts_monotonic`, at apply) checks
     every applied entry's `ts` strictly exceeds the previous one this group
     applied — the load-bearing invariant the whole witnessing chain exists
     to guarantee; a failure means the chain itself is broken, not a
     recoverable condition. Regression: `tests/cross_group_lww.rs`
-    (split/merge/seal-rejection/in-flight-race/clock-skew shapes) and
+    (split/seal-rejection/in-flight-race/clock-skew shapes) and
     `tests/witnessing.rs` (leader-change and restart-recovery
     monotonicity).
   - **`propose_ordered`: minting a proposal's `ts` and appending it to the
@@ -598,31 +607,18 @@ State once here; cross-referenced from the sections below.
   the entry's actual apply; the pre-propose reject is load-bearing, not
   redundant (see `animusd/CLAUDE.md` and the root `CLAUDE.md` entry on a
   safety mechanism with zero production callers).
-- **An `Absorb` teardown DRAINS the committed log into the engine BEFORE
-  halting, and the survivor's `WidenScope` is deferred until the absorb
-  confirms.** The apply task exits on `shutdown()` at its next loop-top
-  check **without** draining committed-but-unapplied entries, and teardown
-  then deletes the group's Raft WAL — the only local copy. Harmless for
-  `Release`/`Reclaim` (they erase the data anyway) but fatal for `Absorb`:
-  the absorbed range is about to be served from this same engine through
-  the survivor's widened scope, so an acked write still in the commit
-  pipeline would silently never reach the engine. The drain
-  (`ABSORB_DRAIN_TIMEOUT`) waits — while the driver is live — for commit to
-  cover the full local log, engine-applied to cover that commit, **and**
-  for this replica's own engine to locally observe a *committed*
-  range-seal covering this tablet's scope — never proceeding on "nothing
-  pending locally" alone, which a quiescent replica satisfies trivially
-  before the seal has even been proposed. On timeout, the stuck-apply
-  escape hatch (proceed with a loud warning) fires only when the seal is
-  already locally observed and it's purely the engine-merge watermark
-  lagging; a stuck seal *commit* retries next tick instead, logging
-  loudly so a genuinely quorum-dead absorbed group is visible to
-  operators rather than silently torn down. `plan`'s `absorbing` gate
-  sequences drain-before-widen. ADR 0033 post-merge hardening — a 1-in-5
-  `ProdEnv` flake in `animusd`'s `tablet_merge.rs` was a real, permanent
-  false-"absent," caught only once a genuine multi-process split
-  deployment exposed it. The read-side halves live in this crate's
-  `RaftKvNode` + `animusd` — see the root `CLAUDE.md` and ADR 0033.
+- **Superseded by ADR 0044**: an `Absorb` teardown's drain-before-halt
+  mechanism (a merge survivor's `WidenScope` deferred on the absorbed
+  group's own committed-log drain, closing a data-loss window
+  `shutdown()`'s non-draining halt otherwise left open) no longer exists —
+  tablet merge, `HostAction::Absorb`/`WidenScope`, and `TeardownKind::Absorb`
+  were all removed (tablets are split-only). `Release`/`Reclaim`'s teardown
+  remains non-draining, safely, since both erase the data anyway. The full
+  original postmortem (the `ProdEnv` flake that found the gap, the
+  three-part fix) is archived verbatim in
+  `docs/engineering-lessons-archive.md`'s "Superseded by ADR 0044" section —
+  the still-general lesson: a teardown that deletes local state must drain
+  first if that state is about to be served elsewhere. See ADR 0033/0044.
 
 ## The host module
 
@@ -638,12 +634,14 @@ lifecycle's invariants and is directly `SimEnv`-testable.
 - **`plan(view: &MetadataView, facts: &BTreeMap<TabletId, TabletFacts>,
   state: &LocalState, base_id: NodeId) -> (Vec<HostAction>, LocalState)`**.
   Pure and synchronous — no `Env`, clock, RNG, or I/O. `MetadataView` is a
-  small owned projection (`tablets`, `down`, `merged`, `split_parent`/
-  `absorbed_by`), deliberately *not* the whole `animus_control::Metadata`,
-  keeping the crate decoupled from the control plane's state shape.
-  `TabletFacts` bundles the impure per-tablet inputs the caller gathers
-  first (`hosted`, `is_leader`, `config_excludes_me`, `scope_range`,
-  `has_data`, `parent_seal_observed`/`widen_seal_observed`). `LocalState`
+  small owned projection (`tablets`, `down`, `split_parent`), deliberately
+  *not* the whole `animus_control::Metadata`, keeping the crate decoupled
+  from the control plane's state shape. (Tablets are split-only, ADR 0044 —
+  merge's own fields here, `merged`/`absorbed_by`, were removed along with
+  `HostAction::Absorb`/`WidenScope`.) `TabletFacts` bundles the impure
+  per-tablet inputs the caller gathers first (`hosted`, `is_leader`,
+  `config_excludes_me`, `scope_range`, `has_data`,
+  `parent_seal_observed`). `LocalState`
   is the pure mirror of `animusd`'s `minted` claim set + `pending_release`
   epoch dampener, threaded call to call.
 - **`plan` never removes a tablet from `LocalState::hosted` on its own**
@@ -667,35 +665,32 @@ lifecycle's invariants and is directly `SimEnv`-testable.
 
 ### HostAction
 
-**Emitted in this fixed order: `ProposeSeal` → `NarrowScope`/`WidenScope` →
-`Host` → `Reconfigure` → `Release`/`Reclaim`/`Absorb`.** Briefly: `ProposeSeal`
-(re-)proposes a still-owed range-seal (persistent, re-derived every tick, a
-no-op unless leading); `NarrowScope`/`WidenScope` move an already-hosted
-tablet's scope to match its current metadata range (provably one-directional
-each — `is_subrange`/its widen dual); `Host` stands up a fresh/joining/
+**Emitted in this fixed order: `ProposeSeal` → `NarrowScope` → `Host` →
+`Reconfigure` → `Release`/`Reclaim`.** Briefly: `ProposeSeal` (re-)proposes a
+still-owed range-seal (persistent, re-derived every tick, a no-op unless
+leading); `NarrowScope` moves an already-hosted tablet's scope to match its
+current (narrower) metadata range; `Host` stands up a fresh/joining/
 restarting tablet, deferred for a split child until its parent's range-seal
 is locally observed; `Reconfigure` is one `reconfigure_step` toward the
-desired replica set; `Release`/`Reclaim`/`Absorb` tear down a tablet moved
-off, dropped, or merged away respectively.
+desired replica set; `Release`/`Reclaim` tear down a tablet moved off or
+dropped, respectively. (Tablets are split-only, ADR 0044: merge's own dual
+actions, `WidenScope` and `Absorb`, no longer exist — a hosted-but-now-absent
+tablet is unconditionally `Reclaim`ed now, with no second case to
+disambiguate.)
 
-**`Reclaim` vs `Absorb` cannot be told apart from `tablets` alone.** A hosted
-tablet vanishing looks identical whether its table was dropped or it was
-merged; inferring "merge" from "some other tablet's range now covers mine" is
-unsound (two tables' still-unsplit tablets can have byte-identical
-`KeyRange::whole()` ranges, with no table identity in scope). `merged` is the
-explicit signal (a tiny, never-pruned marker — tablet ids are never reused).
-`Reclaim` erases; `Absorb` never erases (the survivor now owns the range on
-the same node-shared engine) and drains before halting (see Key invariants).
 - **`Reconciler` teardown** (`Release`/`Reclaim`): call `on_teardown`
   (unregister from routing *before* touching the driver), `shutdown()`, poll
   `is_stopped()` bounded by `RECLAIM_STOP_TIMEOUT` (10s, via `env.sleep` — no
   tokio-only primitive), re-register via `on_host` and leave `LocalState`
   untouched on timeout (so `plan` re-emits the same action next tick), else
   narrow to `erase_bound` (Release only), `erase_scope()`, delete the WAL, and
-  only then `confirm_torn_down`. `Absorb`'s teardown (`TeardownKind::Absorb`)
-  skips both the narrow and the `erase_scope()` — only the driver stops and its
-  WAL is removed. Timeouts: `ABSORB_DRAIN_TIMEOUT`, `RELEASE_CONFIRM_TICKS`,
-  `RECLAIM_STOP_TIMEOUT`.
+  only then `confirm_torn_down`. Timeouts: `RELEASE_CONFIRM_TICKS`,
+  `RECLAIM_STOP_TIMEOUT`. (Merge's `Absorb` teardown skipped both the narrow
+  and the `erase_scope()` call — the absorbed tablet's data was about to be
+  served elsewhere, never erased — and drained the committed log before
+  halting; see the Key invariants entry above for what remains of that
+  mechanism's lesson now that `TeardownKind::Absorb`/`ABSORB_DRAIN_TIMEOUT`
+  are gone.)
 
 ## What's non-obvious
 
@@ -834,7 +829,7 @@ the real-thread `ProdEnv` regression noted above.
 
 ### Reconciler lifecycle corpus (`tests/reconciler_corpus.rs`)
 
-The 34 `host.rs` unit tests prove `plan` correct as a pure function; the entry
+The 31 `host.rs` unit tests prove `plan` correct as a pure function; the entry
 above proves ONE end-to-end sequence; this corpus is the first
 **seed-reproducible fault-injection** suite for the whole tablet lifecycle. It
 follows the house corpus doctrine (ADR 0014): a frozen, name-seeded scenario
@@ -849,21 +844,23 @@ list (`scenario_cells()`), a depth knob, and coverage/seed-expansion guards.
   (`stop`/`crash`/`partition_pair`/`heal`) since `Simulator` derives
   `Clone` (cloning just hands out another reference to the same
   `Arc`-backed world).
-- **~20 frozen scenarios** (`ANIMUS_RECONCILER_SEEDS`, default 1 =
+- **18 frozen scenarios** (`ANIMUS_RECONCILER_SEEDS`, default 1 =
   byte-identical), covering the tablet lifecycle end to end: fresh-host,
   split-narrows-source, rebalance-off-releases (sparing a sibling),
   drop-table-reclaims, spare-join-then-promoted, reconfigure-removes-a-
-  down-replica-first, merge-widens-survivor-and-absorbs-sibling-unerased
-  (the deterministic absorb-drain regression, zero sim time before the
-  merge view ticks), crash-restart shapes (single-replica upgrade via
+  down-replica-first, crash-restart shapes (single-replica upgrade via
   `has_data`, follower rejoin), a deliberate **contract-boundary** test
   proving *why* the `last_applied == 0` guard is load-bearing (bypassing
   it genuinely erases-then-rehosts empty), partition/release interplay,
-  and two scenarios (`absorb_follower_waits_for_committed_seal_before_
-  tearing_down`/`narrow_seal_survives_a_late_promotion_after_narrowing_
-  as_a_follower`) that make the range-seal livelock fix (see Key
-  invariants) deterministic under `SimEnv` by controlling per-node tick
-  order and a real Raft membership change by hand.
+  and `narrow_seal_survives_a_late_promotion_after_narrowing_as_a_follower`,
+  which makes the range-seal livelock fix (see Key invariants) deterministic
+  under `SimEnv` by controlling per-node tick order and a real Raft
+  membership change by hand. (Tablets are split-only, ADR 0044: the merge
+  scenario this corpus used to carry —
+  `merge-widens-survivor-and-absorbs-sibling-unerased`, the deterministic
+  absorb-drain regression, and its livelock-fix twin
+  `absorb_follower_waits_for_committed_seal_before_tearing_down` — were both
+  removed along with the reconciler actions they exercised.)
 - **Invariant checks, generic across scenarios**: (a) hosting convergence
   (`assert_hosted_converged`); (b) data safety (`assert_present`/
   `assert_absent`, raw physical-key reads — survivors readable, released/

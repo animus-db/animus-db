@@ -219,8 +219,10 @@ the data at risk**, not **is anything in transition**. A tablet mid-formation �
 a split-child standing up its Raft group, a freshly-provisioned table's first
 election, a rebalance/repair move catching up, or plain reconciler/admin-fan-out
 lag — is not a data-risk state as long as every replica assigned to it is on a
-live node: per ADR 0028, split/merge/provision are each a single control-plane
-command with no data-plane half, so the data already sits safely in the source
+live node: per ADR 0028, split/provision are each a single control-plane
+command with no data-plane half (tablets are split-only, ADR 0044 — merge
+briefly existed under this same shape, ADR 0033, before being removed), so
+the data already sits safely in the source
 replicas' shared storage engines the whole time the new group is forming. That
 state renders as a neutral **`forming`** pill and does **not** degrade health —
 otherwise every routine split would read as an outage.

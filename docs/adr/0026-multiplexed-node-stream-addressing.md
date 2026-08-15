@@ -306,8 +306,10 @@ serialized message.
   Deferred to whichever follow-up actually migrates a component onto streams
   (there's nothing to observe yet in Stage A, since nothing uses a second
   stream).
-- **(c) Stream lifecycle — does a stream for a merged/dropped tablet stop
-  receiving, and does this need a new GC path?** It composes with the
+- **(c) Stream lifecycle — does a stream for a dropped tablet stop
+  receiving, and does this need a new GC path?** (Tablet merge briefly
+  raised the same question under ADR 0033; moot since ADR 0044 removed
+  merge entirely — tablets are split-only.) It composes with the
   **existing** GC path (ADR 0024) rather than needing a new one: today, dropping
   a tablet already means `CpGroup::shutdown()` + tearing down that tablet's
   `Coresident` sibling env (`shutdown_tasks()`, never the pool-draining

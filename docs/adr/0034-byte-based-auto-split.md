@@ -61,10 +61,11 @@ choice, not an oversight to walk back apologetically. Since ADR 0028, a
 split is a single, cheap, metadata-only control-plane command — no data
 moves, so a mis-timed or badly-positioned split under the old key-count
 trigger was inexpensive to have made and is not a stranded mistake to
-"repair" retroactively. And a tablet **merge** (in flight on a parallel
-branch, reserved as ADR 0033) will make an over-eager split *reversible* —
-between the two, getting the trigger byte-based now is about making new
-splits track the real cost going forward, not remediating history.
+"repair" retroactively. Tablet **merge** (ADR 0033) briefly made an
+over-eager split *reversible* — since removed entirely (ADR 0044, tablets
+are split-only) — so getting the trigger byte-based now is about making
+new splits track the real cost going forward; a mis-timed split is a
+permanent, if cheap, cost, not a remediable one.
 
 ## Decision
 

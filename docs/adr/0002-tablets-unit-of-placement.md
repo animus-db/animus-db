@@ -1,6 +1,6 @@
 # ADR 0002 — Tablets as the unit of placement and migration
 
-- **Status:** Accepted (partition function **amended by [ADR 0022](0022-hash-ring-partitioning.md) + [ADR 0023](0023-table-scoped-tablets.md)**)
+- **Status:** Accepted (partition function **amended by [ADR 0022](0022-hash-ring-partitioning.md) + [ADR 0023](0023-table-scoped-tablets.md)**; tablet lifecycle **amended by [ADR 0044](0044-split-only-tablets.md)** — split-only, tablet merge removed)
 - **Date:** 2026-08-01
 
 > **Amendment (ADR 0022 + 0023):** the tablet/epoch/split-merge model below is
@@ -11,6 +11,12 @@
 > recorded here is resolved by hashing the *partition key only*, so range scans
 > still hold *within a partition* (just not across partitions). See ADR 0022
 > (the Murmur3 token) and ADR 0023 (per-table scoping).
+>
+> **Amendment (ADR 0044, 2026-08-14):** tablets are **split-only** — the
+> "split-merge" model this ADR's title and body describe is now just
+> "split." Tablet merge shipped (ADR 0033) and was later removed entirely;
+> a tablet's range only ever narrows, its count only ever grows, and no
+> revival of merge is planned. See ADR 0044 for the full rationale.
 
 ## Context
 
@@ -31,17 +37,20 @@ tablet's replica set or range.
 The epoch is the fencing token for the data plane (ADR 0001): a data-plane
 operation carries the epoch the client/router believed current, and a replica
 rejects it if the operation's epoch is older than the replica's (fencing is
-tracked **per tablet**). Tablets **split and merge** via control-plane
-commands (`SplitTablet`/`MergeTablets`), each bumping the affected tablet's
-epoch; the data-plane `Router` resolves a key to its owning tablet from a cached
-tablet map. **Split, merge, automatic split-point selection, and replica
-rebalancing have since all shipped** (originally future work at this ADR's
-writing): manual/triggered split is a single control-plane command (ADR 0028);
-merge is its data-plane dual (ADR 0033); split points are chosen automatically
-via a byte-weighted median over the tablet's live data, not a plain positional
-midpoint (ADR 0034); and replica-set rebalancing — including after a
-split/merge, since a new tablet starts from the parent's replica set — runs
+tracked **per tablet**). Tablets **split** via a control-plane command
+(`SplitTablet`), bumping the affected tablet's epoch; the data-plane `Router`
+resolves a key to its owning tablet from a cached tablet map. **Split,
+automatic split-point selection, and replica rebalancing have since all
+shipped** (originally future work at this ADR's writing): manual/triggered
+split is a single control-plane command (ADR 0028); split points are chosen
+automatically via a byte-weighted median over the tablet's live data, not a
+plain positional midpoint (ADR 0034); and replica-set rebalancing — including
+after a split, since a new tablet starts from the parent's replica set — runs
 continuously via `Metadata::rebalance` (ADR 0029), independent of repair.
+**Tablet merge (`MergeTablets`) briefly shipped as split's dual (ADR 0033,
+2026-08-07) and was then removed entirely** (ADR 0044, tablets are
+split-only, 2026-08-14): a tablet's range only ever narrows now, never
+widens, and its count only ever grows.
 
 ## Consequences
 

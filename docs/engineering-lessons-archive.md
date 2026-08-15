@@ -559,3 +559,240 @@ neutral and only genuine data-risk states degrade health (ADR 0021 §7).
   being protected (data replication, request-serving capacity) actually
   recover on a faster/different path than the raw signal does — and if so,
   gate on the protected property, not the signal.**
+
+## Superseded by ADR 0044 (split-only tablets: tablet merge removed)
+
+ADR 0044 (2026-08-14) removed tablet merge entirely — `MetaCommand::
+MergeTablets`, `Metadata::merged_tablets`/`absorbed_by`, and
+`animus-cp-data`'s `HostAction::WidenScope`/`Absorb` reconciler reaction no
+longer exist anywhere in this repository. Every entry below was written
+against that now-deleted mechanism. Two of the three lessons drawn from them
+still generalize beyond merge specifically — a pointer back to each remains
+in `engineering-lessons.md` at the point each entry used to live.
+
+- **When two different root causes produce the identical observable absence,
+  don't try to reconstruct which one happened from the remaining state —
+  record an explicit signal at the moment the distinction is still known.**
+  Wiring tablet merge (ADR 0033, the data-plane dual of ADR 0028's split), a
+  per-node reconciler observing "a tablet I used to host vanished from the
+  replicated tablet map" must react completely differently depending on
+  *why*: merged into a sibling (tear the group down, but the data is still
+  live — a survivor now serves it on the same shared engine, so **never
+  erase**) vs. the whole table dropped (tear down **and erase** — nothing is
+  left to serve that range). Both produce the exact same absence from
+  `Metadata.tablets`, and the tempting inference — "does some other tablet's
+  range now cover mine, so it must be a merge survivor" — is unsound: two
+  different tables' still-unsplit tablets can have byte-identical default
+  ranges (`KeyRange::whole()`), and by the time the reconciler is deciding
+  what to do, the vanished tablet's own table identity is gone from view too
+  (it's not in the map anymore), so there's no way to disambiguate a
+  same-table survivor from an unrelated table's coincidentally-matching
+  tablet. The fix was a tiny, explicit, **permanently-retained** replicated
+  marker (`Metadata::merged_tablets: BTreeSet<TabletId>`, ADR 0033) set at
+  the one moment the distinction is unambiguous (the `MergeTablets` apply
+  itself, which knows exactly which tablet it just absorbed) — cheap because
+  tablet ids are never reused (so the marker never needs pruning and can
+  never resurrect a wrong decision for a later id), and correct by
+  construction instead of by inference. **General check when a planner reacts
+  to "X disappeared" from a coarser view: are there multiple legitimate
+  reasons X can disappear that demand different actions, and if so, is there
+  actually enough information left in the coarser view at decision time to
+  tell them apart — or does the distinguishing fact need to be captured
+  explicitly, closer to where it was still known, even at the cost of a
+  small permanent marker?** (`animus-control::Metadata::merged_tablets`;
+  `animus-cp-data::host::{HostAction::Absorb, MetadataView::merged}`.)
+- **Tearing down a Raft group whose data will keep being SERVED (not erased)
+  must drain the group's committed log into the engine first — `shutdown()`
+  halts the async apply task at its next loop-top check WITHOUT draining, and
+  deleting the group's WAL then destroys the only local copy of the
+  committed-but-unapplied tail.** Found via ADR 0033's own 3-node merge
+  integration test flaking ~1-in-5 *in isolation* (per the standing rule, a
+  flaky `ProdEnv` test is a real bug): a write acked by the absorbed group's
+  leader right before the merge was applied to *that leader's* engine (ack
+  requires leader-local apply) but not yet to a follower's — commit-index
+  propagation runs up to one heartbeat behind, while the reconciler's
+  event-driven `metadata_watch` fires the `Absorb` teardown on the very
+  commit that made the merge visible, i.e. *designed* to race that window.
+  The follower's engine then permanently lacked the acked key, and if that
+  node hosted the merge survivor's leader, linearizable reads answered a
+  definitive "key absent" forever — indistinguishable from data loss. The
+  same non-draining shutdown is **harmless for `Release`/`Reclaim`** (their
+  teardowns erase the data anyway; other replicas serve) — which is exactly
+  why it was never noticed: the invariant "a torn-down group's unapplied
+  tail doesn't matter" was true for every teardown that existed before merge
+  added one whose data lives on. Three-part fix, each load-bearing: the
+  `Absorb` teardown drains (commit covers the local log, engine-applied
+  covers commit) while the driver is still live; `plan` defers the
+  survivor's `WidenScope` until the absorb confirms (drain-before-widen —
+  the planner's fixed emission order alone would have widened *first*); and
+  the read path stopped conflating two "None"s — a ReadIndex barrier
+  failure and a genuinely-served absent — plus gained the read-side dual of
+  ADR 0028's pre-propose range check (a get/scan whose group's live
+  `scope_range()` doesn't contain the request errors retryably; for scans
+  the un-widened scope was otherwise a *silent truncation*, since
+  `linearizable_scan` filters rows through the live scope). **Two general
+  checks: (1) when a new feature makes a previously-universal teardown
+  invariant ("this group's data dies with it") false for one new path, audit
+  the teardown's every step against the new path — the WAL delete that was
+  cleanup before is data loss now; (2) grep read paths for `Option`-collapse
+  points where "couldn't serve" and "served: absent" merge into one value —
+  the Get/Scan arm asymmetry (Get mapped `None` to absent, Scan mapped it to
+  an error) was the tell.** The deterministic regression drives the write →
+  merge-view tick with zero intervening sim time, so the apply task provably
+  hasn't run — no wall-clock race needed.
+  (`animus-cp-data::host::Reconciler::teardown`'s Absorb drain + `plan`'s
+  `absorbing` gate; `RaftKvNode::linearizable_get_served`; `animusd`
+  `cp_get_local`/`cp_scan_local`; regressions:
+  `reconciler_corpus.rs::scenario_merge_widens_and_absorbs`,
+  `host::tests::widen_is_deferred_while_the_absorbed_sibling_is_still_hosted`,
+  `animusd` `split_fence_tests`' read/scan duals.)
+- **CONFIRMED and fixed: a suspected latent cross-group LWW version hazard on
+  split/merge (flagged in a PR #90 review comment) was real** — every tablet
+  a node hosts shares one physical `StorageEngine` (ADR 0026/0028), and
+  `animus-cp-data` stamps each write's MVCC version as its **own** group's
+  local Raft log index, which restarts low/independent for a fresh group. A
+  split's new sibling could carry a version no higher than what the *source*
+  group already stamped for a key now in the sibling's range; a merge
+  survivor's group keeps running but starts serving keys the absorbed
+  sibling's group versioned under a different, unrelated sequence. Either
+  way `StorageEngine::merge`'s per-key LWW silently no-ops the write (loud,
+  not silent corruption — the confirm loop's poll-for-exact-value-equality
+  times out — but the write never lands). Reproduced directly at the
+  `RaftKvNode` level with no control-plane machinery needed: write a key
+  through a whole-keyspace group at a high index, narrow it away, start a
+  **fresh** sibling group over the *same* shared engine scoped to that key's
+  range, write the key again — silently dropped
+  (`animus-cp-data/tests/cross_group_lww.rs`).
+  **Design space explored, and why the obvious-looking alternatives don't
+  work**: (1) seeding a fresh/widened group's floor from a **live,
+  per-replica** read (`storage.latest_version()`, or "whichever
+  `next_tablet_id` counter value happens to be current when this replica's
+  own tick fires") looks tempting since it needs no schema change, but two
+  *different replicas of the same group* can observe different values at
+  slightly different real-world moments — and since the group's `RaftCore`
+  log-index numbering (Host) or an already-running group's live floor
+  (merge's widen) must be **byte-identical across every replica** applying
+  the same command, a per-replica-timing-dependent floor either breaks Raft
+  log-matching outright (Host: divergent `snapshot_index` bases before any
+  election) or makes two replicas stamp *different* versions for the
+  identical committed write (merge: a bare local read has no cross-replica
+  agreement at all). (2) Using the **tablet's own id** as the floor works
+  cleanly for split (a fresh sibling's id is always allocated *after*, hence
+  numerically greater than, the source's) but not for merge in general: `left`
+  and `right` are chosen by **key-range adjacency**, not id order — a tablet
+  re-split from the *middle* of an existing chain mints a new id that can be
+  *numerically larger* than an unrelated tablet further right in key-range
+  order, so a later merge of that pair can have `right.id > left.id`, and
+  "bump past `right`'s id" would then either be a no-op or, worse, could
+  someday design itself into `left` permanently unable to out-version
+  `right`'s history. **The fix that actually holds**: a `version_floor: u64`
+  field on `animus_tablet::Tablet` itself (shared by both planes' `Tablet`
+  type, so no projection duplication needed) — `0` by default (byte-identical
+  to today, `#[serde(default)]` for back-compat), bumped **once, by the
+  control plane's own deterministic `apply`** at exactly the two moments a
+  cross-group version collision can occur: `SplitTablet` sets the new
+  sibling's floor to `source.version_floor + 1` (always exceeds anything the
+  source could have stamped, since a group's own local index realistically
+  never approaches the scale factor between rescopes — auto-split already
+  caps a tablet's key/byte count long before that); `MergeTablets` bumps the
+  surviving `left`'s floor to `max(left, right) + 1` (exceeds *both* sides,
+  closing the "which id is bigger" trap the id-based scheme fell into). Every
+  data replica reads this **already-agreed, replicated** value from
+  `Metadata`/`MetadataView` at `Host`/`WidenScope` time — never computes it
+  locally — so it is identical across replicas by construction, the same
+  discipline as every other epoch-CAS'd placement fact in this codebase.
+  `RaftKvNode`'s actual stamped version is `floor * SCALE + local_index`
+  (`effective_version`, `SCALE = 2^40`) — a group's own log index is
+  completely untouched (no Raft log-matching risk at all; `engine_applied`
+  still tracks the raw index), only the *storage-layer version number it
+  stamps* changes, and only for a tablet that has actually been through a
+  split/merge. **General lesson: when a per-group monotonic counter (a Raft
+  log index, a local sequence number) is reused as a version/ordering token
+  that must compare correctly *across* groups whose identities can change
+  over time (a split/merge/rebalance lineage), the floor that keeps groups
+  from colliding must be a value every replica reads identically from
+  already-replicated state — never derived from a live per-replica read (even
+  a "conservative always-safe upper bound" one), and the exact arithmetic
+  direction (which side's id/floor can legitimately end up numerically larger)
+  needs checking against the *actual* pairing rule (adjacency, not allocation
+  order) before trusting an id-based shortcut.** (`animus_tablet::Tablet::
+  version_floor`; `animus-control::meta.rs`'s `SplitTablet`/`MergeTablets`
+  apply; `animus-cp-data::RaftKvNode::start_hosted_with_floor`/
+  `bump_version_floor`/`effective_version`; regressions in both crates —
+  `animus-cp-data/tests/cross_group_lww.rs`,
+  `animus-control::meta::tests::{split_tablet_seeds_the_new_siblings_version_
+  floor_past_the_sources, merge_tablets_bumps_the_survivors_version_floor_
+  past_both_sides}`.) **Superseded twice over: `version_floor` itself was
+  retired by ADR 0018 PR2's range-seal design** (an ordering-based fence
+  replaced the version-space separation this entry's whole fix relied on),
+  **independently of this stack's merge removal** — this entry was already
+  describing dead code before ADR 0044 shipped.
+- **`animusd/tests/split_cluster.rs`'s two failures (`split_and_merge_over_a_
+  split_deployment`, `decommission_racing_a_tablet_split_converges_with_no_
+  data_loss`) were both 100%-deterministic in a genuine multi-process
+  control-only + data-only deployment, tracing to one design gap in the ADR
+  0018 §2 amendment's range-seal handoff (`animus-cp-data/src/host.rs`).**
+  The seal proposal (`propose_seal`) used to be a **one-shot side effect
+  bundled into the same tick as the local, irreversible action it was
+  supposed to precede** — `NarrowScope`'s local scope mutation (leader-gated
+  propose inline) or `Absorb`'s teardown (leader-gated propose, then a
+  drain-wait gated only on "nothing pending locally"). Two related bugs
+  followed from that one shape:
+  1. **A one-shot side effect hung off a self-erasing trigger never
+     retries — make the trigger a persistent, re-derived condition
+     instead.** `NarrowScope`'s local `narrow_scope()` call ran
+     unconditionally, regardless of leadership; the paired seal-propose call
+     only fired if this same replica *also* happened to be leader at that
+     exact tick. Since narrowing immediately makes the triggering mismatch
+     (`t.range != current`) vanish on that replica, a replica that narrowed
+     while a *follower* and was only *later* promoted to leader had no
+     second chance — the condition that would have re-triggered the attempt
+     was already gone, permanently, even though the actual precondition
+     ("does a covering seal exist yet") hadn't changed at all. Fixed by
+     computing the seal-pending condition fresh every tick
+     (`TabletFacts::pending_seals`, an async engine scan independent of
+     local scope/teardown state) and turning it into its own action
+     (`HostAction::ProposeSeal`), so whichever replica eventually holds
+     leadership gets its chance regardless of when leadership shuffles
+     relative to the local mutation.
+  2. **An irreversible local action ordered after a distributed action must
+     gate on committed evidence of that action, not on local progress.**
+     `Absorb`'s teardown considered itself free to tear down (delete the
+     only local copy of the group's Raft WAL) once "nothing pending
+     locally" — a check a quiescent follower satisfies trivially *before
+     the leader has even proposed the seal*. A fast follower could
+     therefore destroy its own voter before the seal ever committed,
+     dropping the group below quorum and permanently stranding the
+     leader's own, now-orphaned proposal (accepted locally, never able to
+     commit again). Fixed by additionally requiring a **locally-observed
+     committed** seal (the same `seal_covers` engine scan) before a replica
+     may tear down — not "distributed progress inferred from local state,"
+     the actual distributed fact itself. This gate is self-supporting, not
+     a deadlock: requiring every absorbed replica to stay up until it
+     observes the seal is exactly what keeps the quorum needed to commit
+     that seal alive in the first place; a genuinely quorum-dead group (an
+     unrelated double failure) correctly stalls loudly instead of tearing
+     down early — the same correctness-over-liveness call this system makes
+     everywhere else a durability/visibility gate is at stake.
+  **Diagnostic method**: reproduced deterministically (3/3 identical
+  failures, not contention-gated) in isolation first, then added temporary
+  `eprintln!`s directly at the two decision points (`Reconciler::teardown`'s
+  Absorb `fully_drained` check and propose-seal call; `gather_facts`'s
+  `parent_seal_observed` computation and `NarrowScope`'s propose-seal call)
+  and re-ran each failing test once — the trace immediately showed a
+  follower reaching "fully drained" with `commit == log_end` (nothing to
+  wait for) *before* any "leader proposing seal" line ever printed for test
+  1, and zero "leader proposing narrow-seal" lines across the entire ~150-
+  tick run for test 2 — the same per-call-site `eprintln!` idiom the prior
+  HLC witnessing-chain bug's entry above used, applied to a completely
+  different subsystem. Confirmed the fix by reverting just the source file
+  (keeping the new tests) and re-running: both new `reconciler_corpus.rs`
+  scenarios fail against the unfixed code, pass against the fixed code.
+  Regression: `animusd/tests/split_cluster.rs`'s original pair (the
+  real-world acceptance) plus two new deterministic `SimEnv` scenarios in
+  `animus-cp-data/tests/reconciler_corpus.rs` that force the exact
+  interleaving by hand (`absorb_follower_waits_for_committed_seal_before_
+  tearing_down`, `narrow_seal_survives_a_late_promotion_after_narrowing_
+  as_a_follower`) — see `animus-cp-data/CLAUDE.md`'s range-seal and
+  Absorb-drain invariant entries, and ADR 0018's PR2 amendment corrective
+  note #2, for the full mechanism.
