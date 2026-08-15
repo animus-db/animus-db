@@ -21,6 +21,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use animus_control::{IndexDef, IndexKind, IndexProjection, IndexStatus};
+use animus_dynamo::AttributeValue;
 use animusd::{ClientRequest, ClientResponse, MetaCommand, Node, read_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -622,4 +623,157 @@ async fn a_crash_and_restart_mid_backfill_still_converges() {
     }
 
     node2.shutdown();
+}
+
+/// The data-plane key `dynamo.rs::item_key` computes for a simple
+/// (partition-key-only) item — duplicated per this file's own "every
+/// sibling test keeps its own copy" convention (mirrors `dynamo_txn.rs`'s
+/// identical helper), needed here to predict which side of a chosen split
+/// point a given item id lands on *before* creating it — there is no other
+/// way to predict a DynamoDB item's tablet placement from outside the edge.
+fn item_key(pk: &str) -> Vec<u8> {
+    let av = AttributeValue::S(pk.to_owned());
+    let escaped = animus_dynamo::storage_key(&av, None);
+    let token = animus_tablet::partition_token(&escaped);
+    let mut key = token.to_vec();
+    key.extend_from_slice(&escaped);
+    key
+}
+
+/// The split-during-backfill scenario named as PR4's own deterministic
+/// acceptance test (ADR 0045 §3 Fork A): pre-populate a table with enough
+/// distinct partitions that a single backfill-seeder tick provably *cannot*
+/// finish sweeping it (`BACKFILL_SEED_BATCH == 256`, a production constant —
+/// 300 single-partition rows guarantee at least two ticks), hand-drive
+/// `CreateTableIndex{status: Creating}`, then split the table's *only*
+/// tablet — via the real `ClientRequest::SplitTablet` admin path, not a
+/// hand-driven `MetaCommand` — into a left and a right child straddling a
+/// known, predicted set of pre-existing rows.
+///
+/// This proves Fork A's claim (a post-split right child restarts its own
+/// narrower sweep from scratch, unconditionally correct by the drain's own
+/// idempotence — see `index_drain.rs`'s module doc) against the **real**
+/// production seeder + drain, not a reimplementation: the final materialized
+/// GSI must be exactly correct across both halves regardless of how much of
+/// the parent's sweep had already landed before the split committed.
+///
+/// **On "flips Active only after both children report"**: proving that
+/// precise timing property against real wall-clock ticks here would be
+/// inherently racy (this table is deliberately small enough to converge in
+/// well under a `INDEX_DRAIN_INTERVAL` tick on either child alone). That
+/// exact property is already proven, non-flakily, by
+/// `tests/index_backfill.rs::
+/// a_tablet_that_appears_before_the_flip_blocks_it_until_it_also_reports`
+/// (hand-driven `MarkIndexBackfilled`, no real seeder). Combined with this
+/// test's proof that the real seeder actually *does* independently drive
+/// each child to report — the only way this scenario converges to `Active`
+/// at all — the two tests together are a full proof: the aggregator can't
+/// flip early without both reporting, and both genuinely do report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn split_during_backfill_converges_with_correct_final_gsi() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(3, dir.path()).await;
+    let leader = nodes.iter().position(Node::is_control_leader).unwrap();
+    let client = config.nodes[leader].client;
+    let dynamo_addr = nodes[0].dynamo_addr();
+    let client_addr = nodes[0].client_addr();
+    let table = "bf_split";
+    let index_table = "bf_split$by-email";
+
+    create_table_no_index(dynamo_addr, table).await;
+
+    // 300 candidates, sorted by their actual data-plane key (never by id
+    // string), so a split point chosen between two adjacent candidates is
+    // known to divide them cleanly — same technique as
+    // `dynamo_txn.rs::create_table_pre_split`. 300 > `BACKFILL_SEED_BATCH`
+    // (256), so the parent's very first backfill tick provably cannot
+    // finish sweeping this table in one pass.
+    let mut candidates: Vec<(String, Vec<u8>)> = (0..300)
+        .map(|i| {
+            let id = format!("s{i:04}");
+            let key = item_key(&id);
+            (id, key)
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.1.cmp(&b.1));
+    let mid = candidates.len() / 2;
+    let split_key = candidates[mid].1.clone();
+    let ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
+
+    // Populated via `BatchWriteItem` in chunks (one Raft entry per chunk),
+    // not 300 individual `PutItem` round trips: this table is still
+    // unindexed at population time, so it rides the fast `cp_batch_write`
+    // path (`animusd`'s own CLAUDE.md) — far gentler on WAL fsync
+    // throughput than 300 independent commits, which was found to starve
+    // this environment's disk I/O under concurrent load (three replicas'
+    // WAL group-commits) and produce spurious `Backend(..)` panics
+    // unrelated to backfill/split logic.
+    for chunk in ids.chunks(100) {
+        let puts: Vec<String> = chunk
+            .iter()
+            .map(|id| {
+                format!(r#"{{"PutRequest":{{"Item":{{"id":{{"S":"{id}"}},"email":{{"S":"{id}@x"}}}}}}}}"#)
+            })
+            .collect();
+        let body = format!(r#"{{"RequestItems":{{"{table}":[{}]}}}}"#, puts.join(","));
+        let (status, resp) = dynamo(dynamo_addr, "DynamoDB_20120810.BatchWriteItem", &body).await;
+        assert_eq!(status, 200, "BatchWriteItem failed: {resp}");
+    }
+
+    call(
+        client,
+        ClientRequest::ProposeSchema(MetaCommand::CreateTableIndex {
+            table: table.into(),
+            index: creating_index("by-email", "email"),
+        }),
+    )
+    .await;
+
+    // Split immediately — the bootstrap tablet is always id 1.
+    let resp = call(
+        client,
+        ClientRequest::SplitTablet {
+            tablet: 1,
+            split_key,
+        },
+    )
+    .await;
+    assert!(
+        matches!(resp, ClientResponse::PutOk),
+        "split trigger rejected: {resp:?}"
+    );
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if nodes.iter().all(|n| n.metadata().tablets.len() == 2) {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("split was not recorded within 10s");
+
+    await_index_status(&nodes, table, "by-email", IndexStatus::Active, 60).await;
+    await_row_count(
+        client_addr,
+        index_table,
+        ids.len(),
+        "after split-during-backfill converges",
+    )
+    .await;
+    for id in &ids {
+        await_gsi_hit(
+            dynamo_addr,
+            table,
+            "by-email",
+            "email",
+            &format!("{id}@x"),
+            id,
+        )
+        .await;
+    }
+
+    for n in &nodes {
+        n.shutdown();
+    }
 }
