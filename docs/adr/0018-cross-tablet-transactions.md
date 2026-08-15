@@ -2162,3 +2162,164 @@ Existing acceptance test unchanged: `animusd/tests/dynamo_txn.rs::
 transact_get_items_never_observes_a_torn_pair_under_concurrent_writes` —
 still the real wire-level check, now also the regression for §4's residual
 bug once that gets its own fix.
+
+## Amendment (2026-08-15, write-loss fix — PR3 of the torn-pair-fix stack)
+
+This amendment closes the §4 residual bug the PR2 amendment above left
+explicitly out of scope: a **participant-write-loss** bug on a split
+table's cross-tablet transaction, root-caused as a coordinator-side
+routing defect with no apply-time guard against it, not an HLC/clock issue
+(the PR1/PR2 fixes above remain independently correct and unaffected).
+
+### 1. The bug
+
+`ClientCtx::recovery_resolve` (the resolve half of both `txn_recover`'s
+in-doubt push and `txn_resolver_loop`'s periodic sweep — see §3/§5 of the
+PR5 amendment) grouped a transaction's `intent_spans` by **table name
+alone**, with no tablet dimension, before issuing one `txn_resolve_
+participant` call per group. A table with more than one tablet (any split
+table) can have two participants' keys share one table name but live on
+two different Raft groups; grouping by table name alone bundles both into
+one call, and that call's own `cp_route(table, &keys[0])` resolves a
+single leader from the *first* key alone — so the rest of the bundle rides
+along to whichever tablet the first key happens to belong to, not
+necessarily its own.
+
+Before this fix, `KvCommand::TxnResolve` carried no `fence` at all — every
+*other* key-writing variant (`Put`/`Batch`/`Delete`/`Cas`/`TxnStage`)
+already had one (ADR 0028), but `TxnResolve` was reasoned, incorrectly, to
+need none: "every key here was already fence-checked at `TxnStage` time."
+That reasoning silently assumed `keys` could only ever be a set the
+*applying* tablet itself had staged — true for every in-crate caller, but
+not something the type enforced, and the coordinator-side grouping bug is
+exactly the counterexample. With no fence, the misrouted tablet applied
+the resolve for a key it doesn't own, directly onto the *same physical
+key* the owning tablet separately maintains (ADR 0028: a table's tablets
+share one `StorageScope` prefix on a shared engine — only the logical
+`KeyRange` differs) — stamped with the wrong tablet's own clock. The
+owning tablet's own clock never learns of that foreign version and can
+never mint above it again: every future write to that key silently loses
+the per-key LWW race in `StorageEngine::merge` (whose `Result<bool>`
+"took effect" outcome was discarded via `.expect(..)` at every apply arm
+that merges a value), while the coordinator's own client-facing ack is
+computed independently of whether the merge that's supposed to back it up
+actually landed — an acked write silently and permanently lost, with the
+transaction's own record correctly `Committed` throughout. `txn_resolver_
+loop`'s 1s `unresolved_decided` sweep (not grace-gated, unlike the
+in-doubt `txn_recover` path) races the coordinator's own `resolve_all` on
+essentially every transaction against a split table, so this fired on
+most fast transactions, not just a rare crash-recovery window.
+
+### 2. The fix: correct grouping at the source, a fence as the structural seatbelt
+
+Two independent, complementary changes:
+
+- **`ClientCtx::recovery_resolve` now groups by `(table, tablet)`**, not
+  table alone: each key's *own current* tablet is re-resolved right before
+  grouping (`tablet_for`, the same primitive `cp_route` itself uses),
+  mirroring the same discipline `cp_txn`'s own stage-time key grouping
+  already used (that path was never affected by this bug, and the audit
+  below explains why). A key whose tablet can't be resolved *right now* (a
+  genuinely transient routing gap) is skipped, not fatal to the rest of
+  this best-effort resolve — unchanged from before. Every other
+  `recovery_resolve`/`txn_resolve_participant` caller in the crate
+  (`cp_txn`'s own `resolve_all`, `txn_recover`, `txn_resolver_loop`) was
+  audited and found to already route correctly: `resolve_all` builds its
+  own `(table, tablet)`-keyed `staged` map directly from the *same*
+  per-participant stage calls it just issued, never regrouping through
+  `intent_spans` at all, so it was never exposed to this defect.
+- **`KvCommand::TxnResolve` gains a `fence: KeyRange`**, stamped at
+  propose time from the routed group's own live `scope_range()` — byte-
+  for-byte the same discipline `TxnStage`'s own `fence` already uses — and
+  enforced at apply exactly like `TxnStage`'s: **whole-or-nothing**, every
+  key in `keys` must fall inside `fence` (and not a since-sealed range) or
+  the entire entry is a no-op, never a partial resolve. This is the
+  structural seatbelt: even if a caller (present or, more importantly,
+  future) makes the identical grouping mistake again, the wrong tablet
+  now safely **rejects** the resolve instead of silently corrupting the
+  other tablet's physical key. Fail-before/pass-after (`animus-cp-data/
+  tests/fenced_commands.rs::txn_resolve_misrouted_to_the_wrong_tablet_is_
+  rejected_by_its_own_fence`): with the `!all_in_fence` gate temporarily
+  removed, this same test reproduces the corruption directly — group B's
+  physical intent for its own key gets silently rewritten `Committed`
+  under group A's clock by a resolve proposed on group A's own log, purely
+  from A having been handed a foreign key with no fence to catch it.
+  Restoring the gate makes the resolve a clean no-op instead, leaving the
+  intent physically untouched; a subsequent correctly-routed resolve from
+  B's own group still resolves it normally. Codec version bumped 13 → 14
+  for the new field (pre-alpha, no cross-version wire/disk compatibility
+  required).
+
+An earlier design considered **witnessing** `TxnResolve`'s carried
+`commit_ts` into a non-anchor participant's clock at apply — folding the
+anchor-minted commit timestamp into the participant's own `Hlc` so its
+future mints would provably exceed it, the same "witness a just-observed
+timestamp" pattern the crate's four existing witnessing points already
+use (see this file's Key invariants entry in `animus-cp-data/CLAUDE.md`).
+It was **abandoned**: even gated to a genuine non-anchor participant (never
+the anchor re-witnessing its own already-folded value), it reignited a
+clock-witnessing runaway under sustained cross-group transaction + read
+load — confirmed super-linear in round count by a dedicated regression,
+`animus-cp-data/tests/ts_cache.rs::cross_group_txn_traffic_never_lets_
+either_groups_clock_run_away` (kept as a permanent guard against
+reintroducing this design: green at ~10.6s of ceiling drift over a 30s run
+without the witness, vs. 37.5s/82s at 80/160 rounds with it — the
+runaway's growth tracked round count, not real elapsed time, exactly PR1's
+own outlawed pattern relocated to a new call site). The real fix needed no
+new witnessing chain at all — closing the routing bug at the source, with
+the fence as a structural backstop, is sufficient and does not touch
+`Hlc` in any new way.
+
+### 3. Kept from the investigation, unrelated to the fix above
+
+- **`mint_at_least`'s witness → `bump_strictly_above` swap**: a *second*,
+  independent, previously-unfixed route to the exact `Hlc::witness`
+  poisoning sink the PR1 amendment (`mint_pushed`) closed — same pattern,
+  same fix, found opportunistically while investigating this bug (see
+  `hlc.rs`'s `bump_strictly_above` doc in `animus-cp-data/CLAUDE.md`).
+  Worth keeping regardless of this amendment's own fix.
+- **The merge-took-no-effect seatbelt** (`surface_suspicious_merge_noop`,
+  `Metric::CpMergeTookNoEffect`/`CpMergeTookNoEffectUnexplained`): surfaces
+  a `storage.merge`/`merge_tombstone` call returning `Ok(false)` at the
+  three apply-arm sites that used to discard it via `.expect(..)`
+  (`TxnStage`'s intent write, `TxnResolve`'s commit/abort-restore writes,
+  `Cas`'s swap) — metric + a capped `tracing::warn!` only, **deliberately
+  not a hard assert (not even `debug_assert!`)**: an earlier draft's assert
+  fired on legitimate, already-tested scenarios (an application-level
+  retry landing an identical entry a second time within one process
+  lifetime) the replay-vs-fresh distinguisher doesn't yet account for. This
+  is exactly the signal that would have caught this bug directly (a
+  provable, live "the write I just decided upon didn't actually land")
+  had it existed before this investigation; kept as a permanent, if
+  currently soft, guard against the next bug shaped like it.
+
+### 4. What this closes, what stays true
+
+Closes the acked-participant-write-loss mechanism at its root
+(coordinator-side misrouting) and structurally (the fence), for every
+current and future `TxnResolve` caller. Does not change wire-facing
+behavior beyond the codec version bump; does not touch `Hlc`/witnessing at
+all. The full three-bug torn-pair-fix stack (PR1: `mint_pushed` clock
+runaway; PR2: quiescent-round read-shape; PR3: this write-loss fix) is
+required together for `transact_get_items_never_observes_a_torn_pair_
+under_concurrent_writes` to pass reliably solo — see `docs/engineering-
+lessons.md` for the acceptance numbers at each layer and the general
+lessons this incident leaves behind.
+
+### 5. Tests
+
+New: `animus-cp-data/tests/fenced_commands.rs::txn_resolve_misrouted_to_
+the_wrong_tablet_is_rejected_by_its_own_fence` (the fence, proven
+fail-before/pass-after per §2 above) and `animusd/tests/txn_recovery_
+participant_spans.rs::recovery_resolve_correctly_commits_both_tablets_of_
+a_two_tablet_transaction` (a genuine two-tablet transaction resolved only
+by the automatic recovery sweep, asserted via a table `Scan` rather than a
+point `Get` — a point read resolves a still-`Pending` intent on demand at
+read time regardless of whether the physical resolve landed, which would
+mask this exact bug; a `Scan` does not). The cross-group clock-runaway
+regression from §2 above (`cross_group_txn_traffic_never_lets_either_
+groups_clock_run_away`) stays green as a permanent guard against
+reintroducing the abandoned witnessing design. Existing acceptance test
+unchanged: `animusd/tests/dynamo_txn.rs::transact_get_items_never_
+observes_a_torn_pair_under_concurrent_writes` — the real wire-level check
+this whole three-PR stack exists to make pass reliably.

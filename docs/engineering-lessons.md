@@ -1757,6 +1757,14 @@ debugging anything that feels like it might have happened before.
   hopes something else clears it). Do not fold it into a future PR's diff
   without its own investigation and acceptance evidence — same convention
   as the entry above.
+  **RESOLVED (2026-08-15, torn-pair-fix stack PR3)** — not a duelling-
+  decider race after all: `ClientCtx::recovery_resolve` grouped a
+  transaction's participants by table name alone, misrouting a resolve to
+  the wrong tablet of a split table, and `KvCommand::TxnResolve` had no
+  apply-time fence to catch it (every *other* key-writing variant did).
+  See ADR 0018's 2026-08-15 amendment for the full mechanism/fix, and the
+  three entries below for the generalizable lessons this investigation
+  leaves behind.
 - **`RaftKvNode::start_scoped` pins every group to `PRIMARY_STREAM` — a
   `SimEnv` test that starts more than one tablet group on the *same* set of
   node ids (any split/merge scenario sharing physical nodes across tablets,
@@ -4939,6 +4947,154 @@ debugging anything that feels like it might have happened before.
   animus-cp-data/src/lib.rs::mint_pushed`; ADR 0018 §2 amendment,
   `tests/ts_cache.rs::interleaved_reads_and_writes_never_let_minted_
   timestamps_outrun_real_time`, 2026-08-15.)
+- **Every key-writing `KvCommand` variant must carry AND enforce an
+  apply-time `fence` — an exception "reasoned" safe on a closed-world
+  assumption is exactly where the next caller breaks the assumption.**
+  `KvCommand::TxnResolve` was the one key-writing variant with no `fence`
+  at all, on the theory that "every key here was already fence-checked at
+  `TxnStage` time" — true for every in-crate caller, but not something the
+  type enforced, and `animusd`'s own coordinator (`ClientCtx::
+  recovery_resolve`, misrouting a resolve to the wrong tablet of a split
+  table by grouping participants by table name alone, no tablet
+  dimension) was exactly the counterexample: the wrong tablet applied the
+  resolve for a key it doesn't own, stamped with its own clock onto the
+  *same physical key* the owning tablet separately maintains (ADR 0028: a
+  table's tablets share one `StorageScope` prefix on a shared engine) —
+  an acked write silently and permanently lost. **The general rule this
+  generalizes**: when a command variant is deliberately left without a
+  safety check present on its siblings, the justification is a claim
+  about every *current* caller's behavior, not a property the compiler
+  verifies — grep for that same reasoning shape ("X can't happen because
+  every caller already ensures it") whenever reviewing why one variant in
+  a family lacks a guard the others have, and prefer adding the guard
+  (cheap, whole-or-nothing, matching the siblings' own shape) over trusting
+  the argument to stay true forever. Practically: **when adding a new
+  `KvCommand`/wire-command variant, grep both the relay-gate pattern
+  (`is_relayable_command`, `cp_serve_forwarded`, admin filters — a missed
+  allowlist entry) and the fence-check pattern (every other key-writing
+  variant's apply arm) — a missing fence is a silent data-corruption path,
+  not a compile error or an obvious test failure, exactly like a missing
+  relay-gate entry is a silent per-process-bimodal flake.** (ADR 0018 §2
+  write-loss amendment, torn-pair-fix stack PR3, 2026-08-15.)
+- **A trait contract designed for one architecture's semantics becomes a
+  silent-failure footgun once a different architecture reuses the same
+  trait with different assumptions — audit every return value the new
+  architecture's callers now discard.** `StorageEngine::merge`'s "silently
+  no-op on a stale/duplicate write" contract (`Result<bool>`, `false` =
+  "did not take effect") was designed for the deleted leaderless-AP
+  plane's replay-tolerance semantics (ADR 0001, gone under ADR 0019),
+  where a stale re-application being silently ignored was exactly the
+  intended behavior. The CP data plane (`animus-cp-data`) inherited the
+  same trait and the same silent-`false` contract, but its own callers
+  (`TxnStage`'s intent write, `TxnResolve`'s commit/abort-restore writes,
+  `Cas`'s swap) all assume a write their *own* gating logic already
+  accepted genuinely lands — none of them ever checked the returned bool,
+  via a blanket `.expect(..)` that only asserted the call didn't *error*,
+  never that it *took effect*. This is exactly the shape that let the
+  write-loss bug above hide undetected: the merge silently no-op'd (fence
+  correctly absent pre-fix, corruption aside) while the caller's own
+  control flow (`StageOutcome::Staged`, a resolved commit/abort) had
+  already decided the write landed, computed independently of the merge's
+  own outcome. **The general check**: when a component built for one set
+  of semantics is reused by a component with different ones (a shared
+  trait, a shared library function, a shared protocol message), audit
+  every return value / outcome the *new* caller silently discards — a
+  contract that was safe to ignore under the old semantics may be exactly
+  the signal the new semantics needed. The fix here
+  (`surface_suspicious_merge_noop`, a metric + capped log, deliberately
+  *not* a hard assert — a same-value idempotent WAL-replay re-application
+  is a legitimate, expected `false` this distinguisher can't yet tell
+  apart from a genuine violation) is a permanent guard against the next
+  bug shaped like it, not a full fix for the root cause it happened to
+  hide this time. (ADR 0018 §2 write-loss amendment, torn-pair-fix stack
+  PR3, 2026-08-15.)
+- **Fixing one bug in a multi-bug stack can unmask (or mask) another —
+  re-measure the acceptance baseline after every layer, never assume a
+  fix's own regression proves the end-to-end symptom is gone.** This
+  incident's own three-layer history is the clearest example the repo has
+  of this: PR1 (a clock-witnessing runaway) fixed a real bug and made the
+  end-to-end torn-pair test's failure rate roughly *unchanged* (a
+  coincidental clock-lockstep had been *masking* a second bug); PR2 (a
+  read-shape race) fixed a second real bug with its own clean regression
+  green at depth, yet the wire-level test's failure rate stayed just as
+  high, because a *third*, structurally unrelated bug (this write-loss
+  one) was still live underneath both. Each individual PR's own dedicated
+  `SimEnv` regression was, correctly, green throughout — proving that
+  fix's own protocol-level claim sound — but none of them could have shown
+  the composed system was actually fixed, because each targeted a
+  different mechanism than the one still causing the wire-level failure.
+  **The general practice**: in a multi-bug investigation, treat the real
+  wire-level/end-to-end reproduction as the only trustworthy signal for
+  "is the user-visible symptom actually gone" — a per-fix unit regression
+  proves that fix's own mechanism, never the composition. Re-run the full
+  reproduction (not just the new regression) after every layer, record the
+  baseline number, and don't stop until it reaches the required bar (here,
+  0/20 solo, the strictest baseline in this stack's own history) —
+  anything less and a fourth bug could still be hiding under the same
+  symptom. (Torn-pair-fix stack, all three PRs, 2026-08-07 through
+  2026-08-15.)
+- **A point read's on-demand intent resolution can mask a physical
+  write-side bug from any test that only ever reads via a point `Get` —
+  use a raw physical-storage probe, or at minimum a `Scan`, to prove a
+  resolve actually landed.** Both `RaftKvNode::local_get` and a
+  linearizable point read resolve a still-`Pending` intent *at read time*
+  (`resolve_once_step`/`resolve_decided`) the moment they can determine
+  the covering transaction's decided status — which they usually can, since
+  the transaction's own `TxnCommit`/`TxnAbort` record is a separate,
+  independently-correct write from the per-key resolve this bug breaks.
+  A test asserting only "the value reads back correctly" after some fix
+  can pass for a completely different reason than the fix working: the
+  physical intent never got rewritten to `Committed` at all, and the read
+  path quietly served the right answer anyway by re-deriving it from the
+  record every time. Caught while writing this incident's own regression:
+  an `animus-cp-data` `SimEnv` test asserting on `RaftKvNode::local_get`
+  showed a misrouted, fence-rejected resolve as "succeeded" (the *read*
+  came back correct) even though the physical envelope tag was still
+  provably `Intent`, not `Committed` — the fix was to read the raw stored
+  bytes directly (`StorageEngine::get`, checking the envelope's leading
+  tag byte) instead of going through any resolve-aware accessor. A `Scan`
+  is a partial substitute at the wire level (`resolve_scan_rows` omits a
+  row whose transaction it cannot determine is decided, rather than
+  chasing it down) — but only a *foreign* record lookup is genuinely
+  gated on cross-tablet routing; on a small cluster where every node
+  happens to host every tablet (see the next entry), even a `Scan` can
+  still resolve on demand via engine co-location, and only a true raw
+  physical read is unconditionally trustworthy. (ADR 0018 §2 write-loss
+  amendment, torn-pair-fix stack PR3, `animus-cp-data/tests/
+  fenced_commands.rs`, 2026-08-15.)
+- **A small cluster where every node hosts every tablet (`n == RF`) can
+  silently mask a cross-tablet routing bug — a "foreign" record lookup
+  that should require genuine cross-node routing can instead succeed by
+  accident via same-node engine co-location.** `RaftKvNode::resolve_once_
+  step`'s "is this transaction's record local" check reads the record's
+  physical bytes directly off `self.storage` using the *querying* tablet's
+  own `StorageScope` prefix — which is safe and correct precisely because
+  ADR 0028 puts every tablet of one table's replicas on the *same node*
+  under one shared engine and prefix, so a "local" read really does mean
+  "this replica's own copy." But that same design means that on a
+  3-node/RF-3 cluster (the default `bring_up(3, ..)` shape most `animusd`
+  integration tests use), literally every node hosts every tablet of
+  every table — so a tablet that does *not* logically own a key can still
+  physically read another tablet's record through the identically-prefixed
+  shared engine on the same node, purely because nothing about placement
+  spread them apart. A wire-level regression for this exact write-loss bug
+  (`animusd/tests/txn_recovery_participant_spans.rs::recovery_resolve_
+  correctly_commits_both_tablets_of_a_two_tablet_transaction`) was found
+  to pass identically whether or not the coordinator-side grouping fix was
+  present, for exactly this reason — a real fail-before/pass-after
+  demonstration of *that specific fix* needs a cluster large enough to
+  force the anchor's and participant's tablets onto genuinely disjoint
+  replica sets (well beyond a 3-node default), or a lower-level
+  `animus-cp-data` `SimEnv` test that constructs the shared-engine shape
+  directly without relying on real placement (which is what this
+  incident's actual fail-before/pass-after evidence uses instead — see the
+  entry above). **When a wire-level integration test is meant to prove a
+  cross-tablet/cross-node property, check whether the cluster's own size
+  relative to the replication factor could make "every replica has every
+  tablet" true** — if so, the test may still be a useful regression, but
+  it cannot discriminate the specific bug it was written to catch, and
+  that gap should be documented rather than assumed away. (Torn-pair-fix
+  stack PR3, 2026-08-15.)
 
 ### Parallel-agent orchestration
 - **A stacked series' final "docs/ADR finalization" PR must treat the stack's
