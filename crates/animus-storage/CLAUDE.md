@@ -327,108 +327,38 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
 ## Tests & benchmark
 
 `cargo test -p animus-storage` (proptest semantics + units). The
-`MemoryEngine`-level suites are `tests/storage_basic.rs` (trait-contract units)
-and `tests/storage_props.rs` (property tests). Library unit tests
-also cover the perf formats: `sstable::tests` round-trips a compressible and
-an incompressible block (asserting LZ4 shrinks the former and never inflates the
-latter), round-trips the **shared-prefix codec** across every prefix relation +
-rejects a malformed `shared` length, and asserts shared-prefix encoding is far
-smaller than naive full-key encoding (isolated from LZ4 by comparing the raw
-buffer against the arithmetic full-key cost); and `manifest_tests` round-trips the binary manifest codec,
-checks it is smaller than JSON, and confirms a legacy JSON manifest still decodes.
+`MemoryEngine`-level suites are `tests/storage_basic.rs`/`storage_props.rs`;
+`LsmEngine` gets a much larger battery under `SimEnv` via `Simulator` (a
+dev-dep) — semantics/differential, crash/fault-injection (including an
+opt-in `SimEnv` disk fault model: torn WAL tails, at-rest corruption,
+injected I/O errors), WAL rotation, tombstone GC + snapshot pinning, the
+`trust_monotonic_versions`/`background_maintenance` opt-ins, and the ADR
+0015 metrics counters. `LsmEngine` exposes a `#[doc(hidden)]` introspection
+API for these tests, plus a **documented** read-only introspection API for
+the admin/debug interface (ADR 0020, consumed by `animusd`) —
+`sstable_views()`, `memtable_len`/`memtable_bytes`, `wal_segment_sizes`/
+`wal_durable_seq`/`wal_rotation_count`, `wal_segment_records(seg)` — and
+the **admin actions** `flush_now`/`compact_now`. `open_with_metrics`/
+`with_metrics` is the sim-readable seam every metrics test opens the
+engine through (`SimEnv`'s metrics sink, not `ProdEnv`'s).
 
-`LsmEngine` tests run under `SimEnv` via `Simulator` (a dev-dep): `lsm_semantics.rs`
-mirrors the `MemoryEngine` units + a differential proptest, plus a Bloom test
-asserting a point-miss inside a table's key range reads **zero** blocks; and
-`lsm_crash.rs` fault-injects crashes (synced writes survive; a flushed SSTable
-survives; mid-flush and mid-compaction crashes lose nothing) and asserts
-flush + leveled compaction actually happen (L0 bounded by the trigger, L1+
-non-overlapping) — all seed-reproducible. `lsm_wal_rotation.rs` covers segment
-rotation specifically: writes spanning multiple segments, a flush removing the
-covered segment files, multi-segment recovery restoring all acked data (across
-SSTables + live WAL segments), and a crash mid-rotation recovering correctly
-(including idempotent re-recovery). `LsmEngine` exposes `#[doc(hidden)]`
-`sstable_count`/`flush_count`/`compaction_count`/`block_read_count`/
-`reset_block_reads`/`level_table_counts`/`levels_non_overlapping`/
-`wal_segment_count`/`wal_segments`/`wal_batch_sync_count`/
-`test_write_orphan_sstable`/`test_write_orphan_wal_segment`/`test_disk_versions_of`
-introspection helpers for these tests. It also exposes a **documented** read-only
-introspection API for the admin/debug interface (ADR 0020, consumed by `animusd`):
-`sstable_views()` (a lean `SsTableView` per live table — key/version range, size,
-level, bloom), `memtable_len`/`memtable_bytes`, `wal_segment_sizes`/
-`wal_durable_seq`/`wal_rotation_count`, and `wal_segment_records(seg)` (decoded
-`WalRecordView`s via the existing `decode_wal`); plus the **admin actions**
-`flush_now`/`compact_now` (force a flush+compaction / a compaction pass — `flush_now`
-keeps the `applies_in_flight == 0` WAL-GC invariant). Pure reads or explicit
-actions; they record nothing and change no engine behavior. `lsm_gc.rs` covers tombstone GC: an aged
-tombstone (and its shadowed value) is physically reclaimed while a within-grace
-tombstone is preserved, and GC never resurrects a key with a deeper old value;
-and a held `Snapshot` pins the GC floor below its own version, surviving
-compactions that would otherwise reclaim the very history it needs (and
-releases the pin on drop).
-
-`lsm_disk_faults.rs` drives `LsmEngine` under `SimEnv`'s opt-in disk fault
-model (`DiskConfig`: injected I/O errors, torn WAL tails on crash, at-rest
-corruption) — seed-swept and reproducible. Covers a torn-tail crash recovering
-every acked write (with and without an additional bit-flip in the torn
-region), injected write-path errors losing no acked write, faulty
-flush/compaction losing no acked write, a corrupted SSTable block failing
-cleanly (per-block CRC), a corrupted MANIFEST never panicking, a torn WAL tail
-surviving a *second* restart (the sealing fix), and at-rest WAL corruption
-surfacing loudly instead of silently dropping history (the CRC-framing fix).
-
-`lsm_merge_fast_path.rs` covers `LsmOptions::trust_monotonic_versions`:
-default behavior still reads the SSTable for the LWW check; the opt-in fast
-path reads **zero** blocks for `merge`/`merge_tombstone`/`merge_batch` on a
-key that already lives on disk, while still applying correctly (including
-in-batch dedup for a repeated key).
-
-`lsm_maintenance.rs` covers `LsmOptions::background_maintenance`: a write's ack
-returns before the flush it triggers has run (no simulator driving yet); once
-driven with `Simulator::run_until_quiescent`, the background task completes
-and data is correct; a large burst of writes converges under backpressure with
-no lost/corrupted keys; and the default (`false`) path stays fully synchronous
-with no driving needed, unaffected. See the "What's non-obvious" entry above
-on why these tests spawn the write workload as a task rather than using this
-crate's usual bare `block_on`.
-
-`lsm_metrics.rs` covers the ADR 0015 storage counters: a write workload forces
-several flushes, an L0→L1 compaction (asserting tables/bytes merged), WAL segment
-rotations, and on-disk point reads (block reads + Bloom hits); a proven-absent
-in-range key is a Bloom *miss* that reads **zero** blocks; an aged tombstone is
-counted reclaimed; and the recorded snapshot is asserted byte-identical across two
-runs of the same seed (determinism). All under `SimEnv` via `open_with_metrics`.
-
-`lsm_concurrent.rs` is a **real multi-threaded** regression (`#[tokio::test(flavor
-= "multi_thread")]` over `ProdEnv`, timeout-guarded): the deterministic single-
-threaded `SimEnv` cannot exercise a preemptive interleaving, so the WAL group-
-commit's liveness under genuine parallelism is covered here. (A writer that
-enqueued its record while the leader was mid-`fsync` once parked forever; the
-`DurableUpTo` future now resolves as soon as `!flushing` so it re-leads — see
-`wal.rs`.) It also has `scans_survive_concurrent_compaction`: a writer storm with
-tiny flush/compaction thresholds while scanners loop `entries()`, asserting every
-scan succeeds (the compaction-removal short-read race) **and** never loses a
-previously-seen key (the flush race); and the flush-concurrency regressions
-(maintenance exclusion + surgical clear, see above): concurrent writers *with
-flushes actually occurring* (the original deadlock test never crossed the flush
-threshold — which is exactly how the flush-vs-apply loss went unseen), forced
-`flush_now`/`compact_now` from a second task under live writes, and overlapping
-`flush_now` bursts — each asserting every acked write reads back **live and
-after a restart**, and that SSTable seqs stay unique. **Lesson:** concurrency
+`lsm_concurrent.rs` is a **real multi-threaded** regression
+(`#[tokio::test(flavor = "multi_thread")]` over `ProdEnv`, timeout-guarded):
+the deterministic single-threaded `SimEnv` cannot exercise a preemptive
+interleaving, so the WAL group-commit's liveness under genuine parallelism,
+scans racing concurrent compaction, and flush-concurrency (maintenance
+exclusion + surgical clear) are covered only here. **Lesson:** concurrency
 primitives — and lock-free reads racing flush/compaction — need a `ProdEnv`
-multi-thread test; the sim proves logic/order, not real-thread races. **Second
-lesson:** a concurrency test only has teeth against the code paths its workload
-actually reaches — drive the *maintenance* machinery (cross the flush
-threshold), not just the write path.
+multi-thread test; the sim proves logic/order, not real-thread races.
+**Second lesson:** a concurrency test only has teeth against the code paths
+its workload actually reaches — drive the *maintenance* machinery (cross
+the flush threshold), not just the write path.
 
-`cargo bench -p animus-storage` runs `benches/engine_bench.rs`: a hand-rolled
-(no criterion) macro-benchmark over **`ProdEnv`** comparing `LsmEngine` vs
-`MemoryEngine` on put/get/scan throughput + latency and reporting flush/
-compaction counts. Workload is tunable via `ANIMUS_BENCH_KEYS` /
-`ANIMUS_BENCH_GETS` / `ANIMUS_BENCH_VALUE_BYTES` / `ANIMUS_BENCH_SCAN`. The
-default run shows the per-put WAL `fsync` is the dominant sequential write cost;
-the **concurrent** section shows group commit coalescing it across writers, and the
-**sequential apply-path** section (`ANIMUS_BENCH_APPLY_BATCH`, default 30) compares
-per-op `merge` against `merge_batch` — the CP-data Raft apply pattern — where a
-single task cannot rely on group commit and `merge_batch` gives ~9.7x (fsyncs 30x
-fewer).
+`cargo bench -p animus-storage` runs `benches/engine_bench.rs`: a
+hand-rolled (no criterion) macro-benchmark over **`ProdEnv`** comparing
+`LsmEngine` vs `MemoryEngine` on put/get/scan throughput + latency and
+reporting flush/compaction counts. Workload is tunable via
+`ANIMUS_BENCH_KEYS`/`ANIMUS_BENCH_GETS`/`ANIMUS_BENCH_VALUE_BYTES`/
+`ANIMUS_BENCH_SCAN`/`ANIMUS_BENCH_APPLY_BATCH` (default 30, the
+sequential-apply section comparing per-op `merge` against `merge_batch` —
+the CP-data Raft apply pattern).

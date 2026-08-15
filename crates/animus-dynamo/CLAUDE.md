@@ -11,201 +11,56 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
 
 ## Entry points
 
-- `AttributeValue` — scalars (`S`/`N`/`B`/`Bool`/`Null`), **document** types
-  `M` (map) / `L` (list), and **set** types `SS`/`NS`/`BS` (string/number/binary
-  sets, kept sorted + deduplicated so equality and storage are canonical). Only
-  scalar types are valid key attributes (document/set `key_bytes()` is empty;
-  the schema layer never routes them as keys). `Item`, `TableSchema` (`simple` /
-  `composite`).
-- `Table<S: StorageEngine>` — `put_item`, `get_item`, `delete_item`, `query` /
-  `query_with` (the local-engine item API; `query_with` takes an optional
-  `SortKeyCondition`).
-- `condition` module — `SortKeyCondition` (`Equals` / `Between` / `BeginsWith`,
-  with `matches`) and `ConditionExpression` (`AttributeNotExists` /
-  `AttributeExists` / `Equals`, with `evaluate(current)`) — pure predicates for
-  `Query` sort conditions and conditional writes.
-- `registry` module — `SchemaRegistry`: a pure, in-memory per-table schema map
-  (`create_table` / `create_table_with_indexes` / `create_table_legacy` /
-  `extract_key`) plus per-table secondary-index **shape** bookkeeping
-  (`index_is_composite` + `index_projected_attributes` query it). **Neither the
-  base table's items nor a secondary index's entries are tracked here (ADR
-  0041 §5)** — a base `Query`/`Scan` uses the data plane's native quorum
-  range scan (`DataClient::scan`), and an index `Query` is now a *second*
-  native range scan (over a GSI's own hidden table or an LSI's colocated
-  `KIND_LSI` scope, `animusd::dynamo`'s `run_gsi_query`/`run_lsi_query`) —
-  neither reads this registry at all. What survives is purely the shape a
-  table needs regardless of any index entry: `SecondaryIndex` is either a
-  `GlobalSecondaryIndex` (name + hash key attribute + optional sort attribute
-  + `IndexProjection`) or a `LocalSecondaryIndex` (name + alternate sort
-  attribute + `IndexProjection`, hashing by the base partition key). Any
-  number of indexes per table. `IndexProjection` is `All` / `KeysOnly` /
-  `Include(names)`; `index_projected_attributes` resolves it to the returned
-  attribute set (`None` ⇒ all) — used by neither read path today (an index
-  row's *stored* value is already projected by the writer/drain), kept as
-  definition-level API. `RegistryError` carries the failure cause (incl.
-  `IndexSortMismatch` for a sort condition against a hash-only index, though
-  that check itself now lives at the `animusd` edge, against the replicated
-  catalog's `IndexDef`, not this registry).
-  `sync_indexes(table, schema, &[SecondaryIndex])` reconciles a table's index
-  *definitions* to a desired set (registering the table if absent) — a plain
-  resync now, not a merge: there is no per-index entry data left to preserve
-  or discard across a shape change, so a removed index is simply gone and a
-  changed/new one simply replaces/appears — how the edge rebuilds its
-  key/index-*definition* bookkeeping from the **replicated** definitions (ADR
-  0013) rather than process-local `create_table_with_indexes` state.
-  **Note:** `animusd` keeps the *table key schema* **and the GSI/LSI
-  definitions** in the **control plane's replicated catalog** (ADR 0013); this
-  registry mirrors only that definition shape now, nothing about index
-  contents (deleted: `note_put`/`note_delete`, `index_query_keys`,
-  `touched_since_backfill`/`mark_table_backfilled`/`index_needs_backfill`,
-  and the per-index `entries`/`entry_by_base` maps — see ADR 0041 §5's
-  as-built note).
-- `schema` module — the pure bridge between this crate's DynamoDB `TableSchema`
-  (partition key + optional sort key) and the control plane's `TableSchema`
-  (`animus_control`: partition key + ordered clustering keys + typed columns):
-  `to_control(schema, key_types)` (DynamoDB simple/composite → control schema,
-  recording key columns with their `AttributeType` — `key_types` come from the
-  `CreateTable` request's `AttributeDefinitions`, decoded into
-  `Operation::CreateTable.key_types`; the `animusd` edge now passes them, so a
-  numeric/binary key is recorded as `Number`/`Binary` rather than defaulting to
-  `String`) and `to_dynamo(control)` (back,
-  taking the first clustering key as the DynamoDB sort key, ignoring extra CQL
-  clustering columns). It also bridges **secondary-index definitions**:
-  `index_to_control(&SecondaryIndex, base_pk)` ↔ `index_to_dynamo(&IndexDef)` /
-  `indexes_to_dynamo(&[IndexDef])` (an LSI's control `hash_attribute` is the base
-  partition key). `animusd` uses it to propose/read schemas + index definitions via
-  the catalog.
-- `storage_key(pk, sk)` — the data-plane key for an item, exposed so a caller
-  can route an item through `animus-data` without instantiating a local `Table`.
-- `index` module (**ADR 0041 — the codec every layer of materialized secondary
-  indexes is built on**: the write path, the GSI drain, and the native index
-  read path all construct/parse keys through these same functions) — every
-  byte layout materialized secondary indexes introduce, kept pure so every
-  layer agrees by construction. Like `storage_key` these are
-  **within-table** keys: the ADR 0022 partition token is prepended at the
-  `animusd` edge, and each builder documents *which* value to token-hash (the
-  base partition key for base/LSI/marker keys, the **index hash value** for a GSI
-  row — that difference is why a GSI is a separate table). Row kinds are
-  **separate `StorageScope`s, not bytes in the key** (ADR 0041 §3): `KIND_BASE`
-  (`base_row_key`, byte-identical to `storage_key` — ADR 0022's layout is
-  *unchanged*), `KIND_LSI` (`lsi_row_key` / `lsi_index_prefix`), `KIND_CHANGE`
-  (`change_record_key` / `change_prefix`), `KIND_FOOTPRINT` (`footprint_key`),
-  enumerated by `ALL_KINDS`; `range_end` bounds any prefix. The kind rides in the
-  scope prefix — `escape(table) || KIND || token || …` — because a tablet is a
-  range over *token* space (a kind above the token would break `KeyRange`/the
-  router/split) **and** because `RaftKvNode::txn_stage` asserts a logical key
-  leads with the token, slicing `anchor[..TOKEN_BYTES]` and deriving every txn
-  intent span from it. All four scopes share one tablet group and one `KeyRange`,
-  so a `PutBatch` still writes every kind atomically and a split moves them
-  together. Two keys in different scopes can be byte-identical (a footprint key
-  and a base partition prefix are both bare `escape(pk)`) — the scope prefix is
-  what separates them, which is why there is no `row_kind()`. A GSI row needs no
-  kind at all
-  (`gsi_row_key` / `gsi_hash_prefix` / `gsi_hash_sort_prefix`), living in the
-  hidden table `index_table_name(base, index)` = `<base>$<index>`
-  (`split_index_table_name` / `is_index_table_name`). `parse_gsi_row_key` /
-  `parse_lsi_row_key` recover the base key by peeling escaped segments —
-  `parse_gsi_row_key` takes a `composite` flag because a hash-only index's
-  `escape(base_pk)` sits exactly where a composite index's `escape(isort)` would,
-  so the layout is otherwise ambiguous. `IndexFootprint` (of `ItemFootprint` /
-  `FootprintEntry`) records *where* an item's GSI rows are, never their values —
-  the drain deletes whatever it names that a recomputation didn't produce, which
-  is what makes a stale row structurally impossible. `ChangeRecord` carries
-  `base_sk` + old/new images and `event_name()`
-  (`INSERT`/`MODIFY`/`REMOVE`).
-- `wire` module — the DynamoDB JSON translation: `decode_request(target, body)
-  -> Operation` (CreateTable/PutItem/GetItem/DeleteItem/Query/Scan/**UpdateItem**/
-  **BatchWriteItem**/**TransactWriteItems**/**TransactGetItems**; `CreateTable`
-  decodes `GlobalSecondaryIndexes` (hash-only or composite) + `LocalSecondaryIndexes`,
-  each with an optional `Projection` (`ALL`/`KEYS_ONLY`/`INCLUDE`), `Query` an
-  optional `IndexName` + a sort condition (allowed on a composite GSI / LSI),
-  `Scan` a `Limit`/`ExclusiveStartKey`/`FilterExpression` and, since ADR 0041
-  §5 (2026-08-13), its own optional `IndexName` (`Operation::Scan.index`,
-  `decode_scan`) — unlike `Query`, no sort condition, since a DynamoDB `Scan`
-  never takes a `KeyConditionExpression`, index or not (the GSI-vs-LSI
-  kind-dispatch and `ConsistentRead` enforcement live at the `animusd` edge,
-  same as `Query`'s own `IndexName`), GetItem/Query/Scan an
-  optional `ProjectionExpression`/`AttributesToGet`, Put/DeleteItem an optional
-  `ReturnValues`, plus the existing `ConditionExpression` on writes and
-  `KeyConditionExpression` on Query; `GetItem`/`Query`/`Scan` all decode an
-  optional `ConsistentRead` boolean (default `false`, `decode_consistent_read`
-  — ADR 0041 §5, 2026-08-13 fix) **but this crate never enforces it**: whether
-  `true` is legal depends on an index's replicated *kind* (GSI vs LSI), which
-  lives in the control-plane catalog this crate never sees, so the field rides
-  through `Operation::Query`/`GetItem`/`Scan` for `animusd` to act on
-  (`animusd::dynamo::run_index_query` is the one place that ever rejects it —
-  see that crate's `CLAUDE.md`); `UpdateItem` decodes a `SET`/`REMOVE`
-  `UpdateExpression` into `Vec<UpdateAction>` + `UpdateReturnValues`
-  (`NONE`/`ALL_OLD`/`ALL_NEW`); `BatchWriteItem` a `RequestItems` map of
-  `Put`/`Delete` `WriteRequest`s per table; `TransactWriteItems` a list of
-  `TransactAction` (`Put`/`Delete`/`Update`/`ConditionCheck`) — **atomic since
-  ADR 0018 §2/PR7**, via `animusd`'s `ClientCtx::cp_txn`, not merely decoded
-  here; `TransactGetItems` (new, PR7) a list of `TransactGet` (table + key +
-  optional projection) — a consistent multi-key read, `run_transact_get` in
-  `animusd`; **`UpdateTable`/`DescribeTable` (new, ADR 0042 §2)**, added
-  alongside `CreateTable`'s own new `StreamSpecification` decode (below).
-  The AttributeValue codec encodes/decodes the full type set incl.
-  `M`/`L`/`SS`/`NS`/`BS`.
-  `Projection` (with `apply` / the free `project`) is a pure **dotted document-path**
-  filter (`a.b`, reconstructing nested maps); `ReturnValues` (`None`/`AllOld`)
-  drives `write_response`, `UpdateReturnValues` drives `update_response`, and
-  `apply_update` applies the `SET`/`REMOVE` actions. Plus `encode_item` /
-  `get_item_response` / `empty_response` / `query_response` / `scan_response` /
-  `create_table_response` / `describe_table_response` / `batch_write_response`,
-  `WireError` (carries the
-  DynamoDB `__type` code, incl. `conditional_check_failed`), and
-  `encode_stored_item` / `encode_tombstone` / `decode_stored_item` (the data-plane
-  value encoding, with a tombstone for delete).
+Module-by-module pointers — every module here is pure (no I/O/storage/
+network, `BTreeMap`/`BTreeSet` only, ADR 0003); see each module's own doc
+comment for its full type/method inventory.
 
-  **DynamoDB Streams (ADR 0042 §2), pure-wire slice only — no label minting
-  here (`animusd` mints it, since it needs `env.now()`).**
-  `Operation::CreateTable` gained `stream_view_type:
-  Option<animus_control::StreamViewType>`, decoded from an optional
-  `StreamSpecification` (`decode_create_table_stream_spec`/
-  `decode_stream_view_type` — `StreamEnabled: true` requires
-  `StreamViewType`; absent or `false` decodes `None`). **`Operation::
-  UpdateTable`** is new and stream-spec-only in this adapter:
-  `decode_update_table` rejects a `GlobalSecondaryIndexUpdates` field
-  outright (`ValidationException` — the index-adding shape is still ADR
-  0041 §5's own deferred follow-up) and requires a `StreamSpecification`
-  (the only supported change), decoding to `wire::StreamUpdate::Enable(view_type)`
-  or `::Disable`. **`Operation::DescribeTable`** is new — just a table name,
-  everything else comes from the replicated catalog `animusd` holds.
-  `wire::StreamDescription { view_type, label }` is the tiny bridge type a
-  caller (which holds the full replicated `animus_control::StreamSpec`)
-  builds to hand `create_table_response`/`describe_table_response` the
-  stream fields to render (`StreamSpecification`/`LatestStreamArn`/
-  `LatestStreamLabel`); `wire::stream_arn(table, label)` is the synthetic
-  ARN builder (`arn:aws:dynamodb:animus:0:table/<table>/stream/<label>`).
-  `describe_table_response` also needs `AttributeDefinitions`, resolved from
-  the replicated catalog's typed key columns via the new `schema::
-  key_attribute_types`/`attribute_type_for` (the reverse of `schema::
-  column_type_for`'s existing decode direction).
-- `streams_wire` module (ADR 0042 §3/§5/§6/§7, PR6) — the sibling
-  `DynamoDBStreams_20120810` service's own pure wire layer, mirroring
-  `wire`'s conventions but kept in its own module (a distinct
-  `TARGET_PREFIX`, `decode_request(target, body) -> StreamsOperation`
-  for `ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords`).
-  `parse_shard_id`/`parse_stream_arn` are the inverses of
-  `animus_cp_data::segment::shard_id`/`wire::stream_arn` (duplicated
-  rather than depending on `animus-cp-data`, same precedent as this
-  crate's other cross-crate byte-shape duplications).
-  `encode_iterator`/`decode_iterator` mint/parse the stateless,
-  non-expiring shard-iterator token (`base64url({label, shard_id,
-  position})`, ADR 0042 §6) — `position` is always the **exclusive**
-  lower bound the next read filters on, the same convention
-  `animus_cp_data::segment::slice_to_hlc_range`'s `start_exclusive` and
-  `animusd::index_drain::hot_read`'s `from_position` already use, so a
-  token composes with either serve tier with no translation.
-  `project_view`/`keys_from_images`/`stream_record_json` build one
-  `Records[]` entry from a decoded `ChangeRecord` — the read-time view
-  projection (ADR 0042 §3/§15: a shard always stores both images
-  regardless of the declared type) and key recovery (from whichever
-  image is present, new preferred over old, since both always carry the
-  full item). `list_streams_response`/`describe_stream_response`/
-  `get_shard_iterator_response`/`get_records_response` are the response
-  encoders; `animusd::dynamo_streams` is the one caller, holding
-  `Metadata`/the segment store this module never touches.
+- `AttributeValue`/`Item`/`TableSchema` — the DynamoDB type system (scalars,
+  document `M`/`L`, set `SS`/`NS`/`BS`) and the simple/composite key schema.
+- `Table<S: StorageEngine>` — the local-engine item API (`put_item`/
+  `get_item`/`delete_item`/`query`/`query_with`), used by this crate's own
+  tests.
+- `condition` — `SortKeyCondition` and `ConditionExpression`: pure predicates
+  for `Query` sort conditions and conditional writes.
+- `registry` — `SchemaRegistry`: a pure, in-memory per-table schema +
+  secondary-index-**shape** map (`sync_indexes` resyncs definitions to a
+  desired set). **Neither the base table's items nor an index's entries are
+  tracked here (ADR 0041 §5)** — both reads are native data-plane range
+  scans (`animusd::dynamo`'s `run_gsi_query`/`run_lsi_query`); this registry
+  is definition-shape bookkeeping only, mirroring the control plane's
+  replicated catalog (ADR 0013).
+- `schema` — the pure bridge between this crate's DynamoDB `TableSchema` and
+  `animus_control`'s replicated `TableSchema`/`IndexDef`, both directions.
+- `storage_key(pk, sk)` — the data-plane key for an item.
+- `index` (**ADR 0041 — the codec every layer of materialized secondary
+  indexes is built on**: the write path, the GSI drain, and the native index
+  read path all construct/parse keys through these same functions, so every
+  layer agrees by construction). Two contracts worth stating explicitly:
+  - **Row kinds are separate `StorageScope`s, not bytes in the key** (ADR
+    0041 §3) — because a tablet is a range over *token* space (a kind above
+    the token would break `KeyRange`/the router/split), **and** because
+    `RaftKvNode::txn_stage` asserts a logical key leads with the token,
+    slicing `anchor[..TOKEN_BYTES]` and deriving every txn intent span from
+    it. A GSI row needs no kind at all — it lives in its own hidden table
+    (`index_table_name(base, index)` = `<base>$<index>`).
+  - **`parse_gsi_row_key` takes a `composite` flag** because a hash-only
+    index's `escape(base_pk)` sits exactly where a composite index's
+    `escape(isort)` would, so the layout is otherwise ambiguous.
+- `wire` — the DynamoDB JSON translation (`decode_request` →
+  `Operation`, covering CreateTable/Put/Get/Delete/Query/Scan/UpdateItem/
+  BatchWriteItem/TransactWriteItems/TransactGetItems/UpdateTable/
+  DescribeTable, plus the response encoders). One gotcha: `GetItem`/`Query`/
+  `Scan` decode `ConsistentRead` **but this crate never enforces it** —
+  whether `true` is legal depends on an index's replicated *kind* (GSI vs
+  LSI), which lives in the control-plane catalog this crate never sees, so
+  the field rides through to `animusd::dynamo::run_index_query` to reject.
+- `streams_wire` (ADR 0042 §3/§5/§6/§7) — the `DynamoDBStreams_20120810`
+  service's own pure wire layer. `parse_shard_id`/`parse_stream_arn` are the
+  inverses of `animus_cp_data::segment::shard_id`/`wire::stream_arn`,
+  **duplicated rather than depending on `animus-cp-data`** — this crate
+  stays dependency-light by re-deriving small byte-shape functions instead
+  of pulling in a whole sibling crate, the same precedent its other
+  cross-crate duplications follow.
 
 ## What's non-obvious
 
@@ -363,69 +218,17 @@ adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
 
 ## Tests
 
-`cargo test -p animus-dynamo` — `item_api.rs` over `MemoryEngine` (incl.
-`query_with` sort conditions), plus `wire`, `streams_wire`, `condition`,
-`registry`, and `schema` unit tests (JSON decode/encode incl. document/set types + document-path projection
-+ ReturnValues + UpdateItem/BatchWriteItem/TransactWriteItems/TransactGetItems
-decode + index projection types, base64 round-trip, tombstone, sort/condition
-predicates, `sync_indexes` adding/dropping index *definitions* (no entry data
-left to preserve, ADR 0041 §5) and `index_is_composite`/
-`index_projected_attributes` reflecting a declared shape, and the DynamoDB↔control
-`TableSchema` + `IndexDef` bridge), plus `index` unit tests (ADR 0041: the base
-layout being ADR 0022 unchanged, every kind leading with `escape(pk)` so all four
-share one tablet, byte-identical keys in different scopes not being a collision,
-prefix-freedom across a partition whose key prefixes another's, change records
-sorting in commit order, base-key recovery from composite/hash-only GSI rows and
-from LSI rows — including values containing `0x00` bytes, two LSIs on one
-partition not interleaving, footprint round-trip + sort-invariance under
-out-of-order insertion, change-record round-trip + event naming, and
-`peel_escaped` rejecting malformed segments), and `wire` unit tests for
-`ConsistentRead` decode (ADR 0041 §5, 2026-08-13 fix: `true` decodes on
-`GetItem`/`Query`/`Scan` alike, and it defaults to `false` when omitted) and
-`Scan`'s own `IndexName` decode (`decodes_scan_against_an_index`, ADR 0041
-§5, 2026-08-13 — with and without, mirroring `Query`'s identical coverage).
-The rejection itself (`true` against a GSI `Query`/`Scan` only) is
-`animusd`-only — this crate never sees the replicated catalog needed to know
-an index's kind — and is end-to-end tested in `tests/dynamo_consistent_read.rs`
-(`Query`) and `tests/dynamo_index_scan.rs` (`Scan`).
-`streams_wire` unit tests (PR6) cover every operation's decode (incl. the
-`AT_SEQUENCE_NUMBER`/`AFTER_SEQUENCE_NUMBER` `SequenceNumber`-required
-validation), shard-id/stream-ARN parsing, iterator-token round-trip +
-tampered/garbage rejection, view-type projection for all four
-`StreamViewType`s, `Keys` recovery favoring the new image over the old,
-and every response encoder's JSON shape (incl. a closed vs. open shard's
-`SequenceNumberRange`) — the label-resolution/routing decisions those
-shapes get plugged into (F12-b, the sealed-vs-open serve split) are
-`animusd`-only (`dynamo_streams::tests` + `tests/dynamo_streams.rs` — see
-that crate's `CLAUDE.md`).
-The wire protocol is exercised end-to-end over real HTTP in
-`animusd`'s `tests/dynamo_wire.rs` (Put/Get/Delete), `tests/dynamo_extended.rs`
-(CreateTable/Query/conditional writes), `tests/dynamo_indexes.rs` (Scan with
-pagination + filter, and a GSI write-then-query), `tests/dynamo_documents.rs`
-(document/set types, projection, `ReturnValues: ALL_OLD`, multiple + composite
-GSIs, and an LSI), `tests/dynamo_schema.rs` (**CreateTable consuming the
-replicated catalog — surviving a node restart**, plus UpdateItem/BatchWriteItem/
-TransactWriteItems, document-path projection, a `KEYS_ONLY` GSI projection, and
-**`scan_and_query_read_live_storage_after_restart`** — base `Query`/`Scan` return
-the rows from live storage after a restart wipes the registry, proving they no
-longer depend on any in-memory written-key tracking), `tests/dynamo_gsi_drain.rs`
-(ADR 0041 §4/§5 — the drain materializing + pruning a GSI's hidden-table rows,
-then a real `Query` against it), `tests/kind_scan.rs` (ADR 0041 §5 — the LSI
-`Query` native read path forwarding correctly through a non-leader node, and a
-bare `KindScan`'s refusal), `tests/dynamo_index_scan.rs` (ADR 0041 §5,
-2026-08-13 — `Scan` with `IndexName`: a GSI `Scan`'s `LastEvaluatedKey`
-pagination draining every row exactly once, `ConsistentRead` rejection/
-acceptance parity with `Query`, an LSI `Scan` returning only the requested
-index's rows with no cross-index/cross-partition leakage issued through
-every node in turn, and a `FilterExpression` over LSI-scanned rows), and
-`tests/dynamo_txn.rs`
-(ADR 0018 §2/PR7 — atomic `TransactWriteItems`/`TransactGetItems` over a
-genuine multi-process, pre-split-table cluster: cross-tablet atomic
-visibility through a follower-connected client, a failing `ConditionCheck`
-cancelling the whole transaction, `TransactGetItems` never observing a torn
-pair under a concurrent writer, same-node concurrent transactions racing a
-shared conditioned key resolving to one winner, and `/admin/txns` showing a
-pending record during a simulated coordinator stall then clearing once
-recovery decides it). **Every GSI query assertion in these files is a
-converged-or-timeout poll** (ADR 0041's own eventually-consistent contract);
-an LSI query stays a plain immediate assertion.
+`cargo test -p animus-dynamo` — `item_api.rs` over `MemoryEngine`, plus unit
+tests for `wire`/`streams_wire`/`condition`/`registry`/`schema`/`index`
+(JSON decode/encode, the index key-layout invariants, iterator-token
+round-trip, response-shape encoders). The rejection of `ConsistentRead` on
+a GSI `Query`/`Scan` is `animusd`-only (this crate never sees the
+replicated catalog needed to know an index's kind) and is end-to-end
+tested in `animusd`'s `tests/dynamo_consistent_read.rs`/
+`tests/dynamo_index_scan.rs`. The wire protocol is exercised end-to-end
+over real HTTP in `animusd`'s `tests/dynamo_*.rs` (wire, extended,
+indexes, documents, schema, gsi_drain, kind_scan, index_scan, txn — see
+that crate's `CLAUDE.md`'s Tests section). **Every GSI query assertion in
+those files is a converged-or-timeout poll** (ADR 0041's own
+eventually-consistent contract); an LSI query stays a plain immediate
+assertion.
