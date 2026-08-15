@@ -348,6 +348,34 @@ what a shard actually contains; the object is allowed to be a harmless
 superset because nothing ever trusts it un-sliced. See ADR 0043 §A3/§A7 for
 the mechanism and a dedicated corpus scenario.
 
+**As-built amendment (2026-08-15): the shared-deterministic-id design above
+shipped a real data-loss bug and has been replaced.** The safety argument
+above ("the object is allowed to be a harmless superset") silently assumed
+the *later*-landing `put` always carries the *larger* range — true for a
+sequential same-leader retry (a strictly later `pending_changes()` read, by
+HLC monotonicity), but **false** the moment two *independently-computed*
+attempts for the same `(tablet, epoch)` race (the realistic trigger: a
+brief dual-leadership window during a write-burst-induced re-election).
+Whichever attempt's `put` physically landed *last* won the deterministic
+id's bytes — with no relationship to which attempt's *catalog proposal*
+won `SealStreamShard`'s first-committer-wins rule. When the later-landing
+`put` happened to carry a *smaller* range than the catalog's own committed
+one, the gap was silently, permanently lost. **Fix**: every seal attempt
+now writes at a fresh, attempt-unique id
+(`animus_cp_data::segment::segment_object_id` — the deterministic prefix
+above plus a suffix derived from the proposer's node id, its current Raft
+term, and a fresh RNG draw), carried as a new field on the catalog row
+(`StreamShardRow::object_id`) and resolved from there by every reader/sweep
+rather than ever recomputed. `SegmentStore::put` is now **write-once**
+(identical-content re-put is a safe no-op; differing-content re-put is a
+hard error) rather than "idempotent overwrite, last-write-wins" — since two
+attempts can no longer share a storage key at all, the superset-slice rule
+above is no longer load-bearing for this race (kept as harmless
+defense-in-depth). A losing attempt's own object becomes a permanent,
+uncataloged orphan, reclaimed by the segment janitor's own sweep rather
+than by a future overwrite. See ADR 0043 §A3/§A7's own as-built amendments
+and `docs/engineering-lessons.md` for the full incident.
+
 ### 11. Enable / disable / drop semantics, and F12-b's disable grace
 
 - **Enable**: `SetTableStream{Some(spec)}` mints a fresh `label`. No new

@@ -131,9 +131,12 @@ read path's only impure layer).
   every call** (never cached from mint time) — this is what makes an
   open-shard iterator survive a seal that happens between polls (ADR
   0042 §2): a catalog row present ⇒ the **sealed** path (any node —
-  `SegmentStoreHandle::get_sealed(&row.replicas, seg_id)`, then
-  `segment::decode_and_slice(bytes, row.hlc_range)`, the superset-slice
-  rule, ADR 0042 §10 — filtered/paginated, nulling `NextShardIterator`
+  `SegmentStoreHandle::get_sealed(&row.replicas, &row.object_id)` — the
+  ledger-named-object amendment, ADR 0043 §A3: `seg_id` is always resolved
+  from the row's own `object_id`, never recomputed via `segment::
+  segment_id` — then `segment::decode_and_slice(bytes, row.hlc_range)`, the
+  superset-slice rule, ADR 0042 §10 — filtered/paginated, nulling
+  `NextShardIterator`
   only once the sliced content is truly exhausted); absent ⇒ the
   **open** path (`ClientCtx::read_stream_hot_records`, forwarded to the
   tablet's own leader, no `ReadIndex` barrier, F8 — never nulls; an
