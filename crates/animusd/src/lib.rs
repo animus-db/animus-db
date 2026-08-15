@@ -5527,11 +5527,40 @@ impl ClientCtx {
     /// Resolve every `(table, span)` in `intent_spans` per `status`
     /// (best-effort, fire-and-forget on any individual routing failure —
     /// see [`txn_resolve_participant`](Self::txn_resolve_participant)'s own
-    /// doc): groups spans by table (a span's own exact key,
+    /// doc): groups spans by **`(table, tablet)`** (a span's own exact key,
     /// `span.start`, is the key to resolve — every span this crate ever
     /// builds is a single-key point-span) and issues one
-    /// `txn_resolve_participant` call per table. A no-op if `status` is
+    /// `txn_resolve_participant` call per **tablet**. A no-op if `status` is
     /// still `Pending` (nothing to resolve yet).
+    ///
+    /// **ADR 0018 §2 write-loss amendment (Bug 3): grouping by table name
+    /// alone used to be the bug.** `intent_spans` only ever names a
+    /// `(table, span)` — a table, not a tablet — because a span is recorded
+    /// at STAGE time from the writer's own key alone (`ClientCtx::cp_txn`'s
+    /// `participant_spans`), never from a specific tablet id. A table with
+    /// more than one tablet (any split table) can have two participants'
+    /// keys share one table name but live on two different Raft groups.
+    /// Grouping by table name alone used to bundle both into one
+    /// `txn_resolve_participant` call; that call's own `cp_route(table,
+    /// &first)` picks a single leader from the *first* key alone, so the
+    /// rest of the bundle silently rode along to the wrong tablet. Because
+    /// `KvCommand::TxnResolve` used to carry no fence at all, the wrong
+    /// tablet applied the write anyway — onto the *same physical key*
+    /// (ADR 0028: a table's tablets share one `StorageScope` prefix), MVCC-
+    /// stamped with the wrong tablet's own clock. The right tablet's own
+    /// clock never learns of that foreign version and can never mint above
+    /// it again: every future write to that key silently loses the per-key
+    /// LWW race, forever. Re-resolving each key's own **current** tablet
+    /// here (immediately before grouping, via the same [`tablet_for`]
+    /// [`ClientCtx::cp_txn`] itself uses at stage time) closes this at the
+    /// source; [`KvCommand::TxnResolve`]'s own apply-time fence (added in
+    /// the same amendment, mirroring `TxnStage`'s) is the structural
+    /// seatbelt for every other caller (present or future) that might make
+    /// the identical mistake. A key whose tablet can't be resolved right
+    /// now (a genuinely transient routing gap) is skipped, not failed
+    /// whole-batch — this whole call is best-effort fire-and-forget by
+    /// design (a later resolver-loop tick, or the live coordinator's own
+    /// resolve, picks up anything left over).
     ///
     /// ADR 0018 §2/PR6 torn-resolve audit: `status` must always be a
     /// **post-decision re-read** (`txn_status_local`/`txn_record_view`,
@@ -5556,14 +5585,22 @@ impl ClientCtx {
             TxnDecisionStatus::Aborted => TxnOutcome::Aborted,
             TxnDecisionStatus::Pending => return,
         };
-        let mut by_table: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+        let mut by_table_tablet: BTreeMap<(String, TabletId), Vec<Vec<u8>>> = BTreeMap::new();
         for (table, span) in intent_spans {
-            by_table
-                .entry(table.clone())
+            let key = span.start.clone();
+            // Re-resolve NOW, not at stage time (`intent_spans` carries no
+            // tablet id at all — see this method's own doc) — a genuinely
+            // unroutable key (table/tablet not currently resolvable) is
+            // skipped, not fatal to the rest of this best-effort resolve.
+            let Some(tablet) = self.tablet_for(table, &key) else {
+                continue;
+            };
+            by_table_tablet
+                .entry((table.clone(), tablet))
                 .or_default()
-                .push(span.start.clone());
+                .push(key);
         }
-        for (table, keys) in by_table {
+        for ((table, _tablet), keys) in by_table_tablet {
             let _ = self
                 .txn_resolve_participant(
                     &table,

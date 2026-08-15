@@ -264,6 +264,21 @@ participant's `record_key` names the anchor's record, which lives in a
 tablet, so routing by `record_key` there is correct. These are data-plane
 RPCs, not `MetaCommand`s — `is_relayable_command` does not apply to them.
 
+**`ClientCtx::recovery_resolve` groups a decided transaction's
+`intent_spans` by `(table, tablet)`, re-resolving each key's own current
+tablet immediately before grouping** (ADR 0018 §2 write-loss amendment,
+Bug 3) — never by table name alone, which used to bundle a split table's
+two different tablets' keys into one `txn_resolve_participant` call
+routed by the bundle's first key alone, silently misrouting the rest onto
+the wrong tablet's shared physical key (ADR 0028). `cp_txn`'s own
+`resolve_all` was never affected (it builds its own `(table, tablet)`-keyed
+map directly from the per-participant stage calls it just issued, never
+regrouping through `intent_spans`); only the `txn_recover`/`txn_resolver_
+loop` recovery path went through the buggy grouping. `KvCommand::
+TxnResolve`'s own `fence` (`animus-cp-data/CLAUDE.md`'s Key invariants
+entry) is the structural seatbelt against a repeat of this specific
+mistake, in this function or any future caller.
+
 **A wire-reachable panic found (and fixed) while testing this**:
 `RaftKvNode::txn_stage`'s anchor-key-length assert (ADR 0022, `TOKEN_BYTES`)
 was a sound "caller invariant" before `ClientRequest::Txn` existed — no
