@@ -281,4 +281,19 @@ date/time crate dependency for one cosmetic label format.
   a `drain_tablet_lineage` helper that walks a tablet's *whole* epoch
   chain, since a fixed shard's `NextShardIterator` null only ends one
   epoch, not the whole stream. (The suite's merge-stopgap-rejection case
-  was removed along with `MergeTablets`, ADR 0044.)
+  was removed along with `MergeTablets`, ADR 0044.) PR1 (ADR 0042 §8/ADR
+  0043 §A4/§A6) added `manual_split_with_unsealed_backlog_under_
+  production_seal_knobs`: a split landing on a genuinely unsealed backlog
+  under non-degenerate (`seal_bytes: 1`-free) seal knobs, using the
+  **age** trigger rather than the byte one — the byte trigger, under a
+  real write burst crossing its threshold many times in quick succession,
+  hit a separate, pre-existing timing sensitivity in `change_consumer_
+  loop`'s seal arm (a handful of records occasionally missing from every
+  segment *and* the open tail, reproducible with no split involved at
+  all) that this PR did not chase down; see `docs/engineering-lessons.md`.
+  Building this cell also found (and fixed, since it blocked writing the
+  cell at all) a double-count bug in this file's own `drain_tablet_
+  lineage`/`drain_all_tablets_lineage` test helpers: an epoch that closes
+  while its open-tail iterator is still mid-walk must resume from that
+  iterator, never re-mint `TRIM_HORIZON` — invisible under `tiny_seal_
+  knobs`, whose open tail is always empty the instant it's polled.

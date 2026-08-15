@@ -73,7 +73,7 @@ use animus_storage::{StorageEngine, StorageError};
 use animus_tablet::{Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
-use crate::meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeAddrs};
+use crate::meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeAddrs, StreamSplitBasis};
 use crate::schema::TableSchema;
 use crate::syskv::{self, DecodedKey, EntityKind};
 
@@ -201,6 +201,14 @@ pub fn apply_and_derive_mirror(
             // ADR 0018 §2 amendment: mirror the split-provenance marker
             // (`Metadata::split_parents`).
             writes.push(put_tablet_id(syskv::split_parent_key(*new_id), *tablet));
+            // PR1 bugfix (ADR 0042 §8/ADR 0043 §A4/§A6): mirror the frozen
+            // stream-inheritance basis (`Metadata::stream_split_basis`) —
+            // `Metadata::apply`'s own `SplitTablet` arm always inserts one
+            // entry per split, whether or not the table streams.
+            writes.push(put_json(
+                syskv::stream_split_basis_key(*new_id),
+                &meta.stream_split_basis[new_id],
+            ));
         }
         MetaCommand::SetTabletPolicy { tablet, policy } => match policy {
             Some(p) => writes.push(put_json(syskv::policy_key(*tablet), p)),
@@ -504,6 +512,12 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
                 meta.index_backfill.insert(key, ());
             }
         }
+        EntityKind::StreamSplitBasis => {
+            let basis: StreamSplitBasis =
+                serde_json::from_slice(value).expect("mirrored stream-split-basis value decodes");
+            meta.stream_split_basis
+                .insert(TabletId(decode_u64(&id)), basis);
+        }
     }
 }
 
@@ -563,6 +577,12 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             if let Some(key) = syskv::decode_index_backfill_id(&id) {
                 meta.index_backfill.remove(&key);
             }
+        }
+        EntityKind::StreamSplitBasis => {
+            // Never deleted in practice (`stream_split_basis` is never
+            // pruned, same lifetime discipline as `SplitParent` above) —
+            // listed for match exhaustiveness.
+            meta.stream_split_basis.remove(&TabletId(decode_u64(&id)));
         }
     }
 }
@@ -708,6 +728,10 @@ mod tests {
                 put_counter(NEXT_TABLET_ID_COUNTER, meta.next_tablet_id),
                 put_json(syskv::policy_key(TabletId(2)), &meta.policies[&TabletId(2)]),
                 put_tablet_id(syskv::split_parent_key(TabletId(2)), TabletId(1)),
+                put_json(
+                    syskv::stream_split_basis_key(TabletId(2)),
+                    &meta.stream_split_basis[&TabletId(2)],
+                ),
             ]
         );
     }
@@ -1394,6 +1418,17 @@ mod tests {
             MetaCommand::ExpireStreamShards {
                 rows: vec![(TabletId(1), 0)],
                 remove: false,
+            },
+            // PR1 bugfix (ADR 0042 §8/ADR 0043 §A4/§A6): exercise the
+            // `stream_split_basis` mirror's read side too — a live engine
+            // scan only ever yields `Put`s (this command's own arm derives
+            // one), so this is the one command in this fixture whose mirror
+            // write `rebuild_metadata_from_engine` actually has to decode.
+            MetaCommand::SplitTablet {
+                tablet: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key: vec![5],
+                new_id: TabletId(3),
             },
         ];
         for (index, command) in commands.iter().enumerate() {
