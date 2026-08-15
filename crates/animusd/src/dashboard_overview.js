@@ -7,7 +7,7 @@
 // it), and a tablets-per-node balance chart. Depends on `dashboard_core.js`
 // having loaded first (STATE, $, esc, pill, dot, idSpan, consoleLink,
 // nodeIdOf, nodeDisplayId, cpGroupsByTablet, tabletStatus, worstTabletStatus,
-// statusDotClass, computeHealth, activateTab).
+// statusDotClass, computeHealth, activateTab, splitHiddenTable).
 
 function renderOverview() {
   const status = STATE.status;
@@ -154,20 +154,38 @@ function renderOverview() {
     const name = t.table || "(no table)";
     (byTable[name] = byTable[name] || []).push(t);
   });
-  const tableNames = Object.keys(byTable).sort();
-  const tableRows = tableNames.slice(0, 6).map((name) => {
-    const ts = byTable[name];
-    // Worst status among the table's tablets, not "any non-healthy" — a
-    // table with only `forming` tablets (e.g. right after a split) gets the
-    // neutral "forming" pill, not the same orange "attention" pill as a
-    // table that's actually lost redundancy.
+  // A GSI's hidden `<base>$<index>` materialization table (ADR 0041) is a
+  // real table with its own tablets/health, but listed side-by-side with
+  // ordinary tables it just reads as noise — `splitHiddenTable`
+  // (dashboard_core.js, the one rule every view shares) groups it under its
+  // base table's own row instead, keeping its real rollup intact.
+  const allTableNames = Object.keys(byTable);
+  const rootTableNames = allTableNames.filter((n) => !splitHiddenTable(n)).sort();
+  const hiddenByBase = {};
+  allTableNames.forEach((n) => {
+    const h = splitHiddenTable(n);
+    if (h) (hiddenByBase[h.base] = hiddenByBase[h.base] || []).push({ name: n, index: h.index });
+  });
+  // Worst status among a group's tablets, not "any non-healthy" — a table
+  // with only `forming` tablets (e.g. right after a split) gets the neutral
+  // "forming" pill, not the same orange "attention" pill as a table that's
+  // actually lost redundancy.
+  const tableRow = (label, ts, indexed) => {
     const worst = worstTabletStatus(ts.map((t) => tabletStatus(t, groups[t.id] || [])));
-    const label = worst === "healthy" ? "ok" : worst;
-    return `<div class="list-row"><span class="detail mono">${esc(name)}</span>
+    const statusLabel = worst === "healthy" ? "ok" : worst;
+    const nameHtml = indexed
+      ? `<span class="detail mono" style="padding-left:18px">› ${esc(label)} ${pill("forming", "GSI")}</span>`
+      : `<span class="detail mono">${esc(label)}</span>`;
+    return `<div class="list-row">${nameHtml}
       <span class="muted">${ts.length} tablet(s)</span>
-      ${pill(worst, label)}
+      ${pill(worst, statusLabel)}
     </div>`;
-  }).join("");
+  };
+  const tableRows = rootTableNames.slice(0, 6).flatMap((name) => [
+    tableRow(name, byTable[name], false),
+    ...(hiddenByBase[name] || []).sort((a, b) => a.index.localeCompare(b.index))
+      .map((c) => tableRow(c.index, byTable[c.name], true)),
+  ]).join("");
   $("ov-tables").innerHTML = tableRows || `<div class="empty">no tables yet</div>`;
 
   // ---- balance: tablets per node ----

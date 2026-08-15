@@ -151,9 +151,17 @@
 
         <div class="browser-panel" style="margin-bottom:14px">
           <div class="browser-fields" id="br-dy-fields"></div>
-          <div class="seg-group">
-            <button id="br-dy-op-scan" class="active">Scan</button>
-            <button id="br-dy-op-query">Query</button>
+          <div id="br-dy-indexes"></div>
+          <div class="row" style="gap:16px">
+            <div class="seg-group">
+              <button id="br-dy-op-scan" class="active">Scan</button>
+              <button id="br-dy-op-query">Query</button>
+            </div>
+            <div class="form-field" style="min-width:170px">
+              <label>Index</label>
+              <select id="br-dy-index"><option value="">— base table —</option></select>
+            </div>
+            <span class="muted" id="br-dy-index-note"></span>
           </div>
           <div class="form-grid" id="br-dy-query-form" style="display:none">
             <div class="form-field"><label>Partition key value</label><input type="text" id="br-dy-pk-value"></div>
@@ -373,6 +381,7 @@ $("br-dy-ct-cancel").addEventListener("click", closeTableForm);
 $("br-dy-ct-submit").addEventListener("click", submitTableForm);
 $("br-dy-op-scan").addEventListener("click", () => setDynamoOp("scan"));
 $("br-dy-op-query").addEventListener("click", () => setDynamoOp("query"));
+$("br-dy-index").addEventListener("change", onDyIndexChange);
 $("br-dy-pk-value").addEventListener("input", () => { dyPkValue = $("br-dy-pk-value").value; });
 $("br-dy-sk-op").addEventListener("change", () => { dySkOp = $("br-dy-sk-op").value; });
 $("br-dy-sk-value").addEventListener("input", () => { dySkValue = $("br-dy-sk-value").value; });

@@ -5,7 +5,7 @@
 // load after this file and call into it (STATE, $, esc, getJSON, postJSON,
 // pill, consoleLink, bytes, humanBytes, tokenBound, b64url, nodeIdOf, cpGroupsByTablet,
 // autoSplitThresholds, tabletStatus, worstTabletStatus, statusDotClass, computeHealth,
-// activateTab, gotoStorage);
+// activateTab, gotoStorage, splitHiddenTable);
 // nothing here calls into them except `render()`, the single per-refresh
 // entry point every view's render function hangs off of.
 const SEED = window.location.origin;
@@ -180,6 +180,20 @@ function consoleLink(base, id) {
 }
 
 // ---- shared data-derivation helpers (used by more than one view) ----
+
+// A GSI is materialized as a hidden table named `<base>$<index>` (ADR
+// 0041) — its own ordinary entry in `status.schemas.tables` and
+// `status.tablets[*].table`, with no back-pointer to its base. User table
+// names can't contain `$` (enforced at create), so splitting on the first
+// one is unambiguous. Returns `null` for an ordinary (non-hidden) table
+// name. LSIs never get a hidden table (they're kind scopes inside the base
+// table's own tablets), so this only ever matches a GSI. The one rule
+// every view (`browser`/`tablets`/`overview`) derives its grouping from, so
+// they can't disagree on what counts as "hidden."
+function splitHiddenTable(name) {
+  const i = name.indexOf("$");
+  return i < 0 ? null : { base: name.slice(0, i), index: name.slice(i + 1) };
+}
 
 function nodeById(id) {
   return STATE.nodes.find((n) => n.ok && n.config && n.config.node_id === id);

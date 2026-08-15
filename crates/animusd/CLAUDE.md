@@ -965,7 +965,19 @@ route below the edge through the same `ClientCtx` CP primitives.
   `forming`) only degrades on an actual redundancy/quorum loss; a
   split-child or freshly-provisioned tablet forming its Raft group with
   every assigned replica's node alive renders as a neutral `forming` pill,
-  escalating to degraded only if stuck past 60s.
+  escalating to degraded only if stuck past 60s. **Secondary indexes (ADR
+  0041)** surface in the Data Browser (an Indexes card off the selected
+  table's `schema.indexes`, plus an Index selector that adds `IndexName`
+  to the Scan/Query payload), and a GSI's hidden `<base>$<index>` table
+  is grouped under its base in the Tablets and Overview views
+  (`splitHiddenTable`, `dashboard_core.js`) rather than shown as an
+  unrelated table. **That hidden table has NO entry of its own in
+  `status.schemas.tables`** — verified against a live cluster; it exists
+  only as ordinary rows in `status.tablets[*].table` (and only once the
+  drain lazily provisions its first tablet, i.e. after the first write to
+  an indexed attribute) — so any dashboard code deriving "which tables
+  exist" from the schema catalog naturally already excludes it, and code
+  that needs to know about it must scan the tablet map instead.
 - **OTel** (`otel.rs`, ADR 0027) — `init_tracing(instance_id)` from `main.rs`;
   `current_traceparent`/`set_parent_traceparent` carry W3C trace context across a
   forwarded hop (`cp_forward` injects, the receiver's `handle_client`

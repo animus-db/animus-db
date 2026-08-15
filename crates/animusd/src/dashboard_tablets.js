@@ -10,7 +10,7 @@
 // tracks only current Raft state, not a history of leadership transitions.
 // Depends on `dashboard_core.js` (STATE, $, esc, pill, dot, idSpan, getJSON,
 // humanBytes, nodeIdOf, cpGroupsByTablet, autoSplitThresholds,
-// tabletStatus, tokenBound, gotoStorage).
+// tabletStatus, tokenBound, gotoStorage, splitHiddenTable).
 
 let tbTableFilter = "all";
 let tbStatusFilter = "all";
@@ -26,7 +26,17 @@ function renderTablets() {
 
   $("tb-count").textContent = `${ids.length} tablet(s)`;
 
-  const tableNames = [...new Set(ids.map((id) => tablets[id].table).filter(Boolean))].sort();
+  // The table filter groups a GSI's hidden `<base>$<index>` tablets under
+  // their base table's own name (`splitHiddenTable`, dashboard_core.js) —
+  // picking "orders" matches both its own tablets and `orders$by_status`'s,
+  // so an operator never has to know the hidden spelling exists.
+  const tableOf = (id) => {
+    const name = tablets[id].table;
+    if (!name) return null;
+    const h = splitHiddenTable(name);
+    return h ? h.base : name;
+  };
+  const tableNames = [...new Set(ids.map(tableOf).filter(Boolean))].sort();
   const tsel = $("tb-table-filter");
   const prevTf = tsel.value || tbTableFilter;
   tsel.innerHTML = `<option value="all">All tables</option>`
@@ -37,7 +47,7 @@ function renderTablets() {
 
   const rows = ids.filter((id) => {
     const t = tablets[id];
-    if (tbTableFilter !== "all" && t.table !== tbTableFilter) return false;
+    if (tbTableFilter !== "all" && tableOf(id) !== tbTableFilter) return false;
     if (tbStatusFilter !== "all" && tabletStatus(t, groups[id] || []) !== tbStatusFilter) return false;
     return true;
   });
@@ -69,7 +79,7 @@ function renderTablets() {
     }).join("");
     return `<tr class="clickable${tbSelectedId === id ? " selected" : ""}" data-id="${esc(id)}">
       <td class="mono">${esc(id)}</td>
-      <td>${t.table ? esc(t.table) : `<span class="muted">—</span>`}</td>
+      <td>${tableCellHtml(t.table)}</td>
       <td class="mono">${keysCell}</td>
       <td class="mono">${sizeCell}</td>
       <td class="mono">${lead ? `node ${idSpan(nodeIdOf(lead.node))}` : `<span class="muted">—</span>`}</td>
@@ -85,6 +95,18 @@ function renderTablets() {
     tr.addEventListener("click", () => selectTablet(Number(tr.dataset.id))));
 
   renderTabletDetail(tablets, groups);
+}
+
+// A hidden GSI materialization table (`orders$by_status`) renders as
+// `orders › by_status` with a neutral GSI badge instead of its opaque
+// `$`-joined spelling (`splitHiddenTable`, dashboard_core.js) — the
+// underlying row is still a real, independently-hosted tablet; this is
+// presentation only.
+function tableCellHtml(name) {
+  if (!name) return `<span class="muted">—</span>`;
+  const h = splitHiddenTable(name);
+  if (!h) return esc(name);
+  return `${esc(h.base)} <span class="muted">›</span> ${esc(h.index)} ${pill("forming", "GSI")}`;
 }
 
 function selectTablet(id) {
@@ -136,7 +158,7 @@ function renderTabletDetail(tablets, groups) {
   $("tb-detail").innerHTML = `
     <div class="head"><span class="id">${esc(tbSelectedId)}</span>
       <button class="link-text" id="tb-detail-close">Close ×</button></div>
-    <div class="sub">${t.table ? esc(t.table) : "—"} · ${esc(tokenBound(t.range && t.range.start, "AAAAAAAAAAA"))} → ${esc(tokenBound(t.range && t.range.end, "__________8"))}</div>
+    <div class="sub">${tableCellHtml(t.table)} · ${esc(tokenBound(t.range && t.range.start, "AAAAAAAAAAA"))} → ${esc(tokenBound(t.range && t.range.end, "__________8"))}</div>
     <h3>Raft group</h3>
     <div style="margin-bottom:18px">${replicaRows || `<div class="empty">no replicas</div>`}</div>
     <h3>Storage engine</h3>
