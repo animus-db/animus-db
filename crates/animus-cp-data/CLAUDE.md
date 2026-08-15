@@ -429,7 +429,20 @@ State once here; cross-referenced from the sections below.
   residual race between a caller's pre-propose `scope_range()` check and
   the entry's actual apply; the pre-propose reject is load-bearing, not
   redundant (see `animusd/CLAUDE.md` and the root `CLAUDE.md` entry on a
-  safety mechanism with zero production callers).
+  safety mechanism with zero production callers). **Every key-writing
+  `KvCommand` variant carries one** (`Put`/`Batch`/`Delete`/`Cas`/
+  `TxnStage`/`TxnResolve` — `TxnCommit`/`TxnAbort`/`Seal`/`ReadCeiling`
+  deliberately don't, since they never touch user data). `TxnResolve`
+  gained its `fence` last (ADR 0018 §2 write-loss amendment, Bug 3): it
+  was originally reasoned to need none ("every key here was already
+  fence-checked at `TxnStage` time"), which held for every in-crate caller
+  but not for `animusd`'s own coordinator, whose pre-fix `recovery_resolve`
+  could misroute a resolve to the wrong tablet of a split table — with no
+  fence, that landed directly on the wrong tablet's shared physical key
+  (ADR 0028), permanently breaking the owning tablet's future LWW. See
+  the amendment and `docs/engineering-lessons.md`'s "every key-writing
+  command variant must carry AND enforce the apply-time fence" entry for
+  the general lesson.
 - **Superseded by ADR 0044**: an `Absorb` teardown's drain-before-halt
   mechanism (a merge survivor's `WidenScope` deferred on the absorbed
   group's own committed-log drain, closing a data-loss window

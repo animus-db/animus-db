@@ -47,7 +47,7 @@ use std::time::Duration;
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
 use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId, PRIMARY_STREAM};
-use animus_storage::{MergeOp, StorageEngine};
+use animus_storage::{MergeOp, StorageEngine, Version};
 use animus_tablet::KeyRange;
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
@@ -694,10 +694,35 @@ pub enum KvCommand {
     /// incorrectly shadow that older value — see `txn.rs`'s module doc). A
     /// key whose stored value is no longer that exact intent (already
     /// resolved, or overwritten by something newer) is left untouched —
-    /// idempotent on WAL replay. No `fence`: every key here was already
-    /// fence-checked at `TxnStage` time; resolve only ever converts an
-    /// already-staged intent, never introduces new data outside that
-    /// prior fence.
+    /// idempotent on WAL replay.
+    ///
+    /// **`fence` (ADR 0018 §2 write-loss amendment — Bug 3).** Originally
+    /// this variant carried none, on the theory that "every key here was
+    /// already fence-checked at `TxnStage` time." That reasoning has a
+    /// gap: it assumes `keys` can only ever be a set this exact tablet
+    /// already staged — true for every *in-crate* caller, but not
+    /// something this type enforces, and `animusd`'s own coordinator
+    /// found the counterexample. `ClientCtx::recovery_resolve` used to
+    /// group a transaction's participants by table name alone (no tablet
+    /// dimension), so a split table's two different tablets' keys could
+    /// end up bundled into one `TxnResolve` proposed against whichever
+    /// tablet the *first* key in the bundle belonged to. With no fence
+    /// here, that tablet applied the resolve for a key it doesn't own —
+    /// onto the *same physical key* another tablet of the same table
+    /// separately maintains (ADR 0028: a table's tablets share one
+    /// `StorageScope` prefix) — stamped with the wrong tablet's own clock.
+    /// The owning tablet's own clock never learns of that foreign version
+    /// and can never mint above it again: every future write to that key
+    /// silently loses the per-key LWW race in `StorageEngine::merge`,
+    /// forever (the acked-write-loss symptom this amendment fixes). The
+    /// coordinator-side grouping bug is fixed at the source, but `fence`
+    /// here is the structural seatbelt: **identical semantics to
+    /// `TxnStage`'s own fence** (stamped from the proposing group's live
+    /// `scope_range()`, checked whole-or-nothing against every key in
+    /// `keys` at apply, rejecting the whole entry rather than partially
+    /// applying it) — so a caller that makes the identical mistake again,
+    /// today or in the future, is rejected here instead of silently
+    /// corrupting a foreign key.
     ///
     /// **`outcome` is carried explicitly (ADR 0018 §2/PR4), not
     /// re-derived by reading `record_key` locally** (PR3's original
@@ -716,6 +741,7 @@ pub enum KvCommand {
         record_key: Vec<u8>,
         keys: Vec<Vec<u8>>,
         outcome: txn::TxnOutcome,
+        fence: KeyRange,
         ts: HlcTimestamp,
     },
     /// The leader's no-op-on-election (Raft); applies nothing.
@@ -2065,11 +2091,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if ts > floor {
             return ts;
         }
-        let pushed = self.hlc.witness(floor, self.env.now());
+        let pushed = bump_strictly_above(floor);
         assert!(
             pushed > floor,
-            "raftkv mint_at_least: witnessing the floor must strictly exceed it \
-             (floor={floor:?}, got={pushed:?}) — Hlc::witness's own contract is broken"
+            "raftkv mint_at_least: the no-witness bump must strictly exceed the floor \
+             (floor={floor:?}, got={pushed:?}) — bump_strictly_above's own contract is broken"
         );
         pushed
     }
@@ -2240,6 +2266,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         keys: Vec<Vec<u8>>,
         outcome: txn::TxnOutcome,
     ) -> Option<HlcTimestamp> {
+        // ADR 0018 §2 write-loss amendment: stamped from this group's own
+        // live scope, exactly like `TxnStage`'s `fence` above — see
+        // `KvCommand::TxnResolve`'s doc for why this is no longer safe to
+        // omit.
+        let fence = self.scope_range();
         let (result, ts) = self.propose_ordered_aux(|term| {
             let ts = self.mint_pushed(term, &keys);
             let cmd = KvCommand::TxnResolve {
@@ -2247,6 +2278,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 record_key: record_key.clone(),
                 keys: keys.clone(),
                 outcome: outcome.clone(),
+                fence: fence.clone(),
                 ts,
             };
             (cmd, ts)
@@ -4292,6 +4324,101 @@ fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimesta
     *max_applied_ts = Some(ts);
 }
 
+/// Logged-warning cap for [`surface_suspicious_merge_noop`] (below): the
+/// [`Metric`] counters there are always incremented (cheap, unconditional),
+/// but a genuinely-reoccurring bug logging one line per applied entry would
+/// flood the log with no signal past the first handful — capped so the
+/// first occurrences are loud without a live incident drowning everything
+/// else out. Threaded per apply task, like `max_applied_ts`/`sealed` — this
+/// task is this group's sole writer, so a plain `&mut u32` needs no atomic.
+const SUSPICIOUS_MERGE_NOOP_LOG_CAP: u32 = 20;
+
+/// **Part B of the ADR 0018 §2 write-loss amendment (the seatbelt).**
+/// Surface a `storage.merge`/`merge_tombstone` call that returned
+/// `Ok(false)` ("did not take effect") at one of the three apply-arm sites
+/// that used to discard that bool outright via `.expect(..)`
+/// (`TxnStage`'s intent write, `TxnResolve`'s commit/abort-restore writes,
+/// `Cas`'s swap) — sites whose *caller-visible* outcome
+/// (`StageOutcome::Staged`, a resolved commit/abort, a decided CAS) is
+/// computed independently of whether the merge itself actually landed.
+/// `StorageEngine::merge`'s silent per-key-LWW no-op contract was designed
+/// for the deleted leaderless-AP plane's stale-replay tolerance (ADR 0001,
+/// gone under ADR 0019); every one of this CP plane's callers instead
+/// assumes a write its own gating logic accepted genuinely lands, so a
+/// silent `false` here is exactly the class of failure Bug 3 (acked
+/// participant writes silently lost) hid in — see the amendment for the
+/// full mechanism (the real root cause was `ClientCtx::recovery_resolve`'s
+/// table-only grouping misrouting a resolve to the wrong tablet, closed at
+/// the source in `animusd`, with `KvCommand::TxnResolve`'s own `fence` as
+/// the structural seatbelt against a repeat — see that variant's doc; this
+/// function closes the class so the *next* bug shaped like it can't hide
+/// the same way).
+///
+/// **Why this can't be a bare, unconditional panic/hard-assert.** Apply
+/// arms can legitimately re-run after a crash: WAL recovery replays this
+/// group's log tail unconditionally (`drive`'s doc), and the *engine*'s own
+/// durability can lead the *driver*'s in-memory bookkeeping — `max_applied_
+/// ts`/`engine_applied` both start fresh "each time this task starts,
+/// including after a restart" (`apply_loop`'s doc) — so re-applying an
+/// entry the engine already durably reflects from before this process
+/// started is expected, and `merge` correctly no-ops on it (the identical
+/// value, at the identical version, is already there). A bare assert here
+/// would turn every ordinary restart-and-replay into a crash loop.
+///
+/// **The replay-safe distinguisher.** `recovered_baseline_version` is
+/// `storage.latest_version()` captured **once**, at this apply task's own
+/// start, before it has applied (or this process has minted) anything —
+/// the engine-durable high-water mark a WAL replay can explain a no-op
+/// against. `entry_version` (this specific merge's own version — the same
+/// value [`assert_ts_monotonic`] already checked strictly increases in log
+/// order) at or below that baseline is structurally indistinguishable from
+/// an ordinary post-crash replay and is *not* surfaced loudly. Strictly
+/// above it, a no-op is **provable**, not merely suspicious: this group's
+/// own witnessing chain guarantees a fresh mint already exceeds
+/// `storage.latest_version()` as observed at group start (`start_inner`'s
+/// group-start witness, `drive`'s doc), so nothing this process could
+/// legitimately mint after that point should ever collide with — let alone
+/// lose to — a version already sitting in the engine, unless the value that
+/// beat it got there via exactly Bug 3's mechanism (or a sibling of it this
+/// seatbelt exists to also catch, present or future).
+fn surface_suspicious_merge_noop(
+    metrics: &MetricsHandle,
+    log_budget: &mut u32,
+    site: &'static str,
+    key: &[u8],
+    entry_version: Version,
+    recovered_baseline_version: Version,
+) {
+    metrics.incr(Metric::CpMergeTookNoEffect);
+    if entry_version <= recovered_baseline_version {
+        return; // explainable by an ordinary WAL-replay re-application
+    }
+    metrics.incr(Metric::CpMergeTookNoEffectUnexplained);
+    if *log_budget > 0 {
+        *log_budget -= 1;
+        tracing::warn!(
+            site,
+            key = ?key,
+            entry_version,
+            recovered_baseline_version,
+            "raftkv: apply-time merge silently took no effect on a write this apply arm's own \
+             control flow already treated as landed — not explainable by WAL replay (this \
+             entry's own version exceeds the engine-durable watermark recovered at this apply \
+             task's start), so this is a provable, live invariant violation — see ADR 0018 §2's \
+             write-loss amendment"
+        );
+    }
+    // FIXME(PR3 WIP): a `debug_assert!` here was found to fire on legitimate,
+    // documented scenarios this design didn't account for (e.g. same-txn
+    // re-staging / an application-level client retry landing an identical
+    // entry a second time within the *same* process lifetime, well after
+    // `recovered_baseline_version` — not a node restart at all) — see the
+    // in-progress investigation notes. Metrics + a capped warn log only,
+    // until the fresh-vs-replay distinguisher is redesigned to also
+    // recognize an idempotent identical-value re-application, not just a
+    // post-restart one.
+}
+
 /// Install any received snapshot, apply committed-and-durable commands to the
 /// engine in commit order, and compact when the engine has merged enough past the
 /// snapshot base. **Runs on the apply task only** — off the consensus loop, so a
@@ -4329,6 +4456,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     max_applied_ts: &mut Option<HlcTimestamp>,
     committed_ceiling: &AtomicU64,
     txn_tracker: &Mutex<TxnTracker>,
+    // ADR 0018 §2 write-loss amendment (Part B): the engine-durable version
+    // watermark recovered once at this apply task's own start, and this
+    // task's own remaining `tracing::warn!` budget for a suspicious no-op —
+    // see `surface_suspicious_merge_noop`'s doc. Threaded like `sealed`/
+    // `max_applied_ts`: this apply task's own sequential, single-writer
+    // bookkeeping, never touched by any other task.
+    recovered_baseline_version: Version,
+    suspicious_noop_log_budget: &mut u32,
 ) -> bool {
     let mut did_work = false;
 
@@ -4553,10 +4688,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         // Same write path as `Put`: `hlc::pack(ts)` is the MVCC
                         // version, so re-applying on recovery is idempotent
                         // (per-key LWW).
-                        storage
-                            .merge(&physical_key, &txn::encode_committed(&value), hlc::pack(ts))
+                        let cas_version = hlc::pack(ts);
+                        let took_effect = storage
+                            .merge(&physical_key, &txn::encode_committed(&value), cas_version)
                             .await
                             .expect("raftkv apply cas");
+                        // ADR 0018 §2 write-loss amendment (Part B): this arm
+                        // already decided "swapped" from the *read* above,
+                        // independently of whether the merge itself lands —
+                        // see `surface_suspicious_merge_noop`'s doc.
+                        if !took_effect {
+                            surface_suspicious_merge_noop(
+                                metrics,
+                                suspicious_noop_log_budget,
+                                "Cas",
+                                &physical_key,
+                                cas_version,
+                                recovered_baseline_version,
+                            );
+                        }
                     }
                     swapped
                 } else {
@@ -4763,16 +4913,32 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     flush_pending(storage, &mut pending, metrics).await;
                     let version = hlc::pack(ts);
                     for (key, staged_value) in &writes {
-                        let env = txn::encode_intent(
+                        let intent_env = txn::encode_intent(
                             &txn_id,
                             &record_key,
                             &record_table,
                             staged_value.as_deref(),
                         );
-                        storage
-                            .merge(&scope.physical(key), &env, version)
+                        let physical_key = scope.physical(key);
+                        let took_effect = storage
+                            .merge(&physical_key, &intent_env, version)
                             .await
                             .expect("raftkv apply txn stage intent");
+                        // ADR 0018 §2 write-loss amendment (Part B): `outcome`
+                        // below is computed from the fence/seal/foreign-intent/
+                        // condition gates above, independently of whether this
+                        // specific key's intent merge actually lands — see
+                        // `surface_suspicious_merge_noop`'s doc.
+                        if !took_effect {
+                            surface_suspicious_merge_noop(
+                                metrics,
+                                suspicious_noop_log_budget,
+                                "TxnStage intent",
+                                &physical_key,
+                                version,
+                                recovered_baseline_version,
+                            );
+                        }
                     }
                     if is_anchor {
                         let record = txn::TxnRecord {
@@ -5069,6 +5235,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 record_key,
                 keys,
                 outcome,
+                fence,
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
@@ -5095,6 +5262,45 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         txn::TxnOutcome::Committed { commit_ts } => Some(*commit_ts),
                         txn::TxnOutcome::Aborted => None,
                     };
+                    // `Some(record) if record.txn_id == txn_id` means *this*
+                    // group holds `txn_id`'s own record, i.e. this group
+                    // **is** the anchor for this transaction (only an
+                    // anchor's own `TxnStage` ever writes it — see
+                    // `KvCommand::TxnStage`'s `is_anchor` doc) — never a
+                    // non-anchor participant, and never a different
+                    // transaction's own coincidentally colliding key
+                    // (`record_key` is derived from `txn_id` itself).
+                    //
+                    // (An earlier PR3 draft also witnessed `outcome`'s
+                    // `commit_ts` into a non-anchor participant's clock here,
+                    // to let a lagging participant catch up to the anchor's
+                    // pace. Abandoned: even gated to a genuine non-anchor
+                    // participant, that witness reignited a clock-witnessing
+                    // runaway under sustained cross-group transaction + read
+                    // load — confirmed super-linear in round count by
+                    // `tests/ts_cache.rs`'s `cross_group_txn_traffic_never_
+                    // lets_either_groups_clock_run_away`, which stays as a
+                    // permanent regression against re-introducing it. See
+                    // ADR 0018 §2's write-loss amendment for the full story
+                    // and why the real fix is the fence below instead.)
+                    let local_record = storage
+                        .get(&scope.physical(&record_key))
+                        .await
+                        .expect("raftkv txn resolve record read")
+                        .and_then(|vv| txn::decode_record(&vv.value));
+                    // ADR 0018 §2 write-loss amendment (Bug 3): every key in
+                    // `keys` must fall inside this entry's own `fence` (and
+                    // not a range this group has since sealed off) — the
+                    // structural seatbelt against a caller (present or
+                    // future) that misroutes a resolve to the wrong tablet,
+                    // exactly like `TxnStage`'s own fence check above and
+                    // `KvCommand::TxnResolve`'s doc. Whole-or-nothing, not
+                    // per-key: a partial reject would leave some of this
+                    // transaction's keys resolved and others not, the same
+                    // torn state a fence exists to prevent elsewhere.
+                    let all_in_fence = keys
+                        .iter()
+                        .all(|k| fence.contains(k) && !is_sealed(sealed, k));
                     // ADR 0018 §2/PR6 hardening (defense-in-depth, not a
                     // reproduced bug): every current decider
                     // (`animusd`'s ordinary `cp_txn` commit path and its
@@ -5114,8 +5320,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // refuse to resolve on a mismatch, whole-or-nothing,
                     // rather than silently applying the wrong outcome.
                     // **No known live violator as of PR6; guards a class,
-                    // not a reproduced bug** (see the PR6 audit recorded
-                    // in `docs/engineering-lessons.md` and ADR 0018's PR5
+                    // not a reproduced bug** (see the PR6 audit recorded in
+                    // `docs/engineering-lessons.md` and ADR 0018's PR5
                     // amendment §1's corrective note).
                     //
                     // A non-anchor participant's own apply cannot run this
@@ -5128,12 +5334,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // `ts` so a participant could at least reject an
                     // outcome inconsistent with it, which is left for a
                     // future PR if the cost proves worth it.
-                    let outcome_mismatch = match storage
-                        .get(&scope.physical(&record_key))
-                        .await
-                        .expect("raftkv txn resolve record read")
-                        .and_then(|vv| txn::decode_record(&vv.value))
-                    {
+                    let outcome_mismatch = match &local_record {
                         Some(record) if record.txn_id == txn_id => match (&record.status, &outcome)
                         {
                             (
@@ -5169,7 +5370,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     }
                     let version = hlc::pack(ts);
                     for key in &keys {
-                        if outcome_mismatch {
+                        if outcome_mismatch || !all_in_fence {
                             continue; // whole-or-nothing: skip every key, not just this one
                         }
                         let physical_key = scope.physical(key);
@@ -5194,25 +5395,57 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         let Some(staged_value) = intent else {
                             continue;
                         };
+                        // ADR 0018 §2 write-loss amendment (Part B): every
+                        // branch below already treated this key as resolved
+                        // (it is removed from `TxnTracker`, and the
+                        // coordinator's own client-facing ack was computed
+                        // independently) before this fix started checking
+                        // whether the merge that's supposed to *make* it so
+                        // actually landed — see
+                        // `surface_suspicious_merge_noop`'s doc, and this
+                        // variant's own `fence` (above, in `KvCommand::
+                        // TxnResolve`'s doc) for why a misrouted resolve
+                        // used to leave a foreign tablet's key permanently
+                        // unable to land correctly.
                         match outcome_commit_ts {
                             Some(_commit_ts) => match staged_value {
                                 // Committed: the staged value becomes the
                                 // committed value.
                                 Some(v) => {
-                                    storage
+                                    let took_effect = storage
                                         .merge(&physical_key, &txn::encode_committed(&v), version)
                                         .await
                                         .expect("raftkv apply txn resolve commit");
+                                    if !took_effect {
+                                        surface_suspicious_merge_noop(
+                                            metrics,
+                                            suspicious_noop_log_budget,
+                                            "TxnResolve commit",
+                                            &physical_key,
+                                            version,
+                                            recovered_baseline_version,
+                                        );
+                                    }
                                 }
                                 // A staged delete resolves to an actual
                                 // tombstone — the only place `TxnResolve`
                                 // writes one, since it's finalizing an
                                 // already-decided delete, not guessing.
                                 None => {
-                                    storage
+                                    let took_effect = storage
                                         .merge_tombstone(&physical_key, version)
                                         .await
                                         .expect("raftkv apply txn resolve commit delete");
+                                    if !took_effect {
+                                        surface_suspicious_merge_noop(
+                                            metrics,
+                                            suspicious_noop_log_budget,
+                                            "TxnResolve commit delete",
+                                            &physical_key,
+                                            version,
+                                            recovered_baseline_version,
+                                        );
+                                    }
                                 }
                             },
                             None => {
@@ -5249,16 +5482,34 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     .get_at(&physical_key, vv.version.saturating_sub(1))
                                     .await
                                     .expect("raftkv txn resolve prior read");
-                                match prior {
-                                    Some(pvv) => storage
-                                        .merge(&physical_key, &pvv.value, version)
-                                        .await
-                                        .expect("raftkv apply txn resolve abort restore"),
-                                    None => storage
-                                        .merge_tombstone(&physical_key, version)
-                                        .await
-                                        .expect("raftkv apply txn resolve abort restore tombstone"),
+                                let (took_effect, site) = match prior {
+                                    Some(pvv) => (
+                                        storage
+                                            .merge(&physical_key, &pvv.value, version)
+                                            .await
+                                            .expect("raftkv apply txn resolve abort restore"),
+                                        "TxnResolve abort restore",
+                                    ),
+                                    None => (
+                                        storage
+                                            .merge_tombstone(&physical_key, version)
+                                            .await
+                                            .expect(
+                                                "raftkv apply txn resolve abort restore tombstone",
+                                            ),
+                                        "TxnResolve abort restore tombstone",
+                                    ),
                                 };
+                                if !took_effect {
+                                    surface_suspicious_merge_noop(
+                                        metrics,
+                                        suspicious_noop_log_budget,
+                                        site,
+                                        &physical_key,
+                                        version,
+                                        recovered_baseline_version,
+                                    );
+                                }
                             }
                         }
                     }
@@ -5861,6 +6112,17 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     // qualifying entry it processes is unconditionally accepted (see
     // `assert_ts_monotonic`'s doc for why that boundary case is safe).
     let mut max_applied_ts: Option<HlcTimestamp> = None;
+    // ADR 0018 §2 write-loss amendment (Part B): the engine-durable version
+    // watermark, captured once, right here, before this task (or this
+    // process) has applied or minted anything this lifetime — the
+    // replay-safe baseline `surface_suspicious_merge_noop` compares a
+    // no-op's own entry version against. `drive`'s own recovery has already
+    // run by the time this task is spawned (its doc: "after recovery seeded
+    // the core + `engine_applied` + `sealed` + ..."), so this genuinely
+    // reflects every write durable before this restart, not a half-recovered
+    // snapshot.
+    let recovered_baseline_version = storage.latest_version();
+    let mut suspicious_noop_log_budget = SUSPICIOUS_MERGE_NOOP_LOG_CAP;
     loop {
         if halted.load(Ordering::SeqCst) {
             apply_stopped.store(true, Ordering::SeqCst);
@@ -5885,6 +6147,8 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &mut max_applied_ts,
             &committed_ceiling,
             &txn_tracker,
+            recovered_baseline_version,
+            &mut suspicious_noop_log_budget,
         )
         .await;
         if !did_work {

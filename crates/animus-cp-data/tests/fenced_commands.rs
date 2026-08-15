@@ -17,8 +17,8 @@
 use std::time::Duration;
 
 use animus_control::ProposeResult;
-use animus_cp_data::{RaftKvNode, StorageScope};
-use animus_env::nid;
+use animus_cp_data::{KIND_BASE, RaftKvNode, StageOutcome, StorageScope, TxnOutcome};
+use animus_env::{EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::KeyRange;
@@ -381,4 +381,226 @@ fn scope_range_reflects_narrowing_and_a_fence_stamped_from_it_gates_apply() {
             "node {i} dropped a write inside the narrowed scope_range() (seed={seed})"
         );
     }
+}
+
+// ============================================================================
+// `KvCommand::TxnResolve`'s own fence (ADR 0018 §2 write-loss amendment —
+// Bug 3): the one key-writing command that used to carry no apply-time fence
+// check at all. Two tablets of one split table share the same physical
+// `StorageEngine` under one `StorageScope` prefix (ADR 0028) — only their
+// live `KeyRange` differs — so a resolve misrouted to the wrong tablet's
+// `RaftKvNode` would, pre-fix, land directly on the OTHER tablet's own
+// physical key. This models exactly that shared-engine shape: two
+// single-voter groups, same node id (distinguished only by stream, ADR 0026
+// Stage B — the same "several tablets co-resident on one node" shape
+// `animusd`'s real hosting path uses), same `StorageScope` prefix, disjoint
+// ranges.
+// ============================================================================
+
+const TABLE: &str = "t";
+/// The boundary between the two modeled tablets: keys `< BOUNDARY` belong to
+/// tablet A, `>= BOUNDARY` to tablet B — mirroring `cross_group_lww.rs`'s
+/// identical convention.
+const BOUNDARY: &[u8] = b"m";
+const SETTLE: Duration = Duration::from_millis(300);
+
+/// Two single-voter groups sharing one engine and one `StorageScope` prefix,
+/// with disjoint ranges split at [`BOUNDARY`] — the shared-physical-engine
+/// shape two tablets of one split table take on a real node. Also returns
+/// the shared engine handle directly: `RaftKvNode::local_get` is the wrong
+/// probe for this test (it serves a **read-time-resolved** value the moment
+/// the anchor's own record is known-committed, regardless of whether the
+/// per-key resolve write itself ever physically landed — see
+/// `resolve_once_step`'s doc) — only a raw read off the shared engine can
+/// distinguish "still a `Pending` intent" from "actually resolved."
+fn two_tablets_sharing_one_engine(seed: u64) -> (Simulator, KvNode, KvNode, MemoryEngine) {
+    let sim = Simulator::new(seed);
+    let engine = MemoryEngine::new();
+    let a: KvNode = RaftKvNode::start_hosted(
+        sim.env(nid(0)),
+        vec![nid(0)],
+        engine.clone(),
+        StorageScope::new(
+            b"T:".to_vec(),
+            KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec())),
+        ),
+        1,
+    );
+    let b: KvNode = RaftKvNode::start_hosted(
+        sim.env(nid(0)),
+        vec![nid(0)],
+        engine.clone(),
+        StorageScope::new(b"T:".to_vec(), KeyRange::new(BOUNDARY.to_vec(), None)),
+        2,
+    );
+    (sim, a, b, engine)
+}
+
+/// The envelope tag byte every apply-path write prefixes a value with
+/// (`txn.rs`'s doc: `0` = committed, `1` = an intent) — `Envelope`/
+/// `decode_envelope` are `pub(crate)`, unreachable from this external
+/// `tests/` file, so this reads the tag directly off the raw stored bytes
+/// instead (the shape is a stable, documented on-disk contract, not an
+/// implementation accident).
+#[derive(Debug, PartialEq, Eq)]
+enum RawEnvelopeTag {
+    Committed,
+    Intent,
+    Absent,
+}
+
+fn raw_envelope_tag(engine: &MemoryEngine, physical_key: &[u8]) -> RawEnvelopeTag {
+    use animus_storage::StorageEngine;
+    match block_on(engine.get(physical_key)).expect("engine read") {
+        None => RawEnvelopeTag::Absent,
+        Some(vv) => match vv.value.first() {
+            Some(0) => RawEnvelopeTag::Committed,
+            Some(1) => RawEnvelopeTag::Intent,
+            other => panic!("unexpected envelope tag byte {other:?}"),
+        },
+    }
+}
+
+/// Run `fut` to completion by spawning it on `env` and driving `sim` for
+/// `budget` — required for every txn propose-and-wait method (its future
+/// polls/sleeps internally, which only advances while the simulator itself
+/// is being driven) — mirrors `txn_recovery.rs`/`txn_multi.rs`'s identical
+/// helper. **Never `block_on` one of these directly**: with nothing driving
+/// `sim`, the future's internal `env.sleep` never resolves and the test
+/// hangs forever (caught the hard way — see `docs/engineering-lessons.md`).
+fn drive<T: Send + 'static>(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    budget: Duration,
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> Option<T> {
+    let slot: std::sync::Arc<std::sync::Mutex<Option<T>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let s = std::sync::Arc::clone(&slot);
+    env.clone().spawn_task(async move {
+        let v = fut.await;
+        *s.lock().unwrap() = Some(v);
+    });
+    sim.run_for(budget);
+    slot.lock().unwrap().take()
+}
+
+/// A `TxnResolve` misrouted to the wrong tablet's group — the exact shape
+/// `ClientCtx::recovery_resolve`'s pre-fix table-only grouping could produce
+/// for a split table — is rejected by its own embedded `fence`, exactly like
+/// `Put`/`Batch`/`Delete`/`Cas` above, rather than silently applying onto the
+/// other tablet's shared physical key. The correct tablet's own resolve still
+/// succeeds normally.
+#[test]
+fn txn_resolve_misrouted_to_the_wrong_tablet_is_rejected_by_its_own_fence() {
+    let seed = 0xFE10;
+    let (mut sim, a, b, engine) = two_tablets_sharing_one_engine(seed);
+    sim.run_for(Duration::from_secs(2)); // elect (single voter, both groups)
+
+    // `b_key` belongs to tablet B's own range (`>= BOUNDARY`) and leads with
+    // the 8-byte partition token `txn_stage_anchor` requires (ADR 0022).
+    // `physical_key` is the shared engine's real address for it: `prefix ||
+    // KIND_BASE || logical` (a group's physical key always carries the
+    // row-kind byte, ADR 0041 §3 — see `RaftKvNode::physical_key`'s doc) —
+    // both groups' `StorageScope`s share the `b"T:"` prefix (ADR 0028), so
+    // this is the same address regardless of which group writes to it.
+    let b_key = {
+        let mut k = vec![0xffu8; animus_tablet::TOKEN_BYTES];
+        k.extend_from_slice(b"b");
+        k
+    };
+    let physical_key = [b"T:".as_slice(), &[KIND_BASE], b_key.as_slice()].concat();
+
+    let b_env = b.env().clone();
+    let n = b.clone();
+    let (bk, table) = (b_key.clone(), TABLE);
+    let (txn_id, record_key, outcome) = drive(&mut sim, &b_env, SETTLE, async move {
+        n.txn_stage_anchor(
+            table,
+            vec![(bk, Some(b"v1".to_vec()))],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    })
+    .flatten()
+    .expect("B's anchor stage proposes");
+    assert_eq!(
+        outcome,
+        StageOutcome::Staged,
+        "B's own anchor stage must land cleanly (seed={seed})"
+    );
+    assert_eq!(
+        raw_envelope_tag(&engine, &physical_key),
+        RawEnvelopeTag::Intent,
+        "the stage must leave b_key as an unresolved intent (seed={seed})"
+    );
+
+    let n = b.clone();
+    let (tid, rk) = (txn_id.clone(), record_key.clone());
+    let min_ts = txn_id.ts;
+    let commit_ts = drive(&mut sim, &b_env, SETTLE, async move {
+        n.txn_commit_at_least(tid, rk, min_ts).await
+    })
+    .flatten()
+    .expect("B's own commit applies");
+    let committed = TxnOutcome::Committed { commit_ts };
+    assert_eq!(
+        raw_envelope_tag(&engine, &physical_key),
+        RawEnvelopeTag::Intent,
+        "committing the anchor's own record must not itself touch b_key — only a \
+         real per-key resolve does (seed={seed})"
+    );
+
+    // The misroute: resolve `b_key` through A's group. `txn_resolve` always
+    // proposes successfully (the entry is accepted into A's own log
+    // regardless of what it contains) — the fence rejection happens at
+    // apply, not propose.
+    let a_env = a.env().clone();
+    let n = a.clone();
+    let (tid, rk, keys, oc) = (
+        txn_id.clone(),
+        record_key.clone(),
+        vec![b_key.clone()],
+        committed.clone(),
+    );
+    let misrouted = drive(&mut sim, &a_env, SETTLE, async move {
+        n.txn_resolve(tid, rk, keys, oc).await
+    })
+    .flatten();
+    assert!(
+        misrouted.is_some(),
+        "a misrouted resolve still proposes/applies as an entry — the fence gates \
+         its effect on the key, not whether the entry itself lands (seed={seed})"
+    );
+    assert_eq!(
+        raw_envelope_tag(&engine, &physical_key),
+        RawEnvelopeTag::Intent,
+        "A's own fence excludes b_key — the misrouted resolve must leave the physical \
+         intent untouched (both groups share the same physical key here, ADR 0028, so \
+         this also proves it wasn't silently corrupted with A's own clock) (seed={seed})"
+    );
+
+    // The correct resolve, from B's own group (whose fence covers b_key),
+    // still succeeds normally.
+    let n = b.clone();
+    let keys = vec![b_key.clone()];
+    let correct = drive(&mut sim, &b_env, SETTLE, async move {
+        n.txn_resolve(txn_id, record_key, keys, committed).await
+    })
+    .flatten();
+    assert!(
+        correct.is_some(),
+        "B's own correct resolve applies (seed={seed})"
+    );
+    assert_eq!(
+        raw_envelope_tag(&engine, &physical_key),
+        RawEnvelopeTag::Committed,
+        "the correctly-routed resolve must still land normally (seed={seed})"
+    );
+    assert_eq!(
+        block_on(b.local_get(&b_key)),
+        Some(b"v1".to_vec()),
+        "and read back the right value through the normal read path (seed={seed})"
+    );
 }

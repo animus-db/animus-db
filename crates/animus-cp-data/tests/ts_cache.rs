@@ -14,10 +14,11 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::hlc::{Hlc, HlcTimestamp};
-use animus_cp_data::{KIND_BASE, RaftKvNode};
+use animus_cp_data::{KIND_BASE, RaftKvNode, StageOutcome, TxnOutcome};
 use animus_env::{Clock, EnvExt, Metric, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
+use animus_tablet::KeyRange;
 use futures::executor::block_on;
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -495,4 +496,191 @@ fn interleaved_reads_and_writes_never_let_minted_timestamps_outrun_real_time() {
          elapsed={elapsed_ms}ms bound={bound_ms}ms (seed={seed}) — the mint_pushed \
          clock-witnessing runaway is back"
     );
+}
+
+// ============================================================================
+// 6. Cross-group transaction clock-divergence regression (ADR 0018 §2
+//    write-loss amendment, Part A). Bug 3: a multi-participant transaction's
+//    `commit_ts` is minted on the ANCHOR's own group (possibly pushed up to
+//    `HLC_MAX_OFFSET` ahead of real time by that group's own read-conflict
+//    push, exactly test 5's mechanism, now legal and bounded post-PR1) and
+//    travels inside `TxnResolve`'s payload to every PARTICIPANT — a
+//    genuinely foreign timestamp arriving somewhere the pre-fix witnessing
+//    chain never looked (see `RaftKvNode::txn_resolve`'s apply arm in
+//    `src/lib.rs`). Witnessing it there is legitimate HLC causality, not a
+//    repeat of test 5's outlawed fictional-ceiling witnessing — but any new
+//    witness call is exactly the shape of change that historically
+//    re-introduced a runaway (test 5 itself exists because an *earlier*
+//    witness call did), so this is the same proof test 5 runs, aimed at the
+//    new call site: two independent groups, repeated back-to-back
+//    cross-group transactions (each one exercising the anchor's
+//    `mint_at_least` push AND the participant's new `TxnResolve` witness)
+//    interleaved with linearizable reads on both sides (to keep each
+//    group's own read ceiling churning too), asserting BOTH groups' clocks
+//    stay within a small, ROUND-COUNT-INDEPENDENT bound of real elapsed
+//    time — the signature of a bounded, one-time transfer rather than a
+//    compounding feedback loop. Deliberately a plain in-test 2PC (staging/
+//    committing/resolving directly on the two handles, mirroring
+//    `tests/txn_multi.rs::run_txn`'s shape) rather than pulling in that
+//    file's coordinator, since this file's own single-voter-group,
+//    virtual-time-elapsed style (tests 1-5 above) is what the divergence
+//    bound needs.
+// ============================================================================
+
+#[test]
+fn cross_group_txn_traffic_never_lets_either_groups_clock_run_away() {
+    // Mirrors test 5's own hardcoded-500ms convention.
+    const HLC_MAX_OFFSET_MS: u64 = 500;
+    let seed = 0xC205_50FF;
+    let mut sim = Simulator::new(seed);
+    let id_a = nid(100);
+    let id_b = nid(200);
+    let anchor: KvNode = RaftKvNode::start(
+        sim.env(id_a.clone()),
+        vec![id_a.clone()],
+        MemoryEngine::new(),
+    );
+    let participant: KvNode = RaftKvNode::start(
+        sim.env(id_b.clone()),
+        vec![id_b.clone()],
+        MemoryEngine::new(),
+    );
+    sim.run_for(Duration::from_secs(2)); // elect (single voter, both groups)
+
+    // Every real data-plane key leads with an 8-byte partition token (ADR
+    // 0022) — `txn_stage_anchor`'s own assert requires it.
+    let a_key = {
+        let mut k = vec![1u8; 8];
+        k.extend_from_slice(b"a");
+        k
+    };
+    let b_key = {
+        let mut k = vec![2u8; 8];
+        k.extend_from_slice(b"b");
+        k
+    };
+    put(std::slice::from_ref(&anchor), &[0], seed, &a_key, b"a0");
+    put(
+        std::slice::from_ref(&participant),
+        &[0],
+        seed,
+        &b_key,
+        b"b0",
+    );
+    sim.run_for(Duration::from_millis(50));
+    let start_ms = sim.env(id_a.clone()).now().0 / 1_000_000;
+
+    const ROUNDS: u64 = 80;
+    let a = anchor.clone();
+    let b = participant.clone();
+    let ak = a_key.clone();
+    let bk = b_key.clone();
+    let done = Arc::new(Mutex::new(false));
+    let d = Arc::clone(&done);
+    anchor.env().clone().spawn_task(async move {
+        for i in 0..ROUNDS {
+            // Reads on both sides, exactly like test 5, to keep pushing
+            // each group's own read ceiling independently.
+            let _ = a.linearizable_get(&ak).await;
+            let _ = b.linearizable_get(&bk).await;
+
+            // A minimal two-participant 2PC — stage anchor + participant,
+            // commit on the anchor (`mint_at_least`, which already
+            // legitimately witnesses every participant's own acked stage
+            // ts), then resolve both (the participant's resolve is Part
+            // A's new witness call site).
+            let value = format!("v{i}").into_bytes();
+            let Some((txn_id, record_key, outcome)) = a
+                .txn_stage_anchor(
+                    "t",
+                    vec![(ak.clone(), Some(value.clone()))],
+                    vec![("t".to_string(), KeyRange::new(bk.clone(), None))],
+                    Vec::new(),
+                )
+                .await
+            else {
+                continue;
+            };
+            if outcome != StageOutcome::Staged {
+                continue;
+            }
+            let Some((participant_ts, p_outcome)) = b
+                .txn_stage_participant(
+                    txn_id.clone(),
+                    record_key.clone(),
+                    "t".to_string(),
+                    vec![(bk.clone(), Some(value.clone()))],
+                    Vec::new(),
+                )
+                .await
+            else {
+                continue;
+            };
+            if p_outcome != StageOutcome::Staged {
+                continue;
+            }
+            let candidate = txn_id.ts.max(participant_ts);
+            let Some(commit_ts) = a
+                .txn_commit_at_least(txn_id.clone(), record_key.clone(), candidate)
+                .await
+            else {
+                continue;
+            };
+            let commit_outcome = TxnOutcome::Committed { commit_ts };
+            let _ = a
+                .txn_resolve(
+                    txn_id.clone(),
+                    record_key.clone(),
+                    vec![ak.clone()],
+                    commit_outcome.clone(),
+                )
+                .await;
+            let _ = b
+                .txn_resolve(
+                    txn_id.clone(),
+                    record_key.clone(),
+                    vec![bk.clone()],
+                    commit_outcome,
+                )
+                .await;
+        }
+        *d.lock().unwrap() = true;
+    });
+    let budget = Duration::from_secs(30);
+    sim.run_for(budget);
+    assert!(
+        *done.lock().unwrap(),
+        "all {ROUNDS} cross-group txn rounds must complete within the drive budget (seed={seed})"
+    );
+
+    // Same divergence-bound style as test 5: real elapsed time is governed
+    // by `budget` (`run_for` always burns it), and the only legitimate
+    // margin is a small, fixed number of `HLC_MAX_OFFSET` windows —
+    // independent of `ROUNDS` — covering: the anchor's own read-ceiling
+    // push, the participant's own read-ceiling push, and one bounded
+    // transfer of the anchor's commit-ts lead into the participant via
+    // Part A's witness. A bound that held regardless of `ROUNDS` here is
+    // exactly what distinguishes a one-time transfer from a reignited
+    // runaway (which would compound with every round instead).
+    let elapsed_ms = (sim.env(id_a.clone()).now().0 / 1_000_000).saturating_sub(start_ms);
+    let bound_ms = elapsed_ms + 5 * HLC_MAX_OFFSET_MS;
+
+    let a_ceiling_ms = anchor.committed_ceiling().wall_ms;
+    let b_ceiling_ms = participant.committed_ceiling().wall_ms;
+    let a_write_ms = ts_of(&anchor, &a_key).wall_ms;
+    let b_write_ms = ts_of(&participant, &b_key).wall_ms;
+    for (label, ms) in [
+        ("anchor ceiling", a_ceiling_ms),
+        ("participant ceiling", b_ceiling_ms),
+        ("anchor last write", a_write_ms),
+        ("participant last write", b_write_ms),
+    ] {
+        assert!(
+            ms <= bound_ms,
+            "{label} ran away from real time: {label}={ms}ms elapsed={elapsed_ms}ms \
+             bound={bound_ms}ms (seed={seed}) — either the mint_pushed clock-witnessing \
+             runaway (test 5) is back, or the new cross-group TxnResolve witness (ADR 0018 §2 \
+             write-loss amendment, Part A) has reignited it on the participant side"
+        );
+    }
 }
