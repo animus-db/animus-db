@@ -249,12 +249,26 @@ fn seal_now(
     skip_commit: bool,
 ) -> Option<u64> {
     let watermark = meta.effective_stream_shard_watermark(group.id).unwrap_or(0);
+    // Split-seal range-fence amendment (ADR 0043 §A3/§A4/§A6, 2026-08-15):
+    // mirrors `index_drain::seal_now`'s own fence exactly, same reason —
+    // `pending_changes()` is bounded only by this group's *physical* scope,
+    // which a caller (a scripted scenario here; the reconciler in
+    // production) can leave wider than `meta`'s own declared range for a
+    // while after a split. A record outside that declared range already
+    // belongs to a sibling tablet and must be left for its own seal.
+    let declared_range = meta.tablets.get(&group.id).map(|t| t.range.clone());
     let mut filtered: Vec<(Vec<u8>, u64, Vec<u8>)> =
         block_on(group.nodes[leader].pending_changes())
             .into_iter()
             .filter_map(|(k, v)| {
                 let hlc = record_hlc_suffix(&k)?;
-                (hlc > watermark).then_some((k, hlc, v))
+                if hlc <= watermark {
+                    return None;
+                }
+                if declared_range.as_ref().is_some_and(|r| !r.contains(&k)) {
+                    return None;
+                }
+                Some((k, hlc, v))
             })
             .collect();
     if filtered.is_empty() {
