@@ -220,57 +220,19 @@ pub struct Metadata {
     /// keeps pre-ADR-0032 snapshots loading (empty map).
     #[serde(default)]
     pub node_addrs: BTreeMap<NodeId, NodeAddrs>,
-    /// Tablet ids that have been **merged away** (ADR 0033): a
-    /// [`MetaCommand::MergeTablets`] apply inserts `right` here (never
-    /// pruned — tablet ids are never reused, by the same monotonic-allocator
-    /// invariant [`Metadata::next_tablet_id`] already enforces, so an entry
-    /// can never resurrect a wrong decision for a later, unrelated tablet
-    /// reusing the id). This is what lets a per-node tablet-host reconciler
-    /// tell "this hosted tablet vanished from `tablets` because it was
-    /// **merged into a sibling** — tear its group down but never touch its
-    /// data, a survivor now owns that range on the same shared engine" apart
-    /// from "vanished because its **whole table was dropped**
-    /// ([`MetaCommand::DropTableTablets`]) — tear down **and** erase."
-    /// Inferring this purely from the tablet map (e.g. "does some other
-    /// tablet's range now cover mine") is unsound: two different tables'
-    /// still-unsplit tablets can have byte-identical default ranges
-    /// ([`animus_tablet::KeyRange::whole`]), so a range-containment check
-    /// with no table identity to disambiguate would misattribute an
-    /// unrelated table's tablet as "the merge survivor" and silently skip a
-    /// real drop's erase. A tiny, permanently-retained marker per merge ever
-    /// performed (bounded by the total number of splits ever performed,
-    /// since a tablet cannot be merged unless it was first split off from
-    /// something) is far cheaper than getting that inference wrong. See ADR
-    /// 0033. `#[serde(default)]` keeps pre-ADR-0033 snapshots loading (empty
-    /// set).
-    #[serde(default)]
-    pub merged_tablets: BTreeSet<TabletId>,
     /// Split provenance (ADR 0018 PR2, the range-seal design): every split
     /// child's id mapped to its source tablet's id, recorded by
     /// [`MetaCommand::SplitTablet`]'s apply. Never pruned (tablet ids are
-    /// never reused, same discipline as [`Metadata::merged_tablets`]). This is
-    /// what lets a per-node tablet-host reconciler know **whose** seal marker
-    /// a fresh split child must observe before it may host
-    /// (`animus-cp-data`'s `host::HostAction::Host`) — the marker itself
-    /// lives in the (possibly shared) `StorageEngine`, keyed by the source's
-    /// tablet id, and this map is the only way to learn which source that is
-    /// once the source's own row may have narrowed (or, after further
-    /// splits/merges, changed shape) since the child was minted.
+    /// never reused). This is what lets a per-node tablet-host reconciler
+    /// know **whose** seal marker a fresh split child must observe before it
+    /// may host (`animus-cp-data`'s `host::HostAction::Host`) — the marker
+    /// itself lives in the (possibly shared) `StorageEngine`, keyed by the
+    /// source's tablet id, and this map is the only way to learn which
+    /// source that is once the source's own row may have narrowed (or,
+    /// after further splits, changed shape) since the child was minted.
     /// `#[serde(default)]` keeps pre-ADR-0018 snapshots loading (empty map).
     #[serde(default)]
     pub split_parents: BTreeMap<TabletId, TabletId>,
-    /// Merge provenance (ADR 0018 PR2, the range-seal design): every absorbed
-    /// tablet's id mapped to the surviving (`left`) tablet's id it was merged
-    /// into, recorded by [`MetaCommand::MergeTablets`]'s apply — the reverse
-    /// direction from [`Metadata::merged_tablets`] (which only records *that*
-    /// a tablet was absorbed, not *into whom*). Never pruned, same discipline
-    /// as `merged_tablets`/`split_parents`. Lets a survivor's reconciler find
-    /// every tablet id it has ever absorbed, to look up each one's seal
-    /// marker before widening past the range it handed off (the merge dual of
-    /// `split_parents`' gating). `#[serde(default)]` keeps pre-ADR-0018
-    /// snapshots loading (empty map).
-    #[serde(default)]
-    pub absorbed_by: BTreeMap<TabletId, TabletId>,
     /// The stream-shard segment catalog (ADR 0042 §3, ADR 0043 §A8): every
     /// sealed shard ever committed, keyed by `(tablet, epoch)` — globally
     /// unique for a tablet's whole lifetime (a tablet's own epoch counter
@@ -470,23 +432,6 @@ pub enum MetaCommand {
         expected_epoch: Epoch,
         split_key: Vec<u8>,
         new_id: TabletId,
-    },
-    /// Merge adjacent tablets `left` and `right` (where `left.end == right.start`,
-    /// they share a replica set, and they are scoped to the same table) into
-    /// `left`, extended to cover both ranges with a bumped epoch; `right` is
-    /// removed and recorded in [`Metadata::merged_tablets`] (ADR 0033) so a
-    /// per-node reconciler can tell this apart from a table drop. **Compare-and-swap
-    /// on both `expected_left_epoch` and `expected_right_epoch`** (mirroring
-    /// `SplitTablet`/`CasTabletReplicas`): rejected if either tablet's epoch has
-    /// moved since the caller read it, so a merge proposal computed from a stale
-    /// view (e.g. racing a concurrent rebalance/repair CAS or another split/merge
-    /// touching either tablet) is cleanly rejected instead of applying against
-    /// state the proposer never actually observed.
-    MergeTablets {
-        left: TabletId,
-        expected_left_epoch: Epoch,
-        right: TabletId,
-        expected_right_epoch: Epoch,
     },
     /// Set (or clear) a tablet's placement policy (ADR 0005). Once a tablet has
     /// a policy, the leader's reconciler keeps its replica set satisfying it;
@@ -1094,7 +1039,7 @@ impl Metadata {
                 self.tablets.insert(*new_id, new_tablet);
                 self.next_tablet_id = self.next_tablet_id.max(new_id.0 + 1);
                 // ADR 0018 PR2 (range-seal design): record split provenance —
-                // never pruned, same discipline as `merged_tablets`. This is how
+                // never pruned (tablet ids are never reused). This is how
                 // the child's per-node reconciler later learns whose seal
                 // marker (keyed by the *source's* tablet id) it must observe in
                 // the shared engine before it may host — see
@@ -1107,92 +1052,6 @@ impl Metadata {
                 if let Some(policy) = self.policies.get(tablet).cloned() {
                     self.policies.insert(*new_id, policy);
                 }
-                ApplyOutcome::Applied
-            }
-            MetaCommand::MergeTablets {
-                left,
-                expected_left_epoch,
-                right,
-                expected_right_epoch,
-            } => {
-                let (Some(l), Some(r)) = (self.tablets.get(left), self.tablets.get(right)) else {
-                    return ApplyOutcome::Rejected("no such tablet");
-                };
-                // CAS on both epochs (mirroring `SplitTablet`/`CasTabletReplicas`,
-                // ADR 0033): a merge proposal is computed from one metadata
-                // snapshot of both tablets, so either one drifting since — a
-                // racing rebalance/repair CAS, or another split/merge touching
-                // either side — must reject cleanly rather than apply against
-                // stale assumptions the proposer never actually observed.
-                if l.epoch != *expected_left_epoch || r.epoch != *expected_right_epoch {
-                    return ApplyOutcome::Rejected("epoch mismatch");
-                }
-                if !l.range.abuts(&r.range) {
-                    return ApplyOutcome::Rejected("tablets are not adjacent");
-                }
-                if l.replicas != r.replicas {
-                    return ApplyOutcome::Rejected("tablets have different replica sets");
-                }
-                // A merge never crosses a table boundary: both halves' physical
-                // keys live under the same table's `StorageScope` prefix on the
-                // node-shared engine (ADR 0026/0028), which only makes sense if
-                // they were always the same table to begin with.
-                if l.table != r.table {
-                    return ApplyOutcome::Rejected("tablets belong to different tables");
-                }
-                // ADR 0042 §12 / ADR 0043 §A5 (F1): **v1 stopgap** — reject
-                // `MergeTablets` outright on a base table with an *enabled*
-                // stream, or one with *any* still-draining catalog rows (a
-                // disabled-but-not-yet-reaped stream's shards still
-                // reference this tablet's own lineage, which a merge would
-                // corrupt by widening a range a shard's `ParentShardId`
-                // chain assumes only ever narrows). This is explicitly
-                // temporary: tablet merge is being removed globally
-                // (split-only tablets, its own forthcoming ADR + deletion
-                // stack) — this guard becomes dead code that ADR deletes
-                // along with `MergeTablets` itself, not a permanent
-                // position on merge. The disable → merge → re-enable
-                // workaround is honest under F12-b (a genuinely new stream
-                // identity).
-                if let Some(table_name) = &l.table {
-                    let has_enabled_stream = self
-                        .schemas
-                        .get(table_name)
-                        .is_some_and(|s| s.stream.is_some());
-                    let has_draining_rows = self
-                        .stream_shards
-                        .values()
-                        .any(|row| row.table == *table_name);
-                    if has_enabled_stream || has_draining_rows {
-                        return ApplyOutcome::Rejected(
-                            "merge rejected (v1 stopgap): base table has an enabled or \
-                             still-draining DynamoDB stream — tablet merge is being removed \
-                             globally in a forthcoming split-only ADR, which will delete this \
-                             guard along with MergeTablets itself; disable the stream (or wait \
-                             for its rows to drain) before merging, or merge then re-enable as \
-                             a new stream identity",
-                        );
-                    }
-                }
-                let new_end = r.range.end.clone();
-                let l = self.tablets.get_mut(left).expect("tablet present");
-                l.range.end = new_end;
-                l.epoch = l.epoch.next();
-                self.tablets.remove(right);
-                // The merged-away tablet can no longer be reconciled.
-                self.policies.remove(right);
-                // Recorded so a per-node reconciler can tell "merged into a
-                // sibling" apart from "table dropped" (ADR 0033) — see
-                // `Metadata::merged_tablets`'s doc. Never pruned.
-                self.merged_tablets.insert(*right);
-                // ADR 0018 PR2 (range-seal design): record merge provenance —
-                // the reverse direction, never pruned. Lets `left`'s
-                // reconciler find every tablet id it has ever absorbed, to
-                // look up each one's seal marker before widening past the
-                // range it handed off — see `Metadata::absorbed_by`'s doc.
-                self.absorbed_by.insert(*right, *left);
-                // …and its CP members' addresses are dead (ADR 0024 GC).
-                self.prune_cp_member_addrs();
                 ApplyOutcome::Applied
             }
             MetaCommand::SetTabletPolicy { tablet, policy } => {
@@ -1269,8 +1128,7 @@ impl Metadata {
                 }
                 for id in dropped {
                     self.tablets.remove(&id);
-                    // A dropped tablet can no longer be reconciled (mirrors the
-                    // `MergeTablets` cleanup).
+                    // A dropped tablet can no longer be reconciled.
                     self.policies.remove(&id);
                 }
                 // Reclaim the dropped tablets' CP member addresses (ADR 0024 GC —
@@ -1658,8 +1516,8 @@ impl Metadata {
 
     /// Drop every CP member-addr entry recorded against a tablet that is **no
     /// longer in the map** (ADR 0024 — the address-book half of drop-table GC,
-    /// closing the designed `cp_member_addrs` leak). Called from the apply arms
-    /// that remove tablets (`DropTableTablets`, `MergeTablets`); keyed purely on
+    /// closing the designed `cp_member_addrs` leak). Called from the apply arm
+    /// that removes tablets (`DropTableTablets`); keyed purely on
     /// current absence, so it is deterministic on every replica and **convergent
     /// under replay**: a re-applied historical sequence re-registers and then
     /// re-prunes in the same order, never leaving a resurrected entry. Members
@@ -2422,8 +2280,8 @@ mod tests {
     }
 
     /// ADR 0024 address GC: a tablet-scoped `RegisterCpAddr` entry is pruned from
-    /// both maps when its tablet leaves the map (`DropTableTablets` /
-    /// `MergeTablets`); a registration for an absent tablet is rejected (the
+    /// both maps when its tablet leaves the map (`DropTableTablets`);
+    /// a registration for an absent tablet is rejected (the
     /// registrar retries); legacy tablet-less entries are never pruned; and the
     /// whole thing is **convergent under replay** — re-applying the same command
     /// sequence to a fresh state machine reaches the identical pruned state, so a
@@ -2495,61 +2353,6 @@ mod tests {
         assert!(!m.cp_member_addrs.contains_key(&nid(1301)));
     }
 
-    /// The `MergeTablets` removal path prunes the merged-away tablet's CP member
-    /// addresses exactly like a drop (ADR 0024 GC).
-    #[test]
-    fn merge_prunes_the_removed_tablets_cp_addrs() {
-        let mut m = Metadata::default();
-        let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: None,
-                range: KeyRange::new(Vec::new(), Some(mid.clone())),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(2),
-                table: None,
-                range: KeyRange::new(mid, None),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            }),
-            ApplyOutcome::Applied
-        );
-        for (id, tablet) in [(1301, 1u64), (2301, 2u64)] {
-            assert_eq!(
-                m.apply(&MetaCommand::RegisterCpAddr {
-                    id: nid(id),
-                    addr: format!("127.0.0.1:{id}"),
-                    tablet: Some(TabletId(tablet)),
-                }),
-                ApplyOutcome::Applied
-            );
-        }
-
-        assert_eq!(
-            m.apply(&MetaCommand::MergeTablets {
-                left: TabletId(1),
-                expected_left_epoch: Epoch::INITIAL,
-                right: TabletId(2),
-                expected_right_epoch: Epoch::INITIAL,
-            }),
-            ApplyOutcome::Applied
-        );
-        // The merged-away right tablet's member is reclaimed; the survivor's stays.
-        assert!(!m.cp_member_addrs.contains_key(&nid(2301)));
-        assert!(!m.cp_member_tablets.contains_key(&nid(2301)));
-        assert!(m.cp_member_addrs.contains_key(&nid(1301)));
-        assert_eq!(m.cp_member_tablets.get(&nid(1301)), Some(&TabletId(1)));
-        assert!(
-            m.merged_tablets.contains(&TabletId(2)),
-            "the merged-away tablet must be recorded (ADR 0033)"
-        );
-    }
-
     /// ADR 0018 PR2 (range-seal design, replacing the retired `version_floor`
     /// cross-group-LWW fix): `SplitTablet` records split provenance
     /// (`Metadata::split_parents`) so a child's reconciler can find its
@@ -2595,70 +2398,6 @@ mod tests {
         assert_eq!(m.split_parents.get(&TabletId(3)), Some(&TabletId(2)));
         // Provenance is permanent (never pruned).
         assert_eq!(m.split_parents.get(&TabletId(2)), Some(&TabletId(1)));
-    }
-
-    /// `MergeTablets` records the reverse-direction provenance
-    /// (`Metadata::absorbed_by`) — the merge dual of the split-provenance fix
-    /// above — so the survivor's reconciler can find every tablet id it has
-    /// ever absorbed.
-    #[test]
-    fn merge_tablets_records_absorbed_by_provenance() {
-        let mut m = Metadata::default();
-        let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: None,
-                range: KeyRange::new(Vec::new(), Some(mid.clone())),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(2),
-                table: None,
-                range: KeyRange::new(mid.clone(), None),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.apply(&MetaCommand::MergeTablets {
-                left: TabletId(1),
-                expected_left_epoch: m.tablets[&TabletId(1)].epoch,
-                right: TabletId(2),
-                expected_right_epoch: m.tablets[&TabletId(2)].epoch,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert!(!m.tablets.contains_key(&TabletId(2)));
-        assert_eq!(m.absorbed_by.get(&TabletId(2)), Some(&TabletId(1)));
-
-        // Split a fresh sibling off tablet 1 and merge it back in too — a
-        // survivor can accumulate more than one absorbed id over its
-        // lifetime, and each must resolve to it independently.
-        assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(1),
-                expected_epoch: m.tablets[&TabletId(1)].epoch,
-                split_key: 0xC000_0000_0000_0000u64.to_be_bytes().to_vec(),
-                new_id: TabletId(3),
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.apply(&MetaCommand::MergeTablets {
-                left: TabletId(1),
-                expected_left_epoch: m.tablets[&TabletId(1)].epoch,
-                right: TabletId(3),
-                expected_right_epoch: m.tablets[&TabletId(3)].epoch,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(m.absorbed_by.get(&TabletId(3)), Some(&TabletId(1)));
-        // The first absorption's provenance is permanent (never pruned).
-        assert_eq!(m.absorbed_by.get(&TabletId(2)), Some(&TabletId(1)));
     }
 
     /// `DropTableTablets` (ADR 0024): removes every tablet scoped to the table —
@@ -3838,123 +3577,6 @@ mod tests {
             ApplyOutcome::Applied,
             "remove works directly on a never-marked row (the drop-table cascade shape)"
         );
-    }
-
-    fn adjacent_tablets(m: &mut Metadata, table: &str) {
-        let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some(table.to_owned()),
-                range: KeyRange::new(Vec::new(), Some(mid.clone())),
-                replicas: vec![nid(1)],
-            }),
-            ApplyOutcome::Applied
-        );
-        // A second direct `CreateTablet` for the same table is rejected
-        // (ADR 0023 — only `SplitTablet` may mint a table's further
-        // tablets), so construct the adjacent sibling by hand, mirroring
-        // `mirror.rs`'s own merge-scenario test helper.
-        m.tablets.insert(
-            TabletId(2),
-            Tablet::with_table(
-                TabletId(2),
-                Some(table.to_owned()),
-                KeyRange::new(mid, None),
-                vec![nid(1)],
-            ),
-        );
-    }
-
-    fn merge_orders(m: &Metadata) -> MetaCommand {
-        MetaCommand::MergeTablets {
-            left: TabletId(1),
-            expected_left_epoch: m.tablets[&TabletId(1)].epoch,
-            right: TabletId(2),
-            expected_right_epoch: m.tablets[&TabletId(2)].epoch,
-        }
-    }
-
-    /// F1 merge stopgap (ADR 0042 §12/ADR 0043 §A5): `MergeTablets` is
-    /// rejected outright on a base table with a currently **enabled**
-    /// stream.
-    #[test]
-    fn merge_rejected_when_base_table_has_an_enabled_stream() {
-        let mut m = Metadata::default();
-        enable_stream(&mut m, "orders", "L1");
-        adjacent_tablets(&mut m, "orders");
-
-        let outcome = m.apply(&merge_orders(&m.clone()));
-        match outcome {
-            ApplyOutcome::Rejected(msg) => assert!(msg.contains("v1 stopgap"), "{msg}"),
-            other => panic!("expected a stopgap rejection, got {other:?}"),
-        }
-        assert!(
-            m.tablets.contains_key(&TabletId(2)),
-            "the merge must not have applied"
-        );
-    }
-
-    /// F1 merge stopgap: also rejected while the base table has any
-    /// still-**draining** catalog rows, even after the stream itself has
-    /// been disabled (the schema no longer names it at all) — a shard's
-    /// lineage still references this tablet, so widening it would corrupt
-    /// that lineage regardless of whether the stream is currently enabled.
-    #[test]
-    fn merge_rejected_when_base_table_has_undrained_catalog_rows() {
-        let mut m = Metadata::default();
-        enable_stream(&mut m, "orders", "L1");
-        m.apply(&seal("orders", "L1", 1, 0, 100));
-        assert_eq!(
-            m.apply(&MetaCommand::SetTableStream {
-                table: "orders".to_owned(),
-                spec: None,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert!(m.table_stream("orders").is_none(), "test premise: disabled");
-        adjacent_tablets(&mut m, "orders");
-
-        let outcome = m.apply(&merge_orders(&m.clone()));
-        match outcome {
-            ApplyOutcome::Rejected(msg) => assert!(msg.contains("v1 stopgap"), "{msg}"),
-            other => panic!("expected a stopgap rejection, got {other:?}"),
-        }
-        assert!(m.tablets.contains_key(&TabletId(2)));
-    }
-
-    /// A plain table with no stream ever enabled, and one whose stream's
-    /// rows have all fully drained, merges exactly as before (positive
-    /// control — the guard must not over-reject).
-    #[test]
-    fn merge_allowed_for_a_table_with_no_stream_or_fully_drained_rows() {
-        // No stream at all.
-        let mut m = Metadata::default();
-        adjacent_tablets(&mut m, "plain");
-        assert_eq!(m.apply(&merge_orders(&m.clone())), ApplyOutcome::Applied);
-
-        // A stream that existed, sealed, and fully drained (every row
-        // removed) — merge must be allowed again.
-        let mut m2 = Metadata::default();
-        enable_stream(&mut m2, "drained", "L1");
-        m2.apply(&seal("drained", "L1", 1, 0, 100));
-        assert_eq!(
-            m2.apply(&MetaCommand::SetTableStream {
-                table: "drained".to_owned(),
-                spec: None,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m2.apply(&MetaCommand::ExpireStreamShards {
-                rows: vec![(TabletId(1), 0)],
-                remove: true,
-            }),
-            ApplyOutcome::Applied
-        );
-        assert!(m2.stream_shards.is_empty(), "test premise: fully drained");
-        adjacent_tablets(&mut m2, "drained");
-        assert_eq!(m2.apply(&merge_orders(&m2.clone())), ApplyOutcome::Applied);
     }
 
     // --- accessors ------------------------------------------------------

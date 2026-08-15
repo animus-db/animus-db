@@ -200,11 +200,8 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             // `drain_tablet` is GSI-specific (it reconciles GSI rows and
             // advances the `"gsi"` cursor) — never call it for a
             // streamed-but-unindexed table, or it would write a spurious
-            // `"gsi"` cursor row this table's schema never expects (a
-            // permanent, own-token unexpected row `cleanup_merge_residue_
-            // cursor_rows` deliberately does not clean up — see its own
-            // doc). A streamed-only table still needs the seal + trim arms
-            // below.
+            // `"gsi"` cursor row this table's schema never expects. A
+            // streamed-only table still needs the seal + trim arms below.
             if !gsis.is_empty()
                 && let Err(e) = drain_tablet(&ctx, &meta, &table, &group, &gsis).await
             {
@@ -687,10 +684,10 @@ pub(crate) async fn hot_read(
 
 /// The hot-trim arm (ADR 0042 §8, ADR 0043 §A6, F10), run once per tablet per
 /// tick, right after this tick's reconciliation/seal. Deletes change records
-/// every *expected, present* term has already cleared, and sweeps stale
-/// merge-residue cursor rows. Advances no cursor and seals nothing itself —
-/// that's [`drain_tablet`]'s job for the "gsi" term, and [`seal_now`]'s for
-/// advancing the stream's own catalog watermark.
+/// every *expected, present* term has already cleared. Advances no cursor
+/// and seals nothing itself — that's [`drain_tablet`]'s job for the "gsi"
+/// term, and [`seal_now`]'s for advancing the stream's own catalog
+/// watermark.
 ///
 /// **The F10/F12-b trim-bound rule** — trim = `min(gsi term if the table has
 /// GSIs, catalog watermark iff the table's CURRENT schema has an enabled
@@ -746,9 +743,6 @@ async fn trim_janitor(
     gsis: &[IndexDef],
     stream_enabled: bool,
 ) -> Result<(), String> {
-    let expected_cursor_tags: &[&str] = if gsis.is_empty() { &[] } else { &[GSI_TAG] };
-    cleanup_merge_residue_cursor_rows(ctx, table, group, expected_cursor_tags).await?;
-
     let mut trim_point: Option<u64> = None;
     let mut blocked = false;
     if !gsis.is_empty() {
@@ -810,36 +804,6 @@ async fn trim_janitor(
     Ok(())
 }
 
-/// Tombstone a cursor row iff its tag is no longer expected by this table's
-/// schema **and** its token isn't this tablet's own — i.e. it is
-/// physically-present residue from an absorbed sibling (ADR 0042 §7's merge
-/// dual: `StorageScope::with_kind` shares one live `KeyRange`, so widening a
-/// survivor's scope over an absorbed tablet exposes whatever cursor rows it
-/// wrote while it was its own tablet). An unexpected row at this tablet's OWN
-/// token — a dropped index's own stale row — is deliberately left alone
-/// here; round 3 has no cursor tag left for a stream to ever leave one of
-/// its own (the stream half of trim is catalog-derived, not a row any
-/// consumer writes).
-async fn cleanup_merge_residue_cursor_rows(
-    ctx: &ClientCtx,
-    table: &str,
-    group: &CpGroup,
-    expected: &[&str],
-) -> Result<(), String> {
-    let own_token = cursor::token_of(&group.scope_range().start);
-    let mut writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
-    for (token, tag, _) in group.cursor_rows_with_token().await {
-        if expected.contains(&tag.as_str()) || token == own_token {
-            continue;
-        }
-        writes.push((KIND_CURSOR, cursor::cursor_key(&token, &tag), None));
-    }
-    if writes.is_empty() {
-        return Ok(());
-    }
-    ctx.cp_kind_write_raw(table, writes).await
-}
-
 /// The full data-plane key of one GSI row: the ADR 0022 token over the **index
 /// hash value** (not the base partition key — that difference is exactly why a
 /// GSI lives in its own tablets and is maintained here rather than inline).
@@ -862,8 +826,8 @@ fn projected(item: &Item, base: &animus_dynamo::TableSchema, idx: &IndexDef) -> 
 /// ADR 0042 §7/§8 regressions for the cursor-based drain + trim janitor
 /// above. **In-crate**, like `lib.rs`'s `split_fence_tests`/
 /// `auto_split_median_tests`: these need private handles (`CpGroup::
-/// pending_changes`/`cursor_min_watermark`/`cursor_rows_with_token`, the
-/// plain-client-protocol `ClientRequest::SplitTablet`/`MergeTablets` with an
+/// pending_changes`/`cursor_min_watermark`, the
+/// plain-client-protocol `ClientRequest::SplitTablet` with an
 /// arbitrary binary `split_key`, and `crate::dynamo::item_key` for
 /// deterministic side-placement) that an external `tests/` crate — a
 /// separate compilation unit, linking only this crate's `pub` surface —
@@ -1124,33 +1088,6 @@ mod gsi_drain_cursor_tests {
         assert!(
             matches!(resp, ClientResponse::PutOk),
             "split failed: {resp:?}"
-        );
-    }
-
-    // Unused since `merge_survivor_uses_the_min_over_rows_not_its_own_higher_
-    // watermark` (ADR 0033's data-plane reaction removed, split-only
-    // tablets) was deleted — kept anyway, per plan, since `MergeTablets`
-    // itself (and this helper along with it) dies in the next rung when the
-    // control-plane command and wire surface go.
-    #[allow(dead_code)]
-    async fn merge(client_addr: SocketAddr, left: TabletId, right: TabletId) {
-        let mut stream = TcpStream::connect(client_addr).await.expect("connect");
-        write_frame(
-            &mut stream,
-            &ClientRequest::MergeTablets {
-                left: left.0,
-                right: right.0,
-            },
-        )
-        .await
-        .expect("send merge");
-        let resp: ClientResponse = read_frame(&mut stream)
-            .await
-            .expect("read reply")
-            .expect("a reply");
-        assert!(
-            matches!(resp, ClientResponse::PutOk),
-            "merge failed: {resp:?}"
         );
     }
 

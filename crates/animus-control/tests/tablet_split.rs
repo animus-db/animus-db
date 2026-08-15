@@ -1,5 +1,5 @@
-//! Tablet split/merge through the control plane: the operations replicate in
-//! order, partition/recombine the keyspace correctly, and bump epochs (so the
+//! Tablet split through the control plane: the operation replicates in
+//! order, partitions the keyspace correctly, and bumps epochs (so the
 //! data plane fences coordinators holding a pre-split view).
 
 use std::time::Duration;
@@ -52,7 +52,7 @@ fn partitions_keyspace(meta: &Metadata) -> bool {
 }
 
 #[test]
-fn split_then_merge_round_trips_through_raft() {
+fn split_round_trips_through_raft() {
     let seed = 0x59_17;
     let (mut sim, nodes) = cluster(seed);
     sim.run_for(Duration::from_secs(2));
@@ -95,92 +95,6 @@ fn split_then_merge_round_trips_through_raft() {
         partitions_keyspace(&meta),
         "keyspace not cleanly partitioned after split"
     );
-
-    // Merge them back; the keyspace is whole again under tablet 1.
-    nodes[l].propose(MetaCommand::MergeTablets {
-        left: TabletId(1),
-        expected_left_epoch: Epoch(2),
-        right: TabletId(2),
-        expected_right_epoch: Epoch::INITIAL,
-    });
-    sim.run_for(Duration::from_secs(2));
-
-    let meta = nodes[l].metadata();
-    assert_eq!(
-        meta.tablets.len(),
-        1,
-        "merge should remove the right tablet"
-    );
-    assert_eq!(meta.tablets[&TabletId(1)].range, KeyRange::whole());
-    assert_eq!(
-        meta.tablets[&TabletId(1)].epoch,
-        Epoch(3),
-        "merge bumps epoch again"
-    );
-    assert!(
-        meta.merged_tablets.contains(&TabletId(2)),
-        "merge must record the merged-away tablet (ADR 0033)"
-    );
-    for n in &nodes {
-        assert_eq!(n.metadata(), meta);
-    }
-}
-
-/// Two proposers racing to merge tablets computed from an equally-stale view —
-/// one merging `left`+`right` and another concurrently CAS-ing `left`'s
-/// replica set (a rebalance move) — must not let the merge apply against a
-/// replica set the merge proposer never actually observed. With the
-/// double-epoch CAS, whichever commits first wins and the other is cleanly
-/// rejected.
-#[test]
-fn merge_rejects_a_stale_epoch_racing_a_concurrent_replica_change() {
-    let seed = 0x59_19;
-    let (mut sim, nodes) = cluster(seed);
-    sim.run_for(Duration::from_secs(2));
-    let l = leader(&nodes);
-
-    nodes[l].propose(MetaCommand::CreateTablet {
-        tablet: TabletId(1),
-        table: None,
-        range: KeyRange::new(b"".to_vec(), Some(b"m".to_vec())),
-        replicas: NODES.iter().copied().map(nid).collect(),
-    });
-    nodes[l].propose(MetaCommand::CreateTablet {
-        tablet: TabletId(2),
-        table: None,
-        range: KeyRange::new(b"m".to_vec(), None),
-        replicas: NODES.iter().copied().map(nid).collect(),
-    });
-    sim.run_for(Duration::from_secs(2));
-
-    // A concurrent replica-set change on `left` at its current epoch races the
-    // merge (both proposed back-to-back on the same leader's log).
-    nodes[l].propose(MetaCommand::CasTabletReplicas {
-        tablet: TabletId(1),
-        expected_epoch: Epoch::INITIAL,
-        replicas: vec![nid(NODES[0]), nid(NODES[1])],
-    });
-    nodes[l].propose(MetaCommand::MergeTablets {
-        left: TabletId(1),
-        expected_left_epoch: Epoch::INITIAL,
-        right: TabletId(2),
-        expected_right_epoch: Epoch::INITIAL,
-    });
-    sim.run_for(Duration::from_secs(2));
-
-    let meta = nodes[l].metadata();
-    for n in &nodes {
-        assert_eq!(n.metadata(), meta, "metadata diverged across nodes");
-    }
-    // The replica CAS landed first (proposed first, same epoch); the merge's
-    // `expected_left_epoch` is now stale, so it must have been rejected.
-    assert_eq!(meta.tablets.len(), 2, "the stale merge must not apply");
-    assert_eq!(
-        meta.tablets[&TabletId(1)].replicas,
-        vec![nid(NODES[0]), nid(NODES[1])]
-    );
-    assert_eq!(meta.tablets[&TabletId(1)].epoch, Epoch(2));
-    assert!(!meta.merged_tablets.contains(&TabletId(2)));
 }
 
 /// Two proposers racing to split the same tablet at the same epoch — each
@@ -248,18 +162,12 @@ fn racing_splits_at_the_same_epoch_only_one_applies() {
 }
 
 #[test]
-fn invalid_split_and_merge_are_rejected_deterministically() {
+fn invalid_split_is_rejected_deterministically() {
     let mut meta = Metadata::default();
     meta.apply(&MetaCommand::CreateTablet {
         tablet: TabletId(1),
         table: None,
         range: KeyRange::new(b"a".to_vec(), Some(b"c".to_vec())),
-        replicas: vec![nid(0), nid(1)],
-    });
-    meta.apply(&MetaCommand::CreateTablet {
-        tablet: TabletId(9),
-        table: None,
-        range: KeyRange::new(b"x".to_vec(), Some(b"z".to_vec())),
         replicas: vec![nid(0), nid(1)],
     });
 
@@ -274,53 +182,9 @@ fn invalid_split_and_merge_are_rejected_deterministically() {
         }),
         Rejected(_)
     ));
-    // Non-adjacent tablets cannot merge ([a,c) and [x,z) have a gap).
-    assert!(matches!(
-        meta.apply(&MetaCommand::MergeTablets {
-            left: TabletId(1),
-            expected_left_epoch: Epoch::INITIAL,
-            right: TabletId(9),
-            expected_right_epoch: Epoch::INITIAL,
-        }),
-        Rejected(_)
-    ));
-    // State unchanged by the rejected commands.
-    assert_eq!(meta.tablets.len(), 2);
+    // State unchanged by the rejected command.
+    assert_eq!(meta.tablets.len(), 1);
     assert_eq!(meta.tablets[&TabletId(1)].epoch, Epoch::INITIAL);
-}
-
-/// A merge across two different tables' tablets is rejected even when their
-/// ranges happen to abut and their replica sets happen to coincide — the
-/// physical keyspace of each side lives under a different table's
-/// `StorageScope` prefix on the shared engine (ADR 0026/0028), so merging
-/// them would silently conflate two unrelated tables' data.
-#[test]
-fn merge_rejects_tablets_from_different_tables() {
-    let mut meta = Metadata::default();
-    meta.apply(&MetaCommand::CreateTablet {
-        tablet: TabletId(1),
-        table: Some("users".to_owned()),
-        range: KeyRange::new(b"".to_vec(), Some(b"m".to_vec())),
-        replicas: vec![nid(0), nid(1)],
-    });
-    meta.apply(&MetaCommand::CreateTablet {
-        tablet: TabletId(2),
-        table: Some("orders".to_owned()),
-        range: KeyRange::new(b"m".to_vec(), None),
-        replicas: vec![nid(0), nid(1)],
-    });
-
-    use animus_control::ApplyOutcome::Rejected;
-    assert!(matches!(
-        meta.apply(&MetaCommand::MergeTablets {
-            left: TabletId(1),
-            expected_left_epoch: Epoch::INITIAL,
-            right: TabletId(2),
-            expected_right_epoch: Epoch::INITIAL,
-        }),
-        Rejected(_)
-    ));
-    assert_eq!(meta.tablets.len(), 2, "cross-table merge must not apply");
 }
 
 /// A split child inherits the source tablet's placement policy (ADR 0029):
