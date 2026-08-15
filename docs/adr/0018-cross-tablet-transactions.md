@@ -1910,3 +1910,114 @@ GC remains out of scope (ADR 0018 §2/PR5's own note).
 Codec: `animus-cp-data`'s wire/image `VERSION` bumped 10 → 11
 (`TxnStage.conditions`) — internal format only, no cross-version
 compatibility required (no live deployments, house convention).
+
+## Amendment (2026-08-15, `mint_pushed` clock-witnessing-runaway fix)
+
+This amendment fixes a live bug in PR2b's write-conflict push (§2/§3 above):
+`RaftKvNode::mint_pushed` had its own, independent route to the exact
+`Hlc::witness`-poisoning hazard the PR2b amendment's own §3 already named and
+fixed for `ensure_ceiling_above`/`next_ceiling_candidate`. It does not change
+any wire-facing behavior or the codec version — the fix is entirely internal
+to how a write's timestamp is computed.
+
+### 1. The bug
+
+`mint_pushed` folded the **live** `committed_ceiling()` into `ts_cache`'s
+`low_water` on **every** mint (`cache.raise_low_water(self.committed_ceiling())`,
+previously unconditional), then, whenever the honest mint fell at or below
+the resulting floor (the ceiling is deliberately `Hlc::uncertainty_upper`
+— `HLC_MAX_OFFSET` (500ms) — ahead of real time, so this was the *common*
+case, not an edge one), called `self.hlc.witness(floor, ..)` to push past
+it. Witnessing a value `HLC_MAX_OFFSET` in the future permanently ratchets
+the group's shared `Hlc` into that fiction — exactly the hazard §3's own
+`next_ceiling_candidate` doc already described and built a separate CAS
+ratchet to avoid. `mint_pushed` was PR2b's *other* caller of the identical
+unsafe pattern, never covered by that fix.
+
+The result is a self-sustaining feedback loop under interleaved reads and
+writes: a write's `mint_pushed` witnesses the ceiling forward → the next
+read mints near that poisoned clock and almost immediately exceeds the
+(now merely 500ms old) ceiling → `ensure_ceiling_above` proposes a fresh
+`ReadCeiling` another `HLC_MAX_OFFSET` further out → the next write folds
+*that* in as its floor and witnesses it too. Each round adds roughly one
+`HLC_MAX_OFFSET`, **independent of how much real (virtual) time actually
+elapses** — probe-verified as a k×`HLC_MAX_OFFSET` runaway lattice, and
+reproduced deterministically by `tests/ts_cache.rs`'s
+`interleaved_reads_and_writes_never_let_minted_timestamps_outrun_real_time`
+(pre-fix: committed ceiling reached 102s of manufactured time after only
+20s of real elapsed simulated time). The manufactured `ReadCeiling` churn
+this produces on the propose path also starves genuine log entries behind
+it.
+
+### 2. The fix, part A: per-term ceiling absorption
+
+The unconditional per-mint fold is strictly stronger than the safety
+property needs. **The committed ceiling's write-floor role only exists to
+cover a *predecessor* leader's reads** — reads served by *this* leader are
+already covered by its own `ts_cache` entries, bumped at their real serve
+`ts` by every `linearizable_get`/`_scan`/`read_at`/`scan_at` call. A
+predecessor's ceiling, meanwhile, is fixed as of this leader's own
+takeover: Raft leader completeness means the new leader already witnessed
+the prior ceiling's `ts` via ordinary `AppendEntries` receipt before it
+could ever campaign, and a deposed leader cannot commit a fresher ceiling
+after losing leadership (its own `ensure_ceiling_above`/`propose_ordered`
+calls require it). So absorbing `committed_ceiling()` into `ts_cache`'s
+`low_water` **once per term** — the first time this leader mints in a
+given term — is exactly as safe as absorbing it on every mint, while
+breaking the feedback loop: every mint after the first in a term is
+floored only by the per-key `ts_cache`/`last_proposed_ts`, both of which
+reflect *real* served/proposed timestamps, never a manufactured
+future-shifted one.
+
+**New invariant, replacing the unconditional-fold reading of §2 above**: a
+write's floor covers (a) every read *this* leader has itself served
+(`ts_cache`'s per-span entries, bumped at real serve `ts`), and (b) every
+read any *predecessor* could have served, via the ceiling absorbed once at
+this leader's first mint of its current term. `RaftKvNode::mint_pushed`
+tracks the absorption via a new field, `last_absorbed_term` (an
+`AtomicU64`, sentinel `u64::MAX` so the very first mint on a fresh group
+still absorbs), compared against the Raft `term` — which `mint_pushed`
+cannot read via `term()` itself (it always runs inside `propose_ordered`/
+`propose_ordered_aux`'s already-held `core` lock, so a second `lock()`
+call would deadlock); `propose_ordered`/`propose_ordered_aux` now read
+`core.term()` once and hand it down to their `build` closure for exactly
+this reason.
+
+### 3. The fix, part B: no-witness push
+
+Independent of part A (defense in depth: even a floor that is occasionally
+still ceiling-derived must not poison the clock), `mint_pushed`'s
+witness-and-retry branch is replaced with pure arithmetic: a new
+`hlc::bump_strictly_above(ts)` computes the next value that strictly
+exceeds `ts` (bump `logical` by one, carrying into `wall_ms` on
+`LOGICAL_BITS` overflow) with **no** `Hlc::witness` call and no mutation of
+`Hlc`'s own persistent state — the identical bump rule
+`next_ceiling_candidate`'s own CAS-ratchet branch already used inline,
+factored out into this shared, unit-tested function so both call sites
+stay byte-for-byte identical by construction rather than by discipline.
+Monotonicity across a leader's own successive proposes still holds without
+witnessing: the floor `mint_pushed` bumps above already includes
+`last_proposed_ts` (this leader's own last-*logged* ts, from
+`propose_ordered`'s existing floor-tracking — unchanged by this
+amendment), so each pushed write's ts strictly exceeds every ts this
+leader has minted or proposed so far, the same property `Hlc::witness`
+would have provided, without its side effect on `self.hlc`.
+
+### 4. What this closes, what stays true
+
+`next_ceiling_candidate`'s own doc already named the "never witness a
+future-shifted value" rule; this amendment is the fix for the second,
+independent path to the same `Hlc::witness` sink that rule never covered.
+Regression: `tests/ts_cache.rs`'s
+`interleaved_reads_and_writes_never_let_minted_timestamps_outrun_real_time`
+(new — proven to fail against the pre-fix code, per above) and the
+pre-existing `leader_change_never_lets_a_write_undercut_a_served_read_even_
+under_extreme_clock_skew` (unchanged, still green — the safety argument in
+§3 above that this amendment's new invariant rests on). See
+`docs/engineering-lessons.md` for the general "a fix must cover every path
+to a dangerous primitive's sink, not just the caller that surfaced it"
+lesson this incident is an instance of.
+
+No codec change (no `KvCommand`/wire-image field touched) and no change to
+`ensure_ceiling_above`/`next_ceiling_candidate` beyond factoring out the
+shared bump helper.

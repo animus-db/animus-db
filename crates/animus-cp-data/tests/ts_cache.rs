@@ -401,3 +401,98 @@ fn a_real_node_stays_correct_after_its_cache_has_rotated_several_times_over() {
         "a write must still commit/apply correctly after heavy cache churn (seed={seed})"
     );
 }
+
+// ============================================================================
+// 5. Clock-divergence regression: the `mint_pushed` clock-witnessing
+//    runaway (ADR 0018 §2 amendment). `mint_pushed` used to fold the LIVE
+//    committed ceiling into every write's floor and, whenever the honest
+//    mint fell short of it (the ceiling is deliberately `HLC_MAX_OFFSET`
+//    ahead of real time), witness that floor — permanently ratcheting the
+//    group's shared `Hlc` into the fiction. The next read then mints near
+//    that poisoned clock, exceeds the (now-stale) ceiling almost at once,
+//    forcing a fresh one `HLC_MAX_OFFSET` further out, which floors the
+//    next write, and so on: a k*HLC_MAX_OFFSET runaway lattice that grows
+//    roughly one `HLC_MAX_OFFSET` per round regardless of how much real
+//    (virtual) time actually elapses. Per-term ceiling absorption (fold the
+//    ceiling in at most once per term, not on every mint) plus the
+//    no-witness push (bump strictly above the floor as pure arithmetic,
+//    never through `Hlc::witness`) close this. This test is deliberately
+//    interleaved reads-then-writes on a tight loop — exactly the shape that
+//    drives the feedback loop — and is a genuine `SimEnv` regression: the
+//    bug is a logic error in how the clock advances, not a real-thread
+//    timing race, so simulation catches it byte-for-byte.
+// ============================================================================
+
+#[test]
+fn interleaved_reads_and_writes_never_let_minted_timestamps_outrun_real_time() {
+    // Mirrors `HLC_MAX_OFFSET`'s own value (private to the crate) — see this
+    // file's other tests for the same hardcoded-500ms convention.
+    const HLC_MAX_OFFSET_MS: u64 = 500;
+    let seed = 0x7ED0_C1DE;
+    let mut sim = Simulator::new(seed);
+    let id = nid(0);
+    let node: KvNode =
+        RaftKvNode::start(sim.env(id.clone()), vec![id.clone()], MemoryEngine::new());
+    sim.run_for(Duration::from_secs(2)); // elect (single voter)
+
+    put(std::slice::from_ref(&node), &[0], seed, b"k", b"v0");
+    sim.run_for(Duration::from_millis(50));
+    let start_ms = sim.env(id.clone()).now().0 / 1_000_000;
+
+    // Tight, back-to-back rounds of a linearizable read (which observes/
+    // proposes the read ceiling) immediately followed by a write (which
+    // mints through `mint_pushed`) — precisely the read-pushes-ceiling /
+    // write-folds-and-witnesses-it-forward / next-read-mints-near-the-
+    // poisoned-clock cycle the bug produces. A single-voter group keeps
+    // every read barrier resolving at negligible simulated cost (mirroring
+    // test 4's rationale), so real elapsed time stays governed by
+    // `run_for`'s budget, not by network round trips — the clean baseline
+    // the divergence bound below needs.
+    const ROUNDS: u64 = 200;
+    let n = node.clone();
+    let done = Arc::new(Mutex::new(false));
+    let d = Arc::clone(&done);
+    node.env().clone().spawn_task(async move {
+        for i in 0..ROUNDS {
+            let _ = n.linearizable_get(b"k").await;
+            let value = format!("v{i}").into_bytes();
+            let _ = n.put(b"k".to_vec(), value);
+        }
+        *d.lock().unwrap() = true;
+    });
+    let budget = Duration::from_secs(20);
+    sim.run_for(budget);
+    assert!(
+        *done.lock().unwrap(),
+        "all {ROUNDS} interleaved read/write rounds must complete within the drive budget \
+         (seed={seed})"
+    );
+
+    // `run_for` always burns its entire budget (the house `SimEnv` gotcha
+    // this file's other tests already document), so real elapsed time here
+    // is governed by `budget`, not by how long the loop above actually took.
+    let elapsed_ms = (sim.env(id.clone()).now().0 / 1_000_000).saturating_sub(start_ms);
+    let ceiling_ms = node.committed_ceiling().wall_ms;
+    let write_ms = ts_of(&node, b"k").wall_ms;
+
+    // Neither the committed read ceiling nor the last write's own minted
+    // timestamp may run away from real elapsed time. The only legitimate
+    // margin is a small, bounded number of `HLC_MAX_OFFSET` windows (the
+    // ceiling is always proposed one `HLC_MAX_OFFSET` ahead of the read it
+    // covers, amortizing to roughly one refresh per window under sustained
+    // load — see test 3 above); anything beyond that means the
+    // clock-witnessing feedback loop is running again.
+    let bound_ms = elapsed_ms + 3 * HLC_MAX_OFFSET_MS;
+    assert!(
+        ceiling_ms <= bound_ms,
+        "committed ceiling ran away from real time: ceiling={ceiling_ms}ms \
+         elapsed={elapsed_ms}ms bound={bound_ms}ms (seed={seed}) — the mint_pushed \
+         clock-witnessing runaway is back"
+    );
+    assert!(
+        write_ms <= bound_ms,
+        "minted write timestamp ran away from real time: write={write_ms}ms \
+         elapsed={elapsed_ms}ms bound={bound_ms}ms (seed={seed}) — the mint_pushed \
+         clock-witnessing runaway is back"
+    );
+}
