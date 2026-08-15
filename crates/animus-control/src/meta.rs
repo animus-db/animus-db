@@ -498,6 +498,19 @@ pub struct StreamShardRow {
     /// §A7b/§A3 step 3) — recorded so a future reader/repair sweep knows
     /// exactly where to look without a discovery round.
     pub replicas: Vec<NodeId>,
+    /// The **unique per-attempt** `SegmentStore` id this row's segment
+    /// object actually lives at (the ledger-named-object as-built
+    /// amendment, ADR 0042 §10/ADR 0043 §A3) —
+    /// `animus_cp_data::segment::segment_object_id`'s output, never the
+    /// bare deterministic `segment_id(table, label, tablet, epoch)` a
+    /// reader used to recompute directly. **Every reader/sweep must resolve
+    /// this field rather than recomputing an id** — recomputing would
+    /// silently reintroduce the shared-id race this amendment exists to
+    /// close (see `animus_cp_data::segment`'s own module doc for the full
+    /// incident). No `#[serde(default)]`: this codebase has no live-
+    /// deployment/back-compat requirement (fresh clusters only), so a row
+    /// this field predates simply cannot exist.
+    pub object_id: String,
     /// Set by [`MetaCommand::ExpireStreamShards`]'s **mark** phase
     /// (`remove: false`): the janitor's own record that it has begun
     /// reclaiming this row's segment object, so a crash-and-resume knows to
@@ -722,6 +735,17 @@ pub enum MetaCommand {
         count: u64,
         seal_wall_ms: u64,
         replicas: Vec<NodeId>,
+        /// The unique per-attempt object id this proposal's own segment
+        /// object was already durably written at (the ledger-named-object
+        /// amendment — see [`StreamShardRow::object_id`]'s own doc). Part of
+        /// this command's own "content" for the first-committer-wins
+        /// comparison below: two attempts computed from different snapshots
+        /// always mint different ids (even when every other field happens
+        /// to agree), so this field is what makes a genuine race between
+        /// independently-computed attempts a **content** mismatch — never
+        /// silently treated as the identical-content no-op case that a
+        /// true same-attempt retry (same id, reused) is.
+        object_id: String,
     },
     /// The segment-janitor's two-phase reclaim of already-sealed catalog
     /// rows (ADR 0043 §A9), and the drop-table cascade's own removal path
@@ -1441,6 +1465,7 @@ impl Metadata {
                 count,
                 seal_wall_ms,
                 replicas,
+                object_id,
             } => {
                 // First-committer-wins on CONTENT, not merely on identity
                 // (round-3 PR7 amendment, ADR 0043 §A3/§A9): a second
@@ -1468,12 +1493,25 @@ impl Metadata {
                 // an in-place update is observed atomically, never a torn
                 // read of a half-updated set.
                 if let Some(existing) = self.stream_shards.get_mut(&(*tablet, *epoch)) {
+                    // `object_id` is part of CONTENT here, not merely
+                    // descriptive (ledger-named-object amendment): two
+                    // independently-computed attempts for the same epoch —
+                    // the dueling-seal race this amendment closes — always
+                    // mint different ids even when every other field
+                    // happens to agree, so including it here is what makes
+                    // that race a genuine content mismatch (correctly
+                    // rejected below) rather than misclassified as the
+                    // replicas-only-update path. A true same-attempt retry
+                    // (the sealer's own crash-retry loop racing itself)
+                    // reuses its own already-written id unchanged, so it
+                    // still matches here exactly as before.
                     let content_matches = existing.table == *table
                         && existing.label == *label
                         && existing.view_type == *view_type
                         && existing.hlc_range == *hlc_range
                         && existing.count == *count
-                        && existing.seal_wall_ms == *seal_wall_ms;
+                        && existing.seal_wall_ms == *seal_wall_ms
+                        && existing.object_id == *object_id;
                     if !content_matches || existing.replicas == *replicas {
                         return ApplyOutcome::NoOp;
                     }
@@ -1523,6 +1561,7 @@ impl Metadata {
                         count: *count,
                         seal_wall_ms: *seal_wall_ms,
                         replicas: replicas.clone(),
+                        object_id: object_id.clone(),
                         expired: false,
                     },
                 );
@@ -3916,6 +3955,17 @@ mod tests {
         );
     }
 
+    /// A test-only object id, deterministic in exactly `(table, label,
+    /// tablet, epoch)` — NOT the real per-attempt scheme
+    /// (`animus_cp_data::segment::segment_object_id`, unreachable from this
+    /// crate's own dependency direction), but stable enough that two calls
+    /// to [`seal`] with the same identity produce the same id (so the
+    /// existing "byte-identical re-propose" tests below still see a true
+    /// no-op) while two calls with a different identity never collide.
+    fn test_object_id(table: &str, label: &str, tablet: u64, epoch: u64) -> String {
+        format!("{table}/{label}/{tablet}/{epoch}/test")
+    }
+
     fn seal(table: &str, label: &str, tablet: u64, epoch: u64, end: u64) -> MetaCommand {
         MetaCommand::SealStreamShard {
             table: table.to_owned(),
@@ -3927,6 +3977,7 @@ mod tests {
             count: 1,
             seal_wall_ms: 1_700_000_000_000,
             replicas: vec![nid(1), nid(2), nid(3)],
+            object_id: test_object_id(table, label, tablet, epoch),
         }
     }
 
@@ -3966,6 +4017,44 @@ mod tests {
             m.stream_shards[&(TabletId(1), 0)],
             first,
             "the first committer's row must survive unchanged"
+        );
+    }
+
+    /// **The ledger-named-object amendment's own regression**: two
+    /// attempts that agree on every field EXCEPT `object_id` — exactly what
+    /// two independently-computed seal attempts for the same epoch produce,
+    /// the dueling-seal race this amendment closes (each attempt mints its
+    /// own unique per-attempt id even when it happens to compute the
+    /// identical `hlc_range`/`count`, e.g. a lost-ack retry of the exact
+    /// same underlying computation) — must be treated as a genuine content
+    /// mismatch, a `NoOp` that leaves the first committer's row (and its
+    /// own `object_id`) untouched. Before this field existed, this exact
+    /// shape was misclassified as the identical-content case.
+    #[test]
+    fn seal_stream_shard_treats_a_differing_object_id_as_a_content_mismatch() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+
+        let mut first_attempt = seal("orders", "L1", 1, 0, 100);
+        if let MetaCommand::SealStreamShard { object_id, .. } = &mut first_attempt {
+            *object_id = "orders/L1/1/0/attempt-a".to_owned();
+        }
+        assert_eq!(m.apply(&first_attempt), ApplyOutcome::Applied);
+        let winner = m.stream_shards[&(TabletId(1), 0)].clone();
+        assert_eq!(winner.object_id, "orders/L1/1/0/attempt-a");
+
+        // A second attempt, identical `hlc_range`/`count`/etc but its OWN
+        // freshly-minted object_id — the lost-ack-retry / dueling-seal
+        // shape.
+        let mut second_attempt = seal("orders", "L1", 1, 0, 100);
+        if let MetaCommand::SealStreamShard { object_id, .. } = &mut second_attempt {
+            *object_id = "orders/L1/1/0/attempt-b".to_owned();
+        }
+        assert_eq!(m.apply(&second_attempt), ApplyOutcome::NoOp);
+        assert_eq!(
+            m.stream_shards[&(TabletId(1), 0)],
+            winner,
+            "the first committer's row, object_id included, must survive unchanged"
         );
     }
 
