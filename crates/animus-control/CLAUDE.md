@@ -155,6 +155,24 @@ per-tablet CP data plane (`animus-cp-data`).
   (`syskv::stream_shard_key`/`decode_stream_shard_id` — fixed-width, so no
   internal escaping is needed the way a variable-length id would).
 
+  **`Metadata::stream_shards`'s own field-level codec, not its natural
+  `BTreeMap<(TabletId, u64), _>` shape, is what actually rides the wire.**
+  `serde_json` cannot serialize a tuple (or any non-string) map key at
+  all — `MapKeySerializer` errors "key must be a string" the moment the
+  map is non-empty, which every pre-existing whole-`Metadata` round-trip
+  test missed by never populating it. `#[serde(with =
+  "stream_shards_codec")]` (a small in-file module right below the field)
+  encodes/decodes a flat `Vec<{tablet, epoch, ...StreamShardRow fields}>`
+  instead, via `#[serde(flatten)]` — no duplicate-field struct to drift
+  out of sync with `StreamShardRow` itself. The in-memory type is
+  unchanged (still a plain `BTreeMap`, still `.get`/`.insert`/`.range`-able
+  everywhere else in this crate); only `Metadata`'s own
+  `Serialize`/`Deserialize` impl is affected. Regression:
+  `meta::tests::metadata_round_trips_through_json_with_populated_stream_
+  shards`. See `docs/engineering-lessons.md` for the general "an empty
+  collection can't prove a map-key encoding rule" lesson this is an
+  instance of.
+
   **`RegisterNode` is the sole claim path for a fresh node identity**,
   retiring ADR 0036's `AllocateNodeId` monotonic allocator entirely. `node`
   may be self-minted (`NodeId::mint`) or operator-/config-proposed
