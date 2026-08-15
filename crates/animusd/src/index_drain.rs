@@ -732,6 +732,49 @@ async fn advance_backfill_cursor(
     Err("backfill cursor advance did not apply in time".into())
 }
 
+/// Delete `index`'s own backfill cursor row on `group`'s tablet (ADR 0045
+/// §5 step 3 of the drop-index cascade) — a tombstone write via the same
+/// [`put_kind_batch_fenced`](CpGroup::put_kind_batch_fenced) primitive
+/// [`advance_backfill_cursor`] uses to advance the row, unfenced
+/// (`KeyRange::whole()`) for the identical reason documented on that
+/// function: a cursor row's identity is its own token, independent of this
+/// tablet's *current* live range. Idempotent — deleting an already-absent
+/// row is a harmless no-op tombstone (the same committed-order guarantee
+/// every other apply-time delete in this codebase relies on).
+///
+/// **Why this exists at all**: `change_consumer_loop`'s `gsis` filter
+/// excludes `Deleting`, so once an index's `SetIndexStatus{Deleting}`
+/// commits, [`backfill_seed_tick`] never runs for it again — but the last
+/// value it wrote under `backfill:{index}` survives in `KIND_CURSOR`
+/// forever unless something explicitly removes it. Left alone, a *later*
+/// `CreateTableIndex` proposing the exact same index name would have its
+/// own fresh seeder read that stale row and silently resume "scanning" from
+/// the deleted index's own old position — skipping every partition before
+/// it for a backfill that is supposed to start from scratch. Called (via
+/// `ClientCtx::clear_backfill_cursor_for_table`, forwarded per tablet like
+/// [`seal_now`]) from `dynamo.rs::drop_index`'s own cascade — see that
+/// function's doc for exactly when and why twice.
+pub(crate) async fn clear_backfill_cursor(group: &CpGroup, index: &str) -> Result<(), String> {
+    let tag = backfill_tag(index);
+    let cursor_key_bytes = cursor::cursor_key(&group.scope_range().start, &tag);
+    let propose_index = match group.put_kind_batch_fenced(
+        vec![(KIND_CURSOR, cursor_key_bytes, None)],
+        None,
+        KeyRange::whole(),
+    ) {
+        ProposeResult::Accepted { index } => index,
+        other => return Err(format!("backfill cursor clear not accepted: {other:?}")),
+    };
+    let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if group.engine_applied_index() >= propose_index {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("backfill cursor clear did not apply in time".into())
+}
+
 /// Find the length of `token || escape(pk)` at the front of a raw
 /// `KIND_BASE` key — this tablet's own partition-prefix boundary, given only
 /// that the key's first `TOKEN_BYTES` are the ADR 0022 token and

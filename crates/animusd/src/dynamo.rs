@@ -144,7 +144,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjection};
+use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjection, IndexStatus};
 use animus_control::{MetaCommand, Metadata, ReplicationMode};
 use animus_cp_data::{KIND_BASE, KIND_LSI};
 use animus_dynamo::wire::{
@@ -412,7 +412,11 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             indexes,
             stream_view_type,
         } => create_table(ctx, &table, &schema, &key_types, &indexes, stream_view_type).await,
-        Operation::UpdateTable { table, stream } => update_table(ctx, &table, stream).await,
+        Operation::UpdateTable {
+            table,
+            stream,
+            index_update,
+        } => update_table(ctx, &table, stream, index_update).await,
         Operation::DescribeTable { table } => describe_table(ctx, meta, &table),
         Operation::PutItem {
             table,
@@ -926,12 +930,13 @@ fn stream_description(spec: &animus_control::StreamSpec) -> wire::StreamDescript
     }
 }
 
-/// `UpdateTable` (ADR 0042 §2): stream-spec-only in this adapter (the wire
-/// decoder already rejected any index/key/throughput change). Enable mints a
-/// fresh label via [`enable_stream`] (rejected by the state machine if a
-/// stream is already enabled — the caller must disable first, matching ADR
-/// 0042 §9's "no same-command relabel" contract); disable proposes
-/// `SetTableStream{None}` via [`disable_stream`].
+/// `UpdateTable`: dispatches whichever of the wire decoder's two mutually
+/// exclusive change shapes this call carries (ADR 0045 §6 Fork C — never
+/// both; the decoder already rejected that combination, and any other
+/// index/key/throughput change). A stream change goes through
+/// [`enable_stream`]/[`disable_stream`], unchanged from ADR 0042 §2/§9. An
+/// index change dispatches to [`drop_index`] (`Delete`) or is rejected
+/// outright (`Create` — PR6's named follow-up, ADR 0045 §2).
 ///
 /// **The round-3 read/wire-API path still lands in a later PR (PR6)** — the
 /// sealer itself (this PR) is wired: enabling needs no provisioning step
@@ -943,27 +948,211 @@ fn stream_description(spec: &animus_control::StreamSpec) -> wire::StreamDescript
 async fn update_table(
     ctx: &ClientCtx,
     table: &str,
-    stream: wire::StreamUpdate,
+    stream: Option<wire::StreamUpdate>,
+    index_update: Option<wire::IndexUpdate>,
 ) -> Result<String, WireError> {
     if !metadata_fresh(ctx).await.has_table_schema(table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
             table.to_owned(),
         )));
     }
-    match stream {
-        wire::StreamUpdate::Enable(view_type) => {
-            if metadata_fresh(ctx).await.table_stream(table).is_some() {
-                return Err(WireError::validation(format!(
-                    "table `{table}` already has a stream enabled — disable it before \
-                     re-enabling (ADR 0042 §9: re-enable always mints a fresh, empty stream)"
-                )));
+    match (stream, index_update) {
+        (Some(stream), None) => match stream {
+            wire::StreamUpdate::Enable(view_type) => {
+                if metadata_fresh(ctx).await.table_stream(table).is_some() {
+                    return Err(WireError::validation(format!(
+                        "table `{table}` already has a stream enabled — disable it before \
+                         re-enabling (ADR 0042 §9: re-enable always mints a fresh, empty stream)"
+                    )));
+                }
+                enable_stream(ctx, table, view_type).await?;
             }
-            enable_stream(ctx, table, view_type).await?;
+            wire::StreamUpdate::Disable => disable_stream(ctx, table).await?,
+        },
+        (None, Some(update)) => match update {
+            wire::IndexUpdate::Create(_) => {
+                return Err(WireError::validation(
+                    "UpdateTable does not yet support adding a GlobalSecondaryIndex to a \
+                     table (ADR 0045 §2: index-adding UpdateTable is a named follow-up)",
+                ));
+            }
+            wire::IndexUpdate::Delete(index) => drop_index(ctx, table, &index).await?,
+        },
+        // Unreachable via the wire decoder (it always sets exactly one), but
+        // handled explicitly rather than assumed — a future direct
+        // `Operation` construction (e.g. a test) gets a clear error instead
+        // of silently no-op-ing through to `describe_table`.
+        (None, None) | (Some(_), Some(_)) => {
+            return Err(WireError::validation(
+                "UpdateTable requires exactly one of a StreamSpecification or a \
+                 GlobalSecondaryIndexUpdates change",
+            ));
         }
-        wire::StreamUpdate::Disable => disable_stream(ctx, table).await?,
     }
     let meta = metadata_fresh(ctx).await;
     describe_table(ctx, &meta, table)
+}
+
+/// The four-step convergent drop-index cascade (ADR 0045 §5): tearing down a
+/// GSI that may still be `Creating`/backfilling needs more than
+/// `DropTableIndex`'s single atomic catalog removal — the index's hidden
+/// table's own tablets need reclaiming, and the drain/seeder must stop
+/// touching the index before that reclaim runs, or a live drain tick can
+/// re-provision the very tablet being dropped. Each step is independently
+/// idempotent (a no-op if already applied on this or a prior attempt), so a
+/// crash between any two steps converges correctly on retry:
+///
+/// 1. [`set_index_status`] `Deleting` — `change_consumer_loop`'s `gsis`
+///    filter excludes `Deleting`, so the drain/seeder stop touching this
+///    index from their very next tick, before anything is torn down.
+/// 2. `MetaCommand::DropTableTablets` scoped to the index's own hidden table
+///    (`index_table_name`) — the exact primitive `ClientCtx::drop_table`'s
+///    own GSI cascade uses, just for one index instead of every one.
+/// 3. [`drop_table_index`] — the catalog definition's removal, which also
+///    prunes every `index_backfill` row for this index (`meta.rs`'s own
+///    apply arm, ADR 0045 §4).
+/// 4. A belt-and-suspenders re-scan mirroring `ClientCtx::drop_table`'s own
+///    defense: the drain provisions a hidden table's first tablet lazily
+///    (ADR 0023) and can race step 2's drop, re-creating it after the
+///    drop's own commit-wait already observed zero tablets. A final sweep
+///    for a tablet still named exactly the hidden table's name catches that
+///    race and drops it too.
+///
+/// Rejects an unknown index (the same `NoSuchIndex` dispatch
+/// `run_index_query` uses) or a **local** index (`ValidationException` —
+/// LSIs are create-time-only in real DynamoDB, so deleting one is not a
+/// real operation either) before proposing anything.
+///
+/// **A fifth, cross-cutting concern folded into steps 1 and 4 rather than
+/// its own numbered step**: `index_backfill_seeder`'s cursor row
+/// (`ClientCtx::clear_backfill_cursor_for_table`, ADR 0045 §5) is deleted
+/// from every one of the **base** table's own tablets — not the hidden
+/// table's, which step 2 already reclaims wholesale. Left alone, that row
+/// would silently poison a later `CreateTableIndex` of the exact same
+/// name (see `index_drain::clear_backfill_cursor`'s doc) — bounded garbage
+/// was considered and rejected as an option for exactly this reason (see
+/// this PR's own report). Run **twice**: once right after step 1 (the
+/// index's own `Deleting` transition has already committed by then, so
+/// `change_consumer_loop`'s `gsis` filter excludes it from every *new*
+/// seeder tick going forward) and once more at the very end, alongside
+/// step 4 — closing the one residual race a single pass can't (a seeder
+/// tick that had already read the schema, and so is still mid-flight,
+/// a moment *before* the `Deleting` transition landed, finishing its own
+/// write after the first clear). Both passes are plain idempotent
+/// tombstone writes; running twice costs nothing.
+async fn drop_index(ctx: &ClientCtx, table: &str, index: &str) -> Result<(), WireError> {
+    let meta = metadata_fresh(ctx).await;
+    let Some(def) = meta
+        .table_indexes(table)
+        .iter()
+        .find(|d| d.name == index)
+        .cloned()
+    else {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchIndex(
+            index.to_owned(),
+        )));
+    };
+    if def.kind == IndexKind::Local {
+        return Err(WireError::validation(format!(
+            "local secondary index `{index}` cannot be deleted (LSIs are create-time-only \
+             and live for the base table's whole lifetime, matching DynamoDB)"
+        )));
+    }
+
+    // Step 1: signal `Deleting` so the drain/seeder stop touching this index
+    // before anything about it is torn down.
+    set_index_status(ctx, table, index, IndexStatus::Deleting).await?;
+    ctx.clear_backfill_cursor_for_table(table, index)
+        .await
+        .map_err(|e| internal(&e))?;
+
+    // Step 2: reclaim the hidden table's own tablets.
+    let hidden_table = dynamo_index::index_table_name(table, index);
+    ctx.drop_table_tablets(hidden_table.clone())
+        .await
+        .map_err(|e| internal(&e))?;
+
+    // Step 3: remove the catalog definition (also prunes `index_backfill` rows).
+    drop_table_index(ctx, table, index).await?;
+
+    // Step 4: belt-and-suspenders — see this function's own doc for both halves.
+    if metadata_fresh(ctx).await.has_table_tablet(&hidden_table) {
+        ctx.drop_table_tablets(hidden_table)
+            .await
+            .map_err(|e| internal(&e))?;
+    }
+    ctx.clear_backfill_cursor_for_table(table, index)
+        .await
+        .map_err(|e| internal(&e))?;
+    Ok(())
+}
+
+/// Propose `MetaCommand::SetIndexStatus{table, index, status}` and wait for
+/// it to commit — the same commit-wait shape [`enable_stream`]/
+/// [`disable_stream`] already use for their own schema-catalog proposals.
+/// Idempotent: returns `Ok(())` immediately (on the first poll) if `index`
+/// is already at `status`, whether from an earlier attempt at this same
+/// call or a genuinely-concurrent transition.
+async fn set_index_status(
+    ctx: &ClientCtx,
+    table: &str,
+    index: &str,
+    status: IndexStatus,
+) -> Result<(), WireError> {
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::SetIndexStatus {
+            table: table.to_owned(),
+            index: index.to_owned(),
+            status,
+        })
+        .await;
+        if metadata_fresh(ctx)
+            .await
+            .table_indexes(table)
+            .iter()
+            .any(|d| d.name == index && d.status == status)
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(&format!(
+                "index `{index}` status change to {status:?} did not commit to the control \
+                 plane in time (no leader reachable?)"
+            )));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+}
+
+/// Propose `MetaCommand::DropTableIndex{table, index}` and wait for the
+/// index definition to disappear from the replicated catalog. Idempotent:
+/// returns `Ok(())` immediately if `index` is already absent (a retry after
+/// a prior attempt's proposal already committed).
+async fn drop_table_index(ctx: &ClientCtx, table: &str, index: &str) -> Result<(), WireError> {
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::DropTableIndex {
+            table: table.to_owned(),
+            index: index.to_owned(),
+        })
+        .await;
+        if !metadata_fresh(ctx)
+            .await
+            .table_indexes(table)
+            .iter()
+            .any(|d| d.name == index)
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(&format!(
+                "index `{index}` definition did not drop from the control plane in time \
+                 (no leader reachable?)"
+            )));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
 }
 
 /// `DescribeTable` (ADR 0042 §2): a pure read of the replicated catalog — key

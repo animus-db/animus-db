@@ -1090,6 +1090,24 @@ pub enum ClientRequest {
         from_position: u64,
         limit: usize,
     },
+    /// **Internal backfill-cursor-cleanup RPC — never sent bare, only
+    /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0045 §5 step 3):
+    /// delete `tablet`'s own backfill cursor row for `index` (`KIND_CURSOR`,
+    /// tag `backfill:{index}`) — an idempotent tombstone write, a no-op if
+    /// already absent. The **one** production use is `ClientCtx::
+    /// clear_backfill_cursor_for_table`, called by the DynamoDB `UpdateTable`
+    /// index-delete cascade (`dynamo.rs::drop_index`) for every one of the
+    /// base table's *current* tablets, so a later `CreateTableIndex` of the
+    /// exact same name never silently resumes from a stale position the
+    /// deleted index's own backfill sweep left behind (see
+    /// `index_drain::clear_backfill_cursor`'s doc for the full argument).
+    /// Addressed by `tablet` directly, mirroring [`ForceSeal`](Self::ForceSeal)/
+    /// [`StreamHotRead`](Self::StreamHotRead) (there is no client key to
+    /// derive it from). Bare delivery is refused for the same reason those
+    /// two are. Not a `MetaCommand`, so `is_relayable_command` does not
+    /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
+    /// only through the `Forwarded` arm.
+    ClearBackfillCursor { tablet: u64, index: String },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
     Get { key: Vec<u8>, table: String },
@@ -6867,6 +6885,19 @@ impl ClientCtx {
                     .collect();
                 ClientResponse::Pairs(pairs)
             }
+            // ADR 0045 §5 step 3: the backfill-cursor-cleanup RPC —
+            // addressed by `tablet` directly, mirroring `ForceSeal`/
+            // `StreamHotRead` above (see this variant's own doc for why).
+            ClientRequest::ClearBackfillCursor { tablet, index } => {
+                let tablet = TabletId(tablet);
+                let Some(leader) = self.edge.cp_leader(tablet) else {
+                    return self.not_leader_refusal(Some(tablet));
+                };
+                match index_drain::clear_backfill_cursor(&leader, &index).await {
+                    Ok(()) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
             // ADR 0018 §2/PR4: the four internal 2PC coordinator RPCs.
             // Routed by the first write key (`TxnPrepare`) or one of `keys`
             // (`TxnResolve`) — **never** `record_key` for a non-anchor
@@ -8679,6 +8710,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
+        ClientRequest::ClearBackfillCursor { .. } => "clear_backfill_cursor",
         ClientRequest::Get { .. } => "get",
         ClientRequest::Scan { .. } => "scan",
         ClientRequest::Delete { .. } => "delete",
@@ -8830,6 +8862,11 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         ClientRequest::StreamHotRead { .. } => ClientResponse::Error(
             "this request is an internal open-shard hot-read RPC and must be sent wrapped in \
              `Forwarded`"
+                .into(),
+        ),
+        ClientRequest::ClearBackfillCursor { .. } => ClientResponse::Error(
+            "this request is an internal backfill-cursor-cleanup RPC and must be sent wrapped \
+             in `Forwarded`"
                 .into(),
         ),
         ClientRequest::TxnPrepare { .. }
@@ -9283,13 +9320,15 @@ impl ClientCtx {
 
     /// Propose `MetaCommand::DropTableTablets` for `table` and wait until every
     /// tablet scoped to it has left this node's replicated metadata (ADR 0024).
-    /// Shared by [`drop_table`](Self::drop_table)'s base-table drop and its
-    /// GSI-hidden-table cascade (ADR 0041 §5) — same command, same
-    /// commit-wait discipline either way. `table` need not have a schema
-    /// entry: a hidden index table never has one, and `DropTableTablets`'s
-    /// apply is keyed purely on the tablet map (`tablets_for_table`), not the
-    /// schema catalog.
-    async fn drop_table_tablets(&self, table: String) -> Result<(), String> {
+    /// Shared by [`drop_table`](Self::drop_table)'s base-table drop, its
+    /// GSI-hidden-table cascade (ADR 0041 §5), and `dynamo.rs`'s single-index
+    /// drop cascade (ADR 0045 §5, `drop_index`) — same command, same
+    /// commit-wait discipline in all three. `pub(crate)` (not module-private)
+    /// for exactly that last caller, a sibling module. `table` need not have
+    /// a schema entry: a hidden index table never has one, and
+    /// `DropTableTablets`'s apply is keyed purely on the tablet map
+    /// (`tablets_for_table`), not the schema catalog.
+    pub(crate) async fn drop_table_tablets(&self, table: String) -> Result<(), String> {
         let command = MetaCommand::DropTableTablets {
             table: table.clone(),
         };
@@ -9455,6 +9494,79 @@ impl ClientCtx {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err("force-seal did not reach a tablet leader in time".into());
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Delete `index`'s own backfill cursor row (ADR 0045 §5 step 3) on
+    /// **every** tablet currently scoped to `table`, wherever each one's
+    /// own leader actually runs — the table-wide sibling of
+    /// [`clear_backfill_cursor_tablet`](Self::clear_backfill_cursor_tablet),
+    /// called once per tablet since each tablet is its own Raft group with
+    /// its own cursor row. See `dynamo.rs::drop_index`'s own doc for why
+    /// this step exists (a stale cursor row would otherwise silently
+    /// poison a later same-named `CreateTableIndex`'s fresh backfill) and
+    /// exactly when it runs.
+    pub(crate) async fn clear_backfill_cursor_for_table(
+        &self,
+        table: &str,
+        index: &str,
+    ) -> Result<(), String> {
+        let tablets: Vec<TabletId> = self
+            .effective_metadata()
+            .tablets_for_table(table)
+            .map(|(&id, _)| id)
+            .collect();
+        for tablet in tablets {
+            self.clear_backfill_cursor_tablet(tablet, index).await?;
+        }
+        Ok(())
+    }
+
+    /// Delete `index`'s own backfill cursor row on one `tablet`, wherever
+    /// its leader actually runs — mirrors
+    /// [`force_seal_tablet`](Self::force_seal_tablet)'s per-tablet
+    /// forward/retry shape exactly (re-resolves
+    /// [`resolve_cp_route`](Self::resolve_cp_route) fresh every attempt;
+    /// this is a rare, human-request-driven action with no latency budget
+    /// to protect).
+    async fn clear_backfill_cursor_tablet(
+        &self,
+        tablet: TabletId,
+        index: &str,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            match self.resolve_cp_route(tablet) {
+                Some(CpRoute::Local(leader)) => {
+                    return index_drain::clear_backfill_cursor(&leader, index).await;
+                }
+                Some(CpRoute::Forward(addr)) => {
+                    let request = ClientRequest::Forwarded {
+                        request: Box::new(ClientRequest::ClearBackfillCursor {
+                            tablet: tablet.0,
+                            index: index.to_owned(),
+                        }),
+                        traceparent: otel::current_traceparent(),
+                    };
+                    match self.relay(addr, request).await {
+                        ClientResponse::PutOk => return Ok(()),
+                        ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
+                            return Err(e);
+                        }
+                        ClientResponse::Error(_) => {} // retry below
+                        other => {
+                            return Err(format!(
+                                "unexpected reply to forwarded cursor-clear: {other:?}"
+                            ));
+                        }
+                    }
+                }
+                Some(CpRoute::None) | None => {} // not settled yet, retry
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("backfill-cursor clear did not reach a tablet leader in time".into());
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }

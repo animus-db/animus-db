@@ -111,7 +111,17 @@ reason (see each file's own entry below).
   for the authoritative design. **The hot-trim arm's merge-residue
   cursor-row cleanup was removed** (tablets are split-only, ADR 0044) —
   `trim_janitor` only ever touches
-  `KIND_CHANGE` rows now, never `KIND_CURSOR`.
+  `KIND_CHANGE` rows now, never `KIND_CURSOR`. **`clear_backfill_cursor`**
+  (ADR 0045 §5 step 3) is a fifth, on-demand (not per-tick) function in this
+  module: an idempotent tombstone of one index's own backfill cursor row on
+  one tablet, reached via the internal-only `ClientRequest::
+  ClearBackfillCursor` RPC (refused bare, mirroring `ForceSeal`/
+  `StreamHotRead`'s shape) and `ClientCtx::clear_backfill_cursor_for_table`
+  — called (twice) by `dynamo.rs::drop_index`'s drop-index cascade so a
+  later same-named `CreateTableIndex` never silently resumes the deleted
+  index's own stale scan position (see the function's own doc and
+  `docs/engineering-lessons.md`'s "convergent per-name cursor... can
+  silently poison a same-named recreation" entry).
 - **`cql.rs`** (~42 KB) — the CQL (Cassandra) v4 binary-protocol edge.
 - **`cql_client.rs`** — a minimal loopback CQL client the admin dashboard's CQL
   editor uses (`POST /admin/data/cql`) to drive this node's own CQL port.
@@ -429,6 +439,19 @@ after step 3 `drop_table` re-scans the tablet map itself (not the now-gone
 `IndexDef`s) for any tablet named `<table>$<index>` and drops those too —
 which also mops up any orphan a pre-fix drop left behind. Regression:
 `tests/drop_table_index_cascade.rs`.
+
+**`dynamo.rs::drop_index` (ADR 0045 §5) is `drop_table`'s single-index
+sibling** — `UpdateTable`'s `GlobalSecondaryIndexUpdates` `Delete` path,
+not `drop_table`'s own DROP-TABLE-wide cascade. Same idempotent-steps/
+belt-and-suspenders shape, one index instead of every one, plus a fourth
+concern `drop_table` doesn't need: `SetIndexStatus{Deleting}` first (so the
+drain/seeder stop touching the index before anything is torn down) and
+`ClientCtx::clear_backfill_cursor_for_table` (run twice) to keep a stale
+backfill cursor from poisoning a later same-named recreate — see
+`index_drain.rs`'s own entry above and `docs/engineering-lessons.md`.
+Regression: `tests/update_table_drop_index.rs` (a populated `Active`
+index, an in-flight-cancellation of a still-`Creating` one, a
+create-drop-recreate of the same name, and a crash/retry mid-cascade).
 
 ## Wire edges
 
