@@ -16,7 +16,9 @@ use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{IndexDef, SchemaCatalog, StreamSpec, StreamViewType, TableName, TableSchema};
+use crate::schema::{
+    IndexDef, IndexStatus, SchemaCatalog, StreamSpec, StreamViewType, TableName, TableSchema,
+};
 
 /// The default a [`StreamShardRow`]/[`MetaCommand::SealStreamShard`]'s
 /// `view_type` field decodes to when loading a snapshot encoded before this
@@ -487,6 +489,18 @@ pub enum MetaCommand {
     /// Remove a secondary index definition from a table's schema (ADR 0013).
     /// Idempotent: a no-op if the table or the named index does not exist.
     DropTableIndex { table: TableName, index: String },
+    /// Set a secondary index's lifecycle **status** (ADR 0045):
+    /// `Creating`/`Active`/`Deleting`. Mirrors `SetTableMode`'s minimal shape.
+    /// Rejected if the table or the named index does not exist; a no-op if the
+    /// index is already at `status`. In-place mutation via
+    /// `TableSchema::set_index_status` — deliberately **not**
+    /// `upsert_index`'s whole-struct replace, so a status transition never
+    /// clobbers a concurrently-updated copy of the rest of the definition.
+    SetIndexStatus {
+        table: TableName,
+        index: String,
+        status: IndexStatus,
+    },
     /// Set a table's **replication mode** (ADR 0016 / ADR 0017): `Ap` (leaderless
     /// data plane) or `Cp` (leaderful per-tablet Raft). Rejected if the table has
     /// no schema; a no-op if the mode is already set. Replicated like the rest of
@@ -1161,6 +1175,23 @@ impl Metadata {
                 } else {
                     ApplyOutcome::NoOp
                 }
+            }
+            MetaCommand::SetIndexStatus {
+                table,
+                index,
+                status,
+            } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let Some(current) = schema.index(index) else {
+                    return ApplyOutcome::Rejected("no such table index");
+                };
+                if current.status == *status {
+                    return ApplyOutcome::NoOp;
+                }
+                schema.set_index_status(index, *status);
+                ApplyOutcome::Applied
             }
             MetaCommand::SetTableMode { table, mode } => {
                 let Some(schema) = self.schemas.get_mut(table) else {

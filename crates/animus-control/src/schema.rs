@@ -134,6 +134,40 @@ pub struct StreamSpec {
     pub label: String,
 }
 
+/// The lifecycle status of a secondary index (ADR 0045): whether it is still
+/// being backfilled, fully materialized and queryable, or being torn down.
+///
+/// A just-created table's indexes start `Active` directly (they are empty by
+/// construction, ADR 0041 §5) — only `UpdateTable`-added indexes on an already
+/// populated table pass through `Creating` first. `#[serde(default =
+/// "IndexStatus::active")]` on [`IndexDef::status`] means this only matters for
+/// deserializing a status-less fixture/pre-existing record (no live deployments
+/// exist to migrate, root `CLAUDE.md`); a status-less record is never actually
+/// mid-backfill, so `Active` is the correct default, not merely a convenient one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexStatus {
+    /// Declared but not yet fully backfilled — writes since declaration are
+    /// already covered (`table_takes_kind_write_path` gates on presence, not
+    /// status), but rows that predate declaration may not be materialized yet.
+    /// The drain still maintains it (see `IndexKind`'s consumers) so it is not
+    /// left further behind while backfill catches up.
+    Creating,
+    /// Fully backfilled and queryable.
+    Active,
+    /// Being torn down — the drain/backfill stop touching it; its hidden table
+    /// is being reclaimed. Never observed by a query (rejected at the wire edge).
+    Deleting,
+}
+
+impl IndexStatus {
+    /// The default for a status-less (pre-ADR-0045) `IndexDef` — see the type's
+    /// own doc for why `Active`, not `Creating`, is correct here.
+    #[must_use]
+    pub fn active() -> Self {
+        IndexStatus::Active
+    }
+}
+
 /// A secondary-index **definition** as replicated in the schema catalog (ADR
 /// 0013): its name, kind, key attributes, and projection. This is the *shape* of
 /// the index — the cluster-wide, durable agreement on which indexes exist — not
@@ -154,6 +188,10 @@ pub struct IndexDef {
     pub sort_attribute: Option<String>,
     /// What attributes a query against this index returns.
     pub projection: IndexProjection,
+    /// This index's lifecycle status (ADR 0045). Mutated only through
+    /// `MetaCommand::SetIndexStatus` (so it replicates); see [`IndexStatus`].
+    #[serde(default = "IndexStatus::active")]
+    pub status: IndexStatus,
 }
 
 /// One column's declared name and type. The name is stored as written
@@ -428,6 +466,23 @@ impl TableSchema {
         self.indexes.retain(|i| i.name != name);
         self.indexes.len() != before
     }
+
+    /// Set a secondary index's status in place, leaving every other field
+    /// untouched (deliberately **not** `upsert_index`'s whole-struct replace —
+    /// a status transition must not resurrect a stale copy of the rest of the
+    /// definition a racing proposer read before this one committed). Returns
+    /// whether the index exists at all; a no-op (but still `true`) if it is
+    /// already at `status`. Used by the state machine; callers go through
+    /// `MetaCommand::SetIndexStatus`.
+    pub(crate) fn set_index_status(&mut self, name: &str, status: IndexStatus) -> bool {
+        match self.indexes.iter_mut().find(|i| i.name == name) {
+            Some(idx) => {
+                idx.status = status;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// The replicated catalog of table schemas, keyed by table name.
@@ -595,6 +650,7 @@ mod tests {
             hash_attribute: hash.into(),
             sort_attribute: None,
             projection: IndexProjection::All,
+            status: IndexStatus::Active,
         }
     }
 
@@ -643,6 +699,7 @@ mod tests {
             hash_attribute: "pk".into(),
             sort_attribute: None,
             projection: IndexProjection::All,
+            status: IndexStatus::Active,
         }];
         assert_eq!(s.validate(), Err(SchemaError::LocalIndexMissingSort));
     }
@@ -657,6 +714,7 @@ mod tests {
             hash_attribute: "id".into(),
             sort_attribute: Some("ts".into()),
             projection: IndexProjection::KeysOnly,
+            status: IndexStatus::Active,
         });
         assert!(s.validate().is_ok());
     }

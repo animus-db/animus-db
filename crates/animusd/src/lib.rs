@@ -1325,6 +1325,11 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             | MetaCommand::ReplaceTableSchema { .. }
             | MetaCommand::CreateTableIndex { .. }
             | MetaCommand::DropTableIndex { .. }
+            // Index status transition (ADR 0045): same schema-catalog class as
+            // `CreateTableIndex`/`DropTableIndex`/`SetTableMode` — the backfill
+            // seeder/aggregator (this crate) may propose it from wherever the
+            // relevant tablet/control leader actually runs.
+            | MetaCommand::SetIndexStatus { .. }
             | MetaCommand::SetTableMode { .. }
             // DynamoDB Streams enable/disable (ADR 0042): schema-catalog
             // class, same relay reason as `CreateTableIndex`/`SetTableMode` —

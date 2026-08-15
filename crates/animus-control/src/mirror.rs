@@ -201,6 +201,7 @@ pub fn apply_and_derive_mirror(
         }
         MetaCommand::CreateTableIndex { table, .. }
         | MetaCommand::DropTableIndex { table, .. }
+        | MetaCommand::SetIndexStatus { table, .. }
         | MetaCommand::SetTableMode { table, .. }
         // ADR 0042: a stream (de)configuration is part of the table's schema
         // entry, so it mirrors identically to an index/mode change — the
@@ -745,6 +746,7 @@ mod tests {
             hash_attribute: "id".to_string(),
             sort_attribute: None,
             projection: crate::schema::IndexProjection::All,
+            status: crate::schema::IndexStatus::Active,
         });
         let command = MetaCommand::ReplaceTableSchema {
             table: "orders".to_string(),
@@ -816,6 +818,7 @@ mod tests {
             hash_attribute: "id".to_string(),
             sort_attribute: None,
             projection: crate::schema::IndexProjection::All,
+            status: crate::schema::IndexStatus::Active,
         };
         let create = MetaCommand::CreateTableIndex {
             table: "orders".to_string(),

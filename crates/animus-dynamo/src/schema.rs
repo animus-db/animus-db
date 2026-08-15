@@ -31,7 +31,7 @@
 //! on a CQL table it does not own.
 
 use animus_control::{
-    ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection as ControlProjection,
+    ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection as ControlProjection, IndexStatus,
     TableSchema as ControlSchema,
 };
 
@@ -137,6 +137,13 @@ pub fn to_dynamo(schema: &ControlSchema) -> TableSchema {
 /// A GSI carries its own hash attribute and optional range; an LSI carries an
 /// alternate sort attribute and, by the catalog's convention, hashes by
 /// `base_partition_key` (DynamoDB LSIs share the base partition key).
+///
+/// The returned definition's `status` is always [`IndexStatus::Active`] — today's
+/// sole caller is `CreateTable`, whose indexes are always empty-by-construction
+/// (ADR 0041 §5), so `Active` is correct as-is. A future `UpdateTable`-driven
+/// caller adding an index to an already-populated table (ADR 0045) must
+/// explicitly override `status` to `Creating` on the returned value before
+/// proposing it — this bridge does not know which caller it serves.
 #[must_use]
 pub fn index_to_control(index: &SecondaryIndex, base_partition_key: &str) -> IndexDef {
     match index {
@@ -146,6 +153,7 @@ pub fn index_to_control(index: &SecondaryIndex, base_partition_key: &str) -> Ind
             hash_attribute: g.key_attribute.clone(),
             sort_attribute: g.sort_attribute.clone(),
             projection: projection_to_control(&g.projection),
+            status: IndexStatus::Active,
         },
         SecondaryIndex::Local(l) => IndexDef {
             name: l.name.clone(),
@@ -153,6 +161,7 @@ pub fn index_to_control(index: &SecondaryIndex, base_partition_key: &str) -> Ind
             hash_attribute: base_partition_key.to_owned(),
             sort_attribute: Some(l.sort_attribute.clone()),
             projection: projection_to_control(&l.projection),
+            status: IndexStatus::Active,
         },
     }
 }
