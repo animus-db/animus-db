@@ -235,6 +235,42 @@ pub struct Metadata {
     /// `#[serde(default)]` keeps pre-ADR-0018 snapshots loading (empty map).
     #[serde(default)]
     pub split_parents: BTreeMap<TabletId, TabletId>,
+    /// **Frozen split-time stream-inheritance basis** (ADR 0042 §8/ADR 0043
+    /// §A4/§A6, PR1 bugfix): every split child's id mapped to a snapshot of
+    /// its immediate parent's stream state **at the instant of the split**,
+    /// captured by [`MetaCommand::SplitTablet`]'s apply arm from the
+    /// parent's pre-mutation state. Never mutated again afterward, and
+    /// never pruned (same lifetime discipline as [`split_parents`]
+    /// (Self::split_parents), which it is a sibling to, not a replacement
+    /// for).
+    ///
+    /// **The bug this exists to fix**: [`effective_stream_shard_watermark`]
+    /// (Self::effective_stream_shard_watermark) and
+    /// [`stream_shard_parent_id`](Self::stream_shard_parent_id) used to walk
+    /// [`split_parents`](Self::split_parents) to the parent's **current**
+    /// chain, live, every time either was called. That is correct only if
+    /// the parent never seals again before the child does — if it does, the
+    /// parent's later seal's end-HLC (necessarily higher, since a tablet's
+    /// own `KIND_CHANGE` scope only ever advances) becomes the child's own
+    /// effective watermark too, retroactively appearing to have already
+    /// sealed a pre-split backlog the child physically inherited in place
+    /// (ADR 0043 §A4's shared-storage design) but had not yet sealed itself.
+    /// The child's own first seal then silently filters that backlog out
+    /// (`hlc <= watermark`) — a permanent, silent loss, invisible unless the
+    /// child happens to seal before the parent does (the race that made
+    /// this bug ship undetected). Freezing the basis at the split itself —
+    /// the one moment both children's shared inheritance is well-defined —
+    /// closes this: a later seal by *either* sibling can never move what an
+    /// already-split child inherited. Recorded unconditionally by every
+    /// split (mirroring [`split_parents`](Self::split_parents)'s own
+    /// unconditional recording), whether or not the table streams at all —
+    /// cheap, and correct if streaming is enabled on the table later.
+    /// `#[serde(default)]` keeps pre-fix snapshots loading (empty map); this
+    /// repo has no live-deployment/back-compat requirement (fresh clusters
+    /// only), so a pre-fix snapshot's split children simply have no basis
+    /// entry, which is not a state this codebase needs to handle.
+    #[serde(default)]
+    pub stream_split_basis: BTreeMap<TabletId, StreamSplitBasis>,
     /// The stream-shard segment catalog (ADR 0042 §3, ADR 0043 §A8): every
     /// sealed shard ever committed, keyed by `(tablet, epoch)` — globally
     /// unique for a tablet's whole lifetime (a tablet's own epoch counter
@@ -381,6 +417,34 @@ mod index_backfill_codec {
             .map(|entry| ((entry.tablet, entry.index), ()))
             .collect())
     }
+}
+
+/// A split child's frozen stream-inheritance basis
+/// ([`Metadata::stream_split_basis`], ADR 0042 §8/ADR 0043 §A4/§A6, PR1
+/// bugfix) — see that field's own doc for the live-derivation bug this
+/// exists to fix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamSplitBasis {
+    /// The immediate split source — always equal to
+    /// `split_parents[child]` at the moment this entry was written,
+    /// carried here too so [`Metadata::effective_stream_shard_watermark`]/
+    /// [`Metadata::stream_shard_parent_id`] need only consult this one map.
+    pub parent: TabletId,
+    /// The parent's own last-sealed epoch **at split time**, if it had ever
+    /// sealed a shard of its own by then — `None` for a split of a parent
+    /// that had never sealed (a fresh table, or a stream disabled since
+    /// before its first seal). What
+    /// [`Metadata::stream_shard_parent_id`] needs to answer a child's own
+    /// epoch-0 `ParentShardId` without re-deriving it from whatever the
+    /// parent's chain looks like *now*.
+    pub last_sealed_epoch: Option<u64>,
+    /// The parent's own **effective** stream watermark at split time
+    /// ([`Metadata::effective_stream_shard_watermark`] evaluated on the
+    /// parent at the moment of the split, so a parent that is itself a
+    /// split child inherits transitively through its *own* already-frozen
+    /// basis) — `None` if the parent had never sealed anything at all,
+    /// including through its own ancestry.
+    pub watermark: Option<u64>,
 }
 
 /// A sealed stream shard's catalog row (ADR 0042 §3, ADR 0043 §A3/§A8) — the
@@ -1139,6 +1203,28 @@ impl Metadata {
                 // the shared engine before it may host — see
                 // `Metadata::split_parents`'s doc.
                 self.split_parents.insert(*new_id, *tablet);
+                // PR1 bugfix (ADR 0042 §8/ADR 0043 §A4/§A6): freeze the
+                // child's stream-inheritance basis from the source's own
+                // stream state *right now* — before any later command can
+                // mutate it further. See `Metadata::stream_split_basis`'s
+                // own doc for the live-derivation data-loss bug this fixes.
+                // Reads `self.stream_shards`/`self.stream_split_basis`
+                // only, both untouched by the tablet-map mutation just
+                // above, so evaluation order relative to it doesn't matter.
+                let last_sealed_epoch = self
+                    .stream_shards
+                    .range((*tablet, 0)..=(*tablet, u64::MAX))
+                    .next_back()
+                    .map(|(&(_, epoch), _)| epoch);
+                let watermark = self.effective_stream_shard_watermark(*tablet);
+                self.stream_split_basis.insert(
+                    *new_id,
+                    StreamSplitBasis {
+                        parent: *tablet,
+                        last_sealed_epoch,
+                        watermark,
+                    },
+                );
                 // The split child inherits the source's placement policy (ADR 0029):
                 // without it the new sibling has no policy and is invisible to both
                 // the repair reconciler and the load rebalancer, so it would never
@@ -1781,23 +1867,28 @@ impl Metadata {
     /// explicit that such a child's *initial* watermark is its parent
     /// tablet's chain's own last-sealed end-HLC, not absent, since the
     /// parent's sealed segments are shared history both children inherit.
-    /// This walks [`Metadata::split_parents`] (a tablet can itself be a
-    /// split child of a split child, so the walk continues until it finds a
-    /// tablet with a sealed row of its own, or runs out of provenance) and
-    /// is what the sealer/hot-trim arm (ADR 0043 §A3/§A6, `animusd::
-    /// index_drain`) actually calls — never the bare
+    ///
+    /// **PR1 bugfix**: this used to walk [`Metadata::split_parents`] to the
+    /// parent's *current* chain, live, on every call — which let a parent
+    /// seal *after* the split retroactively move a child's inherited
+    /// watermark past backlog the child had physically inherited but not
+    /// yet sealed itself, silently dropping it (see
+    /// [`Metadata::stream_split_basis`]'s own doc for the full account).
+    /// Reads [`Metadata::stream_split_basis`] instead — a single-hop lookup
+    /// of the value that was frozen once, at split time, already resolved
+    /// transitively through however many ancestor splits came before it (a
+    /// tablet can itself be a split child of a split child), so no walk is
+    /// needed here at all. This is what the sealer/hot-trim arm (ADR 0043
+    /// §A3/§A6, `animusd::index_drain`) actually calls — never the bare
     /// [`stream_shard_watermark`], which only answers "this exact tablet's
     /// own chain," a narrower question than the one a fresh child's watermark
     /// computation needs answered.
     #[must_use]
     pub fn effective_stream_shard_watermark(&self, tablet: TabletId) -> Option<u64> {
-        let mut current = tablet;
-        loop {
-            if let Some(w) = self.stream_shard_watermark(current) {
-                return Some(w);
-            }
-            current = *self.split_parents.get(&current)?;
+        if let Some(w) = self.stream_shard_watermark(tablet) {
+            return Some(w);
         }
+        self.stream_split_basis.get(&tablet)?.watermark
     }
 
     /// Every catalog row for `(table, label)`, across every tablet, in
@@ -1850,23 +1941,26 @@ impl Metadata {
             .collect()
     }
 
-    /// `(tablet, epoch)`'s own `ParentShardId` (ADR 0042 §2/ADR 0043 §A4),
-    /// derived rather than stored — a routine seal's child names the same
-    /// tablet's own previous epoch; an epoch-0 shard names the *parent
-    /// tablet's* own last shard, if any (via [`Metadata::split_parents`]).
-    /// `None` for a genuine root (an epoch-0 shard whose tablet has no
-    /// split parent, or a split parent that itself never sealed).
+    /// `(tablet, epoch)`'s own `ParentShardId` (ADR 0042 §2/ADR 0043 §A4). An
+    /// epoch above 0 names the same tablet's own previous epoch, always
+    /// derived (a routine seal can never race itself). An epoch-0 shard
+    /// names the parent tablet's own last-sealed shard **as frozen in
+    /// [`Metadata::stream_split_basis`] at split time** — **PR1 bugfix**:
+    /// this used to derive it live from the parent's *current* chain
+    /// (`self.split_parents` + a fresh lookup into `self.stream_shards`),
+    /// which let a parent that sealed again after the split retroactively
+    /// change what a child's already-answered `ParentShardId` had been (see
+    /// [`Metadata::stream_split_basis`]'s own doc). `None` for a genuine
+    /// root (an epoch-0 shard whose tablet was never split, or whose split
+    /// parent had never itself sealed at split time).
     #[must_use]
     pub fn stream_shard_parent_id(&self, tablet: TabletId, epoch: u64) -> Option<String> {
         if epoch > 0 {
             return Some(shard_id_string(tablet, epoch - 1));
         }
-        let parent_tablet = *self.split_parents.get(&tablet)?;
-        let ((_, parent_epoch), _) = self
-            .stream_shards
-            .range((parent_tablet, 0)..=(parent_tablet, u64::MAX))
-            .next_back()?;
-        Some(shard_id_string(parent_tablet, *parent_epoch))
+        let basis = self.stream_split_basis.get(&tablet)?;
+        let parent_epoch = basis.last_sealed_epoch?;
+        Some(shard_id_string(basis.parent, parent_epoch))
     }
 
     /// The tablets scoped to `table` (ADR 0023), in ascending tablet-id order.
@@ -4122,6 +4216,25 @@ mod tests {
 
     // --- accessors ------------------------------------------------------
 
+    /// A real `SplitTablet` apply of `source` into `new_id` (a `CreateTablet`
+    /// for `source` must already have applied) — used by the stream-basis
+    /// tests below instead of hand-poking `split_parents`, so
+    /// `Metadata::stream_split_basis` gets frozen exactly the way production
+    /// freezes it.
+    fn split_tablet(m: &mut Metadata, source: TabletId, split_key: Vec<u8>, new_id: TabletId) {
+        let expected_epoch = m.tablets.get(&source).map_or(Epoch::INITIAL, |t| t.epoch);
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: source,
+                expected_epoch,
+                split_key,
+                new_id,
+            }),
+            ApplyOutcome::Applied,
+            "test setup: split must apply"
+        );
+    }
+
     /// `stream_shard_chain`/`stream_shard_watermark`/
     /// `stream_shard_rows_for_label`/`stream_labels_with_rows` over a
     /// multi-epoch, multi-tablet fixture (one tablet with a split child).
@@ -4129,10 +4242,26 @@ mod tests {
     fn stream_shard_accessors_over_a_multi_epoch_multi_tablet_fixture() {
         let mut m = Metadata::default();
         enable_stream(&mut m, "orders", "L1");
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
         m.apply(&seal("orders", "L1", 1, 0, 100));
         m.apply(&seal("orders", "L1", 1, 1, 200));
         m.apply(&seal("orders", "L1", 1, 2, 300));
-        m.split_parents.insert(TabletId(2), TabletId(1));
+        // A real split — not a hand-poked `split_parents` entry — freezes
+        // tablet 2's `stream_split_basis` from tablet 1's state right now.
+        split_tablet(
+            &mut m,
+            TabletId(1),
+            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(2),
+        );
         m.apply(&seal("orders", "L1", 2, 0, 350));
 
         // Chain: ascending epoch order, scoped to this tablet + label.
@@ -4162,7 +4291,8 @@ mod tests {
         assert!(m.stream_labels_with_rows("nonexistent").is_empty());
 
         // Parent shard id: epoch>0 names the same tablet's own previous
-        // epoch; a split child's epoch-0 names its parent's last shard.
+        // epoch; a split child's epoch-0 names its parent's last-sealed
+        // shard AS FROZEN AT SPLIT TIME (`Metadata::stream_split_basis`).
         assert_eq!(
             m.stream_shard_parent_id(TabletId(1), 2),
             Some("shardId-1-1".to_owned())
@@ -4171,32 +4301,48 @@ mod tests {
         assert_eq!(
             m.stream_shard_parent_id(TabletId(2), 0),
             Some("shardId-1-2".to_owned()),
-            "the split child's epoch-0 parent is tablet 1's own LAST shard"
+            "the split child's epoch-0 parent is tablet 1's own LAST shard at split time"
         );
     }
 
     /// `effective_stream_shard_watermark` (ADR 0043 §A4/§A6): a tablet with
     /// its own sealed rows answers from its own chain (matching the plain
     /// `stream_shard_watermark`); a fresh split child with NO rows of its
-    /// own inherits its parent's last-sealed end-HLC instead of reading as
-    /// absent; the inheritance walk continues through a **chain** of split
-    /// parents (a grandchild inherits from its grandparent's own last seal
-    /// when neither it nor its immediate parent has ever sealed); and a
-    /// tablet with no rows and no split-parent provenance at all is still
-    /// genuinely absent.
+    /// own inherits its parent's last-sealed end-HLC, frozen at split time,
+    /// instead of reading as absent; the inheritance resolves transitively
+    /// through a **chain** of split parents (a grandchild inherits its
+    /// grandparent's own last seal, through its parent's own already-frozen
+    /// basis, when neither it nor its immediate parent has ever sealed); a
+    /// tablet with no rows and no split provenance at all is still
+    /// genuinely absent; and — the PR1 bugfix property — **none of this
+    /// moves when a parent seals again after the split**.
     #[test]
     fn effective_stream_shard_watermark_inherits_through_split_provenance() {
         let mut m = Metadata::default();
         enable_stream(&mut m, "orders", "L1");
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
         m.apply(&seal("orders", "L1", 1, 0, 100));
         m.apply(&seal("orders", "L1", 1, 1, 200));
 
         // Tablet 1 has its own rows: identical to the plain accessor.
         assert_eq!(m.effective_stream_shard_watermark(TabletId(1)), Some(200));
 
-        // Tablet 2 is a split child of tablet 1 with no rows of its own yet:
-        // inherits tablet 1's last-sealed end-HLC.
-        m.split_parents.insert(TabletId(2), TabletId(1));
+        // Tablet 2 is a real split child of tablet 1, with no rows of its
+        // own yet: inherits tablet 1's last-sealed end-HLC, frozen now.
+        split_tablet(
+            &mut m,
+            TabletId(1),
+            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(2),
+        );
         assert_eq!(
             m.stream_shard_watermark(TabletId(2)),
             None,
@@ -4204,20 +4350,110 @@ mod tests {
         );
         assert_eq!(m.effective_stream_shard_watermark(TabletId(2)), Some(200));
 
-        // Tablet 3 is a split child of tablet 2 (itself a split child), with
-        // no rows anywhere in the chain: inherits transitively through both
-        // hops to tablet 1's watermark.
-        m.split_parents.insert(TabletId(3), TabletId(2));
+        // Tablet 3 is a real split child of tablet 2 (itself a split child,
+        // and still unsealed on its own at this instant), with no rows
+        // anywhere in the chain yet: inherits transitively through both
+        // hops, frozen by THIS split's own apply.
+        split_tablet(
+            &mut m,
+            TabletId(2),
+            0xC000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(3),
+        );
         assert_eq!(m.effective_stream_shard_watermark(TabletId(3)), Some(200));
 
-        // Once tablet 2 seals its own first shard, tablet 3 still has no
-        // rows of its own, but its immediate parent now does — the walk
-        // stops one hop earlier and answers from tablet 2 (350), not
-        // tablet 1's now-stale 200.
+        // PR1 bugfix property: tablet 2 now seals its own first shard
+        // (350). Under the old live derivation this would have
+        // retroactively become tablet 3's effective watermark too — it
+        // must not, since tablet 3's basis was frozen before tablet 2 had
+        // ever sealed.
         m.apply(&seal("orders", "L1", 2, 0, 350));
-        assert_eq!(m.effective_stream_shard_watermark(TabletId(3)), Some(350));
+        assert_eq!(
+            m.effective_stream_shard_watermark(TabletId(3)),
+            Some(200),
+            "a split child's frozen basis must not move when its parent seals again afterward"
+        );
+        // Tablet 2's own (not tablet 3's) watermark does legitimately advance.
+        assert_eq!(m.effective_stream_shard_watermark(TabletId(2)), Some(350));
 
-        // No rows and no split-parent provenance at all: genuinely absent.
+        // No rows and no split provenance at all: genuinely absent.
         assert_eq!(m.effective_stream_shard_watermark(TabletId(99)), None);
+    }
+
+    /// PR1 bugfix regression, the `stream_shard_parent_id` sibling of the
+    /// watermark property above: a child's epoch-0 `ParentShardId` must not
+    /// change when its parent seals again after the split. Before the fix
+    /// this was derived live from `split_parents` + a fresh lookup into the
+    /// parent's *current* chain, so a later parent seal would retroactively
+    /// rename an already-answered child's `ParentShardId`.
+    #[test]
+    fn stream_shard_parent_id_is_frozen_at_split_time_not_the_parents_current_chain() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        m.apply(&seal("orders", "L1", 1, 0, 100));
+        split_tablet(
+            &mut m,
+            TabletId(1),
+            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(2),
+        );
+        assert_eq!(
+            m.stream_shard_parent_id(TabletId(2), 0),
+            Some("shardId-1-0".to_owned())
+        );
+
+        // The parent seals again after the split.
+        m.apply(&seal("orders", "L1", 1, 1, 200));
+        assert_eq!(
+            m.stream_shard_parent_id(TabletId(2), 0),
+            Some("shardId-1-0".to_owned()),
+            "a split child's ParentShardId must not move when its parent seals again afterward"
+        );
+    }
+
+    /// The frozen basis itself must survive a `Metadata` JSON round trip —
+    /// the same "an empty collection can't prove a map-key encoding rule"
+    /// discipline `metadata_round_trips_through_json_with_populated_stream_
+    /// shards` follows for `stream_shards`. `TabletId`'s newtype `Serialize`
+    /// impl already serializes transparently as a bare integer (unlike a
+    /// tuple key), so this is a lower-risk round trip than that one, but is
+    /// cheap insurance against a future shape change all the same.
+    #[test]
+    fn metadata_round_trips_through_json_with_populated_stream_split_basis() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+        m.apply(&seal("orders", "L1", 1, 0, 100));
+        split_tablet(
+            &mut m,
+            TabletId(1),
+            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(2),
+        );
+        assert!(
+            !m.stream_split_basis.is_empty(),
+            "test premise: the basis map must actually be populated"
+        );
+
+        let value = serde_json::to_value(&m).expect("metadata serializes with stream_split_basis");
+        let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
+        assert_eq!(decoded, m);
     }
 }

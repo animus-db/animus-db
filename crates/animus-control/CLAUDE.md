@@ -294,6 +294,30 @@ per-tablet CP data plane (`animus-cp-data`).
   from "table dropped" — see ADR 0033/ADR 0044 — were both removed along
   with `MergeTablets`.)
 
+- **`SplitTablet` also freezes a stream-inheritance basis
+  (`Metadata::stream_split_basis`, ADR 0042 §8/ADR 0043 §A4/§A6) — a PR1
+  bugfix, sibling to `split_parents` just above, not a replacement for
+  it.** `effective_stream_shard_watermark`/`stream_shard_parent_id` used
+  to walk `split_parents` to the parent's *current* chain live, on every
+  call — correct only if the parent never seals again before the child
+  does; when it does, the parent's later (necessarily higher) end-HLC
+  became the child's own effective watermark too, silently dropping a
+  pre-split backlog the child had physically inherited (ADR 0043 §A4's
+  shared-storage design) but not yet sealed itself. The fix captures the
+  parent's own stream state — its last-sealed epoch and its own effective
+  watermark — **once**, from `MetaCommand::SplitTablet`'s apply, before
+  anything can mutate it further; both accessors now read this frozen
+  basis instead of walking `split_parents` live. No new `MetaCommand`
+  (ADR 0043 §A8's "exactly two commands" claim, about `SealStreamShard`/
+  `ExpireStreamShards`, is unaffected). Mirrored the same way as
+  `split_parents` (`syskv::EntityKind::StreamSplitBasis`). Regression:
+  `animus-test`'s `stream_lineage_corpus.rs::
+  split_then_parent_seals_first` (the deliberate inverse of
+  `split_mid_stream`'s ordering — confirmed to reproduce the loss against
+  the unfixed accessors) and `meta::tests::effective_stream_shard_
+  watermark_inherits_through_split_provenance`/`stream_shard_parent_id_
+  is_frozen_at_split_time_not_the_parents_current_chain`.
+
 ## What's non-obvious
 
 - **The sync/driver split is deliberate.** All consensus logic is in the sync

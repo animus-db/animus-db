@@ -153,6 +153,13 @@ pub enum EntityKind {
     /// the fact — mirrors [`Keyspace`](Self::Keyspace)'s empty-value
     /// convention).
     IndexBackfill,
+    /// A split child's frozen stream-inheritance basis
+    /// (`Metadata::stream_split_basis`, ADR 0042 §8/ADR 0043 §A4/§A6, PR1
+    /// bugfix), keyed by the split child's [`TabletId`] — the same id shape
+    /// as [`SplitParent`](Self::SplitParent), a sibling map recorded by the
+    /// same `MetaCommand::SplitTablet` apply. The value is the JSON-encoded
+    /// `StreamSplitBasis`, same convention as `Tablet`/`Schema`/etc.
+    StreamSplitBasis,
 }
 
 impl EntityKind {
@@ -175,6 +182,7 @@ impl EntityKind {
             EntityKind::SplitParent => "split_parent",
             EntityKind::StreamShard => "stream_shard",
             EntityKind::IndexBackfill => "index_backfill",
+            EntityKind::StreamSplitBasis => "stream_split_basis",
         }
     }
 
@@ -198,6 +206,7 @@ impl EntityKind {
             b"split_parent" => EntityKind::SplitParent,
             b"stream_shard" => EntityKind::StreamShard,
             b"index_backfill" => EntityKind::IndexBackfill,
+            b"stream_split_basis" => EntityKind::StreamSplitBasis,
             _ => return None,
         })
     }
@@ -337,6 +346,15 @@ pub fn split_parent_key(child: TabletId) -> Vec<u8> {
     entity_key(EntityKind::SplitParent, &child.0.to_be_bytes())
 }
 
+/// A split child [`TabletId`]'s key under [`EntityKind::StreamSplitBasis`]
+/// (ADR 0042 §8/ADR 0043 §A4/§A6, PR1 bugfix) — same id shape as
+/// [`split_parent_key`], a sibling entity recorded by the same
+/// `MetaCommand::SplitTablet` apply.
+#[must_use]
+pub fn stream_split_basis_key(child: TabletId) -> Vec<u8> {
+    entity_key(EntityKind::StreamSplitBasis, &child.0.to_be_bytes())
+}
+
 /// A `(tablet, epoch)` pair's key under [`EntityKind::StreamShard`] (ADR
 /// 0042 §3/ADR 0043 §A8): the raw 16-byte concatenation of both fixed-width
 /// fields, big-endian — unambiguous with no internal escaping needed, since
@@ -461,7 +479,7 @@ pub fn decode_key(key: &[u8]) -> Option<DecodedKey> {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [EntityKind; 11] = [
+    const ALL_KINDS: [EntityKind; 12] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
@@ -473,6 +491,7 @@ mod tests {
         EntityKind::SplitParent,
         EntityKind::StreamShard,
         EntityKind::IndexBackfill,
+        EntityKind::StreamSplitBasis,
     ];
 
     // --- reserved-name guard -------------------------------------------------
@@ -575,6 +594,18 @@ mod tests {
             Some(DecodedKey::Entity {
                 kind: EntityKind::Keyspace,
                 id: b"my_ks".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn stream_split_basis_key_round_trips() {
+        let key = stream_split_basis_key(TabletId(11));
+        assert_eq!(
+            decode_key(&key),
+            Some(DecodedKey::Entity {
+                kind: EntityKind::StreamSplitBasis,
+                id: 11u64.to_be_bytes().to_vec(),
             })
         );
     }

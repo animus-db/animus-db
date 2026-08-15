@@ -36,6 +36,21 @@ fn tiny_seal_knobs() -> StreamSealKnobs {
     }
 }
 
+/// **Production-shaped** seal knobs (PR1 bugfix regression) — deliberately
+/// NOT `tiny_seal_knobs()`'s `seal_bytes: 1` (which seals on every single
+/// write, so a tablet can never carry a real unsealed backlog into a
+/// split). `seal_bytes` is set high enough to never fire on its own in
+/// this cell's small workload; sealing is driven by the **age** trigger
+/// instead, so a real backlog of several writes accumulates and ages past
+/// `seal_age` before a seal fires — exactly the precondition the frozen
+/// `stream_split_basis` fix (ADR 0042 §8/ADR 0043 §A4/§A6) exists for.
+fn production_seal_knobs() -> StreamSealKnobs {
+    StreamSealKnobs {
+        seal_bytes: 1_000_000,
+        seal_age: Duration::from_secs(2),
+    }
+}
+
 async fn start_streamed_cluster(n: usize, dir: &Path, knobs: StreamSealKnobs) -> Vec<Node> {
     start_streamed_cluster_full(n, dir, knobs, None, None, SegmentStoreConfig::default()).await
 }
@@ -156,6 +171,24 @@ fn tablets_for(meta: &Metadata, table: &str) -> Vec<TabletId> {
     meta.tablets_for_table(table).map(|(&t, _)| t).collect()
 }
 
+/// `PutItem`s `{"id": "o{i:05}", "body": filler}` into table `orders` via
+/// `node`, asserting success, and returns the item's own id — the shared
+/// write helper for `manual_split_with_unsealed_backlog_under_production_
+/// seal_knobs` below.
+async fn put_order_item(node: &Node, i: usize, filler: &str) -> String {
+    let id = format!("o{i:05}");
+    let (status, body) = dynamo(
+        node.dynamo_addr(),
+        "DynamoDB_20120810.PutItem",
+        &format!(
+            r#"{{"TableName":"orders","Item":{{"id":{{"S":"{id}"}},"body":{{"S":"{filler}"}}}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "PutItem({id}) failed: {body}");
+    id
+}
+
 async fn get_shard_iterator(
     addr: SocketAddr,
     stream_arn: &str,
@@ -204,6 +237,12 @@ async fn describe_stream(addr: SocketAddr, stream_arn: &str) -> String {
 /// epoch, not treat a null as "done." Recomputes the tablet's own current
 /// chain length from a fresh `Metadata` read on every pass, so it never
 /// races ahead of (or falls behind) seals still happening concurrently.
+/// **An epoch that closes while its open-tail iterator is still mid-walk is
+/// resumed from that same iterator, never re-minted at `TRIM_HORIZON`** —
+/// found while building a production-shaped-seal-knobs regression cell:
+/// under `tiny_seal_knobs` the open tail is always empty the instant it's
+/// polled, so this double-count path was never exercised until a cell left
+/// more than one record in it.
 async fn drain_tablet_lineage(
     dynamo_addr: SocketAddr,
     stream_arn: &str,
@@ -227,9 +266,23 @@ async fn drain_tablet_lineage(
             .range((tablet, 0)..=(tablet, u64::MAX))
             .count() as u64;
         while next_epoch < chain_len {
-            let shard_id = segment::shard_id(tablet.0, next_epoch);
-            let mut iterator =
-                get_shard_iterator(dynamo_addr, stream_arn, &shard_id, "TRIM_HORIZON").await;
+            // If this epoch was already being polled as the open tail,
+            // resume from that exact position (stable across sealing —
+            // ADR 0042 §2) instead of re-minting a fresh `TRIM_HORIZON`
+            // iterator, which would re-deliver whatever the open-tail
+            // poll already collected from it in an earlier pass, before
+            // it sealed — a genuine double-count under any seal knob
+            // that ever leaves more than one record in the open tail
+            // (invisible under `tiny_seal_knobs`, where the open tail is
+            // always empty the instant it's polled).
+            let mut iterator = if open_epoch == Some(next_epoch) {
+                open_iterator
+                    .take()
+                    .expect("open_epoch implies an iterator")
+            } else {
+                let shard_id = segment::shard_id(tablet.0, next_epoch);
+                get_shard_iterator(dynamo_addr, stream_arn, &shard_id, "TRIM_HORIZON").await
+            };
             loop {
                 let (records, next) = get_records(dynamo_addr, &iterator).await;
                 collected.extend(records);
@@ -297,9 +350,18 @@ async fn drain_all_tablets_lineage(
                 .count() as u64;
             let cursor = next_epoch.get_mut(&tablet).expect("tracked tablet");
             while *cursor < chain_len {
-                let shard_id = segment::shard_id(tablet.0, *cursor);
-                let mut iterator =
-                    get_shard_iterator(dynamo_addr, stream_arn, &shard_id, "TRIM_HORIZON").await;
+                // See `drain_tablet_lineage`'s identical fix: resume from
+                // the open-tail iterator if this epoch was already being
+                // polled as open, rather than re-minting `TRIM_HORIZON`
+                // and re-delivering what that poll already collected.
+                let mut iterator = if open_epoch.get(&tablet) == Some(&*cursor) {
+                    open_iterator
+                        .remove(&tablet)
+                        .expect("open_epoch implies an iterator")
+                } else {
+                    let shard_id = segment::shard_id(tablet.0, *cursor);
+                    get_shard_iterator(dynamo_addr, stream_arn, &shard_id, "TRIM_HORIZON").await
+                };
                 loop {
                     let (records, next) = get_records(dynamo_addr, &iterator).await;
                     collected.extend(records);
@@ -332,8 +394,21 @@ async fn drain_all_tablets_lineage(
             return collected;
         }
         if tokio::time::Instant::now() >= deadline {
+            let chain_lens: Vec<(TabletId, usize)> = tablets
+                .iter()
+                .map(|&t| {
+                    (
+                        t,
+                        node.metadata()
+                            .stream_shards
+                            .range((t, 0)..=(t, u64::MAX))
+                            .count(),
+                    )
+                })
+                .collect();
             panic!(
-                "the lineage never delivered {want_total} records ({} so far)",
+                "the lineage never delivered {want_total} records ({} so far); \
+                 per-tablet closed-chain lengths: {chain_lens:?}",
                 collected.len()
             );
         }
@@ -637,10 +712,13 @@ async fn fs_segment_store_opt_in_smoke() {
 /// the table's tablet auto-splits mid-stream, driving the consumer's own
 /// `DescribeStream`/`GetRecords` calls through **every node in turn** (the
 /// house forwarded-command-regression pattern) both before and after the
-/// split — proving the lineage handover (the parent's own final seal at the
-/// split boundary, and the child's `ParentShardId` link) is observable
-/// through the real wire API from any node, not just whichever one
-/// happened to host the split.
+/// split — proving the lineage handover (the parent tablet's own seal
+/// after the split, and the child's `ParentShardId` link to it, both frozen
+/// from the split-time basis — ADR 0043 §A4/§A6, PR1 — not a final seal *at*
+/// the split boundary, which the split itself never performs: the source
+/// tablet survives as the left child with its own open shard continuing
+/// uninterrupted) is observable through the real wire API from any node,
+/// not just whichever one happened to host the split.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -795,6 +873,146 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
         delivered.len(),
         expected,
         "exactly-once delivery must hold across the whole auto-split lineage"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR1 bugfix regression: a split with a real, still-unsealed backlog,
+// under production-shaped seal knobs (ADR 0042 §8/ADR 0043 §A4/§A6).
+// ---------------------------------------------------------------------------
+
+/// The `ProdEnv` end-to-end counterpart of `animus-test`'s
+/// `stream_lineage_corpus.rs::split_then_parent_seals_first` corpus cell —
+/// same bug, same fix, exercised through the real DynamoDB wire API and the
+/// real background loops (`change_consumer_loop`'s seal arm,
+/// `auto_split_loop`) instead of a hand-driven `Metadata`/segment-store
+/// model. Deliberately uses `production_seal_knobs()`, not
+/// `tiny_seal_knobs()`: a tablet must carry a genuine multi-write, still
+/// **unsealed** backlog across the split, so both the split and the first
+/// seal that follows it happen only from real accumulated pressure — never
+/// a size-1 knob that seals every write and can never leave anything
+/// unsealed to inherit.
+///
+/// Uses the **age** trigger (`seal_bytes` set high enough to never fire on
+/// its own here), not the byte trigger: no further writes happen after the
+/// split, so each side gets **exactly one** seal, once its inherited
+/// backlog ages past `seal_age`. This sidesteps an unrelated, pre-existing
+/// timing sensitivity in `change_consumer_loop`'s byte-triggered seal arm
+/// under a real write burst crossing the threshold many times in quick
+/// succession (a handful of records occasionally missing from every
+/// segment *and* the open tail, reproducible even with no split involved
+/// at all) — a real finding from building this cell, out of scope for this
+/// fix (which is about `Metadata`'s pure watermark/`ParentShardId`
+/// derivation, not the seal arm's own scan/trim sequencing) and reported
+/// separately rather than chased down here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_split_with_unsealed_backlog_under_production_seal_knobs() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let nodes = start_streamed_cluster_full(
+        3,
+        dir.path(),
+        production_seal_knobs(),
+        None,
+        Some(128), // auto-split threshold — small, so the split fires fast off a handful of writes
+        SegmentStoreConfig::default(),
+    )
+    .await;
+    await_bootstrap(&nodes).await;
+
+    let (status, body) = dynamo(
+        nodes[0].dynamo_addr(),
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"orders",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "StreamSpecification":{"StreamEnabled":true,
+                "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+    let label = field(&body, "LatestStreamLabel");
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/orders/stream/{label}");
+
+    let filler = "x".repeat(64);
+    let mut ids: Vec<String> = Vec::new();
+
+    // A real, multi-item, still-unsealed backlog before the split: enough
+    // base-scope bytes to cross the auto-split threshold (128), comfortably
+    // inside `seal_age` (2s) so nothing seals before the split lands.
+    for i in 0..6 {
+        ids.push(put_order_item(&nodes[0], i, &filler).await);
+    }
+    await_true(
+        20,
+        "table never auto-split from the pre-split backlog",
+        || tablets_for(&nodes[0].metadata(), "orders").len() >= 2,
+    )
+    .await;
+
+    // The precondition this cell exists to exercise: at the instant of the
+    // split, nothing has sealed yet anywhere in the catalog — every write
+    // so far is still sitting in the hot backlog, physically split across
+    // whichever two tablets now exist.
+    assert!(
+        nodes[0].metadata().stream_shards.is_empty(),
+        "test premise: the split must land on a genuinely unsealed backlog"
+    );
+
+    // Determine parent/child via `split_parents` — never assumed from
+    // tablet-id ordering (same idiom as the auto-split test above).
+    let meta = nodes[0].metadata();
+    let table_tablets = tablets_for(&meta, "orders");
+    let (child, parent) = table_tablets
+        .iter()
+        .find_map(|&t| meta.split_parents.get(&t).map(|&p| (t, p)))
+        .unwrap_or_else(|| panic!("no split-parent provenance recorded among {table_tablets:?}"));
+
+    // No further writes. Both sides' inherited backlog ages past
+    // `seal_age` on its own, giving each exactly one seal — the parent's
+    // own seal of its narrowed left range, and the child's first-ever seal
+    // of whatever right-range backlog it physically inherited in place
+    // (ADR 0043 §A4). This is where an unfixed `effective_stream_shard_
+    // watermark`/`stream_shard_parent_id` would show up as a missing id
+    // (the child's inherited backlog silently dropped from its own first
+    // seal) rather than a wrong count alone.
+    await_true(
+        20,
+        "parent and child never both sealed at least once",
+        || {
+            let meta = nodes[0].metadata();
+            meta.stream_shard_watermark(parent).is_some()
+                && meta.stream_shard_watermark(child).is_some()
+        },
+    )
+    .await;
+
+    // Drain the whole lineage (both tablets, every epoch) from a different
+    // node than the one that wrote everything, and confirm every write was
+    // delivered exactly once, no gaps, no duplicates.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let delivered = drain_all_tablets_lineage(
+        nodes[1].dynamo_addr(),
+        &stream_arn,
+        &nodes[1],
+        &[parent, child],
+        ids.len(),
+        deadline,
+    )
+    .await;
+    let mut seen: Vec<String> = delivered
+        .iter()
+        .map(|r| {
+            r["dynamodb"]["Keys"]["id"]["S"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no id in {r:?}"))
+                .to_owned()
+        })
+        .collect();
+    seen.sort();
+    let mut expected_ids = ids.clone();
+    expected_ids.sort();
+    assert_eq!(
+        seen, expected_ids,
+        "every write must be delivered exactly once, including the pre-split backlog"
     );
 }
 

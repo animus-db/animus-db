@@ -1981,6 +1981,66 @@ debugging anything that feels like it might have happened before.
   every log source before anything interesting happens, not just whichever
   timestamp format was most convenient at each individual call site. (Same
   investigation, 2026-08-15.)
+- **A value a child inherits from a parent that keeps mutating must be
+  frozen at the inheritance event, never derived live from the parent's
+  current state.** `Metadata::effective_stream_shard_watermark`/
+  `stream_shard_parent_id` (ADR 0042 §8/ADR 0043 §A4/§A6) used to walk
+  `split_parents` to the parent tablet's *current* seal chain on every
+  call — correct only so long as the parent never sealed again before the
+  child did. The moment it did, the parent's later (necessarily higher)
+  end-HLC retroactively became the child's own effective watermark too,
+  making a pre-split backlog the child had physically inherited in place
+  (ADR 0043 §A4's shared-storage split design) look already-sealed before
+  the child ever sealed it itself — a silent, permanent loss, invisible
+  unless the child happened to seal first (the race that let this ship
+  undetected through round 3). The fix (PR1) captures the parent's stream
+  state **once**, at the instant `MetaCommand::SplitTablet` applies, into
+  a frozen `Metadata::stream_split_basis` entry — a single-hop lookup
+  thereafter, not a live walk. **Corollary: a test comment that
+  acknowledges a derivation's time-dependency (e.g. "this assertion must
+  run before the parent seals again, since X is derived live") is a
+  signal to fix the derivation, not to order the test around it** — the
+  pre-fix `stream_lineage_corpus.rs::scenario_split_mid_stream` had
+  exactly such a comment, naming its own ordering constraint, for months
+  before this bug was found and its literal inverse
+  (`split_then_parent_seals_first`) written as the regression.
+- **A test-drain helper polling both a "closed epoch, replay from
+  `TRIM_HORIZON`" path and a "current open tail, resume from last
+  position" path must resume the SAME iterator when an epoch transitions
+  from open to closed mid-poll, never re-mint a fresh `TRIM_HORIZON` walk
+  for it.** `streams_e2e.rs`'s `drain_tablet_lineage`/
+  `drain_all_tablets_lineage` always re-minted `TRIM_HORIZON` for a
+  newly-closed epoch, discarding whatever position the open-tail poll had
+  already reached in it one pass earlier — double-delivering any record
+  the open-tail poll had already returned before that epoch sealed. This
+  was invisible under `tiny_seal_knobs()` (`seal_bytes: 1`), whose open
+  tail is always empty the instant it's polled (every write seals as its
+  own epoch immediately), so no existing test before PR1's
+  production-shaped-knobs regression cell ever left more than one record
+  in an open tail across two poll passes. General form: a resumable
+  iterator's identity survives a state transition (here: open → closed);
+  a caller that mints a fresh one anyway on the transition, instead of
+  continuing the one it already has, double-reads whatever the old one
+  had already delivered.
+- **Found but deliberately not fixed here (report, don't scope-creep):
+  `streams_e2e.rs::auto_split_mid_stream_with_live_consumer_across_every_
+  node` (D8) is flaky on `main` independent of any change in this
+  PR** — confirmed by running the *unmodified* file against the same
+  workload: an intermittent `exactly-once delivery` over-count (delivered
+  > expected by a handful of records) under `tiny_seal_knobs()`'s
+  size-1-triggered rapid resealing. A related, likely-connected symptom
+  found independently while building PR1's own e2e cell: under
+  *non-tiny* seal-byte knobs with a real write burst crossing the
+  threshold many times in quick succession, a handful of records can go
+  missing from *every* segment and the open tail alike (base row present
+  via `GetItem`, change record nowhere) — reproducible with no split
+  involved at all, so it isn't the split-basis bug this PR fixes. Both
+  point at a timing sensitivity in `change_consumer_loop`'s seal arm
+  (`animusd::index_drain`) under many-seals-in-quick-succession, not
+  investigated further here; PR1's own new e2e cell sidesteps it entirely
+  by using the **age** seal trigger (`seal_bytes` set high enough to never
+  fire) instead of the byte one, so each side seals exactly once. Worth a
+  dedicated investigation as its own PR.
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer

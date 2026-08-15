@@ -211,20 +211,46 @@ ever moves its bytes.
 ### A4. Split lineage — records never move
 
 Kind scopes share the tablet's live `KeyRange`: after `SplitTablet`, the
-left child's narrowed `KIND_CHANGE` scope keeps left-range records in
-place; the right sibling exposes right-range ones, likewise in place. ADR
-0018's range seal guarantees no late write lands through the old group
-after handoff. The parent tablet's open shard **closes at its last sealed
-position** (`EndingSequenceNumber` = that segment's own max HLC); whatever
-was still unsealed in its hot tail becomes the two children's own earliest
-hot records, split by range exactly as the base rows already are. Each
-child's **epoch-0** shard carries `ParentShardId` = the parent's last
-shard; each child's **initial watermark** is the parent chain's own last
-sealed end-HLC (catalog-derived, mirroring exactly how the GSI cursor's
+left child (the same tablet id, its own already-open shard continuing
+uninterrupted — **the split never closes or re-seals anything**) keeps
+left-range records in place; the right sibling's fresh epoch-0 open shard
+exposes right-range records, likewise in place — nothing is copied. Each
+child's **epoch-0** shard carries `ParentShardId` = the parent's own
+last-*sealed* shard, and each child's **initial watermark** is the parent
+chain's own last sealed end-HLC (mirroring exactly how the GSI cursor's
 min-over-rows rule already treats a fresh split child at `W = 0` over an
 empty row set — here it's `W = parent's last sealed end-HLC`, not zero,
 because the parent's own sealed segments are shared history both children
-inherit, not each child's own to re-derive).
+inherit, not each child's own to re-derive) — **both frozen once, at the
+split's own apply, into `Metadata::stream_split_basis`** (PR1 amendment
+below), not re-derived from the parent's live chain on every later read.
+
+**PR1 bugfix, 2026-08-15 (a live-derivation data-loss bug, found and fixed
+after PR8 shipped).** The two values above used to be derived *live*
+instead of frozen: `effective_stream_shard_watermark`/
+`stream_shard_parent_id` walked `Metadata::split_parents` to the parent's
+**current** chain on every call. That is correct only so long as the
+parent never seals again before the child does. The moment it does, the
+parent's later seal's end-HLC — necessarily higher, since a tablet's own
+`KIND_CHANGE` scope only ever advances — became the child's own effective
+watermark too, retroactively appearing to have already sealed a pre-split
+backlog the child had physically inherited in place (this section's own
+"records never move" design) but had not yet sealed itself. The child's
+own first seal then silently filtered that backlog out (`hlc <=
+watermark`), and the same inflated watermark blocked it from the open-tail
+read path as well — a permanent, silent loss, invisible unless the child
+happened to seal before the parent did (the race that let this ship
+undetected). The fix freezes both values once, at the instant
+`MetaCommand::SplitTablet` applies, into a new sibling map,
+`Metadata::stream_split_basis: BTreeMap<TabletId, StreamSplitBasis>` —
+`split_parents` itself is untouched (ADR 0018's range-seal and the
+tablet-host reconciler still consume it). No new `MetaCommand` (§A8's
+"exactly two commands" claim is about `SealStreamShard`/
+`ExpireStreamShards`, and still holds). Regression:
+`animus-test`'s `stream_lineage_corpus.rs::split_then_parent_seals_first`
+(the deliberate inverse of `split_mid_stream`'s ordering, confirmed to
+reproduce the loss on the unfixed code) and `animusd`'s `streams_e2e.rs::
+manual_split_with_unsealed_backlog_under_production_seal_knobs`.
 
 **Cross-group HLC safety**: a child group's start witnesses the shared
 engine's own `latest_version()` (the pre-existing witnessing chain ADR
@@ -254,8 +280,10 @@ revived") is moot and not carried forward.
 
 The stream half of the trim computation (ADR 0042 §8) is entirely
 catalog-derived: a tablet's watermark is its own chain's last sealed
-end-HLC, or its parent chain's for a fresh split child, or absent if it has
-never sealed. The GSI half (`"gsi"` cursor tag, min-over-rows) is
+end-HLC, or — for a fresh split child with no rows of its own yet — its
+parent's, **frozen at split time** (§A4's PR1 amendment; never re-derived
+from the parent's chain as it stands *now*), or absent if it has never
+sealed. The GSI half (`"gsi"` cursor tag, min-over-rows) is
 **completely unchanged** — ADR 0041's drain still owns it, still advances
 it in its own trailing write, still generalizes correctly across a
 split/merge. `expected_consumer_tags` drops `"copier"` and the row it used

@@ -300,9 +300,11 @@ that tag's row, because there is no copier.
 directly from the segment catalog**, not a row a consumer writes. A
 tablet's watermark is its own shard chain's **last sealed end-HLC**
 (`0`/absent if it has never sealed) — a split child inherits its *parent
-tablet's* chain's last sealed end-HLC as its own initial watermark, exactly
-mirroring how the GSI cursor's min-over-rows rule already treats a fresh
-child (§"Split lineage," ADR 0043 §A4). The change-consumer loop's trim
+tablet's* chain's last sealed end-HLC, **frozen at the instant of the
+split** (a live-derivation bug here was found and fixed after this
+subsystem first shipped — see ADR 0043 §A4's PR1 amendment), as its own
+initial watermark, exactly mirroring how the GSI cursor's min-over-rows
+rule already treats a fresh child (§"Split lineage," ADR 0043 §A4). The change-consumer loop's trim
 janitor (ADR 0043 §A6) computes this from the very `Metadata` snapshot it
 already holds each tick — no new read, and one less kind of durable row a
 disabled-then-dropped stream could ever leave stale behind (there is

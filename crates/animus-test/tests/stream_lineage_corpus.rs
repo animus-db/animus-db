@@ -679,6 +679,144 @@ fn split_mid_stream() {
     for_each_seed("split_mid_stream", scenario_split_mid_stream);
 }
 
+// --- cell 3b: split_then_parent_seals_first (PR1 frozen-basis bugfix) ----
+
+/// PR1 bugfix regression (ADR 0042 §8/ADR 0043 §A4/§A6) — the **inverse** of
+/// `scenario_split_mid_stream`'s deliberate ordering above. That scenario
+/// seals the parent *before* splitting ("so the split boundary lands
+/// cleanly on a sealed watermark") and seals the *sibling* first
+/// afterward, with its own comment naming exactly why: `stream_shard_
+/// parent_id`/`effective_stream_shard_watermark` used to be derived live
+/// from the parent's *current* chain, so letting the parent seal again
+/// after the split would retroactively move what "the parent's last sealed
+/// shard" means out from under an already-answered child. **A test comment
+/// acknowledging a derivation's time-dependency is a signal to fix the
+/// derivation, not to order the test around it** — this cell is that fix's
+/// own regression test, driving the ordering the old comment had to avoid.
+///
+/// Setup: a non-empty, still-**unsealed** backlog on both sides of the
+/// future split boundary — the parent never seals before splitting at all.
+/// After the split, the **parent** seals its own narrowed scope again
+/// first (its `hlc_range.1` necessarily lands above every pre-split HLC,
+/// since the shared engine's HLC/version space — ADR 0018 §2's amendment —
+/// only ever advances, never resets per tablet), and only *then* does the
+/// **sibling** seal its own epoch 0.
+///
+/// Before the PR1 fix, `effective_stream_shard_watermark(sibling)` walked
+/// to the parent's live chain and picked up that inflated post-split
+/// watermark, so the sibling's first seal silently filtered its entire
+/// inherited backlog out (`hlc <= watermark`) — and since the *hot-tail*
+/// read path uses the identical effective watermark, the backlog was never
+/// delivered via the open shard either: a total, silent loss.
+/// `verify_lineage`'s write-journal diff catches exactly this (delivered
+/// count < journal count). After the fix (the frozen `stream_split_basis`,
+/// `None` here since the parent had never sealed anything before the
+/// split), the sibling's watermark never moves regardless of what the
+/// parent seals afterward, and every record is delivered exactly once.
+fn scenario_split_then_parent_seals_first(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(11), KeyRange::whole());
+    let parent = start_group(&sim, &engines, TabletId(11), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    // Left- and right-side backlog, still unsealed at split time — unlike
+    // `scenario_split_mid_stream`, the parent never seals before splitting.
+    for i in 0..4 {
+        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"L", seed);
+    }
+    for i in 600..604 {
+        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"R", seed);
+    }
+
+    let parent_epoch = meta
+        .tablets
+        .get(&parent.id)
+        .map_or(animus_tablet::Epoch::INITIAL, |t| t.epoch);
+    let sibling_id = TabletId(12);
+    for n in &parent.nodes {
+        n.narrow_scope(KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec())));
+    }
+    let outcome = meta.apply(&MetaCommand::SplitTablet {
+        tablet: parent.id,
+        expected_epoch: parent_epoch,
+        split_key: BOUNDARY.to_vec(),
+        new_id: sibling_id,
+    });
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied,
+        "[seed={seed}] split must apply"
+    );
+    let sibling = start_group(
+        &sim,
+        &engines,
+        sibling_id,
+        KeyRange::new(BOUNDARY.to_vec(), None),
+    );
+    sim.run_for(Duration::from_secs(2));
+
+    // More left-side writes on the parent's own narrowed scope, then seal
+    // the PARENT first — its `hlc_range.1` lands strictly above every
+    // pre-split HLC.
+    for i in 4..8 {
+        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"L2", seed);
+    }
+    let parent_leader = elect(&mut sim, &parent, &live, seed);
+    let sealed = seal_now(&mut meta, &store, &parent, parent_leader, 2_000, false);
+    assert_eq!(
+        sealed,
+        Some(0),
+        "[seed={seed}] the parent's own first post-split seal must apply"
+    );
+
+    // A couple more right-side writes on the sibling, THEN the sibling
+    // seals its own epoch 0 — last, and only now. Its inherited pre-split
+    // backlog (600..603) must still be in it.
+    for i in 610..612 {
+        write_and_journal(
+            &mut sim,
+            &sibling,
+            &live,
+            &mut journal,
+            &key(i),
+            b"R2",
+            seed,
+        );
+    }
+    let sibling_leader = elect(&mut sim, &sibling, &live, seed);
+    // Deliberately not asserted against `Some(0)` here: under the
+    // unfixed code this call can legitimately return `None` (nothing left
+    // past the — wrongly inflated — watermark to seal), which is itself
+    // part of the loss this cell exists to catch. `verify_lineage` below is
+    // the real assertion either way.
+    let _ = seal_now(&mut meta, &store, &sibling, sibling_leader, 2_100, false);
+
+    // Parent-before-child: the lineage discipline itself. This is where an
+    // unfixed `effective_stream_shard_watermark` shows up as a diff: the
+    // 600..603 backlog present in `journal` but never delivered by either
+    // shard.
+    verify_lineage(
+        &meta,
+        &store,
+        &[(&parent, parent_leader), (&sibling, sibling_leader)],
+        &journal,
+        seed,
+    );
+}
+
+#[test]
+fn split_then_parent_seals_first() {
+    for_each_seed(
+        "split_then_parent_seals_first",
+        scenario_split_then_parent_seals_first,
+    );
+}
+
 // --- cell 4: kill_sealing_leader ------------------------------------------
 
 fn scenario_kill_sealing_leader(seed: u64) {

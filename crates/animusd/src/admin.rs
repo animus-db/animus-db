@@ -984,7 +984,10 @@ async fn system_table(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 fn system_table_id_is_numeric(kind: syskv::EntityKind) -> bool {
     matches!(
         kind,
-        syskv::EntityKind::Tablet | syskv::EntityKind::Policy | syskv::EntityKind::SplitParent
+        syskv::EntityKind::Tablet
+            | syskv::EntityKind::Policy
+            | syskv::EntityKind::SplitParent
+            | syskv::EntityKind::StreamSplitBasis
     )
 }
 
@@ -1050,7 +1053,10 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         | syskv::EntityKind::CpMemberAddr
         // A `StreamShardRow` (ADR 0042 §3) — `serde_json` passthrough like
         // every other JSON-encoded entity kind above.
-        | syskv::EntityKind::StreamShard => {
+        | syskv::EntityKind::StreamShard
+        // A `StreamSplitBasis` (ADR 0042 §8/ADR 0043 §A4/§A6, PR1 bugfix) —
+        // same JSON passthrough convention.
+        | syskv::EntityKind::StreamSplitBasis => {
             serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
         }
         syskv::EntityKind::Counter => match <[u8; 8]>::try_from(value) {
