@@ -1273,3 +1273,213 @@ fn durability_invariant_holds_at_every_kill_point() {
         scenario_durability_kill_points,
     );
 }
+
+// --- investigation: dueling seals for the same epoch (2026-08-15) -------
+//
+// **Root-cause repro, not a frozen corpus cell** — for the byte-seal
+// record-loss bug reported while building the split-basis-fix e2e test
+// (docs/engineering-lessons.md's "Found but deliberately not fixed here"
+// entry) and the D8 (`auto_split_mid_stream_with_live_consumer_across_
+// every_node`) exactly-once over-count flake. Deliberately NOT wired into
+// `for_each_seed`/the frozen scenario set — it is a hand-scripted proof of
+// one exact interleaving, not a fault-injection cell a seed sweep discovers
+// on its own (running the existing 8 cells at `ANIMUS_STREAM_SEEDS=300`
+// found nothing; this harness's own `seal_now` helper reads and applies
+// against the *same* `&mut Metadata` reference every call, so no seed of
+// *that* harness can express "two attempts computed from two different
+// metadata snapshots").
+//
+// **The mechanism**: two independent seal attempts for the tablet's SAME
+// open epoch — exactly what a brief dual-leadership window would produce
+// (a re-election triggered by write-burst backpressure on the very node
+// driving the seal; see `animus-cp-data/CLAUDE.md`'s "leader-election
+// storm" driver-liveness entry for why heavy write load is exactly what
+// induces this). `Metadata::apply`'s `SealStreamShard` arm
+// (`animus-control/src/meta.rs:1384-1396`) correctly protects the
+// **catalog**: a second proposal for an already-recorded `(tablet, epoch)`
+// whose content (in particular `hlc_range`) differs from what's already
+// committed is rejected outright as `ApplyOutcome::NoOp` — first-committer-
+// wins, by design, and proven never to silently change `hlc_range` once
+// set.
+//
+// **What nothing protects**: the *segment object* physically stored at the
+// deterministic `segment_id(table, label, tablet, epoch)` — `SegmentStore::
+// put`/`put_sealed` is an unconditional, un-ordered overwrite (see
+// `animus-cp-data/CLAUDE.md`'s "idempotent overwrite" note, which is sound
+// only for the *sequential-retry* case the crate's own doc describes — "the
+// sealer's own crash-retry loop racing itself" — never audited against two
+// attempts computed from two *different* metadata snapshots landing their
+// physical `put`s out of chronological order). The design's own safety
+// argument for a retry ("a harmless superset... because a reader always
+// slices to the catalog row's own committed `hlc_range`") tacitly assumes
+// the LATER-landing `put` is always the one with the LARGER (superset)
+// range — true for a sequential same-leader retry (whose own
+// `pending_changes()` read is strictly later, hence a superset by HLC
+// monotonicity), but **false** the moment two independently-computed
+// attempts race: whichever `put` lands chronologically last wins the
+// physical bytes, with NO relationship to which attempt's *proposal* wins
+// the catalog's first-committer-wins rule.
+//
+// Below: attempt "slow" computes its own record set from a metadata/
+// pending-changes snapshot taken BEFORE a second batch of writes lands
+// (mirroring a leader whose own `put_sealed` — a real K-way replicated
+// write — takes long enough for a second, independent leader to fully
+// seal, catalog-commit, and move on before the first's `put` physically
+// arrives). Attempt "fast" runs the ordinary, complete `seal_now` sequence
+// against the live metadata (sees both batches), wins the catalog. Then
+// "slow"'s own `put` finally lands, overwriting the segment object with a
+// smaller record set than the catalog's own `hlc_range` claims; its own
+// catalog proposal is (correctly) rejected as a `NoOp`. The catalog is
+// intact and self-consistent throughout — `verify_lineage` (the same
+// decision tree `DescribeStream`/`GetShardIterator(TRIM_HORIZON)`/
+// `GetRecords` walks in production) is what actually observes the loss:
+// batch 2's 5 records are in the catalog's claimed range, sealed out of
+// the (now too-small) segment object, and excluded from the open tail by
+// the advanced watermark — in no segment and not in the open tail, exactly
+// the reported symptom.
+fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    let group = start_group(&sim, &engines, TabletId(20), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    // Batch 1: what the "slow" (about-to-lose-leadership) attempt sees.
+    for i in 0..5 {
+        write_and_journal(
+            &mut sim,
+            &group,
+            &live,
+            &mut journal,
+            &key(i),
+            b"batch1",
+            seed,
+        );
+    }
+    let slow_leader = elect(&mut sim, &group, &live, seed);
+
+    // The slow attempt's own snapshot, taken now — mirrors
+    // `index_drain::seal_now`'s own sequence up through its `pending_
+    // changes()` read (`animusd/src/index_drain.rs:944-960`), before its
+    // (real, K-way replicated, hence slow) `put_sealed` call.
+    let watermark_slow = meta.effective_stream_shard_watermark(group.id).unwrap_or(0);
+    let mut slow_records: Vec<(Vec<u8>, u64, Vec<u8>)> =
+        block_on(group.nodes[slow_leader].pending_changes())
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let hlc = record_hlc_suffix(&k)?;
+                (hlc > watermark_slow).then_some((k, hlc, v))
+            })
+            .collect();
+    slow_records.sort_by_key(|(_, hlc, _)| *hlc);
+    assert_eq!(
+        slow_records.len(),
+        5,
+        "[seed={seed}] the slow attempt's own snapshot must see exactly batch 1"
+    );
+
+    // Batch 2 lands while the slow attempt's `put_sealed` is modeled as
+    // still in flight (its own snapshot above is already taken and won't
+    // change) — a second leader takes over and drives a genuinely
+    // independent, complete seal.
+    for i in 5..10 {
+        write_and_journal(
+            &mut sim,
+            &group,
+            &live,
+            &mut journal,
+            &key(i),
+            b"batch2",
+            seed,
+        );
+    }
+
+    // The "fast" attempt: an ordinary, complete `seal_now` against live
+    // metadata — sees both batches, and is the only proposal that has
+    // landed when the catalog resolves this epoch, so it wins outright.
+    let fast_leader = elect(&mut sim, &group, &live, seed);
+    let sealed_fast = seal_now(&mut meta, &store, &group, fast_leader, 1_000, false);
+    assert_eq!(
+        sealed_fast,
+        Some(0),
+        "[seed={seed}] the fast attempt seals epoch 0 covering both batches"
+    );
+    let fast_watermark = meta
+        .effective_stream_shard_watermark(group.id)
+        .expect("fast attempt just committed a watermark");
+
+    // The slow attempt's `put_sealed` finally lands — using the bytes it
+    // computed BEFORE batch 2 ever existed — physically overwriting the
+    // segment object the fast attempt just wrote, at the same deterministic
+    // `segment_id` (mirrors `index_drain::seal_now`'s own id derivation,
+    // `animusd/src/index_drain.rs:993`).
+    let epoch = 0u64;
+    let hlc_range_slow = (watermark_slow, slow_records.last().unwrap().1);
+    let count = slow_records.len() as u64;
+    let seg_records: Vec<segment::SegmentRecord> = slow_records
+        .iter()
+        .map(|(k, hlc, v)| segment::SegmentRecord {
+            source_key: k.clone(),
+            packed_hlc: *hlc,
+            change_record: v.clone(),
+        })
+        .collect();
+    let header = segment::SegmentHeader {
+        table: TABLE.into(),
+        label: LABEL.into(),
+        shard_id: segment::shard_id(group.id.0, epoch),
+        tablet: group.id.0,
+        epoch,
+        parent_shard_id: meta.stream_shard_parent_id(group.id, epoch),
+        hlc_range: hlc_range_slow,
+        count,
+        seal_wall_ms: 900, // the slow attempt started first, in wall-clock terms
+    };
+    let bytes = segment::encode(&header, &seg_records);
+    let seg_id = segment::segment_id(TABLE, LABEL, group.id.0, epoch);
+    block_on(store.put(&seg_id, &bytes)).expect("the slow attempt's late put still succeeds");
+
+    // The slow attempt's own catalog proposal, now that it finally gets
+    // around to it: content (`hlc_range`) differs from what's already
+    // committed, so `Metadata::apply`'s first-committer-wins rule correctly
+    // rejects it as a `NoOp` — the catalog itself is proven intact here.
+    let slow_outcome = meta.apply(&MetaCommand::SealStreamShard {
+        table: TABLE.into(),
+        label: LABEL.into(),
+        tablet: group.id,
+        epoch,
+        view_type: StreamViewType::NewAndOldImages,
+        hlc_range: hlc_range_slow,
+        count,
+        seal_wall_ms: 900,
+        replicas: Vec::new(),
+    });
+    assert_eq!(
+        slow_outcome,
+        ApplyOutcome::NoOp,
+        "[seed={seed}] the catalog must reject the slow attempt's differing content"
+    );
+    assert_eq!(
+        meta.effective_stream_shard_watermark(group.id),
+        Some(fast_watermark),
+        "[seed={seed}] the catalog's committed watermark must be untouched by the rejected proposal"
+    );
+
+    // The catalog is self-consistent throughout. `verify_lineage` is what
+    // actually observes the loss — batch 2's 5 records are claimed by the
+    // catalog's own committed range but physically absent from the segment
+    // object the slow `put` overwrote it with, and excluded from the open
+    // tail by the advanced watermark.
+    verify_lineage(&meta, &store, &[(&group, fast_leader)], &journal, seed);
+}
+
+#[test]
+fn dueling_seals_orphan_hot_range() {
+    for_each_seed(
+        "dueling_seals_orphan_hot_range",
+        scenario_dueling_seals_orphan_hot_range,
+    );
+}
