@@ -43,25 +43,26 @@ pub async fn assert_segment_store_contract<S: SegmentStore>(store: &S) {
         "get must return exactly what was put"
     );
 
-    // Idempotent overwrite: same bytes.
+    // Write-once, identical-bytes case: a safe no-op.
     store
         .put(id_a, b"hello")
         .await
-        .expect("put a again, same bytes");
+        .expect("put a again, identical bytes must be a safe no-op");
     assert_eq!(
         store.get(id_a).await.expect("get a"),
         Some(b"hello".to_vec())
     );
 
-    // Idempotent overwrite: different bytes — Ok, last-write-wins.
+    // Write-once, differing-bytes case: a hard error, and the stored
+    // content must be untouched by the rejected attempt.
     store
         .put(id_a, b"goodbye")
         .await
-        .expect("put a again, different bytes");
+        .expect_err("differing bytes at an existing id must be rejected (write-once)");
     assert_eq!(
         store.get(id_a).await.expect("get a"),
-        Some(b"goodbye".to_vec()),
-        "overwrite is last-write-wins"
+        Some(b"hello".to_vec()),
+        "a rejected write-once violation must not change the stored bytes"
     );
 
     // A never-written id reads None, not an error.

@@ -58,15 +58,29 @@
 //! (`READ_TIMEOUT`/`READ_POLL` in `lib.rs`): a partitioned/dead target makes
 //! a `put`/`get`/`delete` fail cleanly within its own timeout, never hang.
 //!
-//! **Partial-K puts leave harmless orphans.** If `put_replicated` errors
-//! after successfully writing to some (but not all) of its K targets, those
-//! written copies are never cataloged (the caller — the eventual sealer,
-//! PR 5 — only commits `MetaCommand::SealStreamShard` after `put_replicated`
-//! itself returns `Ok`) and `SegmentStore::put` is idempotent overwrite by
-//! contract, so a retried `put_replicated` to the same deterministic id
-//! simply overwrites those stray copies with identical or superset content —
-//! never a correctness hazard, only a bounded amount of wasted disk on nodes
-//! that happened to ack an attempt nothing ever pointed at.
+//! **Partial-K puts leave harmless orphans (as-built amendment).** If
+//! `put_replicated` errors after successfully writing to some (but not all)
+//! of its K targets, those written copies are never cataloged (the caller —
+//! the sealer, `animusd::index_drain::seal_now` — only commits
+//! `MetaCommand::SealStreamShard` after `put_replicated` itself returns
+//! `Ok`). **This used to say a retried `put_replicated` "simply overwrites
+//! those stray copies" — that was true only because every attempt shared one
+//! deterministic id, which is exactly the design this crate no longer uses**
+//! (see `animus_cp_data::segment`'s own module doc for the data-loss bug the
+//! shared-id scheme caused). Every real caller now writes each attempt at
+//! its own unique id (`segment::segment_object_id`), so a genuine *retry* of
+//! the *same* attempt reuses that *same* id (`SegmentStore::put`'s
+//! write-once contract treats a byte-identical re-put as a safe no-op —
+//! never a real hazard), while a **different** attempt (a fresh `seal_now`
+//! call, e.g. after a lost ack) writes to a **fresh** id and leaves the
+//! partial-K copies at the *old* id as permanent, unreferenced orphans — a
+//! bounded amount of wasted disk on nodes that happened to ack an attempt
+//! nothing ever pointed at, reclaimed by the segment janitor's own orphan
+//! sweep (`animusd::segment_janitor`) rather than by a future overwrite.
+//! Never "fix" a partial failure by trying to roll back the targets that
+//! already succeeded — that would add a second distributed failure mode
+//! (the rollback itself can partially fail) to clean up a case that is
+//! already safe to leave alone.
 
 use std::collections::BTreeMap;
 use std::io;
