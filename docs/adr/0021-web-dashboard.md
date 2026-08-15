@@ -368,6 +368,24 @@ client-side SPA).
    this rides the existing streams read API (ADR 0042 §3) through the
    admin proxy the same way the Data Browser already reaches the item API.
 
+10. ✅ **The Streams tab also shows on control-only nodes.** #9's
+    control-only exclusion was broader than the actual gap: a control-only
+    node holds the full replicated `Metadata` (schemas incl. stream specs,
+    and the `stream_shards` segment catalog), so the stream list and the
+    shard-chain detail (`ListStreams`/`DescribeStream`, both pure functions
+    of `Metadata`) render truthfully there — verified against a real split
+    deployment, not assumed. Only the live-tail poller
+    (`GetShardIterator`/`GetRecords`) genuinely needs a local CP data plane;
+    it degrades in-view instead (a note + a `consoleLink` to a live
+    data/combined node), rather than hiding the whole tab. See
+    `animusd/CLAUDE.md`'s Streams-tab entries and `dashboard_streams.js`'s
+    own doc for exactly which ops work from a control-only node's admin
+    port and which don't (including a pre-existing backend gap this
+    surfaced but left unfixed: `GetRecords` on a sealed shard panics via
+    `ClientCtx::data()` there, and the open-shard path stalls ~10s before
+    failing — both because that path assumes a local CP data plane a
+    control-only node structurally never has).
+
 This ADR builds directly on ADR 0020 (the admin JSON surface it renders and the
 follow-up it fulfils), ADR 0018 (the transaction state it will visualize), ADR
 0015 (the observe-only / aggregate-live discipline), and ADR 0003 (which it sits

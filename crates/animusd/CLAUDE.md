@@ -261,9 +261,26 @@ reason (see each file's own entry below).
   disabling a table's stream is a `dashboard_browser.js` Data Browser
   action instead (a per-table `UpdateTable{StreamSpecification}` toggle,
   next to that table's Indexes card), not a Streams-tab one — the same
-  reasoning that already puts create/drop table there. Shown for
-  combined/data roles, never control-only (`ROLE_TABS`) — a control-only
-  node hosts no CP data plane, so it has no stream state to show.
+  reasoning that already puts create/drop table there. **Shown on every
+  role now, including control-only** (`ROLE_TABS`) — a control-only node
+  holds the full replicated `Metadata`, so the stream list and the
+  shard-chain detail (`ListStreams`/`DescribeStream`, both pure functions of
+  `Metadata`) render truthfully there; only the live-tail poller
+  (`GetShardIterator`/`GetRecords`) needs a genuine local CP data plane and
+  degrades in-view with a note + a `consoleLink` to a live data/combined
+  node instead (verified against a real split cluster, not assumed — see
+  `dashboard_streams.js`'s own doc). **A real backend gap this surfaced,
+  deliberately left unfixed here** (small, dashboard-scoped PR; see
+  `docs/engineering-lessons.md`): `dynamo_streams::get_records_sealed` calls
+  `ClientCtx::data()` unconditionally, which **panics** (an empty/dropped
+  HTTP reply, not a JSON error) on a control-only node reached via
+  `POST /admin/data/dynamo`'s existing proxy — `ClientCtx::data()`'s own doc
+  already says this must never be reachable from a client-dispatch path;
+  this call site is the one that violates it. The open-shard path
+  (`GetShardIterator{LATEST}`/`GetRecords`) doesn't panic but stalls the
+  full `SCHEMA_COMMIT_TIMEOUT` (~10s) before failing, since a control-only
+  node's `resolve_cp_route` blind-forward fallback has no local replica to
+  derive a real leader hint from and so never chases one.
 
 ## CLI reference
 
@@ -999,7 +1016,8 @@ route below the edge through the same `ClientCtx` CP primitives.
   Streams tab (ADR 0042/0043)** lists every currently-`ENABLED` stream plus
   any `DISABLED`-but-in-grace-window one, with a shard-chain detail panel
   and a live-tail poller (see `dashboard.rs`'s own entry above for the full
-  design) — shown for combined/data roles, never control-only.
+  design) — shown on every role now, including control-only; only the
+  live-tail poller degrades there (no local CP data plane to serve it).
 - **OTel** (`otel.rs`, ADR 0027) — `init_tracing(instance_id)` from `main.rs`;
   `current_traceparent`/`set_parent_traceparent` carry W3C trace context across a
   forwarded hop (`cp_forward` injects, the receiver's `handle_client`

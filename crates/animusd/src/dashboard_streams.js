@@ -8,12 +8,24 @@
 // topology from a real `DescribeStream` call, plus a live-tail poller
 // (GetShardIterator → GetRecords, following NextShardIterator) and per-node
 // stream metric tiles. Depends on `dashboard_core.js` (STATE, $, esc, pill,
-// idSpan, humanBytes, getJSON, postJSON, SEED, loadAll).
+// idSpan, humanBytes, getJSON, postJSON, SEED, loadAll, ROLE, nodeDisplayId).
 //
 // `viewTypeLabel`/`streamArn` are also called from `dashboard_browser.js`'s
 // Data Browser Streams row (the enable/disable UI, which lives there per
 // ADR 0021 — a table's stream toggle is a table-panel action, not a
 // Streams-tab one), which is why this file loads before it.
+//
+// **Shown on every role now, including control-only** (`ROLE_TABS`,
+// `dashboard_core.js`) — a control-only node holds the full replicated
+// `Metadata`, so the stream list (`streamsList()`) and the shard-chain
+// detail (`loadStreamDescribe`/`renderShardChain`, both pure functions of
+// `Metadata`/a `DescribeStream` call) render truthfully there. Only the
+// live-tail poller degrades on a control-only node — see
+// `findDataPlaneNode`/`renderTailControls`'s own doc below for exactly why
+// and how it degrades (verified against a live split cluster, not assumed).
+// The per-node metric tiles (`renderStreamTiles`) already fan out over every
+// reachable node via `loadAll()`'s existing `STATE.nodes` — unaffected by
+// which node's own console is currently loaded.
 
 // ---- shared helpers (also used by dashboard_browser.js) ----
 
@@ -383,7 +395,37 @@ function tailShardOptions(sd) {
   return sd.Shards.map((s) => ({ id: s.ShardId, open: s.SequenceNumberRange.EndingSequenceNumber == null }));
 }
 
+// The live tail (`GetShardIterator`/`GetRecords`, both called against `SEED`
+// — this loaded page's own admin port) needs a genuine local CP data plane
+// to serve: the sealed path reads this node's own `SegmentStoreHandle`
+// (`ClientCtx::data()`, which **panics**, not errors, on a control-only
+// node — verified live: an empty-reply/dropped connection, not a JSON
+// error), and the open path forwards to the tablet's leader via
+// `resolve_cp_route`'s blind-replica fallback, which a control-only node
+// (no local replica, hence no real leader hint to chase) can only ever
+// guess at — verified live: a ~10s `SCHEMA_COMMIT_TIMEOUT` stall ending in
+// "not the leader here." Both are a genuine backend gap, not a UI
+// shortcoming — this view simply never dials either op from a control-only
+// console (`ROLE`, `dashboard_core.js`) rather than surfacing either
+// failure mode. The stream list + shard-chain detail above are unaffected:
+// `ListStreams`/`DescribeStream` are pure functions of the replicated
+// `Metadata`, so they render identically here.
+function findDataPlaneNode() {
+  return STATE.nodes.find((n) => {
+    const role = (n.config && n.config.role) || n.role;
+    return (role === "data" || role === "combined") && n.base;
+  });
+}
+
 function renderTailControls() {
+  if (ROLE === "control") {
+    const target = findDataPlaneNode();
+    const link = target
+      ? `<a href="${esc(target.base)}/admin/ui/streams" target="_blank" rel="noopener" class="link-text">open node ${esc(nodeDisplayId(target))}'s console →</a>`
+      : `<span class="muted">no data node reachable from here right now</span>`;
+    return `<div class="empty">live tail needs a local CP data plane — a control-only
+      node has none. ${link}</div>`;
+  }
   const sd = smDetail && smDetail.sd;
   const opts = tailShardOptions(sd);
   const shardSel = opts.length
