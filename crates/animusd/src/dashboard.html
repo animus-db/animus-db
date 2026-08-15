@@ -29,6 +29,7 @@
     <button class="navlink" data-tab="placement">Placement</button>
     <button class="navlink" data-tab="tablets">Tablets</button>
     <button class="navlink" data-tab="browser">Data Browser</button>
+    <button class="navlink" data-tab="streams">Streams</button>
     <button class="navlink" data-tab="storage">Storage</button>
     <button class="navlink" data-tab="node">Node</button>
     <span class="spacer"></span>
@@ -151,9 +152,18 @@
 
         <div class="browser-panel" style="margin-bottom:14px">
           <div class="browser-fields" id="br-dy-fields"></div>
-          <div class="seg-group">
-            <button id="br-dy-op-scan" class="active">Scan</button>
-            <button id="br-dy-op-query">Query</button>
+          <div id="br-dy-indexes"></div>
+          <div id="br-dy-stream"></div>
+          <div class="row" style="gap:16px">
+            <div class="seg-group">
+              <button id="br-dy-op-scan" class="active">Scan</button>
+              <button id="br-dy-op-query">Query</button>
+            </div>
+            <div class="form-field" style="min-width:170px">
+              <label>Index</label>
+              <select id="br-dy-index"><option value="">— base table —</option></select>
+            </div>
+            <span class="muted" id="br-dy-index-note"></span>
           </div>
           <div class="form-grid" id="br-dy-query-form" style="display:none">
             <div class="form-field"><label>Partition key value</label><input type="text" id="br-dy-pk-value"></div>
@@ -212,6 +222,22 @@
           </div>
           <div id="seed-status"></div>
         </div>
+      </div>
+    </section>
+
+    <section id="streams" class="view-max">
+      <div class="view-head">
+        <h1>Streams</h1>
+        <span class="muted" id="sm-summary"></span>
+      </div>
+      <div class="card"><div class="stat-tiles" id="sm-tiles"></div></div>
+      <div class="streams-layout">
+        <div class="streams-list">
+          <div class="card scroll">
+            <div id="sm-body"><div class="empty">loading…</div></div>
+          </div>
+        </div>
+        <div class="stream-detail" id="sm-detail" style="display:none"></div>
       </div>
     </section>
 
@@ -329,6 +355,7 @@
 <script src="/admin/ui/dashboard_overview.js"></script>
 <script src="/admin/ui/dashboard_placement.js"></script>
 <script src="/admin/ui/dashboard_tablets.js"></script>
+<script src="/admin/ui/dashboard_streams.js"></script>
 <script src="/admin/ui/dashboard_browser.js"></script>
 <script src="/admin/ui/dashboard_storage.js"></script>
 <script src="/admin/ui/dashboard_node.js"></script>
@@ -373,6 +400,7 @@ $("br-dy-ct-cancel").addEventListener("click", closeTableForm);
 $("br-dy-ct-submit").addEventListener("click", submitTableForm);
 $("br-dy-op-scan").addEventListener("click", () => setDynamoOp("scan"));
 $("br-dy-op-query").addEventListener("click", () => setDynamoOp("query"));
+$("br-dy-index").addEventListener("change", onDyIndexChange);
 $("br-dy-pk-value").addEventListener("input", () => { dyPkValue = $("br-dy-pk-value").value; });
 $("br-dy-sk-op").addEventListener("change", () => { dySkOp = $("br-dy-sk-op").value; });
 $("br-dy-sk-value").addEventListener("input", () => { dySkValue = $("br-dy-sk-value").value; });

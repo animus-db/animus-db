@@ -1751,6 +1751,54 @@ debugging anything that feels like it might have happened before.
   silent, hard-to-diagnose one (the symptom is "election never converges,"
   not an obvious "wrong stream" error). (`crates/animus-test/tests/
   stream_lineage_corpus.rs`, ADR 0042/0043 round-3 PR8, 2026-08-14.)
+- **A tuple-keyed (or any non-string-keyed) `BTreeMap`/`HashMap` field on a
+  type that derives plain `Serialize`/`Deserialize` and gets JSON-encoded
+  fails only at runtime, and only once the map is actually non-empty**:
+  `serde_json`'s `MapKeySerializer` rejects any non-string map key
+  (`Error("key must be a string")`), but an *empty* map serializes fine (no
+  keys to reject), and `cargo build`/`clippy`/`fmt` all see a perfectly
+  ordinary `#[derive(Serialize, Deserialize)]` and say nothing. This let
+  `animus_control::Metadata::stream_shards: BTreeMap<(TabletId, u64),
+  StreamShardRow>` (ADR 0042/0043's segment catalog) ship, merge, and pass
+  every gate untouched for an entire round of streams work, because every
+  existing test that round-tripped a whole `Metadata` through JSON
+  (`meta::tests::metadata_round_trips_with_the_remove_member_variant_in_
+  scope` and its siblings) happened to leave `stream_shards` empty. The bug
+  was live on `main` from the moment the field was added, waiting for the
+  first real seal anywhere in a running cluster to blank `animusd`'s whole
+  `GET /admin/status` (the handler swallowed the encode error into
+  `Value::Null`) and panic the serving connection for any wire caller of
+  `ClientResponse::Status`/`WatchMetadata`'s full-clone fallback
+  (`write_frame` `.expect()`s the encode). The generalizable rule: a "does
+  this type round-trip through JSON" test must populate *every* collection
+  field it owns, not just exercise one representative command path; an
+  empty collection cannot exercise a map-key encoding rule at all, no
+  matter how many other fields the test fills in. The fix
+  (`#[serde(with = "stream_shards_codec")]`, encoding the map as a flat
+  `Vec<{tablet, epoch, ...row fields}>` instead) keeps the in-memory
+  `BTreeMap` untouched, so every `.get`/`.insert`/`.range` call site in
+  `animus-control` is unaffected. See `crates/animus-control/src/meta.rs`'s
+  `stream_shards` field doc and `crates/animus-control/CLAUDE.md`'s own
+  entry. (2026-08-14.)
+- **An integration test that greps a served JS asset for an exact literal
+  (`core_js.contains(r#"data: [...]"#)`) is asserting the string, not the
+  behavior it happens to encode today** — it goes red the instant a later
+  change legitimately edits that literal, with no way to tell "this broke
+  the gating logic" apart from "this is exactly the intended new tab list"
+  from the failure alone; the fix is always to update the literal to match
+  the new intended list, never to treat the failure as a signal something
+  is wrong. Hit adding a Streams tab to `dashboard_core.js`'s `ROLE_TABS`
+  (ADR 0042/0043's Console follow-up): `dashboard_endpoint.rs`'s
+  `dashboard_role_gating_split_deployment` asserted the data role's tab
+  list was exactly `["node", "browser"]`, so appending `"streams"` to that
+  array failed the test even though the new list was exactly the intended
+  change. Not worth restructuring away (a substring match still proves the
+  asset actually ships the gating logic, which is the property ADR 0021 §6
+  wants — "the JSON/JS it renders is the tested JSON/JS," not a new
+  correctness proof) — just keep it front-of-mind when grepping a
+  gate-failure diff against a change that touches one of these string
+  literals: check whether the assertion's own expected string needs
+  updating before assuming the change broke something. (2026-08-14.)
 
 ### Code patterns
 - **Derived numbering from "the highest currently-present entry" is only
@@ -4650,6 +4698,30 @@ debugging anything that feels like it might have happened before.
   document you're extending. (`crates/animus-control/src/meta.rs::
   CreateTableSchema`; ADR 0041 §1's as-built correction, ADR 0042/0043
   round-3 streams salvage, 2026-08-14.)
+- **A same-listener "dispatch" fork between two sibling services is a gate
+  every shortcut caller must go through, not just the real edge.** ADR
+  0042 §3 put the DynamoDB item API and the DynamoDB Streams read API on
+  one listener, forked by `X-Amz-Target` prefix in `dynamo::dispatch`. The
+  admin dashboard's write proxy (`POST /admin/data/dynamo` →
+  `action_data_dynamo`) reused the item API's own decode+run helper
+  (`dynamo::execute`) directly — a reasonable-looking shortcut at the time,
+  since Streams didn't exist yet — but never went through `dispatch`
+  itself. Once Streams landed one layer up, the proxy could build a
+  perfectly well-formed `DynamoDBStreams_20120810.*` target and it would
+  still 400 as "unknown operation," because it never reached the code that
+  checks the prefix. Nothing caught this: the fork is a plain `if` in one
+  function, not a match arm on an enum clippy/exhaustiveness can flag, and
+  every dispatch-side test call went through the real edge, never the
+  admin route. The general shape to watch for: when a request can enter a
+  multi-service surface through more than one caller (a real wire edge and
+  an in-process admin/test shortcut alike), extract the fork itself into
+  its own named function and have *every* entry point call that function
+  — never let a shortcut call the fork's *callee* on the assumption "this
+  target will always be item-API." Fixed by factoring the `if target.
+  starts_with(..)` fork out of `dynamo::dispatch` into `dynamo::
+  execute_routed`, then pointing both the edge and the admin proxy at it.
+  (`crates/animusd/src/dynamo.rs::execute_routed`; `crates/animusd/src/
+  admin.rs::action_data_dynamo`; ADR 0042 §3, 2026-08-14.)
 
 ### Parallel-agent orchestration
 - **A stacked series' final "docs/ADR finalization" PR must treat the stack's

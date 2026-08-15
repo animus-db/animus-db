@@ -348,9 +348,9 @@ async fn dashboard_role_gating_split_deployment() {
         assert!(
             core_js.contains("ROLE_TABS")
                 && core_js.contains("applyRoleGating")
-                && core_js.contains(r#"data: ["node", "browser"]"#),
+                && core_js.contains(r#"data: ["node", "browser", "streams"]"#),
             "dashboard_core.js defines the per-role tab gating, including the \
-             data role's node-first tab list: {core_js}"
+             data role's node-first tab list (now with Streams, ADR 0042/0043): {core_js}"
         );
 
         // ---- /admin/config's role differs across the split -----------------

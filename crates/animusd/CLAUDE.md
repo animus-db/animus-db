@@ -243,9 +243,27 @@ reason (see each file's own entry below).
 - **`otel.rs`** — OTLP/HTTP distributed-tracing seam (ADR 0027); opt-in, no-op
   unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Scoped to this crate only.
 - **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_{core,overview,
-  placement,tablets,browser,storage,node}.js`** — the "AnimusDB Console" SPA
-  (ADR 0021), `include_str!`'d and served as distinct static assets. Vanilla JS,
-  no bundler/CDN. Tabs are role-gated client-side (ADR 0035 PR7).
+  placement,tablets,streams,browser,storage,node}.js`** — the "AnimusDB Console"
+  SPA (ADR 0021), `include_str!`'d and served as distinct static assets. Vanilla
+  JS, no bundler/CDN. Tabs are role-gated client-side (ADR 0035 PR7).
+  `dashboard_streams.js` (ADR 0042/0043) is the Streams view: a list of
+  currently-`ENABLED` streams (`status.schemas.tables[t].stream`) plus any
+  `DISABLED`-but-in-grace-window one (a `status.stream_shards` row whose
+  `(table, label)` no longer matches the table's current schema stream,
+  F12-b), per-node stream metric tiles (the Console's first `/admin/metrics`
+  consumer — `dashboard_core.js`'s `loadAll()` fans it out alongside
+  `config`/`raft`/`raftkv`/`health`), and a detail panel merging the segment
+  catalog with a live `DescribeStream` call into a per-tablet shard chain,
+  plus a live-tail poller (`GetShardIterator`/`GetRecords`, following
+  `NextShardIterator`) — all through `POST /admin/data/dynamo`'s existing
+  proxy (bare `ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords`
+  op names, `action_data_dynamo`'s `STREAMS_OPS` resolution). Enabling/
+  disabling a table's stream is a `dashboard_browser.js` Data Browser
+  action instead (a per-table `UpdateTable{StreamSpecification}` toggle,
+  next to that table's Indexes card), not a Streams-tab one — the same
+  reasoning that already puts create/drop table there. Shown for
+  combined/data roles, never control-only (`ROLE_TABS`) — a control-only
+  node hosts no CP data plane, so it has no stream state to show.
 
 ## CLI reference
 
@@ -910,7 +928,16 @@ route below the edge through the same `ClientCtx` CP primitives.
   interface.** The `animus admin` CLI consumes it. The bulk seeder
   (`action_data_seed`) writes real **DynamoDB items** — key/value bytes
   built exactly as the DynamoDB edge's `PutItem` would, so seeded rows read
-  back through `GetItem`/`Query`/`Scan`. `key_display`/`parse_key_display`
+  back through `GetItem`/`Query`/`Scan`. `POST /admin/data/dynamo`
+  (`action_data_dynamo`) reaches **both** services on the DynamoDB
+  listener — the item API and, for `ListStreams`/`DescribeStream`/
+  `GetShardIterator`/`GetRecords` (bare op name or `DynamoDBStreams_
+  20120810.`-qualified), the Streams read API (ADR 0042 §3) — by resolving
+  `op` to a target and calling `dynamo::execute_routed`, the same
+  prefix-fork function `dynamo::dispatch` itself uses; **never** call
+  `dynamo::execute` from here directly, which skips that fork entirely
+  (see `docs/engineering-lessons.md`'s "same-listener dispatch fork" entry
+  for the bug this shortcut caused before the fix). `key_display`/`parse_key_display`
   render a binary partition token as unpadded base64url; a plain-client key
   is verbatim/printable. `/admin/peers`'s `peers: [{admin, role}, ...]`
   field carries each node's deployment role straight off replicated
@@ -956,7 +983,23 @@ route below the edge through the same `ClientCtx` CP primitives.
   `forming`) only degrades on an actual redundancy/quorum loss; a
   split-child or freshly-provisioned tablet forming its Raft group with
   every assigned replica's node alive renders as a neutral `forming` pill,
-  escalating to degraded only if stuck past 60s.
+  escalating to degraded only if stuck past 60s. **Secondary indexes (ADR
+  0041)** surface in the Data Browser (an Indexes card off the selected
+  table's `schema.indexes`, plus an Index selector that adds `IndexName`
+  to the Scan/Query payload), and a GSI's hidden `<base>$<index>` table
+  is grouped under its base in the Tablets and Overview views
+  (`splitHiddenTable`, `dashboard_core.js`) rather than shown as an
+  unrelated table. **That hidden table has NO entry of its own in
+  `status.schemas.tables`** — verified against a live cluster; it exists
+  only as ordinary rows in `status.tablets[*].table` (and only once the
+  drain lazily provisions its first tablet, i.e. after the first write to
+  an indexed attribute) — so any dashboard code deriving "which tables
+  exist" from the schema catalog naturally already excludes it, and code
+  that needs to know about it must scan the tablet map instead. **A
+  Streams tab (ADR 0042/0043)** lists every currently-`ENABLED` stream plus
+  any `DISABLED`-but-in-grace-window one, with a shard-chain detail panel
+  and a live-tail poller (see `dashboard.rs`'s own entry above for the full
+  design) — shown for combined/data roles, never control-only.
 - **OTel** (`otel.rs`, ADR 0027) — `init_tracing(instance_id)` from `main.rs`;
   `current_traceparent`/`set_parent_traceparent` carry W3C trace context across a
   forwarded hop (`cp_forward` injects, the receiver's `handle_client`

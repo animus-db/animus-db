@@ -1,11 +1,11 @@
 "use strict";
 // Shared state, fetch helpers, formatting utilities, theme, and tab routing
 // for the AnimusDB Console. `dashboard_overview.js`, `dashboard_placement.js`,
-// `dashboard_tablets.js`, `dashboard_browser.js`, and `dashboard_storage.js`
-// load after this file and call into it (STATE, $, esc, getJSON, postJSON,
+// `dashboard_tablets.js`, `dashboard_streams.js`, `dashboard_browser.js`, and
+// `dashboard_storage.js` load after this file and call into it (STATE, $, esc, getJSON, postJSON,
 // pill, consoleLink, bytes, humanBytes, tokenBound, b64url, nodeIdOf, cpGroupsByTablet,
 // autoSplitThresholds, tabletStatus, worstTabletStatus, statusDotClass, computeHealth,
-// activateTab, gotoStorage);
+// activateTab, gotoStorage, splitHiddenTable);
 // nothing here calls into them except `render()`, the single per-refresh
 // entry point every view's render function hangs off of.
 const SEED = window.location.origin;
@@ -180,6 +180,20 @@ function consoleLink(base, id) {
 }
 
 // ---- shared data-derivation helpers (used by more than one view) ----
+
+// A GSI is materialized as a hidden table named `<base>$<index>` (ADR
+// 0041) — its own ordinary entry in `status.schemas.tables` and
+// `status.tablets[*].table`, with no back-pointer to its base. User table
+// names can't contain `$` (enforced at create), so splitting on the first
+// one is unambiguous. Returns `null` for an ordinary (non-hidden) table
+// name. LSIs never get a hidden table (they're kind scopes inside the base
+// table's own tablets), so this only ever matches a GSI. The one rule
+// every view (`browser`/`tablets`/`overview`) derives its grouping from, so
+// they can't disagree on what counts as "hidden."
+function splitHiddenTable(name) {
+  const i = name.indexOf("$");
+  return i < 0 ? null : { base: name.slice(0, i), index: name.slice(i + 1) };
+}
 
 function nodeById(id) {
   return STATE.nodes.find((n) => n.ok && n.config && n.config.node_id === id);
@@ -436,13 +450,19 @@ async function loadAll() {
     const base = baseFor(addr);
     const node = { addr, base, ok: false, role: roleByAddr[addr] };
     try {
-      const [config, raft, raftkv, health] = await Promise.all([
+      // `metrics` (ADR 0021 Streams tab, the dashboard's first `/admin/metrics`
+      // consumer) fans out alongside the other per-node views already fetched
+      // here — `.catch(() => null)` like `raft`/`raftkv`/`health`, so one
+      // unreachable/older node degrades to "no metrics for this node" rather
+      // than failing the whole fan-out.
+      const [config, raft, raftkv, health, metrics] = await Promise.all([
         getJSON(base, "/admin/config"),
         getJSON(base, "/admin/raft").catch(() => null),
         getJSON(base, "/admin/raftkv").catch(() => null),
         getJSON(base, "/admin/health").catch(() => null),
+        getJSON(base, "/admin/metrics").catch(() => null),
       ]);
-      Object.assign(node, { config, raft, raftkv, health, ok: true });
+      Object.assign(node, { config, raft, raftkv, health, metrics, ok: true });
     } catch (e) {
       node.error = String(e);
     }
@@ -461,6 +481,7 @@ function render() {
   renderOverview();
   renderPlacement();
   renderTablets();
+  renderStreams();
   renderStorageSelectors();
   renderBrowserTables();
   renderSeedTables();
@@ -491,10 +512,15 @@ function render() {
 // role's default tab (`tabFromPath`'s fallback, `activateTab`'s
 // role-mismatch fallback below) — control/combined default to "overview"
 // (unchanged), data defaults to "node".
+// "streams" is data-plane UI (a stream's hot tail is a tablet's own
+// KIND_CHANGE log, ADR 0042 §1) — shown for combined and data roles, never
+// control: a control-only node hosts no CP data plane at all, so it has no
+// stream state to show (the segment janitor still runs there, ADR 0043 §A9,
+// but that's a background reclaim loop, not something to browse per-stream).
 const ROLE_TABS = {
   control: ["overview", "placement", "tablets", "browser", "storage"],
-  combined: ["overview", "placement", "tablets", "browser", "storage", "node"],
-  data: ["node", "browser"],
+  combined: ["overview", "placement", "tablets", "browser", "streams", "storage", "node"],
+  data: ["node", "browser", "streams"],
 };
 // The currently-visible tab set — starts as the superset (`combined`) until
 // `loadSelf()` resolves this node's own role; see `ROLE`'s doc above.

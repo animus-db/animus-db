@@ -282,8 +282,81 @@ pub struct Metadata {
     /// [`MetaCommand::ExpireStreamShards`] (the janitor's mark-then-remove
     /// reclaim, ADR 0043 §A9). `#[serde(default)]` keeps pre-streams
     /// snapshots loading (empty map).
-    #[serde(default)]
+    ///
+    /// **Wire shape (`#[serde(with = "stream_shards_codec")]`)**: encoded as
+    /// a flat JSON array of `{tablet, epoch, ...StreamShardRow fields}`
+    /// objects, never as a JSON object/map — `serde_json`'s
+    /// `MapKeySerializer` rejects any non-string map key outright
+    /// (`Error("key must be a string")`), so the natural
+    /// `BTreeMap<(TabletId, u64), _>` representation cannot serialize once
+    /// this map is non-empty. This bit every whole-`Metadata` JSON call site
+    /// the moment a real stream shard sealed: `animusd`'s `GET
+    /// /admin/status` (swallowed the error, silently returned `null`) and
+    /// its `write_frame`/`ClientResponse::Status` wire path (panicked the
+    /// serving connection, since that call site `expect()`s the encode to
+    /// succeed) — see `docs/engineering-lessons.md`. The flat-array shape is
+    /// also what a future admin/dashboard view over the raw catalog wants
+    /// directly, so it doubles as that.
+    #[serde(default, with = "stream_shards_codec")]
     pub stream_shards: BTreeMap<(TabletId, u64), StreamShardRow>,
+}
+
+/// Gives [`Metadata::stream_shards`] a `serde_json`-safe wire shape — see
+/// that field's own doc for why the plain `BTreeMap<(TabletId, u64), _>`
+/// representation cannot round-trip through JSON. Encodes/decodes a flat
+/// `Vec` of `{tablet, epoch, ...StreamShardRow fields}` objects instead,
+/// via `#[serde(flatten)]` on borrowed/owned `StreamShardRow` data — no
+/// intermediate duplicate-field struct to keep in sync with
+/// [`StreamShardRow`] itself.
+mod stream_shards_codec {
+    use std::collections::BTreeMap;
+
+    use animus_tablet::TabletId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::StreamShardRow;
+
+    /// The serialize-side entry shape: borrows the row so a full
+    /// `Metadata::serialize` never clones every catalog row just to encode
+    /// it.
+    #[derive(Serialize)]
+    struct EntryRef<'a> {
+        tablet: TabletId,
+        epoch: u64,
+        #[serde(flatten)]
+        row: &'a StreamShardRow,
+    }
+
+    /// The deserialize-side entry shape: owns the row, since decoding
+    /// necessarily produces owned data.
+    #[derive(Deserialize)]
+    struct Entry {
+        tablet: TabletId,
+        epoch: u64,
+        #[serde(flatten)]
+        row: StreamShardRow,
+    }
+
+    pub fn serialize<S: Serializer>(
+        map: &BTreeMap<(TabletId, u64), StreamShardRow>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let entries: Vec<EntryRef<'_>> = map
+            .iter()
+            .map(|(&(tablet, epoch), row)| EntryRef { tablet, epoch, row })
+            .collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<(TabletId, u64), StreamShardRow>, D::Error> {
+        let entries = Vec::<Entry>::deserialize(deserializer)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| ((entry.tablet, entry.epoch), entry.row))
+            .collect())
+    }
 }
 
 /// A sealed stream shard's catalog row (ADR 0042 §3, ADR 0043 §A3/§A8) — the
@@ -3142,6 +3215,33 @@ mod tests {
             status: NodeStatus::Active,
         });
         let value = serde_json::to_value(&m).expect("metadata serializes");
+        let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
+        assert_eq!(decoded, m);
+    }
+
+    /// `Metadata::stream_shards` is keyed by `(TabletId, u64)` — serde_json's
+    /// `MapKeySerializer` rejects any non-string map key, so once a real
+    /// stream shard seals (the map becomes non-empty), a plain
+    /// `serde_json::to_value(&metadata)` fails outright — silently returning
+    /// `Value::Null` at every call site that swallows the error
+    /// (`animusd`'s `GET /admin/status`) or panicking at every call site that
+    /// unwraps it (`animusd`'s wire `write_frame`). This is the reproduction
+    /// this crate owns: `Metadata` must round-trip through `serde_json`
+    /// regardless of which collection is populated.
+    #[test]
+    fn metadata_round_trips_through_json_with_populated_stream_shards() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        assert_eq!(
+            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            !m.stream_shards.is_empty(),
+            "test premise: the catalog must actually be populated"
+        );
+
+        let value = serde_json::to_value(&m).expect("metadata serializes with stream_shards");
         let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
         assert_eq!(decoded, m);
     }

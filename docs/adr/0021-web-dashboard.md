@@ -1,7 +1,7 @@
 # ADR 0021 — Web dashboard over the admin JSON surface (observe + operator actions)
 
-- **Status:** Accepted (implemented — follow-ups 1–4, 7–8 shipped; 5 awaits ADR 0018, 6 on demand)
-- **Date:** 2026-08-04 (status updated 2026-08-06 — follow-up 8, the "AnimusDB Console" IA redesign)
+- **Status:** Accepted (implemented — follow-ups 1–4, 7–9 shipped; 5 awaits ADR 0018, 6 on demand)
+- **Date:** 2026-08-04 (status updated 2026-08-14 — follow-up 9, the Streams tab)
 
 ## Context
 
@@ -347,6 +347,26 @@ client-side SPA).
    way — the mockup's Google Fonts (`Inter`/`IBM Plex Mono`) links are not
    used; the console approximates them with system font stacks instead. No
    `/admin/*` JSON route changed; this remains a frontend-only follow-up.
+
+9. ✅ **A Streams tab (ADR 0042/0043).** A sixth sidebar view (data-plane
+   deployments only — combined/data, never control-only, since a
+   control-only node hosts no CP data plane): a list of every currently
+   `ENABLED` DynamoDB Stream plus any `DISABLED`-but-in-grace-window one
+   (F12-b), per-node stream metric tiles (the console's first
+   `/admin/metrics` consumer), and a detail panel showing the shard chain
+   — the segment catalog (`status.stream_shards`) merged with a live
+   `DescribeStream` call, grouped per tablet with each epoch's sequence
+   range/record count/seal time/replicas — plus a live-tail poller
+   (`GetShardIterator`/`GetRecords`, following `NextShardIterator`), all
+   through the existing `POST /admin/data/dynamo` proxy. Health rendering
+   follows §7 exactly: an open/unsealed shard is a neutral state, never a
+   warning; the only warn signals are a real repair backlog, a trim-blocked
+   node, or a seal failure. Enabling/disabling a table's stream is a
+   **Data Browser** action instead (a per-table row next to that table's
+   Indexes card), the same reasoning that already puts create/drop table
+   there rather than in a dedicated tab. No new `/admin/*` JSON route —
+   this rides the existing streams read API (ADR 0042 §3) through the
+   admin proxy the same way the Data Browser already reaches the item API.
 
 This ADR builds directly on ADR 0020 (the admin JSON surface it renders and the
 follow-up it fulfils), ADR 0018 (the transaction state it will visualize), ADR

@@ -350,22 +350,33 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
 /// **Same listener, two services (ADR 0042 §3's decided same-listener
 /// F-fork)**: a `DynamoDBStreams_20120810.*` target routes to
 /// `dynamo_streams::execute`; everything else (the `DynamoDB_20120810.*`
-/// item API this module owns) goes through [`execute`] unchanged.
+/// item API this module owns) goes through [`execute`] unchanged. Delegates
+/// to [`execute_routed`], the fork's single implementation.
 async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String) {
-    if request
-        .target
-        .starts_with(animus_dynamo::streams_wire::TARGET_PREFIX)
-    {
-        crate::dynamo_streams::execute(ctx, &request.target, &request.body).await
+    execute_routed(ctx, &request.target, &request.body).await
+}
+
+/// Route a fully-qualified `X-Amz-Target` to whichever of the two services on
+/// this listener owns it, and run it: a `DynamoDBStreams_20120810.*` target
+/// goes to [`crate::dynamo_streams::execute`] (the Streams read API, ADR 0042
+/// §3), everything else to [`execute`] (the `DynamoDB_20120810.*` item API).
+/// The **single** place this fork is expressed — shared by the real edge's
+/// [`dispatch`] and the admin dashboard's write/read proxy (`POST
+/// /admin/data/dynamo`, ADR 0021), so both resolve a target identically.
+pub(crate) async fn execute_routed(ctx: &ClientCtx, target: &str, body: &[u8]) -> (u16, String) {
+    if target.starts_with(animus_dynamo::streams_wire::TARGET_PREFIX) {
+        crate::dynamo_streams::execute(ctx, target, body).await
     } else {
-        execute(ctx, &request.target, &request.body).await
+        execute(ctx, target, body).await
     }
 }
 
-/// Decode + run a DynamoDB operation from its `X-Amz-Target` value and JSON body,
-/// returning `(http status, json body)`. Shared by the DynamoDB HTTP edge (above)
-/// and the admin dashboard's write proxy (`POST /admin/data/dynamo`, ADR 0021), so
-/// both go through the identical decode + `run_operation` path.
+/// Decode + run a DynamoDB **item-API** operation from its `X-Amz-Target`
+/// value and JSON body, returning `(http status, json body)`. Called directly
+/// only where the target is already known to be item-API (this module's
+/// `dispatch`, via [`execute_routed`]); everything else should go through
+/// [`execute_routed`] so a `DynamoDBStreams_20120810.*` target isn't handed to
+/// the wrong decoder.
 pub(crate) async fn execute(ctx: &ClientCtx, target: &str, body: &[u8]) -> (u16, String) {
     match wire::decode_request(target, body) {
         Ok(op) => match run_operation(ctx, op).await {

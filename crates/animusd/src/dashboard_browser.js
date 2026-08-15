@@ -5,17 +5,37 @@
 // writes real DynamoDB items, hence lives here rather than in Storage) — all
 // against the real /admin/data/{cql,dynamo,drop-table,seed} endpoints, not
 // the design mockup's fake in-memory item store. Depends on
-// `dashboard_core.js` (STATE, $, esc, pill, getJSON, postJSON, loadAll).
+// `dashboard_core.js` (STATE, $, esc, pill, getJSON, postJSON, loadAll,
+// splitHiddenTable) and `dashboard_streams.js` (viewTypeLabel — the Stream
+// row's enable/disable UI below lives here per ADR 0021, since a table's
+// stream toggle is a table-panel action, not a Streams-tab one).
 
 let brProtocol = "cql";
 
 // ---- DynamoDB: schema helpers (shared by Scan/Query/item forms) ----
+// Excludes a GSI's own hidden `<base>$<index>` materialization table
+// (`splitHiddenTable`, dashboard_core.js) — it's an implementation detail,
+// not a table a user picks to browse/seed directly; reads against it go
+// through the base table's Index selector instead (below).
 function dynamoTables() {
   const t = STATE.status && STATE.status.schemas && STATE.status.schemas.tables;
   if (!t) return {};
   const out = {};
-  for (const k of Object.keys(t)) if (!k.includes(".")) out[k] = t[k];
+  for (const k of Object.keys(t)) if (!k.includes(".") && !splitHiddenTable(k)) out[k] = t[k];
   return out;
+}
+// "GSI" / "LSI" — the ADR 0041 `IndexKind` label as-serialized ("Global"/
+// "Local", verified against `animus-control::schema::IndexKind`'s plain
+// serde derive — no `rename_all`, so the enum tag rides as-is).
+function indexKindLabel(kind) { return kind === "Global" ? "GSI" : "LSI"; }
+// The ADR 0041 `IndexProjection`'s three shapes, as serialized: unit
+// variants ride as their bare tag string; `Include` rides as `{Include:
+// [...]}` — mirrors `IndexProjection` in animus-control::schema exactly.
+function projectionLabel(p) {
+  if (p === "All") return "ALL";
+  if (p === "KeysOnly") return "KEYS_ONLY";
+  if (p && p.Include) return `INCLUDE (${p.Include.length})`;
+  return "—";
 }
 function dynColType(schema, name) {
   const col = (schema.columns || []).find((c) => c.name === name);
@@ -65,6 +85,10 @@ let dySkOp = "=";
 let dySkValue = "";
 let dyFilterAttr = "";
 let dyFilterValue = "";
+// The Scan/Query Index selector's own state ("" = base table). Distinct
+// from `dySelectedIndex` below (a *result row* index, unrelated concept —
+// unfortunate name collision from the pre-existing code, kept as-is here).
+let dyIndexName = "";
 let dySelectedIndex = null;
 let dyResultItems = []; // raw AttributeValue-map items from the last successful Scan/Query
 let dyResultSummary = "";
@@ -103,6 +127,7 @@ function onDyTableChange() {
 // (Scan with no filter) — matching "picking a table shows you its data".
 function dynOnTable() {
   dyOp = "scan"; dyPkValue = ""; dySkValue = ""; dyFilterAttr = ""; dyFilterValue = "";
+  dyIndexName = ""; // a previously selected table's index name can't carry over
   dySelectedIndex = null; dyResultItems = []; dyResultError = null;
   closeItemForm();
   renderDynamoFields();
@@ -110,15 +135,148 @@ function dynOnTable() {
   if (dyTable) runDynamoOp(); else renderDynamoResults();
 }
 
+// The currently-selected index's own `IndexDef` (ADR 0041), or `null` for
+// the base table. Attribute *types* are always read off the base table's
+// typed columns (`dynColType`, below) — an index has no typed columns of
+// its own, only key attribute *names*.
+function activeIndexDef(schema) {
+  return (schema && dyIndexName) ? (schema.indexes || []).find((i) => i.name === dyIndexName) : null;
+}
+// Which attributes a Scan/Query keys on right now: the base table's own
+// partition/sort key, or — with an index selected — that index's own hash/
+// sort attribute.
+function activeKeyNames(schema) {
+  const idx = activeIndexDef(schema);
+  if (!idx) return dynKeyNames(schema);
+  return idx.sort_attribute ? [idx.hash_attribute, idx.sort_attribute] : [idx.hash_attribute];
+}
+
 function renderDynamoFields() {
   const schema = dynamoTables()[dyTable];
+  const idx = activeIndexDef(schema);
+  const [hashName, sortName] = schema ? activeKeyNames(schema) : [];
   $("br-dy-fields").innerHTML = !schema ? "" : `
-    <div class="field"><div class="k">Partition key</div><div class="v">${esc(schema.partition_key || "—")} <span class="muted">(${esc(dynColType(schema, schema.partition_key))})</span></div></div>
-    ${schema.clustering_keys && schema.clustering_keys[0]
-      ? `<div class="field"><div class="k">Sort key</div><div class="v">${esc(schema.clustering_keys[0])} <span class="muted">(${esc(dynColType(schema, schema.clustering_keys[0]))})</span></div></div>`
+    <div class="field"><div class="k">${idx ? "Index hash key" : "Partition key"}</div><div class="v">${esc(hashName || "—")} <span class="muted">(${esc(dynColType(schema, hashName))})</span></div></div>
+    ${sortName
+      ? `<div class="field"><div class="k">${idx ? "Index sort key" : "Sort key"}</div><div class="v">${esc(sortName)} <span class="muted">(${esc(dynColType(schema, sortName))})</span></div></div>`
       : ""}`;
-  const hasSk = !!(schema && schema.clustering_keys && schema.clustering_keys[0]);
-  $("br-dy-query-sk-group").style.display = hasSk ? "flex" : "none";
+  $("br-dy-query-sk-group").style.display = sortName ? "flex" : "none";
+  renderIndexSelector(schema);
+  renderIndexesSection(schema);
+  renderStreamRow(schema);
+}
+
+// ---- DynamoDB Streams: enable/disable (ADR 0042/0043) ----
+// A table's stream toggle lives here, in the Data Browser's own table panel,
+// not the Streams tab (`dashboard_streams.js`) — the Streams tab is a
+// cluster-wide *observability* view over every stream; enabling/disabling
+// one is a per-table action, the same reasoning that already puts
+// create/drop table here rather than there.
+const STREAM_VIEW_TYPES = ["NEW_AND_OLD_IMAGES", "NEW_IMAGE", "OLD_IMAGE", "KEYS_ONLY"];
+
+function renderStreamRow(schema) {
+  const el = $("br-dy-stream");
+  if (!schema) { el.innerHTML = ""; return; }
+  const stream = schema.stream;
+  if (stream) {
+    el.innerHTML = `<div class="card scroll" style="margin-top:2px">
+      <h2>Stream</h2>
+      <div class="row" style="justify-content:space-between">
+        <div class="row">${pill("ok", "ENABLED")}<span class="mono">${esc(viewTypeLabel(stream.view_type))}</span></div>
+        <div class="row"><span class="muted" id="br-dy-stream-msg"></span><button class="danger-text" id="br-dy-stream-disable">Disable</button></div>
+      </div>
+    </div>`;
+    $("br-dy-stream-disable").addEventListener("click", disableStream);
+  } else {
+    el.innerHTML = `<div class="card scroll" style="margin-top:2px">
+      <h2>Stream</h2>
+      <div class="row" style="justify-content:space-between">
+        <span class="muted">no stream enabled</span>
+        <div class="row">
+          <span class="muted" id="br-dy-stream-msg"></span>
+          <select id="br-dy-stream-vt">${STREAM_VIEW_TYPES.map((v) => `<option value="${v}">${v}</option>`).join("")}</select>
+          <button id="br-dy-stream-enable">Enable</button>
+        </div>
+      </div>
+    </div>`;
+    $("br-dy-stream-enable").addEventListener("click", enableStream);
+  }
+}
+
+async function enableStream() {
+  const table = dyTable;
+  const viewType = $("br-dy-stream-vt").value;
+  if (!window.confirm(`Enable a DynamoDB Stream on “${table}” (view type ${viewType})? Only writes made after this point will appear in it.`)) return;
+  const { status, body } = await postJSON(SEED, "/admin/data/dynamo", {
+    op: "UpdateTable",
+    payload: { TableName: table, StreamSpecification: { StreamEnabled: true, StreamViewType: viewType } },
+  });
+  if (status >= 300) {
+    const msg = $("br-dy-stream-msg");
+    if (msg) msg.innerHTML = `<span class="err-line">${esc((body && body.message) || `HTTP ${status}`)}</span>`;
+    return;
+  }
+  await loadAll();
+}
+
+async function disableStream() {
+  const table = dyTable;
+  if (!window.confirm(`Disable “${table}”'s stream? It stays listed and readable until its retention window expires (F12-b's grace window) — this does not delete it immediately.`)) return;
+  const { status, body } = await postJSON(SEED, "/admin/data/dynamo", {
+    op: "UpdateTable",
+    payload: { TableName: table, StreamSpecification: { StreamEnabled: false } },
+  });
+  if (status >= 300) {
+    const msg = $("br-dy-stream-msg");
+    if (msg) msg.innerHTML = `<span class="err-line">${esc((body && body.message) || `HTTP ${status}`)}</span>`;
+    return;
+  }
+  await loadAll();
+}
+
+// The Scan/Query Index selector (ADR 0041) — "— base table —" plus one
+// option per declared secondary index; picking one adds `IndexName` to the
+// Scan/Query payload sent to `POST /admin/data/dynamo` (see
+// `buildQueryPayload`/`runDynamoOp` below).
+function renderIndexSelector(schema) {
+  const sel = $("br-dy-index");
+  const indexes = (schema && schema.indexes) || [];
+  if (!indexes.some((i) => i.name === dyIndexName)) dyIndexName = "";
+  sel.innerHTML = `<option value="">— base table —</option>`
+    + indexes.map((i) => `<option value="${esc(i.name)}"${i.name === dyIndexName ? " selected" : ""}>${esc(i.name)} (${indexKindLabel(i.kind)})</option>`).join("");
+  sel.value = dyIndexName;
+  sel.disabled = !indexes.length;
+  // GSI reads are DynamoDB's own eventually-consistent contract (the drain
+  // materializes asynchronously); an LSI stays strongly consistent, so the
+  // note only ever fires for a Global index.
+  const idx = activeIndexDef(schema);
+  $("br-dy-index-note").textContent = idx && idx.kind === "Global" ? "eventually consistent (GSI)" : "";
+}
+function onDyIndexChange() {
+  dyIndexName = $("br-dy-index").value;
+  renderDynamoFields();
+  runDynamoOp();
+}
+
+// The table's declared secondary indexes (ADR 0041): name, GSI/LSI, key
+// schema, projection — ground-truth-only, rendered straight off the
+// replicated catalog with nothing inferred or faked.
+function renderIndexesSection(schema) {
+  const indexes = (schema && schema.indexes) || [];
+  const el = $("br-dy-indexes");
+  if (!indexes.length) { el.innerHTML = ""; return; }
+  const rows = indexes.map((i) => `<tr>
+      <td class="mono">${esc(i.name)}</td>
+      <td>${pill("forming", indexKindLabel(i.kind))}</td>
+      <td class="mono">${esc(i.hash_attribute)}</td>
+      <td class="mono">${i.sort_attribute ? esc(i.sort_attribute) : `<span class="muted">—</span>`}</td>
+      <td>${esc(projectionLabel(i.projection))}</td>
+    </tr>`).join("");
+  el.innerHTML = `<div class="card scroll" style="margin-top:2px">
+    <h2>Indexes</h2>
+    <table><thead><tr><th>Name</th><th>Kind</th><th>Hash key</th><th>Sort key</th><th>Projection</th></tr></thead>
+    <tbody>${rows}</tbody></table>
+  </div>`;
 }
 
 function setDynamoOp(op) {
@@ -131,11 +289,13 @@ function setDynamoOp(op) {
 
 // `pk = :pk [AND sk = :sk | AND sk BETWEEN :lo AND :hi | AND begins_with(sk, :sk)]`
 // — the exact grammar animus_dynamo's Query decoder supports (wire.rs).
+// `pk`/`sk` are the *base table's* key when no index is selected, or the
+// selected index's own hash/sort attribute (`activeKeyNames`, ADR 0041) —
+// `IndexName` rides along in the payload whenever one is.
 function buildQueryPayload(schema) {
-  const pk = schema.partition_key;
+  const [pk, sk] = activeKeyNames(schema);
   let expr = `${pk} = :pk`;
   const values = { ":pk": attrValue({ type: dynColType(schema, pk), value: dyPkValue }) };
-  const sk = schema.clustering_keys && schema.clustering_keys[0];
   if (sk && dySkValue.trim()) {
     const skType = dynColType(schema, sk);
     if (dySkOp === "begins_with") {
@@ -151,7 +311,9 @@ function buildQueryPayload(schema) {
       values[":sk"] = attrValue({ type: skType, value: dySkValue });
     }
   }
-  return { TableName: dyTable, KeyConditionExpression: expr, ExpressionAttributeValues: values };
+  const payload = { TableName: dyTable, KeyConditionExpression: expr, ExpressionAttributeValues: values };
+  if (dyIndexName) payload.IndexName = dyIndexName;
+  return payload;
 }
 
 async function runDynamoOp() {
@@ -172,6 +334,7 @@ async function runDynamoOp() {
     } else {
       op = "Scan";
       payload = { TableName: dyTable, Limit: 50 };
+      if (dyIndexName) payload.IndexName = dyIndexName;
     }
     const { status, body } = await postJSON(SEED, "/admin/data/dynamo", { op, payload });
     if (status >= 300) {
