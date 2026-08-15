@@ -8,7 +8,10 @@
 // `dashboard_core.js` (STATE, $, esc, pill, getJSON, postJSON, loadAll,
 // splitHiddenTable) and `dashboard_streams.js` (viewTypeLabel — the Stream
 // row's enable/disable UI below lives here per ADR 0021, since a table's
-// stream toggle is a table-panel action, not a Streams-tab one).
+// stream toggle is a table-panel action, not a Streams-tab one; also
+// `tabletsForTable`, reused below for the Indexes card's backfill-progress
+// count — a stream shard count and an index backfill count both need "every
+// tablet currently mapped to this table", the same live-topology lookup).
 
 let brProtocol = "cql";
 
@@ -96,6 +99,7 @@ let dyResultError = null;
 let dyTableFormOpen = false;
 let dyItemFormOpen = false;
 let dyItemFormMode = "create";
+let dyIxFormOpen = false; // the "Add index (GSI)" form, ADR 0045 §7
 
 function renderBrowserTables() {
   const tables = dynamoTables();
@@ -130,6 +134,7 @@ function dynOnTable() {
   dyIndexName = ""; // a previously selected table's index name can't carry over
   dySelectedIndex = null; dyResultItems = []; dyResultError = null;
   closeItemForm();
+  closeAddIndexForm();
   renderDynamoFields();
   setDynamoOp("scan");
   if (dyTable) runDynamoOp(); else renderDynamoResults();
@@ -237,13 +242,21 @@ async function disableStream() {
 // The Scan/Query Index selector (ADR 0041) — "— base table —" plus one
 // option per declared secondary index; picking one adds `IndexName` to the
 // Scan/Query payload sent to `POST /admin/data/dynamo` (see
-// `buildQueryPayload`/`runDynamoOp` below).
+// `buildQueryPayload`/`runDynamoOp` below). A non-`Active` index (ADR 0045)
+// is listed but `disabled` — a Query/Scan against it fails server-side
+// (`run_index_query`/`run_index_scan`'s `ValidationException`), so a
+// disabled option with a status suffix tells the user why up front instead
+// of letting them click "Run" into an error.
 function renderIndexSelector(schema) {
   const sel = $("br-dy-index");
   const indexes = (schema && schema.indexes) || [];
   if (!indexes.some((i) => i.name === dyIndexName)) dyIndexName = "";
   sel.innerHTML = `<option value="">— base table —</option>`
-    + indexes.map((i) => `<option value="${esc(i.name)}"${i.name === dyIndexName ? " selected" : ""}>${esc(i.name)} (${indexKindLabel(i.kind)})</option>`).join("");
+    + indexes.map((i) => {
+        const status = i.status || "Active";
+        const suffix = status === "Creating" ? " — backfilling" : status === "Deleting" ? " — deleting" : "";
+        return `<option value="${esc(i.name)}"${i.name === dyIndexName ? " selected" : ""}${status === "Active" ? "" : " disabled"}>${esc(i.name)} (${indexKindLabel(i.kind)})${esc(suffix)}</option>`;
+      }).join("");
   sel.value = dyIndexName;
   sel.disabled = !indexes.length;
   // GSI reads are DynamoDB's own eventually-consistent contract (the drain
@@ -258,25 +271,145 @@ function onDyIndexChange() {
   runDynamoOp();
 }
 
-// The table's declared secondary indexes (ADR 0041): name, GSI/LSI, key
-// schema, projection — ground-truth-only, rendered straight off the
-// replicated catalog with nothing inferred or faked.
+// How far a `Creating` index's backfill has gotten (ADR 0045 §4/§7):
+// the only *honest* progress fact is "N of M tablets have reported done" —
+// M is the base table's own tablet count *right now* (`tabletsForTable`,
+// dashboard_streams.js — the backfill seeder runs on base tablets, ADR 0045
+// §2), N is how many of those tablet ids have a matching row in
+// `Metadata::index_backfill` (`status.index_backfill`, a flat `{tablet,
+// index}` array, PR2's tuple-key codec). No percentage, no interpolation —
+// a tablet either has reported or hasn't.
+function indexBackfillProgress(table, indexName) {
+  const tabletIds = new Set(tabletsForTable(table));
+  const rows = (STATE.status && STATE.status.index_backfill) || [];
+  let done = 0;
+  for (const r of rows) if (r.index === indexName && tabletIds.has(r.tablet)) done++;
+  return { done, total: tabletIds.size };
+}
+
+// One index's Status cell (ADR 0045/ADR 0021 §7): `Creating` is a normal
+// transitional state, not a warning — rendered with the same neutral
+// `forming` pill the Tablets view uses for its own transitional state, plus
+// the one real progress fact above. `Active` is the steady-state default,
+// deliberately quiet (no colored pill) so it doesn't compete for attention
+// with the transitional states. `Deleting` is dimmed — it's on its way out.
+function indexStatusCell(table, i) {
+  const status = i.status || "Active";
+  if (status === "Creating") {
+    const { done, total } = indexBackfillProgress(table, i.name);
+    const progress = total > 0 ? `${done} of ${total} tablets` : "awaiting tablets";
+    return `${pill("forming", "Creating")} <span class="muted">backfilling — ${esc(progress)}</span>`;
+  }
+  if (status === "Deleting") return `<span class="muted" style="opacity:.6">Deleting</span>`;
+  return `<span class="muted">Active</span>`;
+}
+
+// The table's declared secondary indexes (ADR 0041) plus their real
+// lifecycle status and backfill progress (ADR 0045) — ground-truth-only,
+// rendered straight off the replicated catalog with nothing inferred or
+// faked — and the add/drop-index actions (`UpdateTable`'s
+// `GlobalSecondaryIndexUpdates`, ADR 0045 §6). The "+ Add index" trigger and
+// each row's "Drop" button are rebuilt here every render (like the Stream
+// row's Enable/Disable buttons below) — stateless controls, no typed input
+// to lose; the form that DOES hold typed input (`#br-dy-ix-form`) is static
+// markup in dashboard.html, touched only by `open`/`closeAddIndexForm`, so a
+// routine poll refresh never wipes an in-progress "Add index" form the same
+// way `#br-dy-table-form`/`#br-dy-item-form` already don't.
 function renderIndexesSection(schema) {
-  const indexes = (schema && schema.indexes) || [];
   const el = $("br-dy-indexes");
-  if (!indexes.length) { el.innerHTML = ""; return; }
-  const rows = indexes.map((i) => `<tr>
+  if (!schema) { el.innerHTML = ""; return; }
+  const table = dyTable;
+  const indexes = schema.indexes || [];
+  const rows = indexes.map((i) => {
+    const status = i.status || "Active";
+    const dim = status === "Deleting" ? ' style="opacity:.6"' : "";
+    const drop = i.kind === "Global" && status !== "Deleting"
+      ? `<button class="danger-text ix-drop" data-name="${esc(i.name)}">Drop</button>`
+      : "";
+    return `<tr${dim}>
       <td class="mono">${esc(i.name)}</td>
       <td>${pill("forming", indexKindLabel(i.kind))}</td>
       <td class="mono">${esc(i.hash_attribute)}</td>
       <td class="mono">${i.sort_attribute ? esc(i.sort_attribute) : `<span class="muted">—</span>`}</td>
       <td>${esc(projectionLabel(i.projection))}</td>
-    </tr>`).join("");
+      <td>${indexStatusCell(table, i)}</td>
+      <td>${drop}</td>
+    </tr>`;
+  }).join("");
   el.innerHTML = `<div class="card scroll" style="margin-top:2px">
-    <h2>Indexes</h2>
-    <table><thead><tr><th>Name</th><th>Kind</th><th>Hash key</th><th>Sort key</th><th>Projection</th></tr></thead>
-    <tbody>${rows}</tbody></table>
+    <div class="row" style="justify-content:space-between">
+      <h2>Indexes</h2>
+      <div class="row"><span class="muted" id="br-dy-ix-drop-msg"></span><button id="br-dy-ix-new">+ Add index</button></div>
+    </div>
+    ${indexes.length
+      ? `<table><thead><tr><th>Name</th><th>Kind</th><th>Hash key</th><th>Sort key</th><th>Projection</th><th>Status</th><th></th></tr></thead>
+         <tbody>${rows}</tbody></table>`
+      : `<div class="empty">no secondary indexes</div>`}
   </div>`;
+  $("br-dy-ix-new").addEventListener("click", openAddIndexForm);
+  document.querySelectorAll(".ix-drop").forEach((b) =>
+    b.addEventListener("click", () => dropIndex(b.dataset.name)));
+}
+
+// ---- add/drop index (ADR 0045 §6/§5) ----
+// GSI only, mirroring real DynamoDB — an LSI can't be added to a populated
+// table (`decode_index_updates` rejects a `Local` kind at the wire edge
+// too; this form simply never offers one).
+function openAddIndexForm() {
+  dyIxFormOpen = true;
+  $("br-dy-ix-name").value = ""; $("br-dy-ix-hash").value = "";
+  $("br-dy-ix-has-sort").checked = false; $("br-dy-ix-sort").value = "";
+  $("br-dy-ix-sort-wrap").style.display = "none";
+  $("br-dy-ix-proj").value = "ALL";
+  $("br-dy-ix-include").value = ""; $("br-dy-ix-include-wrap").style.display = "none";
+  $("br-dy-ix-msg").textContent = "";
+  $("br-dy-ix-form").style.display = "";
+}
+function closeAddIndexForm() {
+  dyIxFormOpen = false;
+  $("br-dy-ix-form").style.display = "none";
+}
+async function submitAddIndexForm() {
+  const table = dyTable;
+  const name = $("br-dy-ix-name").value.trim();
+  const hash = $("br-dy-ix-hash").value.trim();
+  const sort = $("br-dy-ix-has-sort").checked ? $("br-dy-ix-sort").value.trim() : "";
+  const projType = $("br-dy-ix-proj").value;
+  if (!name || !hash) { $("br-dy-ix-msg").textContent = "index name and hash attribute are required"; return; }
+  const keySchema = [{ AttributeName: hash, KeyType: "HASH" }];
+  if (sort) keySchema.push({ AttributeName: sort, KeyType: "RANGE" });
+  const create = { IndexName: name, KeySchema: keySchema };
+  if (projType === "INCLUDE") {
+    const names = $("br-dy-ix-include").value.split(",").map((s) => s.trim()).filter(Boolean);
+    if (!names.length) { $("br-dy-ix-msg").textContent = "INCLUDE projection needs at least one attribute"; return; }
+    create.Projection = { ProjectionType: "INCLUDE", NonKeyAttributes: names };
+  } else if (projType === "KEYS_ONLY") {
+    create.Projection = { ProjectionType: "KEYS_ONLY" };
+  } // ALL: omit `Projection` (the wire decoder's own default)
+  $("br-dy-ix-msg").textContent = "adding…";
+  try {
+    const { status, body } = await postJSON(SEED, "/admin/data/dynamo", {
+      op: "UpdateTable",
+      payload: { TableName: table, GlobalSecondaryIndexUpdates: [{ Create: create }] },
+    });
+    if (status >= 300) { $("br-dy-ix-msg").textContent = (body && body.message) || ("HTTP " + status); return; }
+    closeAddIndexForm();
+    await loadAll();
+  } catch (e) { $("br-dy-ix-msg").textContent = String(e); }
+}
+async function dropIndex(name) {
+  const table = dyTable;
+  if (!window.confirm(`Drop index “${name}” on “${table}”? This deletes the index's materialized data — it cannot be undone.`)) return;
+  const { status, body } = await postJSON(SEED, "/admin/data/dynamo", {
+    op: "UpdateTable",
+    payload: { TableName: table, GlobalSecondaryIndexUpdates: [{ Delete: { IndexName: name } }] },
+  });
+  if (status >= 300) {
+    const msg = $("br-dy-ix-drop-msg");
+    if (msg) msg.innerHTML = `<span class="err-line">${esc((body && body.message) || `HTTP ${status}`)}</span>`;
+    return;
+  }
+  await loadAll();
 }
 
 function setDynamoOp(op) {
