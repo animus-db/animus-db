@@ -103,6 +103,10 @@ fn stage(
     seed: u64,
 ) -> (TxnId, Vec<u8>, StageOutcome) {
     let n = node.clone();
+    let writes = writes
+        .into_iter()
+        .map(|(k, v)| animus_cp_data::TxnWrite::plain(k, v))
+        .collect();
     drive(sim, node.env(), SETTLE, async move {
         n.txn_stage_anchor("t", writes, Vec::new(), conditions)
             .await

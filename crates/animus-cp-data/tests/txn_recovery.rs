@@ -115,6 +115,10 @@ fn stage_anchor(
     participant_spans: Vec<(String, KeyRange)>,
 ) -> Option<(TxnId, Vec<u8>)> {
     let n = node.clone();
+    let writes = writes
+        .into_iter()
+        .map(|(k, v)| animus_cp_data::TxnWrite::plain(k, v))
+        .collect();
     drive(sim, node.env(), SETTLE, async move {
         n.txn_stage_anchor(table, writes, participant_spans, Vec::new())
             .await
@@ -132,6 +136,10 @@ fn stage_participant(
     writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 ) -> Option<HlcTimestamp> {
     let n = node.clone();
+    let writes = writes
+        .into_iter()
+        .map(|(k, v)| animus_cp_data::TxnWrite::plain(k, v))
+        .collect();
     drive(sim, node.env(), SETTLE, async move {
         n.txn_stage_participant(txn_id, record_key, record_table, writes, Vec::new())
             .await

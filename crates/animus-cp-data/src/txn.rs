@@ -268,6 +268,58 @@ impl TxnStatus {
     }
 }
 
+/// One write action staged by a `KvCommand::TxnStage` (ADR 0046
+/// "materialize-at-resolve", A1): a base key/value plus, for a write
+/// against an indexed/streamed table, the derived kind-scope rows (LSI/
+/// footprint rows) and change-log record that write would also produce —
+/// evaluated **at this participant's own leader, at stage time** (mirroring
+/// `animusd::dynamo::kind_write_item_at_leader`'s U3 shape, ADR 0046
+/// Decision 1). These derived writes ride *inside* this write's own intent
+/// envelope as an opaque staged payload — never written into a kind scope
+/// directly, since kind scopes only ever hold committed values (ADR 0046
+/// Decision 2 rejects intent-staging a kind scope) — and are materialized by
+/// `KvCommand::TxnResolve`'s commit branch, via the shared
+/// [`materialize_derived`](crate::materialize_derived)-shaped helper, at the
+/// resolve's own locally-minted `ts` — never at stage time. Abort discards
+/// them: nothing is ever written to a kind scope for an aborted transaction.
+///
+/// For a write against a plain (unindexed, unstreamed) table, `kind_writes`
+/// is empty and `change_log` is `None` — a zero-cost degenerate case
+/// byte-identical to the pre-ADR-0046 shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxnWrite {
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+    /// `(row kind, logical key, value)` — mirrors `KvCommand::KindBatch`'s
+    /// own `writes` field exactly; `None` value is a tombstone. Every key
+    /// here must lead with `key`'s own partition token (ADR 0022) —
+    /// validated, not assumed, at apply (see `KvCommand::TxnStage`'s doc).
+    pub kind_writes: Vec<crate::KindWrite>,
+    /// An optional change-log record to materialize alongside `kind_writes`
+    /// at resolve: `(key prefix, encoded record)`. Completed with
+    /// `hlc::pack(resolve_ts)` exactly as `KvCommand::KindBatch::change_log`
+    /// is completed with its own entry's `ts` — never a stage-time value,
+    /// for the identical reason `KindBatch`'s own doc gives (only the
+    /// entry that actually fixes the record's position in commit order may
+    /// mint its key suffix).
+    pub change_log: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl TxnWrite {
+    /// A plain write with no derived kind payload — the common case for a
+    /// write against a table with no index/stream, and every pre-ADR-0046
+    /// caller.
+    #[must_use]
+    pub fn plain(key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
+        TxnWrite {
+            key,
+            value,
+            kind_writes: Vec::new(),
+            change_log: None,
+        }
+    }
+}
+
 /// The 1-byte-tagged value envelope every apply-path write now wraps its
 /// value in — see the module doc.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,6 +347,12 @@ pub(crate) enum Envelope {
         /// per intent and closes the routing gap PR4 needs.
         record_table: String,
         staged_value: Option<Vec<u8>>,
+        /// ADR 0046 A1 materialize-at-resolve: the derived kind-scope
+        /// writes + change-log record this write's resolve will materialize
+        /// on commit (empty/`None` for a plain write) — see [`TxnWrite`]'s
+        /// doc. Discarded, never materialized, on abort.
+        kind_writes: Vec<crate::KindWrite>,
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
     },
 }
 
@@ -447,6 +505,50 @@ impl<'a> Cursor<'a> {
             node: self.node_id()?,
         })
     }
+
+    /// ADR 0046 A1: the exact inverse of [`put_kind_writes`].
+    fn kind_writes(&mut self) -> Option<Vec<crate::KindWrite>> {
+        let n = self.u32()?;
+        let mut out = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            out.push((self.u8()?, self.bytes()?, self.opt_bytes()?));
+        }
+        Some(out)
+    }
+
+    /// ADR 0046 A1: the exact inverse of [`put_change_log`].
+    fn change_log(&mut self) -> Option<Option<(Vec<u8>, Vec<u8>)>> {
+        match self.u8()? {
+            0 => Some(None),
+            1 => Some(Some((self.bytes()?, self.bytes()?))),
+            _ => None,
+        }
+    }
+}
+
+/// ADR 0046 A1: a [`TxnWrite`]/`Envelope::Intent`'s `kind_writes` payload —
+/// mirrors `KvCommand::KindBatch`'s own inline encoding in `codec.rs`
+/// exactly, kept here since it also needs to ride inside the intent
+/// envelope this module owns.
+fn put_kind_writes(out: &mut Vec<u8>, writes: &[crate::KindWrite]) {
+    put_u32(out, writes.len() as u32);
+    for (kind, key, value) in writes {
+        put_u8(out, *kind);
+        put_bytes(out, key);
+        put_opt_bytes(out, value.as_deref());
+    }
+}
+
+/// ADR 0046 A1: a [`TxnWrite`]/`Envelope::Intent`'s `change_log` payload.
+fn put_change_log(out: &mut Vec<u8>, change_log: Option<&(Vec<u8>, Vec<u8>)>) {
+    match change_log {
+        None => put_u8(out, 0),
+        Some((prefix, record)) => {
+            put_u8(out, 1);
+            put_bytes(out, prefix);
+            put_bytes(out, record);
+        }
+    }
 }
 
 /// Wrap `value` as a committed envelope (tag `0`).
@@ -459,18 +561,26 @@ pub(crate) fn encode_committed(value: &[u8]) -> Vec<u8> {
 }
 
 /// Encode an intent envelope (tag `1`) — see [`Envelope::Intent`].
+///
+/// `kind_writes`/`change_log` are ADR 0046 A1's staged derived payload (empty/
+/// `None` for a plain write, byte-identical to the pre-ADR-0046 encoding
+/// except for the two trailing fields).
 #[must_use]
 pub(crate) fn encode_intent(
     txn_id: &TxnId,
     record_key: &[u8],
     record_table: &str,
     staged_value: Option<&[u8]>,
+    kind_writes: &[crate::KindWrite],
+    change_log: Option<&(Vec<u8>, Vec<u8>)>,
 ) -> Vec<u8> {
     let mut out = vec![1];
     put_txn_id(&mut out, txn_id);
     put_bytes(&mut out, record_key);
     put_bytes(&mut out, record_table.as_bytes());
     put_opt_bytes(&mut out, staged_value);
+    put_kind_writes(&mut out, kind_writes);
+    put_change_log(&mut out, change_log);
     out
 }
 
@@ -507,11 +617,19 @@ pub(crate) fn decode_envelope(bytes: &[u8]) -> Envelope {
             let staged_value = c
                 .opt_bytes()
                 .expect("txn: malformed intent envelope (staged_value)");
+            let kind_writes = c
+                .kind_writes()
+                .expect("txn: malformed intent envelope (kind_writes)");
+            let change_log = c
+                .change_log()
+                .expect("txn: malformed intent envelope (change_log)");
             Envelope::Intent {
                 txn_id,
                 record_key,
                 record_table,
                 staged_value,
+                kind_writes,
+                change_log,
             }
         }
         other => panic!("txn: unknown envelope tag {other} (corrupt engine value)"),
@@ -664,21 +782,57 @@ mod tests {
         let id = txn(7);
         let record = record_key(&[0; TOKEN_BYTES], &id);
         for staged in [Some(b"v".to_vec()), None] {
-            let bytes = encode_intent(&id, &record, "orders", staged.as_deref());
+            let bytes = encode_intent(&id, &record, "orders", staged.as_deref(), &[], None);
             match decode_envelope(&bytes) {
                 Envelope::Intent {
                     txn_id,
                     record_key: rk,
                     record_table,
                     staged_value,
+                    kind_writes,
+                    change_log,
                 } => {
                     assert_eq!(txn_id, id);
                     assert_eq!(rk, record);
                     assert_eq!(record_table, "orders");
                     assert_eq!(staged_value, staged);
+                    assert!(kind_writes.is_empty());
+                    assert!(change_log.is_none());
                 }
                 Envelope::Committed(_) => panic!("expected Intent"),
             }
+        }
+    }
+
+    #[test]
+    fn intent_envelope_round_trips_a_kind_writes_and_change_log_payload() {
+        // ADR 0046 A1: the derived kind-scope payload rides inside the
+        // intent envelope itself, opaque until `TxnResolve` materializes it.
+        let id = txn(11);
+        let record = record_key(&[0; TOKEN_BYTES], &id);
+        let kind_writes = vec![
+            (1u8, b"lsi-key".to_vec(), Some(b"lsi-row".to_vec())),
+            (1u8, b"lsi-old-key".to_vec(), None), // a tombstone (overwrite's stale LSI row)
+        ];
+        let change_log = (b"change-prefix".to_vec(), b"change-record".to_vec());
+        let bytes = encode_intent(
+            &id,
+            &record,
+            "orders",
+            Some(b"v"),
+            &kind_writes,
+            Some(&change_log),
+        );
+        match decode_envelope(&bytes) {
+            Envelope::Intent {
+                kind_writes: kw,
+                change_log: cl,
+                ..
+            } => {
+                assert_eq!(kw, kind_writes);
+                assert_eq!(cl, Some(change_log));
+            }
+            Envelope::Committed(_) => panic!("expected Intent"),
         }
     }
 

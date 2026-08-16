@@ -30,7 +30,7 @@ use animus_env::nid;
 use animus_tablet::KeyRange;
 
 use crate::hlc::HlcTimestamp;
-use crate::txn::{TxnId, TxnOutcome};
+use crate::txn::{TxnId, TxnOutcome, TxnWrite};
 use crate::{ImageEntry, KvCommand, KvWire};
 
 /// First byte of every encoded frame — rejects foreign payloads (e.g. a JSON
@@ -93,7 +93,15 @@ const MAGIC: u8 = 0xCB;
 /// `conditions` field added in version `11` (see `KvCommand::KindBatch`'s
 /// doc). Same house convention: a clean bump, no cross-version
 /// compatibility.
-const VERSION: u8 = 15;
+/// `16` (ADR 0046 "materialize-at-resolve", `TxnStage` kind-writes stack
+/// PR1): `TxnStage.writes`' element changed from the bare `(Vec<u8>,
+/// Option<Vec<u8>>)` tuple to the named `txn::TxnWrite` struct, which adds
+/// two fields per write — `kind_writes: Vec<crate::KindWrite>`
+/// and `change_log: Option<(Vec<u8>, Vec<u8>)>` — the derived kind-scope
+/// payload a transactional write against an indexed/streamed table stages
+/// alongside its base value (see `TxnWrite`'s doc). Same house convention:
+/// a clean bump, no cross-version compatibility.
+const VERSION: u8 = 16;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -334,6 +342,50 @@ fn read_txn_outcome(c: &mut Cursor<'_>) -> Result<TxnOutcome, DecodeError> {
     })
 }
 
+/// A `(row kind, logical key, value)` write list — `KvCommand::KindBatch`'s
+/// own `writes` shape, and (ADR 0046 A1, version `16`) a `txn::TxnWrite`'s
+/// `kind_writes` payload. Shared here so the two never silently drift.
+fn put_kind_writes(out: &mut Vec<u8>, writes: &[crate::KindWrite]) {
+    out.extend_from_slice(&(writes.len() as u32).to_be_bytes());
+    for (kind, k, v) in writes {
+        put_u8(out, *kind);
+        put_bytes(out, k);
+        put_opt_bytes(out, v);
+    }
+}
+
+fn read_kind_writes(c: &mut Cursor<'_>) -> Result<Vec<crate::KindWrite>, DecodeError> {
+    let n = c.u32()?;
+    let mut writes = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        writes.push((c.u8()?, c.bytes()?, c.opt_bytes()?));
+    }
+    Ok(writes)
+}
+
+/// A `(key prefix, encoded record)` optional change-log record —
+/// `KvCommand::KindBatch`'s own `change_log` shape, and (ADR 0046 A1,
+/// version `16`) a `txn::TxnWrite`'s `change_log` payload.
+fn put_change_log(out: &mut Vec<u8>, change_log: &Option<(Vec<u8>, Vec<u8>)>) {
+    match change_log {
+        None => put_u8(out, 0),
+        Some((prefix, record)) => {
+            put_u8(out, 1);
+            put_bytes(out, prefix);
+            put_bytes(out, record);
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn read_change_log(c: &mut Cursor<'_>) -> Result<Option<(Vec<u8>, Vec<u8>)>, DecodeError> {
+    Ok(match c.u8()? {
+        0 => None,
+        1 => Some((c.bytes()?, c.bytes()?)),
+        other => return Err(format!("invalid change_log tag {other}")),
+    })
+}
+
 fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
     match c {
         KvCommand::Put {
@@ -366,20 +418,8 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             ts,
         } => {
             put_u8(out, 12);
-            out.extend_from_slice(&(writes.len() as u32).to_be_bytes());
-            for (kind, k, v) in writes {
-                put_u8(out, *kind);
-                put_bytes(out, k);
-                put_opt_bytes(out, v);
-            }
-            match change_log {
-                None => put_u8(out, 0),
-                Some((prefix, record)) => {
-                    put_u8(out, 1);
-                    put_bytes(out, prefix);
-                    put_bytes(out, record);
-                }
-            }
+            put_kind_writes(out, writes);
+            put_change_log(out, change_log);
             out.extend_from_slice(&(conditions.len() as u32).to_be_bytes());
             for (k, expected) in conditions {
                 put_bytes(out, k);
@@ -434,10 +474,16 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_bytes(out, record_key);
             put_bytes(out, record_table.as_bytes());
             put_bool(out, *is_anchor);
+            // ADR 0046 A1, version 16: each write is a `txn::TxnWrite` —
+            // base key/value plus an optional derived kind-scope payload,
+            // encoded with the SAME `put_kind_writes`/`put_change_log`
+            // helpers `KindBatch` itself uses (never a second copy).
             out.extend_from_slice(&(writes.len() as u32).to_be_bytes());
-            for (k, v) in writes {
-                put_bytes(out, k);
-                put_opt_bytes(out, v);
+            for w in writes {
+                put_bytes(out, &w.key);
+                put_opt_bytes(out, &w.value);
+                put_kind_writes(out, &w.kind_writes);
+                put_change_log(out, &w.change_log);
             }
             out.extend_from_slice(&(spans.len() as u32).to_be_bytes());
             for (table, span) in spans {
@@ -517,16 +563,8 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             }
         }
         12 => {
-            let n = c.u32()?;
-            let mut writes = Vec::with_capacity(n as usize);
-            for _ in 0..n {
-                writes.push((c.u8()?, c.bytes()?, c.opt_bytes()?));
-            }
-            let change_log = match c.u8()? {
-                0 => None,
-                1 => Some((c.bytes()?, c.bytes()?)),
-                other => return Err(format!("invalid change_log tag {other}")),
-            };
+            let writes = read_kind_writes(c)?;
+            let change_log = read_change_log(c)?;
             let n = c.u32()?;
             let mut conditions = Vec::with_capacity(n as usize);
             for _ in 0..n {
@@ -567,7 +605,16 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             let n = c.u32()?;
             let mut writes = Vec::with_capacity(n as usize);
             for _ in 0..n {
-                writes.push((c.bytes()?, c.opt_bytes()?));
+                let key = c.bytes()?;
+                let value = c.opt_bytes()?;
+                let kind_writes = read_kind_writes(c)?;
+                let change_log = read_change_log(c)?;
+                writes.push(TxnWrite {
+                    key,
+                    value,
+                    kind_writes,
+                    change_log,
+                });
             }
             let n = c.u32()?;
             let mut spans = Vec::with_capacity(n as usize);
@@ -1045,8 +1092,16 @@ mod tests {
                     record_table: "orders".to_string(),
                     is_anchor: true,
                     writes: vec![
-                        (b"k1".to_vec(), Some(b"v1".to_vec())),
-                        (b"k2".to_vec(), None), // a staged delete
+                        TxnWrite {
+                            key: b"k1".to_vec(),
+                            value: Some(b"v1".to_vec()),
+                            // ADR 0046 A1: a kind-write payload + change-log
+                            // record staged alongside the base write —
+                            // exercises the version-16 wire shape.
+                            kind_writes: vec![(1u8, b"k1-lsi".to_vec(), Some(b"lsi-row".to_vec()))],
+                            change_log: Some((b"k1-change-prefix".to_vec(), b"record".to_vec())),
+                        },
+                        TxnWrite::plain(b"k2".to_vec(), None), // a staged delete
                     ],
                     spans: vec![(
                         "orders".to_string(),

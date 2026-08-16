@@ -134,6 +134,32 @@ fn stage_participant(
     writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 ) -> Option<HlcTimestamp> {
     let n = node.clone();
+    let writes = writes
+        .into_iter()
+        .map(|(k, v)| animus_cp_data::TxnWrite::plain(k, v))
+        .collect();
+    drive(sim, node.env(), SETTLE, async move {
+        n.txn_stage_participant(txn_id, record_key, record_table, writes, Vec::new())
+            .await
+    })
+    .flatten()
+    .map(|(ts, _outcome)| ts)
+}
+
+/// As [`stage_participant`], but for a write against an indexed/streamed
+/// table: carries a derived kind-writes/change-log payload alongside the
+/// base write (ADR 0046 A1) — used by
+/// `kind_bearing_participant_materializes_at_resolve` below.
+#[allow(clippy::too_many_arguments)]
+fn stage_participant_kind(
+    sim: &mut Simulator,
+    node: &KvNode,
+    txn_id: animus_cp_data::TxnId,
+    record_key: Vec<u8>,
+    record_table: String,
+    writes: Vec<animus_cp_data::TxnWrite>,
+) -> Option<HlcTimestamp> {
+    let n = node.clone();
     drive(sim, node.env(), SETTLE, async move {
         n.txn_stage_participant(txn_id, record_key, record_table, writes, Vec::new())
             .await
@@ -726,6 +752,120 @@ fn two_participant_commit_is_reproducible_across_seeds() {
         assert_eq!(
             block_on(nodes_b[lb].local_get(&kb)),
             Some(b"debited".to_vec())
+        );
+    }
+}
+
+/// ADR 0046 A1 ("materialize-at-resolve"): a **non-anchor participant's**
+/// own write can carry a derived kind-writes/change-log payload too, not
+/// just the anchor's — a cross-tablet transaction touching an
+/// indexed/streamed table on the participant side must materialize its
+/// LSI row + change record atomically with its own base commit, same as a
+/// single-tablet `KindBatch` would, and same as the anchor's own kind
+/// payload (`txn_kind_writes.rs`'s primitive-level suite covers the
+/// single-tablet shape in depth; this proves it composes across the 2PC).
+#[test]
+fn kind_bearing_participant_materializes_its_lsi_row_and_change_record_at_resolve() {
+    let seed = 0x7A10;
+    let mut sim = Simulator::new(seed);
+    let engine = MemoryEngine::new();
+    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    sim.run_for(ELECT);
+
+    let la = leader(&nodes_a, seed, "A");
+    let lb = leader(&nodes_b, seed, "B");
+    let ka = key(1, b":order");
+    // The participant's own base/LSI/change keys must share ONE token (ADR
+    // 0022/0046) — `key(2, ..)` always leads with the same 8-byte token 2.
+    let kb_base = key(2, b":balance");
+    let kb_lsi = key(2, b"\x01:by-amount");
+    let kb_change_prefix = key(2, b"\x02");
+
+    let (txn_id, record_key) = stage_anchor(
+        &mut sim,
+        &nodes_a[la],
+        "orders",
+        vec![(ka.clone(), Some(b"placed".to_vec()))],
+    )
+    .expect("anchor stage should succeed");
+
+    let participant_write = animus_cp_data::TxnWrite {
+        key: kb_base.clone(),
+        value: Some(b"debited".to_vec()),
+        kind_writes: vec![(
+            animus_cp_data::KIND_LSI,
+            kb_lsi.clone(),
+            Some(b"by-amount-row".to_vec()),
+        )],
+        change_log: Some((kb_change_prefix.clone(), b"account-change".to_vec())),
+    };
+    let stage_ts = stage_participant_kind(
+        &mut sim,
+        &nodes_b[lb],
+        txn_id.clone(),
+        record_key.clone(),
+        "accounts".to_string(),
+        vec![participant_write],
+    )
+    .expect("kind-bearing participant stage should succeed");
+
+    let candidate = txn_id.ts.max(stage_ts);
+    let commit_ts = commit_at_least(
+        &mut sim,
+        &nodes_a[la],
+        txn_id.clone(),
+        record_key.clone(),
+        candidate,
+    )
+    .expect("anchor commit should succeed");
+    let outcome = TxnOutcome::Committed { commit_ts };
+    resolve(
+        &mut sim,
+        &nodes_a[la],
+        txn_id.clone(),
+        record_key.clone(),
+        vec![ka.clone()],
+        outcome.clone(),
+    );
+    let resolve_ts = resolve(
+        &mut sim,
+        &nodes_b[lb],
+        txn_id.clone(),
+        record_key.clone(),
+        vec![kb_base.clone()],
+        outcome,
+    )
+    .expect("participant resolve should succeed");
+    sim.run_for(SETTLE);
+
+    assert_eq!(
+        block_on(nodes_a[la].local_get(&ka)),
+        Some(b"placed".to_vec())
+    );
+    assert_eq!(
+        block_on(nodes_b[lb].local_get(&kb_base)),
+        Some(b"debited".to_vec()),
+        "participant's base row must commit (seed={seed})"
+    );
+    assert_eq!(
+        block_on(nodes_b[lb].local_get_kind(animus_cp_data::KIND_LSI, &kb_lsi)),
+        Some(b"by-amount-row".to_vec()),
+        "participant's LSI row must materialize at ITS OWN resolve (seed={seed})"
+    );
+    let mut change_key = kb_change_prefix.clone();
+    change_key.extend_from_slice(&animus_cp_data::hlc::pack(resolve_ts).to_be_bytes());
+    assert_eq!(
+        block_on(nodes_b[lb].local_get_kind(animus_cp_data::KIND_CHANGE, &change_key)),
+        Some(b"account-change".to_vec()),
+        "participant's change record must materialize keyed at its own resolve ts (seed={seed})"
+    );
+    // And every replica of B agrees, not just the leader.
+    for (i, n) in nodes_b.iter().enumerate() {
+        assert_eq!(
+            block_on(n.local_get_kind(animus_cp_data::KIND_LSI, &kb_lsi)),
+            Some(b"by-amount-row".to_vec()),
+            "group B replica {i} missing the participant's materialized LSI row (seed={seed})"
         );
     }
 }

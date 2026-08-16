@@ -67,7 +67,7 @@ mod txn;
 
 use hlc::{Hlc, HlcTimestamp, bump_strictly_above};
 use ts_cache::TsCache;
-pub use txn::{StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome};
+pub use txn::{StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnWrite};
 
 /// The assumed maximum clock-offset bound across the cluster (ADR 0018 §2),
 /// threaded into every [`Hlc::new`] this crate constructs. Not yet consumed
@@ -187,6 +187,14 @@ pub const ALL_KINDS: [u8; 5] = [
     KIND_FOOTPRINT,
     KIND_CURSOR,
 ];
+
+/// A single derived `(row kind, logical key, value)` write — `None` value
+/// means a tombstone. The element `KvCommand::KindBatch::writes` and (ADR
+/// 0046 A1) `txn::TxnWrite::kind_writes` share; named once here so every
+/// function that handles this shape (`materialize_derived`, the codec, the
+/// apply-time token check) names it the same way instead of repeating the
+/// tuple.
+pub type KindWrite = (u8, Vec<u8>, Option<Vec<u8>>);
 
 /// The sibling scope set a tablet group owns, derived from its **parent**
 /// scope (`escape(table)` + this tablet's range), indexed by kind selector.
@@ -497,7 +505,7 @@ pub enum KvCommand {
     /// today).
     KindBatch {
         /// `(row kind, logical key, value)` — `None` writes a tombstone.
-        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        writes: Vec<KindWrite>,
         /// An optional **change-log record** to append in the same entry:
         /// `(key prefix, encoded record)`.
         ///
@@ -660,12 +668,27 @@ pub enum KvCommand {
     /// existing fence/seal/foreign-intent whole-or-nothing behavior — see
     /// this variant's apply arm and [`StageOutcome`] for how a caller learns
     /// *which* reason a stage no-op'd for.
+    ///
+    /// **ADR 0046 A1 ("materialize-at-resolve")**: each `writes` entry is a
+    /// [`txn::TxnWrite`], carrying not just `key`/`value` but also an
+    /// optional derived kind-scope payload (`kind_writes`/`change_log`) —
+    /// evaluated at THIS participant's own leader at stage time (ADR 0046
+    /// Decision 1, U3). The payload rides inside the write's own
+    /// [`txn::Envelope::Intent`], opaque until `TxnResolve`'s commit branch
+    /// materializes it at its own resolve ts via the shared
+    /// `materialize_derived` helper — see `TxnWrite`'s doc for the full
+    /// argument (and why intent-staging a kind scope directly, ADR 0046
+    /// Decision 2, is rejected). Apply validates every `kind_writes` key
+    /// leads with its own write's `key`'s partition token (ADR 0022) —
+    /// a validated rejection (folded into this stage's structural `Fenced`
+    /// outcome), never an `assert!`, since this payload is wire-reachable
+    /// (via `ClientRequest::TxnPrepare`).
     TxnStage {
         txn_id: TxnId,
         record_key: Vec<u8>,
         record_table: String,
         is_anchor: bool,
-        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        writes: Vec<txn::TxnWrite>,
         spans: Vec<(String, KeyRange)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
@@ -1814,7 +1837,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// narrower fence or supply own-key OCC conditions.
     pub fn put_kind_batch(
         &self,
-        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        writes: Vec<KindWrite>,
         change_log: Option<(Vec<u8>, Vec<u8>)>,
     ) -> ProposeResult {
         self.put_kind_batch_fenced(writes, change_log, Vec::new(), KeyRange::whole())
@@ -1831,7 +1854,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// existed).
     pub fn put_kind_batch_fenced(
         &self,
-        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        writes: Vec<KindWrite>,
         change_log: Option<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
@@ -1967,6 +1990,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         table: &str,
         writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Option<(TxnId, Vec<u8>, StageOutcome)> {
+        let writes = writes
+            .into_iter()
+            .map(|(k, v)| txn::TxnWrite::plain(k, v))
+            .collect();
         self.txn_stage_anchor(table, writes, Vec::new(), Vec::new())
             .await
     }
@@ -2001,7 +2028,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     pub async fn txn_stage_anchor(
         &self,
         table: &str,
-        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        writes: Vec<txn::TxnWrite>,
         participant_spans: Vec<(String, KeyRange)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Option<(TxnId, Vec<u8>, StageOutcome)> {
@@ -2009,7 +2036,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             !writes.is_empty(),
             "raftkv txn_stage: writes must be non-empty"
         );
-        let anchor = &writes[0].0;
+        let anchor = &writes[0].key;
         assert!(
             anchor.len() >= animus_tablet::TOKEN_BYTES,
             "raftkv txn_stage: anchor key must lead with the {}-byte partition token \
@@ -2018,7 +2045,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             anchor.len()
         );
         let token = anchor[..animus_tablet::TOKEN_BYTES].to_vec();
-        let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
+        let keys: Vec<Vec<u8>> = writes.iter().map(|w| w.key.clone()).collect();
         let fence = self.scope_range();
         let record_table = table.to_owned();
         let (result, (txn_id, record_key)) = self.propose_ordered_aux(|term| {
@@ -2080,14 +2107,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         txn_id: TxnId,
         record_key: Vec<u8>,
         record_table: String,
-        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        writes: Vec<txn::TxnWrite>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Option<(HlcTimestamp, StageOutcome)> {
         assert!(
             !writes.is_empty(),
             "raftkv txn_stage_participant: writes must be non-empty"
         );
-        let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
+        let keys: Vec<Vec<u8>> = writes.iter().map(|w| w.key.clone()).collect();
         let fence = self.scope_range();
         let (result, ts) = self.propose_ordered_aux(|term| {
             let ts = self.mint_pushed(term, &keys);
@@ -2979,6 +3006,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 record_key,
                 record_table,
                 staged_value,
+                ..
             } => {
                 // The record lives in the **anchor's** tablet, which is
                 // this same tablet's scope for a single-participant
@@ -3546,6 +3574,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 record_key,
                 record_table,
                 staged_value,
+                ..
             } if &found == txn_id => {
                 // Built for parity with `resolve_once_step`'s own call —
                 // unused here whenever `status` isn't `Pending` (the only
@@ -4380,6 +4409,72 @@ fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimesta
     *max_applied_ts = Some(ts);
 }
 
+/// **The one shared "materialize derived writes at this ts" helper (ADR
+/// 0046 binding decision)** — `KvCommand::KindBatch`'s apply arm and
+/// `KvCommand::TxnResolve`'s commit branch both call this and only this,
+/// so their output is byte-identical for identical payloads. Queues every
+/// `(kind, key, value)` write (`None` = tombstone) into `pending` at
+/// `hlc::pack(ts)`, then — if `change_log` is present — completes its key as
+/// `prefix || hlc::pack(ts)` and queues it too, in [`KIND_CHANGE`]'s scope.
+/// `ts` is always the caller's OWN entry's commit timestamp: `KindBatch`
+/// passes its own entry's `ts`; `TxnResolve` passes the *resolve* entry's
+/// `ts` (never the transaction's `commit_ts`, and never the stage's `ts` —
+/// see `txn::TxnWrite`'s doc and ADR 0018 §2's B1 amendment for why a
+/// change record must be keyed by the entry that actually fixes its
+/// position in this tablet's own commit order). An unknown row kind is
+/// skipped with a warning, never guessed at — the same discipline
+/// `KindBatch`'s own arm already had before this extraction.
+fn materialize_derived(
+    kind_scopes: &[StorageScope; ALL_KINDS.len()],
+    writes: &[KindWrite],
+    change_log: &Option<(Vec<u8>, Vec<u8>)>,
+    ts: HlcTimestamp,
+    pending: &mut Vec<MergeOp>,
+) {
+    for (kind, key, value) in writes {
+        let Some(kscope) = kind_scopes.get(*kind as usize) else {
+            tracing::warn!(
+                kind,
+                "materialize_derived: write of unknown row kind skipped"
+            );
+            continue;
+        };
+        let physical = kscope.physical(key);
+        match value {
+            Some(v) => pending.push(MergeOp::put(
+                physical,
+                txn::encode_committed(v),
+                hlc::pack(ts),
+            )),
+            None => pending.push(MergeOp::tombstone(physical, hlc::pack(ts))),
+        }
+    }
+    // The change-log record's key is completed here, with THIS caller's
+    // commit timestamp — the only one that agrees with this entry's
+    // position in the log (ADR 0041 §4a / ADR 0046 principle 1).
+    if let Some((prefix, record)) = change_log {
+        let mut key = prefix.clone();
+        key.extend_from_slice(&hlc::pack(ts).to_be_bytes());
+        pending.push(MergeOp::put(
+            kind_scopes[KIND_CHANGE as usize].physical(&key),
+            txn::encode_committed(record),
+            hlc::pack(ts),
+        ));
+    }
+}
+
+/// ADR 0046 A1: every kind-write key a [`txn::TxnWrite`] stages must lead
+/// with `base_key`'s own partition token (ADR 0022) — see the call sites'
+/// doc for why this is checked, not assumed. `base_key` shorter than a full
+/// token is itself invalid (every real data-plane key leads with one).
+fn kind_writes_token_valid(base_key: &[u8], kind_writes: &[KindWrite]) -> bool {
+    let tb = animus_tablet::TOKEN_BYTES;
+    base_key.len() >= tb
+        && kind_writes
+            .iter()
+            .all(|(_, kk, _)| kk.len() >= tb && kk[..tb] == base_key[..tb])
+}
+
 /// Logged-warning cap for [`surface_suspicious_merge_noop`] (below): the
 /// [`Metric`] counters there are always incremented (cheap, unconditional),
 /// but a genuinely-reoccurring bug logging one line per applied entry would
@@ -4704,40 +4799,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         .iter()
                         .all(|(_, key, _)| fence.contains(key) && !is_sealed(sealed, key))
                 {
-                    for (kind, key, value) in &writes {
-                        // An unknown kind cannot be applied anywhere safe (this
-                        // build has no scope for it) and must not silently land
-                        // in another kind's keyspace. It can only arise from a
-                        // peer proposing a kind this build predates, so skip it
-                        // rather than guess — the same call this crate's
-                        // snapshot install makes for an unknown-kind entry.
-                        let Some(kscope) = kind_scopes.get(*kind as usize) else {
-                            tracing::warn!(kind, "KindBatch write of unknown row kind skipped");
-                            continue;
-                        };
-                        let physical = kscope.physical(key);
-                        match value {
-                            Some(v) => pending.push(MergeOp::put(
-                                physical,
-                                txn::encode_committed(v),
-                                hlc::pack(ts),
-                            )),
-                            None => pending.push(MergeOp::tombstone(physical, hlc::pack(ts))),
-                        }
-                    }
-                    // The change-log record's key is completed here, with THIS
-                    // entry's commit timestamp — the only one that agrees with
-                    // the entry's position in the log, and so the only one that
-                    // makes the log readable in commit order (ADR 0041 §4a).
-                    if let Some((prefix, record)) = &change_log {
-                        let mut key = prefix.clone();
-                        key.extend_from_slice(&hlc::pack(ts).to_be_bytes());
-                        pending.push(MergeOp::put(
-                            kind_scopes[KIND_CHANGE as usize].physical(&key),
-                            txn::encode_committed(record),
-                            hlc::pack(ts),
-                        ));
-                    }
+                    // ADR 0046 binding decision: the ONE shared
+                    // materialization helper, also used by `TxnResolve`'s
+                    // commit branch below — never a second copy of this
+                    // loop.
+                    materialize_derived(kind_scopes, &writes, &change_log, ts, &mut pending);
                 }
             }
             KvCommand::Delete { key, fence, ts } => {
@@ -4914,7 +4980,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // (a WAL-replay re-application) is unaffected — matched by
                 // `txn_id` equality, not mere presence of *an* intent.
                 let blocked_by = 'blocked: {
-                    for (key, _) in &writes {
+                    for w in &writes {
+                        let key = &w.key;
                         let Some(vv) = storage
                             .get(&scope.physical(key))
                             .await
@@ -4952,11 +5019,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // fence/engine (ADR 0018 §2/PR4).
                 let record_in_fence =
                     !is_anchor || (fence.contains(&record_key) && !is_sealed(sealed, &record_key));
+                // ADR 0046 A1: every kind-write key a write stages must lead
+                // with that write's own base key's partition token — checked
+                // here (a validated rejection, folded into the same
+                // structural `Fenced` outcome bucket as a fence/seal miss,
+                // never an `assert!`, since this payload is wire-reachable
+                // via `ClientRequest::TxnPrepare`) rather than assumed. This
+                // is also what makes `TxnResolve`'s own fence check over
+                // these same kind keys meaningful: a kind key sharing its
+                // base key's token sits at the same tablet-range position a
+                // plain `KindBatch` write's own key would.
+                let kind_tokens_ok = writes
+                    .iter()
+                    .all(|w| kind_writes_token_valid(&w.key, &w.kind_writes));
                 let all_in_fence = !already_decided
                     && blocked_by.is_none()
+                    && kind_tokens_ok
                     && writes
                         .iter()
-                        .all(|(k, _)| fence.contains(k) && !is_sealed(sealed, k))
+                        .all(|w| fence.contains(&w.key) && !is_sealed(sealed, &w.key))
                     && record_in_fence;
                 // ADR 0018 §2 apply-time write-key conditions amendment:
                 // evaluate this stage's own-key conditions (byte-level OCC
@@ -5012,14 +5093,20 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 if stage_ok {
                     flush_pending(storage, &mut pending, metrics).await;
                     let version = hlc::pack(ts);
-                    for (key, staged_value) in &writes {
+                    for w in &writes {
+                        // ADR 0046 A1: the derived kind-writes/change-log
+                        // payload rides inside this intent, opaque until
+                        // `TxnResolve`'s commit branch materializes it —
+                        // never written into a kind scope here.
                         let intent_env = txn::encode_intent(
                             &txn_id,
                             &record_key,
                             &record_table,
-                            staged_value.as_deref(),
+                            w.value.as_deref(),
+                            &w.kind_writes,
+                            w.change_log.as_ref(),
                         );
-                        let physical_key = scope.physical(key);
+                        let physical_key = scope.physical(&w.key);
                         let took_effect = storage
                             .merge(&physical_key, &intent_env, version)
                             .await
@@ -5388,6 +5475,48 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         .await
                         .expect("raftkv txn resolve record read")
                         .and_then(|vv| txn::decode_record(&vv.value));
+                    // ADR 0046 A1: read every key's own current value up
+                    // front — before deciding the whole-or-nothing fence
+                    // gate below — so that gate can also cover the derived
+                    // kind keys a commit is about to materialize (the #213
+                    // lesson: every key-writing command must carry AND
+                    // enforce the apply-time fence over every key it
+                    // writes, not just a subset). One read per key, reused
+                    // by the resolve loop further down — never a second
+                    // read pass.
+                    struct ResolvedIntent {
+                        staged_value: Option<Vec<u8>>,
+                        intent_version: Version,
+                        kind_writes: Vec<KindWrite>,
+                        change_log: Option<(Vec<u8>, Vec<u8>)>,
+                    }
+                    let mut resolved: Vec<Option<ResolvedIntent>> = Vec::with_capacity(keys.len());
+                    for key in &keys {
+                        let found = storage
+                            .get(&scope.physical(key))
+                            .await
+                            .expect("raftkv txn resolve key read")
+                            .and_then(|vv| match txn::decode_envelope(&vv.value) {
+                                txn::Envelope::Intent {
+                                    txn_id: found,
+                                    staged_value,
+                                    kind_writes,
+                                    change_log,
+                                    ..
+                                } if found == txn_id => Some(ResolvedIntent {
+                                    staged_value,
+                                    intent_version: vv.version,
+                                    kind_writes,
+                                    change_log,
+                                }),
+                                // Already resolved, or a different/newer
+                                // txn's intent has since overwritten this
+                                // key — nothing of ours left here.
+                                // Idempotent no-op.
+                                _ => None,
+                            });
+                        resolved.push(found);
+                    }
                     // ADR 0018 §2 write-loss amendment (Bug 3): every key in
                     // `keys` must fall inside this entry's own `fence` (and
                     // not a range this group has since sealed off) — the
@@ -5398,9 +5527,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // per-key: a partial reject would leave some of this
                     // transaction's keys resolved and others not, the same
                     // torn state a fence exists to prevent elsewhere.
+                    //
+                    // ADR 0046 A1 extends this same gate to the derived
+                    // kind keys a commit is about to materialize (LSI rows,
+                    // the change-log record) — new key-writing surface this
+                    // entry didn't have before, and just as capable of
+                    // landing on the wrong tablet if misrouted. The
+                    // change-log record's own key isn't checked here (its
+                    // HLC suffix isn't even minted yet at this point,
+                    // exactly like `KindBatch`'s own arm never fence-checks
+                    // its `change_log` prefix directly — it rides under the
+                    // same entry-wide gate as `kind_writes`' keys instead).
                     let all_in_fence = keys
                         .iter()
-                        .all(|k| fence.contains(k) && !is_sealed(sealed, k));
+                        .all(|k| fence.contains(k) && !is_sealed(sealed, k))
+                        && resolved.iter().flatten().all(|ri| {
+                            ri.kind_writes
+                                .iter()
+                                .all(|(_, kk, _)| fence.contains(kk) && !is_sealed(sealed, kk))
+                        });
                     // ADR 0018 §2/PR6 hardening (defense-in-depth, not a
                     // reproduced bug): every current decider
                     // (`animusd`'s ordinary `cp_txn` commit path and its
@@ -5469,31 +5614,19 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         );
                     }
                     let version = hlc::pack(ts);
-                    for key in &keys {
+                    for (key, resolved_intent) in keys.iter().zip(resolved) {
                         if outcome_mismatch || !all_in_fence {
                             continue; // whole-or-nothing: skip every key, not just this one
                         }
                         let physical_key = scope.physical(key);
-                        let Some(vv) = storage
-                            .get(&physical_key)
-                            .await
-                            .expect("raftkv txn resolve key read")
+                        let Some(ResolvedIntent {
+                            staged_value,
+                            intent_version,
+                            kind_writes,
+                            change_log,
+                        }) = resolved_intent
                         else {
-                            continue; // nothing left here to resolve
-                        };
-                        let intent = match txn::decode_envelope(&vv.value) {
-                            txn::Envelope::Intent {
-                                txn_id: found,
-                                staged_value,
-                                ..
-                            } if found == txn_id => Some(staged_value),
-                            // Already resolved, or a different/newer txn's
-                            // intent has since overwritten this key —
-                            // nothing of ours left here. Idempotent no-op.
-                            _ => None,
-                        };
-                        let Some(staged_value) = intent else {
-                            continue;
+                            continue; // nothing left here to resolve (idempotent no-op)
                         };
                         // ADR 0018 §2 write-loss amendment (Part B): every
                         // branch below already treated this key as resolved
@@ -5508,46 +5641,72 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         // used to leave a foreign tablet's key permanently
                         // unable to land correctly.
                         match outcome_commit_ts {
-                            Some(_commit_ts) => match staged_value {
-                                // Committed: the staged value becomes the
-                                // committed value.
-                                Some(v) => {
-                                    let took_effect = storage
-                                        .merge(&physical_key, &txn::encode_committed(&v), version)
-                                        .await
-                                        .expect("raftkv apply txn resolve commit");
-                                    if !took_effect {
-                                        surface_suspicious_merge_noop(
-                                            metrics,
-                                            suspicious_noop_log_budget,
-                                            "TxnResolve commit",
-                                            &physical_key,
-                                            version,
-                                            recovered_baseline_version,
-                                        );
+                            Some(_commit_ts) => {
+                                match staged_value {
+                                    // Committed: the staged value becomes the
+                                    // committed value.
+                                    Some(v) => {
+                                        let took_effect = storage
+                                            .merge(
+                                                &physical_key,
+                                                &txn::encode_committed(&v),
+                                                version,
+                                            )
+                                            .await
+                                            .expect("raftkv apply txn resolve commit");
+                                        if !took_effect {
+                                            surface_suspicious_merge_noop(
+                                                metrics,
+                                                suspicious_noop_log_budget,
+                                                "TxnResolve commit",
+                                                &physical_key,
+                                                version,
+                                                recovered_baseline_version,
+                                            );
+                                        }
+                                    }
+                                    // A staged delete resolves to an actual
+                                    // tombstone — the only place `TxnResolve`
+                                    // writes one, since it's finalizing an
+                                    // already-decided delete, not guessing.
+                                    None => {
+                                        let took_effect = storage
+                                            .merge_tombstone(&physical_key, version)
+                                            .await
+                                            .expect("raftkv apply txn resolve commit delete");
+                                        if !took_effect {
+                                            surface_suspicious_merge_noop(
+                                                metrics,
+                                                suspicious_noop_log_budget,
+                                                "TxnResolve commit delete",
+                                                &physical_key,
+                                                version,
+                                                recovered_baseline_version,
+                                            );
+                                        }
                                     }
                                 }
-                                // A staged delete resolves to an actual
-                                // tombstone — the only place `TxnResolve`
-                                // writes one, since it's finalizing an
-                                // already-decided delete, not guessing.
-                                None => {
-                                    let took_effect = storage
-                                        .merge_tombstone(&physical_key, version)
-                                        .await
-                                        .expect("raftkv apply txn resolve commit delete");
-                                    if !took_effect {
-                                        surface_suspicious_merge_noop(
-                                            metrics,
-                                            suspicious_noop_log_budget,
-                                            "TxnResolve commit delete",
-                                            &physical_key,
-                                            version,
-                                            recovered_baseline_version,
-                                        );
-                                    }
-                                }
-                            },
+                                // ADR 0046 A1 ("materialize-at-resolve"): on
+                                // commit only, materialize this write's
+                                // derived kind-scope rows + change-log
+                                // record — via the SAME shared helper
+                                // `KindBatch`'s own apply arm uses — at THIS
+                                // resolve entry's own `ts`, never the
+                                // transaction's `commit_ts` and never the
+                                // stage's own `ts` (ADR 0018 §2 B1: the key
+                                // position must be monotone in this
+                                // tablet's own log, which only the entry
+                                // that actually fixes commit order can
+                                // provide). Discarded entirely on abort —
+                                // see the `None` arm below.
+                                materialize_derived(
+                                    kind_scopes,
+                                    &kind_writes,
+                                    &change_log,
+                                    ts,
+                                    &mut pending,
+                                );
+                            }
                             None => {
                                 // Aborted: restore whatever this key held
                                 // immediately before the intent — never a
@@ -5557,7 +5716,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 // version this group has ever applied is
                                 // strictly increasing
                                 // (`assert_ts_monotonic`), so
-                                // `vv.version - 1` is guaranteed to sit
+                                // `intent_version - 1` is guaranteed to sit
                                 // strictly below the intent's own version
                                 // and at/above this key's true prior
                                 // version. **This one-hop-back lookback is
@@ -5579,7 +5738,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 // (via the `None` arm) genuinely absent —
                                 // never another live `Intent`.
                                 let prior = storage
-                                    .get_at(&physical_key, vv.version.saturating_sub(1))
+                                    .get_at(&physical_key, intent_version.saturating_sub(1))
                                     .await
                                     .expect("raftkv txn resolve prior read");
                                 let (took_effect, site) = match prior {
@@ -6438,7 +6597,7 @@ mod pr5_orphan_and_resurrection_tests {
                     txn_id_b,
                     record_key_b,
                     "orders".to_string(),
-                    vec![(kb_clone, Some(b"debited".to_vec()))],
+                    vec![txn::TxnWrite::plain(kb_clone, Some(b"debited".to_vec()))],
                     Vec::new(),
                 )
                 .await
@@ -6491,7 +6650,7 @@ mod pr5_orphan_and_resurrection_tests {
         // (it always mints a fresh id), so this in-crate test builds the
         // command by hand via the same private primitives
         // `txn_stage_anchor` itself uses internally.
-        let anchor_writes = vec![(ka.clone(), Some(b"placed".to_vec()))];
+        let anchor_writes = vec![txn::TxnWrite::plain(ka.clone(), Some(b"placed".to_vec()))];
         let fence = node_a.scope_range();
         let participant_span_end = txn::immediate_successor(&kb);
         let (result, late_ts) = node_a.propose_ordered_aux(|term| {
