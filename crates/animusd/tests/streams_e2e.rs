@@ -12,7 +12,7 @@
 //! smoke test; and a GSI+stream table proving the two halves of ADR 0042
 //! §8's trim min-rule genuinely coexist (D5).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -227,6 +227,56 @@ async fn describe_stream(addr: SocketAddr, stream_arn: &str) -> String {
     resp
 }
 
+/// The full, *current* set of tablet ids the stream's shard list spans —
+/// paginating via `ExclusiveStartShardId`/`LastEvaluatedShardId` until a
+/// page comes back with no more to page through. This is the wire-visible
+/// source of truth [`drain_all_tablets_lineage`] re-consults every pass so a
+/// cascading split landing mid-drain (a child tablet's own later split,
+/// minting a brand-new grandchild tablet this walk was never told about up
+/// front) is discovered the same way any real consumer would: by asking
+/// `DescribeStream` again, never by peeking at `Metadata`'s tablet map
+/// directly (that stays reserved for the already-tracked-tablet chain-length
+/// read below, which — unlike *discovering a tablet exists at all* — has no
+/// wire equivalent short of re-deriving it from a full shard list per
+/// tablet).
+async fn stream_tablet_ids(addr: SocketAddr, stream_arn: &str) -> BTreeSet<u64> {
+    let mut ids = BTreeSet::new();
+    let mut start: Option<String> = None;
+    loop {
+        let start_clause = start
+            .as_ref()
+            .map(|s| format!(r#","ExclusiveStartShardId":"{s}""#))
+            .unwrap_or_default();
+        let (status, resp) = dynamo(
+            addr,
+            "DynamoDBStreams_20120810.DescribeStream",
+            &format!(r#"{{"StreamArn":"{stream_arn}"{start_clause}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "DescribeStream (discovery) failed: {resp}");
+        let v = json(&resp);
+        let shards = v["StreamDescription"]["Shards"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for shard in &shards {
+            if let Some(tablet) = shard["ShardId"]
+                .as_str()
+                .and_then(|id| id.strip_prefix("shardId-"))
+                .and_then(|rest| rest.split_once('-'))
+                .and_then(|(tablet, _epoch)| tablet.parse::<u64>().ok())
+            {
+                ids.insert(tablet);
+            }
+        }
+        match v["StreamDescription"]["LastEvaluatedShardId"].as_str() {
+            Some(next) => start = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    ids
+}
+
 /// Drains `tablet`'s **whole** lineage of `TABLE`'s stream (every already
 /// closed epoch, `TRIM_HORIZON` to null, in ascending order, then the open
 /// tail polled until `want` records total have been collected) — the
@@ -357,14 +407,32 @@ async fn drain_tablet_lineage(
 }
 
 /// [`drain_tablet_lineage`]'s multi-tablet sibling: drains every closed
-/// epoch of every tablet in `tablets`, then polls every tablet's open tail
-/// once per pass, summing across all of them, until `want_total` records
-/// have been collected in total or `deadline` elapses. Carries the identical
-/// fix documented on [`drain_tablet_lineage`] for the poll-witnesses-its-own-
-/// seal race, applied **per tablet independently** — each tablet in a
-/// cascading multi-generation split (D8) hits this race on its own
-/// schedule, so the fix must self-correct one tablet at a time rather than
-/// assume the whole set transitions in lockstep.
+/// epoch of every currently-known tablet, then polls every known tablet's
+/// open tail once per pass, summing across all of them, until `want_total`
+/// records have been collected in total or `deadline` elapses. Carries the
+/// identical fix documented on [`drain_tablet_lineage`] for the
+/// poll-witnesses-its-own-seal race, applied **per tablet independently** —
+/// each tablet in a cascading multi-generation split (D8) hits this race on
+/// its own schedule, so the fix must self-correct one tablet at a time
+/// rather than assume the whole set transitions in lockstep.
+///
+/// `tablets` seeds the walk but is **not** a fixed set for its whole
+/// duration: a real cascading split — a child of the caller's own split
+/// child splitting again while this walk is still mid-drain — mints a
+/// brand-new tablet id nobody handed this function up front. Each outer
+/// pass re-resolves the *current* shard chain via a fresh [`DescribeStream`]
+/// call ([`stream_tablet_ids`]) before touching any tablet's records, and
+/// any newly discovered id is folded into the tracked set with its own
+/// fresh `next_epoch = 0` cursor — never disturbing an already-tracked
+/// tablet's in-flight cursor, which is exactly the resume-not-remint
+/// invariant [`drain_tablet_lineage`]'s own doc protects. Previously this
+/// function only ever saw the tablet set the caller captured once, before
+/// the drain started; a third-generation split landing mid-drain (a child's
+/// own child) would mint a tablet this walk could never learn about, and its
+/// records would never be read — a spurious deficit under sustained write
+/// pressure (`auto_split_mid_stream_with_live_consumer_across_every_node`,
+/// D8, ~1/20 iterations before this fix), now closed structurally rather
+/// than adjudicated as a known harness limitation.
 async fn drain_all_tablets_lineage(
     dynamo_addr: SocketAddr,
     stream_arn: &str,
@@ -374,15 +442,29 @@ async fn drain_all_tablets_lineage(
     deadline: tokio::time::Instant,
 ) -> Vec<Value> {
     let mut collected = Vec::new();
+    let mut tracked: BTreeSet<TabletId> = tablets.iter().copied().collect();
     let mut next_epoch: std::collections::BTreeMap<TabletId, u64> =
-        tablets.iter().map(|&t| (t, 0u64)).collect();
+        tracked.iter().map(|&t| (t, 0u64)).collect();
     // Per-tablet open-tail state, resumed from its own last position — see
     // `drain_tablet_lineage`'s identical doc for why re-minting
     // `TRIM_HORIZON` every pass would double-count an open shard's records.
     let mut open_epoch: BTreeMap<TabletId, u64> = BTreeMap::new();
     let mut open_iterator: BTreeMap<TabletId, String> = BTreeMap::new();
     loop {
-        for &tablet in tablets {
+        // Re-resolve the shard chain before touching any tablet's records
+        // this pass — see this function's own doc for why a static snapshot
+        // of `tablets` misses a cascading split's newest generation. A
+        // freshly discovered tablet starts at epoch 0 and has no open-tail
+        // state yet, so it falls straight into the ordinary per-tablet loops
+        // below exactly like one of the originally-seeded tablets would.
+        for tablet_id in stream_tablet_ids(dynamo_addr, stream_arn).await {
+            let tablet = TabletId(tablet_id);
+            if tracked.insert(tablet) {
+                next_epoch.insert(tablet, 0);
+            }
+        }
+        let current_tablets: Vec<TabletId> = tracked.iter().copied().collect();
+        for &tablet in &current_tablets {
             let chain_len = node
                 .metadata()
                 .stream_shards
@@ -414,7 +496,7 @@ async fn drain_all_tablets_lineage(
                 open_epoch.remove(&tablet); // a fresh epoch just closed
             }
         }
-        for &tablet in tablets {
+        for &tablet in &current_tablets {
             let epoch = next_epoch[&tablet];
             if open_epoch.get(&tablet) != Some(&epoch) {
                 let shard_id = segment::shard_id(tablet.0, epoch);
@@ -453,7 +535,7 @@ async fn drain_all_tablets_lineage(
             return collected;
         }
         if tokio::time::Instant::now() >= deadline {
-            let chain_lens: Vec<(TabletId, usize)> = tablets
+            let chain_lens: Vec<(TabletId, usize)> = current_tablets
                 .iter()
                 .map(|&t| {
                     (
@@ -467,7 +549,8 @@ async fn drain_all_tablets_lineage(
                 .collect();
             panic!(
                 "the lineage never delivered {want_total} records ({} so far); \
-                 per-tablet closed-chain lengths: {chain_lens:?}",
+                 tracked tablets: {current_tablets:?}; per-tablet closed-chain lengths: \
+                 {chain_lens:?}",
                 collected.len()
             );
         }
@@ -796,11 +879,29 @@ async fn fs_segment_store_opt_in_smoke() {
 /// digits, different `shardId-<tablet>-<epoch>` prefixes — as opposed to a
 /// harness double-read (which would show a *repeated* `eventID`). Tracked
 /// in `docs/engineering-lessons.md`, not fixed here (this file is test-only
-/// by convention/scope). (2) A rarer **deficit** (a timeout short of
-/// `expected`) is a separate, already-documented pre-existing timing
-/// sensitivity in the byte-triggered seal arm under a real write burst (see
-/// `manual_split_with_unsealed_backlog_under_production_seal_knobs`'s own
-/// doc comment below) — unrelated to (1), no known interaction.
+/// by convention/scope).
+///
+/// (2) A **deficit** (a timeout short of `expected`, ~1/20 iterations
+/// before the fix below) used to be this test's own dedicated harness bug,
+/// now fixed: `drain_all_tablets_lineage` took a **static** snapshot of the
+/// tablet/shard set (`ids`, captured once, above), so a **cascading**
+/// third-generation split — a child of this test's own split child
+/// splitting again while the drain was already mid-walk — minted a
+/// grandchild tablet the walk was never told about and could never read,
+/// silently short-counting. Production was never wrong here: only the
+/// harness's snapshot was stale. `drain_all_tablets_lineage` now
+/// re-resolves the live shard chain via `DescribeStream` every pass
+/// (`stream_tablet_ids`) and folds any newly discovered tablet in without
+/// disturbing an already-tracked one's in-flight iterator (preserving
+/// PR #219's resume-not-remint fix), so this no longer needs adjudicating
+/// as a known limitation. A genuinely unrelated deficit mode remains
+/// possible in principle (`manual_split_with_unsealed_backlog_under_
+/// production_seal_knobs`'s own doc comment below documents a separate,
+/// pre-existing timing sensitivity in the byte-triggered seal arm under a
+/// real write burst) — if a deficit ever recurs here, check the diagnostic
+/// panic's `tracked tablets`/chain-length dump first: a set that still
+/// matches `ids` with no cascading grandchild in it points at that
+/// different, seal-arm-timing cause instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     let dir = tempfile::TempDir::new().unwrap();

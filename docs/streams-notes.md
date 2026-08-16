@@ -300,3 +300,13 @@ date/time crate dependency for one cosmetic label format.
   while its open-tail iterator is still mid-walk must resume from that
   iterator, never re-mint `TRIM_HORIZON` — invisible under `tiny_seal_
   knobs`, whose open tail is always empty the instant it's polled.
+  **`drain_all_tablets_lineage` also used to take its tablet set as a
+  static snapshot for the whole drain** — a genuine, harness-only bug (no
+  `src/` change): under D8's sustained write pressure a child tablet could
+  itself split again *while the drain was already mid-walk*, minting a
+  grandchild tablet id the walk never learns about, silently short-
+  counting (~1/20 iterations). Fixed by re-resolving the live shard chain
+  every pass via a fresh `DescribeStream` call (paginating
+  `ExclusiveStartShardId`), folding any newly discovered tablet id in with
+  a fresh cursor while never disturbing an already-tracked tablet's
+  in-flight open-tail iterator; see `docs/engineering-lessons.md`.
