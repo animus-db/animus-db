@@ -2,6 +2,15 @@
 
 - **Status:** Accepted — implemented (this stack). Supersedes
   [ADR 0033](0033-tablet-merge.md) entirely.
+- **2026-08-16 note:** split-only stands unchanged, but
+  [ADR 0050](0050-per-tablet-storage-copy-based-splits.md) (accepted, in
+  delivery) reverses this ADR's "the storage side of this is already
+  amortized (one shared engine)" pillar: storage returns to per-tablet
+  engines, so per-tablet storage cost joins the per-group costs the
+  cheap-groups roadmap commits to keeping cheap (0050 names the idle-engine
+  cost measurement as a gating item). A split's copy cost also gives the
+  dilution trade below a second leg: tablet count still never shrinks, and
+  creating one now costs real IO.
 - **Date:** 2026-08-14
 
 ## Context

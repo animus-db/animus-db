@@ -19,6 +19,13 @@
   silently drop the overwrite. The two in-text notes below are otherwise
   unchanged (this is additive, not a retraction — `merge`/`merge_tombstone`
   still have no *engine-wide* monotonic floor, and still shouldn't).
+- **2026-08-16 note: [ADR 0050](0050-per-tablet-storage-copy-based-splits.md)
+  (accepted, in delivery as "Train B") will supersede this ADR in full** —
+  both halves: per-tablet physical engines replace the shared per-node
+  engine, and a copy-based background split workflow (build → freeze →
+  cutover → retire) replaces the metadata-only zero-copy split. Until that
+  train lands, this ADR remains the as-built truth; do not build new work on
+  this ADR's mechanisms without reading 0050 first.
 - **2026-08-10 note:** ADR 0038 gives the **control plane** a per-node
   system-keyspace slice of "one shared engine" too (a combined node's control
   `Metadata` now durably lives in the same already-open shared engine this
