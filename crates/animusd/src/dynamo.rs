@@ -3314,8 +3314,106 @@ fn marker_change_log(pk: &AttributeValue, sk: Option<&AttributeValue>) -> (Vec<u
 /// used to be, renamed to what it now actually decides — the record's
 /// *shape*, never whether one exists ("images follow the stream/index
 /// declarations; the record itself follows nothing — it always exists").
-fn table_change_records_carry_images(meta: &Metadata, table: &str) -> bool {
+pub(crate) fn table_change_records_carry_images(meta: &Metadata, table: &str) -> bool {
     !meta.table_indexes(table).is_empty() || meta.table_stream(table).is_some()
+}
+
+/// Whether `cp_txn` must **await** its post-commit resolve under the ADR
+/// 0046 D1 bounded budget (`TXN_RESOLVE_ALL_AWAIT_BUDGET`,
+/// `resolve_all_parallel`) rather than the original fire-and-forget
+/// sequential spawn: only when the transaction stages a pending kind write
+/// against a table whose change records **carry images** — an index or a
+/// stream. D1's rationale is consumer visibility (LSI rows and the
+/// GSI/stream change record only exist from resolve onward, so an
+/// ack-then-async window would leave a committed write transiently absent
+/// from its own index/stream); a marker-only table has no such consumer, so
+/// nothing observable rides on resolve latency and the proven-stable
+/// sequential spawn applies. This scoping is **load-bearing**, not a
+/// latency nicety: keying it on `table_takes_kind_write_path` (constant-
+/// true since ADR 0049) silently universalized the awaited-parallel
+/// configuration onto every plain-table transaction — the exact
+/// configuration `resolve_all_parallel`'s own comment records as
+/// reproduced-red on `dynamo_txn.rs`'s torn-pair hard-gate test, which
+/// promptly went intermittently red again (a budget-expired ack racing the
+/// writer's next same-key stage into `TXN_STAGE_PUSH_ATTEMPTS` exhaustion).
+pub(crate) fn txn_resolve_awaited(meta: &Metadata, writes: &[crate::TxnTableWrite]) -> bool {
+    writes
+        .iter()
+        .any(|w| w.pending.is_some() && table_change_records_carry_images(meta, &w.table))
+}
+
+#[cfg(test)]
+mod txn_resolve_awaited_tests {
+    use animus_control::{ApplyOutcome, MetaCommand, Metadata, StreamSpec, StreamViewType};
+
+    use super::txn_resolve_awaited;
+    use crate::TxnTableWrite;
+
+    fn meta_with_tables() -> Metadata {
+        let mut m = Metadata::default();
+        for table in ["plain", "streamed"] {
+            assert!(matches!(
+                m.apply(&MetaCommand::CreateTableSchema {
+                    table: table.to_owned(),
+                    schema: animus_control::TableSchema::simple(
+                        "pk",
+                        animus_control::ColumnType::String
+                    ),
+                }),
+                ApplyOutcome::Applied
+            ));
+        }
+        assert!(matches!(
+            m.apply(&MetaCommand::SetTableStream {
+                table: "streamed".to_owned(),
+                spec: Some(StreamSpec {
+                    view_type: StreamViewType::NewAndOldImages,
+                    label: "L1".to_owned(),
+                }),
+            }),
+            ApplyOutcome::Applied
+        ));
+        m
+    }
+
+    fn pending_write(table: &str) -> TxnTableWrite {
+        TxnTableWrite {
+            table: table.to_owned(),
+            key: vec![0u8; 8],
+            value: None,
+            pending: Some(crate::PendingKindWrite {
+                pk: animus_dynamo::AttributeValue::S("p".to_owned()),
+                sk: None,
+                op: crate::KindWriteOp::Delete,
+                condition: None,
+            }),
+        }
+    }
+
+    /// A transaction whose pending writes touch only marker tables (no
+    /// index, no stream) keeps the original fire-and-forget sequential
+    /// resolve — the proven-stable configuration the torn-pair hard gate
+    /// pins; one images-carrying participant is what flips it to the D1
+    /// awaited-parallel branch.
+    #[test]
+    fn marker_only_transactions_are_not_awaited_images_ones_are() {
+        let meta = meta_with_tables();
+        assert!(!txn_resolve_awaited(&meta, &[pending_write("plain")]));
+        assert!(txn_resolve_awaited(&meta, &[pending_write("streamed")]));
+        assert!(txn_resolve_awaited(
+            &meta,
+            &[pending_write("plain"), pending_write("streamed")]
+        ));
+        // A plain (already-valued, no-pending) write never awaits, whatever
+        // its table.
+        let plain_valued = TxnTableWrite {
+            table: "streamed".to_owned(),
+            key: vec![0u8; 8],
+            value: Some(vec![1]),
+            pending: None,
+        };
+        assert!(!txn_resolve_awaited(&meta, &[plain_valued]));
+    }
 }
 
 /// Build the multi-kind atomic batch one item write commits (ADR 0041 §2/§4;

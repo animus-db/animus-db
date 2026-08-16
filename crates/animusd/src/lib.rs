@@ -6765,19 +6765,24 @@ impl ClientCtx {
     /// synchronously before returning — there is no successful ack to speed
     /// up on an error return, so the extra safety margin costs nothing.
     ///
-    /// **ADR 0046 D1 amendment**: for a transaction touching at least one
-    /// kind-write-path table, the async-spawn above is instead an **awaited,
-    /// bounded** resolve (`TXN_RESOLVE_ALL_AWAIT_BUDGET`, parallelized
-    /// across participants via `resolve_all_parallel`) — LSI rows and the
-    /// GSI/stream change record only appear at resolve (materialize-at-
-    /// resolve, A1), so an ack-then-async-resolve window would leave a
-    /// committed write readable on the base table but transiently absent
-    /// from its index/stream. A timeout still acks (delayed, never denied).
-    /// A plain transaction is completely unaffected — same fire-and-forget
-    /// spawn, same **sequential** `resolve_all` as before this amendment
-    /// (parallelizing it universally measurably destabilized a pre-existing
-    /// timing-sensitive regression test under concurrent load; see
-    /// `resolve_all_parallel`'s own doc for the full account).
+    /// **ADR 0046 D1 amendment (re-scoped under ADR 0049)**: for a
+    /// transaction touching at least one **images-carrying** table (an
+    /// index or a stream — `dynamo::txn_resolve_awaited`), the async-spawn
+    /// above is instead an **awaited, bounded** resolve
+    /// (`TXN_RESOLVE_ALL_AWAIT_BUDGET`, parallelized across participants
+    /// via `resolve_all_parallel`) — LSI rows and the GSI/stream change
+    /// record only appear at resolve (materialize-at-resolve, A1), so an
+    /// ack-then-async-resolve window would leave a committed write readable
+    /// on the base table but transiently absent from its index/stream. A
+    /// timeout still acks (delayed, never denied). Every other transaction
+    /// — including a marker-table one, which since ADR 0049 also stages
+    /// `pending` kind writes but has no index/stream consumer to protect —
+    /// keeps the fire-and-forget spawn and the **sequential** `resolve_all`
+    /// (parallelizing it universally measurably destabilized the torn-pair
+    /// hard-gate test under concurrent load, twice now: once during the D1
+    /// delivery, and again when ADR 0049's constant-true gate briefly
+    /// re-universalized it by implication; see `resolve_all_parallel`'s own
+    /// doc and `dynamo::txn_resolve_awaited`'s for the full account).
     ///
     /// **`write_conditions`** (ADR 0018 §2 apply-time write-key conditions
     /// amendment) — `(table, key, expected)` own-key byte-level OCC
@@ -6873,11 +6878,20 @@ impl ClientCtx {
             condition_map.insert((table, key), expected);
         }
 
-        // ADR 0046 D1: whether this transaction touches any kind-write-path
-        // table at all — every such write rides as `pending`, never a
-        // precomputed `value` (see `TxnTableWrite`'s doc), so this is exact,
-        // not a heuristic. Gates the awaited-bounded resolve below.
-        let touches_kind_write_path = writes.iter().any(|w| w.pending.is_some());
+        // ADR 0046 D1 (re-scoped under ADR 0049): whether this transaction
+        // must AWAIT its post-commit resolve — only when a pending write
+        // targets a table whose change records carry images (an index or a
+        // stream; the consumer-visibility rationale D1 actually rests on).
+        // Since ADR 0049's constant-true write-path gate, `pending.is_some()`
+        // alone is true for EVERY transaction, and keying this branch on it
+        // silently universalized the awaited `resolve_all_parallel`
+        // configuration that `resolve_all_parallel`'s own comment records as
+        // reproduced-red on the torn-pair hard-gate test — which duly went
+        // intermittently red again. See `dynamo::txn_resolve_awaited`'s doc.
+        let awaits_resolve = {
+            let meta = self.effective_metadata();
+            dynamo::txn_resolve_awaited(&meta, &writes)
+        };
 
         // Group by (table, tablet), preserving first-seen order — `order[0]`
         // is the anchor. `condition_groups` mirrors `groups`' keying, only
@@ -7062,6 +7076,17 @@ impl ClientCtx {
         // `txn_resolver_loop` is the safety net either way), but the
         // sequential default is the proven-stable one, so parallelism stays
         // opt-in to where D1 actually needs it.
+        //
+        // ADR 0049 postscript, proving the scoping is load-bearing: when the
+        // constant-true write-path gate made every transaction stage
+        // `pending` kind writes, the awaited branch below (then keyed on
+        // "any pending") re-universalized this parallel path by implication
+        // — and this same test went intermittently red again (a
+        // budget-expired ack racing the writer's next same-key stage into
+        // `TXN_STAGE_PUSH_ATTEMPTS` exhaustion). The branch is now keyed on
+        // `dynamo::txn_resolve_awaited` (images-carrying tables only), which
+        // restores the exact pre-ADR-0049 behavior for every marker-only
+        // transaction.
         let resolve_all_parallel = |outcome: TxnOutcome, staged: Vec<(String, Vec<Vec<u8>>)>| {
             let this = self.clone();
             let txn_id = txn_id.clone();
@@ -7171,18 +7196,19 @@ impl ClientCtx {
                     // liveness/latency.
                     //
                     // ADR 0046 D1: for a transaction touching any
-                    // kind-write-path table, LSI rows and the stream/GSI
-                    // change record only appear at resolve (materialize-
-                    // at-resolve, A1) — an ack-then-async-resolve window
-                    // would leave a committed write readable on the base
-                    // table but transiently absent from its index/stream.
-                    // Await `resolve_all` under a short bounded budget
-                    // first; a timeout still acks (delayed, never denied —
-                    // `txn_resolver_loop` remains the safety net for
-                    // whatever the bound didn't cover). A plain
-                    // transaction keeps the original fire-and-forget spawn
-                    // unchanged.
-                    if touches_kind_write_path {
+                    // images-carrying table (index/stream), LSI rows and
+                    // the stream/GSI change record only appear at resolve
+                    // (materialize-at-resolve, A1) — an ack-then-async-
+                    // resolve window would leave a committed write readable
+                    // on the base table but transiently absent from its
+                    // index/stream. Await `resolve_all` under a short
+                    // bounded budget first; a timeout still acks (delayed,
+                    // never denied — `txn_resolver_loop` remains the safety
+                    // net for whatever the bound didn't cover). Every other
+                    // transaction — marker-only tables included, since ADR
+                    // 0049 — keeps the original fire-and-forget sequential
+                    // spawn unchanged (see `dynamo::txn_resolve_awaited`).
+                    if awaits_resolve {
                         let _ = tokio::time::timeout(
                             TXN_RESOLVE_ALL_AWAIT_BUDGET,
                             resolve_all_parallel(TxnOutcome::Committed { commit_ts }, staged),
