@@ -890,11 +890,14 @@ admin HTTP surface's UTF8-string one); `dynamo.rs`'s own
 (a new, non-linearizable bounded kind-scan wrapper, mirroring
 `local_get_kind`'s existing shape) to prove a streamed-unindexed table's
 write commits exactly base + change, no LSI/footprint row;
-`index_drain.rs`'s own `stream_sealer_tests` is a fifth (round-3 sealer PR)
-— the seal arm's triggers/sequence (size, age, empty-hot no-seal, the
-exactly-at-watermark boundary), the F10/F12-b hot-trim rework (the
-GSI+stream min-rule, and — reviewed hard — the
-disabled-draining-does-not-block-trim rule), disable-as-final-seal with
+`index_drain.rs`'s own `stream_sealer_tests` is a fifth (round-3 sealer PR,
+extended by the ADR 0042 fork G age-trigger-derivation rewrite) — the seal
+arm's triggers/sequence (size, age — both the never-sealed driver-local
+fallback and the catalog-derived basis a later backlog uses once a tablet
+has sealed at least once — empty-hot no-seal, a real-but-below-threshold
+backlog also never seals, and the exactly-at-watermark boundary), the
+F10/F12-b hot-trim rework (the GSI+stream min-rule, and — reviewed hard —
+the disabled-draining-does-not-block-trim rule), disable-as-final-seal with
 epoch continuity across a disable/re-enable cycle, and F11's split-key
 token alignment, needing `CpGroup`'s private `pending_changes`/
 `approx_bytes_kind`/`cursor_min_watermark` and, to confirm a segment

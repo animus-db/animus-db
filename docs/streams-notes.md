@@ -310,3 +310,41 @@ date/time crate dependency for one cosmetic label format.
   `ExclusiveStartShardId`), folding any newly discovered tablet id in with
   a fresh cursor while never disturbing an already-tracked tablet's
   in-flight open-tail iterator; see `docs/engineering-lessons.md`.
+- **ADR 0042 fork G (2026-08-16)**: `index_drain.rs`'s own `stream_sealer_
+  tests` gained `sub_threshold_backlog_never_seals_while_below_both_triggers`
+  (a real, nonzero `KIND_CHANGE` backlog under both huge knobs sits for many
+  ticks with zero catalog rows — proving the unconditional every-tick scan
+  is gone even with a real hot tail, `empty_hot_tail_never_seals`'s
+  nonzero-bytes sibling) and `age_trigger_uses_catalog_seal_time_for_a_later_
+  backlog` (a second seal, after a first one has already landed, is timed
+  off `Metadata::last_seal_wall_ms` rather than the never-sealed fallback
+  `age_trigger_seals_a_quiet_table` exercises). **The never-sealed
+  fallback's own design went through two broken iterations before landing**
+  — both caught by `streams_e2e.rs::manual_split_with_unsealed_backlog_
+  under_production_seal_knobs` (a pre-existing regression this fork did not
+  intend to touch) going deterministically red, then flaky: seeding the
+  fallback at a bare driver-local "now" timestamp forgets how old a split
+  child's *inherited* backlog actually is (silently delaying its first seal
+  by however long the parent's own backlog had already been aging, and
+  compounding across a cascade of auto-splits); a same-node "inherit the
+  parent tablet's own memoized basis" patch is *also* wrong, since a split
+  child is routinely led by a different node than its parent and the
+  fallback map is per-node in-memory state — that node never even observed
+  the parent tablet. The landed fix is a **one-time** `pending_changes()`
+  scan of the true oldest pending record's own HLC, run only the first time
+  a tablet is ever seen with a nonzero, never-sealed backlog and memoized
+  from then on — correct (reads the real data, not a per-node guess) and
+  still eliminates the overwhelming majority of the target cost (once per
+  tablet's lifetime, not once per tick forever). See `seal_tick`'s own doc
+  (`crates/animusd/src/index_drain.rs`) for the full account and
+  `docs/engineering-lessons.md` for the generalized lesson.
+  `ANIMUS_STREAM_SEEDS=20 cargo test -p animus-test --test
+  stream_lineage_corpus` stayed green throughout — the corpus never
+  exercises `seal_tick`'s internal trigger-derivation mechanism directly (it
+  drives real seals via knobs the same way the pre-fork code did), so it is
+  a regression check on the seal *sequence*/lineage, not on the trigger
+  rewrite itself; the sealer-tests matrix above is what actually pins the
+  new derivation down, and `manual_split_with_unsealed_backlog_under_
+  production_seal_knobs` (a real 3-node `ProdEnv` cluster, in `streams_e2e.
+  rs`) is what caught the cross-node inheritance gap the sealer-tests
+  matrix's own single-node harness structurally cannot reach.

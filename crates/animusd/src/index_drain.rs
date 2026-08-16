@@ -187,6 +187,7 @@
 //! term — see [`trim_janitor`]'s own doc for the F12-b coexistence rule this
 //! implements and why it's safe.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -267,9 +268,22 @@ const BACKFILL_SEED_TIMEOUT: Duration = Duration::from_secs(10);
 /// term says it's safe to, and a failed seal simply re-evaluates its
 /// triggers next tick).
 pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
+    // Driver-local memo of the seal arm's age-trigger basis for a tablet
+    // that has never sealed a shard of its own (no catalog row to read a
+    // last-seal time from yet) — see `seal_tick`'s own doc for the full
+    // design, including why the memoized value is a one-time real scan's
+    // true oldest-record HLC, not a bare "now" timestamp. Owned by this one
+    // task (this loop is the only writer/reader, one instance per node), so
+    // no lock is needed.
+    let mut first_hot_seen: BTreeMap<TabletId, u64> = BTreeMap::new();
     loop {
         tokio::time::sleep(INDEX_DRAIN_INTERVAL).await;
         let meta = ctx.effective_metadata();
+        // Bound the fallback map to tablets that still exist at all — a
+        // cheap `BTreeMap` retain, never a data scan — so a tablet dropped
+        // (or moved off this node permanently) doesn't leak an entry
+        // forever.
+        first_hot_seen.retain(|t, _| meta.tablets.contains_key(t));
         for (tablet, group) in ctx.edge.hosted_groups() {
             if !group.is_leader() {
                 continue;
@@ -344,7 +358,10 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
                     );
                 }
             }
-            if stream_enabled && let Err(e) = seal_tick(&ctx, &meta, &table, tablet, &group).await {
+            if stream_enabled
+                && let Err(e) =
+                    seal_tick(&ctx, &meta, &table, tablet, &group, &mut first_hot_seen).await
+            {
                 tracing::debug!(tablet = tablet.0, table, error = %e, "seal arm: tick failed");
             }
             if let Err(e) =
@@ -896,19 +913,87 @@ async fn seed_change_log_record(
 
 /// The seal arm's trigger evaluation (ADR 0043 §A3 "When"), run once per
 /// streamed tablet per tick: seals via [`seal_now`] iff the `KIND_CHANGE`
-/// scope's approximate size exceeds `--stream-seal-bytes`, **or** the oldest
-/// unsealed record's age exceeds `--stream-seal-age`. Neither trigger fires
-/// on an empty hot tail (nothing to seal, and age has nothing to measure).
-/// Also records this tick's own observability levels (`Metric::
-/// StreamHotBytes`/`StreamSealBacklogMs`) regardless of whether a seal
-/// actually fires — the whole point of a level metric is that it reflects
-/// the current state, not just the moments something happened.
+/// scope's approximate size exceeds `--stream-seal-bytes`, **or** the time
+/// since this tablet's own last seal (while unsealed bytes exist) exceeds
+/// `--stream-seal-age`. Neither trigger fires on an empty hot tail (nothing
+/// to seal, and age has nothing to measure). Also records this tick's own
+/// observability levels (`Metric::StreamHotBytes`/`StreamSealBacklogMs`)
+/// regardless of whether a seal actually fires — the whole point of a level
+/// metric is that it reflects the current state, not just the moments
+/// something happened.
+///
+/// **ADR 0042 fork G (2026-08-16): no more unconditional `KIND_CHANGE`
+/// scan.** This used to call `group.pending_changes()` — a full scan of the
+/// change-log scope, up to `--stream-seal-bytes`' worth of bytes — on
+/// *every* tick of *every* streamed led tablet (5×/s at the default
+/// `INDEX_DRAIN_INTERVAL`), purely to find the oldest unsealed record's own
+/// HLC for the age trigger and the backlog metric, even on a tick where
+/// nothing ends up sealing. On an idle streamed tablet that scan was ~100%
+/// waste, and it structurally blocked such a tablet from ever quiescing
+/// (ADR 0044 phase 1). The fix derives everything this function needs from
+/// data that's already cheap:
+///
+/// - **"are there unsealed changes at all"**: `approx_bytes_kind(KIND_CHANGE)`
+///   is nonzero — the same cheap accessor the size trigger already reads.
+///   Zero bytes short-circuits immediately: no catalog lookup, no scan,
+///   nothing to measure.
+/// - **"how long have they been waiting"**: time since this tablet's own
+///   last seal, read straight off the `stream_shards` catalog
+///   (`Metadata::last_seal_wall_ms` — an O(log n) `BTreeMap` lookup, not a
+///   scan of anything data-sized) rather than re-deriving it from the
+///   oldest pending record's own HLC.
+/// - **the never-sealed fallback**: a tablet with no catalog row yet has no
+///   catalog time to read. The caller ([`change_consumer_loop`]) keeps a
+///   small **driver-local** `BTreeMap<TabletId, u64>` memoizing, per
+///   tablet, the age basis established the first time it's ever seen with
+///   a nonzero, never-sealed backlog — cleared the moment either a real
+///   catalog seal time becomes available or the backlog empties out (so a
+///   later backlog starts its own fresh clock rather than inheriting a
+///   stale one). **The value memoized on that first observation is a
+///   one-time [`CpGroup::pending_changes`] scan's true oldest-record HLC**,
+///   not a bare "now" timestamp — an earlier draft of this fork seeded
+///   "now" instead (cheaper still, no read at all), but that is wrong for a
+///   split child: the backlog it inherits is physically whatever its
+///   parent hadn't sealed yet, so "now" silently forgets how old it really
+///   is, and a same-node "look up the parent's own entry in this map" patch
+///   is *also* wrong, since a split's child is routinely led by a
+///   *different* node than its parent — this map is per-node, so that node
+///   never even heard of the parent tablet. Both failure modes compound
+///   across a cascade of splits (ADR 0034's auto-split runs on its own
+///   fixed interval, independent of sealing), found by
+///   `streams_e2e.rs::manual_split_with_unsealed_backlog_under_production_
+///   seal_knobs` going red/flaky under exactly this scenario. The one-time
+///   scan is the only source that is both correct (reads the actual data,
+///   not a per-node guess) and identical regardless of which node leads
+///   which tablet — and it still eliminates the overwhelming majority of
+///   this fork's target cost, since it runs at most once per tablet's
+///   entire lifetime (between "created" and "its first seal ever
+///   commits"), never once more per tick thereafter.
+///
+/// **Consequence for `pending_changes()`**: after this fork it is reachable
+/// from two places rather than every tick of every streamed tablet forever
+/// — inside [`seal_now`] (reached only once `size_hot || age_hot` is
+/// already `true`), and the never-sealed fallback's own one-time bootstrap
+/// scan above (reached at most once per tablet's lifetime). A tablet that
+/// has already been memoized (sealed at least once, or already tracked by
+/// the fallback map) performs no `KIND_CHANGE` scan on an idle tick, by
+/// construction — the steady-state cost this fork exists to remove.
+///
+/// **Accepted metric-semantics change**: `Metric::StreamSealBacklogMs` used
+/// to measure the oldest unsealed record's own age; it now measures time
+/// since the tablet's last seal while unsealed bytes exist (see the
+/// variant's own doc). The two agree whenever the hot tail is a single
+/// contiguous burst (the common case); they can differ during a slow,
+/// trickling backlog where the very first record arrived long before the
+/// most recent seal — an accepted precision loss in exchange for never
+/// scanning to compute it.
 async fn seal_tick(
     ctx: &ClientCtx,
     meta: &Metadata,
     table: &str,
     tablet: TabletId,
     group: &CpGroup,
+    first_hot_seen: &mut BTreeMap<TabletId, u64>,
 ) -> Result<(), String> {
     // ADR 0043 §A3's "When": the change log's OWN bytes, never the base
     // row bytes `CpGroup::approx_bytes` measures — that accessor is
@@ -920,25 +1005,93 @@ async fn seal_tick(
         .raftkv_metrics
         .set(Metric::StreamHotBytes, approx_bytes);
 
-    let watermark = meta.effective_stream_shard_watermark(tablet);
+    if approx_bytes == 0 {
+        // Nothing pending at all: no backlog for the age trigger to
+        // measure, and no future backlog should inherit whatever fallback
+        // basis a previous, now-fully-cleared backlog left behind.
+        first_hot_seen.remove(&tablet);
+        ctx.data()
+            .raftkv_metrics
+            .set(Metric::StreamSealBacklogMs, 0);
+        return Ok(());
+    }
+
     let now_ms = ctx.env.now().0 / 1_000_000;
-    let oldest_unsealed_ms = group
-        .pending_changes()
-        .await
-        .iter()
-        .filter_map(|(key, _)| record_hlc(key))
-        .filter(|ts| watermark.is_none_or(|w| hlc::pack(*ts) > w))
-        .map(|ts| ts.wall_ms)
-        .min();
-    let backlog_ms = oldest_unsealed_ms.map_or(0, |oldest| now_ms.saturating_sub(oldest));
+    let last_seal_ms = match meta.last_seal_wall_ms(tablet) {
+        Some(ms) => {
+            // The catalog is now the authority for this tablet; drop any
+            // fallback basis a pre-first-seal tick may have seeded, so a
+            // later never-sealed-again tablet (impossible in practice, but
+            // cheap to keep tidy) never reads a stale value.
+            first_hot_seen.remove(&tablet);
+            ms
+        }
+        None => match first_hot_seen.get(&tablet).copied() {
+            Some(ms) => ms,
+            None => {
+                // First time this driver has ever seen this tablet with a
+                // nonzero, never-sealed backlog. Seeding this at "now" (a
+                // pure driver-local guess, no data read at all) was this
+                // fork's original design — and it is WRONG for a **split
+                // child**: the backlog it just inherited is physically
+                // whatever its parent hadn't sealed yet (the shared engine
+                // only narrowed the declared range; it never touched the
+                // records), so "now" silently forgets how long that
+                // inherited backlog had already been waiting. A same-node
+                // "inherit the parent's own basis" fix (looking up the
+                // parent tablet's entry in this same map) is *also* wrong,
+                // and more subtly so: the parent and child are placement
+                // decisions, not process-affinity ones — a split's child is
+                // routinely led by a *different* node than its parent, and
+                // this map is per-node, in-memory state. On a different
+                // node this map has never even heard of the parent tablet,
+                // so the lookup silently misses and falls back to "now"
+                // anyway. Both failure modes compound across a cascade of
+                // splits (ADR 0034's auto-split runs on its own fixed
+                // interval, independent of sealing): each further child
+                // restarts its own clock from "now", so a chain of N splits
+                // can delay the age trigger by roughly N *
+                // `--stream-seal-age` before ever converging. Found by
+                // `streams_e2e.rs::manual_split_with_unsealed_backlog_
+                // under_production_seal_knobs` going deterministically red
+                // (same-node fix) or flaky (cross-node split placement)
+                // under this exact scenario.
+                //
+                // The only source that is both correct and available
+                // identically regardless of which node leads which tablet
+                // is the data itself: the true oldest pending record's own
+                // HLC — exactly what the pre-fork code computed on *every*
+                // tick. The fix keeps that computation but runs it *once*
+                // per tablet's entire lifetime rather than forever: the
+                // moment it's memoized here, every subsequent tick this
+                // tablet is revisited hits the cheap `Some` branch above
+                // and never scans again. A tablet transitions through this
+                // branch at most once between "created" and "its first
+                // seal ever commits" — going from a per-tick cost (5×/s,
+                // forever) to a one-time bootstrap cost is still the
+                // overwhelming majority of this fork's win, and it is the
+                // only design that doesn't reintroduce a genuine data-
+                // delivery regression.
+                let oldest = group
+                    .pending_changes()
+                    .await
+                    .iter()
+                    .filter_map(|(key, _)| record_hlc(key))
+                    .map(|ts| ts.wall_ms)
+                    .min()
+                    .unwrap_or(now_ms);
+                first_hot_seen.insert(tablet, oldest);
+                oldest
+            }
+        },
+    };
+    let backlog_ms = now_ms.saturating_sub(last_seal_ms);
     ctx.data()
         .raftkv_metrics
         .set(Metric::StreamSealBacklogMs, backlog_ms);
 
     let size_hot = approx_bytes > ctx.data().stream_seal_knobs.seal_bytes;
-    let age_hot = oldest_unsealed_ms.is_some_and(|oldest| {
-        Duration::from_millis(now_ms.saturating_sub(oldest)) > ctx.data().stream_seal_knobs.seal_age
-    });
+    let age_hot = Duration::from_millis(backlog_ms) > ctx.data().stream_seal_knobs.seal_age;
     if !size_hot && !age_hot {
         return Ok(());
     }
@@ -2094,6 +2247,17 @@ mod stream_sealer_tests {
     /// **Age trigger** on an otherwise quiet table: a tiny `--stream-seal-age`
     /// seals a couple of items whose combined bytes never approach the (huge)
     /// size threshold.
+    ///
+    /// **This is also the never-sealed-fallback regression (ADR 0042 fork
+    /// G)**: this tablet has no `stream_shards` catalog row at all when the
+    /// two writes land, so `seal_tick`'s age trigger has no
+    /// `Metadata::last_seal_wall_ms` to read and must run its one-time
+    /// `pending_changes()` bootstrap scan to seed the fallback basis instead
+    /// — this test is exactly the scenario that fallback exists to prevent
+    /// from regressing into "never fires" for a genuinely low-traffic stream
+    /// that has never sealed before. [`age_trigger_uses_catalog_seal_time_for_a_later_backlog`]
+    /// below is this test's catalog-basis sibling, for a tablet that HAS
+    /// already sealed once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn age_trigger_seals_a_quiet_table() {
         timeout(Duration::from_secs(60), async {
@@ -2127,6 +2291,14 @@ mod stream_sealer_tests {
     /// trigger ever fires (there is nothing for the age trigger to measure,
     /// and zero bytes never exceeds any positive size threshold) — several
     /// ticks' worth of real time produces zero catalog rows.
+    ///
+    /// **Also the ADR 0042 fork G idle-no-scan regression, zero-bytes case**:
+    /// `seal_tick`'s `approx_bytes_kind(KIND_CHANGE) == 0` short-circuit
+    /// returns before ever reaching `pending_changes()`/`seal_now` — this
+    /// test's real assertion (zero catalog rows after many ticks) is the
+    /// observable proof that branch never fired.
+    /// [`sub_threshold_backlog_never_seals_while_below_both_triggers`] below
+    /// is this test's nonzero-but-below-threshold sibling.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn empty_hot_tail_never_seals() {
         timeout(Duration::from_secs(30), async {
@@ -2146,6 +2318,131 @@ mod stream_sealer_tests {
             assert!(
                 node.metadata().stream_shards.is_empty(),
                 "an empty hot tail must never produce a seal"
+            );
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// **Below-both-triggers backlog performs no *repeated* scan (ADR 0042
+    /// fork G)**: with both thresholds deliberately huge, a real, nonzero
+    /// `KIND_CHANGE` backlog sits for many ticks without ever tripping a
+    /// seal — proving the unconditional every-tick scan this fork removes
+    /// is gone even when there IS a hot tail, not just when it's empty
+    /// ([`empty_hot_tail_never_seals`] covers the zero-bytes case; this is
+    /// its nonzero-but-below-threshold sibling, and the more important of
+    /// the two — an idle streamed tablet in practice almost always has
+    /// *some* residual hot bytes sitting well under both knobs, not
+    /// literally zero).
+    ///
+    /// **One bounded, one-time scan is still expected here, and that's by
+    /// design**: this tablet has never sealed, so its very first tick with
+    /// nonzero bytes runs `seal_tick`'s one-time `pending_changes()`
+    /// bootstrap to seed the never-sealed fallback basis (see that
+    /// function's own doc for why a scan-free driver-local guess is
+    /// actually wrong, not just more expensive). What this test actually
+    /// proves is that this happens **at most once** for this tablet, never
+    /// again on any of the many subsequent ticks the `sleep` below spans —
+    /// the observable evidence is the same as `empty_hot_tail_never_seals`
+    /// (zero catalog rows after many ticks), since a repeated scan finding
+    /// the identical unsealed backlog every tick would still never trip
+    /// either trigger on its own; what would differ under a *regressed*
+    /// unconditional-scan design is the CPU cost paid to reach that same
+    /// "no seal" outcome, which this test's real-time-bounded `sleep` cannot
+    /// directly observe (no `pending_changes()` call counter exists, and
+    /// adding one at the `CpGroup` level would also count the GSI drain and
+    /// hot-trim arms' own independent calls to the same accessor — both out
+    /// of this fork's scope). The steady-state no-scan property is instead
+    /// enforced by construction: after the one bootstrap tick memoizes this
+    /// tablet's basis, `pending_changes()` is reachable from `seal_tick`
+    /// only inside [`seal_now`], itself reachable only through the
+    /// `size_hot || age_hot` branch — which, with both knobs huge, provably
+    /// never evaluates `true` for the rest of this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sub_threshold_backlog_never_seals_while_below_both_triggers() {
+        timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 64 * 1024 * 1024,        // this backlog never approaches it
+                    seal_age: Duration::from_secs(3600), // nor does elapsed time
+                },
+            )
+            .await;
+            let table = "sub_threshold";
+            create_streamed_table(node.dynamo_addr(), table).await;
+            put_item_padded(node.dynamo_addr(), table, "k0", 16).await;
+            put_item_padded(node.dynamo_addr(), table, "k1", 16).await;
+
+            // Several ticks' worth of real time (`INDEX_DRAIN_INTERVAL` is
+            // 200ms) — long enough for many idle evaluations of a real,
+            // nonzero backlog.
+            sleep(Duration::from_millis(900)).await;
+            assert!(
+                node.metadata().stream_shards.is_empty(),
+                "a real, nonzero backlog below both triggers must never seal"
+            );
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// **Catalog-derived repeat seal (ADR 0042 fork G)**: once a tablet has
+    /// sealed at least once, a LATER backlog's age trigger is computed from
+    /// `Metadata::last_seal_wall_ms` (the catalog row's own `seal_wall_ms`),
+    /// never from the driver-local never-sealed fallback
+    /// [`age_trigger_seals_a_quiet_table`] exercises. Proven by forcing a
+    /// first seal (age trigger, necessarily the fallback path — no catalog
+    /// row exists yet), then writing again and confirming a second seal
+    /// lands under the same tiny `--stream-seal-age`: by this point
+    /// `seal_tick`'s fallback map entry for this tablet was already cleared
+    /// the instant the first catalog row appeared (see that function's own
+    /// doc), so the second seal's timing can only have come from the
+    /// catalog read.
+    ///
+    /// A deliberate consequence of "time since last seal" semantics (the
+    /// accepted `Metric::StreamSealBacklogMs` change) is visible here too:
+    /// the second seal can fire almost as soon as its own backlog is merely
+    /// non-empty, once the first seal is already older than
+    /// `--stream-seal-age` — it does not wait for the SECOND backlog's own
+    /// records to individually age past the threshold. That is the
+    /// intended "seal roughly every `seal_age` while the tablet keeps
+    /// writing" rhythm (ADR 0042 §13's AWS-echoing ~4h default), not a bug.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn age_trigger_uses_catalog_seal_time_for_a_later_backlog() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 64 * 1024 * 1024, // never trips by size
+                    seal_age: Duration::from_millis(300),
+                },
+            )
+            .await;
+            let table = "catalog_age_repeat";
+            create_streamed_table(node.dynamo_addr(), table).await;
+            put_item_padded(node.dynamo_addr(), table, "first", 4).await;
+
+            let tablet = only_tablet(&node, table);
+            await_true(20, "the first (never-sealed-fallback) seal commits", || {
+                node.metadata().stream_shards.contains_key(&(tablet, 0))
+            })
+            .await;
+
+            // A second write starts a fresh, tiny backlog.
+            put_item_padded(node.dynamo_addr(), table, "second", 4).await;
+            await_true(
+                20,
+                "a second seal lands using the catalog's own last-seal time",
+                || node.metadata().stream_shards.contains_key(&(tablet, 1)),
+            )
+            .await;
+            let second = node.metadata().stream_shards[&(tablet, 1)].clone();
+            assert_eq!(
+                second.count, 1,
+                "the second seal covers only the fresh write"
             );
         })
         .await

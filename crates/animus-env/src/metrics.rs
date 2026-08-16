@@ -302,10 +302,24 @@ pub enum Metric {
     /// evaluated — a level, not a count: each tick overwrites it via
     /// `MetricsHandle::set`.
     StreamHotBytes,
-    /// The age (milliseconds, the loop's own `env` clock) of the oldest
-    /// unsealed `KIND_CHANGE` record as of the most recent seal-arm tick that
-    /// found one — `0` when the hot tail is empty. A level, overwritten via
-    /// `MetricsHandle::set`.
+    /// **Semantics changed, ADR 0042 fork G (2026-08-16).** Used to be the
+    /// age (milliseconds) of the *oldest unsealed record*, computed by
+    /// scanning `KIND_CHANGE` every tick. It is now the age (milliseconds,
+    /// the loop's own `env` clock, never a raw OS clock) of the tablet's own
+    /// **last seal**, measured only while unsealed bytes exist
+    /// (`approx_bytes_kind(KIND_CHANGE) > 0`) — `0` whenever the hot tail is
+    /// empty. Read straight off the `stream_shards` catalog
+    /// (`Metadata::last_seal_wall_ms`) for a tablet that has sealed before;
+    /// a tablet that never has falls back to a one-time-memoized real scan
+    /// of the true oldest pending record's own HLC, cached per tablet after
+    /// its first observation so no *further* scan is ever needed for that
+    /// tablet again (see `animusd::index_drain::seal_tick`'s own doc for the
+    /// full design and why a cheaper driver-local timestamp guess doesn't
+    /// work). The old and new values agree whenever the hot tail is one
+    /// contiguous burst (the common case) and can differ for a slow,
+    /// trickling backlog — traded deliberately for never *repeatedly*
+    /// scanning `KIND_CHANGE` just to keep this level current.
+    /// A level, overwritten via `MetricsHandle::set`.
     StreamSealBacklogMs,
     /// A stream shard seal committed (the segment `put` succeeded on every
     /// replica and `MetaCommand::SealStreamShard` was confirmed in the

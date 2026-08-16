@@ -1959,6 +1959,35 @@ impl Metadata {
             .map(|(_, row)| row.hlc_range.1)
     }
 
+    /// `tablet`'s own most recent seal's wall-clock time (ADR 0042 fork G) —
+    /// the `seal_wall_ms` of the newest row in this tablet's own chain, by
+    /// `(tablet, epoch)` order (the same `next_back()` lookup
+    /// [`stream_shard_watermark`] uses just above), or `None` if this tablet
+    /// has never sealed a shard of its own. This is the cheap, catalog-only
+    /// basis the seal arm's age trigger derives its "time since the last
+    /// seal" from (`animusd::index_drain::seal_tick`) — no `KIND_CHANGE`
+    /// scan needed.
+    ///
+    /// **Deliberately NOT split-parent-inherited**, unlike
+    /// [`effective_stream_shard_watermark`]: a fresh split child with no
+    /// seal of its own reads as `None` here rather than walking
+    /// [`Metadata::stream_split_basis`] for a parent's last seal time — a
+    /// parent's last seal time says nothing about how old the *child's own*
+    /// post-split backlog actually is (records inherited via the shared
+    /// engine can be older than that seal, or the parent may never have
+    /// sealed at all). The seal arm's own never-sealed fallback (a one-time
+    /// real scan of the true oldest pending record's HLC, memoized per
+    /// tablet — see `animusd::index_drain::seal_tick`'s own doc for the
+    /// full design and why a cheaper driver-local guess doesn't work) is
+    /// the answer for "never sealed" instead.
+    #[must_use]
+    pub fn last_seal_wall_ms(&self, tablet: TabletId) -> Option<u64> {
+        self.stream_shards
+            .range((tablet, 0)..=(tablet, u64::MAX))
+            .next_back()
+            .map(|(_, row)| row.seal_wall_ms)
+    }
+
     /// `tablet`'s effective stream watermark **including split-parent
     /// inheritance** (ADR 0043 §A4/§A6): [`stream_shard_watermark`]
     /// restricted to `tablet`'s own chain is `None` for a fresh split child
