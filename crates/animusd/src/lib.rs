@@ -1006,6 +1006,32 @@ pub enum StorageBackend {
     Memory,
 }
 
+/// One [`ClientRequest::KindWriteItem`] operation — a DynamoDB `PutItem`/
+/// `DeleteItem`/`UpdateItem`'s payload, self-contained enough for the
+/// tablet leader to evaluate a `condition` and compute the item's new value
+/// **itself**, rather than trusting a pre-computed value from the
+/// (possibly stale, possibly racing) edge that received the request — see
+/// [`ClientRequest::KindWriteItem`]'s doc for why (ADR 0046 "evaluate at
+/// leader", U3).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum KindWriteOp {
+    /// `PutItem`'s full new item.
+    Put(animus_dynamo::Item),
+    /// `DeleteItem` — the leader writes the tombstone sentinel itself.
+    Delete,
+    /// `UpdateItem`'s raw `SET`/`REMOVE` actions — the leader applies them
+    /// to the old image it itself reads (so the leader resolves the
+    /// base-value read-modify-write hazard too, not just the LSI/
+    /// change-record one `PutItem`/`DeleteItem` already close). `key_item`
+    /// covers the upsert-from-key-attributes-when-absent behavior
+    /// ([`animus_dynamo::wire::apply_update`]'s existing contract) when the
+    /// item doesn't exist yet.
+    Update {
+        key_item: animus_dynamo::Item,
+        actions: Vec<animus_dynamo::wire::UpdateAction>,
+    },
+}
+
 /// A request from a client to a node (length-prefixed JSON over TCP).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ClientRequest {
@@ -1145,6 +1171,45 @@ pub enum ClientRequest {
     /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
     /// only through the `Forwarded` arm.
     ClearBackfillCursor { tablet: u64, index: String },
+    /// **Internal evaluate-at-leader write RPC — never sent bare, only
+    /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0046 "evaluate at
+    /// leader", U3, tracked against `docs/adr-tablet-log-model` #222): the
+    /// fix for a cross-node race the edge-evaluated
+    /// `index_aware_write`/`kind_writes_for_item` design had — two edge
+    /// nodes writing the same item never contended on the same
+    /// **node-local** `rmw_lock`, so both could diff against the same stale
+    /// old image and the loser's stale LSI row orphaned forever (nothing
+    /// reconciles an LSI; only a GSI drain self-heals). Moving the
+    /// read → evaluate-`condition` → diff span onto the item's own tablet
+    /// **leader** — which every write of this item reaches regardless of
+    /// which edge node received it — closes the race structurally: `pk`/
+    /// `sk` name the item, `op` is the write itself (self-contained enough
+    /// for the leader to compute the new value without trusting anything
+    /// the caller precomputed), and `condition` (now `Serialize`/
+    /// `Deserialize`, ADR 0046 U3) is the caller's own `ConditionExpression`,
+    /// evaluated by the leader against its own read rather than the
+    /// caller's.
+    ///
+    /// Folds in `UpdateItem` too (`KindWriteOp::Update`): its base-value
+    /// read-modify-write had the identical cross-node hazard, closed by the
+    /// same mechanism at no extra cost.
+    ///
+    /// Bare delivery is refused for the same reason [`KindWrite`](Self::KindWrite)
+    /// is — a client could otherwise force an arbitrary write into a
+    /// table's base/LSI/change scopes bypassing every DynamoDB-level
+    /// validation. Not a `MetaCommand`, so `is_relayable_command` does not
+    /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
+    /// only through the `Forwarded` arm. Answered with
+    /// [`KindWriteOk`](ClientResponse::KindWriteOk) or
+    /// [`ConditionFailed`](ClientResponse::ConditionFailed).
+    KindWriteItem {
+        table: String,
+        pk: animus_dynamo::AttributeValue,
+        sk: Option<animus_dynamo::AttributeValue>,
+        op: KindWriteOp,
+        #[serde(default)]
+        condition: Option<animus_dynamo::ConditionExpression>,
+    },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
     Get { key: Vec<u8>, table: String },
@@ -1560,6 +1625,24 @@ pub enum ClientResponse {
     PutOk,
     /// A read reached its quorum; the value (or `None` if absent).
     Value(Option<Vec<u8>>),
+    /// Reply to [`KindWriteItem`](ClientRequest::KindWriteItem): the write
+    /// landed (base row, plus its LSI rows/change-log record if the table
+    /// takes the kind-write path) — `old`/`new` are exactly what
+    /// `index_aware_write`'s edge-evaluated design used to hand back to its
+    /// own caller directly, needed for `ReturnValues`/`UpdateReturnValues`
+    /// echo. `new: None` for a `Delete` op.
+    KindWriteOk {
+        old: Option<animus_dynamo::Item>,
+        new: Option<animus_dynamo::Item>,
+    },
+    /// Reply to [`KindWriteItem`](ClientRequest::KindWriteItem): the
+    /// caller's own `condition` did not match the leader's own read of the
+    /// current item. Distinguishable on the wire from
+    /// [`Error`](Self::Error) — like [`Unresolved`](Self::Unresolved) just
+    /// below, this is an expected outcome a caller acts on directly (compose
+    /// `WireError::conditional_check_failed`), not a transient failure to
+    /// retry.
+    ConditionFailed,
     /// Reply to [`GetSnapshot`](ClientRequest::GetSnapshot): the queried
     /// key's covering transaction did not resolve within one single,
     /// point-in-time attempt (ADR 0018 §2, torn-pair-fix stack PR2) — see
@@ -4706,66 +4789,66 @@ impl ClientCtx {
         }
     }
 
-    /// CP **batch write** of many `(key, value)` pairs of `table` (ADR 0017 —
-    /// bulk-write batching): the keys are grouped by their owning **tablet**, and
-    /// each group is committed as **one** `Batch` Raft entry on that tablet's group
-    /// leader (one propose → one commit round → one apply; forwarded cross-process
-    /// if this node isn't the leader), waited to durable+applied before returning.
-    /// **Within a tablet the batch is atomic** (one entry — it commits whole or not
-    /// at all); **across tablets it is not** (each tablet commits independently),
-    /// which matches real DynamoDB `BatchWriteItem` (non-atomic) semantics. Takes an
-    /// arbitrary `N` (the wire edge caps its own surface). Provisions `table`'s first
-    /// tablet on demand, like [`cp_write`](Self::cp_write). The bulk-write throughput
-    /// primitive behind DynamoDB `BatchWriteItem` and the admin bulk seeder.
-    /// Commit a **multi-kind atomic batch** for one item (ADR 0041 §3/§4):
-    /// `writes` spanning this tablet's base/LSI/footprint scopes plus an
-    /// optional change-log record, as one Raft entry.
-    ///
-    /// Every write must belong to the **same tablet** — they share the item's
-    /// partition key, hence its token. That is checked here rather than
-    /// assumed: a batch straddling two tablets cannot be atomic, and silently
-    /// committing only the first tablet's share is exactly the torn
-    /// base-row-without-its-index-row state this whole mechanism exists to
-    /// prevent. A caller that needs several partitions issues one call each.
-    pub(crate) async fn cp_kind_write(
+    /// **The evaluate-at-leader write primitive (ADR 0046 U3)** —
+    /// `PutItem`/`DeleteItem`/`UpdateItem`'s entry point on an indexed or
+    /// streamed table, replacing the edge-evaluated
+    /// `index_aware_write`/`ClientCtx::cp_kind_write` pairing those three
+    /// call sites (plus `BatchWriteItem`'s indexed branch) used to go
+    /// through. Resolves the item's own base key (recomputed from `pk`/`sk`,
+    /// the single source of truth — never trusted from a caller-supplied
+    /// key), then either serves **locally** (zero hops — this node hosts
+    /// the leader, so [`dynamo::kind_write_item_at_leader`] runs in-process)
+    /// or **forwards** [`ClientRequest::KindWriteItem`] one hop to the
+    /// leader's node, inheriting `cp_forward`'s hinted-retry/backoff/
+    /// election-wait exactly like every other CP write. See
+    /// [`ClientRequest::KindWriteItem`]'s doc for why this closes the
+    /// cross-node LSI/change-record orphan race `index_aware_write`'s
+    /// design had.
+    pub(crate) async fn cp_kind_write_item(
         &self,
+        meta: &Metadata,
         table: &str,
-        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<(), String> {
-        let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
-            return Ok(());
-        };
+        pk: &animus_dynamo::AttributeValue,
+        sk: Option<&animus_dynamo::AttributeValue>,
+        op: KindWriteOp,
+        condition: Option<&animus_dynamo::ConditionExpression>,
+    ) -> Result<dynamo::KindWriteOutcome, animus_dynamo::wire::WireError> {
         // Auto-provision the table's tablet on first write (ADR 0023), as
-        // `cp_write`/`cp_batch_write` do.
+        // `cp_kind_write` does — an indexed/streamed table's first item write
+        // can race its own `CreateTable`'s tablet provisioning.
         if !self.effective_metadata().has_table_tablet(table) {
-            self.provision_tablet(table).await?;
+            self.provision_tablet(table)
+                .await
+                .map_err(|e| dynamo::internal(&e))?;
         }
-        let tablet = self
-            .tablet_for(table, &first)
-            .ok_or_else(|| format!("no tablet owns a kind-batch key of table `{table}`"))?;
-        for (_, key, _) in &writes {
-            if self.tablet_for(table, key) != Some(tablet) {
-                return Err(format!(
-                    "kind-batch keys of table `{table}` span more than one tablet; \
-                     an atomic index write must stay within one partition"
-                ));
+        let base_key = dynamo::item_key(pk, sk);
+        match self.cp_route(table, &base_key).await {
+            CpRoute::Local(leader) => {
+                dynamo::kind_write_item_at_leader(self, &leader, meta, table, pk, sk, op, condition)
+                    .await
             }
-        }
-        match self.cp_route(table, &first).await {
-            CpRoute::Local(leader) => Self::cp_kind_local(&leader, writes, change_log).await,
             CpRoute::Forward(addr) => {
-                let request = ClientRequest::KindWrite {
+                let request = ClientRequest::KindWriteItem {
                     table: table.to_owned(),
-                    writes,
-                    change_log,
+                    pk: pk.clone(),
+                    sk: sk.cloned(),
+                    op,
+                    condition: condition.cloned(),
                 };
-                Self::ok_or_err(
-                    self.cp_forward(table, &first, addr, request).await,
-                    "forwarded CP kind write",
-                )
+                match self.cp_forward(table, &base_key, addr, request).await {
+                    ClientResponse::KindWriteOk { old, new } => {
+                        Ok(dynamo::KindWriteOutcome::Ok { old, new })
+                    }
+                    ClientResponse::ConditionFailed => {
+                        Ok(dynamo::KindWriteOutcome::ConditionFailed)
+                    }
+                    ClientResponse::Error(e) => Err(dynamo::internal(&e)),
+                    other => Err(dynamo::internal(&format!(
+                        "unexpected reply to forwarded kind write item: {other:?}"
+                    ))),
+                }
             }
-            CpRoute::None => Err("no CP group leader reachable".into()),
+            CpRoute::None => Err(dynamo::internal("no CP group leader reachable")),
         }
     }
 
@@ -4845,10 +4928,22 @@ impl ClientCtx {
     /// rather than acked unconfirmed — a fenced-out entry commits as a no-op,
     /// so acking without a probe would falsely report a write that never
     /// happened (the hazard `cp_batch_local`'s doc spells out).
-    async fn cp_kind_local(
+    ///
+    /// **`conditions` (ADR 0046 U3, `pub(crate)` since [`dynamo::
+    /// kind_write_item_at_leader`] calls this from outside `impl ClientCtx`)**:
+    /// threaded straight through to `put_kind_batch_fenced`'s own
+    /// `KvCommand::KindBatch.conditions` field — see that field's doc. Every
+    /// pre-existing caller here passes an empty `Vec` (zero behavior
+    /// change); `kind_write_item_at_leader` is the one caller that supplies
+    /// its own-key OCC seatbelt. A failed condition no-ops the whole batch
+    /// silently, indistinguishable from a fence miss, so it surfaces through
+    /// this same function's existing `"CP kind write did not commit in
+    /// time"` timeout — deliberately no new outcome channel.
+    pub(crate) async fn cp_kind_local(
         leader: &CpGroup,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Option<(Vec<u8>, Vec<u8>)>,
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Result<(), String> {
         let probe = writes
             .iter()
@@ -4866,7 +4961,7 @@ impl ClientCtx {
                 return Err("kind write outside this group's live range; retry".into());
             }
         }
-        match leader.put_kind_batch_fenced(writes, change_log, Vec::new(), fence) {
+        match leader.put_kind_batch_fenced(writes, change_log, conditions, fence) {
             ProposeResult::Accepted { .. } => {}
             other => return Err(format!("kind write not accepted: {other:?}")),
         }
@@ -7061,9 +7156,49 @@ impl ClientCtx {
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
-                match Self::cp_kind_local(&leader, writes, change_log).await {
+                match Self::cp_kind_local(&leader, writes, change_log, Vec::new()).await {
                     Ok(()) => ClientResponse::PutOk,
                     Err(e) => ClientResponse::Error(e),
+                }
+            }
+            // ADR 0046 U3: the evaluate-at-leader write RPC — resolve the
+            // leader by the item's own base key, recomputed here from
+            // `pk`/`sk` rather than trusted from the caller (the same
+            // discipline `Get`'s arm below already follows), then defer to
+            // the identical leader-side evaluator `ClientCtx::
+            // cp_kind_write_item`'s own `Local` branch calls in-process.
+            ClientRequest::KindWriteItem {
+                table,
+                pk,
+                sk,
+                op,
+                condition,
+            } => {
+                let key = dynamo::item_key(&pk, sk.as_ref());
+                let tablet = self.tablet_for(&table, &key);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
+                };
+                let meta = self.effective_metadata();
+                match dynamo::kind_write_item_at_leader(
+                    self,
+                    &leader,
+                    &meta,
+                    &table,
+                    &pk,
+                    sk.as_ref(),
+                    op,
+                    condition.as_ref(),
+                )
+                .await
+                {
+                    Ok(dynamo::KindWriteOutcome::Ok { old, new }) => {
+                        ClientResponse::KindWriteOk { old, new }
+                    }
+                    Ok(dynamo::KindWriteOutcome::ConditionFailed) => {
+                        ClientResponse::ConditionFailed
+                    }
+                    Err(e) => ClientResponse::Error(e.message),
                 }
             }
             ClientRequest::Get { key, table } => {
@@ -9013,6 +9148,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::Put { .. } => "put",
         ClientRequest::PutBatch { .. } => "put_batch",
         ClientRequest::KindWrite { .. } => "kind_write",
+        ClientRequest::KindWriteItem { .. } => "kind_write_item",
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
@@ -9148,6 +9284,16 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         ClientRequest::KindWrite { .. } => ClientResponse::Error(
             "this request is an internal index-maintenance RPC and must be sent wrapped in \
              `Forwarded`"
+                .into(),
+        ),
+        // ADR 0046 U3: the evaluate-at-leader write RPC, refused bare for the
+        // identical reason `KindWrite` just above is — see
+        // `ClientRequest::KindWriteItem`'s doc. Real handling lives in
+        // `cp_serve_forwarded`'s match, reached only through `Forwarded`; not
+        // a `MetaCommand`, so `is_relayable_command` does not apply.
+        ClientRequest::KindWriteItem { .. } => ClientResponse::Error(
+            "this request is an internal evaluate-at-leader write RPC and must be sent wrapped \
+             in `Forwarded`"
                 .into(),
         ),
         // ADR 0041 §5: the LSI `Query` read primitive, the read-side dual of

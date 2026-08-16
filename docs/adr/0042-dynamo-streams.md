@@ -539,3 +539,19 @@ were considered and declined as out of scope for this adapter.
   a `DescribeStream`/`GetRecords` request's validity now depends on
   retention timing, not just the current schema, for the lifetime of a
   disable grace window.
+
+## Amendment (2026-08-16, ADR 0046 U3 — evaluate-at-leader)
+
+§1's change-record `OLD_IMAGE`/`NEW_AND_OLD_IMAGES` fidelity depends on the
+same prior-image read `kind_writes_for_item`'s LSI diff needs — and that
+read used to happen wherever the write landed at the DynamoDB edge, under
+only a node-local lock (see ADR 0041's identical amendment for the full
+mechanism and its cross-node-orphan incident). A streamed table's change
+record inherits the same fix for free: `dynamo::kind_write_item_at_leader`
+now reads `old` on the item's own tablet leader — the one node every write
+of that item reaches regardless of which edge node the client happened to
+connect to — so a change record's `old_image` can no longer be computed
+against a value a concurrent write on a different node has already
+superseded. No change to this ADR's record format, per-partition HLC
+ordering, or shard-sealing/retention machinery; only *where* the image that
+feeds a record is read.

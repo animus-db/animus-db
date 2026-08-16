@@ -606,6 +606,45 @@ per-partition HLC ordering, or the atomic co-write this ADR established:
 ADR 0042/0043 only had to add the multi-consumer cursor/trim machinery on
 top.
 
+## Amendment (2026-08-16, ADR 0046 U3 — evaluate-at-leader)
+
+§2/§4's write path (`kind_writes_for_item`, unchanged in mechanism) used to
+be *evaluated* at whichever edge node received the request
+(`index_aware_write`, now deleted): each node read the item's prior value
+and diffed the LSI/change-record image locally, serialized only by a
+**node-local** `ctx.data().rmw_lock`. Two edge nodes writing the same item
+never contended on the same lock, so both could read → diff against the
+same stale prior value; the loser's stale LSI row orphaned forever (nothing
+reconciles a stale LSI row once written — only the GSI drain, being a full
+re-derivation, self-heals) and a stream's `OLD_IMAGE` fidelity went stale
+the same way. This is Fork U's decision, recorded in ADR 0046 ("the tablet
+log model," draft PR #222 as of this writing — not yet merged, referenced
+here in prose only): **U3, evaluate-at-leader**. The edge now forwards a
+logical `ClientRequest::KindWriteItem { table, pk, sk, op, condition }` to
+the item's own tablet leader (`ClientCtx::cp_kind_write_item`, zero hops if
+local); `dynamo::kind_write_item_at_leader` reads `old`, evaluates
+`condition`, computes `new`, and *then* calls `kind_writes_for_item` —
+identical diff logic, just moved onto the node every write of this item now
+actually reaches, which is what makes `rmw_lock` **there** a real
+cross-node serialization point instead of a per-node one. `UpdateItem`'s
+base-value read-modify-write folds into the same mechanism
+(`KindWriteOp::Update`), closing an identical, previously unguarded
+lost-update hazard on its own base value. A `KindBatch.conditions` OCC
+seatbelt (new in this amendment's companion PR1, `animus-cp-data` codec
+v15) covers the one gap the leader-side lock alone can't: a transaction
+resolver's recovery push, which never takes `rmw_lock` — unreachable today
+(a transaction is rejected outright on an indexed/streamed table) but real
+once that restriction lifts.
+
+**Named gap, deliberately not closed here**: a *plain* (unindexed,
+unstreamed) table's `PutItem`/`DeleteItem` `ConditionExpression`,
+`UpdateItem`'s base value on such a table, and CQL's own read-modify-write
+(`cql.rs`) all still rely on nothing but the edge-local `rmw_lock` — there
+is no tablet-log hook for a bare `cp_write` to evaluate against, and this
+amendment's mechanism is specific to the `KindBatch` path. Closing it would
+need the identical evaluate-at-leader treatment extended to `cp_write`
+itself, not attempted here.
+
 ## Amendment (2026-08-15, ADR 0045)
 
 §5's own deferral — "Adding or dropping an index on a **populated** table

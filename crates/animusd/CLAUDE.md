@@ -508,22 +508,44 @@ route below the edge through the same `ClientCtx` CP primitives.
   0013) and waits for commit; a node reconciles its local registry from
   `Metadata::table_indexes` — the registry holds only *definition*
   bookkeeping, never index entries (there is no in-memory index at all). An
-  indexed table's `PutItem`/`DeleteItem`/`UpdateItem` goes through
-  `index_aware_write` → `ClientCtx::cp_kind_write`, committing the base row,
-  its **LSI rows** and a **change-log record** as one `KvCommand::KindBatch`
-  Raft entry. An LSI can ride that entry because it hashes by the base
-  partition key; a **GSI cannot** (its rows live in their own hidden
-  table's tablets) and is materialized asynchronously by the drain
-  (`index_drain.rs`) from those change records. `BatchWriteItem` keeps the
-  fast `cp_batch_write` path for an **unindexed** table but routes each
-  `Put`/`Delete` through `index_aware_write` individually for an
-  **indexed** one, atomic per-item only. **`TransactWriteItems` is the one
-  op that can't participate**: a write action against an indexed table
-  makes `run_transact` reject the **whole transaction** with a
+  indexed/streamed table's `PutItem`/`DeleteItem`/`UpdateItem` commits the
+  base row, its **LSI rows** and a **change-log record** as one
+  `KvCommand::KindBatch` Raft entry (`kind_writes_for_item`) — but the *diff*
+  is now evaluated **at the tablet's own leader**, not at the receiving edge
+  node: `ClientCtx::cp_kind_write_item` routes a `ClientRequest::
+  KindWriteItem { table, pk, sk, op: KindWriteOp, condition }` to the leader
+  (in-process if local, one forwarded hop via `cp_serve_forwarded` if not),
+  and `dynamo::kind_write_item_at_leader` — the only caller of
+  `kind_writes_for_item` — reads its own `old` image, evaluates `condition`,
+  computes `new` from `op` (`Put`/`Delete`/`Update{key_item, actions}`, the
+  last folding `UpdateItem`'s base-value RMW into the same mechanism), then
+  proposes. **This is the ADR 0046 ("the tablet log model", draft PR #222)
+  U3 fix**: `index_aware_write`'s prior edge-evaluated design (now deleted)
+  read/diffed under a **node-local** `ctx.data().rmw_lock`, so two edge
+  nodes writing the same item never contended on the same lock and could
+  both diff against the same stale `old` — the loser's stale LSI row
+  orphaned forever (nothing reconciles it; only the GSI drain self-heals).
+  Locking `rmw_lock` **at the leader** instead serializes every write of one
+  item regardless of which edge node received it, since every write now
+  funnels through the same function on the same node. A `KindBatch.
+  conditions` OCC seatbelt (PR1, `animus-cp-data`) closes the one residual
+  the lock alone can't: a `txn_resolver_loop` recovery push never takes
+  `rmw_lock` (unreachable today — transactions are rejected outright on an
+  indexed/streamed table — but real the moment that restriction lifts).
+  **Named gap, unchanged by this fix**: a plain (unindexed, unstreamed)
+  table's `PutItem`/`DeleteItem` `ConditionExpression`, `UpdateItem`'s base
+  value on such a table, and CQL's own RMW (`cql.rs`) all still only have
+  today's node-local `rmw_lock` protection — there is no tablet-log hook for
+  a bare `cp_write` to evaluate at. `BatchWriteItem` routes each `Put`/
+  `Delete` through the identical per-item mechanism for an **indexed**
+  table, atomic per-item only, and keeps the fast `cp_batch_write` path for
+  an **unindexed, unstreamed** one. **`TransactWriteItems` is the one op
+  that can't participate**: a write action against an indexed table makes
+  `run_transact` reject the **whole transaction** with a
   `ValidationException` — `cp_txn`'s `KvCommand::TxnStage` has no
   multi-kind-write extension yet, so staging just the base row would
   silently never produce the LSI rows/change-log record. The real fix (a
-  `cp_txn` analogue of `cp_kind_write`) is a named `animus-cp-data`
+  `cp_txn` analogue of this write path) is a named `animus-cp-data`
   protocol follow-up in ADR 0041, not yet built. **ADR 0042 extends this same rejection to a streamed table**
   (`run_transact`'s per-action loop now checks `meta.table_stream`
   alongside `meta.table_indexes`), for the identical reason: `TxnStage`

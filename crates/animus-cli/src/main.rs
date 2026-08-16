@@ -642,6 +642,16 @@ fn print_response(response: &ClientResponse) {
             }
         }
         ClientResponse::Error(e) => println!("error: {e}"),
+        // Internal evaluate-at-leader write RPC replies (ADR 0046 U3):
+        // consumed programmatically by `ClientCtx::cp_kind_write_item`'s own
+        // caller (`dynamo.rs`'s `PutItem`/`DeleteItem`/`UpdateItem`/
+        // `BatchWriteItem` handlers) and by tests driving the client
+        // protocol directly — not requested by any CLI subcommand of its
+        // own, mirroring `JoinInfo`/`MetadataDelta` above.
+        ClientResponse::KindWriteOk { old, new } => {
+            println!("kind write ok: old={old:?} new={new:?}");
+        }
+        ClientResponse::ConditionFailed => println!("condition failed"),
         // Join discovery (ADR 0032 PR2): consumed programmatically by
         // `animusd join`'s startup, not requested by any CLI subcommand —
         // printed raw if one ever surfaces here.

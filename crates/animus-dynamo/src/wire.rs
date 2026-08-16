@@ -211,7 +211,13 @@ pub enum UpdateReturnValues {
 /// One action of an `UpdateItem` `UpdateExpression` (the supported subset): set a
 /// top-level attribute to a value, or remove one. `ADD`/`DELETE` (set/number
 /// arithmetic) are deferred.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **`Serialize`/`Deserialize` (ADR 0046 U3)**: rides the wire inside
+/// `ClientRequest::KindWriteItem`'s `KindWriteOp::Update` — the leader-side
+/// write evaluator applies `UpdateItem`'s own raw actions to the old image
+/// it itself reads, rather than trusting a pre-computed new item from the
+/// (possibly stale, possibly racing) edge that received the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UpdateAction {
     /// `SET attr = :v` — set (or overwrite) a top-level attribute.
     Set(String, AttributeValue),

@@ -32,6 +32,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animusd::{Node, bind_cluster, start_cluster};
+use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -562,5 +563,278 @@ async fn unconditional_put_and_delete_maintain_lsi_without_a_condition_or_all_ol
     assert!(
         body.contains("\"Count\":0"),
         "p1's LSI row must be gone after an unconditional delete: {body}"
+    );
+}
+
+/// One hammer loop's outcome: how many of its `iterations` unconditional
+/// `PutItem`s the server acknowledged with `200`, and how many returned
+/// something else. A non-200 is **tolerated**, never panicked on — on the
+/// unfixed baseline under sustained cross-node contention a write's
+/// client-visible outcome can be genuinely ambiguous (it may time out at
+/// *confirm* while still committing moments later), so asserting on any
+/// one write's own result would be asserting against an outcome that
+/// isn't actually known (see `docs/engineering-lessons.md`). This loop's
+/// only job is to keep pushing writes long enough for the race to have a
+/// chance to fire; the final check below reads the cluster's own
+/// **converged** state afterward and never consults this outcome
+/// directly — `acked`/`failed` exist purely as run-health diagnostics (a
+/// loop that acks almost nothing didn't meaningfully exercise anything).
+struct HammerOutcome {
+    acked: u32,
+    failed: u32,
+}
+
+/// One loop's worth of unconditional `PutItem`s against the SAME item key
+/// (`id`/`sk` fixed), each cycling a distinct `alt` value tagged with this
+/// loop's own `tag` and an increasing counter — `dynamo_txn.rs`'s racing
+/// pattern, generalized to a sustained hammer instead of one single-shot
+/// race.
+async fn hammer_puts(
+    addr: SocketAddr,
+    table: &str,
+    id: &str,
+    sk: &str,
+    tag: &str,
+    iterations: u32,
+) -> HammerOutcome {
+    let mut acked = 0;
+    let mut failed = 0;
+    for i in 0..iterations {
+        let alt = format!("{tag}-{i:05}");
+        let body = format!(
+            r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"sk":{{"S":"{sk}"}},"alt":{{"S":"{alt}"}}}}}}"#
+        );
+        let (status, _resp_body) = dynamo(addr, "DynamoDB_20120810.PutItem", &body).await;
+        if status == 200 {
+            acked += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    HammerOutcome { acked, failed }
+}
+
+/// A few sequential `PutItem`s from EACH node against a key the real race
+/// below never touches (`id = "warmup"`, vs. the race's own `"shared"`),
+/// each retried on a non-200 for up to 5s — settling the freshly created
+/// table's tablet routing (its lone tablet's own Raft group has completed
+/// leader election, and both edge nodes' outbound relay connections to
+/// that leader are already warm) before the concurrent hammer starts.
+///
+/// **Diagnoses a real, but separate, t=0 provisioning/election race**:
+/// without this, the very FIRST write of either hammer loop reliably (8/8
+/// observed) failed outright on the unfixed baseline with a hard
+/// `InternalServerError` ("relay to peer node failed" / "CP kind write did
+/// not commit in time") — before the cross-node LSI-diff race this test
+/// exists to provoke ever got a chance to fire. A brand-new tablet's own
+/// Raft group has to complete its own (normally sub-second) leader
+/// election, and every node's tablet-host reconciler has to observe it
+/// should host/relay for that tablet, before either edge node's first
+/// request can resolve a route — and `CreateTable`'s own success only
+/// guarantees the *catalog* entry committed, not that every node has
+/// already reconciled hosting for it. The unfixed baseline's
+/// `index_aware_write` does two sequential forwarded hops per write (a
+/// `cp_get` read, then a separate `cp_kind_write` propose) where the fixed
+/// path does one (`KindWriteItem`), doubling this window's exposure — which
+/// is why the fixed path can look like it "masks" the race rather than
+/// truly closing it. This is plausibly reachable on `main` today for *any*
+/// table (indexed or not) hit by two nodes' very first concurrent writes
+/// immediately after `CreateTable`, not specific to the evaluate-at-leader
+/// change this test's real assertion covers — noted here for a separate
+/// report, deliberately not fixed in this stack.
+async fn settle_tablet_routing(addr_a: SocketAddr, addr_b: SocketAddr, table: &str) {
+    for addr in [addr_a, addr_b] {
+        for i in 0..3 {
+            let body = format!(
+                r#"{{"TableName":"{table}","Item":{{"id":{{"S":"warmup"}},"sk":{{"S":"w"}},"alt":{{"S":"w{i}"}}}}}}"#
+            );
+            let mut ok = false;
+            for _retry in 0..50 {
+                let (status, _) = dynamo(addr, "DynamoDB_20120810.PutItem", &body).await;
+                if status == 200 {
+                    ok = true;
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            assert!(
+                ok,
+                "warm-up PutItem from {addr} never succeeded after 5s of retries — the cluster \
+                 itself looks unhealthy, not just cold"
+            );
+        }
+    }
+}
+
+/// The `alt` attribute's string value out of a `GetItem`/`Query` JSON body
+/// (`{"Item": {"alt": {"S": "..."}, ...}}` or one entry of `{"Items": [{...}]}`).
+fn item_alt(item: &Value) -> Option<String> {
+    item.get("alt")?.get("S")?.as_str().map(str::to_owned)
+}
+
+/// Poll `GetItem` on `key_json` until its `alt` value reads identically on
+/// three consecutive samples 150ms apart (a settle detector), then return
+/// it. Required now that the hammer loops tolerate transient per-write
+/// errors: a write whose *client* saw a confirm-poll timeout is not
+/// guaranteed to have already lost its race with Raft — it can still land
+/// after the loop that issued it has already returned. A single plain read
+/// right after both loops finish (sound only when every issued write is
+/// known to have already applied) is therefore not sound here; only a
+/// genuine quiescence poll is.
+async fn await_settled_alt(addr: SocketAddr, key_json: &str) -> String {
+    let mut streak: u32 = 0;
+    let mut last: Option<String> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (status, body) = dynamo(addr, "DynamoDB_20120810.GetItem", key_json).await;
+        assert_eq!(status, 200, "GetItem failed while settling: {body}");
+        let reply: Value = serde_json::from_str(&body).expect("GetItem reply is valid JSON");
+        let alt = item_alt(reply.get("Item").expect("item must exist while settling"));
+        if alt == last {
+            streak += 1;
+            if streak >= 3 {
+                return alt.expect("item must carry an alt attribute");
+            }
+        } else {
+            streak = 0;
+            last = alt;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("base item's alt never settled within 20s (last saw {last:?})");
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// **ADR 0046 U3 red→green repro**: the cross-node LSI orphan race
+/// `index_aware_write`'s edge-evaluated design had. Two unsynchronized
+/// loops hammer unconditional `PutItem`s against the SAME item key, one
+/// through `nodes[0]`'s DynamoDB endpoint, the other through `nodes[1]`'s —
+/// each cycling its own tag's `alt` values, so whichever loop's write lands
+/// last determines the base item's final `alt`. Before the fix: each edge
+/// node's `index_aware_write` reads the prior item and diffs the LSI
+/// **locally**, under a **node-local** `rmw_lock` — the two loops' writes
+/// never contend on the same lock (they're on different nodes), so both can
+/// read the same stale prior item and compute a diff against it, silently
+/// producing an orphaned stale LSI row alongside the correct current one
+/// (nothing reconciles a stale LSI row — only a GSI drain self-heals).
+/// After the fix, every write of this item — from either node — evaluates
+/// on the item's own tablet leader, serialized by that leader's own
+/// `rmw_lock`, so no diff is ever computed against a value another node's
+/// write has already superseded.
+///
+/// A one-time settling `settle_tablet_routing` call precedes the hammer (see
+/// its own doc for the unrelated t=0 race it gets past), and each loop
+/// tolerates its own per-write transient errors (`HammerOutcome`) rather
+/// than panicking on one — both needed to reach the actual assertion below
+/// on the unfixed baseline; see the module doc for the full red/green story.
+/// `await_settled_alt` (converged-or-timeout, never a single plain read —
+/// see its own doc) gets the base item's final value once both loops finish
+/// (LSI writes are strongly consistent — same Raft entry as the base row —
+/// so once the base item itself stops changing, its LSI row set is already
+/// final too); then assert **exactly one** live LSI row for this partition,
+/// and that its `alt` matches the base item's own current `alt` — an
+/// orphan means either a second row (extra) or a mismatch (the surviving
+/// row names a `alt` the base item no longer holds).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_node_racing_unconditional_puts_never_orphan_an_lsi_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr_a = nodes[0].dynamo_addr();
+    let addr_b = nodes[1].dynamo_addr();
+    let addr_c = nodes[2].dynamo_addr();
+
+    let (status, body) = dynamo(
+        addr_a,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"race",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
+                         {"AttributeName":"sk","KeyType":"RANGE"}],
+            "LocalSecondaryIndexes":[
+                {"IndexName":"by-alt",
+                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
+                              {"AttributeName":"alt","KeyType":"RANGE"}]}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+
+    // Get past the t=0 provisioning/election race before starting the real
+    // hammer — see `settle_tablet_routing`'s own doc.
+    settle_tablet_routing(addr_a, addr_b, "race").await;
+
+    // Env-tunable so the red-run investigation can sweep iteration counts
+    // without editing the source; defaults to the plan's own starting point.
+    let iterations: u32 = std::env::var("RACE_ITERATIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
+
+    let (outcome_a, outcome_b) = tokio::join!(
+        hammer_puts(addr_a, "race", "shared", "x", "A", iterations),
+        hammer_puts(addr_b, "race", "shared", "x", "B", iterations),
+    );
+    let total_acked = outcome_a.acked + outcome_b.acked;
+    eprintln!(
+        "hammer outcome: loop A {}/{iterations} acked ({} failed), loop B {}/{iterations} acked \
+         ({} failed)",
+        outcome_a.acked, outcome_a.failed, outcome_b.acked, outcome_b.failed
+    );
+    // A run health gate, not a correctness assertion: the final check below
+    // reads converged state and doesn't care which individual writes were
+    // acked — but a run where almost nothing landed didn't meaningfully
+    // exercise cross-node contention at all, and would make "no orphan
+    // found" a vacuous pass rather than real evidence.
+    assert!(
+        total_acked >= iterations,
+        "too few writes acked ({total_acked} of {}) to exercise real cross-node contention — \
+         the cluster looks unhealthy beyond ordinary transient contention",
+        2 * iterations
+    );
+
+    // Converged-or-timeout poll from a THIRD node (never touched by either
+    // loop) — required now that each loop tolerates its own transient
+    // errors; see `await_settled_alt`'s own doc for why a single plain read
+    // is no longer sound here.
+    let base_alt = await_settled_alt(
+        addr_c,
+        r#"{"TableName":"race","Key":{"id":{"S":"shared"},"sk":{"S":"x"}}}"#,
+    )
+    .await;
+
+    // The whole-partition LSI scan (no `alt` filter — see `by-alt` Queries
+    // elsewhere in this file for the identical shape) is the orphan
+    // detector: more than one row means a stale diff computed against an
+    // already-superseded value left its old row behind.
+    let (status, body) = dynamo(
+        addr_c,
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"race","IndexName":"by-alt",
+            "KeyConditionExpression":"id = :i",
+            "ExpressionAttributeValues":{":i":{"S":"shared"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "LSI query failed: {body}");
+    let query_reply: Value = serde_json::from_str(&body).expect("Query reply is valid JSON");
+    let items = query_reply["Items"]
+        .as_array()
+        .expect("Items is an array")
+        .clone();
+    assert_eq!(
+        items.len(),
+        1,
+        "expected exactly one live LSI row for partition `shared`, got {} \
+         (an orphan stale row from a cross-node racing diff) — base item alt={base_alt}, \
+         rows={items:?}",
+        items.len()
+    );
+    let row_alt = item_alt(&items[0]).expect("LSI row must carry alt");
+    assert_eq!(
+        row_alt, base_alt,
+        "the one surviving LSI row's alt ({row_alt}) must match the base item's own current \
+         alt ({base_alt}) — a mismatch means the surviving row is itself stale"
     );
 }
