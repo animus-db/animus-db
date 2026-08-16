@@ -282,3 +282,64 @@ txn_stage_local` (transactional path, the same U3 shape applied to a
 write staged inside a 2PC) — both funnel every write of one item through
 one node's own `rmw_lock`, regardless of which edge node received the
 request.
+
+## As-built amendment (2026-08-16) — the consumer-offset consolidation
+
+Context §(a)'s "three independent consumer-offset implementations" is now
+one named rule with one shared implementation and one explicit
+classification, delivered as the small, scoped-down version the approved
+plan called for — not the deeper storage unification the plan explicitly
+rejected as over-unification (dependency direction, `animus-cp-data` →
+`animus-control` never the reverse, and plane separation — replicated
+`Metadata` vs per-tablet engine rows — forbid a shared storage home; what's
+shared is the *rule*, not the implementation).
+
+**Principle 3, factored out.** `animus_tablet::split_basis::effective(own,
+frozen_basis)` (`own.or_else(|| frozen_basis.cloned())`) is the one generic
+form of "a split is a log cut; every consumer offset crossing it inherits
+from a basis frozen at the cut, never a live re-derivation from the
+parent's later state." `Metadata::effective_stream_shard_watermark`
+(`animus-control`) is its first caller, ported to a one-line wrapper around
+its own two lookups with no behavior change (regression:
+`meta::tests::effective_stream_shard_watermark_inherits_through_split_
+provenance`, `stream_shard_parent_id_is_frozen_at_split_time_not_the_
+parents_current_chain`, and `animus-test`'s `stream_lineage_corpus::
+split_then_parent_seals_first`).
+
+**One value type, still two conventions.** `animus_cp_data::cursor::
+ConsumerOffset { Watermark(HlcTimestamp), KeyPos(Vec<u8>) }` is an
+additive wrapper over the two byte conventions the module doc already
+documented side by side (the packed-HLC watermark and the raw
+last-scanned-base-key) — for a future generic consumer (a per-CQL-CDC
+cursor is the concrete case the module doc names) that wants to hold
+either shape without hard-coding its own tag's convention. It delegates to
+the pre-existing `encode_watermark`/`decode_watermark`/
+`encode_backfill_cursor`/`decode_backfill_cursor` free functions rather
+than duplicating either encoding; those functions and every existing
+caller are untouched, consistent with principle 5 (no second,
+independently-maintained copy of an encoding to drift from the first).
+
+**Split-policy classification, made explicit.** `animus_cp_data::cursor::
+SplitPolicy { RestartFromScratch, InheritFrozenBasis }` names the two
+outcomes principle 3 leaves open for a consumer offset, plus a
+`classify_tag` function and a module-doc table pairing every known
+`KIND_CURSOR` tag with its policy: `"gsi"` and `"backfill:{index_name}"`
+both classify `RestartFromScratch` (their cursor row simply reads empty
+for a split's right child — `cursor_key` embeds `range.start`,
+`narrow_scope` never moves rows — and each consumer's own idempotent
+reconciliation makes "restart from scratch" unconditionally safe, ADR 0045
+§5 Fork A/F1); the stream seal watermark is the one
+`InheritFrozenBasis` case, but it is a doc-level table entry only — it
+lives in the control plane's replicated `Metadata`, not a `KIND_CURSOR`
+row, so `classify_tag` (a data-plane crate) has no row of its own to
+classify. This is **not** a runtime cross-plane registry — the plan's own
+non-goal — precisely because the dependency direction that forbids a
+shared storage home (above) equally forbids a shared runtime classifier;
+the table is the one place a human reads both halves together. The
+regression is `cursor`'s own `every_known_cursor_tag_prefix_is_classified`
+test: it enumerates every tag this crate constructs today and asserts each
+maps to a policy, with a failure message that tells whoever adds a third
+tag to classify it — deliberately by hand, since a new tag is exactly the
+moment ADR 0046 principle 3 needs a conscious answer, not a default.
+`animusd::index_drain`'s own module doc cross-references this table from
+the two arms (the GSI drain, the backfill seeder) that own those tags.

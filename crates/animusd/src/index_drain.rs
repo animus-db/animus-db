@@ -186,6 +186,22 @@
 //! draining stream's un-reaped catalog rows do **not** re-add the stream
 //! term — see [`trim_janitor`]'s own doc for the F12-b coexistence rule this
 //! implements and why it's safe.
+//!
+//! ## Split policy for this loop's own cursor tags (ADR 0046)
+//!
+//! Both cursor tags this loop owns (`"gsi"` above, and the per-index
+//! `format!("backfill:{index_name}")` the backfill seeder writes — "The
+//! backfill seeder" section above) classify as
+//! [`animus_cp_data::cursor::SplitPolicy::RestartFromScratch`]: see
+//! `animus_cp_data::cursor`'s own module doc "Split classification" table
+//! for the full per-tag rationale (and its `every_known_cursor_tag_prefix_
+//! is_classified` test, the regression that keeps a future third tag from
+//! shipping with no split-behavior decision on record). The stream seal
+//! watermark this loop's seal arm reads
+//! (`Metadata::effective_stream_shard_watermark`, "The seal arm" section
+//! above) is the one `SplitPolicy::InheritFrozenBasis` case — it lives in
+//! the control plane's `Metadata`, not a `KIND_CURSOR` row, which is why
+//! that table lists it at the doc level rather than in `classify_tag`.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
