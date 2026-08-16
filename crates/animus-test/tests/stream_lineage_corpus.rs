@@ -320,6 +320,18 @@ fn seal_now(
     if skip_commit {
         return None; // modelled crash before catalog commit
     }
+    // Split-seal range-fence CAS (2026-08-15, ADR 0043 §A3/§A4): fetched
+    // fresh from `meta` at this exact call — mirrors `index_drain::
+    // seal_now`'s own `ctx.effective_metadata()` re-fetch on every call.
+    // Deliberately NOT `group.range`, a static field this harness never
+    // updates after `start_group`: using it here would silently desync from
+    // whatever the calling scenario has since done to `meta` (a
+    // `SplitTablet` apply), which is exactly the staleness this CAS exists
+    // to catch, not to reintroduce via the test's own scripting shortcut.
+    let expected_range = meta
+        .tablets
+        .get(&group.id)
+        .map_or_else(KeyRange::whole, |t| t.range.clone());
     let outcome = meta.apply(&MetaCommand::SealStreamShard {
         table: TABLE.into(),
         label: LABEL.into(),
@@ -331,6 +343,7 @@ fn seal_now(
         seal_wall_ms: wall_ms,
         replicas: Vec::new(),
         object_id: seg_id,
+        expected_range,
     });
     matches!(outcome, ApplyOutcome::Applied).then_some(epoch)
 }
@@ -1003,6 +1016,237 @@ fn split_then_parent_reseals_before_scope_narrows() {
     );
 }
 
+// --- cell 3d: split_then_parent_seals_against_stale_cached_metadata (the
+// SECOND staleness layer, ADR 0043 §A3/§A4 CAS amendment) -----------------
+
+/// The metadata-CACHE-staleness sibling of `scenario_split_then_parent_
+/// reseals_before_scope_narrows` above: that cell modelled the PHYSICAL
+/// scope lagging a split (`RaftKvNode::narrow_scope`'s own local, un-
+/// replicated lag); this one models the DIFFERENT staleness layer found
+/// while verifying that cell's own fix in production (the D8 e2e
+/// diagnostic, 2026-08-15) — the sealer's own `Metadata` READ (`ctx.
+/// effective_metadata()`, backed by the ADR 0038 async apply-task cache)
+/// can ITSELF be stale relative to the true, already-committed
+/// `SplitTablet` on the SAME node, independent of whether the physical
+/// scope has narrowed. A metadata-range fence computed against a stale
+/// read (Fork A, `in_declared_range`) cannot see past this: the fence and
+/// the tablet's own physical scope can both agree with each other while
+/// BOTH being stale relative to the SAME just-committed split. Only an
+/// apply-time check against the TRUE, sequentially-applied state (never a
+/// cache) closes it — this cell proves exactly that check
+/// (`Metadata::apply`'s `SealStreamShard` `expected_range` CAS).
+///
+/// Script: clone `meta` into `stale_view` BEFORE the split (the sealer's
+/// own cached snapshot); apply `SplitTablet` only to the AUTHORITATIVE
+/// `meta`; compute the parent's seal candidates/watermark/`expected_range`
+/// entirely from `stale_view` (still wide) but PROPOSE the resulting
+/// command against the AUTHORITATIVE `meta` — exactly the sequence a real
+/// node's seal arm produces when its own metadata cache hasn't caught up
+/// to a split the control Raft has already committed. Without the CAS,
+/// this proposal applies, duplicating whatever the sibling later seals;
+/// with it, `Metadata::apply` sees the TRUE post-split range and rejects
+/// it outright, regardless of what `stale_view` believed — proven by
+/// temporarily short-circuiting the CAS check (red) and restoring it
+/// (green), the same "teeth proof" technique `negative_control.rs`-style
+/// corpora use elsewhere in this repo.
+fn scenario_split_then_parent_seals_against_stale_cached_metadata(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(31), KeyRange::whole());
+    let parent = start_group(&sim, &engines, TabletId(31), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    // Left- and right-side backlog, unsealed at split time.
+    for i in 0..4 {
+        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"L", seed);
+    }
+    for i in 600..604 {
+        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"R", seed);
+    }
+
+    // The sealer's own cached snapshot, taken BEFORE the split — stands in
+    // for a node whose ADR 0038 apply-task cache hasn't caught up to the
+    // (about to commit) split yet.
+    let stale_view = meta.clone();
+
+    // The control-plane split commits, on the AUTHORITATIVE view only.
+    let parent_epoch = meta
+        .tablets
+        .get(&parent.id)
+        .map_or(animus_tablet::Epoch::INITIAL, |t| t.epoch);
+    let sibling_id = TabletId(32);
+    let outcome = meta.apply(&MetaCommand::SplitTablet {
+        tablet: parent.id,
+        expected_epoch: parent_epoch,
+        split_key: BOUNDARY.to_vec(),
+        new_id: sibling_id,
+    });
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied,
+        "[seed={seed}] split must apply"
+    );
+
+    // The parent's seal arm runs entirely against its STALE cached view:
+    // watermark, candidate records (the group's own physical scope is ALSO
+    // still wide — this scenario never calls `narrow_scope` at all,
+    // modelling the same node not having caught up on either axis), and
+    // `expected_range` all come from `stale_view`, never the authoritative
+    // `meta`.
+    let parent_leader = elect(&mut sim, &parent, &live, seed);
+    let stale_watermark = stale_view
+        .effective_stream_shard_watermark(parent.id)
+        .unwrap_or(0);
+    let mut records: Vec<(Vec<u8>, u64, Vec<u8>)> =
+        block_on(parent.nodes[parent_leader].pending_changes())
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let hlc = record_hlc_suffix(&k)?;
+                (hlc > stale_watermark).then_some((k, hlc, v))
+            })
+            .collect();
+    records.sort_by_key(|(_, hlc, _)| *hlc);
+    assert!(
+        !records.is_empty(),
+        "[seed={seed}] the parent's stale-view scan must still see the full pre-split backlog"
+    );
+    let stale_epoch = current_open_epoch(&stale_view, parent.id);
+    let stale_hlc_range = (stale_watermark, records.last().expect("checked above").1);
+    let stale_count = records.len() as u64;
+    let seg_records: Vec<segment::SegmentRecord> = records
+        .iter()
+        .map(|(k, hlc, v)| segment::SegmentRecord {
+            source_key: k.clone(),
+            packed_hlc: *hlc,
+            change_record: v.clone(),
+        })
+        .collect();
+    let header = segment::SegmentHeader {
+        table: TABLE.into(),
+        label: LABEL.into(),
+        shard_id: segment::shard_id(parent.id.0, stale_epoch),
+        tablet: parent.id.0,
+        epoch: stale_epoch,
+        parent_shard_id: stale_view.stream_shard_parent_id(parent.id, stale_epoch),
+        hlc_range: stale_hlc_range,
+        count: stale_count,
+        seal_wall_ms: 2_000,
+    };
+    let bytes = segment::encode(&header, &seg_records);
+    let env = parent.nodes[parent_leader].env();
+    let seg_id = segment::segment_object_id(
+        TABLE,
+        LABEL,
+        parent.id.0,
+        stale_epoch,
+        env.node_id().as_str(),
+        parent.nodes[parent_leader].term(),
+        env.next_u64(),
+    );
+    block_on(store.put(&seg_id, &bytes)).expect("segment store put succeeds regardless");
+
+    // The proposal itself, built ENTIRELY from the stale view — including
+    // its own `expected_range` (still `whole()`, the pre-split range) —
+    // but applied against the AUTHORITATIVE `meta`, which has already
+    // committed the split. This is the exact sequence a real racing node
+    // produces.
+    let stale_range = stale_view
+        .tablets
+        .get(&parent.id)
+        .map_or_else(KeyRange::whole, |t| t.range.clone());
+    let outcome = meta.apply(&MetaCommand::SealStreamShard {
+        table: TABLE.into(),
+        label: LABEL.into(),
+        tablet: parent.id,
+        epoch: stale_epoch,
+        view_type: StreamViewType::NewAndOldImages,
+        hlc_range: stale_hlc_range,
+        count: stale_count,
+        seal_wall_ms: 2_000,
+        replicas: Vec::new(),
+        object_id: seg_id,
+        expected_range: stale_range,
+    });
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Rejected(
+            "declared range stale — a split raced this seal, retry with the current range"
+        ),
+        "[seed={seed}] the parent's stale-metadata-view seal must be rejected by the range CAS"
+    );
+    assert!(
+        !meta.stream_shards.contains_key(&(parent.id, stale_epoch)),
+        "[seed={seed}] a rejected seal must never land in the catalog"
+    );
+
+    // The reconciler catches up: narrow the parent's own PHYSICAL scope now
+    // (mirroring `narrow_scope`'s real, separate, un-replicated timing).
+    // This scenario is deliberately isolating the metadata-CACHE-staleness
+    // layer/CAS above from the DIFFERENT, already-known, accepted hot_read
+    // open-tail residual (ADR 0043's own doc amendment) — without this, the
+    // parent's own still-wide-physical-scope hot tail would independently
+    // re-surface the right-side backlog via `collect_tablet_records`'
+    // unbounded watermark-only read below, which is that OTHER residual,
+    // not the one this cell exists to prove.
+    for n in &parent.nodes {
+        n.narrow_scope(KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec())));
+    }
+
+    // Only NOW does the sibling get hosted, with the authoritative
+    // (already-split) metadata — its own seal reads fresh, correctly-
+    // scoped state throughout, and seals its own epoch 0 exactly once.
+    let sibling = start_group(
+        &sim,
+        &engines,
+        sibling_id,
+        KeyRange::new(BOUNDARY.to_vec(), None),
+    );
+    sim.run_for(Duration::from_secs(2));
+    let sibling_leader = elect(&mut sim, &sibling, &live, seed);
+    let sealed = seal_now(&mut meta, &store, &sibling, sibling_leader, 2_100, false);
+    assert_eq!(
+        sealed,
+        Some(0),
+        "[seed={seed}] the sibling's own first seal must apply"
+    );
+
+    // The parent gets a fresh chance to seal its OWN left-side backlog,
+    // this time with the shared `seal_now` helper's own fresh (and
+    // correctly-scoped) read — proving the rejection above was a genuine
+    // retry-next-tick, never a permanent wedge.
+    let parent_leader2 = elect(&mut sim, &parent, &live, seed);
+    let resealed = seal_now(&mut meta, &store, &parent, parent_leader2, 2_200, false);
+    assert_eq!(
+        resealed,
+        Some(0),
+        "[seed={seed}] the parent's own retry, now correctly scoped, must apply"
+    );
+
+    // Exactly-once end to end: the left-side backlog sealed exactly once
+    // (the parent's correctly-scoped retry, never the rejected stale
+    // attempt), the right-side backlog exactly once (the sibling) — no
+    // duplication survives.
+    verify_lineage(
+        &meta,
+        &store,
+        &[(&parent, parent_leader2), (&sibling, sibling_leader)],
+        &journal,
+        seed,
+    );
+}
+
+#[test]
+fn split_then_parent_seals_against_stale_cached_metadata() {
+    for_each_seed(
+        "split_then_parent_seals_against_stale_cached_metadata",
+        scenario_split_then_parent_seals_against_stale_cached_metadata,
+    );
+}
+
 // --- cell 4: kill_sealing_leader ------------------------------------------
 
 fn scenario_kill_sealing_leader(seed: u64) {
@@ -1191,6 +1435,8 @@ fn scenario_disable_grace_drain(seed: u64) {
         seal_wall_ms: 3_000,
         replicas: Vec::new(),
         object_id: format!("{TABLE}/{LABEL2}/{}/test", group.id.0),
+        // No `CreateTablet` in this scenario — permissive (absent tablet).
+        expected_range: KeyRange::whole(),
     });
     // An empty shard is never sealed in production (`seal_now` never calls
     // `SealStreamShard` for an empty scan) — this hand-built row exists only
@@ -1658,6 +1904,10 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
         seal_wall_ms: 900,
         replicas: Vec::new(),
         object_id: slow_seg_id,
+        // No `CreateTablet` in this scenario at all — the range CAS reads
+        // as permissive (absent tablet); `whole()` is never actually
+        // checked, same as this scenario's other unaffected assertions.
+        expected_range: KeyRange::whole(),
     });
     assert_eq!(
         slow_outcome,

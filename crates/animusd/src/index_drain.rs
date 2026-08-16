@@ -1086,6 +1086,15 @@ pub(crate) async fn seal_now(
         .map_or(animus_control::StreamViewType::NewAndOldImages, |s| {
             s.view_type
         });
+    // Split-seal range-fence CAS (2026-08-15, ADR 0043 §A3/§A4): the exact
+    // range `in_declared_range` just fenced this seal's candidate set
+    // against, carried through so `Metadata::apply` can re-check it against
+    // the tablet's true, authoritative range at apply time — the backstop
+    // this proposal-side (possibly stale) read cannot be by itself.
+    let expected_range = meta
+        .tablets
+        .get(&tablet)
+        .map_or_else(KeyRange::whole, |t| t.range.clone());
     let cmd = MetaCommand::SealStreamShard {
         table: table.to_owned(),
         label,
@@ -1097,6 +1106,7 @@ pub(crate) async fn seal_now(
         seal_wall_ms,
         replicas,
         object_id: seg_id,
+        expected_range,
     };
     // Retry-after-lost-ack semantics (ledger-named-object amendment): this
     // check function already treats "the row now exists" as success

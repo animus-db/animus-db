@@ -119,7 +119,7 @@ use std::time::Duration;
 use animus_control::RaftNode;
 use animus_cp_data::segment;
 use animus_env::{Clock, Env, Metric, NodeId, ProdEnv};
-use animus_tablet::TabletId;
+use animus_tablet::{KeyRange, TabletId};
 
 use crate::ClientCtx;
 use crate::{MetaCommand, Metadata, NodeStatus};
@@ -375,6 +375,16 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
                 // content check to recognize this as the legitimate
                 // replicas-only-update shape, not a content conflict).
                 object_id: row.object_id.clone(),
+                // A replicas-only repair reuses the existing row's own
+                // already-validated content (matched by `object_id` above),
+                // so `Metadata::apply`'s range CAS never checks this value
+                // for the existing-row path (see that field's own doc) —
+                // this tablet's current range is passed anyway, purely for
+                // self-documentation, since the CAS is genuinely inert here.
+                expected_range: meta
+                    .tablets
+                    .get(tablet)
+                    .map_or_else(KeyRange::whole, |t| t.range.clone()),
             });
         }
     }
@@ -599,6 +609,7 @@ mod orphan_reap_tests {
                 seal_wall_ms: 1_000,
                 replicas: Vec::new(),
                 object_id: winner_id.clone(),
+                expected_range: KeyRange::whole(),
             }),
             ApplyOutcome::Applied,
             "test setup: seal epoch 0 with the winning object"

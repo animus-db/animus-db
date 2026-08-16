@@ -1276,6 +1276,9 @@ mod tests {
             seal_wall_ms: 1_700_000_000_000,
             replicas: vec![nid(1), nid(2)],
             object_id: format!("orders/L1/{}/{epoch}/test", tablet.0),
+            // No `CreateTablet` in any of this helper's callers — the range
+            // CAS (`Metadata::apply`) reads as permissive (absent tablet).
+            expected_range: KeyRange::whole(),
         }
     }
 
