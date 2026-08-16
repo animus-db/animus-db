@@ -520,6 +520,38 @@ here.
 > draining every row, the `ConsistentRead` matrix, an LSI `Scan`'s
 > no-cross-index-leakage issued through every node of the cluster in turn,
 > and a `FilterExpression` over LSI-scanned rows).
+>
+> **As-built amendment (2026-08-16, per-tablet limit on `KindScan`).** Until
+> now, `ClientCtx::cp_scan_kind_table`'s per-tablet fan-out did *not* thread
+> `Limit` into each tablet's own `KindScan` the way its base-scope sibling
+> `cp_scan` threads it into each `Scan` — it fetched every overlapping
+> tablet's whole matching sub-range and truncated only once, in the
+> coordinator, after every tablet's reply was already in hand. `cp_scan_kind_table`
+> now computes `remaining` per tablet across the fan-out exactly as `cp_scan`
+> does, `ClientRequest::KindScan` gained a `#[serde(default)] limit:
+> Option<usize>` field (so an older peer's un-limited `KindScan` still
+> decodes), and `RaftKvNode::local_scan_kind`/`linearizable_scan_kind` gained
+> the matching `limit: Option<usize>` parameter, truncating **after** the
+> intent-drop filter — the identical ordering `local_scan`'s own `limit`
+> already uses, so a still-`Pending` row interleaved in the requested range
+> can never silently consume one of the caller's requested slots.
+>
+> **This is a per-tablet limit, not pushdown, and the wording matters**:
+> `StorageEngine::scan` has no limit parameter of its own, so a tablet still
+> reads its **whole** matching `[start, end)` sub-range off the engine
+> exactly as before — the change saves wire payload size and coordinator-side
+> memory for a table-wide `Scan` whose per-tablet share vastly exceeds what
+> the caller's own `Limit` still needs, never engine I/O. An LSI `Query`
+> (`ClientCtx::cp_scan_kind`, single-tablet) is unaffected and still passes no
+> limit at all — it has no `Limit` parameter to begin with (the pre-existing,
+> still-open DynamoDB-fidelity gap noted just above). Behavior-preserving by
+> construction: regression is `animusd/tests/dynamo_index_scan.rs`'s
+> split-table `Limit`-walk (the identical `by-score` pagination proof this
+> section's own regression note already describes, run again after splitting
+> `events`'s one tablet in two, so the fan-out now spans two tablets and two
+> possibly-different group leaders) plus a primitive-level `local_scan_kind`
+> case in `animus-cp-data/tests/kind_batch.rs` proving `limit` truncates to
+> exactly the requested count.
 
 Adding or dropping an index on a **populated** table (`UpdateTable`, with an
 `IndexStatus` lifecycle and a backfill) is **deferred to a follow-up**; indexes

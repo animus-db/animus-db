@@ -3172,11 +3172,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// (`StorageScope::physical_bounds`) rather than trusted to a caller.
     ///
     /// An unknown `kind` scans as empty.
+    ///
+    /// `limit` is a **per-tablet cap, not pushdown** — `StorageEngine::scan`
+    /// has no limit parameter of its own, so this still reads the whole
+    /// `[start, end)` sub-range off the engine; the win is a smaller wire
+    /// payload and less coordinator-side memory for a caller that only
+    /// wants a bounded prefix (`ClientCtx::cp_scan_kind_table`'s per-tablet
+    /// fan-out, ADR 0041 §5), never reduced engine I/O. Applied **after**
+    /// the intent filter below (mirroring [`local_scan`](Self::local_scan)'s
+    /// identical ordering), so a still-`Pending` row interleaved in the
+    /// requested range never silently consumes one of the caller's
+    /// requested slots.
     pub async fn local_scan_kind(
         &self,
         kind: u8,
         start: &[u8],
         end: Option<&[u8]>,
+        limit: Option<usize>,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let Some(scope) = self.kind_scopes.get(kind as usize) else {
             return Vec::new();
@@ -3207,7 +3219,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 None => Vec::new(),
             },
         };
-        raw.into_iter()
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = raw
+            .into_iter()
             .filter_map(|(k, vv)| {
                 let logical = scope.strip_in_range(&k)?.to_vec();
                 match txn::decode_envelope(&vv.value) {
@@ -3215,7 +3228,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     txn::Envelope::Intent { .. } => None,
                 }
             })
-            .collect()
+            .collect();
+        if let Some(n) = limit {
+            pairs.truncate(n);
+        }
+        pairs
     }
 
     /// This tablet's own consumer-cursor watermark for `consumer` (ADR
@@ -3329,11 +3346,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// [`KvCommand::KindBatch`] writes them, and it always commits outright),
     /// so there is no intent to resolve here, unlike
     /// [`linearizable_scan`](Self::linearizable_scan)'s base-scope reads.
+    ///
+    /// `limit` is threaded straight to [`local_scan_kind`](Self::local_scan_kind)
+    /// — see that method's doc for why this is a **per-tablet cap, not
+    /// pushdown**.
     pub async fn linearizable_scan_kind(
         &self,
         kind: u8,
         start: &[u8],
         end: Option<&[u8]>,
+        limit: Option<usize>,
     ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         if !self.read_barrier().await {
             return None;
@@ -3342,7 +3364,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.ensure_ceiling_above(ts).await {
             return None;
         }
-        let rows = self.local_scan_kind(kind, start, end).await;
+        let rows = self.local_scan_kind(kind, start, end, limit).await;
         // Bump the *whole requested span*, mirroring `linearizable_scan`'s
         // identical reasoning — a future write anywhere in `[start, end)` is
         // pushed above this read regardless of how many rows it returned.

@@ -274,8 +274,8 @@ impl CpGroup {
         end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         match self {
-            CpGroup::Lsm(n) => n.local_scan_kind(kind, start, end).await,
-            CpGroup::Mem(n) => n.local_scan_kind(kind, start, end).await,
+            CpGroup::Lsm(n) => n.local_scan_kind(kind, start, end, None).await,
+            CpGroup::Mem(n) => n.local_scan_kind(kind, start, end, None).await,
         }
     }
 
@@ -290,16 +290,19 @@ impl CpGroup {
 
     /// Linearizable ReadIndex range scan of a non-base row-kind scope (ADR
     /// 0041 §3) — the LSI `Query`/`Scan` read primitive. `end: None` is
-    /// unbounded above. See [`RaftKvNode::linearizable_scan_kind`].
+    /// unbounded above; `limit` is a **per-tablet cap, not pushdown** (see
+    /// [`RaftKvNode::local_scan_kind`]'s doc). See
+    /// [`RaftKvNode::linearizable_scan_kind`].
     async fn linearizable_scan_kind(
         &self,
         kind: u8,
         start: &[u8],
         end: Option<&[u8]>,
+        limit: Option<usize>,
     ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         match self {
-            CpGroup::Lsm(n) => n.linearizable_scan_kind(kind, start, end).await,
-            CpGroup::Mem(n) => n.linearizable_scan_kind(kind, start, end).await,
+            CpGroup::Lsm(n) => n.linearizable_scan_kind(kind, start, end, limit).await,
+            CpGroup::Mem(n) => n.linearizable_scan_kind(kind, start, end, limit).await,
         }
     }
 
@@ -1094,12 +1097,23 @@ pub enum ClientRequest {
     /// exposing it bare would let an arbitrary caller read a table's
     /// LSI/change-log/footprint bytes by kind number rather than through the
     /// DynamoDB surface that interprets them.
+    ///
+    /// `limit` (ADR 0041 §5 as-built) is [`ClientCtx::cp_scan_kind_table`]'s
+    /// per-tablet cap — **not pushdown**: `StorageEngine::scan` has no limit
+    /// parameter, so the tablet still reads its whole `[start, end)`
+    /// sub-range; the win is a smaller wire payload for this reply and less
+    /// coordinator-side memory, never reduced engine I/O. `#[serde(default)]`
+    /// so an older peer's un-limited `KindScan` (equivalent to `None`)
+    /// decodes on a newer one. `#[serde(default)]` on `end` predates this and
+    /// is unrelated.
     KindScan {
         table: String,
         kind: u8,
         start: Vec<u8>,
         #[serde(default)]
         end: Option<Vec<u8>>,
+        #[serde(default)]
+        limit: Option<usize>,
     },
     /// **Internal seal-trigger RPC — never sent bare, only wrapped in
     /// [`Forwarded`](Self::Forwarded)** (ADR 0042/0043, round-3 sealer PR):
@@ -6500,7 +6514,10 @@ impl ClientCtx {
                  an LSI query is scoped to one partition"
             ));
         }
-        self.cp_scan_kind_one(table, kind, start, Some(end)).await
+        // An LSI `Query` has no `Limit` (a documented DynamoDB-fidelity gap,
+        // ADR 0041) — `None` here.
+        self.cp_scan_kind_one(table, kind, start, Some(end), None)
+            .await
     }
 
     /// A **table-wide fan-out** of the kind-scoped scan (ADR 0041 §5) — the
@@ -6556,8 +6573,19 @@ impl ClientCtx {
             {
                 continue;
             }
+            // Per-tablet cap (ADR 0041 §5 as-built) — the identical
+            // `remaining` math `cp_scan` applies across its own tablets: how
+            // many more rows this table-wide fan-out still needs after what
+            // prior tablets already contributed. Threaded into the
+            // `KindScan` request so a tablet with far more matching rows
+            // than `remaining` doesn't ship its whole sub-range over the
+            // wire only to be truncated here — this is still **not
+            // pushdown** (`StorageEngine::scan` has no limit of its own; see
+            // `RaftKvNode::local_scan_kind`'s doc), just a smaller reply and
+            // less coordinator-side memory.
+            let remaining = limit.map(|l| l - out.len());
             out.extend(
-                self.cp_scan_kind_one(table, kind, sub_start, sub_end)
+                self.cp_scan_kind_one(table, kind, sub_start, sub_end, remaining)
                     .await?,
             );
         }
@@ -6571,19 +6599,26 @@ impl ClientCtx {
     /// body both [`cp_scan_kind`](Self::cp_scan_kind) and
     /// [`cp_scan_kind_table`](Self::cp_scan_kind_table) call). `start`
     /// resolves to exactly one tablet of `table`, so it routes/forwards like
-    /// any other CP op. `end == None` is unbounded above.
+    /// any other CP op. `end == None` is unbounded above. `limit` is a
+    /// **per-tablet cap, not pushdown** (see `RaftKvNode::local_scan_kind`'s
+    /// doc) — [`cp_scan_kind`](Self::cp_scan_kind) always passes `None` (an
+    /// LSI `Query` has no `Limit`, ADR 0041); only
+    /// [`cp_scan_kind_table`](Self::cp_scan_kind_table) passes a real value.
     async fn cp_scan_kind_one(
         &self,
         table: &str,
         kind: u8,
         start: Vec<u8>,
         end: Option<Vec<u8>>,
+        limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             let err = match self.cp_route(table, &start).await {
                 CpRoute::Local(leader) => {
-                    match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref()).await {
+                    match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref(), limit)
+                        .await
+                    {
                         Ok(p) => return Ok(p),
                         Err(e) => e,
                     }
@@ -6594,6 +6629,7 @@ impl ClientCtx {
                         kind,
                         start: start.clone(),
                         end: end.clone(),
+                        limit,
                     };
                     match self.cp_forward(table, &start, addr, request).await {
                         ClientResponse::Pairs(p) => return Ok(p),
@@ -6619,12 +6655,15 @@ impl ClientCtx {
     /// kind-scan dual of [`cp_scan_local`](Self::cp_scan_local): a scope that
     /// has not yet caught up to the metadata-derived request window (a
     /// split's narrow in flight) would otherwise silently truncate the
-    /// results rather than error. `end == None` is unbounded above.
+    /// results rather than error. `end == None` is unbounded above; `limit`
+    /// is a **per-tablet cap, not pushdown** (see
+    /// `RaftKvNode::local_scan_kind`'s doc).
     async fn cp_scan_kind_local(
         leader: &CpGroup,
         kind: u8,
         start: &[u8],
         end: Option<&[u8]>,
+        limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
         if !leader.scope_range().contains_range(&requested) {
@@ -6632,7 +6671,7 @@ impl ClientCtx {
                 "scan window {requested:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
-        match leader.linearizable_scan_kind(kind, start, end).await {
+        match leader.linearizable_scan_kind(kind, start, end, limit).await {
             Some(p) => Ok(p),
             None => Err("CP group leader moved; retry".into()),
         }
@@ -7273,12 +7312,13 @@ impl ClientCtx {
                 kind,
                 start,
                 end,
+                limit,
             } => {
                 let tablet = self.tablet_for(&table, &start);
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
-                match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref()).await {
+                match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref(), limit).await {
                     Ok(p) => ClientResponse::Pairs(p),
                     Err(e) => ClientResponse::Error(e),
                 }

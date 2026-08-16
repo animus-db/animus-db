@@ -152,6 +152,7 @@ async fn bare_kind_scan_is_refused() {
         kind: KIND_LSI,
         start: Vec::new(),
         end: Some(vec![0xFF]),
+        limit: None,
     };
     animusd::write_frame(&mut stream, &request)
         .await
