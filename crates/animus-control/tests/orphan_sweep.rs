@@ -88,6 +88,7 @@ fn addrs(role: &str, suffix: u16) -> NodeAddrs {
         internal: format!("127.0.0.1:{}", 9300 + suffix),
         client: format!("127.0.0.1:{}", 9000 + suffix),
         admin: format!("127.0.0.1:{}", 9500 + suffix),
+        intra: format!("127.0.0.1:{}", 9600 + suffix),
         role: role.to_string(),
     }
 }

@@ -676,7 +676,7 @@ async fn bring_up_split_durable(
 ) {
     let total = control_n + data_n;
     for attempt in 0..16 {
-        let addrs = free_addrs(total * 5);
+        let addrs = free_addrs(total * 6);
         let nodes_cfg: Vec<RoleAddrs> = (0..total)
             .map(|i| {
                 let role = if i < control_n {
@@ -687,11 +687,12 @@ async fn bring_up_split_durable(
                 RoleAddrs {
                     id: animusd::config::node_id(i),
                     role,
-                    internal: addrs[5 * i],
-                    client: addrs[5 * i + 1],
-                    dynamo: addrs[5 * i + 2],
-                    cql: addrs[5 * i + 3],
-                    admin: addrs[5 * i + 4],
+                    internal: addrs[6 * i],
+                    client: addrs[6 * i + 1],
+                    dynamo: addrs[6 * i + 2],
+                    cql: addrs[6 * i + 3],
+                    admin: addrs[6 * i + 4],
+                    intra: addrs[6 * i + 5],
                 }
             })
             .collect();

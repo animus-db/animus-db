@@ -1868,8 +1868,26 @@ pub struct RoleAddrs {
     /// control-plane Raft (stream 0) and every per-tablet Raft group this
     /// node hosts (stream = tablet id ≥ 1, ADR 0026) share it. Required for
     /// every role.
+    ///
+    /// **Naming note (ADR 0047)**: `internal` is the raw `ProdEnv`/Raft-wire
+    /// transport — not the same thing as [`intra`](Self::intra) below, one
+    /// letter-swap away and a recurring source of confusion. `intra` is the
+    /// **`ClientRequest`/`ClientResponse`-framed** node-to-node RPC port
+    /// (same length-prefixed JSON framing as `client`, just a disjoint
+    /// allowed-variant set); `internal` is never dialed with that framing.
     pub internal: SocketAddr,
     pub client: SocketAddr,
+    /// This node's **intra-cluster** RPC listen address (ADR 0047): every
+    /// internal-only `ClientRequest` variant (`Forwarded`, `ProposeSchema`,
+    /// `WatchMetadata`, `JoinInfo`, and the internal-only forwarding
+    /// payloads) is served here instead of on `client`. Required for every
+    /// role — a control-only node receives `ProposeSchema` relays and serves
+    /// `WatchMetadata` long-polls; a data-only node originates both. No
+    /// default (a deliberate clean break, matching `internal`/`client`'s own
+    /// no-default convention — no live deployments to keep back-compat
+    /// with). See [`internal`](Self::internal)'s doc for the naming
+    /// distinction from that field.
+    pub intra: SocketAddr,
     /// The DynamoDB JSON-over-HTTP endpoint. Defaults (when absent in older
     /// configs) to an ephemeral loopback port.
     #[serde(default = "default_ephemeral_addr")]
@@ -1913,6 +1931,12 @@ pub struct BoundNode {
     cql_addr: SocketAddr,
     admin_listener: TcpListener,
     admin_addr: SocketAddr,
+    /// The intra-cluster RPC listener (ADR 0047) — bound but not yet served
+    /// in this PR; carried through to [`start_with`](Self::start_with) so a
+    /// later PR can spawn `serve_requests` on it without touching the bind
+    /// sequence.
+    intra_listener: TcpListener,
+    intra_addr: SocketAddr,
 }
 
 /// A node's identity + bound addresses, captured for the admin `/admin/config`
@@ -1976,7 +2000,10 @@ pub(crate) struct AdminInfo {
 /// combined/data-role ([`BoundNode::start_with`]): `route_sync_loop`,
 /// `metrics_sample_loop`, this node's own one-shot `register_node_addrs`
 /// self-registration, the plain client-request server, and the admin HTTP
-/// endpoint (ADR 0020). Returns the built `ClientCtx` — so the caller can
+/// endpoint (ADR 0020). Also takes the intra-cluster RPC listener (ADR
+/// 0047): in this PR it is only bound and held open (a placeholder task
+/// keeps its port reserved) — `intra/2-cutover` is what actually spawns
+/// `serve_requests` on it. Returns the built `ClientCtx` — so the caller can
 /// spawn whatever role-specific tasks it still needs (`bootstrap`/
 /// `peer_sync_loop`/the growth-node mirror/`heartbeat_loop`/the tablet-host
 /// reconciler/`auto_split_loop`/the dynamo+cql listeners for a data-capable
@@ -1998,6 +2025,7 @@ fn spawn_common_tail(
     self_addrs: (NodeId, NodeAddrs),
     client_listener: TcpListener,
     admin_listener: TcpListener,
+    intra_listener: TcpListener,
     control_storage: Option<SharedEngine>,
     env: ProdEnv,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
@@ -2057,6 +2085,16 @@ fn spawn_common_tail(
     tasks.push(tokio::spawn(serve_clients(client_listener, ctx.clone())));
     // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020).
     tasks.push(tokio::spawn(admin::serve(admin_listener, ctx.clone())));
+    // The intra-cluster RPC listener (ADR 0047): bound and held open here so
+    // its port stays reserved for this node's lifetime, but **not yet
+    // served** — nothing dials it, and no `ClientRequest` variant is
+    // reachable through it, until `intra/2-cutover` replaces this
+    // placeholder with a real `serve_requests(.., ListenerKind::Intra)`
+    // spawn. No client-visible behavior change in this PR.
+    tasks.push(tokio::spawn(async move {
+        let _held_open = intra_listener;
+        std::future::pending::<()>().await;
+    }));
 
     (ctx, tasks)
 }
@@ -2086,6 +2124,11 @@ impl BoundNode {
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
     pub fn admin_addr(&self) -> SocketAddr {
         self.admin_addr
+    }
+
+    /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
+    pub fn intra_addr(&self) -> SocketAddr {
+        self.intra_addr
     }
 
     /// Wire the peer address book into the node's one env and start all
@@ -2239,6 +2282,7 @@ impl BoundNode {
         // further down, but the addresses themselves are needed there too.
         let my_client_addr = self.client_addr;
         let my_admin_addr = self.admin_addr;
+        let my_intra_addr = self.intra_addr;
 
         // The node's identity + bound addresses for the admin `/admin/config`
         // view (ADR 0020), captured before the env is consumed below.
@@ -2404,11 +2448,13 @@ impl BoundNode {
                     internal: my_addr.to_string(),
                     client: my_client_addr.to_string(),
                     admin: my_admin_addr.to_string(),
+                    intra: my_intra_addr.to_string(),
                     role: "combined".to_string(),
                 },
             ),
             self.client_listener,
             self.admin_listener,
+            self.intra_listener,
             Some(storage.clone()),
             self.env.clone(),
         );
@@ -2628,6 +2674,7 @@ impl BoundNode {
             dynamo_addr: Some(self.dynamo_addr),
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
+            intra_addr: self.intra_addr,
         })
     }
 }
@@ -2673,6 +2720,10 @@ pub struct Node {
     /// never bound there. See [`cql_addr`](Self::cql_addr)'s doc.
     cql_addr: Option<SocketAddr>,
     admin_addr: SocketAddr,
+    /// This node's intra-cluster RPC listen address (ADR 0047). Always
+    /// populated — every deployment shape binds and (from `intra/2-cutover`
+    /// onward) serves it.
+    intra_addr: SocketAddr,
 }
 
 impl Node {
@@ -2700,6 +2751,8 @@ impl Node {
         let cql_addr = cql_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
+        let intra_listener = TcpListener::bind(addrs.intra).await?;
+        let intra_addr = intra_listener.local_addr()?;
         Ok(BoundNode {
             id,
             env,
@@ -2713,6 +2766,8 @@ impl Node {
             cql_addr,
             admin_listener,
             admin_addr,
+            intra_listener,
+            intra_addr,
         })
     }
 
@@ -2735,6 +2790,8 @@ impl Node {
         let client_addr = client_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
+        let intra_listener = TcpListener::bind(addrs.intra).await?;
+        let intra_addr = intra_listener.local_addr()?;
         Ok(BoundControlNode {
             id,
             env,
@@ -2743,6 +2800,8 @@ impl Node {
             client_addr,
             admin_listener,
             admin_addr,
+            intra_listener,
+            intra_addr,
         })
     }
 
@@ -2770,6 +2829,8 @@ impl Node {
         let cql_addr = cql_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
+        let intra_listener = TcpListener::bind(addrs.intra).await?;
+        let intra_addr = intra_listener.local_addr()?;
         Ok(BoundDataNode {
             id,
             env,
@@ -2783,6 +2844,8 @@ impl Node {
             cql_addr,
             admin_listener,
             admin_addr,
+            intra_listener,
+            intra_addr,
         })
     }
 
@@ -2814,6 +2877,11 @@ impl Node {
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
     pub fn admin_addr(&self) -> SocketAddr {
         self.admin_addr
+    }
+
+    /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
+    pub fn intra_addr(&self) -> SocketAddr {
+        self.intra_addr
     }
 
     /// Whether this node's control replica currently believes it is leader.
@@ -3002,6 +3070,8 @@ pub struct BoundControlNode {
     client_addr: SocketAddr,
     admin_listener: TcpListener,
     admin_addr: SocketAddr,
+    intra_listener: TcpListener,
+    intra_addr: SocketAddr,
 }
 
 impl BoundControlNode {
@@ -3018,6 +3088,11 @@ impl BoundControlNode {
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
     pub fn admin_addr(&self) -> SocketAddr {
         self.admin_addr
+    }
+
+    /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
+    pub fn intra_addr(&self) -> SocketAddr {
+        self.intra_addr
     }
 
     /// `(id, addr)` — this node's entry in the cluster's peer book.
@@ -3165,11 +3240,13 @@ impl BoundControlNode {
                     internal: self.internal_addr.to_string(),
                     client: self.client_addr.to_string(),
                     admin: self.admin_addr.to_string(),
+                    intra: self.intra_addr.to_string(),
                     role: "control".to_string(),
                 },
             ),
             self.client_listener,
             self.admin_listener,
+            self.intra_listener,
             Some(control_storage),
             sync_env.clone(),
         );
@@ -3215,6 +3292,7 @@ impl BoundControlNode {
             dynamo_addr: None,
             cql_addr: None,
             admin_addr: self.admin_addr,
+            intra_addr: self.intra_addr,
         })
     }
 }
@@ -3240,6 +3318,8 @@ pub struct BoundDataNode {
     cql_addr: SocketAddr,
     admin_listener: TcpListener,
     admin_addr: SocketAddr,
+    intra_listener: TcpListener,
+    intra_addr: SocketAddr,
 }
 
 impl BoundDataNode {
@@ -3261,6 +3341,11 @@ impl BoundDataNode {
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
     pub fn admin_addr(&self) -> SocketAddr {
         self.admin_addr
+    }
+
+    /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
+    pub fn intra_addr(&self) -> SocketAddr {
+        self.intra_addr
     }
 
     /// `(id, addr)` — this node's entry in the cluster's *raftkv* peer
@@ -3362,6 +3447,7 @@ impl BoundDataNode {
         let my_addr = self.internal_addr;
         let my_client_addr = self.client_addr;
         let my_admin_addr = self.admin_addr;
+        let my_intra_addr = self.intra_addr;
 
         let control = ControlHandle::Remote(RemoteControlClient::new(control_seeds.clone()));
 
@@ -3431,11 +3517,13 @@ impl BoundDataNode {
                     internal: my_addr.to_string(),
                     client: my_client_addr.to_string(),
                     admin: my_admin_addr.to_string(),
+                    intra: my_intra_addr.to_string(),
                     role: "data".to_string(),
                 },
             ),
             self.client_listener,
             self.admin_listener,
+            self.intra_listener,
             // A data-only node has no local control role at all (ADR 0035) —
             // no system-keyspace engine to surface (ADR 0038 PR4).
             None,
@@ -3554,6 +3642,7 @@ impl BoundDataNode {
             dynamo_addr: Some(self.dynamo_addr),
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
+            intra_addr: self.intra_addr,
         })
     }
 }
@@ -8201,6 +8290,7 @@ impl ClientCtx {
                 internal: String::new(),
                 client: String::new(),
                 admin: String::new(),
+                intra: String::new(),
                 role: "control".to_string(),
             });
             if addrs.internal != addr.to_string() {
@@ -8243,6 +8333,7 @@ impl ClientCtx {
                         internal: String::new(),
                         client: String::new(),
                         admin: String::new(),
+                        intra: String::new(),
                         role: "control".to_string(),
                     });
                 addrs.internal = addr.to_string();
@@ -10418,6 +10509,7 @@ pub async fn bind_cluster(
             dynamo: addr(),
             cql: addr(),
             admin: addr(),
+            intra: addr(),
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
         nodes.push(node);
@@ -10744,6 +10836,7 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
             dynamo: ephemeral(),
             cql: ephemeral(),
             admin: ephemeral(),
+            intra: ephemeral(),
         };
         control_bound.push(
             Node::bind_control(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?,
@@ -10759,6 +10852,7 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
             dynamo: ephemeral(),
             cql: ephemeral(),
             admin: ephemeral(),
+            intra: ephemeral(),
         };
         data_bound
             .push(Node::bind_data(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?);
@@ -11322,6 +11416,7 @@ pub async fn run_node_join(
         internal: addrs.internal.to_string(),
         client: addrs.client.to_string(),
         admin: addrs.admin.to_string(),
+        intra: addrs.intra.to_string(),
         role: "combined".to_string(),
     };
     let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
@@ -11561,6 +11656,7 @@ pub async fn run_node_data_join(
         internal: addrs.internal.to_string(),
         client: addrs.client.to_string(),
         admin: addrs.admin.to_string(),
+        intra: addrs.intra.to_string(),
         role: "data".to_string(),
     };
     let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
@@ -11825,7 +11921,7 @@ mod split_fence_tests {
     async fn stale_routed_write_for_a_split_childs_key_is_rejected_not_lost() {
         timeout(Duration::from_secs(60), async {
             let dir = tempfile::tempdir().expect("tempdir");
-            let addrs = free_addrs(5);
+            let addrs = free_addrs(6);
             let config = ClusterConfig {
                 nodes: vec![RoleAddrs {
                     id: crate::config::node_id(0),
@@ -11835,6 +11931,7 @@ mod split_fence_tests {
                     dynamo: addrs[2],
                     cql: addrs[3],
                     admin: addrs[4],
+                    intra: addrs[5],
                 }],
             };
             let node = run_node(&config, 0, dir.path().join("node-0"))

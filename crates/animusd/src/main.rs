@@ -581,6 +581,7 @@ async fn run_data_join(
         dynamo: p(2),
         cql: p(3),
         admin: p(4),
+        intra: p(5),
     };
     let dir_name = id
         .as_ref()
@@ -672,6 +673,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         dynamo: p(2),
         cql: p(3),
         admin: p(4),
+        intra: p(5),
     };
     let dir_name = id
         .as_ref()

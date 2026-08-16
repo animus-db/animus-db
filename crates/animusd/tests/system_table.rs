@@ -43,7 +43,7 @@ use tokio::time::{sleep, timeout};
 /// fresh `tempfile::tempdir()` + freshly-bound `:0` ports per call is enough
 /// isolation for one node).
 async fn bring_up_one(dir: &std::path::Path) -> Node {
-    let addrs = free_addrs(5);
+    let addrs = free_addrs(6);
     let node_cfg = animusd::RoleAddrs {
         id: animusd::config::node_id(0),
         role: animusd::config::NodeRole::Both,
@@ -52,6 +52,7 @@ async fn bring_up_one(dir: &std::path::Path) -> Node {
         dynamo: addrs[2],
         cql: addrs[3],
         admin: addrs[4],
+        intra: addrs[5],
     };
     let config = animusd::ClusterConfig {
         nodes: vec![node_cfg],

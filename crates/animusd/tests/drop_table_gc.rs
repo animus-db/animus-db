@@ -36,16 +36,17 @@ async fn bring_up(
     dir: &Path,
 ) -> (Vec<Node>, animusd::ClusterConfig, Vec<std::path::PathBuf>) {
     for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 5);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[5 * i],
-                client: addrs[5 * i + 1],
-                dynamo: addrs[5 * i + 2],
-                cql: addrs[5 * i + 3],
-                admin: addrs[5 * i + 4],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                admin: addrs[6 * i + 4],
+                intra: addrs[6 * i + 5],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };

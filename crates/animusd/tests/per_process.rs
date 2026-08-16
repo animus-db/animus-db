@@ -47,16 +47,17 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
     let dir = tempfile::tempdir().unwrap();
     let mut brought_up = None;
     'attempts: for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 5);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[5 * i],
-                client: addrs[5 * i + 1],
-                dynamo: addrs[5 * i + 2],
-                cql: addrs[5 * i + 3],
-                admin: addrs[5 * i + 4],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                admin: addrs[6 * i + 4],
+                intra: addrs[6 * i + 5],
             })
             .collect();
         let config = ClusterConfig { nodes: nodes_cfg };

@@ -1558,7 +1558,7 @@ mod gsi_drain_cursor_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(5);
+        let addrs = free_addrs(6);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -1568,6 +1568,7 @@ mod gsi_drain_cursor_tests {
                 dynamo: addrs[2],
                 cql: addrs[3],
                 admin: addrs[4],
+                intra: addrs[5],
             }],
         }
     }
@@ -2043,7 +2044,7 @@ mod stream_sealer_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(5);
+        let addrs = free_addrs(6);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -2053,6 +2054,7 @@ mod stream_sealer_tests {
                 dynamo: addrs[2],
                 cql: addrs[3],
                 admin: addrs[4],
+                intra: addrs[5],
             }],
         }
     }

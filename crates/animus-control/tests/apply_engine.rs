@@ -114,6 +114,7 @@ fn run_scenario(seed: u64) {
                 internal: "127.0.0.1:9900".to_string(),
                 client: "127.0.0.1:9000".to_string(),
                 admin: "127.0.0.1:9500".to_string(),
+                intra: "127.0.0.1:9600".to_string(),
                 role: "combined".to_string(),
             },
             labels: BTreeMap::new(),

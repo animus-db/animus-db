@@ -111,17 +111,18 @@ pub struct ClusterConfig {
 
 impl ClusterConfig {
     /// Generate a **combined-mode** config for `n` nodes on `host`, assigning
-    /// each node five consecutive ports starting at `base_port` (node `i` uses
-    /// `base_port + 5*i .. +5`): internal, client, dynamo, cql, admin (the
-    /// admin/debug interface, ADR 0020). Every node is [`NodeRole::Both`] —
-    /// see [`generate_split`] for the split-deployment shape.
+    /// each node six consecutive ports starting at `base_port` (node `i` uses
+    /// `base_port + 6*i .. +6`): internal, client, dynamo, cql, admin (the
+    /// admin/debug interface, ADR 0020), intra (the cluster-internal RPC port,
+    /// ADR 0047). Every node is [`NodeRole::Both`] — see [`generate_split`]
+    /// for the split-deployment shape.
     ///
     /// [`generate_split`]: Self::generate_split
     #[must_use]
     pub fn generate(n: usize, host: IpAddr, base_port: u16) -> Self {
         let nodes = (0..n)
             .map(|i| {
-                let p = |role: u16| SocketAddr::new(host, base_port + (i as u16) * 5 + role);
+                let p = |role: u16| SocketAddr::new(host, base_port + (i as u16) * 6 + role);
                 RoleAddrs {
                     id: minted_id(i, n),
                     role: NodeRole::Both,
@@ -130,6 +131,7 @@ impl ClusterConfig {
                     dynamo: p(2),
                     cql: p(3),
                     admin: p(4),
+                    intra: p(5),
                 }
             })
             .collect();
@@ -139,14 +141,14 @@ impl ClusterConfig {
     /// Generate a **split-deployment** config (ADR 0035 target topology):
     /// `control_n` control-only nodes followed by `data_n` data-only nodes,
     /// all on `host` starting at `base_port`. Each node still gets a full
-    /// five-port block (same stride as [`generate`](Self::generate)) so the
+    /// six-port block (same stride as [`generate`](Self::generate)) so the
     /// two generators stay trivially comparable.
     #[must_use]
     pub fn generate_split(control_n: usize, data_n: usize, host: IpAddr, base_port: u16) -> Self {
         let total = control_n + data_n;
         let nodes = (0..total)
             .map(|i| {
-                let p = |role: u16| SocketAddr::new(host, base_port + (i as u16) * 5 + role);
+                let p = |role: u16| SocketAddr::new(host, base_port + (i as u16) * 6 + role);
                 let role = if i < control_n {
                     NodeRole::Control
                 } else {
@@ -160,6 +162,7 @@ impl ClusterConfig {
                     dynamo: p(2),
                     cql: p(3),
                     admin: p(4),
+                    intra: p(5),
                 }
             })
             .collect();
@@ -284,8 +287,9 @@ mod tests {
         assert_eq!(cfg.nodes[0].dynamo.port(), 7002);
         assert_eq!(cfg.nodes[0].cql.port(), 7003);
         assert_eq!(cfg.nodes[0].admin.port(), 7004);
-        assert_eq!(cfg.nodes[1].internal.port(), 7005);
-        assert_eq!(cfg.nodes[2].internal.port(), 7010);
+        assert_eq!(cfg.nodes[0].intra.port(), 7005);
+        assert_eq!(cfg.nodes[1].internal.port(), 7006);
+        assert_eq!(cfg.nodes[2].internal.port(), 7012);
     }
 
     #[test]
@@ -301,15 +305,17 @@ mod tests {
         let cfg = ClusterConfig::generate(3, "127.0.0.1".parse().unwrap(), 7000);
         let book = cfg.peer_book();
         assert_eq!(book.len(), 3, "3 nodes, one identity/address each");
-        assert_eq!(book[&node_id(1)].port(), 7005);
+        assert_eq!(book[&node_id(1)].port(), 7006);
         assert_eq!(book[&node_id(0)].port(), 7000);
-        assert_eq!(book[&node_id(2)].port(), 7010);
-        // Client / dynamo / cql / admin addresses are intentionally absent
-        // from the internal book (external client channels, not the network).
+        assert_eq!(book[&node_id(2)].port(), 7012);
+        // Client / dynamo / cql / admin / intra addresses are intentionally
+        // absent from the internal book (external client channels, not the
+        // network).
         assert!(!book.values().any(|a| a.port() == 7001)); // client (node 0)
         assert!(!book.values().any(|a| a.port() == 7002)); // dynamo (node 0)
         assert!(!book.values().any(|a| a.port() == 7003)); // cql (node 0)
         assert!(!book.values().any(|a| a.port() == 7004)); // admin (node 0)
+        assert!(!book.values().any(|a| a.port() == 7005)); // intra (node 0)
     }
 
     #[test]

@@ -360,7 +360,7 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     // 7. Collision: joining at the SAME index with DIFFERENT addresses must
     // fail loudly (the collision guard), and the cluster stays unharmed.
     let collision_addrs = {
-        let raw = support::free_addrs(5);
+        let raw = support::free_addrs(6);
         RoleAddrs {
             id: join_raftkv_id.clone(),
             role: animusd::config::NodeRole::Both,
@@ -369,6 +369,7 @@ async fn node_joins_via_seed_with_no_expanded_config() {
             dynamo: raw[2],
             cql: raw[3],
             admin: raw[4],
+            intra: raw[5],
         }
     };
     let collision_result = animusd::run_node_join(

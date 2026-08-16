@@ -126,9 +126,20 @@ pub struct NodeAddrs {
     /// needs no separate address-replication path either: its `internal`
     /// address is either already registered (an existing node being promoted
     /// to a voter) or supplied directly by the admin action.
+    ///
+    /// **Naming note (ADR 0047)**: `internal` is the raw `ProdEnv`/Raft-wire
+    /// transport, not the same thing as [`intra`](Self::intra) below — one
+    /// letter-swap away and a recurring source of confusion. `intra` is the
+    /// `ClientRequest`/`ClientResponse`-framed node-to-node RPC address
+    /// (same framing as `client`, a disjoint allowed-variant set).
     pub internal: String,
     /// The plain client-protocol listen address.
     pub client: String,
+    /// This node's intra-cluster RPC listen address (ADR 0047) — where
+    /// every internal-only `ClientRequest` variant is actually served.
+    /// Always populated at self-registration, for every role, mirroring
+    /// `internal`/`client`/`admin` above.
+    pub intra: String,
     /// The admin/debug HTTP listen address.
     pub admin: String,
     /// This node's deployment role (ADR 0035): `"control"` / `"data"` /
@@ -2773,6 +2784,7 @@ mod tests {
             internal: format!("127.0.0.1:{}", 9300 + suffix),
             client: format!("127.0.0.1:{}", 9000 + suffix),
             admin: format!("127.0.0.1:{}", 9500 + suffix),
+            intra: format!("127.0.0.1:{}", 9600 + suffix),
             role: "combined".to_string(),
         };
         for node in [300, 301] {
@@ -2865,6 +2877,7 @@ mod tests {
                         internal: format!("127.0.0.1:{}", 9300 + node),
                         client: format!("127.0.0.1:{}", 9000 + node),
                         admin: format!("127.0.0.1:{}", 9500 + node),
+                        intra: format!("127.0.0.1:{}", 9600 + node),
                         role: role.to_string(),
                     },
                 }),
@@ -2889,6 +2902,7 @@ mod tests {
             internal: "127.0.0.1:9300".to_owned(),
             client: "127.0.0.1:9000".to_owned(),
             admin: "127.0.0.1:9500".to_owned(),
+            intra: "127.0.0.1:9600".to_owned(),
             role: "combined".to_string(),
         };
         let mut value = serde_json::to_value(&addrs).expect("NodeAddrs serializes");
@@ -3401,6 +3415,7 @@ mod tests {
                     internal: "127.0.0.1:9301".to_owned(),
                     client: "127.0.0.1:9001".to_owned(),
                     admin: "127.0.0.1:9501".to_owned(),
+                    intra: "127.0.0.1:9601".to_owned(),
                     role: "combined".to_string(),
                 },
             });
@@ -3445,6 +3460,7 @@ mod tests {
                 internal: "127.0.0.1:9301".to_owned(),
                 client: "127.0.0.1:9001".to_owned(),
                 admin: "127.0.0.1:9501".to_owned(),
+                intra: "127.0.0.1:9601".to_owned(),
                 role: "control".to_string(),
             },
             labels: BTreeMap::new(),
@@ -3574,6 +3590,7 @@ mod tests {
                 internal: "127.0.0.1:9900".to_owned(),
                 client: "127.0.0.1:9000".to_owned(),
                 admin: "127.0.0.1:9950".to_owned(),
+                intra: "127.0.0.1:9960".to_owned(),
                 role: "combined".to_string(),
             },
             labels: BTreeMap::new(),
@@ -3585,6 +3602,7 @@ mod tests {
                 internal: "127.0.0.1:9901".to_owned(),
                 client: "127.0.0.1:9001".to_owned(),
                 admin: "127.0.0.1:9951".to_owned(),
+                intra: "127.0.0.1:9961".to_owned(),
                 role: "control".to_string(),
             },
             labels: BTreeMap::new(),
@@ -3607,6 +3625,7 @@ mod tests {
                 internal: "127.0.0.1:9902".to_owned(),
                 client: "127.0.0.1:9002".to_owned(),
                 admin: "127.0.0.1:9952".to_owned(),
+                intra: "127.0.0.1:9962".to_owned(),
                 role: "combined".to_string(),
             },
         });
@@ -3618,6 +3637,7 @@ mod tests {
                 internal: "127.0.0.1:9903".to_owned(),
                 client: "127.0.0.1:9003".to_owned(),
                 admin: "127.0.0.1:9953".to_owned(),
+                intra: "127.0.0.1:9963".to_owned(),
                 role: "combined".to_string(),
             },
             labels: BTreeMap::new(),
@@ -3756,6 +3776,7 @@ mod tests {
             internal: format!("127.0.0.1:{}", 9300 + suffix),
             client: format!("127.0.0.1:{}", 9000 + suffix),
             admin: format!("127.0.0.1:{}", 9500 + suffix),
+            intra: format!("127.0.0.1:{}", 9600 + suffix),
             role: "combined".to_string(),
         }
     }
@@ -3968,6 +3989,7 @@ mod tests {
             internal: "127.0.0.1:9906".to_string(),
             client: "127.0.0.1:9006".to_string(),
             admin: "127.0.0.1:9506".to_string(),
+            intra: "127.0.0.1:9606".to_string(),
             role: "control".to_string(),
         };
         assert_eq!(

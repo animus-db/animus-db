@@ -1189,6 +1189,7 @@ mod tests {
             internal: "a".to_string(),
             client: "b".to_string(),
             admin: "c".to_string(),
+            intra: "d".to_string(),
             role: "combined".to_string(),
         };
         let command = MetaCommand::RegisterNodeAddrs {
@@ -1234,6 +1235,7 @@ mod tests {
             internal: "127.0.0.1:9910".to_string(),
             client: "127.0.0.1:9010".to_string(),
             admin: "127.0.0.1:9510".to_string(),
+            intra: "127.0.0.1:9610".to_string(),
             role: "combined".to_string(),
         };
         let command = MetaCommand::RegisterNode {
@@ -1410,6 +1412,7 @@ mod tests {
                     internal: "127.0.0.1:9902".to_string(),
                     client: "127.0.0.1:9002".to_string(),
                     admin: "127.0.0.1:9502".to_string(),
+                    intra: "127.0.0.1:9602".to_string(),
                     role: "combined".to_string(),
                 },
                 labels: BTreeMap::new(),
