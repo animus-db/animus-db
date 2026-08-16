@@ -818,8 +818,18 @@ where
         self.pending_install.is_some()
     }
 
-    /// The next virtual instant at which this node wants a timer tick.
-    pub fn next_deadline(&self) -> Nanos {
+    /// The next virtual instant at which this node wants a timer tick, or
+    /// `None` if it wants no timer at all right now.
+    ///
+    /// `None` is reserved for **quiescence** (ADR 0044 phase-1 PR3, gated by
+    /// opt-in `quiesce_after: Option<Duration>` — still absent from the core
+    /// as of this PR): a quiesced leader has nothing to time out on until some
+    /// other event (an inbound message, a local propose, `shutdown()`, an
+    /// explicit wake) un-quiesces it. This PR (phase-1 PR2) only changes the
+    /// *type*, threading `Option` through both drivers so they drop the timer
+    /// arm from their `select` on `None` — since nothing in the core can yet
+    /// produce `None`, this always returns `Some`, byte-identical to before.
+    pub fn next_deadline(&self) -> Option<Nanos> {
         if self.role == Role::Leader {
             // While a transfer is armed, also wake in time to evaluate its abort
             // deadline (`tick`) even if that falls before the next heartbeat —
@@ -827,11 +837,13 @@ where
             // timeout, so this rarely changes the wait, but it keeps the bound
             // exact rather than incidental.
             match self.transfer_target {
-                Some(_) => Nanos(self.heartbeat_deadline.0.min(self.transfer_deadline.0)),
-                None => self.heartbeat_deadline,
+                Some(_) => Some(Nanos(
+                    self.heartbeat_deadline.0.min(self.transfer_deadline.0),
+                )),
+                None => Some(self.heartbeat_deadline),
             }
         } else {
-            self.election_deadline
+            Some(self.election_deadline)
         }
     }
 

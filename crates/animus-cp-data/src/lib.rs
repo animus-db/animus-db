@@ -183,6 +183,59 @@ impl Future for ApplyPending<'_> {
     }
 }
 
+/// The **driver-level wake** signal (ADR 0044 phase-1 PR2): the same shape as
+/// [`ProposeSignal`]/[`ApplySignal`], but for the **consensus loop's own park**
+/// rather than a proposer or the apply task. Today the consensus loop always
+/// re-wakes well within one heartbeat/election interval regardless (continual
+/// Raft traffic even at rest), so this signal is inert in practice — it exists
+/// now, ahead of need, because phase-1 PR3's quiescence makes
+/// [`RaftCore::next_deadline`] return `None` for real: a quiesced leader's
+/// consensus loop then has **no timer at all**, parked purely on inbound
+/// traffic, [`ProposePending`], and this signal — so [`shutdown`](RaftKvNode::shutdown)
+/// must raise it (finding 4's hazard 1: without this, a quiesced group's
+/// `shutdown()` could sit unnoticed forever instead of within one wake) and
+/// [`RaftKvNode::wake`] exists as the same hook a later PR's edge/reconciler
+/// proactive-wake caller (PR4) and quiescence's own un-quiesce triggers (PR3)
+/// reuse. Kept distinct from `ProposeSignal` (proposer-specific: replicates a
+/// freshly appended entry immediately) and `ApplySignal` (apply-task-specific)
+/// rather than overloading either, since a generic "please re-evaluate, nothing
+/// specific happened" wake is a different concept from either of those.
+#[derive(Default)]
+struct WakeSignal {
+    /// Set by `shutdown`/`wake`, consumed by the consensus loop.
+    pending: AtomicBool,
+    /// The consensus loop's waker, registered each time it parks.
+    waker: AtomicWaker,
+}
+
+impl WakeSignal {
+    /// Raise the flag, then wake the parked consensus loop — same
+    /// register-before-check discipline as [`ProposeSignal::notify`].
+    fn notify(&self) {
+        self.pending.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+}
+
+/// A future that resolves once a driver-level wake is pending, for the
+/// consensus loop's `select` — the [`WakeSignal`] counterpart to
+/// [`ProposePending`]/[`ApplyPending`].
+struct WakePending<'a> {
+    signal: &'a WakeSignal,
+}
+
+impl Future for WakePending<'_> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.signal.waker.register(cx.waker());
+        if self.signal.pending.swap(false, Ordering::AcqRel) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 /// The physical key-space a `RaftKvNode`'s group is confined to within a
 /// possibly-**shared** `StorageEngine` (ADR 0028): every physical key this
 /// group ever writes is `prefix || key`, and a read is bounded to physical
@@ -1229,6 +1282,12 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// races this against [`APPLY_SAFETY_POLL`] instead of spinning on
     /// `APPLY_IDLE_POLL`. See [`ApplySignal`]'s doc for the enumerated raise points.
     apply_signal: Arc<ApplySignal>,
+    /// **Driver-level wake** signal (ADR 0044 phase-1 PR2): raised by
+    /// [`shutdown`](Self::shutdown) and [`wake`](Self::wake) so the consensus
+    /// loop's park races this alongside `propose_signal`/inbound traffic/the
+    /// timer arm — the hook phase-1 PR3's quiescence (a timerless park) and
+    /// PR4's proactive external wake both need. See [`WakeSignal`]'s doc.
+    wake_signal: Arc<WakeSignal>,
     /// Observability sink (ADR 0015). The public propose API records the real
     /// accept/reject outcome into it, and the consensus loop + apply task each hold
     /// a clone for the commit/apply/read-barrier/snapshot recording sites. Cheap to
@@ -1441,6 +1500,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let propose_signal = Arc::new(ProposeSignal::default());
         let apply_signal = Arc::new(ApplySignal::default());
+        let wake_signal = Arc::new(WakeSignal::default());
         // Group-start witnessing (ADR 0018 §2 amendment): fold in whatever
         // this (possibly shared, ADR 0026/0028) engine's highest MVCC
         // version already reflects, so this group's own future mints never
@@ -1477,6 +1537,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             apply_stopped: Arc::clone(&apply_stopped),
             propose_signal: Arc::clone(&propose_signal),
             apply_signal: Arc::clone(&apply_signal),
+            wake_signal: Arc::clone(&wake_signal),
             metrics: metrics.clone(),
             scope: scope.clone(),
             kind_scopes: kind_scopes.clone(),
@@ -1507,6 +1568,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             apply_stopped,
             propose_signal,
             apply_signal,
+            wake_signal,
             metrics,
             scope,
             kind_scopes,
@@ -1533,6 +1595,30 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // 5ms poll), so without this a shutdown request could sit unnoticed by the
         // apply task for up to that whole interval instead of within one wake.
         self.apply_signal.notify();
+        // Wake a parked consensus loop too (ADR 0044 phase-1 PR2, finding 4's
+        // hazard 1): today the consensus loop always re-wakes well within one
+        // heartbeat/election interval on its own (continual Raft traffic even at
+        // rest), so this is a no-op in effect — but once phase-1 PR3's
+        // quiescence makes `next_deadline()` return `None` for a quiesced
+        // leader, its consensus loop parks with **no timer at all**, and without
+        // this notify a `shutdown()` on such a group could sit unnoticed
+        // forever (never observed, so `is_stopped()` never flips, so
+        // `Reconciler::teardown`'s `RECLAIM_STOP_TIMEOUT` would expire and
+        // drop-table GC would never converge) instead of within one wake.
+        self.wake_signal.notify();
+    }
+
+    /// Explicitly wake this group's consensus loop for one extra pass — the
+    /// **unused-for-now** hook a later PR needs: PR3's quiescence un-quiesce
+    /// triggers, and PR4's proactive wake (the edge's `resolve_cp_route` before
+    /// routing to a local group, and the reconciler waking a group whose
+    /// replica set intersects a newly-`Down` node) both call this instead of
+    /// duplicating [`WakeSignal`]'s plumbing. Idempotent and always safe: it
+    /// only ever causes one extra, otherwise-inert loop iteration (re-checking
+    /// `halted` and re-evaluating `next_deadline`), never a state change on its
+    /// own.
+    pub fn wake(&self) {
+        self.wake_signal.notify();
     }
 
     /// Whether [`shutdown`](Self::shutdown) has been requested.
@@ -6131,6 +6217,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     apply_stopped: Arc<AtomicBool>,
     propose_signal: Arc<ProposeSignal>,
     apply_signal: Arc<ApplySignal>,
+    wake_signal: Arc<WakeSignal>,
     metrics: MetricsHandle,
     /// The **base**-kind scope (ADR 0041 §3) — see [`RaftKvNode::scope`].
     scope: StorageScope,
@@ -6219,6 +6306,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         apply_stopped,
         propose_signal,
         apply_signal,
+        wake_signal,
         metrics,
         scope,
         kind_scopes,
@@ -6332,24 +6420,42 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
 
         let now = env.now();
         let deadline = core.lock().expect("raftkv core poisoned").next_deadline();
-        let wait = Duration::from_nanos(deadline.0.saturating_sub(now.0));
+        // `None` (ADR 0044 phase-1 PR3 — quiescence, always `Some` as of this PR:
+        // nothing in the core produces `None` yet) drops the timer arm entirely
+        // rather than sleeping on a synthetic wait, so a genuinely quiesced group
+        // posts zero `SimEnv` timeline events instead of a degenerate busy-loop.
+        let timer = match deadline {
+            Some(deadline) => {
+                Either::Left(env.sleep(Duration::from_nanos(deadline.0.saturating_sub(now.0))))
+            }
+            None => Either::Right(std::future::pending()),
+        };
 
         // Snapshot the commit index before stepping the core so a real advance
         // (ADR 0015: record the outcome, not the attempt) can be attributed below.
         let before_commit = core.lock().expect("raftkv core poisoned").commit_index();
 
         // Each step yields outbound `KvWire` messages (Raft traffic and/or a read
-        // probe ack). Three wakeup sources race: an inbound message, the Raft timer
-        // deadline, and a **wake-on-propose** signal — a proposer raising the flag so
-        // a freshly appended entry replicates at once (ADR 0017 single-write latency),
-        // treated like an immediate heartbeat (`replicate_now`) rather than waiting
-        // for the ~50ms tick.
-        let recv_or_timer = select(env.recv_stream(stream), env.sleep(wait));
+        // probe ack). Four wakeup sources race: an inbound message, the Raft timer
+        // deadline (absent — `None` — while quiesced, PR3), a **wake-on-propose**
+        // signal — a proposer raising the flag so a freshly appended entry
+        // replicates at once (ADR 0017 single-write latency), treated like an
+        // immediate heartbeat (`replicate_now`) rather than waiting for the ~50ms
+        // tick — and the driver-level **wake** signal (`shutdown`/`wake`, PR2/PR4),
+        // which does nothing itself beyond looping back to re-check `halted` and
+        // re-evaluate `next_deadline`.
+        let recv_or_timer = select(env.recv_stream(stream), timer);
+        let wake_or_recv_or_timer = select(
+            WakePending {
+                signal: &wake_signal,
+            },
+            recv_or_timer,
+        );
         let outs: Vec<(NodeId, KvWire)> = match select(
             ProposePending {
                 signal: &propose_signal,
             },
-            recv_or_timer,
+            wake_or_recv_or_timer,
         )
         .await
         {
@@ -6364,7 +6470,11 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                     .map(|(to, m)| (to, KvWire::Raft(m)))
                     .collect()
             }
-            Either::Right((Either::Left((envelope, _)), _)) => {
+            // Driver-level wake: nothing to do by itself — looping back already
+            // re-checks `halted` and re-evaluates `next_deadline`, which is the
+            // whole point (finding 4's hazard 1, and PR3/PR4's un-quiesce hooks).
+            Either::Right((Either::Left(((), _)), _)) => Vec::new(),
+            Either::Right((Either::Right((Either::Left((envelope, _)), _)), _)) => {
                 let entropy = env.next_u64();
                 match codec::decode_wire(&envelope.payload) {
                     Ok(KvWire::Raft(msg)) => {
@@ -6408,7 +6518,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                     }
                 }
             }
-            Either::Right((Either::Right(((), _)), _)) => {
+            Either::Right((Either::Right((Either::Right(((), _)), _)), _)) => {
                 let entropy = env.next_u64();
                 let raft_outs = core
                     .lock()
