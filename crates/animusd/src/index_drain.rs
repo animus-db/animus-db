@@ -309,6 +309,20 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             if !group.is_leader() {
                 continue;
             }
+            // ADR 0044 phase-1 PR6: "quiesced ⇒ nothing new for the
+            // sweeper" is an invariant PR5's veto makes sound — a led
+            // tablet that reached quiescence had an empty change log on
+            // this loop's own last sweep (the veto set by *this very loop*
+            // is what let it quiesce at all), so re-scanning it is pure
+            // waste. Skipping is what actually cashes in the wakeup-count
+            // win quiescence exists for; PR5 alone only avoided pointless
+            // Raft timer/heartbeat activity, not this loop's own LSM
+            // scans. A tablet re-woken (a write, a proposal, `wake()`) is
+            // simply re-scanned the very next tick once `is_quiesced()`
+            // flips back to `false` — no separate re-arm needed.
+            if group.is_quiesced() {
+                continue;
+            }
             let Some(table) = meta.tablets.get(&tablet).and_then(|t| t.table.clone()) else {
                 continue; // legacy whole-keyspace tablet, or a stale view
             };
@@ -2137,15 +2151,18 @@ mod stream_sealer_tests {
 
     /// Like [`single_node_with_streams`], but also opts the node's
     /// data-plane CP groups into quiescence with `quiesce_after` (ADR 0044
-    /// phase-1 PR5) — no test-only wrapper mirroring `run_node_with_streams`
+    /// phase-1 PR5) and, optionally, a **byte** auto-split threshold (PR6's
+    /// own multi-sweeper regression needs auto-split and streaming/sealing
+    /// wired at once) — no test-only wrapper mirroring `run_node_with_streams`
     /// exists for this combination yet (PR7 adds the production `--quiesce-
     /// after` CLI flag), so this builds the node directly via
     /// `BoundNode::start_with_growth` (`run_node_with_streams`'s own body,
-    /// with the one extra argument) rather than growing the production
-    /// surface just for this test.
+    /// with the extra arguments) rather than growing the production surface
+    /// just for these tests.
     async fn single_node_with_streams_and_quiesce_after(
         dir: &Path,
         knobs: StreamSealKnobs,
+        auto_split_bytes: Option<u64>,
         quiesce_after: Duration,
     ) -> Node {
         let config = single_node_config();
@@ -2167,7 +2184,7 @@ mod stream_sealer_tests {
                 client_route,
                 intra_route,
                 None,
-                None,
+                auto_split_bytes,
                 vec![config.nodes[0].admin],
                 Duration::from_secs(600),
                 knobs,
@@ -2971,6 +2988,7 @@ mod stream_sealer_tests {
                     seal_bytes: 200,
                     seal_age: Duration::from_secs(3600),
                 },
+                None,
                 Duration::from_millis(300),
             )
             .await;
@@ -3016,6 +3034,100 @@ mod stream_sealer_tests {
             await_true(10, "the veto releases and the group quiesces", || {
                 group.is_quiesced()
             })
+            .await;
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// ADR 0044 phase-1 PR6: the sweeper-skip regression — once
+    /// `change_consumer_loop`/`auto_split_loop` start skipping a quiesced
+    /// group outright (rather than merely finding nothing to do, as PR5
+    /// alone left it), a **re-woken** tablet must still be picked back up
+    /// by every sweeper within roughly one of its own intervals. Combines
+    /// both plan-named test shapes in one scenario, since `animusd` has no
+    /// `SimEnv` tier of its own to split them across (this crate's whole
+    /// suite is real `ProdEnv` sockets/time, per its own `CLAUDE.md`):
+    ///
+    /// 1. an idle, genuinely empty table quiesces (nothing for any sweeper
+    ///    to strand — the negative control);
+    /// 2. a write burst crossing the auto-split byte threshold, issued
+    ///    *while quiesced*, must still trigger a real split — proving
+    ///    `auto_split_loop`'s own skip-gate (`leader.is_quiesced()`) is a
+    ///    strict, reversible short-circuit, never a stuck "permanently
+    ///    disabled" state: the write itself un-quiesces the group (an
+    ///    ordinary Raft propose), so the very next `auto_split_loop` tick
+    ///    sees `is_quiesced() == false` again and resumes its ordinary
+    ///    byte-threshold check;
+    /// 3. the same burst's change-log backlog must still get sealed —
+    ///    proving `change_consumer_loop`'s identical skip-gate doesn't
+    ///    strand the seal/trim arms either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rewoken_tablet_is_picked_back_up_by_every_sweeper_within_one_interval() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams_and_quiesce_after(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 2_000,
+                    seal_age: Duration::from_secs(3600),
+                },
+                Some(2_000), // tiny byte auto-split threshold
+                Duration::from_millis(300),
+            )
+            .await;
+            let table = "rewoken";
+            create_streamed_table(node.dynamo_addr(), table).await;
+
+            let tablet = only_tablet(&node, table);
+            let group = node
+                .edge
+                .local_cp(tablet)
+                .expect("this node hosts the tablet");
+
+            // (1) Negative control: an untouched, empty table quiesces —
+            // every sweeper is now skipping it every tick.
+            await_true(10, "an idle empty table must quiesce", || {
+                group.is_quiesced()
+            })
+            .await;
+
+            // (2)+(3) A write burst crossing the auto-split byte threshold,
+            // issued against the now-quiesced group.
+            for i in 0..40u32 {
+                put_item_padded(node.dynamo_addr(), table, &format!("r{i}"), 100).await;
+            }
+
+            // auto_split_loop must resume and trigger a real split within a
+            // couple of its own `AUTO_SPLIT_INTERVAL` (2s) ticks.
+            await_true(
+                20,
+                "auto_split_loop must resume after the wake and split",
+                || node.metadata().tablets_for_table(table).count() >= 2,
+            )
+            .await;
+
+            // change_consumer_loop must resume and seal the burst's own
+            // change-log backlog within a couple of its own
+            // `INDEX_DRAIN_INTERVAL` (200ms) ticks.
+            await_true(
+                20,
+                "change_consumer_loop must resume and seal the backlog",
+                || {
+                    node.metadata()
+                        .stream_shards
+                        .range((tablet, 0)..=(tablet, u64::MAX))
+                        .next()
+                        .is_some()
+                        || node.metadata().tablets_for_table(table).any(|(t, _)| {
+                            node.metadata()
+                                .stream_shards
+                                .range((*t, 0)..=(*t, u64::MAX))
+                                .next()
+                                .is_some()
+                        })
+                },
+            )
             .await;
         })
         .await

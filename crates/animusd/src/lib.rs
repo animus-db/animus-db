@@ -435,9 +435,8 @@ impl CpGroup {
     }
 
     /// Whether this replica currently considers its own group quiesced (ADR
-    /// 0044 phase-1). See [`RaftKvNode::is_quiesced`]. Test-only until PR7
-    /// wires it into `/admin/raftkv`'s `CpRaftView`.
-    #[allow(dead_code)]
+    /// 0044 phase-1) — the sweeper-skip gate every per-node background loop
+    /// checks first (ADR 0044 phase-1 PR6). See [`RaftKvNode::is_quiesced`].
     fn is_quiesced(&self) -> bool {
         match self {
             CpGroup::Lsm(n) => n.is_quiesced(),
@@ -9781,6 +9780,15 @@ async fn txn_resolver_loop(ctx: ClientCtx) {
             if !group.is_leader() {
                 continue;
             }
+            // ADR 0044 phase-1 PR6: sound by the identical argument
+            // `change_consumer_loop`'s own gate gives — a quiesced group's
+            // `TxnTracker` is, by construction, empty (PR5's in-crate veto
+            // is exactly "a non-empty tracker never quiesces"), so both
+            // loops below are guaranteed no-ops here; skip the
+            // `pending_txns()`/`unresolved_decided()` clones entirely.
+            if group.is_quiesced() {
+                continue;
+            }
             let Some(table) = ctx
                 .effective_metadata()
                 .tablets
@@ -10028,6 +10036,19 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             let Some(leader) = ctx.edge.cp_leader(tablet) else {
                 continue;
             };
+            // ADR 0044 phase-1 PR6: a quiesced group's bytes/key-count are,
+            // by construction, static — no activity for `quiesce_after`
+            // means no new writes since it quiesced, and a write is the
+            // only way either could ever change. Whatever this tablet's
+            // last pre-quiescence tick already checked (over threshold ⇒
+            // triggered; under ⇒ correctly left alone) still holds, so
+            // re-estimating/re-materializing it here (including the
+            // periodic `due_confirm` correction below, which exists only
+            // to catch estimate drift from *new* data) is pure waste until
+            // something un-quiesces it.
+            if leader.is_quiesced() {
+                continue;
+            }
             // Cheap per-tick gate: materializing every led tablet's live pairs
             // every tick is O(total data) per 2s — instead, take the free
             // (over-)estimate(s) and only materialize when one says the tablet
