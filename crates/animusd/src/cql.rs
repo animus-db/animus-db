@@ -1136,6 +1136,23 @@ mod cql_kind_write_tests {
         cluster_config(1)
     }
 
+    /// One named counter off the public `GET /metrics` text export (the
+    /// DynamoDB listener) — mirrors `stream_write_path_tests`'s identical
+    /// helper (sibling-mod duplication, per the precedent above).
+    async fn metrics_value(addr: SocketAddr, name: &str) -> u64 {
+        let mut s = TcpStream::connect(addr).await.expect("connect");
+        s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.expect("read");
+        let text = String::from_utf8_lossy(&buf);
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name} ")))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("metric {name} absent from /metrics"))
+    }
+
     async fn single_node(dir: &Path) -> Node {
         let config = single_node_config();
         let node = run_node(&config, 0, dir.join("node-0"))
@@ -1360,12 +1377,18 @@ mod cql_kind_write_tests {
         // Whole-partition delete: the partition empties — the tombstone arm.
         cql_exec(cql, Some("ks"), "DELETE FROM t WHERE id = 'b'").await;
 
+        // Trim-safe accounting (ADR 0049 rung 4): the every-table hot-trim
+        // arm keeps a CQL table's markers transient, so a racing trim tick
+        // may already have deleted some — an emitted marker is either still
+        // pending or counted by `change_log_trimmed_total`.
         let records = group.pending_changes().await;
+        let trimmed = metrics_value(node.dynamo_addr(), "change_log_trimmed_total").await;
         assert_eq!(
-            records.len(),
+            records.len() as u64 + trimmed,
             7,
             "exactly one marker per mutation (4 singles + 2 batch members + \
-             the whole-partition tombstone delete)"
+             the whole-partition tombstone delete; live {} + trimmed {trimmed})",
+            records.len()
         );
         let mut prefixes = std::collections::BTreeSet::new();
         let mut hlcs = std::collections::BTreeSet::new();
@@ -1384,13 +1407,23 @@ mod cql_kind_write_tests {
             hlcs.insert(hlc);
             prefixes.insert(key[..key.len() - 8].to_vec());
         }
-        assert_eq!(hlcs.len(), 7, "each mutation gets its own commit HLC");
         assert_eq!(
-            prefixes.len(),
-            2,
-            "the change keys share their partitions' own key prefixes \
-             (two partitions were written)"
+            hlcs.len(),
+            records.len(),
+            "each live mutation gets its own commit HLC"
         );
+        assert!(
+            prefixes.len() <= 2,
+            "the change keys share their partitions' own key prefixes \
+             (two partitions were written): {prefixes:?}"
+        );
+        if records.len() == 7 {
+            assert_eq!(
+                prefixes.len(),
+                2,
+                "with every marker still live, both partitions' prefixes appear"
+            );
+        }
         assert!(
             group
                 .local_scan_kind_bounded(KIND_LSI, &[], None)

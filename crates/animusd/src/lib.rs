@@ -5819,119 +5819,6 @@ impl ClientCtx {
         }
     }
 
-    /// Like [`cp_batch_write`](Self::cp_batch_write), but for a caller that
-    /// itself retries on failure (the admin bulk seeder,
-    /// [`admin::action_data_seed`](crate::admin::action_data_seed)) — up to
-    /// `attempts` tries per tablet group, backing off `retry_backoff` between
-    /// them.
-    ///
-    /// **Why this exists rather than just looping `cp_batch_write`:** a bare
-    /// confirm-timeout from [`cp_batch_local`](Self::cp_batch_local) does not mean
-    /// the batch is lost — `ProposeResult::Accepted` only means it reached the
-    /// leader's local log; under a slow or contended commit path (a slow disk, a
-    /// growing number of concurrent per-tablet Raft groups) it can still be
-    /// committing well after [`CLIENT_TIMEOUT`] has elapsed. A caller that
-    /// retries by calling `cp_batch_write` again unconditionally proposes a
-    /// **second, fully duplicate** `Batch` entry for the same keys — safe by
-    /// per-key LWW, but it doubles the outstanding replication/fsync work for no
-    /// benefit, compounding under exactly the conditions that caused the
-    /// timeout (observed turning a slow bulk-seed into an apparent pile of
-    /// "did not commit in time" failures with `commit_index` still climbing the
-    /// whole time — no leader ever actually changed).
-    ///
-    /// So per tablet group, this proposes **at most once per attempt** and only
-    /// when the previous attempt didn't get as far as `Accepted`: on a plain
-    /// confirm-timeout it polls the *same* already-proposed entry for a second
-    /// full [`CLIENT_TIMEOUT`] window before considering the attempt to have
-    /// failed, rather than proposing again. A genuinely stale route (the classic
-    /// case: a tablet split moved the target range mid-seed, so the old leader's
-    /// copy is truncated/tombstoned) is still retried with a fresh propose, since
-    /// `cp_route` re-resolves the current tablet map on every attempt.
-    pub(crate) async fn cp_batch_write_patient(
-        &self,
-        table: &str,
-        entries: Vec<(Vec<u8>, Vec<u8>)>,
-        attempts: usize,
-        retry_backoff: Duration,
-    ) -> Result<(), String> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        // `effective_metadata()`, not the raw handle: see `cp_batch_write`.
-        if !self.effective_metadata().has_table_tablet(table) {
-            self.provision_tablet(table).await?;
-        }
-        let mut groups: BTreeMap<TabletId, KvPairs> = BTreeMap::new();
-        for (key, value) in entries {
-            let tablet = self
-                .tablet_for(table, &key)
-                .ok_or_else(|| format!("no tablet owns a batch key of table `{table}`"))?;
-            groups.entry(tablet).or_default().push((key, value));
-        }
-        for (_tablet, group) in groups {
-            self.cp_batch_write_group_patient(table, group, attempts, retry_backoff)
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// One tablet group's share of [`cp_batch_write_patient`] — see its doc for
-    /// why a plain confirm-timeout polls the existing entry instead of proposing
-    /// a fresh one.
-    async fn cp_batch_write_group_patient(
-        &self,
-        table: &str,
-        group: KvPairs,
-        attempts: usize,
-        retry_backoff: Duration,
-    ) -> Result<(), String> {
-        let Some(first) = group.first().map(|(k, _)| k.clone()) else {
-            return Ok(());
-        };
-        let mut last_err = String::new();
-        for attempt in 0..attempts.max(1) {
-            match self.cp_route(table, &first).await {
-                CpRoute::Local(leader) => match Self::cp_batch_propose(&leader, group.clone()) {
-                    Ok(None) => return Ok(()),
-                    Ok(Some((probe_key, probe_val))) => {
-                        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-                        if Self::poll_probe(&leader, &probe_key, &probe_val, deadline).await {
-                            return Ok(());
-                        }
-                        // Accepted but not yet confirmed — keep polling the same
-                        // entry for a second full window instead of proposing a
-                        // duplicate (see the module doc above).
-                        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-                        if Self::poll_probe(&leader, &probe_key, &probe_val, deadline).await {
-                            return Ok(());
-                        }
-                        last_err = "CP batch write did not commit in time".into();
-                    }
-                    Err(e) => last_err = e,
-                },
-                CpRoute::Forward(addr) => {
-                    let request = ClientRequest::PutBatch {
-                        entries: group.clone(),
-                        table: table.to_owned(),
-                    };
-                    match self.cp_forward(table, &first, addr, request).await {
-                        ClientResponse::PutOk => return Ok(()),
-                        ClientResponse::Error(e) => last_err = e,
-                        other => {
-                            last_err =
-                                format!("unexpected reply to forwarded CP batch write: {other:?}")
-                        }
-                    }
-                }
-                CpRoute::None => last_err = "no CP group leader reachable".into(),
-            }
-            if attempt + 1 < attempts {
-                tokio::time::sleep(retry_backoff).await;
-            }
-        }
-        Err(last_err)
-    }
-
     /// CP **delete** of `key` (ADR 0017): a Raft-committed tombstone, waited to
     /// durable+applied (a linearizable read then reads `None`) before returning.
     /// Forwarded if this node isn't the leader. Used by the CQL whole-partition
@@ -6827,7 +6714,25 @@ impl ClientCtx {
         let mut pending = Vec::new();
         for w in group {
             match (w.value, w.pending) {
-                (Some(value), None) => writes.push(TxnWrite::plain(w.key, Some(value))),
+                // A plain-value transactional write only ever comes from the
+                // raw client protocol now (`ClientRequest::Txn` — the Dynamo
+                // edge's `run_transact` always builds `pending` kind-write
+                // specs under ADR 0049's constant-true gate), and it too must
+                // leave the ADR 0049 §3 stage marker: a raw write staged
+                // during an ADR 0050 split build would otherwise be invisible
+                // to the build's change-log tail until resolve — which can
+                // land after the parent is gone. Prefix = the write's own
+                // full key bytes (a raw write has no pk/sk decomposition;
+                // the CQL edge's own convention — the finest per-key dirty
+                // hint, leading with the key's own token so the apply-time
+                // token validation holds), `base_sk` empty, exactly like
+                // `cql::kind_partition_write`'s markers.
+                (Some(value), None) => {
+                    let marker = crate::dynamo::stage_marker_change_log(&w.key, Vec::new());
+                    let mut write = TxnWrite::plain(w.key, Some(value));
+                    write.stage_marker = Some(marker);
+                    writes.push(write);
+                }
                 (None, Some(p)) => pending.push(p),
                 (None, None) => {
                     return Err(format!(

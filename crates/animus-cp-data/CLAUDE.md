@@ -144,7 +144,13 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   prefix token-validated at apply like `kind_writes`' keys
   (`stage_marker_token_valid`); an aborted transaction's marker remains as
   a harmless dirty hint. Tests: `txn_kind_writes.rs`'s `stage_marker_*`/
-  `stage_writes_*` group.
+  `stage_writes_*` group. **`TxnWrite.change_log`'s prefix is validated
+  the same way** (`change_log_token_valid`, Train A rung 4 — it was the
+  one of the three wire-reachable stage payload prefixes that went
+  unvalidated; `TxnResolve` completes-and-writes it wherever it points, so
+  a mis-tokened prefix rejects the whole stage as `Fenced` at the stage,
+  never at resolve). Test: `txn_kind_writes.rs::
+  a_change_log_prefix_off_its_own_token_is_rejected_at_apply`.
 
 ### lib.rs API
 

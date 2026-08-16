@@ -925,3 +925,42 @@ fn a_stage_marker_prefix_off_its_own_token_is_rejected_at_apply() {
         "whole-or-nothing: no intent may land either (seed={seed})"
     );
 }
+
+/// The `change_log` twin of the stage-marker rejection above (ADR 0049
+/// Train A rung 4): a resolve-time change record's prefix rides the same
+/// wire-reachable stage payload, and `TxnResolve` would complete-and-write
+/// it wherever it points — so a prefix off its own write's partition token
+/// must reject the whole stage at apply (`Fenced`), never be admitted and
+/// materialized at resolve. Red before the rung: the stage was admitted
+/// (`Staged`) with the mis-tokened prefix riding the intent envelope.
+#[test]
+fn a_change_log_prefix_off_its_own_token_is_rejected_at_apply() {
+    let seed = 0x4900_0405;
+    let (mut sim, node) = group(seed);
+    sim.run_for(ELECT);
+
+    let pk = b"change-log-victim";
+    let base = logical(pk, b"");
+    let mut write = kind_bearing_write(pk, b"v1".to_vec(), b"lsi-row-1".to_vec());
+    // A different partition's token — the resolve record would land at a
+    // range position no fence ever checked for this entry.
+    write.change_log = Some((logical(b"some-other-pk", b"\x02"), b"evil".to_vec()));
+
+    let n = node.clone();
+    let (_txn_id, _record_key, outcome) = drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_stage_anchor(TABLE, vec![write], Vec::new(), Vec::new())
+            .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("txn_stage_anchor did not complete (seed={seed})"));
+    assert_eq!(
+        outcome,
+        animus_cp_data::StageOutcome::Fenced,
+        "a mis-tokened change_log prefix must reject the whole stage (seed={seed})"
+    );
+    assert_eq!(
+        block_on(node.local_get(&base)),
+        None,
+        "whole-or-nothing: no intent may land either (seed={seed})"
+    );
+}

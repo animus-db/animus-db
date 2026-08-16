@@ -252,9 +252,20 @@ const HLC_BYTES: usize = 8;
 
 /// How many change records one trim `KindBatch` entry deletes at most —
 /// bounds a large backlog's catch-up to several ticks instead of one
-/// outsized Raft entry, mirroring `cp_batch_write_patient`'s own bounded-batch
-/// discipline.
+/// outsized Raft entry (a bounded-batch discipline, like the seeder's own
+/// chunking).
 const TRIM_BATCH: usize = 256;
+
+/// The marker branch's trim floor (ADR 0049 §4): an actively-written
+/// (`marker_bytes_seen`-busy) plain table's marker backlog is left to
+/// accumulate up to this many estimated `KIND_CHANGE` bytes before the trim
+/// arm interposes a delete proposal into the tablet's own Raft group — per-
+/// tick trimming of a hot tablet measurably destabilized a latency-
+/// sensitive transaction pipeline sharing the group (see the branch's own
+/// comment). A quiet tablet (backlog unchanged for one tick) trims
+/// immediately regardless, so the idle→trim→quiesce path never waits on
+/// this floor.
+const MARKER_TRIM_FLOOR_BYTES: u64 = 1 << 20;
 
 /// How many newly-discovered partitions [`backfill_seed_tick`] seeds in one
 /// call (ADR 0045 §2) — bounds one tick's own worth of work, mirroring
@@ -292,6 +303,13 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
     // task (this loop is the only writer/reader, one instance per node), so
     // no lock is needed.
     let mut first_hot_seen: BTreeMap<TabletId, u64> = BTreeMap::new();
+    // Driver-local memo of each marker tablet's `KIND_CHANGE` byte estimate
+    // as of the previous tick — the marker branch's busy detector (a backlog
+    // that *changed* since last tick means writes are actively arriving; see
+    // the branch's own comment for why a hot tablet's markers are left to
+    // accumulate to a floor instead of being trimmed per tick). Same
+    // ownership/bounding discipline as `first_hot_seen` above.
+    let mut marker_bytes_seen: BTreeMap<TabletId, u64> = BTreeMap::new();
     loop {
         tokio::time::sleep(INDEX_DRAIN_INTERVAL).await;
         let meta = ctx.effective_metadata();
@@ -300,6 +318,7 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
         // (or moved off this node permanently) doesn't leak an entry
         // forever.
         first_hot_seen.retain(|t, _| meta.tablets.contains_key(t));
+        marker_bytes_seen.retain(|t, _| meta.tablets.contains_key(t));
         // Growth PR3 Fork F: bound the change-rate tracker the same way —
         // `ctx.data()` is safe unconditionally here, exactly like
         // `seal_tick`'s own `ctx.data().raftkv_metrics` access below: this
@@ -361,7 +380,71 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             // `disable_final_seal_then_reenable_continues_the_epoch_chain`
             // test, which failed intermittently before this fix).
             let ever_streamed = meta.stream_shard_watermark(tablet).is_some();
+            // ADR 0049 §4 (Train A rung 4): a table with no GSI and no
+            // enabled/ever-enabled stream is still visited — every write
+            // leaves an image-less marker record (`ChangeRecord::marker`)
+            // now, and this loop's hot-trim arm is markers' only deleter.
+            // The **idle fast path is mandatory** (the ADR's
+            // quiescence-compatibility clause, and the fork-G lesson —
+            // never a per-tick scan): the cheap `approx_bytes_kind` gate
+            // (the same accessor the seal arm's size trigger reads) decides
+            // whether the tick does anything at all. Three cases:
+            //
+            // - **No change bytes at all** (the steady idle state): release
+            //   the veto and skip — no scan, no trim call, nothing.
+            // - **Bytes but no pending records** (the bounded LSM overhang:
+            //   trimmed records' tombstones still occupy table files until
+            //   compaction, so the byte estimate stays nonzero for a while;
+            //   the one `pending_changes` scan per tick this costs lasts
+            //   only until the group quiesces — `quiesce_after` later —
+            //   after which the `is_quiesced` skip above short-circuits the
+            //   whole visit): release the veto and skip.
+            // - **A busy tablet's small backlog is deliberately left
+            //   alone** (`marker_bytes_seen`): a byte estimate that CHANGED
+            //   since the last tick means writes are actively arriving, and
+            //   trimming per tick would inject one propose+fsync into the
+            //   tablet's own Raft group every interval — measured to
+            //   destabilize a latency-sensitive concurrent-transaction
+            //   pipeline on the same tablet (the torn-pair regression went
+            //   solo-red under the per-tick shape; the same
+            //   contention class as `resolve_all`'s documented
+            //   sensitivity). The veto still holds (markers exist), so
+            //   quiescence stays sound; the backlog is bounded by
+            //   `MARKER_TRIM_FLOOR_BYTES`, past which trim runs even while
+            //   busy (amortized: one trim per floor's worth of markers).
+            // - **Pending markers, quiet or over the floor**: hold the veto
+            //   (the trim these markers are owed is a real obligation only
+            //   this loop will ever act on — quiescing before it runs would
+            //   strand them forever, since the sweeper-skip stops visiting
+            //   a quiesced group) and run ONLY the trim arm: `gsis` is
+            //   empty and `stream_enabled` is false, so `trim_janitor`
+            //   derives **zero expected terms** and its existing
+            //   trim-everything rule (F10/F12-b) deletes every marker in
+            //   declared range — the same rule, not a second deleter.
             if gsis.is_empty() && !stream_enabled && !ever_streamed {
+                let bytes = group.approx_bytes_kind(KIND_CHANGE).await;
+                if bytes == 0 {
+                    group.set_quiesce_veto(false);
+                    marker_bytes_seen.remove(&tablet);
+                    continue;
+                }
+                let busy = marker_bytes_seen.insert(tablet, bytes) != Some(bytes);
+                if busy && bytes < MARKER_TRIM_FLOOR_BYTES {
+                    // Actively written, still small: markers exist, so the
+                    // veto holds; the trim waits for a quiet tick (or the
+                    // floor) so it never contends with the live writes.
+                    group.set_quiesce_veto(true);
+                    continue;
+                }
+                let pending = !group.pending_changes().await.is_empty();
+                group.set_quiesce_veto(pending);
+                if !pending {
+                    continue;
+                }
+                if let Err(e) = trim_janitor(&ctx, &meta, &table, tablet, &group, &[], false).await
+                {
+                    tracing::debug!(tablet = tablet.0, table, error = %e, "marker trim: tick failed");
+                }
                 continue;
             }
             // ADR 0044 phase-1 PR5, fork D: hold this group's quiesce veto
@@ -372,17 +455,9 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             // while still owing a GSI materialization or a not-yet-due
             // seal-age trigger — a real obligation only *this* loop would
             // ever notice and act on, silently stalled until something
-            // else happened to touch the group. A table with neither GSIs
-            // nor an enabled/ever-enabled stream never reaches this point
-            // at all (the `continue` above), so it never holds this veto.
-            // **ADR 0049 interim note**: such a table's change log is no
-            // longer empty — every write now leaves an image-less marker
-            // record (`ChangeRecord::marker`) — but skipping it here stays
-            // correct for the veto's own purpose (no GSI/seal obligation
-            // exists on it, so quiescing owes nothing), while it does leave
-            // those markers untrimmed for now: extending this loop's
-            // coverage + the trim rule to every table is Train A's own
-            // trim rung (ADR 0049 §4), deliberately not smuggled in here.
+            // else happened to touch the group. (A table with neither GSIs
+            // nor an enabled/ever-enabled stream holds it too now — via the
+            // marker branch above, for its own trim obligation.)
             let hot_backlog_present = !group.pending_changes().await.is_empty();
             group.set_quiesce_veto(hot_backlog_present);
             // `drain_tablet` is GSI-specific (it reconciles GSI rows and
@@ -1514,11 +1589,10 @@ pub(crate) async fn hot_read(
 ///   to know about.
 /// - **Zero expected terms at all means trim EVERYTHING, not block
 ///   everything** — the opposite of the "one term absent" case above, and
-///   the one subtlety this rule depends on getting right. This is
-///   reachable in exactly one production shape: a table whose stream was
-///   disabled and that has no GSI (the caller's own top-level gate widens
-///   for exactly this case — `gsis.is_empty() && !stream_enabled &&
-///   !ever_streamed`, `change_consumer_loop` — so a tablet that has ever
+///   the one subtlety this rule depends on getting right. Two production
+///   shapes reach it. (1) A table whose stream was disabled and that has no
+///   GSI (the caller's own top-level gate widens for exactly this case —
+///   `ever_streamed`, `change_consumer_loop` — so a tablet that has ever
 ///   sealed keeps being visited after its stream disables, specifically so
 ///   this arm gets a **guaranteed** chance to run rather than depending on
 ///   winning a race against `disable_stream`'s own `SetTableStream` commit
@@ -1527,12 +1601,14 @@ pub(crate) async fn hot_read(
 ///   protecting the hot log anymore, so blocking here would leave those
 ///   records stranded forever (found live: this PR's own
 ///   `disable_final_seal_then_reenable_continues_the_epoch_chain` test
-///   failed intermittently, exactly on this race, before the fix). A table
-///   that was **never** streamed and has no GSIs never reaches this
-///   function at all (`ever_streamed` is `false` too, so the caller's gate
-///   still skips it) — this "trim everything" branch is therefore never
-///   reached for a table with nothing to protect in the first place *and*
-///   nothing that ever needed protecting.
+///   failed intermittently, exactly on this race, before the fix).
+///   (2) **A never-streamed, never-indexed table's marker records (ADR
+///   0049 §4, Train A rung 4)**: every write leaves an image-less
+///   `ChangeRecord::marker` now, no consumer ever holds a term over them,
+///   and this rule — unchanged — is what keeps them transient rather than
+///   accumulating forever (`change_consumer_loop`'s marker branch calls
+///   this arm with `gsis` empty and `stream_enabled` false, precisely to
+///   land here). One trim rule, both shapes; never a second deleter.
 async fn trim_janitor(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -1563,13 +1639,14 @@ async fn trim_janitor(
         return Ok(()); // an expected term has nothing to derive from yet
     }
     // `trim_point == None` here means **zero terms were expected at all**
-    // (`blocked` is already known `false`) — reachable only for a tablet
-    // this loop's own caller gate still visits (`ever_streamed`) despite
-    // `gsis.is_empty() && !stream_enabled`: a table whose stream was
-    // disabled and that has no GSI. Nothing is protecting this hot log
+    // (`blocked` is already known `false`) — a table whose stream was
+    // disabled and that has no GSI (still visited via `ever_streamed`), or
+    // a never-streamed never-indexed table's ADR 0049 markers (the caller's
+    // marker branch). Nothing is protecting this hot log
     // anymore — the disable-triggered final seal (F12-b) already moved
     // every one of its records into a committed segment before the write
-    // gate closed, so every hot record physically still present for that
+    // gate closed (and a marker was never a consumer-visible event at all),
+    // so every hot record physically still present for that
     // label is, by construction, safe to delete outright. `trim_all` makes
     // that explicit rather than leaving a `None` trim point to be
     // (wrongly) read as "block everything," which is the bug this
@@ -1604,12 +1681,20 @@ async fn trim_janitor(
         }
         writes.push((KIND_CHANGE, key, None));
         if writes.len() >= TRIM_BATCH {
+            let n = writes.len() as u64;
             ctx.cp_kind_write_raw(table, std::mem::take(&mut writes), Vec::new())
                 .await?;
+            ctx.data()
+                .raftkv_metrics
+                .incr_by(Metric::ChangeLogTrimmedTotal, n);
         }
     }
     if !writes.is_empty() {
+        let n = writes.len() as u64;
         ctx.cp_kind_write_raw(table, writes, Vec::new()).await?;
+        ctx.data()
+            .raftkv_metrics
+            .incr_by(Metric::ChangeLogTrimmedTotal, n);
     }
     Ok(())
 }
@@ -2144,8 +2229,9 @@ mod stream_sealer_tests {
     use super::*;
     use crate::config::NodeRole;
     use crate::{
-        ClusterConfig, ClusterEdgeState, Node, RoleAddrs, SegmentStoreConfig, StorageBackend,
-        StreamSealKnobs, run_node_with_streams,
+        ClientRequest, ClientResponse, ClusterConfig, ClusterEdgeState, Node, RoleAddrs,
+        SegmentStoreConfig, StorageBackend, StreamSealKnobs, TxnTableWrite, read_frame,
+        run_node_with_streams, write_frame,
     };
 
     fn free_addrs(count: usize) -> Vec<SocketAddr> {
@@ -3090,6 +3176,265 @@ mod stream_sealer_tests {
                 group.is_quiesced()
             })
             .await;
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// A table with a single-attribute key and **no stream** — the ADR 0049
+    /// marker-record shape (`create_streamed_table`'s plain sibling).
+    async fn create_plain_table(addr: SocketAddr, table: &str) {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.CreateTable",
+            &format!(
+                r#"{{"TableName":"{table}",
+                    "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+    }
+
+    /// One admin HTTP-JSON POST (the same hand-rolled wire shape as
+    /// [`dynamo`] above, minus the `X-Amz-Target` header).
+    async fn admin_post(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
+        let mut s = TcpStream::connect(addr).await.expect("connect admin");
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.expect("write");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.expect("read");
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        (status, body.to_owned())
+    }
+
+    /// **ADR 0049 §4 (Train A rung 4) — the plain-table marker lifecycle:**
+    /// a never-streamed, never-indexed table's writes leave image-less
+    /// marker records; `change_consumer_loop` now visits such a tablet, the
+    /// trim arm's zero-expected-terms rule deletes the markers, the quiesce
+    /// veto releases, and the group quiesces. Red before this rung on the
+    /// very first await: the loop skipped plain tables outright, so markers
+    /// accumulated forever and `pending_changes` never emptied. The second
+    /// write/trim/quiesce round proves the sweeper-skip stays a reversible
+    /// short-circuit for the marker branch too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn plain_table_markers_trim_to_empty_and_the_tablet_quiesces() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams_and_quiesce_after(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: u64::MAX,
+                    seal_age: Duration::from_secs(3600),
+                },
+                None,
+                Duration::from_millis(300),
+            )
+            .await;
+            let table = "plain-markers";
+            create_plain_table(node.dynamo_addr(), table).await;
+            for i in 0..3u32 {
+                put_item_padded(node.dynamo_addr(), table, &format!("p{i}"), 8).await;
+            }
+            let tablet = only_tablet(&node, table);
+            let group = node
+                .edge
+                .local_cp(tablet)
+                .expect("this node hosts the tablet");
+            await_true(20, "plain-table markers trim to empty", || {
+                futures::executor::block_on(group.pending_changes()).is_empty()
+            })
+            .await;
+            await_true(10, "the veto releases and the group quiesces", || {
+                group.is_quiesced()
+            })
+            .await;
+            // Re-wake: a fresh write un-quiesces the group, its marker is
+            // trimmed on the loop's next visits, and quiescence returns.
+            put_item_padded(node.dynamo_addr(), table, "p-rewake", 8).await;
+            await_true(20, "the re-wake write's marker trims too", || {
+                futures::executor::block_on(group.pending_changes()).is_empty()
+            })
+            .await;
+            await_true(10, "the group re-quiesces after the re-wake", || {
+                group.is_quiesced()
+            })
+            .await;
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// **ADR 0049 §4 — the admin seeder writes through the kind path**: a
+    /// seed of a *streamed* table must leave one real change record per
+    /// seeded row (red before this rung: the seeder wrote via the plain
+    /// `cp_batch_write`, emitting **zero** records — every seeded row was
+    /// silently absent from the table's stream, the same drifted-gate class
+    /// as `BatchWriteItem`'s streamed-but-unindexed bug), and a seed of a
+    /// *plain* table lands readable rows whose markers trim away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admin_seed_writes_through_the_kind_path_on_both_table_shapes() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams_and_quiesce_after(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: u64::MAX, // never seal — records must persist
+                    seal_age: Duration::from_secs(3600),
+                },
+                None,
+                Duration::from_millis(300),
+            )
+            .await;
+
+            // Streamed table: every seeded row leaves a change record.
+            let streamed = "seed-streamed";
+            create_streamed_table(node.dynamo_addr(), streamed).await;
+            let (status, body) = admin_post(
+                node.admin_addr(),
+                "/admin/data/seed",
+                &format!(r#"{{"table":"{streamed}","count":5}}"#),
+            )
+            .await;
+            assert_eq!(status, 200, "seed(streamed) failed: {body}");
+            assert!(body.contains(r#""written": 5"#), "partial seed: {body}");
+            let group = node
+                .edge
+                .local_cp(only_tablet(&node, streamed))
+                .expect("hosts the streamed tablet");
+            await_true(20, "each seeded row left a change record", || {
+                futures::executor::block_on(group.pending_changes()).len() == 5
+            })
+            .await;
+
+            // Plain table: rows land readable; their markers trim away.
+            let plain = "seed-plain";
+            create_plain_table(node.dynamo_addr(), plain).await;
+            let (status, body) = admin_post(
+                node.admin_addr(),
+                "/admin/data/seed",
+                &format!(r#"{{"table":"{plain}","count":5}}"#),
+            )
+            .await;
+            assert_eq!(status, 200, "seed(plain) failed: {body}");
+            assert!(body.contains(r#""written": 5"#), "partial seed: {body}");
+            let (status, body) = dynamo(
+                node.dynamo_addr(),
+                "DynamoDB_20120810.GetItem",
+                &format!(r#"{{"TableName":"{plain}","Key":{{"id":{{"S":"seed:000000000000"}}}}}}"#),
+            )
+            .await;
+            assert_eq!(status, 200, "GetItem failed: {body}");
+            assert!(body.contains("payload"), "seeded row unreadable: {body}");
+            let group = node
+                .edge
+                .local_cp(only_tablet(&node, plain))
+                .expect("hosts the plain tablet");
+            await_true(20, "seeded plain-table markers trim to empty", || {
+                futures::executor::block_on(group.pending_changes()).is_empty()
+            })
+            .await;
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// **ADR 0049 §3/§4 — a raw client-protocol transactional write leaves a
+    /// (consumer-hidden) stage marker**: `ClientRequest::Txn`'s plain-value
+    /// writes ride `TxnWrite::plain` with no derived payload, and before
+    /// this rung staged **nothing** into the change log — a raw write staged
+    /// during an ADR 0050 split build would be invisible to the build's
+    /// change-log tail until resolve. On a streamed table (trim blocked —
+    /// never sealed), exactly one record must appear per raw transactional
+    /// write: the stage marker, `staged` + hidden, never a stream event.
+    /// Red before this rung: zero records.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn raw_txn_write_leaves_a_hidden_stage_marker() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams_and_quiesce_after(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: u64::MAX, // never seal — the marker must persist
+                    seal_age: Duration::from_secs(3600),
+                },
+                None,
+                Duration::from_secs(600),
+            )
+            .await;
+            let table = "raw-txn-marker";
+            create_streamed_table(node.dynamo_addr(), table).await;
+            // Provision the tablet before the raw write (a raw `Txn` write
+            // auto-provisions via `cp_txn`, but creating it through the edge
+            // keeps the schema catalog consistent for the streams surface).
+            put_item_padded(node.dynamo_addr(), table, "warmup", 4).await;
+            let group = node
+                .edge
+                .local_cp(only_tablet(&node, table))
+                .expect("hosts the tablet");
+            let baseline = group.pending_changes().await.len();
+
+            // One raw plain-value transactional write over the real client
+            // protocol — the exact shape `animus-cli`/external callers use.
+            let pk = animus_dynamo::AttributeValue::S("t-raw-1".into());
+            let key = crate::dynamo::item_key(&pk, None);
+            let mut item = animus_dynamo::Item::new();
+            item.insert("id".to_string(), pk);
+            let value = animus_dynamo::wire::encode_stored_item(&item);
+            let mut stream = TcpStream::connect(node.client_addr())
+                .await
+                .expect("connect");
+            write_frame(
+                &mut stream,
+                &ClientRequest::Txn {
+                    writes: vec![TxnTableWrite::plain(table.to_string(), key, Some(value))],
+                    preconditions: Vec::new(),
+                    write_conditions: Vec::new(),
+                },
+            )
+            .await
+            .expect("send txn");
+            let resp: ClientResponse = read_frame(&mut stream)
+                .await
+                .expect("read reply")
+                .expect("a reply");
+            assert!(
+                matches!(resp, ClientResponse::TxnCommitted { .. }),
+                "raw txn failed: {resp:?}"
+            );
+
+            // Exactly one new record: the stage marker — image-less,
+            // `staged`, and consumer-hidden (a plain-value write has no
+            // resolve-time change record to materialize).
+            await_true(20, "the raw txn write's stage marker appears", || {
+                futures::executor::block_on(group.pending_changes()).len() == baseline + 1
+            })
+            .await;
+            let records = group.pending_changes().await;
+            let new: Vec<_> = records
+                .iter()
+                .filter_map(|(_, v)| animus_dynamo::ChangeRecord::decode(v))
+                .filter(|r| r.staged)
+                .collect();
+            assert_eq!(new.len(), 1, "exactly one stage marker: {records:?}");
+            assert!(
+                new[0].consumer_hidden(),
+                "a stage marker must never be a stream event"
+            );
+            assert!(
+                new[0].old_image.is_none() && new[0].new_image.is_none(),
+                "a stage marker carries no images"
+            );
         })
         .await
         .expect("did not converge in time");

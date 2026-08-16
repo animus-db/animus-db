@@ -301,7 +301,10 @@ pub struct TxnWrite {
     /// is completed with its own entry's `ts` — never a stage-time value,
     /// for the identical reason `KindBatch`'s own doc gives (only the
     /// entry that actually fixes the record's position in commit order may
-    /// mint its key suffix).
+    /// mint its key suffix). Prefix must lead with `key`'s own partition
+    /// token — validated at *stage* apply exactly like `kind_writes`' keys
+    /// and `stage_marker`'s prefix (ADR 0049 rung 4 closed this one's gap;
+    /// the payload is wire-reachable via `ClientRequest::TxnPrepare`).
     pub change_log: Option<(Vec<u8>, Vec<u8>)>,
     /// The ADR 0049 §3 **stage marker**: an image-less `(key prefix,
     /// encoded record)` pair `KvCommand::TxnStage`'s own apply arm

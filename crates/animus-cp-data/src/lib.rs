@@ -4748,6 +4748,24 @@ fn stage_marker_token_valid(base_key: &[u8], stage_marker: Option<&(Vec<u8>, Vec
     })
 }
 
+/// The [`txn::TxnWrite::change_log`] twin of [`stage_marker_token_valid`]
+/// (ADR 0049 Train A rung 4): the resolve-time change record's key prefix is
+/// staged through the identical wire-reachable payload
+/// (`ClientRequest::TxnPrepare`) as `kind_writes`/`stage_marker`, yet was
+/// the one of the three that went unvalidated — `TxnResolve` completes
+/// `change_log`'s key with its own `ts` and writes it wherever the staged
+/// prefix points, so a mis-tokened prefix could land a change-log row
+/// outside the anchor's own tablet range long after the stage's fence check
+/// passed. Same rule, same structural `Fenced` bucket, validated at stage
+/// (the serialization point that admits the payload), never at resolve
+/// (which must stay able to finish any stage that was admitted).
+fn change_log_token_valid(base_key: &[u8], change_log: Option<&(Vec<u8>, Vec<u8>)>) -> bool {
+    let tb = animus_tablet::TOKEN_BYTES;
+    change_log.is_none_or(|(prefix, _)| {
+        base_key.len() >= tb && prefix.len() >= tb && prefix[..tb] == base_key[..tb]
+    })
+}
+
 /// Logged-warning cap for [`surface_suspicious_merge_noop`] (below): the
 /// [`Metric`] counters there are always incremented (cheap, unconditional),
 /// but a genuinely-reoccurring bug logging one line per applied entry would
@@ -5305,6 +5323,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 let kind_tokens_ok = writes.iter().all(|w| {
                     kind_writes_token_valid(&w.key, &w.kind_writes)
                         && stage_marker_token_valid(&w.key, w.stage_marker.as_ref())
+                        && change_log_token_valid(&w.key, w.change_log.as_ref())
                 });
                 let all_in_fence = !already_decided
                     && blocked_by.is_none()

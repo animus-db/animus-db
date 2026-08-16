@@ -214,7 +214,9 @@ could do that job — see the DynamoDB wire-edge entry above).
 
 **`cp_write`/`cp_delete` do NOT auto-provision a table's first tablet** —
 unlike most of their write-side siblings (`cp_put`, `cp_kind_write`,
-`cp_batch_write`, `cp_batch_write_patient`, `cp_txn` all do). A caller
+`cp_batch_write`, `cp_txn` all do; `cp_batch_write_patient` was deleted in
+Train A rung 4 with its one caller, the admin seeder — its
+poll-not-repropose retry lore lives in the seeder's own comment). A caller
 targeting a table nothing upstream has provisioned must call
 `provision_tablet` itself first, or `cp_route` waits out `CLIENT_TIMEOUT` on
 a tablet that will never exist and fails — every tick, forever, if the
@@ -801,10 +803,18 @@ route below the edge through the same `ClientCtx` CP primitives.
   protection" gap is **closed for the Dynamo edge** (every write now
   evaluates at the tablet leader; CQL's own RMW keeps the gap — see the
   routing section's note on why the CQL rung deliberately did not move it),
-  and a plain or CQL table's markers are currently **never trimmed** —
-  `change_consumer_loop` still skips tables with no GSI/stream,
-  deliberately; extending trim to every table is Train A's own trim rung
-  (see the loop's ADR 0049 interim note). **A
+  and a plain or CQL table's markers are **transient** (Train A rung 4):
+  `change_consumer_loop` now visits every led tablet — a marker table gets
+  a mandatory cheap idle gate (`approx_bytes_kind(KIND_CHANGE) == 0` ⇒
+  nothing at all this tick), holds the quiesce veto while markers are
+  pending, and runs only the trim arm, whose existing zero-expected-terms
+  trim-everything rule deletes them (`Metric::ChangeLogTrimmedTotal`
+  counts deletions — also the trim-safe half of the marker-emission
+  tests' accounting, since a racing trim tick may erase the live
+  evidence). The admin seeder and raw `ClientRequest::Txn` plain writes
+  emit markers/stage-markers too (rung 4's entry-point completeness —
+  the seeder routes through `dynamo::marker_batch_write`/the per-item
+  funnel like `BatchWriteItem` itself). **A
   streamed-but-unindexed table**: `indexes` is empty, so the LSI loop is
   simply a no-op, and the entry commits exactly base row + change record —
   this same change record *is* the hot shard the sealer reads directly, no
