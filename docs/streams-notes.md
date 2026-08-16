@@ -51,6 +51,20 @@ derive a real leader hint from and so never chases one.
 
 ## DynamoDB Streams wire edge (`dynamo.rs` / `dynamo_streams.rs`)
 
+**Consumer-hidden records (ADR 0045 "E1" + ADR 0049 §1).** Two record
+classes live in a change log but must never surface as stream events, and
+both `GetRecords` serve paths (sealed segment decode and the open-tail
+`hot_read`) filter them through the one shared predicate
+`ChangeRecord::consumer_hidden` (`dynamo_streams::consumer_hidden`): the
+backfill seeder's synthetic `seeded` dirty markers (real DynamoDB emits no
+event for a GSI backfill's coverage sweep), and ADR 0049's image-less
+`marker` records (written while the table had no stream — a stream begins
+at enable, never retroactively). The **sealer deliberately does seal both
+into segments** (watermark/trim mechanics stay uniform; the dead weight is
+a few tens of bytes per record) — hiding is a serve-time decision, exactly
+like view-type projection. Regression:
+`tests/dynamo_streams.rs::pre_enable_marker_records_never_surface_on_the_stream`.
+
 **DynamoDB Streams (ADR 0042 §1/§2/§4/§9).** `TableSchema.stream:
 Option<StreamSpec>` (replicated, ADR 0013) rides through the identical
 `CreateTable`/`UpdateTable` surface as the key schema/indexes:

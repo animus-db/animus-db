@@ -195,7 +195,8 @@ Five `ClientCtx` primitives resolve the tablet's group leader the same way via
 ReadIndex), `cp_write`/`cp_delete` (Raft-committed, waited to durable+applied),
 `cp_scan` (linearizable range read), and `cp_batch_write` (groups keys by tablet,
 commits each group as one `KvCommand::Batch` entry — atomic within a tablet, not
-across; backs DynamoDB `BatchWriteItem` and the admin seeder).
+across; backs the admin seeder — DynamoDB `BatchWriteItem` no longer reaches it
+since ADR 0049, see the DynamoDB wire-edge entry).
 
 **`cp_scan_kind` (ADR 0041)** is `cp_scan`'s single-tablet, kind-scoped
 sibling — the LSI `Query` read primitive: unlike `cp_scan`'s per-table
@@ -720,14 +721,22 @@ route below the edge through the same `ClientCtx` CP primitives.
   the lock alone can't: a `txn_resolver_loop` recovery push never takes
   `rmw_lock` — real now that `TransactWriteItems` participates on these
   tables too (see below).
-  **Named gap, unchanged by this fix**: a plain (unindexed, unstreamed)
-  table's `PutItem`/`DeleteItem` `ConditionExpression`, `UpdateItem`'s base
-  value on such a table, and CQL's own RMW (`cql.rs`) all still only have
-  today's node-local `rmw_lock` protection — there is no tablet-log hook for
-  a bare `cp_write` to evaluate at. `BatchWriteItem` routes each `Put`/
-  `Delete` through the identical per-item mechanism for an **indexed**
-  table, atomic per-item only, and keeps the fast `cp_batch_write` path for
-  an **unindexed, unstreamed** one. **`TransactWriteItems` now participates
+  **The plain-table half of the old named gap is closed (ADR 0049)**: a
+  plain table's conditioned `PutItem`/`DeleteItem` and `UpdateItem` now
+  route through this same leader funnel (constant-true gate, below), so
+  their conditions/RMW evaluate at the leader too; only CQL's own RMW
+  (`cql.rs`) keeps the node-local-`rmw_lock`-only scope until Train A's
+  CQL rung. An **unevaluated** plain-table write (no condition, no
+  old-image echo) takes the ADR 0049 **fast arm** instead
+  (`dynamo::fast_marker_write`): the edge builds base row + marker record
+  and proposes routed, no leader read, no `rmw_lock` — see that function's
+  doc for why the funnel must NOT carry these (lock-across-commit
+  serializes a batch into N sequential fsync round trips, the documented
+  disk-starvation shape). `BatchWriteItem` routes marker-table requests
+  through the fast arm **concurrently** (`join_all`, chunked) and
+  images-carrying tables' requests through the per-item funnel, atomic
+  per-item only; the old `cp_batch_write` fast path is unreachable dead
+  code kept until Train A's deletion rung. **`TransactWriteItems` now participates
   too (2026-08-16, ADR 0046 A1/U3, `TxnStage` kind-writes stack)** — the
   wholesale per-table rejection this paragraph used to document (a write
   action against an indexed *or* streamed table cancelling the whole
@@ -753,15 +762,34 @@ route below the edge through the same `ClientCtx` CP primitives.
   `docs/streams-notes.md`. The write-path gate predicate
   (`table_takes_kind_write_path`) stays here, next paragraph.
 
-  **The write-path gate (`kind_writes_for_item`'s `None` fast path) becomes
-  `!table_takes_kind_write_path(meta, table)`** — a new shared predicate
-  (`!indexes.is_empty() || stream.is_some()`) both this function and every
-  write handler's `needs_old` computation call, kept as one function so the
-  two can never silently drift apart. **A streamed-but-unindexed table now
-  takes the `KindBatch` path too**: `indexes` is empty, so the LSI loop is
+  **The write-path gate (`table_takes_kind_write_path`) is constant-true
+  since ADR 0049 (the universal kind-write path, Train A rung 1)**: every
+  Dynamo table's every mutation commits through `KindBatch`, so every
+  tablet has a change log unconditionally. What *varies* per table is the
+  record's shape, decided by `table_change_records_carry_images` (the old
+  predicate, `!indexes.is_empty() || stream.is_some()`, renamed to what it
+  now actually gates): with a stream or index the record carries both
+  images exactly as before; with neither, it is an **image-less marker**
+  (`ChangeRecord::marker` — the ADR 0049 §1 dirty-key signal, filtered off
+  both Streams serve paths by `ChangeRecord::consumer_hidden`, exactly like
+  the backfill's `seeded` records; the GSI drain additionally **skips**
+  marker records outright — a marker predates every index by construction,
+  so pre-index history stays the backfill seeder's job, and a marker-only
+  backlog must never lazily provision a hidden table mid-`drop_index` —
+  see `drain_tablet`'s ADR 0049 comment). The plain single-key fallbacks in the
+  handlers (and `kind_writes_for_item`'s `None` arm) are unreachable dead
+  code kept until Train A's deletion rung. Two consequences worth knowing:
+  ADR 0046 §2's "a plain table's condition only has node-local `rmw_lock`
+  protection" gap is **closed for the Dynamo edge** (every write now
+  evaluates at the tablet leader; CQL's own RMW keeps the gap until Train
+  A's CQL rung), and a plain table's markers are currently **never
+  trimmed** — `change_consumer_loop` still skips tables with no
+  GSI/stream, deliberately; extending trim to every table is Train A's own
+  trim rung (see the loop's ADR 0049 interim note). **A
+  streamed-but-unindexed table**: `indexes` is empty, so the LSI loop is
   simply a no-op, and the entry commits exactly base row + change record —
-  this same change record *is* the hot shard the eventual sealer reads
-  directly, no separate copier involved.
+  this same change record *is* the hot shard the sealer reads directly, no
+  separate copier involved.
   **A real, independent correctness gap this surfaced**: `PutItem`/
   `DeleteItem` only fetched the prior item (`needs_old`) when a
   `ConditionExpression` or `ALL_OLD` was requested — an unconditional

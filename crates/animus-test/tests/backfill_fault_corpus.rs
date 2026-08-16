@@ -291,6 +291,7 @@ fn write_base_row_live(sim: &mut Simulator, node: &KvNode, range: &KeyRange, pk:
         old_image: None,
         new_image: None,
         seeded: false,
+        marker: false,
     }
     .encode();
     let result = node.put_kind_batch_fenced(
@@ -349,6 +350,7 @@ fn backfill_seed_tick(
             old_image: None,
             new_image: None,
             seeded: true,
+            marker: false,
         }
         .encode();
         let result = node.put_kind_batch_fenced(

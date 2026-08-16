@@ -490,9 +490,35 @@ pub struct ChangeRecord {
     /// design (it re-derives from a live base-row scan regardless).
     #[serde(default)]
     pub seeded: bool,
+    /// `true` for an **image-less marker record** — the record a table with
+    /// no stream and no secondary index writes for every mutation under the
+    /// universal kind-write path (ADR 0049 §1). A marker is a dirty-key
+    /// signal for change-log consumers that re-read current rows (the split
+    /// build's tail, a future CDC); it is never a stream event: real
+    /// DynamoDB has no stream on such a table at all, and a stream enabled
+    /// *later* begins at enable, never retroactively (ADR 0049's "images
+    /// follow the stream declaration; the record itself follows nothing").
+    /// The Streams read path filters markers exactly as it filters `seeded`
+    /// records — see [`ChangeRecord::consumer_hidden`]. `#[serde(default)]`
+    /// so every pre-existing record decodes as a real write.
+    #[serde(default)]
+    pub marker: bool,
 }
 
 impl ChangeRecord {
+    /// `true` when this record must never surface as a stream event: the
+    /// ADR 0045 §2 backfill seeder's synthetic dirty marker (`seeded`), or
+    /// an ADR 0049 §1 image-less marker record (`marker`). One predicate so
+    /// the sealed and open `GetRecords` serve paths (and any future
+    /// consumer-facing reader) can never drift on which records are
+    /// consumer-visible — change-log *consumers* (the GSI drain, the split
+    /// build) deliberately ignore this: to them every record is a dirty-key
+    /// signal.
+    #[must_use]
+    pub fn consumer_hidden(&self) -> bool {
+        self.seeded || self.marker
+    }
+
     /// The DynamoDB Streams event name this record represents.
     ///
     /// Present now because it is a pure function of the two images and belongs
@@ -504,15 +530,16 @@ impl ChangeRecord {
             (None, Some(_)) => "INSERT",
             (Some(_), Some(_)) => "MODIFY",
             (Some(_), None) => "REMOVE",
-            // The only record ever constructed with neither image is a
-            // backfill-seed marker (`seeded: true`, ADR 0045 §2) — a pure
-            // dirty marker for the GSI drain, which never calls this. The
-            // Streams read path (`animusd::dynamo_streams`) filters every
-            // `seeded` record out before `stream_record_json` ever reaches
-            // this function (ADR 0045 follow-up "E1"), so this arm is
-            // unreachable from that caller in practice; kept as a no-op
-            // rather than a panic for any other decode path that might land
-            // here.
+            // The only records ever constructed with neither image are the
+            // backfill-seed marker (`seeded: true`, ADR 0045 §2) and the
+            // ADR 0049 §1 image-less marker record (`marker: true`) — pure
+            // dirty markers for change-log consumers, which never call
+            // this. The Streams read path (`animusd::dynamo_streams`)
+            // filters every `consumer_hidden()` record out before
+            // `stream_record_json` ever reaches this function (ADR 0045
+            // follow-up "E1"), so this arm is unreachable from that caller
+            // in practice; kept as a no-op rather than a panic for any
+            // other decode path that might land here.
             (None, None) => "MODIFY",
         }
     }
@@ -757,6 +784,7 @@ mod tests {
             old_image: None,
             new_image: Some(item.clone()),
             seeded: false,
+            marker: false,
         };
         assert_eq!(insert.event_name(), "INSERT");
         assert_eq!(
@@ -769,6 +797,7 @@ mod tests {
             old_image: Some(item.clone()),
             new_image: Some(item.clone()),
             seeded: false,
+            marker: false,
         };
         assert_eq!(modify.event_name(), "MODIFY");
 
@@ -777,6 +806,7 @@ mod tests {
             old_image: Some(item),
             new_image: None,
             seeded: false,
+            marker: false,
         };
         assert_eq!(remove.event_name(), "REMOVE");
         assert_eq!(ChangeRecord::decode(b"garbage"), None);

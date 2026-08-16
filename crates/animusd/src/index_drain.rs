@@ -374,10 +374,15 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             // ever notice and act on, silently stalled until something
             // else happened to touch the group. A table with neither GSIs
             // nor an enabled/ever-enabled stream never reaches this point
-            // at all (the `continue` above), so its change log is always
-            // empty and it never holds this veto — correct by construction,
-            // since an unindexed/unstreamed table's write path never
-            // produces a change record in the first place.
+            // at all (the `continue` above), so it never holds this veto.
+            // **ADR 0049 interim note**: such a table's change log is no
+            // longer empty — every write now leaves an image-less marker
+            // record (`ChangeRecord::marker`) — but skipping it here stays
+            // correct for the veto's own purpose (no GSI/seal obligation
+            // exists on it, so quiescing owes nothing), while it does leave
+            // those markers untrimmed for now: extending this loop's
+            // coverage + the trim rule to every table is Train A's own
+            // trim rung (ADR 0049 §4), deliberately not smuggled in here.
             let hot_backlog_present = !group.pending_changes().await.is_empty();
             group.set_quiesce_veto(hot_backlog_present);
             // `drain_tablet` is GSI-specific (it reconciles GSI rows and
@@ -441,21 +446,6 @@ async fn drain_tablet(
     if records.is_empty() {
         return Ok(());
     }
-    // A GSI's rows live in its own hidden table, provisioned lazily here on
-    // the first drain that has records to apply (ADR 0023). This is
-    // load-bearing, not an optimization: `reconcile_partition` writes rows
-    // via `cp_write`, which — unlike `cp_kind_write`/`cp_txn` — does NOT
-    // auto-provision; without a tablet to route to, its `cp_route` would
-    // wait out `CLIENT_TIMEOUT` and fail, every tick, forever. Gated on the
-    // caller's metadata snapshot: a stale "absent" just re-proposes an
-    // idempotent `CreateTablet` (first-committer wins), and the hit path is
-    // sound because tablets are only ever removed by drop-table.
-    for idx in gsis {
-        let index_table = index_table_name(table, &idx.name);
-        if !meta.has_table_tablet(&index_table) {
-            ctx.provision_tablet(&index_table).await?;
-        }
-    }
     // A record's key is `footprint_key || hlc`, so the partition it belongs to
     // is its key minus that fixed-width suffix — no parsing needed. Several
     // records for one partition collapse into a single reconciliation, which is
@@ -467,9 +457,26 @@ async fn drain_tablet(
     // up covering, computed **before** any reconciliation happens, since
     // every partition it comes from is guaranteed to get reconciled below
     // (nothing in `by_partition` is ever skipped).
+    //
+    // **ADR 0049 marker records are covered-by-construction, never dirty.**
+    // A `ChangeRecord::marker` exists only from a mutation committed while
+    // its table had no index and no stream at all, so it predates every
+    // index this drain could be maintaining — and pre-existing rows are the
+    // backfill seeder's job (ADR 0045 §2), not this arm's. Reconciling
+    // marker partitions here would silently re-do the seeder's entire sweep
+    // through the drain (a populated-then-indexed table's whole population
+    // shows up as markers), which both duplicates work and — found by
+    // `tests/update_table_drop_index.rs` going flaky — widens the
+    // drain-vs-drop-cascade window enough for this arm's lazy hidden-table
+    // provisioning to race a concurrent `drop_index` and resurrect the
+    // just-dropped tablet. A marker's HLC still folds into `max_hlc` (its
+    // "reconciliation" is vacuously complete), so the cursor advances over
+    // markers and the hot-trim arm is never blocked behind them. `seeded`
+    // records are NOT skipped — they are the seeder's own product, and
+    // draining them is the backfill mechanism itself.
     let mut by_partition: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut max_hlc: Option<HlcTimestamp> = None;
-    for (key, _) in &records {
+    for (key, value) in &records {
         let Some(fp_key) = key.len().checked_sub(HLC_BYTES).map(|n| key[..n].to_vec()) else {
             continue; // malformed; leave it rather than mis-attribute it
         };
@@ -480,10 +487,34 @@ async fn drain_tablet(
             continue; // already consumed by an earlier pass
         }
         max_hlc = Some(max_hlc.map_or(ts, |m: HlcTimestamp| m.max(ts)));
+        if ChangeRecord::decode(value).is_some_and(|r| r.marker) {
+            continue; // pre-index history: the seeder's job, not the drain's
+        }
         by_partition.insert(fp_key);
     }
-    if by_partition.is_empty() {
+    if by_partition.is_empty() && max_hlc.is_none() {
         return Ok(()); // nothing past the watermark; a prior pass covered it all
+    }
+
+    // A GSI's rows live in its own hidden table, provisioned lazily here on
+    // the first drain that has genuinely dirty partitions to reconcile
+    // (ADR 0023). This is load-bearing, not an optimization:
+    // `reconcile_partition` writes rows via `cp_write`, which — unlike
+    // `cp_kind_write`/`cp_txn` — does NOT auto-provision; without a tablet
+    // to route to, its `cp_route` would wait out `CLIENT_TIMEOUT` and fail,
+    // every tick, forever. Gated on the caller's metadata snapshot: a stale
+    // "absent" just re-proposes an idempotent `CreateTablet`
+    // (first-committer wins), and the hit path is sound because tablets are
+    // only ever removed by drop-table. Deliberately gated on real work
+    // (never a marker-only pass, above) so an all-marker backlog can't
+    // provision anything mid-drop.
+    if !by_partition.is_empty() {
+        for idx in gsis {
+            let index_table = index_table_name(table, &idx.name);
+            if !meta.has_table_tablet(&index_table) {
+                ctx.provision_tablet(&index_table).await?;
+            }
+        }
     }
 
     for fp_key in by_partition {
@@ -505,6 +536,7 @@ async fn drain_tablet(
                 cursor_key,
                 Some(cursor::encode_watermark(max_hlc)),
             )],
+            None,
         )
         .await?;
     }
@@ -673,6 +705,7 @@ async fn reconcile_partition(
             fp_key.to_vec(),
             (!desired.is_empty()).then(|| desired.encode()),
         )],
+        None,
     )
     .await
 }
@@ -754,6 +787,7 @@ async fn backfill_seed_tick(
             old_image: None,
             new_image: None,
             seeded: true,
+            marker: false,
         }
         .encode();
         seed_change_log_record(group, prefix.clone(), record).await?;
@@ -1549,12 +1583,12 @@ async fn trim_janitor(
         }
         writes.push((KIND_CHANGE, key, None));
         if writes.len() >= TRIM_BATCH {
-            ctx.cp_kind_write_raw(table, std::mem::take(&mut writes))
+            ctx.cp_kind_write_raw(table, std::mem::take(&mut writes), None)
                 .await?;
         }
     }
     if !writes.is_empty() {
-        ctx.cp_kind_write_raw(table, writes).await?;
+        ctx.cp_kind_write_raw(table, writes, None).await?;
     }
     Ok(())
 }

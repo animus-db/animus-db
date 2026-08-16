@@ -695,6 +695,7 @@ mod tests {
             old_image: None,
             new_image: Some(Item::from([("pk".to_string(), s("alice"))])),
             seeded: false,
+            marker: false,
         };
         let v = stream_record_json(
             "shardId-1-0",
@@ -724,6 +725,7 @@ mod tests {
             old_image: Some(Item::from([("pk".to_string(), s("alice"))])),
             new_image: Some(Item::from([("pk".to_string(), s("alice2"))])),
             seeded: false,
+            marker: false,
         };
         let v = stream_record_json(
             "shardId-1-0",

@@ -2508,7 +2508,22 @@ debugging anything that feels like it might have happened before.
   apply" decision are supposed to always agree, don't let them be two
   separately-maintained booleans; a passing test suite proves today's
   agreement, not tomorrow's. (`crates/animusd/src/dynamo.rs`, ADR 0042 PR A3,
-  2026-08-14.)
+  2026-08-14.) **Second confirmed instance, found wiring ADR 0049
+  (2026-08-16): the drift survived the fix's own review round.**
+  `BatchWriteItem`'s fast-path gate stayed `meta.table_indexes(table)
+  .is_empty()` — written against ADR 0041 (indexes-only), never re-checked
+  when ADR 0042 widened "takes the kind path" to include streams — so a
+  streamed-but-unindexed table's batch writes bypassed the kind path
+  entirely and its stream silently lost every one of them (no LSI existed
+  to corrupt, so nothing else surfaced it; found only because ADR 0049's
+  gate flip forced re-reading every gate site). The factored-predicate fix
+  above only protects call sites that *call the shared function* — grep for
+  raw re-derivations of the same condition (`table_indexes(`,
+  `table_stream(`) whenever the shared predicate's meaning widens, because
+  a site that never adopted the function is exactly the one no widening PR
+  ever touches. Regression: `stream_write_path_tests::
+  batch_write_on_a_streamed_table_emits_change_records` (red on the
+  pre-0049 code).
 - **A marker key built by truncating a tablet's own `range.start` to a fixed
   prefix is disjoint from real data (if it lives in its own kind scope) but
   is *not* thereby proven to stay within `[range.start, range.end)` —

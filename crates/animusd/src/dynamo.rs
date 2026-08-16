@@ -431,8 +431,21 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             return_values,
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &item)?;
-            // ADR 0046 U3: an indexed/streamed table's write is evaluated
-            // **at the tablet leader**, not here — see
+            // ADR 0049 fast arm: nothing to read, nothing to evaluate —
+            // the edge commits base row + marker record directly (see
+            // `fast_marker_write`'s doc for why this must NOT go through
+            // the leader funnel).
+            if condition.is_none()
+                && return_values == ReturnValues::None
+                && !table_change_records_carry_images(meta, &table)
+            {
+                let value = wire::encode_stored_item(&item);
+                fast_marker_write(ctx, &table, &pk, sk.as_ref(), value).await?;
+                return Ok(wire::write_response(return_values, None));
+            }
+            // ADR 0046 U3: an evaluated write (a condition, an old-image
+            // echo, or an images-carrying table) is evaluated **at the
+            // tablet leader**, not here — see
             // `dynamo::kind_write_item_at_leader`'s doc for why (the
             // cross-node LSI/change-record orphan race a node-local
             // `rmw_lock` here could never close). No local read, no local
@@ -458,6 +471,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                     }
                 };
             }
+            // Unreachable since ADR 0049 (the gate above is constant-true);
+            // kept until Train A's deletion rung.
             let key = item_key(&pk, sk.as_ref());
             // For ALL_OLD (or a condition) we need the prior item; read it once.
             let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
@@ -502,8 +517,19 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             return_values,
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
-            // See `PutItem`'s identical fork above for why an indexed/
-            // streamed table's write evaluates at the leader instead.
+            // ADR 0049 fast arm — see `PutItem`'s identical fork above. A
+            // delete's base write is the tombstone *sentinel value*, so the
+            // routed probe still confirms on a `Some`.
+            if condition.is_none()
+                && return_values == ReturnValues::None
+                && !table_change_records_carry_images(meta, &table)
+            {
+                let value = wire::encode_tombstone();
+                fast_marker_write(ctx, &table, &pk, sk.as_ref(), value).await?;
+                return Ok(wire::write_response(return_values, None));
+            }
+            // See `PutItem`'s identical fork above for why an evaluated
+            // write goes to the leader instead.
             if table_takes_kind_write_path(meta, &table) {
                 return match ctx
                     .cp_kind_write_item(
@@ -524,6 +550,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                     }
                 };
             }
+            // Unreachable since ADR 0049 (the gate above is constant-true);
+            // kept until Train A's deletion rung.
             let data_key = item_key(&pk, sk.as_ref());
             let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
             // Same RMW serialization as the conditional `PutItem` above —
@@ -649,6 +677,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                     )),
                 };
             }
+            // Unreachable since ADR 0049 (the gate above is constant-true);
+            // kept until Train A's deletion rung.
             // `UpdateItem` on a PLAIN table is always a read-modify-write: hold
             // the per-node RMW lock across it (taken here, not inside
             // `run_update_item`, which is also called from `run_transact` under
@@ -676,21 +706,66 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // ride the same batch. Within a table `cp_batch_write` groups by tablet
             // (atomic per tablet, non-atomic across tablets — DynamoDB semantics).
             //
-            // **A table with at least one secondary index cannot use that fast
-            // path** (ADR 0041 §2/§4): `cp_batch_write` only ever writes the base
-            // kind, so it would silently produce no LSI rows and no change-log
-            // record. Such a table instead routes each request through
-            // `ClientCtx::cp_kind_write_item` individually — ADR 0046 U3's
-            // evaluate-at-leader write path, the identical primitive `PutItem`/
-            // `DeleteItem` use, which reads the old item and evaluates on the
-            // tablet leader rather than here. `BatchWriteItem` has no per-item
-            // condition, so `KindWriteOutcome::ConditionFailed` can never come
-            // back here (`cp_kind_write_item`'s own `condition: None`). **Per-item
-            // atomicity only**, matching DynamoDB's own non-atomic
-            // `BatchWriteItem` contract (one request's outcome never affects
-            // another's).
+            // **Every table now routes each request through
+            // `ClientCtx::cp_kind_write_item` individually** (ADR 0049) — ADR
+            // 0046 U3's evaluate-at-leader write path, the identical primitive
+            // `PutItem`/`DeleteItem` use, which reads the old item and
+            // evaluates on the tablet leader rather than here. `BatchWriteItem`
+            // has no per-item condition, so `KindWriteOutcome::ConditionFailed`
+            // can never come back here (`cp_kind_write_item`'s own `condition:
+            // None`). **Per-item atomicity only**, matching DynamoDB's own
+            // non-atomic `BatchWriteItem` contract (one request's outcome never
+            // affects another's).
+            //
+            // The fast path below is unreachable now (the shared gate is
+            // constant-true) and kept only until Train A's deletion rung. Its
+            // gate used to be `meta.table_indexes(table).is_empty()` — a
+            // predicate that had silently DRIFTED from the shared
+            // `table_takes_kind_write_path` gate every other handler uses: a
+            // streamed-but-unindexed table's batch writes took this fast path
+            // and emitted **no change record at all**, silently losing every
+            // one of those writes from its stream (found while wiring ADR
+            // 0049; regression: `stream_write_path_tests::
+            // batch_write_on_a_streamed_table_emits_change_records`). An
+            // instance of the recorded "a fast-path gate and its sibling gate
+            // must be the SAME predicate" lesson — the drift arrived with
+            // `BatchWriteItem`'s indexed branch, which was reviewed against
+            // ADR 0041 (indexes) and never re-checked against ADR 0042's
+            // streamed-but-unindexed case.
             for (table, reqs) in &requests {
-                if meta.table_indexes(table).is_empty() {
+                // ADR 0049 fast arm: a marker table's batch needs no
+                // evaluation — commit every request concurrently
+                // (`join_all`, the house 2PC-coordinator idiom) so Raft
+                // group commit amortizes the WAL fsyncs across items, the
+                // way the old `cp_batch_write` fast path's one-entry-per-
+                // tablet shape did. Sequential per-item funnel round trips
+                // here are exactly the disk-starvation shape
+                // `tests/backfill_seeder.rs`'s population comment documents.
+                if !table_change_records_carry_images(meta, table) {
+                    for chunk in reqs.chunks(32) {
+                        let mut futs = Vec::with_capacity(chunk.len());
+                        for req in chunk {
+                            let (pk, sk, value) = match req {
+                                WriteRequest::Put(item) => {
+                                    let (pk, sk) = resolve_key(ctx, meta, table, item)?;
+                                    (pk, sk, wire::encode_stored_item(item))
+                                }
+                                WriteRequest::Delete(key_item) => {
+                                    let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
+                                    (pk, sk, wire::encode_tombstone())
+                                }
+                            };
+                            futs.push(async move {
+                                fast_marker_write(ctx, table, &pk, sk.as_ref(), value).await
+                            });
+                        }
+                        for result in futures::future::join_all(futs).await {
+                            result?;
+                        }
+                    }
+                    continue;
+                }
+                if !table_takes_kind_write_path(meta, table) {
                     let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(reqs.len());
                     for req in reqs {
                         match req {
@@ -3105,14 +3180,92 @@ pub(crate) fn projected_item(item: &Item, base: &TableSchema, idx: &IndexDef) ->
 }
 
 /// Whether `table` takes the multi-kind atomic-batch write path
-/// (`kind_writes_for_item`'s `Some` branch) rather than the plain single-key
-/// one: it has at least one secondary index (ADR 0041), or a stream enabled
-/// (ADR 0042 §1). The single gate both `kind_writes_for_item`'s own
-/// fast-path check and every write handler's `needs_old` computation share —
-/// kept as one function so the two can never silently drift apart (a write
-/// handler that reads `old` less often than `kind_writes_for_item` actually
-/// needs it would silently degrade LSI/stream fidelity with no error).
-fn table_takes_kind_write_path(meta: &Metadata, table: &str) -> bool {
+/// (`kind_writes_for_item`) rather than the plain single-key one.
+///
+/// **Always `true` since ADR 0049 (the universal kind-write path)**: every
+/// table's every mutation commits through `KindBatch`, so every tablet has
+/// a change log unconditionally — a table with no stream and no secondary
+/// index writes an image-less *marker* record (see
+/// [`table_change_records_carry_images`]) instead of a full-image one. Kept
+/// as the single named gate (rather than inlining `true` at each call site)
+/// so the plain-path fallbacks it guards stay greppable until their
+/// deletion rung, and so the historical "one predicate, never two that
+/// happen to agree today" discipline (this function's original reason to
+/// exist) keeps one home if a future deployment knob ever needs it again.
+fn table_takes_kind_write_path(_meta: &Metadata, _table: &str) -> bool {
+    true
+}
+
+/// The **fast arm** of the ADR 0049 universal kind-write path: a
+/// `Put`/`Delete` on a table whose change records carry no images
+/// (`table_change_records_carry_images` is `false`), with no condition and
+/// no old-image echo, needs nothing read before it commits — no LSI diff,
+/// no image, no evaluation. So the *edge* builds the whole `KindBatch`
+/// (base row + image-less marker record) and proposes it routed
+/// (`ClientCtx::cp_kind_write_raw`), skipping the evaluate-at-leader funnel
+/// entirely: no leader-side pre-read, and — critically — no node-global
+/// `rmw_lock` held across a full commit round trip. That lock-across-commit
+/// is what made routing plain-table `BatchWriteItem`s through the funnel
+/// serialize N items into N sequential WAL-fsync round trips, resurrecting
+/// the exact disk-starvation failure `tests/backfill_seeder.rs`'s
+/// population comment documents (`Backend(..)` panics under three replicas'
+/// group commits); fast-arm proposals carry no lock and no read, so
+/// concurrent items amortize through Raft group commit like the old
+/// `cp_batch_write` path did. Two concurrent unconditional writes of one
+/// item are simply log-ordered — the identical semantics the plain path
+/// always had. Anything needing evaluation (a condition, an `Update`'s RMW,
+/// an `ALL_OLD` echo, or an images-carrying table) keeps the ADR 0046 U3
+/// funnel.
+async fn fast_marker_write(
+    ctx: &ClientCtx,
+    table: &str,
+    pk: &AttributeValue,
+    sk: Option<&AttributeValue>,
+    value: Vec<u8>,
+) -> Result<(), WireError> {
+    // Auto-provision the table's tablet on first write (ADR 0023), exactly
+    // as `cp_kind_write_item`/`cp_batch_write` do — `cp_kind_write_raw`
+    // itself never provisions (its other callers only ever write to tablets
+    // that exist).
+    if !ctx.effective_metadata().has_table_tablet(table) {
+        ctx.provision_tablet(table)
+            .await
+            .map_err(|e| internal(&e))?;
+    }
+    let base_key = item_key(pk, sk);
+    let base_sk = storage_key(pk, sk)[storage_key(pk, None).len()..].to_vec();
+    let record = ChangeRecord {
+        base_sk,
+        old_image: None,
+        new_image: None,
+        seeded: false,
+        marker: true,
+    };
+    let change_log = (
+        token_prefixed(pk, &dynamo_index::change_prefix(pk)),
+        record.encode(),
+    );
+    ctx.cp_kind_write_raw(
+        table,
+        vec![(animus_cp_data::KIND_BASE, base_key, Some(value))],
+        Some(change_log),
+    )
+    .await
+    .map_err(|e| internal(&e))
+}
+
+/// Whether `table`'s change records carry the old/new item images — `true`
+/// when something consumes them: a stream (wire-visible events need images
+/// for every view type's read-time projection) or at least one secondary
+/// index (an LSI diff and the drain's fidelity contract predate ADR 0049).
+/// A table with neither writes an image-less **marker** record
+/// (`ChangeRecord::marker`, ADR 0049 §1): the dirty-key signal change-log
+/// consumers need, at a fixed few tens of bytes per write instead of two
+/// item images. This is exactly the predicate `table_takes_kind_write_path`
+/// used to be, renamed to what it now actually decides — the record's
+/// *shape*, never whether one exists ("images follow the stream/index
+/// declarations; the record itself follows nothing — it always exists").
+fn table_change_records_carry_images(meta: &Metadata, table: &str) -> bool {
     !meta.table_indexes(table).is_empty() || meta.table_stream(table).is_some()
 }
 
@@ -3126,17 +3279,17 @@ fn table_takes_kind_write_path(meta: &Metadata, table: &str) -> bool {
 /// drain materializes them asynchronously from the change record this writes.
 /// An LSI *can* be here precisely because it hashes by the base partition key.
 ///
-/// Returns `None` when the table has neither a secondary index nor a stream
-/// enabled — the caller then keeps the plain single-key write path, so a
-/// plain table pays nothing for this machinery. **A streamed-but-unindexed
-/// table takes this path too (ADR 0042 §1)**: `indexes` is then empty, so
-/// the LSI loop below is simply a no-op, and the entry commits exactly base
-/// row + change record — the change record is what the stream copier reads
-/// (ADR 0043 §7), and it is written **unconditionally** here regardless of
-/// which reason (an index, a stream, or both) pulled the table onto this
-/// path, since a stream's `NEW_AND_OLD_IMAGES` fidelity needs the same old
-/// image an LSI diff needs (`table_takes_kind_write_path` is the one gate
-/// both this function and every write handler's `needs_old` share).
+/// Returns `Some` for every table since ADR 0049 (`table_takes_kind_write_
+/// path` is constant-true; the `None` arm below is kept only until Train
+/// A's deletion rung). **A streamed-but-unindexed table**: `indexes` is
+/// empty, so the LSI loop below is simply a no-op, and the entry commits
+/// exactly base row + change record — the change record is what the sealer
+/// reads (ADR 0043 §A1), carrying both images (a stream's
+/// `NEW_AND_OLD_IMAGES` fidelity needs the same old image an LSI diff
+/// needs). **A table with no stream and no index** commits base row + an
+/// image-less *marker* record instead (ADR 0049 §1,
+/// `table_change_records_carry_images`) — same key, same apply-time HLC
+/// completion, no images.
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
 fn kind_writes_for_item(
     meta: &Metadata,
@@ -3188,11 +3341,18 @@ fn kind_writes_for_item(
     // `AttributeValue::key_bytes` (crate-private to `animus-dynamo`): the full
     // storage key minus the partition-key prefix is exactly that suffix.
     let base_sk = storage_key(pk, sk)[storage_key(pk, None).len()..].to_vec();
+    // ADR 0049 §1: the record always exists; only its *shape* follows the
+    // table's declarations. With a stream or an index the images ride along
+    // (view-type projection is read-time; the drain/LSI fidelity contract
+    // needs the old image); with neither, an image-less marker is the whole
+    // record — the dirty-key signal change-log consumers re-read rows from.
+    let carries_images = table_change_records_carry_images(meta, table);
     let record = ChangeRecord {
         base_sk,
-        old_image: old.cloned(),
-        new_image: new.cloned(),
+        old_image: if carries_images { old.cloned() } else { None },
+        new_image: if carries_images { new.cloned() } else { None },
         seeded: false,
+        marker: !carries_images,
     };
     let change_log = (
         token_prefixed(pk, &dynamo_index::change_prefix(pk)),
@@ -3539,11 +3699,15 @@ mod stream_write_path_tests {
         );
     }
 
-    /// An unstreamed, unindexed table keeps the plain single-key write path:
-    /// no change-log record at all (the `None` fast path in
-    /// `kind_writes_for_item`, unaffected by ADR 0042).
+    /// ADR 0049 §1 (inverts this test's pre-0049 ancestor, which asserted a
+    /// plain table pays *nothing* for the change log): a table with no
+    /// stream and no index now emits exactly one **image-less marker
+    /// record** per mutation — `marker: true`, `seeded: false`, no images,
+    /// its key's HLC suffix completed at apply (nonzero, strictly
+    /// increasing in commit order) — and still never an LSI or footprint
+    /// row.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unstreamed_unindexed_table_writes_no_change_log() {
+    async fn plain_table_writes_emit_one_marker_record_each() {
         let dir = tempfile::TempDir::new().unwrap();
         let node = single_node(dir.path()).await;
         let (status, body) = dynamo(
@@ -3559,15 +3723,113 @@ mod stream_write_path_tests {
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.PutItem",
-            r#"{"TableName":"plain","Item":{"id":{"S":"a"}}}"#,
+            r#"{"TableName":"plain","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#,
         )
         .await;
         assert_eq!(status, 200, "PutItem failed: {body}");
-        assert_eq!(
-            group.pending_changes().await.len(),
-            0,
-            "an unstreamed, unindexed table must pay nothing for the change log"
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.UpdateItem",
+            r#"{"TableName":"plain","Key":{"id":{"S":"a"}},
+                "UpdateExpression":"SET n = :v",
+                "ExpressionAttributeValues":{":v":{"N":"2"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "UpdateItem failed: {body}");
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.DeleteItem",
+            r#"{"TableName":"plain","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "DeleteItem failed: {body}");
+
+        let records = group.pending_changes().await;
+        assert_eq!(records.len(), 3, "exactly one marker per mutation");
+        let mut last_hlc = 0u64;
+        for (key, value) in &records {
+            let record = ChangeRecord::decode(value).expect("marker record decodes");
+            assert!(record.marker, "a plain table's record is a marker");
+            assert!(!record.seeded, "a live write is never a seed");
+            assert!(record.old_image.is_none(), "a marker carries no images");
+            assert!(record.new_image.is_none(), "a marker carries no images");
+            let hlc_suffix = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+            assert!(
+                hlc_suffix > last_hlc,
+                "marker HLCs are apply-time-completed and strictly increasing \
+                 in commit order ({hlc_suffix} after {last_hlc})"
+            );
+            last_hlc = hlc_suffix;
+        }
+        assert!(
+            group
+                .local_scan_kind_bounded(KIND_LSI, &[], None)
+                .await
+                .is_empty(),
+            "a plain table still never writes an LSI row"
         );
+        assert!(
+            group
+                .local_scan_kind_bounded(KIND_FOOTPRINT, &[], None)
+                .await
+                .is_empty(),
+            "a plain table still never writes a footprint row"
+        );
+
+        // The base row's own read path is untouched by the marker.
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.GetItem",
+            r#"{"TableName":"plain","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "GetItem failed: {body}");
+        assert!(
+            !body.contains("\"n\""),
+            "the delete must have removed the item: {body}"
+        );
+    }
+
+    /// ADR 0049's gate-drift regression: `BatchWriteItem` on a
+    /// streamed-but-unindexed table must emit one change record per request
+    /// — its fast path's old gate (`table_indexes(table).is_empty()`) had
+    /// silently drifted from the shared `table_takes_kind_write_path`
+    /// predicate, so such a table's batch writes bypassed the kind path and
+    /// its stream silently lost every one of them (red on the pre-ADR-0049
+    /// code).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_write_on_a_streamed_table_emits_change_records() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = single_node(dir.path()).await;
+        create_streamed_table(node.dynamo_addr(), "sb").await;
+        let group = await_group(&node, "sb").await;
+
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.BatchWriteItem",
+            r#"{"RequestItems":{"sb":[
+                {"PutRequest":{"Item":{"id":{"S":"a"},"n":{"N":"1"}}}},
+                {"PutRequest":{"Item":{"id":{"S":"b"},"n":{"N":"2"}}}}
+            ]}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "BatchWriteItem failed: {body}");
+
+        let records = group.pending_changes().await;
+        assert_eq!(
+            records.len(),
+            2,
+            "a streamed table's batch writes must each leave a change record \
+             (the drifted fast-path gate used to lose both)"
+        );
+        for (_, value) in &records {
+            let record = ChangeRecord::decode(value).expect("change record decodes");
+            assert!(!record.marker, "a streamed table's record is no marker");
+            assert!(
+                record.new_image.is_some(),
+                "a streamed table's record carries images"
+            );
+        }
     }
 
     /// A shard record's stored form always carries both images regardless of

@@ -5545,6 +5545,7 @@ impl ClientCtx {
         &self,
         table: &str,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Option<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
         let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
@@ -5561,7 +5562,7 @@ impl ClientCtx {
                     .last()
                     .map(|(kind, key, value)| (*kind, key.clone(), value.clone()))
                     .expect("writes is non-empty — checked via `first` above");
-                match leader.put_kind_batch_fenced(writes, None, Vec::new(), fence) {
+                match leader.put_kind_batch_fenced(writes, change_log, Vec::new(), fence) {
                     ProposeResult::Accepted { .. } => {}
                     other => return Err(format!("kind write not accepted: {other:?}")),
                 }
@@ -5578,7 +5579,7 @@ impl ClientCtx {
                 let request = ClientRequest::KindWrite {
                     table: table.to_owned(),
                     writes,
-                    change_log: None,
+                    change_log,
                 };
                 Self::ok_or_err(
                     self.cp_forward(table, &first, addr, request).await,

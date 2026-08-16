@@ -215,21 +215,20 @@ comment for its full type/method inventory.
   `Scan`/`Query` `FilterExpression` reuses the `ConditionExpression` predicate
   subset (`attribute_exists`/`attribute_not_exists`/`a = :v`), not the fuller
   filter grammar. `animus-cql` would map onto the same core the same way.
-  **Every write op maintains a table's secondary indexes now (ADR 0041,
-  2026-08-13 fix)**, except one deliberately-rejected combination:
-  `animusd`'s `PutItem`/`DeleteItem`/`UpdateItem` all go through
-  `index_aware_write` (ADR 0041 §2/§4), and `BatchWriteItem` does too for any
-  table with at least one index (reading the old item per key first, since
-  the LSI diff needs it — a table with no index keeps its original
-  no-read batch fast path). `TransactWriteItems` is the exception: a
-  transaction containing any `Put`/`Delete`/`Update` against an indexed
-  table is rejected up front with a `ValidationException`, because `cp_txn`'s
-  `KvCommand::TxnStage` has no multi-kind-write extension yet to stage LSI
-  rows/change records atomically with a transactional write — staging just
-  the base row would leave that table's indexes silently, permanently stale.
-  The `TxnStage` extension is a real `animus-cp-data` protocol change, named
-  as a follow-up in ADR 0041's as-built note; see `docs/engineering-
-  lessons.md` for the original gap and its resolution.
+  **Every write op maintains a table's secondary indexes** — and since ADR
+  0049 (the universal kind-write path) **every Dynamo write op on every
+  table commits through `KindBatch`**: `PutItem`/`DeleteItem`/`UpdateItem`/
+  `BatchWriteItem` all route through `animusd`'s evaluate-at-leader
+  primitive (`kind_write_item_at_leader`, ADR 0046 U3), and
+  `TransactWriteItems` stages a derived kind-writes/change-log payload
+  inside the base write's intent, materialized at resolve (ADR 0018's
+  2026-08-16 amendment — the old wholesale rejection of indexed/streamed
+  tables is long gone). A table with no stream and no index writes an
+  **image-less marker record** (`ChangeRecord::marker`, ADR 0049 §1)
+  instead of a full-image one — `ChangeRecord::consumer_hidden` is the one
+  predicate the Streams read path filters markers and the backfill's
+  `seeded` records with; change-log consumers themselves treat every
+  record as a dirty-key signal and ignore both flags.
 
 ## Tests
 
