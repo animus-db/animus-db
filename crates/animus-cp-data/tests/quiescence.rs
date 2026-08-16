@@ -37,13 +37,15 @@
 //! `CpAppendEntriesSent` is the corroborating, still-unambiguous quantitative
 //! proof that the reduced timer activity actually stopped real Raft traffic.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::ProposeResult;
-use animus_cp_data::RaftKvNode;
+use animus_cp_data::{RaftKvNode, StageOutcome};
 use animus_env::{EnvExt, Metric, MetricsHandle, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
+use animus_tablet::{escape, partition_token};
 use futures::executor::block_on;
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -303,5 +305,96 @@ fn killing_the_quiesced_leader_a_survivor_still_converges_via_wake_request() {
                 "surviving node {i} missing the post-recovery write (seed={seed})"
             );
         }
+    }
+}
+
+// ---- ADR 0044 phase-1 PR5 (fork D): a pending transaction vetoes
+// quiescence until resolved ---------------------------------------------
+
+/// A real ADR 0022-shaped data-plane key — mirrors `txn_single.rs`'s own
+/// `key` helper (duplicated rather than shared across separate test
+/// binaries).
+fn key(pk: &[u8], rk: &[u8]) -> Vec<u8> {
+    let mut out = partition_token(pk).to_vec();
+    out.extend_from_slice(&escape(pk));
+    out.extend_from_slice(rk);
+    out
+}
+
+/// Run `fut` to completion by spawning it on `node`'s own env and driving
+/// `sim` for up to `budget` — [`lin_read`]'s identical shape, generalized to
+/// any future's output type.
+fn drive<T: Send + 'static>(
+    sim: &mut Simulator,
+    node: &KvNode,
+    budget: Duration,
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> Option<T> {
+    let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+    let s = Arc::clone(&slot);
+    node.env().clone().spawn_task(async move {
+        let v = fut.await;
+        *s.lock().unwrap() = Some(v);
+    });
+    sim.run_for(budget);
+    slot.lock().unwrap().take()
+}
+
+#[test]
+fn a_pending_transaction_vetoes_quiescence_until_resolved() {
+    for seed in seeds(0xF1DE6) {
+        let (mut sim, nodes, _handles) = group(seed);
+        sim.run_for(Duration::from_secs(2)); // elect + replicate the no-op
+        let leader = leader_index(&nodes, seed);
+
+        let k = key(b"acct-1", b"balance");
+        let n = nodes[leader].clone();
+        let kk = k.clone();
+        let (txn_id, record_key, outcome) = drive(
+            &mut sim,
+            &nodes[leader],
+            Duration::from_secs(5),
+            async move { n.txn_stage("t", vec![(kk, Some(b"100".to_vec()))]).await },
+        )
+        .flatten()
+        .unwrap_or_else(|| panic!("txn_stage did not complete (seed={seed})"));
+        assert_eq!(outcome, StageOutcome::Staged, "seed={seed}");
+
+        // Idle well past `QUIESCE_AFTER`: the veto (a non-empty `TxnTracker`
+        // — this record is still `Pending`) must hold the group awake, even
+        // though the ordinary entry predicate's other clauses are otherwise
+        // satisfied (nothing left to replicate, no membership change, ...).
+        sim.run_for(Duration::from_secs(2));
+        assert!(
+            !nodes[leader].is_quiesced(),
+            "a group with a pending 2PC intent must never quiesce (seed={seed})"
+        );
+
+        // Commit + resolve the anchor's own keys in one call (`txn_decide`,
+        // `commit: true`) — the record moves `Pending -> Committed` and its
+        // resolve lands in the same group, so `TxnTracker` ends up
+        // genuinely empty (neither `pending` nor `unresolved_decided`
+        // holds it) rather than merely moving the veto from one map to the
+        // other.
+        let n = nodes[leader].clone();
+        let commit_ts = drive(
+            &mut sim,
+            &nodes[leader],
+            Duration::from_secs(5),
+            async move { n.txn_decide(txn_id, record_key, vec![k], true).await },
+        )
+        .flatten();
+        assert!(
+            commit_ts.is_some(),
+            "commit+resolve did not complete (seed={seed})"
+        );
+
+        // Now genuinely idle again: the veto must have released, letting
+        // the group reach quiescence exactly as an untouched group would.
+        sim.run_for(Duration::from_secs(2));
+        assert!(
+            nodes[leader].is_quiesced(),
+            "the veto must release once the transaction resolves (seed={seed})"
+        );
     }
 }

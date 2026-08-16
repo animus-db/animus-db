@@ -350,6 +350,22 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             if gsis.is_empty() && !stream_enabled && !ever_streamed {
                 continue;
             }
+            // ADR 0044 phase-1 PR5, fork D: hold this group's quiesce veto
+            // while its change log is non-empty, released the moment a
+            // sweep finds it empty. This is what makes PR6's "quiesced ⇒
+            // nothing new for the sweeper" invariant sound: without it, a
+            // tablet could quiesce (genuinely idle for `quiesce_after`)
+            // while still owing a GSI materialization or a not-yet-due
+            // seal-age trigger — a real obligation only *this* loop would
+            // ever notice and act on, silently stalled until something
+            // else happened to touch the group. A table with neither GSIs
+            // nor an enabled/ever-enabled stream never reaches this point
+            // at all (the `continue` above), so its change log is always
+            // empty and it never holds this veto — correct by construction,
+            // since an unindexed/unstreamed table's write path never
+            // produces a change record in the first place.
+            let hot_backlog_present = !group.pending_changes().await.is_empty();
+            group.set_quiesce_veto(hot_backlog_present);
             // `drain_tablet` is GSI-specific (it reconciles GSI rows and
             // advances the `"gsi"` cursor) — never call it for a
             // streamed-but-unindexed table, or it would write a spurious
@@ -2059,8 +2075,8 @@ mod stream_sealer_tests {
     use super::*;
     use crate::config::NodeRole;
     use crate::{
-        ClusterConfig, Node, RoleAddrs, SegmentStoreConfig, StorageBackend, StreamSealKnobs,
-        run_node_with_streams,
+        ClusterConfig, ClusterEdgeState, Node, RoleAddrs, SegmentStoreConfig, StorageBackend,
+        StreamSealKnobs, run_node_with_streams,
     };
 
     fn free_addrs(count: usize) -> Vec<SocketAddr> {
@@ -2115,6 +2131,53 @@ mod stream_sealer_tests {
         )
         .await
         .expect("bring up single node with stream knobs");
+        await_control_leader(&node).await;
+        node
+    }
+
+    /// Like [`single_node_with_streams`], but also opts the node's
+    /// data-plane CP groups into quiescence with `quiesce_after` (ADR 0044
+    /// phase-1 PR5) — no test-only wrapper mirroring `run_node_with_streams`
+    /// exists for this combination yet (PR7 adds the production `--quiesce-
+    /// after` CLI flag), so this builds the node directly via
+    /// `BoundNode::start_with_growth` (`run_node_with_streams`'s own body,
+    /// with the one extra argument) rather than growing the production
+    /// surface just for this test.
+    async fn single_node_with_streams_and_quiesce_after(
+        dir: &Path,
+        knobs: StreamSealKnobs,
+        quiesce_after: Duration,
+    ) -> Node {
+        let config = single_node_config();
+        let addrs = config.nodes[0].clone();
+        let bound = Node::bind(crate::config::node_id(0), addrs, dir.join("node-0"))
+            .await
+            .expect("bind");
+        let mut client_route = std::collections::BTreeMap::new();
+        client_route.insert(crate::config::node_id(0), config.nodes[0].client);
+        let mut intra_route = std::collections::BTreeMap::new();
+        intra_route.insert(crate::config::node_id(0), config.nodes[0].intra);
+        let node = bound
+            .start_with_growth(
+                config.peer_book(),
+                config.control_ids(),
+                config.data_ids(),
+                StorageBackend::default(),
+                ClusterEdgeState::new(),
+                client_route,
+                intra_route,
+                None,
+                None,
+                vec![config.nodes[0].admin],
+                Duration::from_secs(600),
+                knobs,
+                SegmentStoreConfig::default(),
+                crate::DEFAULT_STREAM_RETENTION,
+                None,
+                quiesce_after,
+            )
+            .await
+            .expect("bring up single node with streams + quiescence");
         await_control_leader(&node).await;
         node
     }
@@ -2886,6 +2949,74 @@ mod stream_sealer_tests {
                 "every streamed-table split boundary must be exactly one \
                  8-byte token, never a longer, unaligned key: {boundary_lens:?}"
             );
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// ADR 0044 phase-1 PR5 (fork D): `change_consumer_loop` holds this
+    /// group's quiesce veto while its change log is non-empty, releasing it
+    /// once the hot tail trims — proving the veto end to end against a
+    /// real streamed table's write/seal/trim cycle (mirrors
+    /// [`seal_size_trigger_lands_segment_and_trims_hot_tail`]'s exact
+    /// shape, with quiescence layered on top via
+    /// [`single_node_with_streams_and_quiesce_after`]).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hot_backlog_holds_the_quiesce_veto_until_the_hot_tail_trims() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams_and_quiesce_after(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 200,
+                    seal_age: Duration::from_secs(3600),
+                },
+                Duration::from_millis(300),
+            )
+            .await;
+            let table = "vetoed";
+            create_streamed_table(node.dynamo_addr(), table).await;
+
+            // One small write: nowhere near the size trigger on its own, so
+            // the record sits in the hot tail for a while.
+            put_item_padded(node.dynamo_addr(), table, "o0", 4).await;
+
+            let tablet = only_tablet(&node, table);
+            let group = node
+                .edge
+                .local_cp(tablet)
+                .expect("this node hosts the tablet");
+
+            await_true(10, "the write lands in the hot tail", || {
+                !futures::executor::block_on(group.pending_changes()).is_empty()
+            })
+            .await;
+
+            // Idle well past `quiesce_after` with the backlog still
+            // present — the veto must hold the group awake the whole time,
+            // or PR6's later sweeper-skip would strand this table's seal
+            // age trigger indefinitely.
+            sleep(Duration::from_secs(2)).await;
+            assert!(
+                !group.is_quiesced(),
+                "a group with a non-empty change log must never quiesce"
+            );
+
+            // Trip the size trigger — the backlog seals and the hot-trim
+            // arm clears it on its next tick.
+            for i in 1..10u32 {
+                put_item_padded(node.dynamo_addr(), table, &format!("o{i}"), 50).await;
+            }
+            await_true(20, "hot tail trims to empty after the seal", || {
+                futures::executor::block_on(group.pending_changes()).is_empty()
+            })
+            .await;
+
+            // The veto releases and the group reaches quiescence again.
+            await_true(10, "the veto releases and the group quiesces", || {
+                group.is_quiesced()
+            })
+            .await;
         })
         .await
         .expect("did not converge in time");

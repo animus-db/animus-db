@@ -1392,6 +1392,18 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// doc for the exact insert/remove rules and the rebuild-at-start
     /// source.
     txn_tracker: Arc<Mutex<TxnTracker>>,
+    /// ADR 0044 phase-1 PR5, fork D: an **external** quiesce veto any
+    /// subsystem outside this crate may hold — `animusd`'s
+    /// `change_consumer_loop` sets this for a group whose change log was
+    /// non-empty on its last sweep (see
+    /// [`set_quiesce_veto`](Self::set_quiesce_veto)). ORed with this
+    /// group's own in-crate `txn_tracker`-derived veto (a non-empty
+    /// [`TxnTracker`] always vetoes on its own, no external input needed)
+    /// before being fed to [`RaftCore::set_quiesce_veto`] once per
+    /// consensus-loop iteration, alongside `quiesce_engine_caught_up`.
+    /// Defaults `false` — zero behavior change for every caller that never
+    /// touches it.
+    external_quiesce_veto: Arc<AtomicBool>,
 }
 
 impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
@@ -1524,6 +1536,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // mirroring `sealed`/`committed_ceiling`'s own rebuild-then-spawn
         // ordering.
         let txn_tracker = Arc::new(Mutex::new(TxnTracker::default()));
+        let external_quiesce_veto = Arc::new(AtomicBool::new(false));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -1549,6 +1562,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             last_proposed_ts,
             last_absorbed_term,
             txn_tracker: Arc::clone(&txn_tracker),
+            external_quiesce_veto: Arc::clone(&external_quiesce_veto),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -1576,6 +1590,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             hlc,
             committed_ceiling,
             txn_tracker,
+            external_quiesce_veto,
         }));
         node
     }
@@ -1640,6 +1655,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     #[must_use]
     pub fn is_quiesced(&self) -> bool {
         self.lock().is_quiesced()
+    }
+
+    /// ADR 0044 phase-1 PR5 (fork D): let an external subsystem (`animusd`'s
+    /// `change_consumer_loop`) hold or release the quiesce veto for this
+    /// group — set for a group whose change log was non-empty on its last
+    /// sweep, cleared once it drains. ORed with this group's own in-crate
+    /// `TxnTracker`-derived veto (always vetoing on a pending 2PC intent or
+    /// an unresolved decided record, no external input needed for that
+    /// part) inside the consensus loop, once per iteration — see that
+    /// loop's own doc. Idempotent, safe to call every tick regardless of
+    /// current state.
+    pub fn set_quiesce_veto(&self, held: bool) {
+        self.external_quiesce_veto.store(held, Ordering::SeqCst);
     }
 
     /// Whether [`shutdown`](Self::shutdown) has been requested.
@@ -6267,6 +6295,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     hlc: Arc<Hlc>,
     committed_ceiling: Arc<AtomicU64>,
     txn_tracker: Arc<Mutex<TxnTracker>>,
+    external_quiesce_veto: Arc<AtomicBool>,
 }
 
 /// The `ts` a mutating [`KvCommand`] variant carries, or `None` for `NoOp`
@@ -6354,6 +6383,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         hlc,
         committed_ceiling,
         txn_tracker,
+        external_quiesce_veto,
     } = st;
 
     let wal = wal_file(stream);
@@ -6444,7 +6474,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&hlc),
         sealed,
         committed_ceiling,
-        txn_tracker,
+        Arc::clone(&txn_tracker),
         Arc::clone(&apply_signal),
     ));
 
@@ -6468,6 +6498,18 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             let mut c = core.lock().expect("raftkv core poisoned");
             let caught_up = engine_applied.load(Ordering::SeqCst) == c.last_applied();
             c.set_quiesce_engine_caught_up(caught_up);
+            // ADR 0044 phase-1 PR5, fork D: feed the quiesce veto — a
+            // non-empty `TxnTracker` (this group has a pending 2PC intent or
+            // a decided-but-unresolved record still owed a resolve) always
+            // vetoes on its own; ORed with whatever external subsystem
+            // (`animusd`'s `change_consumer_loop`) has set via
+            // `set_quiesce_veto`. Same lock acquisition, same once-per-
+            // iteration cadence as `quiesce_engine_caught_up` just above.
+            let txn_veto = {
+                let t = txn_tracker.lock().expect("txn tracker poisoned");
+                !t.pending.is_empty() || !t.unresolved_decided.is_empty()
+            };
+            c.set_quiesce_veto(txn_veto || external_quiesce_veto.load(Ordering::SeqCst));
             c.next_deadline()
         };
         // `None` (ADR 0044 phase-1 PR3 quiescence) drops the timer arm

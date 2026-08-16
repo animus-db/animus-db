@@ -425,6 +425,26 @@ impl CpGroup {
         }
     }
 
+    /// ADR 0044 phase-1 PR5, fork D: hold or release this group's external
+    /// quiesce veto. See [`RaftKvNode::set_quiesce_veto`].
+    fn set_quiesce_veto(&self, held: bool) {
+        match self {
+            CpGroup::Lsm(n) => n.set_quiesce_veto(held),
+            CpGroup::Mem(n) => n.set_quiesce_veto(held),
+        }
+    }
+
+    /// Whether this replica currently considers its own group quiesced (ADR
+    /// 0044 phase-1). See [`RaftKvNode::is_quiesced`]. Test-only until PR7
+    /// wires it into `/admin/raftkv`'s `CpRaftView`.
+    #[allow(dead_code)]
+    fn is_quiesced(&self) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.is_quiesced(),
+            CpGroup::Mem(n) => n.is_quiesced(),
+        }
+    }
+
     /// This replica's `engine_applied_index()` — the confirm-by-index
     /// primitive linearizable reads themselves gate on. See
     /// [`RaftKvNode::engine_applied_index`]. Used by the backfill seeder
