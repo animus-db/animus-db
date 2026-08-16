@@ -87,6 +87,16 @@
 //! differ, and a reader always knows which convention applies from its own
 //! tag, never from inspecting the bytes.
 //!
+//! [`ConsumerOffset`] is an additive, unifying wrapper over the two
+//! conventions above — for a future consumer that wants to hold either
+//! shape without hard-coding which one its own tag uses (a per-CQL-CDC-
+//! consumer cursor is the concrete future case ADR 0042's own roadmap
+//! names, see this doc's own intro). It delegates to the existing
+//! `encode_watermark`/`decode_watermark`/`encode_backfill_cursor`/
+//! `decode_backfill_cursor` free functions rather than re-implementing
+//! either encoding — those functions, and every existing caller of them,
+//! are unchanged.
+//!
 //! **A residual, documented gap** (mirroring `txn.rs`'s own "not closed
 //! here" note about `split_key` not being token-aligned): `cursor_key`
 //! truncates the tablet's live `range.start` to its leading [`TOKEN_BYTES`]
@@ -213,11 +223,65 @@ pub fn decode_backfill_cursor(bytes: &[u8]) -> Vec<u8> {
     bytes.to_vec()
 }
 
+/// A consumer cursor's **value**, unified across the two conventions this
+/// module's own doc lays out side by side (the packed-HLC watermark and the
+/// raw last-scanned-base-key) — additive: [`encode_watermark`]/
+/// [`decode_watermark`]/[`encode_backfill_cursor`]/[`decode_backfill_cursor`]
+/// and every existing caller of them are untouched. This exists for a
+/// **future** generic consumer that wants to hold either offset shape
+/// without hard-coding which convention its own tag uses (the module doc's
+/// own "per-CQL-CDC-consumer cursors named as a follow-up" case) — no
+/// current caller constructs one.
+///
+/// There is deliberately no single `decode(bytes) -> ConsumerOffset`: the
+/// module doc's own disjointness note applies here too — "a reader always
+/// knows which convention applies from its own tag, never from inspecting
+/// the bytes" — so decoding is convention-specific, mirroring the two free
+/// functions it wraps ([`ConsumerOffset::decode_watermark`]/
+/// [`ConsumerOffset::decode_key_pos`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsumerOffset {
+    /// The packed-HLC watermark convention — see [`encode_watermark`].
+    Watermark(HlcTimestamp),
+    /// The raw last-scanned-base-key convention — see
+    /// [`encode_backfill_cursor`].
+    KeyPos(Vec<u8>),
+}
+
+impl ConsumerOffset {
+    /// Encode to the wire bytes of whichever convention this value holds —
+    /// delegates to [`encode_watermark`]/[`encode_backfill_cursor`], never
+    /// re-implementing either.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            ConsumerOffset::Watermark(ts) => encode_watermark(*ts),
+            ConsumerOffset::KeyPos(key) => encode_backfill_cursor(key),
+        }
+    }
+
+    /// Decode `bytes` as the packed-HLC watermark convention — delegates to
+    /// [`decode_watermark`], so `None` on anything but exactly 8 bytes.
+    #[must_use]
+    pub fn decode_watermark(bytes: &[u8]) -> Option<Self> {
+        decode_watermark(bytes).map(ConsumerOffset::Watermark)
+    }
+
+    /// Decode `bytes` as the raw backfill-cursor convention — delegates to
+    /// [`decode_backfill_cursor`], which never fails (see that function's
+    /// own doc for why there is no decode-failure mode for this
+    /// convention).
+    #[must_use]
+    pub fn decode_key_pos(bytes: &[u8]) -> Self {
+        ConsumerOffset::KeyPos(decode_backfill_cursor(bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CURSOR_TAG, cursor_key, decode_backfill_cursor, decode_watermark, encode_backfill_cursor,
-        encode_watermark, parse_cursor_key,
+        CURSOR_TAG, ConsumerOffset, cursor_key, decode_backfill_cursor, decode_watermark,
+        encode_backfill_cursor, encode_watermark, parse_cursor_key,
     };
     use crate::hlc::HlcTimestamp;
     use animus_tablet::TOKEN_BYTES;
@@ -316,5 +380,39 @@ mod tests {
         let (token, tag) = parse_cursor_key(&backfill_row).expect("must parse");
         assert_eq!(token, &range_start[..TOKEN_BYTES]);
         assert_eq!(tag, "backfill:by-status");
+    }
+
+    #[test]
+    fn consumer_offset_watermark_round_trips_through_the_existing_convention() {
+        let ts = HlcTimestamp {
+            wall_ms: 987_654,
+            logical: 7,
+        };
+        let offset = ConsumerOffset::Watermark(ts);
+        let bytes = offset.encode();
+        assert_eq!(
+            bytes,
+            encode_watermark(ts),
+            "must delegate to encode_watermark, not a second encoding"
+        );
+        assert_eq!(ConsumerOffset::decode_watermark(&bytes), Some(offset));
+    }
+
+    #[test]
+    fn consumer_offset_key_pos_round_trips_through_the_existing_convention() {
+        let prefix = b"\x00\x00\x00\x00\x00\x00\x00\x01some-partition".to_vec();
+        let offset = ConsumerOffset::KeyPos(prefix.clone());
+        let bytes = offset.encode();
+        assert_eq!(
+            bytes,
+            encode_backfill_cursor(&prefix),
+            "must delegate to encode_backfill_cursor, not a second encoding"
+        );
+        assert_eq!(ConsumerOffset::decode_key_pos(&bytes), offset);
+    }
+
+    #[test]
+    fn consumer_offset_decode_watermark_rejects_the_wrong_length_like_its_delegate() {
+        assert_eq!(ConsumerOffset::decode_watermark(&[0u8; 7]), None);
     }
 }
