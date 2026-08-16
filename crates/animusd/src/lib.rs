@@ -235,7 +235,7 @@ impl CpGroup {
     fn put_kind_batch_fenced(
         &self,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
     ) -> ProposeResult {
@@ -1171,7 +1171,7 @@ pub enum ClientRequest {
         table: String,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         #[serde(default)]
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
     },
     /// **Internal index-read RPC — never sent bare, only wrapped in
     /// [`Forwarded`](Self::Forwarded)** (ADR 0041 §5): a **linearizable**
@@ -5545,7 +5545,7 @@ impl ClientCtx {
         &self,
         table: &str,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
         let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
@@ -5614,7 +5614,7 @@ impl ClientCtx {
     pub(crate) async fn cp_kind_local(
         leader: &CpGroup,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Result<(), String> {
         let probe = writes

@@ -732,10 +732,18 @@ route below the edge through the same `ClientCtx` CP primitives.
   and proposes routed, no leader read, no `rmw_lock` — see that function's
   doc for why the funnel must NOT carry these (lock-across-commit
   serializes a batch into N sequential fsync round trips, the documented
-  disk-starvation shape). `BatchWriteItem` routes marker-table requests
-  through the fast arm **concurrently** (`join_all`, chunked) and
-  images-carrying tables' requests through the per-item funnel, atomic
-  per-item only; the old `cp_batch_write` fast path is unreachable dead
+  disk-starvation shape). `BatchWriteItem` groups a marker
+  table's requests **per tablet** and commits each group as ONE
+  `KindBatch` entry carrying every base row + every marker record
+  (`KindBatch.change_log` is a `Vec` since codec v17) — the same
+  entry-granularity the old `cp_batch_write` path had; a first cut
+  proposed one entry per item (concurrently), which is ~N× the
+  entries/WAL/apply work and blew `backfill_seeder`'s populate-then-
+  backfill budget under load (regression + guard:
+  `stream_write_path_tests::batch_write_on_a_marker_table_commits_one_
+  entry_per_tablet`, which pins "one distinct apply HLC per tablet per
+  batch"). Images-carrying tables' requests go through the per-item
+  funnel, atomic per-item only; the old `cp_batch_write` fast path is unreachable dead
   code kept until Train A's deletion rung. **`TransactWriteItems` now participates
   too (2026-08-16, ADR 0046 A1/U3, `TxnStage` kind-writes stack)** — the
   wholesale per-table rejection this paragraph used to document (a write

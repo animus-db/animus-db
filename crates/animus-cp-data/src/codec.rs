@@ -101,7 +101,12 @@ const MAGIC: u8 = 0xCB;
 /// payload a transactional write against an indexed/streamed table stages
 /// alongside its base value (see `TxnWrite`'s doc). Same house convention:
 /// a clean bump, no cross-version compatibility.
-const VERSION: u8 = 16;
+/// `17` (ADR 0049 Train A rung-1 fixup): `KindBatch.change_log` changed
+/// from `Option<(Vec<u8>, Vec<u8>)>` to `Vec<(Vec<u8>, Vec<u8>)>` — a
+/// marker-table batch commits one entry per tablet carrying every item's
+/// marker record (the entry-granularity throughput contract; see the
+/// field's own doc). `TxnWrite.change_log` keeps its `Option` shape.
+const VERSION: u8 = 17;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -386,6 +391,28 @@ fn read_change_log(c: &mut Cursor<'_>) -> Result<Option<(Vec<u8>, Vec<u8>)>, Dec
     })
 }
 
+/// `KindBatch.change_log`'s multi-record shape (version `17` — see the
+/// field's own doc for why a marker-table batch carries one record per
+/// item in a single entry). Count-prefixed, unlike the tagged `Option`
+/// form `TxnWrite` keeps.
+fn put_change_logs(out: &mut Vec<u8>, change_log: &[(Vec<u8>, Vec<u8>)]) {
+    out.extend_from_slice(&(change_log.len() as u32).to_be_bytes());
+    for (prefix, record) in change_log {
+        put_bytes(out, prefix);
+        put_bytes(out, record);
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn read_change_logs(c: &mut Cursor<'_>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DecodeError> {
+    let n = c.u32()?;
+    let mut out = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        out.push((c.bytes()?, c.bytes()?));
+    }
+    Ok(out)
+}
+
 fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
     match c {
         KvCommand::Put {
@@ -419,7 +446,7 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
         } => {
             put_u8(out, 12);
             put_kind_writes(out, writes);
-            put_change_log(out, change_log);
+            put_change_logs(out, change_log);
             out.extend_from_slice(&(conditions.len() as u32).to_be_bytes());
             for (k, expected) in conditions {
                 put_bytes(out, k);
@@ -564,7 +591,7 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
         }
         12 => {
             let writes = read_kind_writes(c)?;
-            let change_log = read_change_log(c)?;
+            let change_log = read_change_logs(c)?;
             let n = c.u32()?;
             let mut conditions = Vec::with_capacity(n as usize);
             for _ in 0..n {
@@ -1035,7 +1062,7 @@ mod tests {
                         (crate::KIND_BASE, b"base-key".to_vec(), Some(b"v".to_vec())),
                         (crate::KIND_LSI, b"lsi-key".to_vec(), None), // a tombstone
                     ],
-                    change_log: Some((b"change-prefix".to_vec(), b"record".to_vec())),
+                    change_log: vec![(b"change-prefix".to_vec(), b"record".to_vec())],
                     conditions: vec![
                         (b"base-key".to_vec(), Some(b"old-v".to_vec())),
                         (b"other-key".to_vec(), None), // must be absent

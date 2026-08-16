@@ -103,7 +103,7 @@ fn one_entry_writes_every_kind_into_its_own_scope() {
                     (KIND_CHANGE, change.clone(), Some(b"change".to_vec())),
                     (KIND_FOOTPRINT, footprint.clone(), Some(b"fp".to_vec())),
                 ],
-                None
+                Vec::new()
             ),
             ProposeResult::Accepted { .. }
         ),
@@ -173,7 +173,7 @@ fn one_entry_adds_a_new_index_row_and_removes_the_stale_one() {
                 (KIND_BASE, base.clone(), Some(b"age=30".to_vec())),
                 (KIND_LSI, old_row.clone(), Some(b"row".to_vec())),
             ],
-            None
+            Vec::new()
         ),
         ProposeResult::Accepted { .. }
     ));
@@ -189,7 +189,7 @@ fn one_entry_adds_a_new_index_row_and_removes_the_stale_one() {
                 (KIND_LSI, old_row.clone(), None),
                 (KIND_LSI, new_row.clone(), Some(b"row".to_vec())),
             ],
-            None
+            Vec::new()
         ),
         ProposeResult::Accepted { .. }
     ));
@@ -246,7 +246,7 @@ fn an_out_of_fence_key_blocks_the_whole_entry() {
                 (KIND_BASE, inside.clone(), Some(b"item".to_vec())),
                 (KIND_LSI, lsi.clone(), Some(b"lsi-row".to_vec())),
             ],
-            None,
+            Vec::new(),
             Vec::new(),
             fence,
         ),
@@ -290,7 +290,7 @@ fn the_change_log_key_is_the_entrys_own_commit_timestamp() {
             matches!(
                 nodes[l].put_kind_batch(
                     vec![(KIND_BASE, base.clone(), Some(v.clone()))],
-                    Some((prefix.clone(), format!("rec{i}").into_bytes())),
+                    vec![(prefix.clone(), format!("rec{i}").into_bytes())],
                 ),
                 ProposeResult::Accepted { .. }
             ),
@@ -353,7 +353,7 @@ fn kind_scoped_reads_see_their_own_scope_and_no_other() {
                 (KIND_LSI, row_a.clone(), Some(b"ra".to_vec())),
                 (KIND_LSI, row_b.clone(), Some(b"rb".to_vec())),
             ],
-            None,
+            Vec::new(),
         ),
         ProposeResult::Accepted { .. }
     ));

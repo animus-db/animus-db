@@ -734,34 +734,75 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // streamed-but-unindexed case.
             for (table, reqs) in &requests {
                 // ADR 0049 fast arm: a marker table's batch needs no
-                // evaluation — commit every request concurrently
-                // (`join_all`, the house 2PC-coordinator idiom) so Raft
-                // group commit amortizes the WAL fsyncs across items, the
-                // way the old `cp_batch_write` fast path's one-entry-per-
-                // tablet shape did. Sequential per-item funnel round trips
-                // here are exactly the disk-starvation shape
-                // `tests/backfill_seeder.rs`'s population comment documents.
+                // evaluation — commit **one `KindBatch` Raft entry per
+                // tablet**, carrying every one of that tablet's base rows
+                // AND every one of their marker records, exactly the
+                // entry-granularity the old `cp_batch_write` fast path had
+                // (one entry, one WAL record, one apply per tablet). The
+                // first cut of this arm proposed one entry per ITEM
+                // (concurrently), which looked amortized but is 100x the
+                // entries/WAL bytes/apply work for a 100-item batch — a
+                // measured throughput regression (`tests/backfill_seeder.rs`'s
+                // populate-then-backfill blew its convergence budget under
+                // load), and a break of ADR 0049 §1's own "the marker rides
+                // the same entry — no extra fsync" contract. Per-item
+                // atomicity still holds trivially: one tablet's entry is
+                // whole-or-nothing per tablet, non-atomic across tablets —
+                // DynamoDB's own `BatchWriteItem` contract either way.
                 if !table_change_records_carry_images(meta, table) {
-                    for chunk in reqs.chunks(32) {
-                        let mut futs = Vec::with_capacity(chunk.len());
-                        for req in chunk {
-                            let (pk, sk, value) = match req {
-                                WriteRequest::Put(item) => {
-                                    let (pk, sk) = resolve_key(ctx, meta, table, item)?;
-                                    (pk, sk, wire::encode_stored_item(item))
-                                }
-                                WriteRequest::Delete(key_item) => {
-                                    let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
-                                    (pk, sk, wire::encode_tombstone())
-                                }
-                            };
-                            futs.push(async move {
-                                fast_marker_write(ctx, table, &pk, sk.as_ref(), value).await
-                            });
+                    // Auto-provision on first write (ADR 0023), as
+                    // `fast_marker_write`/`cp_batch_write` do, then group
+                    // by tablet against a fresh post-provision snapshot.
+                    if !ctx.effective_metadata().has_table_tablet(table) {
+                        ctx.provision_tablet(table)
+                            .await
+                            .map_err(|e| internal(&e))?;
+                    }
+                    let route_meta = ctx.effective_metadata();
+                    // One `(kind writes, marker records)` pair per tablet —
+                    // the per-tablet single-entry batches proposed below.
+                    type TabletBatch =
+                        (Vec<(u8, Vec<u8>, Option<Vec<u8>>)>, Vec<(Vec<u8>, Vec<u8>)>);
+                    let mut by_tablet: std::collections::BTreeMap<
+                        Option<animus_tablet::TabletId>,
+                        TabletBatch,
+                    > = std::collections::BTreeMap::new();
+                    for req in reqs {
+                        let (pk, sk, value) = match req {
+                            WriteRequest::Put(item) => {
+                                let (pk, sk) = resolve_key(ctx, meta, table, item)?;
+                                (pk, sk, wire::encode_stored_item(item))
+                            }
+                            WriteRequest::Delete(key_item) => {
+                                let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
+                                (pk, sk, wire::encode_tombstone())
+                            }
+                        };
+                        let base_key = item_key(&pk, sk.as_ref());
+                        let tablet = crate::topology::tablet_for_key(
+                            route_meta.tablets_for_table(table),
+                            &base_key,
+                        );
+                        let entry = by_tablet.entry(tablet).or_default();
+                        entry.1.push(marker_change_log(&pk, sk.as_ref()));
+                        entry
+                            .0
+                            .push((animus_cp_data::KIND_BASE, base_key, Some(value)));
+                    }
+                    for (tablet, (writes, markers)) in by_tablet {
+                        if tablet.is_none() {
+                            // An unroutable key (a racing split/provision
+                            // moved the map under this snapshot): surface
+                            // the house retryable error — the client's own
+                            // retry re-resolves against fresher metadata,
+                            // the same shape every routed write already has.
+                            return Err(internal(&format!(
+                                "no tablet for a batch key of table {table}; retry"
+                            )));
                         }
-                        for result in futures::future::join_all(futs).await {
-                            result?;
-                        }
+                        ctx.cp_kind_write_raw(table, writes, markers)
+                            .await
+                            .map_err(|e| internal(&e))?;
                     }
                     continue;
                 }
@@ -3010,7 +3051,7 @@ pub(crate) async fn kind_write_item_at_leader(
     ) {
         Some((writes, change_log)) => {
             let seatbelt = vec![(base_key, raw_old)];
-            ClientCtx::cp_kind_local(leader, writes, Some(change_log), seatbelt)
+            ClientCtx::cp_kind_local(leader, writes, vec![change_log], seatbelt)
                 .await
                 .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;
         }
@@ -3233,6 +3274,21 @@ async fn fast_marker_write(
             .map_err(|e| internal(&e))?;
     }
     let base_key = item_key(pk, sk);
+    ctx.cp_kind_write_raw(
+        table,
+        vec![(animus_cp_data::KIND_BASE, base_key, Some(value))],
+        vec![marker_change_log(pk, sk)],
+    )
+    .await
+    .map_err(|e| internal(&e))
+}
+
+/// The image-less **marker record** one mutation of a no-images table leaves
+/// (ADR 0049 §1), as the `(key prefix, encoded record)` pair `KindBatch`'s
+/// `change_log` carries — the key's HLC suffix is completed at apply. The one
+/// construction site for markers, shared by the single-item fast arm above
+/// and `BatchWriteItem`'s per-tablet batch arm.
+fn marker_change_log(pk: &AttributeValue, sk: Option<&AttributeValue>) -> (Vec<u8>, Vec<u8>) {
     let base_sk = storage_key(pk, sk)[storage_key(pk, None).len()..].to_vec();
     let record = ChangeRecord {
         base_sk,
@@ -3241,17 +3297,10 @@ async fn fast_marker_write(
         seeded: false,
         marker: true,
     };
-    let change_log = (
+    (
         token_prefixed(pk, &dynamo_index::change_prefix(pk)),
         record.encode(),
-    );
-    ctx.cp_kind_write_raw(
-        table,
-        vec![(animus_cp_data::KIND_BASE, base_key, Some(value))],
-        Some(change_log),
     )
-    .await
-    .map_err(|e| internal(&e))
 }
 
 /// Whether `table`'s change records carry the old/new item images — `true`
@@ -3703,6 +3752,59 @@ mod stream_write_path_tests {
     /// plain table pays *nothing* for the change log): a table with no
     /// stream and no index now emits exactly one **image-less marker
     /// record** per mutation — `marker: true`, `seeded: false`, no images,
+    /// The **entry-granularity contract** (ADR 0049 §1 "the marker rides
+    /// the same entry — no extra fsync", restored by the Train A rung-1
+    /// fixup): a marker-table `BatchWriteItem` commits **one `KindBatch`
+    /// Raft entry per tablet**, never one per item. Proven without touching
+    /// Raft internals: every change record in one entry is completed with
+    /// that entry's own apply timestamp, so on a single-tablet table all N
+    /// markers of one batch must share exactly ONE distinct HLC suffix —
+    /// the per-item shape this replaces produced N distinct ones (one
+    /// entry each), which is how the `backfill_seeder` populate-then-
+    /// backfill regression got in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_write_on_a_marker_table_commits_one_entry_per_tablet() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = single_node(dir.path()).await;
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"mb",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+        let group = await_group(&node, "mb").await;
+
+        let puts: Vec<String> = (0..40)
+            .map(|i| format!(r#"{{"PutRequest":{{"Item":{{"id":{{"S":"k{i:03}"}}}}}}}}"#))
+            .collect();
+        let body_json = format!(r#"{{"RequestItems":{{"mb":[{}]}}}}"#, puts.join(","));
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.BatchWriteItem",
+            &body_json,
+        )
+        .await;
+        assert_eq!(status, 200, "BatchWriteItem failed: {body}");
+
+        let records = group.pending_changes().await;
+        assert_eq!(records.len(), 40, "exactly one marker per batched item");
+        let distinct_hlcs: std::collections::BTreeSet<u64> = records
+            .iter()
+            .map(|(key, _)| u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            distinct_hlcs.len(),
+            1,
+            "one tablet's whole batch must ride ONE Raft entry (one shared \
+             apply HLC) — {} distinct HLCs means {} entries, the per-item \
+             regression shape",
+            distinct_hlcs.len(),
+            distinct_hlcs.len()
+        );
+    }
+
     /// its key's HLC suffix completed at apply (nonzero, strictly
     /// increasing in commit order) — and still never an LSI or footprint
     /// row.

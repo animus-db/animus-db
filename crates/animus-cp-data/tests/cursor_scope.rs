@@ -109,7 +109,7 @@ fn kind_cursor_writes_land_in_their_own_scope_and_dont_alias_a_sibling_scope() {
                     ),
                     (KIND_BASE, shared_key.clone(), Some(b"unrelated".to_vec())),
                 ],
-                None,
+                Vec::new(),
             ),
             ProposeResult::Accepted { .. }
         ),
@@ -160,7 +160,7 @@ fn snapshot_catchup_carries_cursor_rows() {
                 cursor_row_key.clone(),
                 Some(encode_watermark(watermark))
             )],
-            None,
+            Vec::new(),
         ),
         ProposeResult::Accepted { .. }
     ));
@@ -223,7 +223,7 @@ fn split_narrow_keeps_the_left_childs_cursor_row_visible_and_a_fresh_right_child
                 cursor_key(&[], "gsi"),
                 Some(encode_watermark(watermark))
             )],
-            None,
+            Vec::new(),
         ),
         ProposeResult::Accepted { .. }
     ));
@@ -307,7 +307,7 @@ fn widened_scope_exposes_a_co_hosted_row_and_min_over_rows_picks_the_lower_water
                 cursor_key(&[], "copier"),
                 Some(encode_watermark(left_watermark))
             )],
-            None,
+            Vec::new(),
         ),
         ProposeResult::Accepted { .. }
     ));
@@ -318,7 +318,7 @@ fn widened_scope_exposes_a_co_hosted_row_and_min_over_rows_picks_the_lower_water
                 cursor_key(b"m", "copier"),
                 Some(encode_watermark(right_watermark))
             )],
-            None,
+            Vec::new(),
         ),
         ProposeResult::Accepted { .. }
     ));

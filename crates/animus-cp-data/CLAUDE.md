@@ -301,6 +301,14 @@ State once here; cross-referenced from the sections below.
   between that evaluator's own-key read and its own propose call. Tests:
   `tests/kind_batch_conditions.rs`, mirroring `tests/txn_conditions.rs`
   scenario-for-scenario.
+- **`KindBatch.change_log` is a `Vec<(prefix, record)>` (codec v17, ADR
+  0049 Train A rung-1 fixup)** — one entry can carry a whole marker-table
+  batch's records (one per item, all completed at the entry's own apply
+  `ts`; per-item prefixes keep keys distinct). `TxnWrite.change_log` stays
+  an `Option` (a transactional write stages at most its own record). The
+  entry-granularity contract this preserves: a batch to one tablet is ONE
+  Raft entry — never one per item, which is ~N× the WAL/apply work and
+  regressed `animusd`'s populate-then-backfill path when briefly shipped.
 - **`materialize_derived` — the ONE shared "materialize derived writes at
   this ts" helper (ADR 0046 binding decision, `TxnStage` kind-writes stack
   PR1)**: both `KvCommand::KindBatch`'s apply arm and `KvCommand::

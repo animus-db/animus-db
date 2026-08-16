@@ -517,6 +517,7 @@ async fn drain_tablet(
         }
     }
 
+    let marker_only_pass = by_partition.is_empty();
     for fp_key in by_partition {
         reconcile_partition(ctx, meta, table, group, gsis, &fp_key).await?;
     }
@@ -529,6 +530,25 @@ async fn drain_tablet(
     // reconciliations have already landed, never one still in flight.
     if let Some(max_hlc) = max_hlc {
         let cursor_key = cursor::cursor_key(&group.scope_range().start, GSI_TAG);
+        // ADR 0049 fixup: a split's right child's own cursor key is
+        // **token-truncated below its own `range.start`** (the exact shape
+        // `advance_backfill_cursor`'s doc dissects), so the row this write
+        // would create routes to — and lands physically inside — the LEFT
+        // sibling's scope, where this tablet's own `cursor_min_watermark`
+        // can never read it back. On a **marker-only** pass (nothing
+        // reconciled — markers are covered-by-construction) that write is
+        // pure per-tick churn: it can never advance this tablet's own
+        // watermark, so the identical pass would repeat, and repeat its
+        // futile routed round trip, every tick forever. Skip it; the
+        // markers stay pending (bounded: only pre-split history can be in
+        // this state) and cost a scan, which the real fix — a
+        // child-scope-readable cursor key — would remove for the
+        // reconciling case too (a named, pre-existing follow-up: the same
+        // unreadable-row shape exists on main for a child's post-split
+        // reconciliations, where the write is still performed for parity).
+        if marker_only_pass && !group.scope_range().contains(&cursor_key) {
+            return Ok(());
+        }
         ctx.cp_kind_write_raw(
             table,
             vec![(
@@ -536,7 +556,7 @@ async fn drain_tablet(
                 cursor_key,
                 Some(cursor::encode_watermark(max_hlc)),
             )],
-            None,
+            Vec::new(),
         )
         .await?;
     }
@@ -705,7 +725,7 @@ async fn reconcile_partition(
             fp_key.to_vec(),
             (!desired.is_empty()).then(|| desired.encode()),
         )],
-        None,
+        Vec::new(),
     )
     .await
 }
@@ -864,7 +884,7 @@ async fn advance_backfill_cursor(
             cursor_key_bytes,
             Some(cursor::encode_backfill_cursor(prefix)),
         )],
-        None,
+        Vec::new(),
         Vec::new(),
         KeyRange::whole(),
     ) {
@@ -908,7 +928,7 @@ pub(crate) async fn clear_backfill_cursor(group: &CpGroup, index: &str) -> Resul
     let cursor_key_bytes = cursor::cursor_key(&group.scope_range().start, &tag);
     let propose_index = match group.put_kind_batch_fenced(
         vec![(KIND_CURSOR, cursor_key_bytes, None)],
-        None,
+        Vec::new(),
         Vec::new(),
         KeyRange::whole(),
     ) {
@@ -979,7 +999,7 @@ async fn seed_change_log_record(
     }
     let index = match group.put_kind_batch_fenced(
         Vec::new(),
-        Some((change_log_prefix, record)),
+        vec![(change_log_prefix, record)],
         Vec::new(),
         fence,
     ) {
@@ -1583,12 +1603,12 @@ async fn trim_janitor(
         }
         writes.push((KIND_CHANGE, key, None));
         if writes.len() >= TRIM_BATCH {
-            ctx.cp_kind_write_raw(table, std::mem::take(&mut writes), None)
+            ctx.cp_kind_write_raw(table, std::mem::take(&mut writes), Vec::new())
                 .await?;
         }
     }
     if !writes.is_empty() {
-        ctx.cp_kind_write_raw(table, writes, None).await?;
+        ctx.cp_kind_write_raw(table, writes, Vec::new()).await?;
     }
     Ok(())
 }

@@ -617,10 +617,10 @@ pub enum KvCommand {
     KindBatch {
         /// `(row kind, logical key, value)` — `None` writes a tombstone.
         writes: Vec<KindWrite>,
-        /// An optional **change-log record** to append in the same entry:
-        /// `(key prefix, encoded record)`.
+        /// **Change-log records** to append in the same entry, each a
+        /// `(key prefix, encoded record)` pair (empty = none).
         ///
-        /// Its key is completed at **apply** as `prefix || hlc::pack(ts)`, using
+        /// Each key is completed at **apply** as `prefix || hlc::pack(ts)`, using
         /// this entry's own commit timestamp, and it lands in the
         /// [`KIND_CHANGE`] scope. The proposer deliberately cannot supply that
         /// suffix: `ts` is minted inside `propose_ordered` and is the only
@@ -628,8 +628,18 @@ pub enum KvCommand {
         /// edge guess it would silently break the ordering the log exists to
         /// provide (ADR 0041 §4a — DynamoDB Streams reads these in commit
         /// order). Making it structural also means the record can never be
-        /// keyed inconsistently across replicas.
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        /// keyed inconsistently across replicas. **A `Vec`, not an `Option`,
+        /// since ADR 0049's Train A rung-1 fixup**: a marker-table
+        /// `BatchWriteItem` commits one entry per tablet carrying every
+        /// item's base row *and* every item's marker record — the
+        /// entry-granularity throughput contract the plain `Batch` path had
+        /// (one entry per tablet, one WAL record, one apply), which per-item
+        /// `KindBatch` proposals were measured to break (the
+        /// `backfill_seeder` populate-then-backfill regression). Records in
+        /// one entry share the entry's `ts`; their prefixes differ per item
+        /// (`token || escape(pk)`), so the completed keys stay distinct for
+        /// distinct items.
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
         ts: HlcTimestamp,
@@ -2058,7 +2068,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     pub fn put_kind_batch(
         &self,
         writes: Vec<KindWrite>,
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> ProposeResult {
         self.put_kind_batch_fenced(writes, change_log, Vec::new(), KeyRange::whole())
     }
@@ -2075,7 +2085,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     pub fn put_kind_batch_fenced(
         &self,
         writes: Vec<KindWrite>,
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
     ) -> ProposeResult {
@@ -4672,7 +4682,7 @@ fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimesta
 fn materialize_derived(
     kind_scopes: &[StorageScope; ALL_KINDS.len()],
     writes: &[KindWrite],
-    change_log: &Option<(Vec<u8>, Vec<u8>)>,
+    change_log: &[(Vec<u8>, Vec<u8>)],
     ts: HlcTimestamp,
     pending: &mut Vec<MergeOp>,
 ) {
@@ -4694,10 +4704,12 @@ fn materialize_derived(
             None => pending.push(MergeOp::tombstone(physical, hlc::pack(ts))),
         }
     }
-    // The change-log record's key is completed here, with THIS caller's
+    // Each change-log record's key is completed here, with THIS caller's
     // commit timestamp — the only one that agrees with this entry's
-    // position in the log (ADR 0041 §4a / ADR 0046 principle 1).
-    if let Some((prefix, record)) = change_log {
+    // position in the log (ADR 0041 §4a / ADR 0046 principle 1). Several
+    // records in one entry (a marker-table batch) share the ts; their
+    // per-item prefixes keep the completed keys distinct.
+    for (prefix, record) in change_log {
         let mut key = prefix.clone();
         key.extend_from_slice(&hlc::pack(ts).to_be_bytes());
         pending.push(MergeOp::put(
@@ -5947,7 +5959,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 materialize_derived(
                                     kind_scopes,
                                     &kind_writes,
-                                    &change_log,
+                                    // A `TxnWrite` carries at most one record
+                                    // (its own); the helper's slice shape
+                                    // exists for the marker-batch case.
+                                    change_log.as_slice(),
                                     ts,
                                     &mut pending,
                                 );

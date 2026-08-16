@@ -222,7 +222,7 @@ async fn client_port_refuses_intra_traffic_intra_port_serves_it() {
         ClientRequest::KindWrite {
             table: table.to_string(),
             writes: Vec::new(),
-            change_log: None,
+            change_log: Vec::new(),
         },
     )
     .await;

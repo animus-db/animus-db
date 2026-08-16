@@ -525,7 +525,7 @@ fn kind_batch_and_txn_resolve_materialize_byte_identical_rows_for_identical_payl
     let kb_lsi_key = logical(kb_pk, b"\x01lsi");
     match node.put_kind_batch(
         vec![(KIND_LSI, kb_lsi_key.clone(), Some(lsi_value.clone()))],
-        None,
+        Vec::new(),
     ) {
         animus_control::ProposeResult::Accepted { .. } => {}
         other => panic!("KindBatch rejected: {other:?} (seed={seed})"),
