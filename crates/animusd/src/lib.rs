@@ -5551,30 +5551,7 @@ impl ClientCtx {
             return Ok(());
         };
         match self.cp_route(table, &first).await {
-            CpRoute::Local(leader) => {
-                let fence = leader.scope_range();
-                for (_, key, _) in &writes {
-                    if !fence.contains(key) {
-                        return Err("kind write outside this group's live range; retry".into());
-                    }
-                }
-                let (probe_kind, probe_key, probe_value) = writes
-                    .last()
-                    .map(|(kind, key, value)| (*kind, key.clone(), value.clone()))
-                    .expect("writes is non-empty — checked via `first` above");
-                match leader.put_kind_batch_fenced(writes, change_log, Vec::new(), fence) {
-                    ProposeResult::Accepted { .. } => {}
-                    other => return Err(format!("kind write not accepted: {other:?}")),
-                }
-                let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-                while tokio::time::Instant::now() < deadline {
-                    if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
-                        return Ok(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err("index drain batch did not apply in time".into())
-            }
+            CpRoute::Local(leader) => Self::cp_kind_raw_local(&leader, writes, change_log).await,
             CpRoute::Forward(addr) => {
                 let request = ClientRequest::KindWrite {
                     table: table.to_owned(),
@@ -5588,6 +5565,49 @@ impl ClientCtx {
             }
             CpRoute::None => Err("no CP group leader reachable".into()),
         }
+    }
+
+    /// The **known-leader** local half of [`cp_kind_write_raw`](Self::
+    /// cp_kind_write_raw): fence pre-check, propose, then confirm on the
+    /// batch's **last** write — `Some(value)` for a put, `None` for a
+    /// tombstone (see `cp_kind_write_raw`'s doc for why the last write
+    /// proves the whole entry). The ONE confirm implementation for a raw
+    /// kind batch, shared by `cp_kind_write_raw`'s `Local` arm and
+    /// `cp_serve_forwarded`'s `KindWrite` arm — they diverged once
+    /// (the serve arm used [`cp_kind_local`](Self::cp_kind_local), whose
+    /// confirm *requires* a `Some`-valued base write), so a whole-partition
+    /// CQL DELETE — the first raw batch whose base write is a tombstone —
+    /// erred iff the connected node did not lead the tablet
+    /// (leader-placement-bimodal; caught by `cql_clustering`).
+    async fn cp_kind_raw_local(
+        leader: &CpGroup,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        let fence = leader.scope_range();
+        for (_, key, _) in &writes {
+            if !fence.contains(key) {
+                return Err("kind write outside this group's live range; retry".into());
+            }
+        }
+        let Some((probe_kind, probe_key, probe_value)) = writes
+            .last()
+            .map(|(kind, key, value)| (*kind, key.clone(), value.clone()))
+        else {
+            return Ok(()); // empty batch is a no-op
+        };
+        match leader.put_kind_batch_fenced(writes, change_log, Vec::new(), fence) {
+            ProposeResult::Accepted { .. } => {}
+            other => return Err(format!("kind write not accepted: {other:?}")),
+        }
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err("index drain batch did not apply in time".into())
     }
 
     /// Propose a `KindBatch` on a **known-leader** local handle and confirm it.
@@ -8083,7 +8103,12 @@ impl ClientCtx {
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
-                match Self::cp_kind_local(&leader, writes, change_log, Vec::new()).await {
+                // The identical confirm `cp_kind_write_raw`'s own Local arm
+                // runs — never a second implementation (`cp_kind_local`'s
+                // Some-base-write requirement wrongly refused a forwarded
+                // whole-partition CQL DELETE, whose base write is a
+                // tombstone; see `cp_kind_raw_local`'s doc).
+                match Self::cp_kind_raw_local(&leader, writes, change_log).await {
                     Ok(()) => ClientResponse::PutOk,
                     Err(e) => ClientResponse::Error(e),
                 }

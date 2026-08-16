@@ -784,7 +784,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                             &base_key,
                         );
                         let entry = by_tablet.entry(tablet).or_default();
-                        entry.1.push(marker_change_log(&pk, sk.as_ref()));
+                        entry.1.push(item_marker_change_log(&pk, sk.as_ref()));
                         entry
                             .0
                             .push((animus_cp_data::KIND_BASE, base_key, Some(value)));
@@ -3277,19 +3277,40 @@ async fn fast_marker_write(
     ctx.cp_kind_write_raw(
         table,
         vec![(animus_cp_data::KIND_BASE, base_key, Some(value))],
-        vec![marker_change_log(pk, sk)],
+        vec![item_marker_change_log(pk, sk)],
     )
     .await
     .map_err(|e| internal(&e))
 }
 
-/// The image-less **marker record** one mutation of a no-images table leaves
-/// (ADR 0049 §1), as the `(key prefix, encoded record)` pair `KindBatch`'s
-/// `change_log` carries — the key's HLC suffix is completed at apply. The one
-/// construction site for markers, shared by the single-item fast arm above
-/// and `BatchWriteItem`'s per-tablet batch arm.
-fn marker_change_log(pk: &AttributeValue, sk: Option<&AttributeValue>) -> (Vec<u8>, Vec<u8>) {
+/// The image-less **marker record** one mutation of a no-images Dynamo table
+/// leaves (ADR 0049 §1), as the `(key prefix, encoded record)` pair
+/// `KindBatch`'s `change_log` carries — the key's HLC suffix is completed at
+/// apply. A thin item-shaped wrapper over `marker_change_log` (the one shared
+/// constructor, below), used by the single-item fast arm above and
+/// `BatchWriteItem`'s per-tablet batch arm.
+fn item_marker_change_log(pk: &AttributeValue, sk: Option<&AttributeValue>) -> (Vec<u8>, Vec<u8>) {
     let base_sk = storage_key(pk, sk)[storage_key(pk, None).len()..].to_vec();
+    marker_change_log(
+        &token_prefixed(pk, &dynamo_index::change_prefix(pk)),
+        base_sk,
+    )
+}
+
+/// The one construction site for an ADR 0049 §1 image-less **marker**
+/// record's `(change_key_prefix, encoded_record)` pair, shared by every edge
+/// that commits one (this file's fast arm above; the CQL edge's partition
+/// writes, `cql::kind_partition_write`). `partition_prefix` is the change
+/// key's apply-completed prefix — the base row's own partition-scoped key
+/// bytes, token first, so the record lands in the same tablet as the base
+/// row and sorts per-partition (Dynamo: `token(escape(pk)) || escape(pk)`;
+/// CQL: `token(pk_bytes) || pk_bytes`, its `data_key` shape — the two edges'
+/// escaping conventions differ, which is exactly why the prefix is an
+/// argument rather than derived here); apply appends `hlc::pack(ts)` (ADR
+/// 0041 §4a). `base_sk` is the Dynamo sort-key suffix a consumer rebuilds an
+/// item key from — empty for CQL, whose partition is one value with no sort
+/// dimension.
+pub(crate) fn marker_change_log(partition_prefix: &[u8], base_sk: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
     let record = ChangeRecord {
         base_sk,
         old_image: None,
@@ -3297,10 +3318,7 @@ fn marker_change_log(pk: &AttributeValue, sk: Option<&AttributeValue>) -> (Vec<u
         seeded: false,
         marker: true,
     };
-    (
-        token_prefixed(pk, &dynamo_index::change_prefix(pk)),
-        record.encode(),
-    )
+    (partition_prefix.to_vec(), record.encode())
 }
 
 /// Whether `table`'s change records carry the old/new item images — `true`

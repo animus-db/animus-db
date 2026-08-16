@@ -725,8 +725,12 @@ route below the edge through the same `ClientCtx` CP primitives.
   plain table's conditioned `PutItem`/`DeleteItem` and `UpdateItem` now
   route through this same leader funnel (constant-true gate, below), so
   their conditions/RMW evaluate at the leader too; only CQL's own RMW
-  (`cql.rs`) keeps the node-local-`rmw_lock`-only scope until Train A's
-  CQL rung. An **unevaluated** plain-table write (no condition, no
+  (`cql.rs`) keeps the node-local-`rmw_lock`-only scope — deliberately,
+  including after Train A's CQL rung, which moved CQL's *commit* onto the
+  kind path but not its RMW's evaluation point (a CQL partition write has
+  no derived state, so there is no U3 funnel to route it through; the
+  cross-node RMW race stays a documented pre-existing gap of its own).
+  An **unevaluated** plain-table write (no condition, no
   old-image echo) takes the ADR 0049 **fast arm** instead
   (`dynamo::fast_marker_write`): the edge builds base row + marker record
   and proposes routed, no leader read, no `rmw_lock` — see that function's
@@ -789,11 +793,12 @@ route below the edge through the same `ClientCtx` CP primitives.
   code kept until Train A's deletion rung. Two consequences worth knowing:
   ADR 0046 §2's "a plain table's condition only has node-local `rmw_lock`
   protection" gap is **closed for the Dynamo edge** (every write now
-  evaluates at the tablet leader; CQL's own RMW keeps the gap until Train
-  A's CQL rung), and a plain table's markers are currently **never
-  trimmed** — `change_consumer_loop` still skips tables with no
-  GSI/stream, deliberately; extending trim to every table is Train A's own
-  trim rung (see the loop's ADR 0049 interim note). **A
+  evaluates at the tablet leader; CQL's own RMW keeps the gap — see the
+  routing section's note on why the CQL rung deliberately did not move it),
+  and a plain or CQL table's markers are currently **never trimmed** —
+  `change_consumer_loop` still skips tables with no GSI/stream,
+  deliberately; extending trim to every table is Train A's own trim rung
+  (see the loop's ADR 0049 interim note). **A
   streamed-but-unindexed table**: `indexes` is empty, so the LSI loop is
   simply a no-op, and the entry commits exactly base row + change record —
   this same change record *is* the hot shard the sealer reads directly, no
@@ -869,8 +874,15 @@ route below the edge through the same `ClientCtx` CP primitives.
   `QUERY`/`PREPARE`/`EXECUTE` via the pure `animus_cql` crate. `CREATE TABLE`
   proposes a typed schema into the replicated catalog (incl. clustering/
   compound keys). A partition is one CP value, so `INSERT`/`UPDATE`/`DELETE`
-  are RMW under `rmw_lock`; the requested consistency level is accepted but
-  moot (CP). Keyspaces are **replicated** (`CREATE KEYSPACE` proposes
+  are RMW under `rmw_lock`; **the commit itself rides the universal
+  kind-write path (ADR 0049 Train A rung 2)** — `cql::kind_partition_write`
+  commits one `KindBatch` entry per mutation (the partition's base row or
+  whole-partition tombstone + an image-less marker record built by the
+  shared `dynamo::marker_change_log`, change-key prefix = the partition's
+  own `data_key` bytes, `base_sk` empty), so every CQL mutation is
+  observable on the tablet's change log; in-crate regression
+  `cql::cql_kind_write_tests` (real-socket, needs `pending_changes`). The
+  requested consistency level is accepted but moot (CP). Keyspaces are **replicated** (`CREATE KEYSPACE` proposes
   `MetaCommand::CreateKeyspace`; `USE`/qualifier validation reads the
   replicated set via `keyspace_exists`, with a `ks.table`-prefix fallback).
   Only the **prepared-statement store** (`CqlState`) is per-node edge state
