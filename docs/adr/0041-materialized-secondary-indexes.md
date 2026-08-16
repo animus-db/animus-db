@@ -151,27 +151,33 @@ strongly consistent, with no intent, no drain, and no 2PC.
 >   **per-item atomicity only**, matching `BatchWriteItem`'s own pre-existing
 >   non-atomic contract — one request's outcome was never allowed to depend
 >   on another's, before or after this fix.
-> - **`TransactWriteItems` is rejected up front** (`ValidationException`,
->   *"transactional writes on an indexed table are not yet supported (ADR
->   0041: TxnStage kind-write extension pending)"*) whenever any `Put`/
->   `Delete`/`Update` action targets a table with at least one secondary
->   index — a bare `ConditionCheck` doesn't count, so a transaction may still
->   write freely to unindexed tables alongside a `ConditionCheck` on an
->   indexed one. This is a **deliberate, not a stopgap, choice**: `cp_txn`'s
->   `KvCommand::TxnStage` only ever stages the base row, with no multi-kind-
->   write extension (the equivalent of `KindBatch` for a transaction's own
->   apply). Staging just the base row would commit the item while silently
->   never writing its LSI rows or change-log record — the table's indexes go
->   **permanently stale** with no error, no warning, and no drain input ever
->   produced for that write. In a pre-alpha, correctness-first system, a loud
->   rejection of an unsupported combination is strictly better than a silent,
->   permanent wrong answer. The genuine fix — extending `TxnStage` so a
->   transaction's own apply can stage a multi-kind atomic write, the
->   transactional analogue of `cp_kind_write` — is a real `animus-cp-data`
->   protocol change and is intentionally deferred as a named follow-up, not
->   folded into this correctness fix.
+> - **`TransactWriteItems` now participates too (2026-08-16, ADR 0046 A1/U3,
+>   the `TxnStage` kind-writes stack)** — the wholesale rejection this bullet
+>   used to document is gone. `TxnStage`'s `writes` element gained an
+>   optional derived `kind_writes`/`change_log` payload, staged **inside**
+>   the write's own intent envelope (never as a separately-staged kind-scope
+>   intent — see ADR 0046 Decision 2 for why that shape was rejected) and
+>   materialized by `TxnResolve`'s commit branch, at the resolve's own
+>   locally-minted ts, via the SAME shared `materialize_derived` helper
+>   `KindBatch`'s own apply arm uses. A write action's own kind payload is
+>   evaluated **at the item's own tablet leader**, at stage time
+>   (`dynamo::eval_kind_txn_write`, mirroring `kind_write_item_at_leader`'s
+>   identical U3 shape) — never precomputed by the coordinator from a
+>   possibly-stale read, closing the same cross-node race U3 closes for the
+>   non-transactional write path. See `docs/adr/0018-cross-tablet-
+>   transactions.md`'s 2026-08-16 amendment for the full account (the
+>   mechanism, the mandatory own-key OCC seatbelt, the awaited-bounded-
+>   resolve amendment, and two incidental bugs found and fixed while
+>   building it), and `docs/adr/0046-tablet-log-model.md` for the model-level
+>   "why materialize-at-resolve, why evaluate-at-leader" reasoning this
+>   feature is an instance of.
 >
-> Regression coverage: `animusd/tests/dynamo_index_writes.rs`.
+> Regression coverage: `animusd/tests/dynamo_index_writes.rs` (now positive
+> coverage — a cross-tablet transaction across a real split maintains both
+> its LSI rows and its GSI change records; an aborted transaction leaves
+> neither), `animus-cp-data/tests/txn_kind_writes.rs`, and
+> `crates/animus-test/tests/txn_serializable.rs`'s corpus (a
+> `kind_consistency` invariant at `ANIMUS_TXN_SEEDS` depth).
 
 ### 3. Row kinds are separate storage scopes, not a discriminator in the key
 

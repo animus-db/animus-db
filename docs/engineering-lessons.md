@@ -5639,6 +5639,82 @@ debugging anything that feels like it might have happened before.
   precision trade-offs — document the change on the metric itself, not just
   in the code that produces it).
 
+- **A staged intent in a scope whose only reader skips intents is a
+  silent-loss mechanism, not a visibility delay.** The obvious-looking fix
+  for `TransactWriteItems` on an indexed/streamed table was "stage the LSI
+  row / change-log record as an intent in its own kind scope, resolved
+  later, the same way a base row is staged today" (recorded as the planned
+  design in ADR 0041 §2/ADR 0042 §16 before this was built). It looks like
+  ordinary eventual consistency — "the row appears a little later, once
+  resolved" — but it isn't: every consumer of a kind scope (the GSI drain,
+  the Streams sealer, the backfill seeder) scans **forward from a
+  watermark** and is *defined* to skip an intent outright (only a
+  base-scope reader ever resolves one — `RaftKvNode::local_get_kind`'s own
+  doc states the invariant it relies on: "these scopes only ever hold
+  committed values"). A record staged at `ts=10` and resolved at `ts=40`,
+  after a consumer's watermark has already passed 10, is gone forever —
+  not late, not stale, **never delivered, with no error**. The fix
+  (`docs/adr/0046-tablet-log-model.md`'s Decision 2/materialize-at-resolve,
+  ADR 0018 §2's 2026-08-16 amendment) rides the derived payload inside the
+  *base* write's own intent instead, materializing it at resolve in the
+  same atomic apply that finalizes the base value — kind scopes never
+  gain an intent-resolution step at all. **General form**: before staging
+  anything as an intent in a scope, check whether that scope's readers are
+  built to resolve one; a scope whose entire contract is "no intents here"
+  cannot safely grow one just because the writer's *other* scope (the base
+  row) already tolerates staging.
+
+- **A test corpus's own workload mix can reproduce the exact bug class an
+  invariant is built to catch, from the harness alone, with the mechanism
+  under test fully correct.** Adding a `kind_consistency` check to
+  `animus-test/tests/txn_serializable.rs` (every committed transaction's
+  derived `KIND_LSI` row must equal its own base row) failed immediately,
+  consistently, for 3 of 9 keys — looking exactly like "a committed
+  transaction's kind write silently lost." The actual cause: the corpus's
+  write-only and read-modify-write transaction shapes both append to the
+  *same* client-owned keyspace, and only the write-only shape's own writes
+  had been given a kind payload — an RMW-authored append correctly updated
+  the base row but (by design, at the time) carried no kind payload at
+  all, leaving the derived row one commit stale. Diagnosed by reading the
+  raw stored envelope (tag byte + version) directly off both the base and
+  kind physical keys — confirming *both* were durably `Committed` (not one
+  merely inferred at read time from a still-`Pending` intent, which was
+  the first, wrong hypothesis) but at different versions, proving two
+  independently-committed writes rather than one delayed resolve. **General
+  form**: when extending an existing multi-shape workload harness with a
+  new payload on only one shape, audit every *other* shape that can touch
+  the same keys — a corpus's own test-design gap reproduces as a false
+  positive that looks identical to the real bug the invariant exists to
+  catch, and the fastest way to tell them apart is a raw storage-layer read
+  that distinguishes "durably committed, wrong content" from "still
+  pending, inferred at read time." (2026-08-16, `TxnStage` kind-writes
+  stack PR3.)
+
+- **Holding a node-local lock across a call that can recurse back into the
+  same lock, on the same node, is a self-deadlock waiting for the one
+  deployment shape that makes the recursion local.** `dynamo.rs::
+  run_transact` held `ctx.data().rmw_lock` across its entire span,
+  including the `cp_txn` call at the end — safe for as long as `cp_txn`
+  never itself tried to take `rmw_lock`. Adding kind-write-path evaluation
+  (`eval_kind_txn_write`, inside `ClientCtx::txn_stage_local`) gave it
+  exactly that: a *second* acquisition of the same lock, reached the
+  instant a write targets a table whose tablet leader is hosted
+  **on this same node** — true for every combined-role/single-node
+  deployment, i.e. most local dev and every single-node test. A
+  `tokio::sync::Mutex` is not reentrant, so this is not a rare race; it is
+  a guaranteed hang the first time the code path is exercised on the
+  deployment shape that makes it local. Found immediately by a real
+  `ProdEnv` integration test hanging (not a `SimEnv` corpus, which cannot
+  express real-thread self-deadlock at all — see this doc's own "a flaky
+  `ProdEnv` test is a real bug" entry). **General form**: before adding a
+  new call inside a function that already holds a lock across its own
+  return path, check whether the new call's *own* call graph can reach the
+  identical lock — "it never has before" is not evidence it never will
+  once the new code path funnels a same-node case through it; scope the
+  guard to the exact span that needed it, not the whole function, unless
+  every downstream call is provably lock-free. (2026-08-16, `TxnStage`
+  kind-writes stack PR2.)
+
 ### Parallel-agent orchestration
 - **A stacked series' final "docs/ADR finalization" PR must treat the stack's
   own shipped PR bodies (`gh pr view`) as the authoritative source for

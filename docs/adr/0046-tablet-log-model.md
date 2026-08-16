@@ -236,3 +236,49 @@ Context §(b) is not closed by this ADR — Decision 1 (U3, evaluate-at-leader)
 is the fix, and it ships as its own change, not folded into this document.
 This ADR's job is to record *why* U3 rather than U1 or U2, so that change can
 be reviewed against a stated model instead of a bare diff.
+
+## As-built amendment (2026-08-16) — the `TxnStage` kind-writes delivery
+
+Both items this ADR left as forward references have now shipped.
+
+**Decision 2's replacement, materialize-at-resolve, is principle 1's own
+transactional extension.** Principle 1 states "one log entry, one atomic
+materialization" for `KindBatch`; the shipped mechanism is the identical
+claim for a transaction's own commit point. A transactional write's derived
+kind-scope rows and change-log record ride inside the base write's own
+intent envelope (opaque, never written to a kind scope directly — kind
+scopes still only ever hold committed values, unchanged), and
+`KvCommand::TxnResolve`'s commit branch materializes them in the same
+atomic apply that finalizes the base value, at that entry's own commit
+timestamp. The only thing that differs from `KindBatch`'s own case is
+*which* log entry does the materializing — `KindBatch` materializes at the
+entry that proposed the write; a transaction defers materialization to the
+entry that resolves it, since only that entry's position is guaranteed
+monotone across every consumer's own watermark (this document's own §(a)
+argument, restated: a consumer offset must never be assigned from a moment
+earlier than the entry that actually fixes it in commit order). Full
+mechanism, forks, and incidental bugs: `docs/adr/0018-cross-tablet-
+transactions.md`'s 2026-08-16 amendment.
+
+**The shared-helper rule (Consequences, "One shared materialization
+function") is enforced exactly as written, not merely aspired to.**
+`materialize_derived` is the one function both `KindBatch`'s apply arm and
+`TxnResolve`'s commit branch call — `KvCommand::KindBatch`'s own arm was
+refactored to call it too, rather than gaining a sibling copy, in the same
+change that added `TxnResolve`'s call. `animus-cp-data/tests/
+txn_kind_writes.rs::kind_batch_and_txn_resolve_materialize_byte_identical_
+rows_for_identical_payloads` is the regression: an identical `(kind, key,
+value)` payload staged through each of the two paths produces byte-
+identical stored rows. This is also the concrete instance of principle 5
+(replay/snapshot-stability) the shared-helper rule protects: two
+independently-maintained copies are exactly the kind of drift that would
+let one code path's apply-time effect diverge from the other's after either
+was touched alone, even though both replay the identical logical operation.
+
+Decision 1 (U3) itself: the cross-node LSI orphan-row race this ADR left
+open is closed by `animusd::dynamo::kind_write_item_at_leader`
+(non-transactional path) and `eval_kind_txn_write`/`ClientCtx::
+txn_stage_local` (transactional path, the same U3 shape applied to a
+write staged inside a 2PC) — both funnel every write of one item through
+one node's own `rmw_lock`, regardless of which edge node received the
+request.

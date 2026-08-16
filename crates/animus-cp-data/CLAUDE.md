@@ -126,6 +126,14 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   owns it, since tables' rings are independent). `TxnRecord::intent_spans:
   Vec<(String, KeyRange)>` names every key any participant ever staged,
   table name attached. See the Key invariants section for the full design.
+  **`TxnWrite` (ADR 0046 A1, `TxnStage` kind-writes stack, codec version
+  16)**: `KvCommand::TxnStage.writes`' element, a named struct (`key`,
+  `value`, plus an optional derived `kind_writes`/`change_log` payload for
+  a write against an indexed/streamed table) — carried inside the write's
+  own `Envelope::Intent`, opaque until `TxnResolve`'s commit branch
+  materializes it. See the Key invariants section's `materialize_derived`
+  entry and `docs/adr/0018-cross-tablet-transactions.md`'s 2026-08-16
+  amendment for the full mechanism.
 
 ### lib.rs API
 
@@ -286,13 +294,27 @@ State once here; cross-referenced from the sections below.
   in-fence so `StageOutcome` can report the fence/seal reason ahead of a
   condition one, but with no outcome channel to prioritize for `KindBatch`
   there is no reason to gate the read behind the fence check. The two gates
-  still simply AND together either way. As of this field's introduction it
-  has **no production caller** — it lands ahead of its first real use
-  (`animusd`'s leader-side evaluate-then-propose write path, ADR 0046 U3):
-  the seatbelt against a concurrent `TxnStage`/`TxnResolve` commit landing
+  still simply AND together either way. Production caller:
+  `dynamo::kind_write_item_at_leader`'s leader-side evaluate-then-propose
+  write path (ADR 0046 U3) passes `seatbelt: vec![(base_key, raw_old)]` —
+  the guard against a concurrent `TxnStage`/`TxnResolve` commit landing
   between that evaluator's own-key read and its own propose call. Tests:
   `tests/kind_batch_conditions.rs`, mirroring `tests/txn_conditions.rs`
   scenario-for-scenario.
+- **`materialize_derived` — the ONE shared "materialize derived writes at
+  this ts" helper (ADR 0046 binding decision, `TxnStage` kind-writes stack
+  PR1)**: both `KvCommand::KindBatch`'s apply arm and `KvCommand::
+  TxnResolve`'s commit branch call this and only this — never two
+  independently-maintained copies (principle 5 of ADR 0046, replay/
+  snapshot-stability: two copies would start identical and diverge the
+  first time either is touched alone). Queues every `(kind, key, value)`
+  write at `hlc::pack(ts)` and, if present, completes the change-log key as
+  `prefix || hlc::pack(ts)` — `ts` is always the caller's OWN entry's
+  commit timestamp (`KindBatch`'s own entry for that arm; the *resolve*
+  entry's own ts for `TxnResolve`'s, never the transaction's `commit_ts`
+  and never the stage's own ts — ADR 0018 §2 B1). Regression:
+  `tests/txn_kind_writes.rs::kind_batch_and_txn_resolve_materialize_byte_
+  identical_rows_for_identical_payloads`.
 - **The value envelope + transactions (`txn.rs`).** Every value the apply
   path merges into the engine is 1-byte-tagged: `0` = committed (raw value
   follows), `1` = an intent naming the staging `TxnId`, its record's

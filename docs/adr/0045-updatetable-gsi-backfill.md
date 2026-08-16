@@ -507,12 +507,15 @@ warn against:
   change a correctness property. Worth revisiting only if a workload with
   very frequent splits during a very large backfill makes the redundant
   work measurable.
-- **`TxnStage` kind-writes** (unchanged from ADR 0041 §2's original
-  deferral, restated by ADR 0042 §16): lifting `TransactWriteItems`'s
-  rejection on an indexed *or* streamed table needs a multi-kind atomic
-  write extension to the transaction machinery's own apply path. Orthogonal
-  to this ADR — a backfilling index inherits the exact same rejection as an
-  already-`Active` one, no new interaction.
+- ~~`TxnStage` kind-writes~~ **Shipped (2026-08-16, ADR 0046 A1/U3)** —
+  `TransactWriteItems` on an indexed or streamed table no longer rejects;
+  see `docs/adr/0018-cross-tablet-transactions.md`'s 2026-08-16 amendment.
+  Orthogonal to this ADR, confirmed at the time: a backfilling (`Creating`)
+  index takes the identical kind-write-path as an already-`Active` one — a
+  transactional write against a table with a `Creating` GSI stages and
+  resolves the same LSI/change-log payload either way, and the backfill
+  seeder's own synthetic change records (§2/§3) are unaffected (they never
+  go through `TxnStage` at all).
 
 ## Consequences
 

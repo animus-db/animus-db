@@ -135,7 +135,7 @@
 //! rows once per concurrently-backfilling index, expected to be rare and
 //! short-lived.
 //!
-//! **Split-during-backfill (ADR 0044 split-only world, ADR 0045 §3 Fork A)**:
+//! **Split-during-backfill (ADR 0044 split-only world, ADR 0045 §5 Fork A)**:
 //! deliberately **no** split-lineage cursor inheritance. A split's
 //! `narrow_scope` moves every kind scope (cursor rows included) together, so
 //! the *left* child keeps `range.start` and its cursor is found unchanged;

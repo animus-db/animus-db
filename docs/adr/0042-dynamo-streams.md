@@ -461,10 +461,19 @@ amendment about a split racing an in-flight transaction's own token.
 
 ### 16. Named follow-ups (not part of the committed design)
 
-- **`TxnStage` kind-writes**: lifts the rejection of `TransactWriteItems` on
-  an indexed *or streamed* table, once the transaction machinery gains a
-  multi-kind atomic write extension (unchanged from ADR 0041 §2's original
-  deferral).
+- ~~`TxnStage` kind-writes~~ **Shipped (2026-08-16, ADR 0046 A1/U3)**:
+  `TransactWriteItems` on a streamed table (indexed or not) now participates
+  like any other write — a transactional write's change record materializes
+  atomically with its base row at resolve, via the same shared
+  `materialize_derived` helper `KindBatch`'s own apply arm uses. See
+  `docs/adr/0018-cross-tablet-transactions.md`'s 2026-08-16 amendment for
+  the mechanism and `docs/adr/0046-tablet-log-model.md` for the model-level
+  rationale. Regression: `animusd/tests/dynamo_streams.rs` (a
+  transactionally-written table's `GetRecords` delivers the transaction's
+  events correctly, and an aborted transaction leaves none) and
+  `crates/animus-test/tests/stream_lineage_corpus.rs`'s
+  `transactional_writes_exactly_once_and_ordered` cell (exactly-once,
+  per-item order, across a lineage under a leader-kill fault injection).
 - **CQL CDC**: a change-data-capture surface for the CQL adapter over the
   same underlying log/segment machinery.
 - **Follower-served `GetRecords`**: relaxing §7's leader-only restriction for

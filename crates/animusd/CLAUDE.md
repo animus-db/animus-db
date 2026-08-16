@@ -98,14 +98,15 @@ reason (see each file's own entry below).
   produced. Proposes `MetaCommand::MarkIndexBackfilled` once a tick's sweep
   reaches the tablet's *current* range end, re-derived (and re-proposed)
   every tick rather than as a one-shot side effect. Deliberately **no**
-  split-lineage cursor inheritance (ADR 0045 §3 Fork A): a post-split
+  split-lineage cursor inheritance (ADR 0045 §5 Fork A): a post-split
   right child simply restarts its own narrower sweep from scratch,
   unconditionally correct by the drain's own idempotence. See the module's
   own doc for the full per-arm design (including a documented, deliberate
   low-fidelity interaction with a table streamed while backfilling) and
-  `tests/backfill_seeder.rs` for the end-to-end suite (materialization +
-  `Active` flip, live writes racing the sweep, two indexes backfilling
-  independently, and a crash/restart mid-backfill); see also
+  `tests/backfill_seeder.rs` for the end-to-end suite — five scenarios:
+  materialization + `Active` flip, live writes racing the sweep, two
+  indexes backfilling independently, a crash/restart mid-backfill, and a
+  split during backfill converging to the correct final GSI; see also
   `docs/streams-notes.md`. The module's own 95-line `//!` doc predates the
   seeder section — read the doc comment in the source, not this summary,
   for the authoritative design. **The hot-trim arm's merge-residue
@@ -287,9 +288,45 @@ validates every write's key length up front and returns a client-facing
 error instead of ever reaching that assert. See `docs/engineering-
 lessons.md` for the general lesson.
 
+**A write against an indexed/streamed table participates too (2026-08-16,
+ADR 0046 A1/U3, `TxnStage` kind-writes stack)** — `dynamo.rs::run_transact`
+no longer rejects it. `TxnTableWrite` carries either an already-known
+`value` (a plain table's write) or a `pending: PendingKindWrite` (a
+kind-write-path table's write: the item identity + op + condition, no
+coordinator-computed diff). `ClientCtx::txn_stage_local` — the ONE place a
+stage actually executes on the leader's own node, shared by `txn_prepare`'s
+own local branch and `cp_serve_forwarded`'s `TxnPrepare` arm — evaluates
+every `pending_kind_writes` entry there (`dynamo::eval_kind_txn_write`,
+mirroring `kind_write_item_at_leader`'s own U3 shape) under the identical
+`ctx.data().rmw_lock`, merging the result into `writes` immediately before
+staging; a mandatory own-key OCC condition rides alongside (Fork C1). For a
+transaction touching any kind-write-path table, `cp_txn`'s post-commit
+resolve is **awaited under a short bounded budget**
+(`TXN_RESOLVE_ALL_AWAIT_BUDGET`) and parallelized across participants
+(`resolve_all_parallel`) instead of the plain transaction's unchanged
+fire-and-forget spawn (Fork D1) — LSI rows and the GSI/stream change
+record only exist from resolve onward (materialize-at-resolve, ADR 0046
+A1), so an unconditional async-ack window would leave a committed write
+transiently absent from its own index/stream. **Two bugs found and fixed
+delivering this** (see `docs/adr/0018-cross-tablet-transactions.md`'s
+2026-08-16 amendment for the full incidents): a genuine self-deadlock
+(`run_transact` used to hold `rmw_lock` across its own `cp_txn` call,
+which now recurses into the same node-local lock the instant a write
+targets a locally-led kind-write-path table); and parallelizing
+`resolve_all` *universally* (not just for the new bounded-await path)
+destabilized a pre-existing timing-sensitive regression
+(`dynamo_txn.rs`'s torn-pair test) — fixed by keeping `resolve_all`
+sequential and adding `resolve_all_parallel` as a scoped sibling.
+
 Tests: `tests/cp_txn.rs` (real 3-process cluster). The 2PC mechanics
 themselves are proven deterministically at the primitive level in
-`animus-cp-data`'s `tests/txn_multi.rs`/`tests/txn_recovery.rs`.
+`animus-cp-data`'s `tests/txn_multi.rs`/`tests/txn_recovery.rs`, and (ADR
+0046) `tests/txn_kind_writes.rs`. The kind-write-path extension's own wire-
+level coverage is `tests/dynamo_index_writes.rs`/`tests/dynamo_streams.rs`
+(replacing the wholesale-rejection tests they used to carry) and
+`crates/animus-test/tests/txn_serializable.rs`'s corpus (a
+`kind_consistency` invariant) / `tests/stream_lineage_corpus.rs`'s
+`transactional_writes_exactly_once_and_ordered` cell.
 
 ## Control-plane access
 
@@ -530,8 +567,8 @@ route below the edge through the same `ClientCtx` CP primitives.
   funnels through the same function on the same node. A `KindBatch.
   conditions` OCC seatbelt (PR1, `animus-cp-data`) closes the one residual
   the lock alone can't: a `txn_resolver_loop` recovery push never takes
-  `rmw_lock` (unreachable today — transactions are rejected outright on an
-  indexed/streamed table — but real the moment that restriction lifts).
+  `rmw_lock` — real now that `TransactWriteItems` participates on these
+  tables too (see below).
   **Named gap, unchanged by this fix**: a plain (unindexed, unstreamed)
   table's `PutItem`/`DeleteItem` `ConditionExpression`, `UpdateItem`'s base
   value on such a table, and CQL's own RMW (`cql.rs`) all still only have
@@ -539,17 +576,19 @@ route below the edge through the same `ClientCtx` CP primitives.
   a bare `cp_write` to evaluate at. `BatchWriteItem` routes each `Put`/
   `Delete` through the identical per-item mechanism for an **indexed**
   table, atomic per-item only, and keeps the fast `cp_batch_write` path for
-  an **unindexed, unstreamed** one. **`TransactWriteItems` is the one op
-  that can't participate**: a write action against an indexed table makes
-  `run_transact` reject the **whole transaction** with a
-  `ValidationException` — `cp_txn`'s `KvCommand::TxnStage` has no
-  multi-kind-write extension yet, so staging just the base row would
-  silently never produce the LSI rows/change-log record. The real fix (a
-  `cp_txn` analogue of this write path) is a named `animus-cp-data`
-  protocol follow-up in ADR 0041, not yet built. **ADR 0042 extends this same rejection to a streamed table**
-  (`run_transact`'s per-action loop now checks `meta.table_stream`
-  alongside `meta.table_indexes`), for the identical reason: `TxnStage`
-  would silently never produce a streamed table's change-log record.
+  an **unindexed, unstreamed** one. **`TransactWriteItems` now participates
+  too (2026-08-16, ADR 0046 A1/U3, `TxnStage` kind-writes stack)** — the
+  wholesale per-table rejection this paragraph used to document (a write
+  action against an indexed *or* streamed table cancelling the whole
+  transaction, since `TxnStage` could only ever stage the base row) is
+  gone. `TxnStage`'s own `writes` element now carries an optional derived
+  `kind_writes`/`change_log` payload alongside its base `key`/`value`,
+  evaluated **at the item's own tablet leader at stage time**
+  (`dynamo::eval_kind_txn_write`, the identical U3 shape as this
+  paragraph's own non-transactional write path) and materialized by
+  `TxnResolve`'s commit branch — see the "Multi-participant transactions"
+  section below and `docs/adr/0018-cross-tablet-transactions.md`'s
+  2026-08-16 amendment for the full mechanism.
 
   **DynamoDB Streams (ADR 0042/0043).** `TableSchema.stream:
   Option<StreamSpec>` rides the same `CreateTable`/`UpdateTable` surface as

@@ -2323,3 +2323,177 @@ reintroducing the abandoned witnessing design. Existing acceptance test
 unchanged: `animusd/tests/dynamo_txn.rs::transact_get_items_never_
 observes_a_torn_pair_under_concurrent_writes` — the real wire-level check
 this whole three-PR stack exists to make pass reliably.
+
+## Amendment (2026-08-16, `TxnStage` kind-writes — lifts the indexed/streamed rejection)
+
+The PR7 amendment above (§1) recorded, as a known-and-documented gap, that
+a write action against an indexed or streamed table made the whole
+transaction reject outright: `KvCommand::TxnStage` only ever staged the
+base row, so committing an LSI/GSI/stream-bearing write inside a
+transaction would have left that table's derived state permanently stale
+with no signal. `docs/adr/0046-tablet-log-model.md` named the underlying
+shape (a tablet's log deterministically materializes everything colocated
+with it) and settled the mechanism question this amendment implements;
+read that ADR first — this amendment states only the transaction-specific
+consequences.
+
+### 1. A1 — materialize-at-resolve, not intent-staging
+
+The obvious-looking fix — stage LSI rows and the change-log record as
+intents in their own kind scopes, the same way a base row is staged today
+— is **rejected** (ADR 0046 Decision 2), for two reasons that generalize
+past this specific feature:
+
+- Every consumer of a kind scope (the GSI drain, the Streams sealer, the
+  backfill seeder) scans **forward from an HLC watermark** and is defined
+  to **skip an intent outright** — only a base-scope reader ever resolves
+  one. A change record staged as an intent at `ts=10` and resolved at
+  `ts=40`, after a consumer's watermark has already passed 10, is silently
+  skipped forever: a permanently lost GSI update or stream event, with no
+  error.
+- It breaks the invariant every non-base reader relies on: a kind scope
+  only ever holds committed values (`RaftKvNode::local_get_kind`'s own
+  doc). Staging one there would require giving every one of those readers
+  a resolution path they were never built to need.
+
+The adopted mechanism instead: `TxnWrite` (the `TxnStage.writes` element,
+now a named struct, not a bare tuple) carries an optional derived
+`kind_writes`/`change_log` payload alongside its own `key`/`value`. The
+payload rides **inside the base write's own intent envelope**, opaque
+until `KvCommand::TxnResolve`'s commit branch materializes it — via a
+single shared `materialize_derived` helper `KvCommand::KindBatch`'s own
+apply arm also calls, never a second copy (ADR 0046's binding decision) —
+at the resolve entry's own locally-minted `ts`. Abort discards the payload
+entirely: nothing is ever written to a kind scope for an aborted
+transaction. Kind scopes keep holding only committed values, unchanged for
+every existing reader.
+
+Apply-time validation requires every `kind_writes` key to lead with its
+own write's base key's own partition token (ADR 0022) — a validated
+rejection folded into the same structural `Fenced`/whole-or-nothing gate a
+fence/seal miss already uses, never an `assert!` (this payload is
+wire-reachable via `ClientRequest::TxnPrepare`). `TxnResolve`'s own
+whole-or-nothing fence check is extended to cover every `kind_writes` key
+it is about to materialize, not just the base keys in `keys` — the #213
+lesson ("every key-writing command must carry and enforce the apply-time
+fence") applies directly, since these are new key-writing surface.
+
+### 2. B1 — the change record's key position, and an amendment's own scope cut
+
+The change record's **key position** comes from the resolve entry's own
+locally-minted `ts` (monotone in this tablet's own log, so no consumer can
+ever skip it) — **never** the transaction's true `commit_ts` (minted on
+the anchor's, possibly different, group; stamping a foreign clock's
+version into this group's own keyspace is exactly the acked-write-loss
+mechanism the PR3-of-the-torn-pair-stack amendment above closed).
+
+The plan carrying this amendment also proposed an **informational**
+`commit_ts` field inside the change record itself, purely so
+`ApproximateCreationDateTime` reports the transaction's real commit
+instant rather than the (usually very close, but not identical) resolve
+instant. **This sub-piece is not implemented, and is a deliberate scope
+cut, not an oversight**: `eval_kind_txn_write` (the U3 evaluator, §4
+below) builds the change record's bytes at **stage** time, strictly before
+the anchor's `commit_ts` exists — there is no correctness-preserving place
+left to patch the real value in afterward without either (a) making
+`materialize_derived` stop treating change-log bytes as opaque (violating
+ADR 0043's own layering rule and the "one shared helper" binding decision
+in the same stroke), or (b) growing a second, `commit_ts`-aware
+materialization path that would immediately start drifting from the first
+the moment either is touched alone. The **load-bearing** half of B1 — key
+position is resolve-derived, never commit-derived — is implemented and
+tested (`animus-cp-data/tests/txn_kind_writes.rs`,
+`animusd/tests/dynamo_streams.rs`); the informational-timestamp
+refinement is left as a named follow-up if real operational need for
+sub-second `ApproximateCreationDateTime` precision on transactional writes
+ever materializes.
+
+### 3. C1 — the mandatory own-key condition
+
+Every kind-payload-bearing write gets a mandatory own-key OCC condition
+(`TxnStage.conditions`, which already existed for exactly this shape) —
+`(key, raw_old)`, the exact bytes the U3 evaluator's own read observed.
+This is deliberately **redundant with, not a substitute for**, holding
+`ctx.data().rmw_lock` across the evaluate-then-stage span (§4): the lock
+already closes the race for every write reachable through it; the
+condition is the belt-and-suspenders seatbelt for the one thing the lock
+can't cover — a `txn_resolver_loop` recovery push resolving a *different*
+transaction's intent on the same key, which never takes `rmw_lock`. ADR
+0046 predicted exactly this framing ("if U3 is later chosen the condition
+becomes a redundant-but-harmless seatbelt") before this amendment shipped.
+
+### 4. Fork U decided as U3 — evaluate at the participant's own leader
+
+A write action's kind payload is evaluated **at the tablet's own current
+leader**, at stage time — never precomputed by the coordinator from a
+possibly-stale read, and never derived at apply time (ADR 0046 Decision
+1 rejects both U1-as-standing-design and U2). `dynamo::
+eval_kind_txn_write` mirrors `kind_write_item_at_leader`'s existing
+non-transactional U3 shape exactly: read the old image, evaluate the
+caller's `ConditionExpression`, compute the new value, defer to
+`kind_writes_for_item` for the LSI/change-log diff — all under the same
+`ctx.data().rmw_lock` the ordinary write path already serializes on,
+closing the identical cross-node race for the transactional path that
+lock closes for the plain one.
+
+### 5. D1 — awaited, bounded, parallel resolve for kind-write-path transactions
+
+`cp_txn`'s pre-existing "ack, then asynchronously resolve" shape (§6 of
+the PR5 amendment above) is unaffected for a plain transaction. For a
+transaction touching at least one kind-write-path table, the ack instead
+awaits `resolve_all` under a short fixed budget
+(`TXN_RESOLVE_ALL_AWAIT_BUDGET`, 2s) before returning — a timeout still
+acks (delayed, never denied; `txn_resolver_loop` remains the safety net
+for whatever the bound didn't cover) — because the LSI row and the
+GSI/stream change record only exist from resolve onward (materialize-at-
+resolve, A1); an unconditional async-ack window would leave a committed
+write readable on the base table but transiently absent from its own
+index/stream. The awaited path also parallelizes across participants
+(`resolve_all_parallel`, `futures::future::join_all`), so the fixed budget
+buys one round trip's worth of latency regardless of participant count,
+not `O(participants)`.
+
+**A regression found and reverted while building this**: parallelizing
+`resolve_all` **universally** (replacing the plain-transaction fire-and-
+forget spawn's own sequential loop too) measurably destabilized
+`animusd/tests/dynamo_txn.rs::transact_get_items_never_observes_a_torn_
+pair_under_concurrent_writes` under sustained concurrent load — a
+pre-existing, already timing-sensitive regression test. The fix keeps two
+siblings: `resolve_all` stays sequential (the plain-transaction path,
+proven stable), `resolve_all_parallel` is new and used only by the
+awaited-bounded kind-write-path branch, which is the only branch D1
+actually needs it for.
+
+### 6. A genuine self-deadlock found and fixed, unrelated to the mechanism above
+
+`dynamo.rs::run_transact` used to hold `ctx.data().rmw_lock` across its
+entire span, including the `cp_txn` call at the end. Once a kind-write-path
+action's evaluation (`eval_kind_txn_write`, inside `ClientCtx::
+txn_stage_local`) also takes this same node-local lock — reachable
+in-process the instant a write targets a locally-led kind-write-path
+table, i.e. on every combined-role/single-node deployment — the outer hold
+became a real, immediate self-deadlock on a non-reentrant
+`tokio::sync::Mutex`. Fixed by scoping the guard to end **before** the
+`cp_txn` call (it only ever needed to cover the pre-read/evaluate span for
+plain-table condition checks, never the transaction's own staging).
+
+### 7. Tests
+
+New: `animus-cp-data/tests/txn_kind_writes.rs` (commit/abort/double-
+resolve/crash-recovery/split-fence/byte-identical-helper scenarios, plus a
+sabotage-then-restore teeth-proof on the extended fence coverage) and one
+kind-bearing participant added to `tests/txn_multi.rs`. Replaced (not
+merely extended): `animusd/tests/dynamo_index_writes.rs`'s and
+`tests/dynamo_streams.rs`'s wholesale-rejection tests, now positive
+coverage (cross-tablet LSI+GSI transaction across a real split, abort
+leaves no index row/stream event). `crates/animus-test/tests/
+txn_serializable.rs`'s corpus gained a `kind_consistency` check (every
+committed transaction's `KIND_LSI`-mirrored row converges to exactly the
+same value as its own base row, on both compared replicas) and `tests/
+stream_lineage_corpus.rs` gained a transactional-write cell under a
+leader-kill fault injection — see `docs/engineering-lessons.md` for the
+test-harness lesson the corpus extension's own development surfaced (a
+RMW-shaped write sharing a write-only cell's own keyspace needs the
+identical kind payload, or the corpus's own workload mix — not the
+mechanism — produces exactly the "silently stale derived row" symptom the
+check exists to catch).

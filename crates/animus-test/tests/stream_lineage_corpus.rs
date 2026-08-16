@@ -59,12 +59,13 @@ use std::time::Duration;
 use animus_control::{
     ApplyOutcome, ColumnType, MetaCommand, Metadata, StreamSpec, StreamViewType, TableSchema,
 };
-use animus_cp_data::{KIND_BASE, RaftKvNode, StorageScope, segment};
-use animus_env::{Env, Nanos, Rng, SegmentStore, nid};
+use animus_cp_data::{KIND_BASE, RaftKvNode, StorageScope, TxnOutcome, TxnWrite, segment};
+use animus_env::{Env, EnvExt, Nanos, Rng, SegmentStore, nid};
 use animus_sim::{SimEnv, SimSegmentStore, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TabletId};
 use futures::executor::block_on;
+use std::sync::{Arc, Mutex};
 
 type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
 
@@ -210,6 +211,105 @@ fn write_and_journal(
     let leader = elect(sim, group, live, seed);
     let index = propose_write(group, leader, item_key, payload);
     confirm(sim, group, leader, index, seed);
+    journal
+        .entry(item_key.to_vec())
+        .or_default()
+        .push(payload.to_vec());
+}
+
+/// Runs `fut` to completion by spawning it on `env` and driving `sim` in
+/// small steps until it resolves or `attempts` steps elapse — the same
+/// spawn-and-poll idiom `animus-cp-data/tests/txn_multi.rs`'s/
+/// `txn_serializable.rs`'s own `drive` helpers use for exactly the same
+/// reason: `RaftKvNode`'s async txn methods poll internally via
+/// `env.sleep`, so a bare `block_on` would hang forever with nothing
+/// advancing the simulator concurrently.
+fn drive<T: Send + 'static>(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
+    let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+    let s = Arc::clone(&slot);
+    env.clone().spawn_task(async move {
+        let v = fut.await;
+        *s.lock().unwrap() = Some(v);
+    });
+    for _ in 0..500 {
+        if slot.lock().unwrap().is_some() {
+            break;
+        }
+        sim.run_for(Duration::from_millis(20));
+    }
+    slot.lock()
+        .unwrap()
+        .take()
+        .expect("drive: future never completed")
+}
+
+/// As [`write_and_journal`], but through the full cross-tablet 2PC path
+/// (`txn_stage_anchor` -> `txn_commit_at_least` -> `txn_resolve`, ADR 0018
+/// §2) instead of a direct `KindBatch` — ADR 0046 A1/U3, `TxnStage`
+/// kind-writes stack PR3 corpus extension: a transactional write's change
+/// record must reach the shard lineage exactly once and in order, exactly
+/// like a plain `KindBatch` write's (`materialize_derived` is the ONE
+/// shared helper both paths use — see `animus-cp-data/tests/
+/// txn_kind_writes.rs`'s own byte-identical-helper proof at the primitive
+/// level; this proves it end to end through a sealed/open shard lineage
+/// walk too). Single-tablet, single-participant (this corpus's tablet
+/// groups are independent of `txn_serializable.rs`'s own multi-tablet
+/// coordinator) — `item_key` is both the base write and (via `change_log`)
+/// the journaled record, mirroring `propose_write`'s identical convention.
+fn write_txn_and_journal(
+    sim: &mut Simulator,
+    group: &Group,
+    live: &[usize],
+    journal: &mut BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    item_key: &[u8],
+    payload: &[u8],
+    seed: u64,
+) {
+    let leader = elect(sim, group, live, seed);
+    let node = group.nodes[leader].clone();
+    let env = node.env().clone();
+    let write = TxnWrite {
+        key: item_key.to_vec(),
+        value: Some(payload.to_vec()),
+        kind_writes: Vec::new(),
+        change_log: Some((item_key.to_vec(), payload.to_vec())),
+    };
+    let n = node.clone();
+    let (txn_id, record_key, outcome) = drive(sim, &env, async move {
+        n.txn_stage_anchor(TABLE, vec![write], Vec::new(), Vec::new())
+            .await
+    })
+    .unwrap_or_else(|| panic!("txn stage failed (seed={seed})"));
+    assert_eq!(
+        outcome,
+        animus_cp_data::StageOutcome::Staged,
+        "[seed={seed}] txn stage did not land"
+    );
+
+    let n = node.clone();
+    let (txn_id_c, record_key_c) = (txn_id.clone(), record_key.clone());
+    let commit_ts = drive(sim, &env, async move {
+        n.txn_commit_at_least(txn_id_c, record_key_c, txn_id.ts)
+            .await
+    })
+    .unwrap_or_else(|| panic!("txn commit failed (seed={seed})"));
+
+    let n = node.clone();
+    let item_key_owned = item_key.to_vec();
+    drive(sim, &env, async move {
+        n.txn_resolve(
+            txn_id,
+            record_key,
+            vec![item_key_owned],
+            TxnOutcome::Committed { commit_ts },
+        )
+        .await
+    });
+
     journal
         .entry(item_key.to_vec())
         .or_default()
@@ -490,6 +590,15 @@ fn create_tablet(meta: &mut Metadata, id: TabletId, range: KeyRange) {
 
 fn key(i: usize) -> Vec<u8> {
     format!("k{i:04}").into_bytes()
+}
+
+/// An 8-byte-minimum key for the transactional write path only —
+/// `RaftKvNode::txn_stage_anchor`'s own anchor-key assert requires a full
+/// ADR 0022 partition token (`key`'s own 5-byte `"k0000"` shape is too
+/// short); every other cell here never goes through `TxnStage` at all, so
+/// `key`'s shorter form stays untouched.
+fn txn_key(i: usize) -> Vec<u8> {
+    format!("txnkey{i:04}").into_bytes()
 }
 
 // --- cell 1: quiet_table_rollover ---------------------------------------
@@ -1940,5 +2049,76 @@ fn dueling_seals_orphan_hot_range() {
     for_each_seed(
         "dueling_seals_orphan_hot_range",
         scenario_dueling_seals_orphan_hot_range,
+    );
+}
+
+// --- cell 12: transactional_writes_exactly_once_and_ordered -------------
+// ADR 0046 A1/U3 (`TxnStage` kind-writes stack, PR3 corpus extension): a
+// transactionally-committed write's change record must survive the exact
+// same exactly-once/per-item-order/lineage-continuity guarantees as a
+// plain `KindBatch` write's — proven under a leader-kill fault injection
+// (mirroring `kill_sealing_leader`'s shape) so the claim holds across a
+// leadership change mid-stream, not just in the quiet case.
+
+fn scenario_transactional_writes_exactly_once_and_ordered(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    let group = start_group(&sim, &engines, TabletId(30), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    // Batch 1: transactional writes, quiet.
+    for i in 0..5 {
+        write_txn_and_journal(
+            &mut sim,
+            &group,
+            &live,
+            &mut journal,
+            &txn_key(i),
+            b"v0",
+            seed,
+        );
+    }
+
+    // Kill whichever replica currently leads mid-stream (before any seal)
+    // and elect among the survivors — the identical fault `kill_sealing_
+    // leader` injects, but for the transactional write path instead of
+    // `write_and_journal`'s direct `KindBatch`.
+    let dying = elect(&mut sim, &group, &live, seed);
+    sim.crash(nid(NODES[dying]));
+    live.retain(|&i| i != dying);
+    let new_leader = elect(&mut sim, &group, &live, seed);
+
+    // Batch 2: more transactional writes, through the post-election leader.
+    for i in 5..10 {
+        write_txn_and_journal(
+            &mut sim,
+            &group,
+            &live,
+            &mut journal,
+            &txn_key(i),
+            b"v1",
+            seed,
+        );
+    }
+    let sealed = seal_now(&mut meta, &store, &group, new_leader, 1_000, false);
+    assert_eq!(
+        sealed,
+        Some(0),
+        "[seed={seed}] the post-election leader must still seal correctly from committed \
+         transactional writes"
+    );
+
+    verify_lineage(&meta, &store, &[(&group, new_leader)], &journal, seed);
+}
+
+#[test]
+fn transactional_writes_exactly_once_and_ordered() {
+    for_each_seed(
+        "transactional_writes_exactly_once_and_ordered",
+        scenario_transactional_writes_exactly_once_and_ordered,
     );
 }
