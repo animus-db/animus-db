@@ -9910,17 +9910,13 @@ impl ClientCtx {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
                     let meta = self.effective_metadata();
-                    return Ok(index_drain::hot_read(
-                        &meta,
-                        tablet,
-                        &leader,
-                        from_position,
-                        limit,
-                    )
-                    .await
-                    .into_iter()
-                    .map(|(key, _, value)| (key, value))
-                    .collect());
+                    return Ok(
+                        index_drain::hot_read(&meta, tablet, &leader, from_position, limit)
+                            .await
+                            .into_iter()
+                            .map(|(key, _, value)| (key, value))
+                            .collect(),
+                    );
                 }
                 Some(CpRoute::Forward(addr)) => {
                     let request = ClientRequest::Forwarded {

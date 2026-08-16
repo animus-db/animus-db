@@ -734,7 +734,10 @@ mod orphan_reap_tests {
             seal_wall_ms: 0, // irrelevant here: the sealed-epoch sub-case below never checks age
         };
         let bytes = segment::encode(&header, &[]);
-        store.put_sealed(&stale_id, &bytes).await.expect("put stale attempt");
+        store
+            .put_sealed(&stale_id, &bytes)
+            .await
+            .expect("put stale attempt");
 
         let outcome = meta.apply(&MetaCommand::SealStreamShard {
             table: table.to_owned(),
@@ -761,7 +764,10 @@ mod orphan_reap_tests {
         // The retry, correctly declaring the now-narrowed range, lands at
         // a fresh object id — the winner.
         let winner_id = format!("{prefix}/winner-attempt");
-        store.put_sealed(&winner_id, &bytes).await.expect("put winner");
+        store
+            .put_sealed(&winner_id, &bytes)
+            .await
+            .expect("put winner");
         assert_eq!(
             meta.apply(&MetaCommand::SealStreamShard {
                 table: table.to_owned(),

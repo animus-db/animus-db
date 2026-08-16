@@ -4036,7 +4036,14 @@ mod tests {
     /// `whole()` — inert either way, since an absent tablet makes the CAS
     /// permissive regardless of what was stamped (see the apply arm's own
     /// doc).
-    fn seal(m: &Metadata, table: &str, label: &str, tablet: u64, epoch: u64, end: u64) -> MetaCommand {
+    fn seal(
+        m: &Metadata,
+        table: &str,
+        label: &str,
+        tablet: u64,
+        epoch: u64,
+        end: u64,
+    ) -> MetaCommand {
         let expected_range = m
             .tablets
             .get(&TabletId(tablet))
