@@ -599,6 +599,92 @@ beside their existing `ConsistentRead`-against-a-GSI check. Regression:
 concurrent write racing it, client-side validation, and a non-leader-node
 relay convergence check).
 
+## Quiescence (ADR 0044 phase 1 / ADR 0048)
+
+Data-plane-only (the control plane never quiesces, fork G); the mechanism
+itself (`RaftCore`'s state machine, `RaftKvNode::wake`/`enable_quiescence`/
+`is_quiesced`/`set_quiesce_veto`) lives in `animus-cp-data` — see that
+crate's `CLAUDE.md`. This crate's own contribution:
+
+- **Wake-on-demand**: `resolve_cp_route` calls `wake()` on a local handle
+  before deciding anything — cheap, unconditional, a no-op on every state
+  except a locally-woken quiesced follower's "are you still there?" check.
+  `host::Reconciler::tick`'s own proactive wake (fork H, on a `Down`
+  replica) lives in `animus-cp-data`.
+- **The `hot_read` scope-transition latch** (narrows the ADR 0043
+  residual): `hot_read_scope_ok` (`lib.rs`) refuses retryably
+  (`"...; retry"`) whenever a group's **live** `scope_range()` is wider than
+  the tablet's range per a **freshly fetched** `metadata_fresh()` — never
+  `effective_metadata()`/`metadata_cached()`, the cache-lag
+  `in_declared_range`'s own pre-existing filter (`index_drain.rs`) could
+  not close on its own. Both `hot_read` call sites (`ClientRequest::
+  StreamHotRead`'s handler, `ClientCtx::read_stream_hot_records`) gate on
+  it before ever calling `index_drain::hot_read`. **Does not fully close
+  the residual**: on a `ControlHandle::Local` node (the common case),
+  `metadata_fresh()` is itself the ADR 0038 published cache a local,
+  asynchronous control apply task maintains — in the sub-window between a
+  `SplitTablet` committing and that apply task catching this node's cache
+  up to it, the declared range and the live scope are stale *together*, so
+  this check passes and the fabrication class can still surface (the same
+  layer-2 structure the #220 write-side investigation found). See ADR 0048
+  for the full accounting, why this — a live cross-check, not a
+  periodically-refreshed flag — is nonetheless the sound design where a
+  literal "reconciler-maintained latch" would not have been, and why full
+  closure (a per-read control-leader round trip) was rejected as
+  disproportionate.
+- **Quiesce veto**: `change_consumer_loop` (`index_drain.rs`) computes
+  `!group.pending_changes().await.is_empty()` once per led tablet per tick
+  and calls `CpGroup::set_quiesce_veto` with it — held while the change log
+  is non-empty, released the instant a sweep finds it empty.
+- **Sweeper skip** (the fleet-scale CPU win — PR5's veto alone only stops
+  pointless Raft timer/heartbeat/apply-poll activity, not these loops' own
+  per-tablet LSM scans): `change_consumer_loop`, `txn_resolver_loop`, and
+  `auto_split_loop` all skip a led tablet outright once `CpGroup::
+  is_quiesced()` is true, rather than merely finding nothing to do. Sound
+  by construction: the first two follow directly from the veto invariant
+  above; `auto_split_loop`'s skip is sound because a quiesced group's
+  bytes/key-count are provably static (no activity for `quiesce_after`
+  means no write since it last quiesced) — whatever its last
+  pre-quiescence tick already checked still holds. The skip is a strict,
+  reversible short-circuit: any write un-quiesces the group via the
+  pre-existing propose-wake plumbing, so the very next tick resumes normal
+  sweeping.
+- **Observability**: `Metric::CpQuiesces`/`CpUnquiesces` (counters,
+  incremented by `animus-cp-data`'s own consensus loop on every genuine
+  transition) and `Metric::CpGroupsQuiesced` (a level, sampled once per
+  `metrics_sample_loop` tick across `ctx.edge.hosted_groups()` — the
+  identical "counter slot re-purposed as a last-write-wins level"
+  convention `StreamHotBytes`/`StreamSegmentsLive` already use).
+  `CpRaftView.quiesced` (`/admin/raftkv`) and the Console Tablets view's
+  neutral "quiesced" pill (`dashboard_tablets.js`, reusing the `.forming`
+  style — informational, never a health/data-risk signal, ADR 0021 §7's
+  own rule) surface it. **Fork F**: reading it never wakes anything —
+  `CpGroup::is_quiesced()`/`RaftKvNode::is_quiesced()` are pure frozen
+  accessors, so an open dashboard tab cannot un-quiesce a fleet.
+- **Production wiring**: `--quiesce-after SECS` (`main.rs`) threads through
+  `--config`/`--node` (`run_node_with_streams_and_quiesce_after` →
+  `BoundNode::start_with_growth`) and `--cluster N`
+  (`start_cluster_with_growth_and_quiesce_after`) — **defaults ON at 5s**
+  (`main::DEFAULT_QUIESCE_AFTER_SECS`; `0` disables). See that constant's
+  own doc and ADR 0048's Consequences section for the evidence behind this
+  default and what was *not* separately validated (a large fleet under
+  sustained mixed load with real inter-process latency) — a
+  maintainer-reviewable call, not a settled fact. Not yet wired for the
+  `--cluster-control`/`--cluster-data` split-deployment dev path or the
+  standalone `control`/`data`/`join` subcommands (documented gaps in
+  `main.rs`'s own module doc).
+
+Tests: `index_drain.rs`'s own `stream_sealer_tests` module (in-crate, needs
+private `CpGroup` access) covers the veto end to end
+(`hot_backlog_holds_the_quiesce_veto_until_the_hot_tail_trims`) and the
+sweeper-skip regression
+(`a_rewoken_tablet_is_picked_back_up_by_every_sweeper_within_one_interval`);
+`lib.rs`'s own `hot_read_latch_tests` module covers the latch's
+retryable-refusal shape; `tests/cp_quiescence.rs` is the critical
+`ProdEnv` leader-kill liveness regression
+(`write_after_leader_kill_of_a_quiesced_group_converges`) — the one
+property `SimEnv` structurally cannot prove.
+
 ## Wire edges
 
 All edges are production-only I/O (real tokio sockets, hand-rolled framing) and

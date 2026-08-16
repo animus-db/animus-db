@@ -169,7 +169,13 @@ truth; this map is just for navigation.
   **bytes** (ADR 0034, `animusd`); **tablets are split-only** — merge has
   been removed entirely (ADR 0044, supersedes ADR 0033); dropped tables'
   data is reclaimed by a convergent **GC** (ADR 0024). Tablet ids are never
-  reused.
+  reused. An idle CP-data group **quiesces** (ADR 0048, phase 1 of ADR
+  0044's cheap-groups roadmap): no local activity for `--quiesce-after`
+  (default on, 5s) stops its Raft timers/heartbeats/apply-poll entirely
+  until a write, a peer message, or the reconciler's proactive wake (a
+  replica marked `Down`) touches it again — data-plane only (the control
+  group never quiesces), remains leader while quiesced, and admin/
+  dashboard reads never wake a group (`quiesced` is a pure diagnostic).
 - **Placement, rebalancing & growth** — `animus-placement` (ADR 0005): pure
   policy engine (RF + residency labels + failure-domain spread), `replan`
   (failure repair) + `rebalance_step` (ADR 0029: one balance-driven move per

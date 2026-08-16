@@ -6494,7 +6494,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         // has actually caught the engine up to `last_applied` — in the same
         // lock acquisition as `next_deadline`, once per loop iteration, before
         // `tick` can ever consult it (`quiesce_entry_ok`'s own doc).
-        let deadline = {
+        let (deadline, was_quiesced) = {
             let mut c = core.lock().expect("raftkv core poisoned");
             let caught_up = engine_applied.load(Ordering::SeqCst) == c.last_applied();
             c.set_quiesce_engine_caught_up(caught_up);
@@ -6510,7 +6510,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                 !t.pending.is_empty() || !t.unresolved_decided.is_empty()
             };
             c.set_quiesce_veto(txn_veto || external_quiesce_veto.load(Ordering::SeqCst));
-            c.next_deadline()
+            (c.next_deadline(), c.is_quiesced())
         };
         // `None` (ADR 0044 phase-1 PR3 quiescence) drops the timer arm
         // entirely rather than sleeping on a synthetic wait, so a genuinely
@@ -6638,12 +6638,23 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             }
         };
 
-        let (after_commit, install_pending) = {
+        let (after_commit, install_pending, is_quiesced_now) = {
             let c = core.lock().expect("raftkv core poisoned");
-            (c.commit_index(), c.has_pending_install())
+            (c.commit_index(), c.has_pending_install(), c.is_quiesced())
         };
         if after_commit > before_commit {
             metrics.incr_by(Metric::CpCommits, after_commit - before_commit);
+        }
+        // ADR 0044 phase-1 PR7: count every genuine quiesced/ticking
+        // transition this loop iteration observed — `was_quiesced` was
+        // sampled at the very top of this same iteration (before the
+        // message/timer/wake select and the core step that could have
+        // entered or exited quiescence), so exactly one of these fires per
+        // transition, never both and never a repeat while the state holds.
+        match (was_quiesced, is_quiesced_now) {
+            (false, true) => metrics.incr(Metric::CpQuiesces),
+            (true, false) => metrics.incr(Metric::CpUnquiesces),
+            _ => {}
         }
         // Wake-on-commit (ADR 0044 phase-1 PR1): a commit-index advance covers both
         // a follower's in-line apply on `AppendEntries` (gated on `commit_index`

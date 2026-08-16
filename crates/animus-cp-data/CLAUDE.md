@@ -616,6 +616,49 @@ resolve is now moot).
 - Distinct WAL file (`raftkv.wal`) from the control plane's `raft.wal`, so a
   node can host both planes. The name is exported (`animus_cp_data::WAL`) so
   the drop-table GC (ADR 0024) can delete a stopped group's WAL.
+- **Quiescence (ADR 0044 phase 1 / ADR 0048), data-plane groups only.** An
+  idle group opted in via `RaftKvNode::enable_quiescence(after)` stops
+  ticking entirely once its leader has had no local activity for `after`
+  and every other clause of `RaftCore::quiesce_entry_ok` holds (nothing left
+  to replicate, every voter caught up, no transfer/config-change/snapshot in
+  flight, the async apply task caught up, no veto held) — `next_deadline()`
+  returns `None`, so both drivers drop the timer arm from their `select`
+  and a quiesced group posts zero `SimEnv` timeline events. The leader
+  **stays** leader (fork A: every background sweeper gates on `is_leader()`).
+  `RaftKvNode::wake()` (idempotent, safe on every state) is the one
+  external hook every wake path funnels through: `animusd`'s
+  `resolve_cp_route` calls it before routing, and the tablet-host
+  reconciler (`host::Reconciler::tick`) calls it on any hosted group whose
+  replica set intersects `MetadataView::down` (fork H — closes the
+  TiKV-hibernate-regions hazard: without this, a quiesced follower whose
+  leader died while both were dormant has no timer at all and nothing else
+  will ever wake it). A locally-woken **follower** sends `RaftMsg::
+  WakeRequest` to its recorded leader and re-arms a fresh election timeout,
+  campaigning only if unanswered (fork B) — never a bare stale-timeout
+  campaign, which would depose a healthy quiesced leader on every cold
+  tablet's first touch.
+  - **Vetoes (fork D)**: `RaftKvNode::set_quiesce_veto(bool)` lets an
+    external subsystem (`animusd`'s `change_consumer_loop`, for a led
+    tablet whose change log was non-empty on its last sweep) hold the group
+    awake; ORed, once per consensus-loop iteration, with this crate's own
+    in-memory check that `TxnTracker` (`pending`/`unresolved_decided`) is
+    empty — a group with a live 2PC intent or an undelivered resolve can
+    never quiesce out from under `txn_resolver_loop`. Both together make
+    "quiesced ⇒ nothing new for the sweeper" a sound invariant for
+    `animusd`'s own sweeper-skip (below).
+  - `RaftKvNode::is_quiesced()` is a pure frozen-accessor read — never
+    itself a wake (fork F: an admin/dashboard poll must not un-quiesce a
+    fleet). `host::Reconciler::enable_quiescence(after)` is the production
+    hook that opts every group this reconciler hosts *from now on* into
+    quiescence (`animusd`'s `--quiesce-after` CLI flag calls it once at
+    node start).
+  - See `tests/quiescence.rs` (the end-to-end `SimEnv` corpus, depth knob
+    `ANIMUS_QUIESCE_SEEDS`) and `tests/reconciler_corpus.rs`'s
+    `quiesced_group_wakes_when_a_replica_goes_down`/`quiesce_races_a_split_
+    seal_handoff` scenarios for the regressions; ADR 0048 for the full
+    design (including why the control plane's own `RaftNode` never calls
+    the equivalent, fork G) and the phase-2 handoff constraints this
+    mechanism was built to satisfy.
 - **`shutdown()` is a graceful driver halt, not a kill** (ADR 0024): it latches
   a flag the driver observes at the top of its loop — *between* full
   persist+apply passes and within one wake — so WAL and engine are never left

@@ -112,6 +112,13 @@ pub(crate) struct CpRaftView {
     /// gates on (`CpGroup::approx_bytes`), which is scoped but approximate.
     /// Always `Some` — both backends can be scanned.
     pub(crate) byte_size: Option<u64>,
+    /// Whether this replica currently considers its group quiesced (ADR
+    /// 0044 phase-1 PR7). A pure, frozen-accessor read — building this view
+    /// never itself wakes the group (fork F: an operator's browser tab must
+    /// not un-quiesce a fleet every dashboard poll); this field exists
+    /// specifically to surface that the feature is working, the operator's
+    /// own diagnostic.
+    pub(crate) quiesced: bool,
 }
 
 /// One entry of a group's `pending: BTreeMap<TxnId, (record_key, created_ts)>`

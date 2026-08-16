@@ -621,6 +621,7 @@ impl CpGroup {
                     voters: $n.config().into_iter().collect(),
                     key_count,
                     byte_size,
+                    quiesced: $n.is_quiesced(),
                 }
             };
         }
@@ -9864,6 +9865,25 @@ pub(crate) struct MetricsSample {
 async fn metrics_sample_loop(ctx: ClientCtx) {
     loop {
         tokio::time::sleep(METRICS_SAMPLE_INTERVAL).await;
+        // ADR 0044 phase-1 PR7: a level gauge — how many of this node's
+        // currently-hosted CP-data groups this sample found quiesced.
+        // `CpGroup::is_quiesced()` reads a frozen accessor and never itself
+        // wakes a group (fork F: admin/dashboard reads must never disturb
+        // the fleet-wide idle-cost win quiescence exists for), so sampling
+        // this on the same cadence as every other metrics snapshot is free.
+        // A control-only node's `ctx.edge.hosted_groups()` is always empty
+        // (it never registers a raftkv handle), so this is a no-op there;
+        // gated on `ctx.data` regardless, matching every other raftkv-only
+        // metric this loop's sibling background loops record.
+        if let Some(data) = ctx.data.as_ref() {
+            let quiesced = ctx
+                .edge
+                .hosted_groups()
+                .iter()
+                .filter(|(_, g)| g.is_quiesced())
+                .count() as u64;
+            data.raftkv_metrics.set(Metric::CpGroupsQuiesced, quiesced);
+        }
         let (counters, is_leader) = ctx.metrics_json();
         let ts_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -11756,6 +11776,44 @@ pub async fn start_cluster_with_quiesce_after(
     .await
 }
 
+/// Like [`start_cluster_with_growth`], but also opts every **data-plane** CP
+/// group into quiescence (ADR 0044 phase-1 PR7) with the given idle
+/// threshold — `Duration::ZERO` disables it entirely, zero behavior change.
+/// `--cluster N`'s `--quiesce-after SECS` CLI flag threads through here
+/// (the full-combination sibling of [`start_cluster_with_quiesce_after`],
+/// which predates the streams/change-rate knobs being combinable with
+/// quiescence).
+///
+/// # Errors
+/// Propagates a failure to open any node's CP group engine.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_cluster_with_growth_and_quiesce_after(
+    bound: Vec<BoundNode>,
+    backend: StorageBackend,
+    auto_split_keys: Option<usize>,
+    auto_split_bytes: Option<u64>,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    auto_split_change_rate: Option<u64>,
+    quiesce_after: Duration,
+) -> std::io::Result<Vec<Node>> {
+    start_cluster_inner(
+        bound,
+        backend,
+        auto_split_keys,
+        auto_split_bytes,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        auto_split_change_rate,
+        quiesce_after,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_cluster_inner(
     bound: Vec<BoundNode>,
@@ -12143,6 +12201,40 @@ pub async fn run_node_with_streams(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
 ) -> std::io::Result<Node> {
+    run_node_with_streams_and_quiesce_after(
+        config,
+        index,
+        dir,
+        backend,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        Duration::ZERO,
+    )
+    .await
+}
+
+/// Like [`run_node_with_streams`], but also opts this node's **data-plane**
+/// CP groups into quiescence (ADR 0044 phase-1 PR7) with the given idle
+/// threshold — `Duration::ZERO` (every other entry point above) disables it
+/// entirely, zero behavior change. `--config FILE --node I`'s
+/// `--quiesce-after SECS` CLI flag threads through here.
+///
+/// # Errors
+/// As [`run_node_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_with_streams_and_quiesce_after(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    quiesce_after: Duration,
+) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
@@ -12168,7 +12260,7 @@ pub async fn run_node_with_streams(
     // (ADR 0021) can fan out to the whole cluster.
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
     bound
-        .start_with_streams(
+        .start_with_growth(
             config.peer_book(),
             config.control_ids(),
             config.data_ids(),
@@ -12183,6 +12275,8 @@ pub async fn run_node_with_streams(
             stream_seal_knobs,
             segment_store_config,
             stream_retention,
+            None,
+            quiesce_after,
         )
         .await
 }

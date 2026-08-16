@@ -430,6 +430,35 @@ the converged, at-rest catalog state) — closure is deferred to the ADR
 change-consumer loop, across a split's commit-to-local-convergence
 window), not attempted here.
 
+**NARROWED by ADR 0048 (phase-1 quiescence PR4), 2026-08-16.** The
+hot_read scope-transition latch: `hot_read`/`StreamHotRead` refuses
+retryably whenever this node's own **live** `RaftKvNode::scope_range()`
+(the reconciler's own state — `narrow_scope` mutates it directly, PR31)
+is wider than the tablet's declared range per a **freshly re-fetched**
+`metadata_fresh()` (never `effective_metadata()`/`metadata_cached()`, the
+identical cache the CAS amendment above found stale) — one cross-check per
+call, no new shared latch state to get wrong. This closes the reconciler's
+own tick-cadence window and the ADR 0030 mirror's refresh-interval window,
+but **not** the residual in full: on a `ControlHandle::Local` node,
+`metadata_fresh()` is itself the ADR 0038 published cache a local
+asynchronous control apply task maintains, so in the sub-window between a
+`SplitTablet` committing and that apply task catching this node's cache
+up to it, the declared range and the live scope are stale *together* —
+the identical layer-2 structure the CAS amendment above found on the
+write side — and the fabrication class can still surface there. Full
+closure would need a per-read control-leader round trip, rejected as
+disproportionate for the same reason the per-write round trip was
+rejected above. The D8 e2e adjudicator
+(`auto_split_mid_stream_with_live_consumer_across_every_node`) is green
+across 10 consecutive post-fix iterations, versus the 5/15→4/15
+still-present-after-the-fence-alone rate measured above, and remains the
+live signal for the accepted remaining sub-window, not just a historical
+regression check. See ADR 0048 for the full design, the accepted
+remaining window, and why a purely reconciler-tick-cadence-based latch
+(the literal reading of "reconciler-maintained") would have been *even
+less* sound than what shipped — this is a live cross-check, not a
+periodically-refreshed flag.
+
 Regression: three `Metadata::apply` unit tests (`meta::tests::
 seal_stream_shard_range_cas_rejects_a_stale_declared_range_after_a_split`/
 `_accepts_the_current_declared_range`/`_does_not_gate_a_replicas_only_

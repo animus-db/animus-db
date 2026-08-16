@@ -8,6 +8,12 @@
 // from a single node (/admin/storage/lsm) only for the selected tablet's
 // leader — not for every row. No election-history section: this codebase
 // tracks only current Raft state, not a history of leadership transitions.
+// A replica's `quiesced` flag (ADR 0044 phase-1 PR7) renders as a neutral
+// "quiesced" pill (reusing the `.forming` style — informational, not a
+// health/data-risk signal, ADR 0021 §7's same rule) next to the leader cell
+// and in the detail panel's per-replica meta line; this view never fetches
+// it specially, since `CpRaftView` already carries it in the same payload
+// `key_count`/`byte_size` come from.
 // Depends on `dashboard_core.js` (STATE, $, esc, pill, dot, idSpan, getJSON,
 // humanBytes, nodeIdOf, cpGroupsByTablet, autoSplitThresholds,
 // tabletStatus, tokenBound, gotoStorage, splitHiddenTable).
@@ -82,7 +88,7 @@ function renderTablets() {
       <td>${tableCellHtml(t.table)}</td>
       <td class="mono">${keysCell}</td>
       <td class="mono">${sizeCell}</td>
-      <td class="mono">${lead ? `node ${idSpan(nodeIdOf(lead.node))}` : `<span class="muted">—</span>`}</td>
+      <td class="mono">${lead ? `node ${idSpan(nodeIdOf(lead.node))}${lead.g.quiesced ? " " + pill("forming", "quiesced") : ""}` : `<span class="muted">—</span>`}</td>
       <td><span class="replica-dots">${replicaDots}</span></td>
       <td>${pill(st, st)}</td>
     </tr>`;
@@ -127,7 +133,7 @@ function renderTabletDetail(tablets, groups) {
     const g = gs.find((x) => nodeIdOf(x.node) === rid);
     const role = g ? (g.g.is_leader ? "leader" : "follower") : "unreachable";
     const dotCls = g ? (g.g.is_leader ? "ok-dot" : "dim-dot") : "bad-dot";
-    const meta = g ? `t${g.g.term} · i${g.g.last_applied}` : "—";
+    const meta = g ? `t${g.g.term} · i${g.g.last_applied}${g.g.quiesced ? " · quiesced" : ""}` : "—";
     return `<div class="replica-row">${dot(dotCls)}${idSpan(rid, "node mono")}
       <span class="role" style="color:${role === "leader" ? "var(--accent)" : role === "unreachable" ? "var(--danger)" : "var(--text2)"}">${esc(role)}</span>
       <span class="meta">${esc(meta)}</span></div>`;

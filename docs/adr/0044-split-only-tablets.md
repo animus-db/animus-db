@@ -127,10 +127,14 @@ right fix is making that per-group cost cheap enough not to matter, not
 building a way to un-split. None of the following ships in this stack —
 they are named follow-ups, in the rough order they would pay off:
 
-1. **Quiescence — THE FIRST WIN, likely ~80% of the win.** An idle Raft
-   group (no proposals, no client traffic) has no structural reason to
-   keep ticking election timers or exchanging heartbeats at all; it can go
-   fully dormant and wake on its first write. Today every hosted tablet
+1. **Quiescence — THE FIRST WIN, likely ~80% of the win. CLOSED by ADR
+   0048 (phase 1).** An idle Raft group (no proposals, no client traffic)
+   has no structural reason to keep ticking election timers or exchanging
+   heartbeats at all; it can go fully dormant and wake on its first write.
+   **Correction found while implementing (ADR 0048):** the apply task's own
+   5ms idle poll, not named here, turned out to be the larger of the two
+   idle-wakeup sources (~200 wakeups/s/group vs. ~20-40/s from heartbeats/
+   inbound messages) — both are now closed. Today every hosted tablet
    group ticks forever regardless of load, which is the single largest
    avoidable cost a large, mostly-cold tablet fleet pays. If group-count
    cost is ever observed to bite in practice, this is the mitigation to
@@ -153,11 +157,16 @@ they are named follow-ups, in the rough order they would pay off:
    fleet, not less.
 
 **The storage side of this is already amortized, today** (ADR 0028): one
-shared engine and WAL per node, scoped by `StorageScope`, so a tablet's
-storage footprint was never the problem merge was reclaiming. The
-remaining gap is entirely in per-group Raft timers/heartbeats, with no
-quiescence mechanism built yet — this is pre-alpha engineering debt to pay
-down opportunistically, not an architectural gap this ADR needs to close.
+shared **engine** per node, scoped by `StorageScope`, so a tablet's storage
+footprint was never the problem merge was reclaiming. **Doc-drift fix (ADR
+0048):** this used to also claim a shared *WAL*; that part was never true —
+each group still holds its own Raft WAL file
+(`animus_cp_data::wal_file(stream)`, `raftkv.wal.{stream}`), and
+`animus_control::SharedWal` is built and unit-tested but unwired. The
+remaining gap was per-group Raft timers/heartbeats **and** the apply task's
+own idle poll — see ADR 0048 for the as-built quiescence mechanism that
+closes this, and the finding that the apply-poll term was actually the
+larger of the two.
 
 ## Shrink-in-place and dilution
 

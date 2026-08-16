@@ -445,12 +445,41 @@ pub enum Metric {
     /// A per-tablet CP-data `AppendEntries` (replication or heartbeat) was
     /// sent to a peer.
     CpAppendEntriesSent,
+
+    // --- Quiescence observability (ADR 0044 phase-1 PR7) --- Appended
+    // after the append-entries-sent variant above; every earlier variant's
+    // slot and the text-export order stay stable, so the snapshot remains
+    // byte-reproducible. Recorded by `animus-cp-data`'s consensus loop
+    // (`CpQuiesces`/`CpUnquiesces`, incremented on every genuine
+    // quiesced/ticking transition it observes — one per group, all sharing
+    // this node's one sink) and `animusd`'s `metrics_sample_loop`
+    // (`CpGroupsQuiesced`, a level: how many of this node's *currently
+    // hosted* groups this sample found quiesced — see that loop's own doc
+    // for why a per-group increment/decrement can't safely stand in for a
+    // periodic re-count across a shared sink).
+    /// A per-tablet CP-data group transitioned into quiescence (`RaftCore::
+    /// quiesced` flipped `false -> true`) — counts the transition, not a
+    /// duration.
+    CpQuiesces,
+    /// A per-tablet CP-data group transitioned out of quiescence (`RaftCore::
+    /// quiesced` flipped `true -> false`) — any inbound message, local
+    /// propose, or explicit wake.
+    CpUnquiesces,
+    /// The number of this node's currently-hosted CP-data groups this
+    /// node's most recent metrics sample found quiesced — a level,
+    /// overwritten via `MetricsHandle::set` (never `incr`), the identical
+    /// "counter slot re-purposed as a last-write-wins level" shape
+    /// `StreamHotBytes`/`StreamSegmentsLive` already use above. Read-only:
+    /// sampling never itself wakes a group (fork F — admin/dashboard reads
+    /// must never disturb the fleet-wide idle-cost win quiescence exists
+    /// for).
+    CpGroupsQuiesced,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 66] = [
+    pub const ALL: [Metric; 69] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -517,6 +546,9 @@ impl Metric {
         Metric::CpMergeTookNoEffectUnexplained,
         Metric::StreamSplitSingleTokenSkipped,
         Metric::CpAppendEntriesSent,
+        Metric::CpQuiesces,
+        Metric::CpUnquiesces,
+        Metric::CpGroupsQuiesced,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -590,6 +622,9 @@ impl Metric {
             Metric::CpMergeTookNoEffectUnexplained => "cp_merge_took_no_effect_unexplained",
             Metric::StreamSplitSingleTokenSkipped => "stream_split_single_token_skipped",
             Metric::CpAppendEntriesSent => "cp_append_entries_sent",
+            Metric::CpQuiesces => "cp_quiesces",
+            Metric::CpUnquiesces => "cp_unquiesces",
+            Metric::CpGroupsQuiesced => "cp_groups_quiesced",
         }
     }
 

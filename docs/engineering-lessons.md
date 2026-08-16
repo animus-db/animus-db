@@ -2343,6 +2343,29 @@ debugging anything that feels like it might have happened before.
   None` on every replica) rather than inferring it from a whole-sim
   observation that a co-located concern can foil. See `tests/quiescence.rs`'s
   module doc for the full reasoning kept where the next person will read it.
+- **A single-node test that manufactures a live tablet split *mid-write-burst*
+  needs its own client-side retry, matching the discipline a real
+  multi-node routed client already gets for free.** Found writing the ADR
+  0044 phase-1 PR6 sweeper-skip regression
+  (`a_rewoken_tablet_is_picked_back_up_by_every_sweeper_within_one_interval`):
+  a 40-write burst against a tiny `--auto-split-bytes` threshold legitimately
+  splits partway through, and a later write in the same burst can target a
+  key the split just handed to a fresh child tablet — surfacing as a
+  perfectly correct `"kind write outside this group's live range; retry"`
+  rejection (the ADR 0028 write fence doing its job). A real deployment
+  never notices this: `ClientCtx::cp_route`/`cp_forward`'s hinted-retry
+  re-resolves the tablet on every attempt. A single-node test driving the
+  wire API directly against one fixed address has no such re-resolution
+  layer, so its own write helper must retry on this specific, already-
+  retryable-shaped error (`"; retry"`) rather than hard-asserting `200` —
+  never by loosening the shared helper every *other* test also uses (that
+  would mask a genuine regression elsewhere), but with a locally-scoped
+  retry loop in the one test that deliberately invites the race. The same
+  class as the pre-existing, tracked "CreateTable first-write race" (`200`
+  from `CreateTable` doesn't mean the tablet is ready for a concurrent first
+  write) — any test that deliberately drives a live topology change under
+  concurrent writes needs this discipline, not just the specific two cases
+  found so far.
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
@@ -5968,6 +5991,55 @@ debugging anything that feels like it might have happened before.
   every caller — add a narrow companion method the *caller* invokes with the
   input it already has, at the one or two call sites that actually need the
   new behavior. (2026-08-16, `quiesce/3-core-state-machine`.)
+- **A "reconciler-maintained latch" closing a stale-read window is only
+  sound if it's checked against something at least as fresh as the read it
+  guards — a periodically-updated flag derived from the reconciler's own
+  tick cadence is not, no matter how the plan phrases it.** Found delivering
+  ADR 0044 phase-1 PR4's `hot_read` scope-transition latch (the ADR 0043
+  residual): the literal ask was a boolean the reconciler sets when it
+  first notices a scope mismatch and clears once `narrow_scope` executes.
+  Since detection and execution happen in the *same* tick
+  (`Reconciler::tick`'s `gather_facts` → `plan` → execute is one atomic
+  pass with no other writer), such a flag is false throughout the entire
+  window that actually matters — from the moment a split commits in
+  `Metadata` until this replica's *next* tick even starts (bounded by
+  `metadata_watch` wake latency plus, worst case, a 500ms fallback poll) —
+  because the reconciler cannot raise a flag for a change it hasn't
+  observed yet. The sound fix skipped the "maintained flag" entirely and
+  cross-checked a value that has **no observation lag by construction**
+  (`RaftKvNode::scope_range()`, current the instant the reconciler mutates
+  it) against the **freshest obtainable** comparison point
+  (`metadata_fresh()`, never `effective_metadata()`/`metadata_cached()`) —
+  no new shared state, no periodic-refresh lag to reason about. **General
+  rule**: when a design calls for "a component maintains a flag reflecting
+  some external fact," check whether the flag-maintainer's own update
+  cadence has a lag the flag's consumer can't tolerate; if the maintainer's
+  *state* (not a derived boolean about that state) is already live and
+  read-only-safe to expose, prefer exposing the state itself and letting
+  the consumer do a live cross-check over inventing a flag that inherits
+  the maintainer's own staleness window. See ADR 0048 and ADR 0043's
+  residual section for the full incident and the D8 before/after evidence.
+- **A level-gauge `Metric` sampled across every owner sharing ONE
+  `MetricsHandle` sink cannot be maintained by per-owner increment/decrement
+  — it needs a single periodic re-count.** Adding `Metric::CpGroupsQuiesced`
+  (ADR 0044 phase-1 PR7, "how many of this node's hosted CP groups are
+  quiesced right now"): every tablet group on a node shares the *same*
+  `MetricsHandle` (one per-node env sink, ADR 0026), so a naive "each
+  group's own consensus loop increments on quiesce, decrements on wake"
+  would have every group blindly mutating one shared counter with no
+  coordination — correct only if every transition from every group is
+  captured exactly once, which is unverifiable from any single group's own
+  vantage point. Counters that record a *transition* (`CpQuiesces`/
+  `CpUnquiesces`) are fine as per-owner increments (each transition really
+  is independent and additive); a gauge that claims to reflect *current
+  aggregate state across owners* is not, and needs one periodic sampler
+  with a view across every owner (here, `metrics_sample_loop` walking
+  `ClusterEdgeState::hosted_groups()` and calling `MetricsHandle::set`
+  once) rather than N independent mutators each guessing at the whole.
+  **General rule**: before wiring a level gauge via per-event increment/
+  decrement, check whether every event source shares one sink — if so, a
+  single periodic re-aggregation is both simpler and the only version
+  that's actually correct.
 
 ### Parallel-agent orchestration
 - **`gh stack checkout <N>` silently switches the CURRENT worktree's checked-

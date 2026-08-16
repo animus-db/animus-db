@@ -3093,9 +3093,38 @@ mod stream_sealer_tests {
             .await;
 
             // (2)+(3) A write burst crossing the auto-split byte threshold,
-            // issued against the now-quiesced group.
+            // issued against the now-quiesced group. Retries a transient
+            // "outside this group's live range; retry" — a real, expected
+            // race this specific test invites (a split can legitimately
+            // land *mid-burst*, at which point a later write in the burst
+            // targets a key the split just handed to a fresh sibling
+            // tablet, and this single-node harness has no forwarding hop to
+            // re-resolve it automatically the way a multi-node routed
+            // client would) — never masking a genuine failure (any other
+            // status/body still hard-fails).
             for i in 0..40u32 {
-                put_item_padded(node.dynamo_addr(), table, &format!("r{i}"), 100).await;
+                let id = format!("r{i}");
+                let pad = "x".repeat(100);
+                let body = format!(
+                    r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"val":{{"S":"{pad}"}}}}}}"#
+                );
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let (status, resp_body) =
+                        dynamo(node.dynamo_addr(), "DynamoDB_20120810.PutItem", &body).await;
+                    if status == 200 {
+                        break;
+                    }
+                    assert!(
+                        resp_body.contains("; retry") || resp_body.contains("retry"),
+                        "PutItem({id}) failed non-retryably: {resp_body}"
+                    );
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "PutItem({id}) kept failing retryably past its own deadline: {resp_body}"
+                    );
+                    sleep(Duration::from_millis(50)).await;
+                }
             }
 
             // auto_split_loop must resume and trigger a real split within a
