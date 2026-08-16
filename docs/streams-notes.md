@@ -157,6 +157,9 @@ read path's only impure layer).
   `ClientResponse::Pairs` shape (no new response variant — the packed
   HLC rides each key's own trailing 8 bytes, the same suffix
   `change_record_key` already appends, recovered by the caller).
+  **ADR 0047**: `ForceSeal`/`StreamHotRead` now ride the intra port —
+  a bare send on the client port is refused by `handle_request`'s port
+  guard, not just the match arm's own bare-refusal check.
   `index_drain::hot_read` is `seal_now`'s read-only sibling: an
   identical `pending_changes()` scan/HLC-suffix-sort, filtered by
   `from_position` instead of the watermark, never sealing anything.

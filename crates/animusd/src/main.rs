@@ -20,12 +20,15 @@
 //!
 //! Per-process deployment: generate a config once, copy it to each host, and run
 //! `animusd --config cluster.json --node I` with a distinct `I` per process. A
-//! node that has no expanded config at all — just the client address of any
-//! already-running node — can instead `animusd join --seed <that address>
-//! --id NAME`, learning everything else it needs from the cluster itself (ADR
-//! 0032 PR2: a real data-plane member, control group unchanged, ADR 0030); a
-//! data-only node has the same option (`animusd data --seed <that address>
-//! --id NAME`, ADR 0035 PR5) against a separately-deployed control plane.
+//! node that has no expanded config at all — just the **intra-cluster**
+//! address (ADR 0047; not the client one — joining is a cluster-membership
+//! action, so the honest seed address is the one an operator's Kubernetes
+//! Service topology would keep internal) of any already-running node — can
+//! instead `animusd join --seed <that address> --id NAME`, learning
+//! everything else it needs from the cluster itself (ADR 0032 PR2: a real
+//! data-plane member, control group unchanged, ADR 0030); a data-only node
+//! has the same option (`animusd data --seed <that address> --id NAME`, ADR
+//! 0035 PR5) against a separately-deployed control plane.
 //! **`--node I` is gone from `join`/`data --seed` — a clean break (ADR 0040
 //! PR4)**: `--id NAME` proposes a durable identity (validated,
 //! `NodeId::propose`) instead of an operator-picked index; omit it (`--base-
@@ -457,8 +460,10 @@ async fn run_control(args: &[String]) -> Result<(), String> {
 /// Either `--config FILE` (an operator-assembled `ClusterConfig` listing the
 /// control deployment's addresses up front — see
 /// [`animusd::run_node_data`]'s doc) or `--seed ADDR[,ADDR...]` (this node
-/// discovers the control deployment from any already-running node's client
-/// address, mirroring `animusd join`'s discovery — see
+/// discovers the control deployment from any already-running node's
+/// **intra-cluster** address, ADR 0047 — joining is a cluster-membership
+/// action, not an external-client one, so the honest seed address is the
+/// intra one, not the client one; mirrors `animusd join`'s discovery — see
 /// [`animusd::run_node_data_join`]'s doc), never both.
 ///
 /// **`--node I` is required with `--config`** (unchanged). **`--seed` no
@@ -607,8 +612,10 @@ async fn run_data_join(
 }
 
 /// `join`: seed/join startup (ADR 0032 PR2) — a new node starts knowing only
-/// its own addresses + a seed list (client addresses of any existing nodes),
-/// learning the pre-growth control group + peer/route/admin address books
+/// its own addresses + a seed list (**intra-cluster** addresses of any
+/// existing nodes, ADR 0047 — an operator/Kubernetes-operator-supplied seed
+/// names the target's intra port, not its client one), learning the
+/// pre-growth control group + peer/route/admin address books
 /// from the cluster itself instead of an operator-assembled expanded
 /// `ClusterConfig`. See [`animusd::run_node_join`]'s doc for the collision
 /// guard + growth semantics this drives.

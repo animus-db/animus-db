@@ -1360,12 +1360,15 @@ pub enum ClientRequest {
     /// size-telemetry trigger is `auto_split_loop`.
     SplitTablet { tablet: u64, split_key: Vec<u8> },
     /// **Join discovery** (ADR 0032 PR2, `animusd join`): a node that knows only
-    /// a *seed* address (any already-running node's client address — old or
-    /// newly grown, PR1 made every node's address book equally current) asks
+    /// a *seed* address (any already-running node's **intra-cluster** address
+    /// — ADR 0047, was the client address pre-ADR-0047; old or newly grown,
+    /// PR1 made every node's address book equally current) asks
     /// for enough information to start as a growth member without an
     /// operator-assembled expanded `ClusterConfig`. Any node can answer — the
     /// reply is built entirely from the receiving node's own knowledge (its
-    /// captured `AdminInfo` + its live `client_route`), no forwarding needed.
+    /// captured `AdminInfo` + its live `client_route`/`intra_route`), no
+    /// forwarding needed. This is itself served on the intra listener only
+    /// (`JoinInfo` is `Surface::Intra`).
     /// An additive variant: both sides of a cluster are the same build in
     /// this repo's pre-alpha stance, so no version negotiation is needed for
     /// an older peer that predates it.
@@ -11701,10 +11704,13 @@ async fn poll_seeds_for(
 /// Start a node as a **seed/join growth member** (ADR 0032 PR2, `animusd
 /// join`): unlike [`run_node_growth`], which needs an operator-assembled
 /// *expanded* `ClusterConfig` listing every node's addresses up front, this
-/// entry point needs only `addrs` (this node's own five addresses) and
-/// `seeds` (any already-running node's **client** address — old or newly
-/// grown, it no longer matters which, since ADR 0032 PR1 made every node's
-/// address book equally current).
+/// entry point needs only `addrs` (this node's own six addresses) and
+/// `seeds` (any already-running node's **intra-cluster** address — ADR
+/// 0047, was the client address pre-ADR-0047; old or newly grown, it no
+/// longer matters which, since ADR 0032 PR1 made every node's address book
+/// equally current). Joining is a cluster-membership action — the joiner is
+/// about to become an internal `ProdEnv`/Raft peer too — so the intra
+/// address is the honest seed, not a compromise.
 ///
 /// **ADR 0040 PR4 clean break**: `--node I` is gone from the join path
 /// entirely (no operator-index sugar) — `id` is either an explicit,
@@ -11977,7 +11983,9 @@ async fn claim_join_identity(
 ///
 /// The discovered `original_control_ids` (the seed's `JoinInfo`
 /// reply) feed both `heartbeat_loop`'s failure-detection target and, via the
-/// merged `client_route`, [`RemoteControlClient::new`]'s `control_seeds` — the
+/// merged `intra_route` (ADR 0047 — `WatchMetadata` is intra-only, so
+/// `control_seeds` must be intra addresses, not `client_route`'s),
+/// [`RemoteControlClient::new`]'s `control_seeds` — the
 /// discovery root this node's mirror sync/long-poll watch loop
 /// ([`remote_metadata_watch_loop`]) polls from then on. Mirrors
 /// [`run_node_data`]'s own note on why the internal `raftkv` env's peer book

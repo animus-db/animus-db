@@ -260,17 +260,21 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&core_nodes).await;
     let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
+    // ADR 0047: `--seed` now names the seed's intra address — a separate
+    // list from `core_clients` above, which stays client-flavored for the
+    // data-plane `put`/`await_value` calls it feeds.
+    let core_intra: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();
     let core_admin: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.admin).collect();
     for table in TABLES {
         put(&core_clients, table, b"k0", b"v0", 30).await;
     }
 
-    // 2. Join a 4th node passing ONLY the core's client addresses as seeds —
+    // 2. Join a 4th node passing ONLY the core's intra addresses as seeds —
     // no expanded config object anywhere in this test.
     let join_index = core_config.len();
     let join_raftkv_id = animusd::config::node_id(join_index);
     let (joined, joined_addrs, joined_dir) = join_fresh(
-        &core_clients,
+        &core_intra,
         join_index,
         dir.path(),
         StorageBackend::default(),
@@ -373,7 +377,7 @@ async fn node_joins_via_seed_with_no_expanded_config() {
         }
     };
     let collision_result = animusd::run_node_join(
-        core_clients.clone(),
+        core_intra.clone(),
         Some(join_raftkv_id.clone()),
         collision_addrs,
         &dir.path().join("collision"),
@@ -400,7 +404,7 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     joined.shutdown();
     sleep(Duration::from_millis(200)).await;
     let rejoined = rejoin_same(
-        &core_clients,
+        &core_intra,
         join_index,
         joined_addrs,
         &joined_dir,

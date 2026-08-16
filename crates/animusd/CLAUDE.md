@@ -33,8 +33,9 @@ reason (see each file's own entry below).
 - **`config.rs`** — `ClusterConfig`/`RoleAddrs` (per-process deployment
   config; every entry names its own **`id: NodeId`** rather than deriving
   it from position — `from_json` hard-errors on a duplicate) and the
-  **five-port stride** (`base_port + 5*i + {internal,client,dynamo,cql,
-  admin}`). `generate`/`generate_split` mint `"n{i}"`, **zero-padded** once
+  **six-port stride** (ADR 0047: `base_port + 6*i + {internal,client,dynamo,
+  cql,admin,intra}` — `intra` appended at offset 5, the client/intra-cluster
+  RPC port split). `generate`/`generate_split` mint `"n{i}"`, **zero-padded** once
   the cluster has ≥ 10 nodes so lexicographic id order stays == numeric
   index order (`"n10" < "n2"` otherwise) — below that threshold ids stay
   the plain unpadded `"n{i}"` every existing test already assumes.
@@ -256,7 +257,10 @@ animusd-specific rules that aren't in the ADR.
 **Internal-only `ClientRequest` variants — `TxnPrepare`/`TxnDecide`/
 `TxnResolve`/`TxnStatus`/`TxnRecordView`/`TxnVerify` — are never sent
 bare**, only wrapped in `Forwarded`; their real handling lives in
-`cp_serve_forwarded`'s match only. **Routed by the actual data key** being
+`cp_serve_forwarded`'s match only. **Since ADR 0047 all six ride the intra
+port** (`Surface::Intra`) alongside `Forwarded` itself — a bare send, or a
+`Forwarded`-wrapped send, on the client port is refused by the port guard.
+**Routed by the actual data key** being
 staged/resolved/verified (`table` + `writes[0]`/`keys[0]`/`span.start`),
 **never `record_key`** for `TxnPrepare`/`TxnResolve` — a non-anchor
 participant's `record_key` names the anchor's record, which lives in a
@@ -754,7 +758,12 @@ route below the edge through the same `ClientCtx` CP primitives.
   internal-only streams RPCs (F12-b's disable-triggered final seal, and
   the open-shard `GetRecords`/`GetShardIterator` forwarding path) — both
   addressed by tablet id directly, refused bare, handled only inside
-  `cp_serve_forwarded`. **Every send of an internal-only variant across
+  `cp_serve_forwarded`. **Since ADR 0047 both now ride the intra port**
+  (`surface_of` classifies them `Surface::Intra`) — a bare send on the
+  client port is refused by `handle_request`'s port guard before ever
+  reaching their own "must be sent wrapped in `Forwarded`" match-arm
+  refusal (that wording is still reachable, just only via the intra port
+  now). **Every send of an internal-only variant across
   the wire must wrap it in `ClientRequest::Forwarded`, even when the
   caller already knows it isn't the leader** — a first attempt called
   `ClientCtx::relay` directly with a bare `ForceSeal`, which compiled and
@@ -774,6 +783,33 @@ route below the edge through the same `ClientCtx` CP primitives.
   inbox was single-consumer, before ADR 0026 let one id host several
   protocol instances). The client API is a plain TCP server, *not* on the
   `Network` — a non-leader forwards over a fresh client connection.
+- **Two client-protocol listeners, one dispatch (ADR 0047)**: `RoleAddrs.client`
+  (external, DynamoDB/CQL-adjacent callers) and `RoleAddrs.intra` (every
+  node-to-node `ClientRequest` — `Forwarded`, `ProposeSchema`,
+  `WatchMetadata`, `JoinInfo`, and every internal-only forwarding payload)
+  are the **same** length-prefixed JSON `ClientRequest`/`ClientResponse`
+  framing on two ports, not two protocols. `serve_requests`/
+  `handle_connection` (`lib.rs`) are one function parameterized by
+  `ListenerKind::{Client, Intra}`, never forked; `handle_request` has
+  exactly one guard clause before its ~160-line match, refusing a
+  `Client`-listener connection asking for a `Surface::Intra`-classified
+  variant (`surface_of`, the one exhaustive table, no wildcard arm — a new
+  `ClientRequest` variant is a compile error there until classified).
+  `Intra` is deliberately a **superset** of `Client`, not a disjoint
+  partition — neither port has auth yet, and intra is the more-trusted
+  network segment (the operator's Kubernetes topology keeps it off any
+  externally-reachable Service), so it transparently also serving ordinary
+  client-shaped ops is intentional, not a gap. `--seed`/`animusd join`
+  target the **intra** address (joining is a cluster-membership action, not
+  an external-client one). Machine-relay address resolution
+  (`cp_leader_hint`, `propose_schema`'s relay, `remote_metadata_watch_loop`)
+  uses a parallel `intra_route`/`intra_addr`/`intra_leader_hint` — never
+  `client_route`/`route_addr`/`leader_hint`, which stay reserved for
+  human-facing consumers (`not_leader_error`'s admin message, the
+  dashboard's leader display) — see ADR 0047 for the full design and the
+  hint-field-conflation finding that shaped this split, and the standing
+  rule in `docs/engineering-lessons.md` (machine relay →
+  `intra_leader_hint`; anything a human reads → `leader_hint`).
 - **`ClusterEdgeState` is scoped to one NODE** (ADR 0031 PR2), created fresh per
   node — even in `--cluster N`, which previously shared one instance across the
   cluster and masked cross-process bugs. Holds this node's own control handle, its
@@ -881,10 +917,11 @@ route below the edge through the same `ClientCtx` CP primitives.
   not a subdirectory (`ProdEnv`'s disk doesn't create intermediate dirs).
   Node-start entry points are async+fallible (`io::Result`).
 - **`Node::shutdown()` is a graceful teardown** — aborts the listener tasks and
-  `ProdEnv::shutdown()`s the node's one internal env, freeing all five ports
-  (ADR 0040 PR1's `internal`/`client`/`dynamo`/`cql`/`admin` stride — was six,
-  split across two role envs, before) so a replacement can rebind the same
-  addresses/dir. Dropping a `Node` without it leaves tasks running.
+  `ProdEnv::shutdown()`s the node's one internal env, freeing all six ports
+  (ADR 0040 PR1's `internal`/`client`/`dynamo`/`cql`/`admin` stride, plus ADR
+  0047's `intra` — the pre-ADR-0040 stride was six too, but split across two
+  role envs instead of one node/one port-block) so a replacement can rebind
+  the same addresses/dir. Dropping a `Node` without it leaves tasks running.
   **It's fire-and-forget (`abort()` then return), not a guarantee those ports are
   free the instant it returns** — see `animus-env/CLAUDE.md`'s `ProdEnv::shutdown()`
   entry. A same-address restart needs **`Node::shutdown_and_wait()`** (aborts, then

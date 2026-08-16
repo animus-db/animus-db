@@ -5715,7 +5715,104 @@ debugging anything that feels like it might have happened before.
   every downstream call is provably lock-free. (2026-08-16, `TxnStage`
   kind-writes stack PR2.)
 
+- **A `leader_hint`-shaped field grows a second meaning the moment a second
+  network segment exists.** Adding the intra-cluster port (ADR 0047) meant
+  `ControlHandle::leader_addr_hint()`/`RemoteControlClient.leader_hint`
+  suddenly had **three** existing consumers wanting different address
+  flavors off the same field: `propose_schema`'s relay preference
+  (machine-to-machine, wants the new intra address),
+  `not_leader_error`'s human-facing "retry on {addr}" message surfaced
+  through the admin HTTP endpoint (must stay the client address — a human
+  operator dials it), and the dashboard's own leader-hint display (same,
+  explicitly documented as "the client-API address"). A naive
+  find-and-replace repoint would have silently broken the two human-facing
+  consumers on any `ControlHandle::Remote` node. Fix: add a **parallel**
+  hint (`intra_leader_hint` alongside `leader_hint`) rather than repoint the
+  existing one — before repointing any existing hint/route field to a new
+  address flavor, audit **every consumer's intended audience** (human
+  operator vs. machine relay), not just its current call sites. Standing
+  rule this established: machine relay → `intra_leader_hint`; anything a
+  human reads → `leader_hint`. (2026-08-16, ADR 0047 intra-port-split
+  stack.)
+
+- **A "seed a static route table, then let a sync loop overlay
+  `Metadata` on top" pattern needs a real, non-empty static seed if any
+  consumer resolves through it *synchronously*, before the loop's first
+  tick.** Adding `intra_route` (ADR 0047, mirroring the pre-existing
+  `client_route`/`route_sync_loop` shape) first tried an empty static seed
+  on the theory that the sync loop's 200ms cadence would converge it from
+  `Metadata` quickly enough — reasonable for most consumers, which
+  tolerate "not yet known, retry." It broke the growth-node/join-node
+  mirror's own seed-building (`start_with_streams`'s `ctx.intra_addr(id)`
+  call, feeding `remote_metadata_sync_loop`), which runs **synchronously**
+  at ctx-construction time and captures its `seeds` argument once, by
+  value, at spawn time — an empty seed there is permanent, not
+  transient, since the loop it feeds never re-reads the route table itself.
+  Fix: thread the real seed (`intra_route: BTreeMap<NodeId, SocketAddr>`)
+  as a full sibling parameter everywhere `client_route` already is,
+  including through `ClientResponse::JoinInfo`. **General form**: when
+  copying an existing "static seed ∪ replicated overlay" pattern for a new
+  address axis, check whether *every* consumer of the new table reads it
+  lazily (tolerates emptiness) or captures a value from it once,
+  synchronously, at construction time — the latter needs the seed
+  populated for real, not deferred to the first tick.
+
+- **A `Surface`/authorization reclassification's test blast radius includes
+  every direct low-level construction of the reclassified variant across
+  the whole `tests/` tree, not just its production call sites.** ADR 0047
+  reclassified `ProposeSchema`/`WatchMetadata`/`Forwarded` (and friends) as
+  intra-only; the production retargeting was contained, but ~15
+  pre-existing test files drove one of these variants directly against a
+  node's `client_addr()`/`.client` as a test-setup shortcut (most commonly:
+  hand-driving schema DDL without going through the DynamoDB/CQL edge) —
+  found only by running the full suite, not by inspecting the production
+  diff. **General form**: before estimating the blast radius of
+  reclassifying a wire-protocol variant's reachability, `grep` every
+  direct construction of that variant across `tests/`, not just its
+  production callers — a test helper reusing the client address for
+  convenience is a real consumer of the old classification, indistinguishable
+  from inspection alone from one that doesn't need to be.
+
+- **A "no local replica, forward blindly to whoever else has one" fallback
+  path is easy to miss when retargeting an address-resolution axis, because
+  it looks like an edge case rather than a primary path.** ADR 0047
+  retargeted every named machine-relay resolver (`cp_leader_hint`,
+  `other_tablet_replica_addr`, `propose_schema`'s relay/broadcast) to the
+  new intra routing table, but missed `resolve_cp_route`'s own
+  zero-local-replica fallback (the very first guess a node with no local
+  replica of a tablet makes) — it kept reading `route_snapshot()` (client
+  addresses). Invisible by code review (nothing about it looks
+  forwarding-specific at a skim), it surfaced immediately as a real
+  `ProdEnv` test failure once a control-only node tried to forward a write
+  (`cluster_split.rs`'s `single_shot_first_write_through_control_node_
+  succeeds`): `Error("forwarded is a cluster-internal request; send it to
+  this node's intra port")`. **General form**: when retargeting "which
+  address flavor answers a forwarding question," grep every function whose
+  *return type* is an address/route candidate (not just the ones with
+  "leader"/"forward" in the name) — a last-resort/degenerate-case branch
+  inside a bigger routing function is exactly where a mechanical retarget
+  misses a spot. (2026-08-16, ADR 0047 intra-port-split stack.)
+
 ### Parallel-agent orchestration
+- **`gh stack checkout <N>` silently switches the CURRENT worktree's checked-
+  out branch** — in a worktree-isolated agent, this is indistinguishable at a
+  glance from a scratch/tracking branch staying put, and it can happen mid-air
+  underneath a long-running background build or test. Finishing the ADR 0047
+  stack, a `gh stack checkout 228` run purely to inspect the stack's shape
+  (branch order, which PRs it already contained) reset this worktree's HEAD
+  from a local scratch branch to `intra/2-cutover` — while a `cargo test
+  --workspace` run was still executing in the background against the old
+  (correct) source tree. The build didn't crash immediately (already-linked
+  test binaries kept running), but the source tree was no longer the one the
+  run was supposed to verify, so its results couldn't be trusted — the safe
+  fix was killing the run, switching back, and restarting from scratch,
+  costing a full extra `cargo test --workspace` cycle. **General rule**:
+  before running any `gh stack`/similar branch-management subcommand (not
+  just the obviously-destructive ones), check `git branch --show-current`
+  immediately after — never assume a "read-only-sounding" stack-inspection
+  command left the working tree's checked-out branch untouched, and never run
+  one while a background build/test against the current tree is still in
+  flight.
 - **A stacked series' final "docs/ADR finalization" PR must treat the stack's
   own shipped PR bodies (`gh pr view`) as the authoritative source for
   divergences from the plan — not the plan doc, and not just the final code
