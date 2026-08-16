@@ -6011,6 +6011,7 @@ impl ClientCtx {
                     value: Some(eval.value),
                     kind_writes: eval.kind_writes,
                     change_log: eval.change_log,
+                    stage_marker: Some(eval.stage_marker),
                 });
             }
         }

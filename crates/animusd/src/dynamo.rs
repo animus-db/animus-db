@@ -3089,6 +3089,10 @@ pub(crate) struct KindTxnWriteEval {
     /// if absent) — used to build the mandatory own-key OCC `conditions`
     /// entry (ADR 0046 Fork C1) the caller adds alongside this write.
     pub(crate) raw_old: Option<Vec<u8>>,
+    /// The ADR 0049 §3 stage-marker `(change_key_prefix, record)` pair —
+    /// `TxnWrite::stage_marker`, written by `TxnStage`'s apply arm at the
+    /// stage entry's own HLC (see [`stage_marker_change_log`]).
+    pub(crate) stage_marker: (Vec<u8>, Vec<u8>),
     /// The derived kind-scope writes (LSI rows), EXCLUDING the base row
     /// itself (that's `key`/`value` above) — `TxnWrite::kind_writes`. Empty
     /// if `table` lost its last index/stream in the gap between routing and
@@ -3179,6 +3183,7 @@ pub(crate) async fn eval_kind_txn_write(
         raw_old,
         kind_writes,
         change_log,
+        stage_marker: item_stage_marker_change_log(pk, sk),
     }))
 }
 
@@ -3297,6 +3302,21 @@ fn item_marker_change_log(pk: &AttributeValue, sk: Option<&AttributeValue>) -> (
     )
 }
 
+/// The item-shaped wrapper over [`stage_marker_change_log`] (ADR 0049 §3) —
+/// `item_marker_change_log`'s stage-marker sibling, used by
+/// [`eval_kind_txn_write`] for every transactional write's
+/// `TxnWrite::stage_marker`.
+fn item_stage_marker_change_log(
+    pk: &AttributeValue,
+    sk: Option<&AttributeValue>,
+) -> (Vec<u8>, Vec<u8>) {
+    let base_sk = storage_key(pk, sk)[storage_key(pk, None).len()..].to_vec();
+    stage_marker_change_log(
+        &token_prefixed(pk, &dynamo_index::change_prefix(pk)),
+        base_sk,
+    )
+}
+
 /// The one construction site for an ADR 0049 §1 image-less **marker**
 /// record's `(change_key_prefix, encoded_record)` pair, shared by every edge
 /// that commits one (this file's fast arm above; the CQL edge's partition
@@ -3311,12 +3331,36 @@ fn item_marker_change_log(pk: &AttributeValue, sk: Option<&AttributeValue>) -> (
 /// item key from — empty for CQL, whose partition is one value with no sort
 /// dimension.
 pub(crate) fn marker_change_log(partition_prefix: &[u8], base_sk: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+    marker_record(partition_prefix, base_sk, false)
+}
+
+/// The **stage-marker** sibling of [`marker_change_log`] (ADR 0049 §3): the
+/// image-less record `KvCommand::TxnStage`'s apply arm writes for the anchor
+/// key it stages, so a change-log consumer re-reading dirty keys (ADR 0050's
+/// split-build tail) observes a freshly staged intent envelope. Same key
+/// prefix convention, same apply-completed HLC; distinguished only by
+/// `ChangeRecord::staged` (and hidden from consumers by the same
+/// `consumer_hidden` predicate `marker` already is). Built at the edge —
+/// never at apply — because record bytes are opaque to `animus-cp-data`
+/// (ADR 0043's layering rule); it rides `TxnWrite::stage_marker`.
+pub(crate) fn stage_marker_change_log(
+    partition_prefix: &[u8],
+    base_sk: Vec<u8>,
+) -> (Vec<u8>, Vec<u8>) {
+    marker_record(partition_prefix, base_sk, true)
+}
+
+/// The one construction core both marker shapes share — never two literals
+/// that could drift (the same rule that keeps `marker_change_log` itself
+/// the single site for every edge).
+fn marker_record(partition_prefix: &[u8], base_sk: Vec<u8>, staged: bool) -> (Vec<u8>, Vec<u8>) {
     let record = ChangeRecord {
         base_sk,
         old_image: None,
         new_image: None,
         seeded: false,
         marker: true,
+        staged,
     };
     (partition_prefix.to_vec(), record.encode())
 }
@@ -3518,6 +3562,7 @@ fn kind_writes_for_item(
         new_image: if carries_images { new.cloned() } else { None },
         seeded: false,
         marker: !carries_images,
+        staged: false,
     };
     let change_log = (
         token_prefixed(pk, &dynamo_index::change_prefix(pk)),

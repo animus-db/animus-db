@@ -106,7 +106,14 @@ const MAGIC: u8 = 0xCB;
 /// marker-table batch commits one entry per tablet carrying every item's
 /// marker record (the entry-granularity throughput contract; see the
 /// field's own doc). `TxnWrite.change_log` keeps its `Option` shape.
-const VERSION: u8 = 17;
+/// `18` (ADR 0049 §3, Train A rung 3): `TxnWrite` gained `stage_marker:
+/// Option<(Vec<u8>, Vec<u8>)>` — the image-less stage-marker record
+/// `TxnStage`'s apply arm materializes at the stage entry's own `ts` (see
+/// the field's own doc). Encoded with the same tagged-`Option` shape
+/// `change_log` uses (`put_change_log`/`read_change_log` — never a second
+/// copy). Same house convention: a clean bump, no cross-version
+/// compatibility.
+const VERSION: u8 = 18;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -511,6 +518,9 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
                 put_opt_bytes(out, &w.value);
                 put_kind_writes(out, &w.kind_writes);
                 put_change_log(out, &w.change_log);
+                // Version 18: the stage marker shares change_log's own
+                // tagged-Option `(prefix, record)` encoding.
+                put_change_log(out, &w.stage_marker);
             }
             out.extend_from_slice(&(spans.len() as u32).to_be_bytes());
             for (table, span) in spans {
@@ -636,11 +646,13 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 let value = c.opt_bytes()?;
                 let kind_writes = read_kind_writes(c)?;
                 let change_log = read_change_log(c)?;
+                let stage_marker = read_change_log(c)?;
                 writes.push(TxnWrite {
                     key,
                     value,
                     kind_writes,
                     change_log,
+                    stage_marker,
                 });
             }
             let n = c.u32()?;
@@ -1141,6 +1153,11 @@ mod tests {
                             // exercises the version-16 wire shape.
                             kind_writes: vec![(1u8, b"k1-lsi".to_vec(), Some(b"lsi-row".to_vec()))],
                             change_log: Some((b"k1-change-prefix".to_vec(), b"record".to_vec())),
+                            // Version 18: the ADR 0049 §3 stage marker.
+                            stage_marker: Some((
+                                b"k1-change-prefix".to_vec(),
+                                b"stage-marker".to_vec(),
+                            )),
                         },
                         TxnWrite::plain(b"k2".to_vec(), None), // a staged delete
                     ],

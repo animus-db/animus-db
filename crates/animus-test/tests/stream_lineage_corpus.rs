@@ -277,6 +277,7 @@ fn write_txn_and_journal(
         value: Some(payload.to_vec()),
         kind_writes: Vec::new(),
         change_log: Some((item_key.to_vec(), payload.to_vec())),
+        stage_marker: None,
     };
     let n = node.clone();
     let (txn_id, record_key, outcome) = drive(sim, &env, async move {

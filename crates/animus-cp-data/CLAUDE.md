@@ -133,7 +133,18 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   own `Envelope::Intent`, opaque until `TxnResolve`'s commit branch
   materializes it. See the Key invariants section's `materialize_derived`
   entry and `docs/adr/0018-cross-tablet-transactions.md`'s 2026-08-16
-  amendment for the full mechanism.
+  amendment for the full mechanism. **`TxnWrite.stage_marker` (ADR 0049 §3,
+  codec version 18)**: an image-less, consumer-hidden `(prefix, record)`
+  pair `TxnStage`'s own apply arm materializes into `KIND_CHANGE` at the
+  *stage* entry's own `ts` (via the same shared `materialize_derived`) —
+  the dirty-key signal that lets a change-log consumer observe a freshly
+  staged intent envelope. Deliberately a separate record from `change_log`
+  (writing that one early would surface a pre-commit full-image event);
+  never carried in the intent envelope (consumed entirely at stage);
+  prefix token-validated at apply like `kind_writes`' keys
+  (`stage_marker_token_valid`); an aborted transaction's marker remains as
+  a harmless dirty hint. Tests: `txn_kind_writes.rs`'s `stage_marker_*`/
+  `stage_writes_*` group.
 
 ### lib.rs API
 

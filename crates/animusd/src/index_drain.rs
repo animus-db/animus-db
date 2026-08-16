@@ -808,6 +808,7 @@ async fn backfill_seed_tick(
             new_image: None,
             seeded: true,
             marker: false,
+            staged: false,
         }
         .encode();
         seed_change_log_record(group, prefix.clone(), record).await?;

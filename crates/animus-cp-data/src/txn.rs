@@ -303,6 +303,26 @@ pub struct TxnWrite {
     /// entry that actually fixes the record's position in commit order may
     /// mint its key suffix).
     pub change_log: Option<(Vec<u8>, Vec<u8>)>,
+    /// The ADR 0049 §3 **stage marker**: an image-less `(key prefix,
+    /// encoded record)` pair `KvCommand::TxnStage`'s own apply arm
+    /// materializes into `KIND_CHANGE` at the *stage* entry's own `ts` —
+    /// the dirty-key signal that lets a change-log consumer (ADR 0050's
+    /// split-build tail) observe a freshly staged intent envelope, which
+    /// `change_log` above structurally cannot provide (it only exists from
+    /// resolve onward). Deliberately a *separate* record from `change_log`,
+    /// never that record written early: a full-image record surfaced at
+    /// stage time would be a consumer-visible pre-commit event, exactly
+    /// what materialize-at-resolve (ADR 0046 Decision 2) exists to prevent
+    /// — the stage marker's bytes carry no images and are
+    /// `consumer_hidden` (see `animus_dynamo::ChangeRecord::staged`).
+    /// Unlike `kind_writes`/`change_log` it never rides the intent
+    /// envelope: it is consumed entirely by the stage's own apply, so
+    /// `TxnResolve` never sees it. Prefix must lead with `key`'s own
+    /// partition token — validated at apply like `kind_writes`' keys.
+    /// `#[serde(default)]` so every pre-existing wire/WAL shape decodes as
+    /// `None` (fresh-clusters; the binary codec bumps its version anyway).
+    #[serde(default)]
+    pub stage_marker: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl TxnWrite {
@@ -316,6 +336,7 @@ impl TxnWrite {
             value,
             kind_writes: Vec::new(),
             change_log: None,
+            stage_marker: None,
         }
     }
 }

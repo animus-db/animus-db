@@ -503,20 +503,36 @@ pub struct ChangeRecord {
     /// so every pre-existing record decodes as a real write.
     #[serde(default)]
     pub marker: bool,
+    /// `true` for a **stage marker** (ADR 0049 §3): the image-less record
+    /// `KvCommand::TxnStage`'s apply arm writes for the anchor key it
+    /// stages, so a change-log consumer re-reading dirty keys (ADR 0050's
+    /// split-build tail) can observe a freshly staged intent envelope. A
+    /// stage marker always also sets [`marker`](Self::marker) — the
+    /// `staged` flag only records *which kind* of marker this is (an
+    /// intent appeared, and the state it points at may later revert on
+    /// abort — harmless: consumers re-read whatever is current). Never a
+    /// stream event: the transaction's real record materializes at
+    /// `TxnResolve`, at a strictly later HLC in the same log
+    /// (materialize-at-resolve, ADR 0046 Decision 2 — unchanged).
+    /// `#[serde(default)]` like its two siblings.
+    #[serde(default)]
+    pub staged: bool,
 }
 
 impl ChangeRecord {
     /// `true` when this record must never surface as a stream event: the
-    /// ADR 0045 §2 backfill seeder's synthetic dirty marker (`seeded`), or
-    /// an ADR 0049 §1 image-less marker record (`marker`). One predicate so
-    /// the sealed and open `GetRecords` serve paths (and any future
-    /// consumer-facing reader) can never drift on which records are
-    /// consumer-visible — change-log *consumers* (the GSI drain, the split
-    /// build) deliberately ignore this: to them every record is a dirty-key
-    /// signal.
+    /// ADR 0045 §2 backfill seeder's synthetic dirty marker (`seeded`), an
+    /// ADR 0049 §1 image-less marker record (`marker`), or an ADR 0049 §3
+    /// stage marker (`staged` — always also `marker` today, listed here as
+    /// defense-in-depth so a staged record stays hidden even if the two
+    /// flags ever diverge). One predicate so the sealed and open
+    /// `GetRecords` serve paths (and any future consumer-facing reader) can
+    /// never drift on which records are consumer-visible — change-log
+    /// *consumers* (the GSI drain, the split build) deliberately ignore
+    /// this: to them every record is a dirty-key signal.
     #[must_use]
     pub fn consumer_hidden(&self) -> bool {
-        self.seeded || self.marker
+        self.seeded || self.marker || self.staged
     }
 
     /// The DynamoDB Streams event name this record represents.
@@ -785,6 +801,7 @@ mod tests {
             new_image: Some(item.clone()),
             seeded: false,
             marker: false,
+            staged: false,
         };
         assert_eq!(insert.event_name(), "INSERT");
         assert_eq!(
@@ -798,6 +815,7 @@ mod tests {
             new_image: Some(item.clone()),
             seeded: false,
             marker: false,
+            staged: false,
         };
         assert_eq!(modify.event_name(), "MODIFY");
 
@@ -807,9 +825,27 @@ mod tests {
             new_image: None,
             seeded: false,
             marker: false,
+            staged: false,
         };
         assert_eq!(remove.event_name(), "REMOVE");
         assert_eq!(ChangeRecord::decode(b"garbage"), None);
+
+        // ADR 0049 §3: a stage marker is consumer-hidden — via `staged`
+        // itself (defense-in-depth), not only via the `marker` flag every
+        // real stage marker also sets.
+        let stage_marker = ChangeRecord {
+            base_sk: Vec::new(),
+            old_image: None,
+            new_image: None,
+            seeded: false,
+            marker: false,
+            staged: true,
+        };
+        assert!(stage_marker.consumer_hidden());
+        assert_eq!(
+            ChangeRecord::decode(&stage_marker.encode()).as_ref(),
+            Some(&stage_marker)
+        );
     }
 
     #[test]

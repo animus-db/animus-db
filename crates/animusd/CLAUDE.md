@@ -760,7 +760,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   paragraph's own non-transactional write path) and materialized by
   `TxnResolve`'s commit branch — see the "Multi-participant transactions"
   section below and `docs/adr/0018-cross-tablet-transactions.md`'s
-  2026-08-16 amendment for the full mechanism.
+  2026-08-16 amendment for the full mechanism. Every evaluated
+  transactional write also carries an ADR 0049 §3 **stage marker**
+  (`TxnWrite::stage_marker`, built by `dynamo::stage_marker_change_log` via
+  the shared marker core) that `TxnStage`'s apply arm materializes at the
+  stage entry's own HLC — consumer-hidden (`ChangeRecord::staged`), so the
+  existing exactly-one-record-per-transactional-write streams e2e
+  (`tests/dynamo_streams.rs`) doubles as its leak regression.
 
   **DynamoDB Streams (ADR 0042/0043).** `TableSchema.stream:
   Option<StreamSpec>` rides the same `CreateTable`/`UpdateTable` surface as

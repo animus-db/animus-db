@@ -4732,6 +4732,22 @@ fn kind_writes_token_valid(base_key: &[u8], kind_writes: &[KindWrite]) -> bool {
             .all(|(_, kk, _)| kk.len() >= tb && kk[..tb] == base_key[..tb])
 }
 
+/// ADR 0049 §3: a [`txn::TxnWrite`]'s `stage_marker` prefix must lead with
+/// its own base key's partition token, exactly like
+/// [`kind_writes_token_valid`]'s rule for kind-write keys and for the
+/// identical reason — the stage entry's `fence` covers `base_key`, so a
+/// token-matching marker key sits at the same tablet-range position; an
+/// arbitrary (wire-reachable, via `ClientRequest::TxnPrepare`) prefix could
+/// otherwise land a change-log row outside this tablet's own declared range.
+/// Validated, never assumed; a miss folds into the same structural `Fenced`
+/// outcome bucket.
+fn stage_marker_token_valid(base_key: &[u8], stage_marker: Option<&(Vec<u8>, Vec<u8>)>) -> bool {
+    let tb = animus_tablet::TOKEN_BYTES;
+    stage_marker.is_none_or(|(prefix, _)| {
+        base_key.len() >= tb && prefix.len() >= tb && prefix[..tb] == base_key[..tb]
+    })
+}
+
 /// Logged-warning cap for [`surface_suspicious_merge_noop`] (below): the
 /// [`Metric`] counters there are always incremented (cheap, unconditional),
 /// but a genuinely-reoccurring bug logging one line per applied entry would
@@ -5286,9 +5302,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // these same kind keys meaningful: a kind key sharing its
                 // base key's token sits at the same tablet-range position a
                 // plain `KindBatch` write's own key would.
-                let kind_tokens_ok = writes
-                    .iter()
-                    .all(|w| kind_writes_token_valid(&w.key, &w.kind_writes));
+                let kind_tokens_ok = writes.iter().all(|w| {
+                    kind_writes_token_valid(&w.key, &w.kind_writes)
+                        && stage_marker_token_valid(&w.key, w.stage_marker.as_ref())
+                });
                 let all_in_fence = !already_decided
                     && blocked_by.is_none()
                     && kind_tokens_ok
@@ -5383,6 +5400,31 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 recovered_baseline_version,
                             );
                         }
+                    }
+                    // ADR 0049 §3: the stage marker — an image-less,
+                    // consumer-hidden change-log record per staged write,
+                    // materialized at THIS stage entry's own `ts` (its key
+                    // HLC therefore strictly precedes the resolve entry's
+                    // materialized record, by log order — the per-item
+                    // ordering the split-build tail relies on). Goes through
+                    // the ONE shared materialization helper (ADR 0046's
+                    // binding shared-helper rule) with an empty kind-writes
+                    // list; record bytes stay opaque to this crate (ADR 0043
+                    // layering — the edge built them). Only written when the
+                    // stage itself lands (`stage_ok`): a fenced/blocked/
+                    // condition-failed stage leaves no intent, so there is
+                    // no dirty key to signal. WAL-replay re-application
+                    // re-merges the identical row at the identical version —
+                    // a no-op, like the intent merges above. An aborted
+                    // transaction's marker simply remains as a dirty-key
+                    // hint pointing at a row whose envelope reverted —
+                    // harmless by design: consumers re-read current state.
+                    let stage_markers: Vec<(Vec<u8>, Vec<u8>)> = writes
+                        .iter()
+                        .filter_map(|w| w.stage_marker.clone())
+                        .collect();
+                    if !stage_markers.is_empty() {
+                        materialize_derived(kind_scopes, &[], &stage_markers, ts, &mut pending);
                     }
                     if is_anchor {
                         let record = txn::TxnRecord {
