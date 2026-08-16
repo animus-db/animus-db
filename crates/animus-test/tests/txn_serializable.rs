@@ -768,7 +768,28 @@ async fn read_served_with_retry(
 // ---------------------------------------------------------------------------
 
 /// `(table, key, value)` — `value: None` is a staged delete.
-type TxnWrite = (&'static str, Vec<u8>, Option<Vec<u8>>);
+/// `(table, key, value, kind_writes)` — `kind_writes` is ADR 0046 A1's
+/// derived kind-scope payload staged alongside this write's own intent
+/// (empty for every shape except `run_write_only_txn`'s own writes, which
+/// each also mirror their new value into a `KIND_LSI` row keyed by
+/// [`kind_key`] — see that function's own doc for the invariant this
+/// proves).
+type TxnWrite = (&'static str, Vec<u8>, Option<Vec<u8>>, Vec<KindWrite>);
+/// One `(row kind, key, value)` derived write — mirrors
+/// `animus_cp_data::KindWrite` exactly (this corpus stays independent of
+/// `animusd`, so it doesn't reuse that crate's own alias).
+type KindWrite = (u8, Vec<u8>, Option<Vec<u8>>);
+/// The `KIND_LSI`-scoped key a base key `k`'s own derived row lives at
+/// (ADR 0046 A1/PR3 corpus extension): `key_bytes(k)` (the base key's own
+/// 8-byte token) plus a fixed one-byte tail — leads with the SAME token as
+/// the base key, exactly what `TxnStage`'s apply-time token validation
+/// requires (`animus-cp-data/tests/txn_kind_writes.rs`'s identical
+/// convention).
+fn kind_key(k: Key) -> Vec<u8> {
+    let mut out = key_bytes(k);
+    out.push(0x01);
+    out
+}
 /// `(table, key, expected_bytes)` — a value-precondition to re-check
 /// right before the commit decision.
 type TxnPrecondition = (&'static str, Vec<u8>, Vec<u8>);
@@ -1064,16 +1085,28 @@ async fn stage_anchor_pushing(
     table: &'static str,
     key: Vec<u8>,
     val: Option<Vec<u8>>,
+    kind_writes: Vec<KindWrite>,
     participant_spans: Vec<(String, KeyRange)>,
 ) -> Option<(TxnId, Vec<u8>)> {
     for attempt in 0..STAGE_PUSH_ATTEMPTS {
         let staged = with_leader_retry(env, nodes, OP_BUDGET, |node| {
             let key = key.clone();
             let val = val.clone();
+            let kind_writes = kind_writes.clone();
             let participant_spans = participant_spans.clone();
             async move {
-                node.txn_stage_anchor(table, vec![(key, val)], participant_spans, Vec::new())
-                    .await
+                node.txn_stage_anchor(
+                    table,
+                    vec![animus_cp_data::TxnWrite {
+                        key,
+                        value: val,
+                        kind_writes,
+                        change_log: None,
+                    }],
+                    participant_spans,
+                    Vec::new(),
+                )
+                .await
             }
         })
         .await;
@@ -1100,6 +1133,7 @@ async fn stage_participant_pushing(
     record_table: String,
     key: Vec<u8>,
     val: Option<Vec<u8>>,
+    kind_writes: Vec<KindWrite>,
 ) -> Option<HlcTimestamp> {
     for attempt in 0..STAGE_PUSH_ATTEMPTS {
         let ts = with_leader_retry(env, nodes, OP_BUDGET, |node| {
@@ -1108,12 +1142,18 @@ async fn stage_participant_pushing(
             let record_table = record_table.clone();
             let key = key.clone();
             let val = val.clone();
+            let kind_writes = kind_writes.clone();
             async move {
                 node.txn_stage_participant(
                     txn_id,
                     record_key,
                     record_table,
-                    vec![(key, val)],
+                    vec![animus_cp_data::TxnWrite {
+                        key,
+                        value: val,
+                        kind_writes,
+                        change_log: None,
+                    }],
                     Vec::new(),
                 )
                 .await
@@ -1146,11 +1186,11 @@ async fn run_txn(
     abandon_after_commit: bool,
 ) -> TxnRunOutcome {
     assert!(!writes.is_empty(), "run_txn: writes must be non-empty");
-    let (anchor_table, anchor_key, anchor_val) = writes[0].clone();
+    let (anchor_table, anchor_key, anchor_val, anchor_kind_writes) = writes[0].clone();
     let participants: Vec<TxnWrite> = writes[1..].to_vec();
     let participant_spans: Vec<(String, KeyRange)> = participants
         .iter()
-        .map(|(t, k, _)| {
+        .map(|(t, k, _, _)| {
             let mut end = k.clone();
             end.push(0);
             (t.to_string(), KeyRange::new(k.clone(), Some(end)))
@@ -1164,6 +1204,7 @@ async fn run_txn(
         anchor_table,
         anchor_key.clone(),
         anchor_val,
+        anchor_kind_writes,
         participant_spans,
     )
     .await;
@@ -1190,16 +1231,26 @@ async fn run_txn(
     // scope — where it can never be, since it lives on the anchor — so
     // `txn_record_view`/`txn_status_local` always come back empty and the
     // intent never resolves, on demand or otherwise.
-    let stage_futs = participants.iter().map(|(table, key, val)| {
+    let stage_futs = participants.iter().map(|(table, key, val, kind_writes)| {
         let nodes = topo.for_table(table);
         let txn_id = txn_id.clone();
         let record_key = record_key.clone();
         let anchor_table_owned = anchor_table.to_string();
         let key = key.clone();
         let val = val.clone();
+        let kind_writes = kind_writes.clone();
         async move {
-            stage_participant_pushing(env, nodes, txn_id, record_key, anchor_table_owned, key, val)
-                .await
+            stage_participant_pushing(
+                env,
+                nodes,
+                txn_id,
+                record_key,
+                anchor_table_owned,
+                key,
+                val,
+                kind_writes,
+            )
+            .await
         }
     });
     let stage_results: Vec<Option<HlcTimestamp>> = futures::future::join_all(stage_futs).await;
@@ -1207,7 +1258,7 @@ async fn run_txn(
     let mut staged_keys: Vec<(&'static str, Vec<u8>)> = vec![(anchor_table, anchor_key.clone())];
     let mut candidate = txn_id.ts;
     let mut all_staged = true;
-    for ((table, key, _), ts) in participants.iter().zip(stage_results.iter()) {
+    for ((table, key, _, _), ts) in participants.iter().zip(stage_results.iter()) {
         match ts {
             Some(t) => {
                 candidate = candidate.max(*t);
@@ -1358,7 +1409,22 @@ async fn run_write_only_txn(
         let v = shared.fresh_value();
         let mut list = my_lists.get(&k).cloned().unwrap_or_default();
         list.push(v);
-        writes.push((table_of_key(k), key_bytes(k), Some(encode_list(&list))));
+        // ADR 0046 A1 (PR3 corpus extension): every write-only append also
+        // stages a `KIND_LSI` row mirroring the SAME new list — see
+        // `final_kind_state`'s doc for the invariant this proves (the
+        // derived row must converge to exactly the base row's own final
+        // state: present once per commit, absent for every abort).
+        let kind_writes = vec![(
+            animus_cp_data::KIND_LSI,
+            kind_key(k),
+            Some(encode_list(&list)),
+        )];
+        writes.push((
+            table_of_key(k),
+            key_bytes(k),
+            Some(encode_list(&list)),
+            kind_writes,
+        ));
         candidates.insert(k, list);
         mops.push(Mop::Append { key: k, value: v });
     }
@@ -1651,7 +1717,27 @@ async fn run_rmw_txn(
         let value = shared.fresh_value();
         let mut list = my_lists.get(&k).cloned().unwrap_or_default();
         list.push(value);
-        writes.push((table_of_key(k), key_bytes(k), Some(encode_list(&list))));
+        // ADR 0046 A1 (PR3 corpus extension): RMW writes carry the SAME
+        // `KIND_LSI` mirror as `run_write_only_txn`'s own writes — both
+        // transaction shapes can append to the same client-owned key (the
+        // workload mixes shapes freely), so leaving RMW's own writes
+        // kind-payload-free would let an RMW-authored append silently
+        // "skip" the key's own derived row, which isn't a real ADR 0046
+        // bug — it's a gap in this corpus's own coverage that a first
+        // draft of this extension found live (a genuine reproduction of
+        // exactly the class of bug `check_kind_consistency` exists to
+        // catch, here caused by test scope, not the mechanism).
+        let kind_writes = vec![(
+            animus_cp_data::KIND_LSI,
+            kind_key(k),
+            Some(encode_list(&list)),
+        )];
+        writes.push((
+            table_of_key(k),
+            key_bytes(k),
+            Some(encode_list(&list)),
+            kind_writes,
+        ));
         candidates.insert(k, list);
         mops.push(Mop::Append { key: k, value });
     }
@@ -1773,11 +1859,32 @@ struct ScenarioResult {
     cycles: animus_test::CheckReport,
     durability: animus_test::CheckReport,
     convergence: animus_test::CheckReport,
+    /// ADR 0046 A1 (PR3 corpus extension): `final_kind_state` must equal
+    /// `final_state` on **both** replicas — reuses `check_convergence`'s
+    /// exact "these two maps must agree" primitive, just fed a base-vs-
+    /// kind pair per replica instead of a replica-vs-replica pair. See
+    /// `final_kind_state`'s own doc for what this proves.
+    kind_consistency: animus_test::CheckReport,
     history: History,
     ok_txns: usize,
     fail_txns: usize,
     info_txns: usize,
     cross_tablet_ok_txns: usize,
+}
+
+/// Combine two `check_convergence`-shaped reports (one per replica) into
+/// one, so `ScenarioResult` carries a single field — `ok` iff both did,
+/// violations concatenated.
+fn combine_reports(seed: u64, reports: [animus_test::CheckReport; 2]) -> animus_test::CheckReport {
+    let mut violations = Vec::new();
+    for r in &reports {
+        violations.extend(r.violations.iter().cloned());
+    }
+    animus_test::CheckReport {
+        ok: reports.iter().all(|r| r.ok),
+        violations,
+        seed,
+    }
 }
 
 fn final_state(topo: &Topology, replica: usize) -> BTreeMap<Key, Vec<u64>> {
@@ -1788,6 +1895,34 @@ fn final_state(topo: &Topology, replica: usize) -> BTreeMap<Key, Vec<u64>> {
         for c in 0..NUM_CLIENTS {
             let k = owned_key(c, g);
             let list = block_on(node.local_get(&key_bytes(k)))
+                .map(|b| decode_list(&b))
+                .unwrap_or_default();
+            map.insert(k, list);
+        }
+    }
+    map
+}
+
+/// **ADR 0046 A1's own invariant, at corpus depth (PR3)**: every
+/// `KIND_LSI` row `run_write_only_txn`'s writes stage must converge to
+/// *exactly* the same final value as its own base row — never staler
+/// (a committed transaction's derived row silently lost, ADR 0046
+/// Decision 2's whole "materialize-at-resolve" argument), never fresher or
+/// containing a value `final_state` doesn't also show (an aborted
+/// transaction's derived row that materialized anyway). Unlike
+/// `final_state`, `local_get_kind` never resolves an intent (kind scopes
+/// only ever hold committed values, by construction — see
+/// `RaftKvNode::local_get_kind`'s own doc) so this is already exactly as
+/// meaningful a per-replica snapshot as `final_state`'s own raw
+/// `local_get`.
+fn final_kind_state(topo: &Topology, replica: usize) -> BTreeMap<Key, Vec<u64>> {
+    use futures::executor::block_on;
+    let mut map = BTreeMap::new();
+    for g in 0..NUM_GROUPS {
+        let node = &topo.nodes[g][replica];
+        for c in 0..NUM_CLIENTS {
+            let k = owned_key(c, g);
+            let list = block_on(node.local_get_kind(animus_cp_data::KIND_LSI, &kind_key(k)))
                 .map(|b| decode_list(&b))
                 .unwrap_or_default();
             map.insert(k, list);
@@ -1966,16 +2101,34 @@ fn run_scenario(scenario: &Scenario) -> ScenarioResult {
     let last = 2usize; // 3rd replica of each group
     let mut a = final_state(&topo, 0);
     let mut b = final_state(&topo, last);
+    let mut kind_a = final_kind_state(&topo, 0);
+    let mut kind_b = final_kind_state(&topo, last);
     let mut durability = check_durability(&history, &a);
     let mut convergence = check_convergence(scenario.seed, &a, &b);
+    let mut kind_consistency = combine_reports(
+        scenario.seed,
+        [
+            check_convergence(scenario.seed, &a, &kind_a),
+            check_convergence(scenario.seed, &b, &kind_b),
+        ],
+    );
     let poll_deadline = sim.now().0 + CONVERGENCE_BUDGET.as_nanos() as u64;
-    while !(convergence.ok && durability.ok) && sim.now().0 < poll_deadline {
+    while !(convergence.ok && durability.ok && kind_consistency.ok) && sim.now().0 < poll_deadline {
         sim.run_for(CONVERGENCE_POLL_STEP);
         force_resolve_all_owned_keys(&mut sim, &topo);
         a = final_state(&topo, 0);
         b = final_state(&topo, last);
+        kind_a = final_kind_state(&topo, 0);
+        kind_b = final_kind_state(&topo, last);
         durability = check_durability(&history, &a);
         convergence = check_convergence(scenario.seed, &a, &b);
+        kind_consistency = combine_reports(
+            scenario.seed,
+            [
+                check_convergence(scenario.seed, &a, &kind_a),
+                check_convergence(scenario.seed, &b, &kind_b),
+            ],
+        );
     }
 
     let mut ok_txns = 0usize;
@@ -2008,6 +2161,7 @@ fn run_scenario(scenario: &Scenario) -> ScenarioResult {
         cycles,
         durability,
         convergence,
+        kind_consistency,
         history,
         ok_txns,
         fail_txns,
@@ -2016,11 +2170,12 @@ fn run_scenario(scenario: &Scenario) -> ScenarioResult {
     }
 }
 
-/// Asserts the three checks on one scenario result. Serializability is a
+/// Asserts the four checks on one scenario result. Serializability is a
 /// **safety** property (a hard assert at any depth, including under
 /// beyond-uncertainty clock skew — see the module doc); durability +
-/// convergence sit behind the converged-or-timeout poll already, so a
-/// failure here means the budget was genuinely exhausted.
+/// convergence + kind-consistency all sit behind the converged-or-timeout
+/// poll already, so a failure here means the budget was genuinely
+/// exhausted.
 fn assert_scenario_ok(s: &Scenario, r: &ScenarioResult) {
     assert!(
         r.cycles.ok,
@@ -2036,6 +2191,16 @@ fn assert_scenario_ok(s: &Scenario, r: &ScenarioResult) {
         r.convergence.ok,
         "scenario {} did not converge: {:?} (seed={})",
         s.name, r.convergence.violations, s.seed
+    );
+    // ADR 0046 A1 (PR3 corpus extension): every committed transaction's
+    // derived `KIND_LSI` row present exactly once, no aborted
+    // transaction's — see `final_kind_state`'s doc.
+    assert!(
+        r.kind_consistency.ok,
+        "scenario {} has a kind-derived row diverging from its own base row \
+         (a committed transaction's derived write silently lost, or an aborted \
+         transaction's materialized anyway): {:?} (seed={})",
+        s.name, r.kind_consistency.violations, s.seed
     );
 }
 
@@ -2388,8 +2553,13 @@ async fn tight_pair_writer(
 ) {
     for step in 1..=TIGHT_PAIR_STEPS {
         let writes = vec![
-            (table_a, bytes_a.clone(), Some(encode_i64(step))),
-            (table_b, bytes_b.clone(), Some(encode_i64(-step))),
+            (table_a, bytes_a.clone(), Some(encode_i64(step)), Vec::new()),
+            (
+                table_b,
+                bytes_b.clone(),
+                Some(encode_i64(-step)),
+                Vec::new(),
+            ),
         ];
         let _ = run_txn(&env, &topo, writes, None, false, false).await;
     }

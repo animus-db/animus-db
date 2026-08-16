@@ -89,19 +89,71 @@ use tracing::Instrument;
 type KvPair = (Vec<u8>, Vec<u8>);
 type KvPairs = Vec<KvPair>;
 
-/// A single write within a multi-participant transaction (ADR 0018 §2/PR4):
-/// `(key, Option<value>)` — `None` is a staged delete, matching
-/// `RaftKvNode::txn_stage`'s own `writes` shape.
-type TxnWrite = (Vec<u8>, Option<Vec<u8>>);
+/// A single write within a multi-participant transaction (ADR 0018 §2/PR4;
+/// ADR 0046 A1 kind-writes payload) — a direct alias of
+/// `animus_cp_data::TxnWrite`, never a locally-duplicated shape: `key`/
+/// `value` (`None` is a staged delete) plus, for a write against an
+/// indexed/streamed table, the derived `kind_writes`/`change_log` payload
+/// materialized at resolve. Matches `RaftKvNode::txn_stage_anchor`/
+/// `txn_stage_participant`'s own `writes` shape exactly, so it rides through
+/// with zero conversion.
+type TxnWrite = animus_cp_data::TxnWrite;
 /// A `cp_txn` precondition (ADR 0018 §2/PR4): `(table, key, expected)` —
 /// `expected: None` means "must be absent".
 type TxnPrecondition = (String, Vec<u8>, Option<Vec<u8>>);
-/// A `cp_txn`/`ClientRequest::Txn` write spanning tables (ADR 0018 §2/PR4):
-/// `(table, key, Option<value>)` — `None` is a staged delete. Structurally
-/// identical to [`TxnPrecondition`] (both are "table, key, optional bytes"),
-/// but kept as a distinct alias since the two mean different things (a
-/// value to write vs. a value to check).
-type TxnTableWrite = (String, Vec<u8>, Option<Vec<u8>>);
+/// One item write of an indexed/streamed table's transaction (ADR 0046 U3,
+/// `TxnStage` kind-writes stack PR2): the leader-evaluated dual of
+/// [`ClientRequest::KindWriteItem`]'s payload, staged instead of proposed
+/// directly. `run_transact` builds one of these per write action against a
+/// `table_takes_kind_write_path` table rather than precomputing the item's
+/// new value/diff itself (a stale coordinator-local read is exactly the
+/// cross-node race ADR 0046 U3 closes for the *ordinary* write path —
+/// `dynamo::kind_write_item_at_leader` — and closes here identically):
+/// [`ClientCtx::txn_prepare`] evaluates it **at the participant's own tablet
+/// leader**, under the same `ctx.data().rmw_lock` `kind_write_item_at_leader`
+/// takes, immediately before staging — never at the coordinator/edge.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PendingKindWrite {
+    pub(crate) pk: animus_dynamo::AttributeValue,
+    pub(crate) sk: Option<animus_dynamo::AttributeValue>,
+    pub(crate) op: KindWriteOp,
+    #[serde(default)]
+    pub(crate) condition: Option<animus_dynamo::ConditionExpression>,
+}
+
+/// A `cp_txn`/`ClientRequest::Txn` write spanning tables (ADR 0018 §2/PR4;
+/// ADR 0046 U3 kind-writes extension): `(table, key)` plus **either**
+/// `value: Some(..)` (a plain, already-known write — a staged delete is
+/// `Some(tombstone_bytes)`, matching the Dynamo edge's own delete-marker
+/// convention, never engine-level `None`) **or** `pending: Some(..)` (a
+/// write against an indexed/streamed table, evaluated at the participant
+/// leader instead — see [`PendingKindWrite`]'s doc). Exactly one of
+/// `value`/`pending` is ever `Some` for a real write; `cp_txn` treats
+/// `value: None, pending: None` as a caller error.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TxnTableWrite {
+    pub(crate) table: String,
+    pub(crate) key: Vec<u8>,
+    pub(crate) value: Option<Vec<u8>>,
+    #[serde(default)]
+    pub(crate) pending: Option<PendingKindWrite>,
+}
+
+impl TxnTableWrite {
+    /// A plain (already-known-value) write — the common case, and the only
+    /// shape available to a caller outside this crate (every field here is
+    /// `pub(crate)`, so an integration test builds one through this
+    /// constructor rather than the struct literal).
+    #[must_use]
+    pub fn plain(table: String, key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
+        TxnTableWrite {
+            table,
+            key,
+            value,
+            pending: None,
+        }
+    }
+}
 /// A `cp_txn`/`ClientRequest::Txn` **write-key condition** (ADR 0018 §2
 /// apply-time write-key conditions amendment): `(table, key, expected)` —
 /// structurally identical to [`TxnPrecondition`], but semantically distinct
@@ -184,11 +236,12 @@ impl CpGroup {
         &self,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Option<(Vec<u8>, Vec<u8>)>,
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
     ) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.put_kind_batch_fenced(writes, change_log, fence),
-            CpGroup::Mem(n) => n.put_kind_batch_fenced(writes, change_log, fence),
+            CpGroup::Lsm(n) => n.put_kind_batch_fenced(writes, change_log, conditions, fence),
+            CpGroup::Mem(n) => n.put_kind_batch_fenced(writes, change_log, conditions, fence),
         }
     }
 
@@ -273,8 +326,8 @@ impl CpGroup {
         end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         match self {
-            CpGroup::Lsm(n) => n.local_scan_kind(kind, start, end).await,
-            CpGroup::Mem(n) => n.local_scan_kind(kind, start, end).await,
+            CpGroup::Lsm(n) => n.local_scan_kind(kind, start, end, None).await,
+            CpGroup::Mem(n) => n.local_scan_kind(kind, start, end, None).await,
         }
     }
 
@@ -289,16 +342,19 @@ impl CpGroup {
 
     /// Linearizable ReadIndex range scan of a non-base row-kind scope (ADR
     /// 0041 §3) — the LSI `Query`/`Scan` read primitive. `end: None` is
-    /// unbounded above. See [`RaftKvNode::linearizable_scan_kind`].
+    /// unbounded above; `limit` is a **per-tablet cap, not pushdown** (see
+    /// [`RaftKvNode::local_scan_kind`]'s doc). See
+    /// [`RaftKvNode::linearizable_scan_kind`].
     async fn linearizable_scan_kind(
         &self,
         kind: u8,
         start: &[u8],
         end: Option<&[u8]>,
+        limit: Option<usize>,
     ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         match self {
-            CpGroup::Lsm(n) => n.linearizable_scan_kind(kind, start, end).await,
-            CpGroup::Mem(n) => n.linearizable_scan_kind(kind, start, end).await,
+            CpGroup::Lsm(n) => n.linearizable_scan_kind(kind, start, end, limit).await,
+            CpGroup::Mem(n) => n.linearizable_scan_kind(kind, start, end, limit).await,
         }
     }
 
@@ -356,6 +412,35 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.is_leader(),
             CpGroup::Mem(n) => n.is_leader(),
+        }
+    }
+
+    /// Explicitly wake this group's consensus loop for one extra pass (ADR
+    /// 0044 phase-1 PR4) — see [`RaftKvNode::wake`]. Idempotent and safe on
+    /// every state.
+    fn wake(&self) {
+        match self {
+            CpGroup::Lsm(n) => n.wake(),
+            CpGroup::Mem(n) => n.wake(),
+        }
+    }
+
+    /// ADR 0044 phase-1 PR5, fork D: hold or release this group's external
+    /// quiesce veto. See [`RaftKvNode::set_quiesce_veto`].
+    fn set_quiesce_veto(&self, held: bool) {
+        match self {
+            CpGroup::Lsm(n) => n.set_quiesce_veto(held),
+            CpGroup::Mem(n) => n.set_quiesce_veto(held),
+        }
+    }
+
+    /// Whether this replica currently considers its own group quiesced (ADR
+    /// 0044 phase-1) — the sweeper-skip gate every per-node background loop
+    /// checks first (ADR 0044 phase-1 PR6). See [`RaftKvNode::is_quiesced`].
+    fn is_quiesced(&self) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.is_quiesced(),
+            CpGroup::Mem(n) => n.is_quiesced(),
         }
     }
 
@@ -536,6 +621,7 @@ impl CpGroup {
                     voters: $n.config().into_iter().collect(),
                     key_count,
                     byte_size,
+                    quiesced: $n.is_quiesced(),
                 }
             };
         }
@@ -958,6 +1044,15 @@ const TXN_STAGE_PUSH_ATTEMPTS: u32 = 3;
 /// finishing, or `txn_resolver_loop`'s passive sweep once past
 /// `animus_cp_data::RECOVERY_GRACE`), not a hard liveness bound.
 const TXN_STAGE_PUSH_BACKOFF: Duration = Duration::from_millis(250);
+/// ADR 0046 D1: how long [`ClientCtx::cp_txn`] awaits `resolve_all` before
+/// acking anyway, for a transaction that touches at least one kind-write-path
+/// table (a plain transaction keeps the original fire-and-forget spawn,
+/// unaffected). A timeout here never denies the commit — it only means the
+/// LSI/GSI/stream materialization the client's own immediate follow-up read
+/// might race is left for `txn_resolver_loop`'s passive sweep, exactly as a
+/// plain transaction's async resolve always could race a follow-up read on
+/// its own participant tables.
+const TXN_RESOLVE_ALL_AWAIT_BUDGET: Duration = Duration::from_secs(2);
 /// The bootstrap CP group's replication factor (ADR 0017 #3a): the group spans the
 /// first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids. Dynamic CP placement
 /// over more nodes is later v1 work.
@@ -1003,6 +1098,32 @@ pub enum StorageBackend {
     Lsm,
     /// Volatile in-memory engine (ephemeral runs).
     Memory,
+}
+
+/// One [`ClientRequest::KindWriteItem`] operation — a DynamoDB `PutItem`/
+/// `DeleteItem`/`UpdateItem`'s payload, self-contained enough for the
+/// tablet leader to evaluate a `condition` and compute the item's new value
+/// **itself**, rather than trusting a pre-computed value from the
+/// (possibly stale, possibly racing) edge that received the request — see
+/// [`ClientRequest::KindWriteItem`]'s doc for why (ADR 0046 "evaluate at
+/// leader", U3).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum KindWriteOp {
+    /// `PutItem`'s full new item.
+    Put(animus_dynamo::Item),
+    /// `DeleteItem` — the leader writes the tombstone sentinel itself.
+    Delete,
+    /// `UpdateItem`'s raw `SET`/`REMOVE` actions — the leader applies them
+    /// to the old image it itself reads (so the leader resolves the
+    /// base-value read-modify-write hazard too, not just the LSI/
+    /// change-record one `PutItem`/`DeleteItem` already close). `key_item`
+    /// covers the upsert-from-key-attributes-when-absent behavior
+    /// ([`animus_dynamo::wire::apply_update`]'s existing contract) when the
+    /// item doesn't exist yet.
+    Update {
+        key_item: animus_dynamo::Item,
+        actions: Vec<animus_dynamo::wire::UpdateAction>,
+    },
 }
 
 /// A request from a client to a node (length-prefixed JSON over TCP).
@@ -1067,12 +1188,23 @@ pub enum ClientRequest {
     /// exposing it bare would let an arbitrary caller read a table's
     /// LSI/change-log/footprint bytes by kind number rather than through the
     /// DynamoDB surface that interprets them.
+    ///
+    /// `limit` (ADR 0041 §5 as-built) is [`ClientCtx::cp_scan_kind_table`]'s
+    /// per-tablet cap — **not pushdown**: `StorageEngine::scan` has no limit
+    /// parameter, so the tablet still reads its whole `[start, end)`
+    /// sub-range; the win is a smaller wire payload for this reply and less
+    /// coordinator-side memory, never reduced engine I/O. `#[serde(default)]`
+    /// so an older peer's un-limited `KindScan` (equivalent to `None`)
+    /// decodes on a newer one. `#[serde(default)]` on `end` predates this and
+    /// is unrelated.
     KindScan {
         table: String,
         kind: u8,
         start: Vec<u8>,
         #[serde(default)]
         end: Option<Vec<u8>>,
+        #[serde(default)]
+        limit: Option<usize>,
     },
     /// **Internal seal-trigger RPC — never sent bare, only wrapped in
     /// [`Forwarded`](Self::Forwarded)** (ADR 0042/0043, round-3 sealer PR):
@@ -1095,6 +1227,30 @@ pub enum ClientRequest {
     /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
     /// only through the `Forwarded` arm.
     ForceSeal { tablet: u64 },
+    /// **Internal manual-growth split-trigger RPC — never sent bare, only
+    /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0042 §14, growth
+    /// PR3's `POST /admin/stream/grow`): materialize `tablet`'s own live
+    /// pairs and, if it has at least 2 distinct keys, split it at their
+    /// byte-weighted median (ADR 0034) via [`ClientCtx::trigger_split`] —
+    /// which independently applies F11's token-rounding and Fork E's
+    /// single-token skip, exactly as it does for every other split
+    /// proposer. Mirrors [`ForceSeal`](Self::ForceSeal)'s shape: addressed
+    /// by `tablet` directly (the caller already knows it from the table's
+    /// own tablet map, not a client key), bare delivery refused for the
+    /// same reason. The **one** production use is `ClientCtx::
+    /// grow_stream_tablet`, called once per tablet of a streamed table by
+    /// `ClientCtx::grow_stream` — a table's tablets can be led on any node,
+    /// not necessarily the one that received the admin request, so this
+    /// needs the identical one-hop forward/leader-resolution machinery
+    /// every other CP op already has. Not a `MetaCommand`, so
+    /// `is_relayable_command` does not apply; real handling lives in
+    /// `cp_serve_forwarded`'s match, reached only through the `Forwarded`
+    /// arm. A tablet with fewer than 2 distinct keys has no legal interior
+    /// split point at all (regardless of tokens) and answers
+    /// `ClientResponse::Error` naming that, distinct from Fork E's
+    /// single-token-collapse message — both are skips the caller
+    /// classifies as such, never hard failures.
+    TriggerAutoSplit { tablet: u64 },
     /// **Internal open-shard hot-read RPC — never sent bare, only wrapped in
     /// [`Forwarded`](Self::Forwarded)** (ADR 0042 §7/§8, PR6's `GetRecords`
     /// read API): a leader-local, non-linearizable scan of `tablet`'s own
@@ -1144,6 +1300,45 @@ pub enum ClientRequest {
     /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
     /// only through the `Forwarded` arm.
     ClearBackfillCursor { tablet: u64, index: String },
+    /// **Internal evaluate-at-leader write RPC — never sent bare, only
+    /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0046 "evaluate at
+    /// leader", U3, tracked against `docs/adr-tablet-log-model` #222): the
+    /// fix for a cross-node race the edge-evaluated
+    /// `index_aware_write`/`kind_writes_for_item` design had — two edge
+    /// nodes writing the same item never contended on the same
+    /// **node-local** `rmw_lock`, so both could diff against the same stale
+    /// old image and the loser's stale LSI row orphaned forever (nothing
+    /// reconciles an LSI; only a GSI drain self-heals). Moving the
+    /// read → evaluate-`condition` → diff span onto the item's own tablet
+    /// **leader** — which every write of this item reaches regardless of
+    /// which edge node received it — closes the race structurally: `pk`/
+    /// `sk` name the item, `op` is the write itself (self-contained enough
+    /// for the leader to compute the new value without trusting anything
+    /// the caller precomputed), and `condition` (now `Serialize`/
+    /// `Deserialize`, ADR 0046 U3) is the caller's own `ConditionExpression`,
+    /// evaluated by the leader against its own read rather than the
+    /// caller's.
+    ///
+    /// Folds in `UpdateItem` too (`KindWriteOp::Update`): its base-value
+    /// read-modify-write had the identical cross-node hazard, closed by the
+    /// same mechanism at no extra cost.
+    ///
+    /// Bare delivery is refused for the same reason [`KindWrite`](Self::KindWrite)
+    /// is — a client could otherwise force an arbitrary write into a
+    /// table's base/LSI/change scopes bypassing every DynamoDB-level
+    /// validation. Not a `MetaCommand`, so `is_relayable_command` does not
+    /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
+    /// only through the `Forwarded` arm. Answered with
+    /// [`KindWriteOk`](ClientResponse::KindWriteOk) or
+    /// [`ConditionFailed`](ClientResponse::ConditionFailed).
+    KindWriteItem {
+        table: String,
+        pk: animus_dynamo::AttributeValue,
+        sk: Option<animus_dynamo::AttributeValue>,
+        op: KindWriteOp,
+        #[serde(default)]
+        condition: Option<animus_dynamo::ConditionExpression>,
+    },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
     Get { key: Vec<u8>, table: String },
@@ -1219,12 +1414,15 @@ pub enum ClientRequest {
     /// size-telemetry trigger is `auto_split_loop`.
     SplitTablet { tablet: u64, split_key: Vec<u8> },
     /// **Join discovery** (ADR 0032 PR2, `animusd join`): a node that knows only
-    /// a *seed* address (any already-running node's client address — old or
-    /// newly grown, PR1 made every node's address book equally current) asks
+    /// a *seed* address (any already-running node's **intra-cluster** address
+    /// — ADR 0047, was the client address pre-ADR-0047; old or newly grown,
+    /// PR1 made every node's address book equally current) asks
     /// for enough information to start as a growth member without an
     /// operator-assembled expanded `ClusterConfig`. Any node can answer — the
     /// reply is built entirely from the receiving node's own knowledge (its
-    /// captured `AdminInfo` + its live `client_route`), no forwarding needed.
+    /// captured `AdminInfo` + its live `client_route`/`intra_route`), no
+    /// forwarding needed. This is itself served on the intra listener only
+    /// (`JoinInfo` is `Surface::Intra`).
     /// An additive variant: both sides of a cluster are the same build in
     /// this repo's pre-alpha stance, so no version negotiation is needed for
     /// an older peer that predates it.
@@ -1297,6 +1495,13 @@ pub enum ClientRequest {
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         #[serde(default)]
         participant_spans: Vec<(String, KeyRange)>,
+        /// **ADR 0046 U3, `TxnStage` kind-writes stack PR2**: writes against
+        /// an indexed/streamed table, evaluated at THIS receiving leader
+        /// (never precomputed by the coordinator) and merged into `writes`
+        /// before staging — see [`PendingKindWrite`]'s doc. `#[serde(default)]`,
+        /// same house convention as `conditions`/`participant_spans` above.
+        #[serde(default)]
+        pending_kind_writes: Vec<PendingKindWrite>,
     },
     /// **Internal 2PC coordinator RPC — anchor only, never sent bare**
     /// (ADR 0018 §2/PR4): commit or abort `txn_id`'s record at `record_key`
@@ -1367,6 +1572,93 @@ pub enum ClientRequest {
         span: KeyRange,
         txn_id: TxnId,
     },
+}
+
+/// Which listener a connection came in on (ADR 0047). Kept as a distinct
+/// type from [`Surface`] even though both are 2-variant enums over the same
+/// two concepts — see that type's doc for why sharing one enum for both
+/// would make the refusal rule look symmetric when it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerKind {
+    /// The external, DynamoDB/CQL-adjacent client port.
+    Client,
+    /// The cluster-internal RPC port (ADR 0047) — the more-trusted network
+    /// segment; the operator's Kubernetes topology keeps it off any
+    /// externally-reachable Service.
+    Intra,
+}
+
+/// Where a [`ClientRequest`] variant may be received **bare** — a
+/// classification result, not a listener identity (see [`ListenerKind`]'s
+/// doc for why these are two distinct types). [`surface_of`] is the one
+/// exhaustive table computing this; [`handle_request`]'s one guard clause is
+/// the one place it is consulted.
+///
+/// **`Intra` is a superset of `Public`, not a disjoint partition**: nothing
+/// stops the intra listener from also serving a `Public`-surfaced request —
+/// deliberately, since neither port has authentication yet at this
+/// milestone, and intra is meant to be the more, not less, trusted segment.
+/// A future reader should not "fix" this into a second refusal layer without
+/// re-reading ADR 0047's rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    /// Reachable on either listener.
+    Public,
+    /// Reachable **only** on the intra listener — refused bare on `Client`.
+    Intra,
+}
+
+/// The single source of truth for which listener(s) may receive a bare
+/// [`ClientRequest`] variant (ADR 0047). A free function beside
+/// [`request_kind`], same convention: **no wildcard arm**, so adding a
+/// `ClientRequest` variant anywhere is a compile error here until it is
+/// explicitly classified.
+///
+/// Every internal-only forwarding payload is listed explicitly here even
+/// though [`Forwarded`](ClientRequest::Forwarded)'s own `Intra`
+/// classification already makes them transitively unreachable via the
+/// client listener (a bare send of one of them is refused independently of
+/// ever being wrapped) — leaving that implicit would mean "is this variant
+/// reachable on the client port" depends on reasoning about two gates
+/// together instead of this one table being the complete answer on its own.
+///
+/// **Scope note**: this table's exhaustiveness retires the standing "grep
+/// every gating site" lesson (root `CLAUDE.md`) *only* for the
+/// client-vs-intra reachability axis. It does **not** touch
+/// [`is_relayable_command`] (whether a `MetaCommand` may ride the
+/// `ProposeSchema` relay envelope) or [`ClientCtx::cp_serve_forwarded`]'s own
+/// match (whether real handling exists for a forwarded payload) — both stay
+/// exactly as grep-dependent as before; unrelated axes.
+fn surface_of(request: &ClientRequest) -> Surface {
+    match request {
+        ClientRequest::Status
+        | ClientRequest::Put { .. }
+        | ClientRequest::PutBatch { .. }
+        | ClientRequest::Get { .. }
+        | ClientRequest::Scan { .. }
+        | ClientRequest::Delete { .. }
+        | ClientRequest::Txn { .. }
+        | ClientRequest::SplitTablet { .. } => Surface::Public,
+
+        ClientRequest::Forwarded { .. }
+        | ClientRequest::ProposeSchema(_)
+        | ClientRequest::JoinInfo
+        | ClientRequest::WatchMetadata { .. }
+        | ClientRequest::KindWrite { .. }
+        | ClientRequest::KindScan { .. }
+        | ClientRequest::GetSnapshot { .. }
+        | ClientRequest::ForceSeal { .. }
+        | ClientRequest::TriggerAutoSplit { .. }
+        | ClientRequest::StreamHotRead { .. }
+        | ClientRequest::ClearBackfillCursor { .. }
+        | ClientRequest::KindWriteItem { .. }
+        | ClientRequest::TxnPrepare { .. }
+        | ClientRequest::TxnDecide { .. }
+        | ClientRequest::TxnResolve { .. }
+        | ClientRequest::TxnStatus { .. }
+        | ClientRequest::TxnRecordView { .. }
+        | ClientRequest::TxnVerify { .. } => Surface::Intra,
+    }
 }
 
 /// Whether `command` may be **relayed to the control leader** via
@@ -1511,13 +1803,14 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
 pub enum ClientResponse {
     /// Cached cluster metadata (membership + tablet map), plus (ADR 0035 §1)
     /// the answering node's own best-known control-plane leader —
-    /// `self.control.leader()` + `ClientCtx::route_addr(leader_id)`, the same
-    /// lookup `propose_schema`'s relay tier already does. Serves three ADR
-    /// 0035 PR4 needs from one reply: `ControlHandle::Remote`'s `leader()`/
-    /// `leader_addr_hint()`, `metadata_fresh`'s leader-directed retry target,
-    /// and an efficient `propose_schema` relay (no extra `route_addr` hop).
-    /// `#[serde(default)]` so an older node's reply (predating either field)
-    /// still parses, decoding to `None`/`0`.
+    /// `self.control.leader()` + `ClientCtx::route_addr(leader_id)`. Serves
+    /// two ADR 0035 PR4 needs from one reply: `ControlHandle::Remote`'s
+    /// `leader()`/`leader_addr_hint()`, and `metadata_fresh`'s leader-directed
+    /// retry target. **`propose_schema`'s own relay tier no longer uses this
+    /// field** (ADR 0047) — it uses the parallel `intra_leader_hint` below,
+    /// since its relay target must be the intra address, not this
+    /// client-flavored one. `#[serde(default)]` so an older node's reply
+    /// (predating either field) still parses, decoding to `None`/`0`.
     ///
     /// **`watermark` (ADR 0035 PR5)**: the answering node's own applied-index
     /// watch (`ControlHandle::metadata_watch().latest()`) at reply time — the
@@ -1550,6 +1843,12 @@ pub enum ClientResponse {
         metadata: Metadata,
         #[serde(default)]
         leader_hint: Option<(NodeId, SocketAddr)>,
+        /// The intra-cluster dual of `leader_hint` (ADR 0047) — machine-
+        /// relay-only, never surfaced to a human (see the root `CLAUDE.md`'s
+        /// hint-field-conflation lesson). `#[serde(default)]`, same
+        /// robustness pattern as `leader_hint`.
+        #[serde(default)]
+        intra_leader_hint: Option<(NodeId, SocketAddr)>,
         #[serde(default)]
         watermark: u64,
         #[serde(default)]
@@ -1559,6 +1858,24 @@ pub enum ClientResponse {
     PutOk,
     /// A read reached its quorum; the value (or `None` if absent).
     Value(Option<Vec<u8>>),
+    /// Reply to [`KindWriteItem`](ClientRequest::KindWriteItem): the write
+    /// landed (base row, plus its LSI rows/change-log record if the table
+    /// takes the kind-write path) — `old`/`new` are exactly what
+    /// `index_aware_write`'s edge-evaluated design used to hand back to its
+    /// own caller directly, needed for `ReturnValues`/`UpdateReturnValues`
+    /// echo. `new: None` for a `Delete` op.
+    KindWriteOk {
+        old: Option<animus_dynamo::Item>,
+        new: Option<animus_dynamo::Item>,
+    },
+    /// Reply to [`KindWriteItem`](ClientRequest::KindWriteItem): the
+    /// caller's own `condition` did not match the leader's own read of the
+    /// current item. Distinguishable on the wire from
+    /// [`Error`](Self::Error) — like [`Unresolved`](Self::Unresolved) just
+    /// below, this is an expected outcome a caller acts on directly (compose
+    /// `WireError::conditional_check_failed`), not a transient failure to
+    /// retry.
+    ConditionFailed,
     /// Reply to [`GetSnapshot`](ClientRequest::GetSnapshot): the queried
     /// key's covering transaction did not resolve within one single,
     /// point-in-time attempt (ADR 0018 §2, torn-pair-fix stack PR2) — see
@@ -1584,6 +1901,14 @@ pub enum ClientResponse {
         control_ids: Vec<NodeId>,
         peers: BTreeMap<NodeId, SocketAddr>,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        /// The answering node's live intra-cluster routing table (ADR 0047),
+        /// paralleling `client_route` — the joining node seeds its own
+        /// `ctx.intra_route` from this, load-bearing for the exact same
+        /// reason `client_route` is: the growth-node-mirror branch inside
+        /// `BoundNode::start_with_streams` resolves `ctx.intra_addr(id)`
+        /// synchronously, before this node's own `intra_route_sync_loop` has
+        /// had a chance to tick.
+        intra_route: BTreeMap<NodeId, SocketAddr>,
         admin_addrs: Vec<SocketAddr>,
     },
     /// **Incremental long-poll reply to
@@ -1615,6 +1940,10 @@ pub enum ClientResponse {
         writes: Vec<animus_control::mirror::KeyWrite>,
         watermark: u64,
         leader_hint: Option<(NodeId, SocketAddr)>,
+        /// The intra-cluster dual of `leader_hint` (ADR 0047) — see
+        /// `Status`'s own field doc.
+        #[serde(default)]
+        intra_leader_hint: Option<(NodeId, SocketAddr)>,
         control_voters: BTreeSet<NodeId>,
     },
     /// Reply to [`Txn`](ClientRequest::Txn): the transaction committed at
@@ -1702,8 +2031,26 @@ pub struct RoleAddrs {
     /// control-plane Raft (stream 0) and every per-tablet Raft group this
     /// node hosts (stream = tablet id ≥ 1, ADR 0026) share it. Required for
     /// every role.
+    ///
+    /// **Naming note (ADR 0047)**: `internal` is the raw `ProdEnv`/Raft-wire
+    /// transport — not the same thing as [`intra`](Self::intra) below, one
+    /// letter-swap away and a recurring source of confusion. `intra` is the
+    /// **`ClientRequest`/`ClientResponse`-framed** node-to-node RPC port
+    /// (same length-prefixed JSON framing as `client`, just a disjoint
+    /// allowed-variant set); `internal` is never dialed with that framing.
     pub internal: SocketAddr,
     pub client: SocketAddr,
+    /// This node's **intra-cluster** RPC listen address (ADR 0047): every
+    /// internal-only `ClientRequest` variant (`Forwarded`, `ProposeSchema`,
+    /// `WatchMetadata`, `JoinInfo`, and the internal-only forwarding
+    /// payloads) is served here instead of on `client`. Required for every
+    /// role — a control-only node receives `ProposeSchema` relays and serves
+    /// `WatchMetadata` long-polls; a data-only node originates both. No
+    /// default (a deliberate clean break, matching `internal`/`client`'s own
+    /// no-default convention — no live deployments to keep back-compat
+    /// with). See [`internal`](Self::internal)'s doc for the naming
+    /// distinction from that field.
+    pub intra: SocketAddr,
     /// The DynamoDB JSON-over-HTTP endpoint. Defaults (when absent in older
     /// configs) to an ephemeral loopback port.
     #[serde(default = "default_ephemeral_addr")]
@@ -1747,6 +2094,12 @@ pub struct BoundNode {
     cql_addr: SocketAddr,
     admin_listener: TcpListener,
     admin_addr: SocketAddr,
+    /// The intra-cluster RPC listener (ADR 0047) — bound but not yet served
+    /// in this PR; carried through to [`start_with`](Self::start_with) so a
+    /// later PR can spawn `serve_requests` on it without touching the bind
+    /// sequence.
+    intra_listener: TcpListener,
+    intra_addr: SocketAddr,
 }
 
 /// A node's identity + bound addresses, captured for the admin `/admin/config`
@@ -1775,6 +2128,10 @@ pub(crate) struct AdminInfo {
     /// ADR 0035 PR3).
     pub(crate) cql_addr: Option<SocketAddr>,
     pub(crate) admin_addr: SocketAddr,
+    /// This node's own intra-cluster RPC address (ADR 0047) — used to
+    /// self-skip in `propose_schema`'s broadcast fallback (the intra-flavored
+    /// dual of the old `client_addr` self-skip check).
+    pub(crate) intra_addr: SocketAddr,
     /// This node's own deployment role (ADR 0035; ADR 0040 PR1 — no longer
     /// inferred from `control_id`/`raftkv_id` presence, since there is only
     /// one id now): `"control"`/`"data"`/`"combined"`, stamped literally by
@@ -1807,10 +2164,12 @@ pub(crate) struct AdminInfo {
 /// The common assembly tail shared by every node shape (ADR 0035 PR3):
 /// build the [`ClientCtx`] and spawn the tasks every node needs regardless of
 /// role — control-only ([`BoundControlNode::start_control_with`]), or
-/// combined/data-role ([`BoundNode::start_with`]): `route_sync_loop`,
-/// `metrics_sample_loop`, this node's own one-shot `register_node_addrs`
-/// self-registration, the plain client-request server, and the admin HTTP
-/// endpoint (ADR 0020). Returns the built `ClientCtx` — so the caller can
+/// combined/data-role ([`BoundNode::start_with`]): `route_sync_loop`/
+/// `intra_route_sync_loop`, `metrics_sample_loop`, this node's own one-shot
+/// `register_node_addrs` self-registration, **both** client-protocol
+/// listeners (ADR 0047 — `serve_requests` spawned once per `ListenerKind`,
+/// see that function's doc), and the admin HTTP endpoint (ADR 0020).
+/// Returns the built `ClientCtx` — so the caller can
 /// spawn whatever role-specific tasks it still needs (`bootstrap`/
 /// `peer_sync_loop`/the growth-node mirror/`heartbeat_loop`/the tablet-host
 /// reconciler/`auto_split_loop`/the dynamo+cql listeners for a data-capable
@@ -1829,9 +2188,11 @@ fn spawn_common_tail(
     data: Option<DataRole>,
     admin_info: Arc<AdminInfo>,
     client_route: BTreeMap<NodeId, SocketAddr>,
+    intra_route: BTreeMap<NodeId, SocketAddr>,
     self_addrs: (NodeId, NodeAddrs),
     client_listener: TcpListener,
     admin_listener: TcpListener,
+    intra_listener: TcpListener,
     control_storage: Option<SharedEngine>,
     env: ProdEnv,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
@@ -1839,12 +2200,17 @@ fn spawn_common_tail(
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
     // `peer_sync_loop` uses for the raftkv-env peer book.
     let static_route = client_route.clone();
+    // The `intra_route` sibling (ADR 0047) — see `intra_route_sync_loop`'s
+    // doc for why this static seed is load-bearing, not just an
+    // optimization.
+    let static_intra_route = intra_route.clone();
     let ctx = ClientCtx {
         control,
         edge,
         env,
         data,
         client_route: Arc::new(Mutex::new(client_route)),
+        intra_route: Arc::new(Mutex::new(intra_route)),
         admin: admin_info,
         metrics_history: Arc::new(Mutex::new(VecDeque::with_capacity(METRICS_HISTORY_CAP))),
         remote_metadata: Arc::new(Mutex::new(None)),
@@ -1854,11 +2220,19 @@ fn spawn_common_tail(
     let mut tasks = Vec::with_capacity(5);
     // Route-sync loop (ADR 0032 PR1): keep `ctx.client_route` = the static seed
     // above ∪ `Metadata.node_addrs[*].client`, so a node grown in after this
-    // node's own startup still becomes a valid client-op forward target and
-    // `propose_schema`'s relay/broadcast can reach it too. Runs on every node,
+    // node's own startup still becomes a valid client-op forward target
+    // (`propose_schema`'s relay/broadcast reads `ctx.intra_route` instead,
+    // ADR 0047 — see `intra_route_sync_loop` just below). Runs on every node,
     // including a growth node (reads `effective_metadata()`, so it syncs off
     // its own remote mirror) and a control-only node.
     tasks.push(tokio::spawn(route_sync_loop(ctx.clone(), static_route)));
+    // Intra-route sync loop (ADR 0047) — the `route_sync_loop` sibling for
+    // `ctx.intra_route`; see `intra_route_sync_loop`'s own doc for why it
+    // needs no static seed. Runs on every node, same as `route_sync_loop`.
+    tasks.push(tokio::spawn(intra_route_sync_loop(
+        ctx.clone(),
+        static_intra_route,
+    )));
     // Metrics-history sampler (ADR 0020 dashboard sparklines): periodic
     // snapshots of this node's own aggregated counters. Runs on every node —
     // a control-only node's snapshot is just the control sink (`metrics_text`/
@@ -1888,7 +2262,21 @@ fn spawn_common_tail(
             let _ = ctx.register_node(node, addrs, BTreeMap::new()).await;
         }));
     }
-    tasks.push(tokio::spawn(serve_clients(client_listener, ctx.clone())));
+    // The two client-protocol listeners (ADR 0047): one parameterized
+    // `serve_requests` function, not a fork — see that function's doc.
+    // `Client` refuses every `Surface::Intra` request (`handle_request`'s one
+    // guard clause); `Intra` serves everything (a deliberate superset, not a
+    // partition — see `Surface`'s doc).
+    tasks.push(tokio::spawn(serve_requests(
+        client_listener,
+        ctx.clone(),
+        ListenerKind::Client,
+    )));
+    tasks.push(tokio::spawn(serve_requests(
+        intra_listener,
+        ctx.clone(),
+        ListenerKind::Intra,
+    )));
     // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020).
     tasks.push(tokio::spawn(admin::serve(admin_listener, ctx.clone())));
 
@@ -1922,6 +2310,11 @@ impl BoundNode {
         self.admin_addr
     }
 
+    /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
+    pub fn intra_addr(&self) -> SocketAddr {
+        self.intra_addr
+    }
+
     /// Wire the peer address book into the node's one env and start all
     /// protocols, with the CP group backed by the durable on-disk
     /// [`LsmEngine`] ([`StorageBackend::Lsm`]). `control_ids` is the full
@@ -1946,6 +2339,7 @@ impl BoundNode {
             data_ids,
             StorageBackend::default(),
             ClusterEdgeState::new(),
+            BTreeMap::new(),
             BTreeMap::new(),
             None,
             None,
@@ -1987,6 +2381,7 @@ impl BoundNode {
         backend: StorageBackend,
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -1999,6 +2394,7 @@ impl BoundNode {
             backend,
             edge,
             client_route,
+            intra_route,
             auto_split_threshold,
             auto_split_bytes_threshold,
             cluster_admin_addrs,
@@ -2026,7 +2422,9 @@ impl BoundNode {
     /// module's own doc for why it is spawned unconditionally here (a
     /// combined node can always become the control-plane leader) and
     /// self-gates every tick on `ctx.edge.leader_handle()`, the identical
-    /// pattern `auto_split_loop`/`txn_resolver_loop` already use.
+    /// pattern `auto_split_loop`/`txn_resolver_loop` already use. Defaults
+    /// [`start_with_growth`](Self::start_with_growth)'s own
+    /// `auto_split_change_rate` to `None` — see that method's doc.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_streams(
         self,
@@ -2036,6 +2434,7 @@ impl BoundNode {
         backend: StorageBackend,
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -2043,6 +2442,58 @@ impl BoundNode {
         stream_seal_knobs: StreamSealKnobs,
         segment_store_config: SegmentStoreConfig,
         stream_retention: Duration,
+    ) -> std::io::Result<Node> {
+        self.start_with_growth(
+            peers,
+            control_ids,
+            data_ids,
+            backend,
+            edge,
+            client_route,
+            intra_route,
+            auto_split_threshold,
+            auto_split_bytes_threshold,
+            cluster_admin_addrs,
+            orphan_sweep_after,
+            stream_seal_knobs,
+            segment_store_config,
+            stream_retention,
+            None,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    /// Like [`start_with_streams`](Self::start_with_streams), with the
+    /// opt-in **change-rate** auto-split trigger (ADR 0042 §14, growth PR3
+    /// Fork F): `--auto-split-change-rate RATE` — a streamed led tablet
+    /// whose own smoothed change-append rate ([`ChangeRateTracker`],
+    /// bytes/sec) sustains above `RATE` triggers the same `trigger_split`
+    /// path every other trigger uses. `None` (the default every other
+    /// entry point still passes) disables it entirely — zero behavior
+    /// change for an existing deployment/test. See [`AutoSplitThresholds::
+    /// change_rate`]'s own doc for why this needs its own signal at all
+    /// (the base-scoped byte/key thresholds structurally can't see
+    /// change-log churn).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_growth(
+        self,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        control_ids: Vec<NodeId>,
+        data_ids: Vec<NodeId>,
+        backend: StorageBackend,
+        edge: ClusterEdgeState,
+        client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
+        auto_split_threshold: Option<usize>,
+        auto_split_bytes_threshold: Option<u64>,
+        cluster_admin_addrs: Vec<SocketAddr>,
+        orphan_sweep_after: Duration,
+        stream_seal_knobs: StreamSealKnobs,
+        segment_store_config: SegmentStoreConfig,
+        stream_retention: Duration,
+        auto_split_change_rate: Option<u64>,
+        quiesce_after: Duration,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         // The initial (static) peer book + an env clone, kept for the
@@ -2073,6 +2524,7 @@ impl BoundNode {
         // further down, but the addresses themselves are needed there too.
         let my_client_addr = self.client_addr;
         let my_admin_addr = self.admin_addr;
+        let my_intra_addr = self.intra_addr;
 
         // The node's identity + bound addresses for the admin `/admin/config`
         // view (ADR 0020), captured before the env is consumed below.
@@ -2083,6 +2535,7 @@ impl BoundNode {
             dynamo_addr: Some(self.dynamo_addr),
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
+            intra_addr: self.intra_addr,
             role: "combined",
             control_ids: control_ids.clone(),
             peers: static_peers.clone(),
@@ -2180,8 +2633,9 @@ impl BoundNode {
         // `propose_schema` can propose locally when this node happens to be the
         // control leader. When it isn't, `propose_schema` relays
         // `ClientRequest::ProposeSchema` one hop to the leader's node via
-        // `client_route` — the same relay path a follower-connected DDL always
-        // used in one-process-per-node mode (`tests/schema_ddl_relay.rs`); a
+        // `intra_route` (ADR 0047; was `client_route` pre-ADR-0047) — the same
+        // relay path a follower-connected DDL always used in
+        // one-process-per-node mode (`tests/schema_ddl_relay.rs`); a
         // `--cluster N` in-process node now exercises it too instead of always
         // finding the leader's handle locally.
         edge.register_control(raft.clone());
@@ -2205,7 +2659,7 @@ impl BoundNode {
         // split-address relay), not just via a local control-leader handle.
         // `spawn_common_tail` also spawns `route_sync_loop`/`metrics_sample_loop`/
         // this node's own `register_node_addrs` self-registration/
-        // `serve_clients`/`admin::serve` — every task a control-only node needs
+        // `serve_requests` (both listeners)/`admin::serve` — every task a control-only node needs
         // too (see [`BoundControlNode::start_control_with`]); the tasks spawned
         // below this point are combined-mode/data-role-only.
         // This node's stream-shard segment store (ADR 0043 §A7b, round-3
@@ -2225,6 +2679,7 @@ impl BoundNode {
             base_id: my_id.clone(),
             segment_store,
             stream_seal_knobs,
+            change_rates: ChangeRateTracker::default(),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -2232,17 +2687,20 @@ impl BoundNode {
             Some(data_role),
             admin_info,
             client_route,
+            intra_route,
             (
                 my_id.clone(),
                 NodeAddrs {
                     internal: my_addr.to_string(),
                     client: my_client_addr.to_string(),
                     admin: my_admin_addr.to_string(),
+                    intra: my_intra_addr.to_string(),
                     role: "combined".to_string(),
                 },
             ),
             self.client_listener,
             self.admin_listener,
+            self.intra_listener,
             Some(storage.clone()),
             self.env.clone(),
         );
@@ -2260,7 +2718,7 @@ impl BoundNode {
         // stands each table's group up once `CreateTable` provisions its
         // tablet, and re-forms it from the shared engine's already-durable
         // data on restart.
-        let reconciler = {
+        let mut reconciler = {
             let host_edge = edge.clone();
             let teardown_edge = edge.clone();
             let base_id = my_id.clone();
@@ -2290,12 +2748,19 @@ impl BoundNode {
                 )),
             }
         };
+        // ADR 0044 phase-1 PR4 production wiring (PR7 layers the
+        // `--quiesce-after` CLI flag on top of this same knob):
+        // `Duration::ZERO` (every existing call site) disables it entirely —
+        // zero behavior change. Data-plane groups only (fork G).
+        if !quiesce_after.is_zero() {
+            reconciler.enable_quiescence(quiesce_after);
+        }
 
         // Bootstrap: whichever node is leader registers membership (no data tablet)
         // (idempotent). `spawn_common_tail` (above) already started `tasks` with
         // the tail every node shape shares (`route_sync_loop`/
         // `metrics_sample_loop`/this node's own `register_node_addrs`
-        // self-registration/`serve_clients`/`admin::serve`) — everything below is
+        // self-registration/`serve_requests` (both listeners)/`admin::serve`) — everything below is
         // combined-mode/data-role-only, tracked in the same task list so
         // `shutdown` aborts all of it and releases the client/dynamo/cql
         // listener ports (these run on plain `tokio::spawn`, off the `Env`
@@ -2332,15 +2797,16 @@ impl BoundNode {
         // never learned of this node — the control group stays static, ADR
         // 0030's documented v1 limitation). Such a node instead mirrors real
         // cluster state by polling `ClientRequest::Status` from one of the
-        // pre-growth control nodes' client addresses (derived from
-        // `client_route`, which growth's expanded config populates for every
-        // node it lists) into `ctx.remote_metadata`, read via
-        // `effective_metadata()`. A no-op (empty seed list, loop returns
-        // immediately) for every other node.
+        // pre-growth control nodes' **intra** addresses (ADR 0047 — this
+        // node's own `WatchMetadata` long-poll is intra-only; derived from
+        // `intra_route`, which growth's expanded config populates for every
+        // node it lists, mirroring `client_route`) into `ctx.remote_metadata`,
+        // read via `effective_metadata()`. A no-op (empty seed list, loop
+        // returns immediately) for every other node.
         if !control_ids.contains(&self.id) {
             let seeds: Vec<SocketAddr> = control_ids
                 .iter()
-                .filter_map(|id| ctx.route_addr(id.clone()))
+                .filter_map(|id| ctx.intra_addr(id.clone()))
                 .collect();
             tasks.push(tokio::spawn(remote_metadata_sync_loop(ctx.clone(), seeds)));
 
@@ -2435,12 +2901,18 @@ impl BoundNode {
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
         // it leads once it exceeds **either** configured threshold (it checks
         // leadership per tablet, so running it on every node is harmless).
-        if auto_split_threshold.is_some() || auto_split_bytes_threshold.is_some() {
+        // Growth PR3 Fork F: `auto_split_change_rate` joins the same
+        // either-triggers-fires gate, opt-in and streamed-tables-only.
+        if auto_split_threshold.is_some()
+            || auto_split_bytes_threshold.is_some()
+            || auto_split_change_rate.is_some()
+        {
             tasks.push(tokio::spawn(auto_split_loop(
                 ctx.clone(),
                 AutoSplitThresholds {
                     keys: auto_split_threshold,
                     bytes: auto_split_bytes_threshold,
+                    change_rate: auto_split_change_rate,
                 },
             )));
         }
@@ -2462,6 +2934,7 @@ impl BoundNode {
             dynamo_addr: Some(self.dynamo_addr),
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
+            intra_addr: self.intra_addr,
         })
     }
 }
@@ -2507,6 +2980,10 @@ pub struct Node {
     /// never bound there. See [`cql_addr`](Self::cql_addr)'s doc.
     cql_addr: Option<SocketAddr>,
     admin_addr: SocketAddr,
+    /// This node's intra-cluster RPC listen address (ADR 0047). Always
+    /// populated — every deployment shape binds and (from `intra/2-cutover`
+    /// onward) serves it.
+    intra_addr: SocketAddr,
 }
 
 impl Node {
@@ -2534,6 +3011,8 @@ impl Node {
         let cql_addr = cql_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
+        let intra_listener = TcpListener::bind(addrs.intra).await?;
+        let intra_addr = intra_listener.local_addr()?;
         Ok(BoundNode {
             id,
             env,
@@ -2547,6 +3026,8 @@ impl Node {
             cql_addr,
             admin_listener,
             admin_addr,
+            intra_listener,
+            intra_addr,
         })
     }
 
@@ -2569,6 +3050,8 @@ impl Node {
         let client_addr = client_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
+        let intra_listener = TcpListener::bind(addrs.intra).await?;
+        let intra_addr = intra_listener.local_addr()?;
         Ok(BoundControlNode {
             id,
             env,
@@ -2577,6 +3060,8 @@ impl Node {
             client_addr,
             admin_listener,
             admin_addr,
+            intra_listener,
+            intra_addr,
         })
     }
 
@@ -2604,6 +3089,8 @@ impl Node {
         let cql_addr = cql_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
+        let intra_listener = TcpListener::bind(addrs.intra).await?;
+        let intra_addr = intra_listener.local_addr()?;
         Ok(BoundDataNode {
             id,
             env,
@@ -2617,6 +3104,8 @@ impl Node {
             cql_addr,
             admin_listener,
             admin_addr,
+            intra_listener,
+            intra_addr,
         })
     }
 
@@ -2648,6 +3137,11 @@ impl Node {
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
     pub fn admin_addr(&self) -> SocketAddr {
         self.admin_addr
+    }
+
+    /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
+    pub fn intra_addr(&self) -> SocketAddr {
+        self.intra_addr
     }
 
     /// Whether this node's control replica currently believes it is leader.
@@ -2836,6 +3330,8 @@ pub struct BoundControlNode {
     client_addr: SocketAddr,
     admin_listener: TcpListener,
     admin_addr: SocketAddr,
+    intra_listener: TcpListener,
+    intra_addr: SocketAddr,
 }
 
 impl BoundControlNode {
@@ -2852,6 +3348,11 @@ impl BoundControlNode {
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
     pub fn admin_addr(&self) -> SocketAddr {
         self.admin_addr
+    }
+
+    /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
+    pub fn intra_addr(&self) -> SocketAddr {
+        self.intra_addr
     }
 
     /// `(id, addr)` — this node's entry in the cluster's peer book.
@@ -2902,11 +3403,13 @@ impl BoundControlNode {
     ///
     /// # Errors
     /// Propagates a failure to open the dedicated engine (LSM backend only).
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_control_with(
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
         control_ids: Vec<NodeId>,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
         cluster_admin_addrs: Vec<SocketAddr>,
         backend: StorageBackend,
         orphan_sweep_after: Duration,
@@ -2921,6 +3424,7 @@ impl BoundControlNode {
             dynamo_addr: None,
             cql_addr: None,
             admin_addr: self.admin_addr,
+            intra_addr: self.intra_addr,
             role: "control",
             control_ids: control_ids.clone(),
             peers: peers.clone(),
@@ -2993,17 +3497,20 @@ impl BoundControlNode {
             None,
             admin_info,
             client_route,
+            intra_route,
             (
                 self.id,
                 NodeAddrs {
                     internal: self.internal_addr.to_string(),
                     client: self.client_addr.to_string(),
                     admin: self.admin_addr.to_string(),
+                    intra: self.intra_addr.to_string(),
                     role: "control".to_string(),
                 },
             ),
             self.client_listener,
             self.admin_listener,
+            self.intra_listener,
             Some(control_storage),
             sync_env.clone(),
         );
@@ -3049,6 +3556,7 @@ impl BoundControlNode {
             dynamo_addr: None,
             cql_addr: None,
             admin_addr: self.admin_addr,
+            intra_addr: self.intra_addr,
         })
     }
 }
@@ -3074,6 +3582,8 @@ pub struct BoundDataNode {
     cql_addr: SocketAddr,
     admin_listener: TcpListener,
     admin_addr: SocketAddr,
+    intra_listener: TcpListener,
+    intra_addr: SocketAddr,
 }
 
 impl BoundDataNode {
@@ -3095,6 +3605,11 @@ impl BoundDataNode {
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
     pub fn admin_addr(&self) -> SocketAddr {
         self.admin_addr
+    }
+
+    /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
+    pub fn intra_addr(&self) -> SocketAddr {
+        self.intra_addr
     }
 
     /// `(id, addr)` — this node's entry in the cluster's *raftkv* peer
@@ -3130,8 +3645,8 @@ impl BoundDataNode {
     /// (`bootstrap`, `edge.register_control`) — see that method's doc for
     /// what each shared piece does. `spawn_common_tail` still runs
     /// unconditionally (`route_sync_loop`/`metrics_sample_loop`/this node's
-    /// own `register_node_addrs` self-registration/`serve_clients`/
-    /// `admin::serve`), and this node's own `admin_add_member` self-registers
+    /// own `register_node_addrs` self-registration/`serve_requests` (both
+    /// listeners)/`admin::serve`), and this node's own `admin_add_member` self-registers
     /// its membership exactly like an ADR 0030 growth node's does (relayed —
     /// a data-only node can never satisfy `propose_schema`'s local-leader
     /// branch itself).
@@ -3149,6 +3664,7 @@ impl BoundDataNode {
         backend: StorageBackend,
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -3160,6 +3676,7 @@ impl BoundDataNode {
             backend,
             edge,
             client_route,
+            intra_route,
             auto_split_threshold,
             auto_split_bytes_threshold,
             cluster_admin_addrs,
@@ -3171,7 +3688,8 @@ impl BoundDataNode {
 
     /// Like [`start_data_with`](Self::start_data_with) — see
     /// [`BoundNode::start_with_streams`]'s doc for the layered-wrapper
-    /// rationale.
+    /// rationale. Defaults [`start_data_with_growth`](Self::start_data_with_growth)'s
+    /// own `auto_split_change_rate` to `None`.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_streams(
         self,
@@ -3181,11 +3699,51 @@ impl BoundDataNode {
         backend: StorageBackend,
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
         stream_seal_knobs: StreamSealKnobs,
         segment_store_config: SegmentStoreConfig,
+    ) -> std::io::Result<Node> {
+        self.start_data_with_growth(
+            peers,
+            control_ids,
+            control_seeds,
+            backend,
+            edge,
+            client_route,
+            intra_route,
+            auto_split_threshold,
+            auto_split_bytes_threshold,
+            cluster_admin_addrs,
+            stream_seal_knobs,
+            segment_store_config,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`start_data_with_streams`](Self::start_data_with_streams), with
+    /// the opt-in **change-rate** auto-split trigger — see
+    /// [`BoundNode::start_with_growth`]'s doc for the full design (identical
+    /// here; a data-only node runs the same `auto_split_loop`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_data_with_growth(
+        self,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        control_ids: Vec<NodeId>,
+        control_seeds: Vec<SocketAddr>,
+        backend: StorageBackend,
+        edge: ClusterEdgeState,
+        client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
+        auto_split_threshold: Option<usize>,
+        auto_split_bytes_threshold: Option<u64>,
+        cluster_admin_addrs: Vec<SocketAddr>,
+        stream_seal_knobs: StreamSealKnobs,
+        segment_store_config: SegmentStoreConfig,
+        auto_split_change_rate: Option<u64>,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         let static_peers = peers;
@@ -3196,6 +3754,7 @@ impl BoundDataNode {
         let my_addr = self.internal_addr;
         let my_client_addr = self.client_addr;
         let my_admin_addr = self.admin_addr;
+        let my_intra_addr = self.intra_addr;
 
         let control = ControlHandle::Remote(RemoteControlClient::new(control_seeds.clone()));
 
@@ -3206,6 +3765,7 @@ impl BoundDataNode {
             dynamo_addr: Some(self.dynamo_addr),
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
+            intra_addr: self.intra_addr,
             role: "data",
             control_ids: control_ids.clone(),
             peers: static_peers.clone(),
@@ -3252,6 +3812,7 @@ impl BoundDataNode {
             base_id: my_id.clone(),
             segment_store,
             stream_seal_knobs,
+            change_rates: ChangeRateTracker::default(),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             control,
@@ -3259,17 +3820,20 @@ impl BoundDataNode {
             Some(data_role),
             admin_info,
             client_route,
+            intra_route,
             (
                 my_id.clone(),
                 NodeAddrs {
                     internal: my_addr.to_string(),
                     client: my_client_addr.to_string(),
                     admin: my_admin_addr.to_string(),
+                    intra: my_intra_addr.to_string(),
                     role: "data".to_string(),
                 },
             ),
             self.client_listener,
             self.admin_listener,
+            self.intra_listener,
             // A data-only node has no local control role at all (ADR 0035) —
             // no system-keyspace engine to surface (ADR 0038 PR4).
             None,
@@ -3364,12 +3928,16 @@ impl BoundDataNode {
         // — a node that leads no tablet does nothing each tick.
         tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
 
-        if auto_split_threshold.is_some() || auto_split_bytes_threshold.is_some() {
+        if auto_split_threshold.is_some()
+            || auto_split_bytes_threshold.is_some()
+            || auto_split_change_rate.is_some()
+        {
             tasks.push(tokio::spawn(auto_split_loop(
                 ctx.clone(),
                 AutoSplitThresholds {
                     keys: auto_split_threshold,
                     bytes: auto_split_bytes_threshold,
+                    change_rate: auto_split_change_rate,
                 },
             )));
         }
@@ -3388,6 +3956,7 @@ impl BoundDataNode {
             dynamo_addr: Some(self.dynamo_addr),
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
+            intra_addr: self.intra_addr,
         })
     }
 }
@@ -3430,7 +3999,8 @@ pub struct ClusterEdgeState {
     /// propose a schema `MetaCommand` **locally** when this node is the
     /// control-plane leader. When it isn't, `propose_schema` relays
     /// [`ClientRequest::ProposeSchema`] one hop to the leader's node via
-    /// `client_route` (ADR 0013) — the same path every follower-connected DDL
+    /// `intra_route` (ADR 0047; ADR 0013 originally routed this via
+    /// `client_route`) — the same path every follower-connected DDL
     /// in a one-process-per-node deployment always used.
     control: Arc<Mutex<Vec<RaftNode<ProdEnv>>>>,
     /// The DynamoDB edge's in-memory GSI declarations + observation-built
@@ -3882,6 +4452,112 @@ fn build_segment_store(
     }
 }
 
+/// Growth PR3 Fork F (ADR 0042 §14): a per-node, per-tablet estimate of a
+/// streamed tablet's own change-append rate (bytes/sec of `KIND_CHANGE`
+/// growth) — derived entirely from data `index_drain::seal_tick` already
+/// computes every tick (`CpGroup::approx_bytes_kind(KIND_CHANGE)`, the same
+/// level [`Metric::StreamHotBytes`] reads), never a new scan.
+/// `CpGroup::approx_bytes` is deliberately **base**-scoped (ADR 0034's own
+/// fix, so auto-split's byte trigger can't react to change-log churn) —
+/// which structurally means a high-churn, small-footprint streamed table
+/// can write forever without ever crossing a byte/key threshold and
+/// gaining a second shard, regardless of write rate (the exact gap this
+/// tracker exists to close, per the growth plan's Fork F).
+///
+/// A simple EWMA over each tick's own instantaneous bytes-delta ÷ elapsed
+/// (`ALPHA`), so one noisy tick doesn't whipsaw the signal; floored at zero
+/// (a seal + the hot-trim arm's later reclaim can shrink the hot scope
+/// between ticks, which is not a *negative* append rate — just this tick's
+/// own contribution being nothing). Surfaced read-only via
+/// `/admin/metrics`'s `stream_change_rates` array (`admin::metrics_view`)
+/// and consumed by the opt-in `--auto-split-change-rate` trigger
+/// (`auto_split_loop`, streamed tables only). A plain `std::sync::Mutex` is
+/// fine: every access is a quick lock/mutate/drop with no `.await` held
+/// across it, the same discipline `ClientCtx::metrics_history` already
+/// uses.
+#[derive(Clone, Default)]
+pub(crate) struct ChangeRateTracker {
+    inner: Arc<Mutex<BTreeMap<TabletId, RateSample>>>,
+}
+
+#[derive(Clone, Copy)]
+struct RateSample {
+    bytes_per_sec: f64,
+    last_bytes: u64,
+    last_at: tokio::time::Instant,
+}
+
+/// The EWMA smoothing factor for [`ChangeRateTracker::observe`] — closer to
+/// 1.0 tracks the latest tick more closely (noisier); closer to 0.0 smooths
+/// harder (slower to react). Chosen to settle within a handful of
+/// `INDEX_DRAIN_INTERVAL` ticks (~1s) without being so reactive that a
+/// single large write's own tick dominates the reading.
+const CHANGE_RATE_EWMA_ALPHA: f64 = 0.3;
+
+impl ChangeRateTracker {
+    /// Record this tick's own `KIND_CHANGE` byte level for `tablet` and
+    /// return the freshly-updated smoothed rate (bytes/sec).
+    pub(crate) fn observe(&self, tablet: TabletId, bytes_now: u64) -> f64 {
+        let now = tokio::time::Instant::now();
+        let mut inner = self.inner.lock().expect("change-rate tracker lock");
+        let rate = match inner.get(&tablet) {
+            None => 0.0,
+            Some(prev) => {
+                let elapsed = now.saturating_duration_since(prev.last_at).as_secs_f64();
+                if elapsed <= 0.0 {
+                    prev.bytes_per_sec
+                } else {
+                    let instantaneous = bytes_now.saturating_sub(prev.last_bytes) as f64 / elapsed;
+                    CHANGE_RATE_EWMA_ALPHA * instantaneous
+                        + (1.0 - CHANGE_RATE_EWMA_ALPHA) * prev.bytes_per_sec
+                }
+            }
+        };
+        inner.insert(
+            tablet,
+            RateSample {
+                bytes_per_sec: rate,
+                last_bytes: bytes_now,
+                last_at: now,
+            },
+        );
+        rate
+    }
+
+    /// The current smoothed rate for `tablet` (bytes/sec), or `0.0` if
+    /// never observed (e.g. an unstreamed tablet, or one this node has
+    /// never led a `seal_tick` pass for).
+    pub(crate) fn get(&self, tablet: TabletId) -> f64 {
+        self.inner
+            .lock()
+            .expect("change-rate tracker lock")
+            .get(&tablet)
+            .map_or(0.0, |s| s.bytes_per_sec)
+    }
+
+    /// Every currently-tracked tablet's own smoothed rate, in tablet-id
+    /// order — for `/admin/metrics`'s `stream_change_rates` array.
+    pub(crate) fn snapshot(&self) -> Vec<(TabletId, f64)> {
+        self.inner
+            .lock()
+            .expect("change-rate tracker lock")
+            .iter()
+            .map(|(&t, s)| (t, s.bytes_per_sec))
+            .collect()
+    }
+
+    /// Drop every tracked tablet no longer present in `meta` — a cheap
+    /// `BTreeMap` retain, never a data scan, bounding this map the same
+    /// way `change_consumer_loop`'s own `first_hot_seen` fallback map
+    /// bounds itself.
+    pub(crate) fn retain_existing(&self, meta: &Metadata) {
+        self.inner
+            .lock()
+            .expect("change-rate tracker lock")
+            .retain(|t, _| meta.tablets.contains_key(t));
+    }
+}
+
 /// This node's data-plane fields (ADR 0035 PR3) — present in [`ClientCtx`]
 /// iff this node runs the data role (`NodeRole::Data`/`Both`); `None` on a
 /// control-only node, which never hosts a tablet and never runs the CP/
@@ -3911,6 +4587,12 @@ struct DataRole {
     pub(crate) segment_store: SegmentStoreHandle,
     /// The DynamoDB Streams sealer's own size/age knobs (ADR 0042 §13).
     pub(crate) stream_seal_knobs: StreamSealKnobs,
+    /// Growth PR3 Fork F (ADR 0042 §14): this node's own per-tablet
+    /// change-append-rate estimates, written by `index_drain::seal_tick`
+    /// and read by `/admin/metrics` and the opt-in `--auto-split-change-
+    /// rate` trigger (`auto_split_loop`). See [`ChangeRateTracker`]'s own
+    /// doc for the full design.
+    pub(crate) change_rates: ChangeRateTracker,
 }
 
 /// Shared context for the client request server and the DynamoDB/CQL endpoints:
@@ -3951,6 +4633,20 @@ pub(crate) struct ClientCtx {
     /// / [`route_snapshot`](Self::route_snapshot), never locked across an
     /// `.await`.
     client_route: Arc<Mutex<BTreeMap<NodeId, SocketAddr>>>,
+    /// **Intra-cluster routing table (ADR 0047)** — the exact `client_route`
+    /// shape above, mirrored for the intra port: each CP group member id →
+    /// the **intra** address of its hosting node. Kept live by
+    /// [`intra_route_sync_loop`] (overlaying `Metadata.node_addrs[*].intra`
+    /// on a static seed, exactly like `route_sync_loop` does for
+    /// `client_route`). Every machine-relay consumer that used to read
+    /// `client_route`/`route_addr`/`route_snapshot` for a node-to-node hop —
+    /// `cp_leader_hint`, `other_tablet_replica_addr`, `propose_schema`'s
+    /// relay/broadcast tiers — reads this instead via
+    /// [`intra_addr`](Self::intra_addr)/[`intra_route_snapshot`](Self::intra_route_snapshot).
+    /// Human-facing consumers (`not_leader_error`, the admin dashboard's
+    /// `leader_hint` display) keep reading `client_route`/`leader_addr_hint`
+    /// unchanged — see the root `CLAUDE.md`'s hint-field-conflation lesson.
+    intra_route: Arc<Mutex<BTreeMap<NodeId, SocketAddr>>>,
     /// This node's identity + bound addresses for the admin `/admin/config` view
     /// (ADR 0020). `Arc` so cloning the ctx onto each connection is cheap.
     admin: Arc<AdminInfo>,
@@ -4117,6 +4813,12 @@ impl ClientCtx {
             () = tokio::time::sleep(WATCH_METADATA_SERVER_TIMEOUT) => {}
         }
         let leader_hint = self.control_leader_hint();
+        // Intra-cluster dual (ADR 0047) — the same `self.control.leader()`
+        // id, resolved through `intra_addr` instead of `route_addr`. This is
+        // the field `remote_metadata_watch_loop`'s own dial candidates read
+        // (via `RemoteControlClient::intra_leader_addr_hint`), never the
+        // human-facing `leader_hint` above.
+        let intra_leader_hint = self.intra_control_leader_hint();
         let control_voters = self.control.config().unwrap_or_default();
         let growth_mirror_active = self
             .remote_metadata
@@ -4128,12 +4830,14 @@ impl ClientCtx {
                 writes: reply.writes,
                 watermark: reply.watermark,
                 leader_hint,
+                intra_leader_hint,
                 control_voters,
             };
         }
         ClientResponse::Status {
             metadata: self.effective_metadata(),
             leader_hint,
+            intra_leader_hint,
             watermark: watch.latest(),
             control_voters,
         }
@@ -4172,6 +4876,44 @@ impl ClientCtx {
     fn control_leader_hint(&self) -> Option<(NodeId, SocketAddr)> {
         let id = self.control.leader()?;
         let addr = self.route_addr(id.clone())?;
+        Some((id, addr))
+    }
+
+    /// The intra-cluster RPC address `id` currently routes to (ADR 0047) — the
+    /// [`route_addr`](Self::route_addr) sibling for machine-to-machine hops:
+    /// `cp_leader_hint`/`other_tablet_replica_addr`/`propose_schema`'s relay
+    /// all resolve a forwarding target through this, never through
+    /// `route_addr`, since the receiving end (`cp_serve_forwarded`, the
+    /// relayed `ProposeSchema`) is only ever reachable on the intra listener.
+    /// Kept fresh by [`intra_route_sync_loop`].
+    fn intra_addr(&self, id: NodeId) -> Option<SocketAddr> {
+        self.intra_route
+            .lock()
+            .expect("intra route poisoned")
+            .get(&id)
+            .copied()
+    }
+
+    /// The [`route_snapshot`](Self::route_snapshot) sibling for the intra
+    /// routing table (ADR 0047).
+    fn intra_route_snapshot(&self) -> BTreeMap<NodeId, SocketAddr> {
+        self.intra_route
+            .lock()
+            .expect("intra route poisoned")
+            .clone()
+    }
+
+    /// This node's own best-known control-plane leader, as `(id, intra
+    /// address)` (ADR 0047) — the [`control_leader_hint`](Self::control_leader_hint)
+    /// sibling that feeds `intra_leader_hint` on `ClientResponse::Status`/
+    /// `MetadataDelta`, and `remote_metadata_watch_loop`'s own dial
+    /// candidates via `RemoteControlClient::intra_leader_addr_hint`. Machine-
+    /// relay-only — never surfaced to a human (see the root `CLAUDE.md`'s
+    /// hint-field-conflation lesson: anything a human reads keeps using
+    /// `control_leader_hint`/`leader_hint`).
+    fn intra_control_leader_hint(&self) -> Option<(NodeId, SocketAddr)> {
+        let id = self.control.leader()?;
+        let addr = self.intra_addr(id.clone())?;
         Some((id, addr))
     }
 
@@ -4257,6 +4999,16 @@ impl ClientCtx {
     /// only to gather its inputs (cheaply, and lazily where a fact needs a
     /// `Metadata` deep clone) and execute the resulting decision.
     fn resolve_cp_route(&self, tablet: TabletId) -> Option<CpRoute> {
+        // ADR 0044 phase-1 PR4 (the wake-on-demand edge): wake any locally
+        // registered replica of this tablet before deciding anything, so a
+        // first touch on a possibly-quiesced cold group doesn't wait out its
+        // own idle-detection latency on top of ordinary election-wait.
+        // `RaftKvNode::wake()` is cheap and safe on every other state (not
+        // quiesced, or this node isn't the leader) — an idempotent notify
+        // that costs one inert extra loop iteration at worst.
+        if let Some(group) = self.edge.local_cp(tablet) {
+            group.wake();
+        }
         let leader = self.edge.cp_leader(tablet);
         if let Some(leader) = leader {
             return Some(CpRoute::Local(leader));
@@ -4307,7 +5059,10 @@ impl ClientCtx {
                 .data
                 .as_ref()
                 .is_some_and(|data| replicas.is_some_and(|r| r.contains(&data.base_id)));
-            let route = self.route_snapshot();
+            // Intra-flavored (ADR 0047): this is a forwarding target — the
+            // receiving node's `cp_serve_forwarded` is only reachable on the
+            // intra listener.
+            let route = self.intra_route_snapshot();
             let fallback = replicas
                 .into_iter()
                 .flatten()
@@ -4705,66 +5460,66 @@ impl ClientCtx {
         }
     }
 
-    /// CP **batch write** of many `(key, value)` pairs of `table` (ADR 0017 —
-    /// bulk-write batching): the keys are grouped by their owning **tablet**, and
-    /// each group is committed as **one** `Batch` Raft entry on that tablet's group
-    /// leader (one propose → one commit round → one apply; forwarded cross-process
-    /// if this node isn't the leader), waited to durable+applied before returning.
-    /// **Within a tablet the batch is atomic** (one entry — it commits whole or not
-    /// at all); **across tablets it is not** (each tablet commits independently),
-    /// which matches real DynamoDB `BatchWriteItem` (non-atomic) semantics. Takes an
-    /// arbitrary `N` (the wire edge caps its own surface). Provisions `table`'s first
-    /// tablet on demand, like [`cp_write`](Self::cp_write). The bulk-write throughput
-    /// primitive behind DynamoDB `BatchWriteItem` and the admin bulk seeder.
-    /// Commit a **multi-kind atomic batch** for one item (ADR 0041 §3/§4):
-    /// `writes` spanning this tablet's base/LSI/footprint scopes plus an
-    /// optional change-log record, as one Raft entry.
-    ///
-    /// Every write must belong to the **same tablet** — they share the item's
-    /// partition key, hence its token. That is checked here rather than
-    /// assumed: a batch straddling two tablets cannot be atomic, and silently
-    /// committing only the first tablet's share is exactly the torn
-    /// base-row-without-its-index-row state this whole mechanism exists to
-    /// prevent. A caller that needs several partitions issues one call each.
-    pub(crate) async fn cp_kind_write(
+    /// **The evaluate-at-leader write primitive (ADR 0046 U3)** —
+    /// `PutItem`/`DeleteItem`/`UpdateItem`'s entry point on an indexed or
+    /// streamed table, replacing the edge-evaluated
+    /// `index_aware_write`/`ClientCtx::cp_kind_write` pairing those three
+    /// call sites (plus `BatchWriteItem`'s indexed branch) used to go
+    /// through. Resolves the item's own base key (recomputed from `pk`/`sk`,
+    /// the single source of truth — never trusted from a caller-supplied
+    /// key), then either serves **locally** (zero hops — this node hosts
+    /// the leader, so [`dynamo::kind_write_item_at_leader`] runs in-process)
+    /// or **forwards** [`ClientRequest::KindWriteItem`] one hop to the
+    /// leader's node, inheriting `cp_forward`'s hinted-retry/backoff/
+    /// election-wait exactly like every other CP write. See
+    /// [`ClientRequest::KindWriteItem`]'s doc for why this closes the
+    /// cross-node LSI/change-record orphan race `index_aware_write`'s
+    /// design had.
+    pub(crate) async fn cp_kind_write_item(
         &self,
+        meta: &Metadata,
         table: &str,
-        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<(), String> {
-        let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
-            return Ok(());
-        };
+        pk: &animus_dynamo::AttributeValue,
+        sk: Option<&animus_dynamo::AttributeValue>,
+        op: KindWriteOp,
+        condition: Option<&animus_dynamo::ConditionExpression>,
+    ) -> Result<dynamo::KindWriteOutcome, animus_dynamo::wire::WireError> {
         // Auto-provision the table's tablet on first write (ADR 0023), as
-        // `cp_write`/`cp_batch_write` do.
+        // `cp_kind_write` does — an indexed/streamed table's first item write
+        // can race its own `CreateTable`'s tablet provisioning.
         if !self.effective_metadata().has_table_tablet(table) {
-            self.provision_tablet(table).await?;
+            self.provision_tablet(table)
+                .await
+                .map_err(|e| dynamo::internal(&e))?;
         }
-        let tablet = self
-            .tablet_for(table, &first)
-            .ok_or_else(|| format!("no tablet owns a kind-batch key of table `{table}`"))?;
-        for (_, key, _) in &writes {
-            if self.tablet_for(table, key) != Some(tablet) {
-                return Err(format!(
-                    "kind-batch keys of table `{table}` span more than one tablet; \
-                     an atomic index write must stay within one partition"
-                ));
+        let base_key = dynamo::item_key(pk, sk);
+        match self.cp_route(table, &base_key).await {
+            CpRoute::Local(leader) => {
+                dynamo::kind_write_item_at_leader(self, &leader, meta, table, pk, sk, op, condition)
+                    .await
             }
-        }
-        match self.cp_route(table, &first).await {
-            CpRoute::Local(leader) => Self::cp_kind_local(&leader, writes, change_log).await,
             CpRoute::Forward(addr) => {
-                let request = ClientRequest::KindWrite {
+                let request = ClientRequest::KindWriteItem {
                     table: table.to_owned(),
-                    writes,
-                    change_log,
+                    pk: pk.clone(),
+                    sk: sk.cloned(),
+                    op,
+                    condition: condition.cloned(),
                 };
-                Self::ok_or_err(
-                    self.cp_forward(table, &first, addr, request).await,
-                    "forwarded CP kind write",
-                )
+                match self.cp_forward(table, &base_key, addr, request).await {
+                    ClientResponse::KindWriteOk { old, new } => {
+                        Ok(dynamo::KindWriteOutcome::Ok { old, new })
+                    }
+                    ClientResponse::ConditionFailed => {
+                        Ok(dynamo::KindWriteOutcome::ConditionFailed)
+                    }
+                    ClientResponse::Error(e) => Err(dynamo::internal(&e)),
+                    other => Err(dynamo::internal(&format!(
+                        "unexpected reply to forwarded kind write item: {other:?}"
+                    ))),
+                }
             }
-            CpRoute::None => Err("no CP group leader reachable".into()),
+            CpRoute::None => Err(dynamo::internal("no CP group leader reachable")),
         }
     }
 
@@ -4806,7 +5561,7 @@ impl ClientCtx {
                     .last()
                     .map(|(kind, key, value)| (*kind, key.clone(), value.clone()))
                     .expect("writes is non-empty — checked via `first` above");
-                match leader.put_kind_batch_fenced(writes, None, fence) {
+                match leader.put_kind_batch_fenced(writes, None, Vec::new(), fence) {
                     ProposeResult::Accepted { .. } => {}
                     other => return Err(format!("kind write not accepted: {other:?}")),
                 }
@@ -4844,10 +5599,22 @@ impl ClientCtx {
     /// rather than acked unconfirmed — a fenced-out entry commits as a no-op,
     /// so acking without a probe would falsely report a write that never
     /// happened (the hazard `cp_batch_local`'s doc spells out).
-    async fn cp_kind_local(
+    ///
+    /// **`conditions` (ADR 0046 U3, `pub(crate)` since [`dynamo::
+    /// kind_write_item_at_leader`] calls this from outside `impl ClientCtx`)**:
+    /// threaded straight through to `put_kind_batch_fenced`'s own
+    /// `KvCommand::KindBatch.conditions` field — see that field's doc. Every
+    /// pre-existing caller here passes an empty `Vec` (zero behavior
+    /// change); `kind_write_item_at_leader` is the one caller that supplies
+    /// its own-key OCC seatbelt. A failed condition no-ops the whole batch
+    /// silently, indistinguishable from a fence miss, so it surfaces through
+    /// this same function's existing `"CP kind write did not commit in
+    /// time"` timeout — deliberately no new outcome channel.
+    pub(crate) async fn cp_kind_local(
         leader: &CpGroup,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Option<(Vec<u8>, Vec<u8>)>,
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Result<(), String> {
         let probe = writes
             .iter()
@@ -4865,7 +5632,7 @@ impl ClientCtx {
                 return Err("kind write outside this group's live range; retry".into());
             }
         }
-        match leader.put_kind_batch_fenced(writes, change_log, fence) {
+        match leader.put_kind_batch_fenced(writes, change_log, conditions, fence) {
             ProposeResult::Accepted { .. } => {}
             other => return Err(format!("kind write not accepted: {other:?}")),
         }
@@ -5168,6 +5935,89 @@ impl ClientCtx {
 
     // ---- multi-participant transactions (ADR 0018 §2/PR4) --------------------
 
+    /// **The one place a stage actually executes on the leader's own node**
+    /// (ADR 0046 U3, `TxnStage` kind-writes stack PR2) — shared by
+    /// [`txn_prepare`](Self::txn_prepare)'s own `CpRoute::Local` branch (no
+    /// forward needed) and `cp_serve_forwarded`'s `TxnPrepare` arm (a
+    /// forwarded hop just landed on the real leader). Evaluates every
+    /// `pending_kind_writes` entry **here**, under `ctx.data().rmw_lock` —
+    /// the identical lock [`dynamo::kind_write_item_at_leader`] takes for
+    /// the ordinary (non-transactional) write path — merging the result
+    /// into `writes` immediately before staging, never at the coordinator/
+    /// edge (see [`PendingKindWrite`]'s doc for the cross-node race this
+    /// closes). Every evaluated write also gets a mandatory own-key
+    /// `conditions` entry (ADR 0046 Fork C1: `(key, raw_old)`, the exact
+    /// bytes just read) — belt-and-suspenders against the residual window
+    /// between this read and the propose call a few lines down, even
+    /// though holding `rmw_lock` across both already closes it for every
+    /// write this node's own lock covers (a `txn_resolver_loop` recovery
+    /// push resolving a *different* transaction's intent never takes it).
+    #[allow(clippy::too_many_arguments)] // mirrors ClientRequest::TxnPrepare's own field count
+    async fn txn_stage_local(
+        &self,
+        leader: &CpGroup,
+        table: &str,
+        anchor: Option<(TxnId, Vec<u8>, String)>,
+        mut writes: Vec<TxnWrite>,
+        mut conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        participant_spans: Vec<(String, KeyRange)>,
+        pending_kind_writes: Vec<PendingKindWrite>,
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), String> {
+        if !pending_kind_writes.is_empty() {
+            let meta = self.effective_metadata();
+            let _rmw = self.data().rmw_lock.lock().await;
+            for p in pending_kind_writes {
+                let evaluated = dynamo::eval_kind_txn_write(
+                    self,
+                    leader,
+                    &meta,
+                    table,
+                    &p.pk,
+                    p.sk.as_ref(),
+                    &p.op,
+                    p.condition.as_ref(),
+                )
+                .await
+                .map_err(|e| format!("txn prepare: leader-side evaluation failed: {e}"))?;
+                let Some(eval) = evaluated else {
+                    return Err(format!(
+                        "txn prepare: a condition on table `{table}` was not met"
+                    ));
+                };
+                conditions.push((eval.key.clone(), eval.raw_old.clone()));
+                writes.push(animus_cp_data::TxnWrite {
+                    key: eval.key,
+                    value: Some(eval.value),
+                    kind_writes: eval.kind_writes,
+                    change_log: eval.change_log,
+                });
+            }
+        }
+        match anchor {
+            None => {
+                let (txn_id, record_key, outcome) = leader
+                    .txn_stage(table, writes, participant_spans, conditions)
+                    .await
+                    .ok_or("CP group leader moved during anchor stage; retry")?;
+                let ts = txn_id.ts;
+                Ok((txn_id, record_key, table.to_owned(), ts, outcome))
+            }
+            Some((txn_id, record_key, record_table)) => {
+                let (ts, outcome) = leader
+                    .txn_stage_participant(
+                        txn_id.clone(),
+                        record_key.clone(),
+                        record_table.clone(),
+                        writes,
+                        conditions,
+                    )
+                    .await
+                    .ok_or("CP group leader moved during participant stage; retry")?;
+                Ok((txn_id, record_key, record_table, ts, outcome))
+            }
+        }
+    }
+
     /// **Stage** `writes` on `table`'s tablet leader — the anchor
     /// (`anchor: None`, mints a fresh `TxnId`/record key) or a participant
     /// (`anchor: Some((txn_id, record_key, record_table))`, referencing an
@@ -5198,40 +6048,28 @@ impl ClientCtx {
         writes: Vec<TxnWrite>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         participant_spans: Vec<(String, KeyRange)>,
+        pending_kind_writes: Vec<PendingKindWrite>,
     ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), String> {
-        let Some(first) = writes.first().map(|(k, _)| k.clone()) else {
+        let Some(first) = writes.first().map(|w| w.key.clone()).or_else(|| {
+            pending_kind_writes
+                .first()
+                .map(|p| dynamo::item_key(&p.pk, p.sk.as_ref()))
+        }) else {
             return Err("txn prepare: writes must be non-empty".into());
         };
         match self.cp_route(table, &first).await {
-            CpRoute::Local(leader) => match &anchor {
-                None => {
-                    let (txn_id, record_key, outcome) = leader
-                        .txn_stage(table, writes, participant_spans, conditions)
-                        .await
-                        .ok_or("CP group leader moved during anchor stage; retry")?;
-                    let ts = txn_id.ts;
-                    Ok((txn_id, record_key, table.to_owned(), ts, outcome))
-                }
-                Some((txn_id, record_key, record_table)) => {
-                    let (ts, outcome) = leader
-                        .txn_stage_participant(
-                            txn_id.clone(),
-                            record_key.clone(),
-                            record_table.clone(),
-                            writes,
-                            conditions,
-                        )
-                        .await
-                        .ok_or("CP group leader moved during participant stage; retry")?;
-                    Ok((
-                        txn_id.clone(),
-                        record_key.clone(),
-                        record_table.clone(),
-                        ts,
-                        outcome,
-                    ))
-                }
-            },
+            CpRoute::Local(leader) => {
+                self.txn_stage_local(
+                    &leader,
+                    table,
+                    anchor,
+                    writes,
+                    conditions,
+                    participant_spans,
+                    pending_kind_writes,
+                )
+                .await
+            }
             CpRoute::Forward(addr) => {
                 let request = ClientRequest::TxnPrepare {
                     table: table.to_owned(),
@@ -5239,6 +6077,7 @@ impl ClientCtx {
                     writes,
                     conditions,
                     participant_spans,
+                    pending_kind_writes,
                 };
                 match self.cp_forward(table, &first, addr, request).await {
                     ClientResponse::TxnPrepared {
@@ -5292,6 +6131,7 @@ impl ClientCtx {
         writes: Vec<TxnWrite>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         participant_spans: Vec<(String, KeyRange)>,
+        pending_kind_writes: Vec<PendingKindWrite>,
     ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp), String> {
         for attempt in 0..TXN_STAGE_PUSH_ATTEMPTS {
             let (txn_id, record_key, record_table, ts, outcome) = self
@@ -5301,6 +6141,7 @@ impl ClientCtx {
                     writes.clone(),
                     conditions.clone(),
                     participant_spans.clone(),
+                    pending_kind_writes.clone(),
                 )
                 .await?;
             match outcome {
@@ -5923,6 +6764,20 @@ impl ClientCtx {
     /// synchronously before returning — there is no successful ack to speed
     /// up on an error return, so the extra safety margin costs nothing.
     ///
+    /// **ADR 0046 D1 amendment**: for a transaction touching at least one
+    /// kind-write-path table, the async-spawn above is instead an **awaited,
+    /// bounded** resolve (`TXN_RESOLVE_ALL_AWAIT_BUDGET`, parallelized
+    /// across participants via `resolve_all_parallel`) — LSI rows and the
+    /// GSI/stream change record only appear at resolve (materialize-at-
+    /// resolve, A1), so an ack-then-async-resolve window would leave a
+    /// committed write readable on the base table but transiently absent
+    /// from its index/stream. A timeout still acks (delayed, never denied).
+    /// A plain transaction is completely unaffected — same fire-and-forget
+    /// spawn, same **sequential** `resolve_all` as before this amendment
+    /// (parallelizing it universally measurably destabilized a pre-existing
+    /// timing-sensitive regression test under concurrent load; see
+    /// `resolve_all_parallel`'s own doc for the full account).
+    ///
     /// **`write_conditions`** (ADR 0018 §2 apply-time write-key conditions
     /// amendment) — `(table, key, expected)` own-key byte-level OCC
     /// conditions checked at *apply* time on the key's own tablet, upgrading
@@ -5932,6 +6787,40 @@ impl ClientCtx {
     /// this transaction does not write belongs in `preconditions` instead
     /// (see [`TxnWriteCondition`]'s doc for why mixing them up is exactly
     /// the self-referential-stall bug the PR7 amendment documented).
+    /// Split one (table, tablet) group's [`TxnTableWrite`]s into the
+    /// already-concrete writes `RaftKvNode::txn_stage_anchor`/
+    /// `txn_stage_participant` can take directly, and the pending
+    /// kind-write-path ones [`ClientCtx::txn_stage_local`] must still
+    /// evaluate at the leader (ADR 0046 U3, PR2) — see [`TxnTableWrite`]'s
+    /// doc for why exactly one of `value`/`pending` is ever `Some`.
+    fn split_group(
+        group: Vec<TxnTableWrite>,
+    ) -> Result<(Vec<TxnWrite>, Vec<PendingKindWrite>), String> {
+        let mut writes = Vec::new();
+        let mut pending = Vec::new();
+        for w in group {
+            match (w.value, w.pending) {
+                (Some(value), None) => writes.push(TxnWrite::plain(w.key, Some(value))),
+                (None, Some(p)) => pending.push(p),
+                (None, None) => {
+                    return Err(format!(
+                        "cp_txn: write to table `{}` key {:?} has neither a value nor a \
+                         pending kind-write spec",
+                        w.table, w.key
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "cp_txn: write to table `{}` key {:?} has both a value and a pending \
+                         kind-write spec (exactly one is expected)",
+                        w.table, w.key
+                    ));
+                }
+            }
+        }
+        Ok((writes, pending))
+    }
+
     pub(crate) async fn cp_txn(
         &self,
         writes: Vec<TxnTableWrite>,
@@ -5953,21 +6842,22 @@ impl ClientCtx {
         // the anchor's — a future reordering of `writes` should not
         // resurface this) and return a client-facing error instead of ever
         // reaching that assert.
-        if let Some((table, key, _)) = writes.iter().find(|(_, k, _)| k.len() < TOKEN_BYTES) {
+        if let Some(w) = writes.iter().find(|w| w.key.len() < TOKEN_BYTES) {
             return Err(format!(
-                "txn key {key:?} of table `{table}` must be at least {TOKEN_BYTES} bytes long \
-                 (ADR 0022) for a multi-participant transaction"
+                "txn key {:?} of table `{}` must be at least {TOKEN_BYTES} bytes long \
+                 (ADR 0022) for a multi-participant transaction",
+                w.key, w.table
             ));
         }
 
         // Auto-provision every distinct table's first tablet on demand, like
         // `cp_write`.
         let mut seen_tables: BTreeSet<String> = BTreeSet::new();
-        for (table, _, _) in &writes {
-            if seen_tables.insert(table.clone())
-                && !self.effective_metadata().has_table_tablet(table)
+        for w in &writes {
+            if seen_tables.insert(w.table.clone())
+                && !self.effective_metadata().has_table_tablet(&w.table)
             {
-                self.provision_tablet(table).await?;
+                self.provision_tablet(&w.table).await?;
             }
         }
 
@@ -5982,32 +6872,38 @@ impl ClientCtx {
             condition_map.insert((table, key), expected);
         }
 
+        // ADR 0046 D1: whether this transaction touches any kind-write-path
+        // table at all — every such write rides as `pending`, never a
+        // precomputed `value` (see `TxnTableWrite`'s doc), so this is exact,
+        // not a heuristic. Gates the awaited-bounded resolve below.
+        let touches_kind_write_path = writes.iter().any(|w| w.pending.is_some());
+
         // Group by (table, tablet), preserving first-seen order — `order[0]`
         // is the anchor. `condition_groups` mirrors `groups`' keying, only
         // populated for a (table, tablet) that owns at least one
-        // conditioned key.
+        // conditioned key. Kept as the un-split `TxnTableWrite` (ADR 0046
+        // U3, PR2) here — a group can mix plain (already-known) writes and
+        // pending kind-write-path ones; [`split_group`] separates them right
+        // before each group is actually staged.
         let mut order: Vec<(String, TabletId)> = Vec::new();
-        let mut groups: BTreeMap<(String, TabletId), Vec<TxnWrite>> = BTreeMap::new();
+        let mut groups: BTreeMap<(String, TabletId), Vec<TxnTableWrite>> = BTreeMap::new();
         let mut condition_groups: BTreeMap<(String, TabletId), StageConditions> = BTreeMap::new();
-        for (table, key, value) in writes {
+        for w in writes {
             let tablet = self
-                .tablet_for(&table, &key)
-                .ok_or_else(|| format!("no tablet owns a txn key of table `{table}`"))?;
-            if let Some(expected) = condition_map.remove(&(table.clone(), key.clone())) {
+                .tablet_for(&w.table, &w.key)
+                .ok_or_else(|| format!("no tablet owns a txn key of table `{}`", w.table))?;
+            if let Some(expected) = condition_map.remove(&(w.table.clone(), w.key.clone())) {
                 condition_groups
-                    .entry((table.clone(), tablet))
+                    .entry((w.table.clone(), tablet))
                     .or_default()
-                    .push((key.clone(), expected));
+                    .push((w.key.clone(), expected));
             }
-            let gk = (table, tablet);
+            let gk = (w.table.clone(), tablet);
             if let std::collections::btree_map::Entry::Vacant(e) = groups.entry(gk.clone()) {
                 e.insert(Vec::new());
                 order.push(gk.clone());
             }
-            groups
-                .get_mut(&gk)
-                .expect("just inserted")
-                .push((key, value));
+            groups.get_mut(&gk).expect("just inserted").push(w);
         }
         if let Some(((table, key), _)) = condition_map.into_iter().next() {
             return Err(format!(
@@ -6018,10 +6914,11 @@ impl ClientCtx {
         }
 
         let anchor_gk = order[0].clone();
-        let anchor_writes = groups.remove(&anchor_gk).expect("anchor group present");
+        let anchor_group = groups.remove(&anchor_gk).expect("anchor group present");
         let anchor_conditions = condition_groups.remove(&anchor_gk).unwrap_or_default();
         let (anchor_table, _anchor_tablet) = anchor_gk;
-        let anchor_keys: Vec<Vec<u8>> = anchor_writes.iter().map(|(k, _)| k.clone()).collect();
+        let anchor_keys: Vec<Vec<u8>> = anchor_group.iter().map(|w| w.key.clone()).collect();
+        let (anchor_writes, anchor_pending) = Self::split_group(anchor_group)?;
 
         // ADR 0018 §2/PR5 (task #18 fix): the anchor's record must name
         // every OTHER participant's `(table, span)` pairs up front, not
@@ -6035,12 +6932,12 @@ impl ClientCtx {
         // 0018-cross-tablet-transactions.md`'s corrective note on this).
         let participant_spans: Vec<(String, KeyRange)> = groups
             .iter()
-            .flat_map(|((table, _tablet), writes)| {
+            .flat_map(|((table, _tablet), group)| {
                 let table = table.clone();
-                writes.iter().map(move |(key, _)| {
-                    let mut end = key.clone();
+                group.iter().map(move |w| {
+                    let mut end = w.key.clone();
                     end.push(0);
-                    (table.clone(), KeyRange::new(key.clone(), Some(end)))
+                    (table.clone(), KeyRange::new(w.key.clone(), Some(end)))
                 })
             })
             .collect();
@@ -6052,6 +6949,7 @@ impl ClientCtx {
                 anchor_writes,
                 anchor_conditions,
                 participant_spans,
+                anchor_pending,
             )
             .await?;
 
@@ -6059,13 +6957,17 @@ impl ClientCtx {
         let participant_gks: Vec<(String, TabletId)> = order.into_iter().skip(1).collect();
         let participant_futs = participant_gks.iter().map(|gk| {
             let table = gk.0.clone();
-            let writes = groups.get(gk).expect("group present").clone();
+            let group = groups.get(gk).expect("group present").clone();
             let conditions = condition_groups.get(gk).cloned().unwrap_or_default();
-            let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
+            let keys: Vec<Vec<u8>> = group.iter().map(|w| w.key.clone()).collect();
             let txn_id = txn_id.clone();
             let record_key = record_key.clone();
             let record_table = record_table.clone();
             async move {
+                let (writes, pending) = match Self::split_group(group) {
+                    Ok(split) => split,
+                    Err(e) => return (table, keys, Err(e)),
+                };
                 let result = self
                     .txn_prepare_pushing(
                         &table,
@@ -6073,6 +6975,7 @@ impl ClientCtx {
                         writes,
                         conditions,
                         Vec::new(), // unused: a participant's own stage creates no record.
+                        pending,
                     )
                     .await;
                 (table, keys, result)
@@ -6134,6 +7037,47 @@ impl ClientCtx {
                         )
                         .await;
                 }
+            }
+        };
+        // ADR 0046 D1: a **parallel** sibling of `resolve_all` above, used
+        // only by the awaited-bounded branch further down (a transaction
+        // touching a kind-write-path table) — fanning out to every
+        // participant's own tablet leader concurrently instead of one at a
+        // time is what makes a short fixed budget plausible at all once
+        // there's more than one participant. Deliberately **not** used for
+        // the ordinary fire-and-forget spawn path above: that path's
+        // resolves already run fully in the background with no latency
+        // budget to protect, and switching it to `join_all` measurably
+        // destabilized a pre-existing, already-timing-sensitive regression
+        // test (`dynamo_txn.rs`'s
+        // `transact_get_items_never_observes_a_torn_pair_under_concurrent_writes`,
+        // a tight concurrent-writer loop where a resolve's own wall-clock
+        // latency doubles as the next transaction's own staging retry
+        // budget) — reproduced red with the parallel version applied
+        // universally, green again scoped like this. Not fully root-caused
+        // (plausibly increased concurrent Raft/network load momentarily
+        // slowing an individual resolve under this test's specific tight
+        // loop, not a correctness bug — every resolve still completes,
+        // `txn_resolver_loop` is the safety net either way), but the
+        // sequential default is the proven-stable one, so parallelism stays
+        // opt-in to where D1 actually needs it.
+        let resolve_all_parallel = |outcome: TxnOutcome, staged: Vec<(String, Vec<Vec<u8>>)>| {
+            let this = self.clone();
+            let txn_id = txn_id.clone();
+            let record_key = record_key.clone();
+            async move {
+                let futs = staged.into_iter().map(|(table, keys)| {
+                    let this = this.clone();
+                    let txn_id = txn_id.clone();
+                    let record_key = record_key.clone();
+                    let outcome = outcome.clone();
+                    async move {
+                        let _ = this
+                            .txn_resolve_participant(&table, txn_id, record_key, keys, outcome)
+                            .await;
+                    }
+                });
+                futures::future::join_all(futs).await;
             }
         };
 
@@ -6224,7 +7168,28 @@ impl ClientCtx {
                     // not merely faster: it no longer holds the client
                     // response hostage to every participant's own
                     // liveness/latency.
-                    tokio::spawn(resolve_all(TxnOutcome::Committed { commit_ts }, staged));
+                    //
+                    // ADR 0046 D1: for a transaction touching any
+                    // kind-write-path table, LSI rows and the stream/GSI
+                    // change record only appear at resolve (materialize-
+                    // at-resolve, A1) — an ack-then-async-resolve window
+                    // would leave a committed write readable on the base
+                    // table but transiently absent from its index/stream.
+                    // Await `resolve_all` under a short bounded budget
+                    // first; a timeout still acks (delayed, never denied —
+                    // `txn_resolver_loop` remains the safety net for
+                    // whatever the bound didn't cover). A plain
+                    // transaction keeps the original fire-and-forget spawn
+                    // unchanged.
+                    if touches_kind_write_path {
+                        let _ = tokio::time::timeout(
+                            TXN_RESOLVE_ALL_AWAIT_BUDGET,
+                            resolve_all_parallel(TxnOutcome::Committed { commit_ts }, staged),
+                        )
+                        .await;
+                    } else {
+                        tokio::spawn(resolve_all(TxnOutcome::Committed { commit_ts }, staged));
+                    }
                     Ok(commit_ts)
                 }
                 // The anchor's own commit lost to a concurrent recovery
@@ -6404,7 +7369,10 @@ impl ClientCtx {
                  an LSI query is scoped to one partition"
             ));
         }
-        self.cp_scan_kind_one(table, kind, start, Some(end)).await
+        // An LSI `Query` has no `Limit` (a documented DynamoDB-fidelity gap,
+        // ADR 0041) — `None` here.
+        self.cp_scan_kind_one(table, kind, start, Some(end), None)
+            .await
     }
 
     /// A **table-wide fan-out** of the kind-scoped scan (ADR 0041 §5) — the
@@ -6460,8 +7428,19 @@ impl ClientCtx {
             {
                 continue;
             }
+            // Per-tablet cap (ADR 0041 §5 as-built) — the identical
+            // `remaining` math `cp_scan` applies across its own tablets: how
+            // many more rows this table-wide fan-out still needs after what
+            // prior tablets already contributed. Threaded into the
+            // `KindScan` request so a tablet with far more matching rows
+            // than `remaining` doesn't ship its whole sub-range over the
+            // wire only to be truncated here — this is still **not
+            // pushdown** (`StorageEngine::scan` has no limit of its own; see
+            // `RaftKvNode::local_scan_kind`'s doc), just a smaller reply and
+            // less coordinator-side memory.
+            let remaining = limit.map(|l| l - out.len());
             out.extend(
-                self.cp_scan_kind_one(table, kind, sub_start, sub_end)
+                self.cp_scan_kind_one(table, kind, sub_start, sub_end, remaining)
                     .await?,
             );
         }
@@ -6475,19 +7454,26 @@ impl ClientCtx {
     /// body both [`cp_scan_kind`](Self::cp_scan_kind) and
     /// [`cp_scan_kind_table`](Self::cp_scan_kind_table) call). `start`
     /// resolves to exactly one tablet of `table`, so it routes/forwards like
-    /// any other CP op. `end == None` is unbounded above.
+    /// any other CP op. `end == None` is unbounded above. `limit` is a
+    /// **per-tablet cap, not pushdown** (see `RaftKvNode::local_scan_kind`'s
+    /// doc) — [`cp_scan_kind`](Self::cp_scan_kind) always passes `None` (an
+    /// LSI `Query` has no `Limit`, ADR 0041); only
+    /// [`cp_scan_kind_table`](Self::cp_scan_kind_table) passes a real value.
     async fn cp_scan_kind_one(
         &self,
         table: &str,
         kind: u8,
         start: Vec<u8>,
         end: Option<Vec<u8>>,
+        limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             let err = match self.cp_route(table, &start).await {
                 CpRoute::Local(leader) => {
-                    match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref()).await {
+                    match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref(), limit)
+                        .await
+                    {
                         Ok(p) => return Ok(p),
                         Err(e) => e,
                     }
@@ -6498,6 +7484,7 @@ impl ClientCtx {
                         kind,
                         start: start.clone(),
                         end: end.clone(),
+                        limit,
                     };
                     match self.cp_forward(table, &start, addr, request).await {
                         ClientResponse::Pairs(p) => return Ok(p),
@@ -6523,12 +7510,15 @@ impl ClientCtx {
     /// kind-scan dual of [`cp_scan_local`](Self::cp_scan_local): a scope that
     /// has not yet caught up to the metadata-derived request window (a
     /// split's narrow in flight) would otherwise silently truncate the
-    /// results rather than error. `end == None` is unbounded above.
+    /// results rather than error. `end == None` is unbounded above; `limit`
+    /// is a **per-tablet cap, not pushdown** (see
+    /// `RaftKvNode::local_scan_kind`'s doc).
     async fn cp_scan_kind_local(
         leader: &CpGroup,
         kind: u8,
         start: &[u8],
         end: Option<&[u8]>,
+        limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
         if !leader.scope_range().contains_range(&requested) {
@@ -6536,7 +7526,7 @@ impl ClientCtx {
                 "scan window {requested:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
-        match leader.linearizable_scan_kind(kind, start, end).await {
+        match leader.linearizable_scan_kind(kind, start, end, limit).await {
             Some(p) => Ok(p),
             None => Err("CP group leader moved; retry".into()),
         }
@@ -6700,14 +7690,16 @@ impl ClientCtx {
     /// exactly the hint a forwarder chasing a wrong first guess needs.
     fn cp_leader_hint(&self, tablet: TabletId) -> Option<(NodeId, SocketAddr)> {
         // Since ADR 0026 Stage B a tablet's CP group member id **is** simply the
-        // base `raftkv` id, so the local replica's leader hint is already a
-        // `client_route` key — no more base<->member translation needed.
+        // base `raftkv` id, so the local replica's leader hint is already an
+        // `intra_route` key — no more base<->member translation needed.
+        // Intra-flavored (ADR 0047): the receiving end of a forward
+        // (`cp_serve_forwarded`) is only ever reachable on the intra port.
         let leader = self.edge.local_cp(tablet).and_then(|n| n.leader())?;
-        let addr = self.route_addr(leader.clone())?;
+        let addr = self.intra_addr(leader.clone())?;
         Some((leader, addr))
     }
 
-    /// The client-API address to forward a `tablet` op to — see
+    /// The intra-cluster address to forward a `tablet` op to — see
     /// [`cp_leader_hint`](Self::cp_leader_hint) (the caller waits rather than
     /// guessing when there is no hint yet, so it never forwards a CP op to a
     /// non-leader, including itself).
@@ -6739,7 +7731,9 @@ impl ClientCtx {
     ) -> Option<SocketAddr> {
         let meta = self.effective_metadata();
         let replicas = meta.tablets.get(&tablet)?.replicas.clone();
-        let route = self.route_snapshot();
+        // Intra-flavored (ADR 0047): this is a forwarding fallback, same as
+        // `cp_leader_hint` above.
+        let route = self.intra_route_snapshot();
         replicas
             .into_iter()
             .find_map(|id| route.get(&id).copied().filter(|a| !tried.contains(a)))
@@ -6878,16 +7872,18 @@ impl ClientCtx {
                 ProposeResult::Accepted { .. }
             );
         }
-        // Prefer the control handle's own leader-address hint (ADR 0035 PR4:
-        // populated directly from `Status` replies for a `Remote` data node,
-        // see `ControlHandle::leader_addr_hint`'s doc) over a `route_addr`
-        // lookup — the hint is strictly fresher for a data-only node, since
-        // it rides the very `Status` reply that filled the mirror, whereas
-        // `route_addr` needs this leader's address to have separately synced
-        // into the replicated node-address book. A no-op for `Local` (always
-        // `None`), so this changes nothing for any node shape that existed
-        // before this PR.
-        if let Some(addr) = self.control.leader_addr_hint() {
+        // Prefer the control handle's own **intra** leader-address hint (ADR
+        // 0047; ADR 0035 PR4's original `leader_addr_hint` populated directly
+        // from `Status` replies for a `Remote` data node) over an
+        // `intra_addr` lookup — the hint is strictly fresher for a data-only
+        // node, since it rides the very `Status` reply that filled the
+        // mirror, whereas `intra_addr` needs this leader's address to have
+        // separately synced into the replicated node-address book. This is a
+        // machine-to-machine relay, so it uses the intra hint/route, never
+        // the human-facing `leader_addr_hint`/`route_addr` (see the root
+        // `CLAUDE.md`'s hint-field-conflation lesson). A no-op for `Local`
+        // (always `None`).
+        if let Some(addr) = self.control.intra_leader_addr_hint() {
             return !matches!(
                 self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
                     .await,
@@ -6895,7 +7891,7 @@ impl ClientCtx {
             );
         }
         if let Some(leader_id) = self.control.leader()
-            && let Some(addr) = self.route_addr(leader_id)
+            && let Some(addr) = self.intra_addr(leader_id)
         {
             return !matches!(
                 self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
@@ -6910,15 +7906,15 @@ impl ClientCtx {
         // traffic for a group it was never a voter of — for it, this is the
         // *only* path that can ever reach the real cluster (its own local
         // `propose` always fails, and it has no leader hint to relay a single
-        // hop to). Broadcast to every other known client-API address instead:
+        // hop to). Broadcast to every other known **intra** address instead:
         // a real control-group member among them resolves the actual leader
         // itself (one more hop — `ProposeSchema`'s handler is a single,
         // bounded relay, never a chain). Returns true on the first address that
         // connects, regardless of what its own `propose_schema` achieves
         // (best-effort, same as every other branch here — the caller confirms
         // via replicated `Metadata`, not this return value).
-        for addr in self.route_snapshot().into_values() {
-            if addr == self.admin.client_addr {
+        for addr in self.intra_route_snapshot().into_values() {
+            if addr == self.admin.intra_addr {
                 continue;
             }
             if !matches!(
@@ -7060,9 +8056,49 @@ impl ClientCtx {
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
-                match Self::cp_kind_local(&leader, writes, change_log).await {
+                match Self::cp_kind_local(&leader, writes, change_log, Vec::new()).await {
                     Ok(()) => ClientResponse::PutOk,
                     Err(e) => ClientResponse::Error(e),
+                }
+            }
+            // ADR 0046 U3: the evaluate-at-leader write RPC — resolve the
+            // leader by the item's own base key, recomputed here from
+            // `pk`/`sk` rather than trusted from the caller (the same
+            // discipline `Get`'s arm below already follows), then defer to
+            // the identical leader-side evaluator `ClientCtx::
+            // cp_kind_write_item`'s own `Local` branch calls in-process.
+            ClientRequest::KindWriteItem {
+                table,
+                pk,
+                sk,
+                op,
+                condition,
+            } => {
+                let key = dynamo::item_key(&pk, sk.as_ref());
+                let tablet = self.tablet_for(&table, &key);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
+                };
+                let meta = self.effective_metadata();
+                match dynamo::kind_write_item_at_leader(
+                    self,
+                    &leader,
+                    &meta,
+                    &table,
+                    &pk,
+                    sk.as_ref(),
+                    op,
+                    condition.as_ref(),
+                )
+                .await
+                {
+                    Ok(dynamo::KindWriteOutcome::Ok { old, new }) => {
+                        ClientResponse::KindWriteOk { old, new }
+                    }
+                    Ok(dynamo::KindWriteOutcome::ConditionFailed) => {
+                        ClientResponse::ConditionFailed
+                    }
+                    Err(e) => ClientResponse::Error(e.message),
                 }
             }
             ClientRequest::Get { key, table } => {
@@ -7137,12 +8173,13 @@ impl ClientCtx {
                 kind,
                 start,
                 end,
+                limit,
             } => {
                 let tablet = self.tablet_for(&table, &start);
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
-                match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref()).await {
+                match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref(), limit).await {
                     Ok(p) => ClientResponse::Pairs(p),
                     Err(e) => ClientResponse::Error(e),
                 }
@@ -7168,6 +8205,23 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
+            // Growth PR3 (ADR 0042 §14): the manual-growth split-trigger
+            // RPC — addressed by `tablet` directly, mirroring `ForceSeal`
+            // just above. Materializes this tablet's own live pairs
+            // (leader-local — only reachable once this arm confirms this
+            // node hosts it) and splits at their byte-weighted median via
+            // `trigger_split`, which itself applies F11 rounding and Fork
+            // E's single-token skip.
+            ClientRequest::TriggerAutoSplit { tablet } => {
+                let tablet = TabletId(tablet);
+                let Some(leader) = self.edge.cp_leader(tablet) else {
+                    return self.not_leader_refusal(Some(tablet));
+                };
+                match median_split_key(&leader).await {
+                    None => ClientResponse::Error(STREAM_GROW_NO_SPLIT_POINT.into()),
+                    Some(split_key) => self.trigger_split(tablet, split_key).await,
+                }
+            }
             // ADR 0042 §7/§8, PR6: the open-shard hot-read RPC — addressed
             // by `tablet` directly, mirroring `ForceSeal` just above (see
             // this variant's own doc for why). Leader-local, no ReadIndex
@@ -7182,7 +8236,15 @@ impl ClientCtx {
                 let Some(leader) = self.edge.cp_leader(tablet) else {
                     return self.not_leader_refusal(Some(tablet));
                 };
-                let meta = self.effective_metadata();
+                // ADR 0044 phase-1 PR4: the hot_read scope-transition latch,
+                // sourced from `metadata_fresh()` — see
+                // `hot_read_scope_ok`'s own doc for why this narrows the ADR
+                // 0043 residual `effective_metadata()` alone left open (and
+                // for the accepted remaining sub-window it does not close).
+                let meta = self.metadata_fresh().await;
+                if let Err(e) = Self::hot_read_scope_ok(&meta, tablet, &leader) {
+                    return ClientResponse::Error(e);
+                }
                 let pairs = index_drain::hot_read(&meta, tablet, &leader, from_position, limit)
                     .await
                     .into_iter()
@@ -7216,51 +8278,44 @@ impl ClientCtx {
                 writes,
                 conditions,
                 participant_spans,
+                pending_kind_writes,
             } => {
-                let Some(first) = writes.first().map(|(k, _)| k.clone()) else {
+                let Some(first) = writes.first().map(|w| w.key.clone()).or_else(|| {
+                    pending_kind_writes
+                        .first()
+                        .map(|p| dynamo::item_key(&p.pk, p.sk.as_ref()))
+                }) else {
                     return ClientResponse::Error("txn prepare: writes must be non-empty".into());
                 };
                 let tablet = self.tablet_for(&table, &first);
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
-                match anchor {
-                    None => match leader
-                        .txn_stage(&table, writes, participant_spans, conditions)
-                        .await
-                    {
-                        Some((txn_id, record_key, outcome)) => ClientResponse::TxnPrepared {
-                            ts: txn_id.ts,
-                            txn_id,
-                            record_key,
-                            record_table: table,
-                            outcome,
-                        },
-                        None => ClientResponse::Error(
-                            "CP group leader moved during anchor stage; retry".into(),
-                        ),
-                    },
-                    Some((txn_id, record_key, record_table)) => match leader
-                        .txn_stage_participant(
-                            txn_id.clone(),
-                            record_key.clone(),
-                            record_table.clone(),
-                            writes,
-                            conditions,
-                        )
-                        .await
-                    {
-                        Some((ts, outcome)) => ClientResponse::TxnPrepared {
+                // ADR 0046 U3 (PR2): the shared local-stage step also used by
+                // `txn_prepare`'s own `CpRoute::Local` branch — see
+                // `txn_stage_local`'s doc.
+                match self
+                    .txn_stage_local(
+                        &leader,
+                        &table,
+                        anchor,
+                        writes,
+                        conditions,
+                        participant_spans,
+                        pending_kind_writes,
+                    )
+                    .await
+                {
+                    Ok((txn_id, record_key, record_table, ts, outcome)) => {
+                        ClientResponse::TxnPrepared {
                             txn_id,
                             record_key,
                             record_table,
                             ts,
                             outcome,
-                        },
-                        None => ClientResponse::Error(
-                            "CP group leader moved during participant stage; retry".into(),
-                        ),
-                    },
+                        }
+                    }
+                    Err(e) => ClientResponse::Error(e),
                 }
             }
             ClientRequest::TxnDecide {
@@ -7463,6 +8518,17 @@ impl ClientCtx {
             is_leader = is_leader.max(snap.is_leader);
         }
         (counters, is_leader)
+    }
+
+    /// Growth PR3 Fork F (ADR 0042 §14): every currently-tracked tablet's
+    /// own smoothed change-append rate (bytes/sec), for `/admin/metrics`'s
+    /// `stream_change_rates` array — empty on a control-only node (no
+    /// [`DataRole`] at all, so nothing was ever tracked).
+    pub(crate) fn stream_change_rates(&self) -> Vec<(TabletId, f64)> {
+        self.data
+            .as_ref()
+            .map(|d| d.change_rates.snapshot())
+            .unwrap_or_default()
     }
 
     /// A snapshot of this node's metrics-history ring buffer (oldest first),
@@ -7766,6 +8832,7 @@ impl ClientCtx {
                 internal: String::new(),
                 client: String::new(),
                 admin: String::new(),
+                intra: String::new(),
                 role: "control".to_string(),
             });
             if addrs.internal != addr.to_string() {
@@ -7808,6 +8875,7 @@ impl ClientCtx {
                         internal: String::new(),
                         client: String::new(),
                         admin: String::new(),
+                        intra: String::new(),
                         role: "control".to_string(),
                     });
                 addrs.internal = addr.to_string();
@@ -8164,8 +9232,9 @@ async fn peer_sync_loop(ctx: ClientCtx, env: ProdEnv, static_peers: BTreeMap<Nod
 /// Keep `ctx.client_route` = the **static** seed (this node's own config-time
 /// route table) ∪ the replicated `Metadata.node_addrs[*].client` (ADR 0032 PR1),
 /// so a node grown in after this node's own startup becomes a valid forward
-/// target for a client op / `propose_schema` relay — closing the ADR 0030
-/// residual gap where `client_route` was a process-start-only snapshot. Sibling
+/// target for a client op (`propose_schema`'s own relay reads `intra_route`
+/// instead, ADR 0047) — closing the ADR 0030 residual gap where `client_route`
+/// was a process-start-only snapshot. Sibling
 /// of [`peer_sync_loop`] in every respect: same [`PEER_SYNC_INTERVAL`] cadence,
 /// same static-base-∪-replicated-overlay shape, reads
 /// [`ClientCtx::effective_metadata`] so a control-plane-follower-less growth
@@ -8181,6 +9250,33 @@ async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAd
             }
         }
         *ctx.client_route.lock().expect("client route poisoned") = book;
+        tokio::time::sleep(PEER_SYNC_INTERVAL).await;
+    }
+}
+
+/// The [`route_sync_loop`] sibling for `ctx.intra_route` (ADR 0047): keeps it
+/// = the static seed (this node's own config/discovery-time knowledge of
+/// every peer's intra address, exactly mirroring `client_route`'s own static
+/// seed) ∪ the replicated `Metadata.node_addrs[*].intra`, same cadence/
+/// shape/`effective_metadata` sourcing as `route_sync_loop`. A real static
+/// seed (not an empty one) is load-bearing here, not just an optimization:
+/// unlike `client_route`'s consumers, `cp_leader_hint`/`propose_schema`'s
+/// relay and (critically) the **growth-node mirror's own seed-building**
+/// (`start_with_streams`'s `ctx.intra_addr(id)` call, feeding
+/// `remote_metadata_sync_loop`) run synchronously at ctx-construction time,
+/// before this loop's first tick — an empty seed there would make a growth
+/// node's very first mirror-poll attempt see zero addresses and never
+/// recover (this loop's *next* tick can't help, since `remote_metadata_sync_
+/// loop` captures its `seeds` argument once, at spawn time).
+async fn intra_route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAddr>) {
+    loop {
+        let mut book = static_route.clone();
+        for (id, addrs) in ctx.effective_metadata().node_addrs {
+            if let Ok(sa) = addrs.intra.parse::<SocketAddr>() {
+                book.insert(id, sa);
+            }
+        }
+        *ctx.intra_route.lock().expect("intra route poisoned") = book;
         tokio::time::sleep(PEER_SYNC_INTERVAL).await;
     }
 }
@@ -8311,7 +9407,12 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
     loop {
         let last_seen = remote.metadata_watch().latest();
         let mut candidates = Vec::with_capacity(seeds.len() + 1);
-        if let Some(addr) = remote.leader_addr_hint() {
+        // Intra-flavored (ADR 0047): `WatchMetadata` is intra-only, so the
+        // dial candidates must be intra addresses, never the human-facing
+        // `leader_addr_hint`/`seeds` this loop used before the port split
+        // (`seeds` itself is now intra-flavored too — see
+        // `RemoteControlClient.seeds`'s doc).
+        if let Some(addr) = remote.intra_leader_addr_hint() {
             candidates.push(addr);
         }
         candidates.extend(seeds.iter().copied());
@@ -8328,10 +9429,17 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
                 ClientResponse::Status {
                     metadata,
                     leader_hint,
+                    intra_leader_hint,
                     watermark,
                     control_voters,
                 } => {
-                    remote.observe(metadata, leader_hint, watermark, control_voters);
+                    remote.observe(
+                        metadata,
+                        leader_hint,
+                        intra_leader_hint,
+                        watermark,
+                        control_voters,
+                    );
                     synced = true;
                     break;
                 }
@@ -8343,12 +9451,14 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
                     writes,
                     watermark,
                     leader_hint,
+                    intra_leader_hint,
                     control_voters,
                 } => {
                     remote.observe_delta(
                         last_seen,
                         &writes,
                         leader_hint,
+                        intra_leader_hint,
                         watermark,
                         control_voters,
                     );
@@ -8375,11 +9485,18 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
             if let ClientResponse::Status {
                 metadata,
                 leader_hint,
+                intra_leader_hint,
                 watermark,
                 control_voters,
             } = relay_request(addr, &ClientRequest::Status).await
             {
-                remote.observe(metadata, leader_hint, watermark, control_voters);
+                remote.observe(
+                    metadata,
+                    leader_hint,
+                    intra_leader_hint,
+                    watermark,
+                    control_voters,
+                );
                 break;
             }
         }
@@ -8515,6 +9632,15 @@ impl CpReconciler {
         match self {
             CpReconciler::Lsm(r) => r.tick(view).await,
             CpReconciler::Mem(r) => r.tick(view).await,
+        }
+    }
+
+    /// ADR 0044 phase-1 PR4 production wiring — see
+    /// [`Reconciler::enable_quiescence`]'s doc.
+    fn enable_quiescence(&mut self, after: Duration) {
+        match self {
+            CpReconciler::Lsm(r) => r.enable_quiescence(after),
+            CpReconciler::Mem(r) => r.enable_quiescence(after),
         }
     }
 }
@@ -8655,6 +9781,15 @@ async fn txn_resolver_loop(ctx: ClientCtx) {
             if !group.is_leader() {
                 continue;
             }
+            // ADR 0044 phase-1 PR6: sound by the identical argument
+            // `change_consumer_loop`'s own gate gives — a quiesced group's
+            // `TxnTracker` is, by construction, empty (PR5's in-crate veto
+            // is exactly "a non-empty tracker never quiesces"), so both
+            // loops below are guaranteed no-ops here; skip the
+            // `pending_txns()`/`unresolved_decided()` clones entirely.
+            if group.is_quiesced() {
+                continue;
+            }
             let Some(table) = ctx
                 .effective_metadata()
                 .tablets
@@ -8730,6 +9865,25 @@ pub(crate) struct MetricsSample {
 async fn metrics_sample_loop(ctx: ClientCtx) {
     loop {
         tokio::time::sleep(METRICS_SAMPLE_INTERVAL).await;
+        // ADR 0044 phase-1 PR7: a level gauge — how many of this node's
+        // currently-hosted CP-data groups this sample found quiesced.
+        // `CpGroup::is_quiesced()` reads a frozen accessor and never itself
+        // wakes a group (fork F: admin/dashboard reads must never disturb
+        // the fleet-wide idle-cost win quiescence exists for), so sampling
+        // this on the same cadence as every other metrics snapshot is free.
+        // A control-only node's `ctx.edge.hosted_groups()` is always empty
+        // (it never registers a raftkv handle), so this is a no-op there;
+        // gated on `ctx.data` regardless, matching every other raftkv-only
+        // metric this loop's sibling background loops record.
+        if let Some(data) = ctx.data.as_ref() {
+            let quiesced = ctx
+                .edge
+                .hosted_groups()
+                .iter()
+                .filter(|(_, g)| g.is_quiesced())
+                .count() as u64;
+            data.raftkv_metrics.set(Metric::CpGroupsQuiesced, quiesced);
+        }
         let (counters, is_leader) = ctx.metrics_json();
         let ts_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -8783,6 +9937,63 @@ struct AutoSplitThresholds {
     /// `--auto-split-bytes B` (ADR 0034): split once a led tablet's
     /// (approximate) scoped bytes exceed `B`.
     bytes: Option<u64>,
+    /// `--auto-split-change-rate RATE` (ADR 0042 §14, growth PR3 Fork F):
+    /// split once a **streamed** led tablet's own smoothed change-append
+    /// rate ([`ChangeRateTracker`], bytes/sec) exceeds `RATE`. Absent by
+    /// default (opt-in only, no surprise splits on an existing deployment)
+    /// — an unstreamed table is never subject to this trigger regardless
+    /// of this setting, since the rate is only ever tracked for a streamed
+    /// tablet in the first place (`index_drain::seal_tick` only runs its
+    /// seal arm, which feeds the tracker, when `stream_enabled`).
+    change_rate: Option<u64>,
+}
+
+/// F11 (ADR 0042 §14): the exact error [`ClientCtx::trigger_split`] returns
+/// when [`align_split_key`] finds a streamed table's split key rounds down
+/// onto the target tablet's own `range.start` — matched by `auto_split_loop`
+/// to downgrade its logging (Fork E: skip + meter via
+/// [`Metric::StreamSplitSingleTokenSkipped`], never its ordinary "split did
+/// not commit" warning, which would otherwise fire every cooldown, forever,
+/// for a single-token hot partition that structurally cannot split).
+const SPLIT_KEY_NOT_TOKEN_VIABLE: &str =
+    "split key rounds onto the tablet's own range start (single-token hot partition)";
+
+/// F11 (ADR 0042 §14, Fork D): round `split_key` down to its own 8-byte
+/// token boundary (`TOKEN_BYTES`) if `tablet`'s table is streamed, so one
+/// partition key's records — and hence one shard's, ADR 0043 §A4 — never
+/// separate across sibling tablets. A plain, unstreamed table's split key is
+/// returned unchanged. Called from the **one** choke point every split
+/// proposer funnels through ([`ClientCtx::trigger_split`]), so this can
+/// never be forgotten by a future caller the way the pre-PR2 code (rounding
+/// done only inside `auto_split_loop`) could be bypassed by the two manual
+/// paths (`POST /admin/tablet/split`, `ClientRequest::SplitTablet`).
+///
+/// Returns `(key, viable)`: `viable` is whether the (possibly rounded) key
+/// is still a legal **interior** split point for `tablet`'s current range
+/// (`KeyRange::split_at`'s own "strictly inside" rule). Rounding a hot
+/// single-token partition's own key can collapse it onto `range.start` —
+/// Fork E's accepted single-token hot-partition limit: one very hot
+/// partition key ends up owning the tablet's entire range, and it can never
+/// legally split without separating that same token's records across
+/// siblings — the exact affinity F11 exists to protect. `viable == false`
+/// for an unknown tablet too (the caller's own subsequent lookup reports
+/// that more precisely; this just never claims a key is fine for a tablet
+/// this function can't even see).
+fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) -> (Vec<u8>, bool) {
+    let Some(t) = meta.tablets.get(&tablet) else {
+        return (split_key, false);
+    };
+    let streamed = t
+        .table
+        .as_deref()
+        .is_some_and(|table| meta.table_stream(table).is_some());
+    let key = if streamed {
+        split_key[..TOKEN_BYTES.min(split_key.len())].to_vec()
+    } else {
+        split_key
+    };
+    let viable = t.range.split_at(&key).is_some();
+    (key, viable)
 }
 
 /// The leader-driven **automatic split trigger**: on each tick, for every tablet
@@ -8845,6 +10056,19 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             let Some(leader) = ctx.edge.cp_leader(tablet) else {
                 continue;
             };
+            // ADR 0044 phase-1 PR6: a quiesced group's bytes/key-count are,
+            // by construction, static — no activity for `quiesce_after`
+            // means no new writes since it quiesced, and a write is the
+            // only way either could ever change. Whatever this tablet's
+            // last pre-quiescence tick already checked (over threshold ⇒
+            // triggered; under ⇒ correctly left alone) still holds, so
+            // re-estimating/re-materializing it here (including the
+            // periodic `due_confirm` correction below, which exists only
+            // to catch estimate drift from *new* data) is pure waste until
+            // something un-quiesces it.
+            if leader.is_quiesced() {
+                continue;
+            }
             // Cheap per-tick gate: materializing every led tablet's live pairs
             // every tick is O(total data) per 2s — instead, take the free
             // (over-)estimate(s) and only materialize when one says the tablet
@@ -8865,7 +10089,16 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
                 Some(t) => leader.approx_bytes().await > t,
                 None => false,
             };
-            if !key_hot && !byte_hot && !due_confirm {
+            // Growth PR3 Fork F (ADR 0042 §14): the opt-in change-append-rate
+            // trigger — a streamed tablet's own smoothed rate
+            // ([`ChangeRateTracker`]) is already cheap to read (no
+            // materialization), exactly like the key/byte estimates above.
+            // Reads as `0.0` (never hot) for an unstreamed tablet, since
+            // nothing ever calls `ChangeRateTracker::observe` for one.
+            let change_rate_hot = thresholds
+                .change_rate
+                .is_some_and(|t| ctx.data().change_rates.get(tablet) > t as f64);
+            if !key_hot && !byte_hot && !change_rate_hot && !due_confirm {
                 continue;
             }
             // Materialize once: the authoritative count, byte total, and (if over
@@ -8878,45 +10111,58 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
                 let total_bytes: u64 = pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
                 total_bytes > t
             });
+            // Re-read (not reused from the cheap gate above): a materializing
+            // confirm pass is exactly the point at which every other trigger
+            // here re-derives its own authoritative value from this same
+            // snapshot, and the tracker is cheap enough that re-reading it
+            // costs nothing extra.
+            let over_change_rate_threshold = thresholds
+                .change_rate
+                .is_some_and(|t| ctx.data().change_rates.get(tablet) > t as f64);
             // Need at least 2 distinct keys for any split to have an interior
             // point (`SplitTablet` requires `start < at < end`).
-            if key_count < 2 || (!over_key_threshold && !over_byte_threshold) {
+            if key_count < 2
+                || (!over_key_threshold && !over_byte_threshold && !over_change_rate_threshold)
+            {
                 continue;
             }
-            // A byte-configured cluster uses the byte-weighted median (ADR
-            // 0034) so a skewed value-size distribution still bisects the
-            // tablet's *bytes* roughly evenly; a key-count-only cluster keeps
-            // the plain positional median unchanged from before this ADR (the
-            // interior key of `> threshold >= 2` distinct keys `SplitTablet`
-            // accepts).
-            let split_key = if thresholds.bytes.is_some() {
+            // A byte- or change-rate-configured cluster uses the
+            // byte-weighted median (ADR 0034) so a skewed value-size
+            // distribution still bisects the tablet's *bytes* roughly
+            // evenly; a key-count-only cluster keeps the plain positional
+            // median unchanged from before this ADR (the interior key of
+            // `> threshold >= 2` distinct keys `SplitTablet` accepts).
+            let split_key = if thresholds.bytes.is_some() || over_change_rate_threshold {
                 byte_weighted_median(&pairs)
             } else {
                 pairs[pairs.len() / 2].0.clone()
             };
-            // F11 (ADR 0042 §14): a streamed table's split key rounds DOWN to
-            // its own 8-byte token boundary, so one partition key's records
-            // — and hence one shard's, ADR 0043 §A4 — never separate across
-            // the split. A plain, unstreamed table's split key is unchanged.
-            let split_key = if meta
-                .tablets
-                .get(&tablet)
-                .and_then(|t| t.table.as_deref())
-                .is_some_and(|table| meta.table_stream(table).is_some())
-            {
-                split_key[..TOKEN_BYTES.min(split_key.len())].to_vec()
-            } else {
-                split_key
-            };
+            // F11 (ADR 0042 §14, Fork D): the token-alignment rounding itself
+            // now lives inside `ClientCtx::trigger_split` — the one choke
+            // point every split proposer (this loop, `POST
+            // /admin/tablet/split`, `ClientRequest::SplitTablet`) funnels
+            // through, so it can't be forgotten by a future caller the way
+            // the pre-PR2 code (rounding done only here) let the two manual
+            // paths bypass it. `trigger_split` returns immediately (no
+            // propose attempt) with `SPLIT_KEY_NOT_TOKEN_VIABLE` for Fork
+            // E's accepted single-token hot-partition limit — matched below
+            // so this loop's own "split did not commit" warning never fires
+            // for that expected, already-metered outcome (it would
+            // otherwise fire every single cooldown, forever, for a tablet
+            // that structurally cannot split).
             last_triggered.insert(tablet, tokio::time::Instant::now());
             let span = tracing::info_span!("auto_split", tablet = tablet.0);
             let response = ctx.trigger_split(tablet, split_key).instrument(span).await;
-            if !matches!(response, ClientResponse::PutOk) {
-                tracing::warn!(
-                    tablet = tablet.0,
-                    ?response,
-                    "auto_split: split did not commit"
-                );
+            match &response {
+                ClientResponse::PutOk => {}
+                ClientResponse::Error(msg) if msg == SPLIT_KEY_NOT_TOKEN_VIABLE => {}
+                other => {
+                    tracing::warn!(
+                        tablet = tablet.0,
+                        ?other,
+                        "auto_split: split did not commit"
+                    );
+                }
             }
         }
     }
@@ -8964,26 +10210,66 @@ fn byte_weighted_median(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     pairs[best_idx].0.clone()
 }
 
-async fn serve_clients(listener: TcpListener, ctx: ClientCtx) {
+/// Growth PR3 (ADR 0042 §14): the exact error [`ClientRequest::
+/// TriggerAutoSplit`]'s handler (and, table-wide, [`ClientCtx::
+/// grow_stream`]) returns for a tablet with fewer than 2 distinct keys — no
+/// legal interior split point exists at all, regardless of tokens (the same
+/// precondition `auto_split_loop` checks before ever computing a median).
+/// Distinct from [`SPLIT_KEY_NOT_TOKEN_VIABLE`] (a real single-token
+/// hot-partition collapse) so a caller can tell "nothing to split" from
+/// "one partition owns everything" — both are skips, never hard failures.
+const STREAM_GROW_NO_SPLIT_POINT: &str =
+    "tablet has fewer than 2 distinct keys — no legal interior split point";
+
+/// Materialize `group`'s own live pairs and compute their byte-weighted
+/// median (ADR 0034's [`byte_weighted_median`]) — the same key
+/// `auto_split_loop` computes for a byte-configured cluster, reused here for
+/// growth PR3's manual `POST /admin/stream/grow` trigger and Fork F's
+/// change-rate auto-trigger, neither of which has (or needs) a byte/key
+/// **threshold** of its own: an explicit trigger always uses the
+/// byte-weighted metric, unconditionally. Returns `None` for fewer than 2
+/// distinct keys (no legal interior split point regardless of tokens) —
+/// the caller answers [`STREAM_GROW_NO_SPLIT_POINT`] rather than ever
+/// calling [`ClientCtx::trigger_split`] with a meaningless key.
+async fn median_split_key(group: &CpGroup) -> Option<Vec<u8>> {
+    let pairs = group.local_pairs().await;
+    if pairs.len() < 2 {
+        return None;
+    }
+    Some(byte_weighted_median(&pairs))
+}
+
+/// Accept loop shared by **both** listeners (ADR 0047) — the client port and
+/// the intra-cluster port alike — parameterized by [`ListenerKind`] rather
+/// than forked: `spawn_common_tail` spawns two instantiations of this same
+/// function, one per listener, and threads `listener` straight through
+/// [`handle_connection`] into [`handle_request`]'s one guard clause. Replaces
+/// the pre-ADR-0047 `serve_clients`/`handle_client` pair, which only ever
+/// served the client port.
+async fn serve_requests(listener_socket: TcpListener, ctx: ClientCtx, listener: ListenerKind) {
     loop {
-        match listener.accept().await {
+        match listener_socket.accept().await {
             Ok((stream, _addr)) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_client(stream, ctx).await {
-                        tracing::debug!(?err, "client connection closed");
+                    if let Err(err) = handle_connection(stream, ctx, listener).await {
+                        tracing::debug!(?err, "connection closed");
                     }
                 });
             }
             Err(err) => {
-                tracing::warn!(?err, "client accept failed");
+                tracing::warn!(?err, "accept failed");
                 return;
             }
         }
     }
 }
 
-async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<()> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    ctx: ClientCtx,
+    listener: ListenerKind,
+) -> std::io::Result<()> {
     while let Some(request) = read_frame::<ClientRequest>(&mut stream).await? {
         // Every accepted request is a root span (ADR 0027): this is what gives
         // `otel::current_traceparent()` something to inject if the request's
@@ -8998,7 +10284,9 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
         {
             otel::set_parent_traceparent(&span, tp);
         }
-        let response = handle_request(&ctx, request).instrument(span).await;
+        let response = handle_request(&ctx, request, listener)
+            .instrument(span)
+            .await;
         write_frame(&mut stream, &response).await?;
     }
     Ok(())
@@ -9012,8 +10300,10 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::Put { .. } => "put",
         ClientRequest::PutBatch { .. } => "put_batch",
         ClientRequest::KindWrite { .. } => "kind_write",
+        ClientRequest::KindWriteItem { .. } => "kind_write_item",
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
+        ClientRequest::TriggerAutoSplit { .. } => "trigger_auto_split",
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
         ClientRequest::ClearBackfillCursor { .. } => "clear_backfill_cursor",
         ClientRequest::Get { .. } => "get",
@@ -9035,7 +10325,23 @@ fn request_kind(request: &ClientRequest) -> &'static str {
     }
 }
 
-async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientResponse {
+async fn handle_request(
+    ctx: &ClientCtx,
+    request: ClientRequest,
+    listener: ListenerKind,
+) -> ClientResponse {
+    // The one asymmetric refusal rule (ADR 0047): only a `Client`-listener
+    // connection asking for an `Intra`-surfaced variant is refused — the
+    // reverse (an `Intra` listener serving a `Public` variant) is fine by
+    // design, since intra is the more-trusted segment and neither port has
+    // auth yet (see `Surface`'s doc). Everything below this guard is the
+    // pre-ADR-0047 match, untouched.
+    if listener == ListenerKind::Client && surface_of(&request) == Surface::Intra {
+        return ClientResponse::Error(format!(
+            "{} is a cluster-internal request; send it to this node's intra port",
+            request_kind(&request)
+        ));
+    }
     match request {
         // `effective_metadata`, not `ctx.control.metadata_cached()` directly (mirroring
         // `/admin/status`, ADR 0030): on a control-plane-follower-less growth
@@ -9049,6 +10355,7 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         ClientRequest::Status => ClientResponse::Status {
             metadata: ctx.effective_metadata(),
             leader_hint: ctx.control_leader_hint(),
+            intra_leader_hint: ctx.intra_control_leader_hint(),
             watermark: ctx.control.metadata_watch().latest(),
             control_voters: ctx.control.config().unwrap_or_default(),
         },
@@ -9082,7 +10389,7 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         }
         // A CP op forwarded from another node (cross-process routing, ADR 0017
         // #3b): serve locally iff we are the leader; never re-forward. The
-        // enclosing `client_request` span (in `handle_client`) was already
+        // enclosing `client_request` span (in `handle_connection`) was already
         // re-parented onto the originating node's trace (ADR 0027) before this
         // request reached here.
         ClientRequest::Forwarded { request, .. } => ctx.cp_serve_forwarded(*request).await,
@@ -9107,6 +10414,7 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
             control_ids: ctx.admin.control_ids.clone(),
             peers: ctx.admin.peers.clone(),
             client_route: ctx.route_snapshot(),
+            intra_route: ctx.intra_route_snapshot(),
             admin_addrs: ctx.admin.admin_addrs.clone(),
         },
         // Long-poll metadata watch (ADR 0035 PR5) — see `ClientCtx::
@@ -9149,6 +10457,16 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
              `Forwarded`"
                 .into(),
         ),
+        // ADR 0046 U3: the evaluate-at-leader write RPC, refused bare for the
+        // identical reason `KindWrite` just above is — see
+        // `ClientRequest::KindWriteItem`'s doc. Real handling lives in
+        // `cp_serve_forwarded`'s match, reached only through `Forwarded`; not
+        // a `MetaCommand`, so `is_relayable_command` does not apply.
+        ClientRequest::KindWriteItem { .. } => ClientResponse::Error(
+            "this request is an internal evaluate-at-leader write RPC and must be sent wrapped \
+             in `Forwarded`"
+                .into(),
+        ),
         // ADR 0041 §5: the LSI `Query` read primitive, the read-side dual of
         // `KindWrite` just above and refused for the identical reason — a
         // bare caller could otherwise read a table's LSI/change-log/
@@ -9173,6 +10491,11 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         ),
         ClientRequest::ForceSeal { .. } => ClientResponse::Error(
             "this request is an internal seal-trigger RPC and must be sent wrapped in \
+             `Forwarded`"
+                .into(),
+        ),
+        ClientRequest::TriggerAutoSplit { .. } => ClientResponse::Error(
+            "this request is an internal growth split-trigger RPC and must be sent wrapped in \
              `Forwarded`"
                 .into(),
         ),
@@ -9272,13 +10595,6 @@ impl ClientCtx {
         fields(tablet = tablet.0, new_id = tracing::field::Empty)
     )]
     async fn trigger_split(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
-        // The new tablet id comes from the **monotonic allocator**
-        // (`next_free_tablet_id`, ADR 0023 — the same allocator provisioning
-        // uses), *not* `max(existing ids) + 1`, which could re-mint a freed id
-        // after a `DropTableTablets`. `new_id` and `expected_epoch` come from
-        // the **same** metadata snapshot so the CAS reflects exactly what this
-        // call saw.
-        //
         // `effective_metadata()`, not `self.control.metadata_cached()`
         // directly (ADR 0035 PR5 staleness-audit fix): unlike a plain stale
         // read racing a *concurrent* epoch bump — which the CAS below catches
@@ -9291,29 +10607,100 @@ impl ClientCtx {
         // exists on the real cluster. The CAS only protects against
         // staleness *after* a read succeeds; it can't rescue a read that
         // never has anything to see.
-        let meta = self.effective_metadata();
-        let new_id = meta.next_free_tablet_id();
-        let Some(expected_epoch) = meta.tablets.get(&tablet).map(|t| t.epoch) else {
+        let Some(initial_epoch) = self
+            .effective_metadata()
+            .tablets
+            .get(&tablet)
+            .map(|t| t.epoch)
+        else {
             return ClientResponse::Error("no such tablet".into());
         };
-        tracing::Span::current().record("new_id", new_id.0);
-        let cmd = MetaCommand::SplitTablet {
-            tablet,
-            expected_epoch,
-            split_key,
-            new_id,
-        };
-        match self
-            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
-                self.effective_metadata()
-                    .tablets
-                    .contains_key(&new_id)
-                    .then_some(())
-            })
-            .await
-        {
-            Ok(()) => ClientResponse::PutOk,
-            Err(()) => ClientResponse::Error("split did not commit in time".into()),
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        let mut next_propose_at = tokio::time::Instant::now();
+        loop {
+            // Confirmed: this tablet's own epoch has advanced past what we
+            // initially observed. The CAS-gated apply arm only ever bumps a
+            // tablet's epoch on a REAL, committed split of that exact
+            // tablet (`source.epoch = source.epoch.next()`), so this is
+            // true iff *some* split of THIS tablet — ours, or a racing
+            // proposer's that happened to land first (harmless: the
+            // operation the caller wanted, "this tablet is now split," is
+            // accomplished either way) — has actually landed. Deliberately
+            // **not** `tablets.contains_key(&new_id)` (the bug this
+            // rewrite fixes, found building growth PR3's multi-tablet
+            // `POST /admin/stream/grow`): `new_id` is computed fresh below
+            // from a possibly-stale `effective_metadata()` snapshot — on a
+            // lagging-mirror node in particular, two *different*
+            // `SplitTablet` proposals (splitting two different source
+            // tablets, issued in quick succession by `ClientCtx::
+            // grow_stream`'s per-tablet loop) can independently compute the
+            // identical `new_id` from equally-stale reads. The control
+            // leader's own apply-time check (`new tablet id already
+            // exists`) correctly rejects the second one — but a
+            // confirmation that only asks "does a tablet with this id
+            // exist now" can't tell that rejected proposal apart from its
+            // own success once the FIRST proposal's commit replicates
+            // here, silently reporting `PutOk` for a split that never
+            // actually happened. Checking THIS tablet's own epoch instead
+            // is robust regardless of which `new_id` a later, corrected
+            // retry (below) ends up minting.
+            let meta = self.effective_metadata();
+            match meta.tablets.get(&tablet).map(|t| t.epoch) {
+                None => return ClientResponse::Error("no such tablet".into()),
+                Some(epoch) if epoch != initial_epoch => return ClientResponse::PutOk,
+                Some(_) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return ClientResponse::Error("split did not commit in time".into());
+            }
+            if tokio::time::Instant::now() >= next_propose_at {
+                // The new tablet id comes from the **monotonic allocator**
+                // (`next_free_tablet_id`, ADR 0023 — the same allocator
+                // provisioning uses), *not* `max(existing ids) + 1`, which
+                // could re-mint a freed id after a `DropTableTablets`.
+                // Recomputed fresh on **every** propose attempt (not once
+                // up front) — the actual fix for the collision race
+                // described above: a later attempt, once this node's own
+                // metadata has caught up, sees the allocator floor moved
+                // past whatever else was created meanwhile and mints a
+                // genuinely free id instead of repeating a doomed one.
+                let new_id = meta.next_free_tablet_id();
+                // F11 (ADR 0042 §14, Fork D): this is the ONE choke point
+                // every split proposer funnels through — `auto_split_loop`,
+                // `POST /admin/tablet/split` (`admin::action_split`), and
+                // `ClientRequest::SplitTablet`'s handler all call this
+                // method and nothing else, so rounding here (rather than in
+                // each caller) structurally can't be forgotten by a future
+                // one. See `align_split_key`'s own doc for the rounding +
+                // single-token-skip rule (Fork E). `tablet`'s range cannot
+                // have changed since `initial_epoch` was captured (the loop
+                // only reaches here while the epoch check above still
+                // matches), so recomputing this every attempt is
+                // equivalent to computing it once — just simpler to read
+                // alongside the fresh `new_id` above.
+                let (aligned_key, viable) = align_split_key(&meta, tablet, split_key.clone());
+                if !viable {
+                    self.control
+                        .metrics()
+                        .incr(Metric::StreamSplitSingleTokenSkipped);
+                    return ClientResponse::Error(SPLIT_KEY_NOT_TOKEN_VIABLE.into());
+                }
+                tracing::Span::current().record("new_id", new_id.0);
+                let cmd = MetaCommand::SplitTablet {
+                    tablet,
+                    expected_epoch: initial_epoch,
+                    split_key: aligned_key,
+                    new_id,
+                };
+                let sent = self.propose_schema(&cmd).await;
+                next_propose_at = tokio::time::Instant::now()
+                    + if sent {
+                        SCHEMA_PROPOSE_PATIENCE
+                    } else {
+                        Duration::ZERO
+                    };
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -9816,6 +11203,87 @@ impl ClientCtx {
         }
     }
 
+    /// One tablet's own share of growth PR3's manual trigger (`POST
+    /// /admin/stream/grow`, [`grow_stream`](Self::grow_stream)'s per-tablet
+    /// call): wherever `tablet`'s own CP group leader actually runs,
+    /// materialize its live pairs and split at their byte-weighted median
+    /// ([`median_split_key`]) via [`trigger_split`](Self::trigger_split) —
+    /// which independently applies F11's token-rounding and Fork E's
+    /// single-token skip, exactly as every other split proposer does.
+    /// Returns the tablet's own [`ClientResponse`] verbatim: `PutOk` for a
+    /// genuine split, or an `Error` naming [`STREAM_GROW_NO_SPLIT_POINT`]/
+    /// [`SPLIT_KEY_NOT_TOKEN_VIABLE`] for an expected skip (or any other
+    /// real error) — the caller (`admin::action_stream_grow`) classifies
+    /// these, never treating one tablet's skip as a failure of the whole
+    /// multi-tablet action. Same shape as
+    /// [`force_seal_tablet`](Self::force_seal_tablet) (resolve → local or
+    /// forward, retry until a deadline), except a `Forward` reply is
+    /// returned immediately unless it is specifically a stale "not leader
+    /// here" refusal (`topology::parse_not_leader_refusal`) — every other
+    /// error (including this action's own expected skips) is a terminal
+    /// outcome, not a signal to keep retrying.
+    pub(crate) async fn grow_stream_tablet(&self, tablet: TabletId) -> ClientResponse {
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            match self.resolve_cp_route(tablet) {
+                Some(CpRoute::Local(leader)) => {
+                    return match median_split_key(&leader).await {
+                        None => ClientResponse::Error(STREAM_GROW_NO_SPLIT_POINT.into()),
+                        Some(split_key) => self.trigger_split(tablet, split_key).await,
+                    };
+                }
+                Some(CpRoute::Forward(addr)) => {
+                    let request = ClientRequest::Forwarded {
+                        request: Box::new(ClientRequest::TriggerAutoSplit { tablet: tablet.0 }),
+                        traceparent: otel::current_traceparent(),
+                    };
+                    match self.relay(addr, request).await {
+                        ClientResponse::Error(e)
+                            if topology::parse_not_leader_refusal(&e).is_some() => {} // stale hint, retry below
+                        other => return other,
+                    }
+                }
+                Some(CpRoute::None) | None => {} // not settled yet, retry
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return ClientResponse::Error(
+                    "stream grow: did not reach this tablet's leader in time".into(),
+                );
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Growth PR3 (ADR 0042 §14): split EVERY tablet of streamed `table` at
+    /// its own byte-weighted median, in one action (`POST
+    /// /admin/stream/grow`) — each child mints exactly one
+    /// `ParentShardId`, so the table's shard count doubles (minus any
+    /// tablet [`grow_stream_tablet`](Self::grow_stream_tablet) skips: Fork
+    /// E's single-token limit, or an empty/singleton tablet). `Err` only
+    /// for a request-shaped problem (the table has no stream, or no
+    /// tablets at all yet); a per-tablet skip/error is reported inside the
+    /// returned vector, never escalated into the whole call failing — the
+    /// caller (`admin::action_stream_grow`) classifies each entry.
+    pub(crate) async fn grow_stream(
+        &self,
+        table: &str,
+    ) -> Result<Vec<(TabletId, ClientResponse)>, String> {
+        let meta = self.effective_metadata();
+        if meta.table_stream(table).is_none() {
+            return Err(format!("table `{table}` has no stream enabled"));
+        }
+        let tablets: Vec<TabletId> = meta.tablets_for_table(table).map(|(id, _)| *id).collect();
+        if tablets.is_empty() {
+            return Err(format!("table `{table}` has no tablets yet"));
+        }
+        let mut results = Vec::with_capacity(tablets.len());
+        for tablet in tablets {
+            let response = self.grow_stream_tablet(tablet).await;
+            results.push((tablet, response));
+        }
+        Ok(results)
+    }
+
     /// Delete `index`'s own backfill cursor row (ADR 0045 §5 step 3) on
     /// **every** tablet currently scoped to `table`, wherever each one's
     /// own leader actually runs — the table-wide sibling of
@@ -9889,6 +11357,74 @@ impl ClientCtx {
         }
     }
 
+    /// The hot_read scope-transition latch (ADR 0044 phase-1 PR4, narrowing
+    /// the ADR 0043 `hot_read` residual — see [[split-seal-duplication-bug]]
+    /// and `docs/adr/0043-*.md`'s amendment on the #220 fix): refuses a
+    /// hot-read retryably instead of ever risking a stale-wide answer,
+    /// whenever this node's own **live** `scope_range()` for `tablet` (the
+    /// exact field `animus_cp_data::host::Reconciler::tick` mutates via
+    /// `narrow_scope` — see that module's doc) is currently **wider** than
+    /// the tablet's range per `meta`.
+    ///
+    /// **`meta` must come from [`metadata_fresh`](Self::metadata_fresh),
+    /// never [`effective_metadata`](Self::effective_metadata)/
+    /// `metadata_cached()`.** `index_drain::hot_read`'s own pre-existing
+    /// `in_declared_range` filter (2026-08-15) already checks a record's key
+    /// against a caller-supplied snapshot, but every prior call site sourced
+    /// that snapshot from the possibly-stale `effective_metadata()` mirror.
+    /// Reading the group's own live scope needs no new shared state at all —
+    /// it is always exactly current the instant the reconciler narrows it
+    /// (`RaftKvNode::narrow_scope` sets it synchronously, no propagation
+    /// delay) — so cross-checking it against a **freshly fetched** declared
+    /// range closes two of the three staleness axes `in_declared_range`
+    /// alone left open: (a) a data-only/growth node's ADR 0030 mirror
+    /// lagging a `SplitTablet` commit by its own refresh interval, and (b)
+    /// this node's own reconciler having observed the split in its cached
+    /// `Metadata` but not yet having ticked `narrow_scope` locally.
+    ///
+    /// **This narrows, but does not fully close, the residual — the same
+    /// layer-2 structure the #220 investigation found on the write side.**
+    /// For a `ControlHandle::Local` node (every combined node — the common
+    /// case), `metadata_fresh()` resolves to `raft.metadata()`, the ADR 0038
+    /// published cache a **local, asynchronous control apply task**
+    /// maintains, not the control Raft's own commit index directly. In the
+    /// sub-window between a `SplitTablet` actually committing and this
+    /// node's own control apply task catching its published cache up to it,
+    /// `meta` and the live scope are stale **together**: the declared range
+    /// still shows the pre-split width, so this check passes and a hot-read
+    /// can still observe the fabrication class ADR 0043 describes. Full
+    /// closure of this sub-window would need a per-read control-leader
+    /// round trip on every `hot_read` call — rejected as disproportionate in
+    /// the #220 analysis for the same reason a per-write round trip was
+    /// rejected there. The accepted remaining exposure is bounded to the
+    /// control apply task's own catch-up latency (milliseconds under normal
+    /// load), not the reconciler's (much longer) tick cadence — see ADR
+    /// 0048's residual section for the full accounting, and the D8 e2e
+    /// adjudicator (`streams_e2e.rs::
+    /// auto_split_mid_stream_with_live_consumer_across_every_node`)'s own
+    /// doc for how a distinct-`eventID` failure there should be read against
+    /// this specific remaining window rather than assumed to be the
+    /// pre-latch bug recurring wholesale.
+    fn hot_read_scope_ok(meta: &Metadata, tablet: TabletId, group: &CpGroup) -> Result<(), String> {
+        let Some(t) = meta.tablets.get(&tablet) else {
+            // Dropped/reclaimed table — the caller's own absence handling
+            // (an empty/error reply upstream) applies; not this latch's
+            // concern.
+            return Ok(());
+        };
+        let live = group.scope_range();
+        if live != t.range && live.contains_range(&t.range) {
+            // This node's live scope is strictly wider than the freshest
+            // known declared range: a split-driven narrow this node's own
+            // reconciler owes is outstanding. Refuse retryably rather than
+            // risk serving a record that, per `meta`, already belongs to a
+            // split-off sibling (which will itself answer for it once
+            // hosted) — the fabrication class this latch exists to prevent.
+            return Err("tablet scope transitioning (split narrow pending); retry".into());
+        }
+        Ok(())
+    }
+
     /// Fetch up to `limit` of `tablet`'s own open-shard hot records with
     /// packed HLC strictly greater than `from_position` (ADR 0042 §7/§8,
     /// PR6's `GetRecords` open-shard path) — the internal `ClientRequest::
@@ -9909,7 +11445,19 @@ impl ClientCtx {
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
-                    let meta = self.effective_metadata();
+                    // ADR 0044 phase-1 PR4: the hot_read scope-transition
+                    // latch (see `hot_read_scope_ok`'s own doc) — a
+                    // retryable refusal here re-enters this same loop
+                    // (re-resolving routing fresh next pass) rather than
+                    // ever risking a stale-wide answer.
+                    let meta = self.metadata_fresh().await;
+                    if let Err(e) = Self::hot_read_scope_ok(&meta, tablet, &leader) {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(e);
+                        }
+                        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+                        continue;
+                    }
                     return Ok(
                         index_drain::hot_read(&meta, tablet, &leader, from_position, limit)
                             .await
@@ -9972,6 +11520,7 @@ pub async fn bind_cluster(
             dynamo: addr(),
             cql: addr(),
             admin: addr(),
+            intra: addr(),
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
         nodes.push(node);
@@ -10005,6 +11554,8 @@ pub async fn start_cluster_with(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
+        Duration::ZERO,
     )
     .await
 }
@@ -10029,6 +11580,8 @@ pub async fn start_cluster_auto_split(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
+        Duration::ZERO,
     )
     .await
 }
@@ -10053,6 +11606,8 @@ pub async fn start_cluster_with_auto_split(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
+        Duration::ZERO,
     )
     .await
 }
@@ -10080,6 +11635,8 @@ pub async fn start_cluster_with_auto_split_bytes(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
+        Duration::ZERO,
     )
     .await
 }
@@ -10108,6 +11665,8 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
+        Duration::ZERO,
     )
     .await
 }
@@ -10118,6 +11677,8 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
 /// [`BoundNode::start_with_streams`]'s doc for the layered-wrapper
 /// rationale. `--cluster N`'s `--stream-seal-bytes`/`--stream-seal-age`/
 /// `--stream-retention`/`--segment-store` CLI flags thread through here.
+/// Defaults [`start_cluster_with_growth`]'s own `auto_split_change_rate` to
+/// `None`.
 ///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
@@ -10141,6 +11702,114 @@ pub async fn start_cluster_with_streams(
         stream_seal_knobs,
         segment_store_config,
         stream_retention,
+        None,
+        Duration::ZERO,
+    )
+    .await
+}
+
+/// Like [`start_cluster_with_streams`], with the opt-in **change-rate**
+/// auto-split trigger (ADR 0042 §14, growth PR3 Fork F) — see
+/// [`BoundNode::start_with_growth`]'s doc for the full design. `--cluster
+/// N`'s `--auto-split-change-rate RATE` CLI flag threads through here.
+///
+/// # Errors
+/// Propagates a failure to open any node's CP group engine.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_cluster_with_growth(
+    bound: Vec<BoundNode>,
+    backend: StorageBackend,
+    auto_split_keys: Option<usize>,
+    auto_split_bytes: Option<u64>,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    auto_split_change_rate: Option<u64>,
+) -> std::io::Result<Vec<Node>> {
+    start_cluster_inner(
+        bound,
+        backend,
+        auto_split_keys,
+        auto_split_bytes,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        auto_split_change_rate,
+        Duration::ZERO,
+    )
+    .await
+}
+
+/// Like [`start_cluster_with_growth`], but also opts every **data-plane** CP
+/// group into quiescence (ADR 0044 phase-1 PR4/PR7) with the given idle
+/// threshold — `Duration::ZERO` (every other entry point above) disables it
+/// entirely, zero behavior change. Test-only today (no CLI flag threads
+/// through this specific wrapper yet — PR7 adds `--quiesce-after SECS` to
+/// the per-process `run_node*`/`gen-config` paths); combined-mode
+/// (`--cluster N`) only, mirroring every other knob in this file's layered
+/// stack.
+///
+/// # Errors
+/// Propagates a failure to open any node's CP group engine.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_cluster_with_quiesce_after(
+    bound: Vec<BoundNode>,
+    backend: StorageBackend,
+    auto_split_keys: Option<usize>,
+    auto_split_bytes: Option<u64>,
+    quiesce_after: Duration,
+) -> std::io::Result<Vec<Node>> {
+    start_cluster_inner(
+        bound,
+        backend,
+        auto_split_keys,
+        auto_split_bytes,
+        DEFAULT_ORPHAN_SWEEP_AFTER,
+        StreamSealKnobs::default(),
+        SegmentStoreConfig::default(),
+        DEFAULT_STREAM_RETENTION,
+        None,
+        quiesce_after,
+    )
+    .await
+}
+
+/// Like [`start_cluster_with_growth`], but also opts every **data-plane** CP
+/// group into quiescence (ADR 0044 phase-1 PR7) with the given idle
+/// threshold — `Duration::ZERO` disables it entirely, zero behavior change.
+/// `--cluster N`'s `--quiesce-after SECS` CLI flag threads through here
+/// (the full-combination sibling of [`start_cluster_with_quiesce_after`],
+/// which predates the streams/change-rate knobs being combinable with
+/// quiescence).
+///
+/// # Errors
+/// Propagates a failure to open any node's CP group engine.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_cluster_with_growth_and_quiesce_after(
+    bound: Vec<BoundNode>,
+    backend: StorageBackend,
+    auto_split_keys: Option<usize>,
+    auto_split_bytes: Option<u64>,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    auto_split_change_rate: Option<u64>,
+    quiesce_after: Duration,
+) -> std::io::Result<Vec<Node>> {
+    start_cluster_inner(
+        bound,
+        backend,
+        auto_split_keys,
+        auto_split_bytes,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        auto_split_change_rate,
+        quiesce_after,
     )
     .await
 }
@@ -10155,6 +11824,8 @@ async fn start_cluster_inner(
     stream_seal_knobs: StreamSealKnobs,
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
+    auto_split_change_rate: Option<u64>,
+    quiesce_after: Duration,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -10185,13 +11856,19 @@ async fn start_cluster_inner(
         .iter()
         .map(|b| (b.id.clone(), b.client_addr))
         .collect();
+    // The `intra_route` sibling (ADR 0047) — identical static-seed shape,
+    // sourced from each bound node's intra address instead of its client one.
+    let intra_route: BTreeMap<NodeId, SocketAddr> = bound
+        .iter()
+        .map(|b| (b.id.clone(), b.intra_addr()))
+        .collect();
     // Every node's admin address, so each node's dashboard (ADR 0021) can fan out
     // to the whole in-process cluster.
     let admin_addrs: Vec<SocketAddr> = bound.iter().map(BoundNode::admin_addr).collect();
     let mut nodes = Vec::with_capacity(n);
     for b in bound {
         let node = b
-            .start_with_streams(
+            .start_with_growth(
                 peers.clone(),
                 control_ids.clone(),
                 data_ids.clone(),
@@ -10201,6 +11878,7 @@ async fn start_cluster_inner(
                 // comment above).
                 ClusterEdgeState::new(),
                 client_route.clone(),
+                intra_route.clone(),
                 auto_split_threshold,
                 auto_split_bytes_threshold,
                 admin_addrs.clone(),
@@ -10208,6 +11886,8 @@ async fn start_cluster_inner(
                 stream_seal_knobs,
                 segment_store_config.clone(),
                 stream_retention,
+                auto_split_change_rate,
+                quiesce_after,
             )
             .await?;
         nodes.push(node);
@@ -10284,6 +11964,40 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
     auto_split_bytes_threshold: Option<u64>,
     orphan_sweep_after: Duration,
 ) -> std::io::Result<Vec<Node>> {
+    start_split_cluster_with_growth(
+        control_n,
+        data_n,
+        dir,
+        ip,
+        backend,
+        auto_split_threshold,
+        auto_split_bytes_threshold,
+        orphan_sweep_after,
+        None,
+    )
+    .await
+}
+
+/// Like [`start_split_cluster_with_orphan_sweep_after`], with the opt-in
+/// **change-rate** auto-split trigger (ADR 0042 §14, growth PR3 Fork F) on
+/// every data-role node — see [`BoundNode::start_with_growth`]'s doc for
+/// the full design. `--cluster-control`/`--cluster-data`'s
+/// `--auto-split-change-rate RATE` CLI flag threads through here.
+///
+/// # Errors
+/// As [`start_split_cluster_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn start_split_cluster_with_growth(
+    control_n: usize,
+    data_n: usize,
+    dir: impl Into<PathBuf>,
+    ip: std::net::IpAddr,
+    backend: StorageBackend,
+    auto_split_threshold: Option<usize>,
+    auto_split_bytes_threshold: Option<u64>,
+    orphan_sweep_after: Duration,
+    auto_split_change_rate: Option<u64>,
+) -> std::io::Result<Vec<Node>> {
     let dir = dir.into();
     let total = control_n + data_n;
     let ephemeral = || SocketAddr::new(ip, 0);
@@ -10298,6 +12012,7 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
             dynamo: ephemeral(),
             cql: ephemeral(),
             admin: ephemeral(),
+            intra: ephemeral(),
         };
         control_bound.push(
             Node::bind_control(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?,
@@ -10313,6 +12028,7 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
             dynamo: ephemeral(),
             cql: ephemeral(),
             admin: ephemeral(),
+            intra: ephemeral(),
         };
         data_bound
             .push(Node::bind_data(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?);
@@ -10345,10 +12061,21 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
         client_route.insert(b.id.clone(), b.client_addr);
     }
 
-    // The control deployment's client addresses — the discovery root each
-    // data node's `ControlHandle::Remote` mirrors from.
-    let control_client_addrs: Vec<SocketAddr> =
-        control_bound.iter().map(|b| b.client_addr).collect();
+    // The `intra_route` sibling (ADR 0047) — identical shape, `.intra_addr`
+    // instead of `.client_addr`.
+    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for b in &control_bound {
+        intra_route.insert(b.id.clone(), b.intra_addr);
+    }
+    for b in &data_bound {
+        intra_route.insert(b.id.clone(), b.intra_addr);
+    }
+
+    // The control deployment's **intra** addresses (ADR 0047) — the
+    // discovery root each data node's `ControlHandle::Remote` mirrors from
+    // (`WatchMetadata` is intra-only, so this must not be the client
+    // address).
+    let control_intra_addrs: Vec<SocketAddr> = control_bound.iter().map(|b| b.intra_addr).collect();
 
     // Every node's admin address, so each node's dashboard (ADR 0021) fans
     // out to the whole split deployment.
@@ -10365,6 +12092,7 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
                 control_peer_book.clone(),
                 control_ids.clone(),
                 client_route.clone(),
+                intra_route.clone(),
                 admin_addrs.clone(),
                 backend,
                 orphan_sweep_after,
@@ -10374,18 +12102,22 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
     }
     for b in data_bound {
         nodes.push(
-            b.start_data_with(
+            b.start_data_with_growth(
                 data_env_peers.clone(),
                 control_ids.clone(),
-                control_client_addrs.clone(),
+                control_intra_addrs.clone(),
                 backend,
                 // A fresh, node-local edge-state set per node — never shared
                 // (see the doc comment above).
                 ClusterEdgeState::new(),
                 client_route.clone(),
+                intra_route.clone(),
                 auto_split_threshold,
                 auto_split_bytes_threshold,
                 admin_addrs.clone(),
+                StreamSealKnobs::default(),
+                SegmentStoreConfig::default(),
+                auto_split_change_rate,
             )
             .await?,
         );
@@ -10469,6 +12201,40 @@ pub async fn run_node_with_streams(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
 ) -> std::io::Result<Node> {
+    run_node_with_streams_and_quiesce_after(
+        config,
+        index,
+        dir,
+        backend,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        Duration::ZERO,
+    )
+    .await
+}
+
+/// Like [`run_node_with_streams`], but also opts this node's **data-plane**
+/// CP groups into quiescence (ADR 0044 phase-1 PR7) with the given idle
+/// threshold — `Duration::ZERO` (every other entry point above) disables it
+/// entirely, zero behavior change. `--config FILE --node I`'s
+/// `--quiesce-after SECS` CLI flag threads through here.
+///
+/// # Errors
+/// As [`run_node_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_with_streams_and_quiesce_after(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    quiesce_after: Duration,
+) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
@@ -10484,17 +12250,24 @@ pub async fn run_node_with_streams(
     for (i, addrs) in config.nodes.iter().enumerate() {
         client_route.insert(config::node_id(i), addrs.client);
     }
+    // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
+    // instead of `.client`.
+    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for (i, addrs) in config.nodes.iter().enumerate() {
+        intra_route.insert(config::node_id(i), addrs.intra);
+    }
     // Every node's admin address from the shared config, so this node's dashboard
     // (ADR 0021) can fan out to the whole cluster.
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
     bound
-        .start_with_streams(
+        .start_with_growth(
             config.peer_book(),
             config.control_ids(),
             config.data_ids(),
             backend,
             ClusterEdgeState::new(),
             client_route,
+            intra_route,
             None,
             None,
             admin_addrs,
@@ -10502,6 +12275,8 @@ pub async fn run_node_with_streams(
             stream_seal_knobs,
             segment_store_config,
             stream_retention,
+            None,
+            quiesce_after,
         )
         .await
 }
@@ -10511,7 +12286,7 @@ pub async fn run_node_with_streams(
 /// plus the client + admin listeners, and runs only the control [`RaftNode`]
 /// (its own `reconcile_loop`/`detect_loop`) plus the tail every node shape
 /// shares (`route_sync_loop`/`metrics_sample_loop`/self-registration/
-/// `serve_clients`/admin `serve`, via
+/// `serve_requests` (both listeners)/admin `serve`, via
 /// [`BoundControlNode::start_control_with`]) — no CP data storage engine, no
 /// `raftkv` env, no DynamoDB/CQL listeners. `backend` (ADR 0038) selects the
 /// **dedicated** system-keyspace engine this control-only node provisions
@@ -10580,6 +12355,12 @@ pub async fn run_node_control_with_orphan_sweep_after(
     for (i, a) in config.nodes.iter().enumerate() {
         client_route.insert(config::node_id(i), a.client);
     }
+    // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
+    // instead of `.client`.
+    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for (i, a) in config.nodes.iter().enumerate() {
+        intra_route.insert(config::node_id(i), a.intra);
+    }
     // Every node's admin address from the shared config, so this node's
     // dashboard (ADR 0021) can fan out to the whole cluster (control and data
     // nodes alike).
@@ -10590,6 +12371,7 @@ pub async fn run_node_control_with_orphan_sweep_after(
             config.peer_book(),
             config.control_ids(),
             client_route,
+            intra_route,
             admin_addrs,
             backend,
             orphan_sweep_after,
@@ -10607,9 +12389,10 @@ pub async fn run_node_control_with_orphan_sweep_after(
 /// `config`'s data-role entries (`ClusterConfig::data_indexes`) are this
 /// node's data fleet — `index` must be one of them. `config`'s control-role
 /// entries (`ClusterConfig::control_ids`) are the **separately-deployed**
-/// control plane this node mirrors: their **client** addresses seed the
-/// mirror + leader-hint sync loop and `propose_schema`'s relay/broadcast
-/// tiers (ADR 0035 §1/§4), and their **control** ids are what this node's own
+/// control plane this node mirrors: their **intra** addresses (ADR 0047; was
+/// **client** pre-ADR-0047) seed the mirror + leader-hint sync loop and
+/// `propose_schema`'s relay/broadcast tiers (ADR 0035 §1/§4), and their
+/// **control** ids are what this node's own
 /// `heartbeat_loop` targets (unchanged ADR 0012 failure-detection semantics —
 /// see `ClusterConfig::control_peer_book`'s doc for why this node's `raftkv`
 /// env peer book must union both address books, not `raftkv_peer_book()`
@@ -10643,14 +12426,15 @@ pub async fn run_node_data(
     }
     let bound = Node::bind_data(config::node_id(index), addrs, dir).await?;
 
-    // The control deployment's **client**-API addresses — the mirror/
-    // leader-hint discovery root (ADR 0035 §1/§4), a wholly different address
-    // axis from the internal env peer book below.
-    let control_client_addrs: Vec<SocketAddr> = config
+    // The control deployment's **intra**-cluster addresses (ADR 0047) — the
+    // mirror/leader-hint discovery root (ADR 0035 §1/§4; `WatchMetadata` is
+    // intra-only, so this must be the intra address, not the client one), a
+    // wholly different address axis from the internal env peer book below.
+    let control_intra_addrs: Vec<SocketAddr> = config
         .nodes
         .iter()
         .filter(|a| a.role.has_control())
-        .map(|a| a.client)
+        .map(|a| a.intra)
         .collect();
 
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
@@ -10658,6 +12442,12 @@ pub async fn run_node_data(
     let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
     for (i, a) in config.nodes.iter().enumerate() {
         client_route.insert(config::node_id(i), a.client);
+    }
+    // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
+    // instead of `.client`.
+    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for (i, a) in config.nodes.iter().enumerate() {
+        intra_route.insert(config::node_id(i), a.intra);
     }
     // Every node's admin address from the shared config, so this node's
     // dashboard fan-out (ADR 0021) covers the whole split deployment.
@@ -10670,10 +12460,11 @@ pub async fn run_node_data(
             // below sends to `control_ids` over this very env.
             config.peer_book(),
             control_ids,
-            control_client_addrs,
+            control_intra_addrs,
             backend,
             ClusterEdgeState::new(),
             client_route,
+            intra_route,
             None,
             None,
             admin_addrs,
@@ -10730,6 +12521,14 @@ pub async fn run_node_growth(
     for (i, addrs) in config.nodes.iter().enumerate() {
         client_route.insert(config::node_id(i), addrs.client);
     }
+    // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
+    // instead of `.client`; this is what makes the growth-node mirror's own
+    // seed-building (`start_with_streams`'s `ctx.intra_addr(id)` call) resolve
+    // correctly from this node's very first tick.
+    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for (i, addrs) in config.nodes.iter().enumerate() {
+        intra_route.insert(config::node_id(i), addrs.intra);
+    }
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
     // `bootstrap` must never auto-register this growth node itself (it
     // self-registers `Down` via `admin_add_member` instead, see this fn's
@@ -10746,6 +12545,7 @@ pub async fn run_node_growth(
             backend,
             ClusterEdgeState::new(),
             client_route,
+            intra_route,
             None,
             None,
             admin_addrs,
@@ -10816,10 +12616,13 @@ async fn poll_seeds_for(
 /// Start a node as a **seed/join growth member** (ADR 0032 PR2, `animusd
 /// join`): unlike [`run_node_growth`], which needs an operator-assembled
 /// *expanded* `ClusterConfig` listing every node's addresses up front, this
-/// entry point needs only `addrs` (this node's own five addresses) and
-/// `seeds` (any already-running node's **client** address — old or newly
-/// grown, it no longer matters which, since ADR 0032 PR1 made every node's
-/// address book equally current).
+/// entry point needs only `addrs` (this node's own six addresses) and
+/// `seeds` (any already-running node's **intra-cluster** address — ADR
+/// 0047, was the client address pre-ADR-0047; old or newly grown, it no
+/// longer matters which, since ADR 0032 PR1 made every node's address book
+/// equally current). Joining is a cluster-membership action — the joiner is
+/// about to become an internal `ProdEnv`/Raft peer too — so the intra
+/// address is the honest seed, not a compromise.
 ///
 /// **ADR 0040 PR4 clean break**: `--node I` is gone from the join path
 /// entirely (no operator-index sugar) — `id` is either an explicit,
@@ -10869,18 +12672,20 @@ pub async fn run_node_join(
             "join needs at least one --seed address",
         ));
     }
-    let (original_control_ids, peers, client_route, admin_addrs) =
+    let (original_control_ids, peers, client_route, intra_route, admin_addrs) =
         discover_join_info(&seeds).await?;
 
     let mine = NodeAddrs {
         internal: addrs.internal.to_string(),
         client: addrs.client.to_string(),
         admin: addrs.admin.to_string(),
+        intra: addrs.intra.to_string(),
         role: "combined".to_string(),
     };
     let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
     let my_client_addr = addrs.client;
     let my_admin_addr = addrs.admin;
+    let my_intra_addr = addrs.intra;
 
     let bound = Node::bind(my_id.clone(), addrs, dir).await?;
 
@@ -10889,9 +12694,11 @@ pub async fn run_node_join(
         my_id,
         my_client_addr,
         my_admin_addr,
+        my_intra_addr,
         original_control_ids,
         peers,
         client_route,
+        intra_route,
         admin_addrs,
         backend,
     )
@@ -10916,16 +12723,21 @@ async fn finish_combined_join(
     my_id: NodeId,
     my_client_addr: SocketAddr,
     my_admin_addr: SocketAddr,
+    my_intra_addr: SocketAddr,
     original_control_ids: Vec<NodeId>,
     mut peers: BTreeMap<NodeId, SocketAddr>,
     mut client_route: BTreeMap<NodeId, SocketAddr>,
+    mut intra_route: BTreeMap<NodeId, SocketAddr>,
     mut admin_addrs: Vec<SocketAddr>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
     for (id, addr) in bound.peer_entries() {
         peers.insert(id, addr);
     }
-    client_route.insert(my_id, my_client_addr);
+    client_route.insert(my_id.clone(), my_client_addr);
+    // The `intra_route` sibling (ADR 0047) — see `ClientResponse::JoinInfo`'s
+    // own field doc for why this must be a real, discovered seed, not empty.
+    intra_route.insert(my_id, my_intra_addr);
     if !admin_addrs.contains(&my_admin_addr) {
         admin_addrs.push(my_admin_addr);
     }
@@ -10939,6 +12751,7 @@ async fn finish_combined_join(
             backend,
             ClusterEdgeState::new(),
             client_route,
+            intra_route,
             None,
             None,
             admin_addrs,
@@ -10958,6 +12771,7 @@ async fn discover_join_info(
     Vec<NodeId>,
     BTreeMap<NodeId, SocketAddr>,
     BTreeMap<NodeId, SocketAddr>,
+    BTreeMap<NodeId, SocketAddr>,
     Vec<SocketAddr>,
 )> {
     match poll_seeds_for(seeds, &ClientRequest::JoinInfo, JOIN_DISCOVERY_BUDGET).await? {
@@ -10965,8 +12779,9 @@ async fn discover_join_info(
             control_ids,
             peers,
             client_route,
+            intra_route,
             admin_addrs,
-        } => Ok((control_ids, peers, client_route, admin_addrs)),
+        } => Ok((control_ids, peers, client_route, intra_route, admin_addrs)),
         other => Err(std::io::Error::other(format!(
             "seed returned an unexpected reply to JoinInfo: {other:?}"
         ))),
@@ -11080,7 +12895,9 @@ async fn claim_join_identity(
 ///
 /// The discovered `original_control_ids` (the seed's `JoinInfo`
 /// reply) feed both `heartbeat_loop`'s failure-detection target and, via the
-/// merged `client_route`, [`RemoteControlClient::new`]'s `control_seeds` — the
+/// merged `intra_route` (ADR 0047 — `WatchMetadata` is intra-only, so
+/// `control_seeds` must be intra addresses, not `client_route`'s),
+/// [`RemoteControlClient::new`]'s `control_seeds` — the
 /// discovery root this node's mirror sync/long-poll watch loop
 /// ([`remote_metadata_watch_loop`]) polls from then on. Mirrors
 /// [`run_node_data`]'s own note on why the internal `raftkv` env's peer book
@@ -11108,18 +12925,20 @@ pub async fn run_node_data_join(
             "join needs at least one --seed address",
         ));
     }
-    let (original_control_ids, peers, client_route, admin_addrs) =
+    let (original_control_ids, peers, client_route, intra_route, admin_addrs) =
         discover_join_info(&seeds).await?;
 
     let mine = NodeAddrs {
         internal: addrs.internal.to_string(),
         client: addrs.client.to_string(),
         admin: addrs.admin.to_string(),
+        intra: addrs.intra.to_string(),
         role: "data".to_string(),
     };
     let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
     let my_client_addr = addrs.client;
     let my_admin_addr = addrs.admin;
+    let my_intra_addr = addrs.intra;
 
     let bound = Node::bind_data(my_id.clone(), addrs, dir).await?;
 
@@ -11128,9 +12947,11 @@ pub async fn run_node_data_join(
         my_id,
         my_client_addr,
         my_admin_addr,
+        my_intra_addr,
         original_control_ids,
         peers,
         client_route,
+        intra_route,
         admin_addrs,
         backend,
     )
@@ -11146,9 +12967,11 @@ async fn finish_data_join(
     my_id: NodeId,
     my_client_addr: SocketAddr,
     my_admin_addr: SocketAddr,
+    my_intra_addr: SocketAddr,
     original_control_ids: Vec<NodeId>,
     mut peers: BTreeMap<NodeId, SocketAddr>,
     mut client_route: BTreeMap<NodeId, SocketAddr>,
+    mut intra_route: BTreeMap<NodeId, SocketAddr>,
     mut admin_addrs: Vec<SocketAddr>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
@@ -11156,17 +12979,21 @@ async fn finish_data_join(
     // peer entry, no control id of its own to add).
     let (peer_id, peer_addr) = bound.peer_entry();
     peers.insert(peer_id, peer_addr);
-    client_route.insert(my_id, my_client_addr);
+    client_route.insert(my_id.clone(), my_client_addr);
+    // The `intra_route` sibling (ADR 0047) — see `finish_combined_join`'s
+    // identical treatment.
+    intra_route.insert(my_id, my_intra_addr);
     if !admin_addrs.contains(&my_admin_addr) {
         admin_addrs.push(my_admin_addr);
     }
 
-    // The control deployment's client-API addresses (ADR 0035 §1/§4) — the
-    // same derivation `run_node_data` does from a static `ClusterConfig`,
-    // here from the merged, discovery-built `client_route` instead.
+    // The control deployment's **intra** addresses (ADR 0047; `WatchMetadata`
+    // is intra-only) — the same derivation `run_node_data` does from a static
+    // `ClusterConfig`, here from the merged, discovery-built `intra_route`
+    // instead.
     let control_seeds: Vec<SocketAddr> = original_control_ids
         .iter()
-        .filter_map(|id| client_route.get(id).copied())
+        .filter_map(|id| intra_route.get(id).copied())
         .collect();
 
     bound
@@ -11177,6 +13004,7 @@ async fn finish_data_join(
             backend,
             ClusterEdgeState::new(),
             client_route,
+            intra_route,
             None,
             None,
             admin_addrs,
@@ -11379,7 +13207,7 @@ mod split_fence_tests {
     async fn stale_routed_write_for_a_split_childs_key_is_rejected_not_lost() {
         timeout(Duration::from_secs(60), async {
             let dir = tempfile::tempdir().expect("tempdir");
-            let addrs = free_addrs(5);
+            let addrs = free_addrs(6);
             let config = ClusterConfig {
                 nodes: vec![RoleAddrs {
                     id: crate::config::node_id(0),
@@ -11389,6 +13217,7 @@ mod split_fence_tests {
                     dynamo: addrs[2],
                     cql: addrs[3],
                     admin: addrs[4],
+                    intra: addrs[5],
                 }],
             };
             let node = run_node(&config, 0, dir.path().join("node-0"))
@@ -11558,6 +13387,108 @@ mod split_fence_tests {
     }
 }
 
+/// ADR 0044 phase-1 PR4: unit coverage for the hot_read scope-transition
+/// latch (`ClientCtx::hot_read_scope_ok`) in isolation — the function is a
+/// private associate of `ClientCtx` (no `pub`), so this lives in-crate like
+/// `split_fence_tests` above rather than under `tests/`, which can't reach
+/// it. Deterministic: `hot_read_scope_ok` is a pure comparison given a
+/// `Metadata` snapshot and a live `CpGroup`'s own `scope_range()`, no real
+/// cluster bring-up needed. The end-to-end, real-race evidence that this
+/// narrows the ADR 0043 residual (see `hot_read_scope_ok`'s own doc for the
+/// control-apply-lag sub-window it does not close) is `tests/streams_e2e.rs`'s
+/// `auto_split_mid_stream_with_live_consumer_across_every_node` (D8), the
+/// historical adjudicator for this exact fabrication class (distinct-
+/// `eventID` duplicates straddling a split boundary) — still the live
+/// signal for the accepted remaining window, not just the pre-latch bug.
+#[cfg(test)]
+mod hot_read_latch_tests {
+    use std::time::Duration;
+
+    use animus_control::Metadata;
+    use animus_cp_data::{RaftKvNode, StorageScope};
+    use animus_env::{ProdEnv, nid};
+    use animus_storage::MemoryEngine;
+    use animus_tablet::{KeyRange, Tablet, TabletId};
+    use tokio::time::sleep;
+
+    use crate::{ClientCtx, CpGroup};
+
+    /// A lone single-voter group over a real (loopback) `ProdEnv` — self-
+    /// elects immediately (`initial_formation`-shaped: `all_nodes` is just
+    /// this one id), scoped to `range`.
+    async fn lone_group(range: KeyRange) -> CpGroup {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), dir.path())
+            .await
+            .expect("bind");
+        let scope = StorageScope::new(b"t".to_vec(), range);
+        let node: RaftKvNode<ProdEnv, MemoryEngine> =
+            RaftKvNode::start_hosted(env, vec![nid(0)], MemoryEngine::new(), scope, 1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !node.is_leader() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "single-voter group never elected itself leader"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        CpGroup::Mem(node)
+    }
+
+    fn meta_with_range(tablet: TabletId, range: KeyRange) -> Metadata {
+        let mut meta = Metadata::default();
+        meta.tablets.insert(
+            tablet,
+            Tablet::new_for_table(tablet, "t", range, vec![nid(0)]),
+        );
+        meta
+    }
+
+    /// The exact scenario the latch exists to catch: metadata already
+    /// reflects a post-split narrower declared range, but this node's own
+    /// reconciler has not yet locally executed `narrow_scope` — the live
+    /// scope is still the pre-split wide range.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refuses_retryably_while_the_live_scope_is_wider_than_the_declared_range() {
+        let tablet = TabletId(1);
+        let group = lone_group(KeyRange::whole()).await;
+        let meta = meta_with_range(tablet, KeyRange::new(b"".to_vec(), Some(b"m".to_vec())));
+        let err = ClientCtx::hot_read_scope_ok(&meta, tablet, &group)
+            .expect_err("a wider-than-declared live scope must refuse retryably");
+        assert!(
+            err.ends_with("; retry"),
+            "the refusal must use this crate's established retryable-error shape (`read_should_retry`): {err}"
+        );
+    }
+
+    /// Once the reconciler's own `narrow_scope` has executed (the live scope
+    /// now matches the declared range), the latch must not refuse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allows_once_the_live_scope_matches_the_declared_range() {
+        let tablet = TabletId(1);
+        let range = KeyRange::new(b"".to_vec(), Some(b"m".to_vec()));
+        let group = lone_group(range.clone()).await;
+        let meta = meta_with_range(tablet, range);
+        assert!(
+            ClientCtx::hot_read_scope_ok(&meta, tablet, &group).is_ok(),
+            "a live scope that already matches the declared range must not be refused"
+        );
+    }
+
+    /// A dropped/reclaimed tablet (absent from `Metadata` entirely) is not
+    /// this latch's concern — the caller's own absence handling applies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_tablet_is_not_this_latchs_concern() {
+        let tablet = TabletId(1);
+        let group = lone_group(KeyRange::whole()).await;
+        let meta = Metadata::default();
+        assert!(
+            ClientCtx::hot_read_scope_ok(&meta, tablet, &group).is_ok(),
+            "an absent tablet must fall through, not be refused by this latch"
+        );
+    }
+}
+
 /// Unit tests for [`byte_weighted_median`] (ADR 0034) — a private free
 /// function, so this lives as an in-crate `#[cfg(test)]` module (like
 /// `split_fence_tests` above) rather than under `tests/`, which can't reach
@@ -11653,6 +13584,139 @@ mod auto_split_median_tests {
     }
 }
 
+/// Unit tests for [`align_split_key`] (F11, ADR 0042 §14, growth PR2) — a
+/// private free function, so this lives as an in-crate `#[cfg(test)]`
+/// module (like `auto_split_median_tests` above) rather than under
+/// `tests/`, which can't reach it. `manual_split_with_unaligned_key_on_
+/// streamed_table_rounds_to_token_boundary` (`tests/f11_split_alignment.rs`)
+/// covers the same rounding end to end, through a real cluster's admin HTTP
+/// surface; these are the fast, pure-function siblings for the rounding
+/// rule itself and the Fork E degenerate case.
+#[cfg(test)]
+mod align_split_key_tests {
+    use animus_control::{MetaCommand, Metadata, StreamSpec, StreamViewType};
+    use animus_tablet::{KeyRange, TabletId};
+
+    use super::align_split_key;
+
+    fn streamed_metadata_with_tablet(tablet: TabletId, range: KeyRange) -> Metadata {
+        let mut m = Metadata::default();
+        assert!(matches!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: animus_control::TableSchema::simple(
+                    "pk",
+                    animus_control::ColumnType::String
+                ),
+            }),
+            animus_control::ApplyOutcome::Applied
+        ));
+        assert!(matches!(
+            m.apply(&MetaCommand::SetTableStream {
+                table: "orders".to_owned(),
+                spec: Some(StreamSpec {
+                    view_type: StreamViewType::NewAndOldImages,
+                    label: "L1".to_owned(),
+                }),
+            }),
+            animus_control::ApplyOutcome::Applied
+        ));
+        assert!(matches!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet,
+                table: Some("orders".to_owned()),
+                range,
+                replicas: Vec::new(),
+            }),
+            animus_control::ApplyOutcome::Applied
+        ));
+        m
+    }
+
+    /// A streamed table's split key rounds down to exactly `TOKEN_BYTES`,
+    /// discarding everything past the token — the F11 rule.
+    #[test]
+    fn rounds_a_streamed_tables_key_down_to_the_token_boundary() {
+        let tablet = TabletId(1);
+        let m = streamed_metadata_with_tablet(tablet, KeyRange::whole());
+        let raw = b"orders-mXX".to_vec(); // 10 bytes.
+        let (rounded, viable) = align_split_key(&m, tablet, raw);
+        assert_eq!(rounded, b"orders-m".to_vec());
+        assert!(
+            viable,
+            "the rounded key is still strictly inside the whole range"
+        );
+    }
+
+    /// An unstreamed table's split key is returned byte-for-byte unchanged,
+    /// whatever its length — F11 only applies to a streamed table.
+    #[test]
+    fn leaves_an_unstreamed_tables_key_untouched() {
+        let mut m = Metadata::default();
+        assert!(matches!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("plain".to_owned()),
+                range: KeyRange::whole(),
+                replicas: Vec::new(),
+            }),
+            animus_control::ApplyOutcome::Applied
+        ));
+        let raw = b"any-length-key-at-all".to_vec();
+        let (key, viable) = align_split_key(&m, TabletId(1), raw.clone());
+        assert_eq!(key, raw);
+        assert!(viable);
+    }
+
+    /// A key already exactly `TOKEN_BYTES` long round-trips unchanged (the
+    /// idempotent case: `trigger_split` re-rounding a key `auto_split_loop`
+    /// or a prior caller already rounded).
+    #[test]
+    fn a_key_already_token_aligned_is_unchanged() {
+        let tablet = TabletId(1);
+        let m = streamed_metadata_with_tablet(tablet, KeyRange::whole());
+        let raw = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
+        let (rounded, viable) = align_split_key(&m, tablet, raw.clone());
+        assert_eq!(rounded, raw);
+        assert!(viable);
+    }
+
+    /// Fork E (ADR 0042 §14): a single very hot partition token owns the
+    /// whole tablet — rounding its own key collapses it onto `range.start`,
+    /// so `viable` reports `false` (the degenerate, structurally
+    /// unsplittable case `trigger_split` turns into a metered skip rather
+    /// than ever proposing).
+    #[test]
+    fn reports_not_viable_when_the_rounded_key_collapses_onto_range_start() {
+        // Range starting at the token "orders-m" itself (as a real sibling
+        // tablet's own `range.start` would look after a prior split) — any
+        // key beginning with that same 8-byte prefix rounds right back onto
+        // it.
+        let tablet = TabletId(2);
+        let range = KeyRange {
+            start: b"orders-m".to_vec(),
+            end: None,
+        };
+        let m = streamed_metadata_with_tablet(tablet, range);
+        let (rounded, viable) = align_split_key(&m, tablet, b"orders-mZZ".to_vec());
+        assert_eq!(rounded, b"orders-m".to_vec());
+        assert!(
+            !viable,
+            "a token-rounded key equal to the tablet's own range.start is not a legal split point"
+        );
+    }
+
+    /// An unknown tablet id reports `viable == false` (nothing to check
+    /// against) rather than optimistically claiming any key would work.
+    #[test]
+    fn reports_not_viable_for_an_unknown_tablet() {
+        let m = Metadata::default();
+        let (key, viable) = align_split_key(&m, TabletId(999), b"whatever".to_vec());
+        assert_eq!(key, b"whatever".to_vec());
+        assert!(!viable);
+    }
+}
+
 /// Back-compat coverage for [`ClientResponse::Status`]'s additive fields
 /// (ADR 0037 PR2's `control_voters`, mirroring `leader_hint`/`watermark`'s
 /// own `#[serde(default)]` discipline when they were added) — a pre-existing
@@ -11678,6 +13742,7 @@ mod status_wire_compat_tests {
         let reply = ClientResponse::Status {
             metadata: Default::default(),
             leader_hint: None,
+            intra_leader_hint: None,
             watermark: 7,
             control_voters: [0, 1, 2].into_iter().map(nid).collect(),
         };

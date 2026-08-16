@@ -37,16 +37,17 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
     // re-allocate fresh ports and retry the whole bring-up as a unit.
     let mut brought_up = None;
     'attempts: for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 5);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[5 * i],
-                client: addrs[5 * i + 1],
-                dynamo: addrs[5 * i + 2],
-                cql: addrs[5 * i + 3],
-                admin: addrs[5 * i + 4],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                admin: addrs[6 * i + 4],
+                intra: addrs[6 * i + 5],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -91,7 +92,8 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
     // The control-plane leader, and a *different* node to issue DDL against.
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
     let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
-    let follower_client = config.nodes[follower].client;
+    // ADR 0047: `ProposeSchema` is intra-only.
+    let follower_client = config.nodes[follower].intra;
 
     // Issue a schema create against the FOLLOWER. Pre-A2 this would time out (the
     // follower has no local leader handle to propose on); now it relays to the
@@ -197,7 +199,8 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
     // Gate: a non-schema (membership/placement) command must be rejected by the
     // relay, on any node — this is not a general "propose anything" surface.
     let bad = call(
-        config.nodes[leader].client,
+        // ADR 0047: `ProposeSchema` is intra-only.
+        config.nodes[leader].intra,
         ClientRequest::ProposeSchema(MetaCommand::UpsertMember {
             node: nid(999),
             labels: std::collections::BTreeMap::new(),
@@ -239,7 +242,8 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
 
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
     let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
-    let follower_client = config.nodes[follower].client;
+    // ADR 0047: `ProposeSchema` is intra-only.
+    let follower_client = config.nodes[follower].intra;
 
     // Register a table + enable a stream first (SealStreamShard's own label
     // validation needs a schema entry to license the label) — through the
@@ -338,7 +342,8 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
     // gate test above), since its only intended caller (the segment
     // janitor) never needs a relay path at all.
     let expire = call(
-        config.nodes[leader].client,
+        // ADR 0047: `ProposeSchema` is intra-only.
+        config.nodes[leader].intra,
         ClientRequest::ProposeSchema(MetaCommand::ExpireStreamShards {
             rows: vec![(TabletId(1), 0)],
             remove: false,

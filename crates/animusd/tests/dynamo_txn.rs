@@ -33,16 +33,17 @@ mod support;
 
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 5);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[5 * i],
-                client: addrs[5 * i + 1],
-                dynamo: addrs[5 * i + 2],
-                cql: addrs[5 * i + 3],
-                admin: addrs[5 * i + 4],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                admin: addrs[6 * i + 4],
+                intra: addrs[6 * i + 5],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -652,7 +653,8 @@ async fn admin_txns_shows_a_pending_record_then_clears_after_recovery() {
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
-    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+    // ADR 0047: Forwarded is intra-only.
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect();
 
     // A single-participant (degenerate) transaction is enough here — the
     // anchor's own tablet is what `/admin/txns` on that tablet's leader
@@ -672,9 +674,13 @@ async fn admin_txns_shows_a_pending_record_then_clears_after_recovery() {
         ClientRequest::TxnPrepare {
             table: "admintxn".to_string(),
             anchor: None,
-            writes: vec![(b"admin-txn-key".to_vec(), Some(b"pending-value".to_vec()))],
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                b"admin-txn-key".to_vec(),
+                Some(b"pending-value".to_vec()),
+            )],
             conditions: Vec::new(),
             participant_spans: Vec::new(),
+            pending_kind_writes: Vec::new(),
         },
     )
     .await;

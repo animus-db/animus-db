@@ -517,7 +517,7 @@ fn txn_resolve_misrouted_to_the_wrong_tablet_is_rejected_by_its_own_fence() {
     let (txn_id, record_key, outcome) = drive(&mut sim, &b_env, SETTLE, async move {
         n.txn_stage_anchor(
             table,
-            vec![(bk, Some(b"v1".to_vec()))],
+            vec![animus_cp_data::TxnWrite::plain(bk, Some(b"v1".to_vec()))],
             Vec::new(),
             Vec::new(),
         )

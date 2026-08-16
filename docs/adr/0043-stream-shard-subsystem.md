@@ -163,9 +163,47 @@ segments are cluster-wide catalog concerns, not any one tablet's own
 hot-log housekeeping, and are never performed by this per-tablet loop.
 
 **When**: `KIND_CHANGE` scope `approx_bytes` exceeds `--stream-seal-bytes`,
-**or** the oldest unsealed record's age exceeds `--stream-seal-age` (the
-loop's own `env` clock, never wall-clock directly — ADR 0003), **or** a
-disable-triggered final seal fires (ADR 0042 §11's F12-b grace).
+**or** the time since this tablet's own last seal (while `approx_bytes > 0`)
+exceeds `--stream-seal-age` (the loop's own `env` clock, never wall-clock
+directly — ADR 0003), **or** a disable-triggered final seal fires (ADR 0042
+§11's F12-b grace). **Age-trigger-derivation amendment, 2026-08-16 (as-built,
+fork G)**: the age trigger no longer scans `pending_changes()` to find the
+oldest unsealed record's own HLC — that scan ran on *every* tick of *every*
+streamed led tablet regardless of whether either trigger fired (5×/s at the
+default `INDEX_DRAIN_INTERVAL`), which was both wasted work on an idle
+tablet and a structural blocker to ADR 0044 phase-1 quiescence for a
+streamed tablet. The trigger is now: "does `KIND_CHANGE` have any bytes at
+all" (`approx_bytes > 0`, the same cheap accessor the size trigger already
+reads) gates whether age is even evaluated; the age itself is time since
+`Metadata::last_seal_wall_ms` (an O(log n) catalog lookup, not a scan) —
+falling back, for a tablet that has never sealed at all (no catalog row to
+read), to a **one-time** `pending_changes()` scan of the true oldest
+pending record's own HLC, memoized in a driver-local `BTreeMap<TabletId,
+u64>` `change_consumer_loop` keeps in memory, so no *further* scan is ever
+needed for that tablet again (cleared once a real catalog seal time exists
+or the backlog empties). An earlier draft of this fork seeded that fallback
+at "now" instead (no read at all) — wrong for a split child, whose
+inherited backlog can be arbitrarily older than the split itself, and a
+same-node "inherit the parent's own memoized basis" patch is *also* wrong,
+since a split's child is routinely led by a *different* node than its
+parent and this map is per-node; both failure modes compound across a
+cascade of splits (ADR 0034's auto-split runs on its own fixed interval,
+independent of sealing) and were caught by
+`streams_e2e.rs::manual_split_with_unsealed_backlog_under_production_seal_
+knobs` going red/flaky. The one-time real scan is the only source that is
+both correct and identical regardless of which node leads which tablet,
+and it still eliminates the overwhelming majority of the target cost: it
+runs at most once per tablet's entire lifetime, never once more per tick
+thereafter. `pending_changes()` is therefore reachable from the seal arm in
+two places only — inside `seal_now` (once a trigger has already fired) and
+this one-time bootstrap — so a tablet that has already been memoized (sealed
+at least once, or already tracked by the fallback) performs no
+`KIND_CHANGE` scan on an idle tick, by construction. See
+`animusd::index_drain::seal_tick`'s own doc for the full design and the
+accepted metric-semantics/precision trade-offs (`Metric::
+StreamSealBacklogMs` now means "time since last seal while unsealed bytes
+exist," not "age of the oldest unsealed record" — the two agree for one
+contiguous burst and can differ for a slow trickle).
 
 **Sequence (durable-before-visible, mirroring every other apply-then-durable
 discipline in this crate):**
@@ -391,6 +429,35 @@ the converged, at-rest catalog state) — closure is deferred to the ADR
 0044 quiescence work (gating the open-tail read, or the whole
 change-consumer loop, across a split's commit-to-local-convergence
 window), not attempted here.
+
+**NARROWED by ADR 0048 (phase-1 quiescence PR4), 2026-08-16.** The
+hot_read scope-transition latch: `hot_read`/`StreamHotRead` refuses
+retryably whenever this node's own **live** `RaftKvNode::scope_range()`
+(the reconciler's own state — `narrow_scope` mutates it directly, PR31)
+is wider than the tablet's declared range per a **freshly re-fetched**
+`metadata_fresh()` (never `effective_metadata()`/`metadata_cached()`, the
+identical cache the CAS amendment above found stale) — one cross-check per
+call, no new shared latch state to get wrong. This closes the reconciler's
+own tick-cadence window and the ADR 0030 mirror's refresh-interval window,
+but **not** the residual in full: on a `ControlHandle::Local` node,
+`metadata_fresh()` is itself the ADR 0038 published cache a local
+asynchronous control apply task maintains, so in the sub-window between a
+`SplitTablet` committing and that apply task catching this node's cache
+up to it, the declared range and the live scope are stale *together* —
+the identical layer-2 structure the CAS amendment above found on the
+write side — and the fabrication class can still surface there. Full
+closure would need a per-read control-leader round trip, rejected as
+disproportionate for the same reason the per-write round trip was
+rejected above. The D8 e2e adjudicator
+(`auto_split_mid_stream_with_live_consumer_across_every_node`) is green
+across 10 consecutive post-fix iterations, versus the 5/15→4/15
+still-present-after-the-fence-alone rate measured above, and remains the
+live signal for the accepted remaining sub-window, not just a historical
+regression check. See ADR 0048 for the full design, the accepted
+remaining window, and why a purely reconciler-tick-cadence-based latch
+(the literal reading of "reconciler-maintained") would have been *even
+less* sound than what shipped — this is a live cross-check, not a
+periodically-refreshed flag.
 
 Regression: three `Metadata::apply` unit tests (`meta::tests::
 seal_stream_shard_range_cas_rejects_a_stale_declared_range_after_a_split`/

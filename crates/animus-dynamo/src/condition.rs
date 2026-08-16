@@ -19,6 +19,8 @@
 //! contract. The fuller expression grammar (AND/OR/NOT, comparators, functions)
 //! is deferred.
 
+use serde::{Deserialize, Serialize};
+
 use crate::{AttributeValue, Item};
 
 /// The sort-key half of a `Query` key condition. The partition key is always an
@@ -53,7 +55,13 @@ impl SortKeyCondition {
 
 /// A minimal DynamoDB `ConditionExpression` subset, evaluated against the
 /// item currently stored at the target key (`None` when absent).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// **`Serialize`/`Deserialize` (ADR 0046 U3)**: this now rides the wire
+/// inside `ClientRequest::KindWriteItem` — the leader-side write evaluator's
+/// forwarding payload — so a caller's condition travels with the request
+/// instead of being evaluated (and compiled away) only at the edge that
+/// received it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConditionExpression {
     /// `attribute_not_exists(attr)` — true iff the item is absent or lacks `attr`.
     AttributeNotExists(String),

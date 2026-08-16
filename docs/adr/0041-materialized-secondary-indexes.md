@@ -151,27 +151,33 @@ strongly consistent, with no intent, no drain, and no 2PC.
 >   **per-item atomicity only**, matching `BatchWriteItem`'s own pre-existing
 >   non-atomic contract — one request's outcome was never allowed to depend
 >   on another's, before or after this fix.
-> - **`TransactWriteItems` is rejected up front** (`ValidationException`,
->   *"transactional writes on an indexed table are not yet supported (ADR
->   0041: TxnStage kind-write extension pending)"*) whenever any `Put`/
->   `Delete`/`Update` action targets a table with at least one secondary
->   index — a bare `ConditionCheck` doesn't count, so a transaction may still
->   write freely to unindexed tables alongside a `ConditionCheck` on an
->   indexed one. This is a **deliberate, not a stopgap, choice**: `cp_txn`'s
->   `KvCommand::TxnStage` only ever stages the base row, with no multi-kind-
->   write extension (the equivalent of `KindBatch` for a transaction's own
->   apply). Staging just the base row would commit the item while silently
->   never writing its LSI rows or change-log record — the table's indexes go
->   **permanently stale** with no error, no warning, and no drain input ever
->   produced for that write. In a pre-alpha, correctness-first system, a loud
->   rejection of an unsupported combination is strictly better than a silent,
->   permanent wrong answer. The genuine fix — extending `TxnStage` so a
->   transaction's own apply can stage a multi-kind atomic write, the
->   transactional analogue of `cp_kind_write` — is a real `animus-cp-data`
->   protocol change and is intentionally deferred as a named follow-up, not
->   folded into this correctness fix.
+> - **`TransactWriteItems` now participates too (2026-08-16, ADR 0046 A1/U3,
+>   the `TxnStage` kind-writes stack)** — the wholesale rejection this bullet
+>   used to document is gone. `TxnStage`'s `writes` element gained an
+>   optional derived `kind_writes`/`change_log` payload, staged **inside**
+>   the write's own intent envelope (never as a separately-staged kind-scope
+>   intent — see ADR 0046 Decision 2 for why that shape was rejected) and
+>   materialized by `TxnResolve`'s commit branch, at the resolve's own
+>   locally-minted ts, via the SAME shared `materialize_derived` helper
+>   `KindBatch`'s own apply arm uses. A write action's own kind payload is
+>   evaluated **at the item's own tablet leader**, at stage time
+>   (`dynamo::eval_kind_txn_write`, mirroring `kind_write_item_at_leader`'s
+>   identical U3 shape) — never precomputed by the coordinator from a
+>   possibly-stale read, closing the same cross-node race U3 closes for the
+>   non-transactional write path. See `docs/adr/0018-cross-tablet-
+>   transactions.md`'s 2026-08-16 amendment for the full account (the
+>   mechanism, the mandatory own-key OCC seatbelt, the awaited-bounded-
+>   resolve amendment, and two incidental bugs found and fixed while
+>   building it), and `docs/adr/0046-tablet-log-model.md` for the model-level
+>   "why materialize-at-resolve, why evaluate-at-leader" reasoning this
+>   feature is an instance of.
 >
-> Regression coverage: `animusd/tests/dynamo_index_writes.rs`.
+> Regression coverage: `animusd/tests/dynamo_index_writes.rs` (now positive
+> coverage — a cross-tablet transaction across a real split maintains both
+> its LSI rows and its GSI change records; an aborted transaction leaves
+> neither), `animus-cp-data/tests/txn_kind_writes.rs`, and
+> `crates/animus-test/tests/txn_serializable.rs`'s corpus (a
+> `kind_consistency` invariant at `ANIMUS_TXN_SEEDS` depth).
 
 ### 3. Row kinds are separate storage scopes, not a discriminator in the key
 
@@ -520,6 +526,38 @@ here.
 > draining every row, the `ConsistentRead` matrix, an LSI `Scan`'s
 > no-cross-index-leakage issued through every node of the cluster in turn,
 > and a `FilterExpression` over LSI-scanned rows).
+>
+> **As-built amendment (2026-08-16, per-tablet limit on `KindScan`).** Until
+> now, `ClientCtx::cp_scan_kind_table`'s per-tablet fan-out did *not* thread
+> `Limit` into each tablet's own `KindScan` the way its base-scope sibling
+> `cp_scan` threads it into each `Scan` — it fetched every overlapping
+> tablet's whole matching sub-range and truncated only once, in the
+> coordinator, after every tablet's reply was already in hand. `cp_scan_kind_table`
+> now computes `remaining` per tablet across the fan-out exactly as `cp_scan`
+> does, `ClientRequest::KindScan` gained a `#[serde(default)] limit:
+> Option<usize>` field (so an older peer's un-limited `KindScan` still
+> decodes), and `RaftKvNode::local_scan_kind`/`linearizable_scan_kind` gained
+> the matching `limit: Option<usize>` parameter, truncating **after** the
+> intent-drop filter — the identical ordering `local_scan`'s own `limit`
+> already uses, so a still-`Pending` row interleaved in the requested range
+> can never silently consume one of the caller's requested slots.
+>
+> **This is a per-tablet limit, not pushdown, and the wording matters**:
+> `StorageEngine::scan` has no limit parameter of its own, so a tablet still
+> reads its **whole** matching `[start, end)` sub-range off the engine
+> exactly as before — the change saves wire payload size and coordinator-side
+> memory for a table-wide `Scan` whose per-tablet share vastly exceeds what
+> the caller's own `Limit` still needs, never engine I/O. An LSI `Query`
+> (`ClientCtx::cp_scan_kind`, single-tablet) is unaffected and still passes no
+> limit at all — it has no `Limit` parameter to begin with (the pre-existing,
+> still-open DynamoDB-fidelity gap noted just above). Behavior-preserving by
+> construction: regression is `animusd/tests/dynamo_index_scan.rs`'s
+> split-table `Limit`-walk (the identical `by-score` pagination proof this
+> section's own regression note already describes, run again after splitting
+> `events`'s one tablet in two, so the fan-out now spans two tablets and two
+> possibly-different group leaders) plus a primitive-level `local_scan_kind`
+> case in `animus-cp-data/tests/kind_batch.rs` proving `limit` truncates to
+> exactly the requested count.
 
 Adding or dropping an index on a **populated** table (`UpdateTable`, with an
 `IndexStatus` lifecycle and a backfill) is **deferred to a follow-up**; indexes
@@ -605,6 +643,45 @@ same log"* — is exactly what ships: no change to the record format, the
 per-partition HLC ordering, or the atomic co-write this ADR established:
 ADR 0042/0043 only had to add the multi-consumer cursor/trim machinery on
 top.
+
+## Amendment (2026-08-16, ADR 0046 U3 — evaluate-at-leader)
+
+§2/§4's write path (`kind_writes_for_item`, unchanged in mechanism) used to
+be *evaluated* at whichever edge node received the request
+(`index_aware_write`, now deleted): each node read the item's prior value
+and diffed the LSI/change-record image locally, serialized only by a
+**node-local** `ctx.data().rmw_lock`. Two edge nodes writing the same item
+never contended on the same lock, so both could read → diff against the
+same stale prior value; the loser's stale LSI row orphaned forever (nothing
+reconciles a stale LSI row once written — only the GSI drain, being a full
+re-derivation, self-heals) and a stream's `OLD_IMAGE` fidelity went stale
+the same way. This is Fork U's decision, recorded in ADR 0046 ("the tablet
+log model," draft PR #222 as of this writing — not yet merged, referenced
+here in prose only): **U3, evaluate-at-leader**. The edge now forwards a
+logical `ClientRequest::KindWriteItem { table, pk, sk, op, condition }` to
+the item's own tablet leader (`ClientCtx::cp_kind_write_item`, zero hops if
+local); `dynamo::kind_write_item_at_leader` reads `old`, evaluates
+`condition`, computes `new`, and *then* calls `kind_writes_for_item` —
+identical diff logic, just moved onto the node every write of this item now
+actually reaches, which is what makes `rmw_lock` **there** a real
+cross-node serialization point instead of a per-node one. `UpdateItem`'s
+base-value read-modify-write folds into the same mechanism
+(`KindWriteOp::Update`), closing an identical, previously unguarded
+lost-update hazard on its own base value. A `KindBatch.conditions` OCC
+seatbelt (new in this amendment's companion PR1, `animus-cp-data` codec
+v15) covers the one gap the leader-side lock alone can't: a transaction
+resolver's recovery push, which never takes `rmw_lock` — unreachable today
+(a transaction is rejected outright on an indexed/streamed table) but real
+once that restriction lifts.
+
+**Named gap, deliberately not closed here**: a *plain* (unindexed,
+unstreamed) table's `PutItem`/`DeleteItem` `ConditionExpression`,
+`UpdateItem`'s base value on such a table, and CQL's own read-modify-write
+(`cql.rs`) all still rely on nothing but the edge-local `rmw_lock` — there
+is no tablet-log hook for a bare `cp_write` to evaluate against, and this
+amendment's mechanism is specific to the `KindBatch` path. Closing it would
+need the identical evaluate-at-leader treatment extended to `cp_write`
+itself, not attempted here.
 
 ## Amendment (2026-08-15, ADR 0045)
 

@@ -25,6 +25,8 @@ use animus_env::NodeId;
 use animus_env::nid;
 use serde::{Deserialize, Serialize};
 
+pub mod split_basis;
+
 /// Width, in bytes, of a [`partition_token`] — a big-endian `u64`.
 pub const TOKEN_BYTES: usize = 8;
 

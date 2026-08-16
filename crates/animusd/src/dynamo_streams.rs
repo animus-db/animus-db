@@ -426,6 +426,21 @@ async fn get_records(
     .await
 }
 
+/// Whether a decoded change record must never surface on the Streams read
+/// path (ADR 0045 follow-up "E1"): the ADR 0045 §2 backfill seeder
+/// (`animusd::index_drain::backfill_seed_tick`) writes one synthetic,
+/// image-less change-log record per pre-existing partition purely as a dirty
+/// marker for the GSI drain — indistinguishable from a live write's own
+/// record by construction, except for this flag. Real DynamoDB emits **no**
+/// stream event at all for a GSI backfill's own coverage sweep over
+/// pre-existing data, so both `GetRecords` serve branches below call this
+/// one shared predicate rather than each growing its own copy of the same
+/// check (this codebase's own "one function, not two that happen to agree
+/// today" discipline).
+fn is_seeded(record: &ChangeRecord) -> bool {
+    record.seeded
+}
+
 /// The **sealed**-shard `GetRecords` path (ADR 0042 §9/§10, ADR 0043 §A7b):
 /// any node fetches via the row's own recorded `replicas`, slices to the
 /// committed `hlc_range` (never trusting the raw object), filters/pages,
@@ -476,6 +491,9 @@ async fn get_records_sealed(
         .iter()
         .filter_map(|r| {
             let record = ChangeRecord::decode(&r.change_record)?;
+            if is_seeded(&record) {
+                return None;
+            }
             Some(streams_wire::stream_record_json(
                 shard_id,
                 r.packed_hlc,
@@ -527,6 +545,9 @@ async fn get_records_open(
         .filter_map(|(key, value)| {
             let packed = record_hlc_suffix(key)?;
             let record = ChangeRecord::decode(value)?;
+            if is_seeded(&record) {
+                return None;
+            }
             Some(streams_wire::stream_record_json(
                 shard_id,
                 packed,

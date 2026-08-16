@@ -43,16 +43,17 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
 async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, animusd::ClusterConfig) {
     let mut brought_up = None;
     'attempts: for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 5);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[5 * i],
-                client: addrs[5 * i + 1],
-                dynamo: addrs[5 * i + 2],
-                cql: addrs[5 * i + 3],
-                admin: addrs[5 * i + 4],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                admin: addrs[6 * i + 4],
+                intra: addrs[6 * i + 5],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -175,7 +176,8 @@ async fn index_backfill_converges_to_active_once_every_tablet_reports() {
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    let client = config.nodes[leader].client;
+    // ADR 0047: `ProposeSchema` is intra-only.
+    let client = config.nodes[leader].intra;
 
     call(
         client,
@@ -291,7 +293,8 @@ async fn a_tablet_that_appears_before_the_flip_blocks_it_until_it_also_reports()
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    let client = config.nodes[leader].client;
+    // ADR 0047: `ProposeSchema` is intra-only.
+    let client = config.nodes[leader].intra;
 
     call(
         client,
@@ -420,7 +423,8 @@ async fn control_only_leader_drives_the_flip() {
     let (control_nodes, data_nodes, config) = support::bring_up_split(1, 0, dir.path()).await;
     assert!(data_nodes.is_empty(), "test premise: no data role anywhere");
     support::await_leader(&control_nodes).await;
-    let client = config.nodes[0].client;
+    // ADR 0047: `ProposeSchema` is intra-only.
+    let client = config.nodes[0].intra;
 
     call(
         client,

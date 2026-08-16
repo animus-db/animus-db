@@ -248,7 +248,8 @@ async fn control_leader_failover_under_live_data_traffic() {
         timeout(Duration::from_secs(20), async {
             loop {
                 let _ = call(
-                    data_nodes[0].client_addr(),
+                    // ADR 0047: `ProposeSchema` is intra-only.
+                    data_nodes[0].intra_addr(),
                     ClientRequest::ProposeSchema(create.clone()),
                 )
                 .await;
@@ -676,7 +677,7 @@ async fn bring_up_split_durable(
 ) {
     let total = control_n + data_n;
     for attempt in 0..16 {
-        let addrs = free_addrs(total * 5);
+        let addrs = free_addrs(total * 6);
         let nodes_cfg: Vec<RoleAddrs> = (0..total)
             .map(|i| {
                 let role = if i < control_n {
@@ -687,11 +688,12 @@ async fn bring_up_split_durable(
                 RoleAddrs {
                     id: animusd::config::node_id(i),
                     role,
-                    internal: addrs[5 * i],
-                    client: addrs[5 * i + 1],
-                    dynamo: addrs[5 * i + 2],
-                    cql: addrs[5 * i + 3],
-                    admin: addrs[5 * i + 4],
+                    internal: addrs[6 * i],
+                    client: addrs[6 * i + 1],
+                    dynamo: addrs[6 * i + 2],
+                    cql: addrs[6 * i + 3],
+                    admin: addrs[6 * i + 4],
+                    intra: addrs[6 * i + 5],
                 }
             })
             .collect();
@@ -857,7 +859,8 @@ async fn full_split_cluster_restart_recovers_metadata_and_data() {
         timeout(Duration::from_secs(20), async {
             loop {
                 let _ = call(
-                    data_nodes[0].client_addr(),
+                    // ADR 0047: `ProposeSchema` is intra-only.
+                    data_nodes[0].intra_addr(),
                     ClientRequest::ProposeSchema(create.clone()),
                 )
                 .await;
@@ -1096,10 +1099,14 @@ async fn control_leader_and_data_node_failure_simultaneously_still_converges() {
             table: "dualfail_ddl_t".into(),
             schema: TableSchema::simple("id", ColumnType::String),
         };
+        // ADR 0047: `ProposeSchema` is intra-only — a separate address list
+        // from `survivor_clients` above (which stays client-flavored for the
+        // data-plane `put`/`await_value` calls it feeds).
+        let survivor_intra: Vec<SocketAddr> = data_nodes.iter().map(Node::intra_addr).collect();
         timeout(Duration::from_secs(20), async {
             loop {
                 let _ = call(
-                    survivor_clients[0],
+                    survivor_intra[0],
                     ClientRequest::ProposeSchema(create.clone()),
                 )
                 .await;

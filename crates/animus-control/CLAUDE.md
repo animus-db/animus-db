@@ -264,6 +264,20 @@ per-tablet CP data plane (`animus-cp-data`).
   read-visibility lag. See "What's non-obvious" for the driver mechanics and
   hand-driven gotchas.
 
+- **`SplitTablet`'s apply arm also enforces F11 token alignment on a
+  streamed table (ADR 0042 §14, growth PR2).** A split key that isn't
+  exactly `TOKEN_BYTES` (8) long is rejected outright when the source
+  tablet's table has a stream (`self.table_stream(table).is_some()`) —
+  the ADR 0028 fence idiom: `animusd`'s `ClientCtx::trigger_split` is the
+  one choke point that actually rounds a caller's key before ever
+  proposing, so this apply-time check is a structural seatbelt against a
+  future caller reaching apply without going through it, not the primary
+  enforcement. See `meta::tests::split_rejects_a_non_token_aligned_key_on_a_streamed_table`/
+  `split_rejects_a_token_aligned_key_equal_to_range_start` (the latter
+  proving the accepted single-token hot-partition limit, Fork E, still
+  rejects at the pre-existing `KeyRange::split_at` "strictly inside" guard
+  rather than accepting a zero-width sibling).
+
 - **Epoch-CAS discipline on `SplitTablet`/`CasTabletReplicas`.** Every
   tablet-mutating command is a compare-and-swap on the tablet's epoch, evaluated
   identically on every replica, so accept/reject is consistent and racing

@@ -258,6 +258,10 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&core_nodes).await;
     let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
+    // ADR 0047: `--seed` now names the seed's intra address — a separate
+    // list from `core_clients` above, which stays client-flavored for the
+    // data-plane `put`/`await_value` calls it feeds.
+    let core_intra: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();
     let core_admin: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.admin).collect();
     for table in TABLES {
         put(&core_clients, table, b"k0", b"v0", 30).await;
@@ -268,7 +272,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     let join_index = core_config.len();
     let join_raftkv_id = animusd::config::node_id(join_index);
     let (joined, _joined_addrs, _joined_dir) = join_fresh(
-        &core_clients,
+        &core_intra,
         join_index,
         dir.path(),
         StorageBackend::default(),
@@ -483,7 +487,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     // removal (remove + a fresh process at the same raftkv id is, by design,
     // equivalent to a fresh join).
     let (rejoined, _rejoined_addrs, _rejoined_dir) = join_fresh(
-        &core_clients,
+        &core_intra,
         join_index,
         &dir.path().join("rejoin"),
         StorageBackend::default(),
@@ -556,6 +560,8 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&core_nodes).await;
     let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
+    // ADR 0047: `--seed` now names the seed's intra address.
+    let core_intra: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();
     let core_admin: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.admin).collect();
     for table in TABLES {
         put(&core_clients, table, b"k0", b"v0", 30).await;
@@ -568,7 +574,7 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
         let join_index = core_config.len() + i;
         let join_raftkv_id = animusd::config::node_id(join_index);
         let (node, addrs, _node_dir) = join_fresh(
-            &core_clients,
+            &core_intra,
             join_index,
             dir.path(),
             StorageBackend::default(),
@@ -746,6 +752,8 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&core_nodes).await;
     let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
+    // ADR 0047: `--seed` now names the seed's intra address.
+    let core_intra: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();
     let core_admin: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.admin).collect();
     for table in TABLES {
         put(&core_clients, table, b"k0", b"v0", 30).await;
@@ -756,7 +764,7 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
     // non-voter (ADR 0030); this test only needs its data role.
     let join_index = core_config.len();
     let (joined, _joined_addrs, _joined_dir) = join_fresh(
-        &core_clients,
+        &core_intra,
         join_index,
         dir.path(),
         StorageBackend::default(),

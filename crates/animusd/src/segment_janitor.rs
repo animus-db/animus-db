@@ -711,7 +711,7 @@ mod orphan_reap_tests {
             meta.apply(&MetaCommand::SplitTablet {
                 tablet,
                 expected_epoch: Epoch::INITIAL,
-                split_key: vec![128u8],
+                split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
                 new_id: TabletId(2),
             }),
             ApplyOutcome::Applied,
@@ -780,7 +780,10 @@ mod orphan_reap_tests {
                 seal_wall_ms: 1_000,
                 replicas: Vec::new(),
                 object_id: winner_id.clone(),
-                expected_range: KeyRange::new(Vec::new(), Some(vec![128u8])),
+                expected_range: KeyRange::new(
+                    Vec::new(),
+                    Some(0x8000_0000_0000_0000u64.to_be_bytes().to_vec()),
+                ),
             }),
             ApplyOutcome::Applied,
             "test setup: the retry, correctly scoped, must apply"

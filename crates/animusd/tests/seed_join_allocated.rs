@@ -271,17 +271,14 @@ async fn no_node_join_becomes_active_and_gets_a_replica() {
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&core_nodes).await;
     let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
+    // ADR 0047: `--seed` now names the seed's intra address.
+    let core_intra: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();
     for table in TABLES {
         put(&core_clients, table, b"k0", b"v0", 30).await;
     }
 
-    let (joined, _addrs, _node_dir) = join_allocated_fresh(
-        &core_clients,
-        dir.path(),
-        "happy",
-        StorageBackend::default(),
-    )
-    .await;
+    let (joined, _addrs, _node_dir) =
+        join_allocated_fresh(&core_intra, dir.path(), "happy", StorageBackend::default()).await;
     let joined_id = own_raftkv_id(joined.admin_addr()).await;
     assert!(
         looks_minted(&joined_id),
@@ -314,7 +311,8 @@ async fn two_concurrent_allocated_joins_get_distinct_ids() {
 
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&core_nodes).await;
-    let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
+    // ADR 0047: `--seed` now names the seed's intra address.
+    let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();
 
     // Both joins race through `join_allocated_fresh`'s port-TOCTOU retry loop
     // concurrently — a genuine race, not a sequential simulation of one.
@@ -372,8 +370,9 @@ async fn data_only_allocated_join_becomes_active_and_gets_a_replica() {
         put(&data_clients, table, b"k0", b"v0", 30).await;
     }
 
-    let mut seeds: Vec<SocketAddr> = control_nodes.iter().map(Node::client_addr).collect();
-    seeds.extend(data_clients.iter().copied());
+    // ADR 0047: `--seed` now names the seed's intra address.
+    let mut seeds: Vec<SocketAddr> = control_nodes.iter().map(Node::intra_addr).collect();
+    seeds.extend(data_nodes.iter().map(Node::intra_addr));
     let joined =
         join_data_allocated_fresh(&seeds, dir.path(), "data", StorageBackend::Memory).await;
     let joined_id = own_raftkv_id(joined.admin_addr()).await;
@@ -409,7 +408,8 @@ async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
 
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&core_nodes).await;
-    let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
+    // ADR 0047: `--seed` now names the seed's intra address.
+    let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();
     let core_admin: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.admin).collect();
 
     // 1. First join: capture its allocated id, let it become Active.
@@ -497,12 +497,13 @@ async fn follower_connected_seed_completes_the_allocate_node_id_round_trip() {
     let follower = (0..core_nodes.len())
         .find(|&i| i != leader_index(&core_nodes))
         .expect("a follower exists in a 3-node core");
-    let follower_client = core_config.nodes[follower].client;
+    // ADR 0047: `--seed` now names the seed's intra address.
+    let follower_intra = core_config.nodes[follower].intra;
 
-    // Contact ONLY the follower's client address — no leader address
+    // Contact ONLY the follower's intra address — no leader address
     // anywhere in the seed list.
     let (joined, _addrs, _node_dir) = join_allocated_fresh(
-        &[follower_client],
+        &[follower_intra],
         dir.path(),
         "follower-seed",
         StorageBackend::default(),

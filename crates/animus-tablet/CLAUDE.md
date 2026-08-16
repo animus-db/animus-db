@@ -8,7 +8,18 @@ The tablet model — the unit of placement and migration (ADR 0002) — **plus t
 per-table hash-ring key layout** (ADR 0022/0023): this crate owns the Murmur3
 partitioner and the order-preserving key-escape primitives every data-plane key
 is built from. Shared types used across the control plane, the CP data plane,
-and the wire edges. One file: `src/lib.rs`.
+and the wire edges. Mostly one file (`src/lib.rs`), plus `split_basis.rs`
+(below).
+
+## Split-inheritance combinator (ADR 0046 principle 3)
+
+- `split_basis::effective<T: Clone>(own: Option<T>, frozen_basis: Option<&T>)
+  -> Option<T>` — the one generic form of "a split is a log cut; every
+  consumer offset crossing it inherits from a basis frozen at the cut, never
+  a live re-derivation from the parent's later state." `own.or_else(||
+  frozen_basis.cloned())`, nothing more — the call site still owns what
+  "own"/"frozen" mean for its own offset convention. First caller:
+  `animus-control::meta::Metadata::effective_stream_shard_watermark`.
 
 ## Key layout (ADR 0022/0023)
 

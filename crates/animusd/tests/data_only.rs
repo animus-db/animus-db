@@ -314,7 +314,8 @@ async fn schema_ddl_via_a_data_node_relays_and_commits() {
         timeout(Duration::from_secs(20), async {
             loop {
                 let _ = call(
-                    data_nodes[0].client_addr(),
+                    // ADR 0047: `ProposeSchema` is intra-only.
+                    data_nodes[0].intra_addr(),
                     ClientRequest::ProposeSchema(create.clone()),
                 )
                 .await;

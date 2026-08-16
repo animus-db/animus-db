@@ -5,9 +5,9 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] # run an N-node cluster in one process
-//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS] # run a whole split deployment in one process (ADR 0035)
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS] # run node I of a cluster (one process)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS] # run an N-node cluster in one process
+//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] # run node I as a control-only node (ADR 0035 PR3)
 //! animusd data --config FILE --node I [--dir DIR] [--ephemeral] # run node I as a data-only node (ADR 0035 PR4)
@@ -20,12 +20,15 @@
 //!
 //! Per-process deployment: generate a config once, copy it to each host, and run
 //! `animusd --config cluster.json --node I` with a distinct `I` per process. A
-//! node that has no expanded config at all — just the client address of any
-//! already-running node — can instead `animusd join --seed <that address>
-//! --id NAME`, learning everything else it needs from the cluster itself (ADR
-//! 0032 PR2: a real data-plane member, control group unchanged, ADR 0030); a
-//! data-only node has the same option (`animusd data --seed <that address>
-//! --id NAME`, ADR 0035 PR5) against a separately-deployed control plane.
+//! node that has no expanded config at all — just the **intra-cluster**
+//! address (ADR 0047; not the client one — joining is a cluster-membership
+//! action, so the honest seed address is the one an operator's Kubernetes
+//! Service topology would keep internal) of any already-running node — can
+//! instead `animusd join --seed <that address> --id NAME`, learning
+//! everything else it needs from the cluster itself (ADR 0032 PR2: a real
+//! data-plane member, control group unchanged, ADR 0030); a data-only node
+//! has the same option (`animusd data --seed <that address> --id NAME`, ADR
+//! 0035 PR5) against a separately-deployed control plane.
 //! **`--node I` is gone from `join`/`data --seed` — a clean break (ADR 0040
 //! PR4)**: `--id NAME` proposes a durable identity (validated,
 //! `NodeId::propose`) instead of an operator-picked index; omit it (`--base-
@@ -69,6 +72,22 @@
 //! `RaftNode` (every mode above except `data`, which has none); a plain
 //! `animusd data --config`/`--seed` has no orphan-sweep knob of its own since
 //! it never runs one.
+//!
+//! `--quiesce-after SECS` (ADR 0044 phase-1 PR7) opts every **data-plane** CP
+//! group into quiescence: once a group's leader has had no local activity
+//! for this long (and every other entry-predicate clause holds — see
+//! `animus-control::RaftCore::quiesce_entry_ok`'s own doc), it stops ticking
+//! (no more Raft timers/heartbeats) until a client write, a peer message, or
+//! the reconciler's proactive wake (a replica set member marked `Down`)
+//! touches it again. **Defaults ON at `main::DEFAULT_QUIESCE_AFTER_SECS`
+//! (5s)** — see that constant's own doc for the evidence behind this default
+//! and how to override it; `0` disables the feature entirely. Threads
+//! through `--config`/`--node` and `--cluster N` today; a documented gap for
+//! a follow-up on two other shapes: passed to `--cluster-control`/
+//! `--cluster-data` it parses but is silently unused (that path has no
+//! growth-combination wrapper to receive it yet); passed to the standalone
+//! `control`/`data`/`join` subcommands it is rejected outright as an unknown
+//! argument (each parses its own flag set independently of `run`'s).
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -133,9 +152,9 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH]\n  \
-    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS]\n  \
+    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS]\n  \
     animusd data --config FILE --node I [--dir DIR] [--ephemeral]\n  \
@@ -209,6 +228,15 @@ async fn run(args: &[String]) -> Result<(), String> {
     // scales with bytes, not key count). Either, both, or neither may be set;
     // when both are set, whichever threshold is hit first triggers.
     let mut auto_split_bytes: Option<u64> = None;
+    // `--auto-split-change-rate RATE` (ADR 0042 §14, growth PR3 Fork F):
+    // opt-in — a **streamed** led tablet whose own smoothed change-append
+    // rate (bytes/sec, `/admin/metrics`'s `stream_change_rates`) sustains
+    // above `RATE` triggers the same split path. Absent means disabled
+    // (zero behavior change); an unstreamed table is never subject to it
+    // regardless. No production-tuned default exists yet (no operational
+    // data) — this flag has no default-on behavior; pick `RATE` per
+    // workload.
+    let mut auto_split_change_rate: Option<u64> = None;
     // `--orphan-sweep-after SECS` (ADR 0040 PR6): overrides
     // `DEFAULT_ORPHAN_SWEEP_AFTER` (10 minutes) for the control-plane
     // leader's auto-reclaim sweep of never-activated members; `0` disables
@@ -230,6 +258,13 @@ async fn run(args: &[String]) -> Result<(), String> {
     // cluster mounts at the identical path. See `SegmentStoreConfig`'s own
     // doc for the durability trade-off this opt-in accepts.
     let mut segment_store: Option<String> = None;
+    // `--quiesce-after SECS` (ADR 0044 phase-1 PR7): opts every data-plane CP
+    // group into quiescence once it has had no local activity for this long
+    // — `0` disables it entirely. Defaults ON (`DEFAULT_QUIESCE_AFTER_SECS`)
+    // for every mode below that hosts a data-plane role: see this constant's
+    // own doc for why (a maintainer-reviewable call, flagged there and in
+    // the delivery PR body, not a settled operational fact).
+    let mut quiesce_after: Option<u64> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -248,6 +283,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--auto-split-bytes" => {
                 auto_split_bytes = Some(parse_next(&mut it, "--auto-split-bytes")?);
             }
+            "--auto-split-change-rate" => {
+                auto_split_change_rate = Some(parse_next(&mut it, "--auto-split-change-rate")?);
+            }
             "--orphan-sweep-after" => {
                 orphan_sweep_after = Some(parse_next(&mut it, "--orphan-sweep-after")?);
             }
@@ -263,6 +301,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--segment-store" => {
                 segment_store = Some(parse_next(&mut it, "--segment-store")?);
             }
+            "--quiesce-after" => {
+                quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -271,6 +312,7 @@ async fn run(args: &[String]) -> Result<(), String> {
     let stream_retention =
         stream_retention_secs.map_or(animusd::DEFAULT_STREAM_RETENTION, Duration::from_secs);
     let segment_store_config = parse_segment_store(segment_store.as_deref())?;
+    let quiesce_after = quiesce_after_duration(quiesce_after);
 
     if cluster_control.is_some() || cluster_data.is_some() {
         if config_path.is_some() || cluster.is_some() {
@@ -281,6 +323,10 @@ async fn run(args: &[String]) -> Result<(), String> {
         }
         let control_n = cluster_control.ok_or("--cluster-data also needs --cluster-control N")?;
         let data_n = cluster_data.ok_or("--cluster-control also needs --cluster-data M")?;
+        // `--quiesce-after` does not thread through the split-deployment dev
+        // path yet (`run_in_process_split_cluster` has no growth-combination
+        // wrapper to call) — a documented gap, matching this path's existing
+        // `--stream-seal-*`/`--segment-store` gap noted below.
         return run_in_process_split_cluster(
             control_n,
             data_n,
@@ -289,6 +335,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             backend,
             auto_split,
             auto_split_bytes,
+            auto_split_change_rate,
             orphan_sweep_after,
         )
         .await;
@@ -307,6 +354,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 stream_seal_knobs,
                 segment_store_config,
                 stream_retention,
+                quiesce_after,
             )
             .await
         }
@@ -318,16 +366,63 @@ async fn run(args: &[String]) -> Result<(), String> {
                 backend,
                 auto_split,
                 auto_split_bytes,
+                auto_split_change_rate,
                 orphan_sweep_after,
                 stream_seal_knobs,
                 segment_store_config,
                 stream_retention,
+                quiesce_after,
             )
             .await
         }
         (None, None) => Err("nothing to do".into()),
     }
 }
+
+/// **Default ON** at [`DEFAULT_QUIESCE_AFTER_SECS`] when `--quiesce-after` is
+/// omitted (ADR 0044 phase-1 PR7) — a data-plane CP group with no local
+/// activity for this long stops ticking (no more Raft timers/heartbeats)
+/// until something touches it again (a client write, a peer message, or the
+/// per-node reconciler waking it if its own replica set has a member marked
+/// `Down`). **This default is a maintainer-reviewable call, not a settled
+/// operational fact** — see this constant's own doc for the evidence behind
+/// it and how to override/disable it. `0` disables the feature entirely,
+/// restoring byte-identical pre-quiescence behavior.
+fn quiesce_after_duration(secs: Option<u64>) -> Duration {
+    Duration::from_secs(secs.unwrap_or(DEFAULT_QUIESCE_AFTER_SECS))
+}
+
+/// The default `--quiesce-after` idle threshold (ADR 0044 phase-1 PR7),
+/// used whenever the flag is omitted: **5 seconds**.
+///
+/// **Why proposed default-ON rather than default-off**: the mechanism
+/// (`animus-control`/`animus-cp-data`'s core state machine, PR3) and every
+/// wake/veto/sweeper-skip path built on top of it (PR4–PR6) are exercised by
+/// a seed-reproducible `SimEnv` corpus at depth, a real-thread `ProdEnv`
+/// leader-kill liveness regression
+/// (`animusd/tests/cp_quiescence.rs::write_after_leader_kill_of_a_quiesced_group_converges`),
+/// and this crate's full existing `ProdEnv` integration suite (auto-split,
+/// 2PC transactions, DynamoDB Streams end-to-end, the D8 historical
+/// split-duplication adjudicator) all passing unmodified with quiescence
+/// wired in — no destabilization was found. 5 seconds is short enough that a
+/// freshly cold tablet's first touch after idling pays only one proactive
+/// wake (`resolve_cp_route`'s wake-on-demand, PR4) plus an ordinary routing
+/// round trip, and long enough that any real client traffic (or the
+/// existing background sweepers, before PR5's veto/PR6's skip apply) keeps
+/// a genuinely busy tablet from ever idling into quiescence in the first
+/// place.
+///
+/// **What was *not* separately validated**: this default was not stress-
+/// tested against a large (dozens-to-hundreds of tablets) fleet under
+/// sustained mixed read/write load with real network latency between
+/// processes — the one instrument the plan's own "one open risk" section
+/// names (`--cluster 3 --auto-split-bytes` low enough to manufacture ~50
+/// tablets, diffing `GET /metrics` over a 60s idle window). If a future
+/// deployment's own soak testing finds this default too aggressive
+/// (churning quiesce/wake cycles under light-but-steady traffic, say), the
+/// fix is lowering this constant or defaulting to `0` — never changing the
+/// mechanism itself, which is correct at any threshold `> 0`.
+const DEFAULT_QUIESCE_AFTER_SECS: u64 = 5;
 
 /// [`animusd::StreamSealKnobs`] from the optional `--stream-seal-bytes`/
 /// `--stream-seal-age` CLI values — each independently defaults to
@@ -366,12 +461,13 @@ async fn run_single(
     stream_seal_knobs: animusd::StreamSealKnobs,
     segment_store_config: animusd::SegmentStoreConfig,
     stream_retention: Duration,
+    quiesce_after: Duration,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-node-{index}")));
 
-    let node = animusd::run_node_with_streams(
+    let node = animusd::run_node_with_streams_and_quiesce_after(
         &config,
         index,
         &dir,
@@ -380,6 +476,7 @@ async fn run_single(
         stream_seal_knobs,
         segment_store_config,
         stream_retention,
+        quiesce_after,
     )
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;
@@ -457,8 +554,10 @@ async fn run_control(args: &[String]) -> Result<(), String> {
 /// Either `--config FILE` (an operator-assembled `ClusterConfig` listing the
 /// control deployment's addresses up front — see
 /// [`animusd::run_node_data`]'s doc) or `--seed ADDR[,ADDR...]` (this node
-/// discovers the control deployment from any already-running node's client
-/// address, mirroring `animusd join`'s discovery — see
+/// discovers the control deployment from any already-running node's
+/// **intra-cluster** address, ADR 0047 — joining is a cluster-membership
+/// action, not an external-client one, so the honest seed address is the
+/// intra one, not the client one; mirrors `animusd join`'s discovery — see
 /// [`animusd::run_node_data_join`]'s doc), never both.
 ///
 /// **`--node I` is required with `--config`** (unchanged). **`--seed` no
@@ -581,6 +680,7 @@ async fn run_data_join(
         dynamo: p(2),
         cql: p(3),
         admin: p(4),
+        intra: p(5),
     };
     let dir_name = id
         .as_ref()
@@ -606,8 +706,10 @@ async fn run_data_join(
 }
 
 /// `join`: seed/join startup (ADR 0032 PR2) — a new node starts knowing only
-/// its own addresses + a seed list (client addresses of any existing nodes),
-/// learning the pre-growth control group + peer/route/admin address books
+/// its own addresses + a seed list (**intra-cluster** addresses of any
+/// existing nodes, ADR 0047 — an operator/Kubernetes-operator-supplied seed
+/// names the target's intra port, not its client one), learning the
+/// pre-growth control group + peer/route/admin address books
 /// from the cluster itself instead of an operator-assembled expanded
 /// `ClusterConfig`. See [`animusd::run_node_join`]'s doc for the collision
 /// guard + growth semantics this drives.
@@ -672,6 +774,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         dynamo: p(2),
         cql: p(3),
         admin: p(4),
+        intra: p(5),
     };
     let dir_name = id
         .as_ref()
@@ -704,10 +807,12 @@ async fn run_in_process_cluster(
     backend: animusd::StorageBackend,
     auto_split: Option<usize>,
     auto_split_bytes: Option<u64>,
+    auto_split_change_rate: Option<u64>,
     orphan_sweep_after: Duration,
     stream_seal_knobs: animusd::StreamSealKnobs,
     segment_store_config: animusd::SegmentStoreConfig,
     stream_retention: Duration,
+    quiesce_after: Duration,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
@@ -716,7 +821,7 @@ async fn run_in_process_cluster(
     let bound = animusd::bind_cluster(n, ip, &dir)
         .await
         .map_err(|e| format!("failed to bind cluster: {e}"))?;
-    let nodes = animusd::start_cluster_with_streams(
+    let nodes = animusd::start_cluster_with_growth_and_quiesce_after(
         bound,
         backend,
         auto_split,
@@ -725,6 +830,8 @@ async fn run_in_process_cluster(
         stream_seal_knobs,
         segment_store_config,
         stream_retention,
+        auto_split_change_rate,
+        quiesce_after,
     )
     .await
     .map_err(|e| format!("failed to start cluster: {e}"))?;
@@ -740,6 +847,11 @@ async fn run_in_process_cluster(
             println!("animusd: started {n}-node cluster (CP) — auto-split at {b} bytes/tablet")
         }
         (None, None) => println!("animusd: started {n}-node cluster (CP)"),
+    }
+    if let Some(rate) = auto_split_change_rate {
+        println!(
+            "animusd: streamed-table auto-split ALSO fires above {rate} change-bytes/sec/tablet"
+        );
     }
     for (i, node) in nodes.iter().enumerate() {
         println!(
@@ -772,13 +884,14 @@ async fn run_in_process_split_cluster(
     backend: animusd::StorageBackend,
     auto_split: Option<usize>,
     auto_split_bytes: Option<u64>,
+    auto_split_change_rate: Option<u64>,
     orphan_sweep_after: Duration,
 ) -> Result<(), String> {
     if control_n == 0 || data_n == 0 {
         return Err("--cluster-control and --cluster-data must each be at least 1".into());
     }
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join("animusd"));
-    let nodes = animusd::start_split_cluster_with_orphan_sweep_after(
+    let nodes = animusd::start_split_cluster_with_growth(
         control_n,
         data_n,
         &dir,
@@ -787,6 +900,7 @@ async fn run_in_process_split_cluster(
         auto_split,
         auto_split_bytes,
         orphan_sweep_after,
+        auto_split_change_rate,
     )
     .await
     .map_err(|e| format!("failed to start split cluster: {e}"))?;
@@ -804,6 +918,11 @@ async fn run_in_process_split_cluster(
         (None, None) => {
             println!("animusd: started split cluster ({control_n} control + {data_n} data, CP)")
         }
+    }
+    if let Some(rate) = auto_split_change_rate {
+        println!(
+            "animusd: streamed-table auto-split ALSO fires above {rate} change-bytes/sec/tablet"
+        );
     }
     for (i, node) in nodes.iter().take(control_n).enumerate() {
         println!(

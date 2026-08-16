@@ -12,17 +12,17 @@
 //! smoke test; and a GSI+stream table proving the two halves of ADR 0042
 //! §8's trim min-rule genuinely coexist (D5).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
 use animus_control::Metadata;
 use animus_cp_data::segment;
-use animus_tablet::TabletId;
+use animus_tablet::{TabletId, partition_token};
 use animusd::{
     ClientRequest, ClientResponse, Node, SegmentStoreConfig, StorageBackend, StreamSealKnobs,
-    bind_cluster, read_frame, start_cluster_with_streams,
+    bind_cluster, read_frame, start_cluster_with_streams, write_frame,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -76,6 +76,35 @@ async fn start_streamed_cluster_full(
         knobs,
         store,
         animusd::DEFAULT_STREAM_RETENTION,
+    )
+    .await
+    .unwrap()
+}
+
+/// Growth PR3 Fork F (ADR 0042 §14): [`start_streamed_cluster`], but with
+/// the opt-in `--auto-split-change-rate` trigger enabled — a test-local
+/// helper (this file's own "sibling test modules keep their own fixtures
+/// independent" convention) rather than widening `start_streamed_cluster_full`'s
+/// already-long signature for a knob only this one cell needs.
+async fn start_streamed_cluster_with_change_rate(
+    n: usize,
+    dir: &Path,
+    knobs: StreamSealKnobs,
+    change_rate_bytes_per_sec: u64,
+) -> Vec<Node> {
+    let bound = bind_cluster(n, "127.0.0.1".parse().unwrap(), dir)
+        .await
+        .unwrap();
+    animusd::start_cluster_with_growth(
+        bound,
+        StorageBackend::default(),
+        None,
+        None,
+        Duration::from_secs(600),
+        knobs,
+        SegmentStoreConfig::default(),
+        animusd::DEFAULT_STREAM_RETENTION,
+        Some(change_rate_bytes_per_sec),
     )
     .await
     .unwrap()
@@ -227,6 +256,56 @@ async fn describe_stream(addr: SocketAddr, stream_arn: &str) -> String {
     resp
 }
 
+/// The full, *current* set of tablet ids the stream's shard list spans —
+/// paginating via `ExclusiveStartShardId`/`LastEvaluatedShardId` until a
+/// page comes back with no more to page through. This is the wire-visible
+/// source of truth [`drain_all_tablets_lineage`] re-consults every pass so a
+/// cascading split landing mid-drain (a child tablet's own later split,
+/// minting a brand-new grandchild tablet this walk was never told about up
+/// front) is discovered the same way any real consumer would: by asking
+/// `DescribeStream` again, never by peeking at `Metadata`'s tablet map
+/// directly (that stays reserved for the already-tracked-tablet chain-length
+/// read below, which — unlike *discovering a tablet exists at all* — has no
+/// wire equivalent short of re-deriving it from a full shard list per
+/// tablet).
+async fn stream_tablet_ids(addr: SocketAddr, stream_arn: &str) -> BTreeSet<u64> {
+    let mut ids = BTreeSet::new();
+    let mut start: Option<String> = None;
+    loop {
+        let start_clause = start
+            .as_ref()
+            .map(|s| format!(r#","ExclusiveStartShardId":"{s}""#))
+            .unwrap_or_default();
+        let (status, resp) = dynamo(
+            addr,
+            "DynamoDBStreams_20120810.DescribeStream",
+            &format!(r#"{{"StreamArn":"{stream_arn}"{start_clause}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "DescribeStream (discovery) failed: {resp}");
+        let v = json(&resp);
+        let shards = v["StreamDescription"]["Shards"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for shard in &shards {
+            if let Some(tablet) = shard["ShardId"]
+                .as_str()
+                .and_then(|id| id.strip_prefix("shardId-"))
+                .and_then(|rest| rest.split_once('-'))
+                .and_then(|(tablet, _epoch)| tablet.parse::<u64>().ok())
+            {
+                ids.insert(tablet);
+            }
+        }
+        match v["StreamDescription"]["LastEvaluatedShardId"].as_str() {
+            Some(next) => start = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    ids
+}
+
 /// Drains `tablet`'s **whole** lineage of `TABLE`'s stream (every already
 /// closed epoch, `TRIM_HORIZON` to null, in ascending order, then the open
 /// tail polled until `want` records total have been collected) — the
@@ -357,14 +436,32 @@ async fn drain_tablet_lineage(
 }
 
 /// [`drain_tablet_lineage`]'s multi-tablet sibling: drains every closed
-/// epoch of every tablet in `tablets`, then polls every tablet's open tail
-/// once per pass, summing across all of them, until `want_total` records
-/// have been collected in total or `deadline` elapses. Carries the identical
-/// fix documented on [`drain_tablet_lineage`] for the poll-witnesses-its-own-
-/// seal race, applied **per tablet independently** — each tablet in a
-/// cascading multi-generation split (D8) hits this race on its own
-/// schedule, so the fix must self-correct one tablet at a time rather than
-/// assume the whole set transitions in lockstep.
+/// epoch of every currently-known tablet, then polls every known tablet's
+/// open tail once per pass, summing across all of them, until `want_total`
+/// records have been collected in total or `deadline` elapses. Carries the
+/// identical fix documented on [`drain_tablet_lineage`] for the
+/// poll-witnesses-its-own-seal race, applied **per tablet independently** —
+/// each tablet in a cascading multi-generation split (D8) hits this race on
+/// its own schedule, so the fix must self-correct one tablet at a time
+/// rather than assume the whole set transitions in lockstep.
+///
+/// `tablets` seeds the walk but is **not** a fixed set for its whole
+/// duration: a real cascading split — a child of the caller's own split
+/// child splitting again while this walk is still mid-drain — mints a
+/// brand-new tablet id nobody handed this function up front. Each outer
+/// pass re-resolves the *current* shard chain via a fresh [`DescribeStream`]
+/// call ([`stream_tablet_ids`]) before touching any tablet's records, and
+/// any newly discovered id is folded into the tracked set with its own
+/// fresh `next_epoch = 0` cursor — never disturbing an already-tracked
+/// tablet's in-flight cursor, which is exactly the resume-not-remint
+/// invariant [`drain_tablet_lineage`]'s own doc protects. Previously this
+/// function only ever saw the tablet set the caller captured once, before
+/// the drain started; a third-generation split landing mid-drain (a child's
+/// own child) would mint a tablet this walk could never learn about, and its
+/// records would never be read — a spurious deficit under sustained write
+/// pressure (`auto_split_mid_stream_with_live_consumer_across_every_node`,
+/// D8, ~1/20 iterations before this fix), now closed structurally rather
+/// than adjudicated as a known harness limitation.
 async fn drain_all_tablets_lineage(
     dynamo_addr: SocketAddr,
     stream_arn: &str,
@@ -374,15 +471,29 @@ async fn drain_all_tablets_lineage(
     deadline: tokio::time::Instant,
 ) -> Vec<Value> {
     let mut collected = Vec::new();
+    let mut tracked: BTreeSet<TabletId> = tablets.iter().copied().collect();
     let mut next_epoch: std::collections::BTreeMap<TabletId, u64> =
-        tablets.iter().map(|&t| (t, 0u64)).collect();
+        tracked.iter().map(|&t| (t, 0u64)).collect();
     // Per-tablet open-tail state, resumed from its own last position — see
     // `drain_tablet_lineage`'s identical doc for why re-minting
     // `TRIM_HORIZON` every pass would double-count an open shard's records.
     let mut open_epoch: BTreeMap<TabletId, u64> = BTreeMap::new();
     let mut open_iterator: BTreeMap<TabletId, String> = BTreeMap::new();
     loop {
-        for &tablet in tablets {
+        // Re-resolve the shard chain before touching any tablet's records
+        // this pass — see this function's own doc for why a static snapshot
+        // of `tablets` misses a cascading split's newest generation. A
+        // freshly discovered tablet starts at epoch 0 and has no open-tail
+        // state yet, so it falls straight into the ordinary per-tablet loops
+        // below exactly like one of the originally-seeded tablets would.
+        for tablet_id in stream_tablet_ids(dynamo_addr, stream_arn).await {
+            let tablet = TabletId(tablet_id);
+            if tracked.insert(tablet) {
+                next_epoch.insert(tablet, 0);
+            }
+        }
+        let current_tablets: Vec<TabletId> = tracked.iter().copied().collect();
+        for &tablet in &current_tablets {
             let chain_len = node
                 .metadata()
                 .stream_shards
@@ -414,7 +525,7 @@ async fn drain_all_tablets_lineage(
                 open_epoch.remove(&tablet); // a fresh epoch just closed
             }
         }
-        for &tablet in tablets {
+        for &tablet in &current_tablets {
             let epoch = next_epoch[&tablet];
             if open_epoch.get(&tablet) != Some(&epoch) {
                 let shard_id = segment::shard_id(tablet.0, epoch);
@@ -453,7 +564,7 @@ async fn drain_all_tablets_lineage(
             return collected;
         }
         if tokio::time::Instant::now() >= deadline {
-            let chain_lens: Vec<(TabletId, usize)> = tablets
+            let chain_lens: Vec<(TabletId, usize)> = current_tablets
                 .iter()
                 .map(|&t| {
                     (
@@ -467,7 +578,8 @@ async fn drain_all_tablets_lineage(
                 .collect();
             panic!(
                 "the lineage never delivered {want_total} records ({} so far); \
-                 per-tablet closed-chain lengths: {chain_lens:?}",
+                 tracked tablets: {current_tablets:?}; per-tablet closed-chain lengths: \
+                 {chain_lens:?}",
                 collected.len()
             );
         }
@@ -796,11 +908,29 @@ async fn fs_segment_store_opt_in_smoke() {
 /// digits, different `shardId-<tablet>-<epoch>` prefixes — as opposed to a
 /// harness double-read (which would show a *repeated* `eventID`). Tracked
 /// in `docs/engineering-lessons.md`, not fixed here (this file is test-only
-/// by convention/scope). (2) A rarer **deficit** (a timeout short of
-/// `expected`) is a separate, already-documented pre-existing timing
-/// sensitivity in the byte-triggered seal arm under a real write burst (see
-/// `manual_split_with_unsealed_backlog_under_production_seal_knobs`'s own
-/// doc comment below) — unrelated to (1), no known interaction.
+/// by convention/scope).
+///
+/// (2) A **deficit** (a timeout short of `expected`, ~1/20 iterations
+/// before the fix below) used to be this test's own dedicated harness bug,
+/// now fixed: `drain_all_tablets_lineage` took a **static** snapshot of the
+/// tablet/shard set (`ids`, captured once, above), so a **cascading**
+/// third-generation split — a child of this test's own split child
+/// splitting again while the drain was already mid-walk — minted a
+/// grandchild tablet the walk was never told about and could never read,
+/// silently short-counting. Production was never wrong here: only the
+/// harness's snapshot was stale. `drain_all_tablets_lineage` now
+/// re-resolves the live shard chain via `DescribeStream` every pass
+/// (`stream_tablet_ids`) and folds any newly discovered tablet in without
+/// disturbing an already-tracked one's in-flight iterator (preserving
+/// PR #219's resume-not-remint fix), so this no longer needs adjudicating
+/// as a known limitation. A genuinely unrelated deficit mode remains
+/// possible in principle (`manual_split_with_unsealed_backlog_under_
+/// production_seal_knobs`'s own doc comment below documents a separate,
+/// pre-existing timing sensitivity in the byte-triggered seal arm under a
+/// real write burst) — if a deficit ever recurs here, check the diagnostic
+/// panic's `tracked tablets`/chain-length dump first: a set that still
+/// matches `ids` with no cascading grandchild in it points at that
+/// different, seal-arm-timing cause instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1445,4 +1575,336 @@ async fn admin_data_dynamo_proxy_rejects_unknown_op_cleanly() {
             .is_some_and(|t| t.ends_with("UnknownOperationException")),
         "must be the standard unknown-operation error shape: {body:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Growth PR3 (ADR 0042 §14): `POST /admin/stream/grow`.
+// ---------------------------------------------------------------------------
+
+/// A plain-client-protocol `SplitTablet` call — an **arbitrary binary**
+/// `split_key`, unlike the admin HTTP surface's UTF8-string one (see
+/// `crates/animusd/CLAUDE.md`'s Tests section) — needed here to bisect a
+/// REAL DynamoDB-written tablet by an actual computed partition token
+/// (murmur hash bytes are not, in general, valid UTF-8, so `POST
+/// /admin/tablet/split`'s JSON string field cannot carry one).
+async fn plain_split(client_addr: SocketAddr, tablet: TabletId, split_key: Vec<u8>, new_id: u64) {
+    let mut stream = TcpStream::connect(client_addr)
+        .await
+        .expect("connect to client port");
+    write_frame(
+        &mut stream,
+        &ClientRequest::SplitTablet {
+            tablet: tablet.0,
+            split_key,
+        },
+    )
+    .await
+    .expect("send SplitTablet");
+    let resp: ClientResponse = read_frame(&mut stream)
+        .await
+        .expect("read reply")
+        .expect("a reply");
+    assert!(
+        matches!(resp, ClientResponse::PutOk),
+        "plain-protocol split of tablet {} into {new_id} failed: {resp:?}",
+        tablet.0
+    );
+}
+
+/// `POST /admin/stream/grow` (ADR 0042 §14, growth PR3): split EVERY
+/// tablet of a streamed table at its own byte-weighted median in one
+/// action. Starts from a genuinely multi-tablet table (a real, data-driven
+/// bootstrap split — the precondition growth's own "every tablet, not just
+/// one" behavior needs to prove anything beyond a single ordinary split),
+/// writes further real items across both halves, then grows through a
+/// THIRD node (neither the one that wrote most items nor necessarily the
+/// leader of either tablet) — doubling 2 tablets to 4 — and walks the
+/// resulting lineage from EVERY node in turn (the house forwarded-command
+/// pattern: `ClientRequest::TriggerAutoSplit` is an internal, relayable-
+/// via-forwarding RPC, since a table's two pre-existing tablets can be led
+/// by two different nodes, neither necessarily the one serving the admin
+/// request), asserting exactly-once delivery across every cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delivery() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let nodes = start_streamed_cluster(3, dir.path(), tiny_seal_knobs()).await;
+    await_bootstrap(&nodes).await;
+
+    let (status, body) = dynamo(
+        nodes[0].dynamo_addr(),
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"widgets",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "StreamSpecification":{"StreamEnabled":true,
+                "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+    let label = field(&body, "LatestStreamLabel");
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/widgets/stream/{label}");
+
+    // 40 items round-robin across every node, into the single bootstrap
+    // tablet.
+    let mut expected = 0usize;
+    let mut ids_written: Vec<String> = Vec::new();
+    for i in 0..40 {
+        let id = format!("w{i:04}");
+        let issuer = &nodes[i % nodes.len()];
+        let (status, body) = dynamo(
+            issuer.dynamo_addr(),
+            "DynamoDB_20120810.PutItem",
+            &format!(r#"{{"TableName":"widgets","Item":{{"id":{{"S":"{id}"}}}}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "PutItem({id}) failed: {body}");
+        ids_written.push(id);
+        expected += 1;
+    }
+
+    // A genuine, data-driven bootstrap split: the median of the 40 items'
+    // OWN real partition tokens (ADR 0022) — not a guessed/arbitrary key —
+    // so both resulting tablets provably hold real rows for growth's own
+    // byte-weighted median to later bisect again.
+    let bootstrap_tablet = tablets_for(&nodes[0].metadata(), "widgets")
+        .into_iter()
+        .next()
+        .expect("bootstrap tablet exists");
+    let mut tokens: Vec<[u8; 8]> = ids_written
+        .iter()
+        .map(|id| partition_token(id.as_bytes()))
+        .collect();
+    tokens.sort_unstable();
+    let median_token = tokens[tokens.len() / 2].to_vec();
+    plain_split(
+        nodes[0].client_addr(),
+        bootstrap_tablet,
+        median_token,
+        // The allocator's next id: only one tablet exists yet.
+        2,
+    )
+    .await;
+
+    await_true(
+        20,
+        "table never converged to exactly 2 tablets on every node",
+        || {
+            nodes
+                .iter()
+                .all(|n| tablets_for(&n.metadata(), "widgets").len() == 2)
+        },
+    )
+    .await;
+
+    // 40 more items, round-robin across every node — real writes into
+    // BOTH halves via ordinary hashing (no placement control needed:
+    // with 80 total near-uniformly-hashed items across 2 tablets, the
+    // chance either one ends up with fewer than 2 distinct keys, and
+    // hence no legal split point for growth to find, is astronomically
+    // small).
+    for i in 40..80 {
+        let id = format!("w{i:04}");
+        let issuer = &nodes[i % nodes.len()];
+        let (status, body) = dynamo(
+            issuer.dynamo_addr(),
+            "DynamoDB_20120810.PutItem",
+            &format!(r#"{{"TableName":"widgets","Item":{{"id":{{"S":"{id}"}}}}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "PutItem({id}) failed: {body}");
+        expected += 1;
+    }
+
+    let pre_grow_ids = tablets_for(&nodes[0].metadata(), "widgets");
+    assert_eq!(
+        pre_grow_ids.len(),
+        2,
+        "test setup: exactly 2 tablets before growing"
+    );
+
+    // Grow through node 2 — not node 0 (which wrote/hosts the original
+    // bootstrap tablet's early traffic) and not necessarily the leader of
+    // either tablet — exercising `TriggerAutoSplit`'s one-hop forward to
+    // whichever node actually leads each of the 2 tablets.
+    let (status, body) = admin(
+        nodes[2].admin_addr(),
+        "POST",
+        "/admin/stream/grow",
+        Some(r#"{"table":"widgets"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "stream/grow failed: {body}");
+    assert_eq!(
+        body["split_count"].as_u64(),
+        Some(2),
+        "both pre-existing tablets must split: {body}"
+    );
+    assert_eq!(
+        body["error_count"].as_u64(),
+        Some(0),
+        "no tablet should error: {body}"
+    );
+
+    // Self-adjudicating failure diagnostic (matching this file's own
+    // `auto_split_mid_stream_with_live_consumer_across_every_node`
+    // convention above): dump each node's own tablet view on a timeout,
+    // rather than a bare "timed out" with nothing to debug from.
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if nodes
+                .iter()
+                .all(|n| tablets_for(&n.metadata(), "widgets").len() == 4)
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                for (i, n) in nodes.iter().enumerate() {
+                    eprintln!(
+                        "DIAGNOSTIC node {i} tablets_for(widgets) = {:?} is_control_leader={}",
+                        tablets_for(&n.metadata(), "widgets"),
+                        n.is_control_leader(),
+                    );
+                }
+                panic!(
+                    "table never converged to exactly 4 tablets on every node (timed out after 20s)"
+                );
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    let ids = tablets_for(&nodes[0].metadata(), "widgets");
+    assert_eq!(ids.len(), 4, "growth must double 2 tablets to 4");
+
+    // Walk the whole doubled lineage from EVERY node in turn: `DescribeStream`
+    // must show all 4 tablets' shard chains from each node's own answer —
+    // not just the one that happened to serve the grow request.
+    let want_tablet_ids: BTreeSet<u64> = ids.iter().map(|t| t.0).collect();
+    for (i, node) in nodes.iter().enumerate() {
+        let found = stream_tablet_ids(node.dynamo_addr(), &stream_arn).await;
+        assert_eq!(
+            found, want_tablet_ids,
+            "node {i}'s DescribeStream must list every one of the 4 tablets"
+        );
+    }
+
+    // Drain the whole doubled lineage from yet another node and confirm
+    // exactly-once total delivery across every cut this growth action made.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let delivered = drain_all_tablets_lineage(
+        nodes[1].dynamo_addr(),
+        &stream_arn,
+        &nodes[1],
+        &ids,
+        expected,
+        deadline,
+    )
+    .await;
+    assert_eq!(
+        delivered.len(),
+        expected,
+        "exactly-once delivery must hold across the whole doubled lineage"
+    );
+}
+
+/// Growth PR3 Fork F (ADR 0042 §14): the opt-in `--auto-split-change-rate`
+/// trigger. Aggressive knobs (a low `RATE`, no other threshold configured)
+/// so a short, sizable write burst against a **streamed** table's single
+/// tablet drives its own smoothed change-append rate well above `RATE`
+/// within a couple of `INDEX_DRAIN_INTERVAL` ticks — proving a high-churn
+/// streamed table splits on rate alone. The SAME burst against a **plain,
+/// unstreamed** table must never split at all: no byte/key threshold is
+/// configured, and the change-rate tracker is never even populated for an
+/// unstreamed tablet (`index_drain::seal_tick`'s `stream_enabled` gate),
+/// so `--auto-split-change-rate` must have zero effect on it regardless of
+/// write volume — the "opt-in, streamed tables only, no surprise splits on
+/// an existing plain table" guarantee.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain_one() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Large seal knobs: the burst below must accumulate in `KIND_CHANGE`
+    // rather than sealing (and hence trimming) mid-burst, so the tracker
+    // sees a clean, strongly-rising byte level rather than seal-driven
+    // sawtooth noise. An aggressive 10 KB/sec threshold — the burst below
+    // produces roughly two orders of magnitude more than that.
+    let nodes = start_streamed_cluster_with_change_rate(
+        1,
+        dir.path(),
+        StreamSealKnobs {
+            seal_bytes: 10_000_000,
+            seal_age: Duration::from_secs(3600),
+        },
+        10_000,
+    )
+    .await;
+    await_bootstrap(&nodes).await;
+
+    // The streamed table.
+    let (status, body) = dynamo(
+        nodes[0].dynamo_addr(),
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"hot_stream",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "StreamSpecification":{"StreamEnabled":true,
+                "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable(hot_stream) failed: {body}");
+
+    // A plain, unstreamed table — otherwise identical treatment.
+    let (status, body) = dynamo(
+        nodes[0].dynamo_addr(),
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"plain_table",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable(plain_table) failed: {body}");
+
+    // The SAME sizable burst against both tables — 60 items of ~2 KB each
+    // (~120 KB total), written as fast as the test can issue them (well
+    // under the `INDEX_DRAIN_INTERVAL` scale this needs to look "bursty"
+    // against).
+    let filler = "x".repeat(2_000);
+    for i in 0..60u32 {
+        for table in ["hot_stream", "plain_table"] {
+            let (status, body) = dynamo(
+                nodes[0].dynamo_addr(),
+                "DynamoDB_20120810.PutItem",
+                &format!(
+                    r#"{{"TableName":"{table}","Item":{{"id":{{"S":"i{i:04}"}},"body":{{"S":"{filler}"}}}}}}"#
+                ),
+            )
+            .await;
+            assert_eq!(status, 200, "PutItem({table}, i{i}) failed: {body}");
+        }
+    }
+
+    // The streamed table's own tablet count must reach 2 — the change-rate
+    // trigger fired.
+    await_true(
+        20,
+        "hot_stream never auto-split on its own change-append rate",
+        || tablets_for(&nodes[0].metadata(), "hot_stream").len() >= 2,
+    )
+    .await;
+
+    // Meanwhile — over a comparable window — the plain table must NEVER
+    // gain a second tablet: no byte/key threshold is configured, and the
+    // change-rate tracker was never populated for an unstreamed tablet in
+    // the first place. A converged-or-timeout window that fails the
+    // instant a split is observed (never a fixed sleep followed by one
+    // assertion), matching this crate's own negative-property discipline.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let plain_tablets = tablets_for(&nodes[0].metadata(), "plain_table").len();
+        assert_eq!(
+            plain_tablets, 1,
+            "an unstreamed table must never be split by --auto-split-change-rate"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 }

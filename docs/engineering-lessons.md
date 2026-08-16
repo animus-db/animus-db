@@ -2235,6 +2235,137 @@ debugging anything that feels like it might have happened before.
   fence — accepted, deferred to the ADR 0044 quiescence work, rather than
   chased with more read-side cleverness that would just move the same
   staleness window somewhere else.
+- **A lineage-walk drain helper that captures its tablet set once, before
+  the drain starts, cannot see a split that lands DURING the drain — and a
+  "cascading" (third-generation) split is exactly the case a single
+  controlled split in a smaller test never exercises.** A further,
+  purely-harness layer of D8's own flake (distinct from every bug above,
+  which were all real production duplication/loss at the split boundary):
+  `streams_e2e.rs`'s `drain_all_tablets_lineage` took its `tablets: &[
+  TabletId]` argument as a fixed set for the whole drain. Under D8's
+  sustained write pressure and tiny byte-auto-split threshold, a child
+  tablet minted by the test's own first split could itself split again
+  *while the drain was already mid-walk* — a real, correct auto-split, not
+  a bug — minting a grandchild tablet id nobody had ever handed the drain
+  helper. That grandchild's own change records were simply never read,
+  producing a spurious **deficit** (`delivered < expected`, distinct in
+  *direction* from the over-count bugs above) at a low but real rate
+  (~1/20 iterations) that had been sitting in the test's own doc comment as
+  an "adjudicate against, don't re-investigate" known limitation rather
+  than fixed — unlike the production bugs in the entries above, this one
+  needed no `src/` change at all, purely a harness fix. **Fixed**: the
+  helper now re-resolves the *live* shard chain every pass via a fresh
+  `DescribeStream`
+  call (`stream_tablet_ids`, paginating `ExclusiveStartShardId`/
+  `LastEvaluatedShardId` to a full page) — the same way any real DynamoDB
+  Streams consumer discovers a new shard exists, never by peeking at
+  `Metadata`'s tablet map directly for tablet *existence* (that stays
+  reserved for a tracked tablet's own chain-*length* read, which has no
+  wire equivalent this cheap). A newly discovered tablet id is folded in
+  with a fresh `next_epoch = 0`, never touching an already-tracked tablet's
+  in-flight open-tail iterator — preserving the resume-not-remint invariant
+  the entries above fixed. **General form**: any test helper that walks a
+  linearly-growing structure (a lineage, a partition set, a shard list) by
+  snapshotting its membership once up front is implicitly assuming the
+  structure is quiescent by the time the walk starts — under real
+  background pressure (an auto-split loop, a compaction, a rebalance) that
+  assumption can be false for the exact scenario the test exists to stress,
+  and the fix is to make the walk's own membership-discovery step live
+  (re-run every pass) rather than a one-time precondition. (2026-08-16,
+  `test/streams-e2e-walk-cascading-split`.)
+- **A hand-driven `MetaCommand::ProposeSchema` test fixture must target the
+  INTRA port, not the client port, since ADR 0047's listener cutover** — a
+  fresh test file (`f11_split_alignment.rs`) sent `ClientRequest::
+  ProposeSchema(CreateTableSchema{..})` to a node's `client_addr()` (the
+  shape every pre-0047 test used, and still the right address for
+  `Put`/`Get`/`SplitTablet`, which stayed `Surface::Public`) and got back
+  `Error("propose_schema is a cluster-internal request; send it to this
+  node's intra port")` — `handle_request` refuses any `Surface::Intra`
+  request (`ProposeSchema` among them, `surface_of`'s own match arm) on the
+  client listener outright. `index_backfill.rs` already carries the fix
+  as a one-line comment ("ADR 0047: `ProposeSchema` is intra-only") right
+  above its own `intra_addr()`-targeted calls, but nothing greppable ties
+  that convention to the wire type itself, so a fresh test file rediscovers
+  it the hard way. **General rule**: when hand-driving a `ClientRequest`
+  variant in a new test, check `surface_of`'s match arms (`lib.rs`) for
+  which listener it's actually gated to — `Surface::Public` variants
+  (`Put`/`Get`/`Scan`/`Delete`/`Txn`/`SplitTablet`/`Status`) work on
+  `client_addr()`; every `Surface::Intra` variant (`ProposeSchema`,
+  `Forwarded`, `KindWrite`/`KindScan`, the `Txn*` internal RPCs, etc.) needs
+  `intra_addr()` instead — the error message names the fix, but only once
+  you've already hit it. (2026-08-16, `growth/1-f11-fence`.)
+- **`SimEnv`'s `Sleep` future logs a `TraceEvent::Timer` at its deadline
+  unconditionally — even for a `select` branch that lost the race and was
+  dropped long before that deadline arrives.** `Sleep::poll`'s *first* call
+  inserts a `(deadline, Event::Timer(id))` entry into the global timeline;
+  nothing removes that entry if the future is later dropped (no `Drop` impl,
+  and `select` drops the losing branch outright), so the scheduler's normal
+  timeline sweep fires it anyway at the original deadline, unconditionally
+  pushing the trace line and popping (now-absent) `timer_wakers` — a
+  functional no-op, but real trace noise. Consequence: raw
+  `TraceEvent::Timer` counts over a window are **not** a clean proxy for
+  "how many times did this task actually wait out its poll interval" the
+  moment any of its sleeps race against something else (a message, a signal)
+  that can resolve first — every such raced-and-abandoned sleep still
+  contributes one *eventual* Timer line at its stale deadline, indistinguishable
+  in the trace from a sleep that genuinely ran to completion. A clean
+  wakeup-count assertion is only cheap for a **provably idle** window (no
+  messages, no signals, nothing else racing the sleep) — anywhere traffic is
+  interleaved, don't reach for a bare `TraceEvent::Timer` tally; either prove
+  the window is idle first or instrument the call site directly (a counter
+  bumped only where the sleep is entered). Found while evaluating a
+  wakeup-count regression test for the ADR 0044 phase-1 apply-signal fix
+  (`quiesce/1-apply-signal`, 2026-08-16) — skipped in favor of the three
+  bounded-convergence tests in `tests/apply_signal.rs`, which don't depend on
+  this distinction.
+- **`Simulator::run_until_quiescent` cannot prove a specific subsystem's
+  timerlessness once *any other* task in the same run keeps its own
+  independent, deliberately-never-eliminated safety-poll timer alive.** Found
+  while writing the ADR 0044 phase-1 PR3 quiescence corpus
+  (`quiesce/3-core-state-machine`, 2026-08-16): the plan asked for
+  `run_until_quiescent(max_steps) == true` as proof that an idle, quiesced
+  `RaftKvNode` group posts zero `SimEnv` timeline events. That's unreachable
+  by construction — the apply task's own idle back-off (PR1) races
+  `ApplyPending` against a 250ms `APPLY_SAFETY_POLL` **forever**, regardless
+  of Raft activity, a deliberate design (a missed/lost `ApplySignal` must
+  still converge, not stall). One node's apply task alone keeps a scheduled
+  timer event alive at all times, so `run_until_quiescent` can never observe
+  a truly empty timeline for a *live* group — quiesced or not. This isn't a
+  defect in the quiescence work; it's a different subsystem's already-shipped
+  trade-off surfacing at a test assertion that assumed no other timer existed
+  anywhere in the run. **General rule**: before reaching for
+  `run_until_quiescent` (or any "the whole sim went idle" assertion) to prove
+  *one* mechanism's timerlessness, check whether anything else in the same
+  process — a different task, a different subsystem's own safety poll — has
+  an independent timer that would prevent it from ever firing, even if the
+  mechanism under test is working perfectly. When it does, assert the
+  mechanism's own state directly instead (here, `RaftCore::next_deadline() ==
+  None` on every replica) rather than inferring it from a whole-sim
+  observation that a co-located concern can foil. See `tests/quiescence.rs`'s
+  module doc for the full reasoning kept where the next person will read it.
+- **A single-node test that manufactures a live tablet split *mid-write-burst*
+  needs its own client-side retry, matching the discipline a real
+  multi-node routed client already gets for free.** Found writing the ADR
+  0044 phase-1 PR6 sweeper-skip regression
+  (`a_rewoken_tablet_is_picked_back_up_by_every_sweeper_within_one_interval`):
+  a 40-write burst against a tiny `--auto-split-bytes` threshold legitimately
+  splits partway through, and a later write in the same burst can target a
+  key the split just handed to a fresh child tablet — surfacing as a
+  perfectly correct `"kind write outside this group's live range; retry"`
+  rejection (the ADR 0028 write fence doing its job). A real deployment
+  never notices this: `ClientCtx::cp_route`/`cp_forward`'s hinted-retry
+  re-resolves the tablet on every attempt. A single-node test driving the
+  wire API directly against one fixed address has no such re-resolution
+  layer, so its own write helper must retry on this specific, already-
+  retryable-shaped error (`"; retry"`) rather than hard-asserting `200` —
+  never by loosening the shared helper every *other* test also uses (that
+  would mask a genuine regression elsewhere), but with a locally-scoped
+  retry loop in the one test that deliberately invites the race. The same
+  class as the pre-existing, tracked "CreateTable first-write race" (`200`
+  from `CreateTable` doesn't mean the tablet is ready for a concurrent first
+  write) — any test that deliberately drives a live topology change under
+  concurrent writes needs this discipline, not just the specific two cases
+  found so far.
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
@@ -5349,8 +5480,587 @@ debugging anything that feels like it might have happened before.
   it cannot discriminate the specific bug it was written to catch, and
   that gap should be documented rather than assumed away. (Torn-pair-fix
   stack PR3, 2026-08-15.)
+- **Three independent implementations of "what does a consumer offset
+  inherit across a split" each got it wrong in a different way, because no
+  ADR ever named the shared invariant they were all separately solving.**
+  The GSI drain's cursor, the Streams sealer's watermark, and the backfill
+  seeder's cursor (ADR 0041/0042/0043/0045) each re-derived split
+  inheritance on its own — yielding the #216 split-watermark data-loss bug,
+  a backfill-cursor fence rejection + same-named-index-recreation poisoning,
+  and the #220 split-seal duplication race, three genuinely different root
+  causes converging on the same missing rule: *a consumer offset crossing a
+  split must be inherited from a basis frozen at the cut, never re-derived
+  live from the parent's later state.* ADR 0046 (the tablet log model) names
+  this, and the other invariants like it, explicitly so a fourth offset
+  tracker gets checked against a stated rule instead of re-deriving its own.
+  **General rule**: when a second near-identical background loop/cursor/
+  offset mechanism is about to be built next to an existing one, look for
+  the shared invariant first — writing it down once is cheaper than paying
+  for its absence a third time. (ADR 0046, 2026-08-16.)
+- **A node-local lock cannot protect a cross-node invariant — move the
+  evaluation to the node that already serializes the data (its leader),
+  don't try to distribute the lock.** `index_aware_write`'s DynamoDB write
+  path read a table's prior item and diffed its LSI/change-record image at
+  whichever edge node received the request, serialized only by a
+  **node-local** `rmw_lock`. Two edge nodes writing the same item never
+  contended on that lock — each could read → diff against the same stale
+  prior value, and the loser's stale LSI row orphaned forever (nothing
+  reconciles a stale LSI row once written; only the GSI drain, being a full
+  re-derivation, self-heals). No amount of making the lock "smarter" at the
+  edge fixes this, because the edge is fundamentally the wrong place to
+  hold it — a lock only serializes callers that actually contend on the
+  *same instance* of it, and two different processes never share one. The
+  fix (ADR 0046 U3, "evaluate at leader") moves the read-diff-propose
+  sequence onto the item's own tablet leader — the one node every write of
+  that item reaches regardless of which edge node the client connected to
+  — so the identical lock, now held on the leader, actually serializes
+  what it was always meant to. General form: before adding or hardening a
+  lock to close a race, ask whether every racing caller can actually reach
+  the *same* lock instance; if the callers are different processes/nodes
+  and the lock is per-process, the lock is decorative, and the fix is to
+  move the guarded work to a single point of serialization that already
+  exists for other reasons (a leader, a single writer, an owning shard) —
+  not to invent a new distributed lock. **A repro for this class of bug
+  needs genuine cross-node contention, and unrelated setup noise can mask
+  the actual assertion before it ever runs — the fix is to get past the
+  noise, not to accept a differently-shaped failure as good enough.** The
+  first version of this stack's hammer test hard-panicked
+  (`assert_eq!(200)`) on any non-200 write reply; against the unfixed
+  baseline it reliably (8/8 runs) failed via a request-level
+  `InternalServerError` ("CP kind write did not commit in time" / "relay to
+  peer node failed") on the very first write of the very first iteration,
+  never by surviving to the intended "assert exactly one live LSI row"
+  check. The actual root cause turned out to be a genuine but **separate**
+  t=0 race: a brand-new tablet's own Raft group needs its own leader
+  election, and every node's tablet-host reconciler needs to observe it
+  should host/relay for it, before either edge node's very first write can
+  resolve a route — `CreateTable`'s own success only guarantees the
+  *catalog* entry committed, not that every node has already reconciled
+  hosting for it. The unfixed design's extra edge-to-leader hop (a separate
+  forwarded read before the forwarded propose, versus the fix's single
+  forwarded RPC) doubled this window's exposure, which is exactly why the
+  fix *looked* like it closed the race outright rather than merely
+  shrinking a pre-existing, unrelated one. Two changes closed the gap
+  between "a failure" and "the failure this test is for": (1) a few
+  retried, sequential warm-up writes against a key the race never touches,
+  settling routing before the concurrent hammer starts, and (2) making the
+  hammer loops tolerate a write's own transient non-200 (counting
+  acked/failed rather than asserting on any one outcome — a write that
+  times out at *confirm* is not known to have failed at *propose*, so
+  asserting on it asserts against an unknown) while gating on a run-health
+  minimum (most writes must still land) so a vacuously "healthy" run
+  doesn't silently masquerade as a real one. With both in place, the
+  **same** unfixed baseline failed differently and far more informatively:
+  every one of 7 runs reached the actual orphan-row assertion and failed it
+  outright (7/7, 100%), with 2–6 live LSI rows (vs. the expected 1) each
+  time, containing verifiably stale `alt` values from iterations neither
+  loop's own latest write named. **The general lesson: when a repro's failure
+  mode doesn't match the mechanism it's supposed to demonstrate, don't
+  rationalize the mismatch as "still legitimate evidence" and move on —
+  the mismatch is itself a signal that something upstream of the intended
+  assertion is misfiring, and it is usually cheap to isolate and fix
+  (here: settle routing first, tolerate transient noise, then assert).**
+  (ADR 0046 U3, `crates/animusd/tests/dynamo_index_writes.rs::
+  cross_node_racing_unconditional_puts_never_orphan_an_lsi_row`,
+  2026-08-16.)
+- **A freshly `CreateTable`d table's very first write from a second node can
+  race the new tablet's own leader election / that node's tablet-host
+  reconciliation — plausibly reachable on `main` today, independent of any
+  particular write path.** Found while chasing the above: `CreateTable`
+  returning `200` only guarantees the *catalog* entry (the schema/tablet-map
+  row) committed on the control-plane leader — it says nothing about
+  whether the new tablet's own CP Raft group has finished its (normally
+  sub-second) internal leader election, or whether every node's
+  tablet-host reconciler has yet observed it should host or relay for that
+  tablet. Two edge nodes issuing their very first write to a table
+  immediately after `CreateTable` returns can each hit this window and see
+  a hard `InternalServerError` (a genuine `relay_request` transport
+  timeout, or the propose confirm-poll's own timeout) — not a logical
+  rejection, a real failure. Not fixed here (out of scope for the ADR 0046
+  U3 stack that found it — flagged for a separate report); a few retried
+  warm-up writes reliably get past it, which is itself informative: the
+  window seems to close quickly once *any* write succeeds, consistent with
+  a one-time per-tablet cost (election + first reconcile tick) rather than
+  a sustained instability.
+- **A doc comment paragraph whose second line happens to start with `+` (or
+  `-`/`*`) fails `clippy -D warnings`'s `doc_lazy_continuation` lint even
+  though nothing about the prose is a list** — `rustdoc`/clippy parse `///`
+  blocks as Markdown, and Markdown reads a line beginning `+ ` as a new list
+  item; every subsequent line of that same paragraph is then flagged as an
+  unindented "continuation" of a list item that was never intended to
+  exist. Hit writing the ADR 0045 "E1" phantom-seed-record fix: "...closed
+  by this PR's `ChangeRecord::seeded` flag\n/// + `animusd::dynamo_streams`'s
+  filter):" read as "start a list item `+ ...`," and clippy flagged every
+  following line of the same paragraph (not just that one) as mis-indented.
+  The fix is prose, not indentation: reword so no line of a doc comment
+  starts with a bare list-marker character unless a list is actually
+  intended. General rule: when clippy's `-D warnings` gate rejects a doc
+  comment you just wrote with "doc list item without indentation," check
+  the *first character* of every line in that paragraph for `-`/`*`/`+`
+  before assuming the lint is confused — it almost always isn't. (ADR 0045
+  follow-up "E1" fix, 2026-08-16.)
+- **When one primitive gains an optimization, check its documented siblings
+  for the identical gap before assuming it's isolated.** `ClientCtx::
+  cp_scan_kind_table` (the LSI `Scan` table-wide fan-out, ADR 0041 §5) never
+  threaded its caller's `limit` into each tablet's own `KindScan` — it
+  fetched every overlapping tablet's whole matching sub-range and truncated
+  once, in the coordinator, after every reply was already in hand. Its
+  base-scope sibling `cp_scan` had threaded `limit` all the way to
+  `RaftKvNode::local_scan`/`linearizable_scan` since ADR 0023's original
+  audit; `cp_scan_kind_table` was added later (ADR 0041 §5) by pattern-
+  matching `cp_scan`'s *shape* without carrying forward that specific
+  optimization, and nothing caught it because the two are behaviorally
+  identical either way — just one wastes wire payload and coordinator
+  memory on a table whose per-tablet share vastly exceeds a small `Limit`.
+  A parity gap like this survives review precisely because it's invisible
+  at the call site and invisible in tests that only check final
+  correctness, never per-tablet reply size. **Precise wording matters when
+  fixing it**: this is a *per-tablet cap*, not "pushdown" — `StorageEngine::
+  scan` has no limit parameter of its own, so a tablet still reads its whole
+  matching sub-range off the engine; only the wire reply and coordinator
+  memory shrink. Calling it "pushdown" in a commit message or ADR note
+  overclaims a reduction in engine I/O that never happened. (ADR 0041 §5
+  as-built amendment, 2026-08-16.)
+- **A doc-mandated test case ("cover an unresolved intent") can be provably
+  inapplicable to the primitive under test — check the primitive's own
+  invariants before reaching for test-harness tricks to force the case.**
+  Asked to prove `RaftKvNode::local_scan_kind`'s new `limit` truncates
+  *after* its intent-drop filter (mirroring `local_scan`'s existing
+  ordering), the natural instinct is to scan over a row holding an
+  unresolved `Envelope::Intent` and check it doesn't consume a `limit` slot.
+  But `local_scan_kind`'s own doc (and `linearizable_scan_kind`'s) already
+  states a non-base row-kind scope **only ever holds committed values** —
+  only `KvCommand::KindBatch` writes them, and it always commits outright;
+  no external test harness constructs an intent there without reaching into
+  crate-private construction functions. Forcing the scenario anyway would
+  either not compile against the public test surface or would silently test
+  something other than the real code path. The regression this repo settled
+  for instead documents *why* the case can't arise (in the test's own
+  comment) and proves the ordering-relevant contract that legitimately can
+  be tested (limit bounds the materialized count, not the raw scan width) —
+  a `Some("if the existing harness makes that cheap")`-qualified test
+  request is exactly this: adapt or skip with a documented reason, don't
+  contort the harness to satisfy the letter of the ask.
+- **A trigger's "how due is it" computation and its "is anything pending at
+  all" gate are two different questions — conflating them makes the
+  expensive one run on every tick instead of only when something's actually
+  due.** The DynamoDB Streams seal arm's age trigger (`animusd::index_drain
+  ::seal_tick`, ADR 0042/0043) used to call `CpGroup::pending_changes()` — a
+  full scan of the `KIND_CHANGE` scope, up to `--stream-seal-bytes`' worth
+  of bytes — on *every* tick of *every* streamed led tablet (5×/s at
+  `INDEX_DRAIN_INTERVAL`), purely to find the oldest unsealed record's own
+  HLC for the age trigger and a backlog metric, even on ticks where neither
+  trigger ends up firing. On an idle streamed tablet this was ~100% wasted
+  work, and — more importantly — it structurally blocked such a tablet from
+  ever quiescing (ADR 0044 phase 1's whole premise). **Fix (ADR 0042 fork
+  G, 2026-08-16)**: split the trigger into a cheap existence gate
+  (`approx_bytes_kind(KIND_CHANGE) > 0`, an accessor already read for the
+  size trigger) and a cheap age basis (`Metadata::last_seal_wall_ms`, an
+  O(log n) catalog lookup — "time since this tablet's own last seal," not
+  "age of the oldest unsealed record"), with the full scan
+  (`pending_changes()`) moved to run in exactly one place: inside the
+  branch that has *already decided* to seal.
+
+  **A never-sealed tablet (no catalog row yet) needed its own basis, and
+  the first two designs tried for it were both wrong in the same general
+  way, caught only by a real multi-node `ProdEnv` test.** Design 1 seeded a
+  bare driver-local "now" timestamp the first tick a tablet was ever seen
+  with nonzero bytes. This is wrong for a split child: the backlog it
+  inherits is *physically* whatever its parent hadn't sealed yet (the
+  shared engine only narrows the declared range at split time; it never
+  touches the records), so seeding "now" silently forgets how old that
+  inherited backlog already was — understating its age, and, since ADR
+  0034's auto-split runs on its own fixed interval independent of sealing,
+  *compounding* across a cascade of splits (each further child restarts its
+  own clock from "now" too). Design 2 tried to patch this by having a new
+  child inherit its parent tablet's own memoized basis from the same
+  driver-local map — which is *also* wrong, more subtly: the fallback map
+  is per-node, in-memory state, but which node leads a split's child is a
+  **placement** decision, completely independent of which node led the
+  parent. In a real cluster a child is routinely led by a different node
+  than its parent, and that node's own map has never even heard of the
+  parent tablet — the "inherit from the map" lookup silently misses and
+  falls back to "now" anyway, reproducing design 1's bug exactly whenever
+  placement happens to split leadership across nodes. Both designs passed
+  every single-node unit test in the sealer-tests matrix (which structurally
+  cannot exercise cross-node placement) and both went red/flaky under
+  `streams_e2e.rs::manual_split_with_unsealed_backlog_under_production_
+  seal_knobs` — a real 3-node cluster test that pre-dated this fork and
+  was not intentionally being touched by it, first deterministically (same
+  node, wrong basis) then intermittently (~50%, once fixed for the same-node
+  case but still wrong cross-node). **The actual fix**: a *one-time* real
+  `pending_changes()` scan of the true oldest pending record's own HLC, run
+  only the first tick a tablet is ever observed with a nonzero, never-sealed
+  backlog, memoized from then on. This reads the real data — correct and
+  identical regardless of which node leads which tablet — while still
+  eliminating the overwhelming majority of the original cost: once per
+  tablet's entire lifetime (between "created" and "its first seal ever
+  commits") instead of once per tick forever.
+
+  **General rule 1**: when a periodic trigger's "should I act" evaluation and
+  its "what should I act on" data-gathering are the same function call,
+  check whether the gate can be answered from something already computed
+  for a *different*, cheaper trigger sharing the same tick — if so,
+  restructure so the expensive gather only runs inside the branch that
+  already decided to act, and prove it by construction (make the expensive
+  call unreachable from the idle path, not merely "unlikely" to be reached).
+
+  **General rule 2, the more important one**: *a value that must remain
+  correct across a leadership or placement change cannot be reconstructed
+  from purely driver-local, per-node, in-memory state* — not even by having
+  the new owner "ask the old owner's own local state," since the new owner
+  is a different process that may never have run on the same node as the
+  old one at all. If the true value isn't cheaply available from replicated
+  state, either accept a bounded, one-time real read to establish it
+  correctly (as done here — "run the expensive path once, memoize, never
+  again" is a very different cost profile than "run it every tick forever"
+  and is often an acceptable trade against a from-scratch replicated-field
+  design), or make the imprecision's failure mode explicit and *safe* (here,
+  it would have needed to bias toward firing *too early*, never too late —
+  a plain "now" timestamp biases the wrong direction, toward firing *late*,
+  which is what actually broke the test). A single-node or single-process
+  test harness cannot catch this class of bug at all; it needs a real
+  multi-node integration test exercising actual placement, which is exactly
+  why `manual_split_with_unsealed_backlog_under_production_seal_knobs`
+  (pre-existing, not written for this fork) caught what the fork's own new
+  unit tests could not.
+
+  See `crates/animusd/src/index_drain.rs`'s `seal_tick` doc and ADR 0043
+  §A3's own amendment for the full design, and `Metric::StreamSealBacklogMs`'s
+  doc for the accepted metric-semantics change this required (level metrics
+  that reuse a trigger's own working data inherit that trigger's own
+  precision trade-offs — document the change on the metric itself, not just
+  in the code that produces it).
+
+- **A staged intent in a scope whose only reader skips intents is a
+  silent-loss mechanism, not a visibility delay.** The obvious-looking fix
+  for `TransactWriteItems` on an indexed/streamed table was "stage the LSI
+  row / change-log record as an intent in its own kind scope, resolved
+  later, the same way a base row is staged today" (recorded as the planned
+  design in ADR 0041 §2/ADR 0042 §16 before this was built). It looks like
+  ordinary eventual consistency — "the row appears a little later, once
+  resolved" — but it isn't: every consumer of a kind scope (the GSI drain,
+  the Streams sealer, the backfill seeder) scans **forward from a
+  watermark** and is *defined* to skip an intent outright (only a
+  base-scope reader ever resolves one — `RaftKvNode::local_get_kind`'s own
+  doc states the invariant it relies on: "these scopes only ever hold
+  committed values"). A record staged at `ts=10` and resolved at `ts=40`,
+  after a consumer's watermark has already passed 10, is gone forever —
+  not late, not stale, **never delivered, with no error**. The fix
+  (`docs/adr/0046-tablet-log-model.md`'s Decision 2/materialize-at-resolve,
+  ADR 0018 §2's 2026-08-16 amendment) rides the derived payload inside the
+  *base* write's own intent instead, materializing it at resolve in the
+  same atomic apply that finalizes the base value — kind scopes never
+  gain an intent-resolution step at all. **General form**: before staging
+  anything as an intent in a scope, check whether that scope's readers are
+  built to resolve one; a scope whose entire contract is "no intents here"
+  cannot safely grow one just because the writer's *other* scope (the base
+  row) already tolerates staging.
+
+- **A test corpus's own workload mix can reproduce the exact bug class an
+  invariant is built to catch, from the harness alone, with the mechanism
+  under test fully correct.** Adding a `kind_consistency` check to
+  `animus-test/tests/txn_serializable.rs` (every committed transaction's
+  derived `KIND_LSI` row must equal its own base row) failed immediately,
+  consistently, for 3 of 9 keys — looking exactly like "a committed
+  transaction's kind write silently lost." The actual cause: the corpus's
+  write-only and read-modify-write transaction shapes both append to the
+  *same* client-owned keyspace, and only the write-only shape's own writes
+  had been given a kind payload — an RMW-authored append correctly updated
+  the base row but (by design, at the time) carried no kind payload at
+  all, leaving the derived row one commit stale. Diagnosed by reading the
+  raw stored envelope (tag byte + version) directly off both the base and
+  kind physical keys — confirming *both* were durably `Committed` (not one
+  merely inferred at read time from a still-`Pending` intent, which was
+  the first, wrong hypothesis) but at different versions, proving two
+  independently-committed writes rather than one delayed resolve. **General
+  form**: when extending an existing multi-shape workload harness with a
+  new payload on only one shape, audit every *other* shape that can touch
+  the same keys — a corpus's own test-design gap reproduces as a false
+  positive that looks identical to the real bug the invariant exists to
+  catch, and the fastest way to tell them apart is a raw storage-layer read
+  that distinguishes "durably committed, wrong content" from "still
+  pending, inferred at read time." (2026-08-16, `TxnStage` kind-writes
+  stack PR3.)
+
+- **Holding a node-local lock across a call that can recurse back into the
+  same lock, on the same node, is a self-deadlock waiting for the one
+  deployment shape that makes the recursion local.** `dynamo.rs::
+  run_transact` held `ctx.data().rmw_lock` across its entire span,
+  including the `cp_txn` call at the end — safe for as long as `cp_txn`
+  never itself tried to take `rmw_lock`. Adding kind-write-path evaluation
+  (`eval_kind_txn_write`, inside `ClientCtx::txn_stage_local`) gave it
+  exactly that: a *second* acquisition of the same lock, reached the
+  instant a write targets a table whose tablet leader is hosted
+  **on this same node** — true for every combined-role/single-node
+  deployment, i.e. most local dev and every single-node test. A
+  `tokio::sync::Mutex` is not reentrant, so this is not a rare race; it is
+  a guaranteed hang the first time the code path is exercised on the
+  deployment shape that makes it local. Found immediately by a real
+  `ProdEnv` integration test hanging (not a `SimEnv` corpus, which cannot
+  express real-thread self-deadlock at all — see this doc's own "a flaky
+  `ProdEnv` test is a real bug" entry). **General form**: before adding a
+  new call inside a function that already holds a lock across its own
+  return path, check whether the new call's *own* call graph can reach the
+  identical lock — "it never has before" is not evidence it never will
+  once the new code path funnels a same-node case through it; scope the
+  guard to the exact span that needed it, not the whole function, unless
+  every downstream call is provably lock-free. (2026-08-16, `TxnStage`
+  kind-writes stack PR2.)
+
+- **A `leader_hint`-shaped field grows a second meaning the moment a second
+  network segment exists.** Adding the intra-cluster port (ADR 0047) meant
+  `ControlHandle::leader_addr_hint()`/`RemoteControlClient.leader_hint`
+  suddenly had **three** existing consumers wanting different address
+  flavors off the same field: `propose_schema`'s relay preference
+  (machine-to-machine, wants the new intra address),
+  `not_leader_error`'s human-facing "retry on {addr}" message surfaced
+  through the admin HTTP endpoint (must stay the client address — a human
+  operator dials it), and the dashboard's own leader-hint display (same,
+  explicitly documented as "the client-API address"). A naive
+  find-and-replace repoint would have silently broken the two human-facing
+  consumers on any `ControlHandle::Remote` node. Fix: add a **parallel**
+  hint (`intra_leader_hint` alongside `leader_hint`) rather than repoint the
+  existing one — before repointing any existing hint/route field to a new
+  address flavor, audit **every consumer's intended audience** (human
+  operator vs. machine relay), not just its current call sites. Standing
+  rule this established: machine relay → `intra_leader_hint`; anything a
+  human reads → `leader_hint`. (2026-08-16, ADR 0047 intra-port-split
+  stack.)
+
+- **A "seed a static route table, then let a sync loop overlay
+  `Metadata` on top" pattern needs a real, non-empty static seed if any
+  consumer resolves through it *synchronously*, before the loop's first
+  tick.** Adding `intra_route` (ADR 0047, mirroring the pre-existing
+  `client_route`/`route_sync_loop` shape) first tried an empty static seed
+  on the theory that the sync loop's 200ms cadence would converge it from
+  `Metadata` quickly enough — reasonable for most consumers, which
+  tolerate "not yet known, retry." It broke the growth-node/join-node
+  mirror's own seed-building (`start_with_streams`'s `ctx.intra_addr(id)`
+  call, feeding `remote_metadata_sync_loop`), which runs **synchronously**
+  at ctx-construction time and captures its `seeds` argument once, by
+  value, at spawn time — an empty seed there is permanent, not
+  transient, since the loop it feeds never re-reads the route table itself.
+  Fix: thread the real seed (`intra_route: BTreeMap<NodeId, SocketAddr>`)
+  as a full sibling parameter everywhere `client_route` already is,
+  including through `ClientResponse::JoinInfo`. **General form**: when
+  copying an existing "static seed ∪ replicated overlay" pattern for a new
+  address axis, check whether *every* consumer of the new table reads it
+  lazily (tolerates emptiness) or captures a value from it once,
+  synchronously, at construction time — the latter needs the seed
+  populated for real, not deferred to the first tick.
+
+- **A `Surface`/authorization reclassification's test blast radius includes
+  every direct low-level construction of the reclassified variant across
+  the whole `tests/` tree, not just its production call sites.** ADR 0047
+  reclassified `ProposeSchema`/`WatchMetadata`/`Forwarded` (and friends) as
+  intra-only; the production retargeting was contained, but ~15
+  pre-existing test files drove one of these variants directly against a
+  node's `client_addr()`/`.client` as a test-setup shortcut (most commonly:
+  hand-driving schema DDL without going through the DynamoDB/CQL edge) —
+  found only by running the full suite, not by inspecting the production
+  diff. **General form**: before estimating the blast radius of
+  reclassifying a wire-protocol variant's reachability, `grep` every
+  direct construction of that variant across `tests/`, not just its
+  production callers — a test helper reusing the client address for
+  convenience is a real consumer of the old classification, indistinguishable
+  from inspection alone from one that doesn't need to be.
+
+- **A "no local replica, forward blindly to whoever else has one" fallback
+  path is easy to miss when retargeting an address-resolution axis, because
+  it looks like an edge case rather than a primary path.** ADR 0047
+  retargeted every named machine-relay resolver (`cp_leader_hint`,
+  `other_tablet_replica_addr`, `propose_schema`'s relay/broadcast) to the
+  new intra routing table, but missed `resolve_cp_route`'s own
+  zero-local-replica fallback (the very first guess a node with no local
+  replica of a tablet makes) — it kept reading `route_snapshot()` (client
+  addresses). Invisible by code review (nothing about it looks
+  forwarding-specific at a skim), it surfaced immediately as a real
+  `ProdEnv` test failure once a control-only node tried to forward a write
+  (`cluster_split.rs`'s `single_shot_first_write_through_control_node_
+  succeeds`): `Error("forwarded is a cluster-internal request; send it to
+  this node's intra port")`. **General form**: when retargeting "which
+  address flavor answers a forwarding question," grep every function whose
+  *return type* is an address/route candidate (not just the ones with
+  "leader"/"forward" in the name) — a last-resort/degenerate-case branch
+  inside a bigger routing function is exactly where a mechanical retarget
+  misses a spot. (2026-08-16, ADR 0047 intra-port-split stack.)
+- **A validation/transformation rule enforced at only SOME of several call
+  sites that all build the same command is a gap, not redundancy — move it
+  to the one function every caller actually funnels through.** F11 (ADR
+  0042 §14, a streamed table's split key must round down to its own token
+  boundary) was implemented inside `auto_split_loop` only; the two manual
+  paths (`POST /admin/tablet/split`, `ClientRequest::SplitTablet`) both
+  called `ClientCtx::trigger_split` directly with the caller's raw key,
+  bypassing the rounding entirely — a manual split on a hot partition could
+  silently separate one token's own records across two **sibling** tablets
+  with no parent/child relation, the exact per-item ordering violation the
+  rule exists to prevent. The fix (growth PR2) generalizes: **grep every
+  call site that builds the guarded command** (here, every caller of
+  `trigger_split` — there were exactly three), confirm they all fall through
+  one shared function, and move the rule INTO that function rather than
+  duplicating it at each site (which just recreates the same gap the next
+  time a fourth caller appears). Add the apply-time seatbelt (the ADR 0028
+  fence idiom) as defense in depth, not as the primary fix — a structural
+  check at apply guards against a *future* bypass of the choke point, but a
+  caller that reaches apply through the guarded rule was never the bug.
+  Corollary the fix also had to handle: rounding a key can produce a
+  **degenerate** result (here, collapsing onto the tablet's own
+  `range.start` when a single hot token owns the whole tablet) that the
+  underlying command legitimately rejects — decide up front whether that's
+  an error (a manual, explicit caller should hear about it) or an expected,
+  metered no-op (a periodic background trigger retrying forever should
+  neither spam a warning nor silently loop with no signal at all); conflating
+  the two callers' needs into one behavior gets one of them wrong.
+  (2026-08-16, `growth/1-f11-fence`.)
+- **A propose-and-confirm retry loop's confirmation predicate must prove
+  THIS call's own effect, not merely "something with the expected shape now
+  exists" — an allocator-derived id computed from a possibly-stale read can
+  collide with a *different* concurrent command's id, and a confirmation
+  that can't tell them apart silently reports success for a proposal that
+  was actually rejected.** `ClientCtx::trigger_split` (`animusd`) computed a
+  new tablet id once (`next_free_tablet_id()` from one metadata snapshot),
+  proposed `SplitTablet`, then confirmed via `tablets.contains_key(&new_id)`
+  — reasonable in isolation, but growth PR3's `grow_stream` calls
+  `trigger_split` for **two different source tablets** in quick succession,
+  each independently computing `new_id` from its own (possibly differently
+  stale, possibly cross-node-forwarded) metadata read. When both attempts
+  computed the identical `new_id`, the control leader correctly rejected
+  the second as "id already exists" — but that second call's own
+  confirmation loop kept polling, and the moment the FIRST call's real
+  commit replicated to it, `tablets.contains_key(&new_id)` turned true and
+  it reported `PutOk` for a split that never happened (only one of the two
+  source tablets actually gained a child). Found by a real-cluster test
+  going from "2 tablets → should be 4" to "2 tablets → 3," flaky at roughly
+  50%. The fix: recompute the allocator-derived id fresh on every retry
+  (so a corrected later attempt, once this node's own metadata catches up,
+  mints a genuinely free id) and confirm via a property **intrinsic to the
+  call's own target** — here, the source tablet's own epoch having
+  advanced past what was observed at the start (the CAS-gated apply arm
+  only ever bumps it on a real committed split of that exact tablet) —
+  rather than a derived, potentially-colliding id. **General form**: when a
+  retry loop proposes command X and separately polls "did X's effect
+  land," ask whether the poll can also be satisfied by some OTHER command's
+  effect that merely looks the same from the outside; if the answer isn't a
+  clean no, the confirmation is checking the wrong thing. (2026-08-16,
+  `growth/2-stream-grow`, `ClientCtx::trigger_split`.)
+- **Converting an unconditional idle poll into a wake-on-X signal requires
+  enumerating every *state transition* that creates the work, not every
+  *call site* that might seem related — and some of those transitions live
+  entirely inside a different subsystem's own timer, with no shared event to
+  hook.** The apply task's `APPLY_IDLE_POLL` (ADR 0044 phase-1 PR1,
+  `animus-cp-data`) looked at first like it needed a signal wherever
+  `RaftCore::apply` could run (a `mark_durable_through` call, a follower's
+  in-line apply inside `handle`, a completed snapshot install's commit-index
+  jump, a single-node group's own commit-advancing propose) — all genuinely
+  correlated with `commit_index` advancing, so one before/after comparison
+  after stepping the core plus one call at `mark_durable_through` covers all
+  of them. But `RaftCore::take_snapshot_needed` — the lazy on-demand
+  snapshot-image-build request the apply task must also notice — is set by
+  `snapshot_chunk_for`, reached from the leader's ordinary
+  heartbeat/replicate cycle discovering a reconnected follower's log has
+  been compacted away, with **no commit advance anywhere in that step**: it
+  is purely a consequence of the consensus loop's own timer, which the apply
+  task has no reason to know about. Trying to add a fourth explicit signal
+  point for this would mean piping a new plumbing path across the two-task
+  split for one rare, already-bounded case. **General rule**: after wiring
+  the signal for every transition you can name, ask whether a transition
+  exists that's driven by a *different* loop's own timer/tick with no data
+  dependency the signal's owner can observe — if so, don't chase it with more
+  plumbing; keep (or add) a bounded safety-poll fallback and prove
+  convergence through it with a test, which is both simpler and strictly
+  safer than an enumeration you can't be sure is exhaustive. (2026-08-16,
+  `quiesce/1-apply-signal`, `tests/apply_signal.rs`'s
+  `apply_converges_via_safety_poll_on_a_signal_less_snapshot_build`.)
+- **A pure core method with no `now` parameter can't record "this happened at
+  time X" itself — give the driver a companion method to call, don't widen
+  the core method's signature.** `RaftCore::propose`/`change_membership` take
+  no `Nanos` (proposing/reconfiguring never needed wall-clock time before ADR
+  0044 phase-1 PR3's `last_activity` idle-clock), and both are called from
+  dozens of test files across two crates plus every production driver — so
+  adding a `now: Nanos` parameter to either to let them bump
+  `last_activity`/clear `quiesced` inline would have rippled through all of
+  them for one new feature's benefit. Instead, `RaftCore::note_local_activity
+  (now: Nanos)` is a tiny, separate, `now`-taking method the *driver* (which
+  already has `now` at every call site that matters) calls immediately after
+  confirming `ProposeResult::Accepted`, inside the same held `core` lock —
+  `become_leader`/`transfer_leadership` do the equivalent inline since they
+  already take `now`. **General rule**: when a new feature needs a
+  time-stamped side effect from an existing widely-called pure method that
+  doesn't carry the needed input, don't widen that method's signature for
+  every caller — add a narrow companion method the *caller* invokes with the
+  input it already has, at the one or two call sites that actually need the
+  new behavior. (2026-08-16, `quiesce/3-core-state-machine`.)
+- **A "reconciler-maintained latch" closing a stale-read window is only
+  sound if it's checked against something at least as fresh as the read it
+  guards — a periodically-updated flag derived from the reconciler's own
+  tick cadence is not, no matter how the plan phrases it.** Found delivering
+  ADR 0044 phase-1 PR4's `hot_read` scope-transition latch (the ADR 0043
+  residual): the literal ask was a boolean the reconciler sets when it
+  first notices a scope mismatch and clears once `narrow_scope` executes.
+  Since detection and execution happen in the *same* tick
+  (`Reconciler::tick`'s `gather_facts` → `plan` → execute is one atomic
+  pass with no other writer), such a flag is false throughout the entire
+  window that actually matters — from the moment a split commits in
+  `Metadata` until this replica's *next* tick even starts (bounded by
+  `metadata_watch` wake latency plus, worst case, a 500ms fallback poll) —
+  because the reconciler cannot raise a flag for a change it hasn't
+  observed yet. The sound fix skipped the "maintained flag" entirely and
+  cross-checked a value that has **no observation lag by construction**
+  (`RaftKvNode::scope_range()`, current the instant the reconciler mutates
+  it) against the **freshest obtainable** comparison point
+  (`metadata_fresh()`, never `effective_metadata()`/`metadata_cached()`) —
+  no new shared state, no periodic-refresh lag to reason about. **General
+  rule**: when a design calls for "a component maintains a flag reflecting
+  some external fact," check whether the flag-maintainer's own update
+  cadence has a lag the flag's consumer can't tolerate; if the maintainer's
+  *state* (not a derived boolean about that state) is already live and
+  read-only-safe to expose, prefer exposing the state itself and letting
+  the consumer do a live cross-check over inventing a flag that inherits
+  the maintainer's own staleness window. See ADR 0048 and ADR 0043's
+  residual section for the full incident and the D8 before/after evidence.
+- **A level-gauge `Metric` sampled across every owner sharing ONE
+  `MetricsHandle` sink cannot be maintained by per-owner increment/decrement
+  — it needs a single periodic re-count.** Adding `Metric::CpGroupsQuiesced`
+  (ADR 0044 phase-1 PR7, "how many of this node's hosted CP groups are
+  quiesced right now"): every tablet group on a node shares the *same*
+  `MetricsHandle` (one per-node env sink, ADR 0026), so a naive "each
+  group's own consensus loop increments on quiesce, decrements on wake"
+  would have every group blindly mutating one shared counter with no
+  coordination — correct only if every transition from every group is
+  captured exactly once, which is unverifiable from any single group's own
+  vantage point. Counters that record a *transition* (`CpQuiesces`/
+  `CpUnquiesces`) are fine as per-owner increments (each transition really
+  is independent and additive); a gauge that claims to reflect *current
+  aggregate state across owners* is not, and needs one periodic sampler
+  with a view across every owner (here, `metrics_sample_loop` walking
+  `ClusterEdgeState::hosted_groups()` and calling `MetricsHandle::set`
+  once) rather than N independent mutators each guessing at the whole.
+  **General rule**: before wiring a level gauge via per-event increment/
+  decrement, check whether every event source shares one sink — if so, a
+  single periodic re-aggregation is both simpler and the only version
+  that's actually correct.
 
 ### Parallel-agent orchestration
+- **`gh stack checkout <N>` silently switches the CURRENT worktree's checked-
+  out branch** — in a worktree-isolated agent, this is indistinguishable at a
+  glance from a scratch/tracking branch staying put, and it can happen mid-air
+  underneath a long-running background build or test. Finishing the ADR 0047
+  stack, a `gh stack checkout 228` run purely to inspect the stack's shape
+  (branch order, which PRs it already contained) reset this worktree's HEAD
+  from a local scratch branch to `intra/2-cutover` — while a `cargo test
+  --workspace` run was still executing in the background against the old
+  (correct) source tree. The build didn't crash immediately (already-linked
+  test binaries kept running), but the source tree was no longer the one the
+  run was supposed to verify, so its results couldn't be trusted — the safe
+  fix was killing the run, switching back, and restarting from scratch,
+  costing a full extra `cargo test --workspace` cycle. **General rule**:
+  before running any `gh stack`/similar branch-management subcommand (not
+  just the obviously-destructive ones), check `git branch --show-current`
+  immediately after — never assume a "read-only-sounding" stack-inspection
+  command left the working tree's checked-out branch untouched, and never run
+  one while a background build/test against the current tree is still in
+  flight.
 - **A stacked series' final "docs/ADR finalization" PR must treat the stack's
   own shipped PR bodies (`gh pr view`) as the authoritative source for
   divergences from the plan — not the plan doc, and not just the final code
@@ -5872,3 +6582,43 @@ debugging anything that feels like it might have happened before.
   PR-changelog paragraph already gets rejected. A doc comment and a guide
   bullet describing the same mechanism are not two independent sources of
   truth; only one of them can be current. (2026-08-15.)
+- **A cross-plane classification can't be one code-checked table when the
+  dependency direction is one-way** (the consumer-offset consolidation, ADR
+  0046's third amendment, 2026-08-16). `SplitPolicy`'s classification table
+  has three entries — `"gsi"`, `"backfill:{index_name}"` (both
+  `animus-cp-data::cursor`, a `KIND_CURSOR` row) and the stream seal
+  watermark (`animus-control::Metadata`, a replicated field, not a cursor
+  row at all). `animus-cp-data` cannot depend on `animus-control` (data
+  plane never depends on control plane) or vice versa in a way that would
+  let one function classify all three and have a compiler-checked test
+  cover all three uniformly — a real registry spanning both would be the
+  over-unification the approved plan explicitly rejected. The resolution:
+  put the code-checked enumeration (`classify_tag` + a test asserting every
+  *known* tag this crate constructs maps to a policy) in the lower crate,
+  covering only what that crate can see, and add the cross-plane member as
+  a **doc-level-only** row in the same table with an explicit note on why
+  it has no corresponding code check. This is weaker than a single
+  compiler-enforced table — a human, not the compiler, is the safety net
+  for the doc-level row staying in sync — but it is the honest version of
+  what a one-directional dependency graph allows, and it is strictly better
+  than the alternative of not naming the third case at all. **General
+  rule**: when a concept genuinely spans two components with a one-way
+  dependency, don't force a single shared type/table across the boundary —
+  split the enumeration at the boundary (code-checked on the side that can
+  see everything relevant, doc-level-only for the rest) and say so
+  explicitly in both the code comment and the table itself, rather than
+  quietly under- or over-claiming what's actually verified.
+- **A cursor tag's own literal string can't be imported across the same
+  one-way dependency, and re-declaring it is the honest option, not a
+  smell** (same delivery, 2026-08-16). `animus-cp-data::cursor::
+  classify_tag` needs to compare against `"gsi"`/`"backfill:"`, but the
+  canonical constants (`animusd::index_drain::GSI_TAG`, `backfill_tag`)
+  live in a crate one layer *above* it in the dependency graph — the same
+  direction constraint as the lesson above. Restating the literals as named
+  constants with a doc comment pointing at the upstream source they must
+  stay byte-identical to (rather than either an inline bare literal with no
+  such pointer, or contorting the dependency graph to share them) keeps the
+  duplication visible and intentional instead of accidental — the
+  regression test that checks the *result* of the classification is the
+  real safety net; the doc pointer is what tells the next person touching
+  either side that the two need to move together.

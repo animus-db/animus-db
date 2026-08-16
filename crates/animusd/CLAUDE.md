@@ -33,8 +33,9 @@ reason (see each file's own entry below).
 - **`config.rs`** — `ClusterConfig`/`RoleAddrs` (per-process deployment
   config; every entry names its own **`id: NodeId`** rather than deriving
   it from position — `from_json` hard-errors on a duplicate) and the
-  **five-port stride** (`base_port + 5*i + {internal,client,dynamo,cql,
-  admin}`). `generate`/`generate_split` mint `"n{i}"`, **zero-padded** once
+  **six-port stride** (ADR 0047: `base_port + 6*i + {internal,client,dynamo,
+  cql,admin,intra}` — `intra` appended at offset 5, the client/intra-cluster
+  RPC port split). `generate`/`generate_split` mint `"n{i}"`, **zero-padded** once
   the cluster has ≥ 10 nodes so lexicographic id order stays == numeric
   index order (`"n10" < "n2"` otherwise) — below that threshold ids stay
   the plain unpadded `"n{i}"` every existing test already assumes.
@@ -98,14 +99,15 @@ reason (see each file's own entry below).
   produced. Proposes `MetaCommand::MarkIndexBackfilled` once a tick's sweep
   reaches the tablet's *current* range end, re-derived (and re-proposed)
   every tick rather than as a one-shot side effect. Deliberately **no**
-  split-lineage cursor inheritance (ADR 0045 §3 Fork A): a post-split
+  split-lineage cursor inheritance (ADR 0045 §5 Fork A): a post-split
   right child simply restarts its own narrower sweep from scratch,
   unconditionally correct by the drain's own idempotence. See the module's
   own doc for the full per-arm design (including a documented, deliberate
   low-fidelity interaction with a table streamed while backfilling) and
-  `tests/backfill_seeder.rs` for the end-to-end suite (materialization +
-  `Active` flip, live writes racing the sweep, two indexes backfilling
-  independently, and a crash/restart mid-backfill); see also
+  `tests/backfill_seeder.rs` for the end-to-end suite — five scenarios:
+  materialization + `Active` flip, live writes racing the sweep, two
+  indexes backfilling independently, a crash/restart mid-backfill, and a
+  split during backfill converging to the correct final GSI; see also
   `docs/streams-notes.md`. The module's own 95-line `//!` doc predates the
   seeder section — read the doc comment in the source, not this summary,
   for the authoritative design. **The hot-trim arm's merge-residue
@@ -150,9 +152,20 @@ help) prints the full invocation reference (durable LSM backend by
 default; `--ephemeral` selects the volatile memory engine). Notes not
 obvious from `--help` alone:
 
-`--auto-split K` (key count) and `--auto-split-bytes B` (byte size) are
-independent OR-gated triggers — either, both, or neither. **`--node I` is
-gone from `join`/`data --seed` entirely** — there is no index to derive a
+`--auto-split K` (key count), `--auto-split-bytes B` (byte size), and
+`--auto-split-change-rate RATE` (streamed tables only, ADR 0042 §14 Fork F —
+bytes/sec of a tablet's own `KIND_CHANGE` growth, `/admin/metrics`'s
+`stream_change_rates`) are independent OR-gated triggers — any combination,
+or none. `--auto-split-change-rate` closes the gap the other two
+structurally can't: `CpGroup::approx_bytes` is base-scoped (ADR 0034), so a
+high-churn, small-footprint streamed table never crosses a byte/key
+threshold regardless of write rate. No production-tuned default exists yet
+— omitting the flag disables the trigger entirely (zero behavior change);
+an operator must pick `RATE` for their own workload. All three flags are
+`--cluster N`/`--cluster-control`+`--cluster-data` dev-cluster-only (not
+reachable from `--config/--node`'s real per-process deployment, matching
+the two older flags' own existing scope). **`--node I` is gone from
+`join`/`data --seed` entirely** — there is no index to derive a
 default port range from, so `--base-port` is **required** on both. `--id
 NAME` proposes a durable identity (`NodeId::propose` validates it at the
 CLI boundary); omitted, the node **self-mints** one (`NodeId::mint`) and
@@ -255,7 +268,10 @@ animusd-specific rules that aren't in the ADR.
 **Internal-only `ClientRequest` variants — `TxnPrepare`/`TxnDecide`/
 `TxnResolve`/`TxnStatus`/`TxnRecordView`/`TxnVerify` — are never sent
 bare**, only wrapped in `Forwarded`; their real handling lives in
-`cp_serve_forwarded`'s match only. **Routed by the actual data key** being
+`cp_serve_forwarded`'s match only. **Since ADR 0047 all six ride the intra
+port** (`Surface::Intra`) alongside `Forwarded` itself — a bare send, or a
+`Forwarded`-wrapped send, on the client port is refused by the port guard.
+**Routed by the actual data key** being
 staged/resolved/verified (`table` + `writes[0]`/`keys[0]`/`span.start`),
 **never `record_key`** for `TxnPrepare`/`TxnResolve` — a non-anchor
 participant's `record_key` names the anchor's record, which lives in a
@@ -287,9 +303,45 @@ validates every write's key length up front and returns a client-facing
 error instead of ever reaching that assert. See `docs/engineering-
 lessons.md` for the general lesson.
 
+**A write against an indexed/streamed table participates too (2026-08-16,
+ADR 0046 A1/U3, `TxnStage` kind-writes stack)** — `dynamo.rs::run_transact`
+no longer rejects it. `TxnTableWrite` carries either an already-known
+`value` (a plain table's write) or a `pending: PendingKindWrite` (a
+kind-write-path table's write: the item identity + op + condition, no
+coordinator-computed diff). `ClientCtx::txn_stage_local` — the ONE place a
+stage actually executes on the leader's own node, shared by `txn_prepare`'s
+own local branch and `cp_serve_forwarded`'s `TxnPrepare` arm — evaluates
+every `pending_kind_writes` entry there (`dynamo::eval_kind_txn_write`,
+mirroring `kind_write_item_at_leader`'s own U3 shape) under the identical
+`ctx.data().rmw_lock`, merging the result into `writes` immediately before
+staging; a mandatory own-key OCC condition rides alongside (Fork C1). For a
+transaction touching any kind-write-path table, `cp_txn`'s post-commit
+resolve is **awaited under a short bounded budget**
+(`TXN_RESOLVE_ALL_AWAIT_BUDGET`) and parallelized across participants
+(`resolve_all_parallel`) instead of the plain transaction's unchanged
+fire-and-forget spawn (Fork D1) — LSI rows and the GSI/stream change
+record only exist from resolve onward (materialize-at-resolve, ADR 0046
+A1), so an unconditional async-ack window would leave a committed write
+transiently absent from its own index/stream. **Two bugs found and fixed
+delivering this** (see `docs/adr/0018-cross-tablet-transactions.md`'s
+2026-08-16 amendment for the full incidents): a genuine self-deadlock
+(`run_transact` used to hold `rmw_lock` across its own `cp_txn` call,
+which now recurses into the same node-local lock the instant a write
+targets a locally-led kind-write-path table); and parallelizing
+`resolve_all` *universally* (not just for the new bounded-await path)
+destabilized a pre-existing timing-sensitive regression
+(`dynamo_txn.rs`'s torn-pair test) — fixed by keeping `resolve_all`
+sequential and adding `resolve_all_parallel` as a scoped sibling.
+
 Tests: `tests/cp_txn.rs` (real 3-process cluster). The 2PC mechanics
 themselves are proven deterministically at the primitive level in
-`animus-cp-data`'s `tests/txn_multi.rs`/`tests/txn_recovery.rs`.
+`animus-cp-data`'s `tests/txn_multi.rs`/`tests/txn_recovery.rs`, and (ADR
+0046) `tests/txn_kind_writes.rs`. The kind-write-path extension's own wire-
+level coverage is `tests/dynamo_index_writes.rs`/`tests/dynamo_streams.rs`
+(replacing the wholesale-rejection tests they used to carry) and
+`crates/animus-test/tests/txn_serializable.rs`'s corpus (a
+`kind_consistency` invariant) / `tests/stream_lineage_corpus.rs`'s
+`transactional_writes_exactly_once_and_ordered` cell.
 
 ## Control-plane access
 
@@ -423,6 +475,35 @@ merge, automatic or operator-driven, to trigger; a tablet's count only ever
 grows, and reversing an over-eager split is no longer possible (see that
 ADR's "shrink-in-place" note).
 
+**Change-append-rate trigger (opt-in, ADR 0042 §14 Fork F, growth PR3)**:
+`--auto-split-change-rate RATE` joins the same either-fires gate above,
+streamed tables only. `CpGroup::approx_bytes` is deliberately base-scoped
+(ADR 0034's own fix), so it structurally cannot see change-log churn — a
+high-churn, small-footprint streamed table would otherwise never gain a
+second shard regardless of write rate. `ChangeRateTracker` (`lib.rs`)
+closes the gap for free: `index_drain::seal_tick` already computes
+`approx_bytes_kind(KIND_CHANGE)` every tick for `Metric::StreamHotBytes`,
+so the tracker just EWMA-smooths each tick's own delta/elapsed into a
+bytes/sec estimate — no new scan. Read via `ClientCtx::stream_change_rates`
+(`/admin/metrics`'s `stream_change_rates` array) and
+`ChangeRateTracker::get` (the trigger check itself). When hot, splits via
+the identical `byte_weighted_median`/`trigger_split` path every other
+trigger uses, so F11/Fork E apply automatically. No production-tuned
+default exists — omitting the flag is a true no-op.
+
+**Manual growth trigger (`POST /admin/stream/grow {table}`, ADR 0042 §14,
+growth PR3)**: splits *every* tablet of a streamed table at its own
+byte-weighted median in one action (`ClientCtx::grow_stream` →
+`grow_stream_tablet` per tablet, reusing the identical
+`local_pairs`/`byte_weighted_median`/`trigger_split` primitives). A tablet
+led by a different node than the one serving the admin request is reached
+via the internal, relayable `ClientRequest::TriggerAutoSplit` RPC (mirrors
+`ForceSeal`'s shape — addressed by tablet id, refused bare, handled only in
+`cp_serve_forwarded`). A per-tablet skip (Fork E's single-token limit, or
+an empty/singleton tablet) is reported in that tablet's own response entry,
+never escalated into a whole-call failure. `animus admin stream-grow
+<admin-addr> <table>` is the CLI form.
+
 **Split** (ADR 0028, `MetaCommand::SplitTablet`, epoch-CAS gated) is a
 single atomic control-plane command with no data-plane half — narrows the
 source's range and mints a sibling on the same shared engine. Exposed via
@@ -430,6 +511,27 @@ source's range and mints a sibling on the same shared engine. Exposed via
 (Merge — `MetaCommand::MergeTablets` and the reconciler's `WidenScope`/
 `Absorb` reaction — was removed entirely by ADR 0044, superseding ADR
 0033.)
+
+**`ClientCtx::trigger_split` is the ONE choke point every split proposer
+calls** (`auto_split_loop`, `admin::action_split`, and
+`ClientRequest::SplitTablet`'s handler — nothing else ever builds a
+`MetaCommand::SplitTablet`), which is where F11 (ADR 0042 §14) rounds a
+streamed table's split key down to its own 8-byte token boundary
+(`align_split_key`, private to `lib.rs`, unit-tested in
+`align_split_key_tests`) — a manual split can no longer separate one
+partition's records across sibling tablets the way it could before growth
+PR2 moved the rounding out of `auto_split_loop` alone.
+`MetaCommand::SplitTablet`'s own apply arm independently re-checks token
+alignment on a streamed table as the ADR 0028 fence-idiom seatbelt (never
+the primary enforcement). A token-rounded key that collapses onto the
+target tablet's own `range.start` (a single very hot partition token owning
+the whole tablet) is the accepted single-token hot-partition limit (ADR
+0042 §14 Fork E): `trigger_split` returns immediately (no propose attempt)
+and increments `Metric::StreamSplitSingleTokenSkipped`; `auto_split_loop`
+matches that specific error to skip its own "split did not commit" warning,
+which would otherwise fire every cooldown, forever. Regression:
+`tests/f11_split_alignment.rs` (a follower-connected admin split with a
+deliberately unaligned key, red on the pre-PR2 code).
 
 **Drop-table GC** (ADR 0024) is the reconciler's `Reclaim` action;
 **removed-replica GC** (ADR 0029) is its `Release` dual — see
@@ -497,6 +599,92 @@ beside their existing `ConsistentRead`-against-a-GSI check. Regression:
 concurrent write racing it, client-side validation, and a non-leader-node
 relay convergence check).
 
+## Quiescence (ADR 0044 phase 1 / ADR 0048)
+
+Data-plane-only (the control plane never quiesces, fork G); the mechanism
+itself (`RaftCore`'s state machine, `RaftKvNode::wake`/`enable_quiescence`/
+`is_quiesced`/`set_quiesce_veto`) lives in `animus-cp-data` — see that
+crate's `CLAUDE.md`. This crate's own contribution:
+
+- **Wake-on-demand**: `resolve_cp_route` calls `wake()` on a local handle
+  before deciding anything — cheap, unconditional, a no-op on every state
+  except a locally-woken quiesced follower's "are you still there?" check.
+  `host::Reconciler::tick`'s own proactive wake (fork H, on a `Down`
+  replica) lives in `animus-cp-data`.
+- **The `hot_read` scope-transition latch** (narrows the ADR 0043
+  residual): `hot_read_scope_ok` (`lib.rs`) refuses retryably
+  (`"...; retry"`) whenever a group's **live** `scope_range()` is wider than
+  the tablet's range per a **freshly fetched** `metadata_fresh()` — never
+  `effective_metadata()`/`metadata_cached()`, the cache-lag
+  `in_declared_range`'s own pre-existing filter (`index_drain.rs`) could
+  not close on its own. Both `hot_read` call sites (`ClientRequest::
+  StreamHotRead`'s handler, `ClientCtx::read_stream_hot_records`) gate on
+  it before ever calling `index_drain::hot_read`. **Does not fully close
+  the residual**: on a `ControlHandle::Local` node (the common case),
+  `metadata_fresh()` is itself the ADR 0038 published cache a local,
+  asynchronous control apply task maintains — in the sub-window between a
+  `SplitTablet` committing and that apply task catching this node's cache
+  up to it, the declared range and the live scope are stale *together*, so
+  this check passes and the fabrication class can still surface (the same
+  layer-2 structure the #220 write-side investigation found). See ADR 0048
+  for the full accounting, why this — a live cross-check, not a
+  periodically-refreshed flag — is nonetheless the sound design where a
+  literal "reconciler-maintained latch" would not have been, and why full
+  closure (a per-read control-leader round trip) was rejected as
+  disproportionate.
+- **Quiesce veto**: `change_consumer_loop` (`index_drain.rs`) computes
+  `!group.pending_changes().await.is_empty()` once per led tablet per tick
+  and calls `CpGroup::set_quiesce_veto` with it — held while the change log
+  is non-empty, released the instant a sweep finds it empty.
+- **Sweeper skip** (the fleet-scale CPU win — PR5's veto alone only stops
+  pointless Raft timer/heartbeat/apply-poll activity, not these loops' own
+  per-tablet LSM scans): `change_consumer_loop`, `txn_resolver_loop`, and
+  `auto_split_loop` all skip a led tablet outright once `CpGroup::
+  is_quiesced()` is true, rather than merely finding nothing to do. Sound
+  by construction: the first two follow directly from the veto invariant
+  above; `auto_split_loop`'s skip is sound because a quiesced group's
+  bytes/key-count are provably static (no activity for `quiesce_after`
+  means no write since it last quiesced) — whatever its last
+  pre-quiescence tick already checked still holds. The skip is a strict,
+  reversible short-circuit: any write un-quiesces the group via the
+  pre-existing propose-wake plumbing, so the very next tick resumes normal
+  sweeping.
+- **Observability**: `Metric::CpQuiesces`/`CpUnquiesces` (counters,
+  incremented by `animus-cp-data`'s own consensus loop on every genuine
+  transition) and `Metric::CpGroupsQuiesced` (a level, sampled once per
+  `metrics_sample_loop` tick across `ctx.edge.hosted_groups()` — the
+  identical "counter slot re-purposed as a last-write-wins level"
+  convention `StreamHotBytes`/`StreamSegmentsLive` already use).
+  `CpRaftView.quiesced` (`/admin/raftkv`) and the Console Tablets view's
+  neutral "quiesced" pill (`dashboard_tablets.js`, reusing the `.forming`
+  style — informational, never a health/data-risk signal, ADR 0021 §7's
+  own rule) surface it. **Fork F**: reading it never wakes anything —
+  `CpGroup::is_quiesced()`/`RaftKvNode::is_quiesced()` are pure frozen
+  accessors, so an open dashboard tab cannot un-quiesce a fleet.
+- **Production wiring**: `--quiesce-after SECS` (`main.rs`) threads through
+  `--config`/`--node` (`run_node_with_streams_and_quiesce_after` →
+  `BoundNode::start_with_growth`) and `--cluster N`
+  (`start_cluster_with_growth_and_quiesce_after`) — **defaults ON at 5s**
+  (`main::DEFAULT_QUIESCE_AFTER_SECS`; `0` disables). See that constant's
+  own doc and ADR 0048's Consequences section for the evidence behind this
+  default and what was *not* separately validated (a large fleet under
+  sustained mixed load with real inter-process latency) — a
+  maintainer-reviewable call, not a settled fact. Not yet wired for the
+  `--cluster-control`/`--cluster-data` split-deployment dev path or the
+  standalone `control`/`data`/`join` subcommands (documented gaps in
+  `main.rs`'s own module doc).
+
+Tests: `index_drain.rs`'s own `stream_sealer_tests` module (in-crate, needs
+private `CpGroup` access) covers the veto end to end
+(`hot_backlog_holds_the_quiesce_veto_until_the_hot_tail_trims`) and the
+sweeper-skip regression
+(`a_rewoken_tablet_is_picked_back_up_by_every_sweeper_within_one_interval`);
+`lib.rs`'s own `hot_read_latch_tests` module covers the latch's
+retryable-refusal shape; `tests/cp_quiescence.rs` is the critical
+`ProdEnv` leader-kill liveness regression
+(`write_after_leader_kill_of_a_quiesced_group_converges`) — the one
+property `SimEnv` structurally cannot prove.
+
 ## Wire edges
 
 All edges are production-only I/O (real tokio sockets, hand-rolled framing) and
@@ -508,26 +696,50 @@ route below the edge through the same `ClientCtx` CP primitives.
   0013) and waits for commit; a node reconciles its local registry from
   `Metadata::table_indexes` — the registry holds only *definition*
   bookkeeping, never index entries (there is no in-memory index at all). An
-  indexed table's `PutItem`/`DeleteItem`/`UpdateItem` goes through
-  `index_aware_write` → `ClientCtx::cp_kind_write`, committing the base row,
-  its **LSI rows** and a **change-log record** as one `KvCommand::KindBatch`
-  Raft entry. An LSI can ride that entry because it hashes by the base
-  partition key; a **GSI cannot** (its rows live in their own hidden
-  table's tablets) and is materialized asynchronously by the drain
-  (`index_drain.rs`) from those change records. `BatchWriteItem` keeps the
-  fast `cp_batch_write` path for an **unindexed** table but routes each
-  `Put`/`Delete` through `index_aware_write` individually for an
-  **indexed** one, atomic per-item only. **`TransactWriteItems` is the one
-  op that can't participate**: a write action against an indexed table
-  makes `run_transact` reject the **whole transaction** with a
-  `ValidationException` — `cp_txn`'s `KvCommand::TxnStage` has no
-  multi-kind-write extension yet, so staging just the base row would
-  silently never produce the LSI rows/change-log record. The real fix (a
-  `cp_txn` analogue of `cp_kind_write`) is a named `animus-cp-data`
-  protocol follow-up in ADR 0041, not yet built. **ADR 0042 extends this same rejection to a streamed table**
-  (`run_transact`'s per-action loop now checks `meta.table_stream`
-  alongside `meta.table_indexes`), for the identical reason: `TxnStage`
-  would silently never produce a streamed table's change-log record.
+  indexed/streamed table's `PutItem`/`DeleteItem`/`UpdateItem` commits the
+  base row, its **LSI rows** and a **change-log record** as one
+  `KvCommand::KindBatch` Raft entry (`kind_writes_for_item`) — but the *diff*
+  is now evaluated **at the tablet's own leader**, not at the receiving edge
+  node: `ClientCtx::cp_kind_write_item` routes a `ClientRequest::
+  KindWriteItem { table, pk, sk, op: KindWriteOp, condition }` to the leader
+  (in-process if local, one forwarded hop via `cp_serve_forwarded` if not),
+  and `dynamo::kind_write_item_at_leader` — the only caller of
+  `kind_writes_for_item` — reads its own `old` image, evaluates `condition`,
+  computes `new` from `op` (`Put`/`Delete`/`Update{key_item, actions}`, the
+  last folding `UpdateItem`'s base-value RMW into the same mechanism), then
+  proposes. **This is the ADR 0046 ("the tablet log model", draft PR #222)
+  U3 fix**: `index_aware_write`'s prior edge-evaluated design (now deleted)
+  read/diffed under a **node-local** `ctx.data().rmw_lock`, so two edge
+  nodes writing the same item never contended on the same lock and could
+  both diff against the same stale `old` — the loser's stale LSI row
+  orphaned forever (nothing reconciles it; only the GSI drain self-heals).
+  Locking `rmw_lock` **at the leader** instead serializes every write of one
+  item regardless of which edge node received it, since every write now
+  funnels through the same function on the same node. A `KindBatch.
+  conditions` OCC seatbelt (PR1, `animus-cp-data`) closes the one residual
+  the lock alone can't: a `txn_resolver_loop` recovery push never takes
+  `rmw_lock` — real now that `TransactWriteItems` participates on these
+  tables too (see below).
+  **Named gap, unchanged by this fix**: a plain (unindexed, unstreamed)
+  table's `PutItem`/`DeleteItem` `ConditionExpression`, `UpdateItem`'s base
+  value on such a table, and CQL's own RMW (`cql.rs`) all still only have
+  today's node-local `rmw_lock` protection — there is no tablet-log hook for
+  a bare `cp_write` to evaluate at. `BatchWriteItem` routes each `Put`/
+  `Delete` through the identical per-item mechanism for an **indexed**
+  table, atomic per-item only, and keeps the fast `cp_batch_write` path for
+  an **unindexed, unstreamed** one. **`TransactWriteItems` now participates
+  too (2026-08-16, ADR 0046 A1/U3, `TxnStage` kind-writes stack)** — the
+  wholesale per-table rejection this paragraph used to document (a write
+  action against an indexed *or* streamed table cancelling the whole
+  transaction, since `TxnStage` could only ever stage the base row) is
+  gone. `TxnStage`'s own `writes` element now carries an optional derived
+  `kind_writes`/`change_log` payload alongside its base `key`/`value`,
+  evaluated **at the item's own tablet leader at stage time**
+  (`dynamo::eval_kind_txn_write`, the identical U3 shape as this
+  paragraph's own non-transactional write path) and materialized by
+  `TxnResolve`'s commit branch — see the "Multi-participant transactions"
+  section below and `docs/adr/0018-cross-tablet-transactions.md`'s
+  2026-08-16 amendment for the full mechanism.
 
   **DynamoDB Streams (ADR 0042/0043).** `TableSchema.stream:
   Option<StreamSpec>` rides the same `CreateTable`/`UpdateTable` surface as
@@ -693,7 +905,12 @@ route below the edge through the same `ClientCtx` CP primitives.
   internal-only streams RPCs (F12-b's disable-triggered final seal, and
   the open-shard `GetRecords`/`GetShardIterator` forwarding path) — both
   addressed by tablet id directly, refused bare, handled only inside
-  `cp_serve_forwarded`. **Every send of an internal-only variant across
+  `cp_serve_forwarded`. **Since ADR 0047 both now ride the intra port**
+  (`surface_of` classifies them `Surface::Intra`) — a bare send on the
+  client port is refused by `handle_request`'s port guard before ever
+  reaching their own "must be sent wrapped in `Forwarded`" match-arm
+  refusal (that wording is still reachable, just only via the intra port
+  now). **Every send of an internal-only variant across
   the wire must wrap it in `ClientRequest::Forwarded`, even when the
   caller already knows it isn't the leader** — a first attempt called
   `ClientCtx::relay` directly with a bare `ForceSeal`, which compiled and
@@ -713,6 +930,33 @@ route below the edge through the same `ClientCtx` CP primitives.
   inbox was single-consumer, before ADR 0026 let one id host several
   protocol instances). The client API is a plain TCP server, *not* on the
   `Network` — a non-leader forwards over a fresh client connection.
+- **Two client-protocol listeners, one dispatch (ADR 0047)**: `RoleAddrs.client`
+  (external, DynamoDB/CQL-adjacent callers) and `RoleAddrs.intra` (every
+  node-to-node `ClientRequest` — `Forwarded`, `ProposeSchema`,
+  `WatchMetadata`, `JoinInfo`, and every internal-only forwarding payload)
+  are the **same** length-prefixed JSON `ClientRequest`/`ClientResponse`
+  framing on two ports, not two protocols. `serve_requests`/
+  `handle_connection` (`lib.rs`) are one function parameterized by
+  `ListenerKind::{Client, Intra}`, never forked; `handle_request` has
+  exactly one guard clause before its ~160-line match, refusing a
+  `Client`-listener connection asking for a `Surface::Intra`-classified
+  variant (`surface_of`, the one exhaustive table, no wildcard arm — a new
+  `ClientRequest` variant is a compile error there until classified).
+  `Intra` is deliberately a **superset** of `Client`, not a disjoint
+  partition — neither port has auth yet, and intra is the more-trusted
+  network segment (the operator's Kubernetes topology keeps it off any
+  externally-reachable Service), so it transparently also serving ordinary
+  client-shaped ops is intentional, not a gap. `--seed`/`animusd join`
+  target the **intra** address (joining is a cluster-membership action, not
+  an external-client one). Machine-relay address resolution
+  (`cp_leader_hint`, `propose_schema`'s relay, `remote_metadata_watch_loop`)
+  uses a parallel `intra_route`/`intra_addr`/`intra_leader_hint` — never
+  `client_route`/`route_addr`/`leader_hint`, which stay reserved for
+  human-facing consumers (`not_leader_error`'s admin message, the
+  dashboard's leader display) — see ADR 0047 for the full design and the
+  hint-field-conflation finding that shaped this split, and the standing
+  rule in `docs/engineering-lessons.md` (machine relay →
+  `intra_leader_hint`; anything a human reads → `leader_hint`).
 - **`ClusterEdgeState` is scoped to one NODE** (ADR 0031 PR2), created fresh per
   node — even in `--cluster N`, which previously shared one instance across the
   cluster and masked cross-process bugs. Holds this node's own control handle, its
@@ -820,10 +1064,11 @@ route below the edge through the same `ClientCtx` CP primitives.
   not a subdirectory (`ProdEnv`'s disk doesn't create intermediate dirs).
   Node-start entry points are async+fallible (`io::Result`).
 - **`Node::shutdown()` is a graceful teardown** — aborts the listener tasks and
-  `ProdEnv::shutdown()`s the node's one internal env, freeing all five ports
-  (ADR 0040 PR1's `internal`/`client`/`dynamo`/`cql`/`admin` stride — was six,
-  split across two role envs, before) so a replacement can rebind the same
-  addresses/dir. Dropping a `Node` without it leaves tasks running.
+  `ProdEnv::shutdown()`s the node's one internal env, freeing all six ports
+  (ADR 0040 PR1's `internal`/`client`/`dynamo`/`cql`/`admin` stride, plus ADR
+  0047's `intra` — the pre-ADR-0040 stride was six too, but split across two
+  role envs instead of one node/one port-block) so a replacement can rebind
+  the same addresses/dir. Dropping a `Node` without it leaves tasks running.
   **It's fire-and-forget (`abort()` then return), not a guarantee those ports are
   free the instant it returns** — see `animus-env/CLAUDE.md`'s `ProdEnv::shutdown()`
   entry. A same-address restart needs **`Node::shutdown_and_wait()`** (aborts, then
@@ -868,11 +1113,14 @@ admin HTTP surface's UTF8-string one); `dynamo.rs`'s own
 (a new, non-linearizable bounded kind-scan wrapper, mirroring
 `local_get_kind`'s existing shape) to prove a streamed-unindexed table's
 write commits exactly base + change, no LSI/footprint row;
-`index_drain.rs`'s own `stream_sealer_tests` is a fifth (round-3 sealer PR)
-— the seal arm's triggers/sequence (size, age, empty-hot no-seal, the
-exactly-at-watermark boundary), the F10/F12-b hot-trim rework (the
-GSI+stream min-rule, and — reviewed hard — the
-disabled-draining-does-not-block-trim rule), disable-as-final-seal with
+`index_drain.rs`'s own `stream_sealer_tests` is a fifth (round-3 sealer PR,
+extended by the ADR 0042 fork G age-trigger-derivation rewrite) — the seal
+arm's triggers/sequence (size, age — both the never-sealed driver-local
+fallback and the catalog-derived basis a later backlog uses once a tablet
+has sealed at least once — empty-hot no-seal, a real-but-below-threshold
+backlog also never seals, and the exactly-at-watermark boundary), the
+F10/F12-b hot-trim rework (the GSI+stream min-rule, and — reviewed hard —
+the disabled-draining-does-not-block-trim rule), disable-as-final-seal with
 epoch continuity across a disable/re-enable cycle, and F11's split-key
 token alignment, needing `CpGroup`'s private `pending_changes`/
 `approx_bytes_kind`/`cursor_min_watermark` and, to confirm a segment

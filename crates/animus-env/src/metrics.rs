@@ -302,10 +302,24 @@ pub enum Metric {
     /// evaluated — a level, not a count: each tick overwrites it via
     /// `MetricsHandle::set`.
     StreamHotBytes,
-    /// The age (milliseconds, the loop's own `env` clock) of the oldest
-    /// unsealed `KIND_CHANGE` record as of the most recent seal-arm tick that
-    /// found one — `0` when the hot tail is empty. A level, overwritten via
-    /// `MetricsHandle::set`.
+    /// **Semantics changed, ADR 0042 fork G (2026-08-16).** Used to be the
+    /// age (milliseconds) of the *oldest unsealed record*, computed by
+    /// scanning `KIND_CHANGE` every tick. It is now the age (milliseconds,
+    /// the loop's own `env` clock, never a raw OS clock) of the tablet's own
+    /// **last seal**, measured only while unsealed bytes exist
+    /// (`approx_bytes_kind(KIND_CHANGE) > 0`) — `0` whenever the hot tail is
+    /// empty. Read straight off the `stream_shards` catalog
+    /// (`Metadata::last_seal_wall_ms`) for a tablet that has sealed before;
+    /// a tablet that never has falls back to a one-time-memoized real scan
+    /// of the true oldest pending record's own HLC, cached per tablet after
+    /// its first observation so no *further* scan is ever needed for that
+    /// tablet again (see `animusd::index_drain::seal_tick`'s own doc for the
+    /// full design and why a cheaper driver-local timestamp guess doesn't
+    /// work). The old and new values agree whenever the hot tail is one
+    /// contiguous burst (the common case) and can differ for a slow,
+    /// trickling backlog — traded deliberately for never *repeatedly*
+    /// scanning `KIND_CHANGE` just to keep this level current.
+    /// A level, overwritten via `MetricsHandle::set`.
     StreamSealBacklogMs,
     /// A stream shard seal committed (the segment `put` succeeded on every
     /// replica and `MetaCommand::SealStreamShard` was confirmed in the
@@ -398,12 +412,74 @@ pub enum Metric {
     /// signal that would have caught the write-loss bug (ADR 0018 §2's
     /// amendment) had it existed then.
     CpMergeTookNoEffectUnexplained,
+
+    // --- F11 token-alignment choke point (ADR 0042 §14, growth PR2) ---
+    // Appended after the merge-write-loss variants above; every earlier
+    // variant's slot and the text-export order stay stable, so the
+    // snapshot remains byte-reproducible. Recorded by `animusd::
+    // ClientCtx::trigger_split` — the single choke point every split
+    // proposer (auto-split, `POST /admin/tablet/split`,
+    // `ClientRequest::SplitTablet`) funnels through.
+    /// A streamed table's split key rounded down (F11) onto the target
+    /// tablet's own `range.start` — a single very-hot partition token that
+    /// owns the tablet's entire range, which can never legally split
+    /// without breaking the per-token affinity F11 exists to protect (ADR
+    /// 0042 §14 Fork E, the accepted single-token hot-partition limit).
+    /// Counts the skip, not an error: `trigger_split` returns immediately
+    /// (no propose attempt) and `auto_split_loop` matches this specific
+    /// outcome to skip its own "split did not commit" warning, which would
+    /// otherwise fire every cooldown, forever, for a tablet that
+    /// structurally cannot split.
+    StreamSplitSingleTokenSkipped,
+
+    // --- Quiescence (ADR 0044 phase-1 PR3) --- Appended after the F11 variant;
+    // every earlier variant's slot and the text-export order stay stable, so
+    // the snapshot remains byte-reproducible. Recorded by `animus-cp-data`'s
+    // consensus-loop send site (`record_kv_outbound`) — the per-tablet
+    // counterpart to the control plane's `AppendEntriesSent`, kept as its own
+    // variant (not reused) since it is recorded off the CP-plane's `KvWire`
+    // outbound list rather than `RaftNode::record_outbound`'s `Out<MetaCommand>`
+    // list. This is what an idle/quiesced tablet group's own heartbeat traffic
+    // going flat is measured against — the ADR 0044 idle-cost win phase 1
+    // targets.
+    /// A per-tablet CP-data `AppendEntries` (replication or heartbeat) was
+    /// sent to a peer.
+    CpAppendEntriesSent,
+
+    // --- Quiescence observability (ADR 0044 phase-1 PR7) --- Appended
+    // after the append-entries-sent variant above; every earlier variant's
+    // slot and the text-export order stay stable, so the snapshot remains
+    // byte-reproducible. Recorded by `animus-cp-data`'s consensus loop
+    // (`CpQuiesces`/`CpUnquiesces`, incremented on every genuine
+    // quiesced/ticking transition it observes — one per group, all sharing
+    // this node's one sink) and `animusd`'s `metrics_sample_loop`
+    // (`CpGroupsQuiesced`, a level: how many of this node's *currently
+    // hosted* groups this sample found quiesced — see that loop's own doc
+    // for why a per-group increment/decrement can't safely stand in for a
+    // periodic re-count across a shared sink).
+    /// A per-tablet CP-data group transitioned into quiescence (`RaftCore::
+    /// quiesced` flipped `false -> true`) — counts the transition, not a
+    /// duration.
+    CpQuiesces,
+    /// A per-tablet CP-data group transitioned out of quiescence (`RaftCore::
+    /// quiesced` flipped `true -> false`) — any inbound message, local
+    /// propose, or explicit wake.
+    CpUnquiesces,
+    /// The number of this node's currently-hosted CP-data groups this
+    /// node's most recent metrics sample found quiesced — a level,
+    /// overwritten via `MetricsHandle::set` (never `incr`), the identical
+    /// "counter slot re-purposed as a last-write-wins level" shape
+    /// `StreamHotBytes`/`StreamSegmentsLive` already use above. Read-only:
+    /// sampling never itself wakes a group (fork F — admin/dashboard reads
+    /// must never disturb the fleet-wide idle-cost win quiescence exists
+    /// for).
+    CpGroupsQuiesced,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 64] = [
+    pub const ALL: [Metric; 69] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -468,6 +544,11 @@ impl Metric {
         Metric::StreamRepairBacklog,
         Metric::CpMergeTookNoEffect,
         Metric::CpMergeTookNoEffectUnexplained,
+        Metric::StreamSplitSingleTokenSkipped,
+        Metric::CpAppendEntriesSent,
+        Metric::CpQuiesces,
+        Metric::CpUnquiesces,
+        Metric::CpGroupsQuiesced,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -539,6 +620,11 @@ impl Metric {
             Metric::StreamRepairBacklog => "stream_repair_backlog",
             Metric::CpMergeTookNoEffect => "cp_merge_took_no_effect",
             Metric::CpMergeTookNoEffectUnexplained => "cp_merge_took_no_effect_unexplained",
+            Metric::StreamSplitSingleTokenSkipped => "stream_split_single_token_skipped",
+            Metric::CpAppendEntriesSent => "cp_append_entries_sent",
+            Metric::CpQuiesces => "cp_quiesces",
+            Metric::CpUnquiesces => "cp_unquiesces",
+            Metric::CpGroupsQuiesced => "cp_groups_quiesced",
         }
     }
 

@@ -67,7 +67,7 @@ mod txn;
 
 use hlc::{Hlc, HlcTimestamp, bump_strictly_above};
 use ts_cache::TsCache;
-pub use txn::{StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome};
+pub use txn::{StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnWrite};
 
 /// The assumed maximum clock-offset bound across the cluster (ADR 0018 §2),
 /// threaded into every [`Hlc::new`] this crate constructs. Not yet consumed
@@ -114,6 +114,117 @@ struct ProposePending<'a> {
 }
 
 impl Future for ProposePending<'_> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.signal.waker.register(cx.waker());
+        if self.signal.pending.swap(false, Ordering::AcqRel) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// The **wake-on-commit** signal (ADR 0044 phase-1 PR1): the same shape as
+/// [`ProposeSignal`], but for the **apply task** rather than the consensus
+/// loop. `apply_loop`'s idle back-off used to be an unconditional
+/// `env.sleep(APPLY_IDLE_POLL)` (5ms) every time there was nothing to merge —
+/// ~200 wakeups/s per hosted group at complete idle, independent of whether
+/// anything ever changed. The consensus loop now raises this signal at every
+/// point that can transition "no apply work" to "apply work exists" —
+/// `persist_wal`'s `mark_durable_through` call, a commit-index advance
+/// observed after stepping the core (covers a follower's in-line apply on
+/// `AppendEntries` and a snapshot install's `commit_index` jump alike), a
+/// proposer's own commit-advancing propose (the single-node/majority-1 fast
+/// path), and [`RaftKvNode::shutdown`](RaftKvNode::shutdown) (so a parked
+/// apply task always notices the halt instead of waiting out the now much
+/// longer [`APPLY_SAFETY_POLL`]) — so `apply_loop` races this against a long
+/// safety poll instead of spinning on a short one. See the "What's
+/// non-obvious" section of this crate's `CLAUDE.md` for the enumerated
+/// raise points and why a signal-less path (e.g. the lazy on-demand
+/// snapshot-image build `take_snapshot_needed` triggers, which is set purely
+/// off the leader's own heartbeat/replicate cycle with no commit advance)
+/// must still converge off the safety poll alone.
+#[derive(Default)]
+struct ApplySignal {
+    /// Set by the consensus loop (or `shutdown`), consumed by the apply task.
+    pending: AtomicBool,
+    /// The apply task's waker, registered each time it parks.
+    waker: AtomicWaker,
+}
+
+impl ApplySignal {
+    /// Raise the flag, then wake the parked apply task. Order matters — the
+    /// flag is visible before the wake, so the apply task's poll (which
+    /// registers *then* checks the flag) can never miss it, mirroring
+    /// [`ProposeSignal::notify`].
+    fn notify(&self) {
+        self.pending.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+}
+
+/// A future that resolves once the apply task has new work to check for, for
+/// `apply_loop`'s idle-backoff `select` — the [`ApplySignal`] counterpart to
+/// [`ProposePending`].
+struct ApplyPending<'a> {
+    signal: &'a ApplySignal,
+}
+
+impl Future for ApplyPending<'_> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.signal.waker.register(cx.waker());
+        if self.signal.pending.swap(false, Ordering::AcqRel) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// The **driver-level wake** signal (ADR 0044 phase-1 PR2): the same shape as
+/// [`ProposeSignal`]/[`ApplySignal`], but for the **consensus loop's own park**
+/// rather than a proposer or the apply task. Today the consensus loop always
+/// re-wakes well within one heartbeat/election interval regardless (continual
+/// Raft traffic even at rest), so this signal is inert in practice — it exists
+/// now, ahead of need, because phase-1 PR3's quiescence makes
+/// [`RaftCore::next_deadline`] return `None` for real: a quiesced leader's
+/// consensus loop then has **no timer at all**, parked purely on inbound
+/// traffic, [`ProposePending`], and this signal — so [`shutdown`](RaftKvNode::shutdown)
+/// must raise it (finding 4's hazard 1: without this, a quiesced group's
+/// `shutdown()` could sit unnoticed forever instead of within one wake) and
+/// [`RaftKvNode::wake`] exists as the same hook a later PR's edge/reconciler
+/// proactive-wake caller (PR4) and quiescence's own un-quiesce triggers (PR3)
+/// reuse. Kept distinct from `ProposeSignal` (proposer-specific: replicates a
+/// freshly appended entry immediately) and `ApplySignal` (apply-task-specific)
+/// rather than overloading either, since a generic "please re-evaluate, nothing
+/// specific happened" wake is a different concept from either of those.
+#[derive(Default)]
+struct WakeSignal {
+    /// Set by `shutdown`/`wake`, consumed by the consensus loop.
+    pending: AtomicBool,
+    /// The consensus loop's waker, registered each time it parks.
+    waker: AtomicWaker,
+}
+
+impl WakeSignal {
+    /// Raise the flag, then wake the parked consensus loop — same
+    /// register-before-check discipline as [`ProposeSignal::notify`].
+    fn notify(&self) {
+        self.pending.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+}
+
+/// A future that resolves once a driver-level wake is pending, for the
+/// consensus loop's `select` — the [`WakeSignal`] counterpart to
+/// [`ProposePending`]/[`ApplyPending`].
+struct WakePending<'a> {
+    signal: &'a WakeSignal,
+}
+
+impl Future for WakePending<'_> {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         self.signal.waker.register(cx.waker());
@@ -187,6 +298,14 @@ pub const ALL_KINDS: [u8; 5] = [
     KIND_FOOTPRINT,
     KIND_CURSOR,
 ];
+
+/// A single derived `(row kind, logical key, value)` write — `None` value
+/// means a tombstone. The element `KvCommand::KindBatch::writes` and (ADR
+/// 0046 A1) `txn::TxnWrite::kind_writes` share; named once here so every
+/// function that handles this shape (`materialize_derived`, the codec, the
+/// apply-time token check) names it the same way instead of repeating the
+/// tuple.
+pub type KindWrite = (u8, Vec<u8>, Option<Vec<u8>>);
 
 /// The sibling scope set a tablet group owns, derived from its **parent**
 /// scope (`escape(table)` + this tablet's range), indexed by kind selector.
@@ -468,9 +587,36 @@ pub enum KvCommand {
     /// partial application would break exactly the atomicity this exists for.
     /// Keys are logical (token-leading, ADR 0022) — the kind selects the scope,
     /// it is never part of the key.
+    ///
+    /// **`conditions` (ADR 0046 "evaluate at leader" seatbelt, modeled on
+    /// [`TxnStage`](Self::TxnStage)'s own `conditions` field)**: `(key,
+    /// expected)` pairs — `expected: Some(bytes)` means `key`'s current
+    /// *committed* value (envelope-unwrapped, the same read discipline `Cas`/
+    /// `TxnStage` use) must equal `bytes` exactly; `None` means it must be
+    /// absent. Byte-level OCC, not a rich expression, exactly like
+    /// `TxnStage.conditions` — a caller (`animusd`'s leader-side write
+    /// evaluator) compiles its own richer condition against a pre-read down to
+    /// "the value must still be exactly what I read" before it ever reaches
+    /// here. Unlike `TxnStage`, a `KindBatch` condition failure has **no**
+    /// outcome-introspection channel — a condition-failed entry no-ops
+    /// silently, indistinguishable from a fence/seal miss, deliberately (the
+    /// existing generic-error/probe-poll-timeout contract every
+    /// `put_kind_batch_fenced` caller already has to handle) — so this field
+    /// is checked once, **before** the fence/seal gate rather than gated
+    /// behind it: there is no reporting-priority reason (no `StageOutcome`
+    /// analogue to disambiguate) to skip the read when the entry would fence
+    /// out anyway. This field has **no production caller as of this PR** —
+    /// it lands ahead of its first real use (`animusd`'s leader-side
+    /// evaluate-then-propose write path, ADR 0046 U3) as the seatbelt against
+    /// a concurrent `TxnStage`/`TxnResolve` commit landing between that
+    /// evaluator's own-key read and its own propose call: real today (every
+    /// `rmw_lock` use lives in edge handlers, never `txn_resolver_loop`) but
+    /// unreachable until a future transaction stack can target an
+    /// indexed/streamed table (transactions are rejected on those tables
+    /// today).
     KindBatch {
         /// `(row kind, logical key, value)` — `None` writes a tombstone.
-        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        writes: Vec<KindWrite>,
         /// An optional **change-log record** to append in the same entry:
         /// `(key prefix, encoded record)`.
         ///
@@ -484,6 +630,7 @@ pub enum KvCommand {
         /// order). Making it structural also means the record can never be
         /// keyed inconsistently across replicas.
         change_log: Option<(Vec<u8>, Vec<u8>)>,
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
         ts: HlcTimestamp,
     },
@@ -632,12 +779,27 @@ pub enum KvCommand {
     /// existing fence/seal/foreign-intent whole-or-nothing behavior — see
     /// this variant's apply arm and [`StageOutcome`] for how a caller learns
     /// *which* reason a stage no-op'd for.
+    ///
+    /// **ADR 0046 A1 ("materialize-at-resolve")**: each `writes` entry is a
+    /// [`txn::TxnWrite`], carrying not just `key`/`value` but also an
+    /// optional derived kind-scope payload (`kind_writes`/`change_log`) —
+    /// evaluated at THIS participant's own leader at stage time (ADR 0046
+    /// Decision 1, U3). The payload rides inside the write's own
+    /// [`txn::Envelope::Intent`], opaque until `TxnResolve`'s commit branch
+    /// materializes it at its own resolve ts via the shared
+    /// `materialize_derived` helper — see `TxnWrite`'s doc for the full
+    /// argument (and why intent-staging a kind scope directly, ADR 0046
+    /// Decision 2, is rejected). Apply validates every `kind_writes` key
+    /// leads with its own write's `key`'s partition token (ADR 0022) —
+    /// a validated rejection (folded into this stage's structural `Fenced`
+    /// outcome), never an `assert!`, since this payload is wire-reachable
+    /// (via `ClientRequest::TxnPrepare`).
     TxnStage {
         txn_id: TxnId,
         record_key: Vec<u8>,
         record_table: String,
         is_anchor: bool,
-        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        writes: Vec<txn::TxnWrite>,
         spans: Vec<(String, KeyRange)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
@@ -1115,6 +1277,17 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// replicate a freshly appended entry immediately, cutting single-write latency
     /// (ADR 0017) — no waiting on the next heartbeat tick.
     propose_signal: Arc<ProposeSignal>,
+    /// **Wake-on-commit** signal (ADR 0044 phase-1 PR1): raised by the consensus
+    /// loop and by [`shutdown`](Self::shutdown) so the apply task's idle back-off
+    /// races this against [`APPLY_SAFETY_POLL`] instead of spinning on
+    /// `APPLY_IDLE_POLL`. See [`ApplySignal`]'s doc for the enumerated raise points.
+    apply_signal: Arc<ApplySignal>,
+    /// **Driver-level wake** signal (ADR 0044 phase-1 PR2): raised by
+    /// [`shutdown`](Self::shutdown) and [`wake`](Self::wake) so the consensus
+    /// loop's park races this alongside `propose_signal`/inbound traffic/the
+    /// timer arm — the hook phase-1 PR3's quiescence (a timerless park) and
+    /// PR4's proactive external wake both need. See [`WakeSignal`]'s doc.
+    wake_signal: Arc<WakeSignal>,
     /// Observability sink (ADR 0015). The public propose API records the real
     /// accept/reject outcome into it, and the consensus loop + apply task each hold
     /// a clone for the commit/apply/read-barrier/snapshot recording sites. Cheap to
@@ -1219,6 +1392,18 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// doc for the exact insert/remove rules and the rebuild-at-start
     /// source.
     txn_tracker: Arc<Mutex<TxnTracker>>,
+    /// ADR 0044 phase-1 PR5, fork D: an **external** quiesce veto any
+    /// subsystem outside this crate may hold — `animusd`'s
+    /// `change_consumer_loop` sets this for a group whose change log was
+    /// non-empty on its last sweep (see
+    /// [`set_quiesce_veto`](Self::set_quiesce_veto)). ORed with this
+    /// group's own in-crate `txn_tracker`-derived veto (a non-empty
+    /// [`TxnTracker`] always vetoes on its own, no external input needed)
+    /// before being fed to [`RaftCore::set_quiesce_veto`] once per
+    /// consensus-loop iteration, alongside `quiesce_engine_caught_up`.
+    /// Defaults `false` — zero behavior change for every caller that never
+    /// touches it.
+    external_quiesce_veto: Arc<AtomicBool>,
 }
 
 impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
@@ -1326,6 +1511,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let engine_applied = Arc::new(AtomicU64::new(0));
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let propose_signal = Arc::new(ProposeSignal::default());
+        let apply_signal = Arc::new(ApplySignal::default());
+        let wake_signal = Arc::new(WakeSignal::default());
         // Group-start witnessing (ADR 0018 §2 amendment): fold in whatever
         // this (possibly shared, ADR 0026/0028) engine's highest MVCC
         // version already reflects, so this group's own future mints never
@@ -1349,6 +1536,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // mirroring `sealed`/`committed_ceiling`'s own rebuild-then-spawn
         // ordering.
         let txn_tracker = Arc::new(Mutex::new(TxnTracker::default()));
+        let external_quiesce_veto = Arc::new(AtomicBool::new(false));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -1361,6 +1549,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             stopped: Arc::clone(&stopped),
             apply_stopped: Arc::clone(&apply_stopped),
             propose_signal: Arc::clone(&propose_signal),
+            apply_signal: Arc::clone(&apply_signal),
+            wake_signal: Arc::clone(&wake_signal),
             metrics: metrics.clone(),
             scope: scope.clone(),
             kind_scopes: kind_scopes.clone(),
@@ -1372,6 +1562,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             last_proposed_ts,
             last_absorbed_term,
             txn_tracker: Arc::clone(&txn_tracker),
+            external_quiesce_veto: Arc::clone(&external_quiesce_veto),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -1390,6 +1581,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             stopped,
             apply_stopped,
             propose_signal,
+            apply_signal,
+            wake_signal,
             metrics,
             scope,
             kind_scopes,
@@ -1397,6 +1590,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             hlc,
             committed_ceiling,
             txn_tracker,
+            external_quiesce_veto,
         }));
         node
     }
@@ -1411,6 +1605,69 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// fresh `start`.
     pub fn shutdown(&self) {
         self.halted.store(true, Ordering::SeqCst);
+        // Wake a parked apply task (ADR 0044 phase-1 PR1): its idle back-off now
+        // races `ApplySignal` against a much longer `APPLY_SAFETY_POLL` (was a bare
+        // 5ms poll), so without this a shutdown request could sit unnoticed by the
+        // apply task for up to that whole interval instead of within one wake.
+        self.apply_signal.notify();
+        // Wake a parked consensus loop too (ADR 0044 phase-1 PR2, finding 4's
+        // hazard 1): today the consensus loop always re-wakes well within one
+        // heartbeat/election interval on its own (continual Raft traffic even at
+        // rest), so this is a no-op in effect — but once phase-1 PR3's
+        // quiescence makes `next_deadline()` return `None` for a quiesced
+        // leader, its consensus loop parks with **no timer at all**, and without
+        // this notify a `shutdown()` on such a group could sit unnoticed
+        // forever (never observed, so `is_stopped()` never flips, so
+        // `Reconciler::teardown`'s `RECLAIM_STOP_TIMEOUT` would expire and
+        // drop-table GC would never converge) instead of within one wake.
+        self.wake_signal.notify();
+    }
+
+    /// Explicitly wake this group's consensus loop for one extra pass. As of
+    /// ADR 0044 phase-1 PR3 this is what a locally-woken **quiesced follower**
+    /// uses to check "are you still there?" with its recorded leader
+    /// ([`RaftCore::on_local_wake`]'s doc — the consensus loop calls it on
+    /// this signal) instead of blindly waiting out a stale election timer.
+    /// PR4's proactive wake (the edge's `resolve_cp_route` before routing to a
+    /// local group, and the reconciler waking a group whose replica set
+    /// intersects a newly-`Down` node) will call this same method rather than
+    /// duplicating [`WakeSignal`]'s plumbing. Idempotent and always safe on
+    /// every other state (not quiesced, or this node is the leader): it then
+    /// only causes one extra, inert loop iteration (re-checking `halted` and
+    /// re-evaluating `next_deadline`), never an unwanted state change.
+    pub fn wake(&self) {
+        self.wake_signal.notify();
+    }
+
+    /// Opt this group into quiescence (ADR 0044 phase-1 PR3): once its leader
+    /// has had no local activity for `after` and every other entry-predicate
+    /// clause holds (see [`RaftCore::enable_quiescence`]'s doc), it stops
+    /// ticking until some event wakes it. Data-plane only — nothing in
+    /// `animus-control`'s own `RaftNode` calls the equivalent (fork G), so the
+    /// control plane's `next_deadline` never returns `None`.
+    pub fn enable_quiescence(&self, after: Duration) {
+        self.lock().enable_quiescence(after);
+    }
+
+    /// Whether this group's local replica currently considers itself
+    /// quiesced (surfaced for tests and, in a later PR, the admin/dashboard
+    /// view — reading it never itself wakes the group, fork F).
+    #[must_use]
+    pub fn is_quiesced(&self) -> bool {
+        self.lock().is_quiesced()
+    }
+
+    /// ADR 0044 phase-1 PR5 (fork D): let an external subsystem (`animusd`'s
+    /// `change_consumer_loop`) hold or release the quiesce veto for this
+    /// group — set for a group whose change log was non-empty on its last
+    /// sweep, cleared once it drains. ORed with this group's own in-crate
+    /// `TxnTracker`-derived veto (always vetoing on a pending 2PC intent or
+    /// an unresolved decided record, no external input needed for that
+    /// part) inside the consensus loop, once per iteration — see that
+    /// loop's own doc. Idempotent, safe to call every tick regardless of
+    /// current state.
+    pub fn set_quiesce_veto(&self, held: bool) {
+        self.external_quiesce_veto.store(held, Ordering::SeqCst);
     }
 
     /// Whether [`shutdown`](Self::shutdown) has been requested.
@@ -1495,14 +1752,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let command = build(term);
         let ts = command_ts(&command);
         let result = record_propose(&self.metrics, core.propose(command));
-        if matches!(result, ProposeResult::Accepted { .. })
-            && let Some(ts) = ts
-        {
-            self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            if let Some(ts) = ts {
+                self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
+            }
+            // ADR 0044 phase-1 PR3, un-quiesce trigger (b): a local propose
+            // that actually lands is real leader activity — `propose` itself
+            // has no `now` to work with (see `RaftCore::note_local_activity`'s
+            // doc), so the driver supplies it here, inside the same held lock.
+            core.note_local_activity(self.env.now());
         }
         drop(core);
         if matches!(result, ProposeResult::Accepted { .. }) {
             self.propose_signal.notify();
+            // A single-node (majority-1) group's `core.propose` above can advance
+            // commit + apply inline (ADR 0044 phase-1 PR1) — nudge the apply task
+            // too in case that just created work for it.
+            self.apply_signal.notify();
         }
         result
     }
@@ -1526,14 +1792,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let (command, aux) = build(term);
         let ts = command_ts(&command);
         let result = record_propose(&self.metrics, core.propose(command));
-        if matches!(result, ProposeResult::Accepted { .. })
-            && let Some(ts) = ts
-        {
-            self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            if let Some(ts) = ts {
+                self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
+            }
+            // See `propose_ordered`'s identical note.
+            core.note_local_activity(self.env.now());
         }
         drop(core);
         if matches!(result, ProposeResult::Accepted { .. }) {
             self.propose_signal.notify();
+            // See `propose_ordered`'s identical note: a single-node group's
+            // `core.propose` can advance commit + apply inline.
+            self.apply_signal.notify();
         }
         (result, aux)
     }
@@ -1781,26 +2052,31 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// the write it describes. Keys are **logical** and token-leading
     /// (ADR 0022); the kind selects the scope and is never part of the key.
     ///
-    /// Stamps `fence = KeyRange::whole()`; use
+    /// Stamps `fence = KeyRange::whole()` and no `conditions`; use
     /// [`put_kind_batch_fenced`](Self::put_kind_batch_fenced) to stamp a
-    /// narrower one.
+    /// narrower fence or supply own-key OCC conditions.
     pub fn put_kind_batch(
         &self,
-        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        writes: Vec<KindWrite>,
         change_log: Option<(Vec<u8>, Vec<u8>)>,
     ) -> ProposeResult {
-        self.put_kind_batch_fenced(writes, change_log, KeyRange::whole())
+        self.put_kind_batch_fenced(writes, change_log, Vec::new(), KeyRange::whole())
     }
 
     /// As [`put_kind_batch`](Self::put_kind_batch), but the leader stamps its
-    /// own `fence` into the entry. If **any** key falls outside `fence`, none of
-    /// the batch applies — the fence gates the whole atomic entry, since a
-    /// half-applied index write is exactly what colocating the kinds exists to
-    /// prevent.
+    /// own `fence` into the entry, and may supply own-key OCC `conditions`. If
+    /// **any** key falls outside `fence`, none of the batch applies — the
+    /// fence gates the whole atomic entry, since a half-applied index write
+    /// is exactly what colocating the kinds exists to prevent. See
+    /// [`KvCommand::KindBatch`]'s doc for what `conditions` means and why it
+    /// is checked ahead of the fence/seal gate; pass an empty `Vec` for the
+    /// pre-existing no-conditions behavior (every caller before this field
+    /// existed).
     pub fn put_kind_batch_fenced(
         &self,
-        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        writes: Vec<KindWrite>,
         change_log: Option<(Vec<u8>, Vec<u8>)>,
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
     ) -> ProposeResult {
         self.propose_ordered(|term| {
@@ -1809,6 +2085,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             KvCommand::KindBatch {
                 writes,
                 change_log,
+                conditions,
                 fence,
                 ts,
             }
@@ -1933,6 +2210,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         table: &str,
         writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Option<(TxnId, Vec<u8>, StageOutcome)> {
+        let writes = writes
+            .into_iter()
+            .map(|(k, v)| txn::TxnWrite::plain(k, v))
+            .collect();
         self.txn_stage_anchor(table, writes, Vec::new(), Vec::new())
             .await
     }
@@ -1967,7 +2248,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     pub async fn txn_stage_anchor(
         &self,
         table: &str,
-        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        writes: Vec<txn::TxnWrite>,
         participant_spans: Vec<(String, KeyRange)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Option<(TxnId, Vec<u8>, StageOutcome)> {
@@ -1975,7 +2256,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             !writes.is_empty(),
             "raftkv txn_stage: writes must be non-empty"
         );
-        let anchor = &writes[0].0;
+        let anchor = &writes[0].key;
         assert!(
             anchor.len() >= animus_tablet::TOKEN_BYTES,
             "raftkv txn_stage: anchor key must lead with the {}-byte partition token \
@@ -1984,7 +2265,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             anchor.len()
         );
         let token = anchor[..animus_tablet::TOKEN_BYTES].to_vec();
-        let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
+        let keys: Vec<Vec<u8>> = writes.iter().map(|w| w.key.clone()).collect();
         let fence = self.scope_range();
         let record_table = table.to_owned();
         let (result, (txn_id, record_key)) = self.propose_ordered_aux(|term| {
@@ -2046,14 +2327,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         txn_id: TxnId,
         record_key: Vec<u8>,
         record_table: String,
-        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        writes: Vec<txn::TxnWrite>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Option<(HlcTimestamp, StageOutcome)> {
         assert!(
             !writes.is_empty(),
             "raftkv txn_stage_participant: writes must be non-empty"
         );
-        let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
+        let keys: Vec<Vec<u8>> = writes.iter().map(|w| w.key.clone()).collect();
         let fence = self.scope_range();
         let (result, ts) = self.propose_ordered_aux(|term| {
             let ts = self.mint_pushed(term, &keys);
@@ -2617,9 +2898,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// the control plane drives to move a replica off a failed node onto a spare,
     /// or to grow the group as the cluster grows.
     pub fn change_membership(&self, voters: BTreeSet<NodeId>) -> ProposeResult {
-        let result = record_reconfigure(&self.metrics, self.lock().change_membership(voters));
+        let mut core = self.lock();
+        let result = record_reconfigure(&self.metrics, core.change_membership(voters));
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            // ADR 0044 phase-1 PR3, un-quiesce trigger (b): see
+            // `propose_ordered`'s identical note.
+            core.note_local_activity(self.env.now());
+        }
+        drop(core);
         if matches!(result, ProposeResult::Accepted { .. }) {
             self.propose_signal.notify();
+            // A single-node group's config-change no-op can commit + apply inline
+            // (ADR 0044 phase-1 PR1), same as `propose_ordered`.
+            self.apply_signal.notify();
         }
         result
     }
@@ -2945,6 +3236,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 record_key,
                 record_table,
                 staged_value,
+                ..
             } => {
                 // The record lives in the **anchor's** tablet, which is
                 // this same tablet's scope for a single-participant
@@ -3138,11 +3430,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// (`StorageScope::physical_bounds`) rather than trusted to a caller.
     ///
     /// An unknown `kind` scans as empty.
+    ///
+    /// `limit` is a **per-tablet cap, not pushdown** — `StorageEngine::scan`
+    /// has no limit parameter of its own, so this still reads the whole
+    /// `[start, end)` sub-range off the engine; the win is a smaller wire
+    /// payload and less coordinator-side memory for a caller that only
+    /// wants a bounded prefix (`ClientCtx::cp_scan_kind_table`'s per-tablet
+    /// fan-out, ADR 0041 §5), never reduced engine I/O. Applied **after**
+    /// the intent filter below (mirroring [`local_scan`](Self::local_scan)'s
+    /// identical ordering), so a still-`Pending` row interleaved in the
+    /// requested range never silently consumes one of the caller's
+    /// requested slots.
     pub async fn local_scan_kind(
         &self,
         kind: u8,
         start: &[u8],
         end: Option<&[u8]>,
+        limit: Option<usize>,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let Some(scope) = self.kind_scopes.get(kind as usize) else {
             return Vec::new();
@@ -3173,7 +3477,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 None => Vec::new(),
             },
         };
-        raw.into_iter()
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = raw
+            .into_iter()
             .filter_map(|(k, vv)| {
                 let logical = scope.strip_in_range(&k)?.to_vec();
                 match txn::decode_envelope(&vv.value) {
@@ -3181,7 +3486,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     txn::Envelope::Intent { .. } => None,
                 }
             })
-            .collect()
+            .collect();
+        if let Some(n) = limit {
+            pairs.truncate(n);
+        }
+        pairs
     }
 
     /// This tablet's own consumer-cursor watermark for `consumer` (ADR
@@ -3295,11 +3604,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// [`KvCommand::KindBatch`] writes them, and it always commits outright),
     /// so there is no intent to resolve here, unlike
     /// [`linearizable_scan`](Self::linearizable_scan)'s base-scope reads.
+    ///
+    /// `limit` is threaded straight to [`local_scan_kind`](Self::local_scan_kind)
+    /// — see that method's doc for why this is a **per-tablet cap, not
+    /// pushdown**.
     pub async fn linearizable_scan_kind(
         &self,
         kind: u8,
         start: &[u8],
         end: Option<&[u8]>,
+        limit: Option<usize>,
     ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         if !self.read_barrier().await {
             return None;
@@ -3308,7 +3622,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.ensure_ceiling_above(ts).await {
             return None;
         }
-        let rows = self.local_scan_kind(kind, start, end).await;
+        let rows = self.local_scan_kind(kind, start, end, limit).await;
         // Bump the *whole requested span*, mirroring `linearizable_scan`'s
         // identical reasoning — a future write anywhere in `[start, end)` is
         // pushed above this read regardless of how many rows it returned.
@@ -3490,6 +3804,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 record_key,
                 record_table,
                 staged_value,
+                ..
             } if &found == txn_id => {
                 // Built for parity with `resolve_once_step`'s own call —
                 // unused here whenever `status` isn't `Pending` (the only
@@ -4239,16 +4554,21 @@ fn record_reconfigure(metrics: &MetricsHandle, result: ProposeResult) -> Propose
     result
 }
 
-/// Record the snapshot-shipping metrics implied by the messages the consensus loop
-/// just emitted (ADR 0015), mirroring the control plane's `record_outbound`: every
-/// outbound `InstallSnapshot` is one chunk actually *shipped*; an outbound
-/// `InstallSnapshotResp` whose `last_index > 0` marks a completed *install* on the
-/// follower that just finished (observed here since the follower is what emits the
-/// ack). A pure read of `outs`.
+/// Record the snapshot-shipping + replication-traffic metrics implied by the
+/// messages the consensus loop just emitted (ADR 0015), mirroring the control
+/// plane's `record_outbound`: every outbound `InstallSnapshot` is one chunk
+/// actually *shipped*; an outbound `InstallSnapshotResp` whose `last_index >
+/// 0` marks a completed *install* on the follower that just finished
+/// (observed here since the follower is what emits the ack); every outbound
+/// `AppendEntries` (replication or heartbeat) counts once — the per-tablet
+/// counterpart of the control plane's `AppendEntriesSent`, and what an
+/// idle/quiesced group's own heartbeat traffic going flat (ADR 0044 phase-1)
+/// is measured against. A pure read of `outs`.
 fn record_kv_outbound(metrics: &MetricsHandle, outs: &[(NodeId, KvWire)]) {
     for (_, wire) in outs {
         if let KvWire::Raft(msg) = wire {
             match msg {
+                RaftMsg::AppendEntries { .. } => metrics.incr(Metric::CpAppendEntriesSent),
                 RaftMsg::InstallSnapshot { .. } => metrics.incr(Metric::CpSnapshotShips),
                 RaftMsg::InstallSnapshotResp { last_index, .. } if *last_index > 0 => {
                     metrics.incr(Metric::CpSnapshotInstalls);
@@ -4267,11 +4587,20 @@ fn record_kv_outbound(metrics: &MetricsHandle, outs: &[(NodeId, KvWire)]) {
 /// timeout (ADR 0017 — the driver-liveness fix). Holds `wal_lock` so the append
 /// cannot interleave with the apply task's compaction rewrite of the same file.
 /// Durability precedes visibility: `mark_durable_through` follows the `fsync`.
+///
+/// **Raises `apply_signal`** (ADR 0044 phase-1 PR1) whenever it reaches
+/// `mark_durable_through`: the leader's apply frontier is `min(commit_index,
+/// durable_index)` (`RaftCore::apply`'s doc), so advancing `durable_index` here is
+/// exactly the point that can newly unblock already-committed-but-not-yet-durable
+/// entries for the apply task to merge — a transition the follower-side in-line
+/// apply (on `AppendEntries`, gated on `commit_index` alone) doesn't need, but this
+/// leader-side one does.
 async fn persist_wal<E: Env>(
     env: &E,
     wal: &str,
     core: &Arc<Mutex<KvCore>>,
     wal_lock: &AsyncMutex<()>,
+    apply_signal: &ApplySignal,
 ) {
     let _wal = wal_lock.lock().await;
     let (records, through) = {
@@ -4290,6 +4619,7 @@ async fn persist_wal<E: Env>(
     core.lock()
         .expect("raftkv core poisoned")
         .mark_durable_through(through);
+    apply_signal.notify();
 }
 
 /// Whether `key` falls inside any range this group has already sealed
@@ -4322,6 +4652,72 @@ fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimesta
         );
     }
     *max_applied_ts = Some(ts);
+}
+
+/// **The one shared "materialize derived writes at this ts" helper (ADR
+/// 0046 binding decision)** — `KvCommand::KindBatch`'s apply arm and
+/// `KvCommand::TxnResolve`'s commit branch both call this and only this,
+/// so their output is byte-identical for identical payloads. Queues every
+/// `(kind, key, value)` write (`None` = tombstone) into `pending` at
+/// `hlc::pack(ts)`, then — if `change_log` is present — completes its key as
+/// `prefix || hlc::pack(ts)` and queues it too, in [`KIND_CHANGE`]'s scope.
+/// `ts` is always the caller's OWN entry's commit timestamp: `KindBatch`
+/// passes its own entry's `ts`; `TxnResolve` passes the *resolve* entry's
+/// `ts` (never the transaction's `commit_ts`, and never the stage's `ts` —
+/// see `txn::TxnWrite`'s doc and ADR 0018 §2's B1 amendment for why a
+/// change record must be keyed by the entry that actually fixes its
+/// position in this tablet's own commit order). An unknown row kind is
+/// skipped with a warning, never guessed at — the same discipline
+/// `KindBatch`'s own arm already had before this extraction.
+fn materialize_derived(
+    kind_scopes: &[StorageScope; ALL_KINDS.len()],
+    writes: &[KindWrite],
+    change_log: &Option<(Vec<u8>, Vec<u8>)>,
+    ts: HlcTimestamp,
+    pending: &mut Vec<MergeOp>,
+) {
+    for (kind, key, value) in writes {
+        let Some(kscope) = kind_scopes.get(*kind as usize) else {
+            tracing::warn!(
+                kind,
+                "materialize_derived: write of unknown row kind skipped"
+            );
+            continue;
+        };
+        let physical = kscope.physical(key);
+        match value {
+            Some(v) => pending.push(MergeOp::put(
+                physical,
+                txn::encode_committed(v),
+                hlc::pack(ts),
+            )),
+            None => pending.push(MergeOp::tombstone(physical, hlc::pack(ts))),
+        }
+    }
+    // The change-log record's key is completed here, with THIS caller's
+    // commit timestamp — the only one that agrees with this entry's
+    // position in the log (ADR 0041 §4a / ADR 0046 principle 1).
+    if let Some((prefix, record)) = change_log {
+        let mut key = prefix.clone();
+        key.extend_from_slice(&hlc::pack(ts).to_be_bytes());
+        pending.push(MergeOp::put(
+            kind_scopes[KIND_CHANGE as usize].physical(&key),
+            txn::encode_committed(record),
+            hlc::pack(ts),
+        ));
+    }
+}
+
+/// ADR 0046 A1: every kind-write key a [`txn::TxnWrite`] stages must lead
+/// with `base_key`'s own partition token (ADR 0022) — see the call sites'
+/// doc for why this is checked, not assumed. `base_key` shorter than a full
+/// token is itself invalid (every real data-plane key leads with one).
+fn kind_writes_token_valid(base_key: &[u8], kind_writes: &[KindWrite]) -> bool {
+    let tb = animus_tablet::TOKEN_BYTES;
+    base_key.len() >= tb
+        && kind_writes
+            .iter()
+            .all(|(_, kk, _)| kk.len() >= tb && kk[..tb] == base_key[..tb])
 }
 
 /// Logged-warning cap for [`surface_suspicious_merge_noop`] (below): the
@@ -4591,53 +4987,68 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             KvCommand::KindBatch {
                 writes,
                 change_log,
+                conditions,
                 fence,
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
+                // ADR 0046 "evaluate at leader" seatbelt: this entry's own-key
+                // `conditions` (see `KvCommand::KindBatch`'s doc) are checked
+                // against the KIND_BASE scope — the only scope a production
+                // caller ever conditions on — BEFORE the fence/seal gate
+                // below. This deliberately differs from `TxnStage`'s own
+                // `condition_failure`, which only evaluates once its entry is
+                // otherwise known to be in-fence (so `StageOutcome` can report
+                // the fence/seal reason ahead of a condition one): a
+                // `KindBatch` condition failure has no outcome-introspection
+                // channel at all — it no-ops silently, indistinguishable from
+                // a fence/seal miss either way — so there is no
+                // reporting-priority reason to gate the read behind the fence
+                // check here. Drain the pending run first (mirrors `Cas`'s and
+                // `TxnStage`'s own read-after-flush-pending discipline) so a
+                // condition observes every earlier committed write in this
+                // same apply pass.
+                let conditions_ok = if conditions.is_empty() {
+                    true
+                } else {
+                    flush_pending(storage, &mut pending, metrics).await;
+                    let mut ok = true;
+                    for (key, expected) in &conditions {
+                        let raw = storage
+                            .get(&scope.physical(key))
+                            .await
+                            .expect("raftkv kind batch condition read");
+                        let matches = match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                            None => expected.is_none(),
+                            Some(txn::Envelope::Committed(v)) => Some(v) == *expected,
+                            // An unresolved intent makes "the current
+                            // committed value" ambiguous — never guess at a
+                            // match, mirroring `Cas`/`TxnStage`'s identical
+                            // discipline.
+                            Some(txn::Envelope::Intent { .. }) => false,
+                        };
+                        if !matches {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                };
                 // Gated as one unit, exactly like `Batch` — an index write that
                 // half-applied would leave an LSI row describing a base row
                 // that never landed, which is the one thing colocating them was
                 // supposed to make impossible. Every kind shares this tablet's
                 // single range, so one fence covers them all.
-                if writes
-                    .iter()
-                    .all(|(_, key, _)| fence.contains(key) && !is_sealed(sealed, key))
+                if conditions_ok
+                    && writes
+                        .iter()
+                        .all(|(_, key, _)| fence.contains(key) && !is_sealed(sealed, key))
                 {
-                    for (kind, key, value) in &writes {
-                        // An unknown kind cannot be applied anywhere safe (this
-                        // build has no scope for it) and must not silently land
-                        // in another kind's keyspace. It can only arise from a
-                        // peer proposing a kind this build predates, so skip it
-                        // rather than guess — the same call this crate's
-                        // snapshot install makes for an unknown-kind entry.
-                        let Some(kscope) = kind_scopes.get(*kind as usize) else {
-                            tracing::warn!(kind, "KindBatch write of unknown row kind skipped");
-                            continue;
-                        };
-                        let physical = kscope.physical(key);
-                        match value {
-                            Some(v) => pending.push(MergeOp::put(
-                                physical,
-                                txn::encode_committed(v),
-                                hlc::pack(ts),
-                            )),
-                            None => pending.push(MergeOp::tombstone(physical, hlc::pack(ts))),
-                        }
-                    }
-                    // The change-log record's key is completed here, with THIS
-                    // entry's commit timestamp — the only one that agrees with
-                    // the entry's position in the log, and so the only one that
-                    // makes the log readable in commit order (ADR 0041 §4a).
-                    if let Some((prefix, record)) = &change_log {
-                        let mut key = prefix.clone();
-                        key.extend_from_slice(&hlc::pack(ts).to_be_bytes());
-                        pending.push(MergeOp::put(
-                            kind_scopes[KIND_CHANGE as usize].physical(&key),
-                            txn::encode_committed(record),
-                            hlc::pack(ts),
-                        ));
-                    }
+                    // ADR 0046 binding decision: the ONE shared
+                    // materialization helper, also used by `TxnResolve`'s
+                    // commit branch below — never a second copy of this
+                    // loop.
+                    materialize_derived(kind_scopes, &writes, &change_log, ts, &mut pending);
                 }
             }
             KvCommand::Delete { key, fence, ts } => {
@@ -4814,7 +5225,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // (a WAL-replay re-application) is unaffected — matched by
                 // `txn_id` equality, not mere presence of *an* intent.
                 let blocked_by = 'blocked: {
-                    for (key, _) in &writes {
+                    for w in &writes {
+                        let key = &w.key;
                         let Some(vv) = storage
                             .get(&scope.physical(key))
                             .await
@@ -4852,11 +5264,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // fence/engine (ADR 0018 §2/PR4).
                 let record_in_fence =
                     !is_anchor || (fence.contains(&record_key) && !is_sealed(sealed, &record_key));
+                // ADR 0046 A1: every kind-write key a write stages must lead
+                // with that write's own base key's partition token — checked
+                // here (a validated rejection, folded into the same
+                // structural `Fenced` outcome bucket as a fence/seal miss,
+                // never an `assert!`, since this payload is wire-reachable
+                // via `ClientRequest::TxnPrepare`) rather than assumed. This
+                // is also what makes `TxnResolve`'s own fence check over
+                // these same kind keys meaningful: a kind key sharing its
+                // base key's token sits at the same tablet-range position a
+                // plain `KindBatch` write's own key would.
+                let kind_tokens_ok = writes
+                    .iter()
+                    .all(|w| kind_writes_token_valid(&w.key, &w.kind_writes));
                 let all_in_fence = !already_decided
                     && blocked_by.is_none()
+                    && kind_tokens_ok
                     && writes
                         .iter()
-                        .all(|(k, _)| fence.contains(k) && !is_sealed(sealed, k))
+                        .all(|w| fence.contains(&w.key) && !is_sealed(sealed, &w.key))
                     && record_in_fence;
                 // ADR 0018 §2 apply-time write-key conditions amendment:
                 // evaluate this stage's own-key conditions (byte-level OCC
@@ -4912,14 +5338,20 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 if stage_ok {
                     flush_pending(storage, &mut pending, metrics).await;
                     let version = hlc::pack(ts);
-                    for (key, staged_value) in &writes {
+                    for w in &writes {
+                        // ADR 0046 A1: the derived kind-writes/change-log
+                        // payload rides inside this intent, opaque until
+                        // `TxnResolve`'s commit branch materializes it —
+                        // never written into a kind scope here.
                         let intent_env = txn::encode_intent(
                             &txn_id,
                             &record_key,
                             &record_table,
-                            staged_value.as_deref(),
+                            w.value.as_deref(),
+                            &w.kind_writes,
+                            w.change_log.as_ref(),
                         );
-                        let physical_key = scope.physical(key);
+                        let physical_key = scope.physical(&w.key);
                         let took_effect = storage
                             .merge(&physical_key, &intent_env, version)
                             .await
@@ -5288,6 +5720,48 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         .await
                         .expect("raftkv txn resolve record read")
                         .and_then(|vv| txn::decode_record(&vv.value));
+                    // ADR 0046 A1: read every key's own current value up
+                    // front — before deciding the whole-or-nothing fence
+                    // gate below — so that gate can also cover the derived
+                    // kind keys a commit is about to materialize (the #213
+                    // lesson: every key-writing command must carry AND
+                    // enforce the apply-time fence over every key it
+                    // writes, not just a subset). One read per key, reused
+                    // by the resolve loop further down — never a second
+                    // read pass.
+                    struct ResolvedIntent {
+                        staged_value: Option<Vec<u8>>,
+                        intent_version: Version,
+                        kind_writes: Vec<KindWrite>,
+                        change_log: Option<(Vec<u8>, Vec<u8>)>,
+                    }
+                    let mut resolved: Vec<Option<ResolvedIntent>> = Vec::with_capacity(keys.len());
+                    for key in &keys {
+                        let found = storage
+                            .get(&scope.physical(key))
+                            .await
+                            .expect("raftkv txn resolve key read")
+                            .and_then(|vv| match txn::decode_envelope(&vv.value) {
+                                txn::Envelope::Intent {
+                                    txn_id: found,
+                                    staged_value,
+                                    kind_writes,
+                                    change_log,
+                                    ..
+                                } if found == txn_id => Some(ResolvedIntent {
+                                    staged_value,
+                                    intent_version: vv.version,
+                                    kind_writes,
+                                    change_log,
+                                }),
+                                // Already resolved, or a different/newer
+                                // txn's intent has since overwritten this
+                                // key — nothing of ours left here.
+                                // Idempotent no-op.
+                                _ => None,
+                            });
+                        resolved.push(found);
+                    }
                     // ADR 0018 §2 write-loss amendment (Bug 3): every key in
                     // `keys` must fall inside this entry's own `fence` (and
                     // not a range this group has since sealed off) — the
@@ -5298,9 +5772,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // per-key: a partial reject would leave some of this
                     // transaction's keys resolved and others not, the same
                     // torn state a fence exists to prevent elsewhere.
+                    //
+                    // ADR 0046 A1 extends this same gate to the derived
+                    // kind keys a commit is about to materialize (LSI rows,
+                    // the change-log record) — new key-writing surface this
+                    // entry didn't have before, and just as capable of
+                    // landing on the wrong tablet if misrouted. The
+                    // change-log record's own key isn't checked here (its
+                    // HLC suffix isn't even minted yet at this point,
+                    // exactly like `KindBatch`'s own arm never fence-checks
+                    // its `change_log` prefix directly — it rides under the
+                    // same entry-wide gate as `kind_writes`' keys instead).
                     let all_in_fence = keys
                         .iter()
-                        .all(|k| fence.contains(k) && !is_sealed(sealed, k));
+                        .all(|k| fence.contains(k) && !is_sealed(sealed, k))
+                        && resolved.iter().flatten().all(|ri| {
+                            ri.kind_writes
+                                .iter()
+                                .all(|(_, kk, _)| fence.contains(kk) && !is_sealed(sealed, kk))
+                        });
                     // ADR 0018 §2/PR6 hardening (defense-in-depth, not a
                     // reproduced bug): every current decider
                     // (`animusd`'s ordinary `cp_txn` commit path and its
@@ -5369,31 +5859,19 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         );
                     }
                     let version = hlc::pack(ts);
-                    for key in &keys {
+                    for (key, resolved_intent) in keys.iter().zip(resolved) {
                         if outcome_mismatch || !all_in_fence {
                             continue; // whole-or-nothing: skip every key, not just this one
                         }
                         let physical_key = scope.physical(key);
-                        let Some(vv) = storage
-                            .get(&physical_key)
-                            .await
-                            .expect("raftkv txn resolve key read")
+                        let Some(ResolvedIntent {
+                            staged_value,
+                            intent_version,
+                            kind_writes,
+                            change_log,
+                        }) = resolved_intent
                         else {
-                            continue; // nothing left here to resolve
-                        };
-                        let intent = match txn::decode_envelope(&vv.value) {
-                            txn::Envelope::Intent {
-                                txn_id: found,
-                                staged_value,
-                                ..
-                            } if found == txn_id => Some(staged_value),
-                            // Already resolved, or a different/newer txn's
-                            // intent has since overwritten this key —
-                            // nothing of ours left here. Idempotent no-op.
-                            _ => None,
-                        };
-                        let Some(staged_value) = intent else {
-                            continue;
+                            continue; // nothing left here to resolve (idempotent no-op)
                         };
                         // ADR 0018 §2 write-loss amendment (Part B): every
                         // branch below already treated this key as resolved
@@ -5408,46 +5886,72 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         // used to leave a foreign tablet's key permanently
                         // unable to land correctly.
                         match outcome_commit_ts {
-                            Some(_commit_ts) => match staged_value {
-                                // Committed: the staged value becomes the
-                                // committed value.
-                                Some(v) => {
-                                    let took_effect = storage
-                                        .merge(&physical_key, &txn::encode_committed(&v), version)
-                                        .await
-                                        .expect("raftkv apply txn resolve commit");
-                                    if !took_effect {
-                                        surface_suspicious_merge_noop(
-                                            metrics,
-                                            suspicious_noop_log_budget,
-                                            "TxnResolve commit",
-                                            &physical_key,
-                                            version,
-                                            recovered_baseline_version,
-                                        );
+                            Some(_commit_ts) => {
+                                match staged_value {
+                                    // Committed: the staged value becomes the
+                                    // committed value.
+                                    Some(v) => {
+                                        let took_effect = storage
+                                            .merge(
+                                                &physical_key,
+                                                &txn::encode_committed(&v),
+                                                version,
+                                            )
+                                            .await
+                                            .expect("raftkv apply txn resolve commit");
+                                        if !took_effect {
+                                            surface_suspicious_merge_noop(
+                                                metrics,
+                                                suspicious_noop_log_budget,
+                                                "TxnResolve commit",
+                                                &physical_key,
+                                                version,
+                                                recovered_baseline_version,
+                                            );
+                                        }
+                                    }
+                                    // A staged delete resolves to an actual
+                                    // tombstone — the only place `TxnResolve`
+                                    // writes one, since it's finalizing an
+                                    // already-decided delete, not guessing.
+                                    None => {
+                                        let took_effect = storage
+                                            .merge_tombstone(&physical_key, version)
+                                            .await
+                                            .expect("raftkv apply txn resolve commit delete");
+                                        if !took_effect {
+                                            surface_suspicious_merge_noop(
+                                                metrics,
+                                                suspicious_noop_log_budget,
+                                                "TxnResolve commit delete",
+                                                &physical_key,
+                                                version,
+                                                recovered_baseline_version,
+                                            );
+                                        }
                                     }
                                 }
-                                // A staged delete resolves to an actual
-                                // tombstone — the only place `TxnResolve`
-                                // writes one, since it's finalizing an
-                                // already-decided delete, not guessing.
-                                None => {
-                                    let took_effect = storage
-                                        .merge_tombstone(&physical_key, version)
-                                        .await
-                                        .expect("raftkv apply txn resolve commit delete");
-                                    if !took_effect {
-                                        surface_suspicious_merge_noop(
-                                            metrics,
-                                            suspicious_noop_log_budget,
-                                            "TxnResolve commit delete",
-                                            &physical_key,
-                                            version,
-                                            recovered_baseline_version,
-                                        );
-                                    }
-                                }
-                            },
+                                // ADR 0046 A1 ("materialize-at-resolve"): on
+                                // commit only, materialize this write's
+                                // derived kind-scope rows + change-log
+                                // record — via the SAME shared helper
+                                // `KindBatch`'s own apply arm uses — at THIS
+                                // resolve entry's own `ts`, never the
+                                // transaction's `commit_ts` and never the
+                                // stage's own `ts` (ADR 0018 §2 B1: the key
+                                // position must be monotone in this
+                                // tablet's own log, which only the entry
+                                // that actually fixes commit order can
+                                // provide). Discarded entirely on abort —
+                                // see the `None` arm below.
+                                materialize_derived(
+                                    kind_scopes,
+                                    &kind_writes,
+                                    &change_log,
+                                    ts,
+                                    &mut pending,
+                                );
+                            }
                             None => {
                                 // Aborted: restore whatever this key held
                                 // immediately before the intent — never a
@@ -5457,7 +5961,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 // version this group has ever applied is
                                 // strictly increasing
                                 // (`assert_ts_monotonic`), so
-                                // `vv.version - 1` is guaranteed to sit
+                                // `intent_version - 1` is guaranteed to sit
                                 // strictly below the intent's own version
                                 // and at/above this key's true prior
                                 // version. **This one-hop-back lookback is
@@ -5479,7 +5983,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 // (via the `None` arm) genuinely absent —
                                 // never another live `Intent`.
                                 let prior = storage
-                                    .get_at(&physical_key, vv.version.saturating_sub(1))
+                                    .get_at(&physical_key, intent_version.saturating_sub(1))
                                     .await
                                     .expect("raftkv txn resolve prior read");
                                 let (took_effect, site) = match prior {
@@ -5780,6 +6284,8 @@ struct DriveState<E: Env, S: StorageEngine> {
     stopped: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
     propose_signal: Arc<ProposeSignal>,
+    apply_signal: Arc<ApplySignal>,
+    wake_signal: Arc<WakeSignal>,
     metrics: MetricsHandle,
     /// The **base**-kind scope (ADR 0041 §3) — see [`RaftKvNode::scope`].
     scope: StorageScope,
@@ -5789,6 +6295,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     hlc: Arc<Hlc>,
     committed_ceiling: Arc<AtomicU64>,
     txn_tracker: Arc<Mutex<TxnTracker>>,
+    external_quiesce_veto: Arc<AtomicBool>,
 }
 
 /// The `ts` a mutating [`KvCommand`] variant carries, or `None` for `NoOp`
@@ -5830,11 +6337,19 @@ fn witness_append_entries(hlc: &Hlc, msg: &RaftMsg<KvCommand>, now: Nanos) {
     }
 }
 
-/// Idle back-off for the apply task: when there is nothing committed-and-durable to
-/// merge it sleeps this long before re-checking. Under load `apply_and_compact`
-/// keeps returning `true`, so the task never sleeps and apply stays close behind
-/// commit — this only bounds latency (and CPU) while idle.
-const APPLY_IDLE_POLL: Duration = Duration::from_millis(5);
+/// Safety-net back-off for the apply task (ADR 0044 phase-1 PR1 — replaces the old
+/// unconditional `APPLY_IDLE_POLL` 5ms poll): when there is nothing committed-and-
+/// durable to merge, `apply_loop` races [`ApplyPending`] against a sleep of this
+/// length rather than looping every few milliseconds regardless of whether
+/// anything changed. [`ApplySignal`] normally resolves this well before the
+/// deadline; this bound only matters for a **signal-less** transition (the
+/// on-demand snapshot-image build `RaftCore::take_snapshot_needed` triggers, which
+/// is set purely off the leader's own heartbeat/replicate cycle with no commit
+/// advance — see `ApplySignal`'s doc) or a missed/lost wakeup, so a missed signal
+/// degrades to today's (pre-fix) latency at worst, never a stall. Under load
+/// `apply_and_compact` keeps returning `true`, so the task never sleeps and apply
+/// stays close behind commit — this only bounds latency (and CPU) while idle.
+const APPLY_SAFETY_POLL: Duration = Duration::from_millis(250);
 
 /// The per-node **consensus loop**: recover from the WAL, spawn the apply task, then
 /// repeatedly persist the WAL, wait for the next message or timer, step the core,
@@ -5859,6 +6374,8 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         stopped,
         apply_stopped,
         propose_signal,
+        apply_signal,
+        wake_signal,
         metrics,
         scope,
         kind_scopes,
@@ -5866,6 +6383,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         hlc,
         committed_ceiling,
         txn_tracker,
+        external_quiesce_veto,
     } = st;
 
     let wal = wal_file(stream);
@@ -5956,7 +6474,8 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&hlc),
         sealed,
         committed_ceiling,
-        txn_tracker,
+        Arc::clone(&txn_tracker),
+        Arc::clone(&apply_signal),
     ));
 
     loop {
@@ -5967,28 +6486,68 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             stopped.store(true, Ordering::SeqCst);
             return;
         }
-        persist_wal(&env, &wal, &core, &wal_lock).await;
+        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal).await;
 
         let now = env.now();
-        let deadline = core.lock().expect("raftkv core poisoned").next_deadline();
-        let wait = Duration::from_nanos(deadline.0.saturating_sub(now.0));
+        // ADR 0044 phase-1 PR3: feed the one external input the core has no
+        // visibility into itself — whether the (separate, async) apply task
+        // has actually caught the engine up to `last_applied` — in the same
+        // lock acquisition as `next_deadline`, once per loop iteration, before
+        // `tick` can ever consult it (`quiesce_entry_ok`'s own doc).
+        let (deadline, was_quiesced) = {
+            let mut c = core.lock().expect("raftkv core poisoned");
+            let caught_up = engine_applied.load(Ordering::SeqCst) == c.last_applied();
+            c.set_quiesce_engine_caught_up(caught_up);
+            // ADR 0044 phase-1 PR5, fork D: feed the quiesce veto — a
+            // non-empty `TxnTracker` (this group has a pending 2PC intent or
+            // a decided-but-unresolved record still owed a resolve) always
+            // vetoes on its own; ORed with whatever external subsystem
+            // (`animusd`'s `change_consumer_loop`) has set via
+            // `set_quiesce_veto`. Same lock acquisition, same once-per-
+            // iteration cadence as `quiesce_engine_caught_up` just above.
+            let txn_veto = {
+                let t = txn_tracker.lock().expect("txn tracker poisoned");
+                !t.pending.is_empty() || !t.unresolved_decided.is_empty()
+            };
+            c.set_quiesce_veto(txn_veto || external_quiesce_veto.load(Ordering::SeqCst));
+            (c.next_deadline(), c.is_quiesced())
+        };
+        // `None` (ADR 0044 phase-1 PR3 quiescence) drops the timer arm
+        // entirely rather than sleeping on a synthetic wait, so a genuinely
+        // quiesced group posts zero `SimEnv` timeline events instead of a
+        // degenerate busy-loop.
+        let timer = match deadline {
+            Some(deadline) => {
+                Either::Left(env.sleep(Duration::from_nanos(deadline.0.saturating_sub(now.0))))
+            }
+            None => Either::Right(std::future::pending()),
+        };
 
         // Snapshot the commit index before stepping the core so a real advance
         // (ADR 0015: record the outcome, not the attempt) can be attributed below.
         let before_commit = core.lock().expect("raftkv core poisoned").commit_index();
 
         // Each step yields outbound `KvWire` messages (Raft traffic and/or a read
-        // probe ack). Three wakeup sources race: an inbound message, the Raft timer
-        // deadline, and a **wake-on-propose** signal — a proposer raising the flag so
-        // a freshly appended entry replicates at once (ADR 0017 single-write latency),
-        // treated like an immediate heartbeat (`replicate_now`) rather than waiting
-        // for the ~50ms tick.
-        let recv_or_timer = select(env.recv_stream(stream), env.sleep(wait));
+        // probe ack). Four wakeup sources race: an inbound message, the Raft timer
+        // deadline (absent — `None` — while quiesced, PR3), a **wake-on-propose**
+        // signal — a proposer raising the flag so a freshly appended entry
+        // replicates at once (ADR 0017 single-write latency), treated like an
+        // immediate heartbeat (`replicate_now`) rather than waiting for the ~50ms
+        // tick — and the driver-level **wake** signal (`shutdown`/`wake`, PR2/PR4),
+        // which does nothing itself beyond looping back to re-check `halted` and
+        // re-evaluate `next_deadline`.
+        let recv_or_timer = select(env.recv_stream(stream), timer);
+        let wake_or_recv_or_timer = select(
+            WakePending {
+                signal: &wake_signal,
+            },
+            recv_or_timer,
+        );
         let outs: Vec<(NodeId, KvWire)> = match select(
             ProposePending {
                 signal: &propose_signal,
             },
-            recv_or_timer,
+            wake_or_recv_or_timer,
         )
         .await
         {
@@ -6003,7 +6562,26 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                     .map(|(to, m)| (to, KvWire::Raft(m)))
                     .collect()
             }
-            Either::Right((Either::Left((envelope, _)), _)) => {
+            // Driver-level wake: looping back already re-checks `halted` and
+            // re-evaluates `next_deadline` (finding 4's hazard 1). It also
+            // covers a locally-woken **quiesced follower**'s "are you still
+            // there?" check (ADR 0044 phase-1 PR3, fork B) —
+            // `on_local_wake` is a no-op for every other state (not quiesced,
+            // or this node is the leader), so this arm stays inert exactly as
+            // it was in PR2 for a quiesced-leader wake or any wake on a
+            // ticking group.
+            Either::Right((Either::Left(((), _)), _)) => {
+                let entropy = env.next_u64();
+                let raft_outs = core
+                    .lock()
+                    .expect("raftkv core poisoned")
+                    .on_local_wake(env.now(), entropy);
+                raft_outs
+                    .into_iter()
+                    .map(|(to, m)| (to, KvWire::Raft(m)))
+                    .collect()
+            }
+            Either::Right((Either::Right((Either::Left((envelope, _)), _)), _)) => {
                 let entropy = env.next_u64();
                 match codec::decode_wire(&envelope.payload) {
                     Ok(KvWire::Raft(msg)) => {
@@ -6047,7 +6625,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                     }
                 }
             }
-            Either::Right((Either::Right(((), _)), _)) => {
+            Either::Right((Either::Right((Either::Right(((), _)), _)), _)) => {
                 let entropy = env.next_u64();
                 let raft_outs = core
                     .lock()
@@ -6060,16 +6638,42 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             }
         };
 
-        let after_commit = core.lock().expect("raftkv core poisoned").commit_index();
+        let (after_commit, install_pending, is_quiesced_now) = {
+            let c = core.lock().expect("raftkv core poisoned");
+            (c.commit_index(), c.has_pending_install(), c.is_quiesced())
+        };
         if after_commit > before_commit {
             metrics.incr_by(Metric::CpCommits, after_commit - before_commit);
+        }
+        // ADR 0044 phase-1 PR7: count every genuine quiesced/ticking
+        // transition this loop iteration observed — `was_quiesced` was
+        // sampled at the very top of this same iteration (before the
+        // message/timer/wake select and the core step that could have
+        // entered or exited quiescence), so exactly one of these fires per
+        // transition, never both and never a repeat while the state holds.
+        match (was_quiesced, is_quiesced_now) {
+            (false, true) => metrics.incr(Metric::CpQuiesces),
+            (true, false) => metrics.incr(Metric::CpUnquiesces),
+            _ => {}
+        }
+        // Wake-on-commit (ADR 0044 phase-1 PR1): a commit-index advance covers both
+        // a follower's in-line apply on `AppendEntries` (gated on `commit_index`
+        // alone, so it can create apply work with no separate `mark_durable_through`
+        // call this pass) and a completed snapshot install's `commit_index` jump
+        // (`RaftCore::handle`'s install-completion path sets it directly). A
+        // pending install is also checked explicitly — a read-only peek, never
+        // drained here — since a future core change could in principle decouple
+        // the two; over-notifying is always safe (the apply task just finds no
+        // work and re-parks), so this errs toward raising it.
+        if after_commit > before_commit || install_pending {
+            apply_signal.notify();
         }
         record_kv_outbound(&metrics, &outs);
 
         // Durability before action: persist (fsync) before shipping responses, so a
         // granted vote / appended entry is on disk before its message goes out.
         // Engine apply happens independently on the apply task.
-        persist_wal(&env, &wal, &core, &wal_lock).await;
+        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal).await;
 
         for (to, wire) in outs {
             env.send_stream(to, stream, codec::encode_wire(&wire)).await;
@@ -6080,10 +6684,14 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
 /// The per-node **apply task**: repeatedly install any received snapshot, apply
 /// committed-and-durable commands to the engine, and compact — all off the consensus
 /// loop, so this slow work never delays Raft message/heartbeat processing (the
-/// driver-liveness fix, ADR 0017). Backs off by [`APPLY_IDLE_POLL`] only when idle;
-/// under load it stays in lockstep behind commit. Exits after
-/// [`shutdown`](RaftKvNode::shutdown) between full apply passes (so the engine/WAL
-/// are never left mid-write), setting `apply_stopped` for the teardown path.
+/// driver-liveness fix, ADR 0017). Backs off by racing [`ApplyPending`] against
+/// [`APPLY_SAFETY_POLL`] only when idle (ADR 0044 phase-1 PR1 — replaces the old
+/// unconditional `APPLY_IDLE_POLL` 5ms poll); under load it stays in lockstep
+/// behind commit. Exits after [`shutdown`](RaftKvNode::shutdown) between full
+/// apply passes (so the engine/WAL are never left mid-write), setting
+/// `apply_stopped` for the teardown path — `shutdown` also raises `apply_signal`,
+/// so a parked task notices within one wake rather than waiting out the (now much
+/// longer) safety poll.
 #[allow(clippy::too_many_arguments)] // the apply task's shared-state bundle
 async fn apply_loop<E: Env, S: StorageEngine>(
     env: E,
@@ -6104,6 +6712,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     mut sealed: Vec<(KeyRange, HlcTimestamp)>,
     committed_ceiling: Arc<AtomicU64>,
     txn_tracker: Arc<Mutex<TxnTracker>>,
+    apply_signal: Arc<ApplySignal>,
 ) {
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
@@ -6152,7 +6761,13 @@ async fn apply_loop<E: Env, S: StorageEngine>(
         )
         .await;
         if !did_work {
-            env.sleep(APPLY_IDLE_POLL).await;
+            select(
+                ApplyPending {
+                    signal: &apply_signal,
+                },
+                env.sleep(APPLY_SAFETY_POLL),
+            )
+            .await;
         }
     }
 }
@@ -6338,7 +6953,7 @@ mod pr5_orphan_and_resurrection_tests {
                     txn_id_b,
                     record_key_b,
                     "orders".to_string(),
-                    vec![(kb_clone, Some(b"debited".to_vec()))],
+                    vec![txn::TxnWrite::plain(kb_clone, Some(b"debited".to_vec()))],
                     Vec::new(),
                 )
                 .await
@@ -6391,7 +7006,7 @@ mod pr5_orphan_and_resurrection_tests {
         // (it always mints a fresh id), so this in-crate test builds the
         // command by hand via the same private primitives
         // `txn_stage_anchor` itself uses internally.
-        let anchor_writes = vec![(ka.clone(), Some(b"placed".to_vec()))];
+        let anchor_writes = vec![txn::TxnWrite::plain(ka.clone(), Some(b"placed".to_vec()))];
         let fence = node_a.scope_range();
         let participant_span_end = txn::immediate_successor(&kb);
         let (result, late_ts) = node_a.propose_ordered_aux(|term| {

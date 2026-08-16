@@ -146,7 +146,7 @@ async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
-    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
 
     put_until_ok(addr0, "txn_t5", b"k1", b"seed-lower").await;
     put_until_ok(addr0, "txn_t5", b"k9", b"seed-upper").await;
@@ -161,9 +161,13 @@ async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
         ClientRequest::TxnPrepare {
             table: "txn_t5".to_string(),
             anchor: None,
-            writes: vec![(lower_key.clone(), Some(b"lower-recovered".to_vec()))],
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                lower_key.clone(),
+                Some(b"lower-recovered".to_vec()),
+            )],
             conditions: Vec::new(),
             participant_spans: Vec::new(),
+            pending_kind_writes: Vec::new(),
         },
     )
     .await;
@@ -175,9 +179,13 @@ async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
         ClientRequest::TxnPrepare {
             table: "txn_t5".to_string(),
             anchor: Some((txn_id.clone(), record_key.clone(), record_table.clone())),
-            writes: vec![(upper_key.clone(), Some(b"upper-recovered".to_vec()))],
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                upper_key.clone(),
+                Some(b"upper-recovered".to_vec()),
+            )],
             conditions: Vec::new(),
             participant_spans: Vec::new(),
+            pending_kind_writes: Vec::new(),
         },
     )
     .await;
@@ -238,7 +246,7 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
-    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
 
     put_until_ok(addr0, "txn_t6", b"k1", b"seed-lower").await;
     put_until_ok(addr0, "txn_t6", b"k9", b"seed-upper").await;
@@ -252,9 +260,13 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
         ClientRequest::TxnPrepare {
             table: "txn_t6".to_string(),
             anchor: None,
-            writes: vec![(lower_key.clone(), Some(b"lower-done".to_vec()))],
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                lower_key.clone(),
+                Some(b"lower-done".to_vec()),
+            )],
             conditions: Vec::new(),
             participant_spans: Vec::new(),
+            pending_kind_writes: Vec::new(),
         },
     )
     .await;
@@ -263,9 +275,13 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
         ClientRequest::TxnPrepare {
             table: "txn_t6".to_string(),
             anchor: Some((txn_id.clone(), record_key.clone(), record_table.clone())),
-            writes: vec![(upper_key.clone(), Some(b"upper-done".to_vec()))],
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                upper_key.clone(),
+                Some(b"upper-done".to_vec()),
+            )],
             conditions: Vec::new(),
             participant_spans: Vec::new(),
+            pending_kind_writes: Vec::new(),
         },
     )
     .await;
@@ -347,16 +363,17 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
 /// in the documented port-TOCTOU retry.
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 5);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[5 * i],
-                client: addrs[5 * i + 1],
-                dynamo: addrs[5 * i + 2],
-                cql: addrs[5 * i + 3],
-                admin: addrs[5 * i + 4],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                admin: addrs[6 * i + 4],
+                intra: addrs[6 * i + 5],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -483,12 +500,12 @@ async fn multi_tablet_txn_commits_atomically_across_a_split_table() {
             addr0,
             ClientRequest::Txn {
                 writes: vec![
-                    (
+                    animusd::TxnTableWrite::plain(
                         "txn_t".to_string(),
                         b"k2000000".to_vec(),
                         Some(b"lower-txn".to_vec()),
                     ),
-                    (
+                    animusd::TxnTableWrite::plain(
                         "txn_t".to_string(),
                         b"k8000000".to_vec(),
                         Some(b"upper-txn".to_vec()),
@@ -567,12 +584,12 @@ async fn txn_through_every_node_including_followers_succeeds() {
                 addr,
                 ClientRequest::Txn {
                     writes: vec![
-                        (
+                        animusd::TxnTableWrite::plain(
                             "txn_t2".to_string(),
                             lower_key.clone(),
                             Some(b"lo".to_vec()),
                         ),
-                        (
+                        animusd::TxnTableWrite::plain(
                             "txn_t2".to_string(),
                             upper_key.clone(),
                             Some(b"hi".to_vec()),
@@ -641,12 +658,12 @@ async fn concurrent_transactions_are_individually_atomic() {
                         addr,
                         ClientRequest::Txn {
                             writes: vec![
-                                (
+                                animusd::TxnTableWrite::plain(
                                     "txn_t3".to_string(),
                                     lower_key.clone(),
                                     Some(format!("lo{i}").into_bytes()),
                                 ),
-                                (
+                                animusd::TxnTableWrite::plain(
                                     "txn_t3".to_string(),
                                     upper_key.clone(),
                                     Some(format!("hi{i}").into_bytes()),
@@ -730,12 +747,12 @@ async fn violated_precondition_aborts_the_whole_transaction() {
             addr0,
             ClientRequest::Txn {
                 writes: vec![
-                    (
+                    animusd::TxnTableWrite::plain(
                         "txn_t4".to_string(),
                         lower_key.clone(),
                         Some(b"should-not-land".to_vec()),
                     ),
-                    (
+                    animusd::TxnTableWrite::plain(
                         "txn_t4".to_string(),
                         upper_key.clone(),
                         Some(b"should-not-land-either".to_vec()),

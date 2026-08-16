@@ -198,12 +198,13 @@ async fn data_node_joins_a_split_cluster_via_seed_and_gets_a_rebalanced_replica(
         put(&data_clients, table, b"k0", b"v0", 30).await;
     }
 
-    // 3. Join a THIRD data-only node — no expanded config, just the client
-    // addresses of every already-running node (control *and* data) as seeds,
-    // mirroring how an operator would point a new data node at a live
+    // 3. Join a THIRD data-only node — no expanded config, just the intra
+    // addresses (ADR 0047: `--seed` now names the seed's intra address, not
+    // its client one) of every already-running node (control *and* data) as
+    // seeds, mirroring how an operator would point a new data node at a live
     // cluster without knowing in advance which nodes are control vs. data.
-    let mut seeds: Vec<SocketAddr> = control_nodes.iter().map(Node::client_addr).collect();
-    seeds.extend(data_clients.iter().copied());
+    let mut seeds: Vec<SocketAddr> = control_nodes.iter().map(Node::intra_addr).collect();
+    seeds.extend(data_nodes.iter().map(Node::intra_addr));
     let join_index = config.len();
     let join_raftkv_id = animusd::config::node_id(join_index);
     let joined = join_data_fresh(&seeds, join_index, dir.path(), StorageBackend::Memory).await;

@@ -472,6 +472,34 @@ warn against:
   scan, for a case that only matters when both features are combined) or
   teaching the Streams read path to filter seed-originated records — neither
   attempted here.
+
+  **Update: closed by the "E1 mark + filter" fix (2026-08-16).** A
+  `#[serde(default)] seeded: bool` field on `animus_dynamo::ChangeRecord`,
+  set `true` only at `backfill_seed_tick`'s own record-construction site;
+  both `dynamo_streams.rs::get_records_sealed`/`get_records_open` filter it
+  out via one shared predicate (`is_seeded`) before a record ever reaches
+  `stream_record_json` — a fully-filtered page still yields a well-formed
+  `GetRecords` response (empty `Records`, a live `NextShardIterator`), since
+  both branches already derive `next_position`/`exhausted` from the
+  pre-filter page. The GSI drain is untouched: it never reads the flag (or
+  any record content), exactly per this ADR's own "coverage, not replay"
+  argument above. **Deliberately not fixed by giving the seeder a real
+  base-row image instead** — that was the other option named above, and it
+  would have been the *wrong* fix, not just a costlier one: real DynamoDB
+  emits **no** stream event at all for a GSI backfill's own coverage sweep
+  over pre-existing data, so synthesizing an image would fabricate an event
+  no real client would ever see — a fidelity regression relative to AWS's
+  own contract, not an improvement. Filtering the marker out is the
+  fidelity-*correct* fix (matching what DynamoDB actually does), independent
+  of which option happened to be cheaper. Regression:
+  `animusd/tests/stream_backfill_seed_filter.rs` (a real `UpdateTable`-
+  triggered backfill on a streamed, populated table, concurrent live writes
+  racing it, `GetRecords` drained to convergence — zero phantom-shaped
+  events, every real write delivered exactly once) and
+  `animus-test/tests/backfill_fault_corpus.rs::
+  streamed_mid_backfill_seed_flag_never_misclassified` (the flag's own
+  correctness under adversarial seeder/live-write interleaving, at
+  `ANIMUS_BACKFILL_SEEDS` depth).
 - **Split-lineage cursor inheritance (§5 Fork A) as a pure optimization.**
   The current restart-from-scratch behavior is unconditionally correct and
   geometrically bounded; inheriting a parent's cursor position (ADR 0043
@@ -479,12 +507,15 @@ warn against:
   change a correctness property. Worth revisiting only if a workload with
   very frequent splits during a very large backfill makes the redundant
   work measurable.
-- **`TxnStage` kind-writes** (unchanged from ADR 0041 §2's original
-  deferral, restated by ADR 0042 §16): lifting `TransactWriteItems`'s
-  rejection on an indexed *or* streamed table needs a multi-kind atomic
-  write extension to the transaction machinery's own apply path. Orthogonal
-  to this ADR — a backfilling index inherits the exact same rejection as an
-  already-`Active` one, no new interaction.
+- ~~`TxnStage` kind-writes~~ **Shipped (2026-08-16, ADR 0046 A1/U3)** —
+  `TransactWriteItems` on an indexed or streamed table no longer rejects;
+  see `docs/adr/0018-cross-tablet-transactions.md`'s 2026-08-16 amendment.
+  Orthogonal to this ADR, confirmed at the time: a backfilling (`Creating`)
+  index takes the identical kind-write-path as an already-`Active` one — a
+  transactional write against a table with a `Creating` GSI stages and
+  resolves the same LSI/change-log payload either way, and the backfill
+  seeder's own synthetic change records (§2/§3) are unaffected (they never
+  go through `TxnStage` at all).
 
 ## Consequences
 

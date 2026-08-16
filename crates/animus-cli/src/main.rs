@@ -40,6 +40,7 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     wal-segment <admin-addr> <seg> [tablet]\n    \
     key <admin-addr> <key> [tablet]\n    \
     split <admin-addr> <tablet> <split-key>\n    \
+    stream-grow <admin-addr> <table>\n    \
     flush|compact <admin-addr> <tablet>\n    \
     reconfigure <admin-addr> <tablet> <voter,voter,...>\n    \
     drain <admin-addr> <node-id>\n    \
@@ -195,6 +196,11 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
             let split_key = arg(3).ok_or("split needs <split-key>")?;
             let body = serde_json::json!({"tablet": tablet, "split_key": split_key}).to_string();
             ("POST", "/admin/tablet/split".into(), Some(body))
+        }
+        "stream-grow" => {
+            let table = arg(2).ok_or("stream-grow needs <table>")?;
+            let body = serde_json::json!({"table": table}).to_string();
+            ("POST", "/admin/stream/grow".into(), Some(body))
         }
         "flush" | "compact" => {
             let tablet: u64 = arg(2)
@@ -642,6 +648,16 @@ fn print_response(response: &ClientResponse) {
             }
         }
         ClientResponse::Error(e) => println!("error: {e}"),
+        // Internal evaluate-at-leader write RPC replies (ADR 0046 U3):
+        // consumed programmatically by `ClientCtx::cp_kind_write_item`'s own
+        // caller (`dynamo.rs`'s `PutItem`/`DeleteItem`/`UpdateItem`/
+        // `BatchWriteItem` handlers) and by tests driving the client
+        // protocol directly — not requested by any CLI subcommand of its
+        // own, mirroring `JoinInfo`/`MetadataDelta` above.
+        ClientResponse::KindWriteOk { old, new } => {
+            println!("kind write ok: old={old:?} new={new:?}");
+        }
+        ClientResponse::ConditionFailed => println!("condition failed"),
         // Join discovery (ADR 0032 PR2): consumed programmatically by
         // `animusd join`'s startup, not requested by any CLI subcommand —
         // printed raw if one ever surfaces here.
@@ -649,11 +665,13 @@ fn print_response(response: &ClientResponse) {
             control_ids,
             peers,
             client_route,
+            intra_route,
             admin_addrs,
         } => {
             println!("control ids: {control_ids:?}");
             println!("peers: {peers:?}");
             println!("client route: {client_route:?}");
+            println!("intra route: {intra_route:?}");
             println!("admin addrs: {admin_addrs:?}");
         }
         // Incremental `WatchMetadata` reply (ADR 0038 PR5): consumed

@@ -477,6 +477,19 @@ pub struct ChangeRecord {
     pub old_image: Option<Item>,
     /// The item after the mutation — `None` for a delete.
     pub new_image: Option<Item>,
+    /// `true` only for the ADR 0045 §2 backfill seeder's own synthetic,
+    /// image-less dirty marker (`animusd::index_drain::backfill_seed_tick`)
+    /// — never set by a live write. `#[serde(default)]` so a
+    /// pre-this-change record already on disk decodes as `false` (a real
+    /// write), which is exactly right: no pre-existing record was ever a
+    /// seed marker before this field existed. Exists so the Streams read
+    /// path (`animusd::dynamo_streams`) can filter these out — real
+    /// DynamoDB emits **no** stream event for a GSI backfill's own coverage
+    /// sweep over pre-existing data (ADR 0045's "Phantom no-image seed
+    /// records" follow-up); the GSI drain itself never reads this field, by
+    /// design (it re-derives from a live base-row scan regardless).
+    #[serde(default)]
+    pub seeded: bool,
 }
 
 impl ChangeRecord {
@@ -491,8 +504,15 @@ impl ChangeRecord {
             (None, Some(_)) => "INSERT",
             (Some(_), Some(_)) => "MODIFY",
             (Some(_), None) => "REMOVE",
-            // A record with neither image is never written; treat it as a
-            // no-op rather than panicking in a decode path.
+            // The only record ever constructed with neither image is a
+            // backfill-seed marker (`seeded: true`, ADR 0045 §2) — a pure
+            // dirty marker for the GSI drain, which never calls this. The
+            // Streams read path (`animusd::dynamo_streams`) filters every
+            // `seeded` record out before `stream_record_json` ever reaches
+            // this function (ADR 0045 follow-up "E1"), so this arm is
+            // unreachable from that caller in practice; kept as a no-op
+            // rather than a panic for any other decode path that might land
+            // here.
             (None, None) => "MODIFY",
         }
     }
@@ -736,6 +756,7 @@ mod tests {
             base_sk: b"42".to_vec(),
             old_image: None,
             new_image: Some(item.clone()),
+            seeded: false,
         };
         assert_eq!(insert.event_name(), "INSERT");
         assert_eq!(
@@ -747,6 +768,7 @@ mod tests {
             base_sk: Vec::new(),
             old_image: Some(item.clone()),
             new_image: Some(item.clone()),
+            seeded: false,
         };
         assert_eq!(modify.event_name(), "MODIFY");
 
@@ -754,6 +776,7 @@ mod tests {
             base_sk: Vec::new(),
             old_image: Some(item),
             new_image: None,
+            seeded: false,
         };
         assert_eq!(remove.event_name(), "REMOVE");
         assert_eq!(ChangeRecord::decode(b"garbage"), None);

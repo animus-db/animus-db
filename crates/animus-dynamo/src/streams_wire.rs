@@ -694,6 +694,7 @@ mod tests {
             base_sk: Vec::new(),
             old_image: None,
             new_image: Some(Item::from([("pk".to_string(), s("alice"))])),
+            seeded: false,
         };
         let v = stream_record_json(
             "shardId-1-0",
@@ -722,6 +723,7 @@ mod tests {
             base_sk: Vec::new(),
             old_image: Some(Item::from([("pk".to_string(), s("alice"))])),
             new_image: Some(Item::from([("pk".to_string(), s("alice2"))])),
+            seeded: false,
         };
         let v = stream_record_json(
             "shardId-1-0",

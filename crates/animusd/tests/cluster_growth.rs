@@ -565,7 +565,7 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
     // 0035 PR5 long-poll port above — a request already in flight to a
     // control node at the exact moment it's killed doesn't fail over
     // immediately. `Node::shutdown()` aborts the listener accept loops and
-    // the internal `Env` role tasks, but a `serve_clients` per-connection
+    // the internal `Env` role tasks, but a `serve_requests` per-connection
     // handler already spawned for an earlier request is a fire-and-forget
     // `tokio::spawn` with no tracked handle, so it keeps running; its
     // `WatchMetadata` park then falls through to the *server-side*
@@ -723,7 +723,8 @@ async fn growth_node_observes_metadata_promptly_via_watch() {
     // a cheap `MetadataDelta`, not a full `Status` clone, is therefore
     // equally a proof for the growth-node path.
     let delta_reply = call(
-        base_clients[0],
+        // ADR 0047: `WatchMetadata` is intra-only.
+        base_config.nodes[0].intra,
         ClientRequest::WatchMetadata { last_seen: 0 },
     )
     .await

@@ -126,6 +126,14 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   owns it, since tables' rings are independent). `TxnRecord::intent_spans:
   Vec<(String, KeyRange)>` names every key any participant ever staged,
   table name attached. See the Key invariants section for the full design.
+  **`TxnWrite` (ADR 0046 A1, `TxnStage` kind-writes stack, codec version
+  16)**: `KvCommand::TxnStage.writes`' element, a named struct (`key`,
+  `value`, plus an optional derived `kind_writes`/`change_log` payload for
+  a write against an indexed/streamed table) — carried inside the write's
+  own `Envelope::Intent`, opaque until `TxnResolve`'s commit branch
+  materializes it. See the Key invariants section's `materialize_derived`
+  entry and `docs/adr/0018-cross-tablet-transactions.md`'s 2026-08-16
+  amendment for the full mechanism.
 
 ### lib.rs API
 
@@ -273,6 +281,40 @@ State once here; cross-referenced from the sections below.
   `_participant` poll `stage_outcome` directly instead (`wait_stage_outcome`)
   — `None` on timeout, never a hard-`expect`ed fact that turns out not to be
   guaranteed. See `docs/engineering-lessons.md` for the general lesson.
+- **`KindBatch` gained the identical own-key `conditions` field (ADR 0046
+  "evaluate at leader" seatbelt, codec version 15)** — modeled directly on
+  `TxnStage.conditions`, `(key, expected)` byte-level OCC pairs checked
+  against the KIND_BASE scope. Two deliberate differences from `TxnStage`'s
+  own handling: (1) **no `StageOutcome` analogue** — a condition-failed
+  `KindBatch` no-ops silently, indistinguishable from a fence/seal miss (the
+  existing generic-error/probe-poll-timeout contract every
+  `put_kind_batch_fenced` caller already handles), so there is nothing to
+  disambiguate; and (2) **checked BEFORE the fence/seal gate**, not behind
+  it — `TxnStage`'s `condition_failure` only evaluates once already known
+  in-fence so `StageOutcome` can report the fence/seal reason ahead of a
+  condition one, but with no outcome channel to prioritize for `KindBatch`
+  there is no reason to gate the read behind the fence check. The two gates
+  still simply AND together either way. Production caller:
+  `dynamo::kind_write_item_at_leader`'s leader-side evaluate-then-propose
+  write path (ADR 0046 U3) passes `seatbelt: vec![(base_key, raw_old)]` —
+  the guard against a concurrent `TxnStage`/`TxnResolve` commit landing
+  between that evaluator's own-key read and its own propose call. Tests:
+  `tests/kind_batch_conditions.rs`, mirroring `tests/txn_conditions.rs`
+  scenario-for-scenario.
+- **`materialize_derived` — the ONE shared "materialize derived writes at
+  this ts" helper (ADR 0046 binding decision, `TxnStage` kind-writes stack
+  PR1)**: both `KvCommand::KindBatch`'s apply arm and `KvCommand::
+  TxnResolve`'s commit branch call this and only this — never two
+  independently-maintained copies (principle 5 of ADR 0046, replay/
+  snapshot-stability: two copies would start identical and diverge the
+  first time either is touched alone). Queues every `(kind, key, value)`
+  write at `hlc::pack(ts)` and, if present, completes the change-log key as
+  `prefix || hlc::pack(ts)` — `ts` is always the caller's OWN entry's
+  commit timestamp (`KindBatch`'s own entry for that arm; the *resolve*
+  entry's own ts for `TxnResolve`'s, never the transaction's `commit_ts`
+  and never the stage's own ts — ADR 0018 §2 B1). Regression:
+  `tests/txn_kind_writes.rs::kind_batch_and_txn_resolve_materialize_byte_
+  identical_rows_for_identical_payloads`.
 - **The value envelope + transactions (`txn.rs`).** Every value the apply
   path merges into the engine is 1-byte-tagged: `0` = committed (raw value
   follows), `1` = an intent naming the staging `TxnId`, its record's
@@ -523,8 +565,21 @@ resolve is now moot).
     always heartbeats/acks within the election timeout.
   - **Apply task** (`apply_loop` → `apply_and_compact`): install received
     snapshots, `drain_apply` → `merge`/`merge_tombstone` in commit order, and
-    compact — all off the consensus loop. Backs off (`APPLY_IDLE_POLL`) only
-    when idle.
+    compact — all off the consensus loop. When idle it races a new
+    `ApplySignal` (ADR 0044 phase-1 PR1, same shape as `ProposeSignal` below)
+    against a long `APPLY_SAFETY_POLL` (250ms) rather than spinning on the old
+    unconditional 5ms `APPLY_IDLE_POLL` — the consensus loop raises it at
+    every point that can create apply work (a `mark_durable_through` call in
+    `persist_wal`, a commit-index advance observed after stepping the core —
+    covering both a follower's in-line apply on `AppendEntries` and a
+    completed snapshot install's `commit_index` jump — and a single-node
+    group's own commit-advancing propose), and `shutdown()` also raises it so
+    a parked apply task notices a halt within one wake instead of waiting out
+    the now much longer safety poll. A signal-less transition (the lazy
+    on-demand snapshot-image build `RaftCore::take_snapshot_needed` sets,
+    purely off the leader's own heartbeat/replicate cycle with no commit
+    advance) still converges off the safety poll alone — see
+    `tests/apply_signal.rs`.
   - The WAL is written by both tasks (append vs. compaction rewrite),
     serialized by the async `wal_lock`; compaction snapshots only up to
     `engine_applied` via `snapshot_upto` (not `last_applied`, which the engine
@@ -561,6 +616,49 @@ resolve is now moot).
 - Distinct WAL file (`raftkv.wal`) from the control plane's `raft.wal`, so a
   node can host both planes. The name is exported (`animus_cp_data::WAL`) so
   the drop-table GC (ADR 0024) can delete a stopped group's WAL.
+- **Quiescence (ADR 0044 phase 1 / ADR 0048), data-plane groups only.** An
+  idle group opted in via `RaftKvNode::enable_quiescence(after)` stops
+  ticking entirely once its leader has had no local activity for `after`
+  and every other clause of `RaftCore::quiesce_entry_ok` holds (nothing left
+  to replicate, every voter caught up, no transfer/config-change/snapshot in
+  flight, the async apply task caught up, no veto held) — `next_deadline()`
+  returns `None`, so both drivers drop the timer arm from their `select`
+  and a quiesced group posts zero `SimEnv` timeline events. The leader
+  **stays** leader (fork A: every background sweeper gates on `is_leader()`).
+  `RaftKvNode::wake()` (idempotent, safe on every state) is the one
+  external hook every wake path funnels through: `animusd`'s
+  `resolve_cp_route` calls it before routing, and the tablet-host
+  reconciler (`host::Reconciler::tick`) calls it on any hosted group whose
+  replica set intersects `MetadataView::down` (fork H — closes the
+  TiKV-hibernate-regions hazard: without this, a quiesced follower whose
+  leader died while both were dormant has no timer at all and nothing else
+  will ever wake it). A locally-woken **follower** sends `RaftMsg::
+  WakeRequest` to its recorded leader and re-arms a fresh election timeout,
+  campaigning only if unanswered (fork B) — never a bare stale-timeout
+  campaign, which would depose a healthy quiesced leader on every cold
+  tablet's first touch.
+  - **Vetoes (fork D)**: `RaftKvNode::set_quiesce_veto(bool)` lets an
+    external subsystem (`animusd`'s `change_consumer_loop`, for a led
+    tablet whose change log was non-empty on its last sweep) hold the group
+    awake; ORed, once per consensus-loop iteration, with this crate's own
+    in-memory check that `TxnTracker` (`pending`/`unresolved_decided`) is
+    empty — a group with a live 2PC intent or an undelivered resolve can
+    never quiesce out from under `txn_resolver_loop`. Both together make
+    "quiesced ⇒ nothing new for the sweeper" a sound invariant for
+    `animusd`'s own sweeper-skip (below).
+  - `RaftKvNode::is_quiesced()` is a pure frozen-accessor read — never
+    itself a wake (fork F: an admin/dashboard poll must not un-quiesce a
+    fleet). `host::Reconciler::enable_quiescence(after)` is the production
+    hook that opts every group this reconciler hosts *from now on* into
+    quiescence (`animusd`'s `--quiesce-after` CLI flag calls it once at
+    node start).
+  - See `tests/quiescence.rs` (the end-to-end `SimEnv` corpus, depth knob
+    `ANIMUS_QUIESCE_SEEDS`) and `tests/reconciler_corpus.rs`'s
+    `quiesced_group_wakes_when_a_replica_goes_down`/`quiesce_races_a_split_
+    seal_handoff` scenarios for the regressions; ADR 0048 for the full
+    design (including why the control plane's own `RaftNode` never calls
+    the equivalent, fork G) and the phase-2 handoff constraints this
+    mechanism was built to satisfy.
 - **`shutdown()` is a graceful driver halt, not a kill** (ADR 0024): it latches
   a flag the driver observes at the top of its loop — *between* full
   persist+apply passes and within one wake — so WAL and engine are never left

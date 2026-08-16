@@ -593,7 +593,10 @@ fn cross_group_txn_traffic_never_lets_either_groups_clock_run_away() {
             let Some((txn_id, record_key, outcome)) = a
                 .txn_stage_anchor(
                     "t",
-                    vec![(ak.clone(), Some(value.clone()))],
+                    vec![animus_cp_data::TxnWrite::plain(
+                        ak.clone(),
+                        Some(value.clone()),
+                    )],
                     vec![("t".to_string(), KeyRange::new(bk.clone(), None))],
                     Vec::new(),
                 )
@@ -609,7 +612,10 @@ fn cross_group_txn_traffic_never_lets_either_groups_clock_run_away() {
                     txn_id.clone(),
                     record_key.clone(),
                     "t".to_string(),
-                    vec![(bk.clone(), Some(value.clone()))],
+                    vec![animus_cp_data::TxnWrite::plain(
+                        bk.clone(),
+                        Some(value.clone()),
+                    )],
                     Vec::new(),
                 )
                 .await

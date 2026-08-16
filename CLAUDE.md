@@ -84,6 +84,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_TXN_SEEDS=K` | 1 | multi-tablet cross-transaction corpus depth (`animus-test`, ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | DynamoDB Streams lineage-walk corpus depth (`animus-test`, ADR 0042/0043) |
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | secondary-index backfill fault-injection corpus depth (`animus-test`, ADR 0045) |
+| `ANIMUS_QUIESCE_SEEDS=K` | 1 | idle-tablet-group quiescence corpus depth (`animus-cp-data`, ADR 0044 phase 1) |
 | `ANIMUS_BENCH_{KEYS,GETS,SCAN,VALUE_BYTES,APPLY_BATCH}` | — | `engine_bench` workload tuning |
 
 The deep corpus tier (`ANIMUS_CORPUS_SEEDS=40 ANIMUS_CORPUS_FULL=1`) runs
@@ -168,7 +169,13 @@ truth; this map is just for navigation.
   **bytes** (ADR 0034, `animusd`); **tablets are split-only** — merge has
   been removed entirely (ADR 0044, supersedes ADR 0033); dropped tables'
   data is reclaimed by a convergent **GC** (ADR 0024). Tablet ids are never
-  reused.
+  reused. An idle CP-data group **quiesces** (ADR 0048, phase 1 of ADR
+  0044's cheap-groups roadmap): no local activity for `--quiesce-after`
+  (default on, 5s) stops its Raft timers/heartbeats/apply-poll entirely
+  until a write, a peer message, or the reconciler's proactive wake (a
+  replica marked `Down`) touches it again — data-plane only (the control
+  group never quiesces), remains leader while quiesced, and admin/
+  dashboard reads never wake a group (`quiesced` is a pure diagnostic).
 - **Placement, rebalancing & growth** — `animus-placement` (ADR 0005): pure
   policy engine (RF + residency labels + failure-domain spread), `replan`
   (failure repair) + `rebalance_step` (ADR 0029: one balance-driven move per

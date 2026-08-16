@@ -8,7 +8,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{Node, bind_cluster, start_cluster};
+use animus_dynamo::{AttributeValue, storage_key};
+use animus_tablet::partition_token;
+use animusd::{ClientRequest, ClientResponse, Node, bind_cluster, read_frame, start_cluster};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -383,6 +385,95 @@ async fn lsi_scan_supports_filter_expression() {
             count_occurrences(&combined, &marker),
             1,
             "expected exactly one page to carry sk={sk}, got pages:\n{combined}"
+        );
+    }
+}
+
+/// One `ClientRequest`/`ClientResponse` round trip over the plain
+/// length-prefixed client protocol — used only to drive `SplitTablet` below;
+/// no such op exists on the DynamoDB wire.
+async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("connect to client port");
+    animusd::write_frame(&mut stream, &req)
+        .await
+        .expect("send request");
+    read_frame(&mut stream)
+        .await
+        .expect("read reply")
+        .expect("a reply")
+}
+
+async fn await_true<F: Fn() -> bool>(secs: u64, what: &str, cond: F) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while !cond() {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for: {what}");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// (e) The per-tablet `limit` on `KindScan` (ADR 0041 §5 as-built) is a
+/// **coordinator-side/wire optimization only** — `StorageEngine::scan` has
+/// no limit parameter, so a tablet still reads its whole matching sub-range;
+/// the win is a smaller reply and less coordinator-side memory, never
+/// reduced engine I/O — and must never change what a caller observes. Split
+/// `events`'s one tablet into two (straddling the `p1`/`p2` partitions), then
+/// re-run the exact small-`Limit` pagination walk
+/// `lsi_scan_supports_filter_expression` already proves on a single tablet —
+/// this time fanning `cp_scan_kind_table`'s `KindScan` across **two**
+/// tablets and their (possibly two different) group leaders. The walk must
+/// still recover every `by-score` row exactly once, in the same
+/// Limit-paginated shape as before the split: identical behavior, only a
+/// leaner per-page payload underneath.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lsi_scan_with_limit_paginates_identically_across_a_split_table() {
+    let (nodes, addr) = setup().await;
+
+    // A split point strictly between the `p1` and `p2` partitions' own
+    // token-prefixed keys (ADR 0022/0023): `partition_token` hashes a
+    // partition key's own encoded bytes (`storage_key(pk, None)`, exactly as
+    // `animusd::dynamo::item_key` computes it), so the *larger* of the two
+    // partitions' 8-byte tokens, used verbatim as the split key, is both (a)
+    // strictly greater than every `p1` key — whose own token differs from it
+    // at some byte within the first 8, which alone decides the byte-string
+    // comparison — and (b) a strict byte-string *prefix* of every `p2` key
+    // (which continues past those same 8 bytes), hence strictly less than
+    // every one of them. Together that cleanly divides the two partitions
+    // across the split regardless of which token happens to be larger.
+    let token_p1 = partition_token(&storage_key(&AttributeValue::S("p1".into()), None));
+    let token_p2 = partition_token(&storage_key(&AttributeValue::S("p2".into()), None));
+    let split_key = token_p1.max(token_p2).to_vec();
+
+    // The bootstrap tablet of the one table created so far is always id 1.
+    let resp = call(
+        nodes[0].client_addr(),
+        ClientRequest::SplitTablet {
+            tablet: 1,
+            split_key,
+        },
+    )
+    .await;
+    assert!(
+        matches!(resp, ClientResponse::PutOk),
+        "split did not commit: {resp:?}"
+    );
+    await_true(20, "split child tablet hosted on node 0", || {
+        nodes[0].metadata().tablets.len() >= 2
+    })
+    .await;
+
+    let combined =
+        drain_scan_pages(addr, r#"{"TableName":"events","IndexName":"by-score""#, 1).await;
+    for sk in ["a0", "a1", "a2", "b0", "b1"] {
+        let marker = format!(r#""sk":{{"S":"{sk}"}}"#);
+        assert_eq!(
+            count_occurrences(&combined, &marker),
+            1,
+            "expected exactly one page to carry sk={sk} across the split-table \
+             walk, got pages:\n{combined}"
         );
     }
 }

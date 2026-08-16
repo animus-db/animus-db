@@ -65,6 +65,7 @@ fn register(node: animus_env::NodeId, suffix: u16) -> MetaCommand {
             internal: format!("127.0.0.1:{}", 9300 + suffix),
             client: format!("127.0.0.1:{}", 9000 + suffix),
             admin: format!("127.0.0.1:{}", 9500 + suffix),
+            intra: format!("127.0.0.1:{}", 9600 + suffix),
             role: "combined".to_string(),
         },
         labels: [("region".to_string(), "eu-west".to_string())]

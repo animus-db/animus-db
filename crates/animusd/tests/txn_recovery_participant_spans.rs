@@ -151,16 +151,17 @@ async fn admin_get(addr: SocketAddr, path: &str) -> (u16, Value) {
 
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 5);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[5 * i],
-                client: addrs[5 * i + 1],
-                dynamo: addrs[5 * i + 2],
-                cql: addrs[5 * i + 3],
-                admin: addrs[5 * i + 4],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                admin: addrs[6 * i + 4],
+                intra: addrs[6 * i + 5],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -279,7 +280,7 @@ async fn anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
-    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.admin).collect();
 
     put_until_ok(addr0, "txn_spans_a", b"k1", b"seed-lower").await;
@@ -305,9 +306,13 @@ async fn anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_
         ClientRequest::TxnPrepare {
             table: "txn_spans_a".to_string(),
             anchor: None,
-            writes: vec![(lower_key.clone(), Some(b"should-not-commit".to_vec()))],
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                lower_key.clone(),
+                Some(b"should-not-commit".to_vec()),
+            )],
             conditions: Vec::new(),
             participant_spans,
+            pending_kind_writes: Vec::new(),
         },
     )
     .await;
@@ -448,7 +453,7 @@ async fn recovery_resolve_correctly_commits_both_tablets_of_a_two_tablet_transac
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
-    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
 
     put_until_ok(addr0, "txn_group_fix", b"k1", b"seed-lower").await;
     put_until_ok(addr0, "txn_group_fix", b"k9", b"seed-upper").await;
@@ -468,9 +473,13 @@ async fn recovery_resolve_correctly_commits_both_tablets_of_a_two_tablet_transac
         ClientRequest::TxnPrepare {
             table: "txn_group_fix".to_string(),
             anchor: None,
-            writes: vec![(lower_key.clone(), Some(b"lower-committed".to_vec()))],
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                lower_key.clone(),
+                Some(b"lower-committed".to_vec()),
+            )],
             conditions: Vec::new(),
             participant_spans,
+            pending_kind_writes: Vec::new(),
         },
     )
     .await;
@@ -483,9 +492,13 @@ async fn recovery_resolve_correctly_commits_both_tablets_of_a_two_tablet_transac
         ClientRequest::TxnPrepare {
             table: "txn_group_fix".to_string(),
             anchor: Some((txn_id, record_key, record_table)),
-            writes: vec![(upper_key.clone(), Some(b"upper-committed".to_vec()))],
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                upper_key.clone(),
+                Some(b"upper-committed".to_vec()),
+            )],
             conditions: Vec::new(),
             participant_spans: Vec::new(),
+            pending_kind_writes: Vec::new(),
         },
     )
     .await;

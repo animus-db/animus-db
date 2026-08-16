@@ -44,16 +44,17 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
 async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, animusd::ClusterConfig) {
     let mut brought_up = None;
     'attempts: for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 5);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[5 * i],
-                client: addrs[5 * i + 1],
-                dynamo: addrs[5 * i + 2],
-                cql: addrs[5 * i + 3],
-                admin: addrs[5 * i + 4],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                admin: addrs[6 * i + 4],
+                intra: addrs[6 * i + 5],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -313,7 +314,10 @@ async fn backfill_seeder_materializes_every_pre_existing_row_then_flips_active()
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    let client = config.nodes[leader].client;
+    // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
+    // occasional `SplitTablet` call in this file — a superset, not a
+    // conflict).
+    let client = config.nodes[leader].intra;
     let dynamo_addr = nodes[0].dynamo_addr();
     let client_addr = nodes[0].client_addr();
     let table = "bf_seed";
@@ -373,7 +377,10 @@ async fn live_writes_during_backfill_converge_to_the_correct_final_gsi() {
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    let client = config.nodes[leader].client;
+    // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
+    // occasional `SplitTablet` call in this file — a superset, not a
+    // conflict).
+    let client = config.nodes[leader].intra;
     let dynamo_addr = nodes[0].dynamo_addr();
     let client_addr = nodes[0].client_addr();
     let table = "bf_live";
@@ -448,7 +455,10 @@ async fn two_indexes_creating_simultaneously_converge_independently() {
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    let client = config.nodes[leader].client;
+    // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
+    // occasional `SplitTablet` call in this file — a superset, not a
+    // conflict).
+    let client = config.nodes[leader].intra;
     let dynamo_addr = nodes[0].dynamo_addr();
     let client_addr = nodes[0].client_addr();
     let table = "bf_multi";
@@ -529,7 +539,7 @@ async fn a_crash_and_restart_mid_backfill_still_converges() {
     let node_dir = dir.path().join("node-0");
     let config = animusd::ClusterConfig {
         nodes: vec![{
-            let addrs = support::free_addrs(5);
+            let addrs = support::free_addrs(6);
             animusd::RoleAddrs {
                 id: animusd::config::node_id(0),
                 role: animusd::config::NodeRole::Both,
@@ -538,6 +548,7 @@ async fn a_crash_and_restart_mid_backfill_still_converges() {
                 dynamo: addrs[2],
                 cql: addrs[3],
                 admin: addrs[4],
+                intra: addrs[5],
             }
         }],
     };
@@ -564,7 +575,8 @@ async fn a_crash_and_restart_mid_backfill_still_converges() {
     }
 
     call(
-        node.client_addr(),
+        // ADR 0047: `ProposeSchema` is intra-only.
+        node.intra_addr(),
         ClientRequest::ProposeSchema(MetaCommand::CreateTableIndex {
             table: table.into(),
             index: creating_index("by-email", "email"),
@@ -674,7 +686,10 @@ async fn split_during_backfill_converges_with_correct_final_gsi() {
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    let client = config.nodes[leader].client;
+    // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
+    // occasional `SplitTablet` call in this file — a superset, not a
+    // conflict).
+    let client = config.nodes[leader].intra;
     let dynamo_addr = nodes[0].dynamo_addr();
     let client_addr = nodes[0].client_addr();
     let table = "bf_split";

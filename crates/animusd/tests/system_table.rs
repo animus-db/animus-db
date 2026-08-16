@@ -43,7 +43,7 @@ use tokio::time::{sleep, timeout};
 /// fresh `tempfile::tempdir()` + freshly-bound `:0` ports per call is enough
 /// isolation for one node).
 async fn bring_up_one(dir: &std::path::Path) -> Node {
-    let addrs = free_addrs(5);
+    let addrs = free_addrs(6);
     let node_cfg = animusd::RoleAddrs {
         id: animusd::config::node_id(0),
         role: animusd::config::NodeRole::Both,
@@ -52,6 +52,7 @@ async fn bring_up_one(dir: &std::path::Path) -> Node {
         dynamo: addrs[2],
         cql: addrs[3],
         admin: addrs[4],
+        intra: addrs[5],
     };
     let config = animusd::ClusterConfig {
         nodes: vec![node_cfg],
@@ -139,7 +140,11 @@ async fn system_table_lists_every_seeded_entity_kind() {
         let dir = tempfile::tempdir().unwrap();
         let node = bring_up_one(dir.path()).await;
         await_bootstrap(&node).await;
-        let client = node.client_addr();
+        // ADR 0047: this file seeds several intra-only entity kinds via bare
+        // `ProposeSchema` — dial the intra port (which also happily serves
+        // the plain `Put`/`Scan`/`SplitTablet` calls this test otherwise
+        // makes, since intra is a superset of client).
+        let client = node.intra_addr();
         let admin = node.admin_addr();
 
         let (s, syst0) = admin_get(admin, "/admin/system-table").await;
@@ -410,7 +415,11 @@ async fn system_table_pagination_is_gapless_and_duplicate_free() {
         let dir = tempfile::tempdir().unwrap();
         let node = bring_up_one(dir.path()).await;
         await_bootstrap(&node).await;
-        let client = node.client_addr();
+        // ADR 0047: this file seeds several intra-only entity kinds via bare
+        // `ProposeSchema` — dial the intra port (which also happily serves
+        // the plain `Put`/`Scan`/`SplitTablet` calls this test otherwise
+        // makes, since intra is a superset of client).
+        let client = node.intra_addr();
         let admin = node.admin_addr();
 
         // Auto-provision a dozen distinct tablets (one plain Put per table) —

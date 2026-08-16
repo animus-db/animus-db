@@ -438,13 +438,94 @@ size/age pair are OR-gated triggers on the change-consumer loop's seal arm
 
 ### 14. F11: token-aligned splits on a streamed table
 
-Auto-split's chosen split key is rounded **down** to its own 8-byte token
-boundary when the source table is streamed. This preserves the
-partition-key/shard affinity a change-record's own token-leading key relies
-on (ADR 0022) — an unaligned split key would risk separating one token's
-records, and hence one shard's, across the split boundary — and, as a side
-effect, narrows a pre-existing `txn.rs` residual noted in ADR 0018's own PR3
-amendment about a split racing an in-flight transaction's own token.
+A streamed table's split key is rounded **down** to its own 8-byte token
+boundary. This preserves the partition-key/shard affinity a change-record's
+own token-leading key relies on (ADR 0022) — an unaligned split key would
+risk separating one token's records, and hence one shard's, across the split
+boundary — and, as a side effect, narrows a pre-existing `txn.rs` residual
+noted in ADR 0018's own PR3 amendment about a split racing an in-flight
+transaction's own token.
+
+**Growth-plan amendment (2026-08-16, growth PR2).** The rounding used to
+live *only* inside `auto_split_loop` — the two manual split paths (`POST
+/admin/tablet/split` and `ClientRequest::SplitTablet`) passed the caller's
+raw key straight through to `MetaCommand::SplitTablet`, so a manual split
+inside one token could separate that token's records across two **sibling**
+tablets with no parent/child relation at all, the exact violation this
+section exists to prevent. Fixed at two layers (Fork D — both, not either):
+
+1. **The choke point**: rounding moved into `ClientCtx::trigger_split`
+   (`animusd`), the one method every proposer — `auto_split_loop`, the
+   admin action, and the plain-protocol handler — calls to commit a split.
+   A future caller can no longer forget it, since there is exactly one path
+   to a `SplitTablet` propose.
+2. **The apply-time seatbelt**: `MetaCommand::SplitTablet`'s own apply arm
+   (`animus-control`) independently rejects a non-token-aligned key on a
+   streamed table (`split_key.len() != TOKEN_BYTES`) — the ADR 0028
+   fence idiom, a structural check against any future caller that reaches
+   apply without going through `trigger_split`, not the primary
+   enforcement.
+
+**Fork E — the accepted single-token hot-partition limit.** Rounding a
+split key down can collapse it onto the target tablet's own `range.start`
+when a single, very hot partition token owns the tablet's entire range —
+that tablet cannot legally split without separating that same token's
+records across siblings, exactly the affinity F11 protects. This is
+accepted as an honest limit (one very hot partition key ⇒ one shard,
+permanently) rather than worked around with a within-token split:
+`trigger_split` detects the degenerate case up front (no propose attempt at
+all — `KeyRange::split_at` would just reject it) and returns immediately,
+incrementing `Metric::StreamSplitSingleTokenSkipped` so an operator has a
+signal instead of a silent, forever-retried no-op. `auto_split_loop` matches
+this specific outcome to skip its own "split did not commit" warning, which
+would otherwise fire every cooldown, forever, for a tablet that structurally
+cannot split.
+
+**Growth-plan amendment (2026-08-16, growth PR3) — the manual growth
+trigger and Fork F's opt-in auto-trigger.** "Manual admin trigger, grow by
+2×" is not a resharding command in round 3 — the growth plan's own
+reinterpretation is *"split every tablet of this streamed table now,
+without making me compute keys."* `POST /admin/stream/grow {table}`
+(`admin::action_stream_grow`) does exactly that: one tablet at a time
+(`ClientCtx::grow_stream`), each split at its own byte-weighted median
+(ADR 0034) via `trigger_split` — reusing `auto_split_loop`'s own
+materializing-confirm primitives (`local_pairs` → `byte_weighted_median`),
+so F11's rounding and Fork E's single-token skip apply automatically. A
+tablet led by a different node than the one serving the admin request is
+reached via a new internal, relayable `ClientRequest::TriggerAutoSplit` RPC
+(mirrors `ForceSeal`'s shape). `animus admin stream-grow <admin-addr>
+<table>` is the CLI form.
+
+Building this surfaced a real, independent bug in `trigger_split` itself
+(fixed in the same PR, not specific to streams): its confirmation
+predicate was a bare "does a tablet with this id exist," which a
+lagging-mirror node's independently-computed `new_id` could satisfy from a
+*different*, unrelated split's commit — silently reporting success for a
+proposal the control leader had actually rejected as an id collision.
+Rewritten to recompute `new_id` fresh on every retry and confirm via the
+target tablet's own epoch advancing (robust regardless of which id a
+later, corrected retry mints) — see `docs/engineering-lessons.md` for the
+general form.
+
+**Fork F — the change-append-rate signal and its opt-in auto-trigger.**
+`CpGroup::approx_bytes` (the existing auto-split byte trigger's input) is
+deliberately **base**-scoped (ADR 0034's own fix, so change-log churn can't
+drive splits) — which structurally means a high-churn, small-footprint
+streamed table can write forever without ever crossing a byte/key
+threshold and gaining a second shard, regardless of write rate. A new
+per-tablet `ChangeRateTracker` (`animusd`) closes the visibility gap for
+free: `index_drain::seal_tick` already computes `approx_bytes_kind
+(KIND_CHANGE)` every tick for `Metric::StreamHotBytes`, so the tracker just
+smooths (EWMA) each tick's own delta/elapsed into a bytes/sec estimate —
+no new scan. Surfaced read-only via `/admin/metrics`'s
+`stream_change_rates` array. The trigger itself (`--auto-split-change-rate
+RATE`, streamed tables only) is opt-in and OFF by default — no flag means
+no behavior change at all, and no production-tuned default exists yet (no
+operational data), so the flag has no default-on value; an operator must
+choose `RATE` for their own workload. When set, a streamed led tablet whose
+smoothed rate exceeds `RATE` joins the same either-trigger-fires gate
+`auto_split_loop` already runs, splitting via the identical
+`byte_weighted_median`/`trigger_split` path (so F11/Fork E apply here too).
 
 ### 15. Deviations from AWS, summarized
 
@@ -461,10 +542,19 @@ amendment about a split racing an in-flight transaction's own token.
 
 ### 16. Named follow-ups (not part of the committed design)
 
-- **`TxnStage` kind-writes**: lifts the rejection of `TransactWriteItems` on
-  an indexed *or streamed* table, once the transaction machinery gains a
-  multi-kind atomic write extension (unchanged from ADR 0041 §2's original
-  deferral).
+- ~~`TxnStage` kind-writes~~ **Shipped (2026-08-16, ADR 0046 A1/U3)**:
+  `TransactWriteItems` on a streamed table (indexed or not) now participates
+  like any other write — a transactional write's change record materializes
+  atomically with its base row at resolve, via the same shared
+  `materialize_derived` helper `KindBatch`'s own apply arm uses. See
+  `docs/adr/0018-cross-tablet-transactions.md`'s 2026-08-16 amendment for
+  the mechanism and `docs/adr/0046-tablet-log-model.md` for the model-level
+  rationale. Regression: `animusd/tests/dynamo_streams.rs` (a
+  transactionally-written table's `GetRecords` delivers the transaction's
+  events correctly, and an aborted transaction leaves none) and
+  `crates/animus-test/tests/stream_lineage_corpus.rs`'s
+  `transactional_writes_exactly_once_and_ordered` cell (exactly-once,
+  per-item order, across a lineage under a leader-kill fault injection).
 - **CQL CDC**: a change-data-capture surface for the CQL adapter over the
   same underlying log/segment machinery.
 - **Follower-served `GetRecords`**: relaxing §7's leader-only restriction for
@@ -539,3 +629,19 @@ were considered and declined as out of scope for this adapter.
   a `DescribeStream`/`GetRecords` request's validity now depends on
   retention timing, not just the current schema, for the lifetime of a
   disable grace window.
+
+## Amendment (2026-08-16, ADR 0046 U3 — evaluate-at-leader)
+
+§1's change-record `OLD_IMAGE`/`NEW_AND_OLD_IMAGES` fidelity depends on the
+same prior-image read `kind_writes_for_item`'s LSI diff needs — and that
+read used to happen wherever the write landed at the DynamoDB edge, under
+only a node-local lock (see ADR 0041's identical amendment for the full
+mechanism and its cross-node-orphan incident). A streamed table's change
+record inherits the same fix for free: `dynamo::kind_write_item_at_leader`
+now reads `old` on the item's own tablet leader — the one node every write
+of that item reaches regardless of which edge node the client happened to
+connect to — so a change record's `old_image` can no longer be computed
+against a value a concurrent write on a different node has already
+superseded. No change to this ADR's record format, per-partition HLC
+ordering, or shard-sealing/retention machinery; only *where* the image that
+feeds a record is read.

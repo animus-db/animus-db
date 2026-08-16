@@ -232,16 +232,17 @@ fn voters_of(body: &serde_json::Value) -> Option<Vec<animus_env::NodeId>> {
 /// same shape `tests/decommission.rs::bring_up` uses.
 async fn bring_up_combined(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 5);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<RoleAddrs> = (0..n)
             .map(|i| RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: NodeRole::Both,
-                internal: addrs[5 * i],
-                client: addrs[5 * i + 1],
-                dynamo: addrs[5 * i + 2],
-                cql: addrs[5 * i + 3],
-                admin: addrs[5 * i + 4],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                cql: addrs[6 * i + 3],
+                admin: addrs[6 * i + 4],
+                intra: addrs[6 * i + 5],
             })
             .collect();
         let config = ClusterConfig { nodes: nodes_cfg };
@@ -303,7 +304,7 @@ async fn join_control_nonvoter(
     dir: &Path,
 ) -> (Node, RoleAddrs) {
     for attempt in 0..16 {
-        let raw = support::free_addrs(5);
+        let raw = support::free_addrs(6);
         let addrs = RoleAddrs {
             id: nid(new_control_id),
             role: NodeRole::Control,
@@ -312,6 +313,7 @@ async fn join_control_nonvoter(
             dynamo: raw[2],
             cql: raw[3],
             admin: raw[4],
+            intra: raw[5],
         };
         let bound = match animusd::Node::bind_control(
             nid(new_control_id),
@@ -330,12 +332,17 @@ async fn join_control_nonvoter(
         for (i, a) in config.nodes.iter().enumerate() {
             client_route.insert(animusd::config::node_id(i), a.client);
         }
+        let mut intra_route: BTreeMap<animus_env::NodeId, SocketAddr> = BTreeMap::new();
+        for (i, a) in config.nodes.iter().enumerate() {
+            intra_route.insert(animusd::config::node_id(i), a.intra);
+        }
         let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
         let node = bound
             .start_control_with(
                 config.peer_book(),
                 config.control_ids(),
                 client_route,
+                intra_route,
                 admin_addrs,
                 animusd::StorageBackend::Memory,
                 animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,

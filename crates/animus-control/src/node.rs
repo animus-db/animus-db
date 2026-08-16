@@ -778,7 +778,17 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
 
         let now = env.now();
         let deadline = core.lock().expect("raft core poisoned").next_deadline();
-        let wait = Duration::from_nanos(deadline.0.saturating_sub(now.0));
+        // `None` (ADR 0044 phase-1 PR2 — quiescence, always `Some` here: the
+        // control plane never enables it, fork G) drops the timer arm entirely
+        // rather than sleeping on a synthetic wait, so a hypothetically-quiesced
+        // group posts zero `SimEnv` timeline events instead of a degenerate
+        // `Duration::ZERO` busy-loop.
+        let timer = match deadline {
+            Some(deadline) => {
+                Either::Left(env.sleep(Duration::from_nanos(deadline.0.saturating_sub(now.0))))
+            }
+            None => Either::Right(std::future::pending()),
+        };
 
         // Snapshot role/term before stepping the core so we can attribute any
         // state transition the step causes to a metric (ADR 0015). All inputs to
@@ -789,7 +799,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
             (c.role(), c.term())
         };
 
-        let outs = match select(env.recv(), env.sleep(wait)).await {
+        let outs = match select(env.recv(), timer).await {
             Either::Left((envelope, _)) => {
                 let entropy = env.next_u64();
                 match serde_json::from_slice::<RaftMsg>(&envelope.payload) {

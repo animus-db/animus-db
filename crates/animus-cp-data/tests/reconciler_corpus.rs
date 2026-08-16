@@ -624,6 +624,15 @@ fn scenario_cells() -> Vec<Scenario> {
             "narrow_seal_survives_a_late_promotion_after_narrowing_as_a_follower",
             scenario_narrow_seal_survives_a_late_promotion
         ),
+        // --- ADR 0044 phase-1 PR4 (wake-on-demand + fork H) ---------------------
+        scenario!(
+            "quiesced_group_wakes_when_a_replica_goes_down",
+            scenario_quiesced_group_wakes_when_a_replica_goes_down
+        ),
+        scenario!(
+            "quiesce_races_a_split_seal_handoff",
+            scenario_quiesce_races_a_split_seal_handoff
+        ),
     ]
 }
 
@@ -1751,6 +1760,181 @@ fn scenario_narrow_seal_survives_a_late_promotion(seed: u64) {
         );
 
         assert_hosted_converged(&c, follower_id, [TabletId(1), TabletId(2)]);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0044 phase-1 PR4: wake-on-demand + fork H (proactive wake on `down`).
+//
+// Neither scenario wires production `--quiesce-after` (that's PR7's job) —
+// each calls `RaftKvNode::enable_quiescence` directly on every replica right
+// after hosting, exactly like `animus-cp-data/tests/quiescence.rs` does for
+// the pure-core corpus.
+// ---------------------------------------------------------------------------
+
+/// Short relative to this file's own `env.sleep` step granularity, long
+/// enough that ordinary election/heartbeat settle traffic (well within a
+/// couple hundred ms) has already died down before the idle clock starts
+/// counting — mirrors `tests/quiescence.rs`'s own `QUIESCE_AFTER` choice.
+const RECONCILER_QUIESCE_AFTER: Duration = Duration::from_millis(200);
+
+/// Fork H's whole reason to exist: a quiesced group's consensus loop parks
+/// with **no timer at all** (`RaftCore::next_deadline() == None`), so a
+/// follower whose leader genuinely dies while both are dormant has nothing
+/// that will ever wake it on its own — worse availability than before
+/// quiescence existed, the TiKV-hibernate-regions hazard. Kill the leader's
+/// own tasks outright (its own group handle goes inert; the survivors' own
+/// envs/streams are untouched) and drive only `Reconciler::tick` (never a
+/// raw message/timer) on the survivors with a view marking the dead node
+/// `down` — if `tick` doesn't call `RaftKvNode::wake()` on the affected
+/// group, this scenario times out with no new leader ever elected.
+fn scenario_quiesced_group_wakes_when_a_replica_goes_down(seed: u64) {
+    run(seed, |sim| async move {
+        let env = sim.env(a());
+        let mut c = Cluster::new(sim);
+        c.add_node(a());
+        c.add_node(b());
+        c.add_node(node_c());
+
+        let v1 = view([tablet(1, b"", None, vec![a(), b(), node_c()])]);
+        c.tick_all(&[a(), b(), node_c()], &v1).await;
+        env.sleep(Duration::from_secs(2)).await; // elect
+
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
+        let hc = c.node(node_c()).hosted_node(TabletId(1)).unwrap().clone();
+        for h in [&ha, &hb, &hc] {
+            h.enable_quiescence(RECONCILER_QUIESCE_AFTER);
+        }
+
+        let quiesced = wait_until(&env, 150, Duration::from_millis(50), || {
+            ha.is_quiesced() && hb.is_quiesced() && hc.is_quiesced()
+        })
+        .await;
+        assert!(
+            quiesced,
+            "every replica should reach quiescence while genuinely idle"
+        );
+
+        let (leader_id, survivors): (NodeId, Vec<(NodeId, KvNode)>) = if ha.is_leader() {
+            (a(), vec![(b(), hb.clone()), (node_c(), hc.clone())])
+        } else if hb.is_leader() {
+            (b(), vec![(a(), ha.clone()), (node_c(), hc.clone())])
+        } else {
+            assert!(hc.is_leader(), "tablet 1 must have elected some leader");
+            (node_c(), vec![(a(), ha.clone()), (b(), hb.clone())])
+        };
+
+        // Kill the leader's own tasks — the survivors' own reconcilers/
+        // driver tasks run on independent envs/streams, untouched.
+        c.sim.stop(leader_id.clone());
+
+        let survivor_ids: Vec<NodeId> = survivors.iter().map(|(id, _)| id.clone()).collect();
+        let down_view = view_with_down(
+            [tablet(1, b"", None, [a(), b(), node_c()].to_vec())],
+            [leader_id.clone()],
+        );
+
+        let mut elected = false;
+        for _ in 0..200 {
+            c.tick_all(&survivor_ids, &down_view).await;
+            env.sleep(Duration::from_millis(50)).await;
+            if survivors.iter().any(|(_, h)| h.is_leader()) {
+                elected = true;
+                break;
+            }
+        }
+        assert!(
+            elected,
+            "a quiesced group's surviving replicas never noticed their leader \
+             die and elect a new one — fork H's proactive wake regression"
+        );
+
+        let new_leader = survivors
+            .iter()
+            .find(|(_, h)| h.is_leader())
+            .expect("checked above")
+            .1
+            .clone();
+        let pr = new_leader.put(b"k".to_vec(), b"v".to_vec());
+        assert!(
+            matches!(pr, ProposeResult::Accepted { .. }),
+            "the recovered leader must still accept writes: {pr:?}"
+        );
+    });
+}
+
+/// Quiescence must not interfere with an in-flight split: a quiesced
+/// source's own `narrow_scope` is a pure local mutation the reconciler
+/// performs directly (no Raft round trip, unaffected by whether the
+/// consensus loop currently ticks), and its `ProposeSeal` action relies on
+/// the pre-existing wake-on-propose plumbing to transparently un-quiesce the
+/// group for its own seal proposal.
+fn scenario_quiesce_races_a_split_seal_handoff(seed: u64) {
+    run(seed, |sim| async move {
+        let env = sim.env(a());
+        let mut c = Cluster::new(sim);
+        c.add_node(a());
+
+        let v1 = view([tablet(1, b"", None, vec![a()])]);
+        c.tick(a(), &v1).await;
+        env.sleep(Duration::from_secs(2)).await;
+
+        let h1 = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        h1.enable_quiescence(RECONCILER_QUIESCE_AFTER);
+        for i in 0..5u64 {
+            h1.put(
+                format!("a{i:02}").into_bytes(),
+                format!("lo{i}").into_bytes(),
+            );
+            h1.put(
+                format!("z{i:02}").into_bytes(),
+                format!("hi{i}").into_bytes(),
+            );
+        }
+
+        let quiesced = wait_until(&env, 150, Duration::from_millis(50), || h1.is_quiesced()).await;
+        assert!(
+            quiesced,
+            "the source tablet should quiesce while idle, even with a split about to land"
+        );
+
+        // The split lands: narrow the source. This must take effect on a
+        // currently-quiesced group.
+        let v2 = view([tablet(1, b"", Some(BOUNDARY), vec![a()])]);
+        c.tick(a(), &v2).await;
+        assert_eq!(
+            h1.scope_range(),
+            KeyRange::new(b"".to_vec(), Some(BOUNDARY.to_vec())),
+            "a quiesced group's own reconciler must still narrow its scope on a split"
+        );
+
+        let v3 = view([
+            tablet(1, b"", Some(BOUNDARY), vec![a()]),
+            tablet(2, BOUNDARY, None, vec![a()]),
+        ]);
+        c.tick(a(), &v3).await;
+        env.sleep(Duration::from_secs(2)).await;
+
+        let h2 = c.node(a()).hosted_node(TabletId(2)).unwrap().clone();
+        assert!(
+            h2.is_leader(),
+            "the fresh sibling must self-elect even though its source quiesced"
+        );
+        for i in 0..5u64 {
+            assert_eq!(
+                h1.local_get(format!("a{i:02}").as_bytes()).await,
+                Some(format!("lo{i}").into_bytes()),
+                "source tablet must still see its own (lower-half) data"
+            );
+            assert_eq!(
+                h2.local_get(format!("z{i:02}").as_bytes()).await,
+                Some(format!("hi{i}").into_bytes()),
+                "sibling tablet must see its own (upper-half) data — no double count"
+            );
+        }
+        assert_hosted_converged(&c, a(), [TabletId(1), TabletId(2)]);
+        assert_idempotent(&mut c, a(), &v3).await;
     });
 }
 
