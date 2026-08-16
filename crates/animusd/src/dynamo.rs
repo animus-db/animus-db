@@ -676,21 +676,27 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // ride the same batch. Within a table `cp_batch_write` groups by tablet
             // (atomic per tablet, non-atomic across tablets — DynamoDB semantics).
             //
-            // **A table with at least one secondary index cannot use that fast
-            // path** (ADR 0041 §2/§4): `cp_batch_write` only ever writes the base
-            // kind, so it would silently produce no LSI rows and no change-log
-            // record. Such a table instead routes each request through
-            // `ClientCtx::cp_kind_write_item` individually — ADR 0046 U3's
-            // evaluate-at-leader write path, the identical primitive `PutItem`/
-            // `DeleteItem` use, which reads the old item and evaluates on the
-            // tablet leader rather than here. `BatchWriteItem` has no per-item
-            // condition, so `KindWriteOutcome::ConditionFailed` can never come
-            // back here (`cp_kind_write_item`'s own `condition: None`). **Per-item
+            // **A table that takes the kind-write path cannot use that fast
+            // path** (ADR 0041 §2/§4, ADR 0042 §9): `cp_batch_write` only
+            // ever writes the base kind, so it would silently produce no LSI
+            // rows and no change-log record — gated by the shared
+            // `table_takes_kind_write_path` predicate (secondary index OR
+            // active stream), never a bare `table_indexes(..).is_empty()`
+            // re-derivation, which would (and once did) let a
+            // streamed-but-unindexed table slip through this fast path and
+            // silently drop every change record. Such a table instead routes
+            // each request through `ClientCtx::cp_kind_write_item`
+            // individually — ADR 0046 U3's evaluate-at-leader write path, the
+            // identical primitive `PutItem`/`DeleteItem` use, which reads the
+            // old item and evaluates on the tablet leader rather than here.
+            // `BatchWriteItem` has no per-item condition, so
+            // `KindWriteOutcome::ConditionFailed` can never come back here
+            // (`cp_kind_write_item`'s own `condition: None`). **Per-item
             // atomicity only**, matching DynamoDB's own non-atomic
             // `BatchWriteItem` contract (one request's outcome never affects
             // another's).
             for (table, reqs) in &requests {
-                if meta.table_indexes(table).is_empty() {
+                if !table_takes_kind_write_path(meta, table) {
                     let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(reqs.len());
                     for req in reqs {
                         match req {
@@ -3536,6 +3542,51 @@ mod stream_write_path_tests {
                 .local_scan_kind_bounded(KIND_FOOTPRINT, &[], None)
                 .await
                 .is_empty()
+        );
+    }
+
+    /// A streamed-but-unindexed table's `BatchWriteItem` must take the
+    /// identical kind-write path a single `PutItem` does on the same table
+    /// (`streamed_unindexed_table_writes_base_and_change_only`, above) — one
+    /// change record per item. Regression for a drifted-predicate bug: the
+    /// `BatchWriteItem` fast-path gate used to check
+    /// `meta.table_indexes(table).is_empty()` directly instead of the shared
+    /// `table_takes_kind_write_path` predicate, so a streamed-but-unindexed
+    /// table (indexes empty, stream present) wrongly took the plain
+    /// `cp_batch_write` fast path and silently emitted **no** change records
+    /// — permanent, silent stream-event loss (ADR 0042 §9).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streamed_unindexed_table_batch_write_emits_change_records() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = single_node(dir.path()).await;
+        create_streamed_table(node.dynamo_addr(), "s4").await;
+        let group = await_group(&node, "s4").await;
+        assert_eq!(group.pending_changes().await.len(), 0);
+
+        const N: usize = 5;
+        let puts: Vec<String> = (0..N)
+            .map(|i| format!(r#"{{"PutRequest":{{"Item":{{"id":{{"S":"k{i}"}}}}}}}}"#))
+            .collect();
+        let body = format!(r#"{{"RequestItems":{{"s4":[{}]}}}}"#, puts.join(","));
+        let (status, resp) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.BatchWriteItem",
+            &body,
+        )
+        .await;
+        assert_eq!(status, 200, "BatchWriteItem failed: {resp}");
+        assert_eq!(
+            group.pending_changes().await.len(),
+            N,
+            "BatchWriteItem on a streamed-but-unindexed table must leave one \
+             change record per item"
+        );
+        assert!(
+            group
+                .local_scan_kind_bounded(KIND_LSI, &[], None)
+                .await
+                .is_empty(),
+            "an unindexed table must never write an LSI row, streamed or not"
         );
     }
 
