@@ -232,7 +232,7 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
     use animus_control::{StreamSpec, StreamViewType};
-    use animus_tablet::TabletId;
+    use animus_tablet::{KeyRange, TabletId};
 
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
@@ -308,6 +308,7 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
         seal_wall_ms: 1_700_000_000_000,
         replicas: vec![nid(10), nid(11)],
         object_id: "stream_relay_t/relay-L1/1/0/test".to_owned(),
+        expected_range: KeyRange::whole(),
     };
     timeout(Duration::from_secs(20), async {
         loop {

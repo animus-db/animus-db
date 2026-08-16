@@ -746,6 +746,30 @@ pub enum MetaCommand {
         /// silently treated as the identical-content no-op case that a
         /// true same-attempt retry (same id, reused) is.
         object_id: String,
+        /// **Split-seal range-fence CAS amendment (2026-08-15, ADR 0043
+        /// §A3/§A4).** The tablet's own declared range the proposer fenced
+        /// its `pending_changes()` candidate scan against — checked at
+        /// *apply* time (below) against `self.tablets[tablet].range`,
+        /// **only when this is a genuinely new `(tablet, epoch)` row**
+        /// (never re-checked for an existing row's content-match retry or
+        /// the segment janitor's own replicas-only repair reproposal, both
+        /// of which reuse an already-validated row's content unchanged and
+        /// may legitimately run long after further splits have moved the
+        /// tablet's *current* range on). This is the authoritative backstop
+        /// a proposal-side metadata read (`animusd::index_drain::
+        /// in_declared_range`) cannot be by itself: that read can be stale
+        /// relative to a racing `SplitTablet` commit on the *same* node,
+        /// but `Metadata::apply` sees the true, sequentially-applied state,
+        /// never a cache — so a proposal computed against a stale-wide
+        /// range is rejected here regardless of any node's cache freshness.
+        /// An absent tablet at apply time is permissive (no check at all —
+        /// see the apply arm's own doc). `#[serde(default)]` keeps a
+        /// pre-amendment snapshot loading (this repo has no live-deployment/
+        /// back-compat requirement, but every construction site in Rust
+        /// code still needs the field explicitly — a `serde` default only
+        /// covers wire deserialization, not a struct literal).
+        #[serde(default = "KeyRange::whole")]
+        expected_range: KeyRange,
     },
     /// The segment-janitor's two-phase reclaim of already-sealed catalog
     /// rows (ADR 0043 §A9), and the drop-table cascade's own removal path
@@ -1466,6 +1490,7 @@ impl Metadata {
                 seal_wall_ms,
                 replicas,
                 object_id,
+                expected_range,
             } => {
                 // First-committer-wins on CONTENT, not merely on identity
                 // (round-3 PR7 amendment, ADR 0043 §A3/§A9): a second
@@ -1517,6 +1542,41 @@ impl Metadata {
                     }
                     existing.replicas = replicas.clone();
                     return ApplyOutcome::Applied;
+                }
+                // Split-seal range-fence CAS (2026-08-15, ADR 0043 §A3/§A4):
+                // this is a genuinely NEW (tablet, epoch) row (the existing-
+                // row branch above already returned) — reject unless the
+                // proposer's own declared range, fenced at propose time,
+                // still matches this tablet's CURRENT range as this exact
+                // apply call sees it. `Metadata::apply` runs sequentially in
+                // Raft commit order, so if a racing `SplitTablet` for this
+                // tablet committed earlier in the log, `self.tablets[tablet]
+                // .range` already reflects the narrowed range by the time
+                // this check runs — a proposal fenced against the old, wide
+                // range mismatches and is rejected, regardless of whether
+                // this node's own metadata cache had caught up to the split
+                // when the proposal was *built*. This is the backstop
+                // `animusd::index_drain::in_declared_range`'s own
+                // proposal-side (cache-fed) fence cannot be by itself — see
+                // that function's doc for why a cache-fed fence alone leaves
+                // a real window open.
+                //
+                // An absent tablet reads as permissive (no check to make),
+                // mirroring `in_declared_range`'s own convention — this
+                // should never happen for a live production seal (the
+                // tablet is the seal's own source of pending records), so
+                // being permissive here only matters for hand-built test
+                // commands that exercise this arm's *other* validations
+                // without bothering to register a tablet first.
+                if self
+                    .tablets
+                    .get(tablet)
+                    .is_some_and(|t| t.range != *expected_range)
+                {
+                    return ApplyOutcome::Rejected(
+                        "declared range stale — a split raced this seal, retry with the \
+                         current range",
+                    );
                 }
                 // Label validation (F12-b): licensed by the table's
                 // *current* schema stream spec, or by an existing catalog
@@ -3596,7 +3656,7 @@ mod tests {
         let mut m = Metadata::default();
         enable_stream(&mut m, "orders", "L1");
         assert_eq!(
-            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            m.apply(&seal(&m, "orders", "L1", 1, 0, 100)),
             ApplyOutcome::Applied
         );
         assert!(
@@ -3966,7 +4026,28 @@ mod tests {
         format!("{table}/{label}/{tablet}/{epoch}/test")
     }
 
-    fn seal(table: &str, label: &str, tablet: u64, epoch: u64, end: u64) -> MetaCommand {
+    /// `m`'s CURRENT range for `tablet` becomes this command's own
+    /// `expected_range` stamp — mirroring production's `seal_now`, which
+    /// always fences against whatever the tablet's live metadata range is
+    /// *at the moment it builds the proposal*. This is why `m` is a
+    /// parameter here at all: a caller testing a real split (`split_tablet`
+    /// below) gets an automatically-correct stamp with no per-call
+    /// override, and a caller that never registers a tablet at all gets
+    /// `whole()` — inert either way, since an absent tablet makes the CAS
+    /// permissive regardless of what was stamped (see the apply arm's own
+    /// doc).
+    fn seal(
+        m: &Metadata,
+        table: &str,
+        label: &str,
+        tablet: u64,
+        epoch: u64,
+        end: u64,
+    ) -> MetaCommand {
+        let expected_range = m
+            .tablets
+            .get(&TabletId(tablet))
+            .map_or_else(KeyRange::whole, |t| t.range.clone());
         MetaCommand::SealStreamShard {
             table: table.to_owned(),
             label: label.to_owned(),
@@ -3978,6 +4059,7 @@ mod tests {
             seal_wall_ms: 1_700_000_000_000,
             replicas: vec![nid(1), nid(2), nid(3)],
             object_id: test_object_id(table, label, tablet, epoch),
+            expected_range,
         }
     }
 
@@ -3994,7 +4076,7 @@ mod tests {
         enable_stream(&mut m, "orders", "L1");
 
         assert_eq!(
-            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            m.apply(&seal(&m, "orders", "L1", 1, 0, 100)),
             ApplyOutcome::Applied
         );
         let first = m.stream_shards[&(TabletId(1), 0)].clone();
@@ -4002,7 +4084,7 @@ mod tests {
 
         // Byte-identical re-propose (the sealer's own crash-retry).
         assert_eq!(
-            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            m.apply(&seal(&m, "orders", "L1", 1, 0, 100)),
             ApplyOutcome::NoOp
         );
         assert_eq!(m.stream_shards[&(TabletId(1), 0)], first);
@@ -4010,7 +4092,7 @@ mod tests {
         // A genuinely differing proposal for the SAME (tablet, epoch) — a
         // duelling/stale leader — must not overwrite the winner either.
         assert_eq!(
-            m.apply(&seal("orders", "L1", 1, 0, 999)),
+            m.apply(&seal(&m, "orders", "L1", 1, 0, 999)),
             ApplyOutcome::NoOp
         );
         assert_eq!(
@@ -4035,7 +4117,7 @@ mod tests {
         let mut m = Metadata::default();
         enable_stream(&mut m, "orders", "L1");
 
-        let mut first_attempt = seal("orders", "L1", 1, 0, 100);
+        let mut first_attempt = seal(&m, "orders", "L1", 1, 0, 100);
         if let MetaCommand::SealStreamShard { object_id, .. } = &mut first_attempt {
             *object_id = "orders/L1/1/0/attempt-a".to_owned();
         }
@@ -4046,7 +4128,7 @@ mod tests {
         // A second attempt, identical `hlc_range`/`count`/etc but its OWN
         // freshly-minted object_id — the lost-ack-retry / dueling-seal
         // shape.
-        let mut second_attempt = seal("orders", "L1", 1, 0, 100);
+        let mut second_attempt = seal(&m, "orders", "L1", 1, 0, 100);
         if let MetaCommand::SealStreamShard { object_id, .. } = &mut second_attempt {
             *object_id = "orders/L1/1/0/attempt-b".to_owned();
         }
@@ -4071,7 +4153,7 @@ mod tests {
         let mut m = Metadata::default();
         enable_stream(&mut m, "orders", "L1");
         assert_eq!(
-            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            m.apply(&seal(&m, "orders", "L1", 1, 0, 100)),
             ApplyOutcome::Applied
         );
         let original = m.stream_shards[&(TabletId(1), 0)].clone();
@@ -4079,7 +4161,7 @@ mod tests {
 
         // Repair: node 2 was lost and replaced by node 4 — identical
         // content, a different replica set.
-        let mut repaired = seal("orders", "L1", 1, 0, 100);
+        let mut repaired = seal(&m, "orders", "L1", 1, 0, 100);
         if let MetaCommand::SealStreamShard { replicas, .. } = &mut repaired {
             *replicas = vec![nid(1), nid(3), nid(4)];
         }
@@ -4101,7 +4183,7 @@ mod tests {
         // `hlc_range`) alongside a new replica set is still rejected,
         // never applied — the content check is independent of whether
         // `replicas` happens to differ too.
-        let mut conflicting = seal("orders", "L1", 1, 0, 999);
+        let mut conflicting = seal(&m, "orders", "L1", 1, 0, 999);
         if let MetaCommand::SealStreamShard { replicas, .. } = &mut conflicting {
             *replicas = vec![nid(5)];
         }
@@ -4111,6 +4193,140 @@ mod tests {
             vec![nid(1), nid(3), nid(4)],
             "a content-conflicting proposal must not sneak a replicas update through"
         );
+    }
+
+    /// **Split-seal range-fence CAS (2026-08-15, ADR 0043 §A3/§A4)**: a
+    /// proposal for a genuinely NEW `(tablet, epoch)` row is rejected if its
+    /// declared `expected_range` no longer matches the tablet's CURRENT
+    /// range — this is the authoritative backstop for the case a
+    /// proposal-side metadata read (`animusd::index_drain::
+    /// in_declared_range`) cannot close on its own: the range moved on
+    /// (here, via a real `SplitTablet` apply) between when the proposer
+    /// computed its candidate set and when this command actually applies.
+    #[test]
+    fn seal_stream_shard_range_cas_rejects_a_stale_declared_range_after_a_split() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_owned()),
+                range: KeyRange::whole(),
+                replicas: Vec::new(),
+            }),
+            ApplyOutcome::Applied,
+            "test setup: create tablet"
+        );
+        split_tablet(&mut m, TabletId(1), vec![128u8], TabletId(2));
+
+        // Tablet 1's own range has narrowed to the left half — a proposal
+        // still declaring the pre-split `whole()` range is stale.
+        let mut stale = seal(&m, "orders", "L1", 1, 0, 100);
+        if let MetaCommand::SealStreamShard { expected_range, .. } = &mut stale {
+            *expected_range = KeyRange::whole();
+        }
+        assert_eq!(
+            m.apply(&stale),
+            ApplyOutcome::Rejected(
+                "declared range stale — a split raced this seal, retry with the current range"
+            )
+        );
+        assert!(
+            !m.stream_shards.contains_key(&(TabletId(1), 0)),
+            "a rejected seal must leave the catalog completely untouched"
+        );
+    }
+
+    /// The accepting half of the same CAS: a proposal whose declared range
+    /// matches the tablet's current (post-split) range applies normally —
+    /// the check is a genuine compare-and-swap, not a blanket rejection of
+    /// every seal on a tablet that has ever split.
+    #[test]
+    fn seal_stream_shard_range_cas_accepts_the_current_declared_range() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_owned()),
+                range: KeyRange::whole(),
+                replicas: Vec::new(),
+            }),
+            ApplyOutcome::Applied,
+            "test setup: create tablet"
+        );
+        split_tablet(&mut m, TabletId(1), vec![128u8], TabletId(2));
+
+        let mut current = seal(&m, "orders", "L1", 1, 0, 100);
+        if let MetaCommand::SealStreamShard { expected_range, .. } = &mut current {
+            *expected_range = KeyRange::new(Vec::new(), Some(vec![128u8]));
+        }
+        assert_eq!(m.apply(&current), ApplyOutcome::Applied);
+        assert!(m.stream_shards.contains_key(&(TabletId(1), 0)));
+
+        // The split child's own epoch-0 seal, correctly declaring its own
+        // (right-half) range, applies too.
+        let mut child = seal(&m, "orders", "L1", 2, 0, 200);
+        if let MetaCommand::SealStreamShard { expected_range, .. } = &mut child {
+            *expected_range = KeyRange::new(vec![128u8], None);
+        }
+        assert_eq!(m.apply(&child), ApplyOutcome::Applied);
+    }
+
+    /// The CAS must never gate the existing-row paths (a byte-identical
+    /// crash-retry, or the segment janitor's replicas-only repair) — both
+    /// legitimately reuse an already-validated row's content long after the
+    /// tablet's own range may have moved on for entirely unrelated reasons
+    /// (here, modelled by a further split after the original seal
+    /// committed). See `MetaCommand::SealStreamShard::expected_range`'s own
+    /// doc for why this check is scoped to the no-existing-row branch only.
+    #[test]
+    fn seal_stream_shard_range_cas_does_not_gate_a_replicas_only_repair() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_owned()),
+                range: KeyRange::whole(),
+                replicas: Vec::new(),
+            }),
+            ApplyOutcome::Applied,
+            "test setup: create tablet"
+        );
+
+        // Seal epoch 0 while the tablet's range is still `whole()`.
+        let mut original = seal(&m, "orders", "L1", 1, 0, 100);
+        if let MetaCommand::SealStreamShard { expected_range, .. } = &mut original {
+            *expected_range = KeyRange::whole();
+        }
+        assert_eq!(m.apply(&original), ApplyOutcome::Applied);
+
+        // The tablet splits AFTER the seal above already committed — its
+        // own range has moved on, and stays moved on regardless of what the
+        // repair below declares.
+        split_tablet(&mut m, TabletId(1), vec![128u8], TabletId(2));
+
+        // A replicas-only repair reproposal, reusing the original row's own
+        // `object_id` (so it hits the existing-row/content-matches branch),
+        // but stamped with the now-STALE pre-split range — must still
+        // apply, since the range CAS never runs for this path at all.
+        let mut repair = seal(&m, "orders", "L1", 1, 0, 100);
+        if let MetaCommand::SealStreamShard {
+            replicas,
+            expected_range,
+            ..
+        } = &mut repair
+        {
+            *replicas = vec![nid(9)];
+            *expected_range = KeyRange::whole(); // stale, deliberately
+        }
+        assert_eq!(
+            m.apply(&repair),
+            ApplyOutcome::Applied,
+            "a replicas-only repair must apply regardless of a stale expected_range"
+        );
+        assert_eq!(m.stream_shards[&(TabletId(1), 0)].replicas, vec![nid(9)]);
     }
 
     /// Label validation (F12-b): a label with a matching *current* schema
@@ -4127,7 +4343,7 @@ mod tests {
 
         // A label nobody has ever licensed: rejected.
         assert_eq!(
-            m.apply(&seal("orders", "bogus", 1, 0, 100)),
+            m.apply(&seal(&m, "orders", "bogus", 1, 0, 100)),
             ApplyOutcome::Rejected(
                 "stream label has no current schema entry and no existing catalog rows \
                  to extend"
@@ -4137,7 +4353,7 @@ mod tests {
 
         // The current schema's own label: accepted.
         assert_eq!(
-            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            m.apply(&seal(&m, "orders", "L1", 1, 0, 100)),
             ApplyOutcome::Applied
         );
 
@@ -4154,7 +4370,7 @@ mod tests {
         );
         assert!(m.table_stream("orders").is_none(), "test premise");
         assert_eq!(
-            m.apply(&seal("orders", "L1", 1, 1, 200)),
+            m.apply(&seal(&m, "orders", "L1", 1, 1, 200)),
             ApplyOutcome::Applied,
             "a disabled stream's un-reaped rows must still license a further seal \
              of the same generation"
@@ -4163,7 +4379,7 @@ mod tests {
         // A DIFFERENT label, still with no schema entry and no rows of its
         // own, remains rejected even though the table has *some* rows.
         assert_eq!(
-            m.apply(&seal("orders", "L2", 1, 2, 300)),
+            m.apply(&seal(&m, "orders", "L2", 1, 2, 300)),
             ApplyOutcome::Rejected(
                 "stream label has no current schema entry and no existing catalog rows \
                  to extend"
@@ -4181,7 +4397,7 @@ mod tests {
 
         // epoch 0 with no history at all: always fine.
         assert_eq!(
-            m.apply(&seal("orders", "L1", 1, 0, 100)),
+            m.apply(&seal(&m, "orders", "L1", 1, 0, 100)),
             ApplyOutcome::Applied
         );
 
@@ -4189,7 +4405,7 @@ mod tests {
         // tablet 1: rejected — a genuine gap this state machine can't
         // explain.
         assert_eq!(
-            m.apply(&seal("orders", "L1", 1, 2, 300)),
+            m.apply(&seal(&m, "orders", "L1", 1, 2, 300)),
             ApplyOutcome::Rejected(
                 "epoch chain gap: no prior epoch row for this tablet and no \
                  split-parent provenance to explain it"
@@ -4198,11 +4414,11 @@ mod tests {
 
         // Filling in epoch 1 makes epoch 2 acceptable.
         assert_eq!(
-            m.apply(&seal("orders", "L1", 1, 1, 200)),
+            m.apply(&seal(&m, "orders", "L1", 1, 1, 200)),
             ApplyOutcome::Applied
         );
         assert_eq!(
-            m.apply(&seal("orders", "L1", 1, 2, 300)),
+            m.apply(&seal(&m, "orders", "L1", 1, 2, 300)),
             ApplyOutcome::Applied
         );
 
@@ -4210,7 +4426,7 @@ mod tests {
         // local history at all may seal epoch 0 (the ordinary case)...
         m.split_parents.insert(TabletId(2), TabletId(1));
         assert_eq!(
-            m.apply(&seal("orders", "L1", 2, 0, 350)),
+            m.apply(&seal(&m, "orders", "L1", 2, 0, 350)),
             ApplyOutcome::Applied
         );
         // ...and the permissive escape hatch: epoch 1 is also accepted for
@@ -4220,7 +4436,7 @@ mod tests {
         // local rows at all yet.
         m.split_parents.insert(TabletId(3), TabletId(1));
         assert_eq!(
-            m.apply(&seal("orders", "L1", 3, 1, 400)),
+            m.apply(&seal(&m, "orders", "L1", 3, 1, 400)),
             ApplyOutcome::Applied,
             "split-parent provenance must license a non-zero epoch with no local history"
         );
@@ -4235,8 +4451,8 @@ mod tests {
     fn expire_stream_shards_mark_then_remove_is_idempotent() {
         let mut m = Metadata::default();
         enable_stream(&mut m, "orders", "L1");
-        m.apply(&seal("orders", "L1", 1, 0, 100));
-        m.apply(&seal("orders", "L1", 1, 1, 200));
+        m.apply(&seal(&m, "orders", "L1", 1, 0, 100));
+        m.apply(&seal(&m, "orders", "L1", 1, 1, 200));
 
         // Mark: row(s) present, not yet expired -> Applied, now expired.
         assert_eq!(
@@ -4340,9 +4556,9 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        m.apply(&seal("orders", "L1", 1, 0, 100));
-        m.apply(&seal("orders", "L1", 1, 1, 200));
-        m.apply(&seal("orders", "L1", 1, 2, 300));
+        m.apply(&seal(&m, "orders", "L1", 1, 0, 100));
+        m.apply(&seal(&m, "orders", "L1", 1, 1, 200));
+        m.apply(&seal(&m, "orders", "L1", 1, 2, 300));
         // A real split — not a hand-poked `split_parents` entry — freezes
         // tablet 2's `stream_split_basis` from tablet 1's state right now.
         split_tablet(
@@ -4351,7 +4567,7 @@ mod tests {
             0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
             TabletId(2),
         );
-        m.apply(&seal("orders", "L1", 2, 0, 350));
+        m.apply(&seal(&m, "orders", "L1", 2, 0, 350));
 
         // Chain: ascending epoch order, scoped to this tablet + label.
         let chain: Vec<u64> = m
@@ -4418,8 +4634,8 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        m.apply(&seal("orders", "L1", 1, 0, 100));
-        m.apply(&seal("orders", "L1", 1, 1, 200));
+        m.apply(&seal(&m, "orders", "L1", 1, 0, 100));
+        m.apply(&seal(&m, "orders", "L1", 1, 1, 200));
 
         // Tablet 1 has its own rows: identical to the plain accessor.
         assert_eq!(m.effective_stream_shard_watermark(TabletId(1)), Some(200));
@@ -4456,7 +4672,7 @@ mod tests {
         // retroactively become tablet 3's effective watermark too — it
         // must not, since tablet 3's basis was frozen before tablet 2 had
         // ever sealed.
-        m.apply(&seal("orders", "L1", 2, 0, 350));
+        m.apply(&seal(&m, "orders", "L1", 2, 0, 350));
         assert_eq!(
             m.effective_stream_shard_watermark(TabletId(3)),
             Some(200),
@@ -4488,7 +4704,7 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        m.apply(&seal("orders", "L1", 1, 0, 100));
+        m.apply(&seal(&m, "orders", "L1", 1, 0, 100));
         split_tablet(
             &mut m,
             TabletId(1),
@@ -4501,7 +4717,7 @@ mod tests {
         );
 
         // The parent seals again after the split.
-        m.apply(&seal("orders", "L1", 1, 1, 200));
+        m.apply(&seal(&m, "orders", "L1", 1, 1, 200));
         assert_eq!(
             m.stream_shard_parent_id(TabletId(2), 0),
             Some("shardId-1-0".to_owned()),
@@ -4529,7 +4745,7 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        m.apply(&seal("orders", "L1", 1, 0, 100));
+        m.apply(&seal(&m, "orders", "L1", 1, 0, 100));
         split_tablet(
             &mut m,
             TabletId(1),

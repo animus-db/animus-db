@@ -449,6 +449,47 @@ fn record_hlc(key: &[u8]) -> Option<HlcTimestamp> {
     cursor::decode_watermark(suffix)
 }
 
+/// Whether a `KIND_CHANGE` record's own logical `key` falls inside `tablet`'s
+/// **current metadata-declared range** (`Metadata.tablets[tablet].range`) —
+/// independent of whatever this node's own physical `StorageScope` currently
+/// allows.
+///
+/// **Why this exists (2026-08-15, the split-seal duplication bug)**:
+/// `RaftKvNode::narrow_scope` — the local effect of a `SplitTablet` commit —
+/// is a separate, un-replicated per-node action the tablet-host reconciler
+/// applies only once it next notices the metadata change (event-driven watch
+/// or a fallback tick); nothing synchronizes that against this loop's own
+/// tick. In the window between a `SplitTablet` commit and that local
+/// catch-up, `CpGroup::pending_changes()` — bounded only by the live,
+/// possibly-still-wide physical scope — can still return records that, per
+/// `Metadata`, already belong to a just-split-off sibling tablet. Sealing
+/// (or hot-reading) them here would duplicate whatever the sibling's own
+/// eventual seal covers; trimming them here could delete them before the
+/// sibling ever gets a chance to seal them at all. Filtering every candidate
+/// set to the metadata-declared range — the same authority the ADR 0028
+/// write fence already trusts — closes the gap at its source, with no need
+/// for the local scope to have converged yet. See `docs/engineering-
+/// lessons.md`'s "corpus convention... cannot express the real race" entry
+/// for the full incident.
+///
+/// `key` is checked whole (base-key prefix *and* trailing HLC suffix): a
+/// tablet's `KeyRange` is already reused verbatim across every row kind
+/// (`StorageScope::with_kind`'s shared `Arc<KeyRange>`), so comparing a
+/// change-log key's own bytes against `range` is exactly the check
+/// `StorageScope::strip_in_range` already performs for the physical scope.
+///
+/// Absent from `Metadata.tablets` — should not happen for any tablet this
+/// loop's caller visits, which already requires a `Metadata` tablet entry
+/// with a table (`change_consumer_loop`'s own gate) — reads as permissive
+/// (no declared range to check against), never as "drop everything": a
+/// metadata read racing away underneath is a staler-than-usual view, not
+/// evidence the tablet has no range.
+fn in_declared_range(meta: &Metadata, tablet: TabletId, key: &[u8]) -> bool {
+    meta.tablets
+        .get(&tablet)
+        .is_none_or(|t| t.range.contains(key))
+}
+
 /// Bring one partition's GSI rows in line with its base rows' *current*
 /// values, then atomically record the new footprint. Unlike ADR 0041's
 /// original design, this no longer deletes the change records that triggered
@@ -962,6 +1003,15 @@ pub(crate) async fn seal_now(
             if watermark.is_some_and(|w| packed <= w) {
                 return None; // already covered by an earlier seal
             }
+            // Split-seal duplication fence (2026-08-15, see
+            // `in_declared_range`'s own doc): this tablet's *physical* scope
+            // can still be wider than its *declared* one for a while after a
+            // split commits. A record outside the declared range already
+            // belongs to a split-off sibling — leave it for that sibling's
+            // own first seal, never claim it here.
+            if !in_declared_range(&meta, tablet, &key) {
+                return None;
+            }
             Some(segment::SegmentRecord {
                 source_key: key,
                 packed_hlc: packed,
@@ -1036,6 +1086,15 @@ pub(crate) async fn seal_now(
         .map_or(animus_control::StreamViewType::NewAndOldImages, |s| {
             s.view_type
         });
+    // Split-seal range-fence CAS (2026-08-15, ADR 0043 §A3/§A4): the exact
+    // range `in_declared_range` just fenced this seal's candidate set
+    // against, carried through so `Metadata::apply` can re-check it against
+    // the tablet's true, authoritative range at apply time — the backstop
+    // this proposal-side (possibly stale) read cannot be by itself.
+    let expected_range = meta
+        .tablets
+        .get(&tablet)
+        .map_or_else(KeyRange::whole, |t| t.range.clone());
     let cmd = MetaCommand::SealStreamShard {
         table: table.to_owned(),
         label,
@@ -1047,6 +1106,7 @@ pub(crate) async fn seal_now(
         seal_wall_ms,
         replicas,
         object_id: seg_id,
+        expected_range,
     };
     // Retry-after-lost-ack semantics (ledger-named-object amendment): this
     // check function already treats "the row now exists" as success
@@ -1108,7 +1168,15 @@ pub(crate) async fn seal_now(
 /// then the DynamoDB Streams wire edge) builds a `GetRecords` response from
 /// these identically to how it builds one from a sealed segment's own
 /// `SegmentRecord`s.
+///
+/// `meta`/`tablet` feed the split-seal duplication fence
+/// (`in_declared_range`, 2026-08-15): without it, a poll landing in the
+/// window between a `SplitTablet` commit and this node's own local
+/// scope-narrow could serve a record that, per `Metadata`, already belongs
+/// to a split-off sibling.
 pub(crate) async fn hot_read(
+    meta: &Metadata,
+    tablet: TabletId,
     group: &CpGroup,
     from_position: u64,
     limit: usize,
@@ -1120,6 +1188,15 @@ pub(crate) async fn hot_read(
         .filter_map(|(key, value)| {
             let ts = record_hlc(&key)?;
             let packed = hlc::pack(ts);
+            // Split-seal duplication fence (2026-08-15, see
+            // `in_declared_range`'s own doc): a live consumer polling this
+            // tablet's open tail mid-split must not see a record that, per
+            // Metadata, already belongs to a split-off sibling — that
+            // sibling serves its own hot tail (and eventually its own
+            // seal) for it instead.
+            if !in_declared_range(meta, tablet, &key) {
+                return None;
+            }
             (packed > from_position).then_some((key, packed, value))
         })
         .collect();
@@ -1227,6 +1304,17 @@ async fn trim_janitor(
 
     let mut writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     for (key, _) in group.pending_changes().await {
+        // Split-seal duplication fence (2026-08-15, see
+        // `in_declared_range`'s own doc) — the LOSS-shaped twin of
+        // `seal_now`'s own fence above: a record outside this tablet's
+        // metadata-declared range already belongs to a split-off sibling
+        // that may not have sealed it yet, even under `trim_all`'s
+        // "nothing is protecting this hot log anymore" reasoning (that
+        // reasoning is about *this* tablet's own stream state, not the
+        // sibling's). Never delete it out from under the sibling.
+        if !in_declared_range(meta, tablet, &key) {
+            continue;
+        }
         if !trim_all {
             let Some(ts) = record_hlc(&key) else {
                 continue; // malformed suffix; leave it rather than guess

@@ -594,6 +594,7 @@ mod tests {
             seal_wall_ms: 0,
             replicas: Vec::new(),
             object_id: format!("t/{label}/{}/{epoch}/test", tablet.0),
+            expected_range: KeyRange::whole(),
         });
     }
 
