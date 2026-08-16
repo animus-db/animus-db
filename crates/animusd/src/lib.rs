@@ -415,6 +415,16 @@ impl CpGroup {
         }
     }
 
+    /// Explicitly wake this group's consensus loop for one extra pass (ADR
+    /// 0044 phase-1 PR4) — see [`RaftKvNode::wake`]. Idempotent and safe on
+    /// every state.
+    fn wake(&self) {
+        match self {
+            CpGroup::Lsm(n) => n.wake(),
+            CpGroup::Mem(n) => n.wake(),
+        }
+    }
+
     /// This replica's `engine_applied_index()` — the confirm-by-index
     /// primitive linearizable reads themselves gate on. See
     /// [`RaftKvNode::engine_applied_index`]. Used by the backfill seeder
@@ -2429,6 +2439,7 @@ impl BoundNode {
             segment_store_config,
             stream_retention,
             None,
+            Duration::ZERO,
         )
         .await
     }
@@ -2462,6 +2473,7 @@ impl BoundNode {
         segment_store_config: SegmentStoreConfig,
         stream_retention: Duration,
         auto_split_change_rate: Option<u64>,
+        quiesce_after: Duration,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         // The initial (static) peer book + an env clone, kept for the
@@ -2686,7 +2698,7 @@ impl BoundNode {
         // stands each table's group up once `CreateTable` provisions its
         // tablet, and re-forms it from the shared engine's already-durable
         // data on restart.
-        let reconciler = {
+        let mut reconciler = {
             let host_edge = edge.clone();
             let teardown_edge = edge.clone();
             let base_id = my_id.clone();
@@ -2716,6 +2728,13 @@ impl BoundNode {
                 )),
             }
         };
+        // ADR 0044 phase-1 PR4 production wiring (PR7 layers the
+        // `--quiesce-after` CLI flag on top of this same knob):
+        // `Duration::ZERO` (every existing call site) disables it entirely —
+        // zero behavior change. Data-plane groups only (fork G).
+        if !quiesce_after.is_zero() {
+            reconciler.enable_quiescence(quiesce_after);
+        }
 
         // Bootstrap: whichever node is leader registers membership (no data tablet)
         // (idempotent). `spawn_common_tail` (above) already started `tasks` with
@@ -4960,6 +4979,16 @@ impl ClientCtx {
     /// only to gather its inputs (cheaply, and lazily where a fact needs a
     /// `Metadata` deep clone) and execute the resulting decision.
     fn resolve_cp_route(&self, tablet: TabletId) -> Option<CpRoute> {
+        // ADR 0044 phase-1 PR4 (the wake-on-demand edge): wake any locally
+        // registered replica of this tablet before deciding anything, so a
+        // first touch on a possibly-quiesced cold group doesn't wait out its
+        // own idle-detection latency on top of ordinary election-wait.
+        // `RaftKvNode::wake()` is cheap and safe on every other state (not
+        // quiesced, or this node isn't the leader) — an idempotent notify
+        // that costs one inert extra loop iteration at worst.
+        if let Some(group) = self.edge.local_cp(tablet) {
+            group.wake();
+        }
         let leader = self.edge.cp_leader(tablet);
         if let Some(leader) = leader {
             return Some(CpRoute::Local(leader));
@@ -8187,7 +8216,15 @@ impl ClientCtx {
                 let Some(leader) = self.edge.cp_leader(tablet) else {
                     return self.not_leader_refusal(Some(tablet));
                 };
-                let meta = self.effective_metadata();
+                // ADR 0044 phase-1 PR4: the hot_read scope-transition latch,
+                // sourced from `metadata_fresh()` — see
+                // `hot_read_scope_ok`'s own doc for why this narrows the ADR
+                // 0043 residual `effective_metadata()` alone left open (and
+                // for the accepted remaining sub-window it does not close).
+                let meta = self.metadata_fresh().await;
+                if let Err(e) = Self::hot_read_scope_ok(&meta, tablet, &leader) {
+                    return ClientResponse::Error(e);
+                }
                 let pairs = index_drain::hot_read(&meta, tablet, &leader, from_position, limit)
                     .await
                     .into_iter()
@@ -9575,6 +9612,15 @@ impl CpReconciler {
         match self {
             CpReconciler::Lsm(r) => r.tick(view).await,
             CpReconciler::Mem(r) => r.tick(view).await,
+        }
+    }
+
+    /// ADR 0044 phase-1 PR4 production wiring — see
+    /// [`Reconciler::enable_quiescence`]'s doc.
+    fn enable_quiescence(&mut self, after: Duration) {
+        match self {
+            CpReconciler::Lsm(r) => r.enable_quiescence(after),
+            CpReconciler::Mem(r) => r.enable_quiescence(after),
         }
     }
 }
@@ -11250,6 +11296,74 @@ impl ClientCtx {
         }
     }
 
+    /// The hot_read scope-transition latch (ADR 0044 phase-1 PR4, narrowing
+    /// the ADR 0043 `hot_read` residual — see [[split-seal-duplication-bug]]
+    /// and `docs/adr/0043-*.md`'s amendment on the #220 fix): refuses a
+    /// hot-read retryably instead of ever risking a stale-wide answer,
+    /// whenever this node's own **live** `scope_range()` for `tablet` (the
+    /// exact field `animus_cp_data::host::Reconciler::tick` mutates via
+    /// `narrow_scope` — see that module's doc) is currently **wider** than
+    /// the tablet's range per `meta`.
+    ///
+    /// **`meta` must come from [`metadata_fresh`](Self::metadata_fresh),
+    /// never [`effective_metadata`](Self::effective_metadata)/
+    /// `metadata_cached()`.** `index_drain::hot_read`'s own pre-existing
+    /// `in_declared_range` filter (2026-08-15) already checks a record's key
+    /// against a caller-supplied snapshot, but every prior call site sourced
+    /// that snapshot from the possibly-stale `effective_metadata()` mirror.
+    /// Reading the group's own live scope needs no new shared state at all —
+    /// it is always exactly current the instant the reconciler narrows it
+    /// (`RaftKvNode::narrow_scope` sets it synchronously, no propagation
+    /// delay) — so cross-checking it against a **freshly fetched** declared
+    /// range closes two of the three staleness axes `in_declared_range`
+    /// alone left open: (a) a data-only/growth node's ADR 0030 mirror
+    /// lagging a `SplitTablet` commit by its own refresh interval, and (b)
+    /// this node's own reconciler having observed the split in its cached
+    /// `Metadata` but not yet having ticked `narrow_scope` locally.
+    ///
+    /// **This narrows, but does not fully close, the residual — the same
+    /// layer-2 structure the #220 investigation found on the write side.**
+    /// For a `ControlHandle::Local` node (every combined node — the common
+    /// case), `metadata_fresh()` resolves to `raft.metadata()`, the ADR 0038
+    /// published cache a **local, asynchronous control apply task**
+    /// maintains, not the control Raft's own commit index directly. In the
+    /// sub-window between a `SplitTablet` actually committing and this
+    /// node's own control apply task catching its published cache up to it,
+    /// `meta` and the live scope are stale **together**: the declared range
+    /// still shows the pre-split width, so this check passes and a hot-read
+    /// can still observe the fabrication class ADR 0043 describes. Full
+    /// closure of this sub-window would need a per-read control-leader
+    /// round trip on every `hot_read` call — rejected as disproportionate in
+    /// the #220 analysis for the same reason a per-write round trip was
+    /// rejected there. The accepted remaining exposure is bounded to the
+    /// control apply task's own catch-up latency (milliseconds under normal
+    /// load), not the reconciler's (much longer) tick cadence — see ADR
+    /// 0048's residual section for the full accounting, and the D8 e2e
+    /// adjudicator (`streams_e2e.rs::
+    /// auto_split_mid_stream_with_live_consumer_across_every_node`)'s own
+    /// doc for how a distinct-`eventID` failure there should be read against
+    /// this specific remaining window rather than assumed to be the
+    /// pre-latch bug recurring wholesale.
+    fn hot_read_scope_ok(meta: &Metadata, tablet: TabletId, group: &CpGroup) -> Result<(), String> {
+        let Some(t) = meta.tablets.get(&tablet) else {
+            // Dropped/reclaimed table — the caller's own absence handling
+            // (an empty/error reply upstream) applies; not this latch's
+            // concern.
+            return Ok(());
+        };
+        let live = group.scope_range();
+        if live != t.range && live.contains_range(&t.range) {
+            // This node's live scope is strictly wider than the freshest
+            // known declared range: a split-driven narrow this node's own
+            // reconciler owes is outstanding. Refuse retryably rather than
+            // risk serving a record that, per `meta`, already belongs to a
+            // split-off sibling (which will itself answer for it once
+            // hosted) — the fabrication class this latch exists to prevent.
+            return Err("tablet scope transitioning (split narrow pending); retry".into());
+        }
+        Ok(())
+    }
+
     /// Fetch up to `limit` of `tablet`'s own open-shard hot records with
     /// packed HLC strictly greater than `from_position` (ADR 0042 §7/§8,
     /// PR6's `GetRecords` open-shard path) — the internal `ClientRequest::
@@ -11270,7 +11384,19 @@ impl ClientCtx {
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
-                    let meta = self.effective_metadata();
+                    // ADR 0044 phase-1 PR4: the hot_read scope-transition
+                    // latch (see `hot_read_scope_ok`'s own doc) — a
+                    // retryable refusal here re-enters this same loop
+                    // (re-resolving routing fresh next pass) rather than
+                    // ever risking a stale-wide answer.
+                    let meta = self.metadata_fresh().await;
+                    if let Err(e) = Self::hot_read_scope_ok(&meta, tablet, &leader) {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(e);
+                        }
+                        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+                        continue;
+                    }
                     return Ok(
                         index_drain::hot_read(&meta, tablet, &leader, from_position, limit)
                             .await
@@ -11368,6 +11494,7 @@ pub async fn start_cluster_with(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         None,
+        Duration::ZERO,
     )
     .await
 }
@@ -11393,6 +11520,7 @@ pub async fn start_cluster_auto_split(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         None,
+        Duration::ZERO,
     )
     .await
 }
@@ -11418,6 +11546,7 @@ pub async fn start_cluster_with_auto_split(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         None,
+        Duration::ZERO,
     )
     .await
 }
@@ -11446,6 +11575,7 @@ pub async fn start_cluster_with_auto_split_bytes(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         None,
+        Duration::ZERO,
     )
     .await
 }
@@ -11475,6 +11605,7 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         None,
+        Duration::ZERO,
     )
     .await
 }
@@ -11511,6 +11642,7 @@ pub async fn start_cluster_with_streams(
         segment_store_config,
         stream_retention,
         None,
+        Duration::ZERO,
     )
     .await
 }
@@ -11544,6 +11676,41 @@ pub async fn start_cluster_with_growth(
         segment_store_config,
         stream_retention,
         auto_split_change_rate,
+        Duration::ZERO,
+    )
+    .await
+}
+
+/// Like [`start_cluster_with_growth`], but also opts every **data-plane** CP
+/// group into quiescence (ADR 0044 phase-1 PR4/PR7) with the given idle
+/// threshold — `Duration::ZERO` (every other entry point above) disables it
+/// entirely, zero behavior change. Test-only today (no CLI flag threads
+/// through this specific wrapper yet — PR7 adds `--quiesce-after SECS` to
+/// the per-process `run_node*`/`gen-config` paths); combined-mode
+/// (`--cluster N`) only, mirroring every other knob in this file's layered
+/// stack.
+///
+/// # Errors
+/// Propagates a failure to open any node's CP group engine.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_cluster_with_quiesce_after(
+    bound: Vec<BoundNode>,
+    backend: StorageBackend,
+    auto_split_keys: Option<usize>,
+    auto_split_bytes: Option<u64>,
+    quiesce_after: Duration,
+) -> std::io::Result<Vec<Node>> {
+    start_cluster_inner(
+        bound,
+        backend,
+        auto_split_keys,
+        auto_split_bytes,
+        DEFAULT_ORPHAN_SWEEP_AFTER,
+        StreamSealKnobs::default(),
+        SegmentStoreConfig::default(),
+        DEFAULT_STREAM_RETENTION,
+        None,
+        quiesce_after,
     )
     .await
 }
@@ -11559,6 +11726,7 @@ async fn start_cluster_inner(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     auto_split_change_rate: Option<u64>,
+    quiesce_after: Duration,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -11620,6 +11788,7 @@ async fn start_cluster_inner(
                 segment_store_config.clone(),
                 stream_retention,
                 auto_split_change_rate,
+                quiesce_after,
             )
             .await?;
         nodes.push(node);
@@ -13080,6 +13249,108 @@ mod split_fence_tests {
         })
         .await
         .expect("test timed out");
+    }
+}
+
+/// ADR 0044 phase-1 PR4: unit coverage for the hot_read scope-transition
+/// latch (`ClientCtx::hot_read_scope_ok`) in isolation — the function is a
+/// private associate of `ClientCtx` (no `pub`), so this lives in-crate like
+/// `split_fence_tests` above rather than under `tests/`, which can't reach
+/// it. Deterministic: `hot_read_scope_ok` is a pure comparison given a
+/// `Metadata` snapshot and a live `CpGroup`'s own `scope_range()`, no real
+/// cluster bring-up needed. The end-to-end, real-race evidence that this
+/// narrows the ADR 0043 residual (see `hot_read_scope_ok`'s own doc for the
+/// control-apply-lag sub-window it does not close) is `tests/streams_e2e.rs`'s
+/// `auto_split_mid_stream_with_live_consumer_across_every_node` (D8), the
+/// historical adjudicator for this exact fabrication class (distinct-
+/// `eventID` duplicates straddling a split boundary) — still the live
+/// signal for the accepted remaining window, not just the pre-latch bug.
+#[cfg(test)]
+mod hot_read_latch_tests {
+    use std::time::Duration;
+
+    use animus_control::Metadata;
+    use animus_cp_data::{RaftKvNode, StorageScope};
+    use animus_env::{ProdEnv, nid};
+    use animus_storage::MemoryEngine;
+    use animus_tablet::{KeyRange, Tablet, TabletId};
+    use tokio::time::sleep;
+
+    use crate::{ClientCtx, CpGroup};
+
+    /// A lone single-voter group over a real (loopback) `ProdEnv` — self-
+    /// elects immediately (`initial_formation`-shaped: `all_nodes` is just
+    /// this one id), scoped to `range`.
+    async fn lone_group(range: KeyRange) -> CpGroup {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), dir.path())
+            .await
+            .expect("bind");
+        let scope = StorageScope::new(b"t".to_vec(), range);
+        let node: RaftKvNode<ProdEnv, MemoryEngine> =
+            RaftKvNode::start_hosted(env, vec![nid(0)], MemoryEngine::new(), scope, 1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !node.is_leader() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "single-voter group never elected itself leader"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        CpGroup::Mem(node)
+    }
+
+    fn meta_with_range(tablet: TabletId, range: KeyRange) -> Metadata {
+        let mut meta = Metadata::default();
+        meta.tablets.insert(
+            tablet,
+            Tablet::new_for_table(tablet, "t", range, vec![nid(0)]),
+        );
+        meta
+    }
+
+    /// The exact scenario the latch exists to catch: metadata already
+    /// reflects a post-split narrower declared range, but this node's own
+    /// reconciler has not yet locally executed `narrow_scope` — the live
+    /// scope is still the pre-split wide range.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refuses_retryably_while_the_live_scope_is_wider_than_the_declared_range() {
+        let tablet = TabletId(1);
+        let group = lone_group(KeyRange::whole()).await;
+        let meta = meta_with_range(tablet, KeyRange::new(b"".to_vec(), Some(b"m".to_vec())));
+        let err = ClientCtx::hot_read_scope_ok(&meta, tablet, &group)
+            .expect_err("a wider-than-declared live scope must refuse retryably");
+        assert!(
+            err.ends_with("; retry"),
+            "the refusal must use this crate's established retryable-error shape (`read_should_retry`): {err}"
+        );
+    }
+
+    /// Once the reconciler's own `narrow_scope` has executed (the live scope
+    /// now matches the declared range), the latch must not refuse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allows_once_the_live_scope_matches_the_declared_range() {
+        let tablet = TabletId(1);
+        let range = KeyRange::new(b"".to_vec(), Some(b"m".to_vec()));
+        let group = lone_group(range.clone()).await;
+        let meta = meta_with_range(tablet, range);
+        assert!(
+            ClientCtx::hot_read_scope_ok(&meta, tablet, &group).is_ok(),
+            "a live scope that already matches the declared range must not be refused"
+        );
+    }
+
+    /// A dropped/reclaimed tablet (absent from `Metadata` entirely) is not
+    /// this latch's concern — the caller's own absence handling applies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_tablet_is_not_this_latchs_concern() {
+        let tablet = TabletId(1);
+        let group = lone_group(KeyRange::whole()).await;
+        let meta = Metadata::default();
+        assert!(
+            ClientCtx::hot_read_scope_ok(&meta, tablet, &group).is_ok(),
+            "an absent tablet must fall through, not be refused by this latch"
+        );
     }
 }
 

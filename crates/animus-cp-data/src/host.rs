@@ -663,6 +663,12 @@ pub struct Reconciler<E: Env, S: StorageEngine> {
     /// `animusd::cp_gc_tablet`'s unregister-then-shutdown order (routing must
     /// stop seeing a group before its driver starts winding down).
     on_teardown: OnTeardownFn,
+    /// ADR 0044 phase-1 PR4 production wiring: opt every group this
+    /// reconciler hosts *from now on* into quiescence with this idle
+    /// threshold — see [`enable_quiescence`](Self::enable_quiescence).
+    /// `None` (the default) is exactly today's behavior: every existing
+    /// caller of [`new`](Self::new) is unaffected.
+    quiesce_after: Option<Duration>,
 }
 
 /// `table name -> StorageScope` prefix hook — see [`Reconciler`]'s
@@ -703,6 +709,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             prefix_for: Box::new(prefix_for),
             on_host: Box::new(on_host),
             on_teardown: Box::new(on_teardown),
+            quiesce_after: None,
         }
     }
 
@@ -711,6 +718,19 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// private `hosted` map.
     pub fn local_state(&self) -> &LocalState {
         &self.state
+    }
+
+    /// Opt every group this reconciler hosts **from now on** into quiescence
+    /// (ADR 0044 phase-1 PR4 production wiring — data-plane groups only,
+    /// fork G; the control plane's own `RaftNode` never calls the
+    /// equivalent). Call once, right after construction and before the first
+    /// [`tick`](Self::tick) — a tablet already in [`hosted`](Self::hosted_node)
+    /// at the time this is called is unaffected (there is no production
+    /// caller that hosts before opting in, so this is a non-issue in
+    /// practice; tests that need it can enable quiescence per-node directly
+    /// via [`RaftKvNode::enable_quiescence`] instead).
+    pub fn enable_quiescence(&mut self, after: Duration) {
+        self.quiesce_after = Some(after);
     }
 
     /// The live `RaftKvNode` this reconciler hosts for `tablet`, if any.
@@ -728,6 +748,21 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// taking, per [`plan`]'s own doc) — skip calling `tick` at all before
     /// replicated `Metadata` has recovered.
     pub async fn tick(&mut self, view: &MetadataView) {
+        // ADR 0044 phase-1 PR4, fork H: proactively wake any hosted group
+        // whose replica set intersects the failure detector's `down` set —
+        // the TiKV-hibernate-regions lesson (a quiesced leader that dies
+        // while dormant would otherwise stay cold until some client happens
+        // to touch its tablet, a worse availability story than today).
+        // `RaftKvNode::wake()` is a cheap, idempotent notify, safe to call
+        // unconditionally on every hosted group, quiesced or not.
+        for (&tablet, node) in &self.hosted {
+            if let Some(t) = view.tablets.get(&tablet)
+                && t.replicas.iter().any(|r| view.down.contains(r))
+            {
+                node.wake();
+            }
+        }
+
         let facts = self.gather_facts(view).await;
         let (actions, next) = plan(view, &facts, &self.state, self.base_id.clone());
         self.state = next;
@@ -907,6 +942,12 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             scope,
             tablet.0,
         );
+        // ADR 0044 phase-1 PR4 production wiring: opt every freshly-hosted
+        // data-plane group into quiescence if this reconciler has been
+        // configured to (see `enable_quiescence`'s doc).
+        if let Some(after) = self.quiesce_after {
+            node.enable_quiescence(after);
+        }
         (self.on_host)(tablet, &node);
         self.hosted.insert(tablet, node);
     }
