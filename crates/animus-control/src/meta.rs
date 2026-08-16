@@ -2048,10 +2048,12 @@ impl Metadata {
     /// computation needs answered.
     #[must_use]
     pub fn effective_stream_shard_watermark(&self, tablet: TabletId) -> Option<u64> {
-        if let Some(w) = self.stream_shard_watermark(tablet) {
-            return Some(w);
-        }
-        self.stream_split_basis.get(&tablet)?.watermark
+        animus_tablet::split_basis::effective(
+            self.stream_shard_watermark(tablet),
+            self.stream_split_basis
+                .get(&tablet)
+                .and_then(|b| b.watermark.as_ref()),
+        )
     }
 
     /// Every catalog row for `(table, label)`, across every tablet, in
