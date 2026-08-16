@@ -431,12 +431,26 @@ pub enum Metric {
     /// otherwise fire every cooldown, forever, for a tablet that
     /// structurally cannot split.
     StreamSplitSingleTokenSkipped,
+
+    // --- Quiescence (ADR 0044 phase-1 PR3) --- Appended after the F11 variant;
+    // every earlier variant's slot and the text-export order stay stable, so
+    // the snapshot remains byte-reproducible. Recorded by `animus-cp-data`'s
+    // consensus-loop send site (`record_kv_outbound`) — the per-tablet
+    // counterpart to the control plane's `AppendEntriesSent`, kept as its own
+    // variant (not reused) since it is recorded off the CP-plane's `KvWire`
+    // outbound list rather than `RaftNode::record_outbound`'s `Out<MetaCommand>`
+    // list. This is what an idle/quiesced tablet group's own heartbeat traffic
+    // going flat is measured against — the ADR 0044 idle-cost win phase 1
+    // targets.
+    /// A per-tablet CP-data `AppendEntries` (replication or heartbeat) was
+    /// sent to a peer.
+    CpAppendEntriesSent,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 65] = [
+    pub const ALL: [Metric; 66] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -502,6 +516,7 @@ impl Metric {
         Metric::CpMergeTookNoEffect,
         Metric::CpMergeTookNoEffectUnexplained,
         Metric::StreamSplitSingleTokenSkipped,
+        Metric::CpAppendEntriesSent,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -574,6 +589,7 @@ impl Metric {
             Metric::CpMergeTookNoEffect => "cp_merge_took_no_effect",
             Metric::CpMergeTookNoEffectUnexplained => "cp_merge_took_no_effect_unexplained",
             Metric::StreamSplitSingleTokenSkipped => "stream_split_single_token_skipped",
+            Metric::CpAppendEntriesSent => "cp_append_entries_sent",
         }
     }
 

@@ -2318,6 +2318,31 @@ debugging anything that feels like it might have happened before.
   (`quiesce/1-apply-signal`, 2026-08-16) — skipped in favor of the three
   bounded-convergence tests in `tests/apply_signal.rs`, which don't depend on
   this distinction.
+- **`Simulator::run_until_quiescent` cannot prove a specific subsystem's
+  timerlessness once *any other* task in the same run keeps its own
+  independent, deliberately-never-eliminated safety-poll timer alive.** Found
+  while writing the ADR 0044 phase-1 PR3 quiescence corpus
+  (`quiesce/3-core-state-machine`, 2026-08-16): the plan asked for
+  `run_until_quiescent(max_steps) == true` as proof that an idle, quiesced
+  `RaftKvNode` group posts zero `SimEnv` timeline events. That's unreachable
+  by construction — the apply task's own idle back-off (PR1) races
+  `ApplyPending` against a 250ms `APPLY_SAFETY_POLL` **forever**, regardless
+  of Raft activity, a deliberate design (a missed/lost `ApplySignal` must
+  still converge, not stall). One node's apply task alone keeps a scheduled
+  timer event alive at all times, so `run_until_quiescent` can never observe
+  a truly empty timeline for a *live* group — quiesced or not. This isn't a
+  defect in the quiescence work; it's a different subsystem's already-shipped
+  trade-off surfacing at a test assertion that assumed no other timer existed
+  anywhere in the run. **General rule**: before reaching for
+  `run_until_quiescent` (or any "the whole sim went idle" assertion) to prove
+  *one* mechanism's timerlessness, check whether anything else in the same
+  process — a different task, a different subsystem's own safety poll — has
+  an independent timer that would prevent it from ever firing, even if the
+  mechanism under test is working perfectly. When it does, assert the
+  mechanism's own state directly instead (here, `RaftCore::next_deadline() ==
+  None` on every replica) rather than inferring it from a whole-sim
+  observation that a co-located concern can foil. See `tests/quiescence.rs`'s
+  module doc for the full reasoning kept where the next person will read it.
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
@@ -5924,6 +5949,25 @@ debugging anything that feels like it might have happened before.
   safer than an enumeration you can't be sure is exhaustive. (2026-08-16,
   `quiesce/1-apply-signal`, `tests/apply_signal.rs`'s
   `apply_converges_via_safety_poll_on_a_signal_less_snapshot_build`.)
+- **A pure core method with no `now` parameter can't record "this happened at
+  time X" itself — give the driver a companion method to call, don't widen
+  the core method's signature.** `RaftCore::propose`/`change_membership` take
+  no `Nanos` (proposing/reconfiguring never needed wall-clock time before ADR
+  0044 phase-1 PR3's `last_activity` idle-clock), and both are called from
+  dozens of test files across two crates plus every production driver — so
+  adding a `now: Nanos` parameter to either to let them bump
+  `last_activity`/clear `quiesced` inline would have rippled through all of
+  them for one new feature's benefit. Instead, `RaftCore::note_local_activity
+  (now: Nanos)` is a tiny, separate, `now`-taking method the *driver* (which
+  already has `now` at every call site that matters) calls immediately after
+  confirming `ProposeResult::Accepted`, inside the same held `core` lock —
+  `become_leader`/`transfer_leadership` do the equivalent inline since they
+  already take `now`. **General rule**: when a new feature needs a
+  time-stamped side effect from an existing widely-called pure method that
+  doesn't carry the needed input, don't widen that method's signature for
+  every caller — add a narrow companion method the *caller* invokes with the
+  input it already has, at the one or two call sites that actually need the
+  new behavior. (2026-08-16, `quiesce/3-core-state-machine`.)
 
 ### Parallel-agent orchestration
 - **`gh stack checkout <N>` silently switches the CURRENT worktree's checked-

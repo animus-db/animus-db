@@ -191,12 +191,40 @@ pub enum RaftMsg<C = MetaCommand> {
     /// replica off the current leader, the leader transfers away first, then the
     /// new leader performs the removal itself.
     TimeoutNow { term: u64 },
+    /// Sent **once** by a leader entering quiescence (ADR 0044 phase-1 PR3): "I
+    /// have nothing left to replicate and intend to stop ticking." A follower
+    /// only accepts it (setting its own quiesced flag, so its own
+    /// [`next_deadline`](RaftCore::next_deadline) also returns `None`) if it is
+    /// provably caught up to exactly this state — `term` matches its own
+    /// current term, the sender is its recorded leader, and its own
+    /// `last_log_index` and `commit_index` both equal `commit_index` here.
+    /// Otherwise it is ignored outright: the follower keeps ticking normally,
+    /// and its own ordinary election timeout is what eventually notices if the
+    /// leader really is gone (see `RaftCore`'s module-level quiescence doc).
+    Quiesce { term: u64, commit_index: u64 },
+    /// Sent by a follower whose local caller just touched it while it was
+    /// quiesced (ADR 0044 phase-1 PR3, fork B) — "are you still there?" to its
+    /// recorded `leader_id`, instead of blindly assuming the leader is dead and
+    /// campaigning immediately. A live leader answers with its ordinary
+    /// `AppendEntries` (whether or not it was itself quiesced when this
+    /// arrived — see [`RaftCore::handle`]'s doc), which the follower processes
+    /// exactly like any other heartbeat, resetting its election timer. If the
+    /// leader really is gone, nothing answers, and the follower's own freshly
+    /// re-armed election timeout (see
+    /// [`on_local_wake`](RaftCore::on_local_wake)) is what lets it campaign.
+    /// Carries no term authority of its own (like
+    /// [`Heartbeat`](RaftMsg::Heartbeat) — see [`term`](RaftMsg::term)):
+    /// answering or ignoring it never depends on the sender's believed term,
+    /// only on whether `self` is currently a `Leader`.
+    WakeRequest { term: u64 },
 }
 
 impl<C> RaftMsg<C> {
     /// The Raft term carried by this message. A [`Heartbeat`](RaftMsg::Heartbeat)
-    /// is not consensus traffic and carries none, so it reports 0 (never forcing a
-    /// step-down); the driver intercepts heartbeats before the core sees one.
+    /// or [`WakeRequest`](RaftMsg::WakeRequest) is not consensus traffic and
+    /// carries no term *authority* (it reports 0, never forcing a step-down) —
+    /// the driver intercepts heartbeats before the core sees one, and a
+    /// `WakeRequest`'s own `term` field is purely informational (see its doc).
     fn term(&self) -> u64 {
         match self {
             RaftMsg::PreVote { term, .. }
@@ -207,8 +235,9 @@ impl<C> RaftMsg<C> {
             | RaftMsg::AppendEntriesResp { term, .. }
             | RaftMsg::InstallSnapshot { term, .. }
             | RaftMsg::InstallSnapshotResp { term, .. }
-            | RaftMsg::TimeoutNow { term } => *term,
-            RaftMsg::Heartbeat { .. } => 0,
+            | RaftMsg::TimeoutNow { term }
+            | RaftMsg::Quiesce { term, .. } => *term,
+            RaftMsg::Heartbeat { .. } | RaftMsg::WakeRequest { .. } => 0,
         }
     }
 }
@@ -415,6 +444,40 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // `set_snapshot_blob`. Never raised by an in-core state machine (its blob is
     // kept eagerly).
     snapshot_needed: bool,
+
+    // --- Quiescence (ADR 0044 phase-1 PR3). `None` (the default, set by every
+    // constructor) is byte-identical to pre-PR3 behavior: the entry predicate
+    // in `tick` is only ever evaluated when `Some`, so the control plane
+    // (which never calls `enable_quiescence`, fork G) is untouched. ---
+    // Opt-in idle threshold; `enable_quiescence` sets it.
+    quiesce_after: Option<Duration>,
+    // Whether this node currently considers itself quiesced — both roles
+    // participate: a leader sets it on satisfying the entry predicate and
+    // broadcasting `Quiesce`; a follower sets it on *accepting* one. Volatile,
+    // never persisted or snapshotted (like `last_contact`/`match_index`) — a
+    // restart always starts ticking normally and re-derives this from scratch.
+    quiesced: bool,
+    // The `now` of the last event that should reset the leader's idle clock —
+    // bumped whenever `commit_index` advances (`maybe_advance_commit`, which
+    // captures every local propose/config-change/transfer-driven commit) and
+    // on `become_leader` (a fresh term starts its own clock). The entry
+    // predicate's "no activity for `quiesce_after`" clause is `now.0 -
+    // last_activity.0 >= quiesce_after`.
+    last_activity: Nanos,
+    // External input (ADR 0044 phase-1 PR3 design sketch): whether the async
+    // apply task's engine state has caught up to `last_applied` — the core
+    // itself has no visibility into engine I/O, so the `DRIVER_APPLIED`
+    // driver feeds this in via `set_quiesce_engine_caught_up` once per loop
+    // iteration. Defaults `true` (harmless: only ever consulted when
+    // `quiesce_after` is `Some`, which no caller sets without also driving
+    // this).
+    quiesce_engine_caught_up: bool,
+    // External input (fork D): an always-false placeholder in this PR — no
+    // subsystem holds it yet (that's a later PR, e.g. the txn tracker/change-
+    // log sweeper). Introduced now so the entry predicate's shape is final
+    // and a later PR only needs to *set* this via `set_quiesce_veto`, not
+    // restructure the predicate.
+    quiesce_veto: bool,
 }
 
 impl<C, S> RaftCore<C, S>
@@ -468,6 +531,11 @@ where
             pending: Vec::new(),
             persisted_hard: (0, None),
             snapshot_dirty: false,
+            quiesce_after: None,
+            quiesced: false,
+            last_activity: now,
+            quiesce_engine_caught_up: true,
+            quiesce_veto: false,
         };
         core.reset_election_timer(now, entropy);
         core
@@ -821,15 +889,19 @@ where
     /// The next virtual instant at which this node wants a timer tick, or
     /// `None` if it wants no timer at all right now.
     ///
-    /// `None` is reserved for **quiescence** (ADR 0044 phase-1 PR3, gated by
-    /// opt-in `quiesce_after: Option<Duration>` — still absent from the core
-    /// as of this PR): a quiesced leader has nothing to time out on until some
-    /// other event (an inbound message, a local propose, `shutdown()`, an
-    /// explicit wake) un-quiesces it. This PR (phase-1 PR2) only changes the
-    /// *type*, threading `Option` through both drivers so they drop the timer
-    /// arm from their `select` on `None` — since nothing in the core can yet
-    /// produce `None`, this always returns `Some`, byte-identical to before.
+    /// `None` means **quiescence** (ADR 0044 phase-1 PR3, gated by opt-in
+    /// [`enable_quiescence`](Self::enable_quiescence)): a quiesced node —
+    /// leader or follower — has nothing to time out on until some other event
+    /// (an inbound message, a local propose, `shutdown()`, an explicit wake)
+    /// un-quiesces it. Both drivers drop the timer arm from their `select` on
+    /// `None`, so a quiesced group posts zero `SimEnv` timeline events.
+    /// `quiesce_after` defaults `None` (nothing calls `enable_quiescence`
+    /// without opting in — the control plane never does, fork G), so this is
+    /// byte-identical to pre-PR3 behavior unless a caller opts in.
     pub fn next_deadline(&self) -> Option<Nanos> {
+        if self.quiesced {
+            return None;
+        }
         if self.role == Role::Leader {
             // While a transfer is armed, also wake in time to evaluate its abort
             // deadline (`tick`) even if that falls before the next heartbeat —
@@ -1063,6 +1135,15 @@ where
             self.transfer_deadline =
                 Nanos(now.0.saturating_add(self.election_base.as_nanos() as u64));
         }
+        // ADR 0044 phase-1 PR3, un-quiesce trigger (b): arming (or idempotently
+        // re-arming) a transfer is local leader activity. `quiesce_entry_ok`'s
+        // own `transfer_target.is_none()` clause already blocks entry while
+        // armed, so this mostly matters for the settle window *after* it
+        // clears (an aborted or completed transfer shouldn't let a leader that
+        // was mid-handoff moments ago quiesce immediately on its very next
+        // tick).
+        self.quiesced = false;
+        self.last_activity = now;
         true
     }
 
@@ -1154,6 +1235,18 @@ where
                     self.transfer_target = None;
                 }
                 if now.0 >= self.heartbeat_deadline.0 {
+                    // ADR 0044 phase-1 PR3: at the point this leader would otherwise
+                    // send a routine heartbeat, check whether it can quiesce instead
+                    // (`quiesce_entry_ok`'s doc has the full predicate). Only
+                    // evaluated once per idle settle — `!self.quiesced` guards it, so
+                    // an already-quiesced leader never gets here at all (its own
+                    // `next_deadline` is `None`, so the driver never calls `tick` via
+                    // its timer arm in the first place; this guard is a second,
+                    // redundant-but-cheap line of defense).
+                    if !self.quiesced && self.quiesce_entry_ok(now) {
+                        self.quiesced = true;
+                        return self.broadcast_quiesce();
+                    }
                     self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
                     return self.broadcast_append();
                 }
@@ -1216,6 +1309,26 @@ where
             // `is_leader`-independent inspection (e.g. tests, admin views) never
             // reports a "transfer in flight" for a node that isn't leading.
             self.transfer_target = None;
+        }
+        // ADR 0044 phase-1 PR3, un-quiesce trigger (a): **any** inbound Raft
+        // message un-quiesces, run before dispatch so every specific handler
+        // below always observes `quiesced == false` — including pre-vote
+        // traffic (deliberately not excluded here the way the step-down above
+        // is: a pre-vote round carries no term authority, but it is still
+        // real inbound traffic proving this node is not truly isolated).
+        // Over-triggering is always safe (a quiesced node just resumes
+        // ticking; worst case is one wasted settle window), mirroring this
+        // crate's other witness-even-if-rejected patterns. Deliberately does
+        // NOT touch `election_deadline` — resetting a bystander's own
+        // election timer here would defeat `handle_pre_vote`'s lease check
+        // (left deliberately stale while quiesced, fork C), which is what
+        // lets a follower correctly grant a pre-vote to a genuinely new
+        // candidate once its old leader is truly gone. Only
+        // [`on_local_wake`](Self::on_local_wake) re-arms the election timer,
+        // and only for the follower that itself asked to be woken.
+        if self.quiesced {
+            self.quiesced = false;
+            self.last_activity = now;
         }
         match msg {
             RaftMsg::PreVote {
@@ -1289,6 +1402,11 @@ where
             // ignores any that reach it.
             RaftMsg::Heartbeat { .. } => Vec::new(),
             RaftMsg::TimeoutNow { term } => self.handle_timeout_now(term, now, entropy),
+            RaftMsg::Quiesce { term, commit_index } => {
+                self.handle_quiesce(from, term, commit_index);
+                Vec::new()
+            }
+            RaftMsg::WakeRequest { .. } => self.handle_wake_request(from),
         }
     }
 
@@ -1908,6 +2026,12 @@ where
     fn become_leader(&mut self, now: Nanos) -> Vec<Out<C>> {
         self.role = Role::Leader;
         self.leader_id = Some(self.id.clone());
+        // A fresh leadership stint always starts un-quiesced (ADR 0044 phase-1
+        // PR3) with its idle clock starting now — even if this same node was
+        // quiesced as a follower a moment ago (its own `quiesced` from
+        // accepting the previous leader's `Quiesce` is now meaningless).
+        self.quiesced = false;
+        self.last_activity = now;
         let last = self.last_log_index();
         for p in self.peers.clone() {
             self.next_index.insert(p.clone(), last + 1);
@@ -1977,6 +2101,193 @@ where
             ));
         }
         outs
+    }
+
+    /// The leader-side quiescence **entry predicate** (ADR 0044 phase-1 PR3),
+    /// pure and re-evaluated fresh at every heartbeat deadline this leader
+    /// hasn't already quiesced. All of:
+    /// - no local activity for `quiesce_after` (an idle settle window —
+    ///   `last_activity` is bumped by `become_leader`, `note_local_activity`,
+    ///   and `transfer_leadership`'s successful arm);
+    /// - nothing left to replicate: `commit_index == last_log_index`, and
+    ///   `commit_index >= first_term_index` (Raft §6.4 — otherwise this
+    ///   leader's own commit index might still not cover everything a *prior*
+    ///   leader already committed and acked);
+    /// - every voter has fully caught up (`match_index == last_log_index`);
+    /// - no leadership transfer armed, no departing peer still owed its
+    ///   removal notification, no membership change in flight;
+    /// - no snapshot machinery pending in either direction — a follower mid
+    ///   catch-up (`incoming_snapshot`, meaningless for a leader but checked
+    ///   for symmetry/future-proofing), a fully-received install awaiting the
+    ///   driver (`pending_install`), or a lazily-built image the driver hasn't
+    ///   supplied yet (`snapshot_needed`);
+    /// - the two external inputs a `DRIVER_APPLIED` driver feeds in once per
+    ///   loop iteration: the apply task has caught the engine up
+    ///   (`quiesce_engine_caught_up`), and no subsystem holds the quiesce veto
+    ///   (`quiesce_veto`, fork D — always `false` in this PR; a later PR wires
+    ///   a real veto holder without needing to touch this predicate's shape).
+    fn quiesce_entry_ok(&self, now: Nanos) -> bool {
+        let Some(quiesce_after) = self.quiesce_after else {
+            return false;
+        };
+        if now.0.saturating_sub(self.last_activity.0) < quiesce_after.as_nanos() as u64 {
+            return false;
+        }
+        let last = self.last_log_index();
+        self.commit_index == last
+            && self.commit_index >= self.first_term_index
+            && self
+                .peers
+                .iter()
+                .all(|p| self.match_index.get(p).copied().unwrap_or(0) == last)
+            && self.transfer_target.is_none()
+            && self.departing.is_empty()
+            && !self.config_change_in_flight()
+            && self.incoming_snapshot.is_none()
+            && self.pending_install.is_none()
+            && !self.snapshot_needed
+            && self.quiesce_engine_caught_up
+            && !self.quiesce_veto
+    }
+
+    /// Broadcast [`RaftMsg::Quiesce`] once to every voter — the leader-side
+    /// half of entering quiescence. Deliberately mirrors `broadcast_append`'s
+    /// peer selection (`peers`, not `departing`: a departing peer that hasn't
+    /// yet caught up to its own removal entry would fail `quiesce_entry_ok`'s
+    /// `match_index == last_log_index` clause already, so this path can only
+    /// be reached with no departing peer outstanding).
+    fn broadcast_quiesce(&mut self) -> Vec<Out<C>> {
+        self.peers
+            .clone()
+            .into_iter()
+            .map(|p| {
+                (
+                    p,
+                    RaftMsg::Quiesce {
+                        term: self.current_term,
+                        commit_index: self.commit_index,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Follower-side acceptance of [`RaftMsg::Quiesce`] (ADR 0044 phase-1
+    /// PR3): accept — setting this node's own `quiesced` flag, so its own
+    /// `next_deadline` also returns `None` — only if every condition proves
+    /// this follower is provably caught up to *exactly* the state the leader
+    /// broadcast from: same term, `from` is this node's own recorded leader,
+    /// and this node's own `last_log_index`/`commit_index` both equal the
+    /// message's `commit_index`. Otherwise ignored outright — this follower
+    /// keeps ticking normally, and its own ordinary election timeout is what
+    /// eventually notices if the leader really is gone (see the module-level
+    /// design doc / ADR 0044 for the full argument — a bare timeout-based
+    /// disambiguation is a *correct*, if noisier, fallback here, never a
+    /// safety hazard).
+    fn handle_quiesce(&mut self, from: NodeId, term: u64, commit_index: u64) {
+        let accept = term == self.current_term
+            && self.leader_id.as_ref() == Some(&from)
+            && self.last_log_index() == self.commit_index
+            && self.commit_index == commit_index;
+        if accept {
+            self.quiesced = true;
+        }
+    }
+
+    /// Leader-side answer to [`RaftMsg::WakeRequest`] (ADR 0044 phase-1 PR3,
+    /// fork B): if still leader, reply with an ordinary replication message
+    /// (whatever [`replicate_to`](Self::replicate_to) would normally send this
+    /// peer — heartbeat or catch-up alike), exactly as if this had been the
+    /// next scheduled heartbeat to it. Works identically whether or not this
+    /// leader was itself quiesced when the request arrived — `handle`'s
+    /// top-level un-quiesce-on-any-message rule has already cleared that flag
+    /// by the time this runs. A non-leader answers nothing; the asking
+    /// follower's own re-armed election timeout (see
+    /// [`on_local_wake`](Self::on_local_wake)) is what then lets it campaign.
+    fn handle_wake_request(&mut self, from: NodeId) -> Vec<Out<C>> {
+        if self.role != Role::Leader {
+            return Vec::new();
+        }
+        self.replicate_to(from).into_iter().collect()
+    }
+
+    /// A locally-woken **follower**'s "are you still there?" check (ADR 0044
+    /// phase-1 PR3, fork B) — the driver calls this when something touches
+    /// this group locally while quiesced (e.g. [`RaftKvNode::wake`], a later
+    /// PR's hook). A no-op unless this node is both quiesced and not the
+    /// leader (a quiesced leader has nothing to check on; an already-ticking
+    /// follower doesn't need this). Un-quiesces, re-arms a **full fresh**
+    /// election timeout — giving a merely-quiesced-but-alive leader one whole
+    /// interval to answer before this follower would campaign, rather than
+    /// campaigning against whatever stale deadline quiescence left behind —
+    /// and, if this node has a recorded leader, asks it directly via
+    /// [`WakeRequest`](RaftMsg::WakeRequest) instead of waiting out that whole
+    /// interval blind.
+    pub fn on_local_wake(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
+        if !self.quiesced || self.role == Role::Leader {
+            return Vec::new();
+        }
+        self.quiesced = false;
+        self.last_activity = now;
+        self.reset_election_timer(now, entropy);
+        match &self.leader_id {
+            Some(leader) => vec![(
+                leader.clone(),
+                RaftMsg::WakeRequest {
+                    term: self.current_term,
+                },
+            )],
+            None => Vec::new(),
+        }
+    }
+
+    /// Opt in to quiescence (ADR 0044 phase-1 PR3): once this leader has had
+    /// no local activity for `after` and every other
+    /// [`quiesce_entry_ok`](Self::quiesce_entry_ok) clause holds, it
+    /// broadcasts [`Quiesce`](RaftMsg::Quiesce) once and stops ticking
+    /// (`next_deadline` returns `None`) until some event wakes it. Defaults to
+    /// never (`quiesce_after: None`) — **the control plane's `RaftNode` never
+    /// calls this** (fork G), so quiescence stays data-plane-only throughout
+    /// this stack.
+    pub fn enable_quiescence(&mut self, after: Duration) {
+        self.quiesce_after = Some(after);
+    }
+
+    /// Whether this node currently considers itself quiesced.
+    #[must_use]
+    pub fn is_quiesced(&self) -> bool {
+        self.quiesced
+    }
+
+    /// External input (ADR 0044 phase-1 PR3): whether the async apply task's
+    /// engine state has caught up to [`last_applied`](Self::last_applied) as
+    /// of this call. The core has no visibility into engine I/O itself, so a
+    /// `DRIVER_APPLIED` driver calls this once per loop iteration, before
+    /// `tick`ing, to feed it in. Defaults `true` — harmless, since it is only
+    /// ever consulted by `quiesce_entry_ok`, itself only reachable once a
+    /// caller has opted in via `enable_quiescence`.
+    pub fn set_quiesce_engine_caught_up(&mut self, caught_up: bool) {
+        self.quiesce_engine_caught_up = caught_up;
+    }
+
+    /// External input (ADR 0044 phase-1 PR3, fork D): whether some subsystem
+    /// currently holds the quiesce veto. Always `false` in this PR — no
+    /// caller sets it yet (a later PR wires a real veto holder, e.g. the txn
+    /// tracker or the change-log sweeper, without needing to restructure
+    /// `quiesce_entry_ok`).
+    pub fn set_quiesce_veto(&mut self, veto: bool) {
+        self.quiesce_veto = veto;
+    }
+
+    /// Un-quiesce trigger for a local mutating action that has no `now` of its
+    /// own to work with (`propose`/`change_membership` don't take one — see
+    /// their own docs) — the driver calls this immediately after confirming
+    /// `ProposeResult::Accepted`, mirroring what `become_leader` and
+    /// `transfer_leadership`'s successful arm already do inline. Idempotent
+    /// and harmless if this node isn't even quiesced.
+    pub fn note_local_activity(&mut self, now: Nanos) {
+        self.last_activity = now;
+        self.quiesced = false;
     }
 
     /// Build the right replication message for `peer`: an `InstallSnapshot` chunk

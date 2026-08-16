@@ -799,6 +799,15 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
             put_u8(out, 9);
             put_u64(out, *term);
         }
+        RaftMsg::Quiesce { term, commit_index } => {
+            put_u8(out, 10);
+            put_u64(out, *term);
+            put_u64(out, *commit_index);
+        }
+        RaftMsg::WakeRequest { term } => {
+            put_u8(out, 11);
+            put_u64(out, *term);
+        }
     }
 }
 
@@ -866,6 +875,11 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
         },
         8 => RaftMsg::Heartbeat { node: c.node_id()? },
         9 => RaftMsg::TimeoutNow { term: c.u64()? },
+        10 => RaftMsg::Quiesce {
+            term: c.u64()?,
+            commit_index: c.u64()?,
+        },
+        11 => RaftMsg::WakeRequest { term: c.u64()? },
         other => return Err(format!("unknown RaftMsg tag {other}")),
     })
 }
@@ -1237,6 +1251,11 @@ mod tests {
             },
             RaftMsg::Heartbeat { node: nid(11) },
             RaftMsg::TimeoutNow { term: 7 },
+            RaftMsg::Quiesce {
+                term: 7,
+                commit_index: 23,
+            },
+            RaftMsg::WakeRequest { term: 7 },
         ];
         for m in msgs {
             roundtrip(&KvWire::Raft(m));

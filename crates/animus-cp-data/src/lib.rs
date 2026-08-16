@@ -1608,17 +1608,38 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.wake_signal.notify();
     }
 
-    /// Explicitly wake this group's consensus loop for one extra pass — the
-    /// **unused-for-now** hook a later PR needs: PR3's quiescence un-quiesce
-    /// triggers, and PR4's proactive wake (the edge's `resolve_cp_route` before
-    /// routing to a local group, and the reconciler waking a group whose
-    /// replica set intersects a newly-`Down` node) both call this instead of
-    /// duplicating [`WakeSignal`]'s plumbing. Idempotent and always safe: it
-    /// only ever causes one extra, otherwise-inert loop iteration (re-checking
-    /// `halted` and re-evaluating `next_deadline`), never a state change on its
-    /// own.
+    /// Explicitly wake this group's consensus loop for one extra pass. As of
+    /// ADR 0044 phase-1 PR3 this is what a locally-woken **quiesced follower**
+    /// uses to check "are you still there?" with its recorded leader
+    /// ([`RaftCore::on_local_wake`]'s doc — the consensus loop calls it on
+    /// this signal) instead of blindly waiting out a stale election timer.
+    /// PR4's proactive wake (the edge's `resolve_cp_route` before routing to a
+    /// local group, and the reconciler waking a group whose replica set
+    /// intersects a newly-`Down` node) will call this same method rather than
+    /// duplicating [`WakeSignal`]'s plumbing. Idempotent and always safe on
+    /// every other state (not quiesced, or this node is the leader): it then
+    /// only causes one extra, inert loop iteration (re-checking `halted` and
+    /// re-evaluating `next_deadline`), never an unwanted state change.
     pub fn wake(&self) {
         self.wake_signal.notify();
+    }
+
+    /// Opt this group into quiescence (ADR 0044 phase-1 PR3): once its leader
+    /// has had no local activity for `after` and every other entry-predicate
+    /// clause holds (see [`RaftCore::enable_quiescence`]'s doc), it stops
+    /// ticking until some event wakes it. Data-plane only — nothing in
+    /// `animus-control`'s own `RaftNode` calls the equivalent (fork G), so the
+    /// control plane's `next_deadline` never returns `None`.
+    pub fn enable_quiescence(&self, after: Duration) {
+        self.lock().enable_quiescence(after);
+    }
+
+    /// Whether this group's local replica currently considers itself
+    /// quiesced (surfaced for tests and, in a later PR, the admin/dashboard
+    /// view — reading it never itself wakes the group, fork F).
+    #[must_use]
+    pub fn is_quiesced(&self) -> bool {
+        self.lock().is_quiesced()
     }
 
     /// Whether [`shutdown`](Self::shutdown) has been requested.
@@ -1703,10 +1724,15 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let command = build(term);
         let ts = command_ts(&command);
         let result = record_propose(&self.metrics, core.propose(command));
-        if matches!(result, ProposeResult::Accepted { .. })
-            && let Some(ts) = ts
-        {
-            self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            if let Some(ts) = ts {
+                self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
+            }
+            // ADR 0044 phase-1 PR3, un-quiesce trigger (b): a local propose
+            // that actually lands is real leader activity — `propose` itself
+            // has no `now` to work with (see `RaftCore::note_local_activity`'s
+            // doc), so the driver supplies it here, inside the same held lock.
+            core.note_local_activity(self.env.now());
         }
         drop(core);
         if matches!(result, ProposeResult::Accepted { .. }) {
@@ -1738,10 +1764,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let (command, aux) = build(term);
         let ts = command_ts(&command);
         let result = record_propose(&self.metrics, core.propose(command));
-        if matches!(result, ProposeResult::Accepted { .. })
-            && let Some(ts) = ts
-        {
-            self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            if let Some(ts) = ts {
+                self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
+            }
+            // See `propose_ordered`'s identical note.
+            core.note_local_activity(self.env.now());
         }
         drop(core);
         if matches!(result, ProposeResult::Accepted { .. }) {
@@ -2842,7 +2870,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// the control plane drives to move a replica off a failed node onto a spare,
     /// or to grow the group as the cluster grows.
     pub fn change_membership(&self, voters: BTreeSet<NodeId>) -> ProposeResult {
-        let result = record_reconfigure(&self.metrics, self.lock().change_membership(voters));
+        let mut core = self.lock();
+        let result = record_reconfigure(&self.metrics, core.change_membership(voters));
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            // ADR 0044 phase-1 PR3, un-quiesce trigger (b): see
+            // `propose_ordered`'s identical note.
+            core.note_local_activity(self.env.now());
+        }
+        drop(core);
         if matches!(result, ProposeResult::Accepted { .. }) {
             self.propose_signal.notify();
             // A single-node group's config-change no-op can commit + apply inline
@@ -4491,16 +4526,21 @@ fn record_reconfigure(metrics: &MetricsHandle, result: ProposeResult) -> Propose
     result
 }
 
-/// Record the snapshot-shipping metrics implied by the messages the consensus loop
-/// just emitted (ADR 0015), mirroring the control plane's `record_outbound`: every
-/// outbound `InstallSnapshot` is one chunk actually *shipped*; an outbound
-/// `InstallSnapshotResp` whose `last_index > 0` marks a completed *install* on the
-/// follower that just finished (observed here since the follower is what emits the
-/// ack). A pure read of `outs`.
+/// Record the snapshot-shipping + replication-traffic metrics implied by the
+/// messages the consensus loop just emitted (ADR 0015), mirroring the control
+/// plane's `record_outbound`: every outbound `InstallSnapshot` is one chunk
+/// actually *shipped*; an outbound `InstallSnapshotResp` whose `last_index >
+/// 0` marks a completed *install* on the follower that just finished
+/// (observed here since the follower is what emits the ack); every outbound
+/// `AppendEntries` (replication or heartbeat) counts once — the per-tablet
+/// counterpart of the control plane's `AppendEntriesSent`, and what an
+/// idle/quiesced group's own heartbeat traffic going flat (ADR 0044 phase-1)
+/// is measured against. A pure read of `outs`.
 fn record_kv_outbound(metrics: &MetricsHandle, outs: &[(NodeId, KvWire)]) {
     for (_, wire) in outs {
         if let KvWire::Raft(msg) = wire {
             match msg {
+                RaftMsg::AppendEntries { .. } => metrics.incr(Metric::CpAppendEntriesSent),
                 RaftMsg::InstallSnapshot { .. } => metrics.incr(Metric::CpSnapshotShips),
                 RaftMsg::InstallSnapshotResp { last_index, .. } if *last_index > 0 => {
                     metrics.incr(Metric::CpSnapshotInstalls);
@@ -6419,11 +6459,21 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         persist_wal(&env, &wal, &core, &wal_lock, &apply_signal).await;
 
         let now = env.now();
-        let deadline = core.lock().expect("raftkv core poisoned").next_deadline();
-        // `None` (ADR 0044 phase-1 PR3 — quiescence, always `Some` as of this PR:
-        // nothing in the core produces `None` yet) drops the timer arm entirely
-        // rather than sleeping on a synthetic wait, so a genuinely quiesced group
-        // posts zero `SimEnv` timeline events instead of a degenerate busy-loop.
+        // ADR 0044 phase-1 PR3: feed the one external input the core has no
+        // visibility into itself — whether the (separate, async) apply task
+        // has actually caught the engine up to `last_applied` — in the same
+        // lock acquisition as `next_deadline`, once per loop iteration, before
+        // `tick` can ever consult it (`quiesce_entry_ok`'s own doc).
+        let deadline = {
+            let mut c = core.lock().expect("raftkv core poisoned");
+            let caught_up = engine_applied.load(Ordering::SeqCst) == c.last_applied();
+            c.set_quiesce_engine_caught_up(caught_up);
+            c.next_deadline()
+        };
+        // `None` (ADR 0044 phase-1 PR3 quiescence) drops the timer arm
+        // entirely rather than sleeping on a synthetic wait, so a genuinely
+        // quiesced group posts zero `SimEnv` timeline events instead of a
+        // degenerate busy-loop.
         let timer = match deadline {
             Some(deadline) => {
                 Either::Left(env.sleep(Duration::from_nanos(deadline.0.saturating_sub(now.0))))
@@ -6470,10 +6520,25 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                     .map(|(to, m)| (to, KvWire::Raft(m)))
                     .collect()
             }
-            // Driver-level wake: nothing to do by itself — looping back already
-            // re-checks `halted` and re-evaluates `next_deadline`, which is the
-            // whole point (finding 4's hazard 1, and PR3/PR4's un-quiesce hooks).
-            Either::Right((Either::Left(((), _)), _)) => Vec::new(),
+            // Driver-level wake: looping back already re-checks `halted` and
+            // re-evaluates `next_deadline` (finding 4's hazard 1). It also
+            // covers a locally-woken **quiesced follower**'s "are you still
+            // there?" check (ADR 0044 phase-1 PR3, fork B) —
+            // `on_local_wake` is a no-op for every other state (not quiesced,
+            // or this node is the leader), so this arm stays inert exactly as
+            // it was in PR2 for a quiesced-leader wake or any wake on a
+            // ticking group.
+            Either::Right((Either::Left(((), _)), _)) => {
+                let entropy = env.next_u64();
+                let raft_outs = core
+                    .lock()
+                    .expect("raftkv core poisoned")
+                    .on_local_wake(env.now(), entropy);
+                raft_outs
+                    .into_iter()
+                    .map(|(to, m)| (to, KvWire::Raft(m)))
+                    .collect()
+            }
             Either::Right((Either::Right((Either::Left((envelope, _)), _)), _)) => {
                 let entropy = env.next_u64();
                 match codec::decode_wire(&envelope.payload) {
