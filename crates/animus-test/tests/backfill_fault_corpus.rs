@@ -290,6 +290,7 @@ fn write_base_row_live(sim: &mut Simulator, node: &KvNode, range: &KeyRange, pk:
         base_sk: Vec::new(),
         old_image: None,
         new_image: None,
+        seeded: false,
     }
     .encode();
     let result = node.put_kind_batch_fenced(
@@ -347,6 +348,7 @@ fn backfill_seed_tick(
             base_sk,
             old_image: None,
             new_image: None,
+            seeded: true,
         }
         .encode();
         let result = node.put_kind_batch_fenced(
@@ -425,6 +427,24 @@ fn partitions_with_change_marker(node: &KvNode) -> BTreeSet<Vec<u8>> {
     block_on(node.pending_changes())
         .into_iter()
         .filter_map(|(k, _)| k.len().checked_sub(8).map(|n| k[..n].to_vec()))
+        .collect()
+}
+
+/// Every raw `KIND_CHANGE` row currently on `node`, decoded, paired with its
+/// own partition prefix (`key` minus the trailing 8-byte HLC — the same
+/// slicing [`partitions_with_change_marker`] uses). Unlike that function
+/// this keeps every row rather than deduplicating into a set and actually
+/// decodes each one's content, since the streamed-mid-backfill flag cell
+/// below (ADR 0045 follow-up "E1") needs to classify *every* dirty marker a
+/// partition got, not just whether it got at least one.
+fn decoded_change_records(node: &KvNode) -> Vec<(Vec<u8>, ChangeRecord)> {
+    block_on(node.pending_changes())
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let prefix_len = k.len().checked_sub(8)?;
+            let record = ChangeRecord::decode(&v)?;
+            Some((k[..prefix_len].to_vec(), record))
+        })
         .collect()
 }
 
@@ -1190,4 +1210,137 @@ fn scenario_drop_table_mid_backfill(seed: u64) {
 #[test]
 fn drop_table_mid_backfill() {
     for_each_seed("drop_table_mid_backfill", scenario_drop_table_mid_backfill);
+}
+
+// --- cell 6: streamed_mid_backfill_seed_flag_never_misclassified -----------
+
+/// ADR 0045 follow-up "E1" (closed by this PR's `ChangeRecord::seeded` flag
+/// together with `animusd::dynamo_streams`'s filter): the flag itself must
+/// never be misclassified under adversarial interleaving of seeder ticks and live
+/// writes racing the sweep — a live write's own dirty marker must always
+/// decode `seeded: false` (else the Streams read path would wrongly *drop a
+/// real event*, the opposite-direction bug the filter must not introduce),
+/// and every pre-existing partition's own marker the seeder produces must
+/// always decode `seeded: true` and image-less (else the fix would have
+/// nothing distinguishable to filter, i.e. the original phantom-event bug).
+///
+/// This corpus cannot reach the real Streams read path directly (no
+/// `SimEnv` binding of `animusd::dynamo_streams` — see the module doc's
+/// "what this proves, and against which layer"); the real wire-level
+/// filtering behavior is proven by `animusd/tests/
+/// stream_backfill_seed_filter.rs`'s `ProdEnv` integration test instead.
+/// What this cell adds is fault-injection depth *on the flag's own
+/// correctness* — mirrors `live_writes_race_the_sweep`'s exact interleaving
+/// shape, so a future change to the seeder/live-write paths that mislabels
+/// either one under a similar interleaving has a seed-reproducible corpus
+/// cell to catch it, at `ANIMUS_BACKFILL_SEEDS` depth.
+fn scenario_streamed_mid_backfill_seed_flag_never_misclassified(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let pre_ids: Vec<String> = (0..12).map(|i| format!("pre{i:03}")).collect();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for id in &pre_ids {
+        write_pre_existing_row(&mut sim, &group.nodes[leader], &group.range, id, seed);
+    }
+
+    let tag = backfill_tag("by-email");
+    let live_ids: Vec<String> = (0..4).map(|i| format!("live{i:03}")).collect();
+    // Same interleaving as `live_writes_race_the_sweep`: one sweep tick, then
+    // one concurrent live write, repeated — the sweep may or may not reach a
+    // given live partition before its own live write lands.
+    for id in &live_ids {
+        let leader = elect(&mut sim, &group, &live, seed);
+        backfill_seed_tick(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &tag,
+            SEED_BATCH,
+            seed,
+        );
+        let leader = elect(&mut sim, &group, &live, seed);
+        write_base_row_live(&mut sim, &group.nodes[leader], &group.range, id, seed);
+    }
+    drive_sweep_to_completion(&mut sim, &group, &live, &group.range, &tag, seed);
+    mark_backfilled(&mut meta, TABLE, "by-email", group.id);
+    assert!(maybe_flip_active(&mut meta, TABLE, "by-email"));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    let records = decoded_change_records(&group.nodes[leader]);
+
+    let pre_prefixes: BTreeSet<Vec<u8>> = pre_ids.iter().map(|id| base_key(id)).collect();
+    let live_prefixes: BTreeSet<Vec<u8>> = live_ids.iter().map(|id| base_key(id)).collect();
+
+    // Every pre-existing partition: exactly one marker (the seeder visits
+    // each partition at most once, ever, per the cursor's own monotonicity),
+    // always `seeded: true`, always image-less — the seeder's own
+    // dirty-marker shape (ADR 0045 §2).
+    for prefix in &pre_prefixes {
+        let mine: Vec<&ChangeRecord> = records
+            .iter()
+            .filter(|(p, _)| p == prefix)
+            .map(|(_, r)| r)
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "[seed={seed}] pre-existing partition {prefix:?} got {} markers, want exactly 1",
+            mine.len()
+        );
+        assert!(
+            mine[0].seeded,
+            "[seed={seed}] a pre-existing partition's own seeder marker decoded seeded=false \
+             — this PR's Streams filter would wrongly let it through as a phantom event"
+        );
+        assert!(
+            mine[0].old_image.is_none() && mine[0].new_image.is_none(),
+            "[seed={seed}] the seeder's own marker unexpectedly carries an image"
+        );
+    }
+
+    // Every live-written partition: at least one marker decodes
+    // `seeded: false` — its own real write must never be misclassified as a
+    // seed marker (the opposite-direction bug: silently dropping a genuine
+    // event from the stream). An *additional*, redundant `seeded: true`
+    // marker from the sweep passing over the same partition later is
+    // harmless and allowed (the GSI drain re-derives content regardless),
+    // never required.
+    for prefix in &live_prefixes {
+        let mine: Vec<&ChangeRecord> = records
+            .iter()
+            .filter(|(p, _)| p == prefix)
+            .map(|(_, r)| r)
+            .collect();
+        assert!(
+            !mine.is_empty(),
+            "[seed={seed}] a live-written partition {prefix:?} has no marker at all"
+        );
+        assert!(
+            mine.iter().any(|r| !r.seeded),
+            "[seed={seed}] a live write's own marker was misclassified seeded=true for \
+             partition {prefix:?} — the Streams filter would wrongly drop a real event"
+        );
+    }
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    assert_full_coverage(
+        &group.nodes[leader],
+        seed,
+        "streamed mid-backfill, flag classification",
+    );
+}
+
+#[test]
+fn streamed_mid_backfill_seed_flag_never_misclassified() {
+    for_each_seed(
+        "streamed_mid_backfill_seed_flag_never_misclassified",
+        scenario_streamed_mid_backfill_seed_flag_never_misclassified,
+    );
 }

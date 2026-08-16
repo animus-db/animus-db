@@ -3043,6 +3043,7 @@ fn kind_writes_for_item(
         base_sk,
         old_image: old.cloned(),
         new_image: new.cloned(),
+        seeded: false,
     };
     let change_log = (
         token_prefixed(pk, &dynamo_index::change_prefix(pk)),

@@ -155,21 +155,25 @@
 //! advanced — nothing here assumes stable leadership across ticks, the same
 //! discipline every other arm in this loop already follows.
 //!
-//! **A known, deliberately out-of-scope interaction with Streams**: the
+//! **Interaction with Streams (ADR 0045 follow-up "E1", closed)**: the
 //! synthetic change-log record a seeded partition gets carries no old/new
-//! image (`ChangeRecord { old_image: None, new_image: None, .. }`) — it
-//! exists purely as a dirty marker for the GSI drain, which never reads a
-//! record's content. If a table's stream happens to be enabled *while* a
-//! new GSI backfills against it (allowed — the two are orthogonal; see ADR
-//! 0045 §6 Fork C, which only rejects changing *both* in one `UpdateTable`
-//! call), that image-less record is a legitimate, decodable
-//! [`animus_dynamo::ChangeRecord`] that the seal arm will happily seal
-//! alongside real ones — a low-fidelity, no-image "phantom" event surfaces
-//! in `GetRecords` for exactly one row per pre-existing partition being
-//! backfilled. This is a documented limitation, not a crash risk (the
-//! record decodes fine); a follow-up could give the seeder's own marker a
-//! distinguishable shape so a Streams reader can filter it, if this proves
-//! disruptive in practice — named here rather than silently accepted.
+//! image (`ChangeRecord { old_image: None, new_image: None, seeded: true,
+//! .. }`) — it exists purely as a dirty marker for the GSI drain, which
+//! never reads a record's content (or this flag). If a table's stream
+//! happens to be enabled *while* a new GSI backfills against it (allowed —
+//! the two are orthogonal; see ADR 0045 §6 Fork C, which only rejects
+//! changing *both* in one `UpdateTable` call), that image-less record is
+//! still a legitimate, decodable [`animus_dynamo::ChangeRecord`] that the
+//! seal arm happily seals alongside real ones — but the Streams *read* path
+//! (`dynamo_streams.rs`'s two `GetRecords` serve branches) filters every
+//! `seeded` record out before it ever reaches a `GetRecords` response, so no
+//! phantom no-image event surfaces to a consumer. Deliberately **not**
+//! fixed by giving the seeder a real base-row image: real DynamoDB emits
+//! **no** stream event at all for a GSI backfill's own coverage sweep over
+//! pre-existing data, so a synthesized image would be a fidelity
+//! regression (a fabricated event DynamoDB itself never sends), not an
+//! improvement — filtering is the fidelity-correct fix, not an
+//! implementation-convenience shortcut.
 //!
 //! ## The hot-trim arm (ADR 0042 §8, ADR 0043 §A6, F10)
 //!
@@ -681,6 +685,7 @@ async fn backfill_seed_tick(
             base_sk,
             old_image: None,
             new_image: None,
+            seeded: true,
         }
         .encode();
         seed_change_log_record(group, prefix.clone(), record).await?;
