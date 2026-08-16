@@ -89,19 +89,71 @@ use tracing::Instrument;
 type KvPair = (Vec<u8>, Vec<u8>);
 type KvPairs = Vec<KvPair>;
 
-/// A single write within a multi-participant transaction (ADR 0018 §2/PR4):
-/// `(key, Option<value>)` — `None` is a staged delete, matching
-/// `RaftKvNode::txn_stage`'s own `writes` shape.
-type TxnWrite = (Vec<u8>, Option<Vec<u8>>);
+/// A single write within a multi-participant transaction (ADR 0018 §2/PR4;
+/// ADR 0046 A1 kind-writes payload) — a direct alias of
+/// `animus_cp_data::TxnWrite`, never a locally-duplicated shape: `key`/
+/// `value` (`None` is a staged delete) plus, for a write against an
+/// indexed/streamed table, the derived `kind_writes`/`change_log` payload
+/// materialized at resolve. Matches `RaftKvNode::txn_stage_anchor`/
+/// `txn_stage_participant`'s own `writes` shape exactly, so it rides through
+/// with zero conversion.
+type TxnWrite = animus_cp_data::TxnWrite;
 /// A `cp_txn` precondition (ADR 0018 §2/PR4): `(table, key, expected)` —
 /// `expected: None` means "must be absent".
 type TxnPrecondition = (String, Vec<u8>, Option<Vec<u8>>);
-/// A `cp_txn`/`ClientRequest::Txn` write spanning tables (ADR 0018 §2/PR4):
-/// `(table, key, Option<value>)` — `None` is a staged delete. Structurally
-/// identical to [`TxnPrecondition`] (both are "table, key, optional bytes"),
-/// but kept as a distinct alias since the two mean different things (a
-/// value to write vs. a value to check).
-type TxnTableWrite = (String, Vec<u8>, Option<Vec<u8>>);
+/// One item write of an indexed/streamed table's transaction (ADR 0046 U3,
+/// `TxnStage` kind-writes stack PR2): the leader-evaluated dual of
+/// [`ClientRequest::KindWriteItem`]'s payload, staged instead of proposed
+/// directly. `run_transact` builds one of these per write action against a
+/// `table_takes_kind_write_path` table rather than precomputing the item's
+/// new value/diff itself (a stale coordinator-local read is exactly the
+/// cross-node race ADR 0046 U3 closes for the *ordinary* write path —
+/// `dynamo::kind_write_item_at_leader` — and closes here identically):
+/// [`ClientCtx::txn_prepare`] evaluates it **at the participant's own tablet
+/// leader**, under the same `ctx.data().rmw_lock` `kind_write_item_at_leader`
+/// takes, immediately before staging — never at the coordinator/edge.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PendingKindWrite {
+    pub(crate) pk: animus_dynamo::AttributeValue,
+    pub(crate) sk: Option<animus_dynamo::AttributeValue>,
+    pub(crate) op: KindWriteOp,
+    #[serde(default)]
+    pub(crate) condition: Option<animus_dynamo::ConditionExpression>,
+}
+
+/// A `cp_txn`/`ClientRequest::Txn` write spanning tables (ADR 0018 §2/PR4;
+/// ADR 0046 U3 kind-writes extension): `(table, key)` plus **either**
+/// `value: Some(..)` (a plain, already-known write — a staged delete is
+/// `Some(tombstone_bytes)`, matching the Dynamo edge's own delete-marker
+/// convention, never engine-level `None`) **or** `pending: Some(..)` (a
+/// write against an indexed/streamed table, evaluated at the participant
+/// leader instead — see [`PendingKindWrite`]'s doc). Exactly one of
+/// `value`/`pending` is ever `Some` for a real write; `cp_txn` treats
+/// `value: None, pending: None` as a caller error.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TxnTableWrite {
+    pub(crate) table: String,
+    pub(crate) key: Vec<u8>,
+    pub(crate) value: Option<Vec<u8>>,
+    #[serde(default)]
+    pub(crate) pending: Option<PendingKindWrite>,
+}
+
+impl TxnTableWrite {
+    /// A plain (already-known-value) write — the common case, and the only
+    /// shape available to a caller outside this crate (every field here is
+    /// `pub(crate)`, so an integration test builds one through this
+    /// constructor rather than the struct literal).
+    #[must_use]
+    pub fn plain(table: String, key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
+        TxnTableWrite {
+            table,
+            key,
+            value,
+            pending: None,
+        }
+    }
+}
 /// A `cp_txn`/`ClientRequest::Txn` **write-key condition** (ADR 0018 §2
 /// apply-time write-key conditions amendment): `(table, key, expected)` —
 /// structurally identical to [`TxnPrecondition`], but semantically distinct
@@ -962,6 +1014,15 @@ const TXN_STAGE_PUSH_ATTEMPTS: u32 = 3;
 /// finishing, or `txn_resolver_loop`'s passive sweep once past
 /// `animus_cp_data::RECOVERY_GRACE`), not a hard liveness bound.
 const TXN_STAGE_PUSH_BACKOFF: Duration = Duration::from_millis(250);
+/// ADR 0046 D1: how long [`ClientCtx::cp_txn`] awaits `resolve_all` before
+/// acking anyway, for a transaction that touches at least one kind-write-path
+/// table (a plain transaction keeps the original fire-and-forget spawn,
+/// unaffected). A timeout here never denies the commit — it only means the
+/// LSI/GSI/stream materialization the client's own immediate follow-up read
+/// might race is left for `txn_resolver_loop`'s passive sweep, exactly as a
+/// plain transaction's async resolve always could race a follow-up read on
+/// its own participant tables.
+const TXN_RESOLVE_ALL_AWAIT_BUDGET: Duration = Duration::from_secs(2);
 /// The bootstrap CP group's replication factor (ADR 0017 #3a): the group spans the
 /// first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids. Dynamic CP placement
 /// over more nodes is later v1 work.
@@ -1377,6 +1438,13 @@ pub enum ClientRequest {
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         #[serde(default)]
         participant_spans: Vec<(String, KeyRange)>,
+        /// **ADR 0046 U3, `TxnStage` kind-writes stack PR2**: writes against
+        /// an indexed/streamed table, evaluated at THIS receiving leader
+        /// (never precomputed by the coordinator) and merged into `writes`
+        /// before staging — see [`PendingKindWrite`]'s doc. `#[serde(default)]`,
+        /// same house convention as `conditions`/`participant_spans` above.
+        #[serde(default)]
+        pending_kind_writes: Vec<PendingKindWrite>,
     },
     /// **Internal 2PC coordinator RPC — anchor only, never sent bare**
     /// (ADR 0018 §2/PR4): commit or abort `txn_id`'s record at `record_key`
@@ -5278,6 +5346,89 @@ impl ClientCtx {
 
     // ---- multi-participant transactions (ADR 0018 §2/PR4) --------------------
 
+    /// **The one place a stage actually executes on the leader's own node**
+    /// (ADR 0046 U3, `TxnStage` kind-writes stack PR2) — shared by
+    /// [`txn_prepare`](Self::txn_prepare)'s own `CpRoute::Local` branch (no
+    /// forward needed) and `cp_serve_forwarded`'s `TxnPrepare` arm (a
+    /// forwarded hop just landed on the real leader). Evaluates every
+    /// `pending_kind_writes` entry **here**, under `ctx.data().rmw_lock` —
+    /// the identical lock [`dynamo::kind_write_item_at_leader`] takes for
+    /// the ordinary (non-transactional) write path — merging the result
+    /// into `writes` immediately before staging, never at the coordinator/
+    /// edge (see [`PendingKindWrite`]'s doc for the cross-node race this
+    /// closes). Every evaluated write also gets a mandatory own-key
+    /// `conditions` entry (ADR 0046 Fork C1: `(key, raw_old)`, the exact
+    /// bytes just read) — belt-and-suspenders against the residual window
+    /// between this read and the propose call a few lines down, even
+    /// though holding `rmw_lock` across both already closes it for every
+    /// write this node's own lock covers (a `txn_resolver_loop` recovery
+    /// push resolving a *different* transaction's intent never takes it).
+    #[allow(clippy::too_many_arguments)] // mirrors ClientRequest::TxnPrepare's own field count
+    async fn txn_stage_local(
+        &self,
+        leader: &CpGroup,
+        table: &str,
+        anchor: Option<(TxnId, Vec<u8>, String)>,
+        mut writes: Vec<TxnWrite>,
+        mut conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        participant_spans: Vec<(String, KeyRange)>,
+        pending_kind_writes: Vec<PendingKindWrite>,
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), String> {
+        if !pending_kind_writes.is_empty() {
+            let meta = self.effective_metadata();
+            let _rmw = self.data().rmw_lock.lock().await;
+            for p in pending_kind_writes {
+                let evaluated = dynamo::eval_kind_txn_write(
+                    self,
+                    leader,
+                    &meta,
+                    table,
+                    &p.pk,
+                    p.sk.as_ref(),
+                    &p.op,
+                    p.condition.as_ref(),
+                )
+                .await
+                .map_err(|e| format!("txn prepare: leader-side evaluation failed: {e}"))?;
+                let Some(eval) = evaluated else {
+                    return Err(format!(
+                        "txn prepare: a condition on table `{table}` was not met"
+                    ));
+                };
+                conditions.push((eval.key.clone(), eval.raw_old.clone()));
+                writes.push(animus_cp_data::TxnWrite {
+                    key: eval.key,
+                    value: Some(eval.value),
+                    kind_writes: eval.kind_writes,
+                    change_log: eval.change_log,
+                });
+            }
+        }
+        match anchor {
+            None => {
+                let (txn_id, record_key, outcome) = leader
+                    .txn_stage(table, writes, participant_spans, conditions)
+                    .await
+                    .ok_or("CP group leader moved during anchor stage; retry")?;
+                let ts = txn_id.ts;
+                Ok((txn_id, record_key, table.to_owned(), ts, outcome))
+            }
+            Some((txn_id, record_key, record_table)) => {
+                let (ts, outcome) = leader
+                    .txn_stage_participant(
+                        txn_id.clone(),
+                        record_key.clone(),
+                        record_table.clone(),
+                        writes,
+                        conditions,
+                    )
+                    .await
+                    .ok_or("CP group leader moved during participant stage; retry")?;
+                Ok((txn_id, record_key, record_table, ts, outcome))
+            }
+        }
+    }
+
     /// **Stage** `writes` on `table`'s tablet leader — the anchor
     /// (`anchor: None`, mints a fresh `TxnId`/record key) or a participant
     /// (`anchor: Some((txn_id, record_key, record_table))`, referencing an
@@ -5308,40 +5459,28 @@ impl ClientCtx {
         writes: Vec<TxnWrite>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         participant_spans: Vec<(String, KeyRange)>,
+        pending_kind_writes: Vec<PendingKindWrite>,
     ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), String> {
-        let Some(first) = writes.first().map(|(k, _)| k.clone()) else {
+        let Some(first) = writes.first().map(|w| w.key.clone()).or_else(|| {
+            pending_kind_writes
+                .first()
+                .map(|p| dynamo::item_key(&p.pk, p.sk.as_ref()))
+        }) else {
             return Err("txn prepare: writes must be non-empty".into());
         };
         match self.cp_route(table, &first).await {
-            CpRoute::Local(leader) => match &anchor {
-                None => {
-                    let (txn_id, record_key, outcome) = leader
-                        .txn_stage(table, writes, participant_spans, conditions)
-                        .await
-                        .ok_or("CP group leader moved during anchor stage; retry")?;
-                    let ts = txn_id.ts;
-                    Ok((txn_id, record_key, table.to_owned(), ts, outcome))
-                }
-                Some((txn_id, record_key, record_table)) => {
-                    let (ts, outcome) = leader
-                        .txn_stage_participant(
-                            txn_id.clone(),
-                            record_key.clone(),
-                            record_table.clone(),
-                            writes,
-                            conditions,
-                        )
-                        .await
-                        .ok_or("CP group leader moved during participant stage; retry")?;
-                    Ok((
-                        txn_id.clone(),
-                        record_key.clone(),
-                        record_table.clone(),
-                        ts,
-                        outcome,
-                    ))
-                }
-            },
+            CpRoute::Local(leader) => {
+                self.txn_stage_local(
+                    &leader,
+                    table,
+                    anchor,
+                    writes,
+                    conditions,
+                    participant_spans,
+                    pending_kind_writes,
+                )
+                .await
+            }
             CpRoute::Forward(addr) => {
                 let request = ClientRequest::TxnPrepare {
                     table: table.to_owned(),
@@ -5349,6 +5488,7 @@ impl ClientCtx {
                     writes,
                     conditions,
                     participant_spans,
+                    pending_kind_writes,
                 };
                 match self.cp_forward(table, &first, addr, request).await {
                     ClientResponse::TxnPrepared {
@@ -5402,6 +5542,7 @@ impl ClientCtx {
         writes: Vec<TxnWrite>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         participant_spans: Vec<(String, KeyRange)>,
+        pending_kind_writes: Vec<PendingKindWrite>,
     ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp), String> {
         for attempt in 0..TXN_STAGE_PUSH_ATTEMPTS {
             let (txn_id, record_key, record_table, ts, outcome) = self
@@ -5411,6 +5552,7 @@ impl ClientCtx {
                     writes.clone(),
                     conditions.clone(),
                     participant_spans.clone(),
+                    pending_kind_writes.clone(),
                 )
                 .await?;
             match outcome {
@@ -6033,6 +6175,20 @@ impl ClientCtx {
     /// synchronously before returning — there is no successful ack to speed
     /// up on an error return, so the extra safety margin costs nothing.
     ///
+    /// **ADR 0046 D1 amendment**: for a transaction touching at least one
+    /// kind-write-path table, the async-spawn above is instead an **awaited,
+    /// bounded** resolve (`TXN_RESOLVE_ALL_AWAIT_BUDGET`, parallelized
+    /// across participants via `resolve_all_parallel`) — LSI rows and the
+    /// GSI/stream change record only appear at resolve (materialize-at-
+    /// resolve, A1), so an ack-then-async-resolve window would leave a
+    /// committed write readable on the base table but transiently absent
+    /// from its index/stream. A timeout still acks (delayed, never denied).
+    /// A plain transaction is completely unaffected — same fire-and-forget
+    /// spawn, same **sequential** `resolve_all` as before this amendment
+    /// (parallelizing it universally measurably destabilized a pre-existing
+    /// timing-sensitive regression test under concurrent load; see
+    /// `resolve_all_parallel`'s own doc for the full account).
+    ///
     /// **`write_conditions`** (ADR 0018 §2 apply-time write-key conditions
     /// amendment) — `(table, key, expected)` own-key byte-level OCC
     /// conditions checked at *apply* time on the key's own tablet, upgrading
@@ -6042,6 +6198,40 @@ impl ClientCtx {
     /// this transaction does not write belongs in `preconditions` instead
     /// (see [`TxnWriteCondition`]'s doc for why mixing them up is exactly
     /// the self-referential-stall bug the PR7 amendment documented).
+    /// Split one (table, tablet) group's [`TxnTableWrite`]s into the
+    /// already-concrete writes `RaftKvNode::txn_stage_anchor`/
+    /// `txn_stage_participant` can take directly, and the pending
+    /// kind-write-path ones [`ClientCtx::txn_stage_local`] must still
+    /// evaluate at the leader (ADR 0046 U3, PR2) — see [`TxnTableWrite`]'s
+    /// doc for why exactly one of `value`/`pending` is ever `Some`.
+    fn split_group(
+        group: Vec<TxnTableWrite>,
+    ) -> Result<(Vec<TxnWrite>, Vec<PendingKindWrite>), String> {
+        let mut writes = Vec::new();
+        let mut pending = Vec::new();
+        for w in group {
+            match (w.value, w.pending) {
+                (Some(value), None) => writes.push(TxnWrite::plain(w.key, Some(value))),
+                (None, Some(p)) => pending.push(p),
+                (None, None) => {
+                    return Err(format!(
+                        "cp_txn: write to table `{}` key {:?} has neither a value nor a \
+                         pending kind-write spec",
+                        w.table, w.key
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "cp_txn: write to table `{}` key {:?} has both a value and a pending \
+                         kind-write spec (exactly one is expected)",
+                        w.table, w.key
+                    ));
+                }
+            }
+        }
+        Ok((writes, pending))
+    }
+
     pub(crate) async fn cp_txn(
         &self,
         writes: Vec<TxnTableWrite>,
@@ -6063,21 +6253,22 @@ impl ClientCtx {
         // the anchor's — a future reordering of `writes` should not
         // resurface this) and return a client-facing error instead of ever
         // reaching that assert.
-        if let Some((table, key, _)) = writes.iter().find(|(_, k, _)| k.len() < TOKEN_BYTES) {
+        if let Some(w) = writes.iter().find(|w| w.key.len() < TOKEN_BYTES) {
             return Err(format!(
-                "txn key {key:?} of table `{table}` must be at least {TOKEN_BYTES} bytes long \
-                 (ADR 0022) for a multi-participant transaction"
+                "txn key {:?} of table `{}` must be at least {TOKEN_BYTES} bytes long \
+                 (ADR 0022) for a multi-participant transaction",
+                w.key, w.table
             ));
         }
 
         // Auto-provision every distinct table's first tablet on demand, like
         // `cp_write`.
         let mut seen_tables: BTreeSet<String> = BTreeSet::new();
-        for (table, _, _) in &writes {
-            if seen_tables.insert(table.clone())
-                && !self.effective_metadata().has_table_tablet(table)
+        for w in &writes {
+            if seen_tables.insert(w.table.clone())
+                && !self.effective_metadata().has_table_tablet(&w.table)
             {
-                self.provision_tablet(table).await?;
+                self.provision_tablet(&w.table).await?;
             }
         }
 
@@ -6092,32 +6283,38 @@ impl ClientCtx {
             condition_map.insert((table, key), expected);
         }
 
+        // ADR 0046 D1: whether this transaction touches any kind-write-path
+        // table at all — every such write rides as `pending`, never a
+        // precomputed `value` (see `TxnTableWrite`'s doc), so this is exact,
+        // not a heuristic. Gates the awaited-bounded resolve below.
+        let touches_kind_write_path = writes.iter().any(|w| w.pending.is_some());
+
         // Group by (table, tablet), preserving first-seen order — `order[0]`
         // is the anchor. `condition_groups` mirrors `groups`' keying, only
         // populated for a (table, tablet) that owns at least one
-        // conditioned key.
+        // conditioned key. Kept as the un-split `TxnTableWrite` (ADR 0046
+        // U3, PR2) here — a group can mix plain (already-known) writes and
+        // pending kind-write-path ones; [`split_group`] separates them right
+        // before each group is actually staged.
         let mut order: Vec<(String, TabletId)> = Vec::new();
-        let mut groups: BTreeMap<(String, TabletId), Vec<TxnWrite>> = BTreeMap::new();
+        let mut groups: BTreeMap<(String, TabletId), Vec<TxnTableWrite>> = BTreeMap::new();
         let mut condition_groups: BTreeMap<(String, TabletId), StageConditions> = BTreeMap::new();
-        for (table, key, value) in writes {
+        for w in writes {
             let tablet = self
-                .tablet_for(&table, &key)
-                .ok_or_else(|| format!("no tablet owns a txn key of table `{table}`"))?;
-            if let Some(expected) = condition_map.remove(&(table.clone(), key.clone())) {
+                .tablet_for(&w.table, &w.key)
+                .ok_or_else(|| format!("no tablet owns a txn key of table `{}`", w.table))?;
+            if let Some(expected) = condition_map.remove(&(w.table.clone(), w.key.clone())) {
                 condition_groups
-                    .entry((table.clone(), tablet))
+                    .entry((w.table.clone(), tablet))
                     .or_default()
-                    .push((key.clone(), expected));
+                    .push((w.key.clone(), expected));
             }
-            let gk = (table, tablet);
+            let gk = (w.table.clone(), tablet);
             if let std::collections::btree_map::Entry::Vacant(e) = groups.entry(gk.clone()) {
                 e.insert(Vec::new());
                 order.push(gk.clone());
             }
-            groups
-                .get_mut(&gk)
-                .expect("just inserted")
-                .push((key, value));
+            groups.get_mut(&gk).expect("just inserted").push(w);
         }
         if let Some(((table, key), _)) = condition_map.into_iter().next() {
             return Err(format!(
@@ -6128,10 +6325,11 @@ impl ClientCtx {
         }
 
         let anchor_gk = order[0].clone();
-        let anchor_writes = groups.remove(&anchor_gk).expect("anchor group present");
+        let anchor_group = groups.remove(&anchor_gk).expect("anchor group present");
         let anchor_conditions = condition_groups.remove(&anchor_gk).unwrap_or_default();
         let (anchor_table, _anchor_tablet) = anchor_gk;
-        let anchor_keys: Vec<Vec<u8>> = anchor_writes.iter().map(|(k, _)| k.clone()).collect();
+        let anchor_keys: Vec<Vec<u8>> = anchor_group.iter().map(|w| w.key.clone()).collect();
+        let (anchor_writes, anchor_pending) = Self::split_group(anchor_group)?;
 
         // ADR 0018 §2/PR5 (task #18 fix): the anchor's record must name
         // every OTHER participant's `(table, span)` pairs up front, not
@@ -6145,12 +6343,12 @@ impl ClientCtx {
         // 0018-cross-tablet-transactions.md`'s corrective note on this).
         let participant_spans: Vec<(String, KeyRange)> = groups
             .iter()
-            .flat_map(|((table, _tablet), writes)| {
+            .flat_map(|((table, _tablet), group)| {
                 let table = table.clone();
-                writes.iter().map(move |(key, _)| {
-                    let mut end = key.clone();
+                group.iter().map(move |w| {
+                    let mut end = w.key.clone();
                     end.push(0);
-                    (table.clone(), KeyRange::new(key.clone(), Some(end)))
+                    (table.clone(), KeyRange::new(w.key.clone(), Some(end)))
                 })
             })
             .collect();
@@ -6162,6 +6360,7 @@ impl ClientCtx {
                 anchor_writes,
                 anchor_conditions,
                 participant_spans,
+                anchor_pending,
             )
             .await?;
 
@@ -6169,13 +6368,17 @@ impl ClientCtx {
         let participant_gks: Vec<(String, TabletId)> = order.into_iter().skip(1).collect();
         let participant_futs = participant_gks.iter().map(|gk| {
             let table = gk.0.clone();
-            let writes = groups.get(gk).expect("group present").clone();
+            let group = groups.get(gk).expect("group present").clone();
             let conditions = condition_groups.get(gk).cloned().unwrap_or_default();
-            let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
+            let keys: Vec<Vec<u8>> = group.iter().map(|w| w.key.clone()).collect();
             let txn_id = txn_id.clone();
             let record_key = record_key.clone();
             let record_table = record_table.clone();
             async move {
+                let (writes, pending) = match Self::split_group(group) {
+                    Ok(split) => split,
+                    Err(e) => return (table, keys, Err(e)),
+                };
                 let result = self
                     .txn_prepare_pushing(
                         &table,
@@ -6183,6 +6386,7 @@ impl ClientCtx {
                         writes,
                         conditions,
                         Vec::new(), // unused: a participant's own stage creates no record.
+                        pending,
                     )
                     .await;
                 (table, keys, result)
@@ -6244,6 +6448,47 @@ impl ClientCtx {
                         )
                         .await;
                 }
+            }
+        };
+        // ADR 0046 D1: a **parallel** sibling of `resolve_all` above, used
+        // only by the awaited-bounded branch further down (a transaction
+        // touching a kind-write-path table) — fanning out to every
+        // participant's own tablet leader concurrently instead of one at a
+        // time is what makes a short fixed budget plausible at all once
+        // there's more than one participant. Deliberately **not** used for
+        // the ordinary fire-and-forget spawn path above: that path's
+        // resolves already run fully in the background with no latency
+        // budget to protect, and switching it to `join_all` measurably
+        // destabilized a pre-existing, already-timing-sensitive regression
+        // test (`dynamo_txn.rs`'s
+        // `transact_get_items_never_observes_a_torn_pair_under_concurrent_writes`,
+        // a tight concurrent-writer loop where a resolve's own wall-clock
+        // latency doubles as the next transaction's own staging retry
+        // budget) — reproduced red with the parallel version applied
+        // universally, green again scoped like this. Not fully root-caused
+        // (plausibly increased concurrent Raft/network load momentarily
+        // slowing an individual resolve under this test's specific tight
+        // loop, not a correctness bug — every resolve still completes,
+        // `txn_resolver_loop` is the safety net either way), but the
+        // sequential default is the proven-stable one, so parallelism stays
+        // opt-in to where D1 actually needs it.
+        let resolve_all_parallel = |outcome: TxnOutcome, staged: Vec<(String, Vec<Vec<u8>>)>| {
+            let this = self.clone();
+            let txn_id = txn_id.clone();
+            let record_key = record_key.clone();
+            async move {
+                let futs = staged.into_iter().map(|(table, keys)| {
+                    let this = this.clone();
+                    let txn_id = txn_id.clone();
+                    let record_key = record_key.clone();
+                    let outcome = outcome.clone();
+                    async move {
+                        let _ = this
+                            .txn_resolve_participant(&table, txn_id, record_key, keys, outcome)
+                            .await;
+                    }
+                });
+                futures::future::join_all(futs).await;
             }
         };
 
@@ -6334,7 +6579,28 @@ impl ClientCtx {
                     // not merely faster: it no longer holds the client
                     // response hostage to every participant's own
                     // liveness/latency.
-                    tokio::spawn(resolve_all(TxnOutcome::Committed { commit_ts }, staged));
+                    //
+                    // ADR 0046 D1: for a transaction touching any
+                    // kind-write-path table, LSI rows and the stream/GSI
+                    // change record only appear at resolve (materialize-
+                    // at-resolve, A1) — an ack-then-async-resolve window
+                    // would leave a committed write readable on the base
+                    // table but transiently absent from its index/stream.
+                    // Await `resolve_all` under a short bounded budget
+                    // first; a timeout still acks (delayed, never denied —
+                    // `txn_resolver_loop` remains the safety net for
+                    // whatever the bound didn't cover). A plain
+                    // transaction keeps the original fire-and-forget spawn
+                    // unchanged.
+                    if touches_kind_write_path {
+                        let _ = tokio::time::timeout(
+                            TXN_RESOLVE_ALL_AWAIT_BUDGET,
+                            resolve_all_parallel(TxnOutcome::Committed { commit_ts }, staged),
+                        )
+                        .await;
+                    } else {
+                        tokio::spawn(resolve_all(TxnOutcome::Committed { commit_ts }, staged));
+                    }
                     Ok(commit_ts)
                 }
                 // The anchor's own commit lost to a concurrent recovery
@@ -7392,51 +7658,44 @@ impl ClientCtx {
                 writes,
                 conditions,
                 participant_spans,
+                pending_kind_writes,
             } => {
-                let Some(first) = writes.first().map(|(k, _)| k.clone()) else {
+                let Some(first) = writes.first().map(|w| w.key.clone()).or_else(|| {
+                    pending_kind_writes
+                        .first()
+                        .map(|p| dynamo::item_key(&p.pk, p.sk.as_ref()))
+                }) else {
                     return ClientResponse::Error("txn prepare: writes must be non-empty".into());
                 };
                 let tablet = self.tablet_for(&table, &first);
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
-                match anchor {
-                    None => match leader
-                        .txn_stage(&table, writes, participant_spans, conditions)
-                        .await
-                    {
-                        Some((txn_id, record_key, outcome)) => ClientResponse::TxnPrepared {
-                            ts: txn_id.ts,
-                            txn_id,
-                            record_key,
-                            record_table: table,
-                            outcome,
-                        },
-                        None => ClientResponse::Error(
-                            "CP group leader moved during anchor stage; retry".into(),
-                        ),
-                    },
-                    Some((txn_id, record_key, record_table)) => match leader
-                        .txn_stage_participant(
-                            txn_id.clone(),
-                            record_key.clone(),
-                            record_table.clone(),
-                            writes,
-                            conditions,
-                        )
-                        .await
-                    {
-                        Some((ts, outcome)) => ClientResponse::TxnPrepared {
+                // ADR 0046 U3 (PR2): the shared local-stage step also used by
+                // `txn_prepare`'s own `CpRoute::Local` branch — see
+                // `txn_stage_local`'s doc.
+                match self
+                    .txn_stage_local(
+                        &leader,
+                        &table,
+                        anchor,
+                        writes,
+                        conditions,
+                        participant_spans,
+                        pending_kind_writes,
+                    )
+                    .await
+                {
+                    Ok((txn_id, record_key, record_table, ts, outcome)) => {
+                        ClientResponse::TxnPrepared {
                             txn_id,
                             record_key,
                             record_table,
                             ts,
                             outcome,
-                        },
-                        None => ClientResponse::Error(
-                            "CP group leader moved during participant stage; retry".into(),
-                        ),
-                    },
+                        }
+                    }
+                    Err(e) => ClientResponse::Error(e),
                 }
             }
             ClientRequest::TxnDecide {

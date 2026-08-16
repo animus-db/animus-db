@@ -672,9 +672,13 @@ async fn admin_txns_shows_a_pending_record_then_clears_after_recovery() {
         ClientRequest::TxnPrepare {
             table: "admintxn".to_string(),
             anchor: None,
-            writes: vec![(b"admin-txn-key".to_vec(), Some(b"pending-value".to_vec()))],
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                b"admin-txn-key".to_vec(),
+                Some(b"pending-value".to_vec()),
+            )],
             conditions: Vec::new(),
             participant_spans: Vec::new(),
+            pending_kind_writes: Vec::new(),
         },
     )
     .await;

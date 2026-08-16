@@ -1,9 +1,10 @@
 //! DynamoDB Streams catalog + write-gate end-to-end tests (ADR 0042 §2/§4/
 //! §9/§1) — `SetTableStream`'s replication, `UpdateTable`/`DescribeTable`'s
-//! wire surface, `TransactWriteItems`'s extended rejection, and the trim
-//! janitor's `"copier"`-tag expectation. Real time/sockets (the `ProdEnv`
-//! edge), so every eventual property is a converged-or-timeout poll, never a
-//! fixed sleep.
+//! wire surface, `TransactWriteItems` on a streamed table (ADR 0046 A1/U3,
+//! `TxnStage` kind-writes stack — supersedes the old wholesale rejection this
+//! file used to test), and the trim janitor's `"copier"`-tag expectation.
+//! Real time/sockets (the `ProdEnv` edge), so every eventual property is a
+//! converged-or-timeout poll, never a fixed sleep.
 //!
 //! The write-path itself (a streamed-unindexed table committing exactly a
 //! base row and a change record, view-type storage invariance, trim staying
@@ -319,7 +320,7 @@ async fn describe_table_returns_stream_spec_and_arn_reenable_mints_new_label() {
 /// extension of the ADR 0041 indexed-table rejection) but still works
 /// unmodified on a plain table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn transact_write_items_rejected_on_streamed_table_but_not_plain() {
+async fn transact_write_items_on_a_streamed_table_delivers_correct_events() {
     let dir = tempfile::tempdir().unwrap();
     let node_dir = dir.path().join("node-0");
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
@@ -332,10 +333,14 @@ async fn transact_write_items_rejected_on_streamed_table_but_not_plain() {
         r#"{"TableName":"streamed",
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
-                "StreamViewType":"KEYS_ONLY"}}"#,
+                "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
     )
     .await;
     assert_eq!(status, 200, "CreateTable(streamed) failed: {body}");
+    let label = field(&body, "LatestStreamLabel");
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/streamed/stream/{label}");
+
+    // A plain (unstreamed) table's own transaction still works unaffected.
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
@@ -344,18 +349,6 @@ async fn transact_write_items_rejected_on_streamed_table_but_not_plain() {
     )
     .await;
     assert_eq!(status, 200, "CreateTable(plain) failed: {body}");
-
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.TransactWriteItems",
-        r#"{"TransactItems":[{"Put":{"TableName":"streamed",
-            "Item":{"id":{"S":"a"}}}}]}"#,
-    )
-    .await;
-    assert_eq!(status, 400, "expected rejection: {body}");
-    assert!(body.contains("ValidationException"), "{body}");
-    assert!(body.contains("streamed table"), "{body}");
-
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.TransactWriteItems",
@@ -367,6 +360,162 @@ async fn transact_write_items_rejected_on_streamed_table_but_not_plain() {
         status, 200,
         "plain-table transaction should succeed: {body}"
     );
+
+    // The transaction under test: two Puts on the streamed table, one
+    // participant each (ADR 0046 A1/U3, `TxnStage` kind-writes stack) —
+    // each must produce exactly one change record, correctly imaged.
+    //
+    // NOTE on `ApproximateCreationDateTime` (ADR 0046 B1's "informational
+    // commit_ts" clause): this suite does NOT assert its value reports the
+    // transaction's true commit instant — that sub-piece is a documented,
+    // deliberate scope cut (see this PR's own notes / the ADR 0018
+    // amendment): the change-log record's bytes are frozen at STAGE time
+    // (`eval_kind_txn_write`), strictly before the anchor's commit_ts even
+    // exists, and `animus-cp-data`'s `materialize_derived` must keep
+    // treating those bytes as opaque (ADR 0043) to stay the one shared
+    // helper `KindBatch` also uses — so there is no correctness-preserving
+    // place left to patch the true commit instant in after the fact. B1's
+    // load-bearing half (the KEY position comes from the resolve's own
+    // monotonic ts, never the commit_ts) is unaffected and is what this
+    // test actually exercises.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.TransactWriteItems",
+        r#"{"TransactItems":[
+            {"Put":{"TableName":"streamed","Item":{"id":{"S":"x1"},"v":{"N":"1"}}}},
+            {"Put":{"TableName":"streamed","Item":{"id":{"S":"x2"},"v":{"N":"2"}}}}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "streamed-table transaction failed: {body}");
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDBStreams_20120810.DescribeStream",
+        &format!(r#"{{"StreamArn":"{stream_arn}"}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeStream failed: {body}");
+    let v = json(&body);
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap();
+    let shard_id = shards.last().expect("at least one shard")["ShardId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let it = get_shard_iterator(addr, &stream_arn, &shard_id, "TRIM_HORIZON", None).await;
+    let (records, _next) = get_records(addr, &it, None).await;
+    assert_eq!(
+        records.len(),
+        2,
+        "expected exactly one change record per transactional write, got: {records:?}"
+    );
+    let mut seen_ids: Vec<String> = Vec::new();
+    for record in &records {
+        assert_eq!(record["eventName"], "INSERT", "{record:?}");
+        let new_image = &record["dynamodb"]["NewImage"];
+        let id = new_image["id"]["S"].as_str().unwrap().to_owned();
+        assert!(
+            id == "x1" || id == "x2",
+            "unexpected id in transactional stream record: {record:?}"
+        );
+        seen_ids.push(id);
+        // Present and numeric — see this test's own doc for why its exact
+        // value (whether it reports the true commit instant) is out of
+        // scope here.
+        record["dynamodb"]["ApproximateCreationDateTime"]
+            .as_f64()
+            .unwrap_or_else(|| {
+                panic!("ApproximateCreationDateTime missing/non-numeric: {record:?}")
+            });
+    }
+    seen_ids.sort();
+    assert_eq!(seen_ids, vec!["x1".to_string(), "x2".to_string()]);
+}
+
+/// **Abort case**: a `TransactWriteItems` that fails a `ConditionCheck`
+/// leaves no stream event — ADR 0046 A1's "abort discards the kind-writes
+/// payload entirely" (which includes the change-log record) at the wire
+/// level, proven through the real `GetRecords` read path this time rather
+/// than a direct kind-scope read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transact_write_items_abort_leaves_no_stream_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("node-0");
+    let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
+    let addr = config.nodes[0].dynamo;
+    await_node_bootstrap(&node).await;
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"streamed",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "StreamSpecification":{"StreamEnabled":true,
+                "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+    let label = field(&body, "LatestStreamLabel");
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/streamed/stream/{label}");
+
+    // The ConditionCheck targets a key that does not exist — the whole
+    // transaction, including the Put on the streamed table, must abort.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.TransactWriteItems",
+        r#"{"TransactItems":[
+            {"ConditionCheck":{"TableName":"streamed","Key":{"id":{"S":"missing"}},
+                               "ConditionExpression":"attribute_exists(id)"}},
+            {"Put":{"TableName":"streamed","Item":{"id":{"S":"x1"}}}}]}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "expected TransactionCanceledException: {body}");
+    assert!(body.contains("TransactionCanceledException"), "{body}");
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.GetItem",
+        r#"{"TableName":"streamed","Key":{"id":{"S":"x1"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "{}", "x1 must not have committed: {body}");
+
+    // A genuine, immediately-following write proves the stream is still
+    // alive and correctly ordered — its own event must be the FIRST one
+    // this shard ever serves, with no phantom event from the aborted
+    // transaction ahead of it.
+    let (status, _) = dynamo(
+        addr,
+        "DynamoDB_20120810.PutItem",
+        r#"{"TableName":"streamed","Item":{"id":{"S":"x2"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDBStreams_20120810.DescribeStream",
+        &format!(r#"{{"StreamArn":"{stream_arn}"}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeStream failed: {body}");
+    let v = json(&body);
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap();
+    let shard_id = shards.last().expect("at least one shard")["ShardId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let it = get_shard_iterator(addr, &stream_arn, &shard_id, "TRIM_HORIZON", None).await;
+    let (records, _next) = get_records(addr, &it, None).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "the aborted transaction must not surface any event; only x2's genuine write \
+         should appear: {records:?}"
+    );
+    assert_eq!(records[0]["dynamodb"]["NewImage"]["id"]["S"], "x2");
 }
 
 // ---------------------------------------------------------------------------

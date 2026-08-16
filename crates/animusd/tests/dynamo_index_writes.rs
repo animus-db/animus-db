@@ -7,11 +7,15 @@
 //!   `UpdateItem` setting a not-yet-indexed attribute, `UpdateItem` moving an
 //!   already-indexed one, and `BatchWriteItem` puts + a delete, all against
 //!   one table with both an LSI and a GSI.
-//! - `transact_write_items_rejected_on_indexed_table` — `TransactWriteItems`
-//!   is the one op that still can't participate: a write action against an
-//!   indexed table is rejected wholesale (nothing commits), while a
-//!   `ConditionCheck`-only action against one, alongside a genuine write on
-//!   an unindexed table, still succeeds.
+//! - `transact_write_items_maintains_lsi_and_gsi_across_a_split_table` /
+//!   `transact_write_items_abort_leaves_no_lsi_row_and_no_gsi_row` —
+//!   `TransactWriteItems` now maintains indexes atomically too (ADR 0046
+//!   A1/U3, `TxnStage` kind-writes stack): a cross-tablet transaction's
+//!   writes materialize their LSI rows and GSI change records exactly like
+//!   a plain `PutItem`/`UpdateItem` would, and an aborted transaction
+//!   leaves neither behind. Supersedes the old wholesale-rejection this
+//!   file used to test (ADR 0041 §2/ADR 0042 §16's now-superseded
+//!   TxnStage-has-no-multi-kind-write-extension rationale).
 //! - `unconditional_put_and_delete_maintain_lsi_without_a_condition_or_all_old`
 //!   — the old-image-starvation fix: `PutItem`/`DeleteItem` with **no**
 //!   `ConditionExpression` and **no** `ReturnValues: ALL_OLD` must still fetch
@@ -31,11 +35,30 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{Node, bind_cluster, start_cluster};
+use animus_dynamo::{AttributeValue, storage_key};
+use animus_tablet::partition_token;
+use animusd::{ClientRequest, ClientResponse, Node, bind_cluster, read_frame, start_cluster};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
+
+/// One `ClientRequest`/`ClientResponse` round trip over the plain
+/// length-prefixed client protocol — used only to drive `SplitTablet`; no
+/// such op exists on the DynamoDB wire. Mirrors `dynamo_index_scan.rs`'s
+/// identical helper.
+async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("connect to client port");
+    animusd::write_frame(&mut stream, &req)
+        .await
+        .expect("send request");
+    read_frame(&mut stream)
+        .await
+        .expect("read reply")
+        .expect("a reply")
+}
 
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
@@ -321,18 +344,167 @@ async fn update_item_and_batch_write_item_maintain_secondary_indexes() {
     assert_eq!(body, "{}", "p1 should be deleted: {body}");
 }
 
-/// `TransactWriteItems` is the one op ADR 0041's write-coverage fix does
-/// **not** extend to maintaining indexes: `cp_txn`'s `KvCommand::TxnStage` has
-/// no multi-kind-write extension yet, so staging just the base row inside a
-/// transaction would leave an indexed table's LSI rows / GSI change records
-/// permanently stale with no signal. Instead, a transaction with any
-/// `Put`/`Delete`/`Update` action against a table that has at least one
-/// secondary index is rejected wholesale, before anything commits. A
-/// `ConditionCheck`-only action against an indexed table doesn't count (it
-/// writes nothing) — paired with a genuine write on an unindexed table, the
-/// transaction still succeeds.
+/// **`TransactWriteItems` now maintains indexes atomically (ADR 0046 A1/U3,
+/// `TxnStage` kind-writes stack)** — the rejection this test used to prove
+/// is gone: `TxnStage` stages a write's derived LSI rows/change record
+/// inside its own intent, materialized by `TxnResolve` at resolve, and each
+/// write action's kind payload is evaluated at ITS OWN tablet's leader
+/// (never precomputed by the coordinator). Splits the table so the two
+/// items genuinely land on **different tablets**, proving the mechanism
+/// composes with the 2PC's own cross-tablet atomicity, not just within one
+/// group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn transact_write_items_rejected_on_indexed_table() {
+async fn transact_write_items_maintains_lsi_and_gsi_across_a_split_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr = nodes[0].dynamo_addr();
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"indexed",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
+                         {"AttributeName":"sk","KeyType":"RANGE"}],
+            "GlobalSecondaryIndexes":[
+                {"IndexName":"by-tag",
+                 "KeySchema":[{"AttributeName":"tag","KeyType":"HASH"}],
+                 "Projection":{"ProjectionType":"ALL"}}],
+            "LocalSecondaryIndexes":[
+                {"IndexName":"by-alt",
+                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
+                              {"AttributeName":"alt","KeyType":"RANGE"}]}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable(indexed) failed: {body}");
+
+    // `CreateTable` alone does not provision the table's first tablet
+    // (`cp_write`/`cp_delete`'s own documented non-auto-provisioning
+    // contract) — a throwaway seed write forces it into existence before
+    // `SplitTablet` can target it by id.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.PutItem",
+        r#"{"TableName":"indexed","Item":{"id":{"S":"seed"},"sk":{"S":"a"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "seed PutItem failed: {body}");
+
+    // Split strictly between "p1" and "p2"'s own tokens (mirrors
+    // `dynamo_index_scan.rs`'s identical split-key construction) so the
+    // transaction's two items genuinely land on different tablets.
+    let token_p1 = partition_token(&storage_key(&AttributeValue::S("p1".into()), None));
+    let token_p2 = partition_token(&storage_key(&AttributeValue::S("p2".into()), None));
+    let split_key = token_p1.max(token_p2).to_vec();
+    let resp = call(
+        nodes[0].client_addr(),
+        ClientRequest::SplitTablet {
+            tablet: 1,
+            split_key,
+        },
+    )
+    .await;
+    assert!(
+        matches!(resp, ClientResponse::PutOk),
+        "split did not commit: {resp:?}"
+    );
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if nodes[0].metadata().tablets.len() >= 2 {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("split was not recorded within 20s");
+
+    // The transaction: one Put per partition, each setting both the LSI's
+    // `alt` sort attribute and the GSI's `tag` hash attribute.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.TransactWriteItems",
+        r#"{"TransactItems":[
+            {"Put":{"TableName":"indexed",
+                    "Item":{"id":{"S":"p1"},"sk":{"S":"a"},
+                            "alt":{"S":"mid"},"tag":{"S":"red"}}}},
+            {"Put":{"TableName":"indexed",
+                    "Item":{"id":{"S":"p2"},"sk":{"S":"a"},
+                            "alt":{"S":"high"},"tag":{"S":"blue"}}}}]}"#,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "cross-tablet indexed transaction failed: {body}"
+    );
+
+    // Both base rows visible immediately (the anchor's ack already implies
+    // both committed — 2PC atomicity).
+    for (id, alt) in [("p1", "mid"), ("p2", "high")] {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.GetItem",
+            &format!(r#"{{"TableName":"indexed","Key":{{"id":{{"S":"{id}"}},"sk":{{"S":"a"}}}}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            body.contains(&format!(r#""alt":{{"S":"{alt}"}}"#)),
+            "{id}'s base row missing/wrong after the transaction: {body}"
+        );
+    }
+
+    // Both LSI rows correct — same-entry-synchronous, so a plain immediate
+    // assertion (ADR 0046's "what this model does not change": LSI stays
+    // strongly consistent).
+    for (id, alt) in [("p1", "mid"), ("p2", "high")] {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.Query",
+            &format!(
+                r#"{{"TableName":"indexed","IndexName":"by-alt",
+                    "KeyConditionExpression":"id = :i AND alt = :a",
+                    "ExpressionAttributeValues":{{":i":{{"S":"{id}"}},":a":{{"S":"{alt}"}}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "LSI query failed for {id}: {body}");
+        assert!(
+            body.contains("\"Count\":1"),
+            "LSI row for {id}/alt={alt} missing immediately after the transaction: {body}"
+        );
+    }
+
+    // Both change records land — awaited-resolve (ADR 0046 D1) means this
+    // should already be true, but the GSI drain is itself asynchronous
+    // (DynamoDB's own eventually-consistent contract), so poll.
+    await_query(
+        addr,
+        r#"{"TableName":"indexed","IndexName":"by-tag",
+            "KeyConditionExpression":"tag = :t",
+            "ExpressionAttributeValues":{":t":{"S":"red"}}}"#,
+        |b| b.contains("\"Count\":1"),
+    )
+    .await;
+    await_query(
+        addr,
+        r#"{"TableName":"indexed","IndexName":"by-tag",
+            "KeyConditionExpression":"tag = :t",
+            "ExpressionAttributeValues":{":t":{"S":"blue"}}}"#,
+        |b| b.contains("\"Count\":1"),
+    )
+    .await;
+}
+
+/// **Abort case**: a `TransactWriteItems` that fails a `ConditionCheck`
+/// leaves no trace on an indexed table — no base row, no LSI row, no GSI
+/// change record ever materialized. Proves ADR 0046 A1's "abort discards
+/// the kind-writes payload entirely" at the wire level.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transact_write_items_abort_leaves_no_lsi_row_and_no_gsi_row() {
     let dir = tempfile::tempdir().unwrap();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
@@ -347,32 +519,31 @@ async fn transact_write_items_rejected_on_indexed_table() {
         r#"{"TableName":"indexed",
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
-                {"IndexName":"by-email",
-                 "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}]}]}"#,
+                {"IndexName":"by-tag",
+                 "KeySchema":[{"AttributeName":"tag","KeyType":"HASH"}],
+                 "Projection":{"ProjectionType":"ALL"}}]}"#,
     )
     .await;
-    assert_eq!(status, 200, "CreateTable(indexed) failed: {body}");
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"plain","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "CreateTable(plain) failed: {body}");
+    assert_eq!(status, 200, "CreateTable failed: {body}");
 
-    // A Put on the indexed table is rejected outright — nothing committed.
+    // The ConditionCheck targets a key that does not exist — fails
+    // `attribute_exists`, so the whole transaction (including the Put on
+    // the indexed table) must abort before anything commits.
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.TransactWriteItems",
         r#"{"TransactItems":[
-            {"Put":{"TableName":"indexed","Item":{"id":{"S":"x1"},"email":{"S":"a@x"}}}}]}"#,
+            {"ConditionCheck":{"TableName":"indexed","Key":{"id":{"S":"missing"}},
+                               "ConditionExpression":"attribute_exists(id)"}},
+            {"Put":{"TableName":"indexed","Item":{"id":{"S":"x1"},"tag":{"S":"red"}}}}]}"#,
     )
     .await;
-    assert_eq!(status, 400, "expected rejection: {body}");
+    assert_eq!(status, 400, "expected TransactionCanceledException: {body}");
     assert!(
-        body.contains("ValidationException"),
-        "expected ValidationException, got: {body}"
+        body.contains("TransactionCanceledException"),
+        "expected TransactionCanceledException, got: {body}"
     );
+
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.GetItem",
@@ -382,62 +553,23 @@ async fn transact_write_items_rejected_on_indexed_table() {
     assert_eq!(status, 200);
     assert_eq!(body, "{}", "x1 must not have committed: {body}");
 
-    // A Delete on the indexed table is likewise rejected.
+    // No GSI row either — give the drain a real window to have (wrongly)
+    // materialized one before asserting its absence, rather than winning on
+    // a race.
+    sleep(Duration::from_secs(2)).await;
     let (status, body) = dynamo(
         addr,
-        "DynamoDB_20120810.PutItem",
-        r#"{"TableName":"indexed","Item":{"id":{"S":"x2"},"email":{"S":"b@x"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "seed PutItem(x2) failed: {body}");
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.TransactWriteItems",
-        r#"{"TransactItems":[
-            {"Delete":{"TableName":"indexed","Key":{"id":{"S":"x2"}}}}]}"#,
-    )
-    .await;
-    assert_eq!(status, 400, "expected rejection: {body}");
-    assert!(
-        body.contains("ValidationException"),
-        "expected ValidationException, got: {body}"
-    );
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"indexed","Key":{"id":{"S":"x2"}}}"#,
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"indexed","IndexName":"by-tag",
+            "KeyConditionExpression":"tag = :t",
+            "ExpressionAttributeValues":{":t":{"S":"red"}}}"#,
     )
     .await;
     assert_eq!(status, 200);
     assert!(
-        body.contains(r#""email":{"S":"b@x"}"#),
-        "x2 must still exist, the rejected Delete never committed: {body}"
+        body.contains("\"Count\":0"),
+        "aborted transaction must never materialize a GSI row: {body}"
     );
-
-    // A bare ConditionCheck against the indexed table, alongside a genuine
-    // write on an unindexed one, still succeeds — only a *write* on an
-    // indexed table is rejected.
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.TransactWriteItems",
-        r#"{"TransactItems":[
-            {"ConditionCheck":{"TableName":"indexed","Key":{"id":{"S":"x2"}},
-                               "ConditionExpression":"attribute_exists(id)"}},
-            {"Put":{"TableName":"plain","Item":{"id":{"S":"p1"}}}}]}"#,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "ConditionCheck-only on indexed table should succeed: {body}"
-    );
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"plain","Key":{"id":{"S":"p1"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert!(!body.is_empty() && body != "{}", "p1 not written: {body}");
 }
 
 /// The old-image-starvation fix: an **unconditional** `PutItem` (no

@@ -1502,22 +1502,26 @@ async fn run_update_item(
 /// record backing the window. A narrow, documented limitation of this
 /// corner case (see the PR7 ADR amendment), not the common path.
 ///
-/// **A write action against a table with at least one secondary index, or a
-/// stream enabled, is rejected outright, up front (ADR 0041; ADR 0042)** —
-/// `cp_txn`'s `KvCommand::TxnStage` only ever stages the base row; it has no
-/// multi-kind-write extension yet, so staging a `Put`/`Delete`/`Update` on
-/// such a table would commit the base row while silently never writing an
-/// LSI row / change-log record, leaving that table's indexes **permanently
-/// stale** (or its stream permanently missing that write) with no error and
-/// no signal — worse than refusing the transaction, since a stale index (or
-/// a silently incomplete stream) looks correct until it silently isn't. A
-/// `ConditionCheck` alone doesn't count (it writes nothing); a transaction
-/// may still write freely to any *plain* table alongside a `ConditionCheck`
-/// on an indexed/streamed one. The real fix — extending `KvCommand::TxnStage`
-/// so it can stage a multi-kind atomic write (base + LSI rows + change
-/// record) the same way `cp_kind_write` does outside a transaction — is a
-/// genuine `animus-cp-data` protocol change, deliberately left as a
-/// follow-up rather than folded into this rejection (named in both ADRs).
+/// **A write action against an indexed/streamed table (ADR 0046 A1/U3,
+/// `TxnStage` kind-writes stack) now participates like any other.** Earlier
+/// revisions rejected these outright, up front: `cp_txn`'s
+/// `KvCommand::TxnStage` only ever staged the base row, so committing one
+/// would have left that table's indexes permanently stale (or its stream
+/// permanently missing that write) with no error. That gap is closed —
+/// `TxnStage` now stages the derived kind-writes/change-log payload inside
+/// the base write's own intent, materialized atomically by `TxnResolve` at
+/// its own resolve ts (ADR 0046 Decision 2's "materialize-at-resolve",
+/// never as a separately-staged intent). **The payload itself is never
+/// computed here**: for a `table_takes_kind_write_path` table, this
+/// function builds a [`crate::PendingKindWrite`] (the item identity + op +
+/// condition) instead of precomputing a value from a coordinator-local
+/// read — evaluation (old-image read, condition check, LSI/change-log
+/// diff) happens **at the item's own tablet leader**, at stage time
+/// (`ClientCtx::txn_stage_local`, mirroring [`kind_write_item_at_leader`]'s
+/// U3 shape exactly), closing the identical cross-node stale-diff race a
+/// coordinator-evaluated design would reintroduce. A `ConditionCheck`
+/// against such a table is unaffected either way (it writes nothing, so
+/// stays the ordinary cross-key precondition below).
 async fn run_transact(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -1533,38 +1537,32 @@ async fn run_transact(
             "TransactWriteItems supports at most {MAX_TRANSACT_ITEMS} actions"
         )));
     }
-    for action in actions {
-        let is_write = !matches!(action, TransactAction::ConditionCheck { .. });
-        if !is_write {
-            continue;
-        }
-        if !meta.table_indexes(action.table()).is_empty() {
-            return Err(WireError::validation(
-                "transactional writes on an indexed table are not yet supported \
-                 (ADR 0041: TxnStage kind-write extension pending)",
-            ));
-        }
-        if meta.table_stream(action.table()).is_some() {
-            return Err(WireError::validation(
-                "transactional writes on a streamed table are not yet supported \
-                 (ADR 0042: TxnStage kind-write extension pending)",
-            ));
-        }
-    }
 
-    // Serialize against this node's other RMWs across the whole pre-read/
-    // evaluate/commit span — exactly like every other conditional write here
+    // Serialize against this node's other RMWs across the pre-read/evaluate
+    // span below — exactly like every other conditional write here
     // (`PutItem`/`DeleteItem`/`UpdateItem`). `cp_txn`'s own cross-tablet 2PC
     // (now including apply-time `write_conditions` OCC for a write action's
     // own condition, ADR 0018 §2 amendment) is what makes the commit —
     // *and* every condition's cross-node correctness — atomic; this lock
     // only smooths same-node throughput/ordering between two conditional
     // writes on THIS node, it is no longer load-bearing for correctness.
-    let _rmw = ctx.data().rmw_lock.lock().await;
-
+    //
+    // **Scoped to end BEFORE `cp_txn` is called, deliberately** (ADR 0046
+    // U3, PR2) — `cp_txn` → `txn_prepare` → `ClientCtx::txn_stage_local`
+    // takes this SAME node-local `ctx.data().rmw_lock` again for any
+    // kind-write-path write action, at the moment it evaluates that action
+    // at the tablet's own leader. On a combined-role node hosting the
+    // tablet leader itself, `CpRoute::Local` runs that evaluation
+    // in-process on this exact `ClientCtx` — holding this guard across the
+    // `cp_txn` call would self-deadlock a `tokio::sync::Mutex` (not
+    // reentrant) the instant a write action targets a locally-led
+    // kind-write-path table (every single-node/combined-role deployment
+    // hits this immediately; a real regression a genuinely single-node
+    // `ProdEnv` transactional-write test caught).
     let mut writes: Vec<crate::TxnTableWrite> = Vec::new();
     let mut preconditions: Vec<crate::TxnPrecondition> = Vec::new();
     let mut write_conditions: Vec<crate::TxnWriteCondition> = Vec::new();
+    let _rmw = ctx.data().rmw_lock.lock().await;
     let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
 
     for action in actions {
@@ -1584,6 +1582,43 @@ async fn run_transact(
             return Err(WireError::validation(
                 "Transaction request cannot include multiple operations on one item",
             ));
+        }
+
+        // ADR 0046 U3: a WRITE action (never a bare `ConditionCheck`, which
+        // writes nothing and stays the ordinary precondition path below)
+        // against a table with at least one secondary index or a stream
+        // enabled defers entirely to the participant leader — no
+        // coordinator-local read, no coordinator-local condition
+        // evaluation, no coordinator-computed diff. See this function's own
+        // doc and `PendingKindWrite`'s doc for why.
+        if !is_condition_check && table_takes_kind_write_path(meta, &table) {
+            let op = match action {
+                TransactAction::Put { item, .. } => KindWriteOp::Put(item.clone()),
+                TransactAction::Delete { .. } => KindWriteOp::Delete,
+                TransactAction::Update {
+                    key,
+                    actions: update_actions,
+                    ..
+                } => KindWriteOp::Update {
+                    key_item: key.clone(),
+                    actions: update_actions.clone(),
+                },
+                TransactAction::ConditionCheck { .. } => {
+                    unreachable!("is_condition_check excludes this arm")
+                }
+            };
+            writes.push(crate::TxnTableWrite {
+                table: table.clone(),
+                key: data_key,
+                value: None,
+                pending: Some(crate::PendingKindWrite {
+                    pk,
+                    sk,
+                    op,
+                    condition: condition.cloned(),
+                }),
+            });
+            continue;
         }
 
         // An `Update` always needs a pre-read (to compute its new value); a
@@ -1609,18 +1644,20 @@ async fn run_transact(
 
         match action {
             TransactAction::Put { item, .. } => {
-                writes.push((
-                    table.clone(),
-                    data_key.clone(),
-                    Some(wire::encode_stored_item(item)),
-                ));
+                writes.push(crate::TxnTableWrite {
+                    table: table.clone(),
+                    key: data_key.clone(),
+                    value: Some(wire::encode_stored_item(item)),
+                    pending: None,
+                });
             }
             TransactAction::Delete { .. } => {
-                writes.push((
-                    table.clone(),
-                    data_key.clone(),
-                    Some(wire::encode_tombstone()),
-                ));
+                writes.push(crate::TxnTableWrite {
+                    table: table.clone(),
+                    key: data_key.clone(),
+                    value: Some(wire::encode_tombstone()),
+                    pending: None,
+                });
             }
             TransactAction::Update {
                 actions: update_actions,
@@ -1628,11 +1665,12 @@ async fn run_transact(
             } => {
                 let base = decoded.clone().unwrap_or_else(|| key_item.clone());
                 let new = wire::apply_update(base, update_actions);
-                writes.push((
-                    table.clone(),
-                    data_key.clone(),
-                    Some(wire::encode_stored_item(&new)),
-                ));
+                writes.push(crate::TxnTableWrite {
+                    table: table.clone(),
+                    key: data_key.clone(),
+                    value: Some(wire::encode_stored_item(&new)),
+                    pending: None,
+                });
             }
             TransactAction::ConditionCheck { .. } => {
                 // No write — the condition was already validated above.
@@ -1655,6 +1693,10 @@ async fn run_transact(
             }
         }
     }
+    // ADR 0046 U3, PR2: released HERE, before any `raw_quorum_read`/`cp_txn`
+    // call below — see this guard's own doc for why holding it any longer
+    // would self-deadlock on a combined-role node.
+    drop(_rmw);
 
     if writes.is_empty() {
         // Every action was a `ConditionCheck` — see this function's doc for
@@ -2916,6 +2958,113 @@ type ChangeLog = (Vec<u8>, Vec<u8>);
 /// Everything one item write commits beyond a plain base-row put: the
 /// multi-kind writes and the change-log record that accompanies them.
 type IndexedWrite = (Vec<KindWrite>, ChangeLog);
+
+/// The result of [`eval_kind_txn_write`]: everything `ClientCtx::
+/// txn_stage_local` needs to build the [`animus_cp_data::TxnWrite`] a
+/// kind-write-path item's transactional write stages.
+pub(crate) struct KindTxnWriteEval {
+    /// The item's own base key — `TxnWrite::key`.
+    pub(crate) key: Vec<u8>,
+    /// The encoded new item, or the Dynamo-level tombstone marker for a
+    /// delete (never the engine's own `None`/tombstone — see
+    /// `kind_write_item_at_leader`'s identical convention) — `TxnWrite::value`.
+    pub(crate) value: Vec<u8>,
+    /// The raw bytes this evaluation's own old-image read observed (`None`
+    /// if absent) — used to build the mandatory own-key OCC `conditions`
+    /// entry (ADR 0046 Fork C1) the caller adds alongside this write.
+    pub(crate) raw_old: Option<Vec<u8>>,
+    /// The derived kind-scope writes (LSI rows), EXCLUDING the base row
+    /// itself (that's `key`/`value` above) — `TxnWrite::kind_writes`. Empty
+    /// if `table` lost its last index/stream in the gap between routing and
+    /// evaluation (mirrors `kind_write_item_at_leader`'s own `None`
+    /// fallback — still correct, just no longer index/stream-maintaining).
+    pub(crate) kind_writes: Vec<KindWrite>,
+    /// The change-log record to materialize alongside `kind_writes` at
+    /// resolve — `TxnWrite::change_log`.
+    pub(crate) change_log: Option<ChangeLog>,
+}
+
+/// **ADR 0046 U3, extended to the transactional path (`TxnStage` kind-writes
+/// stack PR2)**: evaluate one item's write **at the tablet's own leader**,
+/// the identical read → evaluate-`condition` → diff span
+/// [`kind_write_item_at_leader`] runs for the ordinary write path — but
+/// returning the diff instead of proposing it. The actual stage propose
+/// happens immediately afterward, in the SAME `TxnPrepare` call this runs
+/// inside of (`ClientCtx::txn_stage_local`), under the identical
+/// `ctx.data().rmw_lock` `kind_write_item_at_leader` takes — so every write
+/// of this item, transactional or not, from whichever edge node received
+/// it, still funnels through one lock on one node (the race U3 exists to
+/// close).
+///
+/// Returns `Ok(None)` for a condition mismatch (no diff computed, mirroring
+/// [`KindWriteOutcome::ConditionFailed`]); `Ok(Some(..))` otherwise.
+#[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
+pub(crate) async fn eval_kind_txn_write(
+    ctx: &ClientCtx,
+    leader: &CpGroup,
+    meta: &Metadata,
+    table: &str,
+    pk: &AttributeValue,
+    sk: Option<&AttributeValue>,
+    op: &KindWriteOp,
+    condition: Option<&ConditionExpression>,
+) -> Result<Option<KindTxnWriteEval>, WireError> {
+    let base_key = item_key(pk, sk);
+    let raw_old = ctx
+        .cp_get_local_resolving(leader, &base_key)
+        .await
+        .map_err(|e| internal(&format!("leader-side old-image read failed: {e}")))?;
+    let old = match &raw_old {
+        Some(bytes) => wire::decode_stored_item(bytes)?,
+        None => None,
+    };
+    if let Some(cond) = condition
+        && !cond.evaluate(old.as_ref())
+    {
+        return Ok(None);
+    }
+    let new = match op {
+        KindWriteOp::Put(item) => Some(item.clone()),
+        KindWriteOp::Delete => None,
+        KindWriteOp::Update { key_item, actions } => {
+            let base = old.clone().unwrap_or_else(|| key_item.clone());
+            Some(wire::apply_update(base, actions))
+        }
+    };
+    let value = match &new {
+        Some(item) => wire::encode_stored_item(item),
+        None => wire::encode_tombstone(),
+    };
+    let (kind_writes, change_log) = match kind_writes_for_item(
+        meta,
+        table,
+        pk,
+        sk,
+        &base_key,
+        value.clone(),
+        old.as_ref(),
+        new.as_ref(),
+    ) {
+        // The base row itself rides as `TxnWrite::key`/`value`, not inside
+        // `kind_writes` — strip it out (it's always `writes[0]` by
+        // `kind_writes_for_item`'s own construction).
+        Some((writes, change_log)) => (
+            writes
+                .into_iter()
+                .filter(|(kind, _, _)| *kind != KIND_BASE)
+                .collect(),
+            Some(change_log),
+        ),
+        None => (Vec::new(), None),
+    };
+    Ok(Some(KindTxnWriteEval {
+        key: base_key,
+        value,
+        raw_old,
+        kind_writes,
+        change_log,
+    }))
+}
 
 /// The data-plane key for a within-table key of `pk`'s partition: the ADR 0022
 /// token prefix plus `within`. The token is over `escape(pk)`, exactly as

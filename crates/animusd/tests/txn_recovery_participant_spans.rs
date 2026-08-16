@@ -305,9 +305,13 @@ async fn anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_
         ClientRequest::TxnPrepare {
             table: "txn_spans_a".to_string(),
             anchor: None,
-            writes: vec![(lower_key.clone(), Some(b"should-not-commit".to_vec()))],
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                lower_key.clone(),
+                Some(b"should-not-commit".to_vec()),
+            )],
             conditions: Vec::new(),
             participant_spans,
+            pending_kind_writes: Vec::new(),
         },
     )
     .await;
@@ -468,9 +472,13 @@ async fn recovery_resolve_correctly_commits_both_tablets_of_a_two_tablet_transac
         ClientRequest::TxnPrepare {
             table: "txn_group_fix".to_string(),
             anchor: None,
-            writes: vec![(lower_key.clone(), Some(b"lower-committed".to_vec()))],
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                lower_key.clone(),
+                Some(b"lower-committed".to_vec()),
+            )],
             conditions: Vec::new(),
             participant_spans,
+            pending_kind_writes: Vec::new(),
         },
     )
     .await;
@@ -483,9 +491,13 @@ async fn recovery_resolve_correctly_commits_both_tablets_of_a_two_tablet_transac
         ClientRequest::TxnPrepare {
             table: "txn_group_fix".to_string(),
             anchor: Some((txn_id, record_key, record_table)),
-            writes: vec![(upper_key.clone(), Some(b"upper-committed".to_vec()))],
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                upper_key.clone(),
+                Some(b"upper-committed".to_vec()),
+            )],
             conditions: Vec::new(),
             participant_spans: Vec::new(),
+            pending_kind_writes: Vec::new(),
         },
     )
     .await;

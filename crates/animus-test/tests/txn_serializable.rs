@@ -1072,8 +1072,13 @@ async fn stage_anchor_pushing(
             let val = val.clone();
             let participant_spans = participant_spans.clone();
             async move {
-                node.txn_stage_anchor(table, vec![(key, val)], participant_spans, Vec::new())
-                    .await
+                node.txn_stage_anchor(
+                    table,
+                    vec![animus_cp_data::TxnWrite::plain(key, val)],
+                    participant_spans,
+                    Vec::new(),
+                )
+                .await
             }
         })
         .await;
@@ -1113,7 +1118,7 @@ async fn stage_participant_pushing(
                     txn_id,
                     record_key,
                     record_table,
-                    vec![(key, val)],
+                    vec![animus_cp_data::TxnWrite::plain(key, val)],
                     Vec::new(),
                 )
                 .await
