@@ -412,12 +412,31 @@ pub enum Metric {
     /// signal that would have caught the write-loss bug (ADR 0018 §2's
     /// amendment) had it existed then.
     CpMergeTookNoEffectUnexplained,
+
+    // --- F11 token-alignment choke point (ADR 0042 §14, growth PR2) ---
+    // Appended after the merge-write-loss variants above; every earlier
+    // variant's slot and the text-export order stay stable, so the
+    // snapshot remains byte-reproducible. Recorded by `animusd::
+    // ClientCtx::trigger_split` — the single choke point every split
+    // proposer (auto-split, `POST /admin/tablet/split`,
+    // `ClientRequest::SplitTablet`) funnels through.
+    /// A streamed table's split key rounded down (F11) onto the target
+    /// tablet's own `range.start` — a single very-hot partition token that
+    /// owns the tablet's entire range, which can never legally split
+    /// without breaking the per-token affinity F11 exists to protect (ADR
+    /// 0042 §14 Fork E, the accepted single-token hot-partition limit).
+    /// Counts the skip, not an error: `trigger_split` returns immediately
+    /// (no propose attempt) and `auto_split_loop` matches this specific
+    /// outcome to skip its own "split did not commit" warning, which would
+    /// otherwise fire every cooldown, forever, for a tablet that
+    /// structurally cannot split.
+    StreamSplitSingleTokenSkipped,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 64] = [
+    pub const ALL: [Metric; 65] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -482,6 +501,7 @@ impl Metric {
         Metric::StreamRepairBacklog,
         Metric::CpMergeTookNoEffect,
         Metric::CpMergeTookNoEffectUnexplained,
+        Metric::StreamSplitSingleTokenSkipped,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -553,6 +573,7 @@ impl Metric {
             Metric::StreamRepairBacklog => "stream_repair_backlog",
             Metric::CpMergeTookNoEffect => "cp_merge_took_no_effect",
             Metric::CpMergeTookNoEffectUnexplained => "cp_merge_took_no_effect_unexplained",
+            Metric::StreamSplitSingleTokenSkipped => "stream_split_single_token_skipped",
         }
     }
 

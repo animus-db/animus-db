@@ -2273,6 +2273,27 @@ debugging anything that feels like it might have happened before.
   and the fix is to make the walk's own membership-discovery step live
   (re-run every pass) rather than a one-time precondition. (2026-08-16,
   `test/streams-e2e-walk-cascading-split`.)
+- **A hand-driven `MetaCommand::ProposeSchema` test fixture must target the
+  INTRA port, not the client port, since ADR 0047's listener cutover** — a
+  fresh test file (`f11_split_alignment.rs`) sent `ClientRequest::
+  ProposeSchema(CreateTableSchema{..})` to a node's `client_addr()` (the
+  shape every pre-0047 test used, and still the right address for
+  `Put`/`Get`/`SplitTablet`, which stayed `Surface::Public`) and got back
+  `Error("propose_schema is a cluster-internal request; send it to this
+  node's intra port")` — `handle_request` refuses any `Surface::Intra`
+  request (`ProposeSchema` among them, `surface_of`'s own match arm) on the
+  client listener outright. `index_backfill.rs` already carries the fix
+  as a one-line comment ("ADR 0047: `ProposeSchema` is intra-only") right
+  above its own `intra_addr()`-targeted calls, but nothing greppable ties
+  that convention to the wire type itself, so a fresh test file rediscovers
+  it the hard way. **General rule**: when hand-driving a `ClientRequest`
+  variant in a new test, check `surface_of`'s match arms (`lib.rs`) for
+  which listener it's actually gated to — `Surface::Public` variants
+  (`Put`/`Get`/`Scan`/`Delete`/`Txn`/`SplitTablet`/`Status`) work on
+  `client_addr()`; every `Surface::Intra` variant (`ProposeSchema`,
+  `Forwarded`, `KindWrite`/`KindScan`, the `Txn*` internal RPCs, etc.) needs
+  `intra_addr()` instead — the error message names the fix, but only once
+  you've already hit it. (2026-08-16, `growth/1-f11-fence`.)
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
@@ -5792,6 +5813,34 @@ debugging anything that feels like it might have happened before.
   "leader"/"forward" in the name) — a last-resort/degenerate-case branch
   inside a bigger routing function is exactly where a mechanical retarget
   misses a spot. (2026-08-16, ADR 0047 intra-port-split stack.)
+- **A validation/transformation rule enforced at only SOME of several call
+  sites that all build the same command is a gap, not redundancy — move it
+  to the one function every caller actually funnels through.** F11 (ADR
+  0042 §14, a streamed table's split key must round down to its own token
+  boundary) was implemented inside `auto_split_loop` only; the two manual
+  paths (`POST /admin/tablet/split`, `ClientRequest::SplitTablet`) both
+  called `ClientCtx::trigger_split` directly with the caller's raw key,
+  bypassing the rounding entirely — a manual split on a hot partition could
+  silently separate one token's own records across two **sibling** tablets
+  with no parent/child relation, the exact per-item ordering violation the
+  rule exists to prevent. The fix (growth PR2) generalizes: **grep every
+  call site that builds the guarded command** (here, every caller of
+  `trigger_split` — there were exactly three), confirm they all fall through
+  one shared function, and move the rule INTO that function rather than
+  duplicating it at each site (which just recreates the same gap the next
+  time a fourth caller appears). Add the apply-time seatbelt (the ADR 0028
+  fence idiom) as defense in depth, not as the primary fix — a structural
+  check at apply guards against a *future* bypass of the choke point, but a
+  caller that reaches apply through the guarded rule was never the bug.
+  Corollary the fix also had to handle: rounding a key can produce a
+  **degenerate** result (here, collapsing onto the tablet's own
+  `range.start` when a single hot token owns the whole tablet) that the
+  underlying command legitimately rejects — decide up front whether that's
+  an error (a manual, explicit caller should hear about it) or an expected,
+  metered no-op (a periodic background trigger retrying forever should
+  neither spam a warning nor silently loop with no signal at all); conflating
+  the two callers' needs into one behavior gets one of them wrong.
+  (2026-08-16, `growth/1-f11-fence`.)
 
 ### Parallel-agent orchestration
 - **`gh stack checkout <N>` silently switches the CURRENT worktree's checked-

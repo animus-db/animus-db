@@ -438,13 +438,48 @@ size/age pair are OR-gated triggers on the change-consumer loop's seal arm
 
 ### 14. F11: token-aligned splits on a streamed table
 
-Auto-split's chosen split key is rounded **down** to its own 8-byte token
-boundary when the source table is streamed. This preserves the
-partition-key/shard affinity a change-record's own token-leading key relies
-on (ADR 0022) — an unaligned split key would risk separating one token's
-records, and hence one shard's, across the split boundary — and, as a side
-effect, narrows a pre-existing `txn.rs` residual noted in ADR 0018's own PR3
-amendment about a split racing an in-flight transaction's own token.
+A streamed table's split key is rounded **down** to its own 8-byte token
+boundary. This preserves the partition-key/shard affinity a change-record's
+own token-leading key relies on (ADR 0022) — an unaligned split key would
+risk separating one token's records, and hence one shard's, across the split
+boundary — and, as a side effect, narrows a pre-existing `txn.rs` residual
+noted in ADR 0018's own PR3 amendment about a split racing an in-flight
+transaction's own token.
+
+**Growth-plan amendment (2026-08-16, growth PR2).** The rounding used to
+live *only* inside `auto_split_loop` — the two manual split paths (`POST
+/admin/tablet/split` and `ClientRequest::SplitTablet`) passed the caller's
+raw key straight through to `MetaCommand::SplitTablet`, so a manual split
+inside one token could separate that token's records across two **sibling**
+tablets with no parent/child relation at all, the exact violation this
+section exists to prevent. Fixed at two layers (Fork D — both, not either):
+
+1. **The choke point**: rounding moved into `ClientCtx::trigger_split`
+   (`animusd`), the one method every proposer — `auto_split_loop`, the
+   admin action, and the plain-protocol handler — calls to commit a split.
+   A future caller can no longer forget it, since there is exactly one path
+   to a `SplitTablet` propose.
+2. **The apply-time seatbelt**: `MetaCommand::SplitTablet`'s own apply arm
+   (`animus-control`) independently rejects a non-token-aligned key on a
+   streamed table (`split_key.len() != TOKEN_BYTES`) — the ADR 0028
+   fence idiom, a structural check against any future caller that reaches
+   apply without going through `trigger_split`, not the primary
+   enforcement.
+
+**Fork E — the accepted single-token hot-partition limit.** Rounding a
+split key down can collapse it onto the target tablet's own `range.start`
+when a single, very hot partition token owns the tablet's entire range —
+that tablet cannot legally split without separating that same token's
+records across siblings, exactly the affinity F11 protects. This is
+accepted as an honest limit (one very hot partition key ⇒ one shard,
+permanently) rather than worked around with a within-token split:
+`trigger_split` detects the degenerate case up front (no propose attempt at
+all — `KeyRange::split_at` would just reject it) and returns immediately,
+incrementing `Metric::StreamSplitSingleTokenSkipped` so an operator has a
+signal instead of a silent, forever-retried no-op. `auto_split_loop` matches
+this specific outcome to skip its own "split did not commit" warning, which
+would otherwise fire every cooldown, forever, for a tablet that structurally
+cannot split.
 
 ### 15. Deviations from AWS, summarized
 

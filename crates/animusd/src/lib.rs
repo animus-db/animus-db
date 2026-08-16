@@ -9611,6 +9611,54 @@ struct AutoSplitThresholds {
 /// sources such as a manual split racing this loop) — harmless: the epoch CAS
 /// lets exactly one win, and the loser just tries again (or backs off) next
 /// tick.
+/// F11 (ADR 0042 §14): the exact error [`ClientCtx::trigger_split`] returns
+/// when [`align_split_key`] finds a streamed table's split key rounds down
+/// onto the target tablet's own `range.start` — matched by `auto_split_loop`
+/// to downgrade its logging (Fork E: skip + meter via
+/// [`Metric::StreamSplitSingleTokenSkipped`], never its ordinary "split did
+/// not commit" warning, which would otherwise fire every cooldown, forever,
+/// for a single-token hot partition that structurally cannot split).
+const SPLIT_KEY_NOT_TOKEN_VIABLE: &str =
+    "split key rounds onto the tablet's own range start (single-token hot partition)";
+
+/// F11 (ADR 0042 §14, Fork D): round `split_key` down to its own 8-byte
+/// token boundary (`TOKEN_BYTES`) if `tablet`'s table is streamed, so one
+/// partition key's records — and hence one shard's, ADR 0043 §A4 — never
+/// separate across sibling tablets. A plain, unstreamed table's split key is
+/// returned unchanged. Called from the **one** choke point every split
+/// proposer funnels through ([`ClientCtx::trigger_split`]), so this can
+/// never be forgotten by a future caller the way the pre-PR2 code (rounding
+/// done only inside `auto_split_loop`) could be bypassed by the two manual
+/// paths (`POST /admin/tablet/split`, `ClientRequest::SplitTablet`).
+///
+/// Returns `(key, viable)`: `viable` is whether the (possibly rounded) key
+/// is still a legal **interior** split point for `tablet`'s current range
+/// (`KeyRange::split_at`'s own "strictly inside" rule). Rounding a hot
+/// single-token partition's own key can collapse it onto `range.start` —
+/// Fork E's accepted single-token hot-partition limit: one very hot
+/// partition key ends up owning the tablet's entire range, and it can never
+/// legally split without separating that same token's records across
+/// siblings — the exact affinity F11 exists to protect. `viable == false`
+/// for an unknown tablet too (the caller's own subsequent lookup reports
+/// that more precisely; this just never claims a key is fine for a tablet
+/// this function can't even see).
+fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) -> (Vec<u8>, bool) {
+    let Some(t) = meta.tablets.get(&tablet) else {
+        return (split_key, false);
+    };
+    let streamed = t
+        .table
+        .as_deref()
+        .is_some_and(|table| meta.table_stream(table).is_some());
+    let key = if streamed {
+        split_key[..TOKEN_BYTES.min(split_key.len())].to_vec()
+    } else {
+        split_key
+    };
+    let viable = t.range.split_at(&key).is_some();
+    (key, viable)
+}
+
 async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
     let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
     // When each tablet last had a *full* (materializing) count — the expensive
@@ -9685,29 +9733,32 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             } else {
                 pairs[pairs.len() / 2].0.clone()
             };
-            // F11 (ADR 0042 §14): a streamed table's split key rounds DOWN to
-            // its own 8-byte token boundary, so one partition key's records
-            // — and hence one shard's, ADR 0043 §A4 — never separate across
-            // the split. A plain, unstreamed table's split key is unchanged.
-            let split_key = if meta
-                .tablets
-                .get(&tablet)
-                .and_then(|t| t.table.as_deref())
-                .is_some_and(|table| meta.table_stream(table).is_some())
-            {
-                split_key[..TOKEN_BYTES.min(split_key.len())].to_vec()
-            } else {
-                split_key
-            };
+            // F11 (ADR 0042 §14, Fork D): the token-alignment rounding itself
+            // now lives inside `ClientCtx::trigger_split` — the one choke
+            // point every split proposer (this loop, `POST
+            // /admin/tablet/split`, `ClientRequest::SplitTablet`) funnels
+            // through, so it can't be forgotten by a future caller the way
+            // the pre-PR2 code (rounding done only here) let the two manual
+            // paths bypass it. `trigger_split` returns immediately (no
+            // propose attempt) with `SPLIT_KEY_NOT_TOKEN_VIABLE` for Fork
+            // E's accepted single-token hot-partition limit — matched below
+            // so this loop's own "split did not commit" warning never fires
+            // for that expected, already-metered outcome (it would
+            // otherwise fire every single cooldown, forever, for a tablet
+            // that structurally cannot split).
             last_triggered.insert(tablet, tokio::time::Instant::now());
             let span = tracing::info_span!("auto_split", tablet = tablet.0);
             let response = ctx.trigger_split(tablet, split_key).instrument(span).await;
-            if !matches!(response, ClientResponse::PutOk) {
-                tracing::warn!(
-                    tablet = tablet.0,
-                    ?response,
-                    "auto_split: split did not commit"
-                );
+            match &response {
+                ClientResponse::PutOk => {}
+                ClientResponse::Error(msg) if msg == SPLIT_KEY_NOT_TOKEN_VIABLE => {}
+                other => {
+                    tracing::warn!(
+                        tablet = tablet.0,
+                        ?other,
+                        "auto_split: split did not commit"
+                    );
+                }
             }
         }
     }
@@ -10129,6 +10180,21 @@ impl ClientCtx {
         let Some(expected_epoch) = meta.tablets.get(&tablet).map(|t| t.epoch) else {
             return ClientResponse::Error("no such tablet".into());
         };
+        // F11 (ADR 0042 §14, Fork D): this is the ONE choke point every
+        // split proposer funnels through — `auto_split_loop`, `POST
+        // /admin/tablet/split` (`admin::action_split`), and
+        // `ClientRequest::SplitTablet`'s handler all call this method and
+        // nothing else, so rounding here (rather than in each caller)
+        // structurally can't be forgotten by a future one. See
+        // `align_split_key`'s own doc for the rounding + single-token-skip
+        // rule (Fork E).
+        let (split_key, viable) = align_split_key(&meta, tablet, split_key);
+        if !viable {
+            self.control
+                .metrics()
+                .incr(Metric::StreamSplitSingleTokenSkipped);
+            return ClientResponse::Error(SPLIT_KEY_NOT_TOKEN_VIABLE.into());
+        }
         tracing::Span::current().record("new_id", new_id.0);
         let cmd = MetaCommand::SplitTablet {
             tablet,
@@ -12567,6 +12633,139 @@ mod auto_split_median_tests {
         let pairs = vec![pair("a", 100_000), pair("b", 1), pair("c", 1)];
         let split = byte_weighted_median(&pairs);
         assert_ne!(split, b"a".to_vec(), "must not return the first key");
+    }
+}
+
+/// Unit tests for [`align_split_key`] (F11, ADR 0042 §14, growth PR2) — a
+/// private free function, so this lives as an in-crate `#[cfg(test)]`
+/// module (like `auto_split_median_tests` above) rather than under
+/// `tests/`, which can't reach it. `manual_split_with_unaligned_key_on_
+/// streamed_table_rounds_to_token_boundary` (`tests/f11_split_alignment.rs`)
+/// covers the same rounding end to end, through a real cluster's admin HTTP
+/// surface; these are the fast, pure-function siblings for the rounding
+/// rule itself and the Fork E degenerate case.
+#[cfg(test)]
+mod align_split_key_tests {
+    use animus_control::{MetaCommand, Metadata, StreamSpec, StreamViewType};
+    use animus_tablet::{KeyRange, TabletId};
+
+    use super::align_split_key;
+
+    fn streamed_metadata_with_tablet(tablet: TabletId, range: KeyRange) -> Metadata {
+        let mut m = Metadata::default();
+        assert!(matches!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: animus_control::TableSchema::simple(
+                    "pk",
+                    animus_control::ColumnType::String
+                ),
+            }),
+            animus_control::ApplyOutcome::Applied
+        ));
+        assert!(matches!(
+            m.apply(&MetaCommand::SetTableStream {
+                table: "orders".to_owned(),
+                spec: Some(StreamSpec {
+                    view_type: StreamViewType::NewAndOldImages,
+                    label: "L1".to_owned(),
+                }),
+            }),
+            animus_control::ApplyOutcome::Applied
+        ));
+        assert!(matches!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet,
+                table: Some("orders".to_owned()),
+                range,
+                replicas: Vec::new(),
+            }),
+            animus_control::ApplyOutcome::Applied
+        ));
+        m
+    }
+
+    /// A streamed table's split key rounds down to exactly `TOKEN_BYTES`,
+    /// discarding everything past the token — the F11 rule.
+    #[test]
+    fn rounds_a_streamed_tables_key_down_to_the_token_boundary() {
+        let tablet = TabletId(1);
+        let m = streamed_metadata_with_tablet(tablet, KeyRange::whole());
+        let raw = b"orders-mXX".to_vec(); // 10 bytes.
+        let (rounded, viable) = align_split_key(&m, tablet, raw);
+        assert_eq!(rounded, b"orders-m".to_vec());
+        assert!(
+            viable,
+            "the rounded key is still strictly inside the whole range"
+        );
+    }
+
+    /// An unstreamed table's split key is returned byte-for-byte unchanged,
+    /// whatever its length — F11 only applies to a streamed table.
+    #[test]
+    fn leaves_an_unstreamed_tables_key_untouched() {
+        let mut m = Metadata::default();
+        assert!(matches!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("plain".to_owned()),
+                range: KeyRange::whole(),
+                replicas: Vec::new(),
+            }),
+            animus_control::ApplyOutcome::Applied
+        ));
+        let raw = b"any-length-key-at-all".to_vec();
+        let (key, viable) = align_split_key(&m, TabletId(1), raw.clone());
+        assert_eq!(key, raw);
+        assert!(viable);
+    }
+
+    /// A key already exactly `TOKEN_BYTES` long round-trips unchanged (the
+    /// idempotent case: `trigger_split` re-rounding a key `auto_split_loop`
+    /// or a prior caller already rounded).
+    #[test]
+    fn a_key_already_token_aligned_is_unchanged() {
+        let tablet = TabletId(1);
+        let m = streamed_metadata_with_tablet(tablet, KeyRange::whole());
+        let raw = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
+        let (rounded, viable) = align_split_key(&m, tablet, raw.clone());
+        assert_eq!(rounded, raw);
+        assert!(viable);
+    }
+
+    /// Fork E (ADR 0042 §14): a single very hot partition token owns the
+    /// whole tablet — rounding its own key collapses it onto `range.start`,
+    /// so `viable` reports `false` (the degenerate, structurally
+    /// unsplittable case `trigger_split` turns into a metered skip rather
+    /// than ever proposing).
+    #[test]
+    fn reports_not_viable_when_the_rounded_key_collapses_onto_range_start() {
+        // Range starting at the token "orders-m" itself (as a real sibling
+        // tablet's own `range.start` would look after a prior split) — any
+        // key beginning with that same 8-byte prefix rounds right back onto
+        // it.
+        let tablet = TabletId(2);
+        let range = KeyRange {
+            start: b"orders-m".to_vec(),
+            end: None,
+        };
+        let m = streamed_metadata_with_tablet(tablet, range);
+        let (rounded, viable) = align_split_key(&m, tablet, b"orders-mZZ".to_vec());
+        assert_eq!(rounded, b"orders-m".to_vec());
+        assert!(
+            !viable,
+            "a token-rounded key equal to the tablet's own range.start is not a legal split point"
+        );
+    }
+
+    /// An unknown tablet id reports `viable == false` (nothing to check
+    /// against) rather than optimistically claiming any key would work.
+    #[test]
+    fn reports_not_viable_for_an_unknown_tablet() {
+        let m = Metadata::default();
+        let (key, viable) = align_split_key(&m, TabletId(999), b"whatever".to_vec());
+        assert_eq!(key, b"whatever".to_vec());
+        assert!(!viable);
     }
 }
 

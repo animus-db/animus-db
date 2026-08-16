@@ -13,7 +13,7 @@ use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
 use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan};
-use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
+use animus_tablet::{Epoch, KeyRange, TOKEN_BYTES, Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{
@@ -1237,6 +1237,30 @@ impl Metadata {
                 // the loser's proposal outright instead of silently accepting it.
                 if source.epoch != *expected_epoch {
                     return ApplyOutcome::Rejected("epoch mismatch");
+                }
+                // F11 (ADR 0042 §14, Fork D): apply-time seatbelt, the ADR
+                // 0028 fence idiom — `ClientCtx::trigger_split` is the one
+                // choke point every proposer (auto-split, `POST
+                // /admin/tablet/split`, `ClientRequest::SplitTablet`) funnels
+                // through, and it already rounds a streamed table's split key
+                // down to its own token boundary before ever proposing. This
+                // is a structural check against a *future* caller bypassing
+                // that rounding, not the primary enforcement — a
+                // well-behaved proposer never trips it. A token-aligned key
+                // is always exactly `TOKEN_BYTES` long (the rounding
+                // truncates to that width); anything else on a streamed
+                // table would separate one partition's change records across
+                // two sibling shards (ADR 0043 §A4), the exact per-item
+                // ordering violation ADR 0042 §14 exists to prevent.
+                if split_key.len() != TOKEN_BYTES
+                    && source
+                        .table
+                        .as_deref()
+                        .is_some_and(|table| self.table_stream(table).is_some())
+                {
+                    return ApplyOutcome::Rejected(
+                        "split key not token-aligned for a streamed table",
+                    );
                 }
                 let Some((left, right)) = source.range.split_at(split_key) else {
                     return ApplyOutcome::Rejected("split key not strictly inside range");
@@ -4153,6 +4177,122 @@ mod tests {
         );
     }
 
+    /// F11 (ADR 0042 §14, Fork D) apply-time seatbelt: `SplitTablet`
+    /// against a **streamed** table's tablet rejects a split key that
+    /// isn't exactly `TOKEN_BYTES` long, the structural check against a
+    /// future caller that bypasses `animusd::ClientCtx::trigger_split`'s
+    /// own rounding (the primary enforcement, tested at that layer). A
+    /// properly token-aligned (8-byte) key still applies normally.
+    #[test]
+    fn split_rejects_a_non_token_aligned_key_on_a_streamed_table() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // A 5-byte key: strictly inside the whole range, but shorter than
+        // one token (`TOKEN_BYTES == 8`) — rejected before `KeyRange::
+        // split_at` is even consulted.
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key: b"mmmmm".to_vec(),
+                new_id: TabletId(2),
+            }),
+            ApplyOutcome::Rejected("split key not token-aligned for a streamed table")
+        );
+        assert_eq!(m.tablets.len(), 1, "the rejected split changed nothing");
+
+        // The same tablet, same epoch, a properly token-aligned key: applies.
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+                new_id: TabletId(2),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.tablets.contains_key(&TabletId(2)));
+
+        // An unstreamed table's tablet is completely unaffected by the
+        // fence — any strictly-interior key, of any length, still applies.
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(10),
+                table: Some("plain".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: TabletId(10),
+                expected_epoch: Epoch::INITIAL,
+                split_key: b"mmmmm".to_vec(),
+                new_id: TabletId(11),
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
+    /// F11 Fork E (ADR 0042 §14): the accepted single-token hot-partition
+    /// limit at the apply layer — a token-aligned split key that happens
+    /// to equal the *target* tablet's own `range.start` (a single very hot
+    /// partition token owning the tablet's entire range) is rejected by
+    /// the pre-existing `KeyRange::split_at` "strictly inside" guard, not
+    /// silently accepted into a zero-width sibling. `ClientCtx::
+    /// trigger_split` (`animusd`) is the layer that turns this into a
+    /// metered skip before ever proposing; this proves the fence holds
+    /// even if a future caller reaches apply directly.
+    #[test]
+    fn split_rejects_a_token_aligned_key_equal_to_range_start() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "orders", "L1");
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        let boundary = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key: boundary.clone(),
+                new_id: TabletId(2),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.tablets[&TabletId(2)].range.start, boundary);
+
+        // Splitting the new sibling at a key equal to its own `range.start`
+        // — the single-hot-token degenerate case — is rejected, not
+        // accepted into a zero-width tablet.
+        assert_eq!(
+            m.apply(&MetaCommand::SplitTablet {
+                tablet: TabletId(2),
+                expected_epoch: m.tablets[&TabletId(2)].epoch,
+                split_key: boundary,
+                new_id: TabletId(3),
+            }),
+            ApplyOutcome::Rejected("split key not strictly inside range")
+        );
+    }
+
     /// **The ledger-named-object amendment's own regression**: two
     /// attempts that agree on every field EXCEPT `object_id` — exactly what
     /// two independently-computed seal attempts for the same epoch produce,
@@ -4268,7 +4408,12 @@ mod tests {
             ApplyOutcome::Applied,
             "test setup: create tablet"
         );
-        split_tablet(&mut m, TabletId(1), vec![128u8], TabletId(2));
+        split_tablet(
+            &mut m,
+            TabletId(1),
+            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(2),
+        );
 
         // Tablet 1's own range has narrowed to the left half — a proposal
         // still declaring the pre-split `whole()` range is stale.
@@ -4306,11 +4451,19 @@ mod tests {
             ApplyOutcome::Applied,
             "test setup: create tablet"
         );
-        split_tablet(&mut m, TabletId(1), vec![128u8], TabletId(2));
+        split_tablet(
+            &mut m,
+            TabletId(1),
+            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(2),
+        );
 
         let mut current = seal(&m, "orders", "L1", 1, 0, 100);
         if let MetaCommand::SealStreamShard { expected_range, .. } = &mut current {
-            *expected_range = KeyRange::new(Vec::new(), Some(vec![128u8]));
+            *expected_range = KeyRange::new(
+                Vec::new(),
+                Some(0x8000_0000_0000_0000u64.to_be_bytes().to_vec()),
+            );
         }
         assert_eq!(m.apply(&current), ApplyOutcome::Applied);
         assert!(m.stream_shards.contains_key(&(TabletId(1), 0)));
@@ -4319,7 +4472,7 @@ mod tests {
         // (right-half) range, applies too.
         let mut child = seal(&m, "orders", "L1", 2, 0, 200);
         if let MetaCommand::SealStreamShard { expected_range, .. } = &mut child {
-            *expected_range = KeyRange::new(vec![128u8], None);
+            *expected_range = KeyRange::new(0x8000_0000_0000_0000u64.to_be_bytes().to_vec(), None);
         }
         assert_eq!(m.apply(&child), ApplyOutcome::Applied);
     }
@@ -4356,7 +4509,12 @@ mod tests {
         // The tablet splits AFTER the seal above already committed — its
         // own range has moved on, and stays moved on regardless of what the
         // repair below declares.
-        split_tablet(&mut m, TabletId(1), vec![128u8], TabletId(2));
+        split_tablet(
+            &mut m,
+            TabletId(1),
+            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(2),
+        );
 
         // A replicas-only repair reproposal, reusing the original row's own
         // `object_id` (so it hits the existing-row/content-matches branch),

@@ -687,7 +687,15 @@ fn hot_table_size_seals() {
 
 // --- cell 3: split_mid_stream --------------------------------------------
 
-const BOUNDARY: &[u8] = b"k0500";
+// F11 (ADR 0042 §14, growth PR2): `MetaCommand::SplitTablet`'s apply arm now
+// rejects a non-token-aligned split key on a streamed table, so this must be
+// exactly `TOKEN_BYTES` (8) long — widened from the original 5-byte
+// `b"k0500"` by a fixed suffix rather than changed in its leading digits, so
+// every ordering relationship this file relies on relative to `key(i)`
+// (`format!("k{i:04}")`, always 5 bytes) is unchanged: `"k0500\0\0\0"` is a
+// strict extension of `"k0500"`, so it still compares strictly between
+// `key(3)` = `"k0003"` and `key(600)` = `"k0600"` exactly as `b"k0500"` did.
+const BOUNDARY: &[u8] = b"k0500\0\0\0";
 
 fn scenario_split_mid_stream(seed: u64) {
     let mut sim = Simulator::new(seed);

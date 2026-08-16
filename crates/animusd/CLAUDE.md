@@ -472,6 +472,27 @@ source's range and mints a sibling on the same shared engine. Exposed via
 `Absorb` reaction — was removed entirely by ADR 0044, superseding ADR
 0033.)
 
+**`ClientCtx::trigger_split` is the ONE choke point every split proposer
+calls** (`auto_split_loop`, `admin::action_split`, and
+`ClientRequest::SplitTablet`'s handler — nothing else ever builds a
+`MetaCommand::SplitTablet`), which is where F11 (ADR 0042 §14) rounds a
+streamed table's split key down to its own 8-byte token boundary
+(`align_split_key`, private to `lib.rs`, unit-tested in
+`align_split_key_tests`) — a manual split can no longer separate one
+partition's records across sibling tablets the way it could before growth
+PR2 moved the rounding out of `auto_split_loop` alone.
+`MetaCommand::SplitTablet`'s own apply arm independently re-checks token
+alignment on a streamed table as the ADR 0028 fence-idiom seatbelt (never
+the primary enforcement). A token-rounded key that collapses onto the
+target tablet's own `range.start` (a single very hot partition token owning
+the whole tablet) is the accepted single-token hot-partition limit (ADR
+0042 §14 Fork E): `trigger_split` returns immediately (no propose attempt)
+and increments `Metric::StreamSplitSingleTokenSkipped`; `auto_split_loop`
+matches that specific error to skip its own "split did not commit" warning,
+which would otherwise fire every cooldown, forever. Regression:
+`tests/f11_split_alignment.rs` (a follower-connected admin split with a
+deliberately unaligned key, red on the pre-PR2 code).
+
 **Drop-table GC** (ADR 0024) is the reconciler's `Reclaim` action;
 **removed-replica GC** (ADR 0029) is its `Release` dual — see
 `animus-cp-data`'s `host.rs`/`CLAUDE.md` for the mechanics
