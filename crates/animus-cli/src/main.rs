@@ -40,6 +40,7 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     wal-segment <admin-addr> <seg> [tablet]\n    \
     key <admin-addr> <key> [tablet]\n    \
     split <admin-addr> <tablet> <split-key>\n    \
+    stream-grow <admin-addr> <table>\n    \
     flush|compact <admin-addr> <tablet>\n    \
     reconfigure <admin-addr> <tablet> <voter,voter,...>\n    \
     drain <admin-addr> <node-id>\n    \
@@ -195,6 +196,11 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
             let split_key = arg(3).ok_or("split needs <split-key>")?;
             let body = serde_json::json!({"tablet": tablet, "split_key": split_key}).to_string();
             ("POST", "/admin/tablet/split".into(), Some(body))
+        }
+        "stream-grow" => {
+            let table = arg(2).ok_or("stream-grow needs <table>")?;
+            let body = serde_json::json!({"table": table}).to_string();
+            ("POST", "/admin/stream/grow".into(), Some(body))
         }
         "flush" | "compact" => {
             let tablet: u64 = arg(2)

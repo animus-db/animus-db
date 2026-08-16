@@ -1197,6 +1197,30 @@ pub enum ClientRequest {
     /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
     /// only through the `Forwarded` arm.
     ForceSeal { tablet: u64 },
+    /// **Internal manual-growth split-trigger RPC — never sent bare, only
+    /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0042 §14, growth
+    /// PR3's `POST /admin/stream/grow`): materialize `tablet`'s own live
+    /// pairs and, if it has at least 2 distinct keys, split it at their
+    /// byte-weighted median (ADR 0034) via [`ClientCtx::trigger_split`] —
+    /// which independently applies F11's token-rounding and Fork E's
+    /// single-token skip, exactly as it does for every other split
+    /// proposer. Mirrors [`ForceSeal`](Self::ForceSeal)'s shape: addressed
+    /// by `tablet` directly (the caller already knows it from the table's
+    /// own tablet map, not a client key), bare delivery refused for the
+    /// same reason. The **one** production use is `ClientCtx::
+    /// grow_stream_tablet`, called once per tablet of a streamed table by
+    /// `ClientCtx::grow_stream` — a table's tablets can be led on any node,
+    /// not necessarily the one that received the admin request, so this
+    /// needs the identical one-hop forward/leader-resolution machinery
+    /// every other CP op already has. Not a `MetaCommand`, so
+    /// `is_relayable_command` does not apply; real handling lives in
+    /// `cp_serve_forwarded`'s match, reached only through the `Forwarded`
+    /// arm. A tablet with fewer than 2 distinct keys has no legal interior
+    /// split point at all (regardless of tokens) and answers
+    /// `ClientResponse::Error` naming that, distinct from Fork E's
+    /// single-token-collapse message — both are skips the caller
+    /// classifies as such, never hard failures.
+    TriggerAutoSplit { tablet: u64 },
     /// **Internal open-shard hot-read RPC — never sent bare, only wrapped in
     /// [`Forwarded`](Self::Forwarded)** (ADR 0042 §7/§8, PR6's `GetRecords`
     /// read API): a leader-local, non-linearizable scan of `tablet`'s own
@@ -1594,6 +1618,7 @@ fn surface_of(request: &ClientRequest) -> Surface {
         | ClientRequest::KindScan { .. }
         | ClientRequest::GetSnapshot { .. }
         | ClientRequest::ForceSeal { .. }
+        | ClientRequest::TriggerAutoSplit { .. }
         | ClientRequest::StreamHotRead { .. }
         | ClientRequest::ClearBackfillCursor { .. }
         | ClientRequest::KindWriteItem { .. }
@@ -2367,7 +2392,9 @@ impl BoundNode {
     /// module's own doc for why it is spawned unconditionally here (a
     /// combined node can always become the control-plane leader) and
     /// self-gates every tick on `ctx.edge.leader_handle()`, the identical
-    /// pattern `auto_split_loop`/`txn_resolver_loop` already use.
+    /// pattern `auto_split_loop`/`txn_resolver_loop` already use. Defaults
+    /// [`start_with_growth`](Self::start_with_growth)'s own
+    /// `auto_split_change_rate` to `None` — see that method's doc.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_streams(
         self,
@@ -2385,6 +2412,56 @@ impl BoundNode {
         stream_seal_knobs: StreamSealKnobs,
         segment_store_config: SegmentStoreConfig,
         stream_retention: Duration,
+    ) -> std::io::Result<Node> {
+        self.start_with_growth(
+            peers,
+            control_ids,
+            data_ids,
+            backend,
+            edge,
+            client_route,
+            intra_route,
+            auto_split_threshold,
+            auto_split_bytes_threshold,
+            cluster_admin_addrs,
+            orphan_sweep_after,
+            stream_seal_knobs,
+            segment_store_config,
+            stream_retention,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`start_with_streams`](Self::start_with_streams), with the
+    /// opt-in **change-rate** auto-split trigger (ADR 0042 §14, growth PR3
+    /// Fork F): `--auto-split-change-rate RATE` — a streamed led tablet
+    /// whose own smoothed change-append rate ([`ChangeRateTracker`],
+    /// bytes/sec) sustains above `RATE` triggers the same `trigger_split`
+    /// path every other trigger uses. `None` (the default every other
+    /// entry point still passes) disables it entirely — zero behavior
+    /// change for an existing deployment/test. See [`AutoSplitThresholds::
+    /// change_rate`]'s own doc for why this needs its own signal at all
+    /// (the base-scoped byte/key thresholds structurally can't see
+    /// change-log churn).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_growth(
+        self,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        control_ids: Vec<NodeId>,
+        data_ids: Vec<NodeId>,
+        backend: StorageBackend,
+        edge: ClusterEdgeState,
+        client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
+        auto_split_threshold: Option<usize>,
+        auto_split_bytes_threshold: Option<u64>,
+        cluster_admin_addrs: Vec<SocketAddr>,
+        orphan_sweep_after: Duration,
+        stream_seal_knobs: StreamSealKnobs,
+        segment_store_config: SegmentStoreConfig,
+        stream_retention: Duration,
+        auto_split_change_rate: Option<u64>,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         // The initial (static) peer book + an env clone, kept for the
@@ -2570,6 +2647,7 @@ impl BoundNode {
             base_id: my_id.clone(),
             segment_store,
             stream_seal_knobs,
+            change_rates: ChangeRateTracker::default(),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -2784,12 +2862,18 @@ impl BoundNode {
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
         // it leads once it exceeds **either** configured threshold (it checks
         // leadership per tablet, so running it on every node is harmless).
-        if auto_split_threshold.is_some() || auto_split_bytes_threshold.is_some() {
+        // Growth PR3 Fork F: `auto_split_change_rate` joins the same
+        // either-triggers-fires gate, opt-in and streamed-tables-only.
+        if auto_split_threshold.is_some()
+            || auto_split_bytes_threshold.is_some()
+            || auto_split_change_rate.is_some()
+        {
             tasks.push(tokio::spawn(auto_split_loop(
                 ctx.clone(),
                 AutoSplitThresholds {
                     keys: auto_split_threshold,
                     bytes: auto_split_bytes_threshold,
+                    change_rate: auto_split_change_rate,
                 },
             )));
         }
@@ -3565,7 +3649,8 @@ impl BoundDataNode {
 
     /// Like [`start_data_with`](Self::start_data_with) — see
     /// [`BoundNode::start_with_streams`]'s doc for the layered-wrapper
-    /// rationale.
+    /// rationale. Defaults [`start_data_with_growth`](Self::start_data_with_growth)'s
+    /// own `auto_split_change_rate` to `None`.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_streams(
         self,
@@ -3581,6 +3666,45 @@ impl BoundDataNode {
         cluster_admin_addrs: Vec<SocketAddr>,
         stream_seal_knobs: StreamSealKnobs,
         segment_store_config: SegmentStoreConfig,
+    ) -> std::io::Result<Node> {
+        self.start_data_with_growth(
+            peers,
+            control_ids,
+            control_seeds,
+            backend,
+            edge,
+            client_route,
+            intra_route,
+            auto_split_threshold,
+            auto_split_bytes_threshold,
+            cluster_admin_addrs,
+            stream_seal_knobs,
+            segment_store_config,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`start_data_with_streams`](Self::start_data_with_streams), with
+    /// the opt-in **change-rate** auto-split trigger — see
+    /// [`BoundNode::start_with_growth`]'s doc for the full design (identical
+    /// here; a data-only node runs the same `auto_split_loop`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_data_with_growth(
+        self,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        control_ids: Vec<NodeId>,
+        control_seeds: Vec<SocketAddr>,
+        backend: StorageBackend,
+        edge: ClusterEdgeState,
+        client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
+        auto_split_threshold: Option<usize>,
+        auto_split_bytes_threshold: Option<u64>,
+        cluster_admin_addrs: Vec<SocketAddr>,
+        stream_seal_knobs: StreamSealKnobs,
+        segment_store_config: SegmentStoreConfig,
+        auto_split_change_rate: Option<u64>,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         let static_peers = peers;
@@ -3649,6 +3773,7 @@ impl BoundDataNode {
             base_id: my_id.clone(),
             segment_store,
             stream_seal_knobs,
+            change_rates: ChangeRateTracker::default(),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             control,
@@ -3764,12 +3889,16 @@ impl BoundDataNode {
         // — a node that leads no tablet does nothing each tick.
         tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
 
-        if auto_split_threshold.is_some() || auto_split_bytes_threshold.is_some() {
+        if auto_split_threshold.is_some()
+            || auto_split_bytes_threshold.is_some()
+            || auto_split_change_rate.is_some()
+        {
             tasks.push(tokio::spawn(auto_split_loop(
                 ctx.clone(),
                 AutoSplitThresholds {
                     keys: auto_split_threshold,
                     bytes: auto_split_bytes_threshold,
+                    change_rate: auto_split_change_rate,
                 },
             )));
         }
@@ -4284,6 +4413,112 @@ fn build_segment_store(
     }
 }
 
+/// Growth PR3 Fork F (ADR 0042 §14): a per-node, per-tablet estimate of a
+/// streamed tablet's own change-append rate (bytes/sec of `KIND_CHANGE`
+/// growth) — derived entirely from data `index_drain::seal_tick` already
+/// computes every tick (`CpGroup::approx_bytes_kind(KIND_CHANGE)`, the same
+/// level [`Metric::StreamHotBytes`] reads), never a new scan.
+/// `CpGroup::approx_bytes` is deliberately **base**-scoped (ADR 0034's own
+/// fix, so auto-split's byte trigger can't react to change-log churn) —
+/// which structurally means a high-churn, small-footprint streamed table
+/// can write forever without ever crossing a byte/key threshold and
+/// gaining a second shard, regardless of write rate (the exact gap this
+/// tracker exists to close, per the growth plan's Fork F).
+///
+/// A simple EWMA over each tick's own instantaneous bytes-delta ÷ elapsed
+/// (`ALPHA`), so one noisy tick doesn't whipsaw the signal; floored at zero
+/// (a seal + the hot-trim arm's later reclaim can shrink the hot scope
+/// between ticks, which is not a *negative* append rate — just this tick's
+/// own contribution being nothing). Surfaced read-only via
+/// `/admin/metrics`'s `stream_change_rates` array (`admin::metrics_view`)
+/// and consumed by the opt-in `--auto-split-change-rate` trigger
+/// (`auto_split_loop`, streamed tables only). A plain `std::sync::Mutex` is
+/// fine: every access is a quick lock/mutate/drop with no `.await` held
+/// across it, the same discipline `ClientCtx::metrics_history` already
+/// uses.
+#[derive(Clone, Default)]
+pub(crate) struct ChangeRateTracker {
+    inner: Arc<Mutex<BTreeMap<TabletId, RateSample>>>,
+}
+
+#[derive(Clone, Copy)]
+struct RateSample {
+    bytes_per_sec: f64,
+    last_bytes: u64,
+    last_at: tokio::time::Instant,
+}
+
+/// The EWMA smoothing factor for [`ChangeRateTracker::observe`] — closer to
+/// 1.0 tracks the latest tick more closely (noisier); closer to 0.0 smooths
+/// harder (slower to react). Chosen to settle within a handful of
+/// `INDEX_DRAIN_INTERVAL` ticks (~1s) without being so reactive that a
+/// single large write's own tick dominates the reading.
+const CHANGE_RATE_EWMA_ALPHA: f64 = 0.3;
+
+impl ChangeRateTracker {
+    /// Record this tick's own `KIND_CHANGE` byte level for `tablet` and
+    /// return the freshly-updated smoothed rate (bytes/sec).
+    pub(crate) fn observe(&self, tablet: TabletId, bytes_now: u64) -> f64 {
+        let now = tokio::time::Instant::now();
+        let mut inner = self.inner.lock().expect("change-rate tracker lock");
+        let rate = match inner.get(&tablet) {
+            None => 0.0,
+            Some(prev) => {
+                let elapsed = now.saturating_duration_since(prev.last_at).as_secs_f64();
+                if elapsed <= 0.0 {
+                    prev.bytes_per_sec
+                } else {
+                    let instantaneous = bytes_now.saturating_sub(prev.last_bytes) as f64 / elapsed;
+                    CHANGE_RATE_EWMA_ALPHA * instantaneous
+                        + (1.0 - CHANGE_RATE_EWMA_ALPHA) * prev.bytes_per_sec
+                }
+            }
+        };
+        inner.insert(
+            tablet,
+            RateSample {
+                bytes_per_sec: rate,
+                last_bytes: bytes_now,
+                last_at: now,
+            },
+        );
+        rate
+    }
+
+    /// The current smoothed rate for `tablet` (bytes/sec), or `0.0` if
+    /// never observed (e.g. an unstreamed tablet, or one this node has
+    /// never led a `seal_tick` pass for).
+    pub(crate) fn get(&self, tablet: TabletId) -> f64 {
+        self.inner
+            .lock()
+            .expect("change-rate tracker lock")
+            .get(&tablet)
+            .map_or(0.0, |s| s.bytes_per_sec)
+    }
+
+    /// Every currently-tracked tablet's own smoothed rate, in tablet-id
+    /// order — for `/admin/metrics`'s `stream_change_rates` array.
+    pub(crate) fn snapshot(&self) -> Vec<(TabletId, f64)> {
+        self.inner
+            .lock()
+            .expect("change-rate tracker lock")
+            .iter()
+            .map(|(&t, s)| (t, s.bytes_per_sec))
+            .collect()
+    }
+
+    /// Drop every tracked tablet no longer present in `meta` — a cheap
+    /// `BTreeMap` retain, never a data scan, bounding this map the same
+    /// way `change_consumer_loop`'s own `first_hot_seen` fallback map
+    /// bounds itself.
+    pub(crate) fn retain_existing(&self, meta: &Metadata) {
+        self.inner
+            .lock()
+            .expect("change-rate tracker lock")
+            .retain(|t, _| meta.tablets.contains_key(t));
+    }
+}
+
 /// This node's data-plane fields (ADR 0035 PR3) — present in [`ClientCtx`]
 /// iff this node runs the data role (`NodeRole::Data`/`Both`); `None` on a
 /// control-only node, which never hosts a tablet and never runs the CP/
@@ -4313,6 +4548,12 @@ struct DataRole {
     pub(crate) segment_store: SegmentStoreHandle,
     /// The DynamoDB Streams sealer's own size/age knobs (ADR 0042 §13).
     pub(crate) stream_seal_knobs: StreamSealKnobs,
+    /// Growth PR3 Fork F (ADR 0042 §14): this node's own per-tablet
+    /// change-append-rate estimates, written by `index_drain::seal_tick`
+    /// and read by `/admin/metrics` and the opt-in `--auto-split-change-
+    /// rate` trigger (`auto_split_loop`). See [`ChangeRateTracker`]'s own
+    /// doc for the full design.
+    pub(crate) change_rates: ChangeRateTracker,
 }
 
 /// Shared context for the client request server and the DynamoDB/CQL endpoints:
@@ -7915,6 +8156,23 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
+            // Growth PR3 (ADR 0042 §14): the manual-growth split-trigger
+            // RPC — addressed by `tablet` directly, mirroring `ForceSeal`
+            // just above. Materializes this tablet's own live pairs
+            // (leader-local — only reachable once this arm confirms this
+            // node hosts it) and splits at their byte-weighted median via
+            // `trigger_split`, which itself applies F11 rounding and Fork
+            // E's single-token skip.
+            ClientRequest::TriggerAutoSplit { tablet } => {
+                let tablet = TabletId(tablet);
+                let Some(leader) = self.edge.cp_leader(tablet) else {
+                    return self.not_leader_refusal(Some(tablet));
+                };
+                match median_split_key(&leader).await {
+                    None => ClientResponse::Error(STREAM_GROW_NO_SPLIT_POINT.into()),
+                    Some(split_key) => self.trigger_split(tablet, split_key).await,
+                }
+            }
             // ADR 0042 §7/§8, PR6: the open-shard hot-read RPC — addressed
             // by `tablet` directly, mirroring `ForceSeal` just above (see
             // this variant's own doc for why). Leader-local, no ReadIndex
@@ -8203,6 +8461,17 @@ impl ClientCtx {
             is_leader = is_leader.max(snap.is_leader);
         }
         (counters, is_leader)
+    }
+
+    /// Growth PR3 Fork F (ADR 0042 §14): every currently-tracked tablet's
+    /// own smoothed change-append rate (bytes/sec), for `/admin/metrics`'s
+    /// `stream_change_rates` array — empty on a control-only node (no
+    /// [`DataRole`] at all, so nothing was ever tracked).
+    pub(crate) fn stream_change_rates(&self) -> Vec<(TabletId, f64)> {
+        self.data
+            .as_ref()
+            .map(|d| d.change_rates.snapshot())
+            .unwrap_or_default()
     }
 
     /// A snapshot of this node's metrics-history ring buffer (oldest first),
@@ -9574,43 +9843,17 @@ struct AutoSplitThresholds {
     /// `--auto-split-bytes B` (ADR 0034): split once a led tablet's
     /// (approximate) scoped bytes exceed `B`.
     bytes: Option<u64>,
+    /// `--auto-split-change-rate RATE` (ADR 0042 §14, growth PR3 Fork F):
+    /// split once a **streamed** led tablet's own smoothed change-append
+    /// rate ([`ChangeRateTracker`], bytes/sec) exceeds `RATE`. Absent by
+    /// default (opt-in only, no surprise splits on an existing deployment)
+    /// — an unstreamed table is never subject to this trigger regardless
+    /// of this setting, since the rate is only ever tracked for a streamed
+    /// tablet in the first place (`index_drain::seal_tick` only runs its
+    /// seal arm, which feeds the tracker, when `stream_enabled`).
+    change_rate: Option<u64>,
 }
 
-/// The leader-driven **automatic split trigger**: on each tick, for every tablet
-/// whose CP group this node currently **leads**, take the leader's **cheap
-/// estimates** ([`CpGroup::approx_key_count`]/[`CpGroup::approx_bytes`] —
-/// memtable + SSTable metadata, no materialization) and only when one says the
-/// tablet might exceed its configured threshold (or on a slow per-tablet confirm
-/// cadence) materialize the live pairs once — the authoritative key count, byte
-/// total, and (if over threshold) **split key** all come from that one snapshot.
-/// Per-tablet cooldown avoids a duplicate trigger while a split is in flight;
-/// once it applies, the parent's counts halve below both thresholds.
-///
-/// **The split point is byte-weighted whenever a byte threshold is configured**
-/// (ADR 0034 — [`byte_weighted_median`], the key that roughly bisects the
-/// tablet's *bytes*, not just its key count): with skewed value sizes a plain
-/// positional median can leave one huge half and one tiny half, which
-/// immediately re-triggers on the huge side. A key-count-only configuration
-/// (`bytes: None`) keeps the plain positional median byte-for-byte unchanged
-/// from before this ADR, so existing key-count auto-split behavior/tests are
-/// untouched.
-///
-/// Since a split is now a **single, atomic, epoch-CAS-gated** control-plane
-/// command (`ClientCtx::trigger_split`, mirroring `CasTabletReplicas`), there is
-/// no second, independently-failable data-plane step and therefore no orphan
-/// tablet it could leave behind — the whole two-phase `pending`/`claim_auto_split`
-/// retry-and-cleanup machinery this loop used to need is gone. A losing proposer's
-/// `SplitTablet` is rejected cleanly at propose time (stale epoch); the winner's
-/// commit is the entire operation.
-///
-/// Only the node hosting a tablet's leader reads `local_pairs`/triggers — `edge`
-/// is per-node (ADR 0031 PR2), so `ctx.edge.cp_leader(tablet)` only returns
-/// `Some` on the one node that actually leads that tablet's group, in both
-/// one-process-per-node and `--cluster N`. A genuine same-tick race is still
-/// possible (e.g. a leadership handoff mid-tick, or two distinct trigger
-/// sources such as a manual split racing this loop) — harmless: the epoch CAS
-/// lets exactly one win, and the loser just tries again (or backs off) next
-/// tick.
 /// F11 (ADR 0042 §14): the exact error [`ClientCtx::trigger_split`] returns
 /// when [`align_split_key`] finds a streamed table's split key rounds down
 /// onto the target tablet's own `range.start` — matched by `auto_split_loop`
@@ -9659,6 +9902,41 @@ fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) -> (Ve
     (key, viable)
 }
 
+/// The leader-driven **automatic split trigger**: on each tick, for every tablet
+/// whose CP group this node currently **leads**, take the leader's **cheap
+/// estimates** ([`CpGroup::approx_key_count`]/[`CpGroup::approx_bytes`] —
+/// memtable + SSTable metadata, no materialization) and only when one says the
+/// tablet might exceed its configured threshold (or on a slow per-tablet confirm
+/// cadence) materialize the live pairs once — the authoritative key count, byte
+/// total, and (if over threshold) **split key** all come from that one snapshot.
+/// Per-tablet cooldown avoids a duplicate trigger while a split is in flight;
+/// once it applies, the parent's counts halve below both thresholds.
+///
+/// **The split point is byte-weighted whenever a byte threshold is configured**
+/// (ADR 0034 — [`byte_weighted_median`], the key that roughly bisects the
+/// tablet's *bytes*, not just its key count): with skewed value sizes a plain
+/// positional median can leave one huge half and one tiny half, which
+/// immediately re-triggers on the huge side. A key-count-only configuration
+/// (`bytes: None`) keeps the plain positional median byte-for-byte unchanged
+/// from before this ADR, so existing key-count auto-split behavior/tests are
+/// untouched.
+///
+/// Since a split is now a **single, atomic, epoch-CAS-gated** control-plane
+/// command (`ClientCtx::trigger_split`, mirroring `CasTabletReplicas`), there is
+/// no second, independently-failable data-plane step and therefore no orphan
+/// tablet it could leave behind — the whole two-phase `pending`/`claim_auto_split`
+/// retry-and-cleanup machinery this loop used to need is gone. A losing proposer's
+/// `SplitTablet` is rejected cleanly at propose time (stale epoch); the winner's
+/// commit is the entire operation.
+///
+/// Only the node hosting a tablet's leader reads `local_pairs`/triggers — `edge`
+/// is per-node (ADR 0031 PR2), so `ctx.edge.cp_leader(tablet)` only returns
+/// `Some` on the one node that actually leads that tablet's group, in both
+/// one-process-per-node and `--cluster N`. A genuine same-tick race is still
+/// possible (e.g. a leadership handoff mid-tick, or two distinct trigger
+/// sources such as a manual split racing this loop) — harmless: the epoch CAS
+/// lets exactly one win, and the loser just tries again (or backs off) next
+/// tick.
 async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
     let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
     // When each tablet last had a *full* (materializing) count — the expensive
@@ -9704,7 +9982,16 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
                 Some(t) => leader.approx_bytes().await > t,
                 None => false,
             };
-            if !key_hot && !byte_hot && !due_confirm {
+            // Growth PR3 Fork F (ADR 0042 §14): the opt-in change-append-rate
+            // trigger — a streamed tablet's own smoothed rate
+            // ([`ChangeRateTracker`]) is already cheap to read (no
+            // materialization), exactly like the key/byte estimates above.
+            // Reads as `0.0` (never hot) for an unstreamed tablet, since
+            // nothing ever calls `ChangeRateTracker::observe` for one.
+            let change_rate_hot = thresholds
+                .change_rate
+                .is_some_and(|t| ctx.data().change_rates.get(tablet) > t as f64);
+            if !key_hot && !byte_hot && !change_rate_hot && !due_confirm {
                 continue;
             }
             // Materialize once: the authoritative count, byte total, and (if over
@@ -9717,18 +10004,28 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
                 let total_bytes: u64 = pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
                 total_bytes > t
             });
+            // Re-read (not reused from the cheap gate above): a materializing
+            // confirm pass is exactly the point at which every other trigger
+            // here re-derives its own authoritative value from this same
+            // snapshot, and the tracker is cheap enough that re-reading it
+            // costs nothing extra.
+            let over_change_rate_threshold = thresholds
+                .change_rate
+                .is_some_and(|t| ctx.data().change_rates.get(tablet) > t as f64);
             // Need at least 2 distinct keys for any split to have an interior
             // point (`SplitTablet` requires `start < at < end`).
-            if key_count < 2 || (!over_key_threshold && !over_byte_threshold) {
+            if key_count < 2
+                || (!over_key_threshold && !over_byte_threshold && !over_change_rate_threshold)
+            {
                 continue;
             }
-            // A byte-configured cluster uses the byte-weighted median (ADR
-            // 0034) so a skewed value-size distribution still bisects the
-            // tablet's *bytes* roughly evenly; a key-count-only cluster keeps
-            // the plain positional median unchanged from before this ADR (the
-            // interior key of `> threshold >= 2` distinct keys `SplitTablet`
-            // accepts).
-            let split_key = if thresholds.bytes.is_some() {
+            // A byte- or change-rate-configured cluster uses the
+            // byte-weighted median (ADR 0034) so a skewed value-size
+            // distribution still bisects the tablet's *bytes* roughly
+            // evenly; a key-count-only cluster keeps the plain positional
+            // median unchanged from before this ADR (the interior key of
+            // `> threshold >= 2` distinct keys `SplitTablet` accepts).
+            let split_key = if thresholds.bytes.is_some() || over_change_rate_threshold {
                 byte_weighted_median(&pairs)
             } else {
                 pairs[pairs.len() / 2].0.clone()
@@ -9806,6 +10103,35 @@ fn byte_weighted_median(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     pairs[best_idx].0.clone()
 }
 
+/// Growth PR3 (ADR 0042 §14): the exact error [`ClientRequest::
+/// TriggerAutoSplit`]'s handler (and, table-wide, [`ClientCtx::
+/// grow_stream`]) returns for a tablet with fewer than 2 distinct keys — no
+/// legal interior split point exists at all, regardless of tokens (the same
+/// precondition `auto_split_loop` checks before ever computing a median).
+/// Distinct from [`SPLIT_KEY_NOT_TOKEN_VIABLE`] (a real single-token
+/// hot-partition collapse) so a caller can tell "nothing to split" from
+/// "one partition owns everything" — both are skips, never hard failures.
+const STREAM_GROW_NO_SPLIT_POINT: &str =
+    "tablet has fewer than 2 distinct keys — no legal interior split point";
+
+/// Materialize `group`'s own live pairs and compute their byte-weighted
+/// median (ADR 0034's [`byte_weighted_median`]) — the same key
+/// `auto_split_loop` computes for a byte-configured cluster, reused here for
+/// growth PR3's manual `POST /admin/stream/grow` trigger and Fork F's
+/// change-rate auto-trigger, neither of which has (or needs) a byte/key
+/// **threshold** of its own: an explicit trigger always uses the
+/// byte-weighted metric, unconditionally. Returns `None` for fewer than 2
+/// distinct keys (no legal interior split point regardless of tokens) —
+/// the caller answers [`STREAM_GROW_NO_SPLIT_POINT`] rather than ever
+/// calling [`ClientCtx::trigger_split`] with a meaningless key.
+async fn median_split_key(group: &CpGroup) -> Option<Vec<u8>> {
+    let pairs = group.local_pairs().await;
+    if pairs.len() < 2 {
+        return None;
+    }
+    Some(byte_weighted_median(&pairs))
+}
+
 /// Accept loop shared by **both** listeners (ADR 0047) — the client port and
 /// the intra-cluster port alike — parameterized by [`ListenerKind`] rather
 /// than forked: `spawn_common_tail` spawns two instantiations of this same
@@ -9870,6 +10196,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::KindWriteItem { .. } => "kind_write_item",
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
+        ClientRequest::TriggerAutoSplit { .. } => "trigger_auto_split",
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
         ClientRequest::ClearBackfillCursor { .. } => "clear_backfill_cursor",
         ClientRequest::Get { .. } => "get",
@@ -10060,6 +10387,11 @@ async fn handle_request(
              `Forwarded`"
                 .into(),
         ),
+        ClientRequest::TriggerAutoSplit { .. } => ClientResponse::Error(
+            "this request is an internal growth split-trigger RPC and must be sent wrapped in \
+             `Forwarded`"
+                .into(),
+        ),
         ClientRequest::StreamHotRead { .. } => ClientResponse::Error(
             "this request is an internal open-shard hot-read RPC and must be sent wrapped in \
              `Forwarded`"
@@ -10156,13 +10488,6 @@ impl ClientCtx {
         fields(tablet = tablet.0, new_id = tracing::field::Empty)
     )]
     async fn trigger_split(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
-        // The new tablet id comes from the **monotonic allocator**
-        // (`next_free_tablet_id`, ADR 0023 — the same allocator provisioning
-        // uses), *not* `max(existing ids) + 1`, which could re-mint a freed id
-        // after a `DropTableTablets`. `new_id` and `expected_epoch` come from
-        // the **same** metadata snapshot so the CAS reflects exactly what this
-        // call saw.
-        //
         // `effective_metadata()`, not `self.control.metadata_cached()`
         // directly (ADR 0035 PR5 staleness-audit fix): unlike a plain stale
         // read racing a *concurrent* epoch bump — which the CAS below catches
@@ -10175,44 +10500,100 @@ impl ClientCtx {
         // exists on the real cluster. The CAS only protects against
         // staleness *after* a read succeeds; it can't rescue a read that
         // never has anything to see.
-        let meta = self.effective_metadata();
-        let new_id = meta.next_free_tablet_id();
-        let Some(expected_epoch) = meta.tablets.get(&tablet).map(|t| t.epoch) else {
+        let Some(initial_epoch) = self
+            .effective_metadata()
+            .tablets
+            .get(&tablet)
+            .map(|t| t.epoch)
+        else {
             return ClientResponse::Error("no such tablet".into());
         };
-        // F11 (ADR 0042 §14, Fork D): this is the ONE choke point every
-        // split proposer funnels through — `auto_split_loop`, `POST
-        // /admin/tablet/split` (`admin::action_split`), and
-        // `ClientRequest::SplitTablet`'s handler all call this method and
-        // nothing else, so rounding here (rather than in each caller)
-        // structurally can't be forgotten by a future one. See
-        // `align_split_key`'s own doc for the rounding + single-token-skip
-        // rule (Fork E).
-        let (split_key, viable) = align_split_key(&meta, tablet, split_key);
-        if !viable {
-            self.control
-                .metrics()
-                .incr(Metric::StreamSplitSingleTokenSkipped);
-            return ClientResponse::Error(SPLIT_KEY_NOT_TOKEN_VIABLE.into());
-        }
-        tracing::Span::current().record("new_id", new_id.0);
-        let cmd = MetaCommand::SplitTablet {
-            tablet,
-            expected_epoch,
-            split_key,
-            new_id,
-        };
-        match self
-            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
-                self.effective_metadata()
-                    .tablets
-                    .contains_key(&new_id)
-                    .then_some(())
-            })
-            .await
-        {
-            Ok(()) => ClientResponse::PutOk,
-            Err(()) => ClientResponse::Error("split did not commit in time".into()),
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        let mut next_propose_at = tokio::time::Instant::now();
+        loop {
+            // Confirmed: this tablet's own epoch has advanced past what we
+            // initially observed. The CAS-gated apply arm only ever bumps a
+            // tablet's epoch on a REAL, committed split of that exact
+            // tablet (`source.epoch = source.epoch.next()`), so this is
+            // true iff *some* split of THIS tablet — ours, or a racing
+            // proposer's that happened to land first (harmless: the
+            // operation the caller wanted, "this tablet is now split," is
+            // accomplished either way) — has actually landed. Deliberately
+            // **not** `tablets.contains_key(&new_id)` (the bug this
+            // rewrite fixes, found building growth PR3's multi-tablet
+            // `POST /admin/stream/grow`): `new_id` is computed fresh below
+            // from a possibly-stale `effective_metadata()` snapshot — on a
+            // lagging-mirror node in particular, two *different*
+            // `SplitTablet` proposals (splitting two different source
+            // tablets, issued in quick succession by `ClientCtx::
+            // grow_stream`'s per-tablet loop) can independently compute the
+            // identical `new_id` from equally-stale reads. The control
+            // leader's own apply-time check (`new tablet id already
+            // exists`) correctly rejects the second one — but a
+            // confirmation that only asks "does a tablet with this id
+            // exist now" can't tell that rejected proposal apart from its
+            // own success once the FIRST proposal's commit replicates
+            // here, silently reporting `PutOk` for a split that never
+            // actually happened. Checking THIS tablet's own epoch instead
+            // is robust regardless of which `new_id` a later, corrected
+            // retry (below) ends up minting.
+            let meta = self.effective_metadata();
+            match meta.tablets.get(&tablet).map(|t| t.epoch) {
+                None => return ClientResponse::Error("no such tablet".into()),
+                Some(epoch) if epoch != initial_epoch => return ClientResponse::PutOk,
+                Some(_) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return ClientResponse::Error("split did not commit in time".into());
+            }
+            if tokio::time::Instant::now() >= next_propose_at {
+                // The new tablet id comes from the **monotonic allocator**
+                // (`next_free_tablet_id`, ADR 0023 — the same allocator
+                // provisioning uses), *not* `max(existing ids) + 1`, which
+                // could re-mint a freed id after a `DropTableTablets`.
+                // Recomputed fresh on **every** propose attempt (not once
+                // up front) — the actual fix for the collision race
+                // described above: a later attempt, once this node's own
+                // metadata has caught up, sees the allocator floor moved
+                // past whatever else was created meanwhile and mints a
+                // genuinely free id instead of repeating a doomed one.
+                let new_id = meta.next_free_tablet_id();
+                // F11 (ADR 0042 §14, Fork D): this is the ONE choke point
+                // every split proposer funnels through — `auto_split_loop`,
+                // `POST /admin/tablet/split` (`admin::action_split`), and
+                // `ClientRequest::SplitTablet`'s handler all call this
+                // method and nothing else, so rounding here (rather than in
+                // each caller) structurally can't be forgotten by a future
+                // one. See `align_split_key`'s own doc for the rounding +
+                // single-token-skip rule (Fork E). `tablet`'s range cannot
+                // have changed since `initial_epoch` was captured (the loop
+                // only reaches here while the epoch check above still
+                // matches), so recomputing this every attempt is
+                // equivalent to computing it once — just simpler to read
+                // alongside the fresh `new_id` above.
+                let (aligned_key, viable) = align_split_key(&meta, tablet, split_key.clone());
+                if !viable {
+                    self.control
+                        .metrics()
+                        .incr(Metric::StreamSplitSingleTokenSkipped);
+                    return ClientResponse::Error(SPLIT_KEY_NOT_TOKEN_VIABLE.into());
+                }
+                tracing::Span::current().record("new_id", new_id.0);
+                let cmd = MetaCommand::SplitTablet {
+                    tablet,
+                    expected_epoch: initial_epoch,
+                    split_key: aligned_key,
+                    new_id,
+                };
+                let sent = self.propose_schema(&cmd).await;
+                next_propose_at = tokio::time::Instant::now()
+                    + if sent {
+                        SCHEMA_PROPOSE_PATIENCE
+                    } else {
+                        Duration::ZERO
+                    };
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -10715,6 +11096,87 @@ impl ClientCtx {
         }
     }
 
+    /// One tablet's own share of growth PR3's manual trigger (`POST
+    /// /admin/stream/grow`, [`grow_stream`](Self::grow_stream)'s per-tablet
+    /// call): wherever `tablet`'s own CP group leader actually runs,
+    /// materialize its live pairs and split at their byte-weighted median
+    /// ([`median_split_key`]) via [`trigger_split`](Self::trigger_split) —
+    /// which independently applies F11's token-rounding and Fork E's
+    /// single-token skip, exactly as every other split proposer does.
+    /// Returns the tablet's own [`ClientResponse`] verbatim: `PutOk` for a
+    /// genuine split, or an `Error` naming [`STREAM_GROW_NO_SPLIT_POINT`]/
+    /// [`SPLIT_KEY_NOT_TOKEN_VIABLE`] for an expected skip (or any other
+    /// real error) — the caller (`admin::action_stream_grow`) classifies
+    /// these, never treating one tablet's skip as a failure of the whole
+    /// multi-tablet action. Same shape as
+    /// [`force_seal_tablet`](Self::force_seal_tablet) (resolve → local or
+    /// forward, retry until a deadline), except a `Forward` reply is
+    /// returned immediately unless it is specifically a stale "not leader
+    /// here" refusal (`topology::parse_not_leader_refusal`) — every other
+    /// error (including this action's own expected skips) is a terminal
+    /// outcome, not a signal to keep retrying.
+    pub(crate) async fn grow_stream_tablet(&self, tablet: TabletId) -> ClientResponse {
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            match self.resolve_cp_route(tablet) {
+                Some(CpRoute::Local(leader)) => {
+                    return match median_split_key(&leader).await {
+                        None => ClientResponse::Error(STREAM_GROW_NO_SPLIT_POINT.into()),
+                        Some(split_key) => self.trigger_split(tablet, split_key).await,
+                    };
+                }
+                Some(CpRoute::Forward(addr)) => {
+                    let request = ClientRequest::Forwarded {
+                        request: Box::new(ClientRequest::TriggerAutoSplit { tablet: tablet.0 }),
+                        traceparent: otel::current_traceparent(),
+                    };
+                    match self.relay(addr, request).await {
+                        ClientResponse::Error(e)
+                            if topology::parse_not_leader_refusal(&e).is_some() => {} // stale hint, retry below
+                        other => return other,
+                    }
+                }
+                Some(CpRoute::None) | None => {} // not settled yet, retry
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return ClientResponse::Error(
+                    "stream grow: did not reach this tablet's leader in time".into(),
+                );
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Growth PR3 (ADR 0042 §14): split EVERY tablet of streamed `table` at
+    /// its own byte-weighted median, in one action (`POST
+    /// /admin/stream/grow`) — each child mints exactly one
+    /// `ParentShardId`, so the table's shard count doubles (minus any
+    /// tablet [`grow_stream_tablet`](Self::grow_stream_tablet) skips: Fork
+    /// E's single-token limit, or an empty/singleton tablet). `Err` only
+    /// for a request-shaped problem (the table has no stream, or no
+    /// tablets at all yet); a per-tablet skip/error is reported inside the
+    /// returned vector, never escalated into the whole call failing — the
+    /// caller (`admin::action_stream_grow`) classifies each entry.
+    pub(crate) async fn grow_stream(
+        &self,
+        table: &str,
+    ) -> Result<Vec<(TabletId, ClientResponse)>, String> {
+        let meta = self.effective_metadata();
+        if meta.table_stream(table).is_none() {
+            return Err(format!("table `{table}` has no stream enabled"));
+        }
+        let tablets: Vec<TabletId> = meta.tablets_for_table(table).map(|(id, _)| *id).collect();
+        if tablets.is_empty() {
+            return Err(format!("table `{table}` has no tablets yet"));
+        }
+        let mut results = Vec::with_capacity(tablets.len());
+        for tablet in tablets {
+            let response = self.grow_stream_tablet(tablet).await;
+            results.push((tablet, response));
+        }
+        Ok(results)
+    }
+
     /// Delete `index`'s own backfill cursor row (ADR 0045 §5 step 3) on
     /// **every** tablet currently scoped to `table`, wherever each one's
     /// own leader actually runs — the table-wide sibling of
@@ -10905,6 +11367,7 @@ pub async fn start_cluster_with(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
     )
     .await
 }
@@ -10929,6 +11392,7 @@ pub async fn start_cluster_auto_split(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
     )
     .await
 }
@@ -10953,6 +11417,7 @@ pub async fn start_cluster_with_auto_split(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
     )
     .await
 }
@@ -10980,6 +11445,7 @@ pub async fn start_cluster_with_auto_split_bytes(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
     )
     .await
 }
@@ -11008,6 +11474,7 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
     )
     .await
 }
@@ -11018,6 +11485,8 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
 /// [`BoundNode::start_with_streams`]'s doc for the layered-wrapper
 /// rationale. `--cluster N`'s `--stream-seal-bytes`/`--stream-seal-age`/
 /// `--stream-retention`/`--segment-store` CLI flags thread through here.
+/// Defaults [`start_cluster_with_growth`]'s own `auto_split_change_rate` to
+/// `None`.
 ///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
@@ -11041,6 +11510,40 @@ pub async fn start_cluster_with_streams(
         stream_seal_knobs,
         segment_store_config,
         stream_retention,
+        None,
+    )
+    .await
+}
+
+/// Like [`start_cluster_with_streams`], with the opt-in **change-rate**
+/// auto-split trigger (ADR 0042 §14, growth PR3 Fork F) — see
+/// [`BoundNode::start_with_growth`]'s doc for the full design. `--cluster
+/// N`'s `--auto-split-change-rate RATE` CLI flag threads through here.
+///
+/// # Errors
+/// Propagates a failure to open any node's CP group engine.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_cluster_with_growth(
+    bound: Vec<BoundNode>,
+    backend: StorageBackend,
+    auto_split_keys: Option<usize>,
+    auto_split_bytes: Option<u64>,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    auto_split_change_rate: Option<u64>,
+) -> std::io::Result<Vec<Node>> {
+    start_cluster_inner(
+        bound,
+        backend,
+        auto_split_keys,
+        auto_split_bytes,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        auto_split_change_rate,
     )
     .await
 }
@@ -11055,6 +11558,7 @@ async fn start_cluster_inner(
     stream_seal_knobs: StreamSealKnobs,
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
+    auto_split_change_rate: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -11097,7 +11601,7 @@ async fn start_cluster_inner(
     let mut nodes = Vec::with_capacity(n);
     for b in bound {
         let node = b
-            .start_with_streams(
+            .start_with_growth(
                 peers.clone(),
                 control_ids.clone(),
                 data_ids.clone(),
@@ -11115,6 +11619,7 @@ async fn start_cluster_inner(
                 stream_seal_knobs,
                 segment_store_config.clone(),
                 stream_retention,
+                auto_split_change_rate,
             )
             .await?;
         nodes.push(node);
@@ -11190,6 +11695,40 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
     auto_split_threshold: Option<usize>,
     auto_split_bytes_threshold: Option<u64>,
     orphan_sweep_after: Duration,
+) -> std::io::Result<Vec<Node>> {
+    start_split_cluster_with_growth(
+        control_n,
+        data_n,
+        dir,
+        ip,
+        backend,
+        auto_split_threshold,
+        auto_split_bytes_threshold,
+        orphan_sweep_after,
+        None,
+    )
+    .await
+}
+
+/// Like [`start_split_cluster_with_orphan_sweep_after`], with the opt-in
+/// **change-rate** auto-split trigger (ADR 0042 §14, growth PR3 Fork F) on
+/// every data-role node — see [`BoundNode::start_with_growth`]'s doc for
+/// the full design. `--cluster-control`/`--cluster-data`'s
+/// `--auto-split-change-rate RATE` CLI flag threads through here.
+///
+/// # Errors
+/// As [`start_split_cluster_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn start_split_cluster_with_growth(
+    control_n: usize,
+    data_n: usize,
+    dir: impl Into<PathBuf>,
+    ip: std::net::IpAddr,
+    backend: StorageBackend,
+    auto_split_threshold: Option<usize>,
+    auto_split_bytes_threshold: Option<u64>,
+    orphan_sweep_after: Duration,
+    auto_split_change_rate: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     let dir = dir.into();
     let total = control_n + data_n;
@@ -11295,7 +11834,7 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
     }
     for b in data_bound {
         nodes.push(
-            b.start_data_with(
+            b.start_data_with_growth(
                 data_env_peers.clone(),
                 control_ids.clone(),
                 control_intra_addrs.clone(),
@@ -11308,6 +11847,9 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
                 auto_split_threshold,
                 auto_split_bytes_threshold,
                 admin_addrs.clone(),
+                StreamSealKnobs::default(),
+                SegmentStoreConfig::default(),
+                auto_split_change_rate,
             )
             .await?,
         );

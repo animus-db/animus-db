@@ -481,6 +481,52 @@ this specific outcome to skip its own "split did not commit" warning, which
 would otherwise fire every cooldown, forever, for a tablet that structurally
 cannot split.
 
+**Growth-plan amendment (2026-08-16, growth PR3) — the manual growth
+trigger and Fork F's opt-in auto-trigger.** "Manual admin trigger, grow by
+2×" is not a resharding command in round 3 — the growth plan's own
+reinterpretation is *"split every tablet of this streamed table now,
+without making me compute keys."* `POST /admin/stream/grow {table}`
+(`admin::action_stream_grow`) does exactly that: one tablet at a time
+(`ClientCtx::grow_stream`), each split at its own byte-weighted median
+(ADR 0034) via `trigger_split` — reusing `auto_split_loop`'s own
+materializing-confirm primitives (`local_pairs` → `byte_weighted_median`),
+so F11's rounding and Fork E's single-token skip apply automatically. A
+tablet led by a different node than the one serving the admin request is
+reached via a new internal, relayable `ClientRequest::TriggerAutoSplit` RPC
+(mirrors `ForceSeal`'s shape). `animus admin stream-grow <admin-addr>
+<table>` is the CLI form.
+
+Building this surfaced a real, independent bug in `trigger_split` itself
+(fixed in the same PR, not specific to streams): its confirmation
+predicate was a bare "does a tablet with this id exist," which a
+lagging-mirror node's independently-computed `new_id` could satisfy from a
+*different*, unrelated split's commit — silently reporting success for a
+proposal the control leader had actually rejected as an id collision.
+Rewritten to recompute `new_id` fresh on every retry and confirm via the
+target tablet's own epoch advancing (robust regardless of which id a
+later, corrected retry mints) — see `docs/engineering-lessons.md` for the
+general form.
+
+**Fork F — the change-append-rate signal and its opt-in auto-trigger.**
+`CpGroup::approx_bytes` (the existing auto-split byte trigger's input) is
+deliberately **base**-scoped (ADR 0034's own fix, so change-log churn can't
+drive splits) — which structurally means a high-churn, small-footprint
+streamed table can write forever without ever crossing a byte/key
+threshold and gaining a second shard, regardless of write rate. A new
+per-tablet `ChangeRateTracker` (`animusd`) closes the visibility gap for
+free: `index_drain::seal_tick` already computes `approx_bytes_kind
+(KIND_CHANGE)` every tick for `Metric::StreamHotBytes`, so the tracker just
+smooths (EWMA) each tick's own delta/elapsed into a bytes/sec estimate —
+no new scan. Surfaced read-only via `/admin/metrics`'s
+`stream_change_rates` array. The trigger itself (`--auto-split-change-rate
+RATE`, streamed tables only) is opt-in and OFF by default — no flag means
+no behavior change at all, and no production-tuned default exists yet (no
+operational data), so the flag has no default-on value; an operator must
+choose `RATE` for their own workload. When set, a streamed led tablet whose
+smoothed rate exceeds `RATE` joins the same either-trigger-fires gate
+`auto_split_loop` already runs, splitting via the identical
+`byte_weighted_median`/`trigger_split` path (so F11/Fork E apply here too).
+
 ### 15. Deviations from AWS, summarized
 
 | Area | Real DynamoDB Streams | This adapter | Why |

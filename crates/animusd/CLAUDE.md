@@ -152,9 +152,20 @@ help) prints the full invocation reference (durable LSM backend by
 default; `--ephemeral` selects the volatile memory engine). Notes not
 obvious from `--help` alone:
 
-`--auto-split K` (key count) and `--auto-split-bytes B` (byte size) are
-independent OR-gated triggers — either, both, or neither. **`--node I` is
-gone from `join`/`data --seed` entirely** — there is no index to derive a
+`--auto-split K` (key count), `--auto-split-bytes B` (byte size), and
+`--auto-split-change-rate RATE` (streamed tables only, ADR 0042 §14 Fork F —
+bytes/sec of a tablet's own `KIND_CHANGE` growth, `/admin/metrics`'s
+`stream_change_rates`) are independent OR-gated triggers — any combination,
+or none. `--auto-split-change-rate` closes the gap the other two
+structurally can't: `CpGroup::approx_bytes` is base-scoped (ADR 0034), so a
+high-churn, small-footprint streamed table never crosses a byte/key
+threshold regardless of write rate. No production-tuned default exists yet
+— omitting the flag disables the trigger entirely (zero behavior change);
+an operator must pick `RATE` for their own workload. All three flags are
+`--cluster N`/`--cluster-control`+`--cluster-data` dev-cluster-only (not
+reachable from `--config/--node`'s real per-process deployment, matching
+the two older flags' own existing scope). **`--node I` is gone from
+`join`/`data --seed` entirely** — there is no index to derive a
 default port range from, so `--base-port` is **required** on both. `--id
 NAME` proposes a durable identity (`NodeId::propose` validates it at the
 CLI boundary); omitted, the node **self-mints** one (`NodeId::mint`) and
@@ -463,6 +474,35 @@ positional median. **Tablets are split-only (ADR 0044)** — there is no
 merge, automatic or operator-driven, to trigger; a tablet's count only ever
 grows, and reversing an over-eager split is no longer possible (see that
 ADR's "shrink-in-place" note).
+
+**Change-append-rate trigger (opt-in, ADR 0042 §14 Fork F, growth PR3)**:
+`--auto-split-change-rate RATE` joins the same either-fires gate above,
+streamed tables only. `CpGroup::approx_bytes` is deliberately base-scoped
+(ADR 0034's own fix), so it structurally cannot see change-log churn — a
+high-churn, small-footprint streamed table would otherwise never gain a
+second shard regardless of write rate. `ChangeRateTracker` (`lib.rs`)
+closes the gap for free: `index_drain::seal_tick` already computes
+`approx_bytes_kind(KIND_CHANGE)` every tick for `Metric::StreamHotBytes`,
+so the tracker just EWMA-smooths each tick's own delta/elapsed into a
+bytes/sec estimate — no new scan. Read via `ClientCtx::stream_change_rates`
+(`/admin/metrics`'s `stream_change_rates` array) and
+`ChangeRateTracker::get` (the trigger check itself). When hot, splits via
+the identical `byte_weighted_median`/`trigger_split` path every other
+trigger uses, so F11/Fork E apply automatically. No production-tuned
+default exists — omitting the flag is a true no-op.
+
+**Manual growth trigger (`POST /admin/stream/grow {table}`, ADR 0042 §14,
+growth PR3)**: splits *every* tablet of a streamed table at its own
+byte-weighted median in one action (`ClientCtx::grow_stream` →
+`grow_stream_tablet` per tablet, reusing the identical
+`local_pairs`/`byte_weighted_median`/`trigger_split` primitives). A tablet
+led by a different node than the one serving the admin request is reached
+via the internal, relayable `ClientRequest::TriggerAutoSplit` RPC (mirrors
+`ForceSeal`'s shape — addressed by tablet id, refused bare, handled only in
+`cp_serve_forwarded`). A per-tablet skip (Fork E's single-token limit, or
+an empty/singleton tablet) is reported in that tablet's own response entry,
+never escalated into a whole-call failure. `animus admin stream-grow
+<admin-addr> <table>` is the CLI form.
 
 **Split** (ADR 0028, `MetaCommand::SplitTablet`, epoch-CAS gated) is a
 single atomic control-plane command with no data-plane half — narrows the

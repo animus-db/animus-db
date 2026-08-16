@@ -6,8 +6,8 @@
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
 //! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] # run an N-node cluster in one process
-//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS] # run a whole split deployment in one process (ADR 0035)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] # run an N-node cluster in one process
+//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] # run node I as a control-only node (ADR 0035 PR3)
 //! animusd data --config FILE --node I [--dir DIR] [--ephemeral] # run node I as a data-only node (ADR 0035 PR4)
@@ -137,8 +137,8 @@ const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
     animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH]\n  \
-    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--orphan-sweep-after SECS]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH]\n  \
+    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS]\n  \
     animusd data --config FILE --node I [--dir DIR] [--ephemeral]\n  \
@@ -212,6 +212,15 @@ async fn run(args: &[String]) -> Result<(), String> {
     // scales with bytes, not key count). Either, both, or neither may be set;
     // when both are set, whichever threshold is hit first triggers.
     let mut auto_split_bytes: Option<u64> = None;
+    // `--auto-split-change-rate RATE` (ADR 0042 §14, growth PR3 Fork F):
+    // opt-in — a **streamed** led tablet whose own smoothed change-append
+    // rate (bytes/sec, `/admin/metrics`'s `stream_change_rates`) sustains
+    // above `RATE` triggers the same split path. Absent means disabled
+    // (zero behavior change); an unstreamed table is never subject to it
+    // regardless. No production-tuned default exists yet (no operational
+    // data) — this flag has no default-on behavior; pick `RATE` per
+    // workload.
+    let mut auto_split_change_rate: Option<u64> = None;
     // `--orphan-sweep-after SECS` (ADR 0040 PR6): overrides
     // `DEFAULT_ORPHAN_SWEEP_AFTER` (10 minutes) for the control-plane
     // leader's auto-reclaim sweep of never-activated members; `0` disables
@@ -250,6 +259,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--auto-split" => auto_split = Some(parse_next(&mut it, "--auto-split")?),
             "--auto-split-bytes" => {
                 auto_split_bytes = Some(parse_next(&mut it, "--auto-split-bytes")?);
+            }
+            "--auto-split-change-rate" => {
+                auto_split_change_rate = Some(parse_next(&mut it, "--auto-split-change-rate")?);
             }
             "--orphan-sweep-after" => {
                 orphan_sweep_after = Some(parse_next(&mut it, "--orphan-sweep-after")?);
@@ -292,6 +304,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             backend,
             auto_split,
             auto_split_bytes,
+            auto_split_change_rate,
             orphan_sweep_after,
         )
         .await;
@@ -321,6 +334,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 backend,
                 auto_split,
                 auto_split_bytes,
+                auto_split_change_rate,
                 orphan_sweep_after,
                 stream_seal_knobs,
                 segment_store_config,
@@ -713,6 +727,7 @@ async fn run_in_process_cluster(
     backend: animusd::StorageBackend,
     auto_split: Option<usize>,
     auto_split_bytes: Option<u64>,
+    auto_split_change_rate: Option<u64>,
     orphan_sweep_after: Duration,
     stream_seal_knobs: animusd::StreamSealKnobs,
     segment_store_config: animusd::SegmentStoreConfig,
@@ -725,7 +740,7 @@ async fn run_in_process_cluster(
     let bound = animusd::bind_cluster(n, ip, &dir)
         .await
         .map_err(|e| format!("failed to bind cluster: {e}"))?;
-    let nodes = animusd::start_cluster_with_streams(
+    let nodes = animusd::start_cluster_with_growth(
         bound,
         backend,
         auto_split,
@@ -734,6 +749,7 @@ async fn run_in_process_cluster(
         stream_seal_knobs,
         segment_store_config,
         stream_retention,
+        auto_split_change_rate,
     )
     .await
     .map_err(|e| format!("failed to start cluster: {e}"))?;
@@ -749,6 +765,11 @@ async fn run_in_process_cluster(
             println!("animusd: started {n}-node cluster (CP) — auto-split at {b} bytes/tablet")
         }
         (None, None) => println!("animusd: started {n}-node cluster (CP)"),
+    }
+    if let Some(rate) = auto_split_change_rate {
+        println!(
+            "animusd: streamed-table auto-split ALSO fires above {rate} change-bytes/sec/tablet"
+        );
     }
     for (i, node) in nodes.iter().enumerate() {
         println!(
@@ -781,13 +802,14 @@ async fn run_in_process_split_cluster(
     backend: animusd::StorageBackend,
     auto_split: Option<usize>,
     auto_split_bytes: Option<u64>,
+    auto_split_change_rate: Option<u64>,
     orphan_sweep_after: Duration,
 ) -> Result<(), String> {
     if control_n == 0 || data_n == 0 {
         return Err("--cluster-control and --cluster-data must each be at least 1".into());
     }
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join("animusd"));
-    let nodes = animusd::start_split_cluster_with_orphan_sweep_after(
+    let nodes = animusd::start_split_cluster_with_growth(
         control_n,
         data_n,
         &dir,
@@ -796,6 +818,7 @@ async fn run_in_process_split_cluster(
         auto_split,
         auto_split_bytes,
         orphan_sweep_after,
+        auto_split_change_rate,
     )
     .await
     .map_err(|e| format!("failed to start split cluster: {e}"))?;
@@ -813,6 +836,11 @@ async fn run_in_process_split_cluster(
         (None, None) => {
             println!("animusd: started split cluster ({control_n} control + {data_n} data, CP)")
         }
+    }
+    if let Some(rate) = auto_split_change_rate {
+        println!(
+            "animusd: streamed-table auto-split ALSO fires above {rate} change-bytes/sec/tablet"
+        );
     }
     for (i, node) in nodes.iter().take(control_n).enumerate() {
         println!(

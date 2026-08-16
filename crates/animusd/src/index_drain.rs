@@ -284,6 +284,11 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
         // (or moved off this node permanently) doesn't leak an entry
         // forever.
         first_hot_seen.retain(|t, _| meta.tablets.contains_key(t));
+        // Growth PR3 Fork F: bound the change-rate tracker the same way —
+        // `ctx.data()` is safe unconditionally here, exactly like
+        // `seal_tick`'s own `ctx.data().raftkv_metrics` access below: this
+        // loop is only ever spawned for a data-capable node.
+        ctx.data().change_rates.retain_existing(&meta);
         for (tablet, group) in ctx.edge.hosted_groups() {
             if !group.is_leader() {
                 continue;
@@ -1004,6 +1009,12 @@ async fn seal_tick(
     ctx.data()
         .raftkv_metrics
         .set(Metric::StreamHotBytes, approx_bytes);
+    // Growth PR3 Fork F (ADR 0042 §14): feed this tick's own already-computed
+    // `KIND_CHANGE` byte level into the per-tablet change-rate tracker — no
+    // new scan, reusing exactly the data `StreamHotBytes` just read above.
+    // Read by `/admin/metrics` and the opt-in `--auto-split-change-rate`
+    // trigger (`auto_split_loop`).
+    ctx.data().change_rates.observe(tablet, approx_bytes);
 
     if approx_bytes == 0 {
         // Nothing pending at all: no backlog for the age trigger to

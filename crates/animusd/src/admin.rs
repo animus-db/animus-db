@@ -33,10 +33,11 @@
 //! - `GET  /admin/storage/key`         — on-disk versions of a key (`?tablet=&key=`)
 //! - `GET  /admin/storage/scan`        — first N live pairs (`?tablet=&start=&limit=`)
 //! - `GET  /admin/system-table`        — browse the control-plane system keyspace (`?kind=&after=&limit=`, ADR 0038 addendum)
-//! - `GET  /admin/metrics`             — the metrics snapshot as JSON
+//! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — liveness/readiness
 //! - `POST /admin/tablet/split`        — `{tablet, split_key}`
+//! - `POST /admin/stream/grow`         — `{table}` — split every tablet of a streamed table at its byte-weighted median (ADR 0042 §14, growth PR3)
 //! - `POST /admin/storage/flush`       — `{tablet}`
 //! - `POST /admin/storage/compact`     — `{tablet}`
 //! - `POST /admin/raftkv/reconfigure`  — `{tablet, voters}`
@@ -336,6 +337,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("GET", "/admin/member/drain-status") => member_drain_status(ctx, q),
         ("GET", "/admin/health") => health(ctx),
         ("POST", "/admin/tablet/split") => action_split(ctx, &request.body).await,
+        ("POST", "/admin/stream/grow") => action_stream_grow(ctx, &request.body).await,
         ("POST", "/admin/storage/flush") => action_flush(ctx, &request.body).await,
         ("POST", "/admin/storage/compact") => action_compact(ctx, &request.body).await,
         ("POST", "/admin/raftkv/reconfigure") => action_reconfigure(ctx, &request.body),
@@ -1085,7 +1087,17 @@ fn system_table_item(kind: syskv::EntityKind, id: &[u8], value: &[u8], version: 
 
 fn metrics_view(ctx: &ClientCtx) -> Value {
     let (counters, is_leader) = ctx.metrics_json();
-    json!({ "counters": counters, "is_leader": is_leader })
+    // Growth PR3 Fork F (ADR 0042 §14): this node's own per-tablet
+    // change-append-rate estimates (bytes/sec) — the signal an operator
+    // needs since a high-churn, small-footprint streamed table never
+    // crosses the base-scoped byte/key auto-split thresholds. Empty on a
+    // control-only node.
+    let stream_change_rates: Vec<Value> = ctx
+        .stream_change_rates()
+        .into_iter()
+        .map(|(tablet, bytes_per_sec)| json!({"tablet": tablet.0, "bytes_per_sec": bytes_per_sec}))
+        .collect();
+    json!({ "counters": counters, "is_leader": is_leader, "stream_change_rates": stream_change_rates })
 }
 
 /// This node's metrics-history ring buffer (ADR 0020), backing the
@@ -1195,6 +1207,74 @@ async fn action_split(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         .trigger_split(TabletId(req.tablet), req.split_key.into_bytes())
         .await;
     client_response_to_json(resp, json!({"ok": true, "tablet": req.tablet}))
+}
+
+#[derive(Deserialize)]
+struct StreamGrowReq {
+    table: String,
+}
+
+/// `POST /admin/stream/grow` (ADR 0042 §14, growth PR3): split every tablet
+/// of a streamed table at its own byte-weighted median in one action — the
+/// manual convenience the plan's own headline names ("split every tablet of
+/// this streamed table now, without making me compute keys"). Reuses
+/// `auto_split_loop`'s own materializing confirm path (`ClientCtx::
+/// grow_stream` → `grow_stream_tablet` → `median_split_key` →
+/// `trigger_split`, the last of which applies F11 rounding and Fork E's
+/// single-token skip on its own). A per-tablet skip (Fork E's single-token
+/// limit, or an empty/singleton tablet) is reported as `"skipped"` in that
+/// tablet's own entry, never escalated into an overall failure — only a
+/// request-shaped problem (unknown/unstreamed table) is a `400`.
+async fn action_stream_grow(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: StreamGrowReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let results = match ctx.grow_stream(&req.table).await {
+        Ok(results) => results,
+        Err(e) => return (400, json!({"error": e})),
+    };
+    let mut split_count = 0u64;
+    let mut skipped_count = 0u64;
+    let mut error_count = 0u64;
+    let tablets: Vec<Value> = results
+        .into_iter()
+        .map(|(tablet, resp)| {
+            let (outcome, detail) = match resp {
+                ClientResponse::PutOk => {
+                    split_count += 1;
+                    ("split", None)
+                }
+                ClientResponse::Error(e)
+                    if e == crate::SPLIT_KEY_NOT_TOKEN_VIABLE
+                        || e == crate::STREAM_GROW_NO_SPLIT_POINT =>
+                {
+                    skipped_count += 1;
+                    ("skipped", Some(e))
+                }
+                ClientResponse::Error(e) => {
+                    error_count += 1;
+                    ("error", Some(e))
+                }
+                other => {
+                    error_count += 1;
+                    ("error", Some(format!("unexpected response: {other:?}")))
+                }
+            };
+            json!({"tablet": tablet.0, "outcome": outcome, "detail": detail})
+        })
+        .collect();
+    (
+        200,
+        json!({
+            "ok": true,
+            "table": req.table,
+            "split_count": split_count,
+            "skipped_count": skipped_count,
+            "error_count": error_count,
+            "tablets": tablets,
+        }),
+    )
 }
 
 async fn action_flush(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
