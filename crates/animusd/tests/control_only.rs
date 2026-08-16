@@ -285,7 +285,8 @@ async fn schema_ddl_via_control_node_commits_and_relays() {
             schema: TableSchema::simple("id", ColumnType::String),
         };
         let resp = call(
-            config.nodes[leader].client,
+            // ADR 0047: `ProposeSchema` is intra-only.
+            config.nodes[leader].intra,
             ClientRequest::ProposeSchema(create.clone()),
         )
         .await;
@@ -319,7 +320,8 @@ async fn schema_ddl_via_control_node_commits_and_relays() {
         timeout(Duration::from_secs(20), async {
             loop {
                 let _ = call(
-                    config.nodes[follower].client,
+                    // ADR 0047: `ProposeSchema` is intra-only.
+                    config.nodes[follower].intra,
                     ClientRequest::ProposeSchema(create2.clone()),
                 )
                 .await;
@@ -525,7 +527,8 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
         timeout(Duration::from_secs(20), async {
             loop {
                 let _ = call(
-                    data_node.client_addr(),
+                    // ADR 0047: `ProposeSchema` is intra-only.
+                    data_node.intra_addr(),
                     ClientRequest::ProposeSchema(create.clone()),
                 )
                 .await;

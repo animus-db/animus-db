@@ -280,7 +280,7 @@ async fn anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
-    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.admin).collect();
 
     put_until_ok(addr0, "txn_spans_a", b"k1", b"seed-lower").await;
@@ -453,7 +453,7 @@ async fn recovery_resolve_correctly_commits_both_tablets_of_a_two_tablet_transac
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
-    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
 
     put_until_ok(addr0, "txn_group_fix", b"k1", b"seed-lower").await;
     put_until_ok(addr0, "txn_group_fix", b"k9", b"seed-upper").await;

@@ -146,7 +146,7 @@ async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
-    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
 
     put_until_ok(addr0, "txn_t5", b"k1", b"seed-lower").await;
     put_until_ok(addr0, "txn_t5", b"k9", b"seed-upper").await;
@@ -246,7 +246,7 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
-    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
 
     put_until_ok(addr0, "txn_t6", b"k1", b"seed-lower").await;
     put_until_ok(addr0, "txn_t6", b"k9", b"seed-upper").await;

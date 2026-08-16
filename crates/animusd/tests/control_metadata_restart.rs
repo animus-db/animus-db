@@ -87,7 +87,10 @@ async fn combined_node_restart_recovers_control_metadata_via_shared_engine() {
 
     // --- First incarnation. ---
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
-    let client = config.nodes[0].client;
+    // ADR 0047: `ProposeSchema` is intra-only now — dial the intra port
+    // (still named `client` here purely to minimize the diff; every call
+    // below is a `ProposeSchema`).
+    let client = config.nodes[0].intra;
     await_bootstrap(&node).await;
     // `bootstrap` already registered this single node's own raftkv id as an
     // `Active` member — proving `members` survives needs no extra proposal.
@@ -235,7 +238,8 @@ async fn ephemeral_control_only_restart_does_not_carry_over_metadata() {
     await_leader_only(&node).await;
     let table = "ephemeral_ctl_t";
     let resp = call(
-        addrs.client,
+        // ADR 0047: `ProposeSchema` is intra-only.
+        addrs.intra,
         ClientRequest::ProposeSchema(MetaCommand::CreateTableSchema {
             table: table.to_string(),
             schema: TableSchema::simple("id", ColumnType::String),
@@ -280,7 +284,8 @@ async fn ephemeral_control_only_restart_does_not_carry_over_metadata() {
     // commits normally.
     let table2 = "ephemeral_ctl_t2";
     let resp = call(
-        addrs.client,
+        // ADR 0047: `ProposeSchema` is intra-only.
+        addrs.intra,
         ClientRequest::ProposeSchema(MetaCommand::CreateTableSchema {
             table: table2.to_string(),
             schema: TableSchema::simple("id", ColumnType::String),

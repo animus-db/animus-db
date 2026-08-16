@@ -1517,6 +1517,92 @@ pub enum ClientRequest {
     },
 }
 
+/// Which listener a connection came in on (ADR 0047). Kept as a distinct
+/// type from [`Surface`] even though both are 2-variant enums over the same
+/// two concepts — see that type's doc for why sharing one enum for both
+/// would make the refusal rule look symmetric when it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerKind {
+    /// The external, DynamoDB/CQL-adjacent client port.
+    Client,
+    /// The cluster-internal RPC port (ADR 0047) — the more-trusted network
+    /// segment; the operator's Kubernetes topology keeps it off any
+    /// externally-reachable Service.
+    Intra,
+}
+
+/// Where a [`ClientRequest`] variant may be received **bare** — a
+/// classification result, not a listener identity (see [`ListenerKind`]'s
+/// doc for why these are two distinct types). [`surface_of`] is the one
+/// exhaustive table computing this; [`handle_request`]'s one guard clause is
+/// the one place it is consulted.
+///
+/// **`Intra` is a superset of `Public`, not a disjoint partition**: nothing
+/// stops the intra listener from also serving a `Public`-surfaced request —
+/// deliberately, since neither port has authentication yet at this
+/// milestone, and intra is meant to be the more, not less, trusted segment.
+/// A future reader should not "fix" this into a second refusal layer without
+/// re-reading ADR 0047's rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    /// Reachable on either listener.
+    Public,
+    /// Reachable **only** on the intra listener — refused bare on `Client`.
+    Intra,
+}
+
+/// The single source of truth for which listener(s) may receive a bare
+/// [`ClientRequest`] variant (ADR 0047). A free function beside
+/// [`request_kind`], same convention: **no wildcard arm**, so adding a
+/// `ClientRequest` variant anywhere is a compile error here until it is
+/// explicitly classified.
+///
+/// Every internal-only forwarding payload is listed explicitly here even
+/// though [`Forwarded`](ClientRequest::Forwarded)'s own `Intra`
+/// classification already makes them transitively unreachable via the
+/// client listener (a bare send of one of them is refused independently of
+/// ever being wrapped) — leaving that implicit would mean "is this variant
+/// reachable on the client port" depends on reasoning about two gates
+/// together instead of this one table being the complete answer on its own.
+///
+/// **Scope note**: this table's exhaustiveness retires the standing "grep
+/// every gating site" lesson (root `CLAUDE.md`) *only* for the
+/// client-vs-intra reachability axis. It does **not** touch
+/// [`is_relayable_command`] (whether a `MetaCommand` may ride the
+/// `ProposeSchema` relay envelope) or [`ClientCtx::cp_serve_forwarded`]'s own
+/// match (whether real handling exists for a forwarded payload) — both stay
+/// exactly as grep-dependent as before; unrelated axes.
+fn surface_of(request: &ClientRequest) -> Surface {
+    match request {
+        ClientRequest::Status
+        | ClientRequest::Put { .. }
+        | ClientRequest::PutBatch { .. }
+        | ClientRequest::Get { .. }
+        | ClientRequest::Scan { .. }
+        | ClientRequest::Delete { .. }
+        | ClientRequest::Txn { .. }
+        | ClientRequest::SplitTablet { .. } => Surface::Public,
+
+        ClientRequest::Forwarded { .. }
+        | ClientRequest::ProposeSchema(_)
+        | ClientRequest::JoinInfo
+        | ClientRequest::WatchMetadata { .. }
+        | ClientRequest::KindWrite { .. }
+        | ClientRequest::KindScan { .. }
+        | ClientRequest::GetSnapshot { .. }
+        | ClientRequest::ForceSeal { .. }
+        | ClientRequest::StreamHotRead { .. }
+        | ClientRequest::ClearBackfillCursor { .. }
+        | ClientRequest::KindWriteItem { .. }
+        | ClientRequest::TxnPrepare { .. }
+        | ClientRequest::TxnDecide { .. }
+        | ClientRequest::TxnResolve { .. }
+        | ClientRequest::TxnStatus { .. }
+        | ClientRequest::TxnRecordView { .. }
+        | ClientRequest::TxnVerify { .. } => Surface::Intra,
+    }
+}
+
 /// Whether `command` may be **relayed to the control leader** via
 /// [`ClientRequest::ProposeSchema`]: the schema-catalog mutations (ADR 0013) that a
 /// wire client drives, plus [`MetaCommand::RegisterCpAddr`] (Phase 2.3a) — a node's
@@ -1659,13 +1745,14 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
 pub enum ClientResponse {
     /// Cached cluster metadata (membership + tablet map), plus (ADR 0035 §1)
     /// the answering node's own best-known control-plane leader —
-    /// `self.control.leader()` + `ClientCtx::route_addr(leader_id)`, the same
-    /// lookup `propose_schema`'s relay tier already does. Serves three ADR
-    /// 0035 PR4 needs from one reply: `ControlHandle::Remote`'s `leader()`/
-    /// `leader_addr_hint()`, `metadata_fresh`'s leader-directed retry target,
-    /// and an efficient `propose_schema` relay (no extra `route_addr` hop).
-    /// `#[serde(default)]` so an older node's reply (predating either field)
-    /// still parses, decoding to `None`/`0`.
+    /// `self.control.leader()` + `ClientCtx::route_addr(leader_id)`. Serves
+    /// two ADR 0035 PR4 needs from one reply: `ControlHandle::Remote`'s
+    /// `leader()`/`leader_addr_hint()`, and `metadata_fresh`'s leader-directed
+    /// retry target. **`propose_schema`'s own relay tier no longer uses this
+    /// field** (ADR 0047) — it uses the parallel `intra_leader_hint` below,
+    /// since its relay target must be the intra address, not this
+    /// client-flavored one. `#[serde(default)]` so an older node's reply
+    /// (predating either field) still parses, decoding to `None`/`0`.
     ///
     /// **`watermark` (ADR 0035 PR5)**: the answering node's own applied-index
     /// watch (`ControlHandle::metadata_watch().latest()`) at reply time — the
@@ -1698,6 +1785,12 @@ pub enum ClientResponse {
         metadata: Metadata,
         #[serde(default)]
         leader_hint: Option<(NodeId, SocketAddr)>,
+        /// The intra-cluster dual of `leader_hint` (ADR 0047) — machine-
+        /// relay-only, never surfaced to a human (see the root `CLAUDE.md`'s
+        /// hint-field-conflation lesson). `#[serde(default)]`, same
+        /// robustness pattern as `leader_hint`.
+        #[serde(default)]
+        intra_leader_hint: Option<(NodeId, SocketAddr)>,
         #[serde(default)]
         watermark: u64,
         #[serde(default)]
@@ -1750,6 +1843,14 @@ pub enum ClientResponse {
         control_ids: Vec<NodeId>,
         peers: BTreeMap<NodeId, SocketAddr>,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        /// The answering node's live intra-cluster routing table (ADR 0047),
+        /// paralleling `client_route` — the joining node seeds its own
+        /// `ctx.intra_route` from this, load-bearing for the exact same
+        /// reason `client_route` is: the growth-node-mirror branch inside
+        /// `BoundNode::start_with_streams` resolves `ctx.intra_addr(id)`
+        /// synchronously, before this node's own `intra_route_sync_loop` has
+        /// had a chance to tick.
+        intra_route: BTreeMap<NodeId, SocketAddr>,
         admin_addrs: Vec<SocketAddr>,
     },
     /// **Incremental long-poll reply to
@@ -1781,6 +1882,10 @@ pub enum ClientResponse {
         writes: Vec<animus_control::mirror::KeyWrite>,
         watermark: u64,
         leader_hint: Option<(NodeId, SocketAddr)>,
+        /// The intra-cluster dual of `leader_hint` (ADR 0047) — see
+        /// `Status`'s own field doc.
+        #[serde(default)]
+        intra_leader_hint: Option<(NodeId, SocketAddr)>,
         control_voters: BTreeSet<NodeId>,
     },
     /// Reply to [`Txn`](ClientRequest::Txn): the transaction committed at
@@ -1965,6 +2070,10 @@ pub(crate) struct AdminInfo {
     /// ADR 0035 PR3).
     pub(crate) cql_addr: Option<SocketAddr>,
     pub(crate) admin_addr: SocketAddr,
+    /// This node's own intra-cluster RPC address (ADR 0047) — used to
+    /// self-skip in `propose_schema`'s broadcast fallback (the intra-flavored
+    /// dual of the old `client_addr` self-skip check).
+    pub(crate) intra_addr: SocketAddr,
     /// This node's own deployment role (ADR 0035; ADR 0040 PR1 — no longer
     /// inferred from `control_id`/`raftkv_id` presence, since there is only
     /// one id now): `"control"`/`"data"`/`"combined"`, stamped literally by
@@ -1997,13 +2106,12 @@ pub(crate) struct AdminInfo {
 /// The common assembly tail shared by every node shape (ADR 0035 PR3):
 /// build the [`ClientCtx`] and spawn the tasks every node needs regardless of
 /// role — control-only ([`BoundControlNode::start_control_with`]), or
-/// combined/data-role ([`BoundNode::start_with`]): `route_sync_loop`,
-/// `metrics_sample_loop`, this node's own one-shot `register_node_addrs`
-/// self-registration, the plain client-request server, and the admin HTTP
-/// endpoint (ADR 0020). Also takes the intra-cluster RPC listener (ADR
-/// 0047): in this PR it is only bound and held open (a placeholder task
-/// keeps its port reserved) — `intra/2-cutover` is what actually spawns
-/// `serve_requests` on it. Returns the built `ClientCtx` — so the caller can
+/// combined/data-role ([`BoundNode::start_with`]): `route_sync_loop`/
+/// `intra_route_sync_loop`, `metrics_sample_loop`, this node's own one-shot
+/// `register_node_addrs` self-registration, **both** client-protocol
+/// listeners (ADR 0047 — `serve_requests` spawned once per `ListenerKind`,
+/// see that function's doc), and the admin HTTP endpoint (ADR 0020).
+/// Returns the built `ClientCtx` — so the caller can
 /// spawn whatever role-specific tasks it still needs (`bootstrap`/
 /// `peer_sync_loop`/the growth-node mirror/`heartbeat_loop`/the tablet-host
 /// reconciler/`auto_split_loop`/the dynamo+cql listeners for a data-capable
@@ -2022,6 +2130,7 @@ fn spawn_common_tail(
     data: Option<DataRole>,
     admin_info: Arc<AdminInfo>,
     client_route: BTreeMap<NodeId, SocketAddr>,
+    intra_route: BTreeMap<NodeId, SocketAddr>,
     self_addrs: (NodeId, NodeAddrs),
     client_listener: TcpListener,
     admin_listener: TcpListener,
@@ -2033,12 +2142,17 @@ fn spawn_common_tail(
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
     // `peer_sync_loop` uses for the raftkv-env peer book.
     let static_route = client_route.clone();
+    // The `intra_route` sibling (ADR 0047) — see `intra_route_sync_loop`'s
+    // doc for why this static seed is load-bearing, not just an
+    // optimization.
+    let static_intra_route = intra_route.clone();
     let ctx = ClientCtx {
         control,
         edge,
         env,
         data,
         client_route: Arc::new(Mutex::new(client_route)),
+        intra_route: Arc::new(Mutex::new(intra_route)),
         admin: admin_info,
         metrics_history: Arc::new(Mutex::new(VecDeque::with_capacity(METRICS_HISTORY_CAP))),
         remote_metadata: Arc::new(Mutex::new(None)),
@@ -2048,11 +2162,19 @@ fn spawn_common_tail(
     let mut tasks = Vec::with_capacity(5);
     // Route-sync loop (ADR 0032 PR1): keep `ctx.client_route` = the static seed
     // above ∪ `Metadata.node_addrs[*].client`, so a node grown in after this
-    // node's own startup still becomes a valid client-op forward target and
-    // `propose_schema`'s relay/broadcast can reach it too. Runs on every node,
+    // node's own startup still becomes a valid client-op forward target
+    // (`propose_schema`'s relay/broadcast reads `ctx.intra_route` instead,
+    // ADR 0047 — see `intra_route_sync_loop` just below). Runs on every node,
     // including a growth node (reads `effective_metadata()`, so it syncs off
     // its own remote mirror) and a control-only node.
     tasks.push(tokio::spawn(route_sync_loop(ctx.clone(), static_route)));
+    // Intra-route sync loop (ADR 0047) — the `route_sync_loop` sibling for
+    // `ctx.intra_route`; see `intra_route_sync_loop`'s own doc for why it
+    // needs no static seed. Runs on every node, same as `route_sync_loop`.
+    tasks.push(tokio::spawn(intra_route_sync_loop(
+        ctx.clone(),
+        static_intra_route,
+    )));
     // Metrics-history sampler (ADR 0020 dashboard sparklines): periodic
     // snapshots of this node's own aggregated counters. Runs on every node —
     // a control-only node's snapshot is just the control sink (`metrics_text`/
@@ -2082,19 +2204,23 @@ fn spawn_common_tail(
             let _ = ctx.register_node(node, addrs, BTreeMap::new()).await;
         }));
     }
-    tasks.push(tokio::spawn(serve_clients(client_listener, ctx.clone())));
+    // The two client-protocol listeners (ADR 0047): one parameterized
+    // `serve_requests` function, not a fork — see that function's doc.
+    // `Client` refuses every `Surface::Intra` request (`handle_request`'s one
+    // guard clause); `Intra` serves everything (a deliberate superset, not a
+    // partition — see `Surface`'s doc).
+    tasks.push(tokio::spawn(serve_requests(
+        client_listener,
+        ctx.clone(),
+        ListenerKind::Client,
+    )));
+    tasks.push(tokio::spawn(serve_requests(
+        intra_listener,
+        ctx.clone(),
+        ListenerKind::Intra,
+    )));
     // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020).
     tasks.push(tokio::spawn(admin::serve(admin_listener, ctx.clone())));
-    // The intra-cluster RPC listener (ADR 0047): bound and held open here so
-    // its port stays reserved for this node's lifetime, but **not yet
-    // served** — nothing dials it, and no `ClientRequest` variant is
-    // reachable through it, until `intra/2-cutover` replaces this
-    // placeholder with a real `serve_requests(.., ListenerKind::Intra)`
-    // spawn. No client-visible behavior change in this PR.
-    tasks.push(tokio::spawn(async move {
-        let _held_open = intra_listener;
-        std::future::pending::<()>().await;
-    }));
 
     (ctx, tasks)
 }
@@ -2156,6 +2282,7 @@ impl BoundNode {
             StorageBackend::default(),
             ClusterEdgeState::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
             None,
             None,
             vec![admin_addr],
@@ -2196,6 +2323,7 @@ impl BoundNode {
         backend: StorageBackend,
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -2208,6 +2336,7 @@ impl BoundNode {
             backend,
             edge,
             client_route,
+            intra_route,
             auto_split_threshold,
             auto_split_bytes_threshold,
             cluster_admin_addrs,
@@ -2245,6 +2374,7 @@ impl BoundNode {
         backend: StorageBackend,
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -2293,6 +2423,7 @@ impl BoundNode {
             dynamo_addr: Some(self.dynamo_addr),
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
+            intra_addr: self.intra_addr,
             role: "combined",
             control_ids: control_ids.clone(),
             peers: static_peers.clone(),
@@ -2390,8 +2521,9 @@ impl BoundNode {
         // `propose_schema` can propose locally when this node happens to be the
         // control leader. When it isn't, `propose_schema` relays
         // `ClientRequest::ProposeSchema` one hop to the leader's node via
-        // `client_route` — the same relay path a follower-connected DDL always
-        // used in one-process-per-node mode (`tests/schema_ddl_relay.rs`); a
+        // `intra_route` (ADR 0047; was `client_route` pre-ADR-0047) — the same
+        // relay path a follower-connected DDL always used in
+        // one-process-per-node mode (`tests/schema_ddl_relay.rs`); a
         // `--cluster N` in-process node now exercises it too instead of always
         // finding the leader's handle locally.
         edge.register_control(raft.clone());
@@ -2415,7 +2547,7 @@ impl BoundNode {
         // split-address relay), not just via a local control-leader handle.
         // `spawn_common_tail` also spawns `route_sync_loop`/`metrics_sample_loop`/
         // this node's own `register_node_addrs` self-registration/
-        // `serve_clients`/`admin::serve` — every task a control-only node needs
+        // `serve_requests` (both listeners)/`admin::serve` — every task a control-only node needs
         // too (see [`BoundControlNode::start_control_with`]); the tasks spawned
         // below this point are combined-mode/data-role-only.
         // This node's stream-shard segment store (ADR 0043 §A7b, round-3
@@ -2442,6 +2574,7 @@ impl BoundNode {
             Some(data_role),
             admin_info,
             client_route,
+            intra_route,
             (
                 my_id.clone(),
                 NodeAddrs {
@@ -2507,7 +2640,7 @@ impl BoundNode {
         // (idempotent). `spawn_common_tail` (above) already started `tasks` with
         // the tail every node shape shares (`route_sync_loop`/
         // `metrics_sample_loop`/this node's own `register_node_addrs`
-        // self-registration/`serve_clients`/`admin::serve`) — everything below is
+        // self-registration/`serve_requests` (both listeners)/`admin::serve`) — everything below is
         // combined-mode/data-role-only, tracked in the same task list so
         // `shutdown` aborts all of it and releases the client/dynamo/cql
         // listener ports (these run on plain `tokio::spawn`, off the `Env`
@@ -2544,15 +2677,16 @@ impl BoundNode {
         // never learned of this node — the control group stays static, ADR
         // 0030's documented v1 limitation). Such a node instead mirrors real
         // cluster state by polling `ClientRequest::Status` from one of the
-        // pre-growth control nodes' client addresses (derived from
-        // `client_route`, which growth's expanded config populates for every
-        // node it lists) into `ctx.remote_metadata`, read via
-        // `effective_metadata()`. A no-op (empty seed list, loop returns
-        // immediately) for every other node.
+        // pre-growth control nodes' **intra** addresses (ADR 0047 — this
+        // node's own `WatchMetadata` long-poll is intra-only; derived from
+        // `intra_route`, which growth's expanded config populates for every
+        // node it lists, mirroring `client_route`) into `ctx.remote_metadata`,
+        // read via `effective_metadata()`. A no-op (empty seed list, loop
+        // returns immediately) for every other node.
         if !control_ids.contains(&self.id) {
             let seeds: Vec<SocketAddr> = control_ids
                 .iter()
-                .filter_map(|id| ctx.route_addr(id.clone()))
+                .filter_map(|id| ctx.intra_addr(id.clone()))
                 .collect();
             tasks.push(tokio::spawn(remote_metadata_sync_loop(ctx.clone(), seeds)));
 
@@ -3143,11 +3277,13 @@ impl BoundControlNode {
     ///
     /// # Errors
     /// Propagates a failure to open the dedicated engine (LSM backend only).
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_control_with(
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
         control_ids: Vec<NodeId>,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
         cluster_admin_addrs: Vec<SocketAddr>,
         backend: StorageBackend,
         orphan_sweep_after: Duration,
@@ -3162,6 +3298,7 @@ impl BoundControlNode {
             dynamo_addr: None,
             cql_addr: None,
             admin_addr: self.admin_addr,
+            intra_addr: self.intra_addr,
             role: "control",
             control_ids: control_ids.clone(),
             peers: peers.clone(),
@@ -3234,6 +3371,7 @@ impl BoundControlNode {
             None,
             admin_info,
             client_route,
+            intra_route,
             (
                 self.id,
                 NodeAddrs {
@@ -3381,8 +3519,8 @@ impl BoundDataNode {
     /// (`bootstrap`, `edge.register_control`) — see that method's doc for
     /// what each shared piece does. `spawn_common_tail` still runs
     /// unconditionally (`route_sync_loop`/`metrics_sample_loop`/this node's
-    /// own `register_node_addrs` self-registration/`serve_clients`/
-    /// `admin::serve`), and this node's own `admin_add_member` self-registers
+    /// own `register_node_addrs` self-registration/`serve_requests` (both
+    /// listeners)/`admin::serve`), and this node's own `admin_add_member` self-registers
     /// its membership exactly like an ADR 0030 growth node's does (relayed —
     /// a data-only node can never satisfy `propose_schema`'s local-leader
     /// branch itself).
@@ -3400,6 +3538,7 @@ impl BoundDataNode {
         backend: StorageBackend,
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -3411,6 +3550,7 @@ impl BoundDataNode {
             backend,
             edge,
             client_route,
+            intra_route,
             auto_split_threshold,
             auto_split_bytes_threshold,
             cluster_admin_addrs,
@@ -3432,6 +3572,7 @@ impl BoundDataNode {
         backend: StorageBackend,
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, SocketAddr>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -3458,6 +3599,7 @@ impl BoundDataNode {
             dynamo_addr: Some(self.dynamo_addr),
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
+            intra_addr: self.intra_addr,
             role: "data",
             control_ids: control_ids.clone(),
             peers: static_peers.clone(),
@@ -3511,6 +3653,7 @@ impl BoundDataNode {
             Some(data_role),
             admin_info,
             client_route,
+            intra_route,
             (
                 my_id.clone(),
                 NodeAddrs {
@@ -3685,7 +3828,8 @@ pub struct ClusterEdgeState {
     /// propose a schema `MetaCommand` **locally** when this node is the
     /// control-plane leader. When it isn't, `propose_schema` relays
     /// [`ClientRequest::ProposeSchema`] one hop to the leader's node via
-    /// `client_route` (ADR 0013) — the same path every follower-connected DDL
+    /// `intra_route` (ADR 0047; ADR 0013 originally routed this via
+    /// `client_route`) — the same path every follower-connected DDL
     /// in a one-process-per-node deployment always used.
     control: Arc<Mutex<Vec<RaftNode<ProdEnv>>>>,
     /// The DynamoDB edge's in-memory GSI declarations + observation-built
@@ -4206,6 +4350,20 @@ pub(crate) struct ClientCtx {
     /// / [`route_snapshot`](Self::route_snapshot), never locked across an
     /// `.await`.
     client_route: Arc<Mutex<BTreeMap<NodeId, SocketAddr>>>,
+    /// **Intra-cluster routing table (ADR 0047)** — the exact `client_route`
+    /// shape above, mirrored for the intra port: each CP group member id →
+    /// the **intra** address of its hosting node. Kept live by
+    /// [`intra_route_sync_loop`] (overlaying `Metadata.node_addrs[*].intra`
+    /// on a static seed, exactly like `route_sync_loop` does for
+    /// `client_route`). Every machine-relay consumer that used to read
+    /// `client_route`/`route_addr`/`route_snapshot` for a node-to-node hop —
+    /// `cp_leader_hint`, `other_tablet_replica_addr`, `propose_schema`'s
+    /// relay/broadcast tiers — reads this instead via
+    /// [`intra_addr`](Self::intra_addr)/[`intra_route_snapshot`](Self::intra_route_snapshot).
+    /// Human-facing consumers (`not_leader_error`, the admin dashboard's
+    /// `leader_hint` display) keep reading `client_route`/`leader_addr_hint`
+    /// unchanged — see the root `CLAUDE.md`'s hint-field-conflation lesson.
+    intra_route: Arc<Mutex<BTreeMap<NodeId, SocketAddr>>>,
     /// This node's identity + bound addresses for the admin `/admin/config` view
     /// (ADR 0020). `Arc` so cloning the ctx onto each connection is cheap.
     admin: Arc<AdminInfo>,
@@ -4372,6 +4530,12 @@ impl ClientCtx {
             () = tokio::time::sleep(WATCH_METADATA_SERVER_TIMEOUT) => {}
         }
         let leader_hint = self.control_leader_hint();
+        // Intra-cluster dual (ADR 0047) — the same `self.control.leader()`
+        // id, resolved through `intra_addr` instead of `route_addr`. This is
+        // the field `remote_metadata_watch_loop`'s own dial candidates read
+        // (via `RemoteControlClient::intra_leader_addr_hint`), never the
+        // human-facing `leader_hint` above.
+        let intra_leader_hint = self.intra_control_leader_hint();
         let control_voters = self.control.config().unwrap_or_default();
         let growth_mirror_active = self
             .remote_metadata
@@ -4383,12 +4547,14 @@ impl ClientCtx {
                 writes: reply.writes,
                 watermark: reply.watermark,
                 leader_hint,
+                intra_leader_hint,
                 control_voters,
             };
         }
         ClientResponse::Status {
             metadata: self.effective_metadata(),
             leader_hint,
+            intra_leader_hint,
             watermark: watch.latest(),
             control_voters,
         }
@@ -4427,6 +4593,44 @@ impl ClientCtx {
     fn control_leader_hint(&self) -> Option<(NodeId, SocketAddr)> {
         let id = self.control.leader()?;
         let addr = self.route_addr(id.clone())?;
+        Some((id, addr))
+    }
+
+    /// The intra-cluster RPC address `id` currently routes to (ADR 0047) — the
+    /// [`route_addr`](Self::route_addr) sibling for machine-to-machine hops:
+    /// `cp_leader_hint`/`other_tablet_replica_addr`/`propose_schema`'s relay
+    /// all resolve a forwarding target through this, never through
+    /// `route_addr`, since the receiving end (`cp_serve_forwarded`, the
+    /// relayed `ProposeSchema`) is only ever reachable on the intra listener.
+    /// Kept fresh by [`intra_route_sync_loop`].
+    fn intra_addr(&self, id: NodeId) -> Option<SocketAddr> {
+        self.intra_route
+            .lock()
+            .expect("intra route poisoned")
+            .get(&id)
+            .copied()
+    }
+
+    /// The [`route_snapshot`](Self::route_snapshot) sibling for the intra
+    /// routing table (ADR 0047).
+    fn intra_route_snapshot(&self) -> BTreeMap<NodeId, SocketAddr> {
+        self.intra_route
+            .lock()
+            .expect("intra route poisoned")
+            .clone()
+    }
+
+    /// This node's own best-known control-plane leader, as `(id, intra
+    /// address)` (ADR 0047) — the [`control_leader_hint`](Self::control_leader_hint)
+    /// sibling that feeds `intra_leader_hint` on `ClientResponse::Status`/
+    /// `MetadataDelta`, and `remote_metadata_watch_loop`'s own dial
+    /// candidates via `RemoteControlClient::intra_leader_addr_hint`. Machine-
+    /// relay-only — never surfaced to a human (see the root `CLAUDE.md`'s
+    /// hint-field-conflation lesson: anything a human reads keeps using
+    /// `control_leader_hint`/`leader_hint`).
+    fn intra_control_leader_hint(&self) -> Option<(NodeId, SocketAddr)> {
+        let id = self.control.leader()?;
+        let addr = self.intra_addr(id.clone())?;
         Some((id, addr))
     }
 
@@ -4562,7 +4766,10 @@ impl ClientCtx {
                 .data
                 .as_ref()
                 .is_some_and(|data| replicas.is_some_and(|r| r.contains(&data.base_id)));
-            let route = self.route_snapshot();
+            // Intra-flavored (ADR 0047): this is a forwarding target — the
+            // receiving node's `cp_serve_forwarded` is only reachable on the
+            // intra listener.
+            let route = self.intra_route_snapshot();
             let fallback = replicas
                 .into_iter()
                 .flatten()
@@ -7190,14 +7397,16 @@ impl ClientCtx {
     /// exactly the hint a forwarder chasing a wrong first guess needs.
     fn cp_leader_hint(&self, tablet: TabletId) -> Option<(NodeId, SocketAddr)> {
         // Since ADR 0026 Stage B a tablet's CP group member id **is** simply the
-        // base `raftkv` id, so the local replica's leader hint is already a
-        // `client_route` key — no more base<->member translation needed.
+        // base `raftkv` id, so the local replica's leader hint is already an
+        // `intra_route` key — no more base<->member translation needed.
+        // Intra-flavored (ADR 0047): the receiving end of a forward
+        // (`cp_serve_forwarded`) is only ever reachable on the intra port.
         let leader = self.edge.local_cp(tablet).and_then(|n| n.leader())?;
-        let addr = self.route_addr(leader.clone())?;
+        let addr = self.intra_addr(leader.clone())?;
         Some((leader, addr))
     }
 
-    /// The client-API address to forward a `tablet` op to — see
+    /// The intra-cluster address to forward a `tablet` op to — see
     /// [`cp_leader_hint`](Self::cp_leader_hint) (the caller waits rather than
     /// guessing when there is no hint yet, so it never forwards a CP op to a
     /// non-leader, including itself).
@@ -7229,7 +7438,9 @@ impl ClientCtx {
     ) -> Option<SocketAddr> {
         let meta = self.effective_metadata();
         let replicas = meta.tablets.get(&tablet)?.replicas.clone();
-        let route = self.route_snapshot();
+        // Intra-flavored (ADR 0047): this is a forwarding fallback, same as
+        // `cp_leader_hint` above.
+        let route = self.intra_route_snapshot();
         replicas
             .into_iter()
             .find_map(|id| route.get(&id).copied().filter(|a| !tried.contains(a)))
@@ -7368,16 +7579,18 @@ impl ClientCtx {
                 ProposeResult::Accepted { .. }
             );
         }
-        // Prefer the control handle's own leader-address hint (ADR 0035 PR4:
-        // populated directly from `Status` replies for a `Remote` data node,
-        // see `ControlHandle::leader_addr_hint`'s doc) over a `route_addr`
-        // lookup — the hint is strictly fresher for a data-only node, since
-        // it rides the very `Status` reply that filled the mirror, whereas
-        // `route_addr` needs this leader's address to have separately synced
-        // into the replicated node-address book. A no-op for `Local` (always
-        // `None`), so this changes nothing for any node shape that existed
-        // before this PR.
-        if let Some(addr) = self.control.leader_addr_hint() {
+        // Prefer the control handle's own **intra** leader-address hint (ADR
+        // 0047; ADR 0035 PR4's original `leader_addr_hint` populated directly
+        // from `Status` replies for a `Remote` data node) over an
+        // `intra_addr` lookup — the hint is strictly fresher for a data-only
+        // node, since it rides the very `Status` reply that filled the
+        // mirror, whereas `intra_addr` needs this leader's address to have
+        // separately synced into the replicated node-address book. This is a
+        // machine-to-machine relay, so it uses the intra hint/route, never
+        // the human-facing `leader_addr_hint`/`route_addr` (see the root
+        // `CLAUDE.md`'s hint-field-conflation lesson). A no-op for `Local`
+        // (always `None`).
+        if let Some(addr) = self.control.intra_leader_addr_hint() {
             return !matches!(
                 self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
                     .await,
@@ -7385,7 +7598,7 @@ impl ClientCtx {
             );
         }
         if let Some(leader_id) = self.control.leader()
-            && let Some(addr) = self.route_addr(leader_id)
+            && let Some(addr) = self.intra_addr(leader_id)
         {
             return !matches!(
                 self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
@@ -7400,15 +7613,15 @@ impl ClientCtx {
         // traffic for a group it was never a voter of — for it, this is the
         // *only* path that can ever reach the real cluster (its own local
         // `propose` always fails, and it has no leader hint to relay a single
-        // hop to). Broadcast to every other known client-API address instead:
+        // hop to). Broadcast to every other known **intra** address instead:
         // a real control-group member among them resolves the actual leader
         // itself (one more hop — `ProposeSchema`'s handler is a single,
         // bounded relay, never a chain). Returns true on the first address that
         // connects, regardless of what its own `propose_schema` achieves
         // (best-effort, same as every other branch here — the caller confirms
         // via replicated `Metadata`, not this return value).
-        for addr in self.route_snapshot().into_values() {
-            if addr == self.admin.client_addr {
+        for addr in self.intra_route_snapshot().into_values() {
+            if addr == self.admin.intra_addr {
                 continue;
             }
             if !matches!(
@@ -8690,8 +8903,9 @@ async fn peer_sync_loop(ctx: ClientCtx, env: ProdEnv, static_peers: BTreeMap<Nod
 /// Keep `ctx.client_route` = the **static** seed (this node's own config-time
 /// route table) ∪ the replicated `Metadata.node_addrs[*].client` (ADR 0032 PR1),
 /// so a node grown in after this node's own startup becomes a valid forward
-/// target for a client op / `propose_schema` relay — closing the ADR 0030
-/// residual gap where `client_route` was a process-start-only snapshot. Sibling
+/// target for a client op (`propose_schema`'s own relay reads `intra_route`
+/// instead, ADR 0047) — closing the ADR 0030 residual gap where `client_route`
+/// was a process-start-only snapshot. Sibling
 /// of [`peer_sync_loop`] in every respect: same [`PEER_SYNC_INTERVAL`] cadence,
 /// same static-base-∪-replicated-overlay shape, reads
 /// [`ClientCtx::effective_metadata`] so a control-plane-follower-less growth
@@ -8707,6 +8921,33 @@ async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAd
             }
         }
         *ctx.client_route.lock().expect("client route poisoned") = book;
+        tokio::time::sleep(PEER_SYNC_INTERVAL).await;
+    }
+}
+
+/// The [`route_sync_loop`] sibling for `ctx.intra_route` (ADR 0047): keeps it
+/// = the static seed (this node's own config/discovery-time knowledge of
+/// every peer's intra address, exactly mirroring `client_route`'s own static
+/// seed) ∪ the replicated `Metadata.node_addrs[*].intra`, same cadence/
+/// shape/`effective_metadata` sourcing as `route_sync_loop`. A real static
+/// seed (not an empty one) is load-bearing here, not just an optimization:
+/// unlike `client_route`'s consumers, `cp_leader_hint`/`propose_schema`'s
+/// relay and (critically) the **growth-node mirror's own seed-building**
+/// (`start_with_streams`'s `ctx.intra_addr(id)` call, feeding
+/// `remote_metadata_sync_loop`) run synchronously at ctx-construction time,
+/// before this loop's first tick — an empty seed there would make a growth
+/// node's very first mirror-poll attempt see zero addresses and never
+/// recover (this loop's *next* tick can't help, since `remote_metadata_sync_
+/// loop` captures its `seeds` argument once, at spawn time).
+async fn intra_route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAddr>) {
+    loop {
+        let mut book = static_route.clone();
+        for (id, addrs) in ctx.effective_metadata().node_addrs {
+            if let Ok(sa) = addrs.intra.parse::<SocketAddr>() {
+                book.insert(id, sa);
+            }
+        }
+        *ctx.intra_route.lock().expect("intra route poisoned") = book;
         tokio::time::sleep(PEER_SYNC_INTERVAL).await;
     }
 }
@@ -8837,7 +9078,12 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
     loop {
         let last_seen = remote.metadata_watch().latest();
         let mut candidates = Vec::with_capacity(seeds.len() + 1);
-        if let Some(addr) = remote.leader_addr_hint() {
+        // Intra-flavored (ADR 0047): `WatchMetadata` is intra-only, so the
+        // dial candidates must be intra addresses, never the human-facing
+        // `leader_addr_hint`/`seeds` this loop used before the port split
+        // (`seeds` itself is now intra-flavored too — see
+        // `RemoteControlClient.seeds`'s doc).
+        if let Some(addr) = remote.intra_leader_addr_hint() {
             candidates.push(addr);
         }
         candidates.extend(seeds.iter().copied());
@@ -8854,10 +9100,17 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
                 ClientResponse::Status {
                     metadata,
                     leader_hint,
+                    intra_leader_hint,
                     watermark,
                     control_voters,
                 } => {
-                    remote.observe(metadata, leader_hint, watermark, control_voters);
+                    remote.observe(
+                        metadata,
+                        leader_hint,
+                        intra_leader_hint,
+                        watermark,
+                        control_voters,
+                    );
                     synced = true;
                     break;
                 }
@@ -8869,12 +9122,14 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
                     writes,
                     watermark,
                     leader_hint,
+                    intra_leader_hint,
                     control_voters,
                 } => {
                     remote.observe_delta(
                         last_seen,
                         &writes,
                         leader_hint,
+                        intra_leader_hint,
                         watermark,
                         control_voters,
                     );
@@ -8901,11 +9156,18 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
             if let ClientResponse::Status {
                 metadata,
                 leader_hint,
+                intra_leader_hint,
                 watermark,
                 control_voters,
             } = relay_request(addr, &ClientRequest::Status).await
             {
-                remote.observe(metadata, leader_hint, watermark, control_voters);
+                remote.observe(
+                    metadata,
+                    leader_hint,
+                    intra_leader_hint,
+                    watermark,
+                    control_voters,
+                );
                 break;
             }
         }
@@ -9490,26 +9752,37 @@ fn byte_weighted_median(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     pairs[best_idx].0.clone()
 }
 
-async fn serve_clients(listener: TcpListener, ctx: ClientCtx) {
+/// Accept loop shared by **both** listeners (ADR 0047) — the client port and
+/// the intra-cluster port alike — parameterized by [`ListenerKind`] rather
+/// than forked: `spawn_common_tail` spawns two instantiations of this same
+/// function, one per listener, and threads `listener` straight through
+/// [`handle_connection`] into [`handle_request`]'s one guard clause. Replaces
+/// the pre-ADR-0047 `serve_clients`/`handle_client` pair, which only ever
+/// served the client port.
+async fn serve_requests(listener_socket: TcpListener, ctx: ClientCtx, listener: ListenerKind) {
     loop {
-        match listener.accept().await {
+        match listener_socket.accept().await {
             Ok((stream, _addr)) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_client(stream, ctx).await {
-                        tracing::debug!(?err, "client connection closed");
+                    if let Err(err) = handle_connection(stream, ctx, listener).await {
+                        tracing::debug!(?err, "connection closed");
                     }
                 });
             }
             Err(err) => {
-                tracing::warn!(?err, "client accept failed");
+                tracing::warn!(?err, "accept failed");
                 return;
             }
         }
     }
 }
 
-async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<()> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    ctx: ClientCtx,
+    listener: ListenerKind,
+) -> std::io::Result<()> {
     while let Some(request) = read_frame::<ClientRequest>(&mut stream).await? {
         // Every accepted request is a root span (ADR 0027): this is what gives
         // `otel::current_traceparent()` something to inject if the request's
@@ -9524,7 +9797,9 @@ async fn handle_client(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result
         {
             otel::set_parent_traceparent(&span, tp);
         }
-        let response = handle_request(&ctx, request).instrument(span).await;
+        let response = handle_request(&ctx, request, listener)
+            .instrument(span)
+            .await;
         write_frame(&mut stream, &response).await?;
     }
     Ok(())
@@ -9562,7 +9837,23 @@ fn request_kind(request: &ClientRequest) -> &'static str {
     }
 }
 
-async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientResponse {
+async fn handle_request(
+    ctx: &ClientCtx,
+    request: ClientRequest,
+    listener: ListenerKind,
+) -> ClientResponse {
+    // The one asymmetric refusal rule (ADR 0047): only a `Client`-listener
+    // connection asking for an `Intra`-surfaced variant is refused — the
+    // reverse (an `Intra` listener serving a `Public` variant) is fine by
+    // design, since intra is the more-trusted segment and neither port has
+    // auth yet (see `Surface`'s doc). Everything below this guard is the
+    // pre-ADR-0047 match, untouched.
+    if listener == ListenerKind::Client && surface_of(&request) == Surface::Intra {
+        return ClientResponse::Error(format!(
+            "{} is a cluster-internal request; send it to this node's intra port",
+            request_kind(&request)
+        ));
+    }
     match request {
         // `effective_metadata`, not `ctx.control.metadata_cached()` directly (mirroring
         // `/admin/status`, ADR 0030): on a control-plane-follower-less growth
@@ -9576,6 +9867,7 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         ClientRequest::Status => ClientResponse::Status {
             metadata: ctx.effective_metadata(),
             leader_hint: ctx.control_leader_hint(),
+            intra_leader_hint: ctx.intra_control_leader_hint(),
             watermark: ctx.control.metadata_watch().latest(),
             control_voters: ctx.control.config().unwrap_or_default(),
         },
@@ -9609,7 +9901,7 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
         }
         // A CP op forwarded from another node (cross-process routing, ADR 0017
         // #3b): serve locally iff we are the leader; never re-forward. The
-        // enclosing `client_request` span (in `handle_client`) was already
+        // enclosing `client_request` span (in `handle_connection`) was already
         // re-parented onto the originating node's trace (ADR 0027) before this
         // request reached here.
         ClientRequest::Forwarded { request, .. } => ctx.cp_serve_forwarded(*request).await,
@@ -9634,6 +9926,7 @@ async fn handle_request(ctx: &ClientCtx, request: ClientRequest) -> ClientRespon
             control_ids: ctx.admin.control_ids.clone(),
             peers: ctx.admin.peers.clone(),
             client_route: ctx.route_snapshot(),
+            intra_route: ctx.intra_route_snapshot(),
             admin_addrs: ctx.admin.admin_addrs.clone(),
         },
         // Long-poll metadata watch (ADR 0035 PR5) — see `ClientCtx::
@@ -10723,6 +11016,12 @@ async fn start_cluster_inner(
         .iter()
         .map(|b| (b.id.clone(), b.client_addr))
         .collect();
+    // The `intra_route` sibling (ADR 0047) — identical static-seed shape,
+    // sourced from each bound node's intra address instead of its client one.
+    let intra_route: BTreeMap<NodeId, SocketAddr> = bound
+        .iter()
+        .map(|b| (b.id.clone(), b.intra_addr()))
+        .collect();
     // Every node's admin address, so each node's dashboard (ADR 0021) can fan out
     // to the whole in-process cluster.
     let admin_addrs: Vec<SocketAddr> = bound.iter().map(BoundNode::admin_addr).collect();
@@ -10739,6 +11038,7 @@ async fn start_cluster_inner(
                 // comment above).
                 ClusterEdgeState::new(),
                 client_route.clone(),
+                intra_route.clone(),
                 auto_split_threshold,
                 auto_split_bytes_threshold,
                 admin_addrs.clone(),
@@ -10885,10 +11185,21 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
         client_route.insert(b.id.clone(), b.client_addr);
     }
 
-    // The control deployment's client addresses — the discovery root each
-    // data node's `ControlHandle::Remote` mirrors from.
-    let control_client_addrs: Vec<SocketAddr> =
-        control_bound.iter().map(|b| b.client_addr).collect();
+    // The `intra_route` sibling (ADR 0047) — identical shape, `.intra_addr`
+    // instead of `.client_addr`.
+    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for b in &control_bound {
+        intra_route.insert(b.id.clone(), b.intra_addr);
+    }
+    for b in &data_bound {
+        intra_route.insert(b.id.clone(), b.intra_addr);
+    }
+
+    // The control deployment's **intra** addresses (ADR 0047) — the
+    // discovery root each data node's `ControlHandle::Remote` mirrors from
+    // (`WatchMetadata` is intra-only, so this must not be the client
+    // address).
+    let control_intra_addrs: Vec<SocketAddr> = control_bound.iter().map(|b| b.intra_addr).collect();
 
     // Every node's admin address, so each node's dashboard (ADR 0021) fans
     // out to the whole split deployment.
@@ -10905,6 +11216,7 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
                 control_peer_book.clone(),
                 control_ids.clone(),
                 client_route.clone(),
+                intra_route.clone(),
                 admin_addrs.clone(),
                 backend,
                 orphan_sweep_after,
@@ -10917,12 +11229,13 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
             b.start_data_with(
                 data_env_peers.clone(),
                 control_ids.clone(),
-                control_client_addrs.clone(),
+                control_intra_addrs.clone(),
                 backend,
                 // A fresh, node-local edge-state set per node — never shared
                 // (see the doc comment above).
                 ClusterEdgeState::new(),
                 client_route.clone(),
+                intra_route.clone(),
                 auto_split_threshold,
                 auto_split_bytes_threshold,
                 admin_addrs.clone(),
@@ -11024,6 +11337,12 @@ pub async fn run_node_with_streams(
     for (i, addrs) in config.nodes.iter().enumerate() {
         client_route.insert(config::node_id(i), addrs.client);
     }
+    // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
+    // instead of `.client`.
+    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for (i, addrs) in config.nodes.iter().enumerate() {
+        intra_route.insert(config::node_id(i), addrs.intra);
+    }
     // Every node's admin address from the shared config, so this node's dashboard
     // (ADR 0021) can fan out to the whole cluster.
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
@@ -11035,6 +11354,7 @@ pub async fn run_node_with_streams(
             backend,
             ClusterEdgeState::new(),
             client_route,
+            intra_route,
             None,
             None,
             admin_addrs,
@@ -11051,7 +11371,7 @@ pub async fn run_node_with_streams(
 /// plus the client + admin listeners, and runs only the control [`RaftNode`]
 /// (its own `reconcile_loop`/`detect_loop`) plus the tail every node shape
 /// shares (`route_sync_loop`/`metrics_sample_loop`/self-registration/
-/// `serve_clients`/admin `serve`, via
+/// `serve_requests` (both listeners)/admin `serve`, via
 /// [`BoundControlNode::start_control_with`]) — no CP data storage engine, no
 /// `raftkv` env, no DynamoDB/CQL listeners. `backend` (ADR 0038) selects the
 /// **dedicated** system-keyspace engine this control-only node provisions
@@ -11120,6 +11440,12 @@ pub async fn run_node_control_with_orphan_sweep_after(
     for (i, a) in config.nodes.iter().enumerate() {
         client_route.insert(config::node_id(i), a.client);
     }
+    // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
+    // instead of `.client`.
+    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for (i, a) in config.nodes.iter().enumerate() {
+        intra_route.insert(config::node_id(i), a.intra);
+    }
     // Every node's admin address from the shared config, so this node's
     // dashboard (ADR 0021) can fan out to the whole cluster (control and data
     // nodes alike).
@@ -11130,6 +11456,7 @@ pub async fn run_node_control_with_orphan_sweep_after(
             config.peer_book(),
             config.control_ids(),
             client_route,
+            intra_route,
             admin_addrs,
             backend,
             orphan_sweep_after,
@@ -11147,9 +11474,10 @@ pub async fn run_node_control_with_orphan_sweep_after(
 /// `config`'s data-role entries (`ClusterConfig::data_indexes`) are this
 /// node's data fleet — `index` must be one of them. `config`'s control-role
 /// entries (`ClusterConfig::control_ids`) are the **separately-deployed**
-/// control plane this node mirrors: their **client** addresses seed the
-/// mirror + leader-hint sync loop and `propose_schema`'s relay/broadcast
-/// tiers (ADR 0035 §1/§4), and their **control** ids are what this node's own
+/// control plane this node mirrors: their **intra** addresses (ADR 0047; was
+/// **client** pre-ADR-0047) seed the mirror + leader-hint sync loop and
+/// `propose_schema`'s relay/broadcast tiers (ADR 0035 §1/§4), and their
+/// **control** ids are what this node's own
 /// `heartbeat_loop` targets (unchanged ADR 0012 failure-detection semantics —
 /// see `ClusterConfig::control_peer_book`'s doc for why this node's `raftkv`
 /// env peer book must union both address books, not `raftkv_peer_book()`
@@ -11183,14 +11511,15 @@ pub async fn run_node_data(
     }
     let bound = Node::bind_data(config::node_id(index), addrs, dir).await?;
 
-    // The control deployment's **client**-API addresses — the mirror/
-    // leader-hint discovery root (ADR 0035 §1/§4), a wholly different address
-    // axis from the internal env peer book below.
-    let control_client_addrs: Vec<SocketAddr> = config
+    // The control deployment's **intra**-cluster addresses (ADR 0047) — the
+    // mirror/leader-hint discovery root (ADR 0035 §1/§4; `WatchMetadata` is
+    // intra-only, so this must be the intra address, not the client one), a
+    // wholly different address axis from the internal env peer book below.
+    let control_intra_addrs: Vec<SocketAddr> = config
         .nodes
         .iter()
         .filter(|a| a.role.has_control())
-        .map(|a| a.client)
+        .map(|a| a.intra)
         .collect();
 
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
@@ -11198,6 +11527,12 @@ pub async fn run_node_data(
     let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
     for (i, a) in config.nodes.iter().enumerate() {
         client_route.insert(config::node_id(i), a.client);
+    }
+    // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
+    // instead of `.client`.
+    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for (i, a) in config.nodes.iter().enumerate() {
+        intra_route.insert(config::node_id(i), a.intra);
     }
     // Every node's admin address from the shared config, so this node's
     // dashboard fan-out (ADR 0021) covers the whole split deployment.
@@ -11210,10 +11545,11 @@ pub async fn run_node_data(
             // below sends to `control_ids` over this very env.
             config.peer_book(),
             control_ids,
-            control_client_addrs,
+            control_intra_addrs,
             backend,
             ClusterEdgeState::new(),
             client_route,
+            intra_route,
             None,
             None,
             admin_addrs,
@@ -11270,6 +11606,14 @@ pub async fn run_node_growth(
     for (i, addrs) in config.nodes.iter().enumerate() {
         client_route.insert(config::node_id(i), addrs.client);
     }
+    // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
+    // instead of `.client`; this is what makes the growth-node mirror's own
+    // seed-building (`start_with_streams`'s `ctx.intra_addr(id)` call) resolve
+    // correctly from this node's very first tick.
+    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    for (i, addrs) in config.nodes.iter().enumerate() {
+        intra_route.insert(config::node_id(i), addrs.intra);
+    }
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
     // `bootstrap` must never auto-register this growth node itself (it
     // self-registers `Down` via `admin_add_member` instead, see this fn's
@@ -11286,6 +11630,7 @@ pub async fn run_node_growth(
             backend,
             ClusterEdgeState::new(),
             client_route,
+            intra_route,
             None,
             None,
             admin_addrs,
@@ -11409,7 +11754,7 @@ pub async fn run_node_join(
             "join needs at least one --seed address",
         ));
     }
-    let (original_control_ids, peers, client_route, admin_addrs) =
+    let (original_control_ids, peers, client_route, intra_route, admin_addrs) =
         discover_join_info(&seeds).await?;
 
     let mine = NodeAddrs {
@@ -11422,6 +11767,7 @@ pub async fn run_node_join(
     let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
     let my_client_addr = addrs.client;
     let my_admin_addr = addrs.admin;
+    let my_intra_addr = addrs.intra;
 
     let bound = Node::bind(my_id.clone(), addrs, dir).await?;
 
@@ -11430,9 +11776,11 @@ pub async fn run_node_join(
         my_id,
         my_client_addr,
         my_admin_addr,
+        my_intra_addr,
         original_control_ids,
         peers,
         client_route,
+        intra_route,
         admin_addrs,
         backend,
     )
@@ -11457,16 +11805,21 @@ async fn finish_combined_join(
     my_id: NodeId,
     my_client_addr: SocketAddr,
     my_admin_addr: SocketAddr,
+    my_intra_addr: SocketAddr,
     original_control_ids: Vec<NodeId>,
     mut peers: BTreeMap<NodeId, SocketAddr>,
     mut client_route: BTreeMap<NodeId, SocketAddr>,
+    mut intra_route: BTreeMap<NodeId, SocketAddr>,
     mut admin_addrs: Vec<SocketAddr>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
     for (id, addr) in bound.peer_entries() {
         peers.insert(id, addr);
     }
-    client_route.insert(my_id, my_client_addr);
+    client_route.insert(my_id.clone(), my_client_addr);
+    // The `intra_route` sibling (ADR 0047) — see `ClientResponse::JoinInfo`'s
+    // own field doc for why this must be a real, discovered seed, not empty.
+    intra_route.insert(my_id, my_intra_addr);
     if !admin_addrs.contains(&my_admin_addr) {
         admin_addrs.push(my_admin_addr);
     }
@@ -11480,6 +11833,7 @@ async fn finish_combined_join(
             backend,
             ClusterEdgeState::new(),
             client_route,
+            intra_route,
             None,
             None,
             admin_addrs,
@@ -11499,6 +11853,7 @@ async fn discover_join_info(
     Vec<NodeId>,
     BTreeMap<NodeId, SocketAddr>,
     BTreeMap<NodeId, SocketAddr>,
+    BTreeMap<NodeId, SocketAddr>,
     Vec<SocketAddr>,
 )> {
     match poll_seeds_for(seeds, &ClientRequest::JoinInfo, JOIN_DISCOVERY_BUDGET).await? {
@@ -11506,8 +11861,9 @@ async fn discover_join_info(
             control_ids,
             peers,
             client_route,
+            intra_route,
             admin_addrs,
-        } => Ok((control_ids, peers, client_route, admin_addrs)),
+        } => Ok((control_ids, peers, client_route, intra_route, admin_addrs)),
         other => Err(std::io::Error::other(format!(
             "seed returned an unexpected reply to JoinInfo: {other:?}"
         ))),
@@ -11649,7 +12005,7 @@ pub async fn run_node_data_join(
             "join needs at least one --seed address",
         ));
     }
-    let (original_control_ids, peers, client_route, admin_addrs) =
+    let (original_control_ids, peers, client_route, intra_route, admin_addrs) =
         discover_join_info(&seeds).await?;
 
     let mine = NodeAddrs {
@@ -11662,6 +12018,7 @@ pub async fn run_node_data_join(
     let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
     let my_client_addr = addrs.client;
     let my_admin_addr = addrs.admin;
+    let my_intra_addr = addrs.intra;
 
     let bound = Node::bind_data(my_id.clone(), addrs, dir).await?;
 
@@ -11670,9 +12027,11 @@ pub async fn run_node_data_join(
         my_id,
         my_client_addr,
         my_admin_addr,
+        my_intra_addr,
         original_control_ids,
         peers,
         client_route,
+        intra_route,
         admin_addrs,
         backend,
     )
@@ -11688,9 +12047,11 @@ async fn finish_data_join(
     my_id: NodeId,
     my_client_addr: SocketAddr,
     my_admin_addr: SocketAddr,
+    my_intra_addr: SocketAddr,
     original_control_ids: Vec<NodeId>,
     mut peers: BTreeMap<NodeId, SocketAddr>,
     mut client_route: BTreeMap<NodeId, SocketAddr>,
+    mut intra_route: BTreeMap<NodeId, SocketAddr>,
     mut admin_addrs: Vec<SocketAddr>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
@@ -11698,17 +12059,21 @@ async fn finish_data_join(
     // peer entry, no control id of its own to add).
     let (peer_id, peer_addr) = bound.peer_entry();
     peers.insert(peer_id, peer_addr);
-    client_route.insert(my_id, my_client_addr);
+    client_route.insert(my_id.clone(), my_client_addr);
+    // The `intra_route` sibling (ADR 0047) — see `finish_combined_join`'s
+    // identical treatment.
+    intra_route.insert(my_id, my_intra_addr);
     if !admin_addrs.contains(&my_admin_addr) {
         admin_addrs.push(my_admin_addr);
     }
 
-    // The control deployment's client-API addresses (ADR 0035 §1/§4) — the
-    // same derivation `run_node_data` does from a static `ClusterConfig`,
-    // here from the merged, discovery-built `client_route` instead.
+    // The control deployment's **intra** addresses (ADR 0047; `WatchMetadata`
+    // is intra-only) — the same derivation `run_node_data` does from a static
+    // `ClusterConfig`, here from the merged, discovery-built `intra_route`
+    // instead.
     let control_seeds: Vec<SocketAddr> = original_control_ids
         .iter()
-        .filter_map(|id| client_route.get(id).copied())
+        .filter_map(|id| intra_route.get(id).copied())
         .collect();
 
     bound
@@ -11719,6 +12084,7 @@ async fn finish_data_join(
             backend,
             ClusterEdgeState::new(),
             client_route,
+            intra_route,
             None,
             None,
             admin_addrs,
@@ -12221,6 +12587,7 @@ mod status_wire_compat_tests {
         let reply = ClientResponse::Status {
             metadata: Default::default(),
             leader_hint: None,
+            intra_leader_hint: None,
             watermark: 7,
             control_voters: [0, 1, 2].into_iter().map(nid).collect(),
         };

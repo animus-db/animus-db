@@ -185,7 +185,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
     let node = start(addrs.clone(), &node_dir).await;
     await_leader(&node).await;
     for id in 0..3 {
-        propose_and_await(&node, addrs.client, upsert(nid(id), NodeStatus::Down)).await;
+        propose_and_await(&node, addrs.intra, upsert(nid(id), NodeStatus::Down)).await;
     }
     // Let the apply task catch up before shutting down.
     sleep(Duration::from_millis(500)).await;
@@ -217,7 +217,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
     .expect("restarted node did not recover its pre-restart members in 10s");
 
     for id in 3..6 {
-        propose_and_await(&node, addrs.client, upsert(nid(id), NodeStatus::Down)).await;
+        propose_and_await(&node, addrs.intra, upsert(nid(id), NodeStatus::Down)).await;
     }
     let reference_after = node.metadata();
     assert_eq!(reference_after.members.len(), 6);
@@ -264,13 +264,13 @@ async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
     // hard (non-graceful) shutdown. ---
     let node = start(addrs.clone(), &node_dir).await;
     await_leader(&node).await;
-    propose_and_await(&node, addrs.client, upsert(nid(7), NodeStatus::Down)).await;
+    propose_and_await(&node, addrs.intra, upsert(nid(7), NodeStatus::Down)).await;
 
     let create_schema = MetaCommand::CreateTableSchema {
         table: table.to_string(),
         schema: TableSchema::simple("id", ColumnType::String),
     };
-    let resp = call(addrs.client, ClientRequest::ProposeSchema(create_schema)).await;
+    let resp = call(addrs.intra, ClientRequest::ProposeSchema(create_schema)).await;
     assert!(matches!(resp, ClientResponse::PutOk));
     timeout(Duration::from_secs(10), async {
         loop {
@@ -289,7 +289,7 @@ async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
         range: KeyRange::whole(),
         replicas: vec![nid(300)],
     };
-    let resp = call(addrs.client, ClientRequest::ProposeSchema(create_tablet)).await;
+    let resp = call(addrs.intra, ClientRequest::ProposeSchema(create_tablet)).await;
     assert!(matches!(resp, ClientResponse::PutOk));
     timeout(Duration::from_secs(10), async {
         loop {

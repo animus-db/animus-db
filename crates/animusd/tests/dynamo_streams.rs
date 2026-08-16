@@ -1082,9 +1082,14 @@ async fn get_records_on_an_open_shard_forwards_correctly_from_every_node() {
 }
 
 /// A bare (non-`Forwarded`) `ClientRequest::StreamHotRead` over the plain
-/// client protocol is refused — mirroring `KindWrite`/`KindScan`/
+/// **client** protocol is refused — mirroring `KindWrite`/`KindScan`/
 /// `ForceSeal`'s identical contract (the house "internal RPC must reject a
-/// bare delivery" rule).
+/// bare delivery" rule). **ADR 0047**: `StreamHotRead` is classified
+/// `Surface::Intra`, so a client-port connection is refused by
+/// `handle_request`'s port guard ("send it to this node's intra port")
+/// before ever reaching the match arm's own "must be sent wrapped in
+/// `Forwarded`" refusal — that wording is still reachable, just only via the
+/// intra port now (see `intra_port_split.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bare_stream_hot_read_is_refused() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1112,8 +1117,8 @@ async fn bare_stream_hot_read_is_refused() {
     match response {
         animusd::ClientResponse::Error(msg) => {
             assert!(
-                msg.contains("must be sent wrapped"),
-                "expected the internal-RPC refusal message, got: {msg}"
+                msg.contains("cluster-internal request"),
+                "expected the ADR 0047 client-port refusal message, got: {msg}"
             );
         }
         other => panic!("expected a bare-request refusal, got: {other:?}"),

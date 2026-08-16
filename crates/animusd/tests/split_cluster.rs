@@ -248,7 +248,8 @@ async fn control_leader_failover_under_live_data_traffic() {
         timeout(Duration::from_secs(20), async {
             loop {
                 let _ = call(
-                    data_nodes[0].client_addr(),
+                    // ADR 0047: `ProposeSchema` is intra-only.
+                    data_nodes[0].intra_addr(),
                     ClientRequest::ProposeSchema(create.clone()),
                 )
                 .await;
@@ -858,7 +859,8 @@ async fn full_split_cluster_restart_recovers_metadata_and_data() {
         timeout(Duration::from_secs(20), async {
             loop {
                 let _ = call(
-                    data_nodes[0].client_addr(),
+                    // ADR 0047: `ProposeSchema` is intra-only.
+                    data_nodes[0].intra_addr(),
                     ClientRequest::ProposeSchema(create.clone()),
                 )
                 .await;
@@ -1097,10 +1099,14 @@ async fn control_leader_and_data_node_failure_simultaneously_still_converges() {
             table: "dualfail_ddl_t".into(),
             schema: TableSchema::simple("id", ColumnType::String),
         };
+        // ADR 0047: `ProposeSchema` is intra-only — a separate address list
+        // from `survivor_clients` above (which stays client-flavored for the
+        // data-plane `put`/`await_value` calls it feeds).
+        let survivor_intra: Vec<SocketAddr> = data_nodes.iter().map(Node::intra_addr).collect();
         timeout(Duration::from_secs(20), async {
             loop {
                 let _ = call(
-                    survivor_clients[0],
+                    survivor_intra[0],
                     ClientRequest::ProposeSchema(create.clone()),
                 )
                 .await;

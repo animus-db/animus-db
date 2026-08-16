@@ -134,7 +134,10 @@ async fn lsi_query_succeeds_through_every_node_including_non_leaders() {
 /// refused — the read-side dual of `KindWrite`'s identical bare refusal (ADR
 /// 0041 §5): a client could otherwise read a table's LSI/change-log/footprint
 /// bytes directly by kind number, bypassing the DynamoDB surface that
-/// interprets them.
+/// interprets them. **ADR 0047**: `KindScan` is `Surface::Intra`, so this
+/// refusal now comes from `handle_request`'s client-port guard, not the
+/// match arm's own "must be sent wrapped" text (still reachable, just only
+/// via the intra port now — see `intra_port_split.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bare_kind_scan_is_refused() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -164,8 +167,8 @@ async fn bare_kind_scan_is_refused() {
     match response {
         ClientResponse::Error(msg) => {
             assert!(
-                msg.contains("must be sent wrapped"),
-                "expected the internal-RPC refusal message, got: {msg}"
+                msg.contains("cluster-internal request"),
+                "expected the ADR 0047 client-port refusal message, got: {msg}"
             );
         }
         other => panic!("expected a bare-request refusal, got: {other:?}"),

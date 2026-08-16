@@ -92,7 +92,8 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
     // The control-plane leader, and a *different* node to issue DDL against.
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
     let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
-    let follower_client = config.nodes[follower].client;
+    // ADR 0047: `ProposeSchema` is intra-only.
+    let follower_client = config.nodes[follower].intra;
 
     // Issue a schema create against the FOLLOWER. Pre-A2 this would time out (the
     // follower has no local leader handle to propose on); now it relays to the
@@ -198,7 +199,8 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
     // Gate: a non-schema (membership/placement) command must be rejected by the
     // relay, on any node — this is not a general "propose anything" surface.
     let bad = call(
-        config.nodes[leader].client,
+        // ADR 0047: `ProposeSchema` is intra-only.
+        config.nodes[leader].intra,
         ClientRequest::ProposeSchema(MetaCommand::UpsertMember {
             node: nid(999),
             labels: std::collections::BTreeMap::new(),
@@ -240,7 +242,8 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
 
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
     let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
-    let follower_client = config.nodes[follower].client;
+    // ADR 0047: `ProposeSchema` is intra-only.
+    let follower_client = config.nodes[follower].intra;
 
     // Register a table + enable a stream first (SealStreamShard's own label
     // validation needs a schema entry to license the label) — through the
@@ -339,7 +342,8 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
     // gate test above), since its only intended caller (the segment
     // janitor) never needs a relay path at all.
     let expire = call(
-        config.nodes[leader].client,
+        // ADR 0047: `ProposeSchema` is intra-only.
+        config.nodes[leader].intra,
         ClientRequest::ProposeSchema(MetaCommand::ExpireStreamShards {
             rows: vec![(TabletId(1), 0)],
             remove: false,

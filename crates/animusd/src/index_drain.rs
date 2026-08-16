@@ -2803,6 +2803,7 @@ mod stream_sealer_tests {
                     StorageBackend::default(),
                     crate::ClusterEdgeState::new(),
                     Default::default(),
+                    Default::default(),
                     None,
                     // A generous threshold, deliberately NOT tiny: this
                     // test only needs ONE split to happen, not a

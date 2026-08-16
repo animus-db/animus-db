@@ -653,7 +653,8 @@ async fn admin_txns_shows_a_pending_record_then_clears_after_recovery() {
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
-    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.client).collect();
+    // ADR 0047: Forwarded is intra-only.
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect();
 
     // A single-participant (degenerate) transaction is enough here — the
     // anchor's own tablet is what `/admin/txns` on that tablet's leader

@@ -140,7 +140,11 @@ async fn system_table_lists_every_seeded_entity_kind() {
         let dir = tempfile::tempdir().unwrap();
         let node = bring_up_one(dir.path()).await;
         await_bootstrap(&node).await;
-        let client = node.client_addr();
+        // ADR 0047: this file seeds several intra-only entity kinds via bare
+        // `ProposeSchema` — dial the intra port (which also happily serves
+        // the plain `Put`/`Scan`/`SplitTablet` calls this test otherwise
+        // makes, since intra is a superset of client).
+        let client = node.intra_addr();
         let admin = node.admin_addr();
 
         let (s, syst0) = admin_get(admin, "/admin/system-table").await;
@@ -411,7 +415,11 @@ async fn system_table_pagination_is_gapless_and_duplicate_free() {
         let dir = tempfile::tempdir().unwrap();
         let node = bring_up_one(dir.path()).await;
         await_bootstrap(&node).await;
-        let client = node.client_addr();
+        // ADR 0047: this file seeds several intra-only entity kinds via bare
+        // `ProposeSchema` — dial the intra port (which also happily serves
+        // the plain `Put`/`Scan`/`SplitTablet` calls this test otherwise
+        // makes, since intra is a superset of client).
+        let client = node.intra_addr();
         let admin = node.admin_addr();
 
         // Auto-provision a dozen distinct tablets (one plain Put per table) —

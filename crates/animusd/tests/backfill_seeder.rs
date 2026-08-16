@@ -314,7 +314,10 @@ async fn backfill_seeder_materializes_every_pre_existing_row_then_flips_active()
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    let client = config.nodes[leader].client;
+    // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
+    // occasional `SplitTablet` call in this file — a superset, not a
+    // conflict).
+    let client = config.nodes[leader].intra;
     let dynamo_addr = nodes[0].dynamo_addr();
     let client_addr = nodes[0].client_addr();
     let table = "bf_seed";
@@ -374,7 +377,10 @@ async fn live_writes_during_backfill_converge_to_the_correct_final_gsi() {
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    let client = config.nodes[leader].client;
+    // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
+    // occasional `SplitTablet` call in this file — a superset, not a
+    // conflict).
+    let client = config.nodes[leader].intra;
     let dynamo_addr = nodes[0].dynamo_addr();
     let client_addr = nodes[0].client_addr();
     let table = "bf_live";
@@ -449,7 +455,10 @@ async fn two_indexes_creating_simultaneously_converge_independently() {
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    let client = config.nodes[leader].client;
+    // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
+    // occasional `SplitTablet` call in this file — a superset, not a
+    // conflict).
+    let client = config.nodes[leader].intra;
     let dynamo_addr = nodes[0].dynamo_addr();
     let client_addr = nodes[0].client_addr();
     let table = "bf_multi";
@@ -566,7 +575,8 @@ async fn a_crash_and_restart_mid_backfill_still_converges() {
     }
 
     call(
-        node.client_addr(),
+        // ADR 0047: `ProposeSchema` is intra-only.
+        node.intra_addr(),
         ClientRequest::ProposeSchema(MetaCommand::CreateTableIndex {
             table: table.into(),
             index: creating_index("by-email", "email"),
@@ -676,7 +686,10 @@ async fn split_during_backfill_converges_with_correct_final_gsi() {
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    let client = config.nodes[leader].client;
+    // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
+    // occasional `SplitTablet` call in this file — a superset, not a
+    // conflict).
+    let client = config.nodes[leader].intra;
     let dynamo_addr = nodes[0].dynamo_addr();
     let client_addr = nodes[0].client_addr();
     let table = "bf_split";

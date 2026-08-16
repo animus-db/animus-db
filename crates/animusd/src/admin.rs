@@ -1698,7 +1698,7 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
 
     // ADR 0027: the seeder emulates a client issuing many `PutBatch` requests,
     // but calls `cp_batch_write` directly rather than going through
-    // `handle_client` — so without a span here, `cp_forward`'s
+    // `handle_connection` — so without a span here, `cp_forward`'s
     // `otel::current_traceparent()` has no active context to inject when a
     // batch forwards to another node, and the seed is invisible in a trace
     // backend no matter how much data it writes. One root span per request

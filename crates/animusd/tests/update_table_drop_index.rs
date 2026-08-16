@@ -420,7 +420,8 @@ async fn in_flight_backfill_is_cancelled_by_a_concurrent_drop() {
         let dir = tempfile::tempdir().unwrap();
         let (nodes, config) = bring_up(3, dir.path()).await;
         let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-        let client = config.nodes[leader].client;
+        // ADR 0047: `ProposeSchema` is intra-only.
+        let client = config.nodes[leader].intra;
         let dynamo_addr = nodes[0].dynamo_addr();
         let client_addr = nodes[0].client_addr();
         let table = "cancel_bf";
@@ -532,7 +533,8 @@ async fn create_drop_recreate_same_index_name_backfills_from_scratch() {
         let dir = tempfile::tempdir().unwrap();
         let (nodes, config) = bring_up(3, dir.path()).await;
         let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-        let client = config.nodes[leader].client;
+        // ADR 0047: `ProposeSchema` is intra-only.
+        let client = config.nodes[leader].intra;
         let dynamo_addr = nodes[0].dynamo_addr();
         let client_addr = nodes[0].client_addr();
         let table = "recreate_bf";

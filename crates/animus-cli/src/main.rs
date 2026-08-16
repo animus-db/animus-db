@@ -659,11 +659,13 @@ fn print_response(response: &ClientResponse) {
             control_ids,
             peers,
             client_route,
+            intra_route,
             admin_addrs,
         } => {
             println!("control ids: {control_ids:?}");
             println!("peers: {peers:?}");
             println!("client route: {client_route:?}");
+            println!("intra route: {intra_route:?}");
             println!("admin addrs: {admin_addrs:?}");
         }
         // Incremental `WatchMetadata` reply (ADR 0038 PR5): consumed

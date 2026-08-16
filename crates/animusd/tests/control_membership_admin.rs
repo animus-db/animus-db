@@ -332,12 +332,17 @@ async fn join_control_nonvoter(
         for (i, a) in config.nodes.iter().enumerate() {
             client_route.insert(animusd::config::node_id(i), a.client);
         }
+        let mut intra_route: BTreeMap<animus_env::NodeId, SocketAddr> = BTreeMap::new();
+        for (i, a) in config.nodes.iter().enumerate() {
+            intra_route.insert(animusd::config::node_id(i), a.intra);
+        }
         let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
         let node = bound
             .start_control_with(
                 config.peer_book(),
                 config.control_ids(),
                 client_route,
+                intra_route,
                 admin_addrs,
                 animusd::StorageBackend::Memory,
                 animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,

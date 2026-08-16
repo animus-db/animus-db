@@ -68,7 +68,7 @@ async fn control_node_wakes_the_watch_on_a_real_commit_not_the_server_timeout() 
     })
     .await
     .expect("control node never became leader");
-    let control_client = control_nodes[0].client_addr();
+    let control_client = control_nodes[0].intra_addr(); // ADR 0047: WatchMetadata/ProposeSchema are intra-only
 
     let watermark0 = watermark_of(&call(control_client, ClientRequest::Status).await);
 
@@ -155,9 +155,12 @@ async fn data_only_node_rejects_watch_metadata_instead_of_degrading() {
     // A data-only node's `ControlHandle` is `Remote` — it has no local
     // `MetadataWatch` tied to any authority, so it must reject the request
     // outright (see `ClientCtx::watch_metadata`'s doc) rather than silently
-    // degrading to an ~8s effective poll.
+    // degrading to an ~8s effective poll. Dialed on the **intra** port (ADR
+    // 0047: `WatchMetadata` is intra-only) so this test still exercises the
+    // `ControlHandle::Remote` rejection this doc is about, not just the
+    // (also-correct, but different) client-port surface guard.
     let reply = call(
-        data_nodes[0].client_addr(),
+        data_nodes[0].intra_addr(),
         ClientRequest::WatchMetadata { last_seen: 0 },
     )
     .await;
@@ -213,7 +216,7 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
     })
     .await
     .expect("single control node did not elect itself leader in 20s");
-    let client_addr = node.client_addr();
+    let client_addr = node.intra_addr(); // ADR 0047: WatchMetadata/ProposeSchema are intra-only
 
     // A watermark from BEFORE any of the commands below — this is the one
     // that must fall back post-restart: those commands land durably in the

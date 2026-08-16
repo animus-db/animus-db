@@ -176,7 +176,8 @@ async fn index_backfill_converges_to_active_once_every_tablet_reports() {
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    let client = config.nodes[leader].client;
+    // ADR 0047: `ProposeSchema` is intra-only.
+    let client = config.nodes[leader].intra;
 
     call(
         client,
@@ -292,7 +293,8 @@ async fn a_tablet_that_appears_before_the_flip_blocks_it_until_it_also_reports()
     let dir = tempfile::tempdir().unwrap();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    let client = config.nodes[leader].client;
+    // ADR 0047: `ProposeSchema` is intra-only.
+    let client = config.nodes[leader].intra;
 
     call(
         client,
@@ -421,7 +423,8 @@ async fn control_only_leader_drives_the_flip() {
     let (control_nodes, data_nodes, config) = support::bring_up_split(1, 0, dir.path()).await;
     assert!(data_nodes.is_empty(), "test premise: no data role anywhere");
     support::await_leader(&control_nodes).await;
-    let client = config.nodes[0].client;
+    // ADR 0047: `ProposeSchema` is intra-only.
+    let client = config.nodes[0].intra;
 
     call(
         client,
