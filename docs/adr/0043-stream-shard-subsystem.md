@@ -179,7 +179,10 @@ discipline in this crate):**
    split), and **sort by the 8-byte HLC key suffix** — `pending_changes`'
    own key order is token-then-pk-then-HLC, *not* commit order, so this sort
    is load-bearing, not a formality. Encode the segment (§"Segment format,"
-   below).
+   below). The range just fenced against rides the proposal itself
+   (`SealStreamShard::expected_range`) as step 3's own apply-time CAS
+   stamp — see §A4's own follow-up amendment for why the fence here is a
+   necessary first-line filter but not, by itself, sufficient.
 2. `SegmentStore::put(id)` at the deterministic id
    `{table}/{label}/{tablet}/{epoch}`. With the default `ClusterSegmentStore`
    (§A5) this is the K-replica push; `Ok` means every replica fsynced.
@@ -307,14 +310,97 @@ serve path) all now additionally fence their `pending_changes()` candidate
 set to the tablet's *current metadata-declared* range
 (`Metadata.tablets[tablet].range`, `animusd::index_drain::
 in_declared_range`) — the identical authority the ADR 0028 write fence
-already trusts, applied here to the seal arm's read side, closing the gap
-regardless of how long the local scope takes to converge. A record outside
+already trusts, applied here to the seal arm's read side. A record outside
 the declared range is simply left for the sibling; nothing here waits on
 or accelerates `narrow_scope` itself. Regression:
 `animus-test`'s `stream_lineage_corpus.rs::
 split_then_parent_reseals_before_scope_narrows` (red on the unfixed
 sealer, drives the exact ordering PR1's own inverse-order regression above
 does not: the parent seals *before* its local scope narrows, not after).
+**This closes the window against local *physical*-scope lag specifically
+— see the next amendment for the *second*, independent staleness layer it
+does not close on its own.**
+
+**Split-seal range-fence CAS amendment, 2026-08-15 (as-built — closes the
+residual the fence above cannot).** The fence just described reads
+`ctx.effective_metadata()`, which for every deployment shape in production
+today resolves to `RaftNode::metadata()` — a plain clone of a cache
+populated by an **asynchronous apply task** (ADR 0038), decoupled from the
+control Raft's own commit index. That cache can itself lag the true,
+already-committed `SplitTablet` on the very node running the seal arm,
+*independent of whether the local physical scope has narrowed* — and
+crucially, the tablet-host reconciler that drives `narrow_scope` reads the
+identical cache to decide when to act. So in the sub-window where this
+node's own cache hasn't yet observed the split at all, **both** the
+physical scope and the metadata fence are consulting the same stale
+snapshot at once; the fence adds no protection there, since it is checking
+against the exact source that let the physical scope stay wide in the
+first place. Confirmed empirically before this amendment: the real D8 e2e
+test (`streams_e2e.rs::
+auto_split_mid_stream_with_live_consumer_across_every_node`) still showed
+the DUPLICATION signature (distinct eventIDs, same item, same packed-HLC
+suffix) after the fence alone, at a rate not clearly distinguishable from
+noise across matched before/after runs (5/15 → 4/15 in one measurement) —
+a proposal-side read, however careful, cannot see past a staleness window
+in the very state it reads.
+
+**Fix**: `MetaCommand::SealStreamShard` gained `expected_range: KeyRange`
+— the range the proposer fenced its `pending_changes()` scan against.
+`Metadata::apply`'s own arm rejects the proposal (`ApplyOutcome::Rejected`,
+mirroring `SplitTablet`/`CasTabletReplicas`'s existing epoch-CAS idiom) if
+`expected_range` no longer matches `self.tablets[tablet].range` — but
+**only** for a genuinely new `(tablet, epoch)` row, never the existing-row
+content-match retry or the segment janitor's own replicas-only repair
+(ADR 0043 §A9), both of which legitimately reuse an already-validated
+row's content long after the tablet's own range may have moved on for
+entirely unrelated reasons (a further split). This closes the gap
+completely, regardless of any node's own cache freshness, because `apply`
+runs strictly sequentially in Raft commit order: if the racing
+`SplitTablet` committed earlier in the log, the tablet's range has *already*
+narrowed in the state this exact call sees, by construction — no read, no
+matter how fresh, is needed or possible to be "fresher" than the state
+being mutated. A rejected proposal's already-`put` segment object becomes
+a permanent orphan exactly like a dueling-seal race's own loser
+(§A3's ledger-named-object amendment) — the existing orphan-reap mechanism
+(§A9) needs no special-casing for this new rejection reason, since it only
+ever compares object presence against catalog reference, never *why* a
+row was never cataloged.
+
+As a consequence, trim (§A6's own hot-trim arm) is also now provably safe
+in the same sub-window, *given* its own range fence stays in place: this
+CAS guarantees `stream_shards`' contributing rows are always legitimately
+scoped, and `Metadata`'s own snapshot is a single atomic clone (never a
+torn read mixing an old `tablets` map with a newer `stream_shards` one) —
+so trim can never observe a legitimately-committed post-split parent seal
+without the split itself already being visible in that identical snapshot,
+meaning its own range fence is never stale relative to what its watermark
+implies.
+
+**What this does NOT close**: the open-shard hot-read path (§A7).
+Reads never go through Raft apply, so no apply-time backstop is possible
+there — a live consumer polling a tablet's open tail during the exact
+cache-staleness sub-window can still observe a record that, per `Metadata`,
+already belongs to a split-off sibling, and later observe the identical
+underlying write again once the sibling correctly seals it — under a
+**different** `eventID` (`{shard_id}-{packed_hlc}`, stamped from whichever
+shard the polling consumer's own iterator names), so this is a genuine
+fabrication, not the AWS-contract-compatible at-least-once redelivery a
+shared `eventID` would be. Accepted as a known, narrower residual (bounded
+to a live consumer actively polling during the specific race window, never
+the converged, at-rest catalog state) — closure is deferred to the ADR
+0044 quiescence work (gating the open-tail read, or the whole
+change-consumer loop, across a split's commit-to-local-convergence
+window), not attempted here.
+
+Regression: three `Metadata::apply` unit tests (`meta::tests::
+seal_stream_shard_range_cas_rejects_a_stale_declared_range_after_a_split`/
+`_accepts_the_current_declared_range`/`_does_not_gate_a_replicas_only_
+repair`); a new scripted corpus cell, `stream_lineage_corpus.rs::
+split_then_parent_seals_against_stale_cached_metadata` (a sealer's own
+metadata snapshot cloned *before* an authoritative `SplitTablet` apply,
+proposed after it — red-then-green confirmed by temporarily
+short-circuiting the CAS check); and `segment_janitor.rs`'s own
+`cas_rejected_seal_orphan_is_reaped_like_any_other`.
 
 **Cross-group HLC safety**: a child group's start witnesses the shared
 engine's own `latest_version()` (the pre-existing witnessing chain ADR
