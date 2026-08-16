@@ -190,13 +190,21 @@ task's published cache (see `animus-control/CLAUDE.md`'s `node.rs`/
 
 ## Request routing (CP)
 
-Five `ClientCtx` primitives resolve the tablet's group leader the same way via
+The `ClientCtx` primitives resolve the tablet's group leader the same way via
 `cp_route` (pure core: `topology::decide_cp_route`): `cp_read` (linearizable
-ReadIndex), `cp_write`/`cp_delete` (Raft-committed, waited to durable+applied),
-`cp_scan` (linearizable range read), and `cp_batch_write` (groups keys by tablet,
-commits each group as one `KvCommand::Batch` entry — atomic within a tablet, not
-across; backs the admin seeder — DynamoDB `BatchWriteItem` no longer reaches it
-since ADR 0049, see the DynamoDB wire-edge entry).
+ReadIndex), `cp_scan` (linearizable range read), and the kind-write family
+(`cp_kind_write_raw`/`cp_kind_write_item`/`cp_kind_write`, all Raft-committed
+and waited to durable+applied). **The plain routed write primitives
+(`cp_write`/`cp_delete`/`cp_put`/`cp_batch_write`) were deleted in Train A
+rung 5 (ADR 0049)** — every write surface now rides the kind path, so no
+production sender of a bare/`Forwarded` plain write remains; the plain
+`KvCommand::Put`/`Batch`/`Delete` variants and `cp_serve_forwarded`'s serve
+arms for them stay (internal machinery + wire compat; the local halves
+`cp_put_local`/`cp_delete_local`/`cp_batch_local` back those arms). The
+plain client protocol's `Put`/`PutBatch`/`Delete` arms commit through
+`dynamo::marker_batch_write_raw` (one `KindBatch` per tablet, one image-less
+marker per mutation, full-raw-key-as-prefix; `Put`/`PutBatch` auto-provision
+like the old `cp_put` did, `Delete` deliberately never does).
 
 **`cp_scan_kind` (ADR 0041)** is `cp_scan`'s single-tablet, kind-scoped
 sibling — the LSI `Query` read primitive: unlike `cp_scan`'s per-table
@@ -212,11 +220,13 @@ None` (unbounded above) is legal on `KindScan` too, resolved inside
 range is open-ended, never computed by the caller (no finite byte string
 could do that job — see the DynamoDB wire-edge entry above).
 
-**`cp_write`/`cp_delete` do NOT auto-provision a table's first tablet** —
-unlike most of their write-side siblings (`cp_put`, `cp_kind_write`,
-`cp_batch_write`, `cp_txn` all do; `cp_batch_write_patient` was deleted in
-Train A rung 4 with its one caller, the admin seeder — its
-poll-not-repropose retry lore lives in the seeder's own comment). A caller
+**`cp_kind_write_raw` does NOT auto-provision a table's first tablet** —
+unlike `cp_kind_write`/`cp_kind_write_item`/`cp_txn`/`marker_batch_write_raw`
+(with its provision flag set), which all do. (`cp_batch_write_patient` was
+deleted in Train A rung 4 with its one caller, the admin seeder — its
+poll-not-repropose retry lore lives in the seeder's own comment; the plain
+`cp_write`/`cp_delete`/`cp_put`/`cp_batch_write` primitives this paragraph
+used to contrast went in rung 5.) A caller
 targeting a table nothing upstream has provisioned must call
 `provision_tablet` itself first, or `cp_route` waits out `CLIENT_TIMEOUT` on
 a tablet that will never exist and fails — every tick, forever, if the
@@ -749,8 +759,8 @@ route below the edge through the same `ClientCtx` CP primitives.
   `stream_write_path_tests::batch_write_on_a_marker_table_commits_one_
   entry_per_tablet`, which pins "one distinct apply HLC per tablet per
   batch"). Images-carrying tables' requests go through the per-item
-  funnel, atomic per-item only; the old `cp_batch_write` fast path is unreachable dead
-  code kept until Train A's deletion rung. **`TransactWriteItems` now participates
+  funnel, atomic per-item only (the old `cp_batch_write` fast path was
+  deleted in rung 5 along with the primitive itself). **`TransactWriteItems` now participates
   too (2026-08-16, ADR 0046 A1/U3, `TxnStage` kind-writes stack)** — the
   wholesale per-table rejection this paragraph used to document (a write
   action against an indexed *or* streamed table cancelling the whole
@@ -779,11 +789,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   `GetRecords`) shares the DynamoDB listener via a target-prefix dispatch
   fork in `dynamo.rs::dispatch`. Full wire-edge contracts — label minting,
   the sealed-vs-open serve split, and the iterator token shape — are in
-  `docs/streams-notes.md`. The write-path gate predicate
-  (`table_takes_kind_write_path`) stays here, next paragraph.
+  `docs/streams-notes.md`. The record-shape predicate
+  (`table_change_records_carry_images`) stays here, next paragraph.
 
-  **The write-path gate (`table_takes_kind_write_path`) is constant-true
-  since ADR 0049 (the universal kind-write path, Train A rung 1)**: every
+  **The write-path gate is structural since ADR 0049 (the universal
+  kind-write path — rung 1 made the old `table_takes_kind_write_path`
+  predicate constant-true; rung 5 deleted it with the plain branches it
+  guarded)**: every
   Dynamo table's every mutation commits through `KindBatch`, so every
   tablet has a change log unconditionally. What *varies* per table is the
   record's shape, decided by `table_change_records_carry_images` (the old
@@ -796,9 +808,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   marker records outright — a marker predates every index by construction,
   so pre-index history stays the backfill seeder's job, and a marker-only
   backlog must never lazily provision a hidden table mid-`drop_index` —
-  see `drain_tablet`'s ADR 0049 comment). The plain single-key fallbacks in the
-  handlers (and `kind_writes_for_item`'s `None` arm) are unreachable dead
-  code kept until Train A's deletion rung. Two consequences worth knowing:
+  see `drain_tablet`'s ADR 0049 comment). The plain single-key fallbacks in
+  the handlers, `kind_writes_for_item`'s `None` arm (it returns
+  `IndexedWrite` directly now), `run_update_item`, `quorum_write`, and
+  `run_transact`'s coordinator-valued write path (with its own-key
+  `write_conditions` feeding — a write action's condition rides
+  `PendingKindWrite::condition` + the C1 OCC instead) were all deleted in
+  rung 5. Two consequences worth knowing:
   ADR 0046 §2's "a plain table's condition only has node-local `rmw_lock`
   protection" gap is **closed for the Dynamo edge** (every write now
   evaluates at the tablet leader; CQL's own RMW keeps the gap — see the
@@ -824,10 +840,11 @@ route below the edge through the same `ClientCtx` CP primitives.
   `ConditionExpression` or `ALL_OLD` was requested — an unconditional
   replace/delete on an indexed *or* streamed table therefore silently
   skipped the read `kind_writes_for_item`'s LSI diff (and now a stream's
-  `OLD_IMAGE`/`NEW_AND_OLD_IMAGES` fidelity) actually needs. Both handlers'
-  `needs_old` now also checks `table_takes_kind_write_path` (`UpdateItem`/
-  the indexed `BatchWriteItem` branch already read unconditionally — only
-  these two needed the fix). See `docs/engineering-lessons.md` for the
+  `OLD_IMAGE`/`NEW_AND_OLD_IMAGES` fidelity) actually needs. The fix made
+  both handlers' `needs_old` check the shared kind-path gate (since rung 5
+  the whole question is moot — every evaluated write reads its old image at
+  the leader, and the `needs_old` sites went with the deleted plain
+  fallbacks). See `docs/engineering-lessons.md` for the
   general lesson (a fast-path gate and a "do I need the old value" gate
   must be the *same* predicate, not two that happen to agree today).
 

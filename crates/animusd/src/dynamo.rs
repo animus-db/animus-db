@@ -154,8 +154,7 @@ use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjecti
 use animus_control::{MetaCommand, Metadata, ReplicationMode};
 use animus_cp_data::{KIND_BASE, KIND_LSI};
 use animus_dynamo::wire::{
-    self, Operation, Projection, ReturnValues, TransactAction, TransactGet, UpdateAction,
-    UpdateReturnValues, WireError, WriteRequest,
+    self, Operation, Projection, ReturnValues, TransactAction, TransactGet, WireError, WriteRequest,
 };
 use animus_dynamo::{
     AttributeValue, ChangeRecord, ConditionExpression, Item, SortKeyCondition, TableSchema,
@@ -451,64 +450,24 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // `rmw_lock` here could never close). No local read, no local
             // lock: the leader does both, and every write of this item from
             // any edge node reaches the same leader.
-            if table_takes_kind_write_path(meta, &table) {
-                return match ctx
-                    .cp_kind_write_item(
-                        meta,
-                        &table,
-                        &pk,
-                        sk.as_ref(),
-                        KindWriteOp::Put(item),
-                        condition.as_ref(),
-                    )
-                    .await?
-                {
-                    KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
-                        "the conditional request failed",
-                    )),
-                    KindWriteOutcome::Ok { old, .. } => {
-                        Ok(wire::write_response(return_values, old.as_ref()))
-                    }
-                };
-            }
-            // Unreachable since ADR 0049 (the gate above is constant-true);
-            // kept until Train A's deletion rung.
-            let key = item_key(&pk, sk.as_ref());
-            // For ALL_OLD (or a condition) we need the prior item; read it once.
-            let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
-            // A conditional (or old-echoing) put is a read-modify-write: hold the
-            // per-node RMW lock across the read → evaluate → write span, as the CQL
-            // edge does, so two concurrent conditional puts on one node can't both
-            // read the same "old" and both pass (a lost update / double create). An
-            // unconditional put does no read and takes no lock. The guard drops at
-            // the end of this arm — never held across the response write.
-            // **This node-local lock only protects a PLAIN (unindexed,
-            // unstreamed) table** — a named, documented gap (ADR 0046 §2):
-            // the identical cross-node hazard on a plain table's own
-            // condition/base value has no tablet-log hook to move onto
-            // (`quorum_write` below is a bare `cp_write`, not a `KindBatch`),
-            // and CQL's own RMW (`cql.rs`) has the same node-local-only
-            // scope.
-            let _rmw = if needs_old {
-                Some(ctx.data().rmw_lock.lock().await)
-            } else {
-                None
-            };
-            let old = if needs_old {
-                quorum_read(ctx, meta, &table, &key).await?
-            } else {
-                None
-            };
-            if let Some(cond) = &condition
-                && !cond.evaluate(old.as_ref())
+            match ctx
+                .cp_kind_write_item(
+                    meta,
+                    &table,
+                    &pk,
+                    sk.as_ref(),
+                    KindWriteOp::Put(item),
+                    condition.as_ref(),
+                )
+                .await?
             {
-                return Err(WireError::conditional_check_failed(
+                KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
-                ));
+                )),
+                KindWriteOutcome::Ok { old, .. } => {
+                    Ok(wire::write_response(return_values, old.as_ref()))
+                }
             }
-            let value = wire::encode_stored_item(&item);
-            quorum_write(ctx, meta, &table, &key, &value).await?;
-            Ok(wire::write_response(return_values, old.as_ref()))
         }
         Operation::DeleteItem {
             table,
@@ -530,54 +489,24 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             }
             // See `PutItem`'s identical fork above for why an evaluated
             // write goes to the leader instead.
-            if table_takes_kind_write_path(meta, &table) {
-                return match ctx
-                    .cp_kind_write_item(
-                        meta,
-                        &table,
-                        &pk,
-                        sk.as_ref(),
-                        KindWriteOp::Delete,
-                        condition.as_ref(),
-                    )
-                    .await?
-                {
-                    KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
-                        "the conditional request failed",
-                    )),
-                    KindWriteOutcome::Ok { old, .. } => {
-                        Ok(wire::write_response(return_values, old.as_ref()))
-                    }
-                };
-            }
-            // Unreachable since ADR 0049 (the gate above is constant-true);
-            // kept until Train A's deletion rung.
-            let data_key = item_key(&pk, sk.as_ref());
-            let needs_old = condition.is_some() || return_values == ReturnValues::AllOld;
-            // Same RMW serialization as the conditional `PutItem` above —
-            // including the identical PLAIN-table-only scope (see that
-            // arm's comment): a conditional delete must not interleave with
-            // another RMW between its read and its write.
-            let _rmw = if needs_old {
-                Some(ctx.data().rmw_lock.lock().await)
-            } else {
-                None
-            };
-            let old = if needs_old {
-                quorum_read(ctx, meta, &table, &data_key).await?
-            } else {
-                None
-            };
-            if let Some(cond) = &condition
-                && !cond.evaluate(old.as_ref())
+            match ctx
+                .cp_kind_write_item(
+                    meta,
+                    &table,
+                    &pk,
+                    sk.as_ref(),
+                    KindWriteOp::Delete,
+                    condition.as_ref(),
+                )
+                .await?
             {
-                return Err(WireError::conditional_check_failed(
+                KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
-                ));
+                )),
+                KindWriteOutcome::Ok { old, .. } => {
+                    Ok(wire::write_response(return_values, old.as_ref()))
+                }
             }
-            let value = wire::encode_tombstone();
-            quorum_write(ctx, meta, &table, &data_key, &value).await?;
-            Ok(wire::write_response(return_values, old.as_ref()))
         }
         // (The `put_item` / `delete_item` helpers above serve the batch/transact
         // paths, which never echo `ReturnValues`, so they avoid the extra read.)
@@ -651,51 +580,30 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // closed by the same mechanism at no extra cost (`KindWriteOp::
             // Update` folds the update expression itself into the leader's
             // own evaluation). See `dynamo::kind_write_item_at_leader`'s doc.
-            if table_takes_kind_write_path(meta, &table) {
-                let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
-                return match ctx
-                    .cp_kind_write_item(
-                        meta,
-                        &table,
-                        &pk,
-                        sk.as_ref(),
-                        KindWriteOp::Update {
-                            key_item: key,
-                            actions,
-                        },
-                        condition.as_ref(),
-                    )
-                    .await?
-                {
-                    KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
-                        "the conditional request failed",
-                    )),
-                    KindWriteOutcome::Ok { old, new } => Ok(wire::update_response(
-                        return_values,
-                        old.as_ref(),
-                        new.as_ref(),
-                    )),
-                };
+            let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
+            match ctx
+                .cp_kind_write_item(
+                    meta,
+                    &table,
+                    &pk,
+                    sk.as_ref(),
+                    KindWriteOp::Update {
+                        key_item: key,
+                        actions,
+                    },
+                    condition.as_ref(),
+                )
+                .await?
+            {
+                KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
+                    "the conditional request failed",
+                )),
+                KindWriteOutcome::Ok { old, new } => Ok(wire::update_response(
+                    return_values,
+                    old.as_ref(),
+                    new.as_ref(),
+                )),
             }
-            // Unreachable since ADR 0049 (the gate above is constant-true);
-            // kept until Train A's deletion rung.
-            // `UpdateItem` on a PLAIN table is always a read-modify-write: hold
-            // the per-node RMW lock across it (taken here, not inside
-            // `run_update_item`, which is also called from `run_transact` under
-            // the same lock — a tokio Mutex is not reentrant). **Node-local-only
-            // scope, a named gap** (ADR 0046 §2) — see `PutItem`'s identical
-            // comment above.
-            let _rmw = ctx.data().rmw_lock.lock().await;
-            run_update_item(
-                ctx,
-                meta,
-                &table,
-                &key,
-                &actions,
-                condition.as_ref(),
-                return_values,
-            )
-            .await
         }
         Operation::BatchWriteItem { requests } => {
             // Commit each table's items as **one Raft entry per tablet** (ADR 0017 —
@@ -717,21 +625,14 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // non-atomic `BatchWriteItem` contract (one request's outcome never
             // affects another's).
             //
-            // The fast path below is unreachable now (the shared gate is
-            // constant-true) and kept only until Train A's deletion rung. Its
-            // gate used to be `meta.table_indexes(table).is_empty()` — a
-            // predicate that had silently DRIFTED from the shared
-            // `table_takes_kind_write_path` gate every other handler uses: a
-            // streamed-but-unindexed table's batch writes took this fast path
-            // and emitted **no change record at all**, silently losing every
-            // one of those writes from its stream (found while wiring ADR
-            // 0049; regression: `stream_write_path_tests::
-            // batch_write_on_a_streamed_table_emits_change_records`). An
-            // instance of the recorded "a fast-path gate and its sibling gate
-            // must be the SAME predicate" lesson — the drift arrived with
-            // `BatchWriteItem`'s indexed branch, which was reviewed against
-            // ADR 0041 (indexes) and never re-checked against ADR 0042's
-            // streamed-but-unindexed case.
+            // (History: this arm once had a plain `cp_batch_write` fast path
+            // whose gate had silently drifted to `table_indexes(..).is_empty()`
+            // — losing a streamed-but-unindexed table's records entirely;
+            // deleted with the rest of the plain branches in Train A's rung 5.
+            // Regression that pins the fixed behavior: `stream_write_path_
+            // tests::batch_write_on_a_streamed_table_emits_change_records`;
+            // the general same-predicate lesson is in
+            // `docs/engineering-lessons.md`.)
             for (table, reqs) in &requests {
                 // ADR 0049 fast arm: a marker table's batch needs no
                 // evaluation — commit **one `KindBatch` Raft entry per
@@ -768,53 +669,31 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                         .map_err(|e| internal(&e))?;
                     continue;
                 }
-                if !table_takes_kind_write_path(meta, table) {
-                    let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(reqs.len());
-                    for req in reqs {
-                        match req {
-                            WriteRequest::Put(item) => {
-                                let (pk, sk) = resolve_key(ctx, meta, table, item)?;
-                                batch.push((
-                                    item_key(&pk, sk.as_ref()),
-                                    wire::encode_stored_item(item),
-                                ));
-                            }
-                            WriteRequest::Delete(key_item) => {
-                                let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
-                                batch.push((item_key(&pk, sk.as_ref()), wire::encode_tombstone()));
-                            }
+                for req in reqs {
+                    match req {
+                        WriteRequest::Put(item) => {
+                            let (pk, sk) = resolve_key(ctx, meta, table, item)?;
+                            ctx.cp_kind_write_item(
+                                meta,
+                                table,
+                                &pk,
+                                sk.as_ref(),
+                                KindWriteOp::Put(item.clone()),
+                                None,
+                            )
+                            .await?;
                         }
-                    }
-                    ctx.cp_batch_write(table, batch)
-                        .await
-                        .map_err(|e| internal(&e))?;
-                } else {
-                    for req in reqs {
-                        match req {
-                            WriteRequest::Put(item) => {
-                                let (pk, sk) = resolve_key(ctx, meta, table, item)?;
-                                ctx.cp_kind_write_item(
-                                    meta,
-                                    table,
-                                    &pk,
-                                    sk.as_ref(),
-                                    KindWriteOp::Put(item.clone()),
-                                    None,
-                                )
-                                .await?;
-                            }
-                            WriteRequest::Delete(key_item) => {
-                                let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
-                                ctx.cp_kind_write_item(
-                                    meta,
-                                    table,
-                                    &pk,
-                                    sk.as_ref(),
-                                    KindWriteOp::Delete,
-                                    None,
-                                )
-                                .await?;
-                            }
+                        WriteRequest::Delete(key_item) => {
+                            let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
+                            ctx.cp_kind_write_item(
+                                meta,
+                                table,
+                                &pk,
+                                sk.as_ref(),
+                                KindWriteOp::Delete,
+                                None,
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -1146,9 +1025,9 @@ async fn update_table(
 ///
 /// **No `provision_tablet` call**: the GSI drain lazily provisions the
 /// hidden table's first tablet (`index_drain.rs`) on its own next tick. From
-/// the moment `CreateTableIndex` commits, `table_takes_kind_write_path`
+/// the moment `CreateTableIndex` commits, `table_change_records_carry_images`
 /// already gates on index *presence*, not status, so every write from this
-/// instant forward is already covered by a change-log record; the backfill
+/// instant forward is already covered by a full-image change-log record; the backfill
 /// seeder + completion aggregator (PR1-4 of this stack) cover every
 /// pre-existing row and flip the index to `Active` with no further action
 /// here.
@@ -1460,51 +1339,6 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// `UpdateItem` on a **plain** (unindexed, unstreamed) table: read-modify-write.
-/// Reads the current item, applies the SET/REMOVE actions (starting from the
-/// key attributes when the item is absent — an upsert, as in DynamoDB), gating
-/// on an optional `condition`, then commits the new item through a plain
-/// single-key `quorum_write` and echoes `ReturnValues`.
-///
-/// **This is the plain-table branch only** — `run_operation`'s `UpdateItem`
-/// arm forks before ever calling this: an indexed/streamed table evaluates at
-/// the tablet leader instead (ADR 0046 U3, `ClientCtx::cp_kind_write_item` /
-/// `dynamo::kind_write_item_at_leader`), which closes the identical
-/// cross-node base-value race this function's own node-local-only read →
-/// evaluate → write span still has (a named, documented gap for plain tables,
-/// ADR 0046 §2). Takes no RMW lock itself — the caller holds
-/// `ctx.data().rmw_lock` around the call.
-async fn run_update_item(
-    ctx: &ClientCtx,
-    meta: &Metadata,
-    table: &str,
-    key_item: &Item,
-    actions: &[UpdateAction],
-    condition: Option<&ConditionExpression>,
-    return_values: UpdateReturnValues,
-) -> Result<String, WireError> {
-    let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
-    let key = item_key(&pk, sk.as_ref());
-    let old = quorum_read(ctx, meta, table, &key).await?;
-    if let Some(cond) = condition
-        && !cond.evaluate(old.as_ref())
-    {
-        return Err(WireError::conditional_check_failed(
-            "the conditional request failed",
-        ));
-    }
-    // Start from the existing item, or (for an upsert) the bare key attributes.
-    let base = old.clone().unwrap_or_else(|| key_item.clone());
-    let new = wire::apply_update(base, actions);
-    let value = wire::encode_stored_item(&new);
-    quorum_write(ctx, meta, table, &key, &value).await?;
-    Ok(wire::update_response(
-        return_values,
-        old.as_ref(),
-        Some(&new),
-    ))
-}
-
 /// `TransactWriteItems`: apply every condition-gated action **atomically**
 /// (ADR 0018 §2/PR7), replacing the old serial-loop implementation's
 /// documented non-atomicity gap. Every action either lands, or none do — no
@@ -1590,7 +1424,7 @@ async fn run_update_item(
 /// the base write's own intent, materialized atomically by `TxnResolve` at
 /// its own resolve ts (ADR 0046 Decision 2's "materialize-at-resolve",
 /// never as a separately-staged intent). **The payload itself is never
-/// computed here**: for a `table_takes_kind_write_path` table, this
+/// computed here**: for every table (the kind path is universal, ADR 0049), this
 /// function builds a [`crate::PendingKindWrite`] (the item identity + op +
 /// condition) instead of precomputing a value from a coordinator-local
 /// read — evaluation (old-image read, condition check, LSI/change-log
@@ -1639,7 +1473,13 @@ async fn run_transact(
     // `ProdEnv` transactional-write test caught).
     let mut writes: Vec<crate::TxnTableWrite> = Vec::new();
     let mut preconditions: Vec<crate::TxnPrecondition> = Vec::new();
-    let mut write_conditions: Vec<crate::TxnWriteCondition> = Vec::new();
+    // Always empty since Train A rung 5 deleted the coordinator-valued write
+    // path: a write action's own condition rides `PendingKindWrite::
+    // condition` now. Kept as an explicit empty argument because `cp_txn`'s
+    // own `write_conditions` mechanism (ADR 0018 §2's apply-time write-key
+    // conditions) is still real machinery the raw `ClientRequest::Txn`
+    // protocol can exercise.
+    let write_conditions: Vec<crate::TxnWriteCondition> = Vec::new();
     let _rmw = ctx.data().rmw_lock.lock().await;
     let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
 
@@ -1662,14 +1502,13 @@ async fn run_transact(
             ));
         }
 
-        // ADR 0046 U3: a WRITE action (never a bare `ConditionCheck`, which
-        // writes nothing and stays the ordinary precondition path below)
-        // against a table with at least one secondary index or a stream
-        // enabled defers entirely to the participant leader — no
-        // coordinator-local read, no coordinator-local condition
-        // evaluation, no coordinator-computed diff. See this function's own
-        // doc and `PendingKindWrite`'s doc for why.
-        if !is_condition_check && table_takes_kind_write_path(meta, &table) {
+        // ADR 0046 U3 (universal since ADR 0049): EVERY write action — never
+        // a bare `ConditionCheck`, which writes nothing and stays the
+        // ordinary precondition path below — defers entirely to the
+        // participant leader: no coordinator-local read, no
+        // coordinator-local condition evaluation, no coordinator-computed
+        // diff. See this function's own doc and `PendingKindWrite`'s doc.
+        if !is_condition_check {
             let op = match action {
                 TransactAction::Put { item, .. } => KindWriteOp::Put(item.clone()),
                 TransactAction::Delete { .. } => KindWriteOp::Delete,
@@ -1699,17 +1538,18 @@ async fn run_transact(
             continue;
         }
 
-        // An `Update` always needs a pre-read (to compute its new value); a
-        // `Put`/`Delete`/`ConditionCheck` only needs one if it carries a
-        // condition to evaluate.
-        let needs_read = condition.is_some() || matches!(action, TransactAction::Update { .. });
-        let raw = if needs_read {
-            Some(raw_quorum_read(ctx, meta, &table, &data_key).await?)
-        } else {
-            None
-        };
+        // Only a `ConditionCheck` reaches here (every write action deferred
+        // to its participant leader above, since ADR 0049 made the kind
+        // path universal — the coordinator-valued write path and its
+        // own-key `write_conditions` mechanism were deleted with it in
+        // Train A rung 5; a write action's condition rides
+        // `PendingKindWrite::condition` + the C1 own-key OCC instead). A
+        // `ConditionCheck`'s condition evaluates against a read here, and
+        // its observed value becomes an ordinary cross-key `cp_txn`
+        // precondition.
+        let raw = raw_quorum_read(ctx, meta, &table, &data_key).await?;
         let decoded = match &raw {
-            Some(Some(bytes)) => wire::decode_stored_item(bytes)?,
+            Some(bytes) => wire::decode_stored_item(bytes)?,
             _ => None,
         };
         if let Some(cond) = condition
@@ -1719,57 +1559,7 @@ async fn run_transact(
                 "a transaction condition check failed",
             ));
         }
-
-        match action {
-            TransactAction::Put { item, .. } => {
-                writes.push(crate::TxnTableWrite {
-                    table: table.clone(),
-                    key: data_key.clone(),
-                    value: Some(wire::encode_stored_item(item)),
-                    pending: None,
-                });
-            }
-            TransactAction::Delete { .. } => {
-                writes.push(crate::TxnTableWrite {
-                    table: table.clone(),
-                    key: data_key.clone(),
-                    value: Some(wire::encode_tombstone()),
-                    pending: None,
-                });
-            }
-            TransactAction::Update {
-                actions: update_actions,
-                ..
-            } => {
-                let base = decoded.clone().unwrap_or_else(|| key_item.clone());
-                let new = wire::apply_update(base, update_actions);
-                writes.push(crate::TxnTableWrite {
-                    table: table.clone(),
-                    key: data_key.clone(),
-                    value: Some(wire::encode_stored_item(&new)),
-                    pending: None,
-                });
-            }
-            TransactAction::ConditionCheck { .. } => {
-                // No write — the condition was already validated above.
-            }
-        }
-
-        // A `ConditionCheck`'s observed value becomes an ordinary cross-key
-        // `cp_txn` precondition; a **write** action's own condition instead
-        // becomes an own-key `write_conditions` entry (ADR 0018 §2
-        // apply-time write-key conditions amendment) — two different
-        // `cp_txn` mechanisms for two structurally different cases, see
-        // this function's own doc. An unconditioned `Update`'s own
-        // mandatory read (`needs_read` above) must NOT gain an implicit
-        // condition here — only `condition.is_some()` does.
-        if let Some(observed) = raw {
-            if is_condition_check {
-                preconditions.push((table, data_key, observed));
-            } else if condition.is_some() {
-                write_conditions.push((table, data_key, observed));
-            }
-        }
+        preconditions.push((table, data_key, raw));
     }
     // ADR 0046 U3, PR2: released HERE, before any `raw_quorum_read`/`cp_txn`
     // call below — see this guard's own doc for why holding it any longer
@@ -2917,7 +2707,7 @@ pub(crate) enum KindWriteOutcome {
 /// **node-local** `ctx.data().rmw_lock`, so both could read → diff against
 /// the same stale `old` and the loser's stale LSI row orphaned forever
 /// (nothing reconciles a stale LSI row; only the GSI drain self-heals — see
-/// `table_takes_kind_write_path`'s doc for why an LSI can even ride this
+/// [`kind_writes_for_item`]'s doc for why an LSI can even ride this
 /// entry). Change-record `OLD_IMAGE` fidelity had the identical staleness.
 ///
 /// This function always runs **on the tablet's own leader** — called
@@ -3001,7 +2791,7 @@ pub(crate) async fn kind_write_item_at_leader(
         Some(item) => wire::encode_stored_item(item),
         None => wire::encode_tombstone(),
     };
-    match kind_writes_for_item(
+    let (writes, change_log) = kind_writes_for_item(
         meta,
         table,
         pk,
@@ -3010,19 +2800,11 @@ pub(crate) async fn kind_write_item_at_leader(
         value.clone(),
         old.as_ref(),
         new.as_ref(),
-    ) {
-        Some((writes, change_log)) => {
-            let seatbelt = vec![(base_key, raw_old)];
-            ClientCtx::cp_kind_local(leader, writes, vec![change_log], seatbelt)
-                .await
-                .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;
-        }
-        None => {
-            ClientCtx::cp_put_local(leader, base_key, value)
-                .await
-                .map_err(|e| internal(&format!("write failed: {e}")))?;
-        }
-    }
+    );
+    let seatbelt = vec![(base_key, raw_old)];
+    ClientCtx::cp_kind_local(leader, writes, vec![change_log], seatbelt)
+        .await
+        .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;
     Ok(KindWriteOutcome::Ok { old, new })
 }
 
@@ -3117,7 +2899,7 @@ pub(crate) async fn eval_kind_txn_write(
         Some(item) => wire::encode_stored_item(item),
         None => wire::encode_tombstone(),
     };
-    let (kind_writes, change_log) = match kind_writes_for_item(
+    let (writes, change_log) = kind_writes_for_item(
         meta,
         table,
         pk,
@@ -3126,19 +2908,17 @@ pub(crate) async fn eval_kind_txn_write(
         value.clone(),
         old.as_ref(),
         new.as_ref(),
-    ) {
-        // The base row itself rides as `TxnWrite::key`/`value`, not inside
-        // `kind_writes` — strip it out (it's always `writes[0]` by
-        // `kind_writes_for_item`'s own construction).
-        Some((writes, change_log)) => (
-            writes
-                .into_iter()
-                .filter(|(kind, _, _)| *kind != KIND_BASE)
-                .collect(),
-            Some(change_log),
-        ),
-        None => (Vec::new(), None),
-    };
+    );
+    // The base row itself rides as `TxnWrite::key`/`value`, not inside
+    // `kind_writes` — strip it out (it's always `writes[0]` by
+    // `kind_writes_for_item`'s own construction).
+    let (kind_writes, change_log) = (
+        writes
+            .into_iter()
+            .filter(|(kind, _, _)| *kind != KIND_BASE)
+            .collect(),
+        Some(change_log),
+    );
     Ok(Some(KindTxnWriteEval {
         key: base_key,
         value,
@@ -3185,23 +2965,6 @@ pub(crate) fn projected_item(item: &Item, base: &TableSchema, idx: &IndexDef) ->
         .filter(|(name, _)| names.contains(&name.as_str()))
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
-}
-
-/// Whether `table` takes the multi-kind atomic-batch write path
-/// (`kind_writes_for_item`) rather than the plain single-key one.
-///
-/// **Always `true` since ADR 0049 (the universal kind-write path)**: every
-/// table's every mutation commits through `KindBatch`, so every tablet has
-/// a change log unconditionally — a table with no stream and no secondary
-/// index writes an image-less *marker* record (see
-/// [`table_change_records_carry_images`]) instead of a full-image one. Kept
-/// as the single named gate (rather than inlining `true` at each call site)
-/// so the plain-path fallbacks it guards stay greppable until their
-/// deletion rung, and so the historical "one predicate, never two that
-/// happen to agree today" discipline (this function's original reason to
-/// exist) keeps one home if a future deployment knob ever needs it again.
-fn table_takes_kind_write_path(_meta: &Metadata, _table: &str) -> bool {
-    true
 }
 
 /// The **fast arm** of the ADR 0049 universal kind-write path: a
@@ -3256,8 +3019,9 @@ async fn fast_marker_write(
 /// base row + every marker record — the entry granularity the plain
 /// `cp_batch_write` path had (one entry, one WAL record, one apply per
 /// tablet; see `BatchWriteItem`'s arm for the measured regression a
-/// per-item shape caused). The ONE implementation shared by
-/// `BatchWriteItem`'s marker arm and the admin seeder
+/// per-item shape caused). A thin item-shaped wrapper over
+/// [`marker_batch_write_raw`] (the ONE grouping implementation, below),
+/// used by `BatchWriteItem`'s marker arm and the admin seeder
 /// (`admin::action_data_seed`) — never a second grouping copy. Only ever
 /// call it for a table whose records carry no images
 /// (`!table_change_records_carry_images`); an images table's batch must go
@@ -3267,10 +3031,38 @@ pub(crate) async fn marker_batch_write(
     table: &str,
     rows: Vec<(AttributeValue, Option<AttributeValue>, Vec<u8>)>,
 ) -> Result<(), String> {
-    // Auto-provision on first write (ADR 0023), as `fast_marker_write`/
-    // `cp_batch_write` do, then group by tablet against a fresh
-    // post-provision snapshot.
-    if !ctx.effective_metadata().has_table_tablet(table) {
+    let raw = rows
+        .into_iter()
+        .map(|(pk, sk, value)| {
+            let marker = item_marker_change_log(&pk, sk.as_ref());
+            (item_key(&pk, sk.as_ref()), Some(value), marker)
+        })
+        .collect();
+    marker_batch_write_raw(ctx, table, raw, true).await
+}
+
+/// One [`marker_batch_write_raw`] row: `(base key, value-or-engine-delete,
+/// the row's marker record pair)`.
+pub(crate) type MarkerRow = (Vec<u8>, Option<Vec<u8>>, (Vec<u8>, Vec<u8>));
+
+/// The raw-key core of [`marker_batch_write`] — the ONE per-tablet grouping
+/// implementation, shared with the plain client-protocol arms
+/// (`ClientRequest::Put`/`PutBatch`/`Delete`, ADR 0049 Train A rung 5),
+/// whose keys are arbitrary caller bytes with no `pk`/`sk` decomposition
+/// (their markers use the full-key-as-prefix convention, like CQL's and the
+/// GSI drain's — see [`marker_change_log`]'s doc). A `None` value is a
+/// genuine engine delete (`KindBatch`'s real tombstone), matching the old
+/// `cp_delete` semantics. `provision_if_absent` mirrors the primitives each
+/// caller replaces: the put paths auto-provision (ADR 0023), a bare delete
+/// never did (deleting from a table nothing provisioned must not conjure an
+/// empty tablet).
+pub(crate) async fn marker_batch_write_raw(
+    ctx: &ClientCtx,
+    table: &str,
+    rows: Vec<MarkerRow>,
+    provision_if_absent: bool,
+) -> Result<(), String> {
+    if provision_if_absent && !ctx.effective_metadata().has_table_tablet(table) {
         ctx.provision_tablet(table).await?;
     }
     let route_meta = ctx.effective_metadata();
@@ -3279,15 +3071,12 @@ pub(crate) async fn marker_batch_write(
     type TabletBatch = (Vec<(u8, Vec<u8>, Option<Vec<u8>>)>, Vec<(Vec<u8>, Vec<u8>)>);
     let mut by_tablet: std::collections::BTreeMap<Option<animus_tablet::TabletId>, TabletBatch> =
         std::collections::BTreeMap::new();
-    for (pk, sk, value) in &rows {
-        let base_key = item_key(pk, sk.as_ref());
+    for (base_key, value, marker) in rows {
         let tablet =
             crate::topology::tablet_for_key(route_meta.tablets_for_table(table), &base_key);
         let entry = by_tablet.entry(tablet).or_default();
-        entry.1.push(item_marker_change_log(pk, sk.as_ref()));
-        entry
-            .0
-            .push((animus_cp_data::KIND_BASE, base_key, Some(value.clone())));
+        entry.1.push(marker);
+        entry.0.push((animus_cp_data::KIND_BASE, base_key, value));
     }
     for (tablet, (writes, markers)) in by_tablet {
         if tablet.is_none() {
@@ -3334,7 +3123,9 @@ fn item_stage_marker_change_log(
 /// The one construction site for an ADR 0049 §1 image-less **marker**
 /// record's `(change_key_prefix, encoded_record)` pair, shared by every edge
 /// that commits one (this file's fast arm above; the CQL edge's partition
-/// writes, `cql::kind_partition_write`). `partition_prefix` is the change
+/// writes, `cql::kind_partition_write`; the GSI drain's hidden-index-table
+/// row writes, `index_drain::reconcile_partition` — full row key as prefix,
+/// empty `base_sk`, the CQL convention). `partition_prefix` is the change
 /// key's apply-completed prefix — the base row's own partition-scoped key
 /// bytes, token first, so the record lands in the same tablet as the base
 /// row and sorts per-partition (Dynamo: `token(escape(pk)) || escape(pk)`;
@@ -3386,7 +3177,7 @@ fn marker_record(partition_prefix: &[u8], base_sk: Vec<u8>, staged: bool) -> (Ve
 /// A table with neither writes an image-less **marker** record
 /// (`ChangeRecord::marker`, ADR 0049 §1): the dirty-key signal change-log
 /// consumers need, at a fixed few tens of bytes per write instead of two
-/// item images. This is exactly the predicate `table_takes_kind_write_path`
+/// item images. This is exactly the predicate the old kind-path gate
 /// used to be, renamed to what it now actually decides — the record's
 /// *shape*, never whether one exists ("images follow the stream/index
 /// declarations; the record itself follows nothing — it always exists").
@@ -3405,7 +3196,7 @@ pub(crate) fn table_change_records_carry_images(meta: &Metadata, table: &str) ->
 /// from its own index/stream); a marker-only table has no such consumer, so
 /// nothing observable rides on resolve latency and the proven-stable
 /// sequential spawn applies. This scoping is **load-bearing**, not a
-/// latency nicety: keying it on `table_takes_kind_write_path` (constant-
+/// latency nicety: keying it on the old kind-path gate (constant-
 /// true since ADR 0049) silently universalized the awaited-parallel
 /// configuration onto every plain-table transaction — the exact
 /// configuration `resolve_all_parallel`'s own comment records as
@@ -3523,11 +3314,8 @@ fn kind_writes_for_item(
     base_value: Vec<u8>,
     old: Option<&Item>,
     new: Option<&Item>,
-) -> Option<IndexedWrite> {
+) -> IndexedWrite {
     let indexes = meta.table_indexes(table);
-    if !table_takes_kind_write_path(meta, table) {
-        return None;
-    }
     let base = schema_for(meta, table);
     let base = &base;
     let mut writes: Vec<KindWrite> = vec![(KIND_BASE, base_key.to_vec(), Some(base_value))];
@@ -3582,7 +3370,7 @@ fn kind_writes_for_item(
         token_prefixed(pk, &dynamo_index::change_prefix(pk)),
         record.encode(),
     );
-    Some((writes, change_log))
+    (writes, change_log)
 }
 
 pub(crate) fn item_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {
@@ -3641,32 +3429,6 @@ fn table_known(ctx: &ClientCtx, meta: &Metadata, table: &str) -> bool {
         .lock()
         .expect("registry poisoned")
         .has_table(table)
-}
-
-/// CP write of `value` at `key` (ADR 0017): proposed on the per-tablet Raft group
-/// leader and waited to durable+applied before returning (durable-before-ack). The
-/// Raft index is the MVCC version, so no client-assigned version is needed (the
-/// AP path's `read_version`+1 dance is gone).
-async fn quorum_write(
-    ctx: &ClientCtx,
-    meta: &Metadata,
-    table: &str,
-    key: &[u8],
-    value: &[u8],
-) -> Result<(), WireError> {
-    // Auto-provision the table's tablet on first write (ADR 0023). A `CreateTable`
-    // provisions up front, but a legacy `pk`/`sk` client that never `CreateTable`d
-    // still needs a tablet to route to — stand one up on demand here. Idempotent
-    // (a request-start snapshot is sound: a stale "absent" just re-proposes the
-    // idempotent provisioning) and fast once the tablet exists.
-    if !meta.has_table_tablet(table) {
-        ctx.provision_tablet(table)
-            .await
-            .map_err(|e| internal(&e))?;
-    }
-    ctx.cp_write(table, key.to_vec(), value.to_vec())
-        .await
-        .map_err(|e| internal(&e))
 }
 
 /// Linearizable CP read of `key`, returning the **raw stored bytes** (the
@@ -3742,7 +3504,10 @@ mod stream_write_path_tests {
     use tokio::time::{sleep, timeout};
 
     use crate::config::NodeRole;
-    use crate::{ClusterConfig, Node, RoleAddrs, run_node};
+    use crate::{
+        ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, read_frame, run_node,
+        write_frame,
+    };
 
     fn free_addrs(count: usize) -> Vec<SocketAddr> {
         let ls: Vec<std::net::TcpListener> = (0..count)
@@ -4010,6 +3775,191 @@ mod stream_write_path_tests {
         );
     }
 
+    /// The ADR 0049 §5 bench gate's harness — `#[ignore]`d (a wall-clock
+    /// measurement, not an assertion; run explicitly with
+    /// `cargo test -p animusd --lib bench_plain_table_put -- --ignored
+    /// --nocapture`). Sequential `PutItem`s on a plain table through the
+    /// real Dynamo edge on one node: the exact path whose per-write cost the
+    /// universal kind path (base row + image-less marker in the same entry)
+    /// changes. Compare medians of ≥3 runs on the pre-train baseline
+    /// (749b4b8) vs the train tip; the recorded numbers live in ADR 0049's
+    /// as-built amendment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "bench gate: wall-clock measurement, run explicitly"]
+    async fn bench_plain_table_put_wall_clock() {
+        const N: usize = 200;
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = single_node(dir.path()).await;
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"benchp",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+        // One warm-up write outside the timed window (tablet formation +
+        // first-leader election are not the write path under test).
+        let (status, _) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.PutItem",
+            r#"{"TableName":"benchp","Item":{"id":{"S":"warmup"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let started = std::time::Instant::now();
+        for i in 0..N {
+            let (status, body) = dynamo(
+                node.dynamo_addr(),
+                "DynamoDB_20120810.PutItem",
+                &format!(
+                    r#"{{"TableName":"benchp","Item":{{"id":{{"S":"k{i:05}"}},"n":{{"N":"{i}"}}}}}}"#
+                ),
+            )
+            .await;
+            assert_eq!(status, 200, "PutItem {i} failed: {body}");
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "bench_plain_table_put_wall_clock: {N} sequential PutItems in {:?} ({:.2} ms/op)",
+            elapsed,
+            elapsed.as_secs_f64() * 1000.0 / N as f64
+        );
+    }
+
+    /// Send one plain-client-protocol request and return the reply.
+    async fn raw_request(addr: SocketAddr, request: &ClientRequest) -> ClientResponse {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        write_frame(&mut stream, request).await.expect("send");
+        read_frame(&mut stream)
+            .await
+            .expect("read reply")
+            .expect("a reply")
+    }
+
+    /// ADR 0049 Train A rung 5: the plain client protocol
+    /// (`ClientRequest::Put`/`PutBatch`/`Delete` — `animus-cli put`'s wire
+    /// surface) is a real write path, so its mutations ride the kind path
+    /// and each leaves exactly one image-less marker (full-raw-key-as-prefix
+    /// convention). Red on the pre-rung arms (plain
+    /// `cp_put`/`cp_batch_write`/`cp_delete`): zero records, ever. The
+    /// delete arm also stays a genuine engine delete, and never
+    /// auto-provisions a table nothing created.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_client_protocol_writes_emit_one_marker_each() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = single_node(dir.path()).await;
+
+        // Delete against a table nothing provisioned: no auto-provision
+        // (the old `cp_delete` contract) — it must fail its routing wait,
+        // not conjure an empty tablet.
+        let resp = raw_request(
+            node.client_addr(),
+            &ClientRequest::Delete {
+                table: "never-created".into(),
+                key: b"k".to_vec(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(resp, ClientResponse::Error(_)),
+            "a bare delete must not conjure a tablet: {resp:?}"
+        );
+        assert!(
+            node.metadata().tablets_for_table("never-created").count() == 0,
+            "delete auto-provisioned a tablet"
+        );
+
+        // Put auto-provisions (the old `cp_put` contract), then the batch
+        // and the delete land on the same table.
+        let put = raw_request(
+            node.client_addr(),
+            &ClientRequest::Put {
+                table: "rawt".into(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
+        let batch = raw_request(
+            node.client_addr(),
+            &ClientRequest::PutBatch {
+                table: "rawt".into(),
+                entries: vec![
+                    (b"k2".to_vec(), b"v2".to_vec()),
+                    (b"k3".to_vec(), b"v3".to_vec()),
+                ],
+            },
+        )
+        .await;
+        assert!(
+            matches!(batch, ClientResponse::PutOk),
+            "batch failed: {batch:?}"
+        );
+        let del = raw_request(
+            node.client_addr(),
+            &ClientRequest::Delete {
+                table: "rawt".into(),
+                key: b"k1".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(del, ClientResponse::PutOk), "del failed: {del:?}");
+
+        // Reads confirm the base effects: k2 present, k1 genuinely deleted.
+        let got = raw_request(
+            node.client_addr(),
+            &ClientRequest::Get {
+                table: "rawt".into(),
+                key: b"k2".to_vec(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(&got, ClientResponse::Value(Some(v)) if v == b"v2"),
+            "get k2: {got:?}"
+        );
+        let gone = raw_request(
+            node.client_addr(),
+            &ClientRequest::Get {
+                table: "rawt".into(),
+                key: b"k1".to_vec(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(gone, ClientResponse::Value(None)),
+            "k1 must be deleted: {gone:?}"
+        );
+
+        // Trim-safe accounting (ADR 0049 rung 4's union rule): one marker
+        // per mutation — 4 total (put + 2 batched + delete), live or
+        // already trimmed.
+        let group = await_group(&node, "rawt").await;
+        let records = group.pending_changes().await;
+        let trimmed = metrics_value(node.dynamo_addr(), "change_log_trimmed_total").await;
+        assert_eq!(
+            records.len() as u64 + trimmed,
+            4,
+            "exactly one marker per raw-protocol mutation (live {} + trimmed {trimmed})",
+            records.len()
+        );
+        for (key, value) in &records {
+            let record = ChangeRecord::decode(value).expect("marker decodes");
+            assert!(record.marker && record.consumer_hidden());
+            assert!(record.old_image.is_none() && record.new_image.is_none());
+            // Full-raw-key-as-prefix: change key = the raw key + the 8-byte
+            // apply-completed HLC suffix.
+            let prefix = &key[..key.len() - 8];
+            assert!(
+                [b"k1".as_slice(), b"k2".as_slice(), b"k3".as_slice()].contains(&prefix),
+                "marker prefix must be the raw key itself: {prefix:?}"
+            );
+        }
+    }
+
     /// its key's HLC suffix completed at apply (nonzero, strictly
     /// increasing in commit order) — and still never an LSI or footprint
     /// row.
@@ -4112,8 +4062,8 @@ mod stream_write_path_tests {
     /// ADR 0049's gate-drift regression: `BatchWriteItem` on a
     /// streamed-but-unindexed table must emit one change record per request
     /// — its fast path's old gate (`table_indexes(table).is_empty()`) had
-    /// silently drifted from the shared `table_takes_kind_write_path`
-    /// predicate, so such a table's batch writes bypassed the kind path and
+    /// silently drifted from the then-shared kind-path gate (since deleted;
+    /// the kind path is structural now), so such a table's batch writes bypassed the kind path and
     /// its stream silently lost every one of them (red on the pre-ADR-0049
     /// code).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -213,7 +213,7 @@ use animus_control::schema::{IndexDef, IndexKind};
 use animus_cp_data::cursor;
 use animus_cp_data::hlc::{self, HlcTimestamp};
 use animus_cp_data::segment;
-use animus_cp_data::{KIND_CHANGE, KIND_CURSOR, KIND_FOOTPRINT};
+use animus_cp_data::{KIND_BASE, KIND_CHANGE, KIND_CURSOR, KIND_FOOTPRINT};
 use animus_dynamo::wire;
 use animus_dynamo::{
     AttributeValue, ChangeRecord, FootprintEntry, IndexFootprint, Item, index as dynamo_index,
@@ -574,9 +574,9 @@ async fn drain_tablet(
     // A GSI's rows live in its own hidden table, provisioned lazily here on
     // the first drain that has genuinely dirty partitions to reconcile
     // (ADR 0023). This is load-bearing, not an optimization:
-    // `reconcile_partition` writes rows via `cp_write`, which — unlike
-    // `cp_kind_write`/`cp_txn` — does NOT auto-provision; without a tablet
-    // to route to, its `cp_route` would wait out `CLIENT_TIMEOUT` and fail,
+    // `reconcile_partition` writes rows via `cp_kind_write_raw`, which —
+    // unlike `cp_kind_write`/`cp_txn` — does NOT auto-provision; without a
+    // tablet to route to, its `cp_route` would wait out `CLIENT_TIMEOUT` and fail,
     // every tick, forever. Gated on the caller's metadata snapshot: a stale
     // "absent" just re-proposes an idempotent `CreateTablet`
     // (first-committer wins), and the hit path is sound because tablets are
@@ -776,18 +776,37 @@ async fn reconcile_partition(
     // stale ones, and only then record the new footprint. A crash mid-way
     // leaves the footprint still naming the old rows, so the next tick redoes
     // the whole reconciliation — over-covering, never under-covering.
+    //
+    // Each row commits through the kind path with an image-less marker
+    // record (ADR 0049 Train A rung 5): a hidden index table is a table, so
+    // its own tablets need a change-log delta feed too (ADR 0050's
+    // split-build tail will consume it when a hidden table's tablet splits).
+    // The marker's prefix is the row's own full key with an empty `base_sk`
+    // — the CQL convention (`marker_change_log`'s doc) — and the markers are
+    // transient exactly like a plain table's: a hidden table has no stream
+    // and no GSI of its own, so the zero-expected-terms trim rule deletes
+    // them. One `KindBatch` entry per row, same entry count as the plain
+    // `cp_write`/`cp_delete` calls this replaces.
     for (index_table, key, value) in writes {
-        ctx.cp_write(&index_table, key, value).await?;
+        let marker = crate::dynamo::marker_change_log(&key, Vec::new());
+        ctx.cp_kind_write_raw(
+            &index_table,
+            vec![(KIND_BASE, key, Some(value))],
+            vec![marker],
+        )
+        .await?;
     }
-    // A genuine engine delete, not a tombstone *value* (`encode_tombstone`):
-    // that sentinel exists so a base-table `DeleteItem` stays observable (to
-    // conditional reads and to the change log this very drain consumes), but
-    // an index row is wholly derived — a dead one has no reader to inform,
-    // and nothing would ever reclaim a sentinel from a hidden index table.
-    // The LSI half of an indexed write already prunes with a real tombstone
-    // (`KindBatch`'s `None` value); this is the GSI dual.
+    // A genuine engine delete (`KindBatch`'s `None` value — the same real
+    // tombstone the LSI half prunes with), not a tombstone *value*
+    // (`encode_tombstone`): that sentinel exists so a base-table
+    // `DeleteItem` stays observable (to conditional reads and to the change
+    // log this very drain consumes), but an index row is wholly derived — a
+    // dead one has no reader to inform, and nothing would ever reclaim a
+    // sentinel from a hidden index table.
     for (index_table, key) in stale {
-        ctx.cp_delete(&index_table, key).await?;
+        let marker = crate::dynamo::marker_change_log(&key, Vec::new());
+        ctx.cp_kind_write_raw(&index_table, vec![(KIND_BASE, key, None)], vec![marker])
+            .await?;
     }
 
     // One entry: just the updated footprint. See the module doc and
@@ -2013,6 +2032,68 @@ mod gsi_drain_cursor_tests {
     /// its unbounded-above end is a legal split point (`SplitTablet` doesn't
     /// require an existing key), so a plain numeric midpoint works.
     const BOUNDARY: [u8; 8] = 0x8000_0000_0000_0000u64.to_be_bytes();
+
+    /// ADR 0049 Train A rung 5: the GSI drain's row writes into a hidden
+    /// index table ride the kind path — every materialized row leaves an
+    /// image-less marker on the HIDDEN table's own change log (a hidden
+    /// table is a table; its tablets need the same delta feed ADR 0050's
+    /// split-build tail consumes everywhere else). Red on the pre-rung
+    /// code: `reconcile_partition` wrote via plain `cp_write`/`cp_delete`,
+    /// so a hidden group's `KIND_CHANGE` scope stayed empty forever no
+    /// matter how long this poll ran. Sustained base writes keep the trim
+    /// busy-gate deferring (changed-since-last-tick), so a live marker is
+    /// observable within the deadline — converged-or-timeout, never a
+    /// fixed-sleep one-shot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hidden_index_table_drain_writes_leave_markers() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node(dir.path()).await;
+            create_table_with_gsi(node.dynamo_addr(), "ht").await;
+            put_item(node.dynamo_addr(), "ht", "a0").await;
+            await_indexed(node.dynamo_addr(), "ht", "a0").await;
+
+            // The drain has materialized at least one GSI row by now, so the
+            // hidden table's tablet exists (lazily provisioned by the drain).
+            let hidden = index_table_name("ht", "by-g");
+            let group = loop {
+                let meta = node.metadata();
+                if let Some((&tablet, _)) = meta.tablets_for_table(&hidden).next()
+                    && let Some(group) = node.edge.local_cp(tablet)
+                {
+                    break group;
+                }
+                sleep(Duration::from_millis(20)).await;
+            };
+
+            let mut i = 0u32;
+            loop {
+                let records = group.pending_changes().await;
+                if let Some((key, value)) = records.first() {
+                    let record = ChangeRecord::decode(value).expect("hidden-table record decodes");
+                    assert!(record.marker, "a hidden table's record is a marker");
+                    assert!(
+                        record.consumer_hidden(),
+                        "a hidden table's marker must never be a stream event"
+                    );
+                    assert!(record.old_image.is_none() && record.new_image.is_none());
+                    // Full-row-key-as-prefix convention (`marker_change_log`'s
+                    // doc): the change key is the GSI row's own key + the
+                    // apply-completed 8-byte HLC suffix.
+                    assert!(
+                        key.len() > 8,
+                        "marker key carries the row key + an HLC suffix"
+                    );
+                    break;
+                }
+                i += 1;
+                put_item(node.dynamo_addr(), "ht", &format!("a{i}")).await;
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("no marker ever appeared on the hidden index table's change log");
+    }
 
     /// The change log must not grow without bound while a stream of writes
     /// to an indexed table is ongoing, and must drain back to nothing once

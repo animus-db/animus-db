@@ -1,7 +1,8 @@
 # ADR 0049 — The universal kind-write path: every tablet has a change log
 
-- **Status:** Accepted — not yet implemented (delivery "Train A"; ADR 0050's
-  split pivot depends on this ADR and lands as its own, later train).
+- **Status:** Accepted — **implemented** (Train A, rungs 1–5; see the
+  2026-08-16 as-built amendment at the bottom). ADR 0050's split pivot
+  depends on this ADR and lands as its own, later train.
 - **Date:** 2026-08-16
 - **Amends:** [ADR 0041](0041-materialized-secondary-indexes.md) (the
   `KindBatch` path stops being conditional on a table's index/stream
@@ -217,3 +218,101 @@ silently.
   (streamed tables' behavior is identical); a new corpus dimension drives
   plain-table marker load under fault injection to prove trim/quiesce
   liveness.
+
+## As-built amendment (2026-08-16) — Train A delivered
+
+Every section above shipped (rungs 1–5, one train). Where the build diverged
+from or sharpened this document:
+
+**§1 as built (rung 1 + its two fixups).** `ChangeRecord.marker` (distinct
+from `seeded`; `consumer_hidden()` is the one serve-path predicate — the
+sealer *does* seal markers into segments, hiding is serve-time, which also
+retroactively covered the backfill's seeded records with the same
+mechanism). The "no evaluate-at-leader hop" claim came out **stronger** than
+written: unevaluated plain-table `Put`/`Delete` skip the U3 funnel entirely
+via the edge-built `fast_marker_write` arm — forced by a real measured
+regression, not taste (routing plain batches through the funnel's
+lock-across-commit serialized N items into N sequential fsync round trips).
+Entry granularity is a **contract**: one `KindBatch` Raft entry per tablet
+per batch (`KindBatch.change_log` became a `Vec<(prefix, record)>`, codec
+v17), guarded by an entry-count test after the first per-item cut measurably
+blew a populate-then-backfill budget. §4's "the D1 awaited-resolve branch"
+consequence, found the hard way: `cp_txn`'s awaited `resolve_all_parallel`
+is keyed on `table_change_records_carry_images` — **never** on the (then
+constant-true, since deleted) kind-path predicate, whose universalization
+re-created the exact torn-pair instability a load-bearing code comment had
+already documented; marker-only transactions keep the proven fire-and-forget
+sequential resolve.
+
+**§2 as built (rung 2).** CQL's writes were already whole-partition RMW
+under `rmw_lock` (a partition is ONE CP value keyed `token || pk_bytes`,
+unescaped), so "no funnel" holds via a different route than Dynamo's: the
+kind path replaced only the commit vehicle (`cql::kind_partition_write`, one
+entry per mutation). The pre-existing cross-node CQL RMW gap is *not*
+closed and remains its own documented item.
+
+**§3 as built (rung 3).** The stage marker's bytes are **edge-built and
+apply-materialized** (`TxnWrite.stage_marker`, codec v18) — record bytes are
+opaque to `animus-cp-data` (ADR 0043's layering rule), so "the apply arm
+writes it" means the apply arm completes and merges edge-built bytes at the
+stage entry's own `ts` via the shared `materialize_derived`. The marker
+carries a `staged` flag; its prefix (and, rung 4, `TxnWrite.change_log`'s —
+the one previously-unvalidated wire-reachable stage prefix) is apply-time
+token-validated into the `Fenced` bucket.
+
+**§4 as built (rung 4).** Trim cadence is **not** per tick: a busy-gate
+(markers changed-since-last-tick + a 1 MiB floor) keeps a hot tablet from
+paying a propose+fsync per 200ms tick; quiet tablets trim immediately, so
+idle → trim → quiesce holds (proven end to end, including re-wake).
+`Metric::ChangeLogTrimmedTotal` counts trim deletions — and is the
+trim-safe half of every marker-emission test's accounting, because
+**transient markers make live-observation tests structurally racy** (assert
+live + trimmed, never live alone). The admin seeder moved onto the kind
+path (it had the same silent stream-loss class as the `BatchWriteItem` gate
+bug; `cp_batch_write_patient` was deleted with it) and raw
+`ClientRequest::Txn` plain writes gained stage markers.
+
+**Entry-point completeness closed (rung 5).** The GSI drain's hidden-table
+row writes ride the kind path (a hidden index table is a table; its markers
+use the full-row-key-as-prefix convention and trim by the zero-terms rule),
+and the plain client protocol's `Put`/`PutBatch`/`Delete` arms — a real
+write surface (`animus-cli put`) — commit through the shared per-tablet
+marker grouping (`dynamo::marker_batch_write_raw`). A raw-protocol write
+always emits a *marker*, even on a streamed/indexed table: a raw value is
+not an item, so there is no image to carry — but the old plain path emitted
+nothing at all, the same silent-loss shape the `BatchWriteItem` gate bug
+had. No exemptions were taken; the plain routed write primitives
+(`cp_write`/`cp_delete`/`cp_put`/`cp_batch_write`) and every dead plain
+fallback branch were deleted (the plain `KvCommand` variants and their
+forwarded serve arms stay — internal machinery and ADR 0050's future
+`SeedBatch` sibling).
+
+**§5 bench gate — measured, with one real find.** Harness:
+`stream_write_path_tests::bench_plain_table_put_wall_clock` (committed,
+`#[ignore]`d; 200 sequential `PutItem`s through the real Dynamo edge, one
+node, LSM backend, warm-up excluded; medians of 3 runs). Pre-train baseline
+(749b4b8): **4.69 ms/op** (4.68/4.69/5.25). Train tip, first measurement:
+**13.57 ms/op — a 2.9× regression, a stop-condition breach** — root-caused
+to the confirm-poll cadence, not marker bytes: `cp_kind_raw_local` (built
+for the background GSI drain) confirmed with a **flat 10ms sleep**, and ADR
+0049 put every plain write on it, so nearly every sequential write ate one
+whole tick. Fix: the same exponential confirm back-off (`CP_CONFIRM_POLL_
+INIT` 200µs → cap 5ms) the plain path always had. Post-fix tip: **4.73
+ms/op** (4.72/4.73/5.27) — a ~1% delta, within this ADR's stated
+expectation. The general lesson (a helper promoted from a background path
+to a client hot path carries its background-tuned cadence with it — bench
+the promoted path) is recorded in `docs/engineering-lessons.md`.
+
+**Testing-plan deltas.** The corpus item ("a new corpus dimension for
+plain-table marker load") is deliberately **not** built: `animusd` has no
+`SimEnv` (it is the assembly layer over two sim-tested crates), the
+quiesce/veto mechanics are already fault-injected in `animus-cp-data`'s
+quiescence corpus, and markers are ordinary `KindBatch` change-log rows the
+existing corpora already drive — a new `animus-test` dimension would mirror
+covered algorithms (the recorded corpus-green-≠-animusd-port lesson cuts
+the other way here: the `ProdEnv` tests in `stream_write_path_tests`/
+`stream_sealer_tests` ARE the gate for this crate's wiring). Everything
+else in the plan above shipped as written, plus regressions this document
+did not anticipate: the torn-pair scoping unit test, the per-tablet
+entry-count guard, the hidden-table marker test, and the raw-protocol
+marker/no-auto-provision test.

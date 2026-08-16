@@ -2439,8 +2439,17 @@ lock closes for the plain one.
 ### 5. D1 — awaited, bounded, parallel resolve for kind-write-path transactions
 
 `cp_txn`'s pre-existing "ack, then asynchronously resolve" shape (§6 of
-the PR5 amendment above) is unaffected for a plain transaction. For a
-transaction touching at least one kind-write-path table, the ack instead
+the PR5 amendment above) is unaffected for a plain transaction. **Scope
+re-worded by ADR 0049 (2026-08-16), which made the kind path universal and
+this clause's original predicate constant-true**: the awaited branch is
+keyed on a pending write against a table whose change records **carry
+images** (`table_change_records_carry_images` — an index or a stream: the
+consumers whose visibility the bound protects), never on the kind path
+itself; a marker-only transaction keeps the fire-and-forget sequential
+spawn (re-universalizing the awaited-parallel shape reproduced exactly the
+torn-pair instability the paragraph below records — see ADR 0049's
+as-built amendment). For a
+transaction staging such an images-table write, the ack instead
 awaits `resolve_all` under a short fixed budget
 (`TXN_RESOLVE_ALL_AWAIT_BUDGET`, 2s) before returning — a timeout still
 acks (delayed, never denied; `txn_resolver_loop` remains the safety net
