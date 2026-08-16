@@ -758,6 +758,7 @@ async fn advance_backfill_cursor(
             Some(cursor::encode_backfill_cursor(prefix)),
         )],
         None,
+        Vec::new(),
         KeyRange::whole(),
     ) {
         ProposeResult::Accepted { index } => index,
@@ -801,6 +802,7 @@ pub(crate) async fn clear_backfill_cursor(group: &CpGroup, index: &str) -> Resul
     let propose_index = match group.put_kind_batch_fenced(
         vec![(KIND_CURSOR, cursor_key_bytes, None)],
         None,
+        Vec::new(),
         KeyRange::whole(),
     ) {
         ProposeResult::Accepted { index } => index,
@@ -868,11 +870,15 @@ async fn seed_change_log_record(
     if !fence.contains(&change_log_prefix) {
         return Err("backfill seed target outside this group's live range; retry".into());
     }
-    let index =
-        match group.put_kind_batch_fenced(Vec::new(), Some((change_log_prefix, record)), fence) {
-            ProposeResult::Accepted { index } => index,
-            other => return Err(format!("backfill seed not accepted: {other:?}")),
-        };
+    let index = match group.put_kind_batch_fenced(
+        Vec::new(),
+        Some((change_log_prefix, record)),
+        Vec::new(),
+        fence,
+    ) {
+        ProposeResult::Accepted { index } => index,
+        other => return Err(format!("backfill seed not accepted: {other:?}")),
+    };
     let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
         if group.engine_applied_index() >= index {

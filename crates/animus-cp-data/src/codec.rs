@@ -87,7 +87,13 @@ const MAGIC: u8 = 0xCB;
 /// that used to carry no apply-time fence check at all — see
 /// `KvCommand::TxnResolve`'s doc. Same house convention: a clean bump, no
 /// cross-version compatibility.
-const VERSION: u8 = 14;
+/// `15` (ADR 0046 "evaluate at leader" seatbelt, PR1): `KindBatch` gained a
+/// `conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>` field — own-key byte-level
+/// OCC preconditions checked at apply, modeled on `TxnStage`'s own
+/// `conditions` field added in version `11` (see `KvCommand::KindBatch`'s
+/// doc). Same house convention: a clean bump, no cross-version
+/// compatibility.
+const VERSION: u8 = 15;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -355,6 +361,7 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
         KvCommand::KindBatch {
             writes,
             change_log,
+            conditions,
             fence,
             ts,
         } => {
@@ -372,6 +379,11 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
                     put_bytes(out, prefix);
                     put_bytes(out, record);
                 }
+            }
+            out.extend_from_slice(&(conditions.len() as u32).to_be_bytes());
+            for (k, expected) in conditions {
+                put_bytes(out, k);
+                put_opt_bytes(out, expected);
             }
             put_key_range(out, fence);
             put_ts(out, *ts);
@@ -515,9 +527,15 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 1 => Some((c.bytes()?, c.bytes()?)),
                 other => return Err(format!("invalid change_log tag {other}")),
             };
+            let n = c.u32()?;
+            let mut conditions = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                conditions.push((c.bytes()?, c.opt_bytes()?));
+            }
             KvCommand::KindBatch {
                 writes,
                 change_log,
+                conditions,
                 fence: read_key_range(c)?,
                 ts: read_ts(c)?,
             }
@@ -943,6 +961,28 @@ mod tests {
                     ts: ts(2, 5),
                 },
                 config: Some([1, 2, 3].into_iter().map(nid).collect()),
+            },
+            // ADR 0046 seatbelt (PR1): `KindBatch.conditions` — exercises a
+            // non-empty condition list alongside a tombstone write and a
+            // change-log record, so the round trip proves every field this PR
+            // touched, not just the new one in isolation.
+            LogEntry {
+                term: 3,
+                index: 18,
+                command: KvCommand::KindBatch {
+                    writes: vec![
+                        (crate::KIND_BASE, b"base-key".to_vec(), Some(b"v".to_vec())),
+                        (crate::KIND_LSI, b"lsi-key".to_vec(), None), // a tombstone
+                    ],
+                    change_log: Some((b"change-prefix".to_vec(), b"record".to_vec())),
+                    conditions: vec![
+                        (b"base-key".to_vec(), Some(b"old-v".to_vec())),
+                        (b"other-key".to_vec(), None), // must be absent
+                    ],
+                    fence: KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())),
+                    ts: ts(2, 6),
+                },
+                config: None,
             },
             LogEntry {
                 term: 4,

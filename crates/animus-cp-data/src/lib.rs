@@ -468,6 +468,33 @@ pub enum KvCommand {
     /// partial application would break exactly the atomicity this exists for.
     /// Keys are logical (token-leading, ADR 0022) — the kind selects the scope,
     /// it is never part of the key.
+    ///
+    /// **`conditions` (ADR 0046 "evaluate at leader" seatbelt, modeled on
+    /// [`TxnStage`](Self::TxnStage)'s own `conditions` field)**: `(key,
+    /// expected)` pairs — `expected: Some(bytes)` means `key`'s current
+    /// *committed* value (envelope-unwrapped, the same read discipline `Cas`/
+    /// `TxnStage` use) must equal `bytes` exactly; `None` means it must be
+    /// absent. Byte-level OCC, not a rich expression, exactly like
+    /// `TxnStage.conditions` — a caller (`animusd`'s leader-side write
+    /// evaluator) compiles its own richer condition against a pre-read down to
+    /// "the value must still be exactly what I read" before it ever reaches
+    /// here. Unlike `TxnStage`, a `KindBatch` condition failure has **no**
+    /// outcome-introspection channel — a condition-failed entry no-ops
+    /// silently, indistinguishable from a fence/seal miss, deliberately (the
+    /// existing generic-error/probe-poll-timeout contract every
+    /// `put_kind_batch_fenced` caller already has to handle) — so this field
+    /// is checked once, **before** the fence/seal gate rather than gated
+    /// behind it: there is no reporting-priority reason (no `StageOutcome`
+    /// analogue to disambiguate) to skip the read when the entry would fence
+    /// out anyway. This field has **no production caller as of this PR** —
+    /// it lands ahead of its first real use (`animusd`'s leader-side
+    /// evaluate-then-propose write path, ADR 0046 U3) as the seatbelt against
+    /// a concurrent `TxnStage`/`TxnResolve` commit landing between that
+    /// evaluator's own-key read and its own propose call: real today (every
+    /// `rmw_lock` use lives in edge handlers, never `txn_resolver_loop`) but
+    /// unreachable until a future transaction stack can target an
+    /// indexed/streamed table (transactions are rejected on those tables
+    /// today).
     KindBatch {
         /// `(row kind, logical key, value)` — `None` writes a tombstone.
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
@@ -484,6 +511,7 @@ pub enum KvCommand {
         /// order). Making it structural also means the record can never be
         /// keyed inconsistently across replicas.
         change_log: Option<(Vec<u8>, Vec<u8>)>,
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
         ts: HlcTimestamp,
     },
@@ -1781,26 +1809,31 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// the write it describes. Keys are **logical** and token-leading
     /// (ADR 0022); the kind selects the scope and is never part of the key.
     ///
-    /// Stamps `fence = KeyRange::whole()`; use
+    /// Stamps `fence = KeyRange::whole()` and no `conditions`; use
     /// [`put_kind_batch_fenced`](Self::put_kind_batch_fenced) to stamp a
-    /// narrower one.
+    /// narrower fence or supply own-key OCC conditions.
     pub fn put_kind_batch(
         &self,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Option<(Vec<u8>, Vec<u8>)>,
     ) -> ProposeResult {
-        self.put_kind_batch_fenced(writes, change_log, KeyRange::whole())
+        self.put_kind_batch_fenced(writes, change_log, Vec::new(), KeyRange::whole())
     }
 
     /// As [`put_kind_batch`](Self::put_kind_batch), but the leader stamps its
-    /// own `fence` into the entry. If **any** key falls outside `fence`, none of
-    /// the batch applies — the fence gates the whole atomic entry, since a
-    /// half-applied index write is exactly what colocating the kinds exists to
-    /// prevent.
+    /// own `fence` into the entry, and may supply own-key OCC `conditions`. If
+    /// **any** key falls outside `fence`, none of the batch applies — the
+    /// fence gates the whole atomic entry, since a half-applied index write
+    /// is exactly what colocating the kinds exists to prevent. See
+    /// [`KvCommand::KindBatch`]'s doc for what `conditions` means and why it
+    /// is checked ahead of the fence/seal gate; pass an empty `Vec` for the
+    /// pre-existing no-conditions behavior (every caller before this field
+    /// existed).
     pub fn put_kind_batch_fenced(
         &self,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Option<(Vec<u8>, Vec<u8>)>,
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
     ) -> ProposeResult {
         self.propose_ordered(|term| {
@@ -1809,6 +1842,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             KvCommand::KindBatch {
                 writes,
                 change_log,
+                conditions,
                 fence,
                 ts,
             }
@@ -4591,18 +4625,62 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             KvCommand::KindBatch {
                 writes,
                 change_log,
+                conditions,
                 fence,
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
+                // ADR 0046 "evaluate at leader" seatbelt: this entry's own-key
+                // `conditions` (see `KvCommand::KindBatch`'s doc) are checked
+                // against the KIND_BASE scope — the only scope a production
+                // caller ever conditions on — BEFORE the fence/seal gate
+                // below. This deliberately differs from `TxnStage`'s own
+                // `condition_failure`, which only evaluates once its entry is
+                // otherwise known to be in-fence (so `StageOutcome` can report
+                // the fence/seal reason ahead of a condition one): a
+                // `KindBatch` condition failure has no outcome-introspection
+                // channel at all — it no-ops silently, indistinguishable from
+                // a fence/seal miss either way — so there is no
+                // reporting-priority reason to gate the read behind the fence
+                // check here. Drain the pending run first (mirrors `Cas`'s and
+                // `TxnStage`'s own read-after-flush-pending discipline) so a
+                // condition observes every earlier committed write in this
+                // same apply pass.
+                let conditions_ok = if conditions.is_empty() {
+                    true
+                } else {
+                    flush_pending(storage, &mut pending, metrics).await;
+                    let mut ok = true;
+                    for (key, expected) in &conditions {
+                        let raw = storage
+                            .get(&scope.physical(key))
+                            .await
+                            .expect("raftkv kind batch condition read");
+                        let matches = match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                            None => expected.is_none(),
+                            Some(txn::Envelope::Committed(v)) => Some(v) == *expected,
+                            // An unresolved intent makes "the current
+                            // committed value" ambiguous — never guess at a
+                            // match, mirroring `Cas`/`TxnStage`'s identical
+                            // discipline.
+                            Some(txn::Envelope::Intent { .. }) => false,
+                        };
+                        if !matches {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                };
                 // Gated as one unit, exactly like `Batch` — an index write that
                 // half-applied would leave an LSI row describing a base row
                 // that never landed, which is the one thing colocating them was
                 // supposed to make impossible. Every kind shares this tablet's
                 // single range, so one fence covers them all.
-                if writes
-                    .iter()
-                    .all(|(_, key, _)| fence.contains(key) && !is_sealed(sealed, key))
+                if conditions_ok
+                    && writes
+                        .iter()
+                        .all(|(_, key, _)| fence.contains(key) && !is_sealed(sealed, key))
                 {
                     for (kind, key, value) in &writes {
                         // An unknown kind cannot be applied anywhere safe (this

@@ -273,6 +273,26 @@ State once here; cross-referenced from the sections below.
   `_participant` poll `stage_outcome` directly instead (`wait_stage_outcome`)
   — `None` on timeout, never a hard-`expect`ed fact that turns out not to be
   guaranteed. See `docs/engineering-lessons.md` for the general lesson.
+- **`KindBatch` gained the identical own-key `conditions` field (ADR 0046
+  "evaluate at leader" seatbelt, codec version 15)** — modeled directly on
+  `TxnStage.conditions`, `(key, expected)` byte-level OCC pairs checked
+  against the KIND_BASE scope. Two deliberate differences from `TxnStage`'s
+  own handling: (1) **no `StageOutcome` analogue** — a condition-failed
+  `KindBatch` no-ops silently, indistinguishable from a fence/seal miss (the
+  existing generic-error/probe-poll-timeout contract every
+  `put_kind_batch_fenced` caller already handles), so there is nothing to
+  disambiguate; and (2) **checked BEFORE the fence/seal gate**, not behind
+  it — `TxnStage`'s `condition_failure` only evaluates once already known
+  in-fence so `StageOutcome` can report the fence/seal reason ahead of a
+  condition one, but with no outcome channel to prioritize for `KindBatch`
+  there is no reason to gate the read behind the fence check. The two gates
+  still simply AND together either way. As of this field's introduction it
+  has **no production caller** — it lands ahead of its first real use
+  (`animusd`'s leader-side evaluate-then-propose write path, ADR 0046 U3):
+  the seatbelt against a concurrent `TxnStage`/`TxnResolve` commit landing
+  between that evaluator's own-key read and its own propose call. Tests:
+  `tests/kind_batch_conditions.rs`, mirroring `tests/txn_conditions.rs`
+  scenario-for-scenario.
 - **The value envelope + transactions (`txn.rs`).** Every value the apply
   path merges into the engine is 1-byte-tagged: `0` = committed (raw value
   follows), `1` = an intent naming the staging `TxnId`, its record's

@@ -172,6 +172,7 @@ fn propose_write(group: &Group, leader: usize, item_key: &[u8], record: &[u8]) -
     match group.nodes[leader].put_kind_batch_fenced(
         vec![(KIND_BASE, item_key.to_vec(), Some(record.to_vec()))],
         Some((item_key.to_vec(), record.to_vec())),
+        Vec::new(),
         group.range.clone(),
     ) {
         animus_control::ProposeResult::Accepted { index } => index,

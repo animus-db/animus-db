@@ -184,11 +184,12 @@ impl CpGroup {
         &self,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Option<(Vec<u8>, Vec<u8>)>,
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
     ) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.put_kind_batch_fenced(writes, change_log, fence),
-            CpGroup::Mem(n) => n.put_kind_batch_fenced(writes, change_log, fence),
+            CpGroup::Lsm(n) => n.put_kind_batch_fenced(writes, change_log, conditions, fence),
+            CpGroup::Mem(n) => n.put_kind_batch_fenced(writes, change_log, conditions, fence),
         }
     }
 
@@ -4806,7 +4807,7 @@ impl ClientCtx {
                     .last()
                     .map(|(kind, key, value)| (*kind, key.clone(), value.clone()))
                     .expect("writes is non-empty — checked via `first` above");
-                match leader.put_kind_batch_fenced(writes, None, fence) {
+                match leader.put_kind_batch_fenced(writes, None, Vec::new(), fence) {
                     ProposeResult::Accepted { .. } => {}
                     other => return Err(format!("kind write not accepted: {other:?}")),
                 }
@@ -4865,7 +4866,7 @@ impl ClientCtx {
                 return Err("kind write outside this group's live range; retry".into());
             }
         }
-        match leader.put_kind_batch_fenced(writes, change_log, fence) {
+        match leader.put_kind_batch_fenced(writes, change_log, Vec::new(), fence) {
             ProposeResult::Accepted { .. } => {}
             other => return Err(format!("kind write not accepted: {other:?}")),
         }

@@ -273,6 +273,7 @@ fn write_pre_existing_row(
     let result = node.put_kind_batch_fenced(
         vec![(KIND_BASE, key, Some(b"v".to_vec()))],
         None,
+        Vec::new(),
         range.clone(),
     );
     propose_confirmed(sim, node, seed, result);
@@ -294,6 +295,7 @@ fn write_base_row_live(sim: &mut Simulator, node: &KvNode, range: &KeyRange, pk:
     let result = node.put_kind_batch_fenced(
         vec![(KIND_BASE, key.clone(), Some(b"v".to_vec()))],
         Some((key, record)),
+        Vec::new(),
         range.clone(),
     );
     propose_confirmed(sim, node, seed, result);
@@ -347,8 +349,12 @@ fn backfill_seed_tick(
             new_image: None,
         }
         .encode();
-        let result =
-            node.put_kind_batch_fenced(Vec::new(), Some((prefix.clone(), record)), range.clone());
+        let result = node.put_kind_batch_fenced(
+            Vec::new(),
+            Some((prefix.clone(), record)),
+            Vec::new(),
+            range.clone(),
+        );
         propose_confirmed(sim, node, seed, result);
         scan_start = dynamo_index::range_end(&prefix);
         last_seeded = Some(prefix);
@@ -369,6 +375,7 @@ fn backfill_seed_tick(
         let result = node.put_kind_batch_fenced(
             vec![(KIND_CURSOR, cursor_key_bytes, Some(cursor_val))],
             None,
+            Vec::new(),
             KeyRange::whole(),
         );
         propose_confirmed(sim, node, seed, result);

@@ -247,6 +247,7 @@ fn an_out_of_fence_key_blocks_the_whole_entry() {
                 (KIND_LSI, lsi.clone(), Some(b"lsi-row".to_vec())),
             ],
             None,
+            Vec::new(),
             fence,
         ),
         ProposeResult::Accepted { .. }
