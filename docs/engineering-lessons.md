@@ -2294,6 +2294,30 @@ debugging anything that feels like it might have happened before.
   `Forwarded`, `KindWrite`/`KindScan`, the `Txn*` internal RPCs, etc.) needs
   `intra_addr()` instead — the error message names the fix, but only once
   you've already hit it. (2026-08-16, `growth/1-f11-fence`.)
+- **`SimEnv`'s `Sleep` future logs a `TraceEvent::Timer` at its deadline
+  unconditionally — even for a `select` branch that lost the race and was
+  dropped long before that deadline arrives.** `Sleep::poll`'s *first* call
+  inserts a `(deadline, Event::Timer(id))` entry into the global timeline;
+  nothing removes that entry if the future is later dropped (no `Drop` impl,
+  and `select` drops the losing branch outright), so the scheduler's normal
+  timeline sweep fires it anyway at the original deadline, unconditionally
+  pushing the trace line and popping (now-absent) `timer_wakers` — a
+  functional no-op, but real trace noise. Consequence: raw
+  `TraceEvent::Timer` counts over a window are **not** a clean proxy for
+  "how many times did this task actually wait out its poll interval" the
+  moment any of its sleeps race against something else (a message, a signal)
+  that can resolve first — every such raced-and-abandoned sleep still
+  contributes one *eventual* Timer line at its stale deadline, indistinguishable
+  in the trace from a sleep that genuinely ran to completion. A clean
+  wakeup-count assertion is only cheap for a **provably idle** window (no
+  messages, no signals, nothing else racing the sleep) — anywhere traffic is
+  interleaved, don't reach for a bare `TraceEvent::Timer` tally; either prove
+  the window is idle first or instrument the call site directly (a counter
+  bumped only where the sleep is entered). Found while evaluating a
+  wakeup-count regression test for the ADR 0044 phase-1 apply-signal fix
+  (`quiesce/1-apply-signal`, 2026-08-16) — skipped in favor of the three
+  bounded-convergence tests in `tests/apply_signal.rs`, which don't depend on
+  this distinction.
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
@@ -5872,6 +5896,34 @@ debugging anything that feels like it might have happened before.
   effect that merely looks the same from the outside; if the answer isn't a
   clean no, the confirmation is checking the wrong thing. (2026-08-16,
   `growth/2-stream-grow`, `ClientCtx::trigger_split`.)
+- **Converting an unconditional idle poll into a wake-on-X signal requires
+  enumerating every *state transition* that creates the work, not every
+  *call site* that might seem related — and some of those transitions live
+  entirely inside a different subsystem's own timer, with no shared event to
+  hook.** The apply task's `APPLY_IDLE_POLL` (ADR 0044 phase-1 PR1,
+  `animus-cp-data`) looked at first like it needed a signal wherever
+  `RaftCore::apply` could run (a `mark_durable_through` call, a follower's
+  in-line apply inside `handle`, a completed snapshot install's commit-index
+  jump, a single-node group's own commit-advancing propose) — all genuinely
+  correlated with `commit_index` advancing, so one before/after comparison
+  after stepping the core plus one call at `mark_durable_through` covers all
+  of them. But `RaftCore::take_snapshot_needed` — the lazy on-demand
+  snapshot-image-build request the apply task must also notice — is set by
+  `snapshot_chunk_for`, reached from the leader's ordinary
+  heartbeat/replicate cycle discovering a reconnected follower's log has
+  been compacted away, with **no commit advance anywhere in that step**: it
+  is purely a consequence of the consensus loop's own timer, which the apply
+  task has no reason to know about. Trying to add a fourth explicit signal
+  point for this would mean piping a new plumbing path across the two-task
+  split for one rare, already-bounded case. **General rule**: after wiring
+  the signal for every transition you can name, ask whether a transition
+  exists that's driven by a *different* loop's own timer/tick with no data
+  dependency the signal's owner can observe — if so, don't chase it with more
+  plumbing; keep (or add) a bounded safety-poll fallback and prove
+  convergence through it with a test, which is both simpler and strictly
+  safer than an enumeration you can't be sure is exhaustive. (2026-08-16,
+  `quiesce/1-apply-signal`, `tests/apply_signal.rs`'s
+  `apply_converges_via_safety_poll_on_a_signal_less_snapshot_build`.)
 
 ### Parallel-agent orchestration
 - **`gh stack checkout <N>` silently switches the CURRENT worktree's checked-

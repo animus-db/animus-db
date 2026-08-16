@@ -809,6 +809,15 @@ where
         self.pending_install.take()
     }
 
+    /// Whether a fully-received snapshot is waiting for
+    /// [`drain_pending_install`](Self::drain_pending_install) — a read-only peek a
+    /// `DRIVER_APPLIED` consensus loop can use to notice "apply work now exists"
+    /// (ADR 0044 phase-1 PR1) without taking it, since only the apply task may
+    /// actually drain it.
+    pub fn has_pending_install(&self) -> bool {
+        self.pending_install.is_some()
+    }
+
     /// The next virtual instant at which this node wants a timer tick.
     pub fn next_deadline(&self) -> Nanos {
         if self.role == Role::Leader {

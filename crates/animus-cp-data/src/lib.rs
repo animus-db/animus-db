@@ -125,6 +125,64 @@ impl Future for ProposePending<'_> {
     }
 }
 
+/// The **wake-on-commit** signal (ADR 0044 phase-1 PR1): the same shape as
+/// [`ProposeSignal`], but for the **apply task** rather than the consensus
+/// loop. `apply_loop`'s idle back-off used to be an unconditional
+/// `env.sleep(APPLY_IDLE_POLL)` (5ms) every time there was nothing to merge —
+/// ~200 wakeups/s per hosted group at complete idle, independent of whether
+/// anything ever changed. The consensus loop now raises this signal at every
+/// point that can transition "no apply work" to "apply work exists" —
+/// `persist_wal`'s `mark_durable_through` call, a commit-index advance
+/// observed after stepping the core (covers a follower's in-line apply on
+/// `AppendEntries` and a snapshot install's `commit_index` jump alike), a
+/// proposer's own commit-advancing propose (the single-node/majority-1 fast
+/// path), and [`RaftKvNode::shutdown`](RaftKvNode::shutdown) (so a parked
+/// apply task always notices the halt instead of waiting out the now much
+/// longer [`APPLY_SAFETY_POLL`]) — so `apply_loop` races this against a long
+/// safety poll instead of spinning on a short one. See the "What's
+/// non-obvious" section of this crate's `CLAUDE.md` for the enumerated
+/// raise points and why a signal-less path (e.g. the lazy on-demand
+/// snapshot-image build `take_snapshot_needed` triggers, which is set purely
+/// off the leader's own heartbeat/replicate cycle with no commit advance)
+/// must still converge off the safety poll alone.
+#[derive(Default)]
+struct ApplySignal {
+    /// Set by the consensus loop (or `shutdown`), consumed by the apply task.
+    pending: AtomicBool,
+    /// The apply task's waker, registered each time it parks.
+    waker: AtomicWaker,
+}
+
+impl ApplySignal {
+    /// Raise the flag, then wake the parked apply task. Order matters — the
+    /// flag is visible before the wake, so the apply task's poll (which
+    /// registers *then* checks the flag) can never miss it, mirroring
+    /// [`ProposeSignal::notify`].
+    fn notify(&self) {
+        self.pending.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+}
+
+/// A future that resolves once the apply task has new work to check for, for
+/// `apply_loop`'s idle-backoff `select` — the [`ApplySignal`] counterpart to
+/// [`ProposePending`].
+struct ApplyPending<'a> {
+    signal: &'a ApplySignal,
+}
+
+impl Future for ApplyPending<'_> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.signal.waker.register(cx.waker());
+        if self.signal.pending.swap(false, Ordering::AcqRel) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 /// The physical key-space a `RaftKvNode`'s group is confined to within a
 /// possibly-**shared** `StorageEngine` (ADR 0028): every physical key this
 /// group ever writes is `prefix || key`, and a read is bounded to physical
@@ -1166,6 +1224,11 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// replicate a freshly appended entry immediately, cutting single-write latency
     /// (ADR 0017) — no waiting on the next heartbeat tick.
     propose_signal: Arc<ProposeSignal>,
+    /// **Wake-on-commit** signal (ADR 0044 phase-1 PR1): raised by the consensus
+    /// loop and by [`shutdown`](Self::shutdown) so the apply task's idle back-off
+    /// races this against [`APPLY_SAFETY_POLL`] instead of spinning on
+    /// `APPLY_IDLE_POLL`. See [`ApplySignal`]'s doc for the enumerated raise points.
+    apply_signal: Arc<ApplySignal>,
     /// Observability sink (ADR 0015). The public propose API records the real
     /// accept/reject outcome into it, and the consensus loop + apply task each hold
     /// a clone for the commit/apply/read-barrier/snapshot recording sites. Cheap to
@@ -1377,6 +1440,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let engine_applied = Arc::new(AtomicU64::new(0));
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let propose_signal = Arc::new(ProposeSignal::default());
+        let apply_signal = Arc::new(ApplySignal::default());
         // Group-start witnessing (ADR 0018 §2 amendment): fold in whatever
         // this (possibly shared, ADR 0026/0028) engine's highest MVCC
         // version already reflects, so this group's own future mints never
@@ -1412,6 +1476,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             stopped: Arc::clone(&stopped),
             apply_stopped: Arc::clone(&apply_stopped),
             propose_signal: Arc::clone(&propose_signal),
+            apply_signal: Arc::clone(&apply_signal),
             metrics: metrics.clone(),
             scope: scope.clone(),
             kind_scopes: kind_scopes.clone(),
@@ -1441,6 +1506,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             stopped,
             apply_stopped,
             propose_signal,
+            apply_signal,
             metrics,
             scope,
             kind_scopes,
@@ -1462,6 +1528,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// fresh `start`.
     pub fn shutdown(&self) {
         self.halted.store(true, Ordering::SeqCst);
+        // Wake a parked apply task (ADR 0044 phase-1 PR1): its idle back-off now
+        // races `ApplySignal` against a much longer `APPLY_SAFETY_POLL` (was a bare
+        // 5ms poll), so without this a shutdown request could sit unnoticed by the
+        // apply task for up to that whole interval instead of within one wake.
+        self.apply_signal.notify();
     }
 
     /// Whether [`shutdown`](Self::shutdown) has been requested.
@@ -1554,6 +1625,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         drop(core);
         if matches!(result, ProposeResult::Accepted { .. }) {
             self.propose_signal.notify();
+            // A single-node (majority-1) group's `core.propose` above can advance
+            // commit + apply inline (ADR 0044 phase-1 PR1) — nudge the apply task
+            // too in case that just created work for it.
+            self.apply_signal.notify();
         }
         result
     }
@@ -1585,6 +1660,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         drop(core);
         if matches!(result, ProposeResult::Accepted { .. }) {
             self.propose_signal.notify();
+            // See `propose_ordered`'s identical note: a single-node group's
+            // `core.propose` can advance commit + apply inline.
+            self.apply_signal.notify();
         }
         (result, aux)
     }
@@ -2681,6 +2759,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let result = record_reconfigure(&self.metrics, self.lock().change_membership(voters));
         if matches!(result, ProposeResult::Accepted { .. }) {
             self.propose_signal.notify();
+            // A single-node group's config-change no-op can commit + apply inline
+            // (ADR 0044 phase-1 PR1), same as `propose_ordered`.
+            self.apply_signal.notify();
         }
         result
     }
@@ -4352,11 +4433,20 @@ fn record_kv_outbound(metrics: &MetricsHandle, outs: &[(NodeId, KvWire)]) {
 /// timeout (ADR 0017 — the driver-liveness fix). Holds `wal_lock` so the append
 /// cannot interleave with the apply task's compaction rewrite of the same file.
 /// Durability precedes visibility: `mark_durable_through` follows the `fsync`.
+///
+/// **Raises `apply_signal`** (ADR 0044 phase-1 PR1) whenever it reaches
+/// `mark_durable_through`: the leader's apply frontier is `min(commit_index,
+/// durable_index)` (`RaftCore::apply`'s doc), so advancing `durable_index` here is
+/// exactly the point that can newly unblock already-committed-but-not-yet-durable
+/// entries for the apply task to merge — a transition the follower-side in-line
+/// apply (on `AppendEntries`, gated on `commit_index` alone) doesn't need, but this
+/// leader-side one does.
 async fn persist_wal<E: Env>(
     env: &E,
     wal: &str,
     core: &Arc<Mutex<KvCore>>,
     wal_lock: &AsyncMutex<()>,
+    apply_signal: &ApplySignal,
 ) {
     let _wal = wal_lock.lock().await;
     let (records, through) = {
@@ -4375,6 +4465,7 @@ async fn persist_wal<E: Env>(
     core.lock()
         .expect("raftkv core poisoned")
         .mark_durable_through(through);
+    apply_signal.notify();
 }
 
 /// Whether `key` falls inside any range this group has already sealed
@@ -6039,6 +6130,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     stopped: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
     propose_signal: Arc<ProposeSignal>,
+    apply_signal: Arc<ApplySignal>,
     metrics: MetricsHandle,
     /// The **base**-kind scope (ADR 0041 §3) — see [`RaftKvNode::scope`].
     scope: StorageScope,
@@ -6089,11 +6181,19 @@ fn witness_append_entries(hlc: &Hlc, msg: &RaftMsg<KvCommand>, now: Nanos) {
     }
 }
 
-/// Idle back-off for the apply task: when there is nothing committed-and-durable to
-/// merge it sleeps this long before re-checking. Under load `apply_and_compact`
-/// keeps returning `true`, so the task never sleeps and apply stays close behind
-/// commit — this only bounds latency (and CPU) while idle.
-const APPLY_IDLE_POLL: Duration = Duration::from_millis(5);
+/// Safety-net back-off for the apply task (ADR 0044 phase-1 PR1 — replaces the old
+/// unconditional `APPLY_IDLE_POLL` 5ms poll): when there is nothing committed-and-
+/// durable to merge, `apply_loop` races [`ApplyPending`] against a sleep of this
+/// length rather than looping every few milliseconds regardless of whether
+/// anything changed. [`ApplySignal`] normally resolves this well before the
+/// deadline; this bound only matters for a **signal-less** transition (the
+/// on-demand snapshot-image build `RaftCore::take_snapshot_needed` triggers, which
+/// is set purely off the leader's own heartbeat/replicate cycle with no commit
+/// advance — see `ApplySignal`'s doc) or a missed/lost wakeup, so a missed signal
+/// degrades to today's (pre-fix) latency at worst, never a stall. Under load
+/// `apply_and_compact` keeps returning `true`, so the task never sleeps and apply
+/// stays close behind commit — this only bounds latency (and CPU) while idle.
+const APPLY_SAFETY_POLL: Duration = Duration::from_millis(250);
 
 /// The per-node **consensus loop**: recover from the WAL, spawn the apply task, then
 /// repeatedly persist the WAL, wait for the next message or timer, step the core,
@@ -6118,6 +6218,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         stopped,
         apply_stopped,
         propose_signal,
+        apply_signal,
         metrics,
         scope,
         kind_scopes,
@@ -6216,6 +6317,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         sealed,
         committed_ceiling,
         txn_tracker,
+        Arc::clone(&apply_signal),
     ));
 
     loop {
@@ -6226,7 +6328,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             stopped.store(true, Ordering::SeqCst);
             return;
         }
-        persist_wal(&env, &wal, &core, &wal_lock).await;
+        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal).await;
 
         let now = env.now();
         let deadline = core.lock().expect("raftkv core poisoned").next_deadline();
@@ -6319,16 +6421,31 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             }
         };
 
-        let after_commit = core.lock().expect("raftkv core poisoned").commit_index();
+        let (after_commit, install_pending) = {
+            let c = core.lock().expect("raftkv core poisoned");
+            (c.commit_index(), c.has_pending_install())
+        };
         if after_commit > before_commit {
             metrics.incr_by(Metric::CpCommits, after_commit - before_commit);
+        }
+        // Wake-on-commit (ADR 0044 phase-1 PR1): a commit-index advance covers both
+        // a follower's in-line apply on `AppendEntries` (gated on `commit_index`
+        // alone, so it can create apply work with no separate `mark_durable_through`
+        // call this pass) and a completed snapshot install's `commit_index` jump
+        // (`RaftCore::handle`'s install-completion path sets it directly). A
+        // pending install is also checked explicitly — a read-only peek, never
+        // drained here — since a future core change could in principle decouple
+        // the two; over-notifying is always safe (the apply task just finds no
+        // work and re-parks), so this errs toward raising it.
+        if after_commit > before_commit || install_pending {
+            apply_signal.notify();
         }
         record_kv_outbound(&metrics, &outs);
 
         // Durability before action: persist (fsync) before shipping responses, so a
         // granted vote / appended entry is on disk before its message goes out.
         // Engine apply happens independently on the apply task.
-        persist_wal(&env, &wal, &core, &wal_lock).await;
+        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal).await;
 
         for (to, wire) in outs {
             env.send_stream(to, stream, codec::encode_wire(&wire)).await;
@@ -6339,10 +6456,14 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
 /// The per-node **apply task**: repeatedly install any received snapshot, apply
 /// committed-and-durable commands to the engine, and compact — all off the consensus
 /// loop, so this slow work never delays Raft message/heartbeat processing (the
-/// driver-liveness fix, ADR 0017). Backs off by [`APPLY_IDLE_POLL`] only when idle;
-/// under load it stays in lockstep behind commit. Exits after
-/// [`shutdown`](RaftKvNode::shutdown) between full apply passes (so the engine/WAL
-/// are never left mid-write), setting `apply_stopped` for the teardown path.
+/// driver-liveness fix, ADR 0017). Backs off by racing [`ApplyPending`] against
+/// [`APPLY_SAFETY_POLL`] only when idle (ADR 0044 phase-1 PR1 — replaces the old
+/// unconditional `APPLY_IDLE_POLL` 5ms poll); under load it stays in lockstep
+/// behind commit. Exits after [`shutdown`](RaftKvNode::shutdown) between full
+/// apply passes (so the engine/WAL are never left mid-write), setting
+/// `apply_stopped` for the teardown path — `shutdown` also raises `apply_signal`,
+/// so a parked task notices within one wake rather than waiting out the (now much
+/// longer) safety poll.
 #[allow(clippy::too_many_arguments)] // the apply task's shared-state bundle
 async fn apply_loop<E: Env, S: StorageEngine>(
     env: E,
@@ -6363,6 +6484,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     mut sealed: Vec<(KeyRange, HlcTimestamp)>,
     committed_ceiling: Arc<AtomicU64>,
     txn_tracker: Arc<Mutex<TxnTracker>>,
+    apply_signal: Arc<ApplySignal>,
 ) {
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
@@ -6411,7 +6533,13 @@ async fn apply_loop<E: Env, S: StorageEngine>(
         )
         .await;
         if !did_work {
-            env.sleep(APPLY_IDLE_POLL).await;
+            select(
+                ApplyPending {
+                    signal: &apply_signal,
+                },
+                env.sleep(APPLY_SAFETY_POLL),
+            )
+            .await;
         }
     }
 }

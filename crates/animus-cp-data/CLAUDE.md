@@ -565,8 +565,21 @@ resolve is now moot).
     always heartbeats/acks within the election timeout.
   - **Apply task** (`apply_loop` → `apply_and_compact`): install received
     snapshots, `drain_apply` → `merge`/`merge_tombstone` in commit order, and
-    compact — all off the consensus loop. Backs off (`APPLY_IDLE_POLL`) only
-    when idle.
+    compact — all off the consensus loop. When idle it races a new
+    `ApplySignal` (ADR 0044 phase-1 PR1, same shape as `ProposeSignal` below)
+    against a long `APPLY_SAFETY_POLL` (250ms) rather than spinning on the old
+    unconditional 5ms `APPLY_IDLE_POLL` — the consensus loop raises it at
+    every point that can create apply work (a `mark_durable_through` call in
+    `persist_wal`, a commit-index advance observed after stepping the core —
+    covering both a follower's in-line apply on `AppendEntries` and a
+    completed snapshot install's `commit_index` jump — and a single-node
+    group's own commit-advancing propose), and `shutdown()` also raises it so
+    a parked apply task notices a halt within one wake instead of waiting out
+    the now much longer safety poll. A signal-less transition (the lazy
+    on-demand snapshot-image build `RaftCore::take_snapshot_needed` sets,
+    purely off the leader's own heartbeat/replicate cycle with no commit
+    advance) still converges off the safety poll alone — see
+    `tests/apply_signal.rs`.
   - The WAL is written by both tasks (append vs. compaction rewrite),
     serialized by the async `wal_lock`; compaction snapshots only up to
     `engine_applied` via `snapshot_upto` (not `last_applied`, which the engine
