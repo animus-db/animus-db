@@ -15,9 +15,10 @@ types. v1 (ADR 0019) is **CP-only**; the leaderless AP `data`/`coord` roles are
 gone. Streams implementation notes: [`docs/streams-notes.md`](../../docs/streams-notes.md).
 
 **`lib.rs` is ~6800 lines** — grep for the symbol, don't scroll. It also holds
-two in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
-can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
-(lib.rs:6725). `index_drain.rs` has a third, `gsi_drain_cursor_tests`, and
+in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
+can't reach — e.g. `auto_split_median_tests` and `hot_read_latch_tests`
+(`split_fence_tests` survives only as a rung-5 tombstone: the zero-copy
+crossover scenario it drove is structurally unrepresentable now). `index_drain.rs` has a third, `gsi_drain_cursor_tests`, and
 `dynamo.rs` a fourth, `stream_write_path_tests` (ADR 0042), for the same
 reason (see each file's own entry below).
 
@@ -164,8 +165,24 @@ parent's change log by **packed-HLC watermark** (never a key-position
 cursor — see the engineering-lessons entry) at token granularity (or full
 prefix for sub-token raw keys). Progress mirrors to
 `ctx.data().split_builds` → `/admin/raftkv`'s
-`split_rows_shipped`/`split_converged`. The build parks at convergence —
-freeze/cutover are B5. E2e: `tests/split_build.rs`.
+`split_rows_shipped`/`split_converged`/`split_phase`. **Rung 5 completes the
+workflow**: at convergence the driver proposes `KvCommand::Freeze` on the
+parent (terminal whole-range seal; USER data only — consumer bookkeeping
+writes stay allowed so the vetoes below can converge, see the
+engineering-lessons entry), then per tick: final tail pass → the **final
+image** (one full re-scan ship of the frozen parent — txn decisions/
+resolves are signal-less writes an O(delta) tail misses; gated on the
+apply task reaching the freeze-window commit floor) → streams final seal
+(`seal_now`, no size/age gate) → GSI-drain veto (`"gsi"` cursor ≥ max
+pending record) → backfill veto (`MarkIndexBackfilled` for every
+`Creating` index) → proposes `CutoverSplit` until the parent leaves the
+map (the reconciler then `Reclaim`s it everywhere). A stale-routed write
+to a frozen parent gets the retryable `FROZEN_REFUSAL` from every local
+write/txn helper (`frozen_refusal`; bookkeeping-only kind batches exempt).
+A `Building` child runs **no consumer arms at all** (its token-truncated
+cursor key would land in the parent's scope and poison the parent's
+min-over-rows watermark). E2e: `tests/split_build.rs` (full workflow +
+racing txns + post-freeze leader kill).
 
 `--auto-split K` (key count), `--auto-split-bytes B` (byte size), and
 `--auto-split-change-rate RATE` (streamed tables only, ADR 0042 §14 Fork F —
@@ -281,7 +298,9 @@ coarser signal would falsely-ack; the embedded fence only covers the sliver
 between pre-check and apply. `cp_get_local`/`cp_scan_local` run the read-side dual
 (ADR 0033): a read resolving to a group whose live scope doesn't cover the
 request errors retryably rather than serving a false "absent" (for scans, avoids a
-silent truncation). See the in-crate `split_fence_tests`.
+silent truncation). (The in-crate `split_fence_tests` is a rung-5 tombstone
+now — successor coverage: `animus-cp-data/tests/freeze.rs` + `tests/
+split_build.rs`.)
 
 ## Multi-participant transactions (ADR 0018 §2)
 
@@ -1225,8 +1244,9 @@ route below the edge through the same `ClientCtx` CP primitives.
 tests that poll with timeouts, not deterministic assertions (this crate has
 no `SimEnv` — it is the assembly/wire layer over the two sim-tested crates
 below it). The restart tests run both incarnations in the same runtime,
-calling `Node::shutdown()` between them. Two in-crate `#[cfg(test)] mod`s
-(`split_fence_tests`, `auto_split_median_tests`) live in `lib.rs` itself
+calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
+(`auto_split_median_tests`, `hot_read_latch_tests`; `split_fence_tests` is
+a rung-5 tombstone) live in `lib.rs` itself
 because they need private handles (a raw `CpGroup`/the private
 `byte_weighted_median` helper) that no external `tests/` file can reach;
 `index_drain.rs`'s own `gsi_drain_cursor_tests` is a third (run via `cargo

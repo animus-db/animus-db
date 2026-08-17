@@ -270,6 +270,46 @@ and never pruned. **Rider:** the segment janitor's max-epoch removal guard
 keys on "tablet still exists" and is taught that a retired tablet's final
 shards expire by ordinary retention.
 
+### Stage 3–5 as-built notes (2026-08-17, Train B rung 5)
+
+Three deviations from the prose above, found by the rung's own teeth:
+
+1. **The freeze's contract is USER data (base/LSI rows), not "every
+   write."** A pure consumer-bookkeeping batch — a cursor row, a footprint,
+   a change-log-only entry (the backfill seeder's synthetic records) —
+   still applies on a frozen parent. Without this the GSI-drain and
+   backfill cutover vetoes deadlock against the very freeze that made the
+   parent drainable (the drain/seeder must WRITE their offsets to finish);
+   caught red by the revived split-during-backfill e2e. Safe: bookkeeping
+   kinds are never copied to children (CHANGE/CURSOR) or self-healing on
+   them (FOOTPRINT).
+2. **The endgame ships a FINAL IMAGE — one full re-scan of the frozen
+   parent — after the final tail pass**, because transaction decisions
+   (`TxnCommit`/`TxnAbort`) and resolves rewrite base rows with **no
+   change record of their own**: an O(delta) tail structurally misses
+   them, and a child inheriting a stale `Pending` record for an
+   acked-committed transaction is the in-doubt-recovery-aborts-a-commit
+   class fork F7 exists to prevent. Cost: a second full read+wire pass per
+   split, accepted for v1; apply-side decision/resolve markers restoring
+   O(delta) are a named follow-up. The image is gated on the apply task
+   reaching the freeze-window commit floor (no decision can apply
+   mid-scan unseen).
+3. **A `Building` child runs no consumer arms** (drain/seeder/seal/trim).
+   Every consumer restarts from scratch at activation (the classified
+   policy) — and running them early is actively harmful: a child's
+   token-truncated `"gsi"` cursor key routes to the still-routable parent
+   and lands in the parent's own cursor scope, where min-over-rows drags
+   the parent's watermark down forever, deadlocking the GSI veto (the
+   split-child-cursor-unreadable shape, poisoning the parent this time).
+
+Also as-built: `Freeze` is implemented as the whole-range entry of the
+existing sealed-set discipline (its durable marker re-latches `frozen` at
+group start, surviving log compaction), plus a propose-side latch in every
+`animusd` write/txn helper returning the retryable
+`"tablet frozen for split cutover…; retry"`; `TxnResolve`/decides landing
+on a frozen parent are refused retryably and chase to the children
+post-cutover (F7, proven end-to-end by the racing-transactions e2e).
+
 ## What this deletes (the defense stack for the seam that no longer exists)
 
 All recon-verified with production call sites; deleted in Train B's final

@@ -130,6 +130,11 @@ pub(crate) struct CpRaftView {
     /// mirror is for operators.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) split_converged: Option<bool>,
+    /// Rung 5: the endgame step the build last parked at (`"build"`,
+    /// `"freeze"`, `"final-drain"`, `"final-seal"`, `"gsi-veto"`,
+    /// `"backfill-veto"`, `"cutover"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) split_phase: Option<&'static str>,
 }
 
 /// One entry of a group's `pending: BTreeMap<TxnId, (record_key, created_ts)>`
@@ -579,7 +584,7 @@ async fn raftkv_view(ctx: &ClientCtx) -> Value {
         // data-role field; absent on a control-only node, which hosts no
         // groups and never reaches this loop body anyway).
         if let Some(data) = ctx.data_opt()
-            && let Some((rows, converged)) = data
+            && let Some((rows, converged, phase)) = data
                 .split_builds
                 .lock()
                 .expect("split_builds poisoned")
@@ -588,6 +593,7 @@ async fn raftkv_view(ctx: &ClientCtx) -> Value {
         {
             view.split_rows_shipped = Some(rows);
             view.split_converged = Some(converged);
+            view.split_phase = Some(phase);
         }
         groups.push(view);
     }

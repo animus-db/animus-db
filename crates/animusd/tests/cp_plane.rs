@@ -216,7 +216,6 @@ async fn cp_member_addresses_register_and_replicate() {
 /// Real TCP/time: bring up a 3-node cluster, write a lower + an upper key, trigger
 /// the split, then poll until the new tablet is in the map and the upper key is
 /// served by the new group (its election takes a moment).
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn cp_tablet_splits_and_both_halves_serve() {
     let dir = tempfile::tempdir().unwrap();
@@ -440,7 +439,6 @@ async fn single_write_latency_is_low() {
 /// loop enabled at a low key-count threshold, writing past it causes the tablet's
 /// leader to split it at the median **with no manual trigger**; afterwards both
 /// halves serve. Closes the auto-shard loop.
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn tablet_auto_splits_when_it_grows() {
     let dir = tempfile::tempdir().unwrap();
@@ -534,7 +532,6 @@ async fn tablet_auto_splits_when_it_grows() {
 /// key-count-balanced (a plain positional median here would put nearly all
 /// the bytes on one side: 6 tiny keys sort before 6 large ones, so the
 /// positional median falls right at the first large key).
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
     let dir = tempfile::tempdir().unwrap();
@@ -645,13 +642,30 @@ async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
     // an estimate-driven split, but tight enough to distinguish it from a
     // plain positional median (which would put ~99% of the bytes on one
     // side here).
-    let tablets = nodes[0].metadata().tablets;
-    assert!(
-        tablets.len() >= 2,
-        "expected at least 2 tablets after the byte-triggered split"
-    );
+    // Wait for the workflow to CUT OVER (>= 2 routable tablets), not just
+    // begin — a mid-split snapshot has one routable tablet (the `Splitting`
+    // parent), which would make the balance assertion below vacuous.
+    let tablets = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let tablets = nodes[0].metadata().tablets;
+            if tablets.values().filter(|t| t.is_routable()).count() >= 2 {
+                break tablets;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cutover never produced 2 routable tablets: {tablets:?}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    // Only ROUTABLE tablets partition the keyspace (ADR 0050): a snapshot
+    // taken mid-workflow legitimately holds a `Splitting` parent AND its
+    // two `Building` children — overlapping by design until cutover — so
+    // the no-gap/no-overlap contract is stated over `is_routable()` ones.
     let mut per_tablet_bytes: Vec<u64> = tablets
         .values()
+        .filter(|t| t.is_routable())
         .map(|t| {
             written
                 .iter()
@@ -664,7 +678,7 @@ async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
     let covered: u64 = per_tablet_bytes.iter().sum();
     assert_eq!(
         covered, total_bytes,
-        "every written key must fall in exactly one tablet's range (no gap/overlap)"
+        "every written key must fall in exactly one ROUTABLE tablet's range (no gap/overlap)"
     );
     // The two tablets carrying the most data (in the common 2-tablet case,
     // both of them) should each hold a non-trivial share of the total bytes —
@@ -690,7 +704,6 @@ async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
 /// lineage repeatedly crosses the threshold, and that every resulting tablet
 /// ends up with a real CP group (structurally guaranteed now — see the root
 /// `CLAUDE.md`).
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn already_split_tablet_splits_again_once_it_regrows() {
     let dir = tempfile::tempdir().unwrap();

@@ -1,11 +1,17 @@
-//! ADR 0050 Train B rung 4 — the split-build driver, end to end over a real
-//! 3-node cluster: a populated table's `BeginSplit` kicks off the copy, the
-//! parent keeps serving while writes RACE the build (the change-log tail
-//! must observe them), both `Building` children converge to exactly their
-//! halves, and a parent-leader kill mid-lifecycle re-runs the (idempotent)
-//! build on the new leader to the same converged answer, racing writes
-//! included. The workflow deliberately stops at convergence in this rung —
-//! freeze/cutover are B5's.
+//! ADR 0050 Train B rungs 4+5 — the copy-based split workflow, end to end
+//! over a real 3-node cluster: a populated table's `BeginSplit` kicks off
+//! the copy, the parent keeps serving while writes AND transactions race
+//! the build, the driver freezes the parent at convergence, ships the
+//! final image, and proposes `CutoverSplit` — children go `Active`, the
+//! parent is removed and reclaimed everywhere, and no acked write is ever
+//! lost across the flip (a stale-routed write gets the frozen refusal and
+//! its retry lands on a child). A parent-leader kill AFTER the freeze
+//! proves the endgame resumes idempotently on the new leader (the freeze
+//! is engine-durable).
+//!
+//! These are rung 5's behavioral red→green teeth: on rung 4's tip the
+//! workflow parks at convergence forever, so every cutover assertion below
+//! times out red.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -101,10 +107,12 @@ async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -
 }
 
 /// A put with a bounded retry on ANY error reply: a put is idempotent, and
-/// early-cluster transients (a peer's intra listener still binding, an
-/// election in flight) surface as retryable one-off errors.
+/// both early-cluster transients AND the rung-5 freeze→cutover blip (the
+/// documented retryable refusal) surface as retryable one-off errors. Every
+/// put this test ever acks must be readable at the end — that is the
+/// no-lost-writes teeth.
 async fn put(stream: &mut TcpStream, key: Vec<u8>, value: Vec<u8>) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         animusd::write_frame(
             stream,
@@ -130,6 +138,29 @@ async fn put(stream: &mut TcpStream, key: Vec<u8>, value: Vec<u8>) {
     }
 }
 
+/// A linearizable read through the plain client protocol.
+async fn get(stream: &mut TcpStream, key: Vec<u8>) -> Option<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        animusd::write_frame(
+            stream,
+            &ClientRequest::Get {
+                key: key.clone(),
+                table: "t".to_string(),
+            },
+        )
+        .await
+        .expect("send frame");
+        match read_frame(stream).await.expect("read").expect("reply") {
+            ClientResponse::Value(v) => return v,
+            ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            other => panic!("get failed: {other:?}"),
+        }
+    }
+}
+
 /// Every live node's `/admin/raftkv` group entries, flattened.
 async fn all_groups(nodes: &[Node], dead: &[usize]) -> Vec<Value> {
     let mut out = Vec::new();
@@ -145,8 +176,68 @@ async fn all_groups(nodes: &[Node], dead: &[usize]) -> Vec<Value> {
     out
 }
 
+/// Kick off the split of tablet 1 at `[k,4]` from a non-control-leader
+/// node (the relay-path regression rides along for free).
+async fn kickoff(nodes: &[Node]) {
+    let follower = nodes
+        .iter()
+        .position(|n| !n.is_control_leader())
+        .expect("a 3-node cluster has a non-leader");
+    let (status, body) = admin(
+        nodes[follower].admin_addr(),
+        "POST",
+        "/admin/tablet/split",
+        Some("{\"tablet\":1,\"split_key\":\"k\\u0004\"}"),
+    )
+    .await;
+    assert_eq!(status, 200, "kickoff failed: {body}");
+}
+
+/// Poll `/admin/status` on the given node until the parent (tablet 1) is
+/// GONE from the map and exactly two `Active` children of table `t` cover
+/// its range — the cutover-complete signal. Returns the children's ids
+/// (left first).
+async fn await_cutover(node: &Node, budget: Duration) -> (u64, u64) {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let (_, s) = admin(node.admin_addr(), "GET", "/admin/status", None).await;
+        let tablets = s["tablets"].as_object().cloned().unwrap_or_default();
+        let parent_gone = !tablets.contains_key("1");
+        let mut active: Vec<(u64, Vec<u8>)> = tablets
+            .iter()
+            .filter(|(_, t)| {
+                t["state"].as_str() == Some("Active") && t["table"].as_str() == Some("t")
+            })
+            .filter_map(|(id, t)| {
+                let start: Vec<u8> = t["range"]["start"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|b| b.as_u64().map(|b| b as u8))
+                    .collect();
+                Some((id.parse().ok()?, start))
+            })
+            .collect();
+        if parent_gone && active.len() == 2 {
+            // Compare actual BYTE arrays (a JSON-stringified sort inverts).
+            active.sort_by(|a, b| a.1.cmp(&b.1));
+            return (active[0].0, active[1].0);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cutover never completed: parent_gone={parent_gone}, tablets={tablets:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The full workflow: populate, kick off, race plain writes AND
+/// transactions against the build/freeze/cutover, then assert — children
+/// `Active` at exactly the partitioned totals, parent gone from metadata
+/// and reclaimed from every host, every acked write (transactional
+/// included) readable, `split_lineage` recorded, and a post-cutover write
+/// landing on a child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn split_build_converges_racing_writes_and_survives_a_parent_leader_kill() {
+async fn full_split_workflow_cutover_completes_with_no_lost_writes() {
     timeout(Duration::from_secs(180), async {
         let dir = tempfile::tempdir().unwrap();
         let (nodes, _config) = bring_up(3, dir.path()).await;
@@ -161,155 +252,226 @@ async fn split_build_converges_racing_writes_and_survives_a_parent_leader_kill()
             put(&mut stream, vec![b'k', i], vec![b'v', i]).await;
         }
 
-        // Kick off from a non-control-leader node (relay path) at `[k,4]`.
-        let follower = nodes
-            .iter()
-            .position(|n| !n.is_control_leader())
-            .expect("a 3-node cluster has a non-leader");
-        let (status, body) = admin(
-            nodes[follower].admin_addr(),
-            "POST",
-            "/admin/tablet/split",
-            Some("{\"tablet\":1,\"split_key\":\"k\\u0004\"}"),
-        )
-        .await;
-        assert_eq!(status, 200, "kickoff failed: {body}");
+        kickoff(&nodes).await;
 
-        // Writes RACING the build: 8 more keys, one per existing key with a
-        // `!` suffix — `[k,i,!]` sorts above `[k,i]`, so i<4 lands left of
-        // `[k,4]` and i>=4 right; totals become 8 per side.
+        // Race the workflow from every node: 8 plain puts (`[k,i,!]` sorts
+        // beside `[k,i]`, 4 per side) plus 4 transactions with 8-byte keys
+        // (`[k,i,t,...]`), 2 per side — each acked exactly once, some
+        // possibly straddling the freeze window (the retry loops absorb
+        // the documented blip).
+        let mut racing_streams = Vec::new();
+        for node in &nodes {
+            racing_streams.push(
+                TcpStream::connect(node.client_addr())
+                    .await
+                    .expect("connect racing client"),
+            );
+        }
         for i in 0..8u8 {
-            put(&mut stream, vec![b'k', i, b'!'], b"racing".to_vec()).await;
+            let s = racing_streams.len();
+            put(
+                &mut racing_streams[i as usize % s],
+                vec![b'k', i, b'!'],
+                b"racing".to_vec(),
+            )
+            .await;
+        }
+        for i in 0..4u8 {
+            // One single-table txn per key; anchor = tablet 1 (or a child,
+            // post-cutover). Keys `[k, 2*i, t, 0, 0, 0, 0, i]` are 8 bytes.
+            let key = vec![b'k', 2 * i, b't', 0, 0, 0, 0, i];
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let s = &mut racing_streams[i as usize % 3];
+                animusd::write_frame(
+                    s,
+                    &ClientRequest::Txn {
+                        writes: vec![animusd::TxnTableWrite::plain(
+                            "t".to_string(),
+                            key.clone(),
+                            Some(b"txn-racing".to_vec()),
+                        )],
+                        preconditions: vec![],
+                        write_conditions: vec![],
+                    },
+                )
+                .await
+                .expect("send txn");
+                match read_frame(s).await.expect("read").expect("reply") {
+                    ClientResponse::TxnCommitted { .. } => break,
+                    ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                        sleep(Duration::from_millis(150)).await;
+                    }
+                    other => panic!("racing txn failed hard: {other:?}"),
+                }
+            }
         }
 
-        // The two Building children (from /admin/status), left = the one
-        // whose range starts at the table's origin.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        let children: (u64, u64) = loop {
-            let (_, s) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
-            let tablets = s["tablets"].as_object().cloned().unwrap_or_default();
-            let mut building: Vec<(u64, Vec<u8>)> = tablets
-                .iter()
-                .filter(|(_, t)| t["state"].as_str() == Some("Building"))
-                .filter_map(|(id, t)| {
-                    let start: Vec<u8> = t["range"]["start"]
-                        .as_array()?
-                        .iter()
-                        .filter_map(|b| b.as_u64().map(|b| b as u8))
-                        .collect();
-                    Some((id.parse().ok()?, start))
-                })
-                .collect();
-            if building.len() == 2 {
-                // The left child's range starts at the parent's own origin —
-                // compare the actual BYTE arrays (a JSON-stringified sort
-                // inverts: "[107,4]" < "[]").
-                building.sort_by(|a, b| a.1.cmp(&b.1));
-                break (building[0].0, building[1].0);
+        // The workflow runs to cutover on its own (rung 5's teeth — rung 4
+        // parked forever here).
+        let (left, right) = await_cutover(&nodes[0], Duration::from_secs(60)).await;
+
+        // Children serve exactly the partitioned totals: 8+8 puts and 4 txn
+        // keys = 10 left / 10 right once every resolve has landed. Assert
+        // via read-back of EVERY acked key (the loss check), not counts —
+        // counts include txn-record rows by design.
+        for i in 0..8u8 {
+            assert_eq!(
+                get(&mut stream, vec![b'k', i]).await,
+                Some(vec![b'v', i]),
+                "pre-split key [k,{i}] lost across cutover"
+            );
+            assert_eq!(
+                get(&mut stream, vec![b'k', i, b'!']).await,
+                Some(b"racing".to_vec()),
+                "racing key [k,{i},!] lost across cutover"
+            );
+        }
+        for i in 0..4u8 {
+            let key = vec![b'k', 2 * i, b't', 0, 0, 0, 0, i];
+            assert_eq!(
+                get(&mut stream, key.clone()).await,
+                Some(b"txn-racing".to_vec()),
+                "acked transactional write {key:?} lost across cutover (fork F7)"
+            );
+        }
+
+        // A post-cutover write routes to a child and lands.
+        put(&mut stream, b"post-cut".to_vec(), b"pv".to_vec()).await;
+        assert_eq!(
+            get(&mut stream, b"post-cut".to_vec()).await,
+            Some(b"pv".to_vec())
+        );
+
+        // `split_lineage` names the parent for both children (fork F9).
+        let (_, s) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
+        for child in [left, right] {
+            let parent = s["split_lineage"][child.to_string()]["parent"].as_u64();
+            assert_eq!(
+                parent,
+                Some(1),
+                "split_lineage missing/wrong for child {child}: {}",
+                s["split_lineage"]
+            );
+        }
+
+        // The parent is reclaimed from every host (hosted-but-absent →
+        // existing Reclaim; poll to convergence).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let groups = all_groups(&nodes, &[]).await;
+            if !groups.iter().any(|g| g["tablet"].as_u64() == Some(1)) {
+                break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "two Building children never appeared: {tablets:?}"
+                "parent group never reclaimed: {groups:?}"
             );
-            sleep(Duration::from_millis(100)).await;
-        };
-
-        // Phase 1: the build converges with the racing writes included.
-        await_converged(&nodes, &[], &children, (8, 8), Duration::from_secs(45)).await;
-
-        // The parent still serves its whole range (reads AND writes), and
-        // its change log was NOT trimmed out from under the build (the
-        // Splitting trim hold): a fresh write still converges below.
-        for i in 0..8u8 {
-            let req = ClientRequest::Get {
-                key: vec![b'k', i],
-                table: "t".to_string(),
-            };
-            animusd::write_frame(&mut stream, &req).await.expect("send");
-            let got = read_frame(&mut stream).await.expect("read").expect("reply");
-            assert!(
-                matches!(got, ClientResponse::Value(Some(_))),
-                "parent read mid-build: {got:?}"
-            );
+            sleep(Duration::from_millis(200)).await;
         }
 
-        // Phase 2: kill the node leading the parent group — the new
-        // leader's driver re-runs the whole build from scratch
-        // (idempotent) and picks up further racing writes.
-        let mut leader_host = None;
-        for (i, node) in nodes.iter().enumerate() {
-            let (_, view) = admin(node.admin_addr(), "GET", "/admin/raftkv", None).await;
-            let leads = view["groups"].as_array().is_some_and(|gs| {
-                gs.iter().any(|g| {
-                    g["tablet"].as_u64() == Some(1) && g["is_leader"].as_bool() == Some(true)
-                })
-            });
-            if leads {
-                leader_host = Some(i);
-                break;
-            }
-        }
-        let dead = leader_host.expect("some node leads the parent");
-        nodes[dead].shutdown_graceful().await;
-
-        // Two more keys through a surviving node — both land LEFT of [k,4].
-        let alive = (0..nodes.len()).find(|i| *i != dead).unwrap();
-        let mut stream2 = TcpStream::connect(nodes[alive].client_addr())
-            .await
-            .expect("connect surviving client port");
-        for i in 0..2u8 {
-            put(&mut stream2, vec![b'j', i], b"after-kill".to_vec()).await;
-        }
-
-        // Converge again on the survivors: left grew to 10.
-        await_converged(&nodes, &[dead], &children, (10, 8), Duration::from_secs(60)).await;
-
-        for (i, node) in nodes.iter().enumerate() {
-            if i != dead {
-                node.shutdown_graceful().await;
-            }
+        for node in &nodes {
+            node.shutdown_graceful().await;
         }
     })
     .await
     .expect("test timed out");
 }
 
-/// Poll until the parent's build reports converged on its leader AND both
-/// children's leader-side key counts equal `expect` — the whole-build
-/// convergence check, retried as one unit (counts move while the tail runs).
-async fn await_converged(
-    nodes: &[Node],
-    dead: &[usize],
-    children: &(u64, u64),
-    expect: (u64, u64),
-    budget: Duration,
-) {
-    let deadline = tokio::time::Instant::now() + budget;
-    loop {
-        let groups = all_groups(nodes, dead).await;
-        let parent_converged = groups.iter().any(|g| {
-            g["tablet"].as_u64() == Some(1)
-                && g["is_leader"].as_bool() == Some(true)
-                && g["split_converged"].as_bool() == Some(true)
-        });
-        let count_of = |tablet: u64| {
-            groups
-                .iter()
-                .find(|g| {
-                    g["tablet"].as_u64() == Some(tablet) && g["is_leader"].as_bool() == Some(true)
-                })
-                .and_then(|g| g["key_count"].as_u64())
-        };
-        let left = count_of(children.0);
-        let right = count_of(children.1);
-        if parent_converged && left == Some(expect.0) && right == Some(expect.1) {
-            return;
+/// Kill the node leading the parent AFTER the freeze has been observed
+/// (`split_phase` past `"build"`): the freeze is engine-durable, so the
+/// re-led driver resumes the endgame idempotently and the survivors
+/// complete cutover with every acked write intact. If the workflow races
+/// past cutover before a phase is ever observed (a fast box), the kill
+/// degrades to a post-cutover leader kill — completion + no-loss still
+/// asserted, and the run says which path it took.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn driver_kill_after_freeze_resumes_and_completes() {
+    timeout(Duration::from_secs(180), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let mut stream = TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect client port");
+        for i in 0..30u8 {
+            put(&mut stream, vec![b'k', i % 8, b'p', i], vec![b'v', i]).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "build never converged to {expect:?}: parent_converged={parent_converged}, \
-             left={left:?}, right={right:?}"
-        );
-        sleep(Duration::from_millis(200)).await;
-    }
+
+        kickoff(&nodes).await;
+
+        // Watch every node's /admin/raftkv for the parent leader's
+        // split_phase leaving "build" (freeze proposed/applied), or the
+        // parent vanishing (already cut over).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut kill_target: Option<usize> = None;
+        loop {
+            let (_, st) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
+            let parent_gone = !st["tablets"]
+                .as_object()
+                .is_some_and(|t| t.contains_key("1"));
+            if parent_gone {
+                break; // fast path: cutover won the race
+            }
+            for (i, node) in nodes.iter().enumerate() {
+                let (_, view) = admin(node.admin_addr(), "GET", "/admin/raftkv", None).await;
+                let frozen_leader = view["groups"].as_array().is_some_and(|gs| {
+                    gs.iter().any(|g| {
+                        g["tablet"].as_u64() == Some(1)
+                            && g["is_leader"].as_bool() == Some(true)
+                            && g["split_phase"].as_str().is_some_and(|p| p != "build")
+                    })
+                });
+                if frozen_leader {
+                    kill_target = Some(i);
+                    break;
+                }
+            }
+            if kill_target.is_some() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "neither a non-build split_phase nor cutover was ever observed"
+            );
+            sleep(Duration::from_millis(30)).await;
+        }
+
+        let dead = match kill_target {
+            Some(i) => {
+                println!("killing parent leader node {i} at an endgame phase");
+                nodes[i].shutdown_graceful().await;
+                Some(i)
+            }
+            None => {
+                println!("cutover completed before a phase was observed — post-cutover kill path");
+                None
+            }
+        };
+
+        // Survivors complete (or already completed) the cutover.
+        let observer = (0..nodes.len()).find(|i| Some(*i) != dead).unwrap();
+        await_cutover(&nodes[observer], Duration::from_secs(90)).await;
+
+        // Every acked write is readable through a survivor.
+        let mut s2 = TcpStream::connect(nodes[observer].client_addr())
+            .await
+            .expect("connect survivor");
+        for i in 0..30u8 {
+            assert_eq!(
+                get(&mut s2, vec![b'k', i % 8, b'p', i]).await,
+                Some(vec![b'v', i]),
+                "acked write {i} lost across the killed-driver cutover"
+            );
+        }
+
+        for (i, node) in nodes.iter().enumerate() {
+            if Some(i) != dead {
+                node.shutdown_graceful().await;
+            }
+        }
+    })
+    .await
+    .expect("test timed out");
 }

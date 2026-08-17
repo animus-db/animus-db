@@ -168,7 +168,13 @@ the split-build driver's history-transfer command — `SeedRow`s
 included), emitting nothing into the child's change log and witnessing the
 batch's max version into the group's HLC (`propose_seed_batch` /
 `seed_rows_kind` are the driver's propose/read pair; `tests/seed_batch.rs`
-+ `ANIMUS_SPLIT_SEEDS` is its corpus); **transactions** (ADR 0018 §2) are covered in Key invariants
++ `ANIMUS_SPLIT_SEEDS` is its corpus); `KvCommand::Freeze` (ADR 0050 rung
+5, codec v20) is the split-cutover freeze — a whole-range entry of the
+existing sealed-set discipline whose durable seal marker re-latches
+`is_frozen()` at group start, refusing every later-ordered USER mutation
+(base/LSI — a consumer-bookkeeping `KindBatch` still applies) while reads
+keep serving; `propose_freeze` is idempotent and `tests/freeze.rs` is its
+suite; **transactions** (ADR 0018 §2) are covered in Key invariants
 below. See the crate's rustdoc for the full method/accessor inventory.
 Four rules that aren't derivable from a doc comment:
 

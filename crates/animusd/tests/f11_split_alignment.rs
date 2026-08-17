@@ -167,7 +167,6 @@ async fn put_retry(client: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
     .unwrap_or_else(|_| panic!("put {key:?} did not succeed in time"));
 }
 
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn manual_split_with_unaligned_key_on_streamed_table_rounds_to_token_boundary() {
     timeout(Duration::from_secs(60), async {
@@ -296,30 +295,35 @@ async fn manual_split_with_unaligned_key_on_streamed_table_rounds_to_token_bound
         .await;
         assert_eq!(status, 200, "split via follower admin port failed: {body}");
 
-        // The new sibling is tablet 501 (the allocator's next id after the
-        // single pre-existing tablet 500).
-        timeout(Duration::from_secs(15), async {
+        // The copy-based workflow (ADR 0050 rung 5) runs to CUTOVER on its
+        // own: the parent (500) leaves the map and two `Active` children
+        // partition its range at the rounded key.
+        let (left_range, right_range) = timeout(Duration::from_secs(45), async {
             loop {
-                if nodes
-                    .iter()
-                    .all(|n| n.metadata().tablets.contains_key(&TabletId(501)))
-                {
-                    return;
+                let meta = nodes[0].metadata();
+                if !meta.tablets.contains_key(&TabletId(500)) {
+                    let mut children: Vec<_> = meta
+                        .tablets
+                        .values()
+                        .filter(|t| t.table.as_deref() == Some("orders") && t.is_routable())
+                        .map(|t| t.range.clone())
+                        .collect();
+                    if children.len() == 2 {
+                        children.sort_by(|a, b| a.start.cmp(&b.start));
+                        return (children.remove(0), children.remove(0));
+                    }
                 }
                 sleep(Duration::from_millis(100)).await;
             }
         })
         .await
-        .expect("split did not produce tablet 501 on every node");
+        .expect("the split workflow never cut over to two Active children");
 
-        // F11's own assertion: the sibling's `range.start` is the ROUNDED
-        // key (`"orders-m"`, the leading `TOKEN_BYTES` of the request), not
-        // the raw 10-byte request the pre-PR2 admin path would have used
-        // verbatim.
-        let sibling_start = nodes[0].metadata().tablets[&TabletId(501)]
-            .range
-            .start
-            .clone();
+        // F11's own assertion: the RIGHT child's `range.start` is the
+        // ROUNDED key (`"orders-m"`, the leading `TOKEN_BYTES` of the
+        // request), not the raw 10-byte request the pre-PR2 admin path
+        // would have used verbatim.
+        let sibling_start = right_range.start.clone();
         assert_eq!(
             sibling_start,
             b"orders-m".to_vec(),
@@ -331,23 +335,16 @@ async fn manual_split_with_unaligned_key_on_streamed_table_rounds_to_token_bound
             "the raw, unaligned request must never be used verbatim on a streamed table"
         );
 
-        // Per-item ordering survives: BOTH rows resolve into the SAME
-        // tablet (501) — `key_a`/`key_b` >= the rounded `"orders-m"`
-        // boundary, so neither stayed behind in the original tablet 500.
-        let source_range = nodes[0].metadata().tablets[&TabletId(500)].range.clone();
-        let sibling_range = nodes[0].metadata().tablets[&TabletId(501)].range.clone();
+        // Per-item ordering survives: BOTH rows land in the SAME (right)
+        // child — `key_a`/`key_b` >= the rounded boundary, so neither
+        // stayed behind on the left.
         assert!(
-            source_range.split_at(&key_a).is_none(),
-            "key_a must NOT be a legal split point of the (now-narrowed) parent — \
-             i.e. key_a is outside [start, {sibling_start:?})"
+            !left_range.contains(&key_a) && !left_range.contains(&key_b),
+            "neither row may land left of the rounded boundary"
         );
         assert!(
-            key_a.as_slice() >= sibling_range.start.as_slice(),
-            "key_a must belong to the new sibling, not the parent"
-        );
-        assert!(
-            key_b.as_slice() >= sibling_range.start.as_slice(),
-            "key_b must belong to the new sibling too — same tablet as key_a"
+            right_range.contains(&key_a) && right_range.contains(&key_b),
+            "both rows must belong to the right child — one tablet, one shard lineage"
         );
 
         // Belt-and-suspenders: both rows are still readable, unharmed by

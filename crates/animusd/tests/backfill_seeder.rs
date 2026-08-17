@@ -681,7 +681,6 @@ fn item_key(pk: &str) -> Vec<u8> {
 /// each child to report — the only way this scenario converges to `Active`
 /// at all — the two tests together are a full proof: the aggregator can't
 /// flip early without both reporting, and both genuinely do report.
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn split_during_backfill_converges_with_correct_final_gsi() {
     let dir = tempfile::tempdir().unwrap();
@@ -758,16 +757,34 @@ async fn split_during_backfill_converges_with_correct_final_gsi() {
         matches!(resp, ClientResponse::PutOk),
         "split trigger rejected: {resp:?}"
     );
-    timeout(Duration::from_secs(10), async {
+    // The copy-based workflow (ADR 0050 rung 5) runs build → freeze →
+    // backfill-veto → cutover on its own; with an index still `Creating`
+    // the cutover deliberately WAITS for the parent's seeder to finish
+    // (the rung-5 backfill veto this test now exercises end to end), so
+    // the budget is generous. Done = the parent (1) has left the map and
+    // two Active children of the base table cover it (the GSI's hidden
+    // table may add its own tablet at any point — count only the base
+    // table's).
+    timeout(Duration::from_secs(90), async {
         loop {
-            if nodes.iter().all(|n| n.metadata().tablets.len() == 2) {
+            let done = nodes.iter().all(|n| {
+                let meta = n.metadata();
+                !meta.tablets.contains_key(&animus_tablet::TabletId(1))
+                    && meta
+                        .tablets
+                        .values()
+                        .filter(|t| t.table.as_deref() == Some(table) && t.is_routable())
+                        .count()
+                        == 2
+            });
+            if done {
                 return;
             }
-            sleep(Duration::from_millis(50)).await;
+            sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("split was not recorded within 10s");
+    .expect("the split workflow did not cut over (backfill veto never released?)");
 
     await_index_status(&nodes, table, "by-email", IndexStatus::Active, 60).await;
     await_row_count(

@@ -526,6 +526,14 @@ async fn drain_all_tablets_lineage(
             }
         }
         for &tablet in &current_tablets {
+            // ADR 0050: a RETIRED split parent has no open shard — its
+            // chain ENDS at its final sealed epoch (all consumed by the
+            // closed-epoch loop above); polling a minted "open" successor
+            // would be answered `TrimmedDataAccess`. The children carry on
+            // via their own tracked entries.
+            if !node.metadata().tablets.contains_key(&tablet) {
+                continue;
+            }
             let epoch = next_epoch[&tablet];
             if open_epoch.get(&tablet) != Some(&epoch) {
                 let shard_id = segment::shard_id(tablet.0, epoch);
@@ -931,7 +939,6 @@ async fn fs_segment_store_opt_in_smoke() {
 /// panic's `tracked tablets`/chain-length dump first: a set that still
 /// matches `ids` with no cascading grandchild in it points at that
 /// different, seal-arm-timing cause instead.
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1002,20 +1009,28 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     )
     .await;
 
-    // Determine parent/child via `split_parents` directly (never assumed
-    // from tablet-id ordering — `SplitTablet` always mints the *new* id for
-    // the fresh sibling, but this test makes no assumption about which
-    // numeric id that turns out to be relative to the source's).
-    let meta = nodes[0].metadata();
-    let ids = tablets_for(&meta, "events");
-    assert!(
-        ids.len() >= 2,
-        "expected at least one split to have happened"
-    );
-    let (child, parent) = ids
-        .iter()
-        .find_map(|&t| meta.split_parents.get(&t).map(|&p| (t, p)))
-        .unwrap_or_else(|| panic!("no split-parent provenance recorded among {ids:?}"));
+    // Determine parent/child via `split_lineage` (ADR 0050 fork F9) —
+    // written at CUTOVER, so poll the workflow to completion rather than
+    // sampling once mid-build (a `Splitting` parent + `Building` children
+    // is a legitimate transient this loop simply waits out).
+    let (child, parent) = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        loop {
+            let meta = nodes[0].metadata();
+            let ids = tablets_for(&meta, "events");
+            if let Some((c, p)) = ids
+                .iter()
+                .find_map(|&t| meta.split_lineage.get(&t).map(|l| (t, l.parent)))
+            {
+                break (c, p);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no cutover lineage ever recorded among {ids:?}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
 
     // The lineage link (ADR 0042 §2/ADR 0043 §A4) needs the **parent** to
     // have sealed at least once — the **child** need not have: its own
@@ -1073,11 +1088,20 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     // Drain the whole lineage from a *different* node than the one that
     // wrote most items, and confirm exactly-once total delivery.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let seed_tablets: Vec<TabletId> = {
+        let meta = nodes[1].metadata();
+        let mut ts = tablets_for(&meta, "events");
+        // The retired parent still carries the pre-split history — walk it
+        // too (its sealed rows persist in the catalog; the helper skips a
+        // retired tablet's nonexistent open tail).
+        ts.push(parent);
+        ts
+    };
     let delivered = drain_all_tablets_lineage(
         nodes[1].dynamo_addr(),
         &stream_arn,
         &nodes[1],
-        &ids,
+        &seed_tablets,
         expected,
         deadline,
     )
@@ -1150,7 +1174,6 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
 /// fix (which is about `Metadata`'s pure watermark/`ParentShardId`
 /// derivation, not the seal arm's own scan/trim sequencing) and reported
 /// separately rather than chased down here.
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manual_split_with_unsealed_backlog_under_production_seal_knobs() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1194,41 +1217,42 @@ async fn manual_split_with_unsealed_backlog_under_production_seal_knobs() {
     )
     .await;
 
-    // The precondition this cell exists to exercise: at the instant of the
-    // split, nothing has sealed yet anywhere in the catalog — every write
-    // so far is still sitting in the hot backlog, physically split across
-    // whichever two tablets now exist.
-    assert!(
-        nodes[0].metadata().stream_shards.is_empty(),
-        "test premise: the split must land on a genuinely unsealed backlog"
-    );
-
-    // Determine parent/child via `split_parents` — never assumed from
-    // tablet-id ordering (same idiom as the auto-split test above).
-    let meta = nodes[0].metadata();
-    let table_tablets = tablets_for(&meta, "orders");
-    let (child, parent) = table_tablets
-        .iter()
-        .find_map(|&t| meta.split_parents.get(&t).map(|&p| (t, p)))
-        .unwrap_or_else(|| panic!("no split-parent provenance recorded among {table_tablets:?}"));
-
-    // No further writes. Both sides' inherited backlog ages past
-    // `seal_age` on its own, giving each exactly one seal — the parent's
-    // own seal of its narrowed left range, and the child's first-ever seal
-    // of whatever right-range backlog it physically inherited in place
-    // (ADR 0043 §A4). This is where an unfixed `effective_stream_shard_
-    // watermark`/`stream_shard_parent_id` would show up as a missing id
-    // (the child's inherited backlog silently dropped from its own first
-    // seal) rather than a wrong count alone.
-    await_true(
-        20,
-        "parent and child never both sealed at least once",
-        || {
+    // The precondition this cell exists to exercise: the workflow lands on
+    // a genuinely unsealed backlog (seal_age = 2s, the auto-split fires
+    // within milliseconds of the byte threshold) — under ADR 0050 that
+    // backlog's consumer-visibility story is now entirely the PARENT's:
+    // the freeze seals it whole into the parent's final shard(s), and the
+    // children are born with EMPTY change logs (no inherited backlog, no
+    // frozen-basis watermark — principle 3's stronger form), so the child
+    // seals nothing at all here (no further writes ever land on it).
+    //
+    // Wait for the workflow to CUT OVER — lineage present = children
+    // Active + parent retired (fork F9's cutover-time map).
+    let (child, parent) = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        loop {
             let meta = nodes[0].metadata();
-            meta.stream_shard_watermark(parent).is_some()
-                && meta.stream_shard_watermark(child).is_some()
-        },
-    )
+            let table_tablets = tablets_for(&meta, "orders");
+            if let Some((c, p)) = table_tablets
+                .iter()
+                .find_map(|&t| meta.split_lineage.get(&t).map(|l| (t, l.parent)))
+            {
+                break (c, p);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the split workflow never cut over (no lineage among {table_tablets:?})"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+
+    // The parent's final seal (the freeze's own step) covers the whole
+    // pre-split backlog — this is where a lost final seal would show up as
+    // missing ids in the walk below.
+    await_true(20, "the retired parent never sealed its backlog", || {
+        nodes[0].metadata().stream_shard_watermark(parent).is_some()
+    })
     .await;
 
     // Drain the whole lineage (both tablets, every epoch) from a different
@@ -1626,7 +1650,6 @@ async fn plain_split(client_addr: SocketAddr, tablet: TabletId, split_key: Vec<u
 /// via-forwarding RPC, since a table's two pre-existing tablets can be led
 /// by two different nodes, neither necessarily the one serving the admin
 /// request), asserting exactly-once delivery across every cut.
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delivery() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1779,15 +1802,27 @@ async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delive
     let ids = tablets_for(&nodes[0].metadata(), "widgets");
     assert_eq!(ids.len(), 4, "growth must double 2 tablets to 4");
 
-    // Walk the whole doubled lineage from EVERY node in turn: `DescribeStream`
-    // must show all 4 tablets' shard chains from each node's own answer —
+    // Walk the whole doubled lineage from EVERY node in turn:
+    // `DescribeStream` must show all 4 children's chains PLUS each retired
+    // parent's closed final shard (ADR 0050 — a copy-based grow retires
+    // the two pre-existing tablets; their sealed history stays listed,
+    // the AWS closed-ancestor-shard shape) — from each node's own answer,
     // not just the one that happened to serve the grow request.
-    let want_tablet_ids: BTreeSet<u64> = ids.iter().map(|t| t.0).collect();
+    let mut want_tablet_ids: BTreeSet<u64> = ids.iter().map(|t| t.0).collect();
+    {
+        // Every ancestor that ever sealed stays visible via its catalog
+        // rows — transitively (the table's own setup split retired a
+        // grandparent too), so derive the set from the catalog itself.
+        let meta = nodes[0].metadata();
+        for (tablet, _) in meta.stream_shards.keys() {
+            want_tablet_ids.insert(tablet.0);
+        }
+    }
     for (i, node) in nodes.iter().enumerate() {
         let found = stream_tablet_ids(node.dynamo_addr(), &stream_arn).await;
         assert_eq!(
             found, want_tablet_ids,
-            "node {i}'s DescribeStream must list every one of the 4 tablets"
+            "node {i}'s DescribeStream must list all 4 children + the retired parents' closed shards"
         );
     }
 
@@ -1822,7 +1857,6 @@ async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delive
 /// so `--auto-split-change-rate` must have zero effect on it regardless of
 /// write volume — the "opt-in, streamed tables only, no surprise splits on
 /// an existing plain table" guarantee.
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain_one() {
     let dir = tempfile::TempDir::new().unwrap();

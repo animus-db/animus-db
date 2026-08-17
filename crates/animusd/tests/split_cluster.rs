@@ -295,7 +295,6 @@ const SPLIT_KEYS: [(&str, &str); 5] = [
     ("z", "v-z"),
 ];
 
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn split_over_a_split_deployment() {
     timeout(Duration::from_secs(120), async {
@@ -1158,7 +1157,6 @@ const CROSSOVER_KEYS: [(&str, &str); 5] = [
 /// readable after full convergence) and that metadata converges (the
 /// decommissioned node is gone from membership/the address book, and both
 /// resulting tablets end up fully replicated across the survivors).
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn decommission_racing_a_tablet_split_converges_with_no_data_loss() {
     timeout(Duration::from_secs(150), async {

@@ -255,7 +255,16 @@ fn describe_stream(
         ));
     }
     if enabled {
-        for (&tablet, _) in meta.tablets_for_table(&table) {
+        // ADR 0050 rung 5: only routable tablets expose an OPEN shard — a
+        // `Building` split child must not surface one before cutover (its
+        // change log is empty by design and it serves nothing), and a
+        // `Splitting` parent keeps its open shard until its final seal +
+        // retire. A retired parent's sealed rows persist above via the
+        // catalog, which is keyed by tablet id and never pruned.
+        for (&tablet, _) in meta
+            .tablets_for_table(&table)
+            .filter(|(_, t)| t.is_routable())
+        {
             let epoch = current_open_epoch(&meta, tablet);
             let starting = meta.effective_stream_shard_watermark(tablet).unwrap_or(0);
             shard_entries.push((
@@ -296,7 +305,10 @@ fn describe_stream(
             .filter(|(_, _, row)| !row.expired)
             .count();
         if enabled {
-            n += meta.tablets_for_table(&table).count();
+            n += meta
+                .tablets_for_table(&table)
+                .filter(|(_, t)| t.is_routable())
+                .count();
         }
         n
     };

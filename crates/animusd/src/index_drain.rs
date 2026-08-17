@@ -374,7 +374,7 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
                     .split_builds
                     .lock()
                     .expect("split_builds poisoned")
-                    .insert(tablet.0, (build.rows_shipped, build.converged));
+                    .insert(tablet.0, (build.rows_shipped, build.converged, build.phase));
             }
             // ADR 0044 phase-1 PR6: "quiesced ⇒ nothing new for the
             // sweeper" is an invariant PR5's veto makes sound — a led
@@ -393,6 +393,26 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             let Some(table) = meta.tablets.get(&tablet).and_then(|t| t.table.clone()) else {
                 continue; // legacy whole-keyspace tablet, or a stale view
             };
+            // ADR 0050 rung 5: a `Building` split child runs NO consumer
+            // arms. It serves nothing yet (unroutable), so every consumer
+            // restarts from scratch at activation (the classified
+            // RestartFromScratch policy, ADR 0046) — and running them early
+            // is actively harmful, not just wasted: the child's own
+            // token-truncated "gsi" cursor key sorts below its range.start,
+            // so its cursor write ROUTES to the still-routable parent and
+            // lands in the parent's own KIND_CURSOR scope, where the
+            // min-over-rows watermark rule drags the PARENT's cursor down
+            // forever — deadlocking the rung-5 GSI cutover veto (the
+            // split-child-cursor-unreadable shape, poisoning the parent
+            // this time; caught red by `backfill_seeder`'s revived
+            // split-during-backfill e2e).
+            if meta
+                .tablets
+                .get(&tablet)
+                .is_some_and(|t| t.state == TabletState::Building)
+            {
+                continue;
+            }
             // A hidden index table holds index rows; it has no indexes of its
             // own, and must never recurse into maintaining any.
             if is_index_table_name(&table) {
@@ -587,6 +607,21 @@ pub(crate) struct SplitBuild {
     rows_shipped: u64,
     /// `bulk_done` and the latest tail pass found zero new records.
     converged: bool,
+    /// The endgame step this build last parked at (observability only,
+    /// mirrored to `/admin/raftkv`): `"build"` -> `"freeze"` ->
+    /// `"final-drain"` -> `"final-seal"` -> `"gsi-veto"`/`"backfill-veto"`
+    /// -> `"cutover"`. Driver-local like everything else here.
+    phase: &'static str,
+    /// The parent's commit index captured at the first frozen tick — every
+    /// mutating entry that will EVER apply is at or below it (the propose
+    /// latch refuses from the moment `Freeze` applies, and the append-to-
+    /// apply sliver's entries are ordered before this read). The final
+    /// image waits for `engine_applied_index()` to reach it, closing the
+    /// "decision applies mid-scan" sliver.
+    frozen_commit_floor: Option<u64>,
+    /// The endgame's one full re-scan ship of the frozen parent completed
+    /// (driver-local — a re-led driver redoes it; idempotent merges).
+    final_image_done: bool,
 }
 
 /// The split-build seed chunk budget: one `SeedBatch` entry's row payload is
@@ -640,35 +675,87 @@ async fn split_driver_tick(
         ));
     }
 
-    // Ship `rows` (already filtered to one child) in bounded chunks.
-    async fn ship(
-        ctx: &ClientCtx,
-        child: TabletId,
-        rows: Vec<animus_cp_data::SeedRow>,
-        shipped: &mut u64,
-    ) -> Result<(), String> {
-        let mut chunk: Vec<animus_cp_data::SeedRow> = Vec::new();
-        let mut bytes = 0usize;
-        for row in rows {
-            bytes += 1 + row.1.len() + row.2.as_ref().map_or(0, |v| v.len()) + 16;
-            chunk.push(row);
-            if bytes >= SEED_CHUNK_BYTES {
-                let n = chunk.len() as u64;
-                ctx.seed_child_rows(child, std::mem::take(&mut chunk))
-                    .await?;
-                *shipped += n;
-                bytes = 0;
+    if !group.is_frozen() {
+        // ---- the build (ADR 0050 stage 2, rung 4) ----
+        if !build.bulk_done {
+            for kind in SEED_KINDS {
+                let rows = group.seed_rows_kind(kind as usize, None).await;
+                for (child, range) in &children {
+                    let child_rows: Vec<_> = rows
+                        .iter()
+                        .filter(|(logical, _, _)| range.contains(logical))
+                        .map(|(l, v, ver)| (kind, l.clone(), v.clone(), *ver))
+                        .collect();
+                    ship(ctx, *child, child_rows, &mut build.rows_shipped).await?;
+                }
             }
+            build.bulk_done = true;
         }
-        if !chunk.is_empty() {
-            let n = chunk.len() as u64;
-            ctx.seed_child_rows(child, chunk).await?;
-            *shipped += n;
+        let shipped = tail_pass(ctx, group, &children, build).await?;
+        build.converged = build.bulk_done && !shipped;
+        if build.converged {
+            // ---- stage 3 kickoff (rung 5): converged — terminally freeze
+            // the parent. Idempotent (a duplicate `Freeze` applies as a
+            // no-op), so a crash/re-lead between propose and apply just
+            // re-proposes here next tick. Once the entry APPLIES,
+            // `is_frozen()` flips and every subsequent tick runs the
+            // endgame below instead.
+            build.phase = "freeze";
+            match group.propose_freeze() {
+                animus_control::ProposeResult::Accepted { .. } => {}
+                other => return Err(format!("freeze not accepted: {other:?}")),
+            }
+        } else {
+            build.phase = "build";
         }
-        Ok(())
+        return Ok(());
     }
 
-    if !build.bulk_done {
+    // ---- the endgame (frozen parent; ADR 0050 stages 3-4, rung 5). Every
+    // step is idempotent and re-derived per tick from durable/replicated
+    // state only, so a driver crash or re-lead at ANY boundary resumes by
+    // simply re-running the tick: the freeze is engine-durable
+    // (`is_frozen()` re-latches from its marker), a re-run tail pass ships
+    // nothing new, a re-run seal finds nothing left to seal, the vetoes are
+    // pure reads, and a duplicate `CutoverSplit` rejects at its own
+    // state/epoch CAS. ----
+    build.bulk_done = true;
+    build.converged = true;
+
+    // 1. Final drain: the identical watermark tail, now over a log that can
+    //    no longer grow (the freeze's own log position bounds it). Runs to
+    //    literally zero new records — no lag threshold in v1.
+    let shipped = tail_pass(ctx, group, &children, build).await?;
+    if shipped {
+        build.phase = "final-drain";
+        return Ok(());
+    }
+
+    // 1b. The FINAL IMAGE: one full re-scan ship of the frozen parent —
+    //     the freeze's log position defines the final state, and this
+    //     transfers it verbatim (carried-version merges make it an
+    //     idempotent no-op for every row the build already shipped). This
+    //     is deliberately a whole-scan, not another tail pass, because
+    //     transaction DECISIONS (`TxnCommit`/`TxnAbort`) and RESOLVES
+    //     rewrite base rows with **no change record of their own** — an
+    //     O(delta) tail structurally misses them, and a child inheriting a
+    //     stale `Pending` record for an acked-committed transaction is the
+    //     in-doubt-recovery-aborts-a-committed-write class, the one thing
+    //     fork F7 exists to prevent. Cost: a second full read+wire pass
+    //     per split, accepted for v1 (the pivot's safe-over-clever ethos);
+    //     apply-side decision/resolve markers restoring O(delta) are the
+    //     named B-final optimization. Gated on the apply task having
+    //     caught up past the freeze-window commit floor, so a decision
+    //     appended in the freeze's own append-to-apply sliver can never
+    //     apply mid-scan and be missed.
+    let floor = *build
+        .frozen_commit_floor
+        .get_or_insert_with(|| group.commit_index());
+    if group.engine_applied_index() < floor {
+        build.phase = "final-drain";
+        return Ok(());
+    }
+    if !build.final_image_done {
         for kind in SEED_KINDS {
             let rows = group.seed_rows_kind(kind as usize, None).await;
             for (child, range) in &children {
@@ -680,20 +767,137 @@ async fn split_driver_tick(
                 ship(ctx, *child, child_rows, &mut build.rows_shipped).await?;
             }
         }
-        build.bulk_done = true;
+        build.final_image_done = true;
+        build.phase = "final-image";
+        return Ok(());
     }
 
-    // Tail pass: new change records past the cursor are dirty-key signals.
-    // The dirt granularity is two-tier, keyed off the change key's own
-    // prefix (the logical key minus its trailing 8-byte packed HLC):
-    // - a prefix carrying a full 8-byte token (every dynamo/CQL key, and
-    //   any raw key ≥ 8 bytes) dirties its whole **token** — the unit that
-    //   also owns the item's LSI rows (which reorder the sk and share only
-    //   the token+pk lead) and its txn-record row (which shares the
-    //   anchor's token), and the unit F11 keeps wholly on one child;
-    // - a shorter raw-protocol prefix dirties exactly itself (such tables
-    //   structurally have no LSI/txn rows — `cp_txn` rejects sub-token
-    //   keys — so the prefix covers everything).
+    let table = parent.table.clone().unwrap_or_default();
+
+    // 2. Streams final seal (stage 3): seal the parent's KIND_CHANGE to
+    //    end-of-log under the ordinary seal machinery — a routine seal
+    //    (same shard-id discipline, so an in-flight iterator drains it and
+    //    walks on), just with no size/age gate. The parent is frozen and
+    //    drained, so one seal covers everything; a tick that sealed
+    //    something re-checks next tick and finds nothing left.
+    if !table.is_empty()
+        && meta.table_stream(&table).is_some()
+        && seal_now(ctx, &table, tablet, group).await?.is_some()
+    {
+        build.phase = "final-seal";
+        return Ok(());
+    }
+
+    // 3a. GSI-drain veto (stage 3): the drain must have consumed the
+    //     parent's change log (its cursor at or past the highest pending
+    //     record — markers included, whose HLCs the drain folds in), or
+    //     cutover would retire records whose GSI updates were never
+    //     materialized (children's change logs are empty by design).
+    if !table.is_empty() && !meta.table_indexes(&table).is_empty() {
+        let max_pending = group
+            .pending_changes()
+            .await
+            .iter()
+            .filter_map(|(k, _)| record_hlc(k))
+            .max();
+        if let Some(max_hlc) = max_pending {
+            let caught_up = group
+                .cursor_min_watermark("gsi")
+                .await
+                .is_some_and(|wm| wm >= max_hlc);
+            if !caught_up {
+                build.phase = "gsi-veto";
+                return Ok(());
+            }
+        }
+    }
+
+    // 3b. Backfill veto (stage 3): a still-`Creating` index's seeder must
+    //     have finished its sweep of the (frozen, hence static) parent —
+    //     its `MarkIndexBackfilled` row present — before the parent may
+    //     retire; the children then restart their own narrower sweeps from
+    //     scratch (ADR 0045 Fork A) and the completion aggregator re-reads
+    //     the live tablet map every tick, so post-cutover convergence is
+    //     sound.
+    if !table.is_empty() {
+        for idx in meta.table_indexes(&table) {
+            if idx.status == IndexStatus::Creating
+                && !meta
+                    .index_backfill
+                    .contains_key(&(tablet, idx.name.clone()))
+            {
+                build.phase = "backfill-veto";
+                return Ok(());
+            }
+        }
+    }
+
+    // 4. Cutover (stage 4): the atomic flip — children Active, parent
+    //    removed, lineage frozen. Confirmed by the parent VANISHING from
+    //    the map (the loop-top retain drops this build entry), so this
+    //    propose is simply re-issued each tick until observed; the
+    //    state/epoch CAS makes a duplicate reject cleanly.
+    build.phase = "cutover";
+    let cmd = MetaCommand::CutoverSplit {
+        parent: tablet,
+        expected_epoch: parent.epoch,
+        cutover_wall_ms: ctx.env.now().0 / 1_000_000,
+    };
+    ctx.propose_schema(&cmd).await;
+    Ok(())
+}
+
+/// Ship `rows` (already filtered to one child) in bounded chunks
+/// (ADR 0050 rung 4 — see [`SEED_CHUNK_BYTES`]).
+async fn ship(
+    ctx: &ClientCtx,
+    child: TabletId,
+    rows: Vec<animus_cp_data::SeedRow>,
+    shipped: &mut u64,
+) -> Result<(), String> {
+    let mut chunk: Vec<animus_cp_data::SeedRow> = Vec::new();
+    let mut bytes = 0usize;
+    for row in rows {
+        bytes += 1 + row.1.len() + row.2.as_ref().map_or(0, |v| v.len()) + 16;
+        chunk.push(row);
+        if bytes >= SEED_CHUNK_BYTES {
+            let n = chunk.len() as u64;
+            ctx.seed_child_rows(child, std::mem::take(&mut chunk))
+                .await?;
+            *shipped += n;
+            bytes = 0;
+        }
+    }
+    if !chunk.is_empty() {
+        let n = chunk.len() as u64;
+        ctx.seed_child_rows(child, chunk).await?;
+        *shipped += n;
+    }
+    Ok(())
+}
+
+/// One tail pass of the split build (ADR 0050 rung 4; reused VERBATIM as
+/// rung 5's post-freeze final drain): ship every dirty unit whose change
+/// record's packed HLC exceeds the driver's watermark, then advance the
+/// watermark only once every ship in the pass succeeded. Returns whether
+/// anything shipped (`false` == the pass found zero new records).
+///
+/// Dirty granularity is two-tier, keyed off the change key's own prefix
+/// (the logical key minus its trailing 8-byte packed HLC):
+/// - a prefix carrying a full 8-byte token (every dynamo/CQL key, and any
+///   raw key >= 8 bytes) dirties its whole **token** — the unit that also
+///   owns the item's LSI rows (which reorder the sk and share only the
+///   token+pk lead) and its txn-record row (which shares the anchor's
+///   token), and the unit F11 keeps wholly on one child;
+/// - a shorter raw-protocol prefix dirties exactly itself (such tables
+///   structurally have no LSI/txn rows — `cp_txn` rejects sub-token keys —
+///   so the prefix covers everything).
+async fn tail_pass(
+    ctx: &ClientCtx,
+    group: &CpGroup,
+    children: &[(TabletId, KeyRange)],
+    build: &mut SplitBuild,
+) -> Result<bool, String> {
     let changes = group.pending_changes().await;
     let fresh: Vec<&Vec<u8>> = changes
         .iter()
@@ -706,10 +910,8 @@ async fn split_driver_tick(
         })
         .collect();
     if fresh.is_empty() {
-        build.converged = build.bulk_done;
-        return Ok(());
+        return Ok(false);
     }
-    build.converged = false;
     let mut dirty: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut max_hlc = build.tail_hlc;
     for logical in fresh {
@@ -757,7 +959,7 @@ async fn split_driver_tick(
     // Only past every successful ship: a failed tick re-derives the same
     // dirty units next tick from the unmoved watermark.
     build.tail_hlc = max_hlc;
-    Ok(())
+    Ok(true)
 }
 
 /// The exclusive upper bound of "every key starting with `prefix`": the
@@ -2459,7 +2661,6 @@ mod gsi_drain_cursor_tests {
     /// empty set: the right child inherits no cursor row at all) — and
     /// confirm it converges to the correct GSI, on both sides, without
     /// corrupting anything (idempotence).
-    #[ignore = "PARKED (ADR 0050 Train B rung 1): drives a zero-copy split of a populated tablet, disabled during the storage pivot; revived/replaced with the copy-based split in later rungs"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn split_right_childs_cold_start_re_reconciles_from_zero_without_corrupting_the_gsi() {
         timeout(Duration::from_secs(90), async {
@@ -3382,7 +3583,6 @@ mod stream_sealer_tests {
     /// so the trigger fires promptly), then reading the resulting sibling
     /// tablets' own `KeyRange` boundary back out of `Metadata` and checking
     /// it is exactly `TOKEN_BYTES` long.
-    #[ignore = "PARKED (ADR 0050 Train B rung 1): drives a zero-copy split of a populated tablet, disabled during the storage pivot; revived/replaced with the copy-based split in later rungs"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn f11_end_to_end_auto_split_on_a_streamed_table_lands_a_token_aligned_boundary() {
         timeout(Duration::from_secs(60), async {
@@ -3814,7 +4014,6 @@ mod stream_sealer_tests {
     /// 3. the same burst's change-log backlog must still get sealed —
     ///    proving `change_consumer_loop`'s identical skip-gate doesn't
     ///    strand the seal/trim arms either.
-    #[ignore = "PARKED (ADR 0050 Train B rung 1): drives a zero-copy split of a populated tablet, disabled during the storage pivot; revived/replaced with the copy-based split in later rungs"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_rewoken_tablet_is_picked_back_up_by_every_sweeper_within_one_interval() {
         timeout(Duration::from_secs(60), async {

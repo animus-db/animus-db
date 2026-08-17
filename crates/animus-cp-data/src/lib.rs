@@ -649,6 +649,34 @@ pub enum KvCommand {
     /// applies (it is itself the authority tightening what future entries
     /// may touch); see `apply_and_compact`'s `Seal` arm.
     Seal { range: KeyRange, ts: HlcTimestamp },
+    /// **Split-cutover freeze** (ADR 0050 Train B rung 5, stage 3): the
+    /// terminal, whole-range descendant of [`Seal`](Self::Seal), proposed
+    /// into the **parent's** own log by the split-build driver once the
+    /// build has converged. After this entry applies, the parent group
+    /// rejects every later-ordered mutating command — its apply pushes
+    /// `(KeyRange::whole(), ts)` into the same in-memory sealed set every
+    /// fence+seal apply gate already consults (zero new per-command gating
+    /// code), persists the identical durable seal marker (`seal.rs`) so a
+    /// restarted/compacted group stays frozen, and latches the driver-level
+    /// `frozen` flag the propose-side refusals read
+    /// ([`RaftKvNode::is_frozen`]). Linearizable reads keep serving — the
+    /// frozen state IS current, since nothing anywhere accepts writes for
+    /// the range until cutover activates the children. The freeze's own log
+    /// position defines the final state the build's final tail pass ships.
+    /// Idempotent: a duplicate `Freeze` on an already-frozen group applies
+    /// as a no-op (no second marker write, no second sealed-set entry). No
+    /// `fence`, exactly like `Seal` — it never touches user data and is
+    /// itself the authority tightening what future entries may do.
+    ///
+    /// **What stays proposable on a frozen group**: `ReadCeiling` (the read
+    /// path's own liveness — reads keep serving), `Seal` (no production
+    /// caller), `NoOp`, and `Freeze` itself. `TxnCommit`/`TxnAbort` are
+    /// refused at propose time but an entry already appended in the
+    /// freeze's own append-to-apply sliver applies normally (harmless: the
+    /// decision's resolves carry the outcome explicitly, and the child's
+    /// copied record is decided post-cutover by the coordinator's own
+    /// retry — see rung 5's e2e).
+    Freeze { ts: HlcTimestamp },
     /// **Logged read ceiling** (ADR 0018 §2/PR2b — see `ceiling.rs`'s module
     /// doc): proposed by a group's own leader, through its **own** Raft log,
     /// when it wants to serve a read at or above the highest ceiling
@@ -1326,6 +1354,13 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// Updated by the apply task (`apply_and_compact`'s `ReadCeiling` arm);
     /// read by this handle's own `ensure_ceiling_above`/`read_at`/`scan_at`.
     committed_ceiling: Arc<AtomicU64>,
+    /// ADR 0050 rung 5: whether this group has applied its split-cutover
+    /// [`KvCommand::Freeze`] — set by the apply arm, re-latched at group
+    /// start from the whole-range seal marker, read by
+    /// [`is_frozen`](Self::is_frozen) (the pre-propose refusal `animusd`'s
+    /// write/txn helpers consult). Never cleared: a frozen parent's only
+    /// future is retirement at cutover.
+    frozen: Arc<AtomicBool>,
     /// The highest `ReadCeiling` **candidate** this leader has ever
     /// proposed (whether committed yet or not), packed via [`hlc::pack`] —
     /// disambiguates two `ensure_ceiling_above` calls that independently
@@ -1505,6 +1540,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         hlc.witness(hlc::unpack(storage.latest_version()), env.now());
         let ts_cache = Arc::new(Mutex::new(TsCache::new()));
         let committed_ceiling = Arc::new(AtomicU64::new(0));
+        let frozen = Arc::new(AtomicBool::new(false));
         let last_ceiling_candidate = Arc::new(AtomicU64::new(0));
         let last_proposed_ts = Arc::new(AtomicU64::new(0));
         // Sentinel (never a real term) so the very first mint on this group
@@ -1538,6 +1574,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             hlc: Arc::clone(&hlc),
             ts_cache: Arc::clone(&ts_cache),
             committed_ceiling: Arc::clone(&committed_ceiling),
+            frozen: Arc::clone(&frozen),
             last_ceiling_candidate,
             last_proposed_ts,
             last_absorbed_term,
@@ -1569,6 +1606,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             stream,
             hlc,
             committed_ceiling,
+            frozen,
             txn_tracker,
             external_quiesce_veto,
         }));
@@ -2169,6 +2207,47 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 pushed
             };
             KvCommand::Seal { range, ts }
+        })
+    }
+
+    /// Whether this group has applied its split-cutover
+    /// [`KvCommand::Freeze`] (ADR 0050 rung 5) — a pure frozen-flag read,
+    /// never itself a wake or a propose. `animusd`'s local write/txn
+    /// helpers consult this **before proposing** and refuse retryably
+    /// (`"...; retry"`), so a stale-routed client re-resolves and lands on
+    /// a split child; the apply-time whole-range seal remains the
+    /// correctness backstop for the propose-vs-apply sliver (such an entry
+    /// no-ops and its proposer's own probe/outcome confirm times out —
+    /// degraded latency, never a false ack).
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::SeqCst)
+    }
+
+    /// Propose the **split-cutover freeze** (ADR 0050 rung 5, stage 3 — see
+    /// [`KvCommand::Freeze`]'s doc): terminally close this whole group to
+    /// further mutation, ordered at this entry's own log position. Called
+    /// only by the split-build driver once the build has converged;
+    /// leader-only, idempotent (a duplicate applies as a no-op — the driver
+    /// may re-propose after a crash/re-lead without checking first).
+    pub fn propose_freeze(&self) -> ProposeResult {
+        self.propose_ordered(|_term| {
+            let ts = self.hlc.mint(self.env.now());
+            // Same `last_proposed_ts` floor discipline as `propose_seal`
+            // (see that method's inline comment).
+            let floor = hlc::unpack(self.last_proposed_ts.load(Ordering::SeqCst));
+            let ts = if ts > floor {
+                ts
+            } else {
+                let pushed = self.hlc.witness(floor, self.env.now());
+                assert!(
+                    pushed > floor,
+                    "raftkv propose_freeze: witnessing the last-proposed floor must strictly \
+                     exceed it (floor={floor:?}, got={pushed:?}) — Hlc::witness's own contract \
+                     is broken"
+                );
+                pushed
+            };
+            KvCommand::Freeze { ts }
         })
     }
 
@@ -4884,6 +4963,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     sealed: &mut Vec<(KeyRange, HlcTimestamp)>,
     max_applied_ts: &mut Option<HlcTimestamp>,
     committed_ceiling: &AtomicU64,
+    // ADR 0050 rung 5: the split-cutover freeze latch — set by
+    // `KvCommand::Freeze`'s apply arm, read by the propose-side refusals
+    // (`RaftKvNode::is_frozen`); re-latched at group start from the
+    // whole-range seal marker (the same rebuild `sealed` gets).
+    frozen: &AtomicBool,
     txn_tracker: &Mutex<TxnTracker>,
     // ADR 0018 §2 write-loss amendment (Part B): the engine-durable version
     // watermark recovered once at this apply task's own start, and this
@@ -5032,10 +5116,13 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // emission, no `encode_committed` re-wrap, no seal check (a
                 // fresh Building child has no sealed ranges; the seal
                 // mechanism itself retires with the zero-copy split).
-                if rows
-                    .iter()
-                    .all(|(_, logical, _, _)| fence.contains(logical))
-                {
+                // Rung 5 addition to the gate: a frozen group (`Freeze`'s
+                // whole-range seal) also refuses seeds — a SeedBatch is
+                // never legitimately directed at a split PARENT, only its
+                // children, so this only fires on a driver bug.
+                if rows.iter().all(|(_, logical, _, _)| {
+                    fence.contains(logical) && !is_sealed(sealed, logical)
+                }) {
                     let mut max_seeded: u64 = 0;
                     for (kind, logical, value, version) in &rows {
                         let Some(kscope) = kind_scopes.get(*kind as usize) else {
@@ -5119,10 +5206,27 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // that never landed, which is the one thing colocating them was
                 // supposed to make impossible. Every kind shares this tablet's
                 // single range, so one fence covers them all.
+                //
+                // ADR 0050 rung 5: the seal/freeze gate applies only to a
+                // batch carrying USER data (a base or LSI write). A pure
+                // consumer-bookkeeping batch — cursor rows, footprint rows,
+                // change-log-only entries (the backfill seeder's synthetic
+                // records) — passes a frozen group's whole-range seal, so
+                // the GSI drain and the backfill seeder can finish draining
+                // a frozen split parent's (static) base state; without this
+                // the rung-5 cutover vetoes deadlock against the very
+                // freeze that made the state drainable. The base state
+                // itself stays fixed at the freeze position (the contract);
+                // bookkeeping kinds are either never copied to the children
+                // (CHANGE/CURSOR) or self-healing on them (FOOTPRINT — the
+                // drain always reconciles toward the current base row).
+                let carries_user_data = writes
+                    .iter()
+                    .any(|(kind, _, _)| *kind == KIND_BASE || *kind == KIND_LSI);
                 if conditions_ok
-                    && writes
-                        .iter()
-                        .all(|(_, key, _)| fence.contains(key) && !is_sealed(sealed, key))
+                    && writes.iter().all(|(_, key, _)| {
+                        fence.contains(key) && (!carries_user_data || !is_sealed(sealed, key))
+                    })
                 {
                     // ADR 0046 binding decision: the ONE shared
                     // materialization helper, also used by `TxnResolve`'s
@@ -5227,6 +5331,32 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .await
                     .expect("raftkv apply seal marker");
                 sealed.push((range, ts));
+            }
+            KvCommand::Freeze { ts } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                // Idempotent: an already-frozen group (a duplicate propose, a
+                // WAL-replay re-application over a marker-rebuilt sealed set)
+                // applies nothing a second time.
+                if !frozen.load(Ordering::SeqCst) {
+                    // The whole-range seal marker — `seal.rs`'s own durability
+                    // discipline (the marker survives compaction; the sealed
+                    // set is rebuilt from it at group start, which is also
+                    // what re-latches `frozen` across a restart). Flush the
+                    // pending run first, `Seal`'s ordering hygiene.
+                    flush_pending(storage, &mut pending, metrics).await;
+                    let whole = KeyRange::whole();
+                    let marker_key = seal::seal_marker_key(tablet, &whole);
+                    storage
+                        .merge(
+                            &marker_key,
+                            &seal::encode_seal_value(&whole, ts),
+                            hlc::pack(ts),
+                        )
+                        .await
+                        .expect("raftkv apply freeze marker");
+                    sealed.push((whole, ts));
+                    frozen.store(true, Ordering::SeqCst);
+                }
             }
             KvCommand::ReadCeiling { ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
@@ -6404,6 +6534,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     stream: u64,
     hlc: Arc<Hlc>,
     committed_ceiling: Arc<AtomicU64>,
+    frozen: Arc<AtomicBool>,
     txn_tracker: Arc<Mutex<TxnTracker>>,
     external_quiesce_veto: Arc<AtomicBool>,
 }
@@ -6426,6 +6557,7 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
         | KvCommand::Delete { ts, .. }
         | KvCommand::Cas { ts, .. }
         | KvCommand::Seal { ts, .. }
+        | KvCommand::Freeze { ts }
         | KvCommand::ReadCeiling { ts, .. }
         | KvCommand::TxnStage { ts, .. }
         | KvCommand::TxnCommit { ts, .. }
@@ -6499,6 +6631,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         stream,
         hlc,
         committed_ceiling,
+        frozen,
         txn_tracker,
         external_quiesce_veto,
     } = st;
@@ -6548,6 +6681,16 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         .into_iter()
         .filter_map(|(_, vv)| seal::decode_seal_value(&vv.value))
         .collect();
+    // Re-latch the split-cutover freeze (ADR 0050 rung 5) from the same
+    // rebuilt marker set: a whole-range seal IS the freeze (its apply wrote
+    // exactly that marker), so a restarted — even fully log-compacted —
+    // frozen parent refuses proposes from its very first post-recovery one.
+    if sealed
+        .iter()
+        .any(|(range, _)| range.start.is_empty() && range.end.is_none())
+    {
+        frozen.store(true, Ordering::SeqCst);
+    }
     // Rebuild `committed_ceiling` from its own durable engine marker (ADR
     // 0018 §2/PR2b, `ceiling.rs`) — the same "engine marker survives
     // compaction, log replay might not" reasoning as `sealed` above. This is
@@ -6591,6 +6734,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&hlc),
         sealed,
         committed_ceiling,
+        frozen,
         Arc::clone(&txn_tracker),
         Arc::clone(&apply_signal),
     ));
@@ -6828,6 +6972,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     hlc: Arc<Hlc>,
     mut sealed: Vec<(KeyRange, HlcTimestamp)>,
     committed_ceiling: Arc<AtomicU64>,
+    frozen: Arc<AtomicBool>,
     txn_tracker: Arc<Mutex<TxnTracker>>,
     apply_signal: Arc<ApplySignal>,
 ) {
@@ -6872,6 +7017,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &mut sealed,
             &mut max_applied_ts,
             &committed_ceiling,
+            &frozen,
             &txn_tracker,
             recovered_baseline_version,
             &mut suspicious_noop_log_budget,

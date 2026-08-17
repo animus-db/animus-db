@@ -746,7 +746,6 @@ async fn admin_seed_writes_synthetic_keys() {
 /// + child (ADR 0028); before the fix, `key_count` read the whole shared engine
 /// (`CpGroup::approx_key_count`), so both halves' rows showed the *node's*
 /// combined total rather than their own subset.
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
     timeout(Duration::from_secs(60), async {
@@ -810,7 +809,14 @@ async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
                 loop {
                     let (_, raftkv) = admin_get(admin_addr, "/admin/raftkv").await;
                     let groups = raftkv["groups"].as_array().cloned().unwrap_or_default();
-                    if groups.len() >= 2 && groups.iter().all(|g| g["key_count"].as_u64().is_some())
+                    // Post-cutover + reclaim (ADR 0050 rung 5): exactly the
+                    // two children remain — the parent's group (tablet 1)
+                    // must be GONE, not merely outnumbered (a mid-workflow
+                    // poll sees parent + two seeding children = 3 groups).
+                    if groups.len() == 2
+                        && groups.iter().all(|g| {
+                            g["tablet"].as_u64() != Some(1) && g["key_count"].as_u64().is_some()
+                        })
                     {
                         return groups
                             .into_iter()

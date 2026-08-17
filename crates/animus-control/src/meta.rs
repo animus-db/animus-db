@@ -2347,6 +2347,16 @@ impl Metadata {
         if epoch > 0 {
             return Some(shard_id_string(tablet, epoch - 1));
         }
+        // ADR 0050 rung 5: a copy-based split child's epoch-0 shard names
+        // its parent's FINAL sealed shard via `split_lineage` — written at
+        // `CutoverSplit`'s own apply, the one moment the parent's chain is
+        // complete and immutable, so this needs no freezing defense layers
+        // at all (fork F9; contrast the zero-copy `stream_split_basis`
+        // below, which B7 deletes).
+        if let Some(lineage) = self.split_lineage.get(&tablet) {
+            let parent_epoch = lineage.parents_final_epoch?;
+            return Some(shard_id_string(lineage.parent, parent_epoch));
+        }
         let basis = self.stream_split_basis.get(&tablet)?;
         let parent_epoch = basis.last_sealed_epoch?;
         Some(shard_id_string(basis.parent, parent_epoch))

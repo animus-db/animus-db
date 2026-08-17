@@ -117,7 +117,11 @@ const MAGIC: u8 = 0xCB;
 /// split-build driver's version-carrying row-transfer command (see the
 /// variant's own doc). Rows are `(kind, logical, Option<value>, version)`
 /// with the standard `fence`/`ts` tail.
-const VERSION: u8 = 19;
+/// `20` (ADR 0050 Train B rung 5): new `KvCommand::Freeze` (tag 14) — the
+/// split-cutover freeze, a bare `ts` (no fence, no keys; see the variant's
+/// own doc). Same house convention: a clean bump, no cross-version
+/// compatibility.
+const VERSION: u8 = 20;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -508,6 +512,10 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_u8(out, 7);
             put_ts(out, *ts);
         }
+        KvCommand::Freeze { ts } => {
+            put_u8(out, 14);
+            put_ts(out, *ts);
+        }
         KvCommand::TxnStage {
             txn_id,
             record_key,
@@ -649,6 +657,7 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             ts: read_ts(c)?,
         },
         7 => KvCommand::ReadCeiling { ts: read_ts(c)? },
+        14 => KvCommand::Freeze { ts: read_ts(c)? },
         8 => {
             let txn_id = read_txn_id(c)?;
             let record_key = c.bytes()?;

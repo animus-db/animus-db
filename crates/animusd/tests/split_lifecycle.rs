@@ -203,40 +203,59 @@ async fn begin_split_lifecycle_over_three_nodes_via_a_follower() {
             sleep(Duration::from_millis(100)).await;
         }
 
-        // The parent still serves BOTH reads and writes over its whole
-        // range — i.e. every client op still routes to the parent, never a
-        // Building child (whose engine is empty: a routed read landing
-        // there would answer `None`).
+        // Every client op keeps routing to an AUTHORITATIVE group — the
+        // parent while it serves, never a `Building` child (whose engine
+        // would answer a false `None`). Rung 5 completes the workflow, so
+        // on a table this small the driver can freeze/cut over at any
+        // moment — an op racing that window gets the documented retryable
+        // refusal and its retry lands on the parent or an activated child
+        // (acked exactly once, never lost, never answered from a Building
+        // engine). Bounded retry, the same shape as every client loop.
         for key in &keys {
-            let got = client_op(
-                &mut stream,
-                &ClientRequest::Get {
-                    key: key.clone(),
-                    table: "t".to_string(),
-                },
-            )
-            .await;
-            assert!(
-                matches!(got, ClientResponse::Value(Some(ref v)) if v == key),
-                "read of {key:?} mid-split must still serve from the parent: {got:?}"
-            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let got = client_op(
+                    &mut stream,
+                    &ClientRequest::Get {
+                        key: key.clone(),
+                        table: "t".to_string(),
+                    },
+                )
+                .await;
+                match got {
+                    ClientResponse::Value(Some(ref v)) if v == key => break,
+                    ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                    other => panic!(
+                        "read of {key:?} mid-split must serve the written value \
+                         (a Building child would answer None): {other:?}"
+                    ),
+                }
+            }
         }
         for key in &keys {
             let mut k2 = key.clone();
             k2.push(b'!');
-            let put = client_op(
-                &mut stream,
-                &ClientRequest::Put {
-                    key: k2,
-                    value: b"post-split".to_vec(),
-                    table: "t".to_string(),
-                },
-            )
-            .await;
-            assert!(
-                matches!(put, ClientResponse::PutOk),
-                "write mid-split must still land on the parent: {put:?}"
-            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let put = client_op(
+                    &mut stream,
+                    &ClientRequest::Put {
+                        key: k2.clone(),
+                        value: b"post-split".to_vec(),
+                        table: "t".to_string(),
+                    },
+                )
+                .await;
+                match put {
+                    ClientResponse::PutOk => break,
+                    ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                    other => panic!("write mid-split never acked: {other:?}"),
+                }
+            }
         }
 
         for node in &nodes {

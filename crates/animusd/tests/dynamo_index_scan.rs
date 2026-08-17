@@ -428,7 +428,6 @@ async fn await_true<F: Fn() -> bool>(secs: u64, what: &str, cond: F) {
 /// still recover every `by-score` row exactly once, in the same
 /// Limit-paginated shape as before the split: identical behavior, only a
 /// leaner per-page payload underneath.
-#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lsi_scan_with_limit_paginates_identically_across_a_split_table() {
     let (nodes, addr) = setup().await;
