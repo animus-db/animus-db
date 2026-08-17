@@ -30,15 +30,98 @@
 //! this module has no excuse either way — it's pure logic).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(test)]
 use animus_env::nid;
 use animus_env::{Env, NodeId};
-use animus_storage::StorageEngine;
+use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 
 use crate::{RaftKvNode, StorageScope, wal_file};
+
+/// The per-tablet engine seam (ADR 0050, Train B rung 1): every hosted
+/// data-plane tablet gets its **own private `StorageEngine`**, opened by the
+/// reconciler when it hosts the tablet and whose files are deleted outright
+/// when the tablet is released/reclaimed. The reconciler owns engine
+/// *lifecycle*; this trait owns engine *identity* — how a tablet id maps to
+/// durable files (`animusd` derives a per-tablet filename prefix on the `Env`
+/// `Disk` seam, the same naming-is-identity mechanism `raftkv.wal.<tablet>`
+/// already uses; sim/test callers use [`MemoryTabletEngines`]' in-memory
+/// registry).
+///
+/// `open` must be idempotent (re-opening recovers the engine's own durable
+/// state); `probe` answers "does durable state for this tablet exist on this
+/// node" *without* necessarily opening (the restart-upgrade signal
+/// [`TabletFacts::has_data`] starts from); `destroy` deletes the engine's
+/// files — the caller guarantees the engine is closed (its group driver
+/// stopped) first.
+#[async_trait::async_trait]
+pub trait EngineFactory<S: StorageEngine>: Send + Sync {
+    /// Open (or re-open) `tablet`'s own engine, recovering its durable state.
+    async fn open(&self, tablet: TabletId) -> Result<S, String>;
+    /// Does durable engine state for `tablet` exist on this node?
+    async fn probe(&self, tablet: TabletId) -> bool;
+    /// Delete every durable file of `tablet`'s engine. The engine must be
+    /// closed. Idempotent — destroying an engine that never existed is a
+    /// no-op.
+    async fn destroy(&self, tablet: TabletId);
+}
+
+/// The [`MemoryEngine`] implementation of [`EngineFactory`]: an in-memory
+/// registry keyed by tablet id. Production caller: `animusd`'s
+/// `StorageBackend::Memory` (ephemeral runs); every sim/reconciler test uses
+/// it too. Cloning shares the registry — a test models "a durable engine
+/// surviving a process crash" by keeping one clone of this factory alive
+/// across the restart (the same modeling `tests/reconciler_corpus.rs` used
+/// to do with one shared `MemoryEngine`).
+#[derive(Clone, Default)]
+pub struct MemoryTabletEngines {
+    engines: Arc<Mutex<BTreeMap<u64, MemoryEngine>>>,
+}
+
+impl MemoryTabletEngines {
+    /// An empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get-or-create `tablet`'s engine — the harness/test accessor for
+    /// seeding data before a host and asserting on it after (clones share
+    /// state, so this is the same engine the reconciler hosts with).
+    #[must_use]
+    pub fn engine(&self, tablet: TabletId) -> MemoryEngine {
+        self.engines
+            .lock()
+            .expect("engine registry poisoned")
+            .entry(tablet.0)
+            .or_default()
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl EngineFactory<MemoryEngine> for MemoryTabletEngines {
+    async fn open(&self, tablet: TabletId) -> Result<MemoryEngine, String> {
+        Ok(self.engine(tablet))
+    }
+
+    async fn probe(&self, tablet: TabletId) -> bool {
+        self.engines
+            .lock()
+            .expect("engine registry poisoned")
+            .contains_key(&tablet.0)
+    }
+
+    async fn destroy(&self, tablet: TabletId) {
+        self.engines
+            .lock()
+            .expect("engine registry poisoned")
+            .remove(&tablet.0);
+    }
+}
 
 /// How many consecutive [`plan`] calls the release condition (this node
 /// dropped from a still-existing tablet's replica set, **and** its own durable
@@ -641,7 +724,13 @@ const RECLAIM_STOP_POLL: Duration = Duration::from_millis(50);
 /// `on_host`/`on_teardown` hooks passed to [`new`](Self::new).
 pub struct Reconciler<E: Env, S: StorageEngine> {
     env: E,
-    storage: S,
+    /// The per-tablet engine seam (ADR 0050 rung 1): how this node maps a
+    /// tablet id to its own private engine — see [`EngineFactory`].
+    factory: Box<dyn EngineFactory<S>>,
+    /// Every open per-tablet engine handle, kept in lockstep with
+    /// [`hosted`](Self::hosted) (plus, transiently within one tick, a probed
+    /// join candidate's — pruned back to the hosted set at each tick's end).
+    engines: BTreeMap<TabletId, S>,
     base_id: NodeId,
     /// Every tablet this node currently hosts a live `RaftKvNode` for — the
     /// authoritative hosting state (kept in lockstep with
@@ -682,19 +771,22 @@ type OnHostFn<E, S> = Box<dyn Fn(TabletId, &RaftKvNode<E, S>) + Send + Sync>;
 type OnTeardownFn = Box<dyn Fn(TabletId) + Send + Sync>;
 
 impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
-    /// A fresh reconciler for one node. `env`/`storage` are this node's
-    /// `raftkv` env and shared storage engine — every tablet's `RaftKvNode`
-    /// this reconciler ever hosts runs on `env.clone()` (stream-addressed by
-    /// the tablet id, ADR 0026 Stage B) and shares `storage.clone()` (ADR
-    /// 0028); `base_id` is this node's identity in a tablet's replica set.
-    /// `prefix_for` maps a table name to its `StorageScope` prefix (the
-    /// caller's own escaping convention — this crate never invents one);
-    /// `on_host`/`on_teardown` mirror hosting changes into the caller's own
-    /// routing registry, letting `Reconciler` stay the single writer of
-    /// hosting state while the caller's registry becomes a read-only mirror.
+    /// A fresh reconciler for one node. `env` is this node's `raftkv` env —
+    /// every tablet's `RaftKvNode` this reconciler ever hosts runs on
+    /// `env.clone()` (stream-addressed by the tablet id, ADR 0026 Stage B) —
+    /// and `factory` is the per-tablet engine seam (ADR 0050 rung 1): each
+    /// hosted tablet gets its **own private engine**, opened via
+    /// `factory.open(tablet)` at host time and destroyed (files deleted) at
+    /// release/reclaim. `base_id` is this node's identity in a tablet's
+    /// replica set. `prefix_for` maps a table name to its `StorageScope`
+    /// prefix (the caller's own escaping convention — this crate never
+    /// invents one); `on_host`/`on_teardown` mirror hosting changes into the
+    /// caller's own routing registry, letting `Reconciler` stay the single
+    /// writer of hosting state while the caller's registry becomes a
+    /// read-only mirror.
     pub fn new(
         env: E,
-        storage: S,
+        factory: impl EngineFactory<S> + 'static,
         base_id: NodeId,
         prefix_for: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static,
         on_host: impl Fn(TabletId, &RaftKvNode<E, S>) + Send + Sync + 'static,
@@ -702,7 +794,8 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     ) -> Self {
         Self {
             env,
-            storage,
+            factory: Box::new(factory),
+            engines: BTreeMap::new(),
             base_id,
             hosted: BTreeMap::new(),
             state: LocalState::default(),
@@ -710,6 +803,25 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             on_host: Box::new(on_host),
             on_teardown: Box::new(on_teardown),
             quiesce_after: None,
+        }
+    }
+
+    /// Get-or-open `tablet`'s own engine, caching the handle. `None` (with a
+    /// warn) if the factory fails to open it — the caller skips the action;
+    /// `plan` re-emits it next tick.
+    async fn ensure_engine(&mut self, tablet: TabletId) -> Option<S> {
+        if let Some(engine) = self.engines.get(&tablet) {
+            return Some(engine.clone());
+        }
+        match self.factory.open(tablet).await {
+            Ok(engine) => {
+                self.engines.insert(tablet, engine.clone());
+                Some(engine)
+            }
+            Err(e) => {
+                tracing::warn!(tablet = tablet.0, %e, "reconciler: opening tablet engine");
+                None
+            }
         }
     }
 
@@ -810,16 +922,22 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 }
                 HostAction::Release {
                     tablet,
-                    erase_bound,
+                    erase_bound: _,
                 } => {
-                    self.teardown(tablet, TeardownKind::Release(erase_bound))
-                        .await;
+                    self.teardown(tablet, TeardownKind::Release).await;
                 }
                 HostAction::Reclaim { tablet } => {
                     self.teardown(tablet, TeardownKind::Reclaim).await;
                 }
             }
         }
+
+        // ADR 0050 rung 1: prune engine handles back to the hosted set — a
+        // join candidate probed by `gather_facts` whose `Host` never fired
+        // this tick (a gate deferred it) must not keep an open handle
+        // parked here; the next tick that actually hosts it just re-opens.
+        let hosted: BTreeSet<TabletId> = self.hosted.keys().copied().collect();
+        self.engines.retain(|t, _| hosted.contains(t));
     }
 
     /// Gather the [`TabletFacts`] [`plan`] needs: every currently-hosted
@@ -827,7 +945,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// plus a `has_data` presence check for every not-yet-hosted candidate
     /// [`plan_join_host`] would place on this node — the one input `plan`
     /// can't gather itself (an async engine read).
-    async fn gather_facts(&self, view: &MetadataView) -> BTreeMap<TabletId, TabletFacts> {
+    async fn gather_facts(&mut self, view: &MetadataView) -> BTreeMap<TabletId, TabletFacts> {
         let mut facts = BTreeMap::new();
         for (&tablet, node) in &self.hosted {
             let scope_range = node.scope_range();
@@ -837,16 +955,22 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             // every child of *this* tablet named in `view.split_parent`,
             // whose range this node's engine doesn't yet have a covering
             // seal marker for. See `TabletFacts::pending_seals`'s doc for the
-            // full argument.
+            // full argument. ADR 0050 rung 1: the seal marker lives in *this
+            // tablet's own* engine now (an engine-global key of a private
+            // engine); a hosted tablet always has its handle in `engines`.
             let mut pending_seals = Vec::new();
             for (&child, parent) in &view.split_parent {
                 if *parent != tablet {
                     continue;
                 }
-                if let Some(child_t) = view.tablets.get(&child)
-                    && !seal_covers(&self.storage, tablet.0, &child_t.range).await
-                {
-                    pending_seals.push(child_t.range.clone());
+                if let Some(child_t) = view.tablets.get(&child) {
+                    let covered = match self.engines.get(&tablet) {
+                        Some(engine) => seal_covers(engine, tablet.0, &child_t.range).await,
+                        None => false,
+                    };
+                    if !covered {
+                        pending_seals.push(child_t.range.clone());
+                    }
                 }
             }
             facts.insert(
@@ -862,31 +986,55 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 },
             );
         }
-        for (&tablet, t) in &view.tablets {
-            if self.state.hosted.contains(&tablet) {
-                continue;
-            }
-            if plan_join_host(self.base_id.clone(), &t.replicas, t.epoch).is_none() {
-                continue;
-            }
-            let scope = StorageScope::new(
-                (self.prefix_for)(t.table.as_deref().unwrap_or_default()),
-                t.range.clone(),
-            );
-            // ADR 0041 §3: ask the **base**-kind scope. `scope` here is the
-            // parent, whose prefix every kind sits under — stripping it would
-            // leave a leading kind byte ahead of the token and the range check
-            // would be meaningless. Base rows are also the right signal for the
-            // reforming-vs-fresh-join question this answers: the other kinds
-            // only ever exist alongside base rows.
-            let has_data = scope
-                .with_kind(crate::KIND_BASE)
-                .has_data(&self.storage)
-                .await;
+        let candidates: Vec<(TabletId, Tablet)> = view
+            .tablets
+            .iter()
+            .filter(|(tablet, t)| {
+                !self.state.hosted.contains(tablet)
+                    && plan_join_host(self.base_id.clone(), &t.replicas, t.epoch).is_some()
+            })
+            .map(|(&tablet, t)| (tablet, t.clone()))
+            .collect();
+        for (tablet, t) in candidates {
+            // ADR 0050 rung 1: the restart-upgrade signal is now two-step —
+            // does this tablet's own engine exist on this node at all
+            // (`probe`, cheap, no open), and if so, does it hold base rows
+            // (the pre-existing `has_data` check, run against the tablet's
+            // own private engine).
+            let has_data = if self.factory.probe(tablet).await {
+                match self.ensure_engine(tablet).await {
+                    Some(engine) => {
+                        let scope = StorageScope::new(
+                            (self.prefix_for)(t.table.as_deref().unwrap_or_default()),
+                            t.range.clone(),
+                        );
+                        // ADR 0041 §3: ask the **base**-kind scope. `scope`
+                        // here is the parent, whose prefix every kind sits
+                        // under — stripping it would leave a leading kind
+                        // byte ahead of the token and the range check would
+                        // be meaningless. Base rows are also the right signal
+                        // for the reforming-vs-fresh-join question this
+                        // answers: the other kinds only ever exist alongside
+                        // base rows.
+                        scope.with_kind(crate::KIND_BASE).has_data(&engine).await
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
             // ADR 0018 §2 amendment: a split child must observe its parent's
             // seal before hosting — see `MetadataView::split_parent`'s doc.
+            // ADR 0050 rung 1: the parent's seal marker lives in the
+            // *parent's* own engine, readable here only when this node hosts
+            // the parent (the zero-copy split's children always shared the
+            // parent's replica set, so co-location held; the old split is
+            // disabled during Train B, so no NEW split ever exercises this).
             let parent_seal_observed = match view.split_parent.get(&tablet) {
-                Some(parent) => seal_covers(&self.storage, parent.0, &t.range).await,
+                Some(parent) => match self.engines.get(parent) {
+                    Some(engine) => seal_covers(engine, parent.0, &t.range).await,
+                    None => false,
+                },
                 None => false,
             };
             facts.insert(
@@ -921,6 +1069,12 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         let Some(t) = view.tablets.get(&tablet) else {
             return;
         };
+        // ADR 0050 rung 1: open (or re-open) this tablet's own private
+        // engine. A factory failure skips the host; `plan` re-emits it next
+        // tick.
+        let Some(engine) = self.ensure_engine(tablet).await else {
+            return;
+        };
         let scope = StorageScope::new((self.prefix_for)(table), range);
         let full: Vec<NodeId> = t.replicas.clone();
         let others: Vec<NodeId> = full
@@ -931,17 +1085,10 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         let config = if initial_formation { full } else { others };
         // ADR 0018 §2 amendment: cross-group MVCC ordering no longer needs a
         // version-floor seed here — `RaftKvNode::start_hosted` already
-        // witnesses this group's HLC off the shared engine's own
-        // `latest_version()` at construction, and `plan`'s `parent_seal_
-        // observed` gate (above) already proved this engine holds the
-        // source's seal marker before this call ever happens.
-        let node = RaftKvNode::start_hosted(
-            self.env.clone(),
-            config,
-            self.storage.clone(),
-            scope,
-            tablet.0,
-        );
+        // witnesses this group's HLC off its engine's own `latest_version()`
+        // at construction (the tablet's private engine since ADR 0050 rung 1
+        // — its own data is the only history a fresh group must out-version).
+        let node = RaftKvNode::start_hosted(self.env.clone(), config, engine, scope, tablet.0);
         // ADR 0044 phase-1 PR4 production wiring: opt every freshly-hosted
         // data-plane group into quiescence if this reconciler has been
         // configured to (see `enable_quiescence`'s doc).
@@ -952,16 +1099,16 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         self.hosted.insert(tablet, node);
     }
 
-    /// Execute a [`HostAction::Release`]/[`HostAction::Reclaim`] —
-    /// `animusd::cp_gc_tablet`'s exact teardown shape: unregister from the
-    /// caller's routing registry first, shut the
-    /// driver down and wait for it to actually stop (never touch data under a
-    /// live driver), then handle data per `kind` (see [`TeardownKind`]) and
-    /// delete the tablet's WAL file, and only then confirm the teardown to
-    /// [`LocalState`] and drop the local handle. A timeout waiting for the
-    /// driver to stop re-registers the handle (so routing keeps working) and
-    /// leaves `state`/`hosted` untouched — `plan` re-emits the identical
-    /// action next tick.
+    /// Execute a [`HostAction::Release`]/[`HostAction::Reclaim`]: unregister
+    /// from the caller's routing registry first, shut the driver down and
+    /// wait for it to actually stop (never touch data under a live driver),
+    /// then **delete the tablet's own engine files** (ADR 0050 rung 1 — both
+    /// kinds; the engine is private, so whole-engine deletion is the erase)
+    /// and its WAL file, and only then confirm the teardown to [`LocalState`]
+    /// and drop the local handle. A timeout waiting for the driver to stop
+    /// re-registers the handle (so routing keeps working) and leaves
+    /// `state`/`hosted` untouched — `plan` re-emits the identical action
+    /// next tick.
     async fn teardown(&mut self, tablet: TabletId, kind: TeardownKind) {
         let Some(node) = self.hosted.remove(&tablet) else {
             return;
@@ -982,18 +1129,17 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             self.env.sleep(RECLAIM_STOP_POLL).await;
         }
 
-        match kind {
-            TeardownKind::Release(erase_bound) => {
-                // Bound the erase to the tablet's current replicated range —
-                // see `HostAction::Release`'s doc for why the group's own
-                // `StorageScope` cannot be trusted for this instead.
-                node.narrow_scope(erase_bound);
-                node.erase_scope().await;
-            }
-            TeardownKind::Reclaim => {
-                node.erase_scope().await;
-            }
-        }
+        // ADR 0050 rung 1: a tablet's engine is private, so BOTH teardown
+        // kinds reduce to deleting its files whole — instant, real space
+        // reclaim, no `merge_tombstone` sweep. `Release(erase_bound)`'s
+        // bound existed to spare co-hosted siblings on the shared engine
+        // (structurally impossible to hit now: no other tablet's rows can
+        // live in this engine); the plan action keeps its shape, the
+        // executor no longer needs the bound.
+        let _ = kind;
+        self.engines.remove(&tablet);
+        drop(node);
+        self.factory.destroy(tablet).await;
         if let Err(e) = self.env.remove(&wal_file(tablet.0)).await {
             tracing::warn!(
                 ?e,
@@ -1007,13 +1153,17 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
 }
 
 /// How [`Reconciler::teardown`] should treat a group's data once its driver
-/// has stopped — the two ways a hosted tablet's lifecycle can end.
+/// has stopped — the two ways a hosted tablet's lifecycle can end. ADR 0050
+/// rung 1: both now end in deleting the tablet's own private engine files
+/// whole; the distinction is kept for intent/logging (release = moved off
+/// this node while the tablet lives elsewhere; reclaim = the table was
+/// dropped), not for a behavioral fork.
 enum TeardownKind {
-    /// [`HostAction::Release`]: narrow to the given bound, then erase —
-    /// moved off this node while the tablet still exists elsewhere.
-    Release(KeyRange),
-    /// [`HostAction::Reclaim`]: erase the group's full existing scope — the
-    /// tablet's whole table was dropped.
+    /// [`HostAction::Release`] — moved off this node while the tablet still
+    /// exists elsewhere (its `erase_bound` no longer bounds anything: a
+    /// private engine holds no sibling's rows to spare).
+    Release,
+    /// [`HostAction::Reclaim`] — the tablet's whole table was dropped.
     Reclaim,
 }
 

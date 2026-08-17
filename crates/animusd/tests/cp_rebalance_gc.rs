@@ -642,6 +642,7 @@ async fn a_joining_spare_is_never_released() {
 /// keys too, at a version high enough to beat the child's own fresh writes
 /// under per-key LWW: silent, permanent corruption of a tablet this node was
 /// never even asked to release.
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn split_then_immediate_release_spares_the_new_siblings_data() {
     timeout(Duration::from_secs(150), async {

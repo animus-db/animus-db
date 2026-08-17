@@ -681,6 +681,7 @@ fn item_key(pk: &str) -> Vec<u8> {
 /// each child to report — the only way this scenario converges to `Active`
 /// at all — the two tests together are a full proof: the aggregator can't
 /// flip early without both reporting, and both genuinely do report.
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn split_during_backfill_converges_with_correct_final_gsi() {
     let dir = tempfile::tempdir().unwrap();

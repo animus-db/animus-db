@@ -167,6 +167,7 @@ async fn put_retry(client: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
     .unwrap_or_else(|_| panic!("put {key:?} did not succeed in time"));
 }
 
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn manual_split_with_unaligned_key_on_streamed_table_rounds_to_token_boundary() {
     timeout(Duration::from_secs(60), async {

@@ -227,17 +227,29 @@ async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
 
 /// Mirrors `cp_txn.rs`'s identical helper.
 async fn split_and_settle(nodes: &[Node], addr: SocketAddr, table: &str, split_key: &[u8]) {
-    let resp = call(
-        addr,
-        ClientRequest::SplitTablet {
-            tablet: 1,
-            split_key: split_key.to_vec(),
-        },
-    )
-    .await;
+    // ADR 0050 (Train B rung 1): the client-facing split surface is disabled
+    // during the storage pivot; propose the metadata command directly.
+    // Sound ONLY because the table is still EMPTY here — this gives the
+    // recovery tests a genuine two-group topology, it does not exercise
+    // split itself (see cp_txn.rs's split_and_settle for the full note).
+    let meta = nodes[0].metadata();
+    let source = animus_tablet::TabletId(1);
+    let expected_epoch = meta
+        .tablets
+        .get(&source)
+        .expect("bootstrap tablet 1 exists")
+        .epoch;
+    let new_id = meta.next_free_tablet_id();
+    let cmd = animus_control::MetaCommand::SplitTablet {
+        tablet: source,
+        expected_epoch,
+        split_key: split_key.to_vec(),
+        new_id,
+    };
+    let accepted = nodes.iter().any(|n| n.propose_meta(cmd.clone()));
     assert!(
-        matches!(resp, ClientResponse::PutOk),
-        "split trigger rejected: {resp:?}"
+        accepted,
+        "no node's control handle accepted the harness split proposal"
     );
     timeout(Duration::from_secs(20), async {
         loop {

@@ -931,6 +931,7 @@ async fn fs_segment_store_opt_in_smoke() {
 /// panic's `tracked tablets`/chain-length dump first: a set that still
 /// matches `ids` with no cascading grandchild in it points at that
 /// different, seal-arm-timing cause instead.
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1149,6 +1150,7 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
 /// fix (which is about `Metadata`'s pure watermark/`ParentShardId`
 /// derivation, not the seal arm's own scan/trim sequencing) and reported
 /// separately rather than chased down here.
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manual_split_with_unsealed_backlog_under_production_seal_knobs() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1624,6 +1626,7 @@ async fn plain_split(client_addr: SocketAddr, tablet: TabletId, split_key: Vec<u
 /// via-forwarding RPC, since a table's two pre-existing tablets can be led
 /// by two different nodes, neither necessarily the one serving the admin
 /// request), asserting exactly-once delivery across every cut.
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delivery() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1819,6 +1822,7 @@ async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delive
 /// so `--auto-split-change-rate` must have zero effect on it regardless of
 /// write volume — the "opt-in, streamed tables only, no surprise splits on
 /// an existing plain table" guarantee.
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain_one() {
     let dir = tempfile::TempDir::new().unwrap();

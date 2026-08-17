@@ -216,6 +216,7 @@ async fn cp_member_addresses_register_and_replicate() {
 /// Real TCP/time: bring up a 3-node cluster, write a lower + an upper key, trigger
 /// the split, then poll until the new tablet is in the map and the upper key is
 /// served by the new group (its election takes a moment).
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn cp_tablet_splits_and_both_halves_serve() {
     let dir = tempfile::tempdir().unwrap();
@@ -439,6 +440,7 @@ async fn single_write_latency_is_low() {
 /// loop enabled at a low key-count threshold, writing past it causes the tablet's
 /// leader to split it at the median **with no manual trigger**; afterwards both
 /// halves serve. Closes the auto-shard loop.
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn tablet_auto_splits_when_it_grows() {
     let dir = tempfile::tempdir().unwrap();
@@ -532,6 +534,7 @@ async fn tablet_auto_splits_when_it_grows() {
 /// key-count-balanced (a plain positional median here would put nearly all
 /// the bytes on one side: 6 tiny keys sort before 6 large ones, so the
 /// positional median falls right at the first large key).
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
     let dir = tempfile::tempdir().unwrap();
@@ -687,6 +690,7 @@ async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
 /// lineage repeatedly crosses the threshold, and that every resulting tablet
 /// ends up with a real CP group (structurally guaranteed now — see the root
 /// `CLAUDE.md`).
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn already_split_tablet_splits_again_once_it_regrows() {
     let dir = tempfile::tempdir().unwrap();

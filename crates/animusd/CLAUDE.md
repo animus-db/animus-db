@@ -517,7 +517,18 @@ an empty/singleton tablet) is reported in that tablet's own response entry,
 never escalated into a whole-call failure. `animus admin stream-grow
 <admin-addr> <table>` is the CLI form.
 
-**Split** (ADR 0028, `MetaCommand::SplitTablet`, epoch-CAS gated) is a
+**Split is DISABLED (ADR 0050 Train B rung 1)**: every split surface
+(`trigger_split`'s gate — the one choke point; `auto_split_loop` warns
+once at spawn and returns) refuses with `SPLIT_DISABLED_MSG` while the
+storage pivot is in flight — the old zero-copy split cannot run across
+per-tablet engines (a child's scope would open an EMPTY engine). Test
+harnesses that only need a two-group topology propose
+`MetaCommand::SplitTablet` directly via `Node::propose_meta` on a still-
+**empty** table (sound: nothing to inherit — see `cp_txn.rs`'s
+`split_and_settle`); populated-tablet split e2e tests are `#[ignore]`d
+with a `PARKED (ADR 0050 ...)` reason until the copy-based workflow lands
+in this train's later rungs. The pre-pivot design for reference:
+(ADR 0028, `MetaCommand::SplitTablet`, epoch-CAS gated) a
 single atomic control-plane command with no data-plane half — narrows the
 source's range and mints a sibling on the same shared engine. Exposed via
 `POST /admin/tablet/split` + `ClientRequest::SplitTablet` (relayable).
@@ -1139,11 +1150,18 @@ route below the edge through the same `ClientCtx` CP primitives.
   checks"). See ADR 0037 (and ADR 0040's amendment on it) for the full
   design, and `docs/engineering-lessons.md` for the id-space-mismatch and
   self-registration/admin-action-clobber war stories.
-- **The CP group is durable by default** — one shared `LsmEngine` over the node's
-  one internal env (ADR 0040 PR1), cloned into every tablet's `RaftKvNode`; acked
-  writes survive restart. Files use a flat filename prefix (`LSM_PREFIX = "db-"`),
-  not a subdirectory (`ProdEnv`'s disk doesn't create intermediate dirs).
-  Node-start entry points are async+fallible (`io::Result`).
+- **The CP group is durable by default** — and since ADR 0050 Train B rung
+  1, **each hosted tablet gets its OWN private `LsmEngine`** (filename
+  prefix `tablet_lsm_prefix(t)` = `db-t{t}-`; the trailing `-` keeps
+  `db-t5-*` from prefix-matching `db-t51-*`), opened/probed/destroyed by
+  the reconciler through `host::EngineFactory` (`LsmTabletFactory` here).
+  The node's own `LSM_PREFIX = "db-"` engine now backs **only** the
+  control plane's system keyspace (ADR 0038). Files use flat filename
+  prefixes, not subdirectories (`ProdEnv`'s disk doesn't create
+  intermediate dirs). Idle per-tablet engines cost ~1 KB RSS each and
+  spawn nothing (`animus-storage/tests/idle_engine_cost.rs` — the ADR
+  0050 gating measurement). Node-start entry points are async+fallible
+  (`io::Result`).
 - **`Node::shutdown()` is a graceful teardown** — aborts the listener tasks and
   `ProdEnv::shutdown()`s the node's one internal env, freeing all six ports
   (ADR 0040 PR1's `internal`/`client`/`dynamo`/`cql`/`admin` stride, plus ADR

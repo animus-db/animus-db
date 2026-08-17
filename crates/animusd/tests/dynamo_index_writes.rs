@@ -37,28 +37,11 @@ use std::time::Duration;
 
 use animus_dynamo::{AttributeValue, storage_key};
 use animus_tablet::partition_token;
-use animusd::{ClientRequest, ClientResponse, Node, bind_cluster, read_frame, start_cluster};
+use animusd::{Node, bind_cluster, start_cluster};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
-
-/// One `ClientRequest`/`ClientResponse` round trip over the plain
-/// length-prefixed client protocol — used only to drive `SplitTablet`; no
-/// such op exists on the DynamoDB wire. Mirrors `dynamo_index_scan.rs`'s
-/// identical helper.
-async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .expect("connect to client port");
-    animusd::write_frame(&mut stream, &req)
-        .await
-        .expect("send request");
-    read_frame(&mut stream)
-        .await
-        .expect("read reply")
-        .expect("a reply")
-}
 
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
@@ -381,35 +364,50 @@ async fn transact_write_items_maintains_lsi_and_gsi_across_a_split_table() {
     .await;
     assert_eq!(status, 200, "CreateTable(indexed) failed: {body}");
 
-    // `CreateTable` alone does not provision the table's first tablet
-    // (`cp_write`/`cp_delete`'s own documented non-auto-provisioning
-    // contract) — a throwaway seed write forces it into existence before
-    // `SplitTablet` can target it by id.
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.PutItem",
-        r#"{"TableName":"indexed","Item":{"id":{"S":"seed"},"sk":{"S":"a"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "seed PutItem failed: {body}");
+    // Wait for the table's bootstrap tablet — `CreateTable` provisions it.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if nodes.iter().any(|n| {
+                n.metadata()
+                    .tablets
+                    .contains_key(&animus_tablet::TabletId(1))
+            }) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("bootstrap tablet was never provisioned");
 
     // Split strictly between "p1" and "p2"'s own tokens (mirrors
     // `dynamo_index_scan.rs`'s identical split-key construction) so the
     // transaction's two items genuinely land on different tablets.
+    //
+    // ADR 0050 (Train B rung 1): the client-facing split surface is
+    // disabled during the storage pivot; propose the metadata command
+    // directly. Sound ONLY because the table is still EMPTY — this gives
+    // the transaction a genuine two-group topology, it does not exercise
+    // split itself (see cp_txn.rs's split_and_settle for the full note).
     let token_p1 = partition_token(&storage_key(&AttributeValue::S("p1".into()), None));
     let token_p2 = partition_token(&storage_key(&AttributeValue::S("p2".into()), None));
     let split_key = token_p1.max(token_p2).to_vec();
-    let resp = call(
-        nodes[0].client_addr(),
-        ClientRequest::SplitTablet {
-            tablet: 1,
-            split_key,
-        },
-    )
-    .await;
+    let meta = nodes
+        .iter()
+        .map(|n| n.metadata())
+        .find(|m| m.tablets.contains_key(&animus_tablet::TabletId(1)))
+        .expect("just observed");
+    let source = animus_tablet::TabletId(1);
+    let cmd = animus_control::MetaCommand::SplitTablet {
+        tablet: source,
+        expected_epoch: meta.tablets[&source].epoch,
+        split_key,
+        new_id: meta.next_free_tablet_id(),
+    };
+    let accepted = nodes.iter().any(|n| n.propose_meta(cmd.clone()));
     assert!(
-        matches!(resp, ClientResponse::PutOk),
-        "split did not commit: {resp:?}"
+        accepted,
+        "no node's control handle accepted the harness split proposal"
     );
     timeout(Duration::from_secs(20), async {
         loop {

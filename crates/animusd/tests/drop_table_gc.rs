@@ -204,6 +204,7 @@ async fn await_true<F: Fn() -> bool>(secs: u64, what: &str, cond: F) {
 /// table and watch it get reclaimed: both tablets out of the map, both WAL
 /// files deleted, no hosted CP groups left. A restart must not resurrect
 /// anything, and the node must keep serving a freshly created table afterwards.
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn dropped_table_data_is_reclaimed_including_split_child() {
     timeout(Duration::from_secs(120), async {

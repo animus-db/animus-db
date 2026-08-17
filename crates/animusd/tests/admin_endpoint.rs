@@ -746,6 +746,7 @@ async fn admin_seed_writes_synthetic_keys() {
 /// + child (ADR 0028); before the fix, `key_count` read the whole shared engine
 /// (`CpGroup::approx_key_count`), so both halves' rows showed the *node's*
 /// combined total rather than their own subset.
+#[ignore = "PARKED (ADR 0050 Train B rung 1): zero-copy split of a populated tablet is disabled during the storage pivot; revived/replaced by the copy-based split workflow in later rungs of this train"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
     timeout(Duration::from_secs(60), async {
@@ -849,6 +850,81 @@ async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
         for node in &nodes {
             node.shutdown_graceful().await;
         }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// ADR 0050 (Train B rung 1) teeth: every split surface refuses with the
+/// documented error while the storage pivot has the old zero-copy split
+/// disabled — the admin action and the raw client-protocol request alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_surfaces_refuse_with_the_documented_error_during_the_storage_pivot() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        // Provision the table's bootstrap tablet through the ordinary client
+        // write path, so the split has a real target to refuse.
+        let mut stream = TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect client port");
+        animusd::write_frame(
+            &mut stream,
+            &ClientRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                table: "t".to_string(),
+            },
+        )
+        .await
+        .expect("send put");
+        let put: ClientResponse = read_frame(&mut stream)
+            .await
+            .expect("read put reply")
+            .expect("a put reply");
+        assert!(matches!(put, ClientResponse::PutOk), "{put:?}");
+
+        // (a) The raw client-protocol split request.
+        animusd::write_frame(
+            &mut stream,
+            &ClientRequest::SplitTablet {
+                tablet: 1,
+                split_key: b"m".to_vec(),
+            },
+        )
+        .await
+        .expect("send split");
+        let resp: ClientResponse = read_frame(&mut stream)
+            .await
+            .expect("read split reply")
+            .expect("a split reply");
+        match resp {
+            ClientResponse::Error(e) => assert!(
+                e.contains("disabled during the ADR 0050 storage pivot"),
+                "unexpected refusal text: {e}"
+            ),
+            other => panic!("split must refuse while disabled, got {other:?}"),
+        }
+
+        // (b) The admin action funnels into the same gate.
+        let (status, body) = admin(
+            nodes[0].admin_addr(),
+            "POST",
+            "/admin/tablet/split",
+            Some(r#"{"tablet":1,"split_key":"m"}"#),
+        )
+        .await;
+        assert_ne!(
+            status, 200,
+            "the admin split action must not report success"
+        );
+        assert!(
+            body.to_string()
+                .contains("disabled during the ADR 0050 storage pivot"),
+            "the admin refusal must carry the documented error, got: {body}"
+        );
     })
     .await
     .expect("test timed out");

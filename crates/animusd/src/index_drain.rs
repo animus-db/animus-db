@@ -2190,6 +2190,7 @@ mod gsi_drain_cursor_tests {
     /// empty set: the right child inherits no cursor row at all) — and
     /// confirm it converges to the correct GSI, on both sides, without
     /// corrupting anything (idempotence).
+    #[ignore = "PARKED (ADR 0050 Train B rung 1): drives a zero-copy split of a populated tablet, disabled during the storage pivot; revived/replaced with the copy-based split in later rungs"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn split_right_childs_cold_start_re_reconciles_from_zero_without_corrupting_the_gsi() {
         timeout(Duration::from_secs(90), async {
@@ -3112,6 +3113,7 @@ mod stream_sealer_tests {
     /// so the trigger fires promptly), then reading the resulting sibling
     /// tablets' own `KeyRange` boundary back out of `Metadata` and checking
     /// it is exactly `TOKEN_BYTES` long.
+    #[ignore = "PARKED (ADR 0050 Train B rung 1): drives a zero-copy split of a populated tablet, disabled during the storage pivot; revived/replaced with the copy-based split in later rungs"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn f11_end_to_end_auto_split_on_a_streamed_table_lands_a_token_aligned_boundary() {
         timeout(Duration::from_secs(60), async {
@@ -3543,6 +3545,7 @@ mod stream_sealer_tests {
     /// 3. the same burst's change-log backlog must still get sealed —
     ///    proving `change_consumer_loop`'s identical skip-gate doesn't
     ///    strand the seal/trim arms either.
+    #[ignore = "PARKED (ADR 0050 Train B rung 1): drives a zero-copy split of a populated tablet, disabled during the storage pivot; revived/replaced with the copy-based split in later rungs"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_rewoken_tablet_is_picked_back_up_by_every_sweeper_within_one_interval() {
         timeout(Duration::from_secs(60), async {

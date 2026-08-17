@@ -247,16 +247,23 @@ async fn system_table_lists_every_seeded_entity_kind() {
         )
         .await;
 
-        // ---- SplitParent: a real split ---------------------------------------
-        let resp = call(
-            client,
-            ClientRequest::SplitTablet {
-                tablet: 1,
-                split_key: b"m".to_vec(),
-            },
-        )
-        .await;
-        assert!(matches!(resp, ClientResponse::PutOk), "{resp:?}");
+        // ---- SplitParent: a metadata split -----------------------------------
+        // ADR 0050 (Train B rung 1): the client-facing split surface is
+        // disabled during the storage pivot; propose the metadata command
+        // directly — this test only asserts the SYSTEM keyspace's entity
+        // kinds (including `split_parent`), never post-split data placement.
+        let meta = node.metadata();
+        let source = animus_tablet::TabletId(1);
+        let cmd = animus_control::MetaCommand::SplitTablet {
+            tablet: source,
+            expected_epoch: meta.tablets[&source].epoch,
+            split_key: b"m".to_vec(),
+            new_id: meta.next_free_tablet_id(),
+        };
+        assert!(
+            node.propose_meta(cmd),
+            "the node's control handle must accept the harness split proposal"
+        );
         let after_split = await_status(
             admin,
             |s| s["tablets"].as_object().is_some_and(|t| t.len() >= 2),

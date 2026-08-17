@@ -18,7 +18,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_cp_data::host::{MetadataView, Reconciler};
+use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{RaftKvNode, StorageScope};
 use animus_env::{Clock, EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
@@ -29,11 +29,6 @@ use futures::executor::block_on;
 const BASE: u64 = 300;
 const OTHER: u64 = 301;
 const TABLE: &str = "t";
-/// The boundary a "split" narrows the parent tablet to: keys `< BOUNDARY` stay
-/// with tablet 1 (the parent), `>= BOUNDARY` belong to tablet 2 (the sibling
-/// that ends up co-hosted on `BASE`'s one shared engine).
-const BOUNDARY: &[u8] = b"m";
-
 type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
 
 fn prefix_for(table: &str) -> Vec<u8> {
@@ -87,25 +82,30 @@ fn poll_until(
     panic!("{msg}");
 }
 
-/// End-to-end: host a fresh whole-keyspace tablet, narrow it (as a split's
-/// source tablet would), host a second, co-hosted "sibling" tablet on the
-/// same node/engine (as a split's new child would), force a **real** Raft
-/// membership change that excludes this node from the first tablet's group
-/// (a realistic release condition, not an injected fact), then drive the
-/// reconciler's own release-confirm dampener to completion and assert:
-/// the released tablet's data is gone from this node's local engine, the
-/// co-hosted sibling's data survives untouched, and the reconciler's
-/// bookkeeping (`on_host`/`on_teardown` hooks, `LocalState`) converges
-/// correctly.
+/// End-to-end (ADR 0050 rung 1): host a fresh whole-keyspace tablet, host a
+/// second, co-hosted tablet of the SAME table on the same node — each with
+/// its OWN private engine — write the SAME logical keys through both groups
+/// (physically impossible to hold independently on the old shared engine,
+/// where both mapped to one physical key and last-writer-wins collapsed
+/// them), force a **real** Raft membership change that excludes this node
+/// from the first tablet's group, drive the reconciler's release-confirm
+/// dampener to completion, and assert: the released tablet's engine is
+/// destroyed whole (reads back fresh/empty), the co-hosted sibling's engine
+/// — same table, same logical keys — survives untouched, and the
+/// reconciler's bookkeeping (`on_host`/`on_teardown` hooks, `LocalState`)
+/// converges correctly.
 #[test]
-fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
+fn reconciler_hosts_releases_and_spares_a_co_hosted_siblings_own_engine() {
     let seed = 0x9EC0_0311;
     let mut sim = Simulator::new(seed);
     let base_env = sim.env(nid(BASE));
     let other_env = sim.env(nid(OTHER));
 
-    let storage = MemoryEngine::new();
-    let reconciler_storage = storage.clone();
+    // ADR 0050 rung 1: BASE's per-tablet engine registry — the reconciler
+    // opens one private engine per hosted tablet through it, and the test
+    // asserts against specific tablets' engines below.
+    let engines = MemoryTabletEngines::new();
+    let reconciler_engines = engines.clone();
 
     // `OTHER` is a second, independent real replica of tablet 1's group —
     // needed so this node (`BASE`) can be genuinely, durably excluded from
@@ -130,7 +130,7 @@ fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
         let other_env = other_env_moved;
         let mut reconciler: Reconciler<SimEnv, MemoryEngine> = Reconciler::new(
             task_env.clone(),
-            reconciler_storage,
+            reconciler_engines,
             nid(BASE),
             prefix_for,
             move |tablet, _node| h_log.lock().unwrap().push(tablet),
@@ -145,7 +145,7 @@ fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
 
         // `OTHER`'s own replica of tablet 1 — constructed directly (not
         // through any reconciler; this test only needs a real second voter,
-        // not a second node's full lifecycle).
+        // not a second node's full lifecycle), on its own private engine.
         let other = KvNode::start_hosted(
             other_env,
             vec![nid(BASE), nid(OTHER)],
@@ -155,9 +155,8 @@ fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
         );
         task_env.sleep(Duration::from_secs(2)).await; // let both sides settle
 
-        // Write into BOTH the soon-to-be-kept lower half ("a..", tablet 1's
-        // own post-split range) and the soon-to-be-sibling upper half ("z..",
-        // tablet 2's future range) — whichever replica currently leads.
+        // Write through tablet 1 — both "a.." keys (t1's own) and "z.."
+        // keys (which the co-hosted sibling will ALSO write, differently).
         let base_h1 = reconciler.hosted_node(TabletId(1)).unwrap().clone();
         for i in 0..5u64 {
             let leader = if base_h1.is_leader() {
@@ -171,34 +170,45 @@ fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
             );
             leader.put(
                 format!("z{i:02}").into_bytes(),
-                format!("hi{i}").into_bytes(),
+                format!("t1z{i}").into_bytes(),
             );
         }
         task_env.sleep(Duration::from_secs(2)).await; // replicate + apply
 
-        // Narrow tablet 1 to the lower half (the split's source-side effect).
-        let v2 = view([tablet(1, b"", Some(BOUNDARY), vec![BASE, OTHER])]);
-        reconciler.tick(&v2).await;
-
-        // Host tablet 2 (the sibling / split child) on the SAME node/engine,
-        // covering the upper half. `has_data` will find the "z.." keys
-        // already present, so it forms with the full (single-voter) config.
+        // Host tablet 2 — SAME table, SAME node, overlapping range, its own
+        // fresh private engine (empty: nothing is inherited).
         let v3 = view([
-            tablet(1, b"", Some(BOUNDARY), vec![BASE, OTHER]),
-            tablet(2, BOUNDARY, None, vec![BASE]),
+            tablet(1, b"", None, vec![BASE, OTHER]),
+            tablet(2, b"", None, vec![BASE]),
         ]);
         reconciler.tick(&v3).await;
         task_env.sleep(Duration::from_secs(2)).await; // elect tablet 2
 
-        // Sanity: the sibling sees its own data before anything is released.
+        let h2 = reconciler.hosted_node(TabletId(2)).unwrap().clone();
         assert_eq!(
-            reconciler
-                .hosted_node(TabletId(2))
-                .unwrap()
-                .local_get(b"z00")
-                .await,
+            h2.local_get(b"z00").await,
+            None,
+            "a fresh sibling's private engine must start EMPTY - no zero-copy inheritance"
+        );
+        for i in 0..5u64 {
+            h2.put(
+                format!("z{i:02}").into_bytes(),
+                format!("hi{i}").into_bytes(),
+            );
+        }
+        task_env.sleep(Duration::from_secs(1)).await;
+
+        // THE rung-1 property: the same logical key holds two different
+        // values in the two co-hosted tablets, independently readable.
+        assert_eq!(
+            base_h1.local_get(b"z00").await,
+            Some(b"t1z0".to_vec()),
+            "tablet 1 must keep ITS OWN value for the shared logical key"
+        );
+        assert_eq!(
+            h2.local_get(b"z00").await,
             Some(b"hi0".to_vec()),
-            "sanity: the sibling tablet must see its own data before release"
+            "tablet 2 must hold ITS OWN value for the same logical key"
         );
 
         // Force a REAL membership change that excludes BASE from tablet 1's
@@ -249,8 +259,8 @@ fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
         // still exists in `Metadata`, but BASE is no longer in its replica
         // set — the tick view the reconciler must react to.
         let v4 = view([
-            tablet(1, b"", Some(BOUNDARY), vec![OTHER]),
-            tablet(2, BOUNDARY, None, vec![BASE]),
+            tablet(1, b"", None, vec![OTHER]),
+            tablet(2, b"", None, vec![BASE]),
         ]);
         // A generous number of ticks: RELEASE_CONFIRM_TICKS consecutive
         // qualifying calls are required before Release actually fires.
@@ -300,29 +310,33 @@ fn reconciler_hosts_narrows_releases_and_confirms_sparing_a_sibling() {
         "on_teardown must fire exactly once, for the released tablet only"
     );
 
-    // The released tablet's own (narrowed) range is fully erased from this
-    // node's local engine...
+    // The released tablet's engine was destroyed whole — the registry hands
+    // back a FRESH, empty engine for it now (ADR 0050 rung 1: release =
+    // delete the tablet's own files, no bounded erase needed)...
+    let t1_engine = engines.engine(TabletId(1));
     for i in 0..5u64 {
-        let key = physical(format!("a{i:02}").as_bytes());
-        assert_eq!(
-            block_on(storage.get(&key)).expect("engine read ok"),
-            None,
-            "released tablet 1's key a{i:02} must be erased from BASE's local engine"
-        );
+        for prefix in ["a", "z"] {
+            let key = physical(format!("{prefix}{i:02}").as_bytes());
+            assert_eq!(
+                block_on(t1_engine.get(&key)).expect("engine read ok"),
+                None,
+                "released tablet 1's key {prefix}{i:02} must be gone with its engine"
+            );
+        }
     }
-    // ...but the co-hosted sibling's keys — on the SAME shared engine, SAME
-    // table prefix — are completely untouched: this is the sibling-sparing
-    // erase-bound invariant this whole design exists to make structural.
+    // ...and the co-hosted sibling's OWN engine — same table, same logical
+    // keys — is completely untouched: sibling-sparing is structural now.
     // The stored bytes carry the ADR 0018 §2/PR3 committed-value envelope
     // (a leading `0` tag byte, `animus_cp_data`'s apply path wraps every
     // committed value) — this reads the engine directly (not through
     // `local_get`, which unwraps it), so the expected bytes below do too.
+    let t2_engine = engines.engine(TabletId(2));
     for i in 0..5u64 {
         let key = physical(format!("z{i:02}").as_bytes());
         let mut expected = vec![0u8];
         expected.extend_from_slice(format!("hi{i}").as_bytes());
         assert_eq!(
-            block_on(storage.get(&key))
+            block_on(t2_engine.get(&key))
                 .expect("engine read ok")
                 .map(|vv| vv.value),
             Some(expected),

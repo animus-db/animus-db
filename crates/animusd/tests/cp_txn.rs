@@ -441,18 +441,34 @@ async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
 /// until the control plane's tablet map records two tablets and the new
 /// upper half is genuinely servable — mirrors `cp_plane.rs`'s
 /// `cp_tablet_splits_and_both_halves_serve`.
+///
+/// ADR 0050 (Train B rung 1): the client-facing split surface is disabled
+/// during the storage pivot, so this harness proposes the metadata command
+/// directly (`Node::propose_meta`, control-leader-only, retried across
+/// nodes). This is sound ONLY because the table is still **empty** at this
+/// point — a metadata-only split of an empty tablet leaves nothing to
+/// inherit, so both children correctly form over their own empty private
+/// engines; this harness exists to give the transaction tests a genuine
+/// two-group topology, not to exercise split itself.
 async fn split_and_settle(nodes: &[Node], addr: SocketAddr, table: &str, split_key: &[u8]) {
-    let resp = call(
-        addr,
-        ClientRequest::SplitTablet {
-            tablet: 1,
-            split_key: split_key.to_vec(),
-        },
-    )
-    .await;
+    let meta = nodes[0].metadata();
+    let source = animus_tablet::TabletId(1);
+    let expected_epoch = meta
+        .tablets
+        .get(&source)
+        .expect("bootstrap tablet 1 exists")
+        .epoch;
+    let new_id = meta.next_free_tablet_id();
+    let cmd = animus_control::MetaCommand::SplitTablet {
+        tablet: source,
+        expected_epoch,
+        split_key: split_key.to_vec(),
+        new_id,
+    };
+    let accepted = nodes.iter().any(|n| n.propose_meta(cmd.clone()));
     assert!(
-        matches!(resp, ClientResponse::PutOk),
-        "split trigger rejected: {resp:?}"
+        accepted,
+        "no node's control handle accepted the harness split proposal"
     );
     timeout(Duration::from_secs(20), async {
         loop {

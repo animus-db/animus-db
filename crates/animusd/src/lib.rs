@@ -59,12 +59,12 @@ use control_handle::{ControlHandle, RemoteControlClient};
 use animus_control::node::{DEFAULT_ORPHAN_SWEEP_AFTER, HEARTBEAT_INTERVAL, send_heartbeat};
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::hlc::HlcTimestamp;
-use animus_cp_data::host::{MetadataView, Reconciler};
+use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{
     FastRead, IntentInfo, RaftKvNode, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome,
     TxnRecordView,
 };
-use animus_env::{Clock, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
+use animus_env::{Clock, Disk, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
     WalRecordView,
@@ -2722,10 +2722,14 @@ impl BoundNode {
             let on_teardown = move |tablet: TabletId| {
                 teardown_edge.unregister_raftkv(tablet, base_id.clone());
             };
-            match storage {
-                SharedEngine::Lsm(lsm) => CpReconciler::Lsm(Reconciler::new(
-                    hook_env,
-                    lsm,
+            // ADR 0050 rung 1: the reconciler no longer receives the node's
+            // shared engine — it opens ONE PRIVATE ENGINE PER HOSTED TABLET
+            // through the factory seam (the node's `storage` above now backs
+            // only the control plane's system keyspace, ADR 0038).
+            match &storage {
+                SharedEngine::Lsm(_) => CpReconciler::Lsm(Reconciler::new(
+                    hook_env.clone(),
+                    LsmTabletFactory { env: hook_env },
                     my_id.clone(),
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
@@ -2733,9 +2737,9 @@ impl BoundNode {
                     },
                     on_teardown,
                 )),
-                SharedEngine::Mem(mem) => CpReconciler::Mem(Reconciler::new(
+                SharedEngine::Mem(_) => CpReconciler::Mem(Reconciler::new(
                     hook_env,
-                    mem,
+                    MemoryTabletEngines::new(),
                     my_id.clone(),
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
@@ -3846,10 +3850,14 @@ impl BoundDataNode {
             let on_teardown = move |tablet: TabletId| {
                 teardown_edge.unregister_raftkv(tablet, base_id.clone());
             };
-            match storage {
-                SharedEngine::Lsm(lsm) => CpReconciler::Lsm(Reconciler::new(
-                    hook_env,
-                    lsm,
+            // ADR 0050 rung 1: the reconciler no longer receives the node's
+            // shared engine — it opens ONE PRIVATE ENGINE PER HOSTED TABLET
+            // through the factory seam (the node's `storage` above now backs
+            // only the control plane's system keyspace, ADR 0038).
+            match &storage {
+                SharedEngine::Lsm(_) => CpReconciler::Lsm(Reconciler::new(
+                    hook_env.clone(),
+                    LsmTabletFactory { env: hook_env },
                     my_id.clone(),
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
@@ -3857,9 +3865,9 @@ impl BoundDataNode {
                     },
                     on_teardown,
                 )),
-                SharedEngine::Mem(mem) => CpReconciler::Mem(Reconciler::new(
+                SharedEngine::Mem(_) => CpReconciler::Mem(Reconciler::new(
                     hook_env,
-                    mem,
+                    MemoryTabletEngines::new(),
                     my_id.clone(),
                     table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
@@ -9452,6 +9460,70 @@ fn table_scope_prefix(table: &str) -> Vec<u8> {
     escape(table.as_bytes())
 }
 
+/// ADR 0050 (Train B rung 1): the old zero-copy split is disabled for the
+/// duration of the storage pivot — flipped back off (and then deleted with
+/// the mechanism it gates) when the copy-based split workflow lands in this
+/// train's later rungs. See [`SPLIT_DISABLED_MSG`] and `trigger_split`'s
+/// gate.
+const SPLIT_DISABLED: bool = true;
+
+/// The client-facing refusal every split surface returns while
+/// [`SPLIT_DISABLED`] holds.
+const SPLIT_DISABLED_MSG: &str = "tablet split is disabled during the ADR 0050 storage pivot \
+     (Train B): the zero-copy split cannot run across per-tablet engines; the copy-based \
+     split workflow lands later in this train";
+
+/// A tablet's own LSM filename prefix on this node's `Disk` (ADR 0050 rung
+/// 1: per-tablet engines — naming is identity, the same mechanism
+/// `raftkv.wal.<tablet>` uses). The trailing `-` is load-bearing: it keeps
+/// `db-t5-*` from prefix-matching `db-t51-*`, and no tablet file ever
+/// collides with the node's own control/syskv engine (whose files are
+/// `db-MANIFEST`/`db-wal-*`/`db-sst-*` under the bare [`LSM_PREFIX`] — the
+/// `t` disambiguates).
+fn tablet_lsm_prefix(tablet: u64) -> String {
+    format!("{LSM_PREFIX}t{tablet}-")
+}
+
+/// The [`LsmEngine`] implementation of the per-tablet engine seam (ADR 0050
+/// rung 1): one private on-disk engine per hosted tablet, opened/probed/
+/// destroyed by filename prefix over this node's one `ProdEnv` disk.
+struct LsmTabletFactory {
+    env: ProdEnv,
+}
+
+#[async_trait::async_trait]
+impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactory {
+    async fn open(&self, tablet: TabletId) -> Result<LsmEngine<ProdEnv>, String> {
+        LsmEngine::open(self.env.clone(), &tablet_lsm_prefix(tablet.0))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn probe(&self, tablet: TabletId) -> bool {
+        // Durable engine state exists iff any file carries this tablet's own
+        // prefix — an `LsmEngine` writes its first file (a WAL segment) on
+        // the first write, so a never-written tablet correctly probes false.
+        let prefix = tablet_lsm_prefix(tablet.0);
+        self.env
+            .list()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|f| f.starts_with(&prefix))
+    }
+
+    async fn destroy(&self, tablet: TabletId) {
+        let prefix = tablet_lsm_prefix(tablet.0);
+        for f in self.env.list().await.unwrap_or_default() {
+            if f.starts_with(&prefix)
+                && let Err(e) = self.env.remove(&f).await
+            {
+                tracing::warn!(?e, file = %f, "deleting a reclaimed tablet's engine file");
+            }
+        }
+    }
+}
+
 /// This node's own tablet-host reconciler (ADR 0031 PR4) — wraps whichever
 /// backend [`SharedEngine`] chose at start, mirroring [`CpGroup`]'s own
 /// two-backend shape: the reconciler (`animus_cp_data::host::Reconciler`) is
@@ -9870,6 +9942,16 @@ fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) -> (Ve
 /// lets exactly one win, and the loser just tries again (or backs off) next
 /// tick.
 async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
+    // ADR 0050 (Train B rung 1): the whole loop is inert while the old
+    // zero-copy split is disabled — `trigger_split` (its only outcome) would
+    // refuse every call anyway. Warn once at spawn, not per tick.
+    if SPLIT_DISABLED {
+        tracing::warn!(
+            "auto-split is configured but disabled: {msg}",
+            msg = SPLIT_DISABLED_MSG
+        );
+        return;
+    }
     let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
     // When each tablet last had a *full* (materializing) count — the expensive
     // confirm is rate-limited per tablet, not run every tick.
@@ -10473,6 +10555,17 @@ impl ClientCtx {
         fields(tablet = tablet.0, new_id = tracing::field::Empty)
     )]
     async fn trigger_split(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
+        // ADR 0050 (Train B rung 1): the zero-copy split is DISABLED for the
+        // duration of the storage pivot — it is structurally impossible
+        // across per-tablet private engines (a split child's scope would
+        // open an EMPTY engine; its data sits in the parent's). This is the
+        // one choke point every split proposer calls (auto-split, admin,
+        // CLI, stream-grow), so the whole surface is gated here. The
+        // copy-based split workflow (BeginSplit → build → freeze →
+        // CutoverSplit) lands in later rungs of this same train.
+        if SPLIT_DISABLED {
+            return ClientResponse::Error(SPLIT_DISABLED_MSG.to_string());
+        }
         // `effective_metadata()`, not `self.control.metadata_cached()`
         // directly (ADR 0035 PR5 staleness-audit fix): unlike a plain stale
         // read racing a *concurrent* epoch bump — which the CAS below catches
@@ -13081,6 +13174,7 @@ mod split_fence_tests {
     /// deterministic substitute: it exercises the identical code path
     /// (`ClientCtx::cp_put_local` against a `CpGroup`) a stale `cp_route`
     /// resolution would have handed the same key to.
+    #[ignore = "PARKED (ADR 0050 Train B rung 1): drives a zero-copy split of a populated tablet, disabled during the storage pivot; revived/replaced with the copy-based split in later rungs"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stale_routed_write_for_a_split_childs_key_is_rejected_not_lost() {
         timeout(Duration::from_secs(60), async {

@@ -531,6 +531,22 @@ own doc for its signature and field shapes); `host::Reconciler<E, S>` is
 the **execute** half, in this crate so it owns the lifecycle's invariants
 and is directly `SimEnv`-testable.
 
+**ADR 0050 Train B rung 1 — per-tablet engines.** The reconciler no longer
+receives one shared engine: it opens **one private engine per hosted
+tablet** through the `host::EngineFactory<S>` seam (`open`/`probe`/
+`destroy`; `animusd` maps a tablet id to an LSM filename prefix
+`db-t{tablet}-`, sim/tests use `host::MemoryTabletEngines`' registry).
+Consequences to keep in mind here: `Release`/`Reclaim` teardown both
+**delete the tablet's engine files whole** (`Release`'s `erase_bound` no
+longer bounds anything — a private engine holds no sibling's rows);
+`has_data` is a two-step `probe`-then-scan against the tablet's own
+engine; a hosted parent's seal marker is readable only via that parent's
+own open engine handle. The zero-copy split lifecycle (`NarrowScope`/
+`ProposeSeal`/`parent_seal_observed`) is **disabled in production** during
+the pivot and its corpus scenarios are parked (four `#[allow(dead_code)]`
+scenario fns + one `#[ignore]`d cross_group_lww test) until the deletion
+rung sweeps them.
+
 - **`plan` never removes a tablet from `LocalState::hosted` on its own**
   when emitting a fallible teardown (`Reclaim`/`Release`) — real teardown
   is async and can time out. The caller calls

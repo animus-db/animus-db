@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::ProposeResult;
-use animus_cp_data::host::{MetadataView, Reconciler};
+use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{RaftKvNode, StorageScope};
 use animus_env::{Clock, EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
@@ -261,14 +261,17 @@ where
 }
 
 #[test]
+#[ignore = "PARKED (ADR 0050 Train B): the zero-copy split's narrow/seal handoff race \
+            this exercises is disabled during the storage pivot — under per-tablet \
+            engines a split child no longer shares the source's physical keys at all; \
+            deleted with its machinery in the deletion rung"]
 fn in_flight_split_race_successor_always_wins() {
     let seed = 0xC0_5E1B_u64;
     run(seed, move |sim| async move {
         let env = sim.env(nid(NODE));
-        let storage = MemoryEngine::new();
         let mut reconciler: Reconciler<SimEnv, MemoryEngine> = Reconciler::new(
             env.clone(),
-            storage,
+            MemoryTabletEngines::new(),
             nid(NODE),
             prefix_for,
             |_, _| {},
