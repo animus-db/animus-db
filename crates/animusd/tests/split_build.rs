@@ -770,6 +770,52 @@ fn json_key(key: &[u8]) -> String {
     key.iter().map(|b| format!("\\u{b:04x}")).collect()
 }
 
+/// Wait until `parent` is gone from the tablet map and both named
+/// `children` are `Active`, then return them ordered by range start (left
+/// first). The multi-round sibling of [`await_cutover_of`]: that helper
+/// counts the table's WHOLE Active set (`== 2`), which is only ever true
+/// after a table's first split — from the second split on, earlier rounds'
+/// children keep the count above 2 forever, so a repeated-split test must
+/// scope its wait to the one round's own children instead.
+async fn await_children_active(
+    node: &Node,
+    parent: u64,
+    children: [u64; 2],
+    budget: Duration,
+) -> (u64, u64) {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let (_, s) = admin(node.admin_addr(), "GET", "/admin/status", None).await;
+        let tablets = s["tablets"].as_object().cloned().unwrap_or_default();
+        let parent_gone = !tablets.contains_key(&parent.to_string());
+        let mut active: Vec<(u64, Vec<u8>)> = children
+            .iter()
+            .filter_map(|id| {
+                let t = tablets.get(&id.to_string())?;
+                if t["state"].as_str() != Some("Active") {
+                    return None;
+                }
+                let start: Vec<u8> = t["range"]["start"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|b| b.as_u64().map(|b| b as u8))
+                    .collect();
+                Some((*id, start))
+            })
+            .collect();
+        if parent_gone && active.len() == 2 {
+            // Compare actual BYTE arrays (a JSON-stringified sort inverts).
+            active.sort_by(|a, b| a.1.cmp(&b.1));
+            return (active[0].0, active[1].0);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cutover of {parent} -> {children:?} never completed: tablets={tablets:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// ADR 0050 fork F5 regression: on a cluster LARGER than the replication
 /// factor, `BeginSplit` mints the children at fresh, balance-chosen homes —
 /// so the parent's leader routinely hosts NO replica of one child (with 5
@@ -791,10 +837,11 @@ fn json_key(key: &[u8]) -> String {
 /// The first is placement-deterministic here; the second is election
 /// randomness (~2/3 per round). So this runs successive split rounds —
 /// every one must cut over — until it has OBSERVED a round with the full
-/// hazard shape, which the pre-fix code reliably turns into a red timeout
-/// within a round or two. No-hazard-in-8-rounds means the placement/election
-/// texture changed and this test must be re-aimed, so it fails loudly
-/// rather than silently passing toothless.
+/// hazard shape (and always at least two rounds, so the repeated-split
+/// bookkeeping is exercised on every run), which the pre-fix code reliably
+/// turns into a red timeout within a round or two. No-hazard-in-8-rounds
+/// means the placement/election texture changed and this test must be
+/// re-aimed, so it fails loudly rather than silently passing toothless.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn split_completes_when_a_child_lives_off_the_parent_leader_node() {
     timeout(Duration::from_secs(300), async {
@@ -813,6 +860,7 @@ async fn split_completes_when_a_child_lives_off_the_parent_leader_node() {
         // Splittable tablets, front-first: (id, sorted keys it holds).
         let mut queue: Vec<(u64, Vec<Vec<u8>>)> = vec![(1, all_keys.clone())];
         let mut hazard_observed = false;
+        let mut rounds_done = 0u32;
         for _round in 0..8 {
             let Some(pos) = queue.iter().position(|(_, keys)| keys.len() >= 2) else {
                 break;
@@ -871,17 +919,13 @@ async fn split_completes_when_a_child_lives_off_the_parent_leader_node() {
                 }
             };
 
-            // Hazard shape: a child that (a) will actually be seeded (its
-            // half is non-empty), (b) the parent's leader hosts no replica
-            // of, and (c) whose own elected leader is NOT its first-listed
-            // replica — the exact combination the un-chased relay loops on.
+            // Hazard shape: a child that (a) will actually be seeded (both
+            // halves are non-empty, since the parent held >= 2 keys and the
+            // split key is one of them), (b) the parent's leader hosts no
+            // replica of, and (c) whose own elected leader is NOT its
+            // first-listed replica — the exact combination the un-chased
+            // relay loops on.
             for (child, replicas) in &children {
-                let (left_keys, right_keys): (Vec<_>, Vec<_>) =
-                    keys.iter().cloned().partition(|k| *k < split_key);
-                // Which half is this child's? Match by id order below after
-                // cutover; for the hazard check the halves' emptiness is all
-                // that matters, and with `keys.len() >= 2` both are non-empty.
-                let _ = (&left_keys, &right_keys);
                 if replicas.contains(&parent_leader) {
                     continue;
                 }
@@ -908,14 +952,29 @@ async fn split_completes_when_a_child_lives_off_the_parent_leader_node() {
 
             // Every round must complete regardless — on the un-chased relay
             // a hazard round parks `Splitting` forever and this times out.
-            let (left, right) =
-                await_cutover_of(&nodes[0], "t", parent, Duration::from_secs(90)).await;
+            // Scoped to THIS round's own children (parent gone + both
+            // Active), never `await_cutover_of`'s whole-table Active count:
+            // from round 2 on, the table legitimately holds earlier rounds'
+            // children too, so that count can never come back down to 2
+            // (the exact predicate bug this test's first CI run tripped).
+            let (left, right) = await_children_active(
+                &nodes[0],
+                parent,
+                [children[0].0, children[1].0],
+                Duration::from_secs(90),
+            )
+            .await;
             let (left_keys, right_keys): (Vec<_>, Vec<_>) =
                 keys.into_iter().partition(|k| *k < split_key);
             queue.push((left, left_keys));
             queue.push((right, right_keys));
+            rounds_done += 1;
 
-            if hazard_observed {
+            // Run at least two rounds even when round 1 already showed the
+            // hazard, so the multi-round bookkeeping (a table with MORE
+            // than two Active tablets) is exercised on every run, not only
+            // on the unlucky-election runs.
+            if hazard_observed && rounds_done >= 2 {
                 break;
             }
         }
