@@ -6,7 +6,7 @@
   guard → PR5 the sealer → PR6 read path + wire API → PR7 segment janitor →
   PR8 lineage corpus + `ProdEnv` e2e + nightly (this PR).
 - **2026-08-16 note:** [ADR 0050](0050-per-tablet-storage-copy-based-splits.md)
-  (accepted, in delivery) retires §A4's zero-copy split-lineage machinery —
+  (implemented 2026-08-17) retires §A4's zero-copy split-lineage machinery —
   the frozen `stream_split_basis`, the `in_declared_range` read-side fence,
   and the `SealStreamShard` range-CAS — because children of a copy-based
   split are born with empty change logs (no inherited backlog exists to

@@ -1,10 +1,10 @@
 # ADR 0050 — Per-tablet physical storage and copy-based symmetric splits
 
-- **Status:** Accepted — not yet implemented (delivery "Train B"; depends on
-  ADR 0049's Train A landing first). **Supersedes [ADR
-  0028](0028-shared-storage-single-command-split.md) in full once
-  implemented** (both halves: the shared per-node engine and the
-  metadata-only zero-copy split).
+- **Status:** Accepted — **implemented** (Train B, rungs 1–8; see the
+  2026-08-17 as-built amendment at the bottom). **Supersedes [ADR
+  0028](0028-shared-storage-single-command-split.md) in full** (both
+  halves: the shared per-node engine and the metadata-only zero-copy
+  split).
 - **Date:** 2026-08-16
 - **Amends:** [ADR 0002](0002-tablets-unit-of-placement.md) (tablet
   lifecycle: `Building`/`Splitting` states, retire-at-cutover), [ADR
@@ -401,3 +401,117 @@ zero-constructor, is retired).
   driver and freeze (SimEnv proves ordering, not liveness); bench: split
   wall-clock, write amplification, and the parent's serve latency under a
   live build.
+
+## As-built amendment (2026-08-17, Train B complete — rungs 1–8)
+
+The train delivered as planned with the deviations below; net across the
+delete-heavy rungs the codebase is **~3,200 lines lighter**. Status is
+implemented; ADR 0028 is superseded in full.
+
+**Rung 1 — per-tablet engines.** The gating measurement passed
+emphatically: an idle `LsmEngine` costs **~1 KB RSS**, creates **zero
+files** at open, and spawns **zero tasks/timers** (`open` is passive;
+production uses `background_maintenance: false`) — quiescence is safe from
+the storage side, and dev-mode `--cluster N` is unaffected. `Release` and
+`Reclaim` collapse to one behavior (whole-engine file deletion;
+`TeardownKind` survives as intent labeling). Surprise: `CreateTable` DOES
+provision the bootstrap tablet — a stale fixture comment said otherwise.
+
+**Rung 2 — F2b keys.** `StorageScope` keeps its name, slimmed to
+`{prefix: [] | [kind], range /* immutable */}`; **no codec bump** (the
+image wire layout was already physical-agnostic). Kind-scope bounds are
+finite by construction, so every "unbounded above" branch died. Marker
+disjointness now rests on first-byte ordering (reserved `0x5F` vs kinds
+`0x00..=0x04`), not escape-prefix-freedom.
+
+**Rung 3 — lifecycle.** Six under-specified points settled: cutover
+recomputes its children from the map (replay-safe); `cutover_wall_ms` is
+proposer-stamped; cutover bumps child epochs; the kickoff confirm re-arms
+on stray epoch bumps; under-satisfiable placement falls back to
+parent-inherit; and "children unroutable" required filtering **both scan
+fan-outs**, not just point routing (a `Building` child overlaps its
+un-narrowed parent).
+
+**Rung 4 — the build.** The tail cursor is a **packed-HLC watermark,
+never a key position** — a key cursor silently lost racing writes while
+reporting converged (`pending_changes`' key order is prefix-then-HLC, not
+commit order). Confirm is by applied index, never a value probe
+(version-carrying merges make probes hang on correctly-no-op'd batches).
+256 KiB `SeedBatch` chunks; `Forwarded{SeedRows}` rides serde_json (~4×
+inflation, accepted). The tail is O(pending) per tick — the trim hold
+grows the pending set over a build's bounded duration; an O(delta)
+commit-ordered read is a named follow-up.
+
+**Rung 5 — freeze/cutover.** The freeze is **writer-classified** (user
+data blocked; consumer bookkeeping passes) — the uniform "reject every
+write" form deadlocked the cutover vetoes against the freeze itself. A
+**final image** replaced the planned final-tail-only endgame: transaction
+decisions/resolves rewrite rows with no change record, so an O(delta)
+tail structurally misses them (a child inheriting a stale `Pending`
+record for an acked commit is the class fork F7 exists to prevent).
+`Building` tablets run **no consumer arms** (a child's token-truncated
+cursor row would poison the parent's trim watermark — the memory-recorded
+`split-child-gsi-cursor-unreadable` shape, now dead by construction).
+`TxnResolve` during the freeze is rejected retryably; the resolve chases
+to the child.
+
+**Rung 6 — lineage.** The segment janitor needed zero production changes
+— retirement was **safe by construction** (the drop rule keys on schema,
+not tablet presence; the live-chain max-epoch pin never applied), proven
+by reversion teeth rather than assumed. A retired parent's open shard id
+becomes its sealed catalog row under the same id, so consumer-error
+concerns dissolved structurally. Lineage is transitive through retired
+ancestors purely on wire data. F11 binds corpus split keys to 8-byte
+tokens.
+
+**Rung 7 — the sweep.** `ceiling.rs` was **kept** (load-bearing ADR 0018
+MVCC read-ceiling machinery, not fence-era). `SealStreamShard`'s
+`expected_range` CAS was **deleted** (verified inert: the
+first-committer-wins content match, `object_id` included, closes the
+dueling-seal race independently, and ranges never mutate while a tablet
+exists). One production-safety nuance: an immediate `BeginSplit`+
+`CutoverSplit` round against a live cluster deadlocks (children first
+observed post-cutover, all replicas empty at a bumped epoch, everyone
+hosts as a quiet non-voter) — real workflows always host children while
+`Building`; pure-metadata fixtures may take the immediate round, populated
+fixtures must run the genuine workflow.
+
+**Rung 8 — acceptance, bench, and two liveness/latency finds.** The
+committed bench (`split_build.rs::bench_split_…`, `#[ignore]`d) drove a
+*continuous* writer and found the shipped convergence predicate
+("tail pass shipped zero new records") **never fires on a
+continuously-written parent** — the hot tablet that most needs splitting
+could never freeze. Fix: `SPLIT_MAX_TAIL_PASSES` (25 post-bulk chasing
+passes ≈ 5 s) freezes regardless; the post-freeze drain + image still
+transfer everything — the residue only sizes the write blip, which is
+exactly stage 4's stated knob. Second find: the unfiltered final image
+re-shipped the whole table *inside the freeze window* (~2 s of blip at
+2,000 rows, scaling with table size). Fix: the final image is filtered by
+a **pre-bulk version floor** (a read-only pass over the copy kinds before
+the bulk starts; apply order == HLC order makes any bulk-missed rewrite
+out-version the floor; deliberately not `latest_version()`, which the
+read-ceiling marker future-shifts), plus the endgame phases now fall
+through within one driver tick instead of parking 200 ms per phase.
+Measured after the fixes (3 nodes, N=2,000 × 256 B, sequential client,
+WSL2): **build 12.8 s (156 rows/s, including the deliberate 5 s
+tail-chase bound); serve-during-build ≈ idle (116 ms vs 112 ms median —
+the 3-node linearizable-read cadence dominates both); write blip 458 ms —
+inside fork F8's sub-second contract.** Deep corpus at
+`ANIMUS_SPLIT_SEEDS=40` / `ANIMUS_STREAM_SEEDS=40` /
+`ANIMUS_RECONCILER_SEEDS=40` / `ANIMUS_QUIESCE_SEEDS=40` /
+`ANIMUS_TXN_SEEDS=5`: all green (nightly workflow extended with the
+three new knobs). Acceptance: the multi-split soak (≥3 cutovers on a
+streamed+GSI'd table under mixed plain/transactional/GSI load — zero
+lost writes, exactly-once lineage delivery, GSI convergence, every
+retired parent's engine files deleted on every node), concurrent splits
+of two tables racing to completion, and a split-deployment
+(control-only + data-only) cluster running one full split. The soak's
+GSI-convergence + reclaim pair also closes the
+`split-child-gsi-cursor-unreadable` bug class end to end.
+
+**Named follow-ups, deliberately not in the train:** apply-side
+decision/resolve markers restoring an O(delta) endgame; an O(delta)
+commit-ordered tail read; presplit at `CreateTable`; `CancelSplit`;
+per-node concurrent-build caps/IO throttling; SSTable-level seed cloning;
+per-tablet admin storage introspection (`/admin/storage/lsm` shows only
+the syskv engine today).

@@ -475,3 +475,290 @@ async fn driver_kill_after_freeze_resumes_and_completes() {
     .await
     .expect("test timed out");
 }
+
+// ---------------------------------------------------------------------------
+// Rung 8 additions: table-parameterized helpers for the concurrent-tables
+// acceptance test and the committed split bench below. The originals above
+// stay hardcoded to table "t" (their tests predate multi-table needs).
+// ---------------------------------------------------------------------------
+
+/// [`put`], parameterized by table. Same bounded-retry contract.
+async fn put_in(stream: &mut TcpStream, table: &str, key: Vec<u8>, value: Vec<u8>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        animusd::write_frame(
+            stream,
+            &ClientRequest::Put {
+                key: key.clone(),
+                value: value.clone(),
+                table: table.to_string(),
+            },
+        )
+        .await
+        .expect("send frame");
+        match read_frame(stream).await.expect("read").expect("reply") {
+            ClientResponse::PutOk => return,
+            ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            other => panic!("put({table}) failed: {other:?}"),
+        }
+    }
+}
+
+/// [`get`], parameterized by table.
+async fn get_in(stream: &mut TcpStream, table: &str, key: Vec<u8>) -> Option<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        animusd::write_frame(
+            stream,
+            &ClientRequest::Get {
+                key: key.clone(),
+                table: table.to_string(),
+            },
+        )
+        .await
+        .expect("send frame");
+        match read_frame(stream).await.expect("read").expect("reply") {
+            ClientResponse::Value(v) => return v,
+            ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            other => panic!("get({table}) failed: {other:?}"),
+        }
+    }
+}
+
+/// The single tablet id currently serving `table` (asserts exactly one —
+/// callers use this before any split).
+fn sole_tablet_of(node: &Node, table: &str) -> u64 {
+    let meta = node.metadata();
+    let ids: Vec<u64> = meta
+        .tablets
+        .iter()
+        .filter(|(_, t)| t.table.as_deref() == Some(table))
+        .map(|(id, _)| id.0)
+        .collect();
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected exactly one tablet of {table}: {ids:?}"
+    );
+    ids[0]
+}
+
+/// Kick off a split of `tablet` at `split_key` via `node`'s admin surface.
+async fn kickoff_tablet(node: &Node, tablet: u64, split_key: &str) {
+    let (status, body) = admin(
+        node.admin_addr(),
+        "POST",
+        "/admin/tablet/split",
+        Some(&format!(
+            "{{\"tablet\":{tablet},\"split_key\":\"{split_key}\"}}"
+        )),
+    )
+    .await;
+    assert_eq!(status, 200, "kickoff of tablet {tablet} failed: {body}");
+}
+
+/// [`await_cutover`], parameterized by table + parent id.
+async fn await_cutover_of(node: &Node, table: &str, parent: u64, budget: Duration) -> (u64, u64) {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let (_, s) = admin(node.admin_addr(), "GET", "/admin/status", None).await;
+        let tablets = s["tablets"].as_object().cloned().unwrap_or_default();
+        let parent_gone = !tablets.contains_key(&parent.to_string());
+        let mut active: Vec<(u64, Vec<u8>)> = tablets
+            .iter()
+            .filter(|(_, t)| {
+                t["state"].as_str() == Some("Active") && t["table"].as_str() == Some(table)
+            })
+            .filter_map(|(id, t)| {
+                let start: Vec<u8> = t["range"]["start"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|b| b.as_u64().map(|b| b as u8))
+                    .collect();
+                Some((id.parse().ok()?, start))
+            })
+            .collect();
+        if parent_gone && active.len() == 2 {
+            active.sort_by(|a, b| a.1.cmp(&b.1));
+            return (active[0].0, active[1].0);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cutover of {table}/{parent} never completed: tablets={tablets:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Rung 8 acceptance (b): two DIFFERENT tables' splits racing each other.
+/// Each workflow is per-tablet state on the shared control plane — two
+/// drivers (possibly on different leaders), two Freeze/Cutover sequences,
+/// interleaved arbitrarily. Both must complete; neither table loses a row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_splits_of_two_tables_both_complete() {
+    timeout(Duration::from_secs(180), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let mut s = TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect");
+        // Populate both tables: keys `a\x00..a\x0f` / `b\x00..b\x0f`.
+        for i in 0..16u8 {
+            put_in(&mut s, "ta", vec![b'a', i], vec![b'A', i]).await;
+            put_in(&mut s, "tb", vec![b'b', i], vec![b'B', i]).await;
+        }
+        let pa = sole_tablet_of(&nodes[0], "ta");
+        let pb = sole_tablet_of(&nodes[0], "tb");
+
+        // Back-to-back kickoffs through a follower (relay path included) —
+        // the two workflows run concurrently from here.
+        let follower = nodes
+            .iter()
+            .position(|n| !n.is_control_leader())
+            .expect("a follower exists");
+        kickoff_tablet(&nodes[follower], pa, "a\\u0008").await;
+        kickoff_tablet(&nodes[follower], pb, "b\\u0008").await;
+
+        // Keep writing to BOTH tables while the two builds race.
+        for i in 16..28u8 {
+            put_in(&mut s, "ta", vec![b'a', i], vec![b'A', i]).await;
+            put_in(&mut s, "tb", vec![b'b', i], vec![b'B', i]).await;
+        }
+
+        let (a_left, a_right) =
+            await_cutover_of(&nodes[0], "ta", pa, Duration::from_secs(90)).await;
+        let (b_left, b_right) =
+            await_cutover_of(&nodes[0], "tb", pb, Duration::from_secs(90)).await;
+        assert_ne!((a_left, a_right), (b_left, b_right));
+
+        // Zero lost writes on either table, through a different node.
+        let mut s2 = TcpStream::connect(nodes[1].client_addr())
+            .await
+            .expect("connect n1");
+        for i in 0..28u8 {
+            assert_eq!(
+                get_in(&mut s2, "ta", vec![b'a', i]).await,
+                Some(vec![b'A', i]),
+                "ta write {i} lost across the racing cutovers"
+            );
+            assert_eq!(
+                get_in(&mut s2, "tb", vec![b'b', i]).await,
+                Some(vec![b'B', i]),
+                "tb write {i} lost across the racing cutovers"
+            );
+        }
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Rung 8: the committed split bench (ADR 0050's named deliverable). Run
+/// explicitly with `cargo test -p animusd --test split_build -- --ignored
+/// bench_split --nocapture`. Reports: (i) build wall-clock + rows/s for an
+/// N-row table, (ii) the parent's sequential serve latency during the live
+/// build vs an idle baseline (median + p99), (iii) the freeze→cutover write
+/// blip as observed by a continuously-retrying client (the F8 contract:
+/// sub-second). Sequential single-client numbers, same caveat as the ADR
+/// 0049 bench.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "bench — run explicitly with --ignored --nocapture"]
+async fn bench_split_build_serve_latency_and_cutover_blip() {
+    const N: usize = 2_000;
+    timeout(Duration::from_secs(600), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let mut s = TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect");
+        let filler = vec![b'x'; 256];
+        for i in 0..N {
+            let key = vec![b'k', (i / 256) as u8, (i % 256) as u8];
+            put_in(&mut s, "bench", key, filler.clone()).await;
+        }
+        let parent = sole_tablet_of(&nodes[0], "bench");
+
+        // (ii) idle baseline: 200 sequential linearizable gets.
+        let mut idle = Vec::with_capacity(200);
+        for i in 0..200usize {
+            let key = vec![b'k', (i / 256) as u8, (i % 256) as u8];
+            let t0 = std::time::Instant::now();
+            let got = get_in(&mut s, "bench", key).await;
+            idle.push(t0.elapsed());
+            assert!(got.is_some());
+        }
+
+        // (i)+(iii): kick off, then sample alternating get/put until the
+        // cutover completes. Reads keep serving through the freeze; a put
+        // hitting the freeze window retries inside `put_in` — its observed
+        // latency IS the write blip.
+        let t_kickoff = std::time::Instant::now();
+        kickoff_tablet(&nodes[0], parent, "k\\u0004").await;
+        let mut build_gets = Vec::new();
+        let mut build_puts = Vec::new();
+        let (left, right) = loop {
+            for i in 0..20usize {
+                let key = vec![b'k', (i / 256) as u8, (i % 256) as u8];
+                let t0 = std::time::Instant::now();
+                let got = get_in(&mut s, "bench", key).await;
+                build_gets.push(t0.elapsed());
+                assert!(got.is_some());
+                let wkey = vec![b'w', (build_puts.len() % 256) as u8];
+                let t0 = std::time::Instant::now();
+                put_in(&mut s, "bench", wkey, vec![b'v']).await;
+                build_puts.push(t0.elapsed());
+            }
+            let (_, st) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
+            let tablets = st["tablets"].as_object().cloned().unwrap_or_default();
+            if !tablets.contains_key(&parent.to_string()) {
+                break await_cutover_of(&nodes[0], "bench", parent, Duration::from_secs(30)).await;
+            }
+            assert!(
+                t_kickoff.elapsed() < Duration::from_secs(300),
+                "build never completed"
+            );
+        };
+        let build = t_kickoff.elapsed();
+
+        let stats = |mut v: Vec<Duration>| {
+            v.sort();
+            let med = v[v.len() / 2];
+            let p99 = v[(v.len() * 99) / 100];
+            let max = *v.last().unwrap();
+            (med, p99, max)
+        };
+        let (i_med, i_p99, _) = stats(idle);
+        let (g_med, g_p99, _) = stats(build_gets);
+        let (p_med, p_p99, p_max) = stats(build_puts);
+        eprintln!("split bench (N={N} rows, 256B values, 3 nodes, children {left}/{right}):");
+        eprintln!(
+            "  build wall-clock: {build:?}  ({:.0} rows/s)",
+            N as f64 / build.as_secs_f64()
+        );
+        eprintln!("  serve GET idle:   median {i_med:?}  p99 {i_p99:?}");
+        eprintln!("  serve GET build:  median {g_med:?}  p99 {g_p99:?}");
+        eprintln!("  serve PUT build:  median {p_med:?}  p99 {p_p99:?}");
+        eprintln!("  write blip (max PUT incl. freeze window): {p_max:?}");
+        assert!(
+            p_max < Duration::from_secs(2),
+            "freeze→cutover write blip materially over the F8 sub-second contract: {p_max:?}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("bench timed out");
+}

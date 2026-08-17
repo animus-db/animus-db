@@ -172,13 +172,20 @@ cursor — see the engineering-lessons entry) at token granularity (or full
 prefix for sub-token raw keys). Progress mirrors to
 `ctx.data().split_builds` → `/admin/raftkv`'s
 `split_rows_shipped`/`split_converged`/`split_phase`. **Rung 5 completes the
-workflow**: at convergence the driver proposes `KvCommand::Freeze` on the
-parent (terminal whole-range seal; USER data only — consumer bookkeeping
-writes stay allowed so the vetoes below can converge, see the
-engineering-lessons entry), then per tick: final tail pass → the **final
-image** (one full re-scan ship of the frozen parent — txn decisions/
-resolves are signal-less writes an O(delta) tail misses; gated on the
-apply task reaching the freeze-window commit floor) → streams final seal
+workflow**: at convergence — caught up, OR `SPLIT_MAX_TAIL_PASSES` (25)
+post-bulk chasing passes elapsed (the rung-8 liveness bound: a
+continuously-written parent must still freeze; see the engineering-lessons
+entry) — the driver proposes `KvCommand::Freeze` on the parent (terminal
+whole-range seal; USER data only — consumer bookkeeping writes stay
+allowed so the vetoes below can converge, see the engineering-lessons
+entry), then in ONE tick (rung 8: each phase-per-tick boundary was pure
+write-blip): final tail drain to zero → the **final image** (a re-scan
+ship of the frozen parent *filtered by the pre-bulk version floor* — txn
+decisions/resolves are signal-less writes an O(delta) tail misses, and
+apply order == HLC order makes every bulk-missed rewrite out-version the
+floor; deliberately not `latest_version()`, which the read-ceiling marker
+future-shifts; gated on the apply task reaching the freeze-window commit
+floor) → streams final seal
 (`seal_now`, no size/age gate) → GSI-drain veto (`"gsi"` cursor ≥ max
 pending record) → backfill veto (`MarkIndexBackfilled` for every
 `Creating` index) → proposes `CutoverSplit` until the parent leaves the

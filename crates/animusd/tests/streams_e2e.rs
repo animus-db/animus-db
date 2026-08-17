@@ -2248,3 +2248,225 @@ async fn cascade_split_walks_the_grandparent_chain_with_closed_shard_shape() {
         "a mid-split tablet must classify as a skip, never an error: {body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rung 8 acceptance (a): the multi-split soak — one streamed + GSI'd table
+// through ≥3 auto-split cutovers under continuous mixed load.
+// ---------------------------------------------------------------------------
+
+/// ADR 0050 Train B rung 8's named acceptance soak. A populated streamed +
+/// GSI'd table auto-splits repeatedly (tiny byte threshold) while plain
+/// writes, `TransactWriteItems`, and GSI queries race the workflows from
+/// every node. Asserts, at the end: zero lost writes (every acked item
+/// reads back), exactly-once stream delivery via the full lineage walk
+/// (retired parents included), GSI convergence to exactly one row per
+/// item, and every retired parent's per-tablet engine physically deleted
+/// from every node's dir (`db-t{parent}-*` gone — the B1 file-deletion
+/// teardown observed end to end). The GSI-convergence + reclaim pair is
+/// also the closure check for the `split-child-gsi-cursor-unreadable`
+/// memory bug class: children's drains start clean (RestartFromScratch at
+/// activation) and no retired parent's watermark row survives to pollute
+/// anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_split_soak_streamed_gsi_table_under_mixed_load() {
+    tokio::time::timeout(Duration::from_secs(300), async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nodes = start_streamed_cluster_full(
+            3,
+            dir.path(),
+            tiny_seal_knobs(),
+            None,
+            Some(2_048),
+            SegmentStoreConfig::default(),
+        )
+        .await;
+        await_bootstrap(&nodes).await;
+
+        let (status, body) = dynamo(
+            nodes[0].dynamo_addr(),
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"soak",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                "StreamSpecification":{"StreamEnabled":true,
+                    "StreamViewType":"NEW_AND_OLD_IMAGES"},
+                "GlobalSecondaryIndexes":[
+                    {"IndexName":"by-tag",
+                     "KeySchema":[{"AttributeName":"tag","KeyType":"HASH"}],
+                     "Projection":{"ProjectionType":"ALL"}}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+        let label = field(&body, "LatestStreamLabel");
+        let stream_arn = format!("arn:aws:dynamodb:animus:0:table/soak/stream/{label}");
+
+        // Mixed load, round-robin across nodes: 120 plain puts, every 10th
+        // iteration ALSO a two-item transaction, every 15th a GSI query.
+        // Every item carries one of 4 tags + a 256B filler (so the 2KiB
+        // auto-split threshold fires early and often — a cascade of
+        // cutovers, not one).
+        let filler = "x".repeat(256);
+        let mut ids: Vec<String> = Vec::new();
+        for i in 0..120usize {
+            let issuer = &nodes[i % nodes.len()];
+            let id = format!("e{i:04}");
+            let (status, body) = dynamo(
+                issuer.dynamo_addr(),
+                "DynamoDB_20120810.PutItem",
+                &format!(
+                    r#"{{"TableName":"soak","Item":{{"id":{{"S":"{id}"}},"tag":{{"S":"t{}"}},"body":{{"S":"{filler}"}}}}}}"#,
+                    i % 4
+                ),
+            )
+            .await;
+            assert_eq!(status, 200, "PutItem({id}) failed: {body}");
+            ids.push(id);
+            if i % 10 == 9 {
+                let (a, b) = (format!("x{i:04}a"), format!("x{i:04}b"));
+                let (status, body) = dynamo(
+                    issuer.dynamo_addr(),
+                    "DynamoDB_20120810.TransactWriteItems",
+                    &format!(
+                        r#"{{"TransactItems":[
+                            {{"Put":{{"TableName":"soak","Item":{{"id":{{"S":"{a}"}},"tag":{{"S":"t0"}}}}}}}},
+                            {{"Put":{{"TableName":"soak","Item":{{"id":{{"S":"{b}"}},"tag":{{"S":"t1"}}}}}}}}]}}"#
+                    ),
+                )
+                .await;
+                assert_eq!(status, 200, "transact({a},{b}) failed: {body}");
+                ids.push(a);
+                ids.push(b);
+            }
+            if i % 15 == 14 {
+                // A live GSI read mid-workflow — result content converges
+                // later; mid-flight it only has to serve.
+                let (status, _) = dynamo(
+                    issuer.dynamo_addr(),
+                    "DynamoDB_20120810.Query",
+                    r#"{"TableName":"soak","IndexName":"by-tag",
+                        "KeyConditionExpression":"tag = :t",
+                        "ExpressionAttributeValues":{":t":{"S":"t0"}}}"#,
+                )
+                .await;
+                assert_eq!(status, 200, "mid-flight GSI query failed");
+            }
+        }
+        let expected = ids.len();
+
+        // ≥3 completed cutovers (retired parents recorded in lineage), and
+        // the surviving topology converged on every node.
+        await_true(60, "fewer than 3 cutovers ever completed", || {
+            let meta = nodes[0].metadata();
+            let parents: BTreeSet<TabletId> =
+                meta.split_lineage.values().map(|l| l.parent).collect();
+            parents.iter().filter(|p| !meta.tablets.contains_key(p)).count() >= 3
+        })
+        .await;
+        let retired: Vec<TabletId> = {
+            let meta = nodes[0].metadata();
+            meta.split_lineage
+                .values()
+                .map(|l| l.parent)
+                .filter(|p| !meta.tablets.contains_key(p))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+
+        // 1. Zero lost writes: every acked item reads back through a node
+        //    that didn't originate most of them.
+        for id in &ids {
+            let (status, body) = dynamo(
+                nodes[2].dynamo_addr(),
+                "DynamoDB_20120810.GetItem",
+                &format!(r#"{{"TableName":"soak","Key":{{"id":{{"S":"{id}"}}}}}}"#),
+            )
+            .await;
+            assert_eq!(status, 200, "GetItem({id}) failed");
+            assert!(
+                body.contains(&format!("\"S\":\"{id}\"")),
+                "acked write {id} lost across the soak's cutovers: {body}"
+            );
+        }
+
+        // 2. Exactly-once stream delivery over the full lineage (live
+        //    tablets + every retired parent; the walk self-discovers any
+        //    generation it wasn't seeded with).
+        let seed_tablets: Vec<TabletId> = {
+            let meta = nodes[1].metadata();
+            let mut ts = tablets_for(&meta, "soak");
+            ts.extend(retired.iter().copied());
+            ts
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let delivered = drain_all_tablets_lineage(
+            nodes[1].dynamo_addr(),
+            &stream_arn,
+            &nodes[1],
+            &seed_tablets,
+            expected,
+            deadline,
+        )
+        .await;
+        assert_eq!(
+            delivered.len(),
+            expected,
+            "exactly-once delivery must hold across every soak cutover"
+        );
+
+        // 3. GSI convergence: the four tags' Counts sum to exactly one row
+        //    per item (children's drains restarted clean at activation).
+        await_true(60, "GSI never converged to one row per item", || {
+            // `await_true` takes a sync closure — sample via a blocking
+            // one-shot runtime handle instead: issue the four queries on
+            // the current runtime through block_in_place.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let mut total = 0u64;
+                    for t in 0..4 {
+                        let (status, body) = dynamo(
+                            nodes[1].dynamo_addr(),
+                            "DynamoDB_20120810.Query",
+                            &format!(
+                                r#"{{"TableName":"soak","IndexName":"by-tag",
+                                    "KeyConditionExpression":"tag = :t",
+                                    "ExpressionAttributeValues":{{":t":{{"S":"t{t}"}}}}}}"#
+                            ),
+                        )
+                        .await;
+                        if status != 200 {
+                            return false;
+                        }
+                        let v: serde_json::Value =
+                            serde_json::from_str(&body).unwrap_or_default();
+                        total += v["Count"].as_u64().unwrap_or(0);
+                    }
+                    total == expected as u64
+                })
+            })
+        })
+        .await;
+
+        // 4. Every retired parent's per-tablet engine physically deleted
+        //    from every node dir (B1's file-deletion teardown, end to end).
+        await_true(30, "a retired parent's engine files survived", || {
+            (0..nodes.len()).all(|n| {
+                let node_dir = dir.path().join(format!("node-{n}"));
+                let Ok(entries) = std::fs::read_dir(&node_dir) else {
+                    return true;
+                };
+                let names: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                retired.iter().all(|p| {
+                    let prefix = format!("db-t{}-", p.0);
+                    let wal = format!("raftkv.wal.{}", p.0);
+                    names.iter().all(|f| !f.starts_with(&prefix) && *f != wal)
+                })
+            })
+        })
+        .await;
+    })
+    .await
+    .expect("soak timed out");
+}
