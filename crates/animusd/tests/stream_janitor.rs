@@ -999,3 +999,166 @@ async fn metrics_reflect_a_completed_retention_cycle() {
     })
     .await;
 }
+
+// --- ADR 0050 Train B rung 6: the retired-tablet rule ---------------------
+
+/// Completes one copy-based split of streamed `table` (currently one
+/// tablet) via `/admin/stream/grow`, returning the retired root's id once
+/// every node observes the cutover (root absent, two routable children).
+async fn grow_and_await_cutover(nodes: &[Node], table: &str) -> TabletId {
+    let root = tablet_for(&nodes[0].metadata(), table);
+    let (status, body) = admin(
+        nodes[1].admin_addr(),
+        "POST",
+        "/admin/stream/grow",
+        Some(&format!(r#"{{"table":"{table}"}}"#)),
+    )
+    .await;
+    assert_eq!(status, 200, "stream/grow failed: {body}");
+    assert_eq!(
+        body["split_count"].as_u64(),
+        Some(1),
+        "root must split: {body}"
+    );
+    await_true(30, "cutover never completed on every node", || {
+        nodes.iter().all(|n| {
+            let m = n.metadata();
+            !m.tablets.contains_key(&root)
+                && m.tablets
+                    .iter()
+                    .filter(|(_, t)| t.serves_table(table))
+                    .count()
+                    == 2
+        })
+    })
+    .await;
+    root
+}
+
+/// The mark half of the retired-tablet rule: a retired split parent's
+/// sealed shards expire by ORDINARY retention — never the drop-table
+/// retention-zero rule, which keys on the TABLE's schema (still live via
+/// the children), not on tablet presence. With a long retention, several
+/// janitor ticks after the cutover must leave every one of the root's rows
+/// present and unexpired. (Teeth: keying the drop rule on tablet presence
+/// instead — a plausible wrong implementation — marks these rows within
+/// one 200ms tick and turns this red.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retired_parents_shards_are_not_reaped_early() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let nodes = start_streamed_cluster(3, dir.path(), Duration::from_secs(3600)).await;
+    await_bootstrap(&nodes).await;
+    let addr = nodes[0].dynamo_addr();
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"rt",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "StreamSpecification":{"StreamEnabled":true,
+                "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+    for i in 0..8 {
+        let (status, _) = dynamo(
+            addr,
+            "DynamoDB_20120810.PutItem",
+            &format!(r#"{{"TableName":"rt","Item":{{"id":{{"S":"r{i:04}"}}}}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+    await_chain_len(&nodes, "rt", 1).await;
+    let root = grow_and_await_cutover(&nodes, "rt").await;
+
+    // Several janitor intervals (200ms each) after the cutover: the
+    // retired root's rows must all still be present and unexpired.
+    sleep(Duration::from_millis(1500)).await;
+    let meta = nodes[0].metadata();
+    let rows: Vec<_> = meta
+        .stream_shards
+        .range((root, 0)..=(root, u64::MAX))
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "the retired root must still have its sealed shards cataloged"
+    );
+    for ((_, epoch), row) in rows {
+        assert!(
+            !row.expired,
+            "a retired parent's shard (epoch {epoch}) must expire by ordinary \
+             retention, never be reaped early as dropped-table work"
+        );
+    }
+}
+
+/// The removal half: past retention, a retired parent's rows are removed
+/// **including its final (max-epoch) shard** — the max-epoch pin exists
+/// only for a LIVE tablet (whose next seal re-derives its epoch from the
+/// chain); a retired tablet can never seal again, so nothing pins its
+/// final row. (Teeth: reverting `may_remove_row`'s absent-tablet arm pins
+/// the final row forever and turns this red.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retired_parents_final_shard_expires_by_retention() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let nodes = start_streamed_cluster(3, dir.path(), TINY_RETENTION).await;
+    await_bootstrap(&nodes).await;
+    let addr = nodes[0].dynamo_addr();
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"re",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "StreamSpecification":{"StreamEnabled":true,
+                "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+    for i in 0..8 {
+        let (status, _) = dynamo(
+            addr,
+            "DynamoDB_20120810.PutItem",
+            &format!(r#"{{"TableName":"re","Item":{{"id":{{"S":"e{i:04}"}}}}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+    await_chain_len(&nodes, "re", 1).await;
+    let root = grow_and_await_cutover(&nodes, "re").await;
+
+    // Capture the final shard's object while it exists, to also prove the
+    // bytes are reclaimed, not just the row.
+    let meta = nodes[0].metadata();
+    let final_row = meta
+        .stream_shards
+        .range((root, 0)..=(root, u64::MAX))
+        .next_back()
+        .map(|(_, row)| row.clone())
+        .expect("the retired root sealed at least one shard");
+
+    await_true(
+        20,
+        "the retired root's rows (final epoch included) were never removed",
+        || {
+            nodes.iter().all(|n| {
+                n.metadata()
+                    .stream_shards
+                    .range((root, 0)..=(root, u64::MAX))
+                    .next()
+                    .is_none()
+            })
+        },
+    )
+    .await;
+    for i in 0..3 {
+        let path = segment_path(&dir.path().join(format!("node-{i}")), &final_row.object_id);
+        await_true_async(
+            10,
+            &format!("node {i}'s final-shard object was never reclaimed"),
+            || async { !tokio::fs::try_exists(&path).await.unwrap_or(true) },
+        )
+        .await;
+    }
+}

@@ -1290,7 +1290,8 @@ async fn action_stream_grow(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
                 }
                 ClientResponse::Error(e)
                     if e == crate::SPLIT_KEY_NOT_TOKEN_VIABLE
-                        || e == crate::STREAM_GROW_NO_SPLIT_POINT =>
+                        || e == crate::STREAM_GROW_NO_SPLIT_POINT
+                        || e == crate::STREAM_GROW_MID_SPLIT =>
                 {
                     skipped_count += 1;
                     ("skipped", Some(e))

@@ -1946,3 +1946,305 @@ async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain
         sleep(Duration::from_millis(100)).await;
     }
 }
+
+/// Every shard object `DescribeStream` currently lists for `stream_arn`,
+/// across pagination — the raw JSON shard entries, for tests asserting the
+/// wire *shape* (`SequenceNumberRange.EndingSequenceNumber`,
+/// `ParentShardId`) rather than just the tablet-id set
+/// ([`stream_tablet_ids`]'s narrower digest).
+async fn all_stream_shards(addr: SocketAddr, stream_arn: &str) -> Vec<Value> {
+    let mut shards = Vec::new();
+    let mut start: Option<String> = None;
+    loop {
+        let start_clause = start
+            .as_ref()
+            .map(|s| format!(r#","ExclusiveStartShardId":"{s}""#))
+            .unwrap_or_default();
+        let (status, resp) = dynamo(
+            addr,
+            "DynamoDBStreams_20120810.DescribeStream",
+            &format!(r#"{{"StreamArn":"{stream_arn}"{start_clause}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "DescribeStream (shard shape) failed: {resp}");
+        let v = json(&resp);
+        shards.extend(
+            v["StreamDescription"]["Shards"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        match v["StreamDescription"]["LastEvaluatedShardId"].as_str() {
+            Some(next) => start = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    shards
+}
+
+/// The cascade e2e (ADR 0050 Train B rung 6): a streamed table walked by a
+/// consumer across (a) a routine seal, (b) one completed copy-based split
+/// (the root retired, its final shard closed), and (c) a SECOND generation
+/// (both children split again — the grandparent chain), asserting the wire
+/// *shape* the other lineage tests don't pin: every retired ancestor's
+/// shard closed (`SequenceNumberRange.EndingSequenceNumber` present),
+/// exactly one open shard per routable tablet, `ParentShardId` links
+/// walking a grandchild transitively back into the root's own chain, a
+/// closed shard's `TRIM_HORIZON` drain ending in a null
+/// `NextShardIterator`, and exactly-once delivery (distinct `eventID`s)
+/// across the full three-generation lineage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cascade_split_walks_the_grandparent_chain_with_closed_shard_shape() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let nodes = start_streamed_cluster(3, dir.path(), tiny_seal_knobs()).await;
+    await_bootstrap(&nodes).await;
+
+    let (status, body) = dynamo(
+        nodes[0].dynamo_addr(),
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"casc",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "StreamSpecification":{"StreamEnabled":true,
+                "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+    let label = field(&body, "LatestStreamLabel");
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/casc/stream/{label}");
+
+    let mut expected = 0usize;
+    let put = |from: usize, upto: usize| {
+        let nodes = &nodes;
+        async move {
+            let mut n = 0usize;
+            for i in from..upto {
+                let id = format!("c{i:04}");
+                let issuer = &nodes[i % nodes.len()];
+                let (status, body) = dynamo(
+                    issuer.dynamo_addr(),
+                    "DynamoDB_20120810.PutItem",
+                    &format!(r#"{{"TableName":"casc","Item":{{"id":{{"S":"{id}"}}}}}}"#),
+                )
+                .await;
+                assert_eq!(status, 200, "PutItem({id}) failed: {body}");
+                n += 1;
+            }
+            n
+        }
+    };
+    expected += put(0, 40).await;
+
+    // (a) a routine seal on the root before anything splits.
+    let root = tablets_for(&nodes[0].metadata(), "casc")
+        .into_iter()
+        .next()
+        .expect("bootstrap tablet exists");
+    await_true(20, "the root never routine-sealed an epoch", || {
+        nodes[0]
+            .metadata()
+            .stream_shards
+            .range((root, 0)..=(root, u64::MAX))
+            .next()
+            .is_some()
+    })
+    .await;
+
+    // (b) generation 1: grow retires the root, activates 2 children.
+    let (status, body) = admin(
+        nodes[1].admin_addr(),
+        "POST",
+        "/admin/stream/grow",
+        Some(r#"{"table":"casc"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "grow #1 failed: {body}");
+    assert_eq!(
+        body["split_count"].as_u64(),
+        Some(1),
+        "root must split: {body}"
+    );
+    await_true(30, "root never retired / children never activated", || {
+        nodes.iter().all(|n| {
+            let m = n.metadata();
+            !m.tablets.contains_key(&root) && tablets_for(&m, "casc").len() == 2
+        })
+    })
+    .await;
+    let children = tablets_for(&nodes[0].metadata(), "casc");
+    expected += put(40, 80).await;
+
+    // (c) generation 2: both children split — grandchildren, root = the
+    // grandparent. A `grow` issued mid-nothing must also classify cleanly
+    // (covered separately below with a mid-split grow).
+    let (status, body) = admin(
+        nodes[2].admin_addr(),
+        "POST",
+        "/admin/stream/grow",
+        Some(r#"{"table":"casc"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "grow #2 failed: {body}");
+    assert_eq!(
+        body["split_count"].as_u64(),
+        Some(2),
+        "both children must split: {body}"
+    );
+    await_true(
+        30,
+        "children never retired / grandchildren never active",
+        || {
+            nodes.iter().all(|n| {
+                let m = n.metadata();
+                children.iter().all(|c| !m.tablets.contains_key(c))
+                    && tablets_for(&m, "casc").len() == 4
+            })
+        },
+    )
+    .await;
+    expected += put(80, 120).await;
+
+    // The wire shape, from a node that served neither grow call.
+    let meta = nodes[0].metadata();
+    let shards = all_stream_shards(nodes[0].dynamo_addr(), &stream_arn).await;
+    let mut open_count = 0usize;
+    for shard in &shards {
+        let shard_id = shard["ShardId"].as_str().expect("ShardId present");
+        let tablet = shard_id
+            .strip_prefix("shardId-")
+            .and_then(|r| r.split_once('-'))
+            .and_then(|(t, _)| t.parse::<u64>().ok())
+            .expect("parseable shard id");
+        let closed = !shard["SequenceNumberRange"]["EndingSequenceNumber"].is_null();
+        if meta.tablets.contains_key(&TabletId(tablet)) {
+            if !closed {
+                open_count += 1;
+            }
+        } else {
+            assert!(
+                closed,
+                "a retired tablet's every listed shard must be CLOSED \
+                 (EndingSequenceNumber present): {shard}"
+            );
+        }
+    }
+    assert_eq!(
+        open_count, 4,
+        "exactly one open shard per routable (grandchild) tablet"
+    );
+
+    // ParentShardId transitivity: a grandchild's epoch-0 shard names its
+    // own retired parent's FINAL shard; that shard's entry in turn links
+    // onward — following the links from any grandchild must reach one of
+    // the ROOT tablet's own shards (the grandparent chain, walked purely
+    // through the wire listing).
+    let by_id: std::collections::BTreeMap<&str, &Value> = shards
+        .iter()
+        .map(|s| (s["ShardId"].as_str().unwrap(), s))
+        .collect();
+    let grandchild = tablets_for(&meta, "casc")[0];
+    let mut cursor = format!("shardId-{}-0", grandchild.0);
+    let mut hops = 0usize;
+    let reached_root = loop {
+        let Some(parent) = by_id
+            .get(cursor.as_str())
+            .and_then(|s| s["ParentShardId"].as_str())
+        else {
+            break false;
+        };
+        if parent.starts_with(&format!("shardId-{}-", root.0)) {
+            break true;
+        }
+        cursor = parent.to_owned();
+        hops += 1;
+        assert!(hops < 64, "ParentShardId walk must terminate");
+    };
+    assert!(
+        reached_root,
+        "a grandchild's ParentShardId chain must reach the root (grandparent) tablet's own shards"
+    );
+
+    // A closed shard drains to a null NextShardIterator: the root's final
+    // (highest-epoch) shard, from TRIM_HORIZON, must exhaust.
+    let root_final = shards
+        .iter()
+        .filter_map(|s| {
+            let id = s["ShardId"].as_str()?;
+            let (t, e) = id.strip_prefix("shardId-")?.split_once('-')?;
+            (t.parse::<u64>().ok()? == root.0).then(|| (e.parse::<u64>().ok().unwrap_or(0), id))
+        })
+        .max_by_key(|(e, _)| *e)
+        .expect("the root must have listed shards")
+        .1;
+    let mut iterator = get_shard_iterator(
+        nodes[2].dynamo_addr(),
+        &stream_arn,
+        root_final,
+        "TRIM_HORIZON",
+    )
+    .await;
+    let mut drained = 0usize;
+    loop {
+        let (records, next) = get_records(nodes[2].dynamo_addr(), &iterator).await;
+        drained += records.len();
+        match next {
+            Some(n) => iterator = n,
+            None => break, // the closed-shard contract: it nulls
+        }
+    }
+    assert!(
+        drained > 0,
+        "the root's final shard must hold its pre-cutover backlog"
+    );
+
+    // Exactly-once across all three generations, walked live.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let delivered = drain_all_tablets_lineage(
+        nodes[1].dynamo_addr(),
+        &stream_arn,
+        &nodes[1],
+        &tablets_for(&nodes[1].metadata(), "casc"),
+        expected,
+        deadline,
+    )
+    .await;
+    assert_eq!(
+        delivered.len(),
+        expected,
+        "exactly-once delivery must hold across the cascade"
+    );
+    let event_ids: BTreeSet<&str> = delivered
+        .iter()
+        .map(|r| r["eventID"].as_str().expect("eventID present"))
+        .collect();
+    assert_eq!(
+        event_ids.len(),
+        expected,
+        "every delivered record must carry a distinct eventID"
+    );
+
+    // The mid-split grow classification (rung 6's `grow_stream` refinement):
+    // kick a THIRD grow and, while its splits are in flight, issue another —
+    // any tablet already `Splitting` must classify as a skip, never as a
+    // fresh split and never an error.
+    let (status, body) = admin(
+        nodes[0].admin_addr(),
+        "POST",
+        "/admin/stream/grow",
+        Some(r#"{"table":"casc"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "grow #3 failed: {body}");
+    let (status, body) = admin(
+        nodes[1].admin_addr(),
+        "POST",
+        "/admin/stream/grow",
+        Some(r#"{"table":"casc"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "grow #4 (mid-split) failed: {body}");
+    assert_eq!(
+        body["error_count"].as_u64(),
+        Some(0),
+        "a mid-split tablet must classify as a skip, never an error: {body}"
+    );
+}

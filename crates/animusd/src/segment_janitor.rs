@@ -211,8 +211,22 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
         // row itself stays (still correctly `expired`, so already invisible
         // to `DescribeStream`'s enumeration and to phase 2's repair) until
         // either the tablet seals past it (no longer the max) or the tablet
-        // itself is gone (dropped — nothing will ever derive an epoch for
-        // it again).
+        // itself is gone from the map — which since ADR 0050 means either
+        // **dropped** (table gone) or **retired** (a copy-based split's
+        // cutover removed it, Train B rung 5). Both are safe for the same
+        // structural reason: every epoch-deriving site (the sealer's
+        // `next_epoch`, `dynamo_streams::current_open_epoch`, this module's
+        // own open-epoch orphan sweep) only ever runs for a tablet present
+        // in `meta.tablets`, and a retired parent's chain is *closed* — its
+        // final shard was sealed before `CutoverSplit` could apply, its
+        // children's epoch-0 `ParentShardId` reads the FROZEN
+        // `split_lineage` row (never this catalog row), and no group for it
+        // exists anywhere to seal again. A retired parent's rows therefore
+        // expire by **ordinary retention** exactly like any sealed shard —
+        // phase 1's mark step keys the drop-table retention-zero rule on
+        // the TABLE's schema (`table_schema`), never on tablet presence, so
+        // retirement (table still live via the children) neither pins the
+        // final shard forever nor reaps it early.
         let is_tablet_max = meta
             .stream_shards
             .range((*tablet, epoch + 1)..=(*tablet, u64::MAX))
@@ -456,7 +470,13 @@ async fn reap_orphans(store: &crate::SegmentStoreHandle, meta: &Metadata, now_ms
         }
     }
 
-    // (b) Open epochs on a live, streamed tablet: age-gated.
+    // (b) Open epochs on a live, streamed tablet: age-gated. Deliberately
+    // iterates `meta.tablets` (live tablets only): a RETIRED tablet (ADR
+    // 0050 cutover-removed split parent) has no open epoch to sweep — its
+    // chain closed with the pre-cutover final seal, so any losing seal
+    // attempt's orphan sits at an epoch that IS cataloged and is reaped by
+    // sub-case (a) above, which iterates catalog rows and needs no tablet
+    // liveness at all.
     for (tablet, t) in meta.tablets.iter() {
         let Some(table) = t.table.as_deref() else {
             continue;

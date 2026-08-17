@@ -63,6 +63,12 @@ reason (see each file's own entry below).
   `stream_shards` catalog. The module's own 80-line `//!` doc has the full
   design (including the load-bearing epoch-derivation guard and the
   convergent drop-table cascade); see also `docs/streams-notes.md`.
+  **Retired-tablet rule (ADR 0050 rung 6)**: a cutover-removed split
+  parent's shards expire by ORDINARY retention — the drop-table
+  retention-zero rule keys on the table's *schema* (still live via the
+  children), never tablet presence, and the max-epoch pin applies to live
+  tablets only (a retired chain can never seal again) — both halves
+  red-proven in `tests/stream_janitor.rs::retired_parents_*`.
 - **`index_backfill.rs`** (ADR 0045 §4) — the secondary-index
   **backfill-completion aggregator**: another control-plane-**leader**-only
   background loop (`index_backfill_loop`), same self-gating idiom as
@@ -546,8 +552,11 @@ byte-weighted median in one action (`ClientCtx::grow_stream` →
 led by a different node than the one serving the admin request is reached
 via the internal, relayable `ClientRequest::TriggerAutoSplit` RPC (mirrors
 `ForceSeal`'s shape — addressed by tablet id, refused bare, handled only in
-`cp_serve_forwarded`). A per-tablet skip (Fork E's single-token limit, or
-an empty/singleton tablet) is reported in that tablet's own response entry,
+`cp_serve_forwarded`). A per-tablet skip (Fork E's single-token limit, an
+empty/singleton tablet, or — since ADR 0050 rung 6 — a mid-split tablet:
+a `Splitting` parent or `Building` child classifies up front as
+`STREAM_GROW_MID_SPLIT`, never routed to and never miscounted as a split
+this call performed) is reported in that tablet's own response entry,
 never escalated into a whole-call failure. `animus admin stream-grow
 <admin-addr> <table>` is the CLI form.
 

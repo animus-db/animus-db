@@ -279,8 +279,16 @@ The Accord-targeted suite exercises `check_cycles` under contention:
   `kill_sealing_leader`, `store_outage_then_heal`, `disable_grace_drain`;
   the five zero-copy-split cells — `split_mid_stream`, the #216/#220
   regressions, `combined_chaos` — died in ADR 0050 Train B rung 2 with the
-  in-place lineage they modeled, see the file's tombstone; copy-based
-  split lineage cells replace them in the cutover rungs) plus a
+  in-place lineage they modeled, see the file's tombstone; their
+  copy-based successors landed in rung 6: `copy_split_children_born_empty`
+  (sealed history + backlog → final seal → cutover-frozen `split_lineage`
+  → children with EMPTY change logs sealing their own epoch 0,
+  exactly-once across the walk) and
+  `copy_split_endgame_survives_seal_faults` (the final seal crashing
+  between `put` and catalog commit, then a store outage, then healing —
+  the identical epoch lands on retry; the fidelity boundary — the animusd
+  driver itself is `split_build.rs`/`streams_e2e.rs`'s subject — is
+  stated in the cells' own section doc) plus a
   dedicated `durability_invariant_holds_at_every_kill_point` scenario
   (ADR 0042 §9, D9): a scripted seal lifecycle with a modeled crash between
   the segment `put` and the catalog commit, asserting every acked write

@@ -10429,6 +10429,19 @@ fn byte_weighted_median(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
 const STREAM_GROW_NO_SPLIT_POINT: &str =
     "tablet has fewer than 2 distinct keys — no legal interior split point";
 
+/// Expected per-tablet skip [`ClientCtx::grow_stream`] reports for a tablet
+/// already inside the ADR 0050 split workflow — a `Splitting` parent (its
+/// split is already in flight, so this call performs nothing for it) or a
+/// `Building` child (unsplittable until activation). Reported *instead of*
+/// calling [`ClientCtx::grow_stream_tablet`] at all: routing a median read
+/// at a mid-split tablet is wasted work, and `trigger_split`'s own
+/// idempotent `PutOk` for a `Splitting` parent would otherwise be counted
+/// by the admin summary as a split *this call* performed (Train B rung 6;
+/// was rung 3's noted "mid-split cosmetic"). A skip, never a failure —
+/// classified alongside [`STREAM_GROW_NO_SPLIT_POINT`]/
+/// [`SPLIT_KEY_NOT_TOKEN_VIABLE`] by `admin::action_stream_grow`.
+const STREAM_GROW_MID_SPLIT: &str = "tablet is mid-split — its split workflow is already in flight";
+
 /// Materialize `group`'s own live pairs and compute their byte-weighted
 /// median (ADR 0034's [`byte_weighted_median`]) — the same key
 /// `auto_split_loop` computes for a byte-configured cluster, reused here for
@@ -11537,13 +11550,26 @@ impl ClientCtx {
         if meta.table_stream(table).is_none() {
             return Err(format!("table `{table}` has no stream enabled"));
         }
-        let tablets: Vec<TabletId> = meta.tablets_for_table(table).map(|(id, _)| *id).collect();
+        let tablets: Vec<(TabletId, TabletState)> = meta
+            .tablets_for_table(table)
+            .map(|(id, t)| (*id, t.state))
+            .collect();
         if tablets.is_empty() {
             return Err(format!("table `{table}` has no tablets yet"));
         }
         let mut results = Vec::with_capacity(tablets.len());
-        for tablet in tablets {
-            let response = self.grow_stream_tablet(tablet).await;
+        for (tablet, state) in tablets {
+            // A mid-split tablet is classified up front (`STREAM_GROW_MID_
+            // SPLIT`), never routed to: a `Splitting` parent's workflow is
+            // already running (kicking it again is an idempotent no-op that
+            // the summary would miscount as a fresh split), and a `Building`
+            // child refuses splits until activation anyway.
+            let response = match state {
+                TabletState::Active => self.grow_stream_tablet(tablet).await,
+                TabletState::Splitting | TabletState::Building => {
+                    ClientResponse::Error(STREAM_GROW_MID_SPLIT.into())
+                }
+            };
             results.push((tablet, response));
         }
         Ok(results)

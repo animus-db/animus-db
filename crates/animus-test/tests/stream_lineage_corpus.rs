@@ -63,7 +63,7 @@ use animus_cp_data::{KIND_BASE, RaftKvNode, StorageScope, TxnOutcome, TxnWrite, 
 use animus_env::{Env, EnvExt, Nanos, Rng, SegmentStore, nid};
 use animus_sim::{SimEnv, SimSegmentStore, Simulator};
 use animus_storage::MemoryEngine;
-use animus_tablet::{KeyRange, TabletId};
+use animus_tablet::{KeyRange, TabletId, TabletState};
 use futures::executor::block_on;
 use std::sync::{Arc, Mutex};
 
@@ -110,9 +110,12 @@ fn for_each_seed(name: &str, mut body: impl FnMut(u64)) {
 
 // --- tablet-group harness ----------------------------------------------
 
-/// A tablet's 3-replica Raft group, sharing each node's own per-node engine
-/// with every other tablet that node hosts (ADR 0028 — the same "one shared
-/// engine per node" discipline `narrow_scope.rs`/`cross_group_lww.rs` use).
+/// A tablet's 3-replica Raft group. Since ADR 0050 rung 1/2 an engine is
+/// **private to one tablet** (keys are `kind || logical`, no table/tablet
+/// prefix) — so every scenario passes each group its OWN fresh `engines()`
+/// map; two groups sharing one engine would collide byte-identically now
+/// (the pre-pivot "one shared engine per node" comment this replaces
+/// described ADR 0028's world).
 struct Group {
     id: TabletId,
     range: KeyRange,
@@ -1340,5 +1343,348 @@ fn transactional_writes_exactly_once_and_ordered() {
     for_each_seed(
         "transactional_writes_exactly_once_and_ordered",
         scenario_transactional_writes_exactly_once_and_ordered,
+    );
+}
+
+// --- cells 9/10: the copy-based split's lineage (ADR 0050 Train B rung 6) --
+//
+// The successors the rung-2 tombstone above promises: the ZERO-COPY split
+// cells died with `narrow_scope`/the shared engine; these model the
+// COPY-BASED workflow's lineage contract instead — children born with
+// EMPTY change logs, the parent's final seal capturing its entire backlog
+// before cutover, and `split_lineage` frozen at `CutoverSplit` apply.
+//
+// **Fidelity boundary, stated honestly** (the corpus-green-≠-port lesson):
+// the animusd split *driver*'s own sequencing/idempotence is NOT under
+// test here — `animusd/tests/split_build.rs`/`freeze.rs` and the cascade
+// e2e are that gate. What these cells prove at the primitive level, under
+// seed-varied write interleavings, is that the pieces the driver composes
+// (the `BeginSplit`/`CutoverSplit` apply arms, the seal path, the frozen
+// `split_lineage` parent-id derivation, and per-tablet private engines)
+// preserve exactly-once + per-item order across a split — including under
+// a seal-attempt crash and a store outage (cell 10). The parent's freeze
+// is modeled by simply issuing no further writes to it (the `Freeze`
+// command's own refusal mechanics are `animus-cp-data/tests/freeze.rs`'s
+// subject, not lineage's).
+
+/// An exactly-8-byte item key for the split cells: `BeginSplit`'s apply arm
+/// keeps the F11 token-alignment seatbelt for a streamed table (a split key
+/// must sit on its own `TOKEN_BYTES` boundary — ADR 0042 §14), so both the
+/// split key and the keys it partitions use a full-token shape here, unlike
+/// `key`'s shorter 5-byte form the non-split cells keep.
+fn key8(i: usize) -> Vec<u8> {
+    format!("sk{i:06}").into_bytes()
+}
+
+/// One completed copy-based split of `parent_group` at `split_key`,
+/// applied to `meta` the way the driver's endgame does: `BeginSplit` →
+/// (writes already stopped) → the parent's FINAL seal (whole backlog) →
+/// `CutoverSplit`. Returns the two child ids. Panics (naming the seed) if
+/// any step's apply is rejected.
+fn complete_copy_split(
+    meta: &mut Metadata,
+    store: &SimSegmentStore,
+    sim: &mut Simulator,
+    parent_group: &Group,
+    split_key: &[u8],
+    wall_ms: u64,
+    seed: u64,
+) -> (TabletId, TabletId) {
+    let left = meta.next_free_tablet_id();
+    let right = TabletId(left.0 + 1);
+    let replicas: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let epoch = meta.tablets[&parent_group.id].epoch;
+    let outcome = meta.apply(&MetaCommand::BeginSplit {
+        parent: parent_group.id,
+        expected_epoch: epoch,
+        split_key: split_key.to_vec(),
+        children: [(left, replicas.clone()), (right, replicas)],
+    });
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied,
+        "[seed={seed}] BeginSplit must apply"
+    );
+
+    // The parent's final seal: everything still pending, one shard. A
+    // quiet parent (no unsealed backlog) legitimately seals nothing —
+    // the driver's own endgame has the same branch.
+    let leader = elect(sim, parent_group, &[0, 1, 2], seed);
+    let _ = seal_now(meta, store, parent_group, leader, wall_ms, false);
+    let watermark = meta
+        .effective_stream_shard_watermark(parent_group.id)
+        .unwrap_or(0);
+    let still_pending = block_on(parent_group.nodes[leader].pending_changes())
+        .into_iter()
+        .filter_map(|(k, _)| record_hlc_suffix(&k))
+        .any(|hlc| hlc > watermark);
+    assert!(
+        !still_pending,
+        "[seed={seed}] the final seal must leave nothing past the watermark"
+    );
+
+    let epoch = meta.tablets[&parent_group.id].epoch;
+    let outcome = meta.apply(&MetaCommand::CutoverSplit {
+        parent: parent_group.id,
+        expected_epoch: epoch,
+        cutover_wall_ms: wall_ms + 1,
+    });
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied,
+        "[seed={seed}] CutoverSplit must apply"
+    );
+    (left, right)
+}
+
+// --- cell 9: copy_split_children_born_empty ------------------------------
+
+/// The copy-based split's core lineage contract (ADR 0050 / ADR 0043 §A4 as
+/// rewritten): sealed history + an unsealed backlog on the parent → the
+/// parent's final seal captures the whole backlog → cutover freezes
+/// `split_lineage` → both children start with **empty** change logs, seal
+/// their own epoch 0, and the full walk (parent chain, then each child's)
+/// delivers every journaled record exactly once, in per-item order.
+fn scenario_copy_split_children_born_empty(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut meta = base_meta();
+    let parent_engines = engines();
+    let parent = start_group(&sim, &parent_engines, TabletId(7), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let replicas: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let outcome = meta.apply(&MetaCommand::CreateTablet {
+        tablet: TabletId(7),
+        table: Some(TABLE.into()),
+        range: KeyRange::whole(),
+        replicas,
+    });
+    assert_eq!(outcome, ApplyOutcome::Applied, "[seed={seed}] CreateTablet");
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    // Sealed history: a seed-varied batch, routine-sealed as epoch 0.
+    let pre = 2 + (seed % 3) as usize;
+    for i in 0..pre {
+        write_and_journal(
+            &mut sim,
+            &parent,
+            &live,
+            &mut journal,
+            &key8(i),
+            b"v0",
+            seed,
+        );
+    }
+    let leader = elect(&mut sim, &parent, &live, seed);
+    let sealed = seal_now(&mut meta, &store, &parent, leader, 1_000, false);
+    assert_eq!(sealed, Some(0), "[seed={seed}] routine seal of epoch 0");
+
+    // Unsealed backlog, one write transactional (the stage-marker path
+    // rides the same log; its resolve-materialized record must arrive
+    // exactly once through the FINAL seal, not the routine one).
+    for i in 0..pre {
+        write_and_journal(
+            &mut sim,
+            &parent,
+            &live,
+            &mut journal,
+            &key8(i),
+            b"v1",
+            seed,
+        );
+    }
+    write_txn_and_journal(
+        &mut sim,
+        &parent,
+        &live,
+        &mut journal,
+        &txn_key(0),
+        b"t1",
+        seed,
+    );
+
+    let (left_id, right_id) = complete_copy_split(
+        &mut meta,
+        &store,
+        &mut sim,
+        &parent,
+        b"sk000002",
+        2_000,
+        seed,
+    );
+
+    // The lineage is frozen at cutover: both children's epoch-0 parent is
+    // the parent's FINAL sealed shard, the parent is gone from the map,
+    // and the children are Active.
+    let final_epoch = meta
+        .stream_shards
+        .range((TabletId(7), 0)..=(TabletId(7), u64::MAX))
+        .next_back()
+        .map(|((_, e), _)| *e)
+        .expect("parent must have sealed shards");
+    let expected_parent = segment::shard_id(7, final_epoch);
+    for child in [left_id, right_id] {
+        assert_eq!(
+            meta.stream_shard_parent_id(child, 0).as_deref(),
+            Some(expected_parent.as_str()),
+            "[seed={seed}] child {child:?} epoch-0 lineage must be the parent's final shard"
+        );
+        assert_eq!(
+            meta.tablets[&child].state,
+            TabletState::Active,
+            "[seed={seed}] cutover must activate the children"
+        );
+    }
+    assert!(
+        !meta.tablets.contains_key(&TabletId(7)),
+        "[seed={seed}] cutover must remove the parent"
+    );
+
+    // Children: PRIVATE empty engines (per-tablet storage), empty change
+    // logs — nothing inherited, the tombstone's own named property.
+    let left_engines = engines();
+    let right_engines = engines();
+    let left = start_group(
+        &sim,
+        &left_engines,
+        left_id,
+        KeyRange::new(Vec::new(), Some(b"sk000002".to_vec())),
+    );
+    let right = start_group(
+        &sim,
+        &right_engines,
+        right_id,
+        KeyRange::new(b"sk000002".to_vec(), None),
+    );
+    sim.run_for(Duration::from_secs(2));
+    for (child, name) in [(&left, "left"), (&right, "right")] {
+        let l = elect(&mut sim, child, &live, seed);
+        assert!(
+            block_on(child.nodes[l].pending_changes()).is_empty(),
+            "[seed={seed}] the {name} child must be born with an EMPTY change log"
+        );
+    }
+
+    // Post-cutover writes route by range; each child seals its own epoch 0.
+    write_and_journal(&mut sim, &left, &live, &mut journal, &key8(0), b"v2", seed);
+    write_and_journal(&mut sim, &right, &live, &mut journal, &key8(3), b"v2", seed);
+    let ll = elect(&mut sim, &left, &live, seed);
+    let rl = elect(&mut sim, &right, &live, seed);
+    assert_eq!(
+        seal_now(&mut meta, &store, &left, ll, 3_000, false),
+        Some(0),
+        "[seed={seed}] the left child's first seal must be its own epoch 0"
+    );
+    assert_eq!(
+        seal_now(&mut meta, &store, &right, rl, 3_000, false),
+        Some(0),
+        "[seed={seed}] the right child's first seal must be its own epoch 0"
+    );
+
+    verify_lineage(
+        &meta,
+        &store,
+        &[(&parent, leader), (&left, ll), (&right, rl)],
+        &journal,
+        seed,
+    );
+}
+
+#[test]
+fn copy_split_children_born_empty() {
+    for_each_seed(
+        "copy_split_children_born_empty",
+        scenario_copy_split_children_born_empty,
+    );
+}
+
+// --- cell 10: copy_split_endgame_survives_seal_crash_and_outage ----------
+
+/// The driver endgame's fault surface at the primitive level: the parent's
+/// final seal first "crashes" between the segment `put` and the catalog
+/// commit (`skip_commit` — the D9 kill point), then retries into a store
+/// outage, then heals and lands. Cutover only after the successful seal;
+/// exactly-once must hold across the whole ordeal (the retried seal
+/// recomputes the identical epoch; the orphaned first `put` is invisible
+/// to the walk — reaped in production by the segment janitor's sub-case
+/// (a), which needs no tablet liveness).
+fn scenario_copy_split_endgame_survives_seal_faults(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut meta = base_meta();
+    let parent_engines = engines();
+    let parent = start_group(&sim, &parent_engines, TabletId(9), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let replicas: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let outcome = meta.apply(&MetaCommand::CreateTablet {
+        tablet: TabletId(9),
+        table: Some(TABLE.into()),
+        range: KeyRange::whole(),
+        replicas: replicas.clone(),
+    });
+    assert_eq!(outcome, ApplyOutcome::Applied, "[seed={seed}] CreateTablet");
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+    let n = 2 + (seed % 4) as usize;
+    for i in 0..n {
+        write_and_journal(&mut sim, &parent, &live, &mut journal, &key8(i), b"w", seed);
+    }
+
+    // BeginSplit lands; the final seal's first attempt crashes after the
+    // `put` (no catalog row), the second hits an outage, the third lands.
+    let left_id = meta.next_free_tablet_id();
+    let right_id = TabletId(left_id.0 + 1);
+    let epoch = meta.tablets[&TabletId(9)].epoch;
+    let outcome = meta.apply(&MetaCommand::BeginSplit {
+        parent: TabletId(9),
+        expected_epoch: epoch,
+        split_key: b"sk000001".to_vec(),
+        children: [(left_id, replicas.clone()), (right_id, replicas)],
+    });
+    assert_eq!(outcome, ApplyOutcome::Applied, "[seed={seed}] BeginSplit");
+
+    let leader = elect(&mut sim, &parent, &live, seed);
+    assert_eq!(
+        seal_now(&mut meta, &store, &parent, leader, 1_000, true),
+        None,
+        "[seed={seed}] the crashed attempt must commit nothing"
+    );
+    store.set_unavailable_until(Nanos(u64::MAX));
+    assert_eq!(
+        seal_now(&mut meta, &store, &parent, leader, 1_100, false),
+        None,
+        "[seed={seed}] the outage attempt must commit nothing"
+    );
+    store.clear_unavailable();
+    assert_eq!(
+        seal_now(&mut meta, &store, &parent, leader, 1_200, false),
+        Some(0),
+        "[seed={seed}] the healed retry must land the identical epoch"
+    );
+
+    let epoch = meta.tablets[&TabletId(9)].epoch;
+    let outcome = meta.apply(&MetaCommand::CutoverSplit {
+        parent: TabletId(9),
+        expected_epoch: epoch,
+        cutover_wall_ms: 1_300,
+    });
+    assert_eq!(outcome, ApplyOutcome::Applied, "[seed={seed}] CutoverSplit");
+    assert_eq!(
+        meta.stream_shard_parent_id(left_id, 0).as_deref(),
+        Some(segment::shard_id(9, 0).as_str()),
+        "[seed={seed}] the frozen lineage must name the retried seal's shard"
+    );
+
+    verify_lineage(&meta, &store, &[(&parent, leader)], &journal, seed);
+}
+
+#[test]
+fn copy_split_endgame_survives_seal_faults() {
+    for_each_seed(
+        "copy_split_endgame_survives_seal_faults",
+        scenario_copy_split_endgame_survives_seal_faults,
     );
 }
