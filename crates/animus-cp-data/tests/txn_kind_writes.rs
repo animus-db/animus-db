@@ -10,17 +10,24 @@
 //! This is the primitive-level suite for the mechanism itself; the wire
 //! edge (participant-leader evaluation, `run_transact`'s rejection removal)
 //! is `animusd`'s PR2, and corpus depth is PR3's `txn_serializable.rs`
-//! extension.
+//! extension. It also pins the issue-#266 residual-window interleaving (a
+//! conditioned `KindBatch` — the U3 funnel's artifact — racing the
+//! stage→resolve window of a transactional write of the same item; see
+//! `a_conditioned_kind_batch_racing_the_stage_resolve_window_never_orphans_
+//! an_lsi_row`); the cross-node wire-level twin is `animusd`'s
+//! `dynamo_index_writes.rs`.
 //!
 //! Deterministic and seed-reproducible (ADR 0003): drive with `run_for`,
 //! never `run()` (the driver has perpetual heartbeat/election timers).
 
 use std::time::Duration;
 
-use animus_cp_data::{KIND_CHANGE, KIND_LSI, RaftKvNode, StorageScope, TxnOutcome, TxnWrite, hlc};
+use animus_cp_data::{
+    KIND_BASE, KIND_CHANGE, KIND_LSI, RaftKvNode, StorageScope, TxnOutcome, TxnWrite, hlc,
+};
 use animus_env::{EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
-use animus_storage::MemoryEngine;
+use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{KeyRange, escape, partition_token};
 use futures::executor::block_on;
 
@@ -382,6 +389,197 @@ fn leader_kill_between_stage_and_resolve_recovers_from_the_intent_alone() {
         Some(b"change-record".to_vec()),
         "recovered resolve must still materialize the change record (seed={seed})"
     );
+}
+
+/// **The issue-#266 residual-window interleaving, pinned**: a
+/// non-transactional evaluate-at-leader write (ADR 0046 U3 — modeled here
+/// as its literal proposed artifact, a conditioned `KindBatch` carrying the
+/// old bytes its evaluator read plus the LSI diff derived from them) lands
+/// inside the stage→resolve window of a transactional write of the SAME
+/// item. The seatbelt's unresolved-intent arm (`KvCommand::KindBatch`'s
+/// conditions check: an intent is never a match) must no-op the WHOLE stale
+/// batch — the one arm `tests/kind_batch_conditions.rs`'s committed-value
+/// scenarios never reach, and exactly the guard that keeps the funnel
+/// write's stale diff (delete `row-v0` / put `row-v2`) from landing between
+/// the stage and the resolve; were it admitted, the resolve's own
+/// materialization (delete `row-v0` / put `row-v1`, from the intent alone,
+/// pushed by a `txn_resolver_loop` that never takes `rmw_lock`) would then
+/// re-derive against a base the batch already moved, leaving an LSI row
+/// orphaned forever (nothing reconciles a stale LSI row; only the GSI
+/// drain self-heals). After the resolve, the funnel caller's re-evaluated
+/// retry (fresh old bytes, fresh diff) applies cleanly — ending on the
+/// invariant the whole mechanism exists to keep: exactly one live LSI row,
+/// derived from the base row's own current value.
+#[test]
+fn a_conditioned_kind_batch_racing_the_stage_resolve_window_never_orphans_an_lsi_row() {
+    let seed = 0x0266_0001;
+    let (mut sim, node) = group(seed);
+    sim.run_for(ELECT);
+
+    let pk = b"heidi";
+    let base = logical(pk, b"");
+    let lsi_v0 = logical(pk, b"\x01alt-v0");
+    let lsi_v1 = logical(pk, b"\x01alt-v1");
+    let lsi_v2 = logical(pk, b"\x01alt-v2");
+
+    // The committed starting state a real indexed item has: a base value
+    // plus its one derived LSI row, written atomically.
+    assert!(matches!(
+        node.put_kind_batch(
+            vec![
+                (KIND_BASE, base.clone(), Some(b"v0".to_vec())),
+                (KIND_LSI, lsi_v0.clone(), Some(b"row-v0".to_vec())),
+            ],
+            Vec::new(),
+        ),
+        animus_control::ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(SETTLE);
+
+    // The transactional write stages v0 → v1: its leader-side eval's LSI
+    // diff rides opaque inside the intent, and the C1 mandatory own-key OCC
+    // condition carries the exact bytes that eval read.
+    let write = TxnWrite {
+        key: base.clone(),
+        value: Some(b"v1".to_vec()),
+        kind_writes: vec![
+            (KIND_LSI, lsi_v0.clone(), None),
+            (KIND_LSI, lsi_v1.clone(), Some(b"row-v1".to_vec())),
+        ],
+        change_log: None,
+        stage_marker: None,
+    };
+    let n = node.clone();
+    let base_c = base.clone();
+    let (txn_id, record_key, outcome) = drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_stage_anchor(
+            TABLE,
+            vec![write],
+            Vec::new(),
+            vec![(base_c, Some(b"v0".to_vec()))],
+        )
+        .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("txn_stage_anchor did not complete (seed={seed})"));
+    assert_eq!(outcome, animus_cp_data::StageOutcome::Staged);
+
+    // The racing non-transactional write of the same item: its evaluator
+    // read v0 (before the stage applied — the eval-to-apply gap `rmw_lock`
+    // does not cover), so its batch carries the v0 seatbelt and the
+    // v0-derived stale diff, and applies while the key holds the unresolved
+    // intent.
+    assert!(matches!(
+        node.put_kind_batch_conditioned(
+            vec![
+                (KIND_BASE, base.clone(), Some(b"v2".to_vec())),
+                (KIND_LSI, lsi_v0.clone(), None),
+                (KIND_LSI, lsi_v2.clone(), Some(b"row-v2".to_vec())),
+            ],
+            Vec::new(),
+            vec![(base.clone(), Some(b"v0".to_vec()))],
+        ),
+        animus_control::ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(SETTLE);
+
+    // Whole-or-nothing: the intent still stands on the base key, and
+    // neither half of the stale diff landed.
+    let raw_base = block_on(node.storage().get(&node.physical_key(KIND_BASE, &base)))
+        .expect("engine read ok")
+        .expect("base key must still exist")
+        .value;
+    assert_eq!(
+        raw_base.first().copied(),
+        Some(1u8),
+        "the base key must still hold the unresolved intent envelope — the stale batch must \
+         not have overwritten it (seed={seed})"
+    );
+    assert_eq!(
+        block_on(node.local_get_kind(KIND_LSI, &lsi_v0)),
+        Some(b"row-v0".to_vec()),
+        "the stale batch's LSI delete must not have landed (seed={seed})"
+    );
+    assert_eq!(
+        block_on(node.local_get_kind(KIND_LSI, &lsi_v2)),
+        None,
+        "the stale batch's LSI put must not have landed (seed={seed})"
+    );
+
+    // Commit, then resolve — as the coordinator's own push or
+    // `txn_resolver_loop`'s recovery push equally would (the resolver knows
+    // only `(txn_id, record_key, keys, outcome)`; the diff comes from the
+    // intent on the key itself). The base rewrite and the LSI
+    // materialization land in ONE entry.
+    let n = node.clone();
+    let (txn_id_c, record_key_c) = (txn_id.clone(), record_key.clone());
+    let commit_ts = drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_commit_at_least(txn_id_c, record_key_c, txn_id.ts)
+            .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("commit did not complete (seed={seed})"));
+    let n = node.clone();
+    let (txn_id_r, record_key_r, base_r) = (txn_id.clone(), record_key.clone(), base.clone());
+    drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_resolve(
+            txn_id_r,
+            record_key_r,
+            vec![base_r],
+            TxnOutcome::Committed { commit_ts },
+        )
+        .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("resolve did not complete (seed={seed})"));
+
+    assert_eq!(
+        block_on(node.local_get(&base)),
+        Some(b"v1".to_vec()),
+        "the transaction's own value must be the committed base (seed={seed})"
+    );
+    assert_eq!(
+        block_on(node.local_get_kind(KIND_LSI, &lsi_v0)),
+        None,
+        "the resolve's materialized delete must have removed the v0 row (seed={seed})"
+    );
+    assert_eq!(
+        block_on(node.local_get_kind(KIND_LSI, &lsi_v1)),
+        Some(b"row-v1".to_vec()),
+        "the resolve must have materialized the v1 row (seed={seed})"
+    );
+
+    // The funnel caller's retry, re-evaluated against the NOW-committed v1
+    // (fresh seatbelt, fresh diff — exactly what a real
+    // `kind_write_item_at_leader` caller's retry recomputes), applies
+    // cleanly.
+    assert!(matches!(
+        node.put_kind_batch_conditioned(
+            vec![
+                (KIND_BASE, base.clone(), Some(b"v2".to_vec())),
+                (KIND_LSI, lsi_v1.clone(), None),
+                (KIND_LSI, lsi_v2.clone(), Some(b"row-v2".to_vec())),
+            ],
+            Vec::new(),
+            vec![(base.clone(), Some(b"v1".to_vec()))],
+        ),
+        animus_control::ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(SETTLE);
+
+    assert_eq!(block_on(node.local_get(&base)), Some(b"v2".to_vec()));
+    for (row, expect, label) in [
+        (&lsi_v0, None, "v0"),
+        (&lsi_v1, None, "v1"),
+        (&lsi_v2, Some(b"row-v2".to_vec()), "v2"),
+    ] {
+        assert_eq!(
+            block_on(node.local_get_kind(KIND_LSI, row)),
+            expect,
+            "after the full interleaving, exactly one live LSI row (v2) may remain — \
+             {label} disagrees (seed={seed})"
+        );
+    }
 }
 
 // TOMBSTONE (ADR 0050 Train B rung 2): two cells died here with the

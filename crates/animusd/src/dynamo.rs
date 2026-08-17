@@ -2744,10 +2744,16 @@ pub(crate) enum KindWriteOutcome {
 /// compared byte-for-byte at apply. `rmw_lock` above already serializes
 /// every write of this item that goes through *this* function, but a
 /// `txn_resolver_loop` recovery push resolving a transaction's intent on
-/// this same key never takes that lock — unreachable today (transactions
-/// are rejected outright on an indexed/streamed table) but real the moment
-/// a future transaction stack lifts that restriction, and this field is
-/// exactly the mechanism that stack will also need. A failed seatbelt
+/// this same key never takes that lock — **live, not hypothetical, since
+/// the `TxnStage` kind-writes stack (ADR 0046 A1/U3, 2026-08-16) let
+/// `TransactWriteItems` participate on indexed/streamed tables**: an
+/// unresolved intent on the base key fails this condition outright (never
+/// a guessed match), so a diff computed against a pre-stage read can never
+/// land astride the stage→resolve window and orphan an LSI row (issue
+/// #266's verified interleaving — pinned by `animus-cp-data`'s
+/// `txn_kind_writes.rs::a_conditioned_kind_batch_racing_the_stage_resolve_
+/// window_never_orphans_an_lsi_row` and this crate's
+/// `dynamo_index_writes.rs` cross-node mixed hammer). A failed seatbelt
 /// no-ops the whole `KindBatch` silently, indistinguishable from a fence
 /// miss — `ClientCtx::cp_kind_local`'s own probe-poll times out with the
 /// same generic error every other silent no-op produces (deliberately no
