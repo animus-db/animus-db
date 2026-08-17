@@ -16,11 +16,13 @@ gone. Streams implementation notes: [`docs/streams-notes.md`](../../docs/streams
 
 **`lib.rs` is ~6800 lines** — grep for the symbol, don't scroll. It also holds
 in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
-can't reach — e.g. `auto_split_median_tests` (`split_fence_tests` and
-`hot_read_latch_tests` were deleted with their fence/latch subjects in the
-ADR 0050 Train B rung-7 sweep). `index_drain.rs` has a third, `gsi_drain_cursor_tests`, and
-`dynamo.rs` a fourth, `stream_write_path_tests` (ADR 0042), for the same
-reason (see each file's own entry below).
+can't reach — e.g. `auto_split_median_tests` and `confirm_futility_tests`
+(issue #268 — the confirm-loop fast-fail regression, needing a raw
+`CpGroup` + the `pub(crate)` `ClientCtx::cp_kind_local`; `split_fence_tests`
+and `hot_read_latch_tests` were deleted with their fence/latch subjects in
+the ADR 0050 Train B rung-7 sweep). `index_drain.rs` has another,
+`gsi_drain_cursor_tests`, and `dynamo.rs` another, `stream_write_path_tests`
+(ADR 0042), for the same reason (see each file's own entry below).
 
 ## Module map (`src/`)
 
@@ -1241,9 +1243,10 @@ tests that poll with timeouts, not deterministic assertions (this crate has
 no `SimEnv` — it is the assembly/wire layer over the two sim-tested crates
 below it). The restart tests run both incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
-(`auto_split_median_tests`) live in `lib.rs` itself
+(`auto_split_median_tests`, `confirm_futility_tests`) live in `lib.rs` itself
 because they need private handles (a raw `CpGroup`/the private
-`byte_weighted_median` helper) that no external `tests/` file can reach;
+`byte_weighted_median` helper/the `pub(crate)` `ClientCtx::cp_kind_local`)
+that no external `tests/` file can reach;
 `index_drain.rs`'s own `gsi_drain_cursor_tests` is a third (run via `cargo
 test -p animusd --lib`, not the `tests/` tree) — the ADR 0042 §7/§8
 cursor-based drain + trim janitor regressions, needing `CpGroup`'s private
