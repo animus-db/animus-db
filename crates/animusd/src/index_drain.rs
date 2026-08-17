@@ -605,7 +605,24 @@ pub(crate) struct SplitBuild {
     tail_hlc: u64,
     /// Rows shipped so far (observability only).
     rows_shipped: u64,
-    /// `bulk_done` and the latest tail pass found zero new records.
+    /// Post-bulk tail passes that shipped something — the freeze-liveness
+    /// counter behind [`SPLIT_MAX_TAIL_PASSES`].
+    tail_passes: u32,
+    /// The max MVCC version over the copy kinds, captured by a read-only
+    /// pass run strictly BEFORE the bulk scan starts. The final image
+    /// ships only rows above it: apply order == HLC order within one group
+    /// (`assert_ts_monotonic`), so any rewrite the bulk image missed —
+    /// i.e. applied after its row's bulk read, hence after bulk start —
+    /// carries a version above everything applied before bulk start, which
+    /// bounds this floor. Rewrites applied *before* bulk start are in the
+    /// bulk image itself (the scan reads current bytes). Deliberately NOT
+    /// `latest_version()`: the ADR 0018 read-ceiling marker merges at a
+    /// deliberately future-shifted version, which would push the floor
+    /// above genuinely-later user writes. `None` (a driver re-led straight
+    /// into the endgame) falls back to floor 0 — the full image.
+    bulk_version_floor: Option<u64>,
+    /// `bulk_done` and the tail is caught up *or* chased long enough
+    /// ([`SPLIT_MAX_TAIL_PASSES`]) — the rung-8 liveness fix.
     converged: bool,
     /// The endgame step this build last parked at (observability only,
     /// mirrored to `/admin/raftkv`): `"build"` -> `"freeze"` ->
@@ -630,6 +647,14 @@ pub(crate) struct SplitBuild {
 /// child's consensus loop past an election timeout (the ADR 0017
 /// apply-stall lesson) and the JSON-framed forwarded hop stays modest.
 const SEED_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Freeze liveness (rung 8): after this many post-bulk tail passes that
+/// each still found fresh writes, the driver freezes anyway — a
+/// continuously-written parent must not starve its own split forever (see
+/// the convergence check's comment for the full argument). At the 200ms
+/// loop cadence this is ~5s of chasing; the final residue is one tick's
+/// writes, drained post-freeze.
+const SPLIT_MAX_TAIL_PASSES: u32 = 25;
 
 /// The copy kinds (ADR 0050): BASE (values, tombstones, intent envelopes,
 /// txn records), LSI, FOOTPRINT — **never** KIND_CHANGE (a child re-serving
@@ -678,6 +703,18 @@ async fn split_driver_tick(
     if !group.is_frozen() {
         // ---- the build (ADR 0050 stage 2, rung 4) ----
         if !build.bulk_done {
+            // The version-floor pre-pass — see `bulk_version_floor`'s doc.
+            // Must COMPLETE before the bulk scan below starts; capturing
+            // the max from the bulk's own reads instead is unsound (a
+            // mid-scan rewrite can be missed by the scan yet undercut a
+            // later-scanned row's version).
+            let mut floor = 0u64;
+            for kind in SEED_KINDS {
+                for (_, _, ver) in group.seed_rows_kind(kind as usize, None).await {
+                    floor = floor.max(ver);
+                }
+            }
+            build.bulk_version_floor = Some(floor);
             for kind in SEED_KINDS {
                 let rows = group.seed_rows_kind(kind as usize, None).await;
                 for (child, range) in &children {
@@ -692,7 +729,23 @@ async fn split_driver_tick(
             build.bulk_done = true;
         }
         let shipped = tail_pass(ctx, group, &children, build).await?;
-        build.converged = build.bulk_done && !shipped;
+        if shipped {
+            build.tail_passes += 1;
+        }
+        // Converged = caught up (a pass shipped nothing) OR chased long
+        // enough. The bounded-passes arm is a LIVENESS fix, not a
+        // correctness relaxation: rung 8's bench drove a *continuous*
+        // sequential writer against the parent and the build never froze —
+        // every 200ms tick's tail pass found that tick's own fresh writes,
+        // so "zero new records" structurally never fired. A hot tablet is
+        // exactly the one that needs splitting, so after
+        // `SPLIT_MAX_TAIL_PASSES` post-bulk passes the driver freezes
+        // regardless; the post-freeze final drain (over a log the freeze
+        // stops from growing) plus the final image still transfer
+        // everything, unchanged — the residue's size only bounds the write
+        // blip, which is the F8 knob ADR 0050 stage 4 names.
+        build.converged =
+            build.bulk_done && (!shipped || build.tail_passes >= SPLIT_MAX_TAIL_PASSES);
         if build.converged {
             // ---- stage 3 kickoff (rung 5): converged — terminally freeze
             // the parent. Idempotent (a duplicate `Freeze` applies as a
@@ -724,12 +777,13 @@ async fn split_driver_tick(
 
     // 1. Final drain: the identical watermark tail, now over a log that can
     //    no longer grow (the freeze's own log position bounds it). Runs to
-    //    literally zero new records — no lag threshold in v1.
-    let shipped = tail_pass(ctx, group, &children, build).await?;
-    if shipped {
-        build.phase = "final-drain";
-        return Ok(());
-    }
+    //    literally zero new records — no lag threshold. Loops to completion
+    //    WITHIN this tick (rung 8): the frozen log bounds the iteration, and
+    //    every 200ms tick boundary spent between endgame phases is pure
+    //    added write-blip — the bench measured ~3s of blip dominated by
+    //    phase-per-tick progression before this fall-through.
+    build.phase = "final-drain";
+    while tail_pass(ctx, group, &children, build).await? {}
 
     // 1b. The FINAL IMAGE: one full re-scan ship of the frozen parent —
     //     the freeze's log position defines the final state, and this
@@ -756,12 +810,20 @@ async fn split_driver_tick(
         return Ok(());
     }
     if !build.final_image_done {
+        // Rung 8: filtered by the pre-bulk version floor — only rows
+        // rewritten since the bulk began ship here (the signal-less
+        // decision/resolve class included, by the floor's monotonicity
+        // argument). The unfiltered image (floor 0) was measured at ~2s of
+        // extra write blip on a 2,000-row table and scales with table
+        // size; the filtered residue scales with the build-window write
+        // rate instead.
+        let floor = build.bulk_version_floor.unwrap_or(0);
         for kind in SEED_KINDS {
             let rows = group.seed_rows_kind(kind as usize, None).await;
             for (child, range) in &children {
                 let child_rows: Vec<_> = rows
                     .iter()
-                    .filter(|(logical, _, _)| range.contains(logical))
+                    .filter(|(logical, _, ver)| *ver > floor && range.contains(logical))
                     .map(|(l, v, ver)| (kind, l.clone(), v.clone(), *ver))
                     .collect();
                 ship(ctx, *child, child_rows, &mut build.rows_shipped).await?;
@@ -769,7 +831,8 @@ async fn split_driver_tick(
         }
         build.final_image_done = true;
         build.phase = "final-image";
-        return Ok(());
+        // Fall through (rung 8): the image is shipped and durable on the
+        // children; nothing below needs a tick boundary to become true.
     }
 
     let table = parent.table.clone().unwrap_or_default();
@@ -780,12 +843,11 @@ async fn split_driver_tick(
     //    walks on), just with no size/age gate. The parent is frozen and
     //    drained, so one seal covers everything; a tick that sealed
     //    something re-checks next tick and finds nothing left.
-    if !table.is_empty()
-        && meta.table_stream(&table).is_some()
-        && seal_now(ctx, &table, tablet, group).await?.is_some()
-    {
+    if !table.is_empty() && meta.table_stream(&table).is_some() {
+        // Loop within the tick (rung 8): the drained, frozen log means at
+        // most one real seal plus one nothing-left re-check.
         build.phase = "final-seal";
-        return Ok(());
+        while seal_now(ctx, &table, tablet, group).await?.is_some() {}
     }
 
     // 3a. GSI-drain veto (stage 3): the drain must have consumed the
