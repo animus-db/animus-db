@@ -166,3 +166,52 @@ fn replan_is_a_noop_when_the_set_still_satisfies_the_policy() {
     let again = replan(&current, &pool, &policy).unwrap();
     assert_eq!(again, current);
 }
+
+/// ADR 0050 fork F5 (`select_replicas_balanced`): fresh placement prefers
+/// the least-loaded eligible nodes under the same hard constraints as
+/// `select_replicas`, ties broken by node id, deterministic; a node absent
+/// from the load map counts as zero (a fresh member is a genuine minimum).
+#[test]
+fn balanced_selection_prefers_least_loaded_within_policy() {
+    use animus_placement::select_replicas_balanced;
+
+    let pool = eu_pool();
+    let policy = PlacementPolicy::simple("p", 2).require_label("region", "eu");
+    // Heavy load on 10 and 12; 11 and 13 idle (13 absent from the map).
+    let load: BTreeMap<NodeId, usize> = [(nid(10), 5), (nid(12), 4), (nid(11), 0)]
+        .into_iter()
+        .collect();
+    let chosen = select_replicas_balanced(&pool, &policy, &load).unwrap();
+    assert_eq!(chosen, vec![nid(11), nid(13)], "the two idle eu nodes");
+
+    // Spread still binds: strict zone spread forces distinct zones even if
+    // the two least-loaded nodes share one.
+    let policy = PlacementPolicy::simple("p", 2)
+        .require_label("region", "eu")
+        .spread_across("zone", true);
+    let load: BTreeMap<NodeId, usize> = [(nid(12), 5), (nid(13), 5)].into_iter().collect();
+    // Least-loaded are 10 and 11 — both zone "a"; strict spread must pull
+    // in a loaded node from another zone instead of doubling up.
+    let chosen = select_replicas_balanced(&pool, &policy, &load).unwrap();
+    let z = zones_of(&chosen, &pool);
+    assert_eq!(z.len(), 2);
+    assert_ne!(z[0], z[1], "strict spread beats load preference");
+    assert!(
+        chosen.contains(&nid(10)),
+        "least-loaded zone-a node still first"
+    );
+
+    // Deterministic under repetition and equal load: ties break by node id.
+    let even: BTreeMap<NodeId, usize> = BTreeMap::new();
+    let eu3 = PlacementPolicy::simple("p", 3).require_label("region", "eu");
+    let a = select_replicas_balanced(&pool, &eu3, &even).unwrap();
+    let b = select_replicas_balanced(&pool, &eu3, &even).unwrap();
+    assert_eq!(a, b);
+
+    // RF too high for the eligible pool still errors like `select_replicas`.
+    let eu5 = PlacementPolicy::simple("p", 5).require_label("region", "eu");
+    assert!(matches!(
+        select_replicas_balanced(&pool, &eu5, &even),
+        Err(PlacementError::InsufficientCandidates { .. })
+    ));
+}

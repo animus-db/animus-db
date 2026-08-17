@@ -196,6 +196,33 @@ fn run_scenario(seed: u64) {
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after split-child seal").await;
 
+        // ADR 0050: a full copy-based split round on the split child —
+        // proves `BeginSplit`'s mirror arm (parent state flip + two
+        // `Building` children + inherited policies) and `CutoverSplit`'s
+        // (children activated, parent tablet+policy DELETED, lineage rows
+        // written) replicate and durably survive like every other command.
+        // The table is streamed, so the split key must be token-aligned
+        // (F11) — 8 bytes, strictly inside tablet 2's `[0x80..]` range.
+        nodes[leader].propose(MetaCommand::BeginSplit {
+            parent: TabletId(2),
+            expected_epoch: Epoch::INITIAL,
+            split_key: vec![0xC0, 0, 0, 0, 0, 0, 0, 0],
+            children: [
+                (TabletId(3), vec![nid(10), nid(11)]),
+                (TabletId(4), vec![nid(10), nid(11)]),
+            ],
+        });
+        sim.run_for(Duration::from_secs(1));
+        assert_cache_matches_engine(&nodes, &engines, seed, "after BeginSplit").await;
+
+        nodes[leader].propose(MetaCommand::CutoverSplit {
+            parent: TabletId(2),
+            expected_epoch: Epoch::INITIAL.next(),
+            cutover_wall_ms: 1_700_000_000_003,
+        });
+        sim.run_for(Duration::from_secs(1));
+        assert_cache_matches_engine(&nodes, &engines, seed, "after CutoverSplit").await;
+
         // The janitor's two-phase reclaim (mark, then remove) — proves
         // `ExpireStreamShards`'s own mirror arm derives a `Put` (the marked
         // row) and then a `Delete` (the removed row), both durable.

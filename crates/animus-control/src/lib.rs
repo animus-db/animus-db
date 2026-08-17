@@ -53,6 +53,11 @@ pub use schema::{
 // `animus-placement` dependency. The policy is part of the control plane's
 // public metadata surface (`Metadata::policies`).
 pub use animus_placement::PlacementPolicy;
+// ADR 0050 fork F5: `animusd`'s `BeginSplit` proposer picks the split
+// children's final homes via the placement engine — re-exported here (like
+// `PlacementPolicy` above) so the assembler still needs no direct
+// `animus-placement` dependency.
+pub use animus_placement::{Candidate, select_replicas_balanced};
 pub use persist::{PersistedState, WalRecord};
 pub use raft::{LogEntry, ProposeResult, RaftCore, RaftMsg, Role, StateMachine};
 pub use shared_wal::SharedWal;

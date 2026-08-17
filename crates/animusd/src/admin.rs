@@ -997,6 +997,7 @@ fn system_table_id_is_numeric(kind: syskv::EntityKind) -> bool {
             | syskv::EntityKind::Policy
             | syskv::EntityKind::SplitParent
             | syskv::EntityKind::StreamSplitBasis
+            | syskv::EntityKind::SplitLineage
     )
 }
 
@@ -1065,7 +1066,10 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         | syskv::EntityKind::StreamShard
         // A `StreamSplitBasis` (ADR 0042 §8/ADR 0043 §A4/§A6, PR1 bugfix) —
         // same JSON passthrough convention.
-        | syskv::EntityKind::StreamSplitBasis => {
+        | syskv::EntityKind::StreamSplitBasis
+        // A `SplitLineage` (ADR 0050 fork F9) — same JSON passthrough
+        // convention.
+        | syskv::EntityKind::SplitLineage => {
             serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
         }
         syskv::EntityKind::Counter => match <[u8; 8]>::try_from(value) {

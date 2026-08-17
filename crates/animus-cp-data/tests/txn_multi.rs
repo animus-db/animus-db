@@ -719,7 +719,6 @@ fn participant_leader_kill_during_prepare_converges_to_a_clean_abort() {
 fn two_participant_commit_is_reproducible_across_seeds() {
     for seed in [0x7B01u64, 0x7B02, 0x7B03, 0x7B04, 0x7B05] {
         let mut sim = Simulator::new(seed);
-        let engine = MemoryEngine::new();
         let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
         let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
         sim.run_for(ELECT);

@@ -145,6 +145,37 @@ pub fn select_replicas(candidates: &[Candidate], policy: &PlacementPolicy) -> Re
     )
 }
 
+/// Choose a replica set for a fresh tablet under `policy`, **balance-aware**
+/// (ADR 0050 fork F5: a copy-based split's children are minted at their final
+/// homes, so the mint itself must weigh current load the way
+/// [`rebalance_step`] would only have fixed up afterwards). Identical hard
+/// constraints to [`select_replicas`] (RF + residency + spread); within them,
+/// prefers the least-loaded eligible nodes — `load` is the caller's per-node
+/// replica count (a node absent from `load` counts as `0`, so a fresh member
+/// is a genuine minimum, matching [`rebalance_step`]'s own seeding rule).
+///
+/// Deterministic: ties break by node id, and [`choose`]'s own
+/// least-loaded-domain-first greedy is unchanged — this only re-orders the
+/// candidate list it feeds from node-sorted to `(load, node)`-sorted.
+///
+/// # Errors
+/// As [`select_replicas`].
+pub fn select_replicas_balanced(
+    candidates: &[Candidate],
+    policy: &PlacementPolicy,
+    load: &BTreeMap<NodeId, usize>,
+) -> Result<Vec<NodeId>> {
+    let mut eligible = eligible_domains(candidates, policy);
+    eligible.sort_by(|(n, _), (m, _)| {
+        let (ln, lm) = (
+            load.get(n).copied().unwrap_or(0),
+            load.get(m).copied().unwrap_or(0),
+        );
+        ln.cmp(&lm).then_with(|| n.cmp(m))
+    });
+    choose(&eligible, &BTreeSet::new(), policy)
+}
+
 /// Recompute a replica set after a membership change, **preserving the current
 /// replicas that are still eligible** so only failed/ineligible ones are
 /// replaced (minimal data movement).

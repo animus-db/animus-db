@@ -517,25 +517,34 @@ an empty/singleton tablet) is reported in that tablet's own response entry,
 never escalated into a whole-call failure. `animus admin stream-grow
 <admin-addr> <table>` is the CLI form.
 
-**Split is DISABLED (ADR 0050 Train B rung 1)**: every split surface
-(`trigger_split`'s gate — the one choke point; `auto_split_loop` warns
-once at spawn and returns) refuses with `SPLIT_DISABLED_MSG` while the
-storage pivot is in flight — the old zero-copy split cannot run across
-per-tablet engines (a child's scope would open an EMPTY engine). Test
-harnesses that only need a two-group topology propose
-`MetaCommand::SplitTablet` directly via `Node::propose_meta` on a still-
-**empty** table (sound: nothing to inherit — see `cp_txn.rs`'s
-`split_and_settle`); populated-tablet split e2e tests are `#[ignore]`d
-with a `PARKED (ADR 0050 ...)` reason until the copy-based workflow lands
-in this train's later rungs. The pre-pivot design for reference:
-(ADR 0028, `MetaCommand::SplitTablet`, epoch-CAS gated) a
-single atomic control-plane command with no data-plane half — narrows the
-source's range and mints a sibling over the same physical rows.
-**DISABLED since ADR 0050 Train B rung 1** (`SPLIT_DISABLED`): zero-copy
-split cannot run across per-tablet private engines; every split surface
-(`POST /admin/tablet/split` + `ClientRequest::SplitTablet`, auto-split,
-stream-grow) returns `SPLIT_DISABLED_MSG` until the copy-based split
-workflow lands in this train's later rungs.
+**Split is the ADR 0050 copy-based workflow's METADATA half (Train B rung
+3)**: `trigger_split` — still the one choke point every surface calls —
+now proposes `MetaCommand::BeginSplit` (parent → `Splitting`, still fully
+serving; two `Building` children minted at **placement-chosen final
+homes**, fork F5 via `split_child_placement` →
+`animus_control::select_replicas_balanced`, falling back to inheriting
+the parent's replicas when the recorded RF exceeds the live member count —
+the same self-heal-later stance `provision_tablet` takes) and confirms by
+observing the parent's own **state** become `Splitting` — never the old
+epoch-advance (a rebalance CAS also bumps the epoch; a stray bump re-arms
+the CAS instead). Kickoff is **asynchronous and idempotent**: success
+means the workflow *started*; a `Splitting` parent returns success
+immediately; a `Building` child refuses ("not splittable"). Routing
+serves only `is_routable()` tablets (`Building` children overlap their
+un-narrowed parent, so the `tablet_for_key`/scan-fan-out filters are
+load-bearing); auto-split skips non-`Active` tablets; placement
+(reconcile + rebalance) is frozen for the whole mid-split set. **The
+workflow STOPS at this rung** — no driver/copy/freeze/cutover callers yet
+(B4/B5), so a started split parks at parent-`Splitting` +
+children-`Building` indefinitely; per-tablet `state` rides
+`/admin/status`'s serialized `Metadata` (the split-status surface —
+no new endpoint). The old zero-copy `MetaCommand::SplitTablet` still
+exists for test topology fixtures on **empty** tables (`cp_txn.rs`'s
+`split_and_settle`; deleted in the B7 sweep); populated-tablet split e2e
+tests stay `#[ignore]`d `PARKED (ADR 0050 ...)` until B4/B5. E2e:
+`tests/split_lifecycle.rs` (3-node, follower-connected kickoff = the
+`BeginSplit` relay regression) and `admin_endpoint.rs::
+admin_split_kicks_off_the_copy_based_workflow`.
 (Merge — `MetaCommand::MergeTablets` and the reconciler's `WidenScope`/
 `Absorb` reaction — was removed entirely by ADR 0044, superseding ADR
 0033.)

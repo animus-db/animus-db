@@ -286,6 +286,31 @@ per-tablet CP data plane (`animus-cp-data`).
   by ADR 0044; tablets are split-only.) Any new tablet-mutating command must
   adopt the same guard.
 
+- **The ADR 0050 copy-based split lifecycle (Train B rung 3):
+  `BeginSplit`/`CutoverSplit`.** `BeginSplit` (epoch-CAS + a state gate:
+  parent must be `Active`) marks the parent `Splitting` — range and rows
+  untouched, it serves until the workflow's freeze — and mints two
+  `Building` children over the half-ranges at the command's own
+  (proposer/placement-chosen, fork F5) replica homes, policy inherited,
+  allocator floor enforced, F11 token-alignment seatbelt shared with
+  `SplitTablet`'s arm. `CutoverSplit` (epoch-CAS; parent must be
+  `Splitting`; recomputes the children from the map — the two `Building`
+  tablets inside the parent's range — rather than trusting carried ids)
+  atomically activates both children, **removes** the parent (tablet +
+  policy; the reconciler reclaims it as ordinary hosted-but-absent), and
+  writes `Metadata::split_lineage[child] = SplitLineage {parent,
+  parents_final_epoch, cutover_wall_ms}` — fork F9, recorded at the one
+  moment the parent's shard chain is complete (never pruned; the B6
+  `ParentShardId` source). Wall time rides the command
+  (`cutover_wall_ms`), `SealStreamShard::seal_wall_ms`'s discipline — the
+  state machine has no clock. Neither command writes
+  `split_parents`/`stream_split_basis` (zero-copy-split machinery, B7
+  sweep). Placement (`reconcile_placement`/`rebalance_placement`) skips
+  every non-`Active` tablet — the mid-split set is frozen. Mirror arms +
+  `syskv::EntityKind::SplitLineage` follow the usual per-entity
+  conventions; the `apply_engine.rs` differential oracle drives a full
+  begin→cutover round.
+
 - **`SplitTablet` records split provenance (`Metadata::split_parents`, ADR
   0018 §2 amendment) — replaces the retired `Tablet::version_floor`
   cross-group-LWW fix.** `SplitTablet` records `split_parents[new_id] =

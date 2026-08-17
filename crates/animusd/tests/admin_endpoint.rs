@@ -855,18 +855,23 @@ async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
     .expect("test timed out");
 }
 
-/// ADR 0050 (Train B rung 1) teeth: every split surface refuses with the
-/// documented error while the storage pivot has the old zero-copy split
-/// disabled — the admin action and the raw client-protocol request alike.
+/// ADR 0050 (Train B rung 3) teeth: a split is now an **asynchronous
+/// workflow kickoff** — `POST /admin/tablet/split` starts it (parent
+/// observed `Splitting`, two `Building` children minted, all visible in
+/// `/admin/status`'s serialized `Metadata`), a second call is an idempotent
+/// "already in flight" success, and a `Building` child is not splittable.
+/// The workflow deliberately STOPS there in this rung (no driver/cutover
+/// yet), so the end state this asserts — parent `Splitting` + children
+/// `Building`, indefinitely — is the rung's contract, not an artifact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn split_surfaces_refuse_with_the_documented_error_during_the_storage_pivot() {
+async fn admin_split_kicks_off_the_copy_based_workflow() {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
         let (nodes, _config) = bring_up(1, dir.path()).await;
         await_bootstrap(&nodes).await;
 
         // Provision the table's bootstrap tablet through the ordinary client
-        // write path, so the split has a real target to refuse.
+        // write path, so the split has a real target.
         let mut stream = TcpStream::connect(nodes[0].client_addr())
             .await
             .expect("connect client port");
@@ -886,45 +891,120 @@ async fn split_surfaces_refuse_with_the_documented_error_during_the_storage_pivo
             .expect("a put reply");
         assert!(matches!(put, ClientResponse::PutOk), "{put:?}");
 
-        // (a) The raw client-protocol split request.
-        animusd::write_frame(
-            &mut stream,
-            &ClientRequest::SplitTablet {
-                tablet: 1,
-                split_key: b"m".to_vec(),
-            },
-        )
-        .await
-        .expect("send split");
-        let resp: ClientResponse = read_frame(&mut stream)
-            .await
-            .expect("read split reply")
-            .expect("a split reply");
-        match resp {
-            ClientResponse::Error(e) => assert!(
-                e.contains("disabled during the ADR 0050 storage pivot"),
-                "unexpected refusal text: {e}"
-            ),
-            other => panic!("split must refuse while disabled, got {other:?}"),
-        }
-
-        // (b) The admin action funnels into the same gate.
+        // Kick off the split via the admin action.
         let (status, body) = admin(
             nodes[0].admin_addr(),
             "POST",
             "/admin/tablet/split",
-            Some(r#"{"tablet":1,"split_key":"m"}"#),
+            Some(r#"{"tablet":1,"split_key":"k"}"#),
         )
         .await;
-        assert_ne!(
-            status, 200,
-            "the admin split action must not report success"
-        );
+        assert_eq!(status, 200, "kickoff must succeed, got: {body}");
+
+        // The lifecycle states ride `/admin/status` (the serialized
+        // `Metadata` — the rung's split-status surface): poll until the
+        // parent reads `Splitting` with exactly two `Building` children.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let states = loop {
+            let (_, status_body) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
+            let tablets = status_body["tablets"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            let state_of = |id: &str| {
+                tablets
+                    .get(id)
+                    .map(|t| t["state"].as_str().unwrap_or("").to_owned())
+            };
+            let building: Vec<String> = tablets
+                .iter()
+                .filter(|(_, t)| t["state"].as_str() == Some("Building"))
+                .map(|(id, _)| id.clone())
+                .collect();
+            if state_of("1").as_deref() == Some("Splitting") && building.len() == 2 {
+                break building;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "parent never read Splitting with two Building children; tablets: {tablets:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        // Idempotent kickoff: a second call reports success (already in
+        // flight), and does NOT mint further children.
+        let (status2, body2) = admin(
+            nodes[0].admin_addr(),
+            "POST",
+            "/admin/tablet/split",
+            Some(r#"{"tablet":1,"split_key":"k"}"#),
+        )
+        .await;
+        assert_eq!(status2, 200, "re-kickoff must be idempotent, got: {body2}");
+        let (_, status_body) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
+        let n_building = status_body["tablets"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter(|t| t["state"].as_str() == Some("Building"))
+            .count();
+        assert_eq!(n_building, 2, "no further children minted");
+
+        // A `Building` child is not splittable.
+        let child = &states[0];
+        let (status3, body3) = admin(
+            nodes[0].admin_addr(),
+            "POST",
+            "/admin/tablet/split",
+            Some(&format!(r#"{{"tablet":{child},"split_key":"k"}}"#)),
+        )
+        .await;
+        assert_ne!(status3, 200, "splitting a Building child must refuse");
         assert!(
-            body.to_string()
-                .contains("disabled during the ADR 0050 storage pivot"),
-            "the admin refusal must carry the documented error, got: {body}"
+            body3.to_string().contains("not splittable"),
+            "refusal must say why, got: {body3}"
         );
+
+        // The parent still serves BOTH reads and writes while `Splitting`.
+        animusd::write_frame(
+            &mut stream,
+            &ClientRequest::Put {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                table: "t".to_string(),
+            },
+        )
+        .await
+        .expect("send post-split put");
+        let put2: ClientResponse = read_frame(&mut stream)
+            .await
+            .expect("read post-split put reply")
+            .expect("a put reply");
+        assert!(
+            matches!(put2, ClientResponse::PutOk),
+            "a Splitting parent must keep serving writes: {put2:?}"
+        );
+        animusd::write_frame(
+            &mut stream,
+            &ClientRequest::Get {
+                key: b"k".to_vec(),
+                table: "t".to_string(),
+            },
+        )
+        .await
+        .expect("send post-split get");
+        let got: ClientResponse = read_frame(&mut stream)
+            .await
+            .expect("read post-split get reply")
+            .expect("a get reply");
+        assert!(
+            matches!(got, ClientResponse::Value(Some(ref v)) if v == b"v"),
+            "a Splitting parent must keep serving reads: {got:?}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
     })
     .await
     .expect("test timed out");

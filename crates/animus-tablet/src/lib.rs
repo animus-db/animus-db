@@ -301,6 +301,30 @@ pub struct Tablet {
     pub replicas: Vec<NodeId>,
     /// The current placement epoch.
     pub epoch: Epoch,
+    /// The tablet's lifecycle state (ADR 0050). `#[serde(default)]` keeps
+    /// pre-lifecycle snapshots loading as `Active`.
+    #[serde(default)]
+    pub state: TabletState,
+}
+
+/// A tablet's lifecycle state (ADR 0050, copy-based splits).
+///
+/// - `Active` — the steady state: routable, rebalance-eligible, splittable.
+/// - `Building` — a split child being seeded by the split driver: hosted (its
+///   group runs, its engine fills) but **unroutable** and frozen for
+///   placement until `CutoverSplit` activates it.
+/// - `Splitting` — a split parent mid-workflow: still fully serving (reads
+///   AND writes, until the B5 freeze) but frozen for placement and not
+///   re-splittable; removed from the tablet map at cutover.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TabletState {
+    /// Routable, rebalance-eligible, splittable — the steady state.
+    #[default]
+    Active,
+    /// A split child under construction: hosted but unroutable.
+    Building,
+    /// A split parent mid-workflow: serving, but frozen for placement.
+    Splitting,
 }
 
 impl Tablet {
@@ -341,7 +365,19 @@ impl Tablet {
             range,
             replicas,
             epoch: Epoch::INITIAL,
+            state: TabletState::default(),
         }
+    }
+
+    /// Whether client routing may serve keys from this tablet (ADR 0050): an
+    /// `Active` tablet always; a `Splitting` parent still serves (reads AND
+    /// writes) until the split workflow's freeze/cutover; a `Building` split
+    /// child never does — its range **overlaps its parent's** (the parent's
+    /// range is not narrowed at `BeginSplit`), so routing to it would serve
+    /// a half-copied engine.
+    #[must_use]
+    pub fn is_routable(&self) -> bool {
+        !matches!(self.state, TabletState::Building)
     }
 
     /// Whether this tablet can serve keys of `table`: a table-scoped tablet serves

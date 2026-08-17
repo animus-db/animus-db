@@ -45,7 +45,14 @@ and the wire edges. Mostly one file (`src/lib.rs`), plus `split_basis.rs`
 - `Tablet` is **table-scoped** (ADR 0023): field `table: Option<TableName>`
   (`None` = a legacy whole-keyspace tablet). Constructors `new` /
   `new_for_table` / `with_table` (all normalize — sort/dedup — the replica
-  set); predicates `serves_table`, `has_replica`.
+  set); predicates `serves_table`, `has_replica`, `is_routable`.
+- `Tablet.state: TabletState {Active, Building, Splitting}` (ADR 0050 Train
+  B rung 3, serde-default `Active`) — the copy-based split's lifecycle. A
+  `Building` split child's range **overlaps its still-serving parent's**
+  (the parent is never narrowed; it is removed whole at cutover), so
+  `is_routable()` (`!Building`) is load-bearing for every routing/scan
+  consumer: without the filter, map-iteration order could serve a
+  half-copied engine.
 - `KeyRange`: `whole()`, `contains`, `contains_range` (subset containment —
   the shared primitive behind the reconciler's narrow-only check and
   `animusd`'s read-path scope pre-checks, ADR 0031/0028), `split_at`

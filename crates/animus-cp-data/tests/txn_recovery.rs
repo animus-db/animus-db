@@ -941,7 +941,6 @@ fn pending_txns_reflects_applies_across_restart() {
 fn recovery_commit_is_reproducible_across_seeds() {
     for seed in [0x9B01u64, 0x9B02, 0x9B03, 0x9B04, 0x9B05] {
         let mut sim = Simulator::new(seed);
-        let engine = MemoryEngine::new();
         let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
         let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
         sim.run_for(ELECT);
@@ -1097,7 +1096,6 @@ fn duelling_commits_at_different_timestamps_the_second_is_a_no_op_never_a_panic(
 fn duelling_commits_at_different_timestamps_are_reproducible_across_seeds() {
     for seed in [0x9C11u64, 0x9C12, 0x9C13, 0x9C14, 0x9C15] {
         let mut sim = Simulator::new(seed);
-        let engine = MemoryEngine::new();
         let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
         sim.run_for(ELECT);
         let la = leader(&nodes_a, seed, "A");

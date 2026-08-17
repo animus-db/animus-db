@@ -160,6 +160,11 @@ pub enum EntityKind {
     /// same `MetaCommand::SplitTablet` apply. The value is the JSON-encoded
     /// `StreamSplitBasis`, same convention as `Tablet`/`Schema`/etc.
     StreamSplitBasis,
+    /// A copy-based split child's lineage row (`Metadata::split_lineage`,
+    /// ADR 0050 fork F9), keyed by the child's [`TabletId`] — recorded by
+    /// `MetaCommand::CutoverSplit`'s apply. The value is the JSON-encoded
+    /// `SplitLineage`, same convention as `Tablet`/`Schema`/etc.
+    SplitLineage,
 }
 
 impl EntityKind {
@@ -183,6 +188,7 @@ impl EntityKind {
             EntityKind::StreamShard => "stream_shard",
             EntityKind::IndexBackfill => "index_backfill",
             EntityKind::StreamSplitBasis => "stream_split_basis",
+            EntityKind::SplitLineage => "split_lineage",
         }
     }
 
@@ -207,6 +213,7 @@ impl EntityKind {
             b"stream_shard" => EntityKind::StreamShard,
             b"index_backfill" => EntityKind::IndexBackfill,
             b"stream_split_basis" => EntityKind::StreamSplitBasis,
+            b"split_lineage" => EntityKind::SplitLineage,
             _ => return None,
         })
     }
@@ -353,6 +360,14 @@ pub fn split_parent_key(child: TabletId) -> Vec<u8> {
 #[must_use]
 pub fn stream_split_basis_key(child: TabletId) -> Vec<u8> {
     entity_key(EntityKind::StreamSplitBasis, &child.0.to_be_bytes())
+}
+
+/// A copy-based split child [`TabletId`]'s key under
+/// [`EntityKind::SplitLineage`] (ADR 0050 fork F9), recorded by
+/// `MetaCommand::CutoverSplit`'s apply.
+#[must_use]
+pub fn split_lineage_key(child: TabletId) -> Vec<u8> {
+    entity_key(EntityKind::SplitLineage, &child.0.to_be_bytes())
 }
 
 /// A `(tablet, epoch)` pair's key under [`EntityKind::StreamShard`] (ADR

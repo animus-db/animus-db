@@ -210,6 +210,39 @@ pub fn apply_and_derive_mirror(
                 &meta.stream_split_basis[new_id],
             ));
         }
+        MetaCommand::BeginSplit {
+            parent, children, ..
+        } => {
+            // ADR 0050 stage 1: the parent's row (state → Splitting, epoch
+            // bumped) plus both freshly-minted `Building` children, their
+            // inherited policies, and the advanced allocator counter.
+            writes.push(put_json(syskv::tablet_key(*parent), &meta.tablets[parent]));
+            writes.push(put_counter(NEXT_TABLET_ID_COUNTER, meta.next_tablet_id));
+            for (child, _) in children {
+                writes.push(put_json(syskv::tablet_key(*child), &meta.tablets[child]));
+                if let Some(policy) = meta.policies.get(child) {
+                    writes.push(put_json(syskv::policy_key(*child), policy));
+                }
+            }
+        }
+        MetaCommand::CutoverSplit { parent, .. } => {
+            // ADR 0050 stage 4: the parent's row (and policy) are gone; both
+            // children re-mirror (state → Active, epoch bumped) along with
+            // their new lineage rows. The children are exactly the
+            // `split_lineage` rows this apply just wrote for `parent` —
+            // parents are removed at cutover and tablet ids never reused, so
+            // the parent id uniquely identifies this cutover's children.
+            writes.push(KeyWrite::Delete(syskv::tablet_key(*parent)));
+            writes.push(KeyWrite::Delete(syskv::policy_key(*parent)));
+            for (child, lineage) in meta
+                .split_lineage
+                .iter()
+                .filter(|(_, l)| l.parent == *parent)
+            {
+                writes.push(put_json(syskv::tablet_key(*child), &meta.tablets[child]));
+                writes.push(put_json(syskv::split_lineage_key(*child), lineage));
+            }
+        }
         MetaCommand::SetTabletPolicy { tablet, policy } => match policy {
             Some(p) => writes.push(put_json(syskv::policy_key(*tablet), p)),
             None => writes.push(KeyWrite::Delete(syskv::policy_key(*tablet))),
@@ -518,6 +551,12 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             meta.stream_split_basis
                 .insert(TabletId(decode_u64(&id)), basis);
         }
+        EntityKind::SplitLineage => {
+            let lineage: crate::meta::SplitLineage =
+                serde_json::from_slice(value).expect("mirrored split-lineage value decodes");
+            meta.split_lineage
+                .insert(TabletId(decode_u64(&id)), lineage);
+        }
     }
 }
 
@@ -583,6 +622,12 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // pruned, same lifetime discipline as `SplitParent` above) —
             // listed for match exhaustiveness.
             meta.stream_split_basis.remove(&TabletId(decode_u64(&id)));
+        }
+        EntityKind::SplitLineage => {
+            // Never deleted in practice (`split_lineage` is never pruned,
+            // same lifetime discipline as `SplitParent` above) — listed for
+            // match exhaustiveness.
+            meta.split_lineage.remove(&TabletId(decode_u64(&id)));
         }
     }
 }

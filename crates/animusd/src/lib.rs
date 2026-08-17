@@ -69,7 +69,7 @@ use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
     WalRecordView,
 };
-use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId};
+use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId, TabletState};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1755,6 +1755,13 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // reach the control leader).
             | MetaCommand::RegisterNodeAddrs { .. }
             | MetaCommand::SplitTablet { .. }
+            // Copy-based split workflow (ADR 0050): `trigger_split` proposes
+            // `BeginSplit` from whichever node's admin/auto-split surface
+            // fired it, and the split driver (B4/B5) proposes `CutoverSplit`
+            // from the parent's own leader node — both need the identical
+            // follower-connected relay path `SplitTablet` already has.
+            | MetaCommand::BeginSplit { .. }
+            | MetaCommand::CutoverSplit { .. }
             // Provision-at-create (ADR 0023): a `CreateTable` on a follower-connected
             // client relays the table's tablet creation + RF policy to the control
             // leader. Scoped to one tablet per table by the state machine's guard.
@@ -7112,6 +7119,10 @@ impl ClientCtx {
         let mut ranges: Vec<KeyRange> = self
             .effective_metadata()
             .tablets_for_table(table)
+            // ADR 0050: a `Building` split child overlaps its still-serving
+            // parent — scanning both would double-serve (or serve a
+            // half-copied engine's slice of) the overlap.
+            .filter(|(_, t)| t.is_routable())
             .map(|(_, t)| t.range.clone())
             .filter(|r| {
                 // [r.start, r.end) overlaps [start, end), each upper bound optional.
@@ -7257,6 +7268,8 @@ impl ClientCtx {
         let mut ranges: Vec<KeyRange> = self
             .effective_metadata()
             .tablets_for_table(table)
+            // ADR 0050: skip `Building` children (see `cp_scan`'s own filter).
+            .filter(|(_, t)| t.is_routable())
             .map(|(_, t)| t.range.clone())
             .filter(|r| {
                 end.as_deref().is_none_or(|e| r.start.as_slice() < e)
@@ -9446,19 +9459,6 @@ impl SharedEngine {
     }
 }
 
-/// ADR 0050 (Train B rung 1): the old zero-copy split is disabled for the
-/// duration of the storage pivot — flipped back off (and then deleted with
-/// the mechanism it gates) when the copy-based split workflow lands in this
-/// train's later rungs. See [`SPLIT_DISABLED_MSG`] and `trigger_split`'s
-/// gate.
-const SPLIT_DISABLED: bool = true;
-
-/// The client-facing refusal every split surface returns while
-/// [`SPLIT_DISABLED`] holds.
-const SPLIT_DISABLED_MSG: &str = "tablet split is disabled during the ADR 0050 storage pivot \
-     (Train B): the zero-copy split cannot run across per-tablet engines; the copy-based \
-     split workflow lands later in this train";
-
 /// A tablet's own LSM filename prefix on this node's `Disk` (ADR 0050 rung
 /// 1: per-tablet engines — naming is identity, the same mechanism
 /// `raftkv.wal.<tablet>` uses). The trailing `-` is load-bearing: it keeps
@@ -9892,6 +9892,67 @@ fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) -> (Ve
     (key, viable)
 }
 
+/// Choose the two `BeginSplit` children's replica sets (ADR 0050 fork F5:
+/// **fresh placement at mint** — children are born at their final homes, so
+/// the copy-based build is the only data movement a split ever makes).
+///
+/// Pure over the given `Metadata` snapshot: candidates are the `Active`
+/// members (the same liveness rule `Metadata::reconcile` applies), the
+/// parent's own placement policy carries RF/residency/spread, and per-node
+/// load is the current replica count across every tablet (seeded `0` for
+/// every candidate — a fresh member is a genuine minimum, matching
+/// `rebalance_step`'s rule). The second child's selection sees the first
+/// child's picks as load, so the two don't pile onto the same least-loaded
+/// nodes. A parent with no recorded policy (not a state `provision_tablet`
+/// produces, but reachable via a hand-built cluster) falls back to
+/// inheriting the parent's own replica set for both children — the
+/// pre-fork-F5 behavior, safe if never balanced.
+fn split_child_placement(meta: &Metadata, parent: TabletId) -> Result<[Vec<NodeId>; 2], String> {
+    let Some(parent_tablet) = meta.tablets.get(&parent) else {
+        return Err("no such tablet".into());
+    };
+    let Some(policy) = meta.policies.get(&parent) else {
+        return Ok([
+            parent_tablet.replicas.clone(),
+            parent_tablet.replicas.clone(),
+        ]);
+    };
+    let candidates: Vec<animus_control::Candidate> = meta
+        .members
+        .iter()
+        .filter(|(_, m)| m.status == NodeStatus::Active)
+        .map(|(id, m)| animus_control::Candidate::new(id.clone(), m.labels.clone()))
+        .collect();
+    let mut load: BTreeMap<NodeId, usize> =
+        candidates.iter().map(|c| (c.node.clone(), 0)).collect();
+    for t in meta.tablets.values() {
+        for r in &t.replicas {
+            if let Some(n) = load.get_mut(r) {
+                *n += 1;
+            }
+        }
+    }
+    // Placement can be under-satisfiable right now (a dev/single-node
+    // cluster whose recorded RF exceeds the live member count — the exact
+    // state `provision_tablet` already documents as legitimate, with repair
+    // self-healing once members exist). Fall back to inheriting the
+    // parent's own replica set then, exactly like the no-policy case above:
+    // best-effort placement now, `reconcile_placement` fixes the children
+    // up after cutover once they are `Active` again.
+    let pick = |load: &BTreeMap<NodeId, usize>| {
+        animus_control::select_replicas_balanced(&candidates, policy, load)
+            .unwrap_or_else(|_| parent_tablet.replicas.clone())
+    };
+    let left = pick(&load);
+    for r in &left {
+        if let Some(n) = load.get_mut(r) {
+            *n += 1;
+        }
+    }
+    let right = pick(&load);
+    Ok([left, right])
+}
+
 /// The leader-driven **automatic split trigger**: on each tick, for every tablet
 /// whose CP group this node currently **leads**, take the leader's **cheap
 /// estimates** ([`CpGroup::approx_key_count`]/[`CpGroup::approx_bytes`] —
@@ -9928,16 +9989,6 @@ fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) -> (Ve
 /// lets exactly one win, and the loser just tries again (or backs off) next
 /// tick.
 async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
-    // ADR 0050 (Train B rung 1): the whole loop is inert while the old
-    // zero-copy split is disabled — `trigger_split` (its only outcome) would
-    // refuse every call anyway. Warn once at spawn, not per tick.
-    if SPLIT_DISABLED {
-        tracing::warn!(
-            "auto-split is configured but disabled: {msg}",
-            msg = SPLIT_DISABLED_MSG
-        );
-        return;
-    }
     let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
     // When each tablet last had a *full* (materializing) count — the expensive
     // confirm is rate-limited per tablet, not run every tick.
@@ -9951,7 +10002,15 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
         // token-alignment check below (ADR 0042 §14) shares one snapshot
         // with the tablet-list read, rather than paying a second clone.
         let meta = ctx.effective_metadata();
-        let tablets: Vec<TabletId> = meta.tablets.keys().copied().collect();
+        // ADR 0050: only an `Active` tablet is auto-splittable — a
+        // `Splitting` parent is already mid-workflow (one split at a time)
+        // and a `Building` child is still being seeded.
+        let tablets: Vec<TabletId> = meta
+            .tablets
+            .iter()
+            .filter(|(_, t)| t.state == TabletState::Active)
+            .map(|(&id, _)| id)
+            .collect();
         for tablet in tablets {
             if matches!(last_triggered.get(&tablet), Some(at) if at.elapsed() < AUTO_SPLIT_COOLDOWN)
             {
@@ -10520,18 +10579,22 @@ impl ClientCtx {
         self.effective_metadata().has_table_schema(table)
     }
 
-    /// Split CP `tablet` at `split_key`: a **single, atomic** control-plane
-    /// command (`MetaCommand::SplitTablet`, epoch-CAS gated exactly like
-    /// `CasTabletReplicas`). The source tablet's range narrows to `[lo,
-    /// split_key)` and a new sibling tablet is minted covering `[split_key, ∞)`
-    /// — both served by the **same** replicas' existing per-node shared engine
-    /// (ADR 0026/0028: one LSM tree per node, confined by [`StorageScope`]), so
-    /// no data moves and there is no second, data-plane step that can fail
-    /// independently. The per-node tablet-host reconciler (ADR 0031 PR4) then
-    /// forms the new sibling's Raft group on every replica (a fresh
-    /// whole-voter formation, identical to a brand-new table's tablet) —
-    /// orphaned, leaderless metadata-only tablets are structurally impossible
-    /// now, since commit of this one command is the whole operation.
+    /// Kick off a **copy-based split** of `tablet` at `split_key` (ADR 0050):
+    /// propose `MetaCommand::BeginSplit` — parent to `Splitting` (still fully
+    /// serving), two `Building` children minted at **placement-chosen final
+    /// homes** (fork F5, [`split_child_placement`]) — and confirm by
+    /// observing the parent's own state become `Splitting` (state-based,
+    /// replacing the old zero-copy epoch-advance confirm: a rebalance's
+    /// `CasTabletReplicas` also bumps the epoch, so an epoch advance alone
+    /// proves nothing about a split; observing the state does, and on a
+    /// stray epoch bump the loop re-arms its CAS instead of mis-reporting).
+    ///
+    /// **Asynchronous by design**: success means *the split workflow
+    /// started* — the split driver (ADR 0050 stages 2–4, later rungs of
+    /// this train) seeds the children and performs the freeze/cutover; this
+    /// call never waits for that. Calling on a tablet already `Splitting`
+    /// returns success immediately ("already in flight" — the caller's
+    /// intent is accomplished-in-progress, and kickoff is idempotent).
     ///
     /// Routed to the control leader (relayable, [`is_relayable_command`]), so
     /// this works from any node the client happens to be connected to.
@@ -10541,17 +10604,6 @@ impl ClientCtx {
         fields(tablet = tablet.0, new_id = tracing::field::Empty)
     )]
     async fn trigger_split(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
-        // ADR 0050 (Train B rung 1): the zero-copy split is DISABLED for the
-        // duration of the storage pivot — it is structurally impossible
-        // across per-tablet private engines (a split child's scope would
-        // open an EMPTY engine; its data sits in the parent's). This is the
-        // one choke point every split proposer calls (auto-split, admin,
-        // CLI, stream-grow), so the whole surface is gated here. The
-        // copy-based split workflow (BeginSplit → build → freeze →
-        // CutoverSplit) lands in later rungs of this same train.
-        if SPLIT_DISABLED {
-            return ClientResponse::Error(SPLIT_DISABLED_MSG.to_string());
-        }
         // `effective_metadata()`, not `self.control.metadata_cached()`
         // directly (ADR 0035 PR5 staleness-audit fix): unlike a plain stale
         // read racing a *concurrent* epoch bump — which the CAS below catches
@@ -10564,64 +10616,63 @@ impl ClientCtx {
         // exists on the real cluster. The CAS only protects against
         // staleness *after* a read succeeds; it can't rescue a read that
         // never has anything to see.
-        let Some(initial_epoch) = self
-            .effective_metadata()
-            .tablets
-            .get(&tablet)
-            .map(|t| t.epoch)
-        else {
-            return ClientResponse::Error("no such tablet".into());
+        let mut initial_epoch = match self.effective_metadata().tablets.get(&tablet) {
+            None => return ClientResponse::Error("no such tablet".into()),
+            Some(t) if t.state == TabletState::Splitting => {
+                // Already mid-workflow: kickoff is idempotent.
+                return ClientResponse::PutOk;
+            }
+            Some(t) if t.state == TabletState::Building => {
+                return ClientResponse::Error(
+                    "tablet is a Building split child - not splittable".into(),
+                );
+            }
+            Some(t) => t.epoch,
         };
         let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
         let mut next_propose_at = tokio::time::Instant::now();
         loop {
-            // Confirmed: this tablet's own epoch has advanced past what we
-            // initially observed. The CAS-gated apply arm only ever bumps a
-            // tablet's epoch on a REAL, committed split of that exact
-            // tablet (`source.epoch = source.epoch.next()`), so this is
-            // true iff *some* split of THIS tablet — ours, or a racing
-            // proposer's that happened to land first (harmless: the
-            // operation the caller wanted, "this tablet is now split," is
-            // accomplished either way) — has actually landed. Deliberately
-            // **not** `tablets.contains_key(&new_id)` (the bug this
-            // rewrite fixes, found building growth PR3's multi-tablet
-            // `POST /admin/stream/grow`): `new_id` is computed fresh below
-            // from a possibly-stale `effective_metadata()` snapshot — on a
-            // lagging-mirror node in particular, two *different*
-            // `SplitTablet` proposals (splitting two different source
-            // tablets, issued in quick succession by `ClientCtx::
-            // grow_stream`'s per-tablet loop) can independently compute the
-            // identical `new_id` from equally-stale reads. The control
-            // leader's own apply-time check (`new tablet id already
-            // exists`) correctly rejects the second one — but a
-            // confirmation that only asks "does a tablet with this id
-            // exist now" can't tell that rejected proposal apart from its
-            // own success once the FIRST proposal's commit replicates
-            // here, silently reporting `PutOk` for a split that never
-            // actually happened. Checking THIS tablet's own epoch instead
-            // is robust regardless of which `new_id` a later, corrected
-            // retry (below) ends up minting.
+            // Confirmed: the parent's own STATE became `Splitting` — the one
+            // transition only a committed `BeginSplit` of this exact tablet
+            // performs (ours, or a racing proposer's that landed first —
+            // harmless: "this tablet's split workflow is running" is what
+            // the caller wanted either way). Deliberately state-based, not
+            // the old epoch-advance confirm: a rebalance's
+            // `CasTabletReplicas` also bumps a tablet's epoch, so an epoch
+            // advance alone can't distinguish "my split landed" from "an
+            // unrelated placement move landed"; a stray epoch bump instead
+            // RE-ARMS the CAS below so the next propose attempt carries the
+            // fresh epoch rather than being rejected forever. (The old
+            // confirm's own hazard — two proposers computing one `new_id`
+            // from equally-stale reads — still shapes the id choice below:
+            // child ids are recomputed fresh from the allocator on every
+            // attempt, never once up front.)
             let meta = self.effective_metadata();
-            match meta.tablets.get(&tablet).map(|t| t.epoch) {
+            match meta.tablets.get(&tablet) {
                 None => return ClientResponse::Error("no such tablet".into()),
-                Some(epoch) if epoch != initial_epoch => return ClientResponse::PutOk,
+                Some(t) if t.state == TabletState::Splitting => return ClientResponse::PutOk,
+                Some(t) if t.epoch != initial_epoch => {
+                    // An unrelated epoch bump (rebalance/repair CAS): re-arm.
+                    initial_epoch = t.epoch;
+                }
                 Some(_) => {}
             }
             if tokio::time::Instant::now() >= deadline {
-                return ClientResponse::Error("split did not commit in time".into());
+                return ClientResponse::Error("split did not begin in time".into());
             }
             if tokio::time::Instant::now() >= next_propose_at {
-                // The new tablet id comes from the **monotonic allocator**
+                // Child ids come from the **monotonic allocator**
                 // (`next_free_tablet_id`, ADR 0023 — the same allocator
                 // provisioning uses), *not* `max(existing ids) + 1`, which
                 // could re-mint a freed id after a `DropTableTablets`.
                 // Recomputed fresh on **every** propose attempt (not once
-                // up front) — the actual fix for the collision race
-                // described above: a later attempt, once this node's own
+                // up front) — the collision-race fix inherited from the old
+                // confirm's rewrite: a later attempt, once this node's own
                 // metadata has caught up, sees the allocator floor moved
-                // past whatever else was created meanwhile and mints a
-                // genuinely free id instead of repeating a doomed one.
-                let new_id = meta.next_free_tablet_id();
+                // past whatever else was created meanwhile and mints
+                // genuinely free ids instead of repeating doomed ones.
+                let left_id = meta.next_free_tablet_id();
+                let right_id = TabletId(left_id.0 + 1);
                 // F11 (ADR 0042 §14, Fork D): this is the ONE choke point
                 // every split proposer funnels through — `auto_split_loop`,
                 // `POST /admin/tablet/split` (`admin::action_split`), and
@@ -10642,12 +10693,20 @@ impl ClientCtx {
                         .incr(Metric::StreamSplitSingleTokenSkipped);
                     return ClientResponse::Error(SPLIT_KEY_NOT_TOKEN_VIABLE.into());
                 }
-                tracing::Span::current().record("new_id", new_id.0);
-                let cmd = MetaCommand::SplitTablet {
-                    tablet,
+                tracing::Span::current().record("new_id", left_id.0);
+                // Fork F5: children are minted at placement-chosen final
+                // homes — the one data movement of a copy-based split is the
+                // build itself, so the mint must pick the real destinations.
+                let children_replicas = match split_child_placement(&meta, tablet) {
+                    Ok(sets) => sets,
+                    Err(e) => return ClientResponse::Error(e),
+                };
+                let [left_replicas, right_replicas] = children_replicas;
+                let cmd = MetaCommand::BeginSplit {
+                    parent: tablet,
                     expected_epoch: initial_epoch,
                     split_key: aligned_key,
-                    new_id,
+                    children: [(left_id, left_replicas), (right_id, right_replicas)],
                 };
                 let sent = self.propose_schema(&cmd).await;
                 next_propose_at = tokio::time::Instant::now()
