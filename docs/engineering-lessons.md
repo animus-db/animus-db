@@ -6236,6 +6236,44 @@ debugging anything that feels like it might have happened before.
   the session's opening env block) and say so plainly in the final report;
   do not claim the shared checkout was cleaned up when the tooling itself
   prevented it.
+- **A worktree-isolated subagent must push its branch before reporting the
+  work done or mergeable.** An orchestrator (or the user) cannot verify,
+  review, or recover work that exists only in the agent's local worktree, and
+  agent worktrees are churned/reclaimed (see the dead-agent entry above) far
+  more casually than a pushed branch ever is. "Mergeable" is a claim about
+  the *remote*: until `git push -u origin <branch>` has succeeded, report the
+  work as in-progress, never done. (The other half of subagent git hygiene —
+  never `cd` into the main checkout — is the entries above.)
+- **The shell's cwd can silently drift across worktrees mid-session** (the
+  watchdog-stall/resume entry above is one confirmed mechanism), so any
+  command whose *meaning* depends on which tree it runs in — `git status`/
+  `diff`/`add`/`commit`, `cargo build`/`test`, anything resolving relative
+  paths — should be fused as `cd <worktree-abs-path> && pwd && <command>` in
+  a single invocation: the explicit `cd` re-anchors the command no matter
+  what the ambient cwd has drifted to, and the `pwd` echo leaves proof in
+  the transcript of where it actually ran. A bare `<command>` that trusts
+  the ambient cwd is the thing that silently runs against the wrong tree.
+- **The multi-agent worktree-churn survival kit.** When several
+  worktree-isolated agents run in parallel, the individual failure modes
+  above compound, and the defenses are cheap enough to be standing practice:
+  (1) give every agent explicit absolute paths (its worktree root, the files
+  it owns) in its prompt rather than letting it derive them; (2) have agents
+  push checkpoints — push after each meaningful commit, not only at the end
+  — so a dead agent's work survives its worktree; (3) verify any PR an agent
+  reports creating actually exists (`gh pr view <N>`) — a report of "opened
+  PR #N" can outlive a failed creation; (4) poll on silence — an agent gone
+  quiet may be stalled or dead, so inspect its worktree and pushed-branch
+  state instead of waiting indefinitely.
+- **Stacked-PR series: retarget before merging, and never delete a branch
+  that is still some open PR's base.** Two gotchas that recur when landing a
+  `gh-stack` series bottom-up: (1) before merging PR N+1, confirm its base
+  has been retargeted onto the branch its diff should be measured against
+  (once PR N merges, N+1's base must move to N's own base) — merging against
+  a stale base lands the remaining stack's commits in one PR, or shows a
+  reviewer a diff full of already-landed work; (2) deleting a merged PR's
+  branch while a later PR in the stack still names it as base can close that
+  open PR or corrupt its diff — delete stack branches only after the entire
+  series has landed.
 - **Closed (ADR 0037 hardening trio's PR3): the ADR 0036 allocator is now
   wired into `control-add`**, closing the last of ADR 0037's three deferrals
   (heartbeat-liveness/hardening PR1, quorum-guard/hardening PR2, this one).
