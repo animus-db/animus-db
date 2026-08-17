@@ -62,8 +62,15 @@ event for a GSI backfill's coverage sweep), and ADR 0049's image-less
 at enable, never retroactively). The **sealer deliberately does seal both
 into segments** (watermark/trim mechanics stay uniform; the dead weight is
 a few tens of bytes per record) — hiding is a serve-time decision, exactly
-like view-type projection. Regression:
-`tests/dynamo_streams.rs::pre_enable_marker_records_never_surface_on_the_stream`.
+like view-type projection. Regressions cover each record class on each
+serve path (a shared predicate only proves the paths *agree*, not that
+each is reached with the shape in hand — issue #267):
+`tests/dynamo_streams.rs::pre_enable_marker_records_never_surface_on_the_stream`
+(`marker`, sealed + open) and `tests/stream_backfill_seed_filter.rs`
+(`seeded` on a table streamed while a GSI backfill runs — one test per
+serve path, seal knobs inverted between them); the `staged` flag's
+defense-in-depth divergence case is unit-pinned in `animus-dynamo`
+(`change_record_round_trips_and_names_its_event`).
 
 **DynamoDB Streams (ADR 0042 §1/§2/§4/§9).** `TableSchema.stream:
 Option<StreamSpec>` (replicated, ADR 0013) rides through the identical
