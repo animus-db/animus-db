@@ -1623,24 +1623,26 @@ async fn action_drop_table(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
 const SEED_MAX_PER_REQUEST: u64 = 200_000;
 /// Cap on a synthetic value's size.
 const SEED_MAX_VALUE_BYTES: usize = 1 << 20;
-/// Keys committed as **one `Batch` Raft entry** (ADR 0017 — bulk-write batching):
-/// a seed chunk of this many keys is proposed as a single consensus round instead
-/// of one round per key, the bulk-seed throughput win. `cp_batch_write` further
-/// groups a chunk by tablet, so a chunk that straddles a split boundary commits one
-/// atomic entry per tablet.
+/// Keys committed as **one `KindBatch` Raft entry per tablet** (ADR 0049 —
+/// `dynamo::marker_batch_write` groups a chunk by tablet): a seed chunk of
+/// this many keys is proposed as a single consensus round per tablet instead
+/// of one round per key, the bulk-seed throughput win. (An images-carrying
+/// table's seed instead routes per item through the evaluate-at-leader
+/// funnel — correctness over throughput for that rare seed target.)
 const SEED_BATCH_SIZE: u64 = 500;
 /// Cap on a seed batch's **raw entry bytes** (keys + values). `SEED_BATCH_SIZE`
 /// alone lets a large-`value_bytes` seed build a 500 × 1 MiB batch, whose
-/// cross-process forwarding frame (`ClientRequest::PutBatch`, JSON at ≤ 4 chars
+/// cross-process forwarding frame (`ClientRequest::KindWrite`, JSON at ≤ 4 chars
 /// per byte) would blow past the client protocol's [`crate::MAX_FRAME_LEN`].
 /// Bounding the batch by bytes keeps the largest legitimate frame well under the
 /// cap (~4 MiB raw → ~17 MiB JSON); default-sized (64 B) seeds still batch the
 /// full 500 keys.
 const SEED_BATCH_MAX_BYTES: usize = 4 << 20;
-/// Attempts per seeded key, to absorb transient failures while a tablet is
+/// Whole-chunk attempts, to absorb transient failures while a tablet is
 /// **splitting** (writes racing the split point are truncated/tombstoned and
-/// re-route to the new child on retry). Each attempt is bounded by the data path's
-/// own `CLIENT_TIMEOUT`.
+/// re-route to the new child on retry — re-proposing is value-idempotent by
+/// per-key LWW; a duplicate *marker* record is harmless by design). Each
+/// attempt is bounded by the data path's own `CLIENT_TIMEOUT`.
 const SEED_WRITE_ATTEMPTS: usize = 4;
 /// Backoff between seed write attempts — long enough for a freshly-split child
 /// group to elect a leader / the tablet map to settle.
@@ -1706,9 +1708,13 @@ fn seed_key_attr(ty: ColumnType, prefix: &str, index_text: &str) -> AttributeVal
 /// declared column, [`seed_key_attr`]), plus the sort key (same index) when the
 /// table is composite; a table with no catalog schema follows the legacy
 /// hash-only `pk` convention. A filler `payload` attribute pads each item to
-/// ~`value_bytes`. Writes go through the normal durable batch path (routed to
-/// the leader). With `--auto-split` enabled, crossing the split threshold splits
-/// the tablet — visible live in the Tablets view.
+/// ~`value_bytes`. Writes go through the ADR 0049 kind-write path (routed to
+/// the leader) exactly like the DynamoDB edge's own: per-tablet single-entry
+/// marker batches for a plain table, the per-item evaluate-at-leader funnel
+/// for an images-carrying (streamed/GSI'd) one — so a seeded row is
+/// observable on the table's change log/stream like any client write. With
+/// `--auto-split` enabled, crossing the split threshold splits the tablet —
+/// visible live in the Tablets view.
 async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let req: SeedReq = match parse_body(body) {
         Ok(r) => r,
@@ -1753,11 +1759,12 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         }
         None => ("pk".to_string(), ColumnType::String, None),
     };
-    // One seeded row: the exact (key, value) bytes the DynamoDB edge's
-    // `PutItem` would store for this item. The filler `payload` attribute pads
-    // the serialized item toward `value_bytes` (skipped in the corner case
+    // One seeded row: the exact item (and pk/sk attributes) the DynamoDB
+    // edge's `PutItem` would store. The filler `payload` attribute pads the
+    // serialized item toward `value_bytes` (skipped in the corner case
     // where the schema claims that name for a key attribute).
-    let seed_row = |index: u64, fill: usize| -> (Vec<u8>, Vec<u8>) {
+    type SeedRow = (AttributeValue, Option<AttributeValue>, Item);
+    let seed_row = |index: u64, fill: usize| -> SeedRow {
         let index_text = format!("{index:012}");
         let pk = seed_key_attr(pk_ty, &prefix, &index_text);
         let sk = sort
@@ -1770,16 +1777,12 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         }
         item.entry("payload".to_string())
             .or_insert_with(|| AttributeValue::S("x".repeat(fill)));
-        let key = crate::dynamo::item_key(&pk, sk.as_ref());
-        // The edge's stored-value envelope (`item` vs the `DeleteItem`
-        // `tombstone` sentinel) — a bare serialized item would fail decode.
-        let value = animus_dynamo::wire::encode_stored_item(&item);
-        (key, value)
+        (pk, sk, item)
     };
     // Every row serializes to the same length (the index is fixed-width), so
     // measure the zero-filler envelope once and derive the padding that lands
     // the item at ~`value_bytes` (floored at the unpadded item).
-    let envelope = seed_row(req.start, 0).1.len();
+    let envelope = animus_dynamo::wire::encode_stored_item(&seed_row(req.start, 0).2).len();
     let fill = value_bytes.saturating_sub(envelope);
     let row_bytes = envelope + fill;
 
@@ -1796,43 +1799,92 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         let mut first_err: Option<String> = None;
         let mut i = 0u64;
         // Bound each batch by entry count *and* raw bytes (see `SEED_BATCH_MAX_BYTES`:
-        // the forwarded `PutBatch` frame must stay under `MAX_FRAME_LEN`). ~64 B of
-        // key overhead per entry (token + escaped pk); at least one entry per batch.
-        let per_entry = row_bytes + 64;
+        // the forwarded `KindWrite` frame must stay under `MAX_FRAME_LEN`). ~192 B
+        // of overhead per entry: token + escaped pk on the base key, plus the
+        // ADR 0049 marker record's own `(prefix, record)` pair riding the same
+        // entry (a marker is a fixed few tens of bytes — image-less by
+        // definition); at least one entry per batch.
+        let per_entry = row_bytes + 192;
         let max_by_bytes = (SEED_BATCH_MAX_BYTES / per_entry).max(1) as u64;
         while i < count {
             let chunk = (count - i).min(SEED_BATCH_SIZE).min(max_by_bytes);
-            // Build the chunk's `(key, value)` pairs and commit them as **one Batch
-            // entry per tablet** (`cp_batch_write` groups by tablet) — one consensus
-            // round for the whole chunk instead of one per key.
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..chunk)
+            let rows: Vec<_> = (0..chunk)
                 .map(|j| seed_row(req.start + i + j, fill))
                 .collect();
             // One child span per chunk (covering all its retry attempts) — gives a
             // trace backend per-batch visibility into forwarding/retries, the same
-            // way a real client's individual `PutBatch` requests would.
+            // way a real client's individual write requests would.
             let batch_span =
                 tracing::info_span!("admin_seed_batch", start_index = req.start + i, len = chunk);
-            // Retry transient failures via `cp_batch_write_patient` rather than a
-            // plain retry loop over `cp_batch_write`: a batch racing a tablet
-            // **split** may route to the parent and be truncated/tombstoned (the
-            // upper range moved to the new child), and a fresh propose against the
-            // now-settled tablet map correctly re-routes to the elected child
-            // (idempotent — same keys+value, per-key LWW). But a *plain*
-            // confirm-timeout on the correct leader does not mean the batch is
-            // lost, just slow — `cp_batch_write_patient` polls the
-            // already-accepted entry instead of proposing a duplicate one, so a
-            // slow/contended commit path doesn't get retry-amplified into
-            // something worse (see its doc).
-            let last = ctx
-                .cp_batch_write_patient(
-                    &table,
-                    entries.clone(),
-                    SEED_WRITE_ATTEMPTS,
-                    SEED_RETRY_BACKOFF,
-                )
-                .instrument(batch_span)
-                .await;
+            // **The seeder writes through the same ADR 0049 kind-write path as
+            // the DynamoDB edge itself** (Train A rung 4's entry-point
+            // completeness): before it, seeded rows went through the plain
+            // `cp_batch_write` — no change record at all, which on a
+            // *streamed* table silently lost every seeded row from its stream
+            // (the same drifted-gate class as `BatchWriteItem`'s own
+            // streamed-but-unindexed bug), and on a plain table violated ADR
+            // 0049 §1's "every mutation leaves a record" invariant that ADR
+            // 0050's split-build tail will depend on. Marker tables commit
+            // per-tablet single-entry batches via the one shared
+            // `dynamo::marker_batch_write`; an images table (streamed/GSI'd —
+            // rare for a seed target, correctness over throughput) routes
+            // each item through the same evaluate-at-leader funnel
+            // `BatchWriteItem` uses.
+            //
+            // Retries are a bounded whole-chunk loop now (`cp_batch_write_
+            // patient`'s poll-not-repropose nuance does not transfer to the
+            // kind path): re-proposing is value-idempotent for the base rows
+            // (per-key LWW, same bytes), and a confirm-timeout retry can at
+            // worst duplicate a chunk's *marker* records — harmless by
+            // design (markers are consumer-hidden dirty-key hints, promptly
+            // trimmed; a duplicate says "this key changed" twice).
+            let last = async {
+                let mut last = Ok(());
+                for attempt in 0..SEED_WRITE_ATTEMPTS {
+                    if attempt > 0 {
+                        tokio::time::sleep(SEED_RETRY_BACKOFF).await;
+                    }
+                    let meta = ctx.effective_metadata();
+                    last = if crate::dynamo::table_change_records_carry_images(&meta, &table) {
+                        let mut r = Ok(());
+                        for (pk, sk, item) in &rows {
+                            if let Err(e) = ctx
+                                .cp_kind_write_item(
+                                    &meta,
+                                    &table,
+                                    pk,
+                                    sk.as_ref(),
+                                    crate::KindWriteOp::Put(item.clone()),
+                                    None,
+                                )
+                                .await
+                            {
+                                r = Err(format!("{e:?}"));
+                                break;
+                            }
+                        }
+                        r
+                    } else {
+                        let batch_rows = rows
+                            .iter()
+                            .map(|(pk, sk, item)| {
+                                (
+                                    pk.clone(),
+                                    sk.clone(),
+                                    animus_dynamo::wire::encode_stored_item(item),
+                                )
+                            })
+                            .collect();
+                        crate::dynamo::marker_batch_write(ctx, &table, batch_rows).await
+                    };
+                    if last.is_ok() {
+                        break;
+                    }
+                }
+                last
+            }
+            .instrument(batch_span)
+            .await;
             match last {
                 Ok(()) => written += chunk,
                 Err(e) => {

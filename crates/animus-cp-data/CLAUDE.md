@@ -133,7 +133,24 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   own `Envelope::Intent`, opaque until `TxnResolve`'s commit branch
   materializes it. See the Key invariants section's `materialize_derived`
   entry and `docs/adr/0018-cross-tablet-transactions.md`'s 2026-08-16
-  amendment for the full mechanism.
+  amendment for the full mechanism. **`TxnWrite.stage_marker` (ADR 0049 §3,
+  codec version 18)**: an image-less, consumer-hidden `(prefix, record)`
+  pair `TxnStage`'s own apply arm materializes into `KIND_CHANGE` at the
+  *stage* entry's own `ts` (via the same shared `materialize_derived`) —
+  the dirty-key signal that lets a change-log consumer observe a freshly
+  staged intent envelope. Deliberately a separate record from `change_log`
+  (writing that one early would surface a pre-commit full-image event);
+  never carried in the intent envelope (consumed entirely at stage);
+  prefix token-validated at apply like `kind_writes`' keys
+  (`stage_marker_token_valid`); an aborted transaction's marker remains as
+  a harmless dirty hint. Tests: `txn_kind_writes.rs`'s `stage_marker_*`/
+  `stage_writes_*` group. **`TxnWrite.change_log`'s prefix is validated
+  the same way** (`change_log_token_valid`, Train A rung 4 — it was the
+  one of the three wire-reachable stage payload prefixes that went
+  unvalidated; `TxnResolve` completes-and-writes it wherever it points, so
+  a mis-tokened prefix rejects the whole stage as `Fenced` at the stage,
+  never at resolve). Test: `txn_kind_writes.rs::
+  a_change_log_prefix_off_its_own_token_is_rejected_at_apply`.
 
 ### lib.rs API
 
@@ -301,6 +318,14 @@ State once here; cross-referenced from the sections below.
   between that evaluator's own-key read and its own propose call. Tests:
   `tests/kind_batch_conditions.rs`, mirroring `tests/txn_conditions.rs`
   scenario-for-scenario.
+- **`KindBatch.change_log` is a `Vec<(prefix, record)>` (codec v17, ADR
+  0049 Train A rung-1 fixup)** — one entry can carry a whole marker-table
+  batch's records (one per item, all completed at the entry's own apply
+  `ts`; per-item prefixes keep keys distinct). `TxnWrite.change_log` stays
+  an `Option` (a transactional write stages at most its own record). The
+  entry-granularity contract this preserves: a batch to one tablet is ONE
+  Raft entry — never one per item, which is ~N× the WAL/apply work and
+  regressed `animusd`'s populate-then-backfill path when briefly shipped.
 - **`materialize_derived` — the ONE shared "materialize derived writes at
   this ts" helper (ADR 0046 binding decision, `TxnStage` kind-writes stack
   PR1)**: both `KvCommand::KindBatch`'s apply arm and `KvCommand::

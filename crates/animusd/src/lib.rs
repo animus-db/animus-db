@@ -83,11 +83,8 @@ use tracing::Instrument;
 // `animus_cp_data::host` (ADR 0031 PR3/PR4), which now owns both the
 // decision and its execution.
 
-/// A list of `(key, value)` pairs — the payload of a batch write (one Raft
-/// `KvCommand::Batch` entry per tablet). Named to keep the batch grouping map
-/// (`BTreeMap<TabletId, KvPairs>`) under clippy's `type_complexity` bar.
+/// A `(key, value)` pair — a scan row / batch-write element.
 type KvPair = (Vec<u8>, Vec<u8>);
-type KvPairs = Vec<KvPair>;
 
 /// A single write within a multi-participant transaction (ADR 0018 §2/PR4;
 /// ADR 0046 A1 kind-writes payload) — a direct alias of
@@ -235,7 +232,7 @@ impl CpGroup {
     fn put_kind_batch_fenced(
         &self,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
     ) -> ProposeResult {
@@ -1171,7 +1168,7 @@ pub enum ClientRequest {
         table: String,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         #[serde(default)]
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
     },
     /// **Internal index-read RPC — never sent bare, only wrapped in
     /// [`Forwarded`](Self::Forwarded)** (ADR 0041 §5): a **linearizable**
@@ -5433,33 +5430,6 @@ impl ClientCtx {
         }
     }
 
-    /// CP **write** of `key = value` (ADR 0017): propose on the group leader and
-    /// wait until the value is committed + durable + applied — a linearizable read
-    /// reflects it — before returning `Ok` (durable-before-ack). Forwarded if this
-    /// node isn't the leader. The CP write primitive the wire edges call directly.
-    pub(crate) async fn cp_write(
-        &self,
-        table: &str,
-        key: Vec<u8>,
-        value: Vec<u8>,
-    ) -> Result<(), String> {
-        match self.cp_route(table, &key).await {
-            CpRoute::Local(leader) => Self::cp_put_local(&leader, key, value).await,
-            CpRoute::Forward(addr) => {
-                let request = ClientRequest::Put {
-                    key: key.clone(),
-                    value,
-                    table: table.to_owned(),
-                };
-                Self::ok_or_err(
-                    self.cp_forward(table, &key, addr, request).await,
-                    "forwarded CP write",
-                )
-            }
-            CpRoute::None => Err("no CP group leader reachable".into()),
-        }
-    }
-
     /// **The evaluate-at-leader write primitive (ADR 0046 U3)** —
     /// `PutItem`/`DeleteItem`/`UpdateItem`'s entry point on an indexed or
     /// streamed table, replacing the edge-evaluated
@@ -5545,40 +5515,18 @@ impl ClientCtx {
         &self,
         table: &str,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
         let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
         };
         match self.cp_route(table, &first).await {
-            CpRoute::Local(leader) => {
-                let fence = leader.scope_range();
-                for (_, key, _) in &writes {
-                    if !fence.contains(key) {
-                        return Err("kind write outside this group's live range; retry".into());
-                    }
-                }
-                let (probe_kind, probe_key, probe_value) = writes
-                    .last()
-                    .map(|(kind, key, value)| (*kind, key.clone(), value.clone()))
-                    .expect("writes is non-empty — checked via `first` above");
-                match leader.put_kind_batch_fenced(writes, None, Vec::new(), fence) {
-                    ProposeResult::Accepted { .. } => {}
-                    other => return Err(format!("kind write not accepted: {other:?}")),
-                }
-                let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-                while tokio::time::Instant::now() < deadline {
-                    if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
-                        return Ok(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err("index drain batch did not apply in time".into())
-            }
+            CpRoute::Local(leader) => Self::cp_kind_raw_local(&leader, writes, change_log).await,
             CpRoute::Forward(addr) => {
                 let request = ClientRequest::KindWrite {
                     table: table.to_owned(),
                     writes,
-                    change_log: None,
+                    change_log,
                 };
                 Self::ok_or_err(
                     self.cp_forward(table, &first, addr, request).await,
@@ -5587,6 +5535,57 @@ impl ClientCtx {
             }
             CpRoute::None => Err("no CP group leader reachable".into()),
         }
+    }
+
+    /// The **known-leader** local half of [`cp_kind_write_raw`](Self::
+    /// cp_kind_write_raw): fence pre-check, propose, then confirm on the
+    /// batch's **last** write — `Some(value)` for a put, `None` for a
+    /// tombstone (see `cp_kind_write_raw`'s doc for why the last write
+    /// proves the whole entry). The ONE confirm implementation for a raw
+    /// kind batch, shared by `cp_kind_write_raw`'s `Local` arm and
+    /// `cp_serve_forwarded`'s `KindWrite` arm — they diverged once
+    /// (the serve arm used [`cp_kind_local`](Self::cp_kind_local), whose
+    /// confirm *requires* a `Some`-valued base write), so a whole-partition
+    /// CQL DELETE — the first raw batch whose base write is a tombstone —
+    /// erred iff the connected node did not lead the tablet
+    /// (leader-placement-bimodal; caught by `cql_clustering`).
+    async fn cp_kind_raw_local(
+        leader: &CpGroup,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        let fence = leader.scope_range();
+        for (_, key, _) in &writes {
+            if !fence.contains(key) {
+                return Err("kind write outside this group's live range; retry".into());
+            }
+        }
+        let Some((probe_kind, probe_key, probe_value)) = writes
+            .last()
+            .map(|(kind, key, value)| (*kind, key.clone(), value.clone()))
+        else {
+            return Ok(()); // empty batch is a no-op
+        };
+        match leader.put_kind_batch_fenced(writes, change_log, Vec::new(), fence) {
+            ProposeResult::Accepted { .. } => {}
+            other => return Err(format!("kind write not accepted: {other:?}")),
+        }
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        // The same exponential confirm back-off `cp_put_local` uses — NOT the
+        // drain's old flat 10ms sleep. This is a client hot path since ADR
+        // 0049 routed every plain Dynamo/CQL/raw-protocol write through it,
+        // and a flat 10ms floor put one whole tick under nearly every
+        // sequential write (measured on the ADR 0049 §5 bench: ~13.6 ms/op
+        // vs the pre-train ~4.7 — the poll cadence, not the marker bytes).
+        let mut poll = CP_CONFIRM_POLL_INIT;
+        while tokio::time::Instant::now() < deadline {
+            if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
+                return Ok(());
+            }
+            tokio::time::sleep(poll).await;
+            poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
+        }
+        Err("kind batch did not apply in time".into())
     }
 
     /// Propose a `KindBatch` on a **known-leader** local handle and confirm it.
@@ -5613,7 +5612,7 @@ impl ClientCtx {
     pub(crate) async fn cp_kind_local(
         leader: &CpGroup,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Result<(), String> {
         let probe = writes
@@ -5641,64 +5640,6 @@ impl ClientCtx {
             Ok(())
         } else {
             Err("CP kind write did not commit in time".into())
-        }
-    }
-
-    pub(crate) async fn cp_batch_write(
-        &self,
-        table: &str,
-        entries: Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<(), String> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        // Auto-provision the table's tablet on first write (ADR 0023), as `cp_write`.
-        // Read through `effective_metadata()` so an ADR 0030 growth node (and PR4's
-        // control-less data node) consults the mirror, not an empty local core.
-        if !self.effective_metadata().has_table_tablet(table) {
-            self.provision_tablet(table).await?;
-        }
-        // Group by owning tablet: every key of a `Batch` entry must belong to the
-        // one tablet whose leader commits it (a tablet's engine holds only its
-        // range). A freshly created table has a single whole-ring tablet (one
-        // group); a split table fans the batch across its halves.
-        let mut groups: BTreeMap<TabletId, KvPairs> = BTreeMap::new();
-        for (key, value) in entries {
-            let tablet = self
-                .tablet_for(table, &key)
-                .ok_or_else(|| format!("no tablet owns a batch key of table `{table}`"))?;
-            groups.entry(tablet).or_default().push((key, value));
-        }
-        for (_tablet, group) in groups {
-            self.cp_batch_write_group(table, group).await?;
-        }
-        Ok(())
-    }
-
-    /// Write one tablet's group of a batch as a single `Batch` entry: all keys share
-    /// the tablet, so route by the group's first key, then serve locally or forward
-    /// one hop (the batch analog of [`cp_write`](Self::cp_write)'s route).
-    async fn cp_batch_write_group(
-        &self,
-        table: &str,
-        group: Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<(), String> {
-        let Some(first) = group.first().map(|(k, _)| k.clone()) else {
-            return Ok(());
-        };
-        match self.cp_route(table, &first).await {
-            CpRoute::Local(leader) => Self::cp_batch_local(&leader, group).await,
-            CpRoute::Forward(addr) => {
-                let request = ClientRequest::PutBatch {
-                    entries: group,
-                    table: table.to_owned(),
-                };
-                Self::ok_or_err(
-                    self.cp_forward(table, &first, addr, request).await,
-                    "forwarded CP batch write",
-                )
-            }
-            CpRoute::None => Err("no CP group leader reachable".into()),
         }
     }
 
@@ -5798,141 +5739,6 @@ impl ClientCtx {
         }
     }
 
-    /// Like [`cp_batch_write`](Self::cp_batch_write), but for a caller that
-    /// itself retries on failure (the admin bulk seeder,
-    /// [`admin::action_data_seed`](crate::admin::action_data_seed)) — up to
-    /// `attempts` tries per tablet group, backing off `retry_backoff` between
-    /// them.
-    ///
-    /// **Why this exists rather than just looping `cp_batch_write`:** a bare
-    /// confirm-timeout from [`cp_batch_local`](Self::cp_batch_local) does not mean
-    /// the batch is lost — `ProposeResult::Accepted` only means it reached the
-    /// leader's local log; under a slow or contended commit path (a slow disk, a
-    /// growing number of concurrent per-tablet Raft groups) it can still be
-    /// committing well after [`CLIENT_TIMEOUT`] has elapsed. A caller that
-    /// retries by calling `cp_batch_write` again unconditionally proposes a
-    /// **second, fully duplicate** `Batch` entry for the same keys — safe by
-    /// per-key LWW, but it doubles the outstanding replication/fsync work for no
-    /// benefit, compounding under exactly the conditions that caused the
-    /// timeout (observed turning a slow bulk-seed into an apparent pile of
-    /// "did not commit in time" failures with `commit_index` still climbing the
-    /// whole time — no leader ever actually changed).
-    ///
-    /// So per tablet group, this proposes **at most once per attempt** and only
-    /// when the previous attempt didn't get as far as `Accepted`: on a plain
-    /// confirm-timeout it polls the *same* already-proposed entry for a second
-    /// full [`CLIENT_TIMEOUT`] window before considering the attempt to have
-    /// failed, rather than proposing again. A genuinely stale route (the classic
-    /// case: a tablet split moved the target range mid-seed, so the old leader's
-    /// copy is truncated/tombstoned) is still retried with a fresh propose, since
-    /// `cp_route` re-resolves the current tablet map on every attempt.
-    pub(crate) async fn cp_batch_write_patient(
-        &self,
-        table: &str,
-        entries: Vec<(Vec<u8>, Vec<u8>)>,
-        attempts: usize,
-        retry_backoff: Duration,
-    ) -> Result<(), String> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        // `effective_metadata()`, not the raw handle: see `cp_batch_write`.
-        if !self.effective_metadata().has_table_tablet(table) {
-            self.provision_tablet(table).await?;
-        }
-        let mut groups: BTreeMap<TabletId, KvPairs> = BTreeMap::new();
-        for (key, value) in entries {
-            let tablet = self
-                .tablet_for(table, &key)
-                .ok_or_else(|| format!("no tablet owns a batch key of table `{table}`"))?;
-            groups.entry(tablet).or_default().push((key, value));
-        }
-        for (_tablet, group) in groups {
-            self.cp_batch_write_group_patient(table, group, attempts, retry_backoff)
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// One tablet group's share of [`cp_batch_write_patient`] — see its doc for
-    /// why a plain confirm-timeout polls the existing entry instead of proposing
-    /// a fresh one.
-    async fn cp_batch_write_group_patient(
-        &self,
-        table: &str,
-        group: KvPairs,
-        attempts: usize,
-        retry_backoff: Duration,
-    ) -> Result<(), String> {
-        let Some(first) = group.first().map(|(k, _)| k.clone()) else {
-            return Ok(());
-        };
-        let mut last_err = String::new();
-        for attempt in 0..attempts.max(1) {
-            match self.cp_route(table, &first).await {
-                CpRoute::Local(leader) => match Self::cp_batch_propose(&leader, group.clone()) {
-                    Ok(None) => return Ok(()),
-                    Ok(Some((probe_key, probe_val))) => {
-                        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-                        if Self::poll_probe(&leader, &probe_key, &probe_val, deadline).await {
-                            return Ok(());
-                        }
-                        // Accepted but not yet confirmed — keep polling the same
-                        // entry for a second full window instead of proposing a
-                        // duplicate (see the module doc above).
-                        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-                        if Self::poll_probe(&leader, &probe_key, &probe_val, deadline).await {
-                            return Ok(());
-                        }
-                        last_err = "CP batch write did not commit in time".into();
-                    }
-                    Err(e) => last_err = e,
-                },
-                CpRoute::Forward(addr) => {
-                    let request = ClientRequest::PutBatch {
-                        entries: group.clone(),
-                        table: table.to_owned(),
-                    };
-                    match self.cp_forward(table, &first, addr, request).await {
-                        ClientResponse::PutOk => return Ok(()),
-                        ClientResponse::Error(e) => last_err = e,
-                        other => {
-                            last_err =
-                                format!("unexpected reply to forwarded CP batch write: {other:?}")
-                        }
-                    }
-                }
-                CpRoute::None => last_err = "no CP group leader reachable".into(),
-            }
-            if attempt + 1 < attempts {
-                tokio::time::sleep(retry_backoff).await;
-            }
-        }
-        Err(last_err)
-    }
-
-    /// CP **delete** of `key` (ADR 0017): a Raft-committed tombstone, waited to
-    /// durable+applied (a linearizable read then reads `None`) before returning.
-    /// Forwarded if this node isn't the leader. Used by the CQL whole-partition
-    /// delete; the DynamoDB edge instead writes a sentinel tombstone *value* via
-    /// [`cp_write`](Self::cp_write).
-    pub(crate) async fn cp_delete(&self, table: &str, key: Vec<u8>) -> Result<(), String> {
-        match self.cp_route(table, &key).await {
-            CpRoute::Local(leader) => Self::cp_delete_local(&leader, key).await,
-            CpRoute::Forward(addr) => {
-                let request = ClientRequest::Delete {
-                    key: key.clone(),
-                    table: table.to_owned(),
-                };
-                Self::ok_or_err(
-                    self.cp_forward(table, &key, addr, request).await,
-                    "forwarded CP delete",
-                )
-            }
-            CpRoute::None => Err("no CP group leader reachable".into()),
-        }
-    }
-
     // ---- multi-participant transactions (ADR 0018 §2/PR4) --------------------
 
     /// **The one place a stage actually executes on the leader's own node**
@@ -5990,6 +5796,7 @@ impl ClientCtx {
                     value: Some(eval.value),
                     kind_writes: eval.kind_writes,
                     change_log: eval.change_log,
+                    stage_marker: Some(eval.stage_marker),
                 });
             }
         }
@@ -6764,19 +6571,24 @@ impl ClientCtx {
     /// synchronously before returning — there is no successful ack to speed
     /// up on an error return, so the extra safety margin costs nothing.
     ///
-    /// **ADR 0046 D1 amendment**: for a transaction touching at least one
-    /// kind-write-path table, the async-spawn above is instead an **awaited,
-    /// bounded** resolve (`TXN_RESOLVE_ALL_AWAIT_BUDGET`, parallelized
-    /// across participants via `resolve_all_parallel`) — LSI rows and the
-    /// GSI/stream change record only appear at resolve (materialize-at-
-    /// resolve, A1), so an ack-then-async-resolve window would leave a
-    /// committed write readable on the base table but transiently absent
-    /// from its index/stream. A timeout still acks (delayed, never denied).
-    /// A plain transaction is completely unaffected — same fire-and-forget
-    /// spawn, same **sequential** `resolve_all` as before this amendment
-    /// (parallelizing it universally measurably destabilized a pre-existing
-    /// timing-sensitive regression test under concurrent load; see
-    /// `resolve_all_parallel`'s own doc for the full account).
+    /// **ADR 0046 D1 amendment (re-scoped under ADR 0049)**: for a
+    /// transaction touching at least one **images-carrying** table (an
+    /// index or a stream — `dynamo::txn_resolve_awaited`), the async-spawn
+    /// above is instead an **awaited, bounded** resolve
+    /// (`TXN_RESOLVE_ALL_AWAIT_BUDGET`, parallelized across participants
+    /// via `resolve_all_parallel`) — LSI rows and the GSI/stream change
+    /// record only appear at resolve (materialize-at-resolve, A1), so an
+    /// ack-then-async-resolve window would leave a committed write readable
+    /// on the base table but transiently absent from its index/stream. A
+    /// timeout still acks (delayed, never denied). Every other transaction
+    /// — including a marker-table one, which since ADR 0049 also stages
+    /// `pending` kind writes but has no index/stream consumer to protect —
+    /// keeps the fire-and-forget spawn and the **sequential** `resolve_all`
+    /// (parallelizing it universally measurably destabilized the torn-pair
+    /// hard-gate test under concurrent load, twice now: once during the D1
+    /// delivery, and again when ADR 0049's constant-true gate briefly
+    /// re-universalized it by implication; see `resolve_all_parallel`'s own
+    /// doc and `dynamo::txn_resolve_awaited`'s for the full account).
     ///
     /// **`write_conditions`** (ADR 0018 §2 apply-time write-key conditions
     /// amendment) — `(table, key, expected)` own-key byte-level OCC
@@ -6800,7 +6612,25 @@ impl ClientCtx {
         let mut pending = Vec::new();
         for w in group {
             match (w.value, w.pending) {
-                (Some(value), None) => writes.push(TxnWrite::plain(w.key, Some(value))),
+                // A plain-value transactional write only ever comes from the
+                // raw client protocol now (`ClientRequest::Txn` — the Dynamo
+                // edge's `run_transact` always builds `pending` kind-write
+                // specs under ADR 0049's constant-true gate), and it too must
+                // leave the ADR 0049 §3 stage marker: a raw write staged
+                // during an ADR 0050 split build would otherwise be invisible
+                // to the build's change-log tail until resolve — which can
+                // land after the parent is gone. Prefix = the write's own
+                // full key bytes (a raw write has no pk/sk decomposition;
+                // the CQL edge's own convention — the finest per-key dirty
+                // hint, leading with the key's own token so the apply-time
+                // token validation holds), `base_sk` empty, exactly like
+                // `cql::kind_partition_write`'s markers.
+                (Some(value), None) => {
+                    let marker = crate::dynamo::stage_marker_change_log(&w.key, Vec::new());
+                    let mut write = TxnWrite::plain(w.key, Some(value));
+                    write.stage_marker = Some(marker);
+                    writes.push(write);
+                }
                 (None, Some(p)) => pending.push(p),
                 (None, None) => {
                     return Err(format!(
@@ -6872,11 +6702,20 @@ impl ClientCtx {
             condition_map.insert((table, key), expected);
         }
 
-        // ADR 0046 D1: whether this transaction touches any kind-write-path
-        // table at all — every such write rides as `pending`, never a
-        // precomputed `value` (see `TxnTableWrite`'s doc), so this is exact,
-        // not a heuristic. Gates the awaited-bounded resolve below.
-        let touches_kind_write_path = writes.iter().any(|w| w.pending.is_some());
+        // ADR 0046 D1 (re-scoped under ADR 0049): whether this transaction
+        // must AWAIT its post-commit resolve — only when a pending write
+        // targets a table whose change records carry images (an index or a
+        // stream; the consumer-visibility rationale D1 actually rests on).
+        // Since ADR 0049's constant-true write-path gate, `pending.is_some()`
+        // alone is true for EVERY transaction, and keying this branch on it
+        // silently universalized the awaited `resolve_all_parallel`
+        // configuration that `resolve_all_parallel`'s own comment records as
+        // reproduced-red on the torn-pair hard-gate test — which duly went
+        // intermittently red again. See `dynamo::txn_resolve_awaited`'s doc.
+        let awaits_resolve = {
+            let meta = self.effective_metadata();
+            dynamo::txn_resolve_awaited(&meta, &writes)
+        };
 
         // Group by (table, tablet), preserving first-seen order — `order[0]`
         // is the anchor. `condition_groups` mirrors `groups`' keying, only
@@ -7061,6 +6900,17 @@ impl ClientCtx {
         // `txn_resolver_loop` is the safety net either way), but the
         // sequential default is the proven-stable one, so parallelism stays
         // opt-in to where D1 actually needs it.
+        //
+        // ADR 0049 postscript, proving the scoping is load-bearing: when the
+        // constant-true write-path gate made every transaction stage
+        // `pending` kind writes, the awaited branch below (then keyed on
+        // "any pending") re-universalized this parallel path by implication
+        // — and this same test went intermittently red again (a
+        // budget-expired ack racing the writer's next same-key stage into
+        // `TXN_STAGE_PUSH_ATTEMPTS` exhaustion). The branch is now keyed on
+        // `dynamo::txn_resolve_awaited` (images-carrying tables only), which
+        // restores the exact pre-ADR-0049 behavior for every marker-only
+        // transaction.
         let resolve_all_parallel = |outcome: TxnOutcome, staged: Vec<(String, Vec<Vec<u8>>)>| {
             let this = self.clone();
             let txn_id = txn_id.clone();
@@ -7170,18 +7020,19 @@ impl ClientCtx {
                     // liveness/latency.
                     //
                     // ADR 0046 D1: for a transaction touching any
-                    // kind-write-path table, LSI rows and the stream/GSI
-                    // change record only appear at resolve (materialize-
-                    // at-resolve, A1) — an ack-then-async-resolve window
-                    // would leave a committed write readable on the base
-                    // table but transiently absent from its index/stream.
-                    // Await `resolve_all` under a short bounded budget
-                    // first; a timeout still acks (delayed, never denied —
-                    // `txn_resolver_loop` remains the safety net for
-                    // whatever the bound didn't cover). A plain
-                    // transaction keeps the original fire-and-forget spawn
-                    // unchanged.
-                    if touches_kind_write_path {
+                    // images-carrying table (index/stream), LSI rows and
+                    // the stream/GSI change record only appear at resolve
+                    // (materialize-at-resolve, A1) — an ack-then-async-
+                    // resolve window would leave a committed write readable
+                    // on the base table but transiently absent from its
+                    // index/stream. Await `resolve_all` under a short
+                    // bounded budget first; a timeout still acks (delayed,
+                    // never denied — `txn_resolver_loop` remains the safety
+                    // net for whatever the bound didn't cover). Every other
+                    // transaction — marker-only tables included, since ADR
+                    // 0049 — keeps the original fire-and-forget sequential
+                    // spawn unchanged (see `dynamo::txn_resolve_awaited`).
+                    if awaits_resolve {
                         let _ = tokio::time::timeout(
                             TXN_RESOLVE_ALL_AWAIT_BUDGET,
                             resolve_all_parallel(TxnOutcome::Committed { commit_ts }, staged),
@@ -7642,31 +7493,13 @@ impl ClientCtx {
         }
     }
 
-    /// Route a CP-mode **write** for the plain client API (returns a wire
-    /// [`ClientResponse`]). Thin adapter over [`cp_write`](Self::cp_write).
-    async fn cp_put(&self, table: &str, key: Vec<u8>, value: Vec<u8>) -> ClientResponse {
-        // Auto-provision the table's tablet on first write (ADR 0023): the raw KV
-        // client names a table but issues no DDL, so stand one up on demand.
-        // `effective_metadata` (not `self.control.metadata_cached()` directly): on a growth
-        // node (ADR 0030) the local raft never reflects a table created before it
-        // existed, which would otherwise misread every write as needing a brand
-        // new (duplicate, rejected) tablet.
-        if !self.effective_metadata().has_table_tablet(table)
-            && let Err(e) = self.provision_tablet(table).await
-        {
-            return ClientResponse::Error(e);
-        }
-        match self.cp_write(table, key, value).await {
-            Ok(()) => ClientResponse::PutOk,
-            Err(e) => ClientResponse::Error(e),
-        }
-    }
-
     /// Route a CP-mode **read** for the plain client API (returns a wire
     /// [`ClientResponse`]). Thin adapter over [`cp_read`](Self::cp_read).
     async fn cp_get(&self, table: &str, key: Vec<u8>) -> ClientResponse {
         // A table with no tablet has no data (ADR 0023) — absent, no routing wait.
-        // `effective_metadata`: see `cp_put`'s identical comment (ADR 0030).
+        // `effective_metadata` (not `metadata_cached()` directly): on a growth
+        // node (ADR 0030) the local raft never reflects a table created
+        // before it existed.
         if !self.effective_metadata().has_table_tablet(table) {
             return ClientResponse::Value(None);
         }
@@ -8056,7 +7889,12 @@ impl ClientCtx {
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
-                match Self::cp_kind_local(&leader, writes, change_log, Vec::new()).await {
+                // The identical confirm `cp_kind_write_raw`'s own Local arm
+                // runs — never a second implementation (`cp_kind_local`'s
+                // Some-base-write requirement wrongly refused a forwarded
+                // whole-partition CQL DELETE, whose base write is a
+                // tombstone; see `cp_kind_raw_local`'s doc).
+                match Self::cp_kind_raw_local(&leader, writes, change_log).await {
                     Ok(()) => ClientResponse::PutOk,
                     Err(e) => ClientResponse::Error(e),
                 }
@@ -10362,9 +10200,41 @@ async fn handle_request(
         // All data ops route to the leaderful CP per-tablet Raft group (ADR 0017
         // #3a), scoped to the named table (ADR 0023). `table` is a required field
         // on the request type, so there is no unscoped data op to reject here.
-        ClientRequest::Put { key, value, table } => ctx.cp_put(&table, key, value).await,
+        //
+        // The plain client protocol is a real write surface (`animus-cli
+        // put`), so since ADR 0049 (Train A rung 5) its mutations ride the
+        // kind path and leave an image-less marker record like every other
+        // edge's — a raw key has no `pk`/`sk` decomposition, so the marker
+        // uses the full-key-as-prefix convention (`dynamo::
+        // marker_change_log`'s doc). Always a marker, never images, even on
+        // a streamed/indexed table: a raw value isn't a Dynamo item, so
+        // there is no image to carry — but the write is at least observable
+        // to change-log consumers (the old plain path emitted nothing at
+        // all, the same silent-loss shape PR #249 fixed for
+        // `BatchWriteItem`).
+        ClientRequest::Put { key, value, table } => {
+            let marker = dynamo::marker_change_log(&key, Vec::new());
+            match dynamo::marker_batch_write_raw(
+                ctx,
+                &table,
+                vec![(key, Some(value), marker)],
+                true,
+            )
+            .await
+            {
+                Ok(()) => ClientResponse::PutOk,
+                Err(e) => ClientResponse::Error(e),
+            }
+        }
         ClientRequest::PutBatch { entries, table } => {
-            match ctx.cp_batch_write(&table, entries).await {
+            let rows = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    let marker = dynamo::marker_change_log(&key, Vec::new());
+                    (key, Some(value), marker)
+                })
+                .collect();
+            match dynamo::marker_batch_write_raw(ctx, &table, rows, true).await {
                 Ok(()) => ClientResponse::PutOk,
                 Err(e) => ClientResponse::Error(e),
             }
@@ -10379,10 +10249,18 @@ async fn handle_request(
             Ok(pairs) => ClientResponse::Pairs(pairs),
             Err(e) => ClientResponse::Error(e),
         },
-        ClientRequest::Delete { key, table } => match ctx.cp_delete(&table, key).await {
-            Ok(()) => ClientResponse::PutOk,
-            Err(e) => ClientResponse::Error(e),
-        },
+        ClientRequest::Delete { key, table } => {
+            // A genuine engine delete + marker (see the `Put` arm's comment).
+            // No auto-provision — the old `cp_delete` never conjured an
+            // empty tablet for a table nothing provisioned.
+            let marker = dynamo::marker_change_log(&key, Vec::new());
+            match dynamo::marker_batch_write_raw(ctx, &table, vec![(key, None, marker)], false)
+                .await
+            {
+                Ok(()) => ClientResponse::PutOk,
+                Err(e) => ClientResponse::Error(e),
+            }
+        }
         // Admin: split a CP tablet — a single atomic control-plane command.
         ClientRequest::SplitTablet { tablet, split_key } => {
             ctx.trigger_split(TabletId(tablet), split_key).await

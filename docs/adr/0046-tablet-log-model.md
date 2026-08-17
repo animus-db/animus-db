@@ -1,6 +1,14 @@
 # ADR 0046 — The tablet log model
 
 - **Status:** Accepted
+- **2026-08-16 note:** [ADR 0049](0049-universal-kind-write-path.md) makes
+  principle 2 universal (every table takes the kind path; every tablet has a
+  change log). [ADR 0050](0050-per-tablet-storage-copy-based-splits.md)
+  (accepted, in delivery) supersedes principle 3 with a strictly stronger
+  invariant: a split *ends* the parent's log and starts two empty ones, so
+  **no consumer offset ever crosses a split** — the frozen-basis inheritance
+  rule (and `split_basis::effective`) retires with the zero-copy split that
+  needed it. Principles 1, 4, and 5 and both Decisions are unchanged.
 - **Date:** 2026-08-16
 - **Amends:** [ADR 0018](0018-cross-tablet-transactions.md) (names the
   serialization-point discipline its apply-time write-key conditions and

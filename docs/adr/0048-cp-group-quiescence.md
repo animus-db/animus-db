@@ -1,6 +1,14 @@
 # ADR 0048 — CP-group quiescence (phase 1)
 
 - **Status:** Accepted — implemented (PR1–PR7 of this stack).
+- **2026-08-16 note (later the same day):**
+  [ADR 0050](0050-per-tablet-storage-copy-based-splits.md) (accepted, in
+  delivery) leaves quiescence itself untouched — a retired split parent's
+  group is *removed*, strictly cheaper than quiesced — but retires this
+  ADR's `hot_read` scope-transition latch together with the residual it
+  narrowed (immutable tablet ranges leave no scope transition to latch),
+  and adds the storage-side sibling of this ADR's concern: the idle cost of
+  a per-tablet engine, measured as a gating item in 0050's first rung.
 - **Date:** 2026-08-16
 - **Amends:** [ADR 0017](0017-per-tablet-raft-data-plane.md) (the per-tablet
   Raft data plane); closes [ADR 0044](0044-split-only-tablets.md)'s

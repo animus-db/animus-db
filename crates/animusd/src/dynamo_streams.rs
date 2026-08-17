@@ -427,18 +427,18 @@ async fn get_records(
 }
 
 /// Whether a decoded change record must never surface on the Streams read
-/// path (ADR 0045 follow-up "E1"): the ADR 0045 §2 backfill seeder
-/// (`animusd::index_drain::backfill_seed_tick`) writes one synthetic,
-/// image-less change-log record per pre-existing partition purely as a dirty
-/// marker for the GSI drain — indistinguishable from a live write's own
-/// record by construction, except for this flag. Real DynamoDB emits **no**
-/// stream event at all for a GSI backfill's own coverage sweep over
-/// pre-existing data, so both `GetRecords` serve branches below call this
-/// one shared predicate rather than each growing its own copy of the same
-/// check (this codebase's own "one function, not two that happen to agree
-/// today" discipline).
-fn is_seeded(record: &ChangeRecord) -> bool {
-    record.seeded
+/// path: the ADR 0045 §2 backfill seeder's synthetic dirty marker (`seeded`,
+/// follow-up "E1" — real DynamoDB emits **no** stream event for a GSI
+/// backfill's own coverage sweep over pre-existing data), or an ADR 0049 §1
+/// image-less marker record (`marker` — written before this table had a
+/// stream at all; a stream begins at enable, never retroactively, so a
+/// marker-era record sealed into a later shard is history the stream never
+/// promised). Both `GetRecords` serve branches below call this one shared
+/// predicate (`ChangeRecord::consumer_hidden`) rather than each growing its
+/// own copy of the same check (this codebase's own "one function, not two
+/// that happen to agree today" discipline).
+fn consumer_hidden(record: &ChangeRecord) -> bool {
+    record.consumer_hidden()
 }
 
 /// The **sealed**-shard `GetRecords` path (ADR 0042 §9/§10, ADR 0043 §A7b):
@@ -491,7 +491,7 @@ async fn get_records_sealed(
         .iter()
         .filter_map(|r| {
             let record = ChangeRecord::decode(&r.change_record)?;
-            if is_seeded(&record) {
+            if consumer_hidden(&record) {
                 return None;
             }
             Some(streams_wire::stream_record_json(
@@ -545,7 +545,7 @@ async fn get_records_open(
         .filter_map(|(key, value)| {
             let packed = record_hlc_suffix(key)?;
             let record = ChangeRecord::decode(value)?;
-            if is_seeded(&record) {
+            if consumer_hidden(&record) {
                 return None;
             }
             Some(streams_wire::stream_record_json(

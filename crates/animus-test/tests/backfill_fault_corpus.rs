@@ -272,7 +272,7 @@ fn write_pre_existing_row(
     let key = base_key(pk);
     let result = node.put_kind_batch_fenced(
         vec![(KIND_BASE, key, Some(b"v".to_vec()))],
-        None,
+        Vec::new(),
         Vec::new(),
         range.clone(),
     );
@@ -291,11 +291,13 @@ fn write_base_row_live(sim: &mut Simulator, node: &KvNode, range: &KeyRange, pk:
         old_image: None,
         new_image: None,
         seeded: false,
+        marker: false,
+        staged: false,
     }
     .encode();
     let result = node.put_kind_batch_fenced(
         vec![(KIND_BASE, key.clone(), Some(b"v".to_vec()))],
-        Some((key, record)),
+        vec![(key, record)],
         Vec::new(),
         range.clone(),
     );
@@ -349,11 +351,13 @@ fn backfill_seed_tick(
             old_image: None,
             new_image: None,
             seeded: true,
+            marker: false,
+            staged: false,
         }
         .encode();
         let result = node.put_kind_batch_fenced(
             Vec::new(),
-            Some((prefix.clone(), record)),
+            vec![(prefix.clone(), record)],
             Vec::new(),
             range.clone(),
         );
@@ -376,7 +380,7 @@ fn backfill_seed_tick(
         // kind) and needs no range-fencing at all.
         let result = node.put_kind_batch_fenced(
             vec![(KIND_CURSOR, cursor_key_bytes, Some(cursor_val))],
-            None,
+            Vec::new(),
             Vec::new(),
             KeyRange::whole(),
         );

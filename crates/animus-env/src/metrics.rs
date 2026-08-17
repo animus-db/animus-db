@@ -474,12 +474,30 @@ pub enum Metric {
     /// must never disturb the fleet-wide idle-cost win quiescence exists
     /// for).
     CpGroupsQuiesced,
+
+    // --- Universal kind-write path (ADR 0049, Train A rung 4) --- Appended
+    // after the quiescence-observability variants above; every earlier
+    // variant's slot and the text-export order stay stable, so the snapshot
+    // remains byte-reproducible. Recorded by `animusd::index_drain`'s
+    // hot-trim arm — the one deleter of hot change records, which under ADR
+    // 0049 covers *every* table (a never-streamed, never-indexed table's
+    // image-less marker records are transient by the zero-expected-terms
+    // trim rule).
+    /// Change-log records this node's hot-trim arm deleted, cumulative —
+    /// a genuine counter. On a plain (no-stream, no-GSI) table this is the
+    /// marker churn the every-table trim keeps transient; on a
+    /// streamed/indexed table it counts ordinary post-seal/post-drain
+    /// trimming exactly as before. Also the trim-safe half of the
+    /// marker-emission regression tests' accounting: an emitted record is
+    /// either still pending or was counted here — a union a racing trim
+    /// tick cannot erase.
+    ChangeLogTrimmedTotal,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 69] = [
+    pub const ALL: [Metric; 70] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -549,6 +567,7 @@ impl Metric {
         Metric::CpQuiesces,
         Metric::CpUnquiesces,
         Metric::CpGroupsQuiesced,
+        Metric::ChangeLogTrimmedTotal,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -625,6 +644,7 @@ impl Metric {
             Metric::CpQuiesces => "cp_quiesces",
             Metric::CpUnquiesces => "cp_unquiesces",
             Metric::CpGroupsQuiesced => "cp_groups_quiesced",
+            Metric::ChangeLogTrimmedTotal => "change_log_trimmed_total",
         }
     }
 

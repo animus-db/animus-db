@@ -92,7 +92,10 @@ fn matching_condition_lets_the_batch_apply() {
     let base = logical(b"alice", b"");
     let lsi = logical(b"alice", b"\x01age30");
     assert!(matches!(
-        nodes[l].put_kind_batch(vec![(KIND_BASE, base.clone(), Some(b"v0".to_vec()))], None),
+        nodes[l].put_kind_batch(
+            vec![(KIND_BASE, base.clone(), Some(b"v0".to_vec()))],
+            Vec::new()
+        ),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(SETTLE);
@@ -104,7 +107,7 @@ fn matching_condition_lets_the_batch_apply() {
                     (KIND_BASE, base.clone(), Some(b"v1".to_vec())),
                     (KIND_LSI, lsi.clone(), Some(b"row".to_vec())),
                 ],
-                None,
+                Vec::new(),
                 vec![(base.clone(), Some(b"v0".to_vec()))],
                 KeyRange::whole(),
             ),
@@ -142,7 +145,7 @@ fn must_be_absent_condition_passes_when_truly_absent() {
         matches!(
             nodes[l].put_kind_batch_fenced(
                 vec![(KIND_BASE, base.clone(), Some(b"created".to_vec()))],
-                None,
+                Vec::new(),
                 vec![(base.clone(), None)],
                 KeyRange::whole(),
             ),
@@ -175,7 +178,7 @@ fn must_be_absent_condition_fails_when_present_no_ops_the_whole_batch() {
     assert!(matches!(
         nodes[l].put_kind_batch(
             vec![(KIND_BASE, base.clone(), Some(b"existing".to_vec()))],
-            None
+            Vec::new()
         ),
         ProposeResult::Accepted { .. }
     ));
@@ -188,7 +191,7 @@ fn must_be_absent_condition_fails_when_present_no_ops_the_whole_batch() {
                     (KIND_BASE, base.clone(), Some(b"overwrite".to_vec())),
                     (KIND_LSI, lsi.clone(), Some(b"row".to_vec())),
                 ],
-                None,
+                Vec::new(),
                 vec![(base.clone(), None)], // must be absent — but it isn't.
                 KeyRange::whole(),
             ),
@@ -224,7 +227,10 @@ fn mismatched_value_condition_no_ops_and_leaves_the_key_untouched() {
 
     let base = logical(b"dave", b"");
     assert!(matches!(
-        nodes[l].put_kind_batch(vec![(KIND_BASE, base.clone(), Some(b"v0".to_vec()))], None),
+        nodes[l].put_kind_batch(
+            vec![(KIND_BASE, base.clone(), Some(b"v0".to_vec()))],
+            Vec::new()
+        ),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(SETTLE);
@@ -232,7 +238,7 @@ fn mismatched_value_condition_no_ops_and_leaves_the_key_untouched() {
     assert!(matches!(
         nodes[l].put_kind_batch_fenced(
             vec![(KIND_BASE, base.clone(), Some(b"v1".to_vec()))],
-            None,
+            Vec::new(),
             vec![(base.clone(), Some(b"999-wrong".to_vec()))],
             KeyRange::whole(),
         ),
@@ -263,7 +269,10 @@ fn condition_check_composes_with_the_fence_gate() {
 
     let base = logical(b"erin", b"");
     assert!(matches!(
-        nodes[l].put_kind_batch(vec![(KIND_BASE, base.clone(), Some(b"v0".to_vec()))], None),
+        nodes[l].put_kind_batch(
+            vec![(KIND_BASE, base.clone(), Some(b"v0".to_vec()))],
+            Vec::new()
+        ),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(SETTLE);
@@ -281,7 +290,7 @@ fn condition_check_composes_with_the_fence_gate() {
     assert!(matches!(
         nodes[l].put_kind_batch_fenced(
             vec![(KIND_BASE, base.clone(), Some(b"v1".to_vec()))],
-            None,
+            Vec::new(),
             vec![(base.clone(), Some(b"wrong".to_vec()))],
             fence,
         ),
@@ -317,7 +326,10 @@ fn condition_gated_batch_survives_crash_restart_idempotently() {
 
     let base = logical(b"frank", b"");
     assert!(matches!(
-        node.put_kind_batch(vec![(KIND_BASE, base.clone(), Some(b"v0".to_vec()))], None),
+        node.put_kind_batch(
+            vec![(KIND_BASE, base.clone(), Some(b"v0".to_vec()))],
+            Vec::new()
+        ),
         ProposeResult::Accepted { .. }
     ));
     sim.run_for(SETTLE);
@@ -325,7 +337,7 @@ fn condition_gated_batch_survives_crash_restart_idempotently() {
     assert!(matches!(
         node.put_kind_batch_fenced(
             vec![(KIND_BASE, base.clone(), Some(b"v1".to_vec()))],
-            None,
+            Vec::new(),
             vec![(base.clone(), Some(b"v0".to_vec()))],
             KeyRange::whole(),
         ),
@@ -374,7 +386,10 @@ fn matching_condition_scenario_is_reproducible_across_seeds() {
 
         let base = logical(b"grace", b"");
         assert!(matches!(
-            nodes[l].put_kind_batch(vec![(KIND_BASE, base.clone(), Some(b"v0".to_vec()))], None),
+            nodes[l].put_kind_batch(
+                vec![(KIND_BASE, base.clone(), Some(b"v0".to_vec()))],
+                Vec::new()
+            ),
             ProposeResult::Accepted { .. }
         ));
         sim.run_for(SETTLE);
@@ -382,7 +397,7 @@ fn matching_condition_scenario_is_reproducible_across_seeds() {
         assert!(matches!(
             nodes[l].put_kind_batch_fenced(
                 vec![(KIND_BASE, base.clone(), Some(b"v1".to_vec()))],
-                None,
+                Vec::new(),
                 vec![(base.clone(), Some(b"v0".to_vec()))],
                 KeyRange::whole(),
             ),

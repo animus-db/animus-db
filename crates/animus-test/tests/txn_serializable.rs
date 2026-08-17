@@ -1102,6 +1102,7 @@ async fn stage_anchor_pushing(
                         value: val,
                         kind_writes,
                         change_log: None,
+                        stage_marker: None,
                     }],
                     participant_spans,
                     Vec::new(),
@@ -1153,6 +1154,7 @@ async fn stage_participant_pushing(
                         value: val,
                         kind_writes,
                         change_log: None,
+                        stage_marker: None,
                     }],
                     Vec::new(),
                 )

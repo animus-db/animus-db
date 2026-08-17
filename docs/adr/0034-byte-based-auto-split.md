@@ -2,6 +2,12 @@
 
 - **Status:** Accepted — implemented in `animus-storage`, `animus-cp-data`,
   `animusd`.
+- **2026-08-16 note:** [ADR 0050](0050-per-tablet-storage-copy-based-splits.md)
+  (accepted, in delivery) keeps this ADR's trigger, byte-weighted median,
+  cooldown, and F11 token alignment — but what they *trigger* becomes a
+  copy-based background workflow, so a split is no longer "cheap to have
+  made"; the "Mitigating context" paragraph below stops applying once 0050
+  lands.
 - **Date:** 2026-08-07
 
 ## Context

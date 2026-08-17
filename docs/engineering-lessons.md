@@ -2367,6 +2367,44 @@ debugging anything that feels like it might have happened before.
   concurrent writes needs this discipline, not just the specific two cases
   found so far.
 
+- **Changing a bulk write path's Raft-entry granularity is a throughput
+  contract change, and the timing-budgeted e2e suites are its regression
+  canary — bisect a "suddenly slow" suite before blaming the machine**
+  (2026-08-16, found delivering ADR 0049 Train A rung 2). Rung 1 replaced
+  `BatchWriteItem`'s one-`Batch`-entry-per-tablet fast path with per-item
+  `KindBatch` proposals (chunked, concurrent). Its own gates ran green, but
+  `backfill_seeder.rs::split_during_backfill_converges_with_correct_final_
+  gsi` — a populate-heavy test with a 60s convergence budget — went
+  deterministically red at the rung's tip (4/4, even single-threaded) while
+  the immediate pre-rung commit passed in 17s: an order-of-magnitude
+  convergence regression that a "flaky on this box" shrug would have
+  shipped. Two lessons: (1) an entry-granularity change (N single-key
+  entries where one multi-key entry used to be) multiplies per-entry apply/
+  confirm costs and must be treated as perf-sensitive — re-run the suites
+  whose comments document timing budgets several times before shipping;
+  (2) the 30-second bisect (run the suite once on the parent commit) is
+  what turns "pre-existing flake, dismissed" into "my rung's regression,
+  fixed" — never classify a red integration test as environmental without
+  that one run, exactly because this machine also has a *genuine*
+  environmental flake class (`AddrInUse` bring-up TOCTOU) to hide behind.
+
+- **A helper promoted from a background path to a client hot path carries
+  its background-tuned cadence with it — bench the promoted path itself,
+  never assume the promotion is free** (2026-08-16, ADR 0049 Train A rung
+  5's bench gate). `cp_kind_raw_local` was built for the GSI drain's
+  footprint/cursor writes, where its flat 10ms confirm-poll sleep was
+  irrelevant; ADR 0049 quietly made it the confirm for *every* plain
+  Dynamo/CQL/raw-protocol write, so nearly every sequential client write
+  ate one whole 10ms tick — a 2.9× sequential-latency regression
+  (13.6 ms/op vs 4.7 pre-train on the ADR's own bench) that every
+  correctness gate ran green through, caught only because the ADR had
+  demanded a before/after measurement as a shipping gate. The plain path's
+  own confirm had used a 200µs-start exponential back-off all along; the
+  fix was giving the promoted helper the same one. Corollary: when an ADR
+  names an expected perf envelope ("low single-digit percent"), build the
+  measurement into the train as a gate — this one paid for itself on its
+  first run.
+
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
   symbol + every consumer + every test asserting the behavior), not by
@@ -2508,7 +2546,22 @@ debugging anything that feels like it might have happened before.
   apply" decision are supposed to always agree, don't let them be two
   separately-maintained booleans; a passing test suite proves today's
   agreement, not tomorrow's. (`crates/animusd/src/dynamo.rs`, ADR 0042 PR A3,
-  2026-08-14.)
+  2026-08-14.) **Second confirmed instance, found wiring ADR 0049
+  (2026-08-16): the drift survived the fix's own review round.**
+  `BatchWriteItem`'s fast-path gate stayed `meta.table_indexes(table)
+  .is_empty()` — written against ADR 0041 (indexes-only), never re-checked
+  when ADR 0042 widened "takes the kind path" to include streams — so a
+  streamed-but-unindexed table's batch writes bypassed the kind path
+  entirely and its stream silently lost every one of them (no LSI existed
+  to corrupt, so nothing else surfaced it; found only because ADR 0049's
+  gate flip forced re-reading every gate site). The factored-predicate fix
+  above only protects call sites that *call the shared function* — grep for
+  raw re-derivations of the same condition (`table_indexes(`,
+  `table_stream(`) whenever the shared predicate's meaning widens, because
+  a site that never adopted the function is exactly the one no widening PR
+  ever touches. Regression: `stream_write_path_tests::
+  batch_write_on_a_streamed_table_emits_change_records` (red on the
+  pre-0049 code).
 - **A marker key built by truncating a tablet's own `range.start` to a fixed
   prefix is disjoint from real data (if it lives in its own kind scope) but
   is *not* thereby proven to stay within `[range.start, range.end)` —
@@ -6040,6 +6093,55 @@ debugging anything that feels like it might have happened before.
   decrement, check whether every event source shares one sink — if so, a
   single periodic re-aggregation is both simpler and the only version
   that's actually correct.
+- **Making a conditional predicate constant-true silently universalizes
+  every branch keyed on it — re-key each one to the property it actually
+  meant, and grep the old predicate's consumers for documented
+  instabilities first** (ADR 0049 Train A rung 1 fixup 2, 2026-08-16). ADR
+  0049 flipped `table_takes_kind_write_path` to constant-true so every
+  table gets a change log. But `cp_txn`'s awaited-bounded resolve branch
+  was keyed on "stages any pending kind write" — a faithful proxy for that
+  predicate — so every plain-table transaction silently moved onto the
+  awaited `resolve_all_parallel` configuration. That exact configuration
+  was already documented, in `resolve_all_parallel`'s own comment, as
+  reproduced-red on `dynamo_txn`'s torn-pair hard-gate test when applied
+  universally ("green again scoped like this") — and the hard gate duly
+  went intermittently red again (2/7 solo here; a budget-expired ack racing
+  the writer's next same-key stage into `TXN_STAGE_PUSH_ATTEMPTS`
+  exhaustion), bisected across three rungs before the cause was spotted
+  sitting in a comment nobody re-read. The fix re-keys the branch on the
+  property D1's rationale actually names (`table_change_records_carry_
+  images` — an index/stream consumer exists whose visibility the await
+  protects), restoring the proven-stable fire-and-forget sequential
+  resolve for every marker-only transaction. **General rule**: a
+  universalization change's review checklist must include every branch
+  keyed on the predicate (or its proxies — here `pending.is_some()`), and
+  each one either genuinely wants the universal behavior or gets re-keyed
+  to the narrower property it was really about; the documented caveats of
+  the path being universalized (ADR text and load-bearing code comments
+  alike) are the first place to look for what will break.
+
+- **A forwarded RPC's serve arm must run the SAME confirm implementation as
+  the caller's own local arm — two implementations for one RPC diverge the
+  moment a new payload shape arrives, and the failure is
+  leader-placement-bimodal.** `cp_kind_write_raw`'s local arm confirmed a
+  raw kind batch on its *last* write, tolerating a tombstone (`None`)
+  probe; `cp_serve_forwarded`'s `KindWrite` arm confirmed the identical
+  batch via `cp_kind_local`, whose confirm *requires* a `Some`-valued base
+  write. The two agreed for every payload shape that existed when they were
+  written (the GSI drain's cursor/footprint puts) and disagreed on the
+  first new shape (ADR 0049 Train A rung 2's whole-partition CQL DELETE — a
+  batch whose base write is a tombstone): the delete succeeded iff the
+  serving node happened to lead the tablet, an election-dependent bimodal
+  failure that one pre-existing e2e (`cql_clustering`) only caught by luck
+  of leader placement. Two lessons: (1) when a request can be served
+  locally or forwarded, extract the serve body into ONE function called
+  from both arms (`ClientCtx::cp_kind_raw_local`) — the local/forward split
+  is transport, never semantics; (2) the existing "every internal RPC needs
+  at least one non-leader-issued call in its suite" rule applies per
+  *payload shape*, not per RPC — a new shape through an old RPC needs its
+  own follower-connected regression
+  (`cql::cql_kind_write_tests::cql_whole_partition_delete_serves_from_every_node`,
+  red on the two-implementation code with exactly the diagnosed refusal).
 
 ### Parallel-agent orchestration
 - **`gh stack checkout <N>` silently switches the CURRENT worktree's checked-
@@ -6622,3 +6724,23 @@ debugging anything that feels like it might have happened before.
   regression test that checks the *result* of the classification is the
   real safety net; the doc pointer is what tells the next person touching
   either side that the two need to move together.
+- **A change that makes previously-permanent state transient must revisit
+  every earlier test that observed that state live — and the fix is an
+  erasure-proof accounting signal, never a race-tolerant wait** (ADR 0049
+  Train A rung 4, 2026-08-16). Rung 4 extended the hot-trim arm to every
+  table, which turned plain-table marker records from
+  accumulate-forever into trimmed-within-a-tick — and silently broke (or
+  made load-flaky) three earlier rungs' own marker-*emission* regressions,
+  which counted live `pending_changes()` rows: under suite load the trim
+  tick could win the race and delete the evidence between the write's ack
+  and the test's read. No sleep/poll tuning can fix that shape — the
+  window is real and the test's observable is genuinely transient. The
+  sound fix is a signal the eraser itself maintains:
+  `Metric::ChangeLogTrimmedTotal` counts every record the trim deletes, so
+  the tests assert `live + trimmed-delta == N` — a union a racing trim
+  cannot erase, and one that still fails on a genuine emission regression
+  (both terms zero). General form: when rung N+1 adds a deleter for rung
+  N's observable, rung N's tests must switch from observing the state to
+  observing state-plus-deletions, and the deleter should export the
+  deletion count as a real metric (it is genuine operational observability,
+  not test scaffolding).

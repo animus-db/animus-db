@@ -1227,3 +1227,102 @@ async fn disabled_stream_grace_window_lists_and_serves_sealed_reads_with_no_open
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("ResourceNotFoundException"), "{body}");
 }
+
+/// ADR 0049 §1: a table written to **before** its stream was enabled holds
+/// image-less marker records in its change log; once a stream is enabled
+/// (and the sealer sweeps the whole hot scope — markers included — into
+/// segments, by design), those markers must never surface as stream events
+/// on either `GetRecords` serve path. A stream begins at enable, never
+/// retroactively: the walk below must deliver exactly the one post-enable
+/// write, on a chain whose sealed segments physically contain the markers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_enable_marker_records_never_surface_on_the_stream() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
+    await_bootstrap(&nodes).await;
+    let addr = nodes[0].dynamo_addr();
+
+    // A plain table: these two writes leave marker records, no stream exists.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"mk",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+    for k in ["m1", "m2"] {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.PutItem",
+            &format!(r#"{{"TableName":"mk","Item":{{"id":{{"S":"{k}"}},"v":{{"N":"1"}}}}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "PutItem({k}) failed: {body}");
+    }
+
+    // Enable the stream, then one real write.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.UpdateTable",
+        r#"{"TableName":"mk","StreamSpecification":
+            {"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "UpdateTable failed: {body}");
+    let label = field(&body, "LatestStreamLabel");
+    await_stream_label_everywhere(&nodes, "mk", &label).await;
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/mk/stream/{label}");
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.PutItem",
+        r#"{"TableName":"mk","Item":{"id":{"S":"real"},"v":{"N":"2"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "PutItem(real) failed: {body}");
+
+    // tiny_seal_knobs seals on the next consumer-loop tick — wait for at
+    // least one sealed shard so the walk exercises the SEALED serve path
+    // over a segment that physically contains the markers.
+    await_chain_len(&nodes, "mk", 1).await;
+
+    // Walk every shard of the chain from TRIM_HORIZON, sealed and open
+    // alike, collecting every delivered event.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDBStreams_20120810.DescribeStream",
+        &format!(r#"{{"StreamArn":"{stream_arn}"}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeStream failed: {body}");
+    let v = json(&body);
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap().clone();
+    assert!(!shards.is_empty(), "expected at least one shard: {body}");
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    for shard in &shards {
+        let shard_id = shard["ShardId"].as_str().unwrap();
+        let mut it =
+            Some(get_shard_iterator(addr, &stream_arn, shard_id, "TRIM_HORIZON", None).await);
+        // A sealed shard drains to a null iterator; an open shard returns
+        // the same position on an empty poll — one empty poll ends it.
+        while let Some(iterator) = it {
+            let (records, next) = get_records(addr, &iterator, None).await;
+            let drained = records.is_empty();
+            events.extend(records);
+            it = if drained { None } else { next };
+        }
+    }
+
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly the one post-enable write may surface — a marker record \
+         leaking through either serve path shows up here as extra events: \
+         {events:?}"
+    );
+    assert_eq!(events[0]["eventName"], "INSERT", "{events:?}");
+    assert_eq!(
+        events[0]["dynamodb"]["Keys"]["id"]["S"], "real",
+        "the delivered event must be the post-enable write: {events:?}"
+    );
+}

@@ -97,6 +97,7 @@ fn kind_bearing_write(pk: &[u8], base_value: Vec<u8>, lsi_value: Vec<u8>) -> Txn
         value: Some(base_value),
         kind_writes: vec![(KIND_LSI, lsi, Some(lsi_value))],
         change_log: Some((change_prefix, b"change-record".to_vec())),
+        stage_marker: None,
     }
 }
 
@@ -525,7 +526,7 @@ fn kind_batch_and_txn_resolve_materialize_byte_identical_rows_for_identical_payl
     let kb_lsi_key = logical(kb_pk, b"\x01lsi");
     match node.put_kind_batch(
         vec![(KIND_LSI, kb_lsi_key.clone(), Some(lsi_value.clone()))],
-        None,
+        Vec::new(),
     ) {
         animus_control::ProposeResult::Accepted { .. } => {}
         other => panic!("KindBatch rejected: {other:?} (seed={seed})"),
@@ -543,6 +544,7 @@ fn kind_batch_and_txn_resolve_materialize_byte_identical_rows_for_identical_payl
         value: Some(b"base-value".to_vec()),
         kind_writes: vec![(KIND_LSI, txn_lsi_key.clone(), Some(lsi_value.clone()))],
         change_log: None,
+        stage_marker: None,
     };
     let n = node.clone();
     let (txn_id, record_key, _outcome) = drive(&mut sim, node.env(), SETTLE, async move {
@@ -666,5 +668,299 @@ fn a_kind_write_key_outside_fence_blocks_the_whole_resolve_even_though_the_base_
         None,
         "the LSI row must never materialize once its key is out of this group's fence, even \
          though the base key that carries it is still in fence (seed={seed})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0049 §3 — the TxnStage stage marker (Train A rung 3)
+// ---------------------------------------------------------------------------
+
+/// `kind_bearing_write` plus an ADR 0049 §3 stage marker sharing the same
+/// change-key prefix, exactly as `animusd::dynamo::eval_kind_txn_write`
+/// stages one (the resolve record and the stage marker share one per-item
+/// prefix; their apply-completed HLC suffixes keep the keys distinct).
+fn stage_bearing_write(pk: &[u8], base_value: Vec<u8>, lsi_value: Vec<u8>) -> TxnWrite {
+    let change_prefix = logical(pk, b"\x02");
+    let mut w = kind_bearing_write(pk, base_value, lsi_value);
+    w.stage_marker = Some((change_prefix, b"stage-marker".to_vec()));
+    w
+}
+
+/// The trailing 8-byte packed-HLC suffix of a completed change-log key.
+fn key_hlc_suffix(prefix: &[u8], key: &[u8]) -> u64 {
+    assert!(
+        key.starts_with(prefix) && key.len() == prefix.len() + 8,
+        "change key must be prefix || 8-byte packed HLC: {key:?}"
+    );
+    u64::from_be_bytes(key[prefix.len()..].try_into().unwrap())
+}
+
+/// ADR 0049 §3: staging an intent leaves exactly one image-less stage
+/// marker in `KIND_CHANGE`, keyed at the stage entry's own apply-completed
+/// HLC — the dirty-key signal ADR 0050's split-build tail re-reads a fresh
+/// intent envelope through. Red on the pre-rung-3 apply arm (which wrote
+/// nothing into any kind scope at stage time, by ADR 0046 Decision 2 —
+/// unchanged for the LSI/change payload, which this marker deliberately is
+/// not).
+#[test]
+fn stage_writes_a_stage_marker_at_the_stage_entrys_own_ts() {
+    let seed = 0x4900_0301;
+    let (mut sim, node) = group(seed);
+    sim.run_for(ELECT);
+
+    let pk = b"stage-marker-alice";
+    let base = logical(pk, b"");
+    let lsi = logical(pk, b"\x01lsi");
+    let change_prefix = logical(pk, b"\x02");
+    let write = stage_bearing_write(pk, b"v1".to_vec(), b"lsi-row-1".to_vec());
+
+    let n = node.clone();
+    let (_txn_id, _record_key, outcome) = drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_stage_anchor(TABLE, vec![write], Vec::new(), Vec::new())
+            .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("txn_stage_anchor did not complete (seed={seed})"));
+    assert_eq!(outcome, animus_cp_data::StageOutcome::Staged);
+
+    // The derived kind payload stays intent-carried (materialize-at-resolve,
+    // unchanged) — only the stage MARKER lands now.
+    assert_eq!(
+        block_on(node.local_get_kind(KIND_LSI, &lsi)),
+        None,
+        "the staged LSI payload must still not be visible at stage time (seed={seed})"
+    );
+    let scanned = block_on(node.local_scan_kind(KIND_CHANGE, &change_prefix, None, None));
+    let matching: Vec<_> = scanned
+        .into_iter()
+        .filter(|(k, _)| k.starts_with(&change_prefix))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "staging must leave exactly one stage marker in KIND_CHANGE (seed={seed}): {matching:?}"
+    );
+    let (marker_key, marker_value) = &matching[0];
+    assert_eq!(
+        marker_value.as_slice(),
+        b"stage-marker",
+        "the marker's bytes are the edge-built record, opaque to this crate (seed={seed})"
+    );
+    // Key shape: prefix || 8-byte packed HLC (apply-completed).
+    let _ = key_hlc_suffix(&change_prefix, marker_key);
+    // The base intent itself staged as usual.
+    assert_eq!(
+        block_on(node.local_get(&base)),
+        None,
+        "a still-pending intent must not read as committed (seed={seed})"
+    );
+}
+
+/// ADR 0049 §3's ordering claim, asserted: the stage marker's key HLC
+/// strictly precedes the resolve-materialized record's — stage applies
+/// before resolve in the anchor's own log, and each key completes at its
+/// own entry's ts.
+#[test]
+fn stage_marker_hlc_strictly_precedes_the_resolve_records() {
+    let seed = 0x4900_0302;
+    let (mut sim, node) = group(seed);
+    sim.run_for(ELECT);
+
+    let pk = b"stage-marker-order";
+    let base = logical(pk, b"");
+    let change_prefix = logical(pk, b"\x02");
+    let write = stage_bearing_write(pk, b"v1".to_vec(), b"lsi-row-1".to_vec());
+
+    let n = node.clone();
+    let (txn_id, record_key, outcome) = drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_stage_anchor(TABLE, vec![write], Vec::new(), Vec::new())
+            .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("txn_stage_anchor did not complete (seed={seed})"));
+    assert_eq!(outcome, animus_cp_data::StageOutcome::Staged);
+
+    let n = node.clone();
+    let (txn_id_c, record_key_c) = (txn_id.clone(), record_key.clone());
+    let stage_ts = txn_id.ts;
+    let commit_ts = drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_commit_at_least(txn_id_c, record_key_c, stage_ts)
+            .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("txn_commit_at_least did not complete (seed={seed})"));
+
+    let n = node.clone();
+    let (txn_id_r, record_key_r, base_r) = (txn_id.clone(), record_key.clone(), base.clone());
+    let resolve_ts = drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_resolve(
+            txn_id_r,
+            record_key_r,
+            vec![base_r],
+            TxnOutcome::Committed { commit_ts },
+        )
+        .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("txn_resolve did not complete (seed={seed})"));
+
+    let scanned = block_on(node.local_scan_kind(KIND_CHANGE, &change_prefix, None, None));
+    let mut suffixes: Vec<u64> = scanned
+        .iter()
+        .filter(|(k, _)| k.starts_with(&change_prefix))
+        .map(|(k, _)| key_hlc_suffix(&change_prefix, k))
+        .collect();
+    suffixes.sort_unstable();
+    assert_eq!(
+        suffixes.len(),
+        2,
+        "one stage marker + one resolve-materialized record (seed={seed}): {scanned:?}"
+    );
+    assert!(
+        suffixes[0] < suffixes[1],
+        "the stage marker must strictly precede the resolve record (seed={seed})"
+    );
+    assert_eq!(
+        suffixes[1],
+        hlc::pack(resolve_ts),
+        "the later record is the resolve's own, keyed at the resolve entry's ts (seed={seed})"
+    );
+}
+
+/// An aborted transaction's stage marker remains — deliberately, with no
+/// special-casing: it is a dirty-key hint pointing at a row whose envelope
+/// reverted, and a change-log consumer re-reads whatever is currently
+/// there (the restored prior value), so a stale hint is harmless by the
+/// same argument the GSI drain's own idempotent reconciliation makes.
+#[test]
+fn an_aborted_stages_marker_remains_a_harmless_dirty_hint() {
+    let seed = 0x4900_0303;
+    let (mut sim, node) = group(seed);
+    sim.run_for(ELECT);
+
+    let pk = b"stage-marker-abort";
+    let base = logical(pk, b"");
+    let change_prefix = logical(pk, b"\x02");
+
+    match node.put_fenced(base.clone(), b"prior".to_vec(), KeyRange::whole()) {
+        animus_control::ProposeResult::Accepted { .. } => {}
+        other => panic!("prior put rejected: {other:?} (seed={seed})"),
+    }
+    sim.run_for(SETTLE);
+
+    let write = stage_bearing_write(pk, b"v2".to_vec(), b"lsi-row-2".to_vec());
+    let n = node.clone();
+    let (txn_id, record_key, outcome) = drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_stage_anchor(TABLE, vec![write], Vec::new(), Vec::new())
+            .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("txn_stage_anchor did not complete (seed={seed})"));
+    assert_eq!(outcome, animus_cp_data::StageOutcome::Staged);
+
+    let n = node.clone();
+    let (txn_id_a, record_key_a) = (txn_id.clone(), record_key.clone());
+    drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_abort(txn_id_a, record_key_a).await
+    });
+    let n = node.clone();
+    let (txn_id_r, record_key_r, base_r) = (txn_id.clone(), record_key.clone(), base.clone());
+    drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_resolve(txn_id_r, record_key_r, vec![base_r], TxnOutcome::Aborted)
+            .await
+    });
+
+    assert_eq!(
+        block_on(node.local_get(&base)),
+        Some(b"prior".to_vec()),
+        "abort must restore the prior value (seed={seed})"
+    );
+    let scanned = block_on(node.local_scan_kind(KIND_CHANGE, &change_prefix, None, None));
+    let matching: Vec<_> = scanned
+        .into_iter()
+        .filter(|(k, _)| k.starts_with(&change_prefix))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly the stage marker remains — no resolve record for an abort (seed={seed}): \
+         {matching:?}"
+    );
+    assert_eq!(matching[0].1.as_slice(), b"stage-marker");
+}
+
+/// A stage marker whose prefix does not lead with its own write's partition
+/// token is rejected whole-or-nothing at apply (`Fenced`), exactly like a
+/// mis-tokened kind-write key — the marker key must sit at the same
+/// tablet-range position the fence-checked base key does (wire-reachable
+/// via `ClientRequest::TxnPrepare`, so validated, never assumed).
+#[test]
+fn a_stage_marker_prefix_off_its_own_token_is_rejected_at_apply() {
+    let seed = 0x4900_0304;
+    let (mut sim, node) = group(seed);
+    sim.run_for(ELECT);
+
+    let pk = b"stage-marker-victim";
+    let base = logical(pk, b"");
+    let mut write = kind_bearing_write(pk, b"v1".to_vec(), b"lsi-row-1".to_vec());
+    // A different partition's token — a change-log row that would land at a
+    // range position the entry's fence never checked.
+    write.stage_marker = Some((logical(b"some-other-pk", b"\x02"), b"evil".to_vec()));
+
+    let n = node.clone();
+    let (_txn_id, _record_key, outcome) = drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_stage_anchor(TABLE, vec![write], Vec::new(), Vec::new())
+            .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("txn_stage_anchor did not complete (seed={seed})"));
+    assert_eq!(
+        outcome,
+        animus_cp_data::StageOutcome::Fenced,
+        "a mis-tokened stage marker must reject the whole stage (seed={seed})"
+    );
+    assert_eq!(
+        block_on(node.local_get(&base)),
+        None,
+        "whole-or-nothing: no intent may land either (seed={seed})"
+    );
+}
+
+/// The `change_log` twin of the stage-marker rejection above (ADR 0049
+/// Train A rung 4): a resolve-time change record's prefix rides the same
+/// wire-reachable stage payload, and `TxnResolve` would complete-and-write
+/// it wherever it points — so a prefix off its own write's partition token
+/// must reject the whole stage at apply (`Fenced`), never be admitted and
+/// materialized at resolve. Red before the rung: the stage was admitted
+/// (`Staged`) with the mis-tokened prefix riding the intent envelope.
+#[test]
+fn a_change_log_prefix_off_its_own_token_is_rejected_at_apply() {
+    let seed = 0x4900_0405;
+    let (mut sim, node) = group(seed);
+    sim.run_for(ELECT);
+
+    let pk = b"change-log-victim";
+    let base = logical(pk, b"");
+    let mut write = kind_bearing_write(pk, b"v1".to_vec(), b"lsi-row-1".to_vec());
+    // A different partition's token — the resolve record would land at a
+    // range position no fence ever checked for this entry.
+    write.change_log = Some((logical(b"some-other-pk", b"\x02"), b"evil".to_vec()));
+
+    let n = node.clone();
+    let (_txn_id, _record_key, outcome) = drive(&mut sim, node.env(), SETTLE, async move {
+        n.txn_stage_anchor(TABLE, vec![write], Vec::new(), Vec::new())
+            .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("txn_stage_anchor did not complete (seed={seed})"));
+    assert_eq!(
+        outcome,
+        animus_cp_data::StageOutcome::Fenced,
+        "a mis-tokened change_log prefix must reject the whole stage (seed={seed})"
+    );
+    assert_eq!(
+        block_on(node.local_get(&base)),
+        None,
+        "whole-or-nothing: no intent may land either (seed={seed})"
     );
 }

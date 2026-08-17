@@ -617,10 +617,10 @@ pub enum KvCommand {
     KindBatch {
         /// `(row kind, logical key, value)` — `None` writes a tombstone.
         writes: Vec<KindWrite>,
-        /// An optional **change-log record** to append in the same entry:
-        /// `(key prefix, encoded record)`.
+        /// **Change-log records** to append in the same entry, each a
+        /// `(key prefix, encoded record)` pair (empty = none).
         ///
-        /// Its key is completed at **apply** as `prefix || hlc::pack(ts)`, using
+        /// Each key is completed at **apply** as `prefix || hlc::pack(ts)`, using
         /// this entry's own commit timestamp, and it lands in the
         /// [`KIND_CHANGE`] scope. The proposer deliberately cannot supply that
         /// suffix: `ts` is minted inside `propose_ordered` and is the only
@@ -628,8 +628,18 @@ pub enum KvCommand {
         /// edge guess it would silently break the ordering the log exists to
         /// provide (ADR 0041 §4a — DynamoDB Streams reads these in commit
         /// order). Making it structural also means the record can never be
-        /// keyed inconsistently across replicas.
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        /// keyed inconsistently across replicas. **A `Vec`, not an `Option`,
+        /// since ADR 0049's Train A rung-1 fixup**: a marker-table
+        /// `BatchWriteItem` commits one entry per tablet carrying every
+        /// item's base row *and* every item's marker record — the
+        /// entry-granularity throughput contract the plain `Batch` path had
+        /// (one entry per tablet, one WAL record, one apply), which per-item
+        /// `KindBatch` proposals were measured to break (the
+        /// `backfill_seeder` populate-then-backfill regression). Records in
+        /// one entry share the entry's `ts`; their prefixes differ per item
+        /// (`token || escape(pk)`), so the completed keys stay distinct for
+        /// distinct items.
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
         ts: HlcTimestamp,
@@ -2058,7 +2068,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     pub fn put_kind_batch(
         &self,
         writes: Vec<KindWrite>,
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> ProposeResult {
         self.put_kind_batch_fenced(writes, change_log, Vec::new(), KeyRange::whole())
     }
@@ -2075,7 +2085,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     pub fn put_kind_batch_fenced(
         &self,
         writes: Vec<KindWrite>,
-        change_log: Option<(Vec<u8>, Vec<u8>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         fence: KeyRange,
     ) -> ProposeResult {
@@ -4672,7 +4682,7 @@ fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimesta
 fn materialize_derived(
     kind_scopes: &[StorageScope; ALL_KINDS.len()],
     writes: &[KindWrite],
-    change_log: &Option<(Vec<u8>, Vec<u8>)>,
+    change_log: &[(Vec<u8>, Vec<u8>)],
     ts: HlcTimestamp,
     pending: &mut Vec<MergeOp>,
 ) {
@@ -4694,10 +4704,12 @@ fn materialize_derived(
             None => pending.push(MergeOp::tombstone(physical, hlc::pack(ts))),
         }
     }
-    // The change-log record's key is completed here, with THIS caller's
+    // Each change-log record's key is completed here, with THIS caller's
     // commit timestamp — the only one that agrees with this entry's
-    // position in the log (ADR 0041 §4a / ADR 0046 principle 1).
-    if let Some((prefix, record)) = change_log {
+    // position in the log (ADR 0041 §4a / ADR 0046 principle 1). Several
+    // records in one entry (a marker-table batch) share the ts; their
+    // per-item prefixes keep the completed keys distinct.
+    for (prefix, record) in change_log {
         let mut key = prefix.clone();
         key.extend_from_slice(&hlc::pack(ts).to_be_bytes());
         pending.push(MergeOp::put(
@@ -4718,6 +4730,40 @@ fn kind_writes_token_valid(base_key: &[u8], kind_writes: &[KindWrite]) -> bool {
         && kind_writes
             .iter()
             .all(|(_, kk, _)| kk.len() >= tb && kk[..tb] == base_key[..tb])
+}
+
+/// ADR 0049 §3: a [`txn::TxnWrite`]'s `stage_marker` prefix must lead with
+/// its own base key's partition token, exactly like
+/// [`kind_writes_token_valid`]'s rule for kind-write keys and for the
+/// identical reason — the stage entry's `fence` covers `base_key`, so a
+/// token-matching marker key sits at the same tablet-range position; an
+/// arbitrary (wire-reachable, via `ClientRequest::TxnPrepare`) prefix could
+/// otherwise land a change-log row outside this tablet's own declared range.
+/// Validated, never assumed; a miss folds into the same structural `Fenced`
+/// outcome bucket.
+fn stage_marker_token_valid(base_key: &[u8], stage_marker: Option<&(Vec<u8>, Vec<u8>)>) -> bool {
+    let tb = animus_tablet::TOKEN_BYTES;
+    stage_marker.is_none_or(|(prefix, _)| {
+        base_key.len() >= tb && prefix.len() >= tb && prefix[..tb] == base_key[..tb]
+    })
+}
+
+/// The [`txn::TxnWrite::change_log`] twin of [`stage_marker_token_valid`]
+/// (ADR 0049 Train A rung 4): the resolve-time change record's key prefix is
+/// staged through the identical wire-reachable payload
+/// (`ClientRequest::TxnPrepare`) as `kind_writes`/`stage_marker`, yet was
+/// the one of the three that went unvalidated — `TxnResolve` completes
+/// `change_log`'s key with its own `ts` and writes it wherever the staged
+/// prefix points, so a mis-tokened prefix could land a change-log row
+/// outside the anchor's own tablet range long after the stage's fence check
+/// passed. Same rule, same structural `Fenced` bucket, validated at stage
+/// (the serialization point that admits the payload), never at resolve
+/// (which must stay able to finish any stage that was admitted).
+fn change_log_token_valid(base_key: &[u8], change_log: Option<&(Vec<u8>, Vec<u8>)>) -> bool {
+    let tb = animus_tablet::TOKEN_BYTES;
+    change_log.is_none_or(|(prefix, _)| {
+        base_key.len() >= tb && prefix.len() >= tb && prefix[..tb] == base_key[..tb]
+    })
 }
 
 /// Logged-warning cap for [`surface_suspicious_merge_noop`] (below): the
@@ -5274,9 +5320,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // these same kind keys meaningful: a kind key sharing its
                 // base key's token sits at the same tablet-range position a
                 // plain `KindBatch` write's own key would.
-                let kind_tokens_ok = writes
-                    .iter()
-                    .all(|w| kind_writes_token_valid(&w.key, &w.kind_writes));
+                let kind_tokens_ok = writes.iter().all(|w| {
+                    kind_writes_token_valid(&w.key, &w.kind_writes)
+                        && stage_marker_token_valid(&w.key, w.stage_marker.as_ref())
+                        && change_log_token_valid(&w.key, w.change_log.as_ref())
+                });
                 let all_in_fence = !already_decided
                     && blocked_by.is_none()
                     && kind_tokens_ok
@@ -5371,6 +5419,31 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 recovered_baseline_version,
                             );
                         }
+                    }
+                    // ADR 0049 §3: the stage marker — an image-less,
+                    // consumer-hidden change-log record per staged write,
+                    // materialized at THIS stage entry's own `ts` (its key
+                    // HLC therefore strictly precedes the resolve entry's
+                    // materialized record, by log order — the per-item
+                    // ordering the split-build tail relies on). Goes through
+                    // the ONE shared materialization helper (ADR 0046's
+                    // binding shared-helper rule) with an empty kind-writes
+                    // list; record bytes stay opaque to this crate (ADR 0043
+                    // layering — the edge built them). Only written when the
+                    // stage itself lands (`stage_ok`): a fenced/blocked/
+                    // condition-failed stage leaves no intent, so there is
+                    // no dirty key to signal. WAL-replay re-application
+                    // re-merges the identical row at the identical version —
+                    // a no-op, like the intent merges above. An aborted
+                    // transaction's marker simply remains as a dirty-key
+                    // hint pointing at a row whose envelope reverted —
+                    // harmless by design: consumers re-read current state.
+                    let stage_markers: Vec<(Vec<u8>, Vec<u8>)> = writes
+                        .iter()
+                        .filter_map(|w| w.stage_marker.clone())
+                        .collect();
+                    if !stage_markers.is_empty() {
+                        materialize_derived(kind_scopes, &[], &stage_markers, ts, &mut pending);
                     }
                     if is_anchor {
                         let record = txn::TxnRecord {
@@ -5947,7 +6020,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 materialize_derived(
                                     kind_scopes,
                                     &kind_writes,
-                                    &change_log,
+                                    // A `TxnWrite` carries at most one record
+                                    // (its own); the helper's slice shape
+                                    // exists for the marker-batch case.
+                                    change_log.as_slice(),
                                     ts,
                                     &mut pending,
                                 );
