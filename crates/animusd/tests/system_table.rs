@@ -10,8 +10,8 @@
 //! - `system_table_lists_every_seeded_entity_kind` — seeds every
 //!   [`animus_control::syskv::EntityKind`] via the client protocol (a plain
 //!   `Put` auto-provisions a tablet, `ProposeSchema` reaches every other
-//!   `MetaCommand` this plane can mirror, a real split produces a
-//!   (ADR 0018 §2 amendment) `SplitParent` provenance marker; `member`/
+//!   `MetaCommand` this plane can mirror, a copy-based split round produces
+//!   an (ADR 0050 fork F9) `SplitLineage` row; `member`/
 //!   `node_addrs` come from the
 //!   bootstrapped node's own self-registration — ADR 0040 PR4 retired the
 //!   ADR 0036 allocator's dedicated `NodeIdAlloc` ledger kind along with the
@@ -247,22 +247,35 @@ async fn system_table_lists_every_seeded_entity_kind() {
         )
         .await;
 
-        // ---- SplitParent: a metadata split -----------------------------------
-        // ADR 0050 (Train B rung 1): the client-facing split surface is
-        // disabled during the storage pivot; propose the metadata command
-        // directly — this test only asserts the SYSTEM keyspace's entity
-        // kinds (including `split_parent`), never post-split data placement.
+        // ---- SplitLineage: a copy-based split round --------------------------
+        // ADR 0050: Begin+Cutover on the (empty) bootstrap tablet — this
+        // test only asserts the SYSTEM keyspace's entity kinds (including
+        // `split_lineage`), never post-split data placement.
         let meta = node.metadata();
         let source = animus_tablet::TabletId(1);
-        let cmd = animus_control::MetaCommand::SplitTablet {
-            tablet: source,
-            expected_epoch: meta.tablets[&source].epoch,
+        let expected_epoch = meta.tablets[&source].epoch;
+        let replicas = meta.tablets[&source].replicas.clone();
+        let new_id = meta.next_free_tablet_id();
+        let cmd = animus_control::MetaCommand::BeginSplit {
+            parent: source,
+            expected_epoch,
             split_key: b"m".to_vec(),
-            new_id: meta.next_free_tablet_id(),
+            children: [
+                (new_id, replicas.clone()),
+                (animus_tablet::TabletId(new_id.0 + 1), replicas),
+            ],
         };
         assert!(
             node.propose_meta(cmd),
-            "the node's control handle must accept the harness split proposal"
+            "the node's control handle must accept the harness begin-split proposal"
+        );
+        assert!(
+            node.propose_meta(animus_control::MetaCommand::CutoverSplit {
+                parent: source,
+                expected_epoch: expected_epoch.next(),
+                cutover_wall_ms: 1_000,
+            }),
+            "the node's control handle must accept the harness cutover proposal"
         );
         let after_split = await_status(
             admin,
@@ -288,9 +301,8 @@ async fn system_table_lists_every_seeded_entity_kind() {
             "keyspace",
             "counter",
             "cp_member_addr",
-            // ADR 0018 §2 amendment: the split above also produces this
-            // provenance marker.
-            "split_parent",
+            // ADR 0050 fork F9: the cutover above froze this lineage row.
+            "split_lineage",
         ];
         let full = timeout(Duration::from_secs(15), async {
             loop {
@@ -359,7 +371,7 @@ async fn system_table_lists_every_seeded_entity_kind() {
         let schema_item = find("schema", "orders");
         assert!(schema_item["value"].is_object());
 
-        let policy_item = find("policy", "1");
+        let policy_item = find("policy", &sibling_id.to_string());
         assert!(policy_item["value"].is_object());
 
         let node_addrs_item = find_one("node_addrs");
@@ -372,15 +384,13 @@ async fn system_table_lists_every_seeded_entity_kind() {
             "keyspace is presence-only: {keyspace_item}"
         );
 
-        // ADR 0018 §2 amendment: the split above minted `split_parents[sibling_id]
-        // = 1`, rendered as a decimal-string TabletId value (like a numeric id,
-        // never a raw JSON number, since the value is itself a TabletId, not a
-        // scalar counter).
-        let split_parent_item = find("split_parent", &sibling_id.to_string());
+        // ADR 0050 fork F9: the cutover above froze `split_lineage[sibling_id]`
+        // naming parent tablet 1 — a JSON entity (unlike the retired
+        // split_parent raw-TabletId rendering).
+        let split_lineage_item = find("split_lineage", &sibling_id.to_string());
         assert_eq!(
-            split_parent_item["value"], "1",
-            "split_parent's value is the source tablet id, rendered as a decimal \
-             string: {split_parent_item}"
+            split_lineage_item["value"]["parent"], 1,
+            "split_lineage's value names the retired parent tablet: {split_lineage_item}"
         );
 
         let counter_item = find("counter", "next_tablet_id");

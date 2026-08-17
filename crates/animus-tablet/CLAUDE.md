@@ -8,18 +8,11 @@ The tablet model — the unit of placement and migration (ADR 0002) — **plus t
 per-table hash-ring key layout** (ADR 0022/0023): this crate owns the Murmur3
 partitioner and the order-preserving key-escape primitives every data-plane key
 is built from. Shared types used across the control plane, the CP data plane,
-and the wire edges. Mostly one file (`src/lib.rs`), plus `split_basis.rs`
-(below).
-
-## Split-inheritance combinator (ADR 0046 principle 3)
-
-- `split_basis::effective<T: Clone>(own: Option<T>, frozen_basis: Option<&T>)
-  -> Option<T>` — the one generic form of "a split is a log cut; every
-  consumer offset crossing it inherits from a basis frozen at the cut, never
-  a live re-derivation from the parent's later state." `own.or_else(||
-  frozen_basis.cloned())`, nothing more — the call site still owns what
-  "own"/"frozen" mean for its own offset convention. First caller:
-  `animus-control::meta::Metadata::effective_stream_shard_watermark`.
+and the wire edges. One file (`src/lib.rs`) — the `split_basis` module
+(ADR 0046 principle 3's frozen-basis combinator) was deleted in the ADR
+0050 Train B rung-7 sweep: copy-based split children are born with empty
+logs, so no consumer offset crosses a split at all (the strictly stronger
+successor invariant).
 
 ## Key layout (ADR 0022/0023)
 
@@ -53,31 +46,25 @@ and the wire edges. Mostly one file (`src/lib.rs`), plus `split_basis.rs`
   `is_routable()` (`!Building`) is load-bearing for every routing/scan
   consumer: without the filter, map-iteration order could serve a
   half-copied engine.
-- `KeyRange`: `whole()`, `contains`, `contains_range` (subset containment —
-  the shared primitive behind the reconciler's narrow-only check and
-  `animusd`'s read-path scope pre-checks, ADR 0031/0028), `split_at`
-  (strictly-inside split into two half-open ranges), `abuts` (contiguity
-  test — originally the adjacency check `MergeTablets` required of its two
-  tablets; tablets are split-only now (ADR 0044), so `abuts` has **no
-  production caller today**, exercised only by this crate's own unit
-  tests).
+- `KeyRange`: `whole()`, `contains`, `contains_range` (subset containment),
+  `split_at` (strictly-inside split into two half-open ranges). `abuts` —
+  merge's contiguity test, production-caller-less since ADR 0044 — was
+  deleted in the ADR 0050 rung-7 sweep.
 
 ## What's non-obvious
 
 - `KeyRange` is half-open `[start, end)`; `end == None` means unbounded above
-  (`whole()` is `start = []`, `end = None`). `abuts` is false for an
-  unbounded-above range (nothing follows it).
+  (`whole()` is `start = []`, `end = None`).
 - `Epoch` is the **data-plane fencing token**: every placement change bumps it.
   The actual split *state transitions* live in `animus-control`'s
   `Metadata::apply`; this crate provides the range primitives. (Tablets are
   split-only, ADR 0044 — there is no merge state transition anymore.)
 - **`Tablet::version_floor` (the cross-group LWW version-floor fix) is
-  retired (ADR 0018 §2 amendment, PR2)**, replaced by HLC witnessing plus a
-  range seal in `animus-cp-data` — see that crate's `CLAUDE.md` and
-  `docs/engineering-lessons.md` for the design and the full writeup of the
-  hazard it used to close. `Tablet` no longer carries this field. The split
-  provenance the seal design's reconciler gating needs (`split_parents`)
-  lives entirely in `animus-control`'s `Metadata`, not on `Tablet` itself —
+  retired (ADR 0018 §2 amendment, PR2)**, replaced by HLC witnessing (plus,
+  historically, the zero-copy range seal — itself deleted with that split
+  design in ADR 0050 Train B rung 7; per-tablet private engines make the
+  cross-group shared-row hazard unrepresentable). Split provenance lives in
+  `animus-control`'s `Metadata::split_lineage`, not on `Tablet` itself —
   this crate has nothing to say about it.
 - Serializable (`serde`) because tablets travel inside control-plane Raft log
   entries and data-plane routing views.
@@ -88,6 +75,6 @@ and the wire edges. Mostly one file (`src/lib.rs`), plus `split_basis.rs`
 ## Tests
 
 `cargo test -p animus-tablet` — inline unit tests for `contains`/
-`contains_range`, `split_at` bounds, `abuts`, token determinism + fixed width,
+`contains_range`, `split_at` bounds, token determinism + fixed width,
 the Murmur3 empty-input spec anchor, token spread across ring octants,
 table-scoped `serves_table`, and `table_key_block` isolation.

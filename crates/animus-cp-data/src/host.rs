@@ -148,15 +148,6 @@ pub struct MetadataView {
     /// executing `reconfigure_step` can tell a failure repair from a healthy
     /// rebalance move (ADR 0029).
     pub down: BTreeSet<NodeId>,
-    /// Split provenance (ADR 0018 §2 amendment, PR2): every split child's id
-    /// mapped to its source tablet's id — mirrors
-    /// `animus_control::Metadata::split_parents` verbatim. Gates
-    /// [`HostAction::Host`] for a fresh split child: it must not stand up
-    /// until this node's own engine contains the source's range-seal marker
-    /// covering the child's range (`TabletFacts::parent_seal_observed`) — see
-    /// `seal.rs`'s module doc for why a structural version-space separation
-    /// (the retired `version_floor`) isn't enough on its own.
-    pub split_parent: BTreeMap<TabletId, TabletId>,
 }
 
 /// Per-tablet facts the caller gathers from live, impure state (a registered
@@ -186,12 +177,9 @@ pub struct TabletFacts {
     /// `hosted` is `false` ("stand-up in flight" reads the same as "still a
     /// voter" — never treated as excluded).
     pub config_excludes_me: bool,
-    /// This group's own current live `StorageScope` range, if hosted — `None`
-    /// when `hosted` is `false`. Compared against the tablet's current
-    /// metadata range to decide [`HostAction::NarrowScope`]; **never** used as
-    /// the bound for [`HostAction::Release`]'s erase (that always uses the
-    /// tablet's current metadata range — see the doc on
-    /// [`HostAction::Release`]).
+    /// This group's own declared range, if hosted — `None` when `hosted` is
+    /// `false`. Immutable for the group's lifetime (ADR 0050 rung 2);
+    /// retained as a fact for diagnostics/idempotence checks only.
     pub scope_range: Option<KeyRange>,
     /// Whether this tablet's scoped range already holds data in the shared
     /// engine (an async presence check, `StorageScope::has_data`) — gathered
@@ -202,41 +190,6 @@ pub struct TabletFacts {
     /// non-voter start). Ignored once a tablet is already in
     /// [`LocalState::hosted`] — narrow-only from then on.
     pub has_data: bool,
-    /// **ADR 0018 §2 amendment (PR2)**: for a not-yet-hosted candidate whose
-    /// [`MetadataView::split_parent`] names a source tablet, whether this
-    /// node's own engine already contains that source's range-seal marker
-    /// covering the candidate's own range (an async prefix scan gathered by
-    /// the caller, mirroring `has_data`'s shape). Irrelevant (left at its
-    /// default `false`) for a candidate with no parent — a bootstrapped
-    /// fresh table's first tablet hosts immediately regardless.
-    pub parent_seal_observed: bool,
-    /// **ADR 0018 §2 amendment, fix (the split_cluster.rs livelock)**: every
-    /// range this *already-hosted* tablet still owes a committed range-seal
-    /// for, but whose local engine does not yet contain — gathered fresh
-    /// every tick, never cached. A **split handoff**: for each child of this
-    /// tablet named in [`MetadataView::split_parent`], the child's own
-    /// current metadata range, if this node's engine lacks a seal marker
-    /// covering it (re-derived from scratch each call, see `gather_facts`).
-    /// [`plan`] turns each entry into a [`HostAction::ProposeSeal`], executed
-    /// only if this node is currently the tablet's leader.
-    ///
-    /// **Why this must be a persistent, re-derived-every-tick condition and
-    /// not a one-shot side effect of the tick that first narrows**: the tick
-    /// that first notices "my scope needs narrowing" happens independently
-    /// on every replica, on its own timer, and is not synchronized with
-    /// *which* replica happens to hold leadership at that exact instant. A
-    /// one-shot design — narrow unconditionally, and *only if I also happen
-    /// to be leader right now* also propose the seal — has no second chance
-    /// if leadership isn't held by anyone at that precise tick (e.g. mid
-    /// leadership transfer): the local mutation that would have re-derived
-    /// the trigger already happened, so the seal is simply never proposed by
-    /// anyone. Re-deriving this fact from durable state every tick instead
-    /// means whichever replica *eventually* holds leadership gets its
-    /// chance, however leadership shuffles relative to the local scope
-    /// change. See `docs/engineering-lessons.md` for the full story (this is
-    /// what produced the deterministic `split_cluster.rs` failures under a
-    /// genuine multi-process split deployment).
-    pub pending_seals: Vec<KeyRange>,
 }
 
 /// This node's persistent-for-the-life-of-the-process bookkeeping that
@@ -362,83 +315,25 @@ pub fn tablets_to_release(
         .collect()
 }
 
-/// Whether `inner` is fully contained within `outer` (`inner ⊆ outer`) —
-/// the narrow-only precondition [`HostAction::NarrowScope`] must satisfy
-/// (never a widen). Delegates to [`KeyRange::contains_range`] (the shared
-/// primitive `animusd`'s read-path scope pre-check uses too, ADR 0033).
-fn is_subrange(inner: &KeyRange, outer: &KeyRange) -> bool {
-    outer.contains_range(inner)
-}
-
-/// Whether `tablet`'s group has ever proposed a range-seal marker covering
-/// `needed` (ADR 0018 §2 amendment) — the async engine scan behind
-/// [`TabletFacts::parent_seal_observed`]. Bounded to `tablet`'s own
-/// seal-marker namespace (`seal::scan_bound`), never a whole-engine scan.
-async fn seal_covers<S: StorageEngine>(storage: &S, tablet: u64, needed: &KeyRange) -> bool {
-    let (start, end) = crate::seal::scan_bound(tablet);
-    let rows = storage.scan(&start, &end).await.unwrap_or_default();
-    rows.iter().any(|(_, vv)| {
-        crate::seal::decode_seal_value(&vv.value)
-            .is_some_and(|(range, _)| range.contains_range(needed))
-    })
-}
-
 /// One reconciling action [`plan`] can emit for a single tablet. A caller
 /// (`animusd`, PR4) executes these against its own live `ProdEnv` state;
 /// `plan` itself performs no I/O.
 ///
-/// Emitted in a fixed overall order — every [`ProposeSeal`](Self::ProposeSeal)
-/// action, then every [`NarrowScope`](Self::NarrowScope) action, then every
-/// [`Host`](Self::Host), then every [`Reconfigure`](Self::Reconfigure), then
-/// every [`Release`](Self::Release)/[`Reclaim`](Self::Reclaim)
-/// — mirroring the existing loops' relative priority (give a pending seal a
-/// chance to land before anything that gates on it; adjust a still-hosted
-/// tablet's scope before deciding anything else about it; stand up a
+/// Emitted in a fixed overall order — every [`Host`](Self::Host), then every
+/// [`Reconfigure`](Self::Reconfigure), then every
+/// [`Release`](Self::Release)/[`Reclaim`](Self::Reclaim)
+/// — mirroring the existing loops' relative priority (stand up a
 /// newly-placed tablet before reconfiguring anyone; reconcile membership
 /// before tearing anything down). Within each group, tablets are emitted in
 /// `TabletId` order (a `BTreeMap` iteration is deterministic on every node).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostAction {
-    /// (Re-)propose this already-hosted tablet's own range-seal for `range`,
-    /// if this node is currently its leader — ADR 0018 §2 amendment fix.
-    /// Derived from [`TabletFacts::pending_seals`], a **persistent condition
-    /// re-checked every tick** (not a one-shot side effect bundled into
-    /// [`NarrowScope`](Self::NarrowScope)'s own tick, as it used to be) — see
-    /// that field's doc for why a one-shot design can silently never propose
-    /// the seal at all. A no-op execution-side if this node isn't currently
-    /// the tablet's leader (harmless — whichever replica eventually *is*
-    /// leader will see the same still-pending condition next tick and
-    /// propose it then). Re-proposing an already-covered range is impossible
-    /// by construction (`pending_seals` stops naming it once this node's own
-    /// engine observes a covering seal marker).
-    ProposeSeal {
-        /// The (already-hosted) tablet whose own group should propose the
-        /// seal — the range handed off (a split child's range).
-        tablet: TabletId,
-        /// The range to seal.
-        range: KeyRange,
-    },
-    /// Narrow this already-hosted tablet's live `StorageScope` range to match
-    /// its current metadata range (a split narrowed the *source* tablet's
-    /// range in `Metadata`, but the already-running group's own scope object
-    /// is otherwise never touched again). Always a proper narrowing —
-    /// [`plan`] never emits this for a range that would widen the scope.
-    NarrowScope {
-        /// The tablet whose local scope should narrow.
-        tablet: TabletId,
-        /// The new (narrower-or-equal) range to narrow to — the tablet's
-        /// current metadata range.
-        range: KeyRange,
-    },
     /// Stand up this node's member of `tablet`'s group for the first time —
     /// a fresh whole-keyspace tablet, a split child, or a reconciler-placed
     /// spare all reach this the same way.
     Host {
         /// The tablet to host.
         tablet: TabletId,
-        /// The table this tablet is scoped to (empty string for the legacy
-        /// whole-keyspace tablet, mirroring `t.table.unwrap_or_default()`).
-        table: String,
         /// The range to scope the new group's `StorageScope` to.
         range: KeyRange,
         /// `true` — start with the full voter config (this node forms fresh,
@@ -465,22 +360,13 @@ pub enum HostAction {
     /// condition has held for [`RELEASE_CONFIRM_TICKS`] consecutive calls at
     /// an unchanged tablet epoch.
     ///
-    /// **`erase_bound` is always the tablet's CURRENT metadata range — never
-    /// a `TabletFacts::scope_range` fact.** A just-split source tablet's
-    /// already-hosted scope can still be stale-wide if this node was dropped
-    /// from its replica set before a `NarrowScope` action for it was ever
-    /// planned and executed; erasing an unbounded/stale-wide scope on a
-    /// shared engine would tombstone a co-hosted sibling's live keys (the
-    /// documented release-GC sibling-corruption bug this design exists to
-    /// make structurally impossible). The caller must re-narrow to
-    /// `erase_bound` immediately before erasing, exactly as
-    /// `animusd::cp_gc_tablet` does.
+    /// Teardown of a tablet moved off this node (ADR 0050: a private
+    /// engine's teardown deletes the tablet's own files whole — the
+    /// stale-wide-scope erase hazard this variant used to document died
+    /// with the shared engine).
     Release {
         /// The tablet to release.
         tablet: TabletId,
-        /// The range to bound the erase to — the tablet's current
-        /// `Metadata`-replicated range.
-        erase_bound: KeyRange,
     },
     /// Reclaim this node's local artifacts of a tablet whose whole table was
     /// dropped (absent from the tablet map entirely, ADR 0024) — the reclaim
@@ -516,72 +402,22 @@ pub fn plan(
     let mut next = state.clone();
     let mut actions = Vec::new();
 
-    // --- Phase 0: (re-)propose any range-seal this node's own hosted groups
-    // still owe (ADR 0018 §2 amendment fix). `TabletFacts::pending_seals` is
-    // re-derived from scratch every tick — a persistent condition, not a
-    // one-shot side effect bundled into this same tick's `NarrowScope`
-    // handling — so whichever replica eventually holds leadership for the
-    // tablet gets a chance to propose it, however leadership shuffles
-    // relative to the local scope change. See `TabletFacts::pending_seals`'s
-    // doc for the full "why a one-shot design can silently never propose the
-    // seal at all" argument.
-    for (&tablet, f) in facts {
-        for range in &f.pending_seals {
-            actions.push(HostAction::ProposeSeal {
-                tablet,
-                range: range.clone(),
-            });
-        }
-    }
-
-    // --- Phase 1: narrow an already-hosted tablet's scope, or host a
-    // newly-placed one. `to_host` batches the Host actions so every
-    // NarrowScope precedes every Host in the returned order, even though
-    // both are decided from the same tablet-map walk.
+    // --- Phase 1: host a newly-placed tablet (a tablet's declared range is
+    // immutable, ADR 0050 rung 2 — there is no scope to adjust on an
+    // already-hosted one).
     let mut to_host = Vec::new();
     for (&tablet, t) in &view.tablets {
         let Some(join_plan) = plan_join_host(base_id.clone(), &t.replicas, t.epoch) else {
             continue;
         };
-        if next.hosted.contains(&tablet) {
-            if let Some(f) = facts.get(&tablet)
-                && f.hosted
-                && let Some(current) = &f.scope_range
-                && t.range != *current
-                && is_subrange(&t.range, current)
-            {
-                actions.push(HostAction::NarrowScope {
-                    tablet,
-                    range: t.range.clone(),
-                });
-            }
-            // Not a subset of the current scope: an incomparable (or
-            // widening) range mismatch that should never happen in
-            // practice, now that tablets are split-only — deliberately
-            // no-op rather than guess a direction.
-        } else {
+        if !next.hosted.contains(&tablet) {
             to_host.push((tablet, t, join_plan));
         }
     }
     for (tablet, t, join_plan) in to_host {
         let has_data = facts.get(&tablet).is_some_and(|f| f.has_data);
-        // ADR 0018 §2 amendment: a split child (named in `view.split_parent`)
-        // must not host until this node's own engine contains its parent's
-        // range-seal marker covering its own range
-        // (`TabletFacts::parent_seal_observed`) — the structural replacement
-        // for the retired `version_floor` seeding. A tablet with no parent
-        // entry (a bootstrapped fresh table's first tablet) hosts
-        // immediately, exactly as before.
-        let seal_ready = match view.split_parent.get(&tablet) {
-            Some(_parent) => facts.get(&tablet).is_some_and(|f| f.parent_seal_observed),
-            None => true,
-        };
-        if !seal_ready {
-            continue;
-        }
         actions.push(HostAction::Host {
             tablet,
-            table: t.table.clone().unwrap_or_default(),
             range: t.range.clone(),
             initial_formation: join_plan.initial_formation || has_data,
         });
@@ -650,10 +486,7 @@ pub fn plan(
         };
         if confirmed {
             next.pending_release.remove(&tablet);
-            actions.push(HostAction::Release {
-                tablet,
-                erase_bound: t.range.clone(),
-            });
+            actions.push(HostAction::Release { tablet });
         }
     }
 
@@ -843,7 +676,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// One reconcile tick (ADR 0031): snapshot the impure facts this node's
     /// own hosted groups + engine can answer, call [`plan`] exactly once, then
     /// execute the returned actions **in the fixed order `plan` emits them**
-    /// (`NarrowScope` → `Host` → `Reconfigure` → `Release`/`Reclaim`).
+    /// (`Host` → `Reconfigure` → `Release`/`Reclaim`).
     ///
     /// The caller is responsible for the `last_applied() == 0` pre-recovery
     /// guard (a live control-plane `RaftNode` read this crate has no business
@@ -871,44 +704,12 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
 
         for action in actions {
             match action {
-                HostAction::ProposeSeal { tablet, range } => {
-                    // ADR 0018 §2 amendment, fix: the seal-proposal side
-                    // effect used to be bundled one-shot into this same
-                    // tick's `NarrowScope` handling below — now it's its own
-                    // persistent, re-derived-every-tick action (see
-                    // `TabletFacts::pending_seals`'s doc). A no-op if this
-                    // node isn't currently the tablet's leader; harmless,
-                    // since `plan` will keep re-emitting this action every
-                    // tick the seal remains unobserved, so whichever replica
-                    // eventually holds leadership gets its chance.
-                    if let Some(node) = self.hosted.get(&tablet)
-                        && node.is_leader()
-                    {
-                        node.propose_seal(range);
-                    }
-                }
-                HostAction::NarrowScope { tablet, range } => {
-                    // ADR 0050 rung 2: a tablet's range is immutable and the
-                    // zero-copy split that narrowed a live scope is disabled,
-                    // so this action is structurally unplannable now
-                    // (`gather_facts` reads the same immutable range
-                    // `Metadata` declares — they can never disagree). The
-                    // variant survives, inert, until the Train B deletion
-                    // sweep removes the whole zero-copy lifecycle.
-                    tracing::warn!(
-                        tablet = tablet.0,
-                        ?range,
-                        "NarrowScope planned for an immutable-range tablet — inert (ADR 0050)"
-                    );
-                }
                 HostAction::Host {
                     tablet,
-                    table,
                     range,
                     initial_formation,
                 } => {
-                    self.host(view, tablet, &table, range, initial_formation)
-                        .await;
+                    self.host(view, tablet, range, initial_formation).await;
                 }
                 HostAction::Reconfigure {
                     tablet,
@@ -919,10 +720,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                         node.reconfigure_step(&desired, &down);
                     }
                 }
-                HostAction::Release {
-                    tablet,
-                    erase_bound: _,
-                } => {
+                HostAction::Release { tablet } => {
                     self.teardown(tablet, TeardownKind::Release).await;
                 }
                 HostAction::Reclaim { tablet } => {
@@ -948,30 +746,6 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         let mut facts = BTreeMap::new();
         for (&tablet, node) in &self.hosted {
             let scope_range = node.scope_range();
-            // ADR 0018 §2 amendment, fix (the split_cluster.rs livelock): a
-            // persistent, re-derived-every-tick condition — never a one-shot
-            // side effect of the tick that first narrows. A split handoff:
-            // every child of *this* tablet named in `view.split_parent`,
-            // whose range this node's engine doesn't yet have a covering
-            // seal marker for. See `TabletFacts::pending_seals`'s doc for the
-            // full argument. ADR 0050 rung 1: the seal marker lives in *this
-            // tablet's own* engine now (an engine-global key of a private
-            // engine); a hosted tablet always has its handle in `engines`.
-            let mut pending_seals = Vec::new();
-            for (&child, parent) in &view.split_parent {
-                if *parent != tablet {
-                    continue;
-                }
-                if let Some(child_t) = view.tablets.get(&child) {
-                    let covered = match self.engines.get(&tablet) {
-                        Some(engine) => seal_covers(engine, tablet.0, &child_t.range).await,
-                        None => false,
-                    };
-                    if !covered {
-                        pending_seals.push(child_t.range.clone());
-                    }
-                }
-            }
             facts.insert(
                 tablet,
                 TabletFacts {
@@ -980,8 +754,6 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     config_excludes_me: !node.config().contains(&self.base_id),
                     scope_range: Some(scope_range),
                     has_data: false,
-                    parent_seal_observed: false,
-                    pending_seals,
                 },
             );
         }
@@ -1015,25 +787,10 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             } else {
                 false
             };
-            // ADR 0018 §2 amendment: a split child must observe its parent's
-            // seal before hosting — see `MetadataView::split_parent`'s doc.
-            // ADR 0050 rung 1: the parent's seal marker lives in the
-            // *parent's* own engine, readable here only when this node hosts
-            // the parent (the zero-copy split's children always shared the
-            // parent's replica set, so co-location held; the old split is
-            // disabled during Train B, so no NEW split ever exercises this).
-            let parent_seal_observed = match view.split_parent.get(&tablet) {
-                Some(parent) => match self.engines.get(parent) {
-                    Some(engine) => seal_covers(engine, parent.0, &t.range).await,
-                    None => false,
-                },
-                None => false,
-            };
             facts.insert(
                 tablet,
                 TabletFacts {
                     has_data,
-                    parent_seal_observed,
                     ..Default::default()
                 },
             );
@@ -1054,10 +811,6 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         &mut self,
         view: &MetadataView,
         tablet: TabletId,
-        // Unused since F2b removed the table prefix from physical keys; the
-        // parameter stays because `HostAction::Host` still carries the table
-        // (plan-output shape, swept in the Train B deletion rung).
-        _table: &str,
         range: KeyRange,
         initial_formation: bool,
     ) {
@@ -1126,11 +879,9 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
 
         // ADR 0050 rung 1: a tablet's engine is private, so BOTH teardown
         // kinds reduce to deleting its files whole — instant, real space
-        // reclaim, no `merge_tombstone` sweep. `Release(erase_bound)`'s
-        // bound existed to spare co-hosted siblings on the shared engine
-        // (structurally impossible to hit now: no other tablet's rows can
-        // live in this engine); the plan action keeps its shape, the
-        // executor no longer needs the bound.
+        // reclaim, no `merge_tombstone` sweep (the shared-engine
+        // sibling-sparing bound this used to need died with the shared
+        // engine, Train B rung 7).
         let _ = kind;
         self.engines.remove(&tablet);
         drop(node);
@@ -1155,8 +906,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
 /// dropped), not for a behavioral fork.
 enum TeardownKind {
     /// [`HostAction::Release`] — moved off this node while the tablet still
-    /// exists elsewhere (its `erase_bound` no longer bounds anything: a
-    /// private engine holds no sibling's rows to spare).
+    /// exists elsewhere.
     Release,
     /// [`HostAction::Reclaim`] — the tablet's whole table was dropped.
     Reclaim,
@@ -1200,21 +950,6 @@ mod tests {
                 .map(|(id, t)| (TabletId(id), t))
                 .collect(),
             ..Default::default()
-        }
-    }
-
-    /// Like [`view`], but also records `split_parent` provenance (ADR 0018 §2
-    /// amendment) — for tests exercising the split-child seal gate.
-    fn view_with_split_parent(
-        tablets: impl IntoIterator<Item = (u64, Tablet)>,
-        split_parent: impl IntoIterator<Item = (u64, u64)>,
-    ) -> MetadataView {
-        MetadataView {
-            split_parent: split_parent
-                .into_iter()
-                .map(|(child, parent)| (TabletId(child), TabletId(parent)))
-                .collect(),
-            ..view(tablets)
         }
     }
 
@@ -1424,8 +1159,6 @@ mod tests {
                 config_excludes_me: false,
                 scope_range: Some(KeyRange::new(b"".to_vec(), None)),
                 has_data: false,
-                parent_seal_observed: false,
-                pending_seals: Vec::new(),
             },
         )]
         .into_iter()
@@ -1436,58 +1169,9 @@ mod tests {
         assert_eq!(next, state);
     }
 
-    // === plan(): NarrowScope semantics =======================================
-
-    #[test]
-    fn plan_narrows_an_already_hosted_tablets_scope_when_metadata_range_shrank() {
-        // Metadata narrowed to [a, m); the group's own scope is still the
-        // pre-split-wide [a, z).
-        let v = view([(1, tablet_for_table(1, "t", b"a", Some(b"m"), vec![base()]))]);
-        let mut state = LocalState::default();
-        state.hosted.insert(TabletId(1));
-        let facts: BTreeMap<TabletId, TabletFacts> = [(
-            TabletId(1),
-            TabletFacts {
-                hosted: true,
-                scope_range: Some(KeyRange::new(b"a".to_vec(), Some(b"z".to_vec()))),
-                ..Default::default()
-            },
-        )]
-        .into_iter()
-        .collect();
-
-        let (actions, _next) = plan(&v, &facts, &state, base());
-        assert_eq!(
-            actions,
-            vec![HostAction::NarrowScope {
-                tablet: TabletId(1),
-                range: KeyRange::new(b"a".to_vec(), Some(b"m".to_vec())),
-            }]
-        );
-    }
-
-    #[test]
-    fn plan_does_not_touch_scope_for_an_incomparable_range_mismatch() {
-        // Not a subset of the current live scope — should never happen in
-        // practice now that tablets are split-only, but the planner must not
-        // guess a direction (defensive: no NarrowScope).
-        let v = view([(1, tablet_for_table(1, "t", b"a", Some(b"k"), vec![base()]))]);
-        let mut state = LocalState::default();
-        state.hosted.insert(TabletId(1));
-        let facts: BTreeMap<TabletId, TabletFacts> = [(
-            TabletId(1),
-            TabletFacts {
-                hosted: true,
-                scope_range: Some(KeyRange::new(b"b".to_vec(), Some(b"m".to_vec()))),
-                ..Default::default()
-            },
-        )]
-        .into_iter()
-        .collect();
-
-        let (actions, _next) = plan(&v, &facts, &state, base());
-        assert_eq!(actions, Vec::new());
-    }
+    // DELETED (ADR 0050 Train B rung 7): the NarrowScope/ProposeSeal planner
+    // semantics tests died with the variants (ranges are immutable; the
+    // copy-based split hosts children fresh and retires parents whole).
 
     #[test]
     fn plan_does_not_narrow_when_ranges_already_match() {
@@ -1521,7 +1205,6 @@ mod tests {
             actions,
             vec![HostAction::Host {
                 tablet: TabletId(1),
-                table: "t".to_string(),
                 range: KeyRange::whole(),
                 initial_formation: true,
             }]
@@ -1535,53 +1218,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_defers_hosting_a_split_child_until_its_parents_seal_is_observed() {
-        // ADR 0018 §2 amendment: a candidate named in `split_parent` must not
-        // host until `TabletFacts::parent_seal_observed` is true — the
-        // structural replacement for the retired `version_floor` seeding.
-        let v = view_with_split_parent(
-            [(2, tablet_for_table(2, "t", b"m", None, vec![base()]))],
-            [(2, 1)],
-        );
-        let state = LocalState::default();
-
-        // No fact at all (equivalent to `parent_seal_observed: false`): the
-        // child must not host yet.
-        let (actions, next) = plan(&v, &BTreeMap::new(), &state, base());
-        assert_eq!(
-            actions,
-            Vec::new(),
-            "a split child must not host before its parent's seal is observed: {actions:?}"
-        );
-        assert!(
-            !next.hosted.contains(&TabletId(2)),
-            "a deferred Host must not mark the tablet hosted"
-        );
-
-        // Once the fact flips true, the very next `plan` call hosts it.
-        let facts: BTreeMap<TabletId, TabletFacts> = [(
-            TabletId(2),
-            TabletFacts {
-                parent_seal_observed: true,
-                ..Default::default()
-            },
-        )]
-        .into_iter()
-        .collect();
-        let (actions2, next2) = plan(&v, &facts, &next, base());
-        assert_eq!(
-            actions2,
-            vec![HostAction::Host {
-                tablet: TabletId(2),
-                table: "t".to_string(),
-                range: KeyRange::new(b"m".to_vec(), None),
-                initial_formation: true,
-            }]
-        );
-        assert!(next2.hosted.contains(&TabletId(2)));
-    }
-
-    #[test]
     fn plan_joins_an_existing_group_as_non_voter() {
         let mut t = tablet_for_table(1, "t", b"", None, vec![base()]);
         t.epoch = Epoch::INITIAL.next();
@@ -1592,7 +1228,6 @@ mod tests {
             actions,
             vec![HostAction::Host {
                 tablet: TabletId(1),
-                table: "t".to_string(),
                 range: KeyRange::whole(),
                 initial_formation: false,
             }]
@@ -1622,7 +1257,6 @@ mod tests {
             actions,
             vec![HostAction::Host {
                 tablet: TabletId(1),
-                table: "t".to_string(),
                 range: KeyRange::whole(),
                 initial_formation: true,
             }]
@@ -1752,7 +1386,6 @@ mod tests {
             actions,
             vec![HostAction::Release {
                 tablet: TabletId(1),
-                erase_bound: KeyRange::whole(),
             }]
         );
         // The dampener entry is cleared once confirmed (mirrors the real
@@ -1811,46 +1444,6 @@ mod tests {
                 || !actions
                     .iter()
                     .any(|a| matches!(a, HostAction::Release { .. }))
-        );
-    }
-
-    #[test]
-    fn release_erase_bound_is_always_the_current_metadata_range_never_the_stale_scope_fact() {
-        // The group's own live scope fact is stale-wide ([a, z)); the
-        // tablet's current metadata range has since narrowed to [a, m) by a
-        // split. The release must bound its erase to the CURRENT metadata
-        // range, never the stale scope fact — this is the regression the
-        // sibling-corruption bug (root CLAUDE.md) needs provable in a unit
-        // test.
-        let v = view([(1, tablet(1, b"a", Some(b"m"), vec![nid(301), nid(302)]))]); // base() moved off
-        let mut state = LocalState::default();
-        state.hosted.insert(TabletId(1));
-        let facts: BTreeMap<TabletId, TabletFacts> = [(
-            TabletId(1),
-            TabletFacts {
-                hosted: true,
-                config_excludes_me: true,
-                scope_range: Some(KeyRange::new(b"a".to_vec(), Some(b"z".to_vec()))),
-                ..Default::default()
-            },
-        )]
-        .into_iter()
-        .collect();
-
-        let mut cur = state;
-        let mut last_actions = Vec::new();
-        for _ in 0..RELEASE_CONFIRM_TICKS {
-            let (actions, next) = plan(&v, &facts, &cur, base());
-            last_actions = actions;
-            cur = next;
-        }
-
-        assert_eq!(
-            last_actions,
-            vec![HostAction::Release {
-                tablet: TabletId(1),
-                erase_bound: KeyRange::new(b"a".to_vec(), Some(b"m".to_vec())),
-            }]
         );
     }
 

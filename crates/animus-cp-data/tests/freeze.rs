@@ -20,7 +20,6 @@ use animus_cp_data::{KIND_BASE, RaftKvNode};
 use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
-use animus_tablet::KeyRange;
 use futures::executor::block_on;
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -86,16 +85,15 @@ fn freeze_rejects_every_later_mutation_and_reads_keep_serving() {
 
     // Plain put: no-op everywhere (the whole-range seal, not the fence —
     // the fence passes, since the key is inside the declared range).
-    match nodes[l].put_fenced(b"post".to_vec(), b"v2".to_vec(), KeyRange::whole()) {
+    match nodes[l].put(b"post".to_vec(), b"v2".to_vec()) {
         ProposeResult::Accepted { .. } => {}
         other => panic!("post-freeze put not appended: {other:?} (seed={seed})"),
     }
     // Kind batch (base + a change record): no-op.
-    match nodes[l].put_kind_batch_fenced(
+    match nodes[l].put_kind_batch_conditioned(
         vec![(KIND_BASE, b"kpost".to_vec(), Some(b"kv".to_vec()))],
         vec![(b"kpost".to_vec(), b"rec".to_vec())],
         Vec::new(),
-        KeyRange::whole(),
     ) {
         ProposeResult::Accepted { .. } => {}
         other => panic!("post-freeze kind batch not appended: {other:?} (seed={seed})"),
@@ -106,10 +104,12 @@ fn freeze_rejects_every_later_mutation_and_reads_keep_serving() {
         other => panic!("post-freeze cas not appended: {other:?} (seed={seed})"),
     }
     // Seed batch (never legitimately directed at a parent): dropped whole.
-    match nodes[l].propose_seed_batch(
-        vec![(KIND_BASE, b"spost".to_vec(), Some(b"sv".to_vec()), 42)],
-        KeyRange::whole(),
-    ) {
+    match nodes[l].propose_seed_batch(vec![(
+        KIND_BASE,
+        b"spost".to_vec(),
+        Some(b"sv".to_vec()),
+        42,
+    )]) {
         ProposeResult::Accepted { .. } => {}
         other => panic!("post-freeze seed batch not appended: {other:?} (seed={seed})"),
     }
@@ -174,7 +174,7 @@ fn consumer_bookkeeping_still_applies_on_a_frozen_group() {
     freeze_and_settle(&mut sim, &nodes, l, seed);
 
     // A cursor-kind write (the GSI drain's own bookkeeping shape).
-    match nodes[l].put_kind_batch_fenced(
+    match nodes[l].put_kind_batch_conditioned(
         vec![(
             animus_cp_data::KIND_CURSOR,
             b"cursor-row".to_vec(),
@@ -182,20 +182,18 @@ fn consumer_bookkeeping_still_applies_on_a_frozen_group() {
         )],
         Vec::new(),
         Vec::new(),
-        KeyRange::whole(),
     ) {
         ProposeResult::Accepted { .. } => {}
         other => panic!("cursor write not appended: {other:?} (seed={seed})"),
     }
     // A change-log-only batch (the backfill seeder's synthetic record).
-    match nodes[l].put_kind_batch_fenced(
+    match nodes[l].put_kind_batch_conditioned(
         Vec::new(),
         vec![(
             b"\x00\x00\x00\x00\x00\x00\x00\x02pk".to_vec(),
             b"rec".to_vec(),
         )],
         Vec::new(),
-        KeyRange::whole(),
     ) {
         ProposeResult::Accepted { .. } => {}
         other => panic!("record-only write not appended: {other:?} (seed={seed})"),
@@ -279,7 +277,7 @@ fn freeze_survives_restart_via_the_durable_marker() {
         restarted.is_frozen(),
         "the restarted group must re-latch frozen from the durable marker (seed={seed})"
     );
-    match restarted.put_fenced(b"post".to_vec(), b"v2".to_vec(), KeyRange::whole()) {
+    match restarted.put(b"post".to_vec(), b"v2".to_vec()) {
         ProposeResult::Accepted { .. } => {}
         other => panic!("post-restart put not appended: {other:?} (seed={seed})"),
     }

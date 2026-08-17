@@ -245,16 +245,15 @@ fn backfill_tag(index_name: &str) -> String {
 fn write_pre_existing_row(
     sim: &mut Simulator,
     node: &KvNode,
-    range: &KeyRange,
+    _range: &KeyRange,
     pk: &str,
     seed: u64,
 ) {
     let key = base_key(pk);
-    let result = node.put_kind_batch_fenced(
+    let result = node.put_kind_batch_conditioned(
         vec![(KIND_BASE, key, Some(b"v".to_vec()))],
         Vec::new(),
         Vec::new(),
-        range.clone(),
     );
     propose_confirmed(sim, node, seed, result);
 }
@@ -264,7 +263,7 @@ fn write_pre_existing_row(
 /// unconditionally leaves a dirty marker regardless of the seeder's own
 /// progress, per ADR 0045 §2's "no write after `Creating` can ever be
 /// missed" argument.
-fn write_base_row_live(sim: &mut Simulator, node: &KvNode, range: &KeyRange, pk: &str, seed: u64) {
+fn write_base_row_live(sim: &mut Simulator, node: &KvNode, _range: &KeyRange, pk: &str, seed: u64) {
     let key = base_key(pk);
     let record = ChangeRecord {
         base_sk: Vec::new(),
@@ -275,11 +274,10 @@ fn write_base_row_live(sim: &mut Simulator, node: &KvNode, range: &KeyRange, pk:
         staged: false,
     }
     .encode();
-    let result = node.put_kind_batch_fenced(
+    let result = node.put_kind_batch_conditioned(
         vec![(KIND_BASE, key.clone(), Some(b"v".to_vec()))],
         vec![(key, record)],
         Vec::new(),
-        range.clone(),
     );
     propose_confirmed(sim, node, seed, result);
 }
@@ -335,12 +333,8 @@ fn backfill_seed_tick(
             staged: false,
         }
         .encode();
-        let result = node.put_kind_batch_fenced(
-            Vec::new(),
-            vec![(prefix.clone(), record)],
-            Vec::new(),
-            range.clone(),
-        );
+        let result =
+            node.put_kind_batch_conditioned(Vec::new(), vec![(prefix.clone(), record)], Vec::new());
         propose_confirmed(sim, node, seed, result);
         scan_start = dynamo_index::range_end(&prefix);
         last_seeded = Some(prefix);
@@ -358,11 +352,10 @@ fn backfill_seed_tick(
         // on every real split, forever. A cursor row's identity is already
         // fully captured by its own token (disjoint from base data by row
         // kind) and needs no range-fencing at all.
-        let result = node.put_kind_batch_fenced(
+        let result = node.put_kind_batch_conditioned(
             vec![(KIND_CURSOR, cursor_key_bytes, Some(cursor_val))],
             Vec::new(),
             Vec::new(),
-            KeyRange::whole(),
         );
         propose_confirmed(sim, node, seed, result);
     }

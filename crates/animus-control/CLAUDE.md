@@ -264,21 +264,21 @@ per-tablet CP data plane (`animus-cp-data`).
   read-visibility lag. See "What's non-obvious" for the driver mechanics and
   hand-driven gotchas.
 
-- **`SplitTablet`'s apply arm also enforces F11 token alignment on a
+- **`BeginSplit`'s apply arm also enforces F11 token alignment on a
   streamed table (ADR 0042 §14, growth PR2).** A split key that isn't
   exactly `TOKEN_BYTES` (8) long is rejected outright when the source
   tablet's table has a stream (`self.table_stream(table).is_some()`) —
-  the ADR 0028 fence idiom: `animusd`'s `ClientCtx::trigger_split` is the
-  one choke point that actually rounds a caller's key before ever
-  proposing, so this apply-time check is a structural seatbelt against a
-  future caller reaching apply without going through it, not the primary
+  an apply-time structural seatbelt: `animusd`'s `ClientCtx::trigger_split`
+  is the one choke point that actually rounds a caller's key before ever
+  proposing, so this check guards a future caller reaching apply without
+  going through it, never the primary
   enforcement. See `meta::tests::split_rejects_a_non_token_aligned_key_on_a_streamed_table`/
   `split_rejects_a_token_aligned_key_equal_to_range_start` (the latter
   proving the accepted single-token hot-partition limit, Fork E, still
   rejects at the pre-existing `KeyRange::split_at` "strictly inside" guard
   rather than accepting a zero-width sibling).
 
-- **Epoch-CAS discipline on `SplitTablet`/`CasTabletReplicas`.** Every
+- **Epoch-CAS discipline on `BeginSplit`/`CutoverSplit`/`CasTabletReplicas`.** Every
   tablet-mutating command is a compare-and-swap on the tablet's epoch, evaluated
   identically on every replica, so accept/reject is consistent and racing
   proposers can't both commit. (`MergeTablets` — ADR 0033, carrying *two*
@@ -292,8 +292,7 @@ per-tablet CP data plane (`animus-cp-data`).
   untouched, it serves until the workflow's freeze — and mints two
   `Building` children over the half-ranges at the command's own
   (proposer/placement-chosen, fork F5) replica homes, policy inherited,
-  allocator floor enforced, F11 token-alignment seatbelt shared with
-  `SplitTablet`'s arm. `CutoverSplit` (epoch-CAS; parent must be
+  allocator floor enforced, F11 token-alignment seatbelt (above). `CutoverSplit` (epoch-CAS; parent must be
   `Splitting`; recomputes the children from the map — the two `Building`
   tablets inside the parent's range — rather than trusting carried ids)
   atomically activates both children, **removes** the parent (tablet +
@@ -303,59 +302,14 @@ per-tablet CP data plane (`animus-cp-data`).
   moment the parent's shard chain is complete (never pruned; the B6
   `ParentShardId` source). Wall time rides the command
   (`cutover_wall_ms`), `SealStreamShard::seal_wall_ms`'s discipline — the
-  state machine has no clock. Neither command writes
-  `split_parents`/`stream_split_basis` (zero-copy-split machinery, B7
-  sweep). Placement (`reconcile_placement`/`rebalance_placement`) skips
+  state machine has no clock. The zero-copy split's own command and
+  provenance maps (`SplitTablet`, `split_parents`, `stream_split_basis`)
+  were deleted in the Train B rung-7 sweep — `split_lineage` is the sole
+  split-provenance record. Placement (`reconcile_placement`/`rebalance_placement`) skips
   every non-`Active` tablet — the mid-split set is frozen. Mirror arms +
   `syskv::EntityKind::SplitLineage` follow the usual per-entity
   conventions; the `apply_engine.rs` differential oracle drives a full
   begin→cutover round.
-
-- **`SplitTablet` records split provenance (`Metadata::split_parents`, ADR
-  0018 §2 amendment) — replaces the retired `Tablet::version_floor`
-  cross-group-LWW fix.** `SplitTablet` records `split_parents[new_id] =
-  tablet` (the fresh sibling's immediate source). Never pruned — tablet ids
-  are never reused, so an entry can never resurrect a wrong decision for a
-  later id. It is a pure function of already-agreed `Metadata` state,
-  computed once here so every data replica reads the identical value instead
-  of deriving it locally. Consumed by `animus-cp-data`'s tablet-host
-  reconciler to know **whose** range-seal marker a split child must observe
-  locally before hosting — see that crate's `CLAUDE.md` and ADR 0018's PR2
-  amendment for the full design this replaces `version_floor` with.
-  Regression: `meta::tests::split_tablet_records_provenance_of_the_immediate_
-  parent`. Also mirrored into the system keyspace
-  (`syskv::EntityKind::SplitParent`, `mirror.rs`'s
-  `apply_and_derive_mirror`/`apply_key_write`) so the incremental
-  delta-consumer path (ADR 0038 PR5) stays byte-identical to a full
-  `Metadata` fetch. (`Metadata::absorbed_by`, merge's mirror-image provenance
-  field, and `Metadata::merged_tablets`, the never-pruned "this tablet was
-  merged away" marker a per-node reconciler needed to tell "merged" apart
-  from "table dropped" — see ADR 0033/ADR 0044 — were both removed along
-  with `MergeTablets`.)
-
-- **`SplitTablet` also freezes a stream-inheritance basis
-  (`Metadata::stream_split_basis`, ADR 0042 §8/ADR 0043 §A4/§A6) — a PR1
-  bugfix, sibling to `split_parents` just above, not a replacement for
-  it.** `effective_stream_shard_watermark`/`stream_shard_parent_id` used
-  to walk `split_parents` to the parent's *current* chain live, on every
-  call — correct only if the parent never seals again before the child
-  does; when it does, the parent's later (necessarily higher) end-HLC
-  became the child's own effective watermark too, silently dropping a
-  pre-split backlog the child had physically inherited (ADR 0043 §A4's
-  shared-storage design) but not yet sealed itself. The fix captures the
-  parent's own stream state — its last-sealed epoch and its own effective
-  watermark — **once**, from `MetaCommand::SplitTablet`'s apply, before
-  anything can mutate it further; both accessors now read this frozen
-  basis instead of walking `split_parents` live. No new `MetaCommand`
-  (ADR 0043 §A8's "exactly two commands" claim, about `SealStreamShard`/
-  `ExpireStreamShards`, is unaffected). Mirrored the same way as
-  `split_parents` (`syskv::EntityKind::StreamSplitBasis`). Regression:
-  `animus-test`'s `stream_lineage_corpus.rs::
-  split_then_parent_seals_first` (the deliberate inverse of
-  `split_mid_stream`'s ordering — confirmed to reproduce the loss against
-  the unfixed accessors) and `meta::tests::effective_stream_shard_
-  watermark_inherits_through_split_provenance`/`stream_shard_parent_id_
-  is_frozen_at_split_time_not_the_parents_current_chain`.
 
 ## What's non-obvious
 

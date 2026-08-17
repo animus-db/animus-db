@@ -593,10 +593,12 @@ fn participant_stage_into_a_sealed_range_is_a_true_no_op() {
     let ka = key(1, b":order");
     let kb = key(2, b":balance");
 
-    // Seal group B's whole range before the transaction ever starts.
-    match nodes_b[lb].propose_seal(KeyRange::whole()) {
+    // Freeze group B (the whole-range terminal seal, ADR 0050) before the
+    // transaction ever starts — the copy-based split's replacement for the
+    // zero-copy range seal this test used to propose.
+    match nodes_b[lb].propose_freeze() {
         ProposeResult::Accepted { .. } => {}
-        other => panic!("seal proposal rejected: {other:?} (seed={seed})"),
+        other => panic!("freeze proposal rejected: {other:?} (seed={seed})"),
     }
     sim.run_for(Duration::from_secs(1));
 

@@ -73,7 +73,7 @@ use animus_storage::{StorageEngine, StorageError};
 use animus_tablet::{Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
-use crate::meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeAddrs, StreamSplitBasis};
+use crate::meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeAddrs};
 use crate::schema::TableSchema;
 use crate::syskv::{self, DecodedKey, EntityKind};
 
@@ -190,25 +190,6 @@ pub fn apply_and_derive_mirror(
         }
         MetaCommand::CasTabletReplicas { tablet, .. } => {
             writes.push(put_json(syskv::tablet_key(*tablet), &meta.tablets[tablet]));
-        }
-        MetaCommand::SplitTablet { tablet, new_id, .. } => {
-            writes.push(put_json(syskv::tablet_key(*tablet), &meta.tablets[tablet]));
-            writes.push(put_json(syskv::tablet_key(*new_id), &meta.tablets[new_id]));
-            writes.push(put_counter(NEXT_TABLET_ID_COUNTER, meta.next_tablet_id));
-            if let Some(policy) = meta.policies.get(new_id) {
-                writes.push(put_json(syskv::policy_key(*new_id), policy));
-            }
-            // ADR 0018 §2 amendment: mirror the split-provenance marker
-            // (`Metadata::split_parents`).
-            writes.push(put_tablet_id(syskv::split_parent_key(*new_id), *tablet));
-            // PR1 bugfix (ADR 0042 §8/ADR 0043 §A4/§A6): mirror the frozen
-            // stream-inheritance basis (`Metadata::stream_split_basis`) —
-            // `Metadata::apply`'s own `SplitTablet` arm always inserts one
-            // entry per split, whether or not the table streams.
-            writes.push(put_json(
-                syskv::stream_split_basis_key(*new_id),
-                &meta.stream_split_basis[new_id],
-            ));
         }
         MetaCommand::BeginSplit {
             parent, children, ..
@@ -398,14 +379,6 @@ fn put_counter(name: &str, value: u64) -> KeyWrite {
     KeyWrite::Put(syskv::counter_key(name), value.to_be_bytes().to_vec())
 }
 
-/// A [`KeyWrite::Put`] of a raw [`TabletId`] value (big-endian `u64`) at
-/// `key` — the value shape [`syskv::split_parent_key`] uses (ADR 0018 §2
-/// amendment): a tablet id, not a JSON entity, mirroring [`put_counter`]'s
-/// primitive-value convention.
-fn put_tablet_id(key: Vec<u8>, id: TabletId) -> KeyWrite {
-    KeyWrite::Put(key, id.0.to_be_bytes().to_vec())
-}
-
 /// Decode an 8-byte big-endian `u64` written by [`put_counter`] or any
 /// numeric-id `*_key` helper. Panics on a malformed value — this module never
 /// writes anything else at these keys, so a mismatch is an internal bug, not
@@ -528,10 +501,6 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
                 meta.cp_member_tablets.insert(node, tablet);
             }
         }
-        EntityKind::SplitParent => {
-            meta.split_parents
-                .insert(TabletId(decode_u64(&id)), TabletId(decode_u64(value)));
-        }
         EntityKind::StreamShard => {
             let Some(key) = syskv::decode_stream_shard_id(&id) else {
                 return;
@@ -544,12 +513,6 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             if let Some(key) = syskv::decode_index_backfill_id(&id) {
                 meta.index_backfill.insert(key, ());
             }
-        }
-        EntityKind::StreamSplitBasis => {
-            let basis: StreamSplitBasis =
-                serde_json::from_slice(value).expect("mirrored stream-split-basis value decodes");
-            meta.stream_split_basis
-                .insert(TabletId(decode_u64(&id)), basis);
         }
         EntityKind::SplitLineage => {
             let lineage: crate::meta::SplitLineage =
@@ -597,11 +560,6 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             meta.cp_member_addrs.remove(&node);
             meta.cp_member_tablets.remove(&node);
         }
-        EntityKind::SplitParent => {
-            // Never deleted in practice (`split_parents` is never pruned) —
-            // listed for match exhaustiveness.
-            meta.split_parents.remove(&TabletId(decode_u64(&id)));
-        }
         EntityKind::StreamShard => {
             // Reachable in practice, unlike the never-pruned markers above
             // — `ExpireStreamShards { remove: true }` genuinely tombstones
@@ -617,16 +575,9 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
                 meta.index_backfill.remove(&key);
             }
         }
-        EntityKind::StreamSplitBasis => {
-            // Never deleted in practice (`stream_split_basis` is never
-            // pruned, same lifetime discipline as `SplitParent` above) —
-            // listed for match exhaustiveness.
-            meta.stream_split_basis.remove(&TabletId(decode_u64(&id)));
-        }
         EntityKind::SplitLineage => {
-            // Never deleted in practice (`split_lineage` is never pruned,
-            // same lifetime discipline as `SplitParent` above) — listed for
-            // match exhaustiveness.
+            // Never deleted in practice (`split_lineage` is never pruned)
+            // — listed for match exhaustiveness.
             meta.split_lineage.remove(&TabletId(decode_u64(&id)));
         }
     }
@@ -735,49 +686,6 @@ mod tests {
                 syskv::tablet_key(TabletId(1)),
                 &meta.tablets[&TabletId(1)]
             )]
-        );
-    }
-
-    #[test]
-    fn split_tablet_writes_both_tablets_the_counter_and_inherited_policy() {
-        let mut meta = Metadata::default();
-        let _ = apply_and_derive_mirror(
-            &mut meta,
-            &MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: None,
-                range: KeyRange::whole(),
-                replicas: vec![nid(1)],
-            },
-        );
-        let _ = apply_and_derive_mirror(
-            &mut meta,
-            &MetaCommand::SetTabletPolicy {
-                tablet: TabletId(1),
-                policy: Some(PlacementPolicy::simple("p", 1)),
-            },
-        );
-        let command = MetaCommand::SplitTablet {
-            tablet: TabletId(1),
-            expected_epoch: Epoch::INITIAL,
-            split_key: vec![5],
-            new_id: TabletId(2),
-        };
-        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
-        assert_eq!(outcome, ApplyOutcome::Applied);
-        assert_eq!(
-            writes,
-            vec![
-                put_json(syskv::tablet_key(TabletId(1)), &meta.tablets[&TabletId(1)]),
-                put_json(syskv::tablet_key(TabletId(2)), &meta.tablets[&TabletId(2)]),
-                put_counter(NEXT_TABLET_ID_COUNTER, meta.next_tablet_id),
-                put_json(syskv::policy_key(TabletId(2)), &meta.policies[&TabletId(2)]),
-                put_tablet_id(syskv::split_parent_key(TabletId(2)), TabletId(1)),
-                put_json(
-                    syskv::stream_split_basis_key(TabletId(2)),
-                    &meta.stream_split_basis[&TabletId(2)],
-                ),
-            ]
         );
     }
 
@@ -1323,9 +1231,6 @@ mod tests {
             seal_wall_ms: 1_700_000_000_000,
             replicas: vec![nid(1), nid(2)],
             object_id: format!("orders/L1/{}/{epoch}/test", tablet.0),
-            // No `CreateTablet` in any of this helper's callers — the range
-            // CAS (`Metadata::apply`) reads as permissive (absent tablet).
-            expected_range: KeyRange::whole(),
         }
     }
 
@@ -1471,16 +1376,20 @@ mod tests {
                 rows: vec![(TabletId(1), 0)],
                 remove: false,
             },
-            // PR1 bugfix (ADR 0042 §8/ADR 0043 §A4/§A6): exercise the
-            // `stream_split_basis` mirror's read side too — a live engine
-            // scan only ever yields `Put`s (this command's own arm derives
-            // one), so this is the one command in this fixture whose mirror
-            // write `rebuild_metadata_from_engine` actually has to decode.
-            MetaCommand::SplitTablet {
-                tablet: TabletId(1),
+            // ADR 0050: exercise the `split_lineage` mirror's read side too
+            // — a live engine scan only ever yields `Put`s, so cutover's
+            // lineage row is a value `rebuild_metadata_from_engine` has to
+            // decode.
+            MetaCommand::BeginSplit {
+                parent: TabletId(1),
                 expected_epoch: Epoch::INITIAL,
                 split_key: vec![5],
-                new_id: TabletId(3),
+                children: [(TabletId(3), vec![nid(1)]), (TabletId(4), vec![nid(1)])],
+            },
+            MetaCommand::CutoverSplit {
+                parent: TabletId(1),
+                expected_epoch: Epoch::INITIAL.next(),
+                cutover_wall_ms: 1_000,
             },
         ];
         for (index, command) in commands.iter().enumerate() {

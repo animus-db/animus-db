@@ -144,26 +144,27 @@ fn run_scenario(seed: u64) {
             seal_wall_ms: 1_700_000_000_000,
             replicas: vec![nid(10), nid(11)],
             object_id: "orders/seed-scenario-L1/1/0/test".to_owned(),
-            expected_range: KeyRange::whole(),
         });
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after SealStreamShard").await;
 
-        // Split the tablet, then drop the table (removes every tablet + policy).
+        // Copy-based split (ADR 0050): Begin, then cutover — the child pair
+        // partitions the range, the parent retires, lineage freezes.
         let split_key = vec![128u8];
-        nodes[leader].propose(MetaCommand::SplitTablet {
-            tablet: TabletId(1),
+        nodes[leader].propose(MetaCommand::BeginSplit {
+            parent: TabletId(1),
             expected_epoch: Epoch::INITIAL,
             split_key,
-            new_id: TabletId(2),
+            children: [
+                (TabletId(2), vec![nid(10), nid(11)]),
+                (TabletId(3), vec![nid(10), nid(11)]),
+            ],
         });
         sim.run_for(Duration::from_secs(1));
-        assert_cache_matches_engine(&nodes, &engines, seed, "after split").await;
+        assert_cache_matches_engine(&nodes, &engines, seed, "after begin-split").await;
 
-        // Seal the narrowed source's next epoch, plus the split child's own
-        // epoch-0 (licensed by `split_parents` provenance the split itself
-        // just recorded — the escape hatch `SealStreamShard`'s epoch-chain
-        // guard grants a fresh child with no local history of its own).
+        // The retired-to-be parent seals its next epoch (its final shard),
+        // then cutover retires it; the child's own epoch-0 seal follows.
         nodes[leader].propose(MetaCommand::SealStreamShard {
             table: "orders".to_string(),
             label: "seed-scenario-L1".to_string(),
@@ -175,9 +176,11 @@ fn run_scenario(seed: u64) {
             seal_wall_ms: 1_700_000_000_001,
             replicas: vec![nid(10), nid(11)],
             object_id: "orders/seed-scenario-L1/1/1/test".to_owned(),
-            // Split narrowed tablet 1 to the left half of `KeyRange::split_at
-            // (&[128u8])` above.
-            expected_range: KeyRange::new(Vec::new(), Some(vec![128u8])),
+        });
+        nodes[leader].propose(MetaCommand::CutoverSplit {
+            parent: TabletId(1),
+            expected_epoch: Epoch::INITIAL.next(),
+            cutover_wall_ms: 1_700_000_000_010,
         });
         nodes[leader].propose(MetaCommand::SealStreamShard {
             table: "orders".to_string(),
@@ -190,8 +193,6 @@ fn run_scenario(seed: u64) {
             seal_wall_ms: 1_700_000_000_002,
             replicas: vec![nid(10), nid(11)],
             object_id: "orders/seed-scenario-L1/2/0/test".to_owned(),
-            // The split child's own range: the right half of the same split.
-            expected_range: KeyRange::new(vec![128u8], None),
         });
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after split-child seal").await;
@@ -205,11 +206,12 @@ fn run_scenario(seed: u64) {
         // (F11) — 8 bytes, strictly inside tablet 2's `[0x80..]` range.
         nodes[leader].propose(MetaCommand::BeginSplit {
             parent: TabletId(2),
-            expected_epoch: Epoch::INITIAL,
+            // Activated by the cutover above (child epoch bump).
+            expected_epoch: Epoch::INITIAL.next(),
             split_key: vec![0xC0, 0, 0, 0, 0, 0, 0, 0],
             children: [
-                (TabletId(3), vec![nid(10), nid(11)]),
                 (TabletId(4), vec![nid(10), nid(11)]),
+                (TabletId(5), vec![nid(10), nid(11)]),
             ],
         });
         sim.run_for(Duration::from_secs(1));
@@ -217,7 +219,7 @@ fn run_scenario(seed: u64) {
 
         nodes[leader].propose(MetaCommand::CutoverSplit {
             parent: TabletId(2),
-            expected_epoch: Epoch::INITIAL.next(),
+            expected_epoch: Epoch::INITIAL.next().next(),
             cutover_wall_ms: 1_700_000_000_003,
         });
         sim.run_for(Duration::from_secs(1));

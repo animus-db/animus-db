@@ -118,7 +118,6 @@ fn for_each_seed(name: &str, mut body: impl FnMut(u64)) {
 /// described ADR 0028's world).
 struct Group {
     id: TabletId,
-    range: KeyRange,
     nodes: Vec<KvNode>,
 }
 
@@ -149,7 +148,7 @@ fn start_group(
             )
         })
         .collect();
-    Group { id, range, nodes }
+    Group { id, nodes }
 }
 
 /// Waits for exactly one leader among `live` node indices, bounded — panics
@@ -173,11 +172,10 @@ fn elect(sim: &mut Simulator, group: &Group, live: &[usize], seed: u64) -> usize
 }
 
 fn propose_write(group: &Group, leader: usize, item_key: &[u8], record: &[u8]) -> u64 {
-    match group.nodes[leader].put_kind_batch_fenced(
+    match group.nodes[leader].put_kind_batch_conditioned(
         vec![(KIND_BASE, item_key.to_vec(), Some(record.to_vec()))],
         vec![(item_key.to_vec(), record.to_vec())],
         Vec::new(),
-        group.range.clone(),
     ) {
         animus_control::ProposeResult::Accepted { index } => index,
         other => panic!("leader rejected a write: {other:?}"),
@@ -353,7 +351,7 @@ fn seal_now(
     wall_ms: u64,
     skip_commit: bool,
 ) -> Option<u64> {
-    let watermark = meta.effective_stream_shard_watermark(group.id).unwrap_or(0);
+    let watermark = meta.stream_shard_watermark(group.id).unwrap_or(0);
     // Split-seal range-fence amendment (ADR 0043 §A3/§A4/§A6, 2026-08-15):
     // mirrors `index_drain::seal_now`'s own fence exactly, same reason —
     // `pending_changes()` is bounded only by this group's *physical* scope,
@@ -425,18 +423,6 @@ fn seal_now(
     if skip_commit {
         return None; // modelled crash before catalog commit
     }
-    // Split-seal range-fence CAS (2026-08-15, ADR 0043 §A3/§A4): fetched
-    // fresh from `meta` at this exact call — mirrors `index_drain::
-    // seal_now`'s own `ctx.effective_metadata()` re-fetch on every call.
-    // Deliberately NOT `group.range`, a static field this harness never
-    // updates after `start_group`: using it here would silently desync from
-    // whatever the calling scenario has since done to `meta` (a
-    // `SplitTablet` apply), which is exactly the staleness this CAS exists
-    // to catch, not to reintroduce via the test's own scripting shortcut.
-    let expected_range = meta
-        .tablets
-        .get(&group.id)
-        .map_or_else(KeyRange::whole, |t| t.range.clone());
     let outcome = meta.apply(&MetaCommand::SealStreamShard {
         table: TABLE.into(),
         label: LABEL.into(),
@@ -448,7 +434,6 @@ fn seal_now(
         seal_wall_ms: wall_ms,
         replicas: Vec::new(),
         object_id: seg_id,
-        expected_range,
     });
     matches!(outcome, ApplyOutcome::Applied).then_some(epoch)
 }
@@ -486,7 +471,7 @@ fn collect_tablet_records(
             all.push((r.source_key, r.packed_hlc, r.change_record));
         }
     }
-    let watermark = meta.effective_stream_shard_watermark(group.id).unwrap_or(0);
+    let watermark = meta.stream_shard_watermark(group.id).unwrap_or(0);
     let mut hot: Vec<(Vec<u8>, u64, Vec<u8>)> = block_on(group.nodes[leader].pending_changes())
         .into_iter()
         .filter_map(|(k, v)| {
@@ -819,7 +804,7 @@ fn scenario_disable_grace_drain(seed: u64) {
         block_on(group.nodes[leader].pending_changes())
             .into_iter()
             .filter_map(|(k, _)| record_hlc_suffix(&k))
-            .all(|hlc| hlc <= meta.effective_stream_shard_watermark(group.id).unwrap_or(0)),
+            .all(|hlc| hlc <= meta.stream_shard_watermark(group.id).unwrap_or(0)),
         "[seed={seed}] nothing should remain above the watermark after a final seal"
     );
 
@@ -865,7 +850,7 @@ fn scenario_disable_grace_drain(seed: u64) {
         ApplyOutcome::Applied,
         "[seed={seed}] re-enable must apply"
     );
-    let watermark = meta.effective_stream_shard_watermark(group.id).unwrap_or(0);
+    let watermark = meta.stream_shard_watermark(group.id).unwrap_or(0);
     let outcome = meta.apply(&MetaCommand::SealStreamShard {
         table: TABLE.into(),
         label: LABEL2.into(),
@@ -878,7 +863,6 @@ fn scenario_disable_grace_drain(seed: u64) {
         replicas: Vec::new(),
         object_id: format!("{TABLE}/{LABEL2}/{}/test", group.id.0),
         // No `CreateTablet` in this scenario — permissive (absent tablet).
-        expected_range: KeyRange::whole(),
     });
     // An empty shard is never sealed in production (`seal_now` never calls
     // `SealStreamShard` for an empty scan) — this hand-built row exists only
@@ -1122,7 +1106,7 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
     // `index_drain::seal_now`'s own sequence up through its `pending_
     // changes()` read (`animusd/src/index_drain.rs:944-960`), before its
     // (real, K-way replicated, hence slow) `put_sealed` call.
-    let watermark_slow = meta.effective_stream_shard_watermark(group.id).unwrap_or(0);
+    let watermark_slow = meta.stream_shard_watermark(group.id).unwrap_or(0);
     let mut slow_records: Vec<(Vec<u8>, u64, Vec<u8>)> =
         block_on(group.nodes[slow_leader].pending_changes())
             .into_iter()
@@ -1181,7 +1165,7 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
         "[seed={seed}] the fast attempt seals epoch 0 covering both batches"
     );
     let fast_watermark = meta
-        .effective_stream_shard_watermark(group.id)
+        .stream_shard_watermark(group.id)
         .expect("fast attempt just committed a watermark");
     let fast_seg_id = meta.stream_shards[&(group.id, 0)].object_id.clone();
 
@@ -1240,7 +1224,6 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
         // No `CreateTablet` in this scenario at all — the range CAS reads
         // as permissive (absent tablet); `whole()` is never actually
         // checked, same as this scenario's other unaffected assertions.
-        expected_range: KeyRange::whole(),
     });
     assert_eq!(
         slow_outcome,
@@ -1248,7 +1231,7 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
         "[seed={seed}] the catalog must reject the slow attempt's differing content"
     );
     assert_eq!(
-        meta.effective_stream_shard_watermark(group.id),
+        meta.stream_shard_watermark(group.id),
         Some(fast_watermark),
         "[seed={seed}] the catalog's committed watermark must be untouched by the rejected proposal"
     );
@@ -1411,9 +1394,7 @@ fn complete_copy_split(
     // the driver's own endgame has the same branch.
     let leader = elect(sim, parent_group, &[0, 1, 2], seed);
     let _ = seal_now(meta, store, parent_group, leader, wall_ms, false);
-    let watermark = meta
-        .effective_stream_shard_watermark(parent_group.id)
-        .unwrap_or(0);
+    let watermark = meta.stream_shard_watermark(parent_group.id).unwrap_or(0);
     let still_pending = block_on(parent_group.nodes[leader].pending_changes())
         .into_iter()
         .filter_map(|(k, _)| record_hlc_suffix(&k))

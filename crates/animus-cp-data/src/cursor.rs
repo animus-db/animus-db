@@ -97,17 +97,18 @@
 //! either encoding — those functions, and every existing caller of them,
 //! are unchanged.
 //!
-//! ## Split classification (ADR 0046, third as-built amendment)
+//! ## Split classification (ADR 0046 third as-built amendment; ADR 0050)
 //!
-//! [`SplitPolicy`] names the two ways a split can affect a consumer's
-//! cursor — the same generalized rule `animus_tablet::split_basis::
-//! effective` implements code-side for the frozen-basis case:
+//! Under copy-based splits (ADR 0050) a child is born with empty cursor and
+//! change-log scopes, so **every** consumer offset is
+//! [`SplitPolicy::RestartFromScratch`] — ADR 0046 principle 3 strengthened
+//! to "no consumer offset ever crosses a split":
 //!
 //! | Consumer tag | `SplitPolicy` | Why |
 //! |---|---|---|
-//! | `"gsi"` | [`SplitPolicy::RestartFromScratch`] | `cursor_key` embeds `range.start`; `narrow_scope` never moves rows, so a split's right child reads an empty cursor and simply restarts its reconcile sweep over its own (strictly narrower) range — safe by construction, ADR 0045 §5 Fork A/F1. |
-//! | `"backfill:{index_name}"` | [`SplitPolicy::RestartFromScratch`] | Identical reasoning: the backfill seeder walks `KIND_BASE`, not the change log, and a fresh child's cursor being empty just means "re-sweep this (narrower) range from the start" — the same idempotent-reconciliation argument, see the module doc's own "Split-during-backfill" note (`animusd::index_drain`). |
-//! | the stream seal watermark | [`SplitPolicy::InheritFrozenBasis`] | **Not** a `KIND_CURSOR` row at all — it lives in the control plane's replicated `Metadata` (`Metadata::stream_split_basis`/`effective_stream_shard_watermark`, ADR 0042 §8/ADR 0043 §A4/§A6), which is why this table lists it for completeness (doc-level) rather than [`classify_tag`] covering it (code-level, since this crate has no row for it to classify). Dependency direction (`animus-cp-data` → `animus-control`, never the reverse) is exactly why there is no runtime cross-plane registry unifying the two — see ADR 0046's own Consequences section. |
+//! | `"gsi"` | [`SplitPolicy::RestartFromScratch`] | A copy-based split child's cursor scope starts empty (CURSOR is never seeded, ADR 0050 rung 4); the drain's reconcile sweep is idempotent, so it restarts over the child's own range — ADR 0045 §5 Fork A/F1's argument, now structural. |
+//! | `"backfill:{index_name}"` | [`SplitPolicy::RestartFromScratch`] | Identical reasoning: the backfill seeder walks `KIND_BASE` and a fresh child's empty cursor just means "re-sweep this (narrower) range from the start." |
+//! | the stream seal watermark | [`SplitPolicy::RestartFromScratch`] | A child's change log is born empty and its shard chain starts at its own epoch 0; the parent's chain is closed by the pre-cutover final seal, with lineage frozen in `Metadata::split_lineage` (fork F9) — no watermark inheritance exists to classify (the zero-copy design's `InheritFrozenBasis` policy retired with `stream_split_basis`, Train B rung 7). |
 //!
 //! [`classify_tag`] enumerates the `KIND_CURSOR` side of this table in code
 //! (checked by this module's own `every_known_cursor_tag_prefix_is_
@@ -308,13 +309,6 @@ pub enum SplitPolicy {
     /// always harmless), so "start over" costs bounded extra work, never
     /// correctness.
     RestartFromScratch,
-    /// The child's value is inherited from a basis frozen once, at split
-    /// time — never re-derived live from the parent's later state (the
-    /// #216 lesson `animus_tablet::split_basis::effective` generalizes).
-    /// No `KIND_CURSOR` tag uses this today; kept as a variant so the
-    /// classification table (module doc) can state it as a real
-    /// alternative, not an implicit "everything else."
-    InheritFrozenBasis,
 }
 
 /// Classify a `KIND_CURSOR` tag by its [`SplitPolicy`] — `None` for a tag
@@ -501,9 +495,9 @@ mod tests {
     /// table, pick [`SplitPolicy::RestartFromScratch`] (safe if your
     /// consumer's reconciliation is idempotent and a fresh child simply
     /// restarting is affordable) or argue for
-    /// [`SplitPolicy::InheritFrozenBasis`] (only justified so far for a
-    /// value that is expensive/impossible to recompute from scratch, like
-    /// the control-plane's stream watermark), add your tag to
+    /// a deliberate policy decision (ADR 0046 principle 3 — under ADR 0050
+    /// every offset restarts from scratch, so a new policy variant needs a
+    /// design review first), add your tag to
     /// [`classify_tag`], and add it to this test's own list.
     #[test]
     fn every_known_cursor_tag_prefix_is_classified() {

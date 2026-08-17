@@ -185,7 +185,7 @@ fn abort_restores_prior_value_and_materializes_nothing() {
     let change_prefix = logical(pk, b"\x02");
 
     // A prior committed value the abort must restore.
-    match node.put_fenced(base.clone(), b"prior".to_vec(), KeyRange::whole()) {
+    match node.put(base.clone(), b"prior".to_vec()) {
         animus_control::ProposeResult::Accepted { .. } => {}
         other => panic!("prior put rejected: {other:?} (seed={seed})"),
     }
@@ -641,7 +641,7 @@ fn an_aborted_stages_marker_remains_a_harmless_dirty_hint() {
     let base = logical(pk, b"");
     let change_prefix = logical(pk, b"\x02");
 
-    match node.put_fenced(base.clone(), b"prior".to_vec(), KeyRange::whole()) {
+    match node.put(base.clone(), b"prior".to_vec()) {
         animus_control::ProposeResult::Accepted { .. } => {}
         other => panic!("prior put rejected: {other:?} (seed={seed})"),
     }

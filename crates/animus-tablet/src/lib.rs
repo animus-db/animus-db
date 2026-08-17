@@ -25,8 +25,6 @@ use animus_env::NodeId;
 use animus_env::nid;
 use serde::{Deserialize, Serialize};
 
-pub mod split_basis;
-
 /// Width, in bytes, of a [`partition_token`] — a big-endian `u64`.
 pub const TOKEN_BYTES: usize = 8;
 
@@ -260,13 +258,6 @@ impl KeyRange {
         };
         Some((left, right))
     }
-
-    /// Whether this range is immediately followed by `next` (`self.end ==
-    /// next.start`), so the two can be merged into one contiguous range.
-    #[must_use]
-    pub fn abuts(&self, next: &KeyRange) -> bool {
-        self.end.as_deref() == Some(next.start.as_slice())
-    }
 }
 
 /// A table name — the catalog identifier a tablet is scoped to. A bare string;
@@ -457,7 +448,6 @@ mod tests {
         assert!(!left.contains(b"m"));
         assert!(right.contains(b"m") && right.contains(b"z"));
         // The two halves are adjacent and recombine to the whole keyspace.
-        assert!(left.abuts(&right));
     }
 
     #[test]
@@ -474,19 +464,6 @@ mod tests {
         assert!(r.split_at(b"a").is_none(), "split before start");
         assert!(r.split_at(b"e").is_none(), "split after end");
         assert!(r.split_at(b"c").is_some());
-    }
-
-    #[test]
-    fn abuts_only_when_contiguous() {
-        let a = KeyRange::new(b"a".to_vec(), Some(b"m".to_vec()));
-        let b = KeyRange::new(b"m".to_vec(), Some(b"z".to_vec()));
-        let gap = KeyRange::new(b"n".to_vec(), Some(b"z".to_vec()));
-        assert!(a.abuts(&b));
-        assert!(!a.abuts(&gap));
-        assert!(
-            !KeyRange::whole().abuts(&b),
-            "unbounded-above range abuts nothing"
-        );
     }
 
     #[test]

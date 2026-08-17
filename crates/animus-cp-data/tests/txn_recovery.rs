@@ -741,11 +741,11 @@ fn push_aborts_an_orphan_intent_with_no_record_anywhere() {
         Some(b"prior".to_vec())
     );
 
-    // Seal the anchor's whole range FIRST — its own stage entry (the one
-    // that would normally create the record) silently no-ops against it at
-    // apply, a whole-or-nothing fence/seal miss (`txn_single.rs`'s
-    // already-sealed-range shape).
-    let sealed = nodes_a[la].propose_seal(nodes_a[la].scope_range());
+    // Freeze the anchor's group FIRST (ADR 0050's terminal whole-range
+    // seal) — its own stage entry (the one that would normally create the
+    // record) silently no-ops against it at apply, a whole-or-nothing
+    // seal miss (`txn_single.rs`'s already-frozen shape).
+    let sealed = nodes_a[la].propose_freeze();
     assert!(matches!(sealed, ProposeResult::Accepted { .. }));
     sim.run_for(ELECT);
 

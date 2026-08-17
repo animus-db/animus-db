@@ -264,7 +264,6 @@ async fn create_table_pre_split(
     // exercise split itself. `create_table` above waits for the bootstrap
     // tablet to exist, but the first PutItem is what lazily provisions it —
     // so provision it first with a throwaway probe write, then split.
-    let _ = client_addr;
     // The bootstrap tablet is provisioned lazily by the first write; the
     // CreateTable wait above only covers the schema. Ensure it exists.
     timeout(Duration::from_secs(20), async {
@@ -281,35 +280,33 @@ async fn create_table_pre_split(
     })
     .await
     .expect("bootstrap tablet was never provisioned before the harness split");
-    let meta = nodes
-        .iter()
-        .map(|n| n.metadata())
-        .find(|m| m.tablets.contains_key(&animus_tablet::TabletId(1)))
-        .expect("just observed");
-    let source = animus_tablet::TabletId(1);
-    let expected_epoch = meta.tablets[&source].epoch;
-    let new_id = meta.next_free_tablet_id();
-    let cmd = animus_control::MetaCommand::SplitTablet {
-        tablet: source,
-        expected_epoch,
-        split_key: upper_key,
-        new_id,
-    };
-    let accepted = nodes.iter().any(|n| n.propose_meta(cmd.clone()));
-    assert!(
-        accepted,
-        "no node's control handle accepted the harness split proposal"
-    );
-    timeout(Duration::from_secs(20), async {
+    // ADR 0050 (Train B rung 5+): drive the REAL workflow via the public
+    // kickoff on the client protocol; the driver cuts over on its own.
+    match call(
+        client_addr,
+        ClientRequest::SplitTablet {
+            tablet: 1,
+            split_key: upper_key,
+        },
+    )
+    .await
+    {
+        ClientResponse::PutOk => {}
+        other => panic!("split kickoff refused: {other:?}"),
+    }
+    timeout(Duration::from_secs(30), async {
         loop {
-            if nodes.iter().all(|n| n.metadata().tablets.len() == 2) {
+            if nodes.iter().all(|n| {
+                let m = n.metadata();
+                m.tablets.len() == 2 && !m.tablets.contains_key(&animus_tablet::TabletId(1))
+            }) {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("split was not recorded in the tablet map within 20s");
+    .expect("the split workflow did not cut over within 30s");
 
     // Confirm both halves actually serve before relying on them.
     for id in [&lower_id, &upper_id] {

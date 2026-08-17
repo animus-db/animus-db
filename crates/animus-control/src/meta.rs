@@ -233,65 +233,15 @@ pub struct Metadata {
     /// keeps pre-ADR-0032 snapshots loading (empty map).
     #[serde(default)]
     pub node_addrs: BTreeMap<NodeId, NodeAddrs>,
-    /// Split provenance (ADR 0018 PR2, the range-seal design): every split
-    /// child's id mapped to its source tablet's id, recorded by
-    /// [`MetaCommand::SplitTablet`]'s apply. Never pruned (tablet ids are
-    /// never reused). This is what lets a per-node tablet-host reconciler
-    /// know **whose** seal marker a fresh split child must observe before it
-    /// may host (`animus-cp-data`'s `host::HostAction::Host`) — the marker
-    /// itself lives in the (possibly shared) `StorageEngine`, keyed by the
-    /// source's tablet id, and this map is the only way to learn which
-    /// source that is once the source's own row may have narrowed (or,
-    /// after further splits, changed shape) since the child was minted.
-    /// `#[serde(default)]` keeps pre-ADR-0018 snapshots loading (empty map).
-    #[serde(default)]
-    pub split_parents: BTreeMap<TabletId, TabletId>,
-    /// **Frozen split-time stream-inheritance basis** (ADR 0042 §8/ADR 0043
-    /// §A4/§A6, PR1 bugfix): every split child's id mapped to a snapshot of
-    /// its immediate parent's stream state **at the instant of the split**,
-    /// captured by [`MetaCommand::SplitTablet`]'s apply arm from the
-    /// parent's pre-mutation state. Never mutated again afterward, and
-    /// never pruned (same lifetime discipline as [`split_parents`]
-    /// (Self::split_parents), which it is a sibling to, not a replacement
-    /// for).
-    ///
-    /// **The bug this exists to fix**: [`effective_stream_shard_watermark`]
-    /// (Self::effective_stream_shard_watermark) and
-    /// [`stream_shard_parent_id`](Self::stream_shard_parent_id) used to walk
-    /// [`split_parents`](Self::split_parents) to the parent's **current**
-    /// chain, live, every time either was called. That is correct only if
-    /// the parent never seals again before the child does — if it does, the
-    /// parent's later seal's end-HLC (necessarily higher, since a tablet's
-    /// own `KIND_CHANGE` scope only ever advances) becomes the child's own
-    /// effective watermark too, retroactively appearing to have already
-    /// sealed a pre-split backlog the child physically inherited in place
-    /// (ADR 0043 §A4's shared-storage design) but had not yet sealed itself.
-    /// The child's own first seal then silently filters that backlog out
-    /// (`hlc <= watermark`) — a permanent, silent loss, invisible unless the
-    /// child happens to seal before the parent does (the race that made
-    /// this bug ship undetected). Freezing the basis at the split itself —
-    /// the one moment both children's shared inheritance is well-defined —
-    /// closes this: a later seal by *either* sibling can never move what an
-    /// already-split child inherited. Recorded unconditionally by every
-    /// split (mirroring [`split_parents`](Self::split_parents)'s own
-    /// unconditional recording), whether or not the table streams at all —
-    /// cheap, and correct if streaming is enabled on the table later.
-    /// `#[serde(default)]` keeps pre-fix snapshots loading (empty map); this
-    /// repo has no live-deployment/back-compat requirement (fresh clusters
-    /// only), so a pre-fix snapshot's split children simply have no basis
-    /// entry, which is not a state this codebase needs to handle.
-    #[serde(default)]
-    pub stream_split_basis: BTreeMap<TabletId, StreamSplitBasis>,
     /// **Copy-based split lineage** (ADR 0050, fork F9): every copy-based
     /// split child's id mapped to its parent's identity and final stream
     /// state, written by [`MetaCommand::CutoverSplit`]'s apply — the one
     /// moment the parent's shard chain is complete and immutable (the
     /// parent is removed from the tablet map in the same apply), so the
     /// recorded lineage can never race a later parent seal. Never pruned
-    /// (tablet ids are never reused). Successor to
-    /// [`split_parents`](Self::split_parents)/
-    /// [`stream_split_basis`](Self::stream_split_basis) for copy-based
-    /// splits: children are born with **empty** change logs (no inherited
+    /// (tablet ids are never reused). Successor to the zero-copy split's
+    /// `split_parents`/`stream_split_basis` provenance maps (deleted, Train
+    /// B rung 7) for copy-based splits: children are born with **empty** change logs (no inherited
     /// backlog, no watermark inheritance — ADR 0050 strengthens ADR 0046
     /// principle 3 to "no consumer offset ever crosses a split"), so all a
     /// child needs is its parent's name and final epoch for
@@ -447,34 +397,6 @@ mod index_backfill_codec {
     }
 }
 
-/// A split child's frozen stream-inheritance basis
-/// ([`Metadata::stream_split_basis`], ADR 0042 §8/ADR 0043 §A4/§A6, PR1
-/// bugfix) — see that field's own doc for the live-derivation bug this
-/// exists to fix.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamSplitBasis {
-    /// The immediate split source — always equal to
-    /// `split_parents[child]` at the moment this entry was written,
-    /// carried here too so [`Metadata::effective_stream_shard_watermark`]/
-    /// [`Metadata::stream_shard_parent_id`] need only consult this one map.
-    pub parent: TabletId,
-    /// The parent's own last-sealed epoch **at split time**, if it had ever
-    /// sealed a shard of its own by then — `None` for a split of a parent
-    /// that had never sealed (a fresh table, or a stream disabled since
-    /// before its first seal). What
-    /// [`Metadata::stream_shard_parent_id`] needs to answer a child's own
-    /// epoch-0 `ParentShardId` without re-deriving it from whatever the
-    /// parent's chain looks like *now*.
-    pub last_sealed_epoch: Option<u64>,
-    /// The parent's own **effective** stream watermark at split time
-    /// ([`Metadata::effective_stream_shard_watermark`] evaluated on the
-    /// parent at the moment of the split, so a parent that is itself a
-    /// split child inherits transitively through its *own* already-frozen
-    /// basis) — `None` if the parent had never sealed anything at all,
-    /// including through its own ancestry.
-    pub watermark: Option<u64>,
-}
-
 /// A copy-based split child's lineage row ([`Metadata::split_lineage`],
 /// ADR 0050 fork F9), written once by [`MetaCommand::CutoverSplit`]'s apply
 /// — see that field's own doc for why cutover time is the only race-free
@@ -607,22 +529,6 @@ pub enum MetaCommand {
         expected_epoch: Epoch,
         replicas: Vec<NodeId>,
     },
-    /// Split `tablet` at `split_key` into `[start, split_key)` (the original,
-    /// with a bumped epoch) and `[split_key, end)` (a new tablet `new_id`,
-    /// inheriting the replica set at [`Epoch::INITIAL`]). The split key must lie
-    /// strictly inside the tablet's range. **Compare-and-swap on `expected_epoch`**
-    /// (mirroring `CasTabletReplicas`): rejected if `tablet`'s epoch has moved
-    /// since the caller read it, so two proposers racing to split the same
-    /// tablet at the same epoch with different keys can't both commit — only the
-    /// first lands, the second is cleanly rejected instead of minting a second
-    /// child tablet id that the per-tablet CP-data Raft group (which applies at
-    /// most one real `Split`, ever) can never actually host.
-    SplitTablet {
-        tablet: TabletId,
-        expected_epoch: Epoch,
-        split_key: Vec<u8>,
-        new_id: TabletId,
-    },
     /// Begin a **copy-based split** (ADR 0050 stage 1): the parent moves to
     /// [`TabletState::Splitting`] (still fully serving — reads AND writes —
     /// until the workflow's freeze), and two children are minted
@@ -632,11 +538,11 @@ pub enum MetaCommand {
     /// the parent's placement policy. Children are hosted (their groups
     /// form, their engines open empty) but **unroutable** until
     /// [`MetaCommand::CutoverSplit`]. Epoch-CAS on the parent (the
-    /// `SplitTablet` discipline); rejected unless the parent is `Active`
+    /// `CasTabletReplicas` discipline); rejected unless the parent is `Active`
     /// (no re-split of a `Splitting` parent, no split of a `Building`
     /// child); child ids obey the monotonic allocator floor; the F11
     /// token-alignment seatbelt applies to a streamed table's split key
-    /// exactly as it does for `SplitTablet`.
+    /// (token-alignment) seatbelt holds for streamed tables.
     BeginSplit {
         parent: TabletId,
         expected_epoch: Epoch,
@@ -803,13 +709,10 @@ pub enum MetaCommand {
     /// rejected — nothing ever licensed sealing under it.
     ///
     /// **Epoch-chain sanity**: `epoch == 0` is always accepted (a tablet's
-    /// genuine root, or a fresh split child's own first seal, ADR 0042
-    /// §2/ADR 0043 §A4). `epoch > 0` requires either this tablet's own
-    /// `epoch - 1` row to already exist, or (permissive escape hatch for a
-    /// tablet whose own chain start this state machine can't otherwise
-    /// explain) [`Metadata::split_parents`] naming a source tablet for it —
-    /// kept permissive rather than exact, since this guard's job is to
-    /// catch a genuinely nonsensical gap, not to re-derive the sealer's own
+    /// genuine root — a copy-based split child's own first seal starts its
+    /// own chain at 0, ADR 0050). `epoch > 0` requires this tablet's own
+    /// `epoch - 1` row to already exist — this guard's job is to catch a
+    /// genuinely nonsensical gap, not to re-derive the sealer's own
     /// scheduling.
     SealStreamShard {
         table: TableName,
@@ -837,30 +740,6 @@ pub enum MetaCommand {
         /// silently treated as the identical-content no-op case that a
         /// true same-attempt retry (same id, reused) is.
         object_id: String,
-        /// **Split-seal range-fence CAS amendment (2026-08-15, ADR 0043
-        /// §A3/§A4).** The tablet's own declared range the proposer fenced
-        /// its `pending_changes()` candidate scan against — checked at
-        /// *apply* time (below) against `self.tablets[tablet].range`,
-        /// **only when this is a genuinely new `(tablet, epoch)` row**
-        /// (never re-checked for an existing row's content-match retry or
-        /// the segment janitor's own replicas-only repair reproposal, both
-        /// of which reuse an already-validated row's content unchanged and
-        /// may legitimately run long after further splits have moved the
-        /// tablet's *current* range on). This is the authoritative backstop
-        /// a proposal-side metadata read (`animusd::index_drain::
-        /// in_declared_range`) cannot be by itself: that read can be stale
-        /// relative to a racing `SplitTablet` commit on the *same* node,
-        /// but `Metadata::apply` sees the true, sequentially-applied state,
-        /// never a cache — so a proposal computed against a stale-wide
-        /// range is rejected here regardless of any node's cache freshness.
-        /// An absent tablet at apply time is permissive (no check at all —
-        /// see the apply arm's own doc). `#[serde(default)]` keeps a
-        /// pre-amendment snapshot loading (this repo has no live-deployment/
-        /// back-compat requirement, but every construction site in Rust
-        /// code still needs the field explicitly — a `serde` default only
-        /// covers wire deserialization, not a struct literal).
-        #[serde(default = "KeyRange::whole")]
-        expected_range: KeyRange,
     },
     /// The segment-janitor's two-phase reclaim of already-sealed catalog
     /// rows (ADR 0043 §A9), and the drop-table cascade's own removal path
@@ -1293,121 +1172,6 @@ impl Metadata {
                     ApplyOutcome::Applied
                 }
             },
-            MetaCommand::SplitTablet {
-                tablet,
-                expected_epoch,
-                split_key,
-                new_id,
-            } => {
-                if self.tablets.contains_key(new_id) {
-                    return ApplyOutcome::Rejected("new tablet id already exists");
-                }
-                // Enforce the monotonic allocator (ADR 0023) at apply time, not just
-                // at the proposer: a `new_id` below [`Metadata::next_free_tablet_id`]
-                // could *reuse* an id freed by `DropTableTablets` — and a replica
-                // still holding the dropped tablet's `db-t{id}-*` files (GC
-                // incomplete, or down during the drop) would re-host them AS the new
-                // tablet, resurrecting dropped data the absence-keyed GC can then
-                // never reclaim. The present-tablet check above cannot catch a
-                // *freed* id, so reject anything below the allocator floor.
-                if new_id.0 < self.next_free_tablet_id().0 {
-                    return ApplyOutcome::Rejected("new tablet id below the monotonic allocator");
-                }
-                let Some(source) = self.tablets.get(tablet) else {
-                    return ApplyOutcome::Rejected("no such tablet");
-                };
-                // CAS on the source's epoch (mirroring `CasTabletReplicas`): a second
-                // proposer racing to split the same tablet at the same epoch — with a
-                // different `split_key`, computed from an equally-stale view of the
-                // pre-split range — must not also commit. The tablet's own per-group
-                // CP-data Raft can only ever apply one real `Split` (an at-most-once
-                // apply-time guard there), so a second metadata-level split of the
-                // same epoch would mint a `new_id` that can never get a CP group: a
-                // permanent, leaderless, unreachable orphan tablet. Checking epoch
-                // equality here — before recomputing the range split below — rejects
-                // the loser's proposal outright instead of silently accepting it.
-                if source.epoch != *expected_epoch {
-                    return ApplyOutcome::Rejected("epoch mismatch");
-                }
-                // F11 (ADR 0042 §14, Fork D): apply-time seatbelt, the ADR
-                // 0028 fence idiom — `ClientCtx::trigger_split` is the one
-                // choke point every proposer (auto-split, `POST
-                // /admin/tablet/split`, `ClientRequest::SplitTablet`) funnels
-                // through, and it already rounds a streamed table's split key
-                // down to its own token boundary before ever proposing. This
-                // is a structural check against a *future* caller bypassing
-                // that rounding, not the primary enforcement — a
-                // well-behaved proposer never trips it. A token-aligned key
-                // is always exactly `TOKEN_BYTES` long (the rounding
-                // truncates to that width); anything else on a streamed
-                // table would separate one partition's change records across
-                // two sibling shards (ADR 0043 §A4), the exact per-item
-                // ordering violation ADR 0042 §14 exists to prevent.
-                if split_key.len() != TOKEN_BYTES
-                    && source
-                        .table
-                        .as_deref()
-                        .is_some_and(|table| self.table_stream(table).is_some())
-                {
-                    return ApplyOutcome::Rejected(
-                        "split key not token-aligned for a streamed table",
-                    );
-                }
-                let Some((left, right)) = source.range.split_at(split_key) else {
-                    return ApplyOutcome::Rejected("split key not strictly inside range");
-                };
-                // The split child inherits the parent's table scope (ADR 0023): a
-                // split never crosses a table boundary, so both halves stay scoped
-                // to the same table.
-                let new_tablet = Tablet::with_table(
-                    *new_id,
-                    source.table.clone(),
-                    right,
-                    source.replicas.clone(),
-                );
-                let source = self.tablets.get_mut(tablet).expect("tablet present");
-                source.range = left;
-                source.epoch = source.epoch.next();
-                self.tablets.insert(*new_id, new_tablet);
-                self.next_tablet_id = self.next_tablet_id.max(new_id.0 + 1);
-                // ADR 0018 PR2 (range-seal design): record split provenance —
-                // never pruned (tablet ids are never reused). This is how
-                // the child's per-node reconciler later learns whose seal
-                // marker (keyed by the *source's* tablet id) it must observe in
-                // the shared engine before it may host — see
-                // `Metadata::split_parents`'s doc.
-                self.split_parents.insert(*new_id, *tablet);
-                // PR1 bugfix (ADR 0042 §8/ADR 0043 §A4/§A6): freeze the
-                // child's stream-inheritance basis from the source's own
-                // stream state *right now* — before any later command can
-                // mutate it further. See `Metadata::stream_split_basis`'s
-                // own doc for the live-derivation data-loss bug this fixes.
-                // Reads `self.stream_shards`/`self.stream_split_basis`
-                // only, both untouched by the tablet-map mutation just
-                // above, so evaluation order relative to it doesn't matter.
-                let last_sealed_epoch = self
-                    .stream_shards
-                    .range((*tablet, 0)..=(*tablet, u64::MAX))
-                    .next_back()
-                    .map(|(&(_, epoch), _)| epoch);
-                let watermark = self.effective_stream_shard_watermark(*tablet);
-                self.stream_split_basis.insert(
-                    *new_id,
-                    StreamSplitBasis {
-                        parent: *tablet,
-                        last_sealed_epoch,
-                        watermark,
-                    },
-                );
-                // The split child inherits the source's placement policy (ADR 0029):
-                // without it the new sibling has no policy and is invisible to both
-                // the repair reconciler and the load rebalancer, so it would never
-                // be re-placed or balanced onto new members.
-                if let Some(policy) = self.policies.get(tablet).cloned() {
-                    self.policies.insert(*new_id, policy);
-                }
-                ApplyOutcome::Applied
-            }
             MetaCommand::BeginSplit {
                 parent,
                 expected_epoch,
@@ -1749,7 +1513,6 @@ impl Metadata {
                 seal_wall_ms,
                 replicas,
                 object_id,
-                expected_range,
             } => {
                 // First-committer-wins on CONTENT, not merely on identity
                 // (round-3 PR7 amendment, ADR 0043 §A3/§A9): a second
@@ -1802,41 +1565,6 @@ impl Metadata {
                     existing.replicas = replicas.clone();
                     return ApplyOutcome::Applied;
                 }
-                // Split-seal range-fence CAS (2026-08-15, ADR 0043 §A3/§A4):
-                // this is a genuinely NEW (tablet, epoch) row (the existing-
-                // row branch above already returned) — reject unless the
-                // proposer's own declared range, fenced at propose time,
-                // still matches this tablet's CURRENT range as this exact
-                // apply call sees it. `Metadata::apply` runs sequentially in
-                // Raft commit order, so if a racing `SplitTablet` for this
-                // tablet committed earlier in the log, `self.tablets[tablet]
-                // .range` already reflects the narrowed range by the time
-                // this check runs — a proposal fenced against the old, wide
-                // range mismatches and is rejected, regardless of whether
-                // this node's own metadata cache had caught up to the split
-                // when the proposal was *built*. This is the backstop
-                // `animusd::index_drain::in_declared_range`'s own
-                // proposal-side (cache-fed) fence cannot be by itself — see
-                // that function's doc for why a cache-fed fence alone leaves
-                // a real window open.
-                //
-                // An absent tablet reads as permissive (no check to make),
-                // mirroring `in_declared_range`'s own convention — this
-                // should never happen for a live production seal (the
-                // tablet is the seal's own source of pending records), so
-                // being permissive here only matters for hand-built test
-                // commands that exercise this arm's *other* validations
-                // without bothering to register a tablet first.
-                if self
-                    .tablets
-                    .get(tablet)
-                    .is_some_and(|t| t.range != *expected_range)
-                {
-                    return ApplyOutcome::Rejected(
-                        "declared range stale — a split raced this seal, retry with the \
-                         current range",
-                    );
-                }
                 // Label validation (F12-b): licensed by the table's
                 // *current* schema stream spec, or by an existing catalog
                 // row already present for this exact (table, label) pair
@@ -1857,17 +1585,11 @@ impl Metadata {
                          to extend",
                     );
                 }
-                // Epoch-chain sanity (permissive-but-sane, see this
-                // command's own doc): epoch 0 always accepted; epoch > 0
-                // needs either a local predecessor row or split-parent
-                // provenance explaining this tablet's own chain start.
-                if *epoch > 0
-                    && !self.stream_shards.contains_key(&(*tablet, *epoch - 1))
-                    && !self.split_parents.contains_key(tablet)
-                {
+                // Epoch-chain sanity (see this command's own doc): epoch 0
+                // always accepted; epoch > 0 needs a local predecessor row.
+                if *epoch > 0 && !self.stream_shards.contains_key(&(*tablet, *epoch - 1)) {
                     return ApplyOutcome::Rejected(
-                        "epoch chain gap: no prior epoch row for this tablet and no \
-                         split-parent provenance to explain it",
+                        "epoch chain gap: no prior epoch row for this tablet",
                     );
                 }
                 self.stream_shards.insert(
@@ -2227,57 +1949,18 @@ impl Metadata {
     /// seal" from (`animusd::index_drain::seal_tick`) — no `KIND_CHANGE`
     /// scan needed.
     ///
-    /// **Deliberately NOT split-parent-inherited**, unlike
-    /// [`effective_stream_shard_watermark`]: a fresh split child with no
-    /// seal of its own reads as `None` here rather than walking
-    /// [`Metadata::stream_split_basis`] for a parent's last seal time — a
-    /// parent's last seal time says nothing about how old the *child's own*
-    /// post-split backlog actually is (records inherited via the shared
-    /// engine can be older than that seal, or the parent may never have
-    /// sealed at all). The seal arm's own never-sealed fallback (a one-time
-    /// real scan of the true oldest pending record's HLC, memoized per
-    /// tablet — see `animusd::index_drain::seal_tick`'s own doc for the
-    /// full design and why a cheaper driver-local guess doesn't work) is
-    /// the answer for "never sealed" instead.
+    /// A never-sealed tablet (including a copy-based split child before its
+    /// own first seal — children are born with empty change logs, ADR 0050)
+    /// reads as `None`; the seal arm's own never-sealed fallback (a
+    /// one-time real scan of the true oldest pending record's HLC, memoized
+    /// per tablet — see `animusd::index_drain::seal_tick`'s own doc) is the
+    /// answer for that case.
     #[must_use]
     pub fn last_seal_wall_ms(&self, tablet: TabletId) -> Option<u64> {
         self.stream_shards
             .range((tablet, 0)..=(tablet, u64::MAX))
             .next_back()
             .map(|(_, row)| row.seal_wall_ms)
-    }
-
-    /// `tablet`'s effective stream watermark **including split-parent
-    /// inheritance** (ADR 0043 §A4/§A6): [`stream_shard_watermark`]
-    /// restricted to `tablet`'s own chain is `None` for a fresh split child
-    /// that hasn't sealed a shard of its own yet — but ADR 0043 §A4 is
-    /// explicit that such a child's *initial* watermark is its parent
-    /// tablet's chain's own last-sealed end-HLC, not absent, since the
-    /// parent's sealed segments are shared history both children inherit.
-    ///
-    /// **PR1 bugfix**: this used to walk [`Metadata::split_parents`] to the
-    /// parent's *current* chain, live, on every call — which let a parent
-    /// seal *after* the split retroactively move a child's inherited
-    /// watermark past backlog the child had physically inherited but not
-    /// yet sealed itself, silently dropping it (see
-    /// [`Metadata::stream_split_basis`]'s own doc for the full account).
-    /// Reads [`Metadata::stream_split_basis`] instead — a single-hop lookup
-    /// of the value that was frozen once, at split time, already resolved
-    /// transitively through however many ancestor splits came before it (a
-    /// tablet can itself be a split child of a split child), so no walk is
-    /// needed here at all. This is what the sealer/hot-trim arm (ADR 0043
-    /// §A3/§A6, `animusd::index_drain`) actually calls — never the bare
-    /// [`stream_shard_watermark`], which only answers "this exact tablet's
-    /// own chain," a narrower question than the one a fresh child's watermark
-    /// computation needs answered.
-    #[must_use]
-    pub fn effective_stream_shard_watermark(&self, tablet: TabletId) -> Option<u64> {
-        animus_tablet::split_basis::effective(
-            self.stream_shard_watermark(tablet),
-            self.stream_split_basis
-                .get(&tablet)
-                .and_then(|b| b.watermark.as_ref()),
-        )
     }
 
     /// Every catalog row for `(table, label)`, across every tablet, in
@@ -2333,15 +2016,10 @@ impl Metadata {
     /// `(tablet, epoch)`'s own `ParentShardId` (ADR 0042 §2/ADR 0043 §A4). An
     /// epoch above 0 names the same tablet's own previous epoch, always
     /// derived (a routine seal can never race itself). An epoch-0 shard
-    /// names the parent tablet's own last-sealed shard **as frozen in
-    /// [`Metadata::stream_split_basis`] at split time** — **PR1 bugfix**:
-    /// this used to derive it live from the parent's *current* chain
-    /// (`self.split_parents` + a fresh lookup into `self.stream_shards`),
-    /// which let a parent that sealed again after the split retroactively
-    /// change what a child's already-answered `ParentShardId` had been (see
-    /// [`Metadata::stream_split_basis`]'s own doc). `None` for a genuine
-    /// root (an epoch-0 shard whose tablet was never split, or whose split
-    /// parent had never itself sealed at split time).
+    /// names the parent tablet's own FINAL sealed shard as frozen in
+    /// [`Metadata::split_lineage`] at cutover (ADR 0050, fork F9). `None`
+    /// for a genuine root (an epoch-0 shard whose tablet was never a split
+    /// child, or whose parent never sealed).
     #[must_use]
     pub fn stream_shard_parent_id(&self, tablet: TabletId, epoch: u64) -> Option<String> {
         if epoch > 0 {
@@ -2351,15 +2029,10 @@ impl Metadata {
         // its parent's FINAL sealed shard via `split_lineage` — written at
         // `CutoverSplit`'s own apply, the one moment the parent's chain is
         // complete and immutable, so this needs no freezing defense layers
-        // at all (fork F9; contrast the zero-copy `stream_split_basis`
-        // below, which B7 deletes).
-        if let Some(lineage) = self.split_lineage.get(&tablet) {
-            let parent_epoch = lineage.parents_final_epoch?;
-            return Some(shard_id_string(lineage.parent, parent_epoch));
-        }
-        let basis = self.stream_split_basis.get(&tablet)?;
-        let parent_epoch = basis.last_sealed_epoch?;
-        Some(shard_id_string(basis.parent, parent_epoch))
+        // at all (fork F9).
+        let lineage = self.split_lineage.get(&tablet)?;
+        let parent_epoch = lineage.parents_final_epoch?;
+        Some(shard_id_string(lineage.parent, parent_epoch))
     }
 
     /// The tablets scoped to `table` (ADR 0023), in ascending tablet-id order.
@@ -3341,52 +3014,6 @@ mod tests {
     }
 
     /// ADR 0018 PR2 (range-seal design, replacing the retired `version_floor`
-    /// cross-group-LWW fix): `SplitTablet` records split provenance
-    /// (`Metadata::split_parents`) so a child's reconciler can find its
-    /// source's seal marker. Chained across two splits to prove the map
-    /// always names the immediate parent, not some transitively-resolved
-    /// ancestor.
-    #[test]
-    fn split_tablet_records_provenance_of_the_immediate_parent() {
-        let mut m = Metadata::default();
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: None,
-                range: KeyRange::whole(),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            }),
-            ApplyOutcome::Applied
-        );
-        assert!(!m.split_parents.contains_key(&TabletId(1)));
-
-        assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(1),
-                expected_epoch: Epoch::INITIAL,
-                split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
-                new_id: TabletId(2),
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(m.split_parents.get(&TabletId(2)), Some(&TabletId(1)));
-
-        // A second split, of the sibling itself, must record ITS immediate
-        // parent (tablet 2), not tablet 1 (the ultimate ancestor).
-        assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(2),
-                expected_epoch: Epoch::INITIAL,
-                split_key: 0xC000_0000_0000_0000u64.to_be_bytes().to_vec(),
-                new_id: TabletId(3),
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(m.split_parents.get(&TabletId(3)), Some(&TabletId(2)));
-        // Provenance is permanent (never pruned).
-        assert_eq!(m.split_parents.get(&TabletId(2)), Some(&TabletId(1)));
-    }
-
     /// Shared harness for the ADR 0050 copy-based-split tests below: one
     /// `Active` parent tablet (id 1, whole range, RF 3) with a recorded
     /// policy, plus the `BeginSplit` command splitting it at the ring
@@ -3453,9 +3080,8 @@ mod tests {
         assert!(m.policies.contains_key(&TabletId(3)));
         assert!(m.next_free_tablet_id().0 >= 4);
 
-        // No zero-copy provenance/basis rows, no premature lineage.
-        assert!(!m.split_parents.contains_key(&TabletId(2)));
-        assert!(!m.stream_split_basis.contains_key(&TabletId(2)));
+        // No premature lineage (the zero-copy provenance/basis maps are
+        // gone entirely — nothing to assert absent, Train B rung 7).
         assert!(m.split_lineage.is_empty());
     }
 
@@ -3729,15 +3355,15 @@ mod tests {
         assert_eq!(m.apply(&create(1, Some("users"))), ApplyOutcome::Applied);
         assert_eq!(m.apply(&create(2, Some("orders"))), ApplyOutcome::Applied);
         assert_eq!(m.apply(&create(3, None)), ApplyOutcome::Applied); // legacy
-        // Split `users` so the table owns two tablets (the child inherits scope).
-        let split = MetaCommand::SplitTablet {
-            tablet: TabletId(1),
-            expected_epoch: Epoch::INITIAL,
-            split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
-            new_id: TabletId(4),
-        };
-        assert_eq!(m.apply(&split), ApplyOutcome::Applied);
-        for id in [1u64, 2, 4] {
+        // Split `users` (copy-based, Begin+Cutover) so the table owns two
+        // tablets (ids 4 and 5; tablet 1 is retired by the cutover).
+        split_tablet(
+            &mut m,
+            TabletId(1),
+            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(4),
+        );
+        for id in [4u64, 5, 2] {
             assert_eq!(
                 m.apply(&MetaCommand::SetTabletPolicy {
                     tablet: TabletId(id),
@@ -3753,10 +3379,10 @@ mod tests {
         assert_eq!(m.apply(&drop), ApplyOutcome::Applied);
         // Both `users` tablets are gone, with their policies…
         assert!(m.tablets_for_table("users").next().is_none());
-        assert!(!m.tablets.contains_key(&TabletId(1)));
         assert!(!m.tablets.contains_key(&TabletId(4)));
-        assert!(!m.policies.contains_key(&TabletId(1)));
+        assert!(!m.tablets.contains_key(&TabletId(5)));
         assert!(!m.policies.contains_key(&TabletId(4)));
+        assert!(!m.policies.contains_key(&TabletId(5)));
         // …while the other table's tablet + policy and the legacy tablet remain.
         assert!(m.tablets.contains_key(&TabletId(2)));
         assert!(m.policies.contains_key(&TabletId(2)));
@@ -3767,7 +3393,7 @@ mod tests {
 
         // The allocator never rewinds: a later table gets a fresh id, above the
         // dropped ones.
-        assert_eq!(m.next_free_tablet_id(), TabletId(5));
+        assert_eq!(m.next_free_tablet_id(), TabletId(6));
     }
 
     /// The monotonic tablet-id allocator (ADR 0023): every created tablet bumps the
@@ -3792,15 +3418,14 @@ mod tests {
         assert_eq!(m.apply(&create(2, "orders")), ApplyOutcome::Applied);
         assert_eq!(m.next_free_tablet_id(), TabletId(3));
 
-        // A split advances the counter past the new child too.
-        let split = MetaCommand::SplitTablet {
-            tablet: TabletId(1),
-            expected_epoch: Epoch::INITIAL,
-            split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
-            new_id: TabletId(3),
-        };
-        assert_eq!(m.apply(&split), ApplyOutcome::Applied);
-        assert_eq!(m.next_free_tablet_id(), TabletId(4));
+        // A begin-split advances the counter past BOTH new children.
+        split_tablet(
+            &mut m,
+            TabletId(1),
+            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(3),
+        );
+        assert_eq!(m.next_free_tablet_id(), TabletId(5));
 
         // A pre-counter snapshot (counter field 0) still allocates above its
         // highest existing tablet, never colliding.
@@ -3823,117 +3448,6 @@ mod tests {
     /// split carrying a below-allocator `new_id` — e.g. from a stale or divergent
     /// proposer computing `max(ids) + 1` — is rejected; the allocator's own id is
     /// accepted and the counter stays monotonic.
-    #[test]
-    fn split_rejects_a_reused_tablet_id_below_the_allocator() {
-        let mut m = Metadata::default();
-        let create = |id: u64, table: &str| MetaCommand::CreateTablet {
-            tablet: TabletId(id),
-            table: Some(table.to_owned()),
-            range: KeyRange::whole(),
-            replicas: vec![nid(1), nid(2), nid(3)],
-        };
-        assert_eq!(m.apply(&create(1, "users")), ApplyOutcome::Applied);
-        assert_eq!(m.apply(&create(2, "orders")), ApplyOutcome::Applied);
-
-        // Drop the table owning the **highest** id; the freed id must not come back.
-        assert_eq!(
-            m.apply(&MetaCommand::DropTableTablets {
-                table: "orders".to_owned(),
-            }),
-            ApplyOutcome::Applied
-        );
-        assert!(!m.tablets.contains_key(&TabletId(2)));
-        assert_eq!(m.next_free_tablet_id(), TabletId(3));
-
-        // A split re-minting the freed id (what `max(ids) + 1` would derive here)
-        // is rejected — it does not collide with a *present* tablet, so only the
-        // allocator floor catches it.
-        let split_at = |new_id: u64| MetaCommand::SplitTablet {
-            tablet: TabletId(1),
-            expected_epoch: Epoch::INITIAL,
-            split_key: b"m".to_vec(),
-            new_id: TabletId(new_id),
-        };
-        assert_eq!(
-            m.apply(&split_at(2)),
-            ApplyOutcome::Rejected("new tablet id below the monotonic allocator")
-        );
-        // The rejected split changed nothing.
-        assert_eq!(m.tablets.len(), 1);
-        assert_eq!(m.tablets[&TabletId(1)].epoch, Epoch::INITIAL);
-
-        // The allocator's own id is accepted, and the counter stays monotonic.
-        assert_eq!(m.apply(&split_at(3)), ApplyOutcome::Applied);
-        assert!(m.tablets.contains_key(&TabletId(3)));
-        assert_eq!(m.next_free_tablet_id(), TabletId(4));
-    }
-
-    /// `SplitTablet` is a compare-and-swap on the source tablet's epoch, exactly
-    /// like `CasTabletReplicas`: two proposers racing to split the same tablet at
-    /// the same epoch — each computing a different median from an equally-stale
-    /// view of the pre-split range — must not both commit. Without this guard the
-    /// second, losing proposal would still apply (its `split_key` is strictly
-    /// inside the *original* range), minting a second child tablet id that the
-    /// per-tablet CP-data Raft group (which applies at most one real `Split`,
-    /// ever) can never actually host — a permanent, leaderless orphan tablet
-    /// (observed live under sustained `--auto-split` bulk-seed load).
-    #[test]
-    fn split_rejects_a_stale_epoch_racing_a_concurrent_split() {
-        let mut m = Metadata::default();
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("users".to_owned()),
-                range: KeyRange::whole(),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            }),
-            ApplyOutcome::Applied
-        );
-
-        // The winner: split at "m", still at the tablet's original epoch.
-        assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(1),
-                expected_epoch: Epoch::INITIAL,
-                split_key: b"m".to_vec(),
-                new_id: TabletId(2),
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(m.tablets[&TabletId(1)].epoch, Epoch::INITIAL.next());
-
-        // The loser: a different median, proposed against the *same* stale
-        // epoch (it read the tablet before the winner's split committed) — even
-        // though "q" is still strictly inside the tablet's original range, this
-        // must be rejected now that the epoch has moved, not silently accepted
-        // into a second, never-hostable child tablet.
-        assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(1),
-                expected_epoch: Epoch::INITIAL,
-                split_key: b"q".to_vec(),
-                new_id: TabletId(3),
-            }),
-            ApplyOutcome::Rejected("epoch mismatch")
-        );
-        // No orphan was minted, and the winning split is untouched.
-        assert!(!m.tablets.contains_key(&TabletId(3)));
-        assert_eq!(m.tablets.len(), 2);
-        assert_eq!(m.tablets[&TabletId(1)].epoch, Epoch::INITIAL.next());
-
-        // A retry against the *current* epoch succeeds normally.
-        assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(1),
-                expected_epoch: Epoch::INITIAL.next(),
-                split_key: b"c".to_vec(),
-                new_id: TabletId(3),
-            }),
-            ApplyOutcome::Applied
-        );
-        assert!(m.tablets.contains_key(&TabletId(3)));
-    }
-
     /// ADR 0032 PR3: `RemoveMember` is rejected while a tablet still names the
     /// member as a replica — removing it would silently drop that tablet below
     /// its replication factor with the member gone from the placement candidate
@@ -4674,17 +4188,13 @@ mod tests {
     /// permissive regardless of what was stamped (see the apply arm's own
     /// doc).
     fn seal(
-        m: &Metadata,
+        _m: &Metadata,
         table: &str,
         label: &str,
         tablet: u64,
         epoch: u64,
         end: u64,
     ) -> MetaCommand {
-        let expected_range = m
-            .tablets
-            .get(&TabletId(tablet))
-            .map_or_else(KeyRange::whole, |t| t.range.clone());
         MetaCommand::SealStreamShard {
             table: table.to_owned(),
             label: label.to_owned(),
@@ -4696,7 +4206,6 @@ mod tests {
             seal_wall_ms: 1_700_000_000_000,
             replicas: vec![nid(1), nid(2), nid(3)],
             object_id: test_object_id(table, label, tablet, epoch),
-            expected_range,
         }
     }
 
@@ -4762,12 +4271,13 @@ mod tests {
         // A 5-byte key: strictly inside the whole range, but shorter than
         // one token (`TOKEN_BYTES == 8`) — rejected before `KeyRange::
         // split_at` is even consulted.
+        let homes = vec![nid(1), nid(2), nid(3)];
         assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(1),
+            m.apply(&MetaCommand::BeginSplit {
+                parent: TabletId(1),
                 expected_epoch: Epoch::INITIAL,
                 split_key: b"mmmmm".to_vec(),
-                new_id: TabletId(2),
+                children: [(TabletId(2), homes.clone()), (TabletId(3), homes.clone())],
             }),
             ApplyOutcome::Rejected("split key not token-aligned for a streamed table")
         );
@@ -4775,11 +4285,11 @@ mod tests {
 
         // The same tablet, same epoch, a properly token-aligned key: applies.
         assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(1),
+            m.apply(&MetaCommand::BeginSplit {
+                parent: TabletId(1),
                 expected_epoch: Epoch::INITIAL,
                 split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
-                new_id: TabletId(2),
+                children: [(TabletId(2), homes.clone()), (TabletId(3), homes)],
             }),
             ApplyOutcome::Applied
         );
@@ -4797,11 +4307,14 @@ mod tests {
             ApplyOutcome::Applied
         );
         assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(10),
+            m.apply(&MetaCommand::BeginSplit {
+                parent: TabletId(10),
                 expected_epoch: Epoch::INITIAL,
                 split_key: b"mmmmm".to_vec(),
-                new_id: TabletId(11),
+                children: [
+                    (TabletId(11), vec![nid(1), nid(2), nid(3)]),
+                    (TabletId(12), vec![nid(1), nid(2), nid(3)]),
+                ],
             }),
             ApplyOutcome::Applied
         );
@@ -4830,26 +4343,19 @@ mod tests {
             ApplyOutcome::Applied
         );
         let boundary = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
-        assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(1),
-                expected_epoch: Epoch::INITIAL,
-                split_key: boundary.clone(),
-                new_id: TabletId(2),
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(m.tablets[&TabletId(2)].range.start, boundary);
+        let homes = vec![nid(1), nid(2), nid(3)];
+        split_tablet(&mut m, TabletId(1), boundary.clone(), TabletId(2));
+        assert_eq!(m.tablets[&TabletId(3)].range.start, boundary);
 
-        // Splitting the new sibling at a key equal to its own `range.start`
+        // Splitting the right child at a key equal to its own `range.start`
         // — the single-hot-token degenerate case — is rejected, not
         // accepted into a zero-width tablet.
         assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: TabletId(2),
-                expected_epoch: m.tablets[&TabletId(2)].epoch,
+            m.apply(&MetaCommand::BeginSplit {
+                parent: TabletId(3),
+                expected_epoch: m.tablets[&TabletId(3)].epoch,
                 split_key: boundary,
-                new_id: TabletId(3),
+                children: [(TabletId(4), homes.clone()), (TabletId(5), homes)],
             }),
             ApplyOutcome::Rejected("split key not strictly inside range")
         );
@@ -4955,151 +4461,6 @@ mod tests {
     /// proposal-side metadata read (`animusd::index_drain::
     /// in_declared_range`) cannot close on its own: the range moved on
     /// (here, via a real `SplitTablet` apply) between when the proposer
-    /// computed its candidate set and when this command actually applies.
-    #[test]
-    fn seal_stream_shard_range_cas_rejects_a_stale_declared_range_after_a_split() {
-        let mut m = Metadata::default();
-        enable_stream(&mut m, "orders", "L1");
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("orders".to_owned()),
-                range: KeyRange::whole(),
-                replicas: Vec::new(),
-            }),
-            ApplyOutcome::Applied,
-            "test setup: create tablet"
-        );
-        split_tablet(
-            &mut m,
-            TabletId(1),
-            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
-            TabletId(2),
-        );
-
-        // Tablet 1's own range has narrowed to the left half — a proposal
-        // still declaring the pre-split `whole()` range is stale.
-        let mut stale = seal(&m, "orders", "L1", 1, 0, 100);
-        if let MetaCommand::SealStreamShard { expected_range, .. } = &mut stale {
-            *expected_range = KeyRange::whole();
-        }
-        assert_eq!(
-            m.apply(&stale),
-            ApplyOutcome::Rejected(
-                "declared range stale — a split raced this seal, retry with the current range"
-            )
-        );
-        assert!(
-            !m.stream_shards.contains_key(&(TabletId(1), 0)),
-            "a rejected seal must leave the catalog completely untouched"
-        );
-    }
-
-    /// The accepting half of the same CAS: a proposal whose declared range
-    /// matches the tablet's current (post-split) range applies normally —
-    /// the check is a genuine compare-and-swap, not a blanket rejection of
-    /// every seal on a tablet that has ever split.
-    #[test]
-    fn seal_stream_shard_range_cas_accepts_the_current_declared_range() {
-        let mut m = Metadata::default();
-        enable_stream(&mut m, "orders", "L1");
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("orders".to_owned()),
-                range: KeyRange::whole(),
-                replicas: Vec::new(),
-            }),
-            ApplyOutcome::Applied,
-            "test setup: create tablet"
-        );
-        split_tablet(
-            &mut m,
-            TabletId(1),
-            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
-            TabletId(2),
-        );
-
-        let mut current = seal(&m, "orders", "L1", 1, 0, 100);
-        if let MetaCommand::SealStreamShard { expected_range, .. } = &mut current {
-            *expected_range = KeyRange::new(
-                Vec::new(),
-                Some(0x8000_0000_0000_0000u64.to_be_bytes().to_vec()),
-            );
-        }
-        assert_eq!(m.apply(&current), ApplyOutcome::Applied);
-        assert!(m.stream_shards.contains_key(&(TabletId(1), 0)));
-
-        // The split child's own epoch-0 seal, correctly declaring its own
-        // (right-half) range, applies too.
-        let mut child = seal(&m, "orders", "L1", 2, 0, 200);
-        if let MetaCommand::SealStreamShard { expected_range, .. } = &mut child {
-            *expected_range = KeyRange::new(0x8000_0000_0000_0000u64.to_be_bytes().to_vec(), None);
-        }
-        assert_eq!(m.apply(&child), ApplyOutcome::Applied);
-    }
-
-    /// The CAS must never gate the existing-row paths (a byte-identical
-    /// crash-retry, or the segment janitor's replicas-only repair) — both
-    /// legitimately reuse an already-validated row's content long after the
-    /// tablet's own range may have moved on for entirely unrelated reasons
-    /// (here, modelled by a further split after the original seal
-    /// committed). See `MetaCommand::SealStreamShard::expected_range`'s own
-    /// doc for why this check is scoped to the no-existing-row branch only.
-    #[test]
-    fn seal_stream_shard_range_cas_does_not_gate_a_replicas_only_repair() {
-        let mut m = Metadata::default();
-        enable_stream(&mut m, "orders", "L1");
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("orders".to_owned()),
-                range: KeyRange::whole(),
-                replicas: Vec::new(),
-            }),
-            ApplyOutcome::Applied,
-            "test setup: create tablet"
-        );
-
-        // Seal epoch 0 while the tablet's range is still `whole()`.
-        let mut original = seal(&m, "orders", "L1", 1, 0, 100);
-        if let MetaCommand::SealStreamShard { expected_range, .. } = &mut original {
-            *expected_range = KeyRange::whole();
-        }
-        assert_eq!(m.apply(&original), ApplyOutcome::Applied);
-
-        // The tablet splits AFTER the seal above already committed — its
-        // own range has moved on, and stays moved on regardless of what the
-        // repair below declares.
-        split_tablet(
-            &mut m,
-            TabletId(1),
-            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
-            TabletId(2),
-        );
-
-        // A replicas-only repair reproposal, reusing the original row's own
-        // `object_id` (so it hits the existing-row/content-matches branch),
-        // but stamped with the now-STALE pre-split range — must still
-        // apply, since the range CAS never runs for this path at all.
-        let mut repair = seal(&m, "orders", "L1", 1, 0, 100);
-        if let MetaCommand::SealStreamShard {
-            replicas,
-            expected_range,
-            ..
-        } = &mut repair
-        {
-            *replicas = vec![nid(9)];
-            *expected_range = KeyRange::whole(); // stale, deliberately
-        }
-        assert_eq!(
-            m.apply(&repair),
-            ApplyOutcome::Applied,
-            "a replicas-only repair must apply regardless of a stale expected_range"
-        );
-        assert_eq!(m.stream_shards[&(TabletId(1), 0)].replicas, vec![nid(9)]);
-    }
-
     /// Label validation (F12-b): a label with a matching *current* schema
     /// stream spec is accepted; a label matching neither the current spec
     /// nor any existing row is rejected; and — the draining case — a label
@@ -5172,15 +4533,12 @@ mod tests {
             ApplyOutcome::Applied
         );
 
-        // epoch 2 with no epoch-1 row and no split-parent provenance for
-        // tablet 1: rejected — a genuine gap this state machine can't
-        // explain.
+        // epoch 2 with no epoch-1 row: rejected — a genuine gap this state
+        // machine can't explain (the zero-copy provenance escape hatch is
+        // gone, Train B rung 7).
         assert_eq!(
             m.apply(&seal(&m, "orders", "L1", 1, 2, 300)),
-            ApplyOutcome::Rejected(
-                "epoch chain gap: no prior epoch row for this tablet and no \
-                 split-parent provenance to explain it"
-            )
+            ApplyOutcome::Rejected("epoch chain gap: no prior epoch row for this tablet")
         );
 
         // Filling in epoch 1 makes epoch 2 acceptable.
@@ -5193,23 +4551,20 @@ mod tests {
             ApplyOutcome::Applied
         );
 
-        // A fresh split child (tablet 2, split_parents[2] = 1) with NO
-        // local history at all may seal epoch 0 (the ordinary case)...
-        m.split_parents.insert(TabletId(2), TabletId(1));
+        // A fresh tablet with NO local history at all may seal epoch 0 —
+        // the ordinary case, and a copy-based split child's own first seal
+        // (ADR 0050: children start their own chains at 0, always).
         assert_eq!(
             m.apply(&seal(&m, "orders", "L1", 2, 0, 350)),
             ApplyOutcome::Applied
         );
-        // ...and the permissive escape hatch: epoch 1 is also accepted for
-        // tablet 2 even without a local epoch-0 row of its own removed —
-        // wait, epoch 0 already exists for tablet 2 above, so exercise the
-        // escape hatch on a THIRD tablet that has split provenance but no
-        // local rows at all yet.
-        m.split_parents.insert(TabletId(3), TabletId(1));
+        // The zero-copy provenance escape hatch is GONE (Train B rung 7):
+        // a non-zero epoch with no local predecessor row is a chain gap,
+        // full stop.
         assert_eq!(
             m.apply(&seal(&m, "orders", "L1", 3, 1, 400)),
-            ApplyOutcome::Applied,
-            "split-parent provenance must license a non-zero epoch with no local history"
+            ApplyOutcome::Rejected("epoch chain gap: no prior epoch row for this tablet"),
+            "no provenance escape hatch remains for a non-zero epoch with no local history"
         );
     }
 
@@ -5297,17 +4652,41 @@ mod tests {
     /// tests below instead of hand-poking `split_parents`, so
     /// `Metadata::stream_split_basis` gets frozen exactly the way production
     /// freezes it.
+    /// Run a full copy-based split of `source` at `split_key` (ADR 0050):
+    /// `BeginSplit` minting children `new_id`/`new_id + 1` on the parent's
+    /// own replicas, then `CutoverSplit` — children `Active`, parent
+    /// removed, `split_lineage` frozen. The metadata-only equivalent of
+    /// the workflow (sound as a fixture: `Metadata::apply` carries no
+    /// build state; on an empty/unhosted fixture there is nothing to copy).
     fn split_tablet(m: &mut Metadata, source: TabletId, split_key: Vec<u8>, new_id: TabletId) {
         let expected_epoch = m.tablets.get(&source).map_or(Epoch::INITIAL, |t| t.epoch);
+        let replicas = m
+            .tablets
+            .get(&source)
+            .map(|t| t.replicas.clone())
+            .unwrap_or_default();
         assert_eq!(
-            m.apply(&MetaCommand::SplitTablet {
-                tablet: source,
+            m.apply(&MetaCommand::BeginSplit {
+                parent: source,
                 expected_epoch,
                 split_key,
-                new_id,
+                children: [
+                    (new_id, replicas.clone()),
+                    (TabletId(new_id.0 + 1), replicas)
+                ],
             }),
             ApplyOutcome::Applied,
-            "test setup: split must apply"
+            "test setup: begin-split must apply"
+        );
+        let bumped = m.tablets.get(&source).map_or(Epoch::INITIAL, |t| t.epoch);
+        assert_eq!(
+            m.apply(&MetaCommand::CutoverSplit {
+                parent: source,
+                expected_epoch: bumped,
+                cutover_wall_ms: 1_000,
+            }),
+            ApplyOutcome::Applied,
+            "test setup: cutover must apply"
         );
     }
 
@@ -5330,8 +4709,8 @@ mod tests {
         m.apply(&seal(&m, "orders", "L1", 1, 0, 100));
         m.apply(&seal(&m, "orders", "L1", 1, 1, 200));
         m.apply(&seal(&m, "orders", "L1", 1, 2, 300));
-        // A real split — not a hand-poked `split_parents` entry — freezes
-        // tablet 2's `stream_split_basis` from tablet 1's state right now.
+        // A real copy-based split — Begin+Cutover — freezes tablet 2's
+        // `split_lineage` naming tablet 1's final epoch (2) at cutover.
         split_tablet(
             &mut m,
             TabletId(1),
@@ -5367,8 +4746,8 @@ mod tests {
         assert!(m.stream_labels_with_rows("nonexistent").is_empty());
 
         // Parent shard id: epoch>0 names the same tablet's own previous
-        // epoch; a split child's epoch-0 names its parent's last-sealed
-        // shard AS FROZEN AT SPLIT TIME (`Metadata::stream_split_basis`).
+        // epoch; a split child's epoch-0 names its retired parent's FINAL
+        // shard via `Metadata::split_lineage` (ADR 0050 fork F9).
         assert_eq!(
             m.stream_shard_parent_id(TabletId(1), 2),
             Some("shardId-1-1".to_owned())
@@ -5377,159 +4756,7 @@ mod tests {
         assert_eq!(
             m.stream_shard_parent_id(TabletId(2), 0),
             Some("shardId-1-2".to_owned()),
-            "the split child's epoch-0 parent is tablet 1's own LAST shard at split time"
+            "the split child's epoch-0 parent is retired tablet 1's final shard"
         );
-    }
-
-    /// `effective_stream_shard_watermark` (ADR 0043 §A4/§A6): a tablet with
-    /// its own sealed rows answers from its own chain (matching the plain
-    /// `stream_shard_watermark`); a fresh split child with NO rows of its
-    /// own inherits its parent's last-sealed end-HLC, frozen at split time,
-    /// instead of reading as absent; the inheritance resolves transitively
-    /// through a **chain** of split parents (a grandchild inherits its
-    /// grandparent's own last seal, through its parent's own already-frozen
-    /// basis, when neither it nor its immediate parent has ever sealed); a
-    /// tablet with no rows and no split provenance at all is still
-    /// genuinely absent; and — the PR1 bugfix property — **none of this
-    /// moves when a parent seals again after the split**.
-    #[test]
-    fn effective_stream_shard_watermark_inherits_through_split_provenance() {
-        let mut m = Metadata::default();
-        enable_stream(&mut m, "orders", "L1");
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("orders".to_owned()),
-                range: KeyRange::whole(),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            }),
-            ApplyOutcome::Applied
-        );
-        m.apply(&seal(&m, "orders", "L1", 1, 0, 100));
-        m.apply(&seal(&m, "orders", "L1", 1, 1, 200));
-
-        // Tablet 1 has its own rows: identical to the plain accessor.
-        assert_eq!(m.effective_stream_shard_watermark(TabletId(1)), Some(200));
-
-        // Tablet 2 is a real split child of tablet 1, with no rows of its
-        // own yet: inherits tablet 1's last-sealed end-HLC, frozen now.
-        split_tablet(
-            &mut m,
-            TabletId(1),
-            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
-            TabletId(2),
-        );
-        assert_eq!(
-            m.stream_shard_watermark(TabletId(2)),
-            None,
-            "test premise: tablet 2 has never sealed on its own"
-        );
-        assert_eq!(m.effective_stream_shard_watermark(TabletId(2)), Some(200));
-
-        // Tablet 3 is a real split child of tablet 2 (itself a split child,
-        // and still unsealed on its own at this instant), with no rows
-        // anywhere in the chain yet: inherits transitively through both
-        // hops, frozen by THIS split's own apply.
-        split_tablet(
-            &mut m,
-            TabletId(2),
-            0xC000_0000_0000_0000u64.to_be_bytes().to_vec(),
-            TabletId(3),
-        );
-        assert_eq!(m.effective_stream_shard_watermark(TabletId(3)), Some(200));
-
-        // PR1 bugfix property: tablet 2 now seals its own first shard
-        // (350). Under the old live derivation this would have
-        // retroactively become tablet 3's effective watermark too — it
-        // must not, since tablet 3's basis was frozen before tablet 2 had
-        // ever sealed.
-        m.apply(&seal(&m, "orders", "L1", 2, 0, 350));
-        assert_eq!(
-            m.effective_stream_shard_watermark(TabletId(3)),
-            Some(200),
-            "a split child's frozen basis must not move when its parent seals again afterward"
-        );
-        // Tablet 2's own (not tablet 3's) watermark does legitimately advance.
-        assert_eq!(m.effective_stream_shard_watermark(TabletId(2)), Some(350));
-
-        // No rows and no split provenance at all: genuinely absent.
-        assert_eq!(m.effective_stream_shard_watermark(TabletId(99)), None);
-    }
-
-    /// PR1 bugfix regression, the `stream_shard_parent_id` sibling of the
-    /// watermark property above: a child's epoch-0 `ParentShardId` must not
-    /// change when its parent seals again after the split. Before the fix
-    /// this was derived live from `split_parents` + a fresh lookup into the
-    /// parent's *current* chain, so a later parent seal would retroactively
-    /// rename an already-answered child's `ParentShardId`.
-    #[test]
-    fn stream_shard_parent_id_is_frozen_at_split_time_not_the_parents_current_chain() {
-        let mut m = Metadata::default();
-        enable_stream(&mut m, "orders", "L1");
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("orders".to_owned()),
-                range: KeyRange::whole(),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            }),
-            ApplyOutcome::Applied
-        );
-        m.apply(&seal(&m, "orders", "L1", 1, 0, 100));
-        split_tablet(
-            &mut m,
-            TabletId(1),
-            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
-            TabletId(2),
-        );
-        assert_eq!(
-            m.stream_shard_parent_id(TabletId(2), 0),
-            Some("shardId-1-0".to_owned())
-        );
-
-        // The parent seals again after the split.
-        m.apply(&seal(&m, "orders", "L1", 1, 1, 200));
-        assert_eq!(
-            m.stream_shard_parent_id(TabletId(2), 0),
-            Some("shardId-1-0".to_owned()),
-            "a split child's ParentShardId must not move when its parent seals again afterward"
-        );
-    }
-
-    /// The frozen basis itself must survive a `Metadata` JSON round trip —
-    /// the same "an empty collection can't prove a map-key encoding rule"
-    /// discipline `metadata_round_trips_through_json_with_populated_stream_
-    /// shards` follows for `stream_shards`. `TabletId`'s newtype `Serialize`
-    /// impl already serializes transparently as a bare integer (unlike a
-    /// tuple key), so this is a lower-risk round trip than that one, but is
-    /// cheap insurance against a future shape change all the same.
-    #[test]
-    fn metadata_round_trips_through_json_with_populated_stream_split_basis() {
-        let mut m = Metadata::default();
-        enable_stream(&mut m, "orders", "L1");
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("orders".to_owned()),
-                range: KeyRange::whole(),
-                replicas: vec![nid(1)],
-            }),
-            ApplyOutcome::Applied
-        );
-        m.apply(&seal(&m, "orders", "L1", 1, 0, 100));
-        split_tablet(
-            &mut m,
-            TabletId(1),
-            0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
-            TabletId(2),
-        );
-        assert!(
-            !m.stream_split_basis.is_empty(),
-            "test premise: the basis map must actually be populated"
-        );
-
-        let value = serde_json::to_value(&m).expect("metadata serializes with stream_split_basis");
-        let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
-        assert_eq!(decoded, m);
     }
 }

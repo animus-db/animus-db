@@ -73,7 +73,7 @@ fn settle(sim: &mut Simulator) {
 /// Propose `rows` to the child leader and settle; panics on a non-accept.
 fn seed(sim: &mut Simulator, child: &[KvNode], rows: Vec<animus_cp_data::SeedRow>, seed_n: u64) {
     let l = leader(child, seed_n);
-    match child[l].propose_seed_batch(rows, child_range()) {
+    match child[l].propose_seed_batch(rows) {
         ProposeResult::Accepted { .. } => {}
         other => panic!("seed propose refused: {other:?} (seed={seed_n})"),
     }
@@ -210,30 +210,11 @@ fn mid_build_updates_win_by_carried_version_and_stale_resends_lose() {
     assert_eq!(rows[0].2, 200);
 }
 
-/// Whole-batch fence discipline: one out-of-range row makes the entire batch
-/// a no-op — never a partial install.
-#[test]
-fn seed_batch_outside_the_fence_is_a_whole_batch_noop() {
-    let seed_n = 13;
-    let (mut sim, _parent, child, engines) = parent_and_child(seed_n);
-    settle(&mut sim);
-
-    let l = leader(&child, seed_n);
-    let rows = vec![
-        (KIND_BASE, b"m-in-range".to_vec(), Some(b"v".to_vec()), 50),
-        (KIND_BASE, b"a-outside".to_vec(), Some(b"v".to_vec()), 51), // below m..
-    ];
-    match child[l].propose_seed_batch(rows, child_range()) {
-        ProposeResult::Accepted { .. } => {}
-        other => panic!("propose refused: {other:?}"),
-    }
-    settle(&mut sim);
-    let landed = block_on(async { engines[l].entries_with_tombstones().await.unwrap() });
-    assert!(
-        landed.is_empty(),
-        "an out-of-fence row must no-op the WHOLE batch, got {landed:?}"
-    );
-}
+// DELETED (ADR 0050 Train B rung 7): `seed_batch_outside_the_fence_is_a_
+// whole_batch_noop` exercised SeedBatch's per-entry range fence, removed
+// with the fence machinery (ranges are immutable; the driver filters rows
+// to each child's range by construction, and the frozen-group seal is the
+// surviving whole-batch gate — covered by `tests/freeze.rs`).
 
 /// Depth knob (`ANIMUS_SPLIT_SEEDS`, default 1) — mirrors
 /// `ANIMUS_RECONCILER_SEEDS`/`ANIMUS_RAFTKV_SEEDS`.
@@ -273,7 +254,7 @@ fn corpus_child_leader_crash_mid_seed_reseeds_to_convergence() {
         // The re-led driver re-runs the pass from scratch: both chunks,
         // duplicate first chunk included.
         for chunk in [chunk1, chunk2] {
-            match child[l].propose_seed_batch(chunk, child_range()) {
+            match child[l].propose_seed_batch(chunk) {
                 ProposeResult::Accepted { .. } => {}
                 other => panic!("re-seed refused: {other:?} (seed={seed_n})"),
             }

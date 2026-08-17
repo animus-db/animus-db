@@ -64,33 +64,38 @@ fn split_round_trips_through_raft() {
         range: KeyRange::whole(),
         replicas: NODES.iter().copied().map(nid).collect(),
     });
-    nodes[l].propose(MetaCommand::SplitTablet {
-        tablet: TabletId(1),
+    let replicas: Vec<_> = NODES.iter().copied().map(nid).collect();
+    nodes[l].propose(MetaCommand::BeginSplit {
+        parent: TabletId(1),
         expected_epoch: Epoch::INITIAL,
         split_key: b"m".to_vec(),
-        new_id: TabletId(2),
+        children: [(TabletId(2), replicas.clone()), (TabletId(3), replicas)],
+    });
+    sim.run_for(Duration::from_secs(2));
+    let bumped = nodes[l].metadata().tablets[&TabletId(1)].epoch;
+    nodes[l].propose(MetaCommand::CutoverSplit {
+        parent: TabletId(1),
+        expected_epoch: bumped,
+        cutover_wall_ms: 1_000,
     });
     sim.run_for(Duration::from_secs(2));
 
-    // Every node agrees, the keyspace stays partitioned, and the split bumped
-    // the original tablet's epoch while the new one starts fresh.
+    // Every node agrees, the parent is retired, the children partition the
+    // keyspace, and both carry frozen lineage naming the parent (ADR 0050).
     let meta = nodes[l].metadata();
     for n in &nodes {
         assert_eq!(n.metadata(), meta, "metadata diverged across nodes");
     }
     assert_eq!(meta.tablets.len(), 2);
+    assert!(!meta.tablets.contains_key(&TabletId(1)), "parent retired");
     assert_eq!(
-        meta.tablets[&TabletId(1)].range.end.as_deref(),
+        meta.tablets[&TabletId(2)].range.end.as_deref(),
         Some(b"m".as_slice())
     );
-    assert_eq!(
-        meta.tablets[&TabletId(1)].epoch,
-        Epoch(2),
-        "split bumps source epoch"
-    );
-    assert_eq!(meta.tablets[&TabletId(2)].range.start, b"m");
-    assert_eq!(meta.tablets[&TabletId(2)].range.end, None);
-    assert_eq!(meta.tablets[&TabletId(2)].epoch, Epoch::INITIAL);
+    assert_eq!(meta.tablets[&TabletId(3)].range.start, b"m");
+    assert_eq!(meta.tablets[&TabletId(3)].range.end, None);
+    assert_eq!(meta.split_lineage[&TabletId(2)].parent, TabletId(1));
+    assert_eq!(meta.split_lineage[&TabletId(3)].parent, TabletId(1));
     assert!(
         partitions_keyspace(&meta),
         "keyspace not cleanly partitioned after split"
@@ -123,17 +128,21 @@ fn racing_splits_at_the_same_epoch_only_one_applies() {
     });
     sim.run_for(Duration::from_secs(2));
 
-    nodes[l].propose(MetaCommand::SplitTablet {
-        tablet: TabletId(1),
+    let replicas: Vec<_> = NODES.iter().copied().map(nid).collect();
+    nodes[l].propose(MetaCommand::BeginSplit {
+        parent: TabletId(1),
         expected_epoch: Epoch::INITIAL,
         split_key: b"m".to_vec(),
-        new_id: TabletId(2),
+        children: [
+            (TabletId(2), replicas.clone()),
+            (TabletId(3), replicas.clone()),
+        ],
     });
-    nodes[l].propose(MetaCommand::SplitTablet {
-        tablet: TabletId(1),
+    nodes[l].propose(MetaCommand::BeginSplit {
+        parent: TabletId(1),
         expected_epoch: Epoch::INITIAL,
         split_key: b"q".to_vec(),
-        new_id: TabletId(3),
+        children: [(TabletId(4), replicas.clone()), (TabletId(5), replicas)],
     });
     sim.run_for(Duration::from_secs(2));
 
@@ -143,21 +152,17 @@ fn racing_splits_at_the_same_epoch_only_one_applies() {
     }
     assert_eq!(
         meta.tablets.len(),
-        2,
-        "the losing split must not create an orphan tablet"
+        3,
+        "the losing begin-split must not mint orphan children (parent + one child pair)"
+    );
+    assert!(
+        meta.tablets.contains_key(&TabletId(2)) ^ meta.tablets.contains_key(&TabletId(4)),
+        "exactly one of the two racing begin-splits should have won"
     );
     assert_eq!(
-        meta.tablets[&TabletId(1)].epoch,
-        Epoch(2),
-        "the source tablet split exactly once"
-    );
-    assert!(
-        meta.tablets.contains_key(&TabletId(2)) ^ meta.tablets.contains_key(&TabletId(3)),
-        "exactly one of the two racing splits should have won"
-    );
-    assert!(
-        partitions_keyspace(&meta),
-        "keyspace not cleanly partitioned after the race"
+        meta.tablets[&TabletId(1)].range.end,
+        None,
+        "a Splitting parent's own range is untouched (children carry the halves)"
     );
 }
 
@@ -174,11 +179,11 @@ fn invalid_split_is_rejected_deterministically() {
     use animus_control::ApplyOutcome::Rejected;
     // Split key outside the range.
     assert!(matches!(
-        meta.apply(&MetaCommand::SplitTablet {
-            tablet: TabletId(1),
+        meta.apply(&MetaCommand::BeginSplit {
+            parent: TabletId(1),
             expected_epoch: Epoch::INITIAL,
             split_key: b"q".to_vec(),
-            new_id: TabletId(2),
+            children: [(TabletId(2), vec![nid(0)]), (TabletId(3), vec![nid(0)])],
         }),
         Rejected(_)
     ));
@@ -215,13 +220,14 @@ fn split_child_inherits_the_source_policy() {
         Applied
     );
 
-    // Split the tablet; the new sibling id must carry the same policy.
+    // Begin the split; BOTH children must carry the same policy.
+    let homes = vec![nid(10), nid(11), nid(12)];
     assert_eq!(
-        meta.apply(&MetaCommand::SplitTablet {
-            tablet: TabletId(1),
+        meta.apply(&MetaCommand::BeginSplit {
+            parent: TabletId(1),
             expected_epoch: Epoch::INITIAL,
             split_key: b"m".to_vec(),
-            new_id: TabletId(2),
+            children: [(TabletId(2), homes.clone()), (TabletId(5), homes.clone())],
         }),
         Applied
     );
@@ -231,6 +237,7 @@ fn split_child_inherits_the_source_policy() {
         Some(&policy),
         "split child did not inherit the source's placement policy"
     );
+    assert_eq!(meta.policies.get(&TabletId(5)), Some(&policy));
 
     // A split of a policy-less tablet leaves the child policy-less (no panic).
     assert_eq!(
@@ -242,14 +249,18 @@ fn split_child_inherits_the_source_policy() {
         }),
         Applied
     );
+    let next = meta.next_free_tablet_id();
     assert_eq!(
-        meta.apply(&MetaCommand::SplitTablet {
-            tablet: TabletId(3),
+        meta.apply(&MetaCommand::BeginSplit {
+            parent: TabletId(3),
             expected_epoch: Epoch::INITIAL,
             split_key: b"m".to_vec(),
-            new_id: TabletId(4),
+            children: [
+                (next, vec![nid(10), nid(11), nid(12)]),
+                (TabletId(next.0 + 1), vec![nid(10), nid(11), nid(12)]),
+            ],
         }),
         Applied
     );
-    assert!(!meta.policies.contains_key(&TabletId(4)));
+    assert!(!meta.policies.contains_key(&next));
 }

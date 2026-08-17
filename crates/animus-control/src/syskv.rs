@@ -128,11 +128,6 @@ pub enum EntityKind {
     /// only by the back-compat-only `MetaCommand::RegisterCpAddr`), keyed by
     /// [`NodeId`] (PR2).
     CpMemberAddr,
-    /// A never-pruned split-provenance marker (`Metadata::split_parents`,
-    /// ADR 0018 §2 amendment), keyed by the split child's [`TabletId`]; the
-    /// value is the source tablet's id (big-endian `u64`, mirroring
-    /// [`Counter`](Self::Counter)'s value shape).
-    SplitParent,
     /// A stream-shard segment catalog row (`Metadata::stream_shards`, ADR
     /// 0042 §3/ADR 0043 §A8), keyed by the composite `(TabletId, epoch)`
     /// pair — 16 raw bytes (`tablet.to_be_bytes() ++ epoch.to_be_bytes()`,
@@ -153,13 +148,6 @@ pub enum EntityKind {
     /// the fact — mirrors [`Keyspace`](Self::Keyspace)'s empty-value
     /// convention).
     IndexBackfill,
-    /// A split child's frozen stream-inheritance basis
-    /// (`Metadata::stream_split_basis`, ADR 0042 §8/ADR 0043 §A4/§A6, PR1
-    /// bugfix), keyed by the split child's [`TabletId`] — the same id shape
-    /// as [`SplitParent`](Self::SplitParent), a sibling map recorded by the
-    /// same `MetaCommand::SplitTablet` apply. The value is the JSON-encoded
-    /// `StreamSplitBasis`, same convention as `Tablet`/`Schema`/etc.
-    StreamSplitBasis,
     /// A copy-based split child's lineage row (`Metadata::split_lineage`,
     /// ADR 0050 fork F9), keyed by the child's [`TabletId`] — recorded by
     /// `MetaCommand::CutoverSplit`'s apply. The value is the JSON-encoded
@@ -184,10 +172,8 @@ impl EntityKind {
             EntityKind::Keyspace => "keyspace",
             EntityKind::Counter => "counter",
             EntityKind::CpMemberAddr => "cp_member_addr",
-            EntityKind::SplitParent => "split_parent",
             EntityKind::StreamShard => "stream_shard",
             EntityKind::IndexBackfill => "index_backfill",
-            EntityKind::StreamSplitBasis => "stream_split_basis",
             EntityKind::SplitLineage => "split_lineage",
         }
     }
@@ -209,10 +195,8 @@ impl EntityKind {
             b"keyspace" => EntityKind::Keyspace,
             b"counter" => EntityKind::Counter,
             b"cp_member_addr" => EntityKind::CpMemberAddr,
-            b"split_parent" => EntityKind::SplitParent,
             b"stream_shard" => EntityKind::StreamShard,
             b"index_backfill" => EntityKind::IndexBackfill,
-            b"stream_split_basis" => EntityKind::StreamSplitBasis,
             b"split_lineage" => EntityKind::SplitLineage,
             _ => return None,
         })
@@ -344,22 +328,6 @@ pub fn counter_key(name: &str) -> Vec<u8> {
 #[must_use]
 pub fn cp_member_addr_key(id: &NodeId) -> Vec<u8> {
     entity_key(EntityKind::CpMemberAddr, id.as_str().as_bytes())
-}
-
-/// A split child [`TabletId`]'s key under [`EntityKind::SplitParent`] (ADR
-/// 0018 §2 amendment).
-#[must_use]
-pub fn split_parent_key(child: TabletId) -> Vec<u8> {
-    entity_key(EntityKind::SplitParent, &child.0.to_be_bytes())
-}
-
-/// A split child [`TabletId`]'s key under [`EntityKind::StreamSplitBasis`]
-/// (ADR 0042 §8/ADR 0043 §A4/§A6, PR1 bugfix) — same id shape as
-/// [`split_parent_key`], a sibling entity recorded by the same
-/// `MetaCommand::SplitTablet` apply.
-#[must_use]
-pub fn stream_split_basis_key(child: TabletId) -> Vec<u8> {
-    entity_key(EntityKind::StreamSplitBasis, &child.0.to_be_bytes())
 }
 
 /// A copy-based split child [`TabletId`]'s key under
@@ -494,7 +462,7 @@ pub fn decode_key(key: &[u8]) -> Option<DecodedKey> {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [EntityKind; 12] = [
+    const ALL_KINDS: [EntityKind; 10] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
@@ -503,10 +471,8 @@ mod tests {
         EntityKind::Keyspace,
         EntityKind::Counter,
         EntityKind::CpMemberAddr,
-        EntityKind::SplitParent,
         EntityKind::StreamShard,
         EntityKind::IndexBackfill,
-        EntityKind::StreamSplitBasis,
     ];
 
     // --- reserved-name guard -------------------------------------------------
@@ -609,18 +575,6 @@ mod tests {
             Some(DecodedKey::Entity {
                 kind: EntityKind::Keyspace,
                 id: b"my_ks".to_vec(),
-            })
-        );
-    }
-
-    #[test]
-    fn stream_split_basis_key_round_trips() {
-        let key = stream_split_basis_key(TabletId(11));
-        assert_eq!(
-            decode_key(&key),
-            Some(DecodedKey::Entity {
-                kind: EntityKind::StreamSplitBasis,
-                id: 11u64.to_be_bytes().to_vec(),
             })
         );
     }

@@ -493,7 +493,6 @@ pub enum KvCommand {
     Put {
         key: Vec<u8>,
         value: Vec<u8>,
-        fence: KeyRange,
         ts: HlcTimestamp,
     },
     /// **Batch put**: set every `(key, value)` in one Raft log entry — one propose,
@@ -510,7 +509,6 @@ pub enum KvCommand {
     /// atomicity — see the type-level doc).
     Batch {
         puts: Vec<(Vec<u8>, Vec<u8>)>,
-        fence: KeyRange,
         ts: HlcTimestamp,
     },
     /// **Multi-kind atomic batch** (ADR 0041 §3/§4): like [`Batch`](Self::Batch),
@@ -584,7 +582,6 @@ pub enum KvCommand {
         /// distinct items.
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-        fence: KeyRange,
         ts: HlcTimestamp,
     },
     /// **Split-build seed batch** (ADR 0050 Train B rung 4, fork F3): a chunk
@@ -612,15 +609,10 @@ pub enum KvCommand {
     SeedBatch {
         /// Raw engine rows, opaque to this command — see [`SeedRow`].
         rows: Vec<SeedRow>,
-        fence: KeyRange,
         ts: HlcTimestamp,
     },
     /// Remove `key` (a tombstone in the engine), iff `key` falls inside `fence`.
-    Delete {
-        key: Vec<u8>,
-        fence: KeyRange,
-        ts: HlcTimestamp,
-    },
+    Delete { key: Vec<u8>, ts: HlcTimestamp },
     /// **Linearizable compare-and-swap**: set `key` to `value` iff the key's
     /// current committed value equals `expected` (`None` == "only if absent")
     /// *and* `key` falls inside `fence`. Evaluated at *apply* time against the
@@ -634,23 +626,10 @@ pub enum KvCommand {
         key: Vec<u8>,
         expected: Option<Vec<u8>>,
         value: Vec<u8>,
-        fence: KeyRange,
         ts: HlcTimestamp,
     },
-    /// **Range seal** (ADR 0018 §2 amendment, PR2 — see `seal.rs`'s module
-    /// doc for the full design): the leader of a range-handoff source (a
-    /// split's `NarrowScope`) commits this through its **own** Raft log to
-    /// mark `range` closed to any further mutation
-    /// ordered after it. Every replica applies its log in the same order, so
-    /// every replica agrees on exactly which entries are "after the seal" —
-    /// unlike `fence`, this is not itself gated by a fence (a seal IS a fence
-    /// change: it never touches engine data itself, only apply-time
-    /// bookkeeping + the durable marker key). No `fence` field: a seal always
-    /// applies (it is itself the authority tightening what future entries
-    /// may touch); see `apply_and_compact`'s `Seal` arm.
-    Seal { range: KeyRange, ts: HlcTimestamp },
     /// **Split-cutover freeze** (ADR 0050 Train B rung 5, stage 3): the
-    /// terminal, whole-range descendant of [`Seal`](Self::Seal), proposed
+    /// terminal whole-range close of a split parent, proposed
     /// into the **parent's** own log by the split-build driver once the
     /// build has converged. After this entry applies, the parent group
     /// rejects every later-ordered mutating command — its apply pushes
@@ -811,7 +790,6 @@ pub enum KvCommand {
         writes: Vec<txn::TxnWrite>,
         spans: Vec<(String, KeyRange)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-        fence: KeyRange,
         ts: HlcTimestamp,
     },
     /// **Transaction commit**: flip `txn_id`'s record at `record_key` to
@@ -912,7 +890,6 @@ pub enum KvCommand {
         record_key: Vec<u8>,
         keys: Vec<Vec<u8>>,
         outcome: txn::TxnOutcome,
-        fence: KeyRange,
         ts: HlcTimestamp,
     },
     /// The leader's no-op-on-election (Raft); applies nothing.
@@ -1377,7 +1354,7 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// (appended to its own Raft log), packed via [`hlc::pack`] — **not**
     /// `committed_ceiling`, which only reflects what has been *applied*.
     /// Every ts-producing path (`mint_pushed`, `next_ceiling_candidate`, and
-    /// [`propose_seal`](Self::propose_seal)'s bare mint) must additionally
+    /// [`propose_freeze`](Self::propose_freeze)'s bare mint) must additionally
     /// exceed this floor, and [`propose_ordered`](Self::propose_ordered)
     /// advances it, all inside the same held `core` lock — the fix for a
     /// real regression: a write's own `mint_pushed` floor check only
@@ -1746,8 +1723,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// Also advances [`last_proposed_ts`](Self::last_proposed_ts) to `command`'s
     /// own `ts` **iff the propose actually lands** (`Accepted`, still inside
     /// this same held lock) — the floor every ts-producing path
-    /// (`mint_pushed`/`next_ceiling_candidate`/[`propose_seal`](Self::
-    /// propose_seal)'s bare mint) must additionally exceed, closing the
+    /// (`mint_pushed`/`next_ceiling_candidate`/[`propose_freeze`](Self::
+    /// propose_freeze)'s bare mint) must additionally exceed, closing the
     /// residual gap serializing propose order alone doesn't: an
     /// already-*proposed* (logged) entry's `ts` can still exceed
     /// `committed_ceiling`/`ts_cache` (both only reflect *applied* state —
@@ -2008,24 +1985,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
 
     /// Propose a write to this group. Honored only on the leader (otherwise
     /// returns the leader hint); the value is durable + applied once committed.
-    /// Stamps `fence = KeyRange::whole()` (unconstrained — see
-    /// [`KvCommand`]'s doc); use [`put_fenced`](Self::put_fenced) to stamp a
-    /// narrower one.
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> ProposeResult {
-        self.put_fenced(key, value, KeyRange::whole())
-    }
-
-    /// As [`put`](Self::put), but the leader stamps its own `fence` into the
-    /// entry instead of the unconstrained default (see [`KvCommand`]'s doc).
-    pub fn put_fenced(&self, key: Vec<u8>, value: Vec<u8>, fence: KeyRange) -> ProposeResult {
         self.propose_ordered(|term| {
             let ts = self.mint_pushed(term, std::slice::from_ref(&key));
-            KvCommand::Put {
-                key,
-                value,
-                fence,
-                ts,
-            }
+            KvCommand::Put { key, value, ts }
         })
     }
 
@@ -2036,26 +1999,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// MVCC version — the keys are distinct so per-key LWW is well-defined, and the
     /// batch is atomic within this tablet (it commits whole or not at all). To learn
     /// it committed + applied, take the [`ProposeResult::Accepted`] `index` and wait
-    /// until `last_applied >= index` (the whole batch has merged by then). Stamps
-    /// `fence = KeyRange::whole()`; use [`put_batch_fenced`](Self::put_batch_fenced)
-    /// to stamp a narrower one.
+    /// until `last_applied >= index` (the whole batch has merged by then).
     pub fn put_batch(&self, puts: Vec<(Vec<u8>, Vec<u8>)>) -> ProposeResult {
-        self.put_batch_fenced(puts, KeyRange::whole())
-    }
-
-    /// As [`put_batch`](Self::put_batch), but the leader stamps its own `fence`
-    /// into the entry (see [`KvCommand`]'s doc). If any key in `puts` falls
-    /// outside `fence`, **none** of the batch applies (the fence gates the
-    /// whole atomic entry, not individual keys).
-    pub fn put_batch_fenced(
-        &self,
-        puts: Vec<(Vec<u8>, Vec<u8>)>,
-        fence: KeyRange,
-    ) -> ProposeResult {
         self.propose_ordered(|term| {
             let keys: Vec<&[u8]> = puts.iter().map(|(k, _)| k.as_slice()).collect();
             let ts = self.mint_pushed(term, &keys);
-            KvCommand::Batch { puts, fence, ts }
+            KvCommand::Batch { puts, ts }
         })
     }
 
@@ -2070,32 +2019,27 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// the write it describes. Keys are **logical** and token-leading
     /// (ADR 0022); the kind selects the scope and is never part of the key.
     ///
-    /// Stamps `fence = KeyRange::whole()` and no `conditions`; use
-    /// [`put_kind_batch_fenced`](Self::put_kind_batch_fenced) to stamp a
-    /// narrower fence or supply own-key OCC conditions.
+    /// Supplies no `conditions`; use
+    /// [`put_kind_batch_conditioned`](Self::put_kind_batch_conditioned) to
+    /// supply own-key OCC conditions.
     pub fn put_kind_batch(
         &self,
         writes: Vec<KindWrite>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> ProposeResult {
-        self.put_kind_batch_fenced(writes, change_log, Vec::new(), KeyRange::whole())
+        self.put_kind_batch_conditioned(writes, change_log, Vec::new())
     }
 
-    /// As [`put_kind_batch`](Self::put_kind_batch), but the leader stamps its
-    /// own `fence` into the entry, and may supply own-key OCC `conditions`. If
-    /// **any** key falls outside `fence`, none of the batch applies — the
-    /// fence gates the whole atomic entry, since a half-applied index write
-    /// is exactly what colocating the kinds exists to prevent. See
-    /// [`KvCommand::KindBatch`]'s doc for what `conditions` means and why it
-    /// is checked ahead of the fence/seal gate; pass an empty `Vec` for the
-    /// pre-existing no-conditions behavior (every caller before this field
-    /// existed).
-    pub fn put_kind_batch_fenced(
+    /// As [`put_kind_batch`](Self::put_kind_batch), but may supply own-key OCC
+    /// `conditions`. See [`KvCommand::KindBatch`]'s doc for what `conditions`
+    /// means and why it is checked ahead of the seal gate; pass an empty `Vec`
+    /// for the pre-existing no-conditions behavior (every caller before this
+    /// field existed).
+    pub fn put_kind_batch_conditioned(
         &self,
         writes: Vec<KindWrite>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-        fence: KeyRange,
     ) -> ProposeResult {
         self.propose_ordered(|term| {
             let keys: Vec<&[u8]> = writes.iter().map(|(_, k, _)| k.as_slice()).collect();
@@ -2104,7 +2048,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 writes,
                 change_log,
                 conditions,
-                fence,
                 ts,
             }
         })
@@ -2113,30 +2056,21 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// Propose a **split-build seed chunk** into this (child) group's log
     /// (ADR 0050 Train B rung 4 — see [`KvCommand::SeedBatch`]'s doc for the
     /// full semantics: version-carrying merges, envelope bytes verbatim, no
-    /// change-log emission, whole-batch fence). `fence` should be the child's
-    /// immutable declared range; the entry's own `ts` is minted normally
+    /// change-log emission). The entry's own `ts` is minted normally
     /// (`propose_ordered`), keeping the apply-time monotonicity assert
     /// honest, while every row merges at its **carried** version.
-    pub fn propose_seed_batch(&self, rows: Vec<SeedRow>, fence: KeyRange) -> ProposeResult {
+    pub fn propose_seed_batch(&self, rows: Vec<SeedRow>) -> ProposeResult {
         self.propose_ordered(|term| {
             let ts = self.mint_pushed::<&[u8]>(term, &[]);
-            KvCommand::SeedBatch { rows, fence, ts }
+            KvCommand::SeedBatch { rows, ts }
         })
     }
 
-    /// Propose a delete (tombstone) to this group. Stamps `fence =
-    /// KeyRange::whole()`; use [`delete_fenced`](Self::delete_fenced) to stamp
-    /// a narrower one.
+    /// Propose a delete (tombstone) to this group.
     pub fn delete(&self, key: Vec<u8>) -> ProposeResult {
-        self.delete_fenced(key, KeyRange::whole())
-    }
-
-    /// As [`delete`](Self::delete), but the leader stamps its own `fence` into
-    /// the entry instead of the unconstrained default (see [`KvCommand`]'s doc).
-    pub fn delete_fenced(&self, key: Vec<u8>, fence: KeyRange) -> ProposeResult {
         self.propose_ordered(|term| {
             let ts = self.mint_pushed(term, std::slice::from_ref(&key));
-            KvCommand::Delete { key, fence, ts }
+            KvCommand::Delete { key, ts }
         })
     }
 
@@ -2147,66 +2081,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// CAS racing from the same `expected` have exactly one winner. To learn the
     /// outcome, take the [`ProposeResult::Accepted`] `index` and read
     /// [`cas_result`](Self::cas_result) once that index applies — or use the
-    /// all-in-one [`compare_and_swap`](Self::compare_and_swap). Stamps `fence =
-    /// KeyRange::whole()`; use [`cas_fenced`](Self::cas_fenced) to stamp a
-    /// narrower one.
+    /// all-in-one [`compare_and_swap`](Self::compare_and_swap).
     pub fn cas(&self, key: Vec<u8>, expected: Option<Vec<u8>>, value: Vec<u8>) -> ProposeResult {
-        self.cas_fenced(key, expected, value, KeyRange::whole())
-    }
-
-    /// As [`cas`](Self::cas), but the leader stamps its own `fence` into the
-    /// entry instead of the unconstrained default (see [`KvCommand`]'s doc). A
-    /// fenced-out CAS records outcome `false` (see the apply-time fence
-    /// check's doc for why).
-    pub fn cas_fenced(
-        &self,
-        key: Vec<u8>,
-        expected: Option<Vec<u8>>,
-        value: Vec<u8>,
-        fence: KeyRange,
-    ) -> ProposeResult {
         self.propose_ordered(|term| {
             let ts = self.mint_pushed(term, std::slice::from_ref(&key));
             KvCommand::Cas {
                 key,
                 expected,
                 value,
-                fence,
                 ts,
             }
-        })
-    }
-
-    /// Propose a **range seal** (ADR 0018 §2 amendment, PR2 — see `seal.rs`'s
-    /// module doc): mark `range` closed to any further mutation ordered after
-    /// this entry in this group's own Raft log. Leader-only (else a leader
-    /// hint, like every other propose method). Called by the tablet-host
-    /// reconciler (`host::Reconciler`) when executing a split source's own
-    /// `ProposeSeal` action for a still-owed handoff — never by any
-    /// data-plane client. Idempotent to re-propose the identical `range`
-    /// (the marker key is keyed by `(tablet, range)`, so a repeat simply
-    /// refreshes it with a newer `ts` — see `seal.rs`).
-    pub fn propose_seal(&self, range: KeyRange) -> ProposeResult {
-        self.propose_ordered(|_term| {
-            let ts = self.hlc.mint(self.env.now());
-            // Same `last_proposed_ts` floor as `mint_pushed` (see
-            // `propose_ordered`'s doc) — a seal is a mutating log entry like
-            // any other and must not land below an as-yet-unapplied
-            // `ReadCeiling` this leader already logged.
-            let floor = hlc::unpack(self.last_proposed_ts.load(Ordering::SeqCst));
-            let ts = if ts > floor {
-                ts
-            } else {
-                let pushed = self.hlc.witness(floor, self.env.now());
-                assert!(
-                    pushed > floor,
-                    "raftkv propose_seal: witnessing the last-proposed floor must strictly \
-                     exceed it (floor={floor:?}, got={pushed:?}) — Hlc::witness's own contract \
-                     is broken"
-                );
-                pushed
-            };
-            KvCommand::Seal { range, ts }
         })
     }
 
@@ -2232,7 +2116,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     pub fn propose_freeze(&self) -> ProposeResult {
         self.propose_ordered(|_term| {
             let ts = self.hlc.mint(self.env.now());
-            // Same `last_proposed_ts` floor discipline as `propose_seal`
+            // Same `last_proposed_ts` floor discipline as `mint_pushed`
             // (see that method's inline comment).
             let floor = hlc::unpack(self.last_proposed_ts.load(Ordering::SeqCst));
             let ts = if ts > floor {
@@ -2339,7 +2223,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         );
         let token = anchor[..animus_tablet::TOKEN_BYTES].to_vec();
         let keys: Vec<Vec<u8>> = writes.iter().map(|w| w.key.clone()).collect();
-        let fence = self.scope_range();
         let record_table = table.to_owned();
         let (result, (txn_id, record_key)) = self.propose_ordered_aux(|term| {
             let ts = self.mint_pushed(term, &keys);
@@ -2366,7 +2249,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 writes: writes.clone(),
                 spans,
                 conditions,
-                fence: fence.clone(),
                 ts,
             };
             (cmd, (txn_id, record_key))
@@ -2408,7 +2290,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             "raftkv txn_stage_participant: writes must be non-empty"
         );
         let keys: Vec<Vec<u8>> = writes.iter().map(|w| w.key.clone()).collect();
-        let fence = self.scope_range();
         let (result, ts) = self.propose_ordered_aux(|term| {
             let ts = self.mint_pushed(term, &keys);
             let cmd = KvCommand::TxnStage {
@@ -2419,7 +2300,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 writes: writes.clone(),
                 spans: Vec::new(), // unused: no local record is ever created here.
                 conditions,
-                fence: fence.clone(),
                 ts,
             };
             (cmd, ts)
@@ -2434,7 +2314,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
 
     /// Mint a ts that strictly exceeds `min_ts` **and** this group's own
     /// `last_proposed_ts` floor (mirrors [`mint_pushed`](Self::mint_pushed)/
-    /// [`propose_seal`](Self::propose_seal)'s identical witness-and-floor
+    /// [`propose_freeze`](Self::propose_freeze)'s identical witness-and-floor
     /// shape) — the primitive [`txn_commit_at_least`](Self::txn_commit_at_least)
     /// uses to honor a coordinator-supplied commit timestamp candidate
     /// while still respecting this group's own log-order monotonicity
@@ -2624,7 +2504,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // live scope, exactly like `TxnStage`'s `fence` above — see
         // `KvCommand::TxnResolve`'s doc for why this is no longer safe to
         // omit.
-        let fence = self.scope_range();
         let (result, ts) = self.propose_ordered_aux(|term| {
             let ts = self.mint_pushed(term, &keys);
             let cmd = KvCommand::TxnResolve {
@@ -2632,7 +2511,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 record_key: record_key.clone(),
                 keys: keys.clone(),
                 outcome: outcome.clone(),
-                fence: fence.clone(),
                 ts,
             };
             (cmd, ts)
@@ -5047,26 +4925,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     let mut max_index = 0u64;
     for (index, command) in effects {
         match command {
-            KvCommand::Put {
-                key,
-                value,
-                fence,
-                ts,
-            } => {
+            KvCommand::Put { key, value, ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
-                // Out-of-fence is a deterministic no-op: the fence rides in the
-                // entry itself (stamped by the leader at propose time), so every
-                // replica reaches this same accept/reject decision regardless of
-                // its own progress learning the tablet's range has changed (see
-                // `KvCommand`'s doc). A sealed-out key is the same shape (ADR 0018
-                // §2 amendment): the key fell in a range this group already
-                // handed off, so this entry — necessarily proposed by a leader
-                // that hadn't yet learned that — is rejected exactly like a fence
-                // miss. The fence/seal checks are against the *logical* key; only
+                // A sealed-out key is a deterministic no-op (ADR 0018 §2
+                // amendment, now `Freeze`'s apply-time backstop): the key fell
+                // in a range this group already closed, so this entry —
+                // necessarily proposed before the freeze applied — is
+                // rejected. The seal check is against the *logical* key; only
                 // the storage-bound `MergeOp` gets the physical address (see
-                // `StorageScope`'s doc — under the default scope this is an
-                // identity transform).
-                if fence.contains(&key) && !is_sealed(sealed, &key) {
+                // `StorageScope`'s doc).
+                if !is_sealed(sealed, &key) {
                     pending.push(MergeOp::put(
                         scope.physical(&key),
                         txn::encode_committed(&value),
@@ -5074,9 +4942,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     ));
                 }
             }
-            KvCommand::Batch { puts, fence, ts } => {
+            KvCommand::Batch { puts, ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
-                // The fence/seal gates the *whole* batch, not per-key: a batch is
+                // The seal gates the *whole* batch, not per-key: a batch is
                 // one atomic Raft entry (see `KvCommand::Batch`'s doc), so
                 // partially applying it on a miss would silently break that
                 // guarantee. Every key in the batch merges at this one entry's
@@ -5085,10 +4953,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // at the end of the loop iteration (the batch is one entry). Composes
                 // with a future coalesced-fsync merge_batch (perf/lsm) — this is the
                 // normal per-key `merge` path that batching optimization refines.
-                if puts
-                    .iter()
-                    .all(|(key, _)| fence.contains(key) && !is_sealed(sealed, key))
-                {
+                if puts.iter().all(|(key, _)| !is_sealed(sealed, key)) {
                     for (key, value) in &puts {
                         storage
                             .merge(
@@ -5101,7 +4966,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     }
                 }
             }
-            KvCommand::SeedBatch { rows, fence, ts } => {
+            KvCommand::SeedBatch { rows, ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
                 // ADR 0050 rung 4 (fork F3): history transfer into this child
                 // group's own engine. Each row merges at its CARRIED version
@@ -5109,20 +4974,18 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // verbatim — envelope tag included, so a staged intent copies
                 // as an intent (fork F7) — making re-proposal an idempotent
                 // no-op and a mid-build parent update a per-key LWW winner on
-                // the child too. Whole-batch fence discipline (`Batch`'s):
-                // the driver filters rows to this child's immutable range by
-                // construction, so a violation is a driver bug surfacing as a
-                // loud no-op, never a partial install. No change-log
-                // emission, no `encode_committed` re-wrap, no seal check (a
-                // fresh Building child has no sealed ranges; the seal
-                // mechanism itself retires with the zero-copy split).
-                // Rung 5 addition to the gate: a frozen group (`Freeze`'s
-                // whole-range seal) also refuses seeds — a SeedBatch is
-                // never legitimately directed at a split PARENT, only its
-                // children, so this only fires on a driver bug.
-                if rows.iter().all(|(_, logical, _, _)| {
-                    fence.contains(logical) && !is_sealed(sealed, logical)
-                }) {
+                // the child too. Whole-batch seal discipline (`Batch`'s): a
+                // frozen group (`Freeze`'s whole-range seal) refuses seeds —
+                // a SeedBatch is never legitimately directed at a split
+                // PARENT, only its children, so a refusal only fires on a
+                // driver bug, as a loud whole-batch no-op, never a partial
+                // install. The driver filters rows to each child's immutable
+                // range by construction (no per-entry range check remains —
+                // ranges are immutable and the route is child-group-direct).
+                if rows
+                    .iter()
+                    .all(|(_, logical, _, _)| !is_sealed(sealed, logical))
+                {
                     let mut max_seeded: u64 = 0;
                     for (kind, logical, value, version) in &rows {
                         let Some(kscope) = kind_scopes.get(*kind as usize) else {
@@ -5155,7 +5018,6 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 writes,
                 change_log,
                 conditions,
-                fence,
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
@@ -5224,9 +5086,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .iter()
                     .any(|(kind, _, _)| *kind == KIND_BASE || *kind == KIND_LSI);
                 if conditions_ok
-                    && writes.iter().all(|(_, key, _)| {
-                        fence.contains(key) && (!carries_user_data || !is_sealed(sealed, key))
-                    })
+                    && writes
+                        .iter()
+                        .all(|(_, key, _)| !carries_user_data || !is_sealed(sealed, key))
                 {
                     // ADR 0046 binding decision: the ONE shared
                     // materialization helper, also used by `TxnResolve`'s
@@ -5235,9 +5097,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     materialize_derived(kind_scopes, &writes, &change_log, ts, &mut pending);
                 }
             }
-            KvCommand::Delete { key, fence, ts } => {
+            KvCommand::Delete { key, ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
-                if fence.contains(&key) && !is_sealed(sealed, &key) {
+                if !is_sealed(sealed, &key) {
                     pending.push(MergeOp::tombstone(scope.physical(&key), hlc::pack(ts)));
                 }
             }
@@ -5245,19 +5107,18 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 key,
                 expected,
                 value,
-                fence,
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
                 // Drain the pending run so the CAS read observes every earlier
                 // committed write in this apply pass.
                 flush_pending(storage, &mut pending, metrics).await;
-                // A fenced- or sealed-out CAS never reads/writes storage — it is
+                // A sealed-out CAS never reads/writes storage — it is
                 // recorded as `false` ("did not swap"), the same outcome shape a
                 // proposer already handles for an ordinary `expected` mismatch, so
                 // a confirm-poll on this index never hangs waiting for an outcome
                 // that will never come.
-                let swapped = if fence.contains(&key) && !is_sealed(sealed, &key) {
+                let swapped = if !is_sealed(sealed, &key) {
                     // Read the key's *current committed* value (the latest applied,
                     // since we apply in commit order and earlier entries in this
                     // batch already merged above) and compare to `expected`. Equal
@@ -5311,26 +5172,6 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .expect("cas results poisoned")
                     .outcomes
                     .insert(index, swapped);
-            }
-            KvCommand::Seal { range, ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
-                // Applying a Seal writes its durable marker (the successor's
-                // observable witness, `seal.rs`) at `hlc::pack(ts)` — flush the
-                // pending run first so the marker's own version never precedes
-                // an already-queued write in this same pass (ordering hygiene,
-                // not a correctness requirement: the marker key is disjoint
-                // from every scoped key, see `seal.rs`).
-                flush_pending(storage, &mut pending, metrics).await;
-                let marker_key = seal::seal_marker_key(tablet, &range);
-                storage
-                    .merge(
-                        &marker_key,
-                        &seal::encode_seal_value(&range, ts),
-                        hlc::pack(ts),
-                    )
-                    .await
-                    .expect("raftkv apply seal marker");
-                sealed.push((range, ts));
             }
             KvCommand::Freeze { ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
@@ -5389,7 +5230,6 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 writes,
                 spans,
                 conditions,
-                fence,
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
@@ -5471,9 +5311,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // **anchor's** record — a key in a different tablet's (or
                 // even a different table's) keyspace entirely — so it is
                 // never checked against or written into *this* group's own
-                // fence/engine (ADR 0018 §2/PR4).
-                let record_in_fence =
-                    !is_anchor || (fence.contains(&record_key) && !is_sealed(sealed, &record_key));
+                // seal set/engine (ADR 0018 §2/PR4).
+                let record_in_fence = !is_anchor || !is_sealed(sealed, &record_key);
                 // ADR 0046 A1: every kind-write key a write stages must lead
                 // with that write's own base key's partition token — checked
                 // here (a validated rejection, folded into the same
@@ -5492,9 +5331,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 let all_in_fence = !already_decided
                     && blocked_by.is_none()
                     && kind_tokens_ok
-                    && writes
-                        .iter()
-                        .all(|w| fence.contains(&w.key) && !is_sealed(sealed, &w.key))
+                    && writes.iter().all(|w| !is_sealed(sealed, &w.key))
                     && record_in_fence;
                 // ADR 0018 §2 apply-time write-key conditions amendment:
                 // evaluate this stage's own-key conditions (byte-level OCC
@@ -5904,7 +5741,6 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 record_key,
                 keys,
                 outcome,
-                fence,
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
@@ -6020,13 +5856,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // exactly like `KindBatch`'s own arm never fence-checks
                     // its `change_log` prefix directly — it rides under the
                     // same entry-wide gate as `kind_writes`' keys instead).
-                    let all_in_fence = keys
-                        .iter()
-                        .all(|k| fence.contains(k) && !is_sealed(sealed, k))
+                    let all_in_fence = keys.iter().all(|k| !is_sealed(sealed, k))
                         && resolved.iter().flatten().all(|ri| {
                             ri.kind_writes
                                 .iter()
-                                .all(|(_, kk, _)| fence.contains(kk) && !is_sealed(sealed, kk))
+                                .all(|(_, kk, _)| !is_sealed(sealed, kk))
                         });
                     // ADR 0018 §2/PR6 hardening (defense-in-depth, not a
                     // reproduced bug): every current decider
@@ -6556,7 +6390,6 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
         | KvCommand::SeedBatch { ts, .. }
         | KvCommand::Delete { ts, .. }
         | KvCommand::Cas { ts, .. }
-        | KvCommand::Seal { ts, .. }
         | KvCommand::Freeze { ts }
         | KvCommand::ReadCeiling { ts, .. }
         | KvCommand::TxnStage { ts, .. }
@@ -7328,7 +7161,6 @@ mod pr5_orphan_and_resurrection_tests {
         // command by hand via the same private primitives
         // `txn_stage_anchor` itself uses internally.
         let anchor_writes = vec![txn::TxnWrite::plain(ka.clone(), Some(b"placed".to_vec()))];
-        let fence = node_a.scope_range();
         let participant_span_end = txn::immediate_successor(&kb);
         let (result, late_ts) = node_a.propose_ordered_aux(|term| {
             let ts = node_a.mint_pushed(term, std::slice::from_ref(&ka));
@@ -7343,7 +7175,6 @@ mod pr5_orphan_and_resurrection_tests {
                     KeyRange::new(kb.clone(), Some(participant_span_end.clone())),
                 )],
                 conditions: Vec::new(),
-                fence: fence.clone(),
                 ts,
             };
             (cmd, ts)

@@ -16,9 +16,9 @@ gone. Streams implementation notes: [`docs/streams-notes.md`](../../docs/streams
 
 **`lib.rs` is ~6800 lines** — grep for the symbol, don't scroll. It also holds
 in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
-can't reach — e.g. `auto_split_median_tests` and `hot_read_latch_tests`
-(`split_fence_tests` survives only as a rung-5 tombstone: the zero-copy
-crossover scenario it drove is structurally unrepresentable now). `index_drain.rs` has a third, `gsi_drain_cursor_tests`, and
+can't reach — e.g. `auto_split_median_tests` (`split_fence_tests` and
+`hot_read_latch_tests` were deleted with their fence/latch subjects in the
+ADR 0050 Train B rung-7 sweep). `index_drain.rs` has a third, `gsi_drain_cursor_tests`, and
 `dynamo.rs` a fourth, `stream_write_path_tests` (ADR 0042), for the same
 reason (see each file's own entry below).
 
@@ -294,19 +294,16 @@ forwarded dual of the local path's `RouteDecision::Wait`. Gated on the tablet
 being resolvable so an unmappable op still fails fast. Regression:
 `tests/cluster_split.rs::single_shot_first_write_through_control_node_succeeds`.
 
-**Write fences (ADR 0028)**: `cp_put_local`/`cp_delete_local`/`cp_batch_propose`
-each (1) **pre-check** the target group's live `RaftKvNode::scope_range()` and
-reject before proposing if any key falls outside it (returning a routing-failure
-error so the caller re-resolves and reaches the correct child), and (2) **stamp**
-that range as the proposed entry's `fence` (`put_fenced`/etc.). The pre-check is
-load-bearing: a fenced-out entry still commits as a no-op, so a confirm keyed on a
-coarser signal would falsely-ack; the embedded fence only covers the sliver
-between pre-check and apply. `cp_get_local`/`cp_scan_local` run the read-side dual
-(ADR 0033): a read resolving to a group whose live scope doesn't cover the
-request errors retryably rather than serving a false "absent" (for scans, avoids a
-silent truncation). (The in-crate `split_fence_tests` is a rung-5 tombstone
-now — successor coverage: `animus-cp-data/tests/freeze.rs` + `tests/
-split_build.rs`.)
+**Write fences are GONE (ADR 0050 Train B rung 7).** A tablet's declared
+range is immutable from birth, so the per-entry `fence` fields, the
+pre-propose `scope_range()` checks, and the `*_fenced` proposers were all
+deleted; the plain `put`/`put_batch`/`put_kind_batch_conditioned`/`delete`/
+`cas` proposers are the only shapes left. What replaces the fence's job:
+route-time filtering (`Building` tablets unroutable, `Active`-only serving)
+plus the frozen split parent's retryable refusal (`frozen_refusal` +
+`KvCommand::Freeze`'s apply-time whole-range seal backstop). One cheap
+pre-propose key∈declared-range guard survives in the kind-write path purely
+as a routing-bug tripwire (immutable range, no lock).
 
 ## Multi-participant transactions (ADR 0018 §2)
 
@@ -581,10 +578,10 @@ workflow STOPS at this rung** — no driver/copy/freeze/cutover callers yet
 (B4/B5), so a started split parks at parent-`Splitting` +
 children-`Building` indefinitely; per-tablet `state` rides
 `/admin/status`'s serialized `Metadata` (the split-status surface —
-no new endpoint). The old zero-copy `MetaCommand::SplitTablet` still
-exists for test topology fixtures on **empty** tables (`cp_txn.rs`'s
-`split_and_settle`; deleted in the B7 sweep); populated-tablet split e2e
-tests stay `#[ignore]`d `PARKED (ADR 0050 ...)` until B4/B5. E2e:
+no new endpoint). The old zero-copy `MetaCommand::SplitTablet` is deleted
+(Train B rung 7) — test topology fixtures propose a real
+`BeginSplit`+`CutoverSplit` round instead (sound on an EMPTY table:
+children activate over nothing, the parent retires). E2e:
 `tests/split_lifecycle.rs` (3-node, follower-connected kickoff = the
 `BeginSplit` relay regression) and `admin_endpoint.rs::
 admin_split_kicks_off_the_copy_based_workflow`.
@@ -595,13 +592,13 @@ admin_split_kicks_off_the_copy_based_workflow`.
 **`ClientCtx::trigger_split` is the ONE choke point every split proposer
 calls** (`auto_split_loop`, `admin::action_split`, and
 `ClientRequest::SplitTablet`'s handler — nothing else ever builds a
-`MetaCommand::SplitTablet`), which is where F11 (ADR 0042 §14) rounds a
+`MetaCommand::BeginSplit`), which is where F11 (ADR 0042 §14) rounds a
 streamed table's split key down to its own 8-byte token boundary
 (`align_split_key`, private to `lib.rs`, unit-tested in
 `align_split_key_tests`) — a manual split can no longer separate one
 partition's records across sibling tablets the way it could before growth
 PR2 moved the rounding out of `auto_split_loop` alone.
-`MetaCommand::SplitTablet`'s own apply arm independently re-checks token
+`MetaCommand::BeginSplit`'s own apply arm independently re-checks token
 alignment on a streamed table as the ADR 0028 fence-idiom seatbelt (never
 the primary enforcement). A token-rounded key that collapses onto the
 target tablet's own `range.start` (a single very hot partition token owning
@@ -691,27 +688,11 @@ crate's `CLAUDE.md`. This crate's own contribution:
   except a locally-woken quiesced follower's "are you still there?" check.
   `host::Reconciler::tick`'s own proactive wake (fork H, on a `Down`
   replica) lives in `animus-cp-data`.
-- **The `hot_read` scope-transition latch** (narrows the ADR 0043
-  residual): `hot_read_scope_ok` (`lib.rs`) refuses retryably
-  (`"...; retry"`) whenever a group's **live** `scope_range()` is wider than
-  the tablet's range per a **freshly fetched** `metadata_fresh()` — never
-  `effective_metadata()`/`metadata_cached()`, the cache-lag
-  `in_declared_range`'s own pre-existing filter (`index_drain.rs`) could
-  not close on its own. Both `hot_read` call sites (`ClientRequest::
-  StreamHotRead`'s handler, `ClientCtx::read_stream_hot_records`) gate on
-  it before ever calling `index_drain::hot_read`. **Does not fully close
-  the residual**: on a `ControlHandle::Local` node (the common case),
-  `metadata_fresh()` is itself the ADR 0038 published cache a local,
-  asynchronous control apply task maintains — in the sub-window between a
-  `SplitTablet` committing and that apply task catching this node's cache
-  up to it, the declared range and the live scope are stale *together*, so
-  this check passes and the fabrication class can still surface (the same
-  layer-2 structure the #220 write-side investigation found). See ADR 0048
-  for the full accounting, why this — a live cross-check, not a
-  periodically-refreshed flag — is nonetheless the sound design where a
-  literal "reconciler-maintained latch" would not have been, and why full
-  closure (a per-read control-leader round trip) was rejected as
-  disproportionate.
+- **The `hot_read` scope-transition latch is GONE (ADR 0050 Train B rung
+  7)** — together with the residual it narrowed: a tablet's range is
+  immutable and a split retires its parent whole (its group refuses via the
+  freeze, then tears down), so no scope-transition window exists for an
+  open-tail read to race. `hot_read` takes only the group handle now.
 - **Quiesce veto**: `change_consumer_loop` (`index_drain.rs`) computes
   `!group.pending_changes().await.is_empty()` once per led tablet per tick
   and calls `CpGroup::set_quiesce_veto` with it — held while the change log
@@ -759,8 +740,7 @@ private `CpGroup` access) covers the veto end to end
 (`hot_backlog_holds_the_quiesce_veto_until_the_hot_tail_trims`) and the
 sweeper-skip regression
 (`a_rewoken_tablet_is_picked_back_up_by_every_sweeper_within_one_interval`);
-`lib.rs`'s own `hot_read_latch_tests` module covers the latch's
-retryable-refusal shape; `tests/cp_quiescence.rs` is the critical
+ `tests/cp_quiescence.rs` is the critical
 `ProdEnv` leader-kill liveness regression
 (`write_after_leader_kill_of_a_quiesced_group_converges`) — the one
 property `SimEnv` structurally cannot prove.
@@ -1254,8 +1234,7 @@ tests that poll with timeouts, not deterministic assertions (this crate has
 no `SimEnv` — it is the assembly/wire layer over the two sim-tested crates
 below it). The restart tests run both incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
-(`auto_split_median_tests`, `hot_read_latch_tests`; `split_fence_tests` is
-a rung-5 tombstone) live in `lib.rs` itself
+(`auto_split_median_tests`) live in `lib.rs` itself
 because they need private handles (a raw `CpGroup`/the private
 `byte_weighted_median` helper) that no external `tests/` file can reach;
 `index_drain.rs`'s own `gsi_drain_cursor_tests` is a third (run via `cargo

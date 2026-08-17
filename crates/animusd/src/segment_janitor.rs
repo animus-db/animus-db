@@ -119,7 +119,7 @@ use std::time::Duration;
 use animus_control::RaftNode;
 use animus_cp_data::segment;
 use animus_env::{Clock, Env, Metric, NodeId, ProdEnv};
-use animus_tablet::{KeyRange, TabletId};
+use animus_tablet::TabletId;
 
 use crate::ClientCtx;
 use crate::{MetaCommand, Metadata, NodeStatus};
@@ -389,16 +389,6 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
                 // content check to recognize this as the legitimate
                 // replicas-only-update shape, not a content conflict).
                 object_id: row.object_id.clone(),
-                // A replicas-only repair reuses the existing row's own
-                // already-validated content (matched by `object_id` above),
-                // so `Metadata::apply`'s range CAS never checks this value
-                // for the existing-row path (see that field's own doc) —
-                // this tablet's current range is passed anyway, purely for
-                // self-documentation, since the CAS is genuinely inert here.
-                expected_range: meta
-                    .tablets
-                    .get(tablet)
-                    .map_or_else(KeyRange::whole, |t| t.range.clone()),
             });
         }
     }
@@ -548,7 +538,7 @@ mod orphan_reap_tests {
     use super::*;
     use animus_control::{ApplyOutcome, ColumnType, StreamSpec, StreamViewType, TableSchema};
     use animus_env::FsSegmentStore;
-    use animus_tablet::{Epoch, KeyRange};
+    use animus_tablet::KeyRange;
 
     fn tmp_store() -> (tempfile::TempDir, crate::SegmentStoreHandle) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -629,7 +619,6 @@ mod orphan_reap_tests {
                 seal_wall_ms: 1_000,
                 replicas: Vec::new(),
                 object_id: winner_id.clone(),
-                expected_range: KeyRange::whole(),
             }),
             ApplyOutcome::Applied,
             "test setup: seal epoch 0 with the winning object"
@@ -709,121 +698,11 @@ mod orphan_reap_tests {
         );
     }
 
-    /// **Split-seal range-fence CAS's own orphan shape (2026-08-15, ADR
-    /// 0043 §A3/§A4)**: a seal attempt whose declared `expected_range` is
-    /// stale relative to a racing `SplitTablet` gets its catalog proposal
-    /// REJECTED (`Metadata::apply`, this crate's own delivery), but the
-    /// segment object it already durably `put` (mirroring production's
-    /// own put-then-propose order) is unaffected by that rejection — an
-    /// orphan by construction, structurally identical to any other
-    /// never-cataloged object at this shard's own prefix. Proves the
-    /// EXISTING orphan-reap mechanism (both sub-cases above) needs no
-    /// special-casing for this NEW rejection reason: it only ever compares
-    /// object presence against catalog reference, never "why."
-    #[tokio::test]
-    async fn cas_rejected_seal_orphan_is_reaped_like_any_other() {
-        let (_dir, store) = tmp_store();
-        let table = "orders";
-        let label = "L1";
-        let tablet = TabletId(1);
-        let mut meta = base_meta_with_stream(table, label, tablet);
-        assert_eq!(
-            meta.apply(&MetaCommand::SplitTablet {
-                tablet,
-                expected_epoch: Epoch::INITIAL,
-                split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
-                new_id: TabletId(2),
-            }),
-            ApplyOutcome::Applied,
-            "test setup: split must apply"
-        );
-
-        // The stale attempt: declares the pre-split `whole()` range —
-        // rejected by the CAS, since tablet 1's own range has narrowed.
-        let prefix = segment::segment_id(table, label, tablet.0, 0);
-        let stale_id = format!("{prefix}/stale-attempt");
-        let header = segment::SegmentHeader {
-            table: table.to_owned(),
-            label: label.to_owned(),
-            shard_id: segment::shard_id(tablet.0, 0),
-            tablet: tablet.0,
-            epoch: 0,
-            parent_shard_id: None,
-            hlc_range: (0, 100),
-            count: 0,
-            seal_wall_ms: 0, // irrelevant here: the sealed-epoch sub-case below never checks age
-        };
-        let bytes = segment::encode(&header, &[]);
-        store
-            .put_sealed(&stale_id, &bytes)
-            .await
-            .expect("put stale attempt");
-
-        let outcome = meta.apply(&MetaCommand::SealStreamShard {
-            table: table.to_owned(),
-            label: label.to_owned(),
-            tablet,
-            epoch: 0,
-            view_type: StreamViewType::NewAndOldImages,
-            hlc_range: (0, 100),
-            count: 0,
-            seal_wall_ms: 1_000,
-            replicas: Vec::new(),
-            object_id: stale_id.clone(),
-            expected_range: KeyRange::whole(), // deliberately stale
-        });
-        assert_eq!(
-            outcome,
-            ApplyOutcome::Rejected(
-                "declared range stale — a split raced this seal, retry with the current range"
-            ),
-            "test setup: the stale attempt's proposal must be rejected"
-        );
-        assert!(!meta.stream_shards.contains_key(&(tablet, 0)));
-
-        // The retry, correctly declaring the now-narrowed range, lands at
-        // a fresh object id — the winner.
-        let winner_id = format!("{prefix}/winner-attempt");
-        store
-            .put_sealed(&winner_id, &bytes)
-            .await
-            .expect("put winner");
-        assert_eq!(
-            meta.apply(&MetaCommand::SealStreamShard {
-                table: table.to_owned(),
-                label: label.to_owned(),
-                tablet,
-                epoch: 0,
-                view_type: StreamViewType::NewAndOldImages,
-                hlc_range: (0, 100),
-                count: 0,
-                seal_wall_ms: 1_000,
-                replicas: Vec::new(),
-                object_id: winner_id.clone(),
-                expected_range: KeyRange::new(
-                    Vec::new(),
-                    Some(0x8000_0000_0000_0000u64.to_be_bytes().to_vec()),
-                ),
-            }),
-            ApplyOutcome::Applied,
-            "test setup: the retry, correctly scoped, must apply"
-        );
-
-        // The sealed-epoch sub-case reaps the stale attempt's orphan
-        // immediately — no age check, exactly like a dueling-seal race's
-        // own loser (`sealed_epoch_orphan_is_reaped_immediately_no_age_
-        // check` above), because the reaper only ever compares object
-        // identity against the catalog's own winning row.
-        reap_orphans(&store, &meta, 1_500).await;
-        assert_eq!(
-            store.get_local(&winner_id).await.expect("get winner"),
-            Some(bytes.clone()),
-            "the winning (correctly-scoped) object survives untouched"
-        );
-        assert_eq!(
-            store.get_local(&stale_id).await.expect("get stale"),
-            None,
-            "the CAS-rejected attempt's orphan is reaped just like any other loser"
-        );
-    }
+    // TOMBSTONE (ADR 0050 Train B rung 7): `cas_rejected_seal_orphan_is_
+    // reaped_like_any_other` was deleted with the `SealStreamShard`
+    // `expected_range` CAS it exercised (ranges are immutable now — no
+    // racing narrow exists for a seal to be stale against). The mechanism it
+    // proved — the orphan reaper compares object presence against catalog
+    // reference, never "why" an object went uncataloged — is covered by the
+    // two orphan sub-case tests above.
 }

@@ -202,43 +202,36 @@ enum CpGroup {
 
 impl CpGroup {
     /// Propose a write to the group (honored on the leader), stamping `fence`
-    /// (ADR 0028 write-fence wiring — see [`RaftKvNode::put_fenced`]) so every
-    /// replica's apply checks the key against the range embedded in the entry
-    /// itself. Every real caller (`ClientCtx::cp_put_local`) stamps the
-    /// group's own current [`scope_range`](Self::scope_range) here — there is
-    /// no unfenced `put` left in this crate; `KeyRange::whole()` is only ever
-    /// used by tests/tools with no split-crossover exposure to guard against.
-    fn put_fenced(&self, key: Vec<u8>, value: Vec<u8>, fence: KeyRange) -> ProposeResult {
+    /// Propose a write to this group. See [`RaftKvNode::put`].
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.put_fenced(key, value, fence),
-            CpGroup::Mem(n) => n.put_fenced(key, value, fence),
+            CpGroup::Lsm(n) => n.put(key, value),
+            CpGroup::Mem(n) => n.put(key, value),
         }
     }
 
-    /// As [`put_fenced`](Self::put_fenced), but for a **batch put** — commit
-    /// every `(key, value)` as one Raft entry. See
-    /// [`RaftKvNode::put_batch_fenced`].
-    fn put_batch_fenced(&self, puts: Vec<(Vec<u8>, Vec<u8>)>, fence: KeyRange) -> ProposeResult {
+    /// As [`put`](Self::put), but for a **batch put** — commit every
+    /// `(key, value)` as one Raft entry. See [`RaftKvNode::put_batch`].
+    fn put_batch(&self, puts: Vec<(Vec<u8>, Vec<u8>)>) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.put_batch_fenced(puts, fence),
-            CpGroup::Mem(n) => n.put_batch_fenced(puts, fence),
+            CpGroup::Lsm(n) => n.put_batch(puts),
+            CpGroup::Mem(n) => n.put_batch(puts),
         }
     }
 
-    /// As [`put_fenced`](Self::put_fenced), but for a **multi-kind atomic
-    /// batch** — base row, LSI rows, footprint and an optional change-log
-    /// record as one Raft entry (ADR 0041 §3/§4). See
-    /// [`RaftKvNode::put_kind_batch_fenced`].
-    fn put_kind_batch_fenced(
+    /// As [`put`](Self::put), but for a **multi-kind atomic batch** — base
+    /// row, LSI rows, footprint and optional change-log records as one Raft
+    /// entry (ADR 0041 §3/§4). See
+    /// [`RaftKvNode::put_kind_batch_conditioned`].
+    fn put_kind_batch_conditioned(
         &self,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-        fence: KeyRange,
     ) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.put_kind_batch_fenced(writes, change_log, conditions, fence),
-            CpGroup::Mem(n) => n.put_kind_batch_fenced(writes, change_log, conditions, fence),
+            CpGroup::Lsm(n) => n.put_kind_batch_conditioned(writes, change_log, conditions),
+            CpGroup::Mem(n) => n.put_kind_batch_conditioned(writes, change_log, conditions),
         }
     }
 
@@ -355,12 +348,12 @@ impl CpGroup {
         }
     }
 
-    /// As [`put_fenced`](Self::put_fenced), but for a delete (tombstone). See
-    /// [`RaftKvNode::delete_fenced`].
-    fn delete_fenced(&self, key: Vec<u8>, fence: KeyRange) -> ProposeResult {
+    /// As [`put`](Self::put), but for a delete (tombstone). See
+    /// [`RaftKvNode::delete`].
+    fn delete(&self, key: Vec<u8>) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.delete_fenced(key, fence),
-            CpGroup::Mem(n) => n.delete_fenced(key, fence),
+            CpGroup::Lsm(n) => n.delete(key),
+            CpGroup::Mem(n) => n.delete(key),
         }
     }
 
@@ -489,11 +482,10 @@ impl CpGroup {
     pub(crate) fn propose_seed_batch(
         &self,
         rows: Vec<animus_cp_data::SeedRow>,
-        fence: animus_tablet::KeyRange,
     ) -> animus_control::ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.propose_seed_batch(rows, fence),
-            CpGroup::Mem(n) => n.propose_seed_batch(rows, fence),
+            CpGroup::Lsm(n) => n.propose_seed_batch(rows),
+            CpGroup::Mem(n) => n.propose_seed_batch(rows),
         }
     }
 
@@ -1848,7 +1840,6 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // `RegisterCpAddr` (a follower-connected node has no other way to
             // reach the control leader).
             | MetaCommand::RegisterNodeAddrs { .. }
-            | MetaCommand::SplitTablet { .. }
             // Copy-based split workflow (ADR 0050): `trigger_split` proposes
             // `BeginSplit` from whichever node's admin/auto-split surface
             // fired it, and the split driver (B4/B5) proposes `CutoverSplit`
@@ -5206,49 +5197,6 @@ impl ClientCtx {
         e.ends_with("; retry")
     }
 
-    /// Serve a linearizable **get** on a known-leader local handle, enforcing
-    /// the **read-side scope pre-check** (ADR 0033 — the read dual of
-    /// [`cp_put_local`](Self::cp_put_local)'s pre-propose range check) and the
-    /// served/absent disambiguation.
-    ///
-    /// `Ok(None)` is a genuinely **served** absent. `Err("…; retry")` covers
-    /// the two conditions that must never be reported as absence: (1) the
-    /// group's live `scope_range()` does not contain `key` — this routing
-    /// resolution raced a split's narrow, so this group
-    /// does not (or does not *yet*) own the key, and serving from its engine
-    /// could return absent-or-stale for data another group is authoritative
-    /// for; (2) the ReadIndex barrier failed (deposed / mid-election leader)
-    /// — nothing can be concluded about the key at all. Both were previously
-    /// collapsed into "absent" (`Value(None)`), which read exactly like data
-    /// loss from the outside — a regression caught under a real
-    /// multi-process deployment, before tablet merge was removed entirely
-    /// (split-only tablets).
-    ///
-    /// **Test-only since ADR 0018 §2/PR4** (`split_fence_tests`'s stale-scope
-    /// regression, which drives a raw `CpGroup` handle with no `ClientCtx`
-    /// around it): every real call site now goes through
-    /// [`cp_get_local_resolving`](Self::cp_get_local_resolving) instead,
-    /// which additionally chases a foreign intent (needs `&self` for the
-    /// cross-tablet `TxnStatus` round trip this associated function has no
-    /// way to make).
-    #[cfg(test)]
-    // Its last non-doc caller (the zero-copy `split_fence_tests`) was
-    // tombstoned in ADR 0050 rung 5; kept as the documented baseline the
-    // `_resolving`/`_snapshot` variants' contracts build on, deleted for
-    // good in the B7 sweep with the rest of the fence-era read guards.
-    #[allow(dead_code)]
-    async fn cp_get_local(leader: &CpGroup, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
-        if !leader.scope_range().contains(key) {
-            return Err(format!(
-                "key {key:?} outside tablet's current range (stale routing, likely a split crossover); retry"
-            ));
-        }
-        match leader.linearizable_get_served(key).await {
-            Some(v) => Ok(v),
-            None => Err("CP group leader moved; retry".into()),
-        }
-    }
-
     /// As [`cp_get_local`](Self::cp_get_local), but additionally chases a
     /// **foreign intent** (ADR 0018 §2/PR4 — a multi-participant
     /// transaction's intent whose covering record lives on a *different*
@@ -5707,8 +5655,7 @@ impl ClientCtx {
             return Ok(());
         }
         Self::frozen_refusal(leader)?;
-        let fence = leader.scope_range();
-        let index = match leader.propose_seed_batch(rows, fence) {
+        let index = match leader.propose_seed_batch(rows) {
             animus_control::ProposeResult::Accepted { index, .. } => index,
             other => return Err(format!("seed batch not accepted: {other:?}; retry")),
         };
@@ -5793,7 +5740,7 @@ impl ClientCtx {
         else {
             return Ok(()); // empty batch is a no-op
         };
-        match leader.put_kind_batch_fenced(writes, change_log, Vec::new(), fence) {
+        match leader.put_kind_batch_conditioned(writes, change_log, Vec::new()) {
             ProposeResult::Accepted { .. } => {}
             other => return Err(format!("kind write not accepted: {other:?}")),
         }
@@ -5859,7 +5806,7 @@ impl ClientCtx {
                 return Err("kind write outside this group's live range; retry".into());
             }
         }
-        match leader.put_kind_batch_fenced(writes, change_log, conditions, fence) {
+        match leader.put_kind_batch_conditioned(writes, change_log, conditions) {
             ProposeResult::Accepted { .. } => {}
             other => return Err(format!("kind write not accepted: {other:?}")),
         }
@@ -5920,7 +5867,7 @@ impl ClientCtx {
                 "key {bad_key:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
-        match leader.put_batch_fenced(group, fence) {
+        match leader.put_batch(group) {
             ProposeResult::Accepted { .. } => Ok(probe),
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
         }
@@ -7670,7 +7617,7 @@ impl ClientCtx {
                 "key outside tablet's current range (stale routing, likely a split crossover); retry".into(),
             );
         }
-        match leader.put_fenced(key.clone(), value.clone(), fence) {
+        match leader.put(key.clone(), value.clone()) {
             ProposeResult::Accepted { .. } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
                 let mut poll = CP_CONFIRM_POLL_INIT;
@@ -7709,7 +7656,7 @@ impl ClientCtx {
                 "key outside tablet's current range (stale routing, likely a split crossover); retry".into(),
             );
         }
-        match leader.delete_fenced(key.clone(), fence) {
+        match leader.delete(key.clone()) {
             ProposeResult::Accepted { .. } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
                 let mut poll = CP_CONFIRM_POLL_INIT;
@@ -8333,16 +8280,11 @@ impl ClientCtx {
                 let Some(leader) = self.edge.cp_leader(tablet) else {
                     return self.not_leader_refusal(Some(tablet));
                 };
-                // ADR 0044 phase-1 PR4: the hot_read scope-transition latch,
-                // sourced from `metadata_fresh()` — see
-                // `hot_read_scope_ok`'s own doc for why this narrows the ADR
-                // 0043 residual `effective_metadata()` alone left open (and
-                // for the accepted remaining sub-window it does not close).
-                let meta = self.metadata_fresh().await;
-                if let Err(e) = Self::hot_read_scope_ok(&meta, tablet, &leader) {
-                    return ClientResponse::Error(e);
-                }
-                let pairs = index_drain::hot_read(&meta, tablet, &leader, from_position, limit)
+                // The ADR 0048 scope-transition latch died with the mutable
+                // scope (ADR 0050 rung 7): ranges are immutable and a split
+                // retires the parent whole, so there is no transition window
+                // left to latch.
+                let pairs = index_drain::hot_read(&leader, from_position, limit)
                     .await
                     .into_iter()
                     .map(|(key, _, value)| (key, value))
@@ -9888,7 +9830,6 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
         let view = MetadataView {
             tablets: meta.tablets,
             down,
-            split_parent: meta.split_parents,
         };
         reconciler.tick(&view).await;
     }
@@ -11685,37 +11626,6 @@ impl ClientCtx {
     /// still shows the pre-split width, so this check passes and a hot-read
     /// can still observe the fabrication class ADR 0043 describes. Full
     /// closure of this sub-window would need a per-read control-leader
-    /// round trip on every `hot_read` call — rejected as disproportionate in
-    /// the #220 analysis for the same reason a per-write round trip was
-    /// rejected there. The accepted remaining exposure is bounded to the
-    /// control apply task's own catch-up latency (milliseconds under normal
-    /// load), not the reconciler's (much longer) tick cadence — see ADR
-    /// 0048's residual section for the full accounting, and the D8 e2e
-    /// adjudicator (`streams_e2e.rs::
-    /// auto_split_mid_stream_with_live_consumer_across_every_node`)'s own
-    /// doc for how a distinct-`eventID` failure there should be read against
-    /// this specific remaining window rather than assumed to be the
-    /// pre-latch bug recurring wholesale.
-    fn hot_read_scope_ok(meta: &Metadata, tablet: TabletId, group: &CpGroup) -> Result<(), String> {
-        let Some(t) = meta.tablets.get(&tablet) else {
-            // Dropped/reclaimed table — the caller's own absence handling
-            // (an empty/error reply upstream) applies; not this latch's
-            // concern.
-            return Ok(());
-        };
-        let live = group.scope_range();
-        if live != t.range && live.contains_range(&t.range) {
-            // This node's live scope is strictly wider than the freshest
-            // known declared range: a split-driven narrow this node's own
-            // reconciler owes is outstanding. Refuse retryably rather than
-            // risk serving a record that, per `meta`, already belongs to a
-            // split-off sibling (which will itself answer for it once
-            // hosted) — the fabrication class this latch exists to prevent.
-            return Err("tablet scope transitioning (split narrow pending); retry".into());
-        }
-        Ok(())
-    }
-
     /// Fetch up to `limit` of `tablet`'s own open-shard hot records with
     /// packed HLC strictly greater than `from_position` (ADR 0042 §7/§8,
     /// PR6's `GetRecords` open-shard path) — the internal `ClientRequest::
@@ -11736,26 +11646,14 @@ impl ClientCtx {
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
-                    // ADR 0044 phase-1 PR4: the hot_read scope-transition
-                    // latch (see `hot_read_scope_ok`'s own doc) — a
-                    // retryable refusal here re-enters this same loop
-                    // (re-resolving routing fresh next pass) rather than
-                    // ever risking a stale-wide answer.
-                    let meta = self.metadata_fresh().await;
-                    if let Err(e) = Self::hot_read_scope_ok(&meta, tablet, &leader) {
-                        if tokio::time::Instant::now() >= deadline {
-                            return Err(e);
-                        }
-                        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
-                        continue;
-                    }
-                    return Ok(
-                        index_drain::hot_read(&meta, tablet, &leader, from_position, limit)
-                            .await
-                            .into_iter()
-                            .map(|(key, _, value)| (key, value))
-                            .collect(),
-                    );
+                    // The ADR 0048 scope-transition latch died with the
+                    // mutable scope (ADR 0050 rung 7) — immutable ranges
+                    // leave no transition window to latch.
+                    return Ok(index_drain::hot_read(&leader, from_position, limit)
+                        .await
+                        .into_iter()
+                        .map(|(key, _, value)| (key, value))
+                        .collect());
                 }
                 Some(CpRoute::Forward(addr)) => {
                     let request = ClientRequest::Forwarded {
@@ -13399,134 +13297,6 @@ pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io:
     let msg = serde_json::from_slice(&buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(msg))
-}
-
-/// Regression tests for the ADR 0028 write-fence pre-propose check
-/// (`cp_put_local`/`cp_delete_local`/`cp_batch_propose`). These live **inside**
-/// the crate (as opposed to `tests/*.rs`, a separate crate) specifically to
-/// reach the private `CpGroup`/`ClientCtx` handles a real stale-routed write
-/// needs to be driven directly against a specific tablet's group — nothing
-/// under `tests/` can construct this scenario, since `cp_route`'s normal
-/// resolution reads this node's own (freshly polled) `Metadata` and would
-/// simply route a post-split write to the correct child on its own.
-#[cfg(test)]
-mod split_fence_tests {
-    // TOMBSTONE (ADR 0050 Train B rung 5): `stale_routed_write_for_a_
-    // split_childs_key_is_rejected_not_lost` was deleted here, not parked.
-    // Its premise was the ZERO-COPY crossover window: a split narrowed the
-    // parent's live scope while both groups shared physical keys on one
-    // engine, so a stale-routed write to the parent could shadow the
-    // child's data — guarded by the pre-propose range check against the
-    // narrowed scope. Under per-tablet engines a tablet's declared range
-    // is IMMUTABLE (nothing ever narrows; there is no shared physical key
-    // to shadow), and the copy-based workflow's stale-routing story is the
-    // FROZEN parent's retryable refusal instead. Successor coverage:
-    // `animus-cp-data/tests/freeze.rs` (every mutating command refused on
-    // a frozen group, durable across restart) and `tests/split_build.rs`
-    // (writes racing the freeze->cutover window from every node re-route
-    // and land exactly once).
-}
-
-/// ADR 0044 phase-1 PR4: unit coverage for the hot_read scope-transition
-/// latch (`ClientCtx::hot_read_scope_ok`) in isolation — the function is a
-/// private associate of `ClientCtx` (no `pub`), so this lives in-crate like
-/// `split_fence_tests` above rather than under `tests/`, which can't reach
-/// it. Deterministic: `hot_read_scope_ok` is a pure comparison given a
-/// `Metadata` snapshot and a live `CpGroup`'s own `scope_range()`, no real
-/// cluster bring-up needed. The end-to-end, real-race evidence that this
-/// narrows the ADR 0043 residual (see `hot_read_scope_ok`'s own doc for the
-/// control-apply-lag sub-window it does not close) is `tests/streams_e2e.rs`'s
-/// `auto_split_mid_stream_with_live_consumer_across_every_node` (D8), the
-/// historical adjudicator for this exact fabrication class (distinct-
-/// `eventID` duplicates straddling a split boundary) — still the live
-/// signal for the accepted remaining window, not just the pre-latch bug.
-#[cfg(test)]
-mod hot_read_latch_tests {
-    use std::time::Duration;
-
-    use animus_control::Metadata;
-    use animus_cp_data::{RaftKvNode, StorageScope};
-    use animus_env::{ProdEnv, nid};
-    use animus_storage::MemoryEngine;
-    use animus_tablet::{KeyRange, Tablet, TabletId};
-    use tokio::time::sleep;
-
-    use crate::{ClientCtx, CpGroup};
-
-    /// A lone single-voter group over a real (loopback) `ProdEnv` — self-
-    /// elects immediately (`initial_formation`-shaped: `all_nodes` is just
-    /// this one id), scoped to `range`.
-    async fn lone_group(range: KeyRange) -> CpGroup {
-        let dir = tempfile::tempdir().unwrap();
-        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), dir.path())
-            .await
-            .expect("bind");
-        let scope = StorageScope::new(range);
-        let node: RaftKvNode<ProdEnv, MemoryEngine> =
-            RaftKvNode::start_hosted(env, vec![nid(0)], MemoryEngine::new(), scope, 1);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !node.is_leader() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "single-voter group never elected itself leader"
-            );
-            sleep(Duration::from_millis(10)).await;
-        }
-        CpGroup::Mem(node)
-    }
-
-    fn meta_with_range(tablet: TabletId, range: KeyRange) -> Metadata {
-        let mut meta = Metadata::default();
-        meta.tablets.insert(
-            tablet,
-            Tablet::new_for_table(tablet, "t", range, vec![nid(0)]),
-        );
-        meta
-    }
-
-    /// The exact scenario the latch exists to catch: metadata already
-    /// reflects a post-split narrower declared range, but this node's own
-    /// reconciler has not yet locally executed `narrow_scope` — the live
-    /// scope is still the pre-split wide range.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn refuses_retryably_while_the_live_scope_is_wider_than_the_declared_range() {
-        let tablet = TabletId(1);
-        let group = lone_group(KeyRange::whole()).await;
-        let meta = meta_with_range(tablet, KeyRange::new(b"".to_vec(), Some(b"m".to_vec())));
-        let err = ClientCtx::hot_read_scope_ok(&meta, tablet, &group)
-            .expect_err("a wider-than-declared live scope must refuse retryably");
-        assert!(
-            err.ends_with("; retry"),
-            "the refusal must use this crate's established retryable-error shape (`read_should_retry`): {err}"
-        );
-    }
-
-    /// Once the reconciler's own `narrow_scope` has executed (the live scope
-    /// now matches the declared range), the latch must not refuse.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn allows_once_the_live_scope_matches_the_declared_range() {
-        let tablet = TabletId(1);
-        let range = KeyRange::new(b"".to_vec(), Some(b"m".to_vec()));
-        let group = lone_group(range.clone()).await;
-        let meta = meta_with_range(tablet, range);
-        assert!(
-            ClientCtx::hot_read_scope_ok(&meta, tablet, &group).is_ok(),
-            "a live scope that already matches the declared range must not be refused"
-        );
-    }
-
-    /// A dropped/reclaimed tablet (absent from `Metadata` entirely) is not
-    /// this latch's concern — the caller's own absence handling applies.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_dropped_tablet_is_not_this_latchs_concern() {
-        let tablet = TabletId(1);
-        let group = lone_group(KeyRange::whole()).await;
-        let meta = Metadata::default();
-        assert!(
-            ClientCtx::hot_read_scope_ok(&meta, tablet, &group).is_ok(),
-            "an absent tablet must fall through, not be refused by this latch"
-        );
-    }
 }
 
 /// Unit tests for [`byte_weighted_median`] (ADR 0034) — a private free

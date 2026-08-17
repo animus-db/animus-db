@@ -41,7 +41,6 @@ pub use delta_ring::DeltaRing;
 pub use detector::{FailureDetector, Liveness};
 pub use meta::{
     ApplyOutcome, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus, StreamShardRow,
-    StreamSplitBasis,
 };
 pub use node::{DeltaReply, MetadataChanged, MetadataWatch, RaftNode};
 pub use schema::{
