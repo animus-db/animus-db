@@ -5700,17 +5700,23 @@ impl ClientCtx {
                     return Self::seed_rows_local(&leader, rows).await;
                 }
                 Some(CpRoute::Forward(addr)) => {
-                    let request = ClientRequest::Forwarded {
-                        request: Box::new(ClientRequest::SeedRows {
-                            tablet: child.0,
-                            rows: rows.clone(),
-                        }),
-                        traceparent: otel::current_traceparent(),
+                    // Hint-chasing forward (`forward_to_tablet_leader`), never a
+                    // single blind relay: fork F5 places a child at fresh homes,
+                    // so this node (the parent's leader) may host NO replica of
+                    // it — `resolve_cp_route`'s fallback is then only a first
+                    // guess among the child's replicas, and only the refusal's
+                    // own leader hint can correct it.
+                    let request = ClientRequest::SeedRows {
+                        tablet: child.0,
+                        rows: rows.clone(),
                     };
-                    match self.relay(addr, request).await {
+                    match self
+                        .forward_to_tablet_leader(Some(child), addr, request)
+                        .await
+                    {
                         ClientResponse::PutOk => return Ok(()),
                         ClientResponse::Error(e)
-                            if topology::parse_not_leader_refusal(&e).is_some() => {} // stale hint, retry below
+                            if topology::parse_not_leader_refusal(&e).is_some() => {} // chase exhausted mid-election, retry below
                         ClientResponse::Error(e) => return Err(e),
                         other => return Err(format!("unexpected seed reply: {other:?}")),
                     }
@@ -7923,6 +7929,36 @@ impl ClientCtx {
         request: ClientRequest,
     ) -> ClientResponse {
         let tablet = self.tablet_for(table, key);
+        self.forward_to_tablet_leader(tablet, addr, request).await
+    }
+
+    /// The tablet-id-addressed core of [`cp_forward`](Self::cp_forward) —
+    /// the ONE hint-chasing forward implementation, shared with every
+    /// internal RPC addressed by **tablet id** rather than by a client key
+    /// ([`seed_child_rows`](Self::seed_child_rows), [`force_seal_tablet`](Self::force_seal_tablet),
+    /// [`grow_stream_tablet`](Self::grow_stream_tablet),
+    /// `clear_backfill_cursor_tablet`, [`read_stream_hot_records`](Self::read_stream_hot_records)).
+    ///
+    /// Those callers used to relay once and, on a "not the leader here"
+    /// refusal, re-run `resolve_cp_route` from scratch — which **never
+    /// converges when this node hosts no replica of the target tablet**:
+    /// the no-local-replica fallback deterministically returns the same
+    /// first replica address every time, that follower refuses with a
+    /// leader hint every time, and the hint was thrown away every time.
+    /// The split-build driver hit exactly this (ADR 0050 fork F5 places a
+    /// child at fresh homes, so on a >RF-node cluster the parent's leader
+    /// routinely hosts no replica of one child): seeding that child spun
+    /// against the same follower forever and the split never converged,
+    /// never froze, never cut over — the parent kept all its keys with two
+    /// empty/half-seeded `Building` children parked beside it, indefinitely.
+    /// Chasing the refusal's own embedded hint here (identically to a
+    /// client-key forward) is what actually reaches the leader.
+    async fn forward_to_tablet_leader(
+        &self,
+        tablet: Option<TabletId>,
+        addr: SocketAddr,
+        request: ClientRequest,
+    ) -> ClientResponse {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         let mut tried: BTreeSet<SocketAddr> = BTreeSet::new();
         let mut next = addr;
@@ -11586,12 +11622,12 @@ impl ClientCtx {
     /// runs — the caller (`dynamo.rs`'s disable flow) may be connected to
     /// any node, not necessarily one that leads any of the table's tablets.
     ///
-    /// Deliberately a **simpler** retry shape than [`cp_forward`](Self::cp_forward)'s
-    /// hint-chasing loop: this re-resolves [`resolve_cp_route`](Self::resolve_cp_route)
-    /// **from scratch** every iteration instead of chasing a stale hint —
-    /// correct (converged-or-timeout) and easier to reason about for a rare,
-    /// human-initiated admin-ish operation with no latency budget to protect,
-    /// unlike the hot per-request CP read/write path `cp_forward` serves.
+    /// Forwards via [`forward_to_tablet_leader`](Self::forward_to_tablet_leader)
+    /// (the hint-chasing shape) — an earlier revision relayed once and
+    /// re-resolved `resolve_cp_route` from scratch instead, which never
+    /// converges when this node hosts no replica of `tablet` (see the
+    /// helper's doc); the outer loop here still re-resolves between chases
+    /// as its converged-or-timeout backstop.
     pub(crate) async fn force_seal_tablet(&self, tablet: TabletId) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
         loop {
@@ -11610,11 +11646,11 @@ impl ClientCtx {
                         .map(|_| ());
                 }
                 Some(CpRoute::Forward(addr)) => {
-                    let request = ClientRequest::Forwarded {
-                        request: Box::new(ClientRequest::ForceSeal { tablet: tablet.0 }),
-                        traceparent: otel::current_traceparent(),
-                    };
-                    match self.relay(addr, request).await {
+                    let request = ClientRequest::ForceSeal { tablet: tablet.0 };
+                    match self
+                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .await
+                    {
                         ClientResponse::PutOk => return Ok(()),
                         ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
                             return Err(e);
@@ -11666,13 +11702,13 @@ impl ClientCtx {
                     };
                 }
                 Some(CpRoute::Forward(addr)) => {
-                    let request = ClientRequest::Forwarded {
-                        request: Box::new(ClientRequest::TriggerAutoSplit { tablet: tablet.0 }),
-                        traceparent: otel::current_traceparent(),
-                    };
-                    match self.relay(addr, request).await {
+                    let request = ClientRequest::TriggerAutoSplit { tablet: tablet.0 };
+                    match self
+                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .await
+                    {
                         ClientResponse::Error(e)
-                            if topology::parse_not_leader_refusal(&e).is_some() => {} // stale hint, retry below
+                            if topology::parse_not_leader_refusal(&e).is_some() => {} // chase exhausted mid-election, retry below
                         other => return other,
                     }
                 }
@@ -11758,10 +11794,10 @@ impl ClientCtx {
     /// Delete `index`'s own backfill cursor row on one `tablet`, wherever
     /// its leader actually runs — mirrors
     /// [`force_seal_tablet`](Self::force_seal_tablet)'s per-tablet
-    /// forward/retry shape exactly (re-resolves
-    /// [`resolve_cp_route`](Self::resolve_cp_route) fresh every attempt;
-    /// this is a rare, human-request-driven action with no latency budget
-    /// to protect).
+    /// forward/retry shape exactly (a hint-chasing
+    /// [`forward_to_tablet_leader`](Self::forward_to_tablet_leader) per
+    /// attempt, re-resolving [`resolve_cp_route`](Self::resolve_cp_route)
+    /// between chases as the converged-or-timeout backstop).
     async fn clear_backfill_cursor_tablet(
         &self,
         tablet: TabletId,
@@ -11774,14 +11810,14 @@ impl ClientCtx {
                     return index_drain::clear_backfill_cursor(&leader, index).await;
                 }
                 Some(CpRoute::Forward(addr)) => {
-                    let request = ClientRequest::Forwarded {
-                        request: Box::new(ClientRequest::ClearBackfillCursor {
-                            tablet: tablet.0,
-                            index: index.to_owned(),
-                        }),
-                        traceparent: otel::current_traceparent(),
+                    let request = ClientRequest::ClearBackfillCursor {
+                        tablet: tablet.0,
+                        index: index.to_owned(),
                     };
-                    match self.relay(addr, request).await {
+                    match self
+                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .await
+                    {
                         ClientResponse::PutOk => return Ok(()),
                         ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
                             return Err(e);
@@ -11846,8 +11882,10 @@ impl ClientCtx {
     /// StreamHotRead` RPC, forwarded to whichever node currently leads
     /// `tablet`. Mirrors [`force_seal_tablet`](Self::force_seal_tablet)'s
     /// retry shape exactly (there is no client key to derive routing from,
-    /// so this re-resolves [`resolve_cp_route`](Self::resolve_cp_route) fresh
-    /// every attempt) — acceptable for a `GetRecords` poll, which already
+    /// so each attempt is a hint-chasing
+    /// [`forward_to_tablet_leader`](Self::forward_to_tablet_leader), with a
+    /// fresh [`resolve_cp_route`](Self::resolve_cp_route) between chases) —
+    /// acceptable for a `GetRecords` poll, which already
     /// tolerates "not there yet, poll again" as part of the stream's own
     /// eventually consistent contract.
     pub(crate) async fn read_stream_hot_records(
@@ -11870,15 +11908,15 @@ impl ClientCtx {
                         .collect());
                 }
                 Some(CpRoute::Forward(addr)) => {
-                    let request = ClientRequest::Forwarded {
-                        request: Box::new(ClientRequest::StreamHotRead {
-                            tablet: tablet.0,
-                            from_position,
-                            limit,
-                        }),
-                        traceparent: otel::current_traceparent(),
+                    let request = ClientRequest::StreamHotRead {
+                        tablet: tablet.0,
+                        from_position,
+                        limit,
                     };
-                    match self.relay(addr, request).await {
+                    match self
+                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .await
+                    {
                         ClientResponse::Pairs(pairs) => return Ok(pairs),
                         ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
                             return Err(e);
