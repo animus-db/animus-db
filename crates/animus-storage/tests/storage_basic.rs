@@ -281,6 +281,18 @@ fn merge_tombstone_is_per_key_lww_and_entries_with_tombstones_retains_deletes() 
                 (b"other".to_vec(), Some(b"x".to_vec()), 100),
             ]
         );
+
+        // `scan_with_tombstones` is the range-scoped sibling (ADR 0050): same
+        // shape, `[start, end)`-bounded, tombstones retained.
+        let ranged = e.scan_with_tombstones(b"k", b"l").await.unwrap();
+        assert_eq!(ranged, vec![(b"k".to_vec(), None, 9)]);
+        let all = e.scan_with_tombstones(b"", b"z").await.unwrap();
+        assert_eq!(
+            all, with_ts,
+            "whole-range scan matches entries_with_tombstones"
+        );
+        let empty = e.scan_with_tombstones(b"l", b"o").await.unwrap();
+        assert!(empty.is_empty(), "range excluding both keys is empty");
     });
 }
 

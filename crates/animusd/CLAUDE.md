@@ -152,6 +152,21 @@ help) prints the full invocation reference (durable LSM backend by
 default; `--ephemeral` selects the volatile memory engine). Notes not
 obvious from `--help` alone:
 
+**The split-build driver** (ADR 0050 Train B rung 4) is a
+`change_consumer_loop` arm: for a `Splitting` parent this node leads, it
+wakes the group, holds the quiesce veto, **holds trim** (metadata-derived —
+the `!splitting` gates on the marker branch and `trim_janitor`; driver
+liveness never gates it), bulk-copies BASE+LSI+FOOTPRINT (never
+CHANGE/CURSOR) into the two `Building` children via
+`ClientCtx::seed_child_rows` (local-or-`Forwarded{SeedRows}`, one confirm
+implementation `seed_rows_local`, confirm-by-applied-index), then tails the
+parent's change log by **packed-HLC watermark** (never a key-position
+cursor — see the engineering-lessons entry) at token granularity (or full
+prefix for sub-token raw keys). Progress mirrors to
+`ctx.data().split_builds` → `/admin/raftkv`'s
+`split_rows_shipped`/`split_converged`. The build parks at convergence —
+freeze/cutover are B5. E2e: `tests/split_build.rs`.
+
 `--auto-split K` (key count), `--auto-split-bytes B` (byte size), and
 `--auto-split-change-rate RATE` (streamed tables only, ADR 0042 §14 Fork F —
 bytes/sec of a tablet's own `KIND_CHANGE` growth, `/admin/metrics`'s

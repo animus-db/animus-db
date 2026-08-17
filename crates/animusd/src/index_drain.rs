@@ -223,6 +223,7 @@ use animus_env::{Clock, Env, Metric, Rng};
 use animus_tablet::KeyRange;
 use animus_tablet::TOKEN_BYTES;
 use animus_tablet::TabletId;
+use animus_tablet::TabletState;
 use animus_tablet::partition_token;
 
 use crate::{ClientCtx, CpGroup, IndexStatus, MetaCommand};
@@ -310,6 +311,11 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
     // accumulate to a floor instead of being trimmed per tick). Same
     // ownership/bounding discipline as `first_hot_seen` above.
     let mut marker_bytes_seen: BTreeMap<TabletId, u64> = BTreeMap::new();
+    // ADR 0050 Train B rung 4: per-parent split-build driver state, keyed by
+    // the `Splitting` parent's id. Driver-local (a re-led driver starts
+    // fresh and re-runs idempotently); mirrored into
+    // `ctx.data().split_builds` for `/admin/raftkv` observability only.
+    let mut split_builds: BTreeMap<TabletId, SplitBuild> = BTreeMap::new();
     loop {
         tokio::time::sleep(INDEX_DRAIN_INTERVAL).await;
         let meta = ctx.effective_metadata();
@@ -319,6 +325,21 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
         // forever.
         first_hot_seen.retain(|t, _| meta.tablets.contains_key(t));
         marker_bytes_seen.retain(|t, _| meta.tablets.contains_key(t));
+        // A build entry lives exactly as long as its parent is `Splitting`
+        // (cutover removes the parent from the map entirely, fork F6).
+        split_builds.retain(|t, _| {
+            meta.tablets
+                .get(t)
+                .is_some_and(|tab| tab.state == TabletState::Splitting)
+        });
+        {
+            let mut mirror = ctx
+                .data()
+                .split_builds
+                .lock()
+                .expect("split_builds poisoned");
+            mirror.retain(|t, _| split_builds.contains_key(&TabletId(*t)));
+        }
         // Growth PR3 Fork F: bound the change-rate tracker the same way —
         // `ctx.data()` is safe unconditionally here, exactly like
         // `seal_tick`'s own `ctx.data().raftkv_metrics` access below: this
@@ -327,6 +348,33 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
         for (tablet, group) in ctx.edge.hosted_groups() {
             if !group.is_leader() {
                 continue;
+            }
+            // ADR 0050 Train B rung 4: the split-build driver arm. Runs for
+            // a `Splitting` parent this node leads, BEFORE the quiesced
+            // skip — a parent that quiesced idle before `BeginSplit`
+            // committed would otherwise never be visited again (nothing
+            // else wakes it), so the driver wakes it and holds the quiesce
+            // veto for the build's whole duration. Trim is held too (the
+            // `!splitting` gates below): the tail's cursor assumes records
+            // never vanish beneath it, and the change log is the build's
+            // delta feed (the metadata-derived trim hold — driver liveness
+            // never gates it, so a driver crash can never let trim advance).
+            let splitting = meta
+                .tablets
+                .get(&tablet)
+                .is_some_and(|t| t.state == TabletState::Splitting);
+            if splitting {
+                group.wake();
+                group.set_quiesce_veto(true);
+                let build = split_builds.entry(tablet).or_default();
+                if let Err(e) = split_driver_tick(&ctx, &meta, tablet, &group, build).await {
+                    tracing::debug!(tablet = tablet.0, error = %e, "split build: tick failed");
+                }
+                ctx.data()
+                    .split_builds
+                    .lock()
+                    .expect("split_builds poisoned")
+                    .insert(tablet.0, (build.rows_shipped, build.converged));
             }
             // ADR 0044 phase-1 PR6: "quiesced ⇒ nothing new for the
             // sweeper" is an invariant PR5's veto makes sound — a led
@@ -422,6 +470,11 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             //   trim-everything rule (F10/F12-b) deletes every marker in
             //   declared range — the same rule, not a second deleter.
             if gsis.is_empty() && !stream_enabled && !ever_streamed {
+                if splitting {
+                    // Trim held for the build (the split driver above holds
+                    // the veto and consumes the markers as its tail feed).
+                    continue;
+                }
                 let bytes = group.approx_bytes_kind(KIND_CHANGE).await;
                 if bytes == 0 {
                     group.set_quiesce_veto(false);
@@ -459,7 +512,9 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             // nor an enabled/ever-enabled stream holds it too now — via the
             // marker branch above, for its own trim obligation.)
             let hot_backlog_present = !group.pending_changes().await.is_empty();
-            group.set_quiesce_veto(hot_backlog_present);
+            // `|| splitting`: the split driver's own hold (above) must not be
+            // released by an empty-backlog sweep mid-build.
+            group.set_quiesce_veto(hot_backlog_present || splitting);
             // `drain_tablet` is GSI-specific (it reconciles GSI rows and
             // advances the `"gsi"` cursor) — never call it for a
             // streamed-but-unindexed table, or it would write a spurious
@@ -495,8 +550,9 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             {
                 tracing::debug!(tablet = tablet.0, table, error = %e, "seal arm: tick failed");
             }
-            if let Err(e) =
-                trim_janitor(&ctx, &meta, &table, tablet, &group, &gsis, stream_enabled).await
+            if !splitting
+                && let Err(e) =
+                    trim_janitor(&ctx, &meta, &table, tablet, &group, &gsis, stream_enabled).await
             {
                 tracing::debug!(tablet = tablet.0, table, error = %e, "index drain: trim janitor tick failed");
             }
@@ -506,6 +562,219 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
 
 /// Reconcile every dirty item of one tablet not yet covered by the "gsi"
 /// cursor, then advance that cursor to the highest HLC this pass covers.
+/// Per-parent driver state for one in-flight split build (ADR 0050 Train B
+/// rung 4) — **driver-local, never correctness state**: everything here is
+/// an optimization over "re-run the whole pass," which is what a fresh
+/// leader's driver does from an empty entry.
+#[derive(Default)]
+pub(crate) struct SplitBuild {
+    /// The one-time whole-scope copy (BASE + LSI + FOOTPRINT) completed.
+    bulk_done: bool,
+    /// The tail's exclusive packed-HLC watermark: only change records whose
+    /// key's own trailing 8 bytes exceed it count as new. **Deliberately an
+    /// HLC watermark, never a key-position cursor**: `pending_changes`' key
+    /// order is prefix-then-HLC, NOT commit order, so a later write to a
+    /// lower prefix inserts *below* any key cursor and would be skipped
+    /// forever (this rung's own e2e went red on exactly that; the sealer's
+    /// load-bearing re-sort is the same lesson). HLC order IS commit order
+    /// within one tablet (`assert_ts_monotonic`), so the watermark is
+    /// complete. Cost: each tail pass re-scans the whole (trim-held)
+    /// pending set — O(pending) per tick, accepted for the build's bounded
+    /// duration; an O(delta) commit-ordered read is a named B-final
+    /// optimization.
+    tail_hlc: u64,
+    /// Rows shipped so far (observability only).
+    rows_shipped: u64,
+    /// `bulk_done` and the latest tail pass found zero new records.
+    converged: bool,
+}
+
+/// The split-build seed chunk budget: one `SeedBatch` entry's row payload is
+/// capped near this many bytes. Large enough to amortize the per-entry
+/// consensus round, small enough that one entry's apply never stalls the
+/// child's consensus loop past an election timeout (the ADR 0017
+/// apply-stall lesson) and the JSON-framed forwarded hop stays modest.
+const SEED_CHUNK_BYTES: usize = 256 * 1024;
+
+/// The copy kinds (ADR 0050): BASE (values, tombstones, intent envelopes,
+/// txn records), LSI, FOOTPRINT — **never** KIND_CHANGE (a child re-serving
+/// parent change records is the #220 duplication class; children are born
+/// with empty change logs) and **never** KIND_CURSOR (consumer-owned,
+/// restart-from-scratch per ADR 0046's consolidation).
+const SEED_KINDS: [u8; 3] = [KIND_BASE, animus_cp_data::KIND_LSI, KIND_FOOTPRINT];
+
+/// One split-build driver tick for a `Splitting` parent this node leads
+/// (ADR 0050 Train B rung 4). Bulk pass on the first tick (whole-scope,
+/// inline — the `local_pairs` materialization precedent), then O(delta)
+/// tail passes off the parent's change log. Everything idempotent: a
+/// crash/re-lead re-runs from an empty [`SplitBuild`] and converges to the
+/// same state. This rung STOPS at convergence — freeze/final-pass/cutover
+/// are B5's.
+async fn split_driver_tick(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    tablet: TabletId,
+    group: &CpGroup,
+    build: &mut SplitBuild,
+) -> Result<(), String> {
+    let Some(parent) = meta.tablets.get(&tablet) else {
+        return Ok(()); // stale view; nothing to do
+    };
+    // The two Building children BeginSplit minted: same table, sub-ranges of
+    // the parent's own range (B3 guarantees exactly two).
+    let children: Vec<(TabletId, KeyRange)> = meta
+        .tablets
+        .iter()
+        .filter(|(_, t)| {
+            t.state == TabletState::Building
+                && t.table == parent.table
+                && parent.range.contains_range(&t.range)
+        })
+        .map(|(id, t)| (*id, t.range.clone()))
+        .collect();
+    if children.len() != 2 {
+        return Err(format!(
+            "split build: expected 2 Building children of tablet {}, found {}",
+            tablet.0,
+            children.len()
+        ));
+    }
+
+    // Ship `rows` (already filtered to one child) in bounded chunks.
+    async fn ship(
+        ctx: &ClientCtx,
+        child: TabletId,
+        rows: Vec<animus_cp_data::SeedRow>,
+        shipped: &mut u64,
+    ) -> Result<(), String> {
+        let mut chunk: Vec<animus_cp_data::SeedRow> = Vec::new();
+        let mut bytes = 0usize;
+        for row in rows {
+            bytes += 1 + row.1.len() + row.2.as_ref().map_or(0, |v| v.len()) + 16;
+            chunk.push(row);
+            if bytes >= SEED_CHUNK_BYTES {
+                let n = chunk.len() as u64;
+                ctx.seed_child_rows(child, std::mem::take(&mut chunk))
+                    .await?;
+                *shipped += n;
+                bytes = 0;
+            }
+        }
+        if !chunk.is_empty() {
+            let n = chunk.len() as u64;
+            ctx.seed_child_rows(child, chunk).await?;
+            *shipped += n;
+        }
+        Ok(())
+    }
+
+    if !build.bulk_done {
+        for kind in SEED_KINDS {
+            let rows = group.seed_rows_kind(kind as usize, None).await;
+            for (child, range) in &children {
+                let child_rows: Vec<_> = rows
+                    .iter()
+                    .filter(|(logical, _, _)| range.contains(logical))
+                    .map(|(l, v, ver)| (kind, l.clone(), v.clone(), *ver))
+                    .collect();
+                ship(ctx, *child, child_rows, &mut build.rows_shipped).await?;
+            }
+        }
+        build.bulk_done = true;
+    }
+
+    // Tail pass: new change records past the cursor are dirty-key signals.
+    // The dirt granularity is two-tier, keyed off the change key's own
+    // prefix (the logical key minus its trailing 8-byte packed HLC):
+    // - a prefix carrying a full 8-byte token (every dynamo/CQL key, and
+    //   any raw key ≥ 8 bytes) dirties its whole **token** — the unit that
+    //   also owns the item's LSI rows (which reorder the sk and share only
+    //   the token+pk lead) and its txn-record row (which shares the
+    //   anchor's token), and the unit F11 keeps wholly on one child;
+    // - a shorter raw-protocol prefix dirties exactly itself (such tables
+    //   structurally have no LSI/txn rows — `cp_txn` rejects sub-token
+    //   keys — so the prefix covers everything).
+    let changes = group.pending_changes().await;
+    let fresh: Vec<&Vec<u8>> = changes
+        .iter()
+        .filter(|(logical, _)| logical.len() >= 8)
+        .map(|(logical, _)| logical)
+        .filter(|logical| {
+            let mut hlc_bytes = [0u8; 8];
+            hlc_bytes.copy_from_slice(&logical[logical.len() - 8..]);
+            u64::from_be_bytes(hlc_bytes) > build.tail_hlc
+        })
+        .collect();
+    if fresh.is_empty() {
+        build.converged = build.bulk_done;
+        return Ok(());
+    }
+    build.converged = false;
+    let mut dirty: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut max_hlc = build.tail_hlc;
+    for logical in fresh {
+        let prefix = &logical[..logical.len() - 8];
+        if prefix.len() >= 8 {
+            dirty.insert(prefix[..8].to_vec());
+        } else if !prefix.is_empty() {
+            dirty.insert(prefix.to_vec());
+        }
+        let mut hlc_bytes = [0u8; 8];
+        hlc_bytes.copy_from_slice(&logical[logical.len() - 8..]);
+        max_hlc = max_hlc.max(u64::from_be_bytes(hlc_bytes));
+    }
+    for unit in dirty {
+        // The child whose range contains the unit's first key owns every
+        // row under it (F11 token alignment for tokenized tables; a raw
+        // prefix is a single key's own lineage).
+        let Some((child, _)) = children.iter().find(|(_, range)| range.contains(&unit)) else {
+            continue; // outside the parent's own range — cannot happen; skip
+        };
+        let upper = prefix_upper(&unit);
+        for kind in SEED_KINDS {
+            let rows = match &upper {
+                Some(hi) => {
+                    group
+                        .seed_rows_kind(kind as usize, Some((unit.as_slice(), hi.as_slice())))
+                        .await
+                }
+                // All-0xFF unit: no finite upper bound — scan the kind
+                // scope whole and keep the unit's own rows.
+                None => group
+                    .seed_rows_kind(kind as usize, None)
+                    .await
+                    .into_iter()
+                    .filter(|(l, _, _)| l.starts_with(&unit))
+                    .collect(),
+            };
+            let rows: Vec<_> = rows
+                .into_iter()
+                .map(|(l, v, ver)| (kind, l, v, ver))
+                .collect();
+            ship(ctx, *child, rows, &mut build.rows_shipped).await?;
+        }
+    }
+    // Only past every successful ship: a failed tick re-derives the same
+    // dirty units next tick from the unmoved watermark.
+    build.tail_hlc = max_hlc;
+    Ok(())
+}
+
+/// The exclusive upper bound of "every key starting with `prefix`": the
+/// prefix as a big-endian integer plus one, trailing `0xFF` bytes dropped —
+/// the `physical_bounds` prefix-upper-bound idiom. `None` when the prefix is
+/// all `0xFF` (no finite bound exists).
+fn prefix_upper(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    while let Some(last) = upper.pop() {
+        if last < 0xFF {
+            upper.push(last + 1);
+            return Some(upper);
+        }
+    }
+    None
+}
+
 async fn drain_tablet(
     ctx: &ClientCtx,
     meta: &Metadata,

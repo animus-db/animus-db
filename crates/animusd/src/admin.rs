@@ -119,6 +119,17 @@ pub(crate) struct CpRaftView {
     /// specifically to surface that the feature is working, the operator's
     /// own diagnostic.
     pub(crate) quiesced: bool,
+    /// ADR 0050 Train B rung 4: rows shipped so far by this node's own
+    /// split-build driver for this (`Splitting`) parent tablet — `None`
+    /// unless a build is in flight and led here. Observability only (a
+    /// leader change restarts the count with the re-run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) split_rows_shipped: Option<u64>,
+    /// Whether that build's tail has converged (bulk done + latest tail
+    /// pass found nothing new). B5's freeze reads the tail directly; this
+    /// mirror is for operators.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) split_converged: Option<bool>,
 }
 
 /// One entry of a group's `pending: BTreeMap<TxnId, (record_key, created_ts)>`
@@ -563,7 +574,22 @@ fn raft_view(ctx: &ClientCtx) -> Value {
 async fn raftkv_view(ctx: &ClientCtx) -> Value {
     let mut groups: Vec<CpRaftView> = Vec::new();
     for (t, g) in ctx.edge.hosted_groups() {
-        groups.push(g.raft_view(t).await);
+        let mut view = g.raft_view(t).await;
+        // ADR 0050 rung 4: overlay this node's own split-build progress (a
+        // data-role field; absent on a control-only node, which hosts no
+        // groups and never reaches this loop body anyway).
+        if let Some(data) = ctx.data_opt()
+            && let Some((rows, converged)) = data
+                .split_builds
+                .lock()
+                .expect("split_builds poisoned")
+                .get(&t.0)
+                .copied()
+        {
+            view.split_rows_shipped = Some(rows);
+            view.split_converged = Some(converged);
+        }
+        groups.push(view);
     }
     json!({ "hosts_cp": !groups.is_empty(), "groups": groups })
 }

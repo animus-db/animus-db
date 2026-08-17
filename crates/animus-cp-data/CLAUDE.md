@@ -161,7 +161,14 @@ tablet's **immutable** declared `range` — physical keys are
 `[kind] || logical`, no table or tablet bytes); `KvCommand::KindBatch`
 (ADR 0041 §3) is the
 multi-kind atomic batch backing materialized secondary indexes and the
-change log; **transactions** (ADR 0018 §2) are covered in Key invariants
+change log; `KvCommand::SeedBatch` (ADR 0050 Train B rung 4, codec v19) is
+the split-build driver's history-transfer command — `SeedRow`s
+(`(kind, logical, value-or-tombstone, version)`) merge-applied at their
+**carried** versions with the stored bytes verbatim (intent envelopes
+included), emitting nothing into the child's change log and witnessing the
+batch's max version into the group's HLC (`propose_seed_batch` /
+`seed_rows_kind` are the driver's propose/read pair; `tests/seed_batch.rs`
++ `ANIMUS_SPLIT_SEEDS` is its corpus); **transactions** (ADR 0018 §2) are covered in Key invariants
 below. See the crate's rustdoc for the full method/accessor inventory.
 Four rules that aren't derivable from a doc comment:
 

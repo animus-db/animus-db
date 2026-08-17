@@ -113,7 +113,11 @@ const MAGIC: u8 = 0xCB;
 /// `change_log` uses (`put_change_log`/`read_change_log` — never a second
 /// copy). Same house convention: a clean bump, no cross-version
 /// compatibility.
-const VERSION: u8 = 18;
+/// `19` (ADR 0050 Train B rung 4): new `KvCommand::SeedBatch` (tag 13) — the
+/// split-build driver's version-carrying row-transfer command (see the
+/// variant's own doc). Rows are `(kind, logical, Option<value>, version)`
+/// with the standard `fence`/`ts` tail.
+const VERSION: u8 = 19;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -462,6 +466,18 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_key_range(out, fence);
             put_ts(out, *ts);
         }
+        KvCommand::SeedBatch { rows, fence, ts } => {
+            put_u8(out, 13);
+            out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+            for (kind, logical, value, version) in rows {
+                put_u8(out, *kind);
+                put_bytes(out, logical);
+                put_opt_bytes(out, value);
+                out.extend_from_slice(&version.to_be_bytes());
+            }
+            put_key_range(out, fence);
+            put_ts(out, *ts);
+        }
         KvCommand::Delete { key, fence, ts } => {
             put_u8(out, 2);
             put_bytes(out, key);
@@ -704,6 +720,22 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 record_key,
                 keys,
                 outcome,
+                fence: read_key_range(c)?,
+                ts: read_ts(c)?,
+            }
+        }
+        13 => {
+            let n = c.u32()?;
+            let mut rows = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let kind = c.u8()?;
+                let logical = c.bytes()?;
+                let value = c.opt_bytes()?;
+                let version = c.u64()?;
+                rows.push((kind, logical, value, version));
+            }
+            KvCommand::SeedBatch {
+                rows,
                 fence: read_key_range(c)?,
                 ts: read_ts(c)?,
             }
@@ -1093,6 +1125,22 @@ mod tests {
                     value: b"v".to_vec(),
                     fence: KeyRange::whole(),
                     ts: ts(3, 0),
+                },
+                config: None,
+            },
+            LogEntry {
+                term: 4,
+                index: 21,
+                // ADR 0050 rung 4 (version 19): a split-build seed chunk —
+                // a value row, a tombstone row, distinct kinds, carried
+                // versions.
+                command: KvCommand::SeedBatch {
+                    rows: vec![
+                        (0, b"seed-base".to_vec(), Some(b"raw-bytes".to_vec()), 42),
+                        (1, b"seed-lsi".to_vec(), None, 7),
+                    ],
+                    fence: KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())),
+                    ts: ts(3, 1),
                 },
                 config: None,
             },

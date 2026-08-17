@@ -455,6 +455,33 @@ impl CpGroup {
         }
     }
 
+    /// Propose a split-build seed chunk into this (child) group's own log
+    /// (ADR 0050 Train B rung 4). See [`RaftKvNode::propose_seed_batch`].
+    pub(crate) fn propose_seed_batch(
+        &self,
+        rows: Vec<animus_cp_data::SeedRow>,
+        fence: animus_tablet::KeyRange,
+    ) -> animus_control::ProposeResult {
+        match self {
+            CpGroup::Lsm(n) => n.propose_seed_batch(rows, fence),
+            CpGroup::Mem(n) => n.propose_seed_batch(rows, fence),
+        }
+    }
+
+    /// The split-build driver's raw row read — one kind scope's rows with
+    /// tombstones and versions, optionally bounded to a logical range. See
+    /// [`RaftKvNode::seed_rows_kind`].
+    pub(crate) async fn seed_rows_kind(
+        &self,
+        kind_idx: usize,
+        logical_range: Option<(&[u8], &[u8])>,
+    ) -> Vec<(Vec<u8>, Option<Vec<u8>>, u64)> {
+        match self {
+            CpGroup::Lsm(n) => n.seed_rows_kind(kind_idx, logical_range).await,
+            CpGroup::Mem(n) => n.seed_rows_kind(kind_idx, logical_range).await,
+        }
+    }
+
     /// The group's current leader id as this node sees it (for cross-process
     /// routing). See [`RaftKvNode::leader`].
     fn leader(&self) -> Option<NodeId> {
@@ -618,6 +645,11 @@ impl CpGroup {
                     key_count,
                     byte_size,
                     quiesced: $n.is_quiesced(),
+                    // Overlaid by `admin::raftkv_view` from the data role's
+                    // split-build mirror (ADR 0050 rung 4); this constructor
+                    // has no `ClientCtx` to read it from.
+                    split_rows_shipped: None,
+                    split_converged: None,
                 }
             };
         }
@@ -1296,6 +1328,29 @@ pub enum ClientRequest {
     /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
     /// only through the `Forwarded` arm.
     ClearBackfillCursor { tablet: u64, index: String },
+    /// **Internal split-build seed RPC — never sent bare, only wrapped in
+    /// [`Forwarded`](Self::Forwarded)** (ADR 0050 Train B rung 4): propose
+    /// one `KvCommand::SeedBatch` chunk — `(kind, logical key,
+    /// value-or-tombstone, MVCC version)` rows — into `tablet`'s (a
+    /// `Building` split child's) own Raft group, applied as
+    /// version-carrying merges. The **one** production sender is the
+    /// split-build driver (`index_drain::split_driver_tick` via
+    /// `ClientCtx::seed_child_rows`), running on the *parent* tablet's
+    /// leader node — a child's own leader can live anywhere (fork F5,
+    /// placement-chosen homes), so this needs the identical one-hop
+    /// forward/leader-resolution machinery every other CP op has.
+    /// Addressed by `tablet` directly, mirroring
+    /// [`ForceSeal`](Self::ForceSeal) (a `Building` child is deliberately
+    /// unroutable by key). Bare delivery is refused for the same reason
+    /// `KindWrite`'s is: an arbitrary caller must never install raw rows
+    /// at arbitrary versions into a tablet's scopes. Not a `MetaCommand`,
+    /// so `is_relayable_command` does not apply; real handling lives in
+    /// `cp_serve_forwarded`'s match, reached only through the `Forwarded`
+    /// arm.
+    SeedRows {
+        tablet: u64,
+        rows: Vec<animus_cp_data::SeedRow>,
+    },
     /// **Internal evaluate-at-leader write RPC — never sent bare, only
     /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0046 "evaluate at
     /// leader", U3, tracked against `docs/adr-tablet-log-model` #222): the
@@ -1647,6 +1702,7 @@ fn surface_of(request: &ClientRequest) -> Surface {
         | ClientRequest::TriggerAutoSplit { .. }
         | ClientRequest::StreamHotRead { .. }
         | ClientRequest::ClearBackfillCursor { .. }
+        | ClientRequest::SeedRows { .. }
         | ClientRequest::KindWriteItem { .. }
         | ClientRequest::TxnPrepare { .. }
         | ClientRequest::TxnDecide { .. }
@@ -2683,6 +2739,7 @@ impl BoundNode {
             segment_store,
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
+            split_builds: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -3818,6 +3875,7 @@ impl BoundDataNode {
             segment_store,
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
+            split_builds: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             control,
@@ -4600,6 +4658,15 @@ struct DataRole {
     /// rate` trigger (`auto_split_loop`). See [`ChangeRateTracker`]'s own
     /// doc for the full design.
     pub(crate) change_rates: ChangeRateTracker,
+    /// ADR 0050 Train B rung 4: this node's own per-parent-tablet split-build
+    /// progress — `(rows shipped, build converged)` — written by
+    /// `index_drain`'s split-driver arm on the parent's leader node, read by
+    /// `/admin/raftkv` (`CpRaftView.split_rows_shipped`/`split_converged`).
+    /// Driver-local observability only, NEVER correctness state: a leader
+    /// change starts a fresh entry on the new leader's node (the build
+    /// re-runs idempotently), and B5's freeze/cutover decisions read the
+    /// tail's own convergence directly, not this mirror.
+    pub(crate) split_builds: Arc<Mutex<BTreeMap<u64, (u64, bool)>>>,
 }
 
 /// Shared context for the client request server and the DynamoDB/CQL endpoints:
@@ -5559,6 +5626,83 @@ impl ClientCtx {
     /// CQL DELETE — the first raw batch whose base write is a tombstone —
     /// erred iff the connected node did not lead the tablet
     /// (leader-placement-bimodal; caught by `cql_clustering`).
+    /// Propose one split-build seed chunk on a **known-leader** local handle
+    /// of the child group and confirm it applied (ADR 0050 Train B rung 4).
+    ///
+    /// The ONE local implementation, shared by `cp_serve_forwarded`'s
+    /// `SeedRows` arm and `seed_child_rows`' own local branch — never two
+    /// copies (the A2-rebase lesson: one confirm implementation per RPC).
+    /// Confirmation is **by applied index**, not a value probe: seed rows
+    /// merge at *carried* versions, so a legitimately newer row on the child
+    /// (per-key LWW — a later tail pass already shipped a fresher version)
+    /// would make a value probe hang forever on a batch that correctly
+    /// no-opped.
+    async fn seed_rows_local(
+        leader: &CpGroup,
+        rows: Vec<animus_cp_data::SeedRow>,
+    ) -> Result<(), String> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let fence = leader.scope_range();
+        let index = match leader.propose_seed_batch(rows, fence) {
+            animus_control::ProposeResult::Accepted { index, .. } => index,
+            other => return Err(format!("seed batch not accepted: {other:?}; retry")),
+        };
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let mut poll = CP_CONFIRM_POLL_INIT;
+        while tokio::time::Instant::now() < deadline {
+            if leader.engine_applied_index() >= index {
+                return Ok(());
+            }
+            tokio::time::sleep(poll).await;
+            poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
+        }
+        Err("seed batch did not apply in time; retry".into())
+    }
+
+    /// Ship one seed chunk to a split child's group leader, wherever it
+    /// lives (ADR 0050 Train B rung 4): local if this node leads the child,
+    /// else one `Forwarded { SeedRows }` hop chased through the standard
+    /// hint machinery — the identical resolve/relay shape
+    /// `grow_stream_tablet` uses. Idempotent (a duplicate chunk re-merges
+    /// the same versions), so the caller may retry freely.
+    pub(crate) async fn seed_child_rows(
+        &self,
+        child: TabletId,
+        rows: Vec<animus_cp_data::SeedRow>,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            match self.resolve_cp_route(child) {
+                Some(CpRoute::Local(leader)) => {
+                    return Self::seed_rows_local(&leader, rows).await;
+                }
+                Some(CpRoute::Forward(addr)) => {
+                    let request = ClientRequest::Forwarded {
+                        request: Box::new(ClientRequest::SeedRows {
+                            tablet: child.0,
+                            rows: rows.clone(),
+                        }),
+                        traceparent: otel::current_traceparent(),
+                    };
+                    match self.relay(addr, request).await {
+                        ClientResponse::PutOk => return Ok(()),
+                        ClientResponse::Error(e)
+                            if topology::parse_not_leader_refusal(&e).is_some() => {} // stale hint, retry below
+                        ClientResponse::Error(e) => return Err(e),
+                        other => return Err(format!("unexpected seed reply: {other:?}")),
+                    }
+                }
+                Some(CpRoute::None) | None => {} // child group not settled yet, retry
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("seed: did not reach the child's leader in time; retry".into());
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
     async fn cp_kind_raw_local(
         leader: &CpGroup,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
@@ -8059,6 +8203,21 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
+            // ADR 0050 Train B rung 4: the split-build seed RPC — addressed
+            // by `tablet` (a Building child, deliberately unroutable by
+            // key) directly, mirroring `ForceSeal` just above. One shared
+            // local implementation with `seed_child_rows`' own local
+            // branch (`seed_rows_local`), never a second confirm copy.
+            ClientRequest::SeedRows { tablet, rows } => {
+                let tablet = TabletId(tablet);
+                let Some(leader) = self.edge.cp_leader(tablet) else {
+                    return self.not_leader_refusal(Some(tablet));
+                };
+                match Self::seed_rows_local(&leader, rows).await {
+                    Ok(()) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
             // Growth PR3 (ADR 0042 §14): the manual-growth split-trigger
             // RPC — addressed by `tablet` directly, mirroring `ForceSeal`
             // just above. Materializes this tablet's own live pairs
@@ -10271,6 +10430,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::TriggerAutoSplit { .. } => "trigger_auto_split",
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
         ClientRequest::ClearBackfillCursor { .. } => "clear_backfill_cursor",
+        ClientRequest::SeedRows { .. } => "seed_rows",
         ClientRequest::Get { .. } => "get",
         ClientRequest::GetSnapshot { .. } => "get_snapshot",
         ClientRequest::Scan { .. } => "scan",
@@ -10506,6 +10666,11 @@ async fn handle_request(
         ),
         ClientRequest::StreamHotRead { .. } => ClientResponse::Error(
             "this request is an internal open-shard hot-read RPC and must be sent wrapped in \
+             `Forwarded`"
+                .into(),
+        ),
+        ClientRequest::SeedRows { .. } => ClientResponse::Error(
+            "this request is an internal split-build seed RPC and must be sent wrapped in \
              `Forwarded`"
                 .into(),
         ),

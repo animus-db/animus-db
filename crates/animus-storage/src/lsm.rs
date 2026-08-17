@@ -2289,6 +2289,22 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
             .collect())
     }
 
+    async fn scan_with_tombstones(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Key, Option<Value>, Version)>> {
+        // `merged_at` is already ranged and tombstone-retaining — the same
+        // machinery `entries_with_tombstones` uses, bounded instead of
+        // whole-keyspace (ADR 0050: the split-build driver's per-chunk reads
+        // must not pay O(engine) per chunk).
+        let merged = self.merged_at(start, Some(end), Version::MAX).await?;
+        Ok(merged
+            .into_iter()
+            .map(|(k, (v, slot))| (k, slot, v))
+            .collect())
+    }
+
     /// **Cheap, non-materializing** override (ADR 0034): reads only in-memory
     /// metadata already held for other purposes — the memtable (a real,
     /// range-scoped byte sum, since a `BTreeMap` range query costs nothing

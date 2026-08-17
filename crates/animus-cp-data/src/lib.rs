@@ -587,6 +587,34 @@ pub enum KvCommand {
         fence: KeyRange,
         ts: HlcTimestamp,
     },
+    /// **Split-build seed batch** (ADR 0050 Train B rung 4, fork F3): a chunk
+    /// of the parent tablet's rows proposed into a **child** group's own log
+    /// by the split-build driver, applied as **version-carrying merges** —
+    /// the `install_engine_image` semantics as a proposable command. Each row
+    /// is `(kind index, logical key, stored bytes or tombstone, MVCC
+    /// version)`; the stored bytes are the parent engine's value **verbatim**
+    /// (envelope tag included — a staged intent copies as an intent, fork
+    /// F7), and apply merges at the **carried** version, never this entry's
+    /// own `ts`, so re-proposing a chunk is an idempotent no-op and a row
+    /// updated on the parent mid-build wins by per-key LWW on the child too.
+    ///
+    /// Deliberately emits **nothing** into the child's change log — this is
+    /// history transfer, not new mutation (a stream consumer already saw
+    /// these records in the parent's own shards; re-emitting them is the
+    /// #220 duplication class by construction). `fence` follows the standard
+    /// whole-batch convention (`Batch`'s all-or-nothing): every logical key
+    /// must fall inside the child's immutable declared range — the driver
+    /// filters by construction, so a violation is a driver bug surfacing as
+    /// a loud no-op, never a partial install. Apply additionally
+    /// **witnesses** the batch's highest carried version into the group's
+    /// HLC (the snapshot-install discipline) so a child leader's own future
+    /// mints strictly exceed every copied row.
+    SeedBatch {
+        /// Raw engine rows, opaque to this command — see [`SeedRow`].
+        rows: Vec<SeedRow>,
+        fence: KeyRange,
+        ts: HlcTimestamp,
+    },
     /// Remove `key` (a tombstone in the engine), iff `key` falls inside `fence`.
     Delete {
         key: Vec<u8>,
@@ -2041,6 +2069,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 fence,
                 ts,
             }
+        })
+    }
+
+    /// Propose a **split-build seed chunk** into this (child) group's log
+    /// (ADR 0050 Train B rung 4 — see [`KvCommand::SeedBatch`]'s doc for the
+    /// full semantics: version-carrying merges, envelope bytes verbatim, no
+    /// change-log emission, whole-batch fence). `fence` should be the child's
+    /// immutable declared range; the entry's own `ts` is minted normally
+    /// (`propose_ordered`), keeping the apply-time monotonicity assert
+    /// honest, while every row merges at its **carried** version.
+    pub fn propose_seed_batch(&self, rows: Vec<SeedRow>, fence: KeyRange) -> ProposeResult {
+        self.propose_ordered(|term| {
+            let ts = self.mint_pushed::<&[u8]>(term, &[]);
+            KvCommand::SeedBatch { rows, fence, ts }
         })
     }
 
@@ -3592,6 +3634,43 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .collect()
     }
 
+    /// The split-build driver's raw row read (ADR 0050 Train B rung 4): every
+    /// row of one kind scope — **tombstones and MVCC versions retained, value
+    /// bytes verbatim** (envelope tag included, so a staged intent ships as
+    /// an intent, fork F7) — optionally bounded to `[start, end)` in
+    /// *logical* key space (the tail's per-token re-read; `None` = the whole
+    /// kind scope, the bulk pass). Leader-local and non-linearizable by
+    /// design: the driver re-reads dirty rows until convergence, and the
+    /// freeze (B5) is what makes the final pass authoritative.
+    pub async fn seed_rows_kind(
+        &self,
+        kind_idx: usize,
+        logical_range: Option<(&[u8], &[u8])>,
+    ) -> Vec<(Vec<u8>, Option<Vec<u8>>, u64)> {
+        let kscope = &self.kind_scopes[kind_idx];
+        let (start, end) = match logical_range {
+            Some((lo, hi)) => (kscope.physical(lo), kscope.physical(hi)),
+            None => {
+                let (start, end) = kscope.physical_bounds();
+                let Some(end) = end else {
+                    return Vec::new(); // only `StorageScope::whole()`; no real tablet
+                };
+                (start, end)
+            }
+        };
+        self.storage
+            .scan_with_tombstones(&start, &end)
+            .await
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, slot, version)| {
+                let logical = kscope.strip_in_range(&k)?.to_vec();
+                Some((logical, slot, version))
+            })
+            .collect()
+    }
+
     /// A **linearizable** read of `key` via **ReadIndex** (ADR 0017): only the
     /// leader can serve it. Records `read_index = commit_index`, confirms it is
     /// still leader by a quorum of peers acking its current term (a read-barrier
@@ -4938,6 +5017,53 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     }
                 }
             }
+            KvCommand::SeedBatch { rows, fence, ts } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                // ADR 0050 rung 4 (fork F3): history transfer into this child
+                // group's own engine. Each row merges at its CARRIED version
+                // (never this entry's own `ts`) with the parent's stored bytes
+                // verbatim — envelope tag included, so a staged intent copies
+                // as an intent (fork F7) — making re-proposal an idempotent
+                // no-op and a mid-build parent update a per-key LWW winner on
+                // the child too. Whole-batch fence discipline (`Batch`'s):
+                // the driver filters rows to this child's immutable range by
+                // construction, so a violation is a driver bug surfacing as a
+                // loud no-op, never a partial install. No change-log
+                // emission, no `encode_committed` re-wrap, no seal check (a
+                // fresh Building child has no sealed ranges; the seal
+                // mechanism itself retires with the zero-copy split).
+                if rows
+                    .iter()
+                    .all(|(_, logical, _, _)| fence.contains(logical))
+                {
+                    let mut max_seeded: u64 = 0;
+                    for (kind, logical, value, version) in &rows {
+                        let Some(kscope) = kind_scopes.get(*kind as usize) else {
+                            // An unknown kind can only come from a newer
+                            // build's driver (ALL_KINDS grew) — drop it, the
+                            // `install_engine_image` discipline.
+                            tracing::warn!(kind, "seed row of unknown kind dropped");
+                            continue;
+                        };
+                        let physical = kscope.physical(logical);
+                        match value {
+                            Some(v) => pending.push(MergeOp::put(physical, v.clone(), *version)),
+                            None => pending.push(MergeOp::tombstone(physical, *version)),
+                        }
+                        max_seeded = max_seeded.max(*version);
+                    }
+                    // Witnessing point (the snapshot-install discipline, this
+                    // arm's own doc): copied rows carry versions this group
+                    // never minted — fold the batch's high-water mark in so a
+                    // child leader's own future mints strictly exceed every
+                    // seeded row.
+                    if max_seeded > 0 {
+                        hlc.witness(hlc::unpack(max_seeded), env.now());
+                    }
+                } else {
+                    tracing::warn!("seed batch outside the child's declared range dropped whole");
+                }
+            }
             KvCommand::KindBatch {
                 writes,
                 change_log,
@@ -6282,6 +6408,12 @@ struct DriveState<E: Env, S: StorageEngine> {
     external_quiesce_veto: Arc<AtomicBool>,
 }
 
+/// One split-build seed row (ADR 0050 Train B rung 4): `(kind index into
+/// [`ALL_KINDS`], logical key, stored-bytes-or-tombstone, MVCC version)` —
+/// a parent engine row verbatim, shipped by the split-build driver and
+/// merge-applied at the carried version by [`KvCommand::SeedBatch`].
+pub type SeedRow = (u8, Vec<u8>, Option<Vec<u8>>, u64);
+
 /// The `ts` a mutating [`KvCommand`] variant carries, or `None` for `NoOp`
 /// (which carries none). The one place that knows every variant's `ts`
 /// field, shared by the WAL-recovery and entry-receipt witnessing sites.
@@ -6290,6 +6422,7 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
         KvCommand::Put { ts, .. }
         | KvCommand::Batch { ts, .. }
         | KvCommand::KindBatch { ts, .. }
+        | KvCommand::SeedBatch { ts, .. }
         | KvCommand::Delete { ts, .. }
         | KvCommand::Cas { ts, .. }
         | KvCommand::Seal { ts, .. }

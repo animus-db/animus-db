@@ -197,6 +197,17 @@ fn merge_tombstone_lww_and_entries_with_tombstones_retains_deletes() {
                 (b"other".to_vec(), Some(b"x".to_vec()), 100),
             ]
         );
+
+        // The range-scoped sibling (ADR 0050) agrees with the whole-keyspace
+        // read on the LSM path too — including across a flush, so the ranged
+        // read is proven against SSTable-resident rows, not just the memtable.
+        let ranged = e.scan_with_tombstones(b"k", b"l").await.unwrap();
+        assert_eq!(ranged, vec![(b"k".to_vec(), None, 9)]);
+        e.flush_now().await.unwrap();
+        let ranged_after_flush = e.scan_with_tombstones(b"k", b"l").await.unwrap();
+        assert_eq!(ranged_after_flush, vec![(b"k".to_vec(), None, 9)]);
+        let all = e.scan_with_tombstones(b"", b"zz").await.unwrap();
+        assert_eq!(all, with_ts);
     });
 }
 
