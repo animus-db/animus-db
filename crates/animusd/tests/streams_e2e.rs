@@ -526,6 +526,14 @@ async fn drain_all_tablets_lineage(
             }
         }
         for &tablet in &current_tablets {
+            // ADR 0050: a RETIRED split parent has no open shard — its
+            // chain ENDS at its final sealed epoch (all consumed by the
+            // closed-epoch loop above); polling a minted "open" successor
+            // would be answered `TrimmedDataAccess`. The children carry on
+            // via their own tracked entries.
+            if !node.metadata().tablets.contains_key(&tablet) {
+                continue;
+            }
             let epoch = next_epoch[&tablet];
             if open_epoch.get(&tablet) != Some(&epoch) {
                 let shard_id = segment::shard_id(tablet.0, epoch);
@@ -1001,20 +1009,28 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     )
     .await;
 
-    // Determine parent/child via `split_parents` directly (never assumed
-    // from tablet-id ordering — `SplitTablet` always mints the *new* id for
-    // the fresh sibling, but this test makes no assumption about which
-    // numeric id that turns out to be relative to the source's).
-    let meta = nodes[0].metadata();
-    let ids = tablets_for(&meta, "events");
-    assert!(
-        ids.len() >= 2,
-        "expected at least one split to have happened"
-    );
-    let (child, parent) = ids
-        .iter()
-        .find_map(|&t| meta.split_parents.get(&t).map(|&p| (t, p)))
-        .unwrap_or_else(|| panic!("no split-parent provenance recorded among {ids:?}"));
+    // Determine parent/child via `split_lineage` (ADR 0050 fork F9) —
+    // written at CUTOVER, so poll the workflow to completion rather than
+    // sampling once mid-build (a `Splitting` parent + `Building` children
+    // is a legitimate transient this loop simply waits out).
+    let (child, parent) = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        loop {
+            let meta = nodes[0].metadata();
+            let ids = tablets_for(&meta, "events");
+            if let Some((c, p)) = ids
+                .iter()
+                .find_map(|&t| meta.split_lineage.get(&t).map(|l| (t, l.parent)))
+            {
+                break (c, p);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no cutover lineage ever recorded among {ids:?}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
 
     // The lineage link (ADR 0042 §2/ADR 0043 §A4) needs the **parent** to
     // have sealed at least once — the **child** need not have: its own
@@ -1072,11 +1088,20 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     // Drain the whole lineage from a *different* node than the one that
     // wrote most items, and confirm exactly-once total delivery.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let seed_tablets: Vec<TabletId> = {
+        let meta = nodes[1].metadata();
+        let mut ts = tablets_for(&meta, "events");
+        // The retired parent still carries the pre-split history — walk it
+        // too (its sealed rows persist in the catalog; the helper skips a
+        // retired tablet's nonexistent open tail).
+        ts.push(parent);
+        ts
+    };
     let delivered = drain_all_tablets_lineage(
         nodes[1].dynamo_addr(),
         &stream_arn,
         &nodes[1],
-        &ids,
+        &seed_tablets,
         expected,
         deadline,
     )
@@ -1192,41 +1217,42 @@ async fn manual_split_with_unsealed_backlog_under_production_seal_knobs() {
     )
     .await;
 
-    // The precondition this cell exists to exercise: at the instant of the
-    // split, nothing has sealed yet anywhere in the catalog — every write
-    // so far is still sitting in the hot backlog, physically split across
-    // whichever two tablets now exist.
-    assert!(
-        nodes[0].metadata().stream_shards.is_empty(),
-        "test premise: the split must land on a genuinely unsealed backlog"
-    );
-
-    // Determine parent/child via `split_parents` — never assumed from
-    // tablet-id ordering (same idiom as the auto-split test above).
-    let meta = nodes[0].metadata();
-    let table_tablets = tablets_for(&meta, "orders");
-    let (child, parent) = table_tablets
-        .iter()
-        .find_map(|&t| meta.split_parents.get(&t).map(|&p| (t, p)))
-        .unwrap_or_else(|| panic!("no split-parent provenance recorded among {table_tablets:?}"));
-
-    // No further writes. Both sides' inherited backlog ages past
-    // `seal_age` on its own, giving each exactly one seal — the parent's
-    // own seal of its narrowed left range, and the child's first-ever seal
-    // of whatever right-range backlog it physically inherited in place
-    // (ADR 0043 §A4). This is where an unfixed `effective_stream_shard_
-    // watermark`/`stream_shard_parent_id` would show up as a missing id
-    // (the child's inherited backlog silently dropped from its own first
-    // seal) rather than a wrong count alone.
-    await_true(
-        20,
-        "parent and child never both sealed at least once",
-        || {
+    // The precondition this cell exists to exercise: the workflow lands on
+    // a genuinely unsealed backlog (seal_age = 2s, the auto-split fires
+    // within milliseconds of the byte threshold) — under ADR 0050 that
+    // backlog's consumer-visibility story is now entirely the PARENT's:
+    // the freeze seals it whole into the parent's final shard(s), and the
+    // children are born with EMPTY change logs (no inherited backlog, no
+    // frozen-basis watermark — principle 3's stronger form), so the child
+    // seals nothing at all here (no further writes ever land on it).
+    //
+    // Wait for the workflow to CUT OVER — lineage present = children
+    // Active + parent retired (fork F9's cutover-time map).
+    let (child, parent) = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        loop {
             let meta = nodes[0].metadata();
-            meta.stream_shard_watermark(parent).is_some()
-                && meta.stream_shard_watermark(child).is_some()
-        },
-    )
+            let table_tablets = tablets_for(&meta, "orders");
+            if let Some((c, p)) = table_tablets
+                .iter()
+                .find_map(|&t| meta.split_lineage.get(&t).map(|l| (t, l.parent)))
+            {
+                break (c, p);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the split workflow never cut over (no lineage among {table_tablets:?})"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+
+    // The parent's final seal (the freeze's own step) covers the whole
+    // pre-split backlog — this is where a lost final seal would show up as
+    // missing ids in the walk below.
+    await_true(20, "the retired parent never sealed its backlog", || {
+        nodes[0].metadata().stream_shard_watermark(parent).is_some()
+    })
     .await;
 
     // Drain the whole lineage (both tablets, every epoch) from a different
@@ -1776,15 +1802,27 @@ async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delive
     let ids = tablets_for(&nodes[0].metadata(), "widgets");
     assert_eq!(ids.len(), 4, "growth must double 2 tablets to 4");
 
-    // Walk the whole doubled lineage from EVERY node in turn: `DescribeStream`
-    // must show all 4 tablets' shard chains from each node's own answer —
+    // Walk the whole doubled lineage from EVERY node in turn:
+    // `DescribeStream` must show all 4 children's chains PLUS each retired
+    // parent's closed final shard (ADR 0050 — a copy-based grow retires
+    // the two pre-existing tablets; their sealed history stays listed,
+    // the AWS closed-ancestor-shard shape) — from each node's own answer,
     // not just the one that happened to serve the grow request.
-    let want_tablet_ids: BTreeSet<u64> = ids.iter().map(|t| t.0).collect();
+    let mut want_tablet_ids: BTreeSet<u64> = ids.iter().map(|t| t.0).collect();
+    {
+        // Every ancestor that ever sealed stays visible via its catalog
+        // rows — transitively (the table's own setup split retired a
+        // grandparent too), so derive the set from the catalog itself.
+        let meta = nodes[0].metadata();
+        for (tablet, _) in meta.stream_shards.keys() {
+            want_tablet_ids.insert(tablet.0);
+        }
+    }
     for (i, node) in nodes.iter().enumerate() {
         let found = stream_tablet_ids(node.dynamo_addr(), &stream_arn).await;
         assert_eq!(
             found, want_tablet_ids,
-            "node {i}'s DescribeStream must list every one of the 4 tablets"
+            "node {i}'s DescribeStream must list all 4 children + the retired parents' closed shards"
         );
     }
 
@@ -1907,4 +1945,528 @@ async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain
         }
         sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Every shard object `DescribeStream` currently lists for `stream_arn`,
+/// across pagination — the raw JSON shard entries, for tests asserting the
+/// wire *shape* (`SequenceNumberRange.EndingSequenceNumber`,
+/// `ParentShardId`) rather than just the tablet-id set
+/// ([`stream_tablet_ids`]'s narrower digest).
+async fn all_stream_shards(addr: SocketAddr, stream_arn: &str) -> Vec<Value> {
+    let mut shards = Vec::new();
+    let mut start: Option<String> = None;
+    loop {
+        let start_clause = start
+            .as_ref()
+            .map(|s| format!(r#","ExclusiveStartShardId":"{s}""#))
+            .unwrap_or_default();
+        let (status, resp) = dynamo(
+            addr,
+            "DynamoDBStreams_20120810.DescribeStream",
+            &format!(r#"{{"StreamArn":"{stream_arn}"{start_clause}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "DescribeStream (shard shape) failed: {resp}");
+        let v = json(&resp);
+        shards.extend(
+            v["StreamDescription"]["Shards"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        match v["StreamDescription"]["LastEvaluatedShardId"].as_str() {
+            Some(next) => start = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    shards
+}
+
+/// The cascade e2e (ADR 0050 Train B rung 6): a streamed table walked by a
+/// consumer across (a) a routine seal, (b) one completed copy-based split
+/// (the root retired, its final shard closed), and (c) a SECOND generation
+/// (both children split again — the grandparent chain), asserting the wire
+/// *shape* the other lineage tests don't pin: every retired ancestor's
+/// shard closed (`SequenceNumberRange.EndingSequenceNumber` present),
+/// exactly one open shard per routable tablet, `ParentShardId` links
+/// walking a grandchild transitively back into the root's own chain, a
+/// closed shard's `TRIM_HORIZON` drain ending in a null
+/// `NextShardIterator`, and exactly-once delivery (distinct `eventID`s)
+/// across the full three-generation lineage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cascade_split_walks_the_grandparent_chain_with_closed_shard_shape() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let nodes = start_streamed_cluster(3, dir.path(), tiny_seal_knobs()).await;
+    await_bootstrap(&nodes).await;
+
+    let (status, body) = dynamo(
+        nodes[0].dynamo_addr(),
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"casc",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "StreamSpecification":{"StreamEnabled":true,
+                "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+    let label = field(&body, "LatestStreamLabel");
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/casc/stream/{label}");
+
+    let mut expected = 0usize;
+    let put = |from: usize, upto: usize| {
+        let nodes = &nodes;
+        async move {
+            let mut n = 0usize;
+            for i in from..upto {
+                let id = format!("c{i:04}");
+                let issuer = &nodes[i % nodes.len()];
+                let (status, body) = dynamo(
+                    issuer.dynamo_addr(),
+                    "DynamoDB_20120810.PutItem",
+                    &format!(r#"{{"TableName":"casc","Item":{{"id":{{"S":"{id}"}}}}}}"#),
+                )
+                .await;
+                assert_eq!(status, 200, "PutItem({id}) failed: {body}");
+                n += 1;
+            }
+            n
+        }
+    };
+    expected += put(0, 40).await;
+
+    // (a) a routine seal on the root before anything splits.
+    let root = tablets_for(&nodes[0].metadata(), "casc")
+        .into_iter()
+        .next()
+        .expect("bootstrap tablet exists");
+    await_true(20, "the root never routine-sealed an epoch", || {
+        nodes[0]
+            .metadata()
+            .stream_shards
+            .range((root, 0)..=(root, u64::MAX))
+            .next()
+            .is_some()
+    })
+    .await;
+
+    // (b) generation 1: grow retires the root, activates 2 children.
+    let (status, body) = admin(
+        nodes[1].admin_addr(),
+        "POST",
+        "/admin/stream/grow",
+        Some(r#"{"table":"casc"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "grow #1 failed: {body}");
+    assert_eq!(
+        body["split_count"].as_u64(),
+        Some(1),
+        "root must split: {body}"
+    );
+    await_true(30, "root never retired / children never activated", || {
+        nodes.iter().all(|n| {
+            let m = n.metadata();
+            !m.tablets.contains_key(&root) && tablets_for(&m, "casc").len() == 2
+        })
+    })
+    .await;
+    let children = tablets_for(&nodes[0].metadata(), "casc");
+    expected += put(40, 80).await;
+
+    // (c) generation 2: both children split — grandchildren, root = the
+    // grandparent. A `grow` issued mid-nothing must also classify cleanly
+    // (covered separately below with a mid-split grow).
+    let (status, body) = admin(
+        nodes[2].admin_addr(),
+        "POST",
+        "/admin/stream/grow",
+        Some(r#"{"table":"casc"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "grow #2 failed: {body}");
+    assert_eq!(
+        body["split_count"].as_u64(),
+        Some(2),
+        "both children must split: {body}"
+    );
+    await_true(
+        30,
+        "children never retired / grandchildren never active",
+        || {
+            nodes.iter().all(|n| {
+                let m = n.metadata();
+                children.iter().all(|c| !m.tablets.contains_key(c))
+                    && tablets_for(&m, "casc").len() == 4
+            })
+        },
+    )
+    .await;
+    expected += put(80, 120).await;
+
+    // The wire shape, from a node that served neither grow call.
+    let meta = nodes[0].metadata();
+    let shards = all_stream_shards(nodes[0].dynamo_addr(), &stream_arn).await;
+    let mut open_count = 0usize;
+    for shard in &shards {
+        let shard_id = shard["ShardId"].as_str().expect("ShardId present");
+        let tablet = shard_id
+            .strip_prefix("shardId-")
+            .and_then(|r| r.split_once('-'))
+            .and_then(|(t, _)| t.parse::<u64>().ok())
+            .expect("parseable shard id");
+        let closed = !shard["SequenceNumberRange"]["EndingSequenceNumber"].is_null();
+        if meta.tablets.contains_key(&TabletId(tablet)) {
+            if !closed {
+                open_count += 1;
+            }
+        } else {
+            assert!(
+                closed,
+                "a retired tablet's every listed shard must be CLOSED \
+                 (EndingSequenceNumber present): {shard}"
+            );
+        }
+    }
+    assert_eq!(
+        open_count, 4,
+        "exactly one open shard per routable (grandchild) tablet"
+    );
+
+    // ParentShardId transitivity: a grandchild's epoch-0 shard names its
+    // own retired parent's FINAL shard; that shard's entry in turn links
+    // onward — following the links from any grandchild must reach one of
+    // the ROOT tablet's own shards (the grandparent chain, walked purely
+    // through the wire listing).
+    let by_id: std::collections::BTreeMap<&str, &Value> = shards
+        .iter()
+        .map(|s| (s["ShardId"].as_str().unwrap(), s))
+        .collect();
+    let grandchild = tablets_for(&meta, "casc")[0];
+    let mut cursor = format!("shardId-{}-0", grandchild.0);
+    let mut hops = 0usize;
+    let reached_root = loop {
+        let Some(parent) = by_id
+            .get(cursor.as_str())
+            .and_then(|s| s["ParentShardId"].as_str())
+        else {
+            break false;
+        };
+        if parent.starts_with(&format!("shardId-{}-", root.0)) {
+            break true;
+        }
+        cursor = parent.to_owned();
+        hops += 1;
+        assert!(hops < 64, "ParentShardId walk must terminate");
+    };
+    assert!(
+        reached_root,
+        "a grandchild's ParentShardId chain must reach the root (grandparent) tablet's own shards"
+    );
+
+    // A closed shard drains to a null NextShardIterator: the root's final
+    // (highest-epoch) shard, from TRIM_HORIZON, must exhaust.
+    let root_final = shards
+        .iter()
+        .filter_map(|s| {
+            let id = s["ShardId"].as_str()?;
+            let (t, e) = id.strip_prefix("shardId-")?.split_once('-')?;
+            (t.parse::<u64>().ok()? == root.0).then(|| (e.parse::<u64>().ok().unwrap_or(0), id))
+        })
+        .max_by_key(|(e, _)| *e)
+        .expect("the root must have listed shards")
+        .1;
+    let mut iterator = get_shard_iterator(
+        nodes[2].dynamo_addr(),
+        &stream_arn,
+        root_final,
+        "TRIM_HORIZON",
+    )
+    .await;
+    let mut drained = 0usize;
+    loop {
+        let (records, next) = get_records(nodes[2].dynamo_addr(), &iterator).await;
+        drained += records.len();
+        match next {
+            Some(n) => iterator = n,
+            None => break, // the closed-shard contract: it nulls
+        }
+    }
+    assert!(
+        drained > 0,
+        "the root's final shard must hold its pre-cutover backlog"
+    );
+
+    // Exactly-once across all three generations, walked live.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let delivered = drain_all_tablets_lineage(
+        nodes[1].dynamo_addr(),
+        &stream_arn,
+        &nodes[1],
+        &tablets_for(&nodes[1].metadata(), "casc"),
+        expected,
+        deadline,
+    )
+    .await;
+    assert_eq!(
+        delivered.len(),
+        expected,
+        "exactly-once delivery must hold across the cascade"
+    );
+    let event_ids: BTreeSet<&str> = delivered
+        .iter()
+        .map(|r| r["eventID"].as_str().expect("eventID present"))
+        .collect();
+    assert_eq!(
+        event_ids.len(),
+        expected,
+        "every delivered record must carry a distinct eventID"
+    );
+
+    // The mid-split grow classification (rung 6's `grow_stream` refinement):
+    // kick a THIRD grow and, while its splits are in flight, issue another —
+    // any tablet already `Splitting` must classify as a skip, never as a
+    // fresh split and never an error.
+    let (status, body) = admin(
+        nodes[0].admin_addr(),
+        "POST",
+        "/admin/stream/grow",
+        Some(r#"{"table":"casc"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "grow #3 failed: {body}");
+    let (status, body) = admin(
+        nodes[1].admin_addr(),
+        "POST",
+        "/admin/stream/grow",
+        Some(r#"{"table":"casc"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "grow #4 (mid-split) failed: {body}");
+    assert_eq!(
+        body["error_count"].as_u64(),
+        Some(0),
+        "a mid-split tablet must classify as a skip, never an error: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rung 8 acceptance (a): the multi-split soak — one streamed + GSI'd table
+// through ≥3 auto-split cutovers under continuous mixed load.
+// ---------------------------------------------------------------------------
+
+/// ADR 0050 Train B rung 8's named acceptance soak. A populated streamed +
+/// GSI'd table auto-splits repeatedly (tiny byte threshold) while plain
+/// writes, `TransactWriteItems`, and GSI queries race the workflows from
+/// every node. Asserts, at the end: zero lost writes (every acked item
+/// reads back), exactly-once stream delivery via the full lineage walk
+/// (retired parents included), GSI convergence to exactly one row per
+/// item, and every retired parent's per-tablet engine physically deleted
+/// from every node's dir (`db-t{parent}-*` gone — the B1 file-deletion
+/// teardown observed end to end). The GSI-convergence + reclaim pair is
+/// also the closure check for the `split-child-gsi-cursor-unreadable`
+/// memory bug class: children's drains start clean (RestartFromScratch at
+/// activation) and no retired parent's watermark row survives to pollute
+/// anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_split_soak_streamed_gsi_table_under_mixed_load() {
+    tokio::time::timeout(Duration::from_secs(300), async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nodes = start_streamed_cluster_full(
+            3,
+            dir.path(),
+            tiny_seal_knobs(),
+            None,
+            Some(2_048),
+            SegmentStoreConfig::default(),
+        )
+        .await;
+        await_bootstrap(&nodes).await;
+
+        let (status, body) = dynamo(
+            nodes[0].dynamo_addr(),
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"soak",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                "StreamSpecification":{"StreamEnabled":true,
+                    "StreamViewType":"NEW_AND_OLD_IMAGES"},
+                "GlobalSecondaryIndexes":[
+                    {"IndexName":"by-tag",
+                     "KeySchema":[{"AttributeName":"tag","KeyType":"HASH"}],
+                     "Projection":{"ProjectionType":"ALL"}}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+        let label = field(&body, "LatestStreamLabel");
+        let stream_arn = format!("arn:aws:dynamodb:animus:0:table/soak/stream/{label}");
+
+        // Mixed load, round-robin across nodes: 120 plain puts, every 10th
+        // iteration ALSO a two-item transaction, every 15th a GSI query.
+        // Every item carries one of 4 tags + a 256B filler (so the 2KiB
+        // auto-split threshold fires early and often — a cascade of
+        // cutovers, not one).
+        let filler = "x".repeat(256);
+        let mut ids: Vec<String> = Vec::new();
+        for i in 0..120usize {
+            let issuer = &nodes[i % nodes.len()];
+            let id = format!("e{i:04}");
+            let (status, body) = dynamo(
+                issuer.dynamo_addr(),
+                "DynamoDB_20120810.PutItem",
+                &format!(
+                    r#"{{"TableName":"soak","Item":{{"id":{{"S":"{id}"}},"tag":{{"S":"t{}"}},"body":{{"S":"{filler}"}}}}}}"#,
+                    i % 4
+                ),
+            )
+            .await;
+            assert_eq!(status, 200, "PutItem({id}) failed: {body}");
+            ids.push(id);
+            if i % 10 == 9 {
+                let (a, b) = (format!("x{i:04}a"), format!("x{i:04}b"));
+                let (status, body) = dynamo(
+                    issuer.dynamo_addr(),
+                    "DynamoDB_20120810.TransactWriteItems",
+                    &format!(
+                        r#"{{"TransactItems":[
+                            {{"Put":{{"TableName":"soak","Item":{{"id":{{"S":"{a}"}},"tag":{{"S":"t0"}}}}}}}},
+                            {{"Put":{{"TableName":"soak","Item":{{"id":{{"S":"{b}"}},"tag":{{"S":"t1"}}}}}}}}]}}"#
+                    ),
+                )
+                .await;
+                assert_eq!(status, 200, "transact({a},{b}) failed: {body}");
+                ids.push(a);
+                ids.push(b);
+            }
+            if i % 15 == 14 {
+                // A live GSI read mid-workflow — result content converges
+                // later; mid-flight it only has to serve.
+                let (status, _) = dynamo(
+                    issuer.dynamo_addr(),
+                    "DynamoDB_20120810.Query",
+                    r#"{"TableName":"soak","IndexName":"by-tag",
+                        "KeyConditionExpression":"tag = :t",
+                        "ExpressionAttributeValues":{":t":{"S":"t0"}}}"#,
+                )
+                .await;
+                assert_eq!(status, 200, "mid-flight GSI query failed");
+            }
+        }
+        let expected = ids.len();
+
+        // ≥3 completed cutovers (retired parents recorded in lineage), and
+        // the surviving topology converged on every node.
+        await_true(60, "fewer than 3 cutovers ever completed", || {
+            let meta = nodes[0].metadata();
+            let parents: BTreeSet<TabletId> =
+                meta.split_lineage.values().map(|l| l.parent).collect();
+            parents.iter().filter(|p| !meta.tablets.contains_key(p)).count() >= 3
+        })
+        .await;
+        let retired: Vec<TabletId> = {
+            let meta = nodes[0].metadata();
+            meta.split_lineage
+                .values()
+                .map(|l| l.parent)
+                .filter(|p| !meta.tablets.contains_key(p))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+
+        // 1. Zero lost writes: every acked item reads back through a node
+        //    that didn't originate most of them.
+        for id in &ids {
+            let (status, body) = dynamo(
+                nodes[2].dynamo_addr(),
+                "DynamoDB_20120810.GetItem",
+                &format!(r#"{{"TableName":"soak","Key":{{"id":{{"S":"{id}"}}}}}}"#),
+            )
+            .await;
+            assert_eq!(status, 200, "GetItem({id}) failed");
+            assert!(
+                body.contains(&format!("\"S\":\"{id}\"")),
+                "acked write {id} lost across the soak's cutovers: {body}"
+            );
+        }
+
+        // 2. Exactly-once stream delivery over the full lineage (live
+        //    tablets + every retired parent; the walk self-discovers any
+        //    generation it wasn't seeded with).
+        let seed_tablets: Vec<TabletId> = {
+            let meta = nodes[1].metadata();
+            let mut ts = tablets_for(&meta, "soak");
+            ts.extend(retired.iter().copied());
+            ts
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let delivered = drain_all_tablets_lineage(
+            nodes[1].dynamo_addr(),
+            &stream_arn,
+            &nodes[1],
+            &seed_tablets,
+            expected,
+            deadline,
+        )
+        .await;
+        assert_eq!(
+            delivered.len(),
+            expected,
+            "exactly-once delivery must hold across every soak cutover"
+        );
+
+        // 3. GSI convergence: the four tags' Counts sum to exactly one row
+        //    per item (children's drains restarted clean at activation).
+        await_true(60, "GSI never converged to one row per item", || {
+            // `await_true` takes a sync closure — sample via a blocking
+            // one-shot runtime handle instead: issue the four queries on
+            // the current runtime through block_in_place.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let mut total = 0u64;
+                    for t in 0..4 {
+                        let (status, body) = dynamo(
+                            nodes[1].dynamo_addr(),
+                            "DynamoDB_20120810.Query",
+                            &format!(
+                                r#"{{"TableName":"soak","IndexName":"by-tag",
+                                    "KeyConditionExpression":"tag = :t",
+                                    "ExpressionAttributeValues":{{":t":{{"S":"t{t}"}}}}}}"#
+                            ),
+                        )
+                        .await;
+                        if status != 200 {
+                            return false;
+                        }
+                        let v: serde_json::Value =
+                            serde_json::from_str(&body).unwrap_or_default();
+                        total += v["Count"].as_u64().unwrap_or(0);
+                    }
+                    total == expected as u64
+                })
+            })
+        })
+        .await;
+
+        // 4. Every retired parent's per-tablet engine physically deleted
+        //    from every node dir (B1's file-deletion teardown, end to end).
+        await_true(30, "a retired parent's engine files survived", || {
+            (0..nodes.len()).all(|n| {
+                let node_dir = dir.path().join(format!("node-{n}"));
+                let Ok(entries) = std::fs::read_dir(&node_dir) else {
+                    return true;
+                };
+                let names: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                retired.iter().all(|p| {
+                    let prefix = format!("db-t{}-", p.0);
+                    let wal = format!("raftkv.wal.{}", p.0);
+                    names.iter().all(|f| !f.starts_with(&prefix) && *f != wal)
+                })
+            })
+        })
+        .await;
+    })
+    .await
+    .expect("soak timed out");
 }

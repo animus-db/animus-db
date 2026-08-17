@@ -8,7 +8,7 @@
 //!
 //! Harness style borrowed from `tests/kind_batch.rs` (the `group`/`leader`/
 //! `logical`/`stored` helpers) rather than `txn_conditions.rs`'s single-key
-//! harness, since the primitive under test is `put_kind_batch_fenced`, not
+//! harness, since the primitive under test is `put_kind_batch_conditioned`, not
 //! `txn_stage_anchor`.
 //!
 //! Deterministic and seed-reproducible (ADR 0003): drive with `run_for`,
@@ -48,7 +48,7 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
                 sim.env(nid(id)),
                 NODES.iter().copied().map(nid).collect(),
                 MemoryEngine::new(),
-                StorageScope::new(escape(b"users"), KeyRange::whole()),
+                StorageScope::new(KeyRange::whole()),
             )
         })
         .collect();
@@ -102,14 +102,13 @@ fn matching_condition_lets_the_batch_apply() {
 
     assert!(
         matches!(
-            nodes[l].put_kind_batch_fenced(
+            nodes[l].put_kind_batch_conditioned(
                 vec![
                     (KIND_BASE, base.clone(), Some(b"v1".to_vec())),
                     (KIND_LSI, lsi.clone(), Some(b"row".to_vec())),
                 ],
                 Vec::new(),
                 vec![(base.clone(), Some(b"v0".to_vec()))],
-                KeyRange::whole(),
             ),
             ProposeResult::Accepted { .. }
         ),
@@ -143,11 +142,10 @@ fn must_be_absent_condition_passes_when_truly_absent() {
     let base = logical(b"bob", b"");
     assert!(
         matches!(
-            nodes[l].put_kind_batch_fenced(
+            nodes[l].put_kind_batch_conditioned(
                 vec![(KIND_BASE, base.clone(), Some(b"created".to_vec()))],
                 Vec::new(),
                 vec![(base.clone(), None)],
-                KeyRange::whole(),
             ),
             ProposeResult::Accepted { .. }
         ),
@@ -186,14 +184,13 @@ fn must_be_absent_condition_fails_when_present_no_ops_the_whole_batch() {
 
     assert!(
         matches!(
-            nodes[l].put_kind_batch_fenced(
+            nodes[l].put_kind_batch_conditioned(
                 vec![
                     (KIND_BASE, base.clone(), Some(b"overwrite".to_vec())),
                     (KIND_LSI, lsi.clone(), Some(b"row".to_vec())),
                 ],
                 Vec::new(),
                 vec![(base.clone(), None)], // must be absent — but it isn't.
-                KeyRange::whole(),
             ),
             ProposeResult::Accepted { .. }
         ),
@@ -236,11 +233,10 @@ fn mismatched_value_condition_no_ops_and_leaves_the_key_untouched() {
     sim.run_for(SETTLE);
 
     assert!(matches!(
-        nodes[l].put_kind_batch_fenced(
+        nodes[l].put_kind_batch_conditioned(
             vec![(KIND_BASE, base.clone(), Some(b"v1".to_vec()))],
             Vec::new(),
             vec![(base.clone(), Some(b"999-wrong".to_vec()))],
-            KeyRange::whole(),
         ),
         ProposeResult::Accepted { .. }
     ));
@@ -256,12 +252,11 @@ fn mismatched_value_condition_no_ops_and_leaves_the_key_untouched() {
 /// The condition is checked BEFORE the fence/seal gate (this PR's own
 /// deliberate ordering difference from `TxnStage`'s `condition_failure`, see
 /// `KvCommand::KindBatch`'s doc) — but the two gates still compose by simple
-/// AND: a batch that fails its condition AND falls outside its fence is
-/// exactly as rejected as one that only fails one of the two. This scenario
-/// pins that composition by using a fence that genuinely admits the base key
-/// so only the condition is actually doing the rejecting.
+/// A batch whose condition fails is rejected whole — nothing else about the
+/// entry (all keys perfectly ordinary) can rescue it; the condition alone
+/// does the rejecting.
 #[test]
-fn condition_check_composes_with_the_fence_gate() {
+fn condition_check_rejects_the_whole_entry_alone() {
     let seed = 0x0046_0005;
     let (mut sim, nodes) = group(seed);
     sim.run_for(ELECT);
@@ -277,22 +272,11 @@ fn condition_check_composes_with_the_fence_gate() {
     ));
     sim.run_for(SETTLE);
 
-    // A fence that genuinely contains the base key — the condition alone
-    // must be what blocks this entry.
-    let mut fence_end = base.clone();
-    fence_end.push(0xFF);
-    let fence = KeyRange::new(base.clone(), Some(fence_end));
-    assert!(
-        fence.contains(&base),
-        "setup: the base key must be INSIDE the fence, or this test is vacuous"
-    );
-
     assert!(matches!(
-        nodes[l].put_kind_batch_fenced(
+        nodes[l].put_kind_batch_conditioned(
             vec![(KIND_BASE, base.clone(), Some(b"v1".to_vec()))],
             Vec::new(),
             vec![(base.clone(), Some(b"wrong".to_vec()))],
-            fence,
         ),
         ProposeResult::Accepted { .. }
     ));
@@ -301,7 +285,7 @@ fn condition_check_composes_with_the_fence_gate() {
     assert_eq!(
         stored(&nodes[l], KIND_BASE, &base).as_deref(),
         Some(&b"v0"[..]),
-        "an in-fence entry with a failing condition must still no-op (seed={seed})"
+        "an entry with a failing condition must no-op whole (seed={seed})"
     );
 }
 
@@ -320,7 +304,7 @@ fn condition_gated_batch_survives_crash_restart_idempotently() {
         sim.env(id.clone()),
         vec![id.clone()],
         engine.clone(),
-        StorageScope::new(escape(b"users"), KeyRange::whole()),
+        StorageScope::new(KeyRange::whole()),
     );
     sim.run_for(ELECT);
 
@@ -335,11 +319,10 @@ fn condition_gated_batch_survives_crash_restart_idempotently() {
     sim.run_for(SETTLE);
 
     assert!(matches!(
-        node.put_kind_batch_fenced(
+        node.put_kind_batch_conditioned(
             vec![(KIND_BASE, base.clone(), Some(b"v1".to_vec()))],
             Vec::new(),
             vec![(base.clone(), Some(b"v0".to_vec()))],
-            KeyRange::whole(),
         ),
         ProposeResult::Accepted { .. }
     ));
@@ -355,7 +338,7 @@ fn condition_gated_batch_survives_crash_restart_idempotently() {
         sim.env(id.clone()),
         vec![id.clone()],
         engine.clone(),
-        StorageScope::new(escape(b"users"), KeyRange::whole()),
+        StorageScope::new(KeyRange::whole()),
     );
     sim.run_for(ELECT);
 
@@ -395,11 +378,10 @@ fn matching_condition_scenario_is_reproducible_across_seeds() {
         sim.run_for(SETTLE);
 
         assert!(matches!(
-            nodes[l].put_kind_batch_fenced(
+            nodes[l].put_kind_batch_conditioned(
                 vec![(KIND_BASE, base.clone(), Some(b"v1".to_vec()))],
                 Vec::new(),
                 vec![(base.clone(), Some(b"v0".to_vec()))],
-                KeyRange::whole(),
             ),
             ProposeResult::Accepted { .. }
         ));

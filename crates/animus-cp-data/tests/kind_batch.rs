@@ -49,7 +49,7 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
                 sim.env(nid(id)),
                 NODES.iter().copied().map(nid).collect(),
                 MemoryEngine::new(),
-                StorageScope::new(escape(b"users"), KeyRange::whole()),
+                StorageScope::new(KeyRange::whole()),
             )
         })
         .collect();
@@ -214,63 +214,11 @@ fn one_entry_adds_a_new_index_row_and_removes_the_stale_one() {
     }
 }
 
-#[test]
-fn an_out_of_fence_key_blocks_the_whole_entry() {
-    let seed = 0x0041_0003;
-    let (mut sim, nodes) = group(seed);
-    sim.run_for(Duration::from_secs(2));
-    let l = leader(&nodes, seed);
-
-    let inside = logical(b"alice", b"");
-    let lsi = logical(b"alice", b"\x01age30");
-    // A fence that genuinely contains the base key but **not** the LSI row.
-    // Getting this wrong is how this test would pass for the wrong reason: an
-    // empty range (`start == end`, the range being half-open) excludes both
-    // keys, so "nothing applied" would prove nothing about atomicity. The
-    // assertions below pin the setup itself.
-    let mut fence_end = inside.clone();
-    fence_end.push(0x01);
-    let fence = KeyRange::new(inside.clone(), Some(fence_end));
-    assert!(
-        fence.contains(&inside),
-        "setup: the base key must be INSIDE the fence, or this test is vacuous"
-    );
-    assert!(
-        !fence.contains(&lsi),
-        "setup: the LSI key must be OUTSIDE the fence, or this test is vacuous"
-    );
-
-    assert!(matches!(
-        nodes[l].put_kind_batch_fenced(
-            vec![
-                (KIND_BASE, inside.clone(), Some(b"item".to_vec())),
-                (KIND_LSI, lsi.clone(), Some(b"lsi-row".to_vec())),
-            ],
-            Vec::new(),
-            Vec::new(),
-            fence,
-        ),
-        ProposeResult::Accepted { .. }
-    ));
-    sim.run_for(Duration::from_secs(2));
-
-    // Neither wrote: the fence gates the entry, not the individual keys. Letting
-    // the base row through alone would leave an item with a missing index row —
-    // precisely the inconsistency atomicity is here to rule out.
-    for (i, node) in nodes.iter().enumerate() {
-        assert_eq!(
-            stored(node, KIND_BASE, &inside),
-            None,
-            "node {i} applied the in-fence half of a fenced-out entry (seed={seed})"
-        );
-        assert_eq!(
-            stored(node, KIND_LSI, &lsi),
-            None,
-            "node {i} applied the out-of-fence half (seed={seed})"
-        );
-    }
-}
-
+// DELETED (ADR 0050 Train B rung 7): `an_out_of_fence_key_blocks_the_whole_entry`
+// exercised the per-entry `fence` field, removed with the zero-copy split's
+// defense stack (ranges are immutable; routing + the Freeze seal replaced it).
+// Whole-batch atomic gating survives as the seal discipline, covered by
+// `tests/freeze.rs::freeze_refuses_every_mutating_command_but_serves_reads`.
 #[test]
 fn the_change_log_key_is_the_entrys_own_commit_timestamp() {
     // The proposer supplies only a key *prefix*; apply completes it with this

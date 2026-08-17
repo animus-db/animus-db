@@ -269,6 +269,24 @@ impl StorageEngine for MemoryEngine {
         Ok(out)
     }
 
+    async fn scan_with_tombstones(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Key, Option<Value>, Version)>> {
+        let inner = self.lock();
+        let mut out = Vec::new();
+        for (key, history) in inner
+            .data
+            .range::<[u8], _>((Bound::Included(start), Bound::Excluded(end)))
+        {
+            if let Some((&version, slot)) = history.iter().next_back() {
+                out.push((key.clone(), slot.clone(), version));
+            }
+        }
+        Ok(out)
+    }
+
     fn snapshot(&self) -> MemorySnapshot {
         let version = self.lock().max_version;
         MemorySnapshot {

@@ -256,28 +256,57 @@ async fn create_table_pre_split(
     let (upper_id, upper_key) = candidates[mid].clone();
     assert!(lower_key < upper_key, "candidates must be strictly ordered");
 
-    let resp = call(
-        client_addr,
-        ClientRequest::SplitTablet {
-            tablet: 1,
-            split_key: upper_key,
-        },
-    )
-    .await;
-    assert!(
-        matches!(resp, ClientResponse::PutOk),
-        "split trigger rejected: {resp:?}"
-    );
+    // ADR 0050 (Train B rung 1): the client-facing split surface is disabled
+    // during the storage pivot; the harness proposes the metadata command
+    // directly instead. Sound ONLY because the table is still EMPTY here —
+    // both children form over their own empty private engines; this gives
+    // the transaction tests a genuine two-group topology, it does not
+    // exercise split itself. `create_table` above waits for the bootstrap
+    // tablet to exist, but the first PutItem is what lazily provisions it —
+    // so provision it first with a throwaway probe write, then split.
+    // The bootstrap tablet is provisioned lazily by the first write; the
+    // CreateTable wait above only covers the schema. Ensure it exists.
     timeout(Duration::from_secs(20), async {
         loop {
-            if nodes.iter().all(|n| n.metadata().tablets.len() == 2) {
+            if nodes.iter().any(|n| {
+                n.metadata()
+                    .tablets
+                    .contains_key(&animus_tablet::TabletId(1))
+            }) {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("split was not recorded in the tablet map within 20s");
+    .expect("bootstrap tablet was never provisioned before the harness split");
+    // ADR 0050 (Train B rung 5+): drive the REAL workflow via the public
+    // kickoff on the client protocol; the driver cuts over on its own.
+    match call(
+        client_addr,
+        ClientRequest::SplitTablet {
+            tablet: 1,
+            split_key: upper_key,
+        },
+    )
+    .await
+    {
+        ClientResponse::PutOk => {}
+        other => panic!("split kickoff refused: {other:?}"),
+    }
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if nodes.iter().all(|n| {
+                let m = n.metadata();
+                m.tablets.len() == 2 && !m.tablets.contains_key(&animus_tablet::TabletId(1))
+            }) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the split workflow did not cut over within 30s");
 
     // Confirm both halves actually serve before relying on them.
     for id in [&lower_id, &upper_id] {

@@ -25,13 +25,17 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
 ## Entry points
 
 - **`lib.rs`** — `RaftKvNode<E, S>` (the running tablet-group node), its
-  command/state types, `StorageScope`, the fenced commands, ReadIndex + CAS,
-  and the consensus-loop/apply-task split. See the API bullets below.
+  command/state types, `StorageScope` (a thin kind-byte prepend/strip since
+  F2b), ReadIndex + CAS, and the consensus-loop/apply-task split. The
+  per-entry write fences were deleted in the ADR 0050 Train B rung-7 sweep
+  (immutable ranges made them inert); the seal set survives as `Freeze`'s
+  apply-time backstop. See the API bullets below.
 - **`host.rs`** — the per-node tablet-host reconciler (ADR 0031): `plan()`,
-  `Reconciler`, and the `HostAction` set (`ProposeSeal`/`NarrowScope`/
-  `Host`/`Reconfigure`/`Release`/`Reclaim` — tablets are split-only, ADR
-  0044; the merge-dual `Absorb`/`WidenScope` actions were removed). 31 unit
-  tests. See "The host module".
+  `Reconciler`, and the `HostAction` set (`Host`/`Reconfigure`/`Release`/
+  `Reclaim` — tablets are split-only, ADR 0044; the zero-copy split's
+  `NarrowScope`/`ProposeSeal` actions were deleted in the ADR 0050 rung-7
+  sweep, as the merge-dual `Absorb`/`WidenScope` were by ADR 0044). See
+  "The host module".
 - **`cluster_segment_store.rs`** (ADR 0043 §A7b) — `ClusterSegmentStore<E,
   S>`: the **default** `SegmentStore` for the stream-shard subsystem, K-way
   replication of an immutable segment over `E`'s `Network` seam. The
@@ -73,15 +77,15 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
   deleted along with `MergeTablets` (ADR 0044, tablets are now split-only);
   kept in case a future consumer needs the same token-vs-physical-presence
   disambiguation.
-- **`seal.rs`** (ADR 0018 §2 amendment) — the **range seal**: the structural
-  replacement for the retired `version_floor` cross-group-LWW fix.
-  `KvCommand::Seal { range, ts }` is proposed by a range-handoff source (a
-  split's `NarrowScope`) through its own Raft log; a
-  later-ordered mutating entry for a key inside a sealed range is rejected
-  at apply, checked against a per-group in-memory set rebuilt at group
-  start from a durable **engine marker key** (deliberately from the
-  engine, not log replay, since compaction can truncate a `Seal` entry out
-  of the log long before its rejection duty is done). The marker's key
+- **`seal.rs`** (ADR 0050 rung 5/7) — the **freeze marker**: the durable
+  half of `KvCommand::Freeze` (the split-cutover terminal whole-range
+  close; the zero-copy range seal this module used to serve was deleted
+  with its proposer in the rung-7 sweep). A later-ordered mutating entry
+  after the freeze is rejected at apply, checked against a per-group
+  in-memory set rebuilt at group start from a durable **engine marker
+  key** (deliberately from the engine, not log replay, since compaction
+  can truncate a `Freeze` entry out of the log long before its rejection
+  duty is done). The marker's key
   lives under `animus_control::syskv::RESERVED_NAMESPACE` — engine-global,
   outside every `StorageScope` — see the module's own doc for the
   key-disjointness proof.
@@ -155,21 +159,38 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
 ### lib.rs API
 
 `RaftKvNode<E, S>` is the running tablet-group node (start/propose/read
-methods); `StorageScope` (ADR 0026/0028) confines a node's physical key
-access within a possibly node-shared `StorageEngine` (a `prefix` plus a
-live-narrowable `range`); `KvCommand::KindBatch` (ADR 0041 §3) is the
+methods); `StorageScope` (ADR 0050 rung 2, F2b) is a thin **kind-scoping**
+helper over a tablet's own private engine (a kind-byte `prefix` plus the
+tablet's **immutable** declared `range` — physical keys are
+`[kind] || logical`, no table or tablet bytes); `KvCommand::KindBatch`
+(ADR 0041 §3) is the
 multi-kind atomic batch backing materialized secondary indexes and the
-change log; **transactions** (ADR 0018 §2) are covered in Key invariants
+change log; `KvCommand::SeedBatch` (ADR 0050 Train B rung 4, codec v19) is
+the split-build driver's history-transfer command — `SeedRow`s
+(`(kind, logical, value-or-tombstone, version)`) merge-applied at their
+**carried** versions with the stored bytes verbatim (intent envelopes
+included), emitting nothing into the child's change log and witnessing the
+batch's max version into the group's HLC (`propose_seed_batch` /
+`seed_rows_kind` are the driver's propose/read pair; `tests/seed_batch.rs`
++ `ANIMUS_SPLIT_SEEDS` is its corpus); `KvCommand::Freeze` (ADR 0050 rung
+5, codec v20) is the split-cutover freeze — a whole-range entry of the
+existing sealed-set discipline whose durable seal marker re-latches
+`is_frozen()` at group start, refusing every later-ordered USER mutation
+(base/LSI — a consumer-bookkeeping `KindBatch` still applies) while reads
+keep serving; `propose_freeze` is idempotent and `tests/freeze.rs` is its
+suite; **transactions** (ADR 0018 §2) are covered in Key invariants
 below. See the crate's rustdoc for the full method/accessor inventory.
 Four rules that aren't derivable from a doc comment:
 
 - **A group owns a scope *set*, not one scope.** `with_kind(kind)` derives a
   sibling scope per row kind (`KIND_BASE`/`KIND_LSI`/`KIND_CHANGE`/
-  `KIND_FOOTPRINT`/`KIND_CURSOR`) over the *same* `Arc<Mutex<KeyRange>>`, so
-  one `narrow`/`widen` moves every kind at once. **`StorageScope::whole()`
-  is no longer an identity transform** — its base-kind scope prefixes one
-  `KIND_BASE` byte, so *any* group's physical key is `prefix || kind ||
-  logical`. **Anything reading a group's bytes straight off the engine must
+  `KIND_FOOTPRINT`/`KIND_CURSOR`), each carrying the same immutable
+  declared range (`narrow`/`widen` died with the zero-copy split, ADR
+  0050). **`StorageScope::whole()` is not an identity transform** — its
+  base-kind scope prefixes one `KIND_BASE` byte, so *any* group's physical
+  key is `[kind] || logical` (engine-global reserved-namespace markers lead
+  `0x5F` and match no kind). **Anything reading a group's bytes straight off
+  the engine must
   go through `RaftKvNode::physical_key(kind, key)` rather than assembling
   `prefix || key` itself** — hard-coding the layout was correct only while
   a group had exactly one scope, and four tests broke on exactly that
@@ -212,73 +233,19 @@ State once here; cross-referenced from the sections below.
     four points: WAL recovery, every received `AppendEntries`
     (`witness_append_entries`, before `RaftCore::handle` — every entry,
     accepted or not, since a redundant witness is always safe), snapshot
-    install, and group start (off the shared engine's own
-    `latest_version()`, which alone covers a restart or a co-hosted
-    sibling's already-present data).
-  - **The range seal** (`seal.rs`) closes the one residual witnessing alone
-    cannot: an in-flight write from a source-group leader that hasn't yet
-    observed a split, still in its own commit pipeline when the handoff
-    happens. A source proposes `KvCommand::Seal { range, ts }` through its
-    own log at handoff time (`host.rs`'s `Reconciler`, on a split's
-    `NarrowScope`); apply rejects any later-ordered mutating entry whose key
-    falls in an already-sealed range, regardless of that entry's own `ts`,
-    because within one group log order and HLC order coincide, so it is the
-    **log position** that is authoritative. The reconciler gates a split
-    child's `Host` on observing the relevant seal marker locally first
-    (`TabletFacts::parent_seal_observed`, `Metadata::split_parents`
-    provenance) — see `host.rs`'s entry below and `seal.rs`'s module doc for
-    the key-disjointness proof. (Tablet merge had a mirror-image gate here —
-    a survivor's `WidenScope` on `widen_seal_observed`/`Metadata::
-    absorbed_by` — until ADR 0044 removed merge and this half of the
-    mechanism along with it.)
-  - **Proposing the seal is a persistent condition, re-derived every tick —
-    never a one-shot side effect of the tick that performs the local
-    irreversible action it precedes.** A replica that narrows its scope
-    while a follower must still propose the seal once later promoted to
-    leader. `host.rs`'s `gather_facts` computes `TabletFacts::pending_seals`
-    fresh every tick (via `seal_covers`), and `plan` turns each into
-    `HostAction::ProposeSeal`, replanned until observed. This gate is
-    self-supporting, not a deadlock: it keeps the quorum needed to commit
-    the seal alive for as long as it takes; a genuinely quorum-dead group
-    correctly stalls loudly instead of proceeding early. See ADR 0018's §2
-    amendment and `docs/engineering-lessons.md` for the full story.
-    Regression: `tests/reconciler_corpus.rs`'s
-    `narrow_seal_survives_a_late_promotion_after_narrowing_as_a_follower`.
-    (Tablet merge had a mirror-image waiting-side gate here — an absorbed
-    replica's `Reconciler::teardown` requiring a locally-*committed* seal,
-    never "nothing pending locally" alone, before tearing down — until ADR
-    0044 removed merge and this half of the mechanism along with it; its
-    own regression, `absorb_follower_waits_for_committed_seal_before_
-    tearing_down`, went with it.)
-  - **A hard, non-`debug` assert** (`assert_ts_monotonic`, at apply) checks
-    every applied entry's `ts` strictly exceeds the previous one this group
-    applied — the load-bearing invariant the whole witnessing chain exists
-    to guarantee; a failure means the chain itself is broken, not a
-    recoverable condition. Regression: `tests/cross_group_lww.rs`
-    (split/seal-rejection/in-flight-race/clock-skew shapes) and
-    `tests/witnessing.rs` (leader-change and restart-recovery
-    monotonicity).
-  - **`propose_ordered`: minting a proposal's `ts` and appending it to the
-    Raft log must be one atomic step, not two** — found via `animusd`'s
-    `self_heal.rs` panicking under real concurrent client load. Every
-    mutating propose method now computes its `ts` **while holding the
-    group's own `core` lock**, immediately followed by `core.propose(..)`
-    in the same critical section; two proposers could otherwise mint
-    monotonically (ts=A then ts=B) but race to append to the log in the
-    *opposite* order, so apply would see a real decrease. **This is a
-    `ProdEnv`-only bug, provably unreachable under `SimEnv`**: the original
-    code had no `.await` point between minting and proposing, so only
-    genuine OS-thread parallelism can interleave there. `propose_ordered`
-    also floors every ts-producing path on `last_proposed_ts` (this
-    leader's own last-*logged*, not just last-*applied*, ts, since the
-    apply task can lag the consensus loop by design). A second, narrower
-    bug: `next_ceiling_candidate`'s ratchet must never hand back
-    `last_proposed_ts` *unmodified* as a candidate, only as a floor to
-    strictly exceed, or a `ReadCeiling` can tie a write's exact ts. See
-    `docs/engineering-lessons.md` for the diagnostic story. Regression:
-    `tests/prod_concurrent_ts_monotonic.rs` — deliberately the one
-    real-thread `ProdEnv` test in a crate whose other binaries are all
-    `SimEnv`, since this race needs genuine thread parallelism to express.
+    install, and group start (off the tablet's own engine's
+    `latest_version()`, which alone covers a restart's already-present
+    data).
+  - **The freeze** (`seal.rs`, `KvCommand::Freeze`) closes the one residual
+    witnessing alone cannot: an in-flight write from the parent's own
+    leader, still in its commit pipeline when the split cutover happens. The
+    split-build driver proposes `Freeze` through the parent's own log; apply
+    rejects any later-ordered mutating entry, regardless of that entry's own
+    `ts`, because within one group log order and HLC order coincide — the
+    **log position** is authoritative. (The zero-copy split's range-scoped
+    seal, its `ProposeSeal` reconciler action, and the `parent_seal_observed`
+    host gate were deleted in the rung-7 sweep — a copy-based child never
+    shares rows with its parent, so there is no handoff to seal.)
 - **CAS is decided at *apply* time, not propose time** — this is what makes it
   linearizable and contention-correct. `RaftCore` agrees only the order; `Cas`
   rides through as opaque data. Apply evaluates it in commit order against the
@@ -303,14 +270,14 @@ State once here; cross-referenced from the sections below.
   `TxnStage.conditions`, `(key, expected)` byte-level OCC pairs checked
   against the KIND_BASE scope. Two deliberate differences from `TxnStage`'s
   own handling: (1) **no `StageOutcome` analogue** — a condition-failed
-  `KindBatch` no-ops silently, indistinguishable from a fence/seal miss (the
+  `KindBatch` no-ops silently, indistinguishable from a seal miss (the
   existing generic-error/probe-poll-timeout contract every
-  `put_kind_batch_fenced` caller already handles), so there is nothing to
-  disambiguate; and (2) **checked BEFORE the fence/seal gate**, not behind
-  it — `TxnStage`'s `condition_failure` only evaluates once already known
-  in-fence so `StageOutcome` can report the fence/seal reason ahead of a
+  `put_kind_batch_conditioned` caller already handles), so there is nothing
+  to disambiguate; and (2) **checked BEFORE the seal gate**, not behind it —
+  `TxnStage`'s `condition_failure` only evaluates once already known
+  unsealed so `StageOutcome` can report the seal reason ahead of a
   condition one, but with no outcome channel to prioritize for `KindBatch`
-  there is no reason to gate the read behind the fence check. The two gates
+  there is no reason to gate the read behind the seal check. The two gates
   still simply AND together either way. Production caller:
   `dynamo::kind_write_item_at_leader`'s leader-side evaluate-then-propose
   write path (ADR 0046 U3) passes `seatbelt: vec![(base_key, raw_old)]` —
@@ -531,6 +498,19 @@ own doc for its signature and field shapes); `host::Reconciler<E, S>` is
 the **execute** half, in this crate so it owns the lifecycle's invariants
 and is directly `SimEnv`-testable.
 
+**ADR 0050 Train B rung 1 — per-tablet engines.** The reconciler no longer
+receives one shared engine: it opens **one private engine per hosted
+tablet** through the `host::EngineFactory<S>` seam (`open`/`probe`/
+`destroy`; `animusd` maps a tablet id to an LSM filename prefix
+`db-t{tablet}-`, sim/tests use `host::MemoryTabletEngines`' registry).
+Consequences to keep in mind here: `Release`/`Reclaim` teardown both
+**delete the tablet's engine files whole** (a private engine holds no
+sibling's rows to spare, so no erase bound exists); `has_data` is a
+two-step `probe`-then-scan against the tablet's own engine. The zero-copy
+split lifecycle (`NarrowScope`/`ProposeSeal`/`parent_seal_observed`, the
+`erase_bound` field, and their corpus scenarios) was **deleted** in the
+ADR 0050 Train B rung-7 sweep.
+
 - **`plan` never removes a tablet from `LocalState::hosted` on its own**
   when emitting a fallible teardown (`Reclaim`/`Release`) — real teardown
   is async and can time out. The caller calls
@@ -552,23 +532,21 @@ and is directly `SimEnv`-testable.
 
 ### HostAction
 
-**Emitted in this fixed order: `ProposeSeal` → `NarrowScope` → `Host` →
-`Reconfigure` → `Release`/`Reclaim`.** `ProposeSeal` (re-)proposes a
-still-owed range-seal (persistent, no-op unless leading); `Host` is
-deferred for a split child until its parent's range-seal is locally
-observed; `Release`/`Reclaim` tear down a tablet moved off or dropped,
-respectively. Tablets are split-only (ADR 0044): merge's dual actions,
-`WidenScope` and `Absorb`, no longer exist — a hosted-but-now-absent
-tablet is unconditionally `Reclaim`ed, with no second case to
-disambiguate (the `Reclaim`-vs-`Absorb` ambiguity this section used to
-resolve is now moot).
+**Emitted in this fixed order: `Host` → `Reconfigure` →
+`Release`/`Reclaim`.** `Release`/`Reclaim` tear down a tablet moved off or
+dropped/retired, respectively. Tablets are split-only (ADR 0044) and
+ranges immutable (ADR 0050): the zero-copy `ProposeSeal`/`NarrowScope`
+actions were deleted in the rung-7 sweep, as merge's `WidenScope`/`Absorb`
+were by ADR 0044 — a hosted-but-now-absent tablet is unconditionally
+`Reclaim`ed; its two causes (dropped table, cutover-retired split parent)
+demand the identical action, so no disambiguation is needed.
 
 - **`Reconciler` teardown** (`Release`/`Reclaim`): unregister from routing
   *before* touching the driver, `shutdown()`, poll `is_stopped()` bounded
   by `RECLAIM_STOP_TIMEOUT` (10s), re-register and leave `LocalState`
   untouched on timeout (so `plan` re-emits the same action next tick), else
-  narrow to `erase_bound` (Release only), `erase_scope()`, delete the WAL,
-  and only then `confirm_torn_down`. (Merge's `Absorb` teardown — which
+  delete the tablet's engine files + WAL, and only then
+  `confirm_torn_down`. (Merge's `Absorb` teardown — which
   skipped the narrow/`erase_scope()` and drained the committed log before
   halting, since the absorbed data was about to be served elsewhere — was
   removed along with `TeardownKind::Absorb`; see the Key invariants entry
@@ -630,14 +608,15 @@ resolve is now moot).
   `animusd/tests/cp_plane.rs::single_write_latency_is_low` (median ~52ms →
   ~11ms).
 - **Unbounded scans must not fall through to `entries()`.** `local_scan`'s
-  `end: None` branch (used by `/admin/raftkv`'s `raft_view`, by `erase_scope()`
-  teardown, and transparently by `linearizable_scan` — the real DynamoDB
-  `Scan`/CQL full-table path) derives a bounded upper bound from
-  `physical_bounds` instead. `entries()` scans the **whole shared engine** (ADR
-  0028), so on a node hosting several tablets every unbounded scan cost
-  O(hosted tablets × whole node engine) — live-observed as `/admin/raftkv`
-  hanging for 20s+ on a grown, auto-split cluster. `entries()` remains the
-  fallback only for `StorageScope::whole()` (no finite bound).
+  `end: None` branch (used by `/admin/raftkv`'s `raft_view`, by teardown, and
+  transparently by `linearizable_scan` — the real DynamoDB `Scan`/CQL
+  full-table path) derives a bounded upper bound from `physical_bounds`
+  instead — post-F2b always finite for a kind scope (`[kind] .. [kind+1]`).
+  The engine is the tablet's own now (ADR 0050), so the historical
+  O(hosted tablets × node engine) blow-up can't recur, but the bounded
+  idiom stays: `entries()` would still walk sibling kinds and the
+  reserved-namespace markers. `entries()` remains the fallback only for the
+  un-prefixed parent scope (no finite bound).
 - Distinct WAL file (`raftkv.wal`) from the control plane's `raft.wal`, so a
   node can host both planes. The name is exported (`animus_cp_data::WAL`) so
   the drop-table GC (ADR 0024) can delete a stopped group's WAL.

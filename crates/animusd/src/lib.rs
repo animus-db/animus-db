@@ -59,17 +59,17 @@ use control_handle::{ControlHandle, RemoteControlClient};
 use animus_control::node::{DEFAULT_ORPHAN_SWEEP_AFTER, HEARTBEAT_INTERVAL, send_heartbeat};
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::hlc::HlcTimestamp;
-use animus_cp_data::host::{MetadataView, Reconciler};
+use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{
     FastRead, IntentInfo, RaftKvNode, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome,
     TxnRecordView,
 };
-use animus_env::{Clock, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
+use animus_env::{Clock, Disk, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
     WalRecordView,
 };
-use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId, escape};
+use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId, TabletState};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -202,43 +202,36 @@ enum CpGroup {
 
 impl CpGroup {
     /// Propose a write to the group (honored on the leader), stamping `fence`
-    /// (ADR 0028 write-fence wiring — see [`RaftKvNode::put_fenced`]) so every
-    /// replica's apply checks the key against the range embedded in the entry
-    /// itself. Every real caller (`ClientCtx::cp_put_local`) stamps the
-    /// group's own current [`scope_range`](Self::scope_range) here — there is
-    /// no unfenced `put` left in this crate; `KeyRange::whole()` is only ever
-    /// used by tests/tools with no split-crossover exposure to guard against.
-    fn put_fenced(&self, key: Vec<u8>, value: Vec<u8>, fence: KeyRange) -> ProposeResult {
+    /// Propose a write to this group. See [`RaftKvNode::put`].
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.put_fenced(key, value, fence),
-            CpGroup::Mem(n) => n.put_fenced(key, value, fence),
+            CpGroup::Lsm(n) => n.put(key, value),
+            CpGroup::Mem(n) => n.put(key, value),
         }
     }
 
-    /// As [`put_fenced`](Self::put_fenced), but for a **batch put** — commit
-    /// every `(key, value)` as one Raft entry. See
-    /// [`RaftKvNode::put_batch_fenced`].
-    fn put_batch_fenced(&self, puts: Vec<(Vec<u8>, Vec<u8>)>, fence: KeyRange) -> ProposeResult {
+    /// As [`put`](Self::put), but for a **batch put** — commit every
+    /// `(key, value)` as one Raft entry. See [`RaftKvNode::put_batch`].
+    fn put_batch(&self, puts: Vec<(Vec<u8>, Vec<u8>)>) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.put_batch_fenced(puts, fence),
-            CpGroup::Mem(n) => n.put_batch_fenced(puts, fence),
+            CpGroup::Lsm(n) => n.put_batch(puts),
+            CpGroup::Mem(n) => n.put_batch(puts),
         }
     }
 
-    /// As [`put_fenced`](Self::put_fenced), but for a **multi-kind atomic
-    /// batch** — base row, LSI rows, footprint and an optional change-log
-    /// record as one Raft entry (ADR 0041 §3/§4). See
-    /// [`RaftKvNode::put_kind_batch_fenced`].
-    fn put_kind_batch_fenced(
+    /// As [`put`](Self::put), but for a **multi-kind atomic batch** — base
+    /// row, LSI rows, footprint and optional change-log records as one Raft
+    /// entry (ADR 0041 §3/§4). See
+    /// [`RaftKvNode::put_kind_batch_conditioned`].
+    fn put_kind_batch_conditioned(
         &self,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-        fence: KeyRange,
     ) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.put_kind_batch_fenced(writes, change_log, conditions, fence),
-            CpGroup::Mem(n) => n.put_kind_batch_fenced(writes, change_log, conditions, fence),
+            CpGroup::Lsm(n) => n.put_kind_batch_conditioned(writes, change_log, conditions),
+            CpGroup::Mem(n) => n.put_kind_batch_conditioned(writes, change_log, conditions),
         }
     }
 
@@ -355,12 +348,12 @@ impl CpGroup {
         }
     }
 
-    /// As [`put_fenced`](Self::put_fenced), but for a delete (tombstone). See
-    /// [`RaftKvNode::delete_fenced`].
-    fn delete_fenced(&self, key: Vec<u8>, fence: KeyRange) -> ProposeResult {
+    /// As [`put`](Self::put), but for a delete (tombstone). See
+    /// [`RaftKvNode::delete`].
+    fn delete(&self, key: Vec<u8>) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.delete_fenced(key, fence),
-            CpGroup::Mem(n) => n.delete_fenced(key, fence),
+            CpGroup::Lsm(n) => n.delete(key),
+            CpGroup::Mem(n) => n.delete(key),
         }
     }
 
@@ -441,6 +434,35 @@ impl CpGroup {
         }
     }
 
+    /// Whether this group has applied its split-cutover freeze (ADR 0050
+    /// rung 5) — a pure flag read, never a wake. Consulted by every local
+    /// write/txn propose helper before proposing; see
+    /// [`RaftKvNode::is_frozen`] and [`frozen_refusal`].
+    pub(crate) fn is_frozen(&self) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.is_frozen(),
+            CpGroup::Mem(n) => n.is_frozen(),
+        }
+    }
+
+    /// This replica's Raft commit index — the rung-5 endgame's
+    /// apply-catch-up floor read. See [`RaftKvNode::commit_index`].
+    pub(crate) fn commit_index(&self) -> u64 {
+        match self {
+            CpGroup::Lsm(n) => n.commit_index(),
+            CpGroup::Mem(n) => n.commit_index(),
+        }
+    }
+
+    /// Propose the split-cutover freeze on this (parent) group (ADR 0050
+    /// rung 5). See [`RaftKvNode::propose_freeze`].
+    pub(crate) fn propose_freeze(&self) -> animus_control::ProposeResult {
+        match self {
+            CpGroup::Lsm(n) => n.propose_freeze(),
+            CpGroup::Mem(n) => n.propose_freeze(),
+        }
+    }
+
     /// This replica's `engine_applied_index()` — the confirm-by-index
     /// primitive linearizable reads themselves gate on. See
     /// [`RaftKvNode::engine_applied_index`]. Used by the backfill seeder
@@ -452,6 +474,32 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.engine_applied_index(),
             CpGroup::Mem(n) => n.engine_applied_index(),
+        }
+    }
+
+    /// Propose a split-build seed chunk into this (child) group's own log
+    /// (ADR 0050 Train B rung 4). See [`RaftKvNode::propose_seed_batch`].
+    pub(crate) fn propose_seed_batch(
+        &self,
+        rows: Vec<animus_cp_data::SeedRow>,
+    ) -> animus_control::ProposeResult {
+        match self {
+            CpGroup::Lsm(n) => n.propose_seed_batch(rows),
+            CpGroup::Mem(n) => n.propose_seed_batch(rows),
+        }
+    }
+
+    /// The split-build driver's raw row read — one kind scope's rows with
+    /// tombstones and versions, optionally bounded to a logical range. See
+    /// [`RaftKvNode::seed_rows_kind`].
+    pub(crate) async fn seed_rows_kind(
+        &self,
+        kind_idx: usize,
+        logical_range: Option<(&[u8], &[u8])>,
+    ) -> Vec<(Vec<u8>, Option<Vec<u8>>, u64)> {
+        match self {
+            CpGroup::Lsm(n) => n.seed_rows_kind(kind_idx, logical_range).await,
+            CpGroup::Mem(n) => n.seed_rows_kind(kind_idx, logical_range).await,
         }
     }
 
@@ -484,9 +532,10 @@ impl CpGroup {
 
     /// The node's `raftkv` env this group runs on. Since ADR 0026 Stage B every
     /// tablet a node hosts shares this **same** env (stream-addressed, not a
-    /// distinct per-tablet id/env) — used to identify *this node's* handle in the
-    /// shared edge registry (`node_id()`), not to locate per-tablet files (the
-    /// engine is shared too; see [`LSM_PREFIX`]).
+    /// distinct per-tablet id/env) — used to identify *this node's* handle in
+    /// the shared edge registry (`node_id()`). Per-tablet files are located by
+    /// the engine factory's own `db-t{t}-` naming (ADR 0050 rung 1), not by
+    /// env identity.
     fn env(&self) -> &ProdEnv {
         match self {
             CpGroup::Lsm(n) => n.env(),
@@ -578,14 +627,12 @@ impl CpGroup {
     /// call the identical `RaftKvNode` accessors, so a local macro keeps it DRY.
     /// `key_count`/`byte_size` are this tablet's own **exact,
     /// `StorageScope`-scoped** count/total ([`local_pairs`](Self::local_pairs))
-    /// — *not* the cheap, unscoped [`approx_key_count`](Self::approx_key_count)
-    /// / scoped-but-approximate [`approx_bytes`](Self::approx_bytes) estimates
-    /// `auto_split_loop` uses as a fast gate. `approx_key_count` reads the whole
-    /// shared engine and so reports every co-resident tablet's combined count —
-    /// a node hosts more than one tablet on the same engine as soon as it hosts
-    /// a split's parent + child (ADR 0028), which is why the unscoped estimate
-    /// showed a mid-split tablet's row as the *node's* total rather than its own
-    /// subset. This is a debug surface, so the materialize-then-count cost is
+    /// — *not* the cheap [`approx_key_count`](Self::approx_key_count) /
+    /// [`approx_bytes`](Self::approx_bytes) estimates `auto_split_loop` uses
+    /// as a fast gate. (Since ADR 0050 rung 1 the engine is the tablet's own,
+    /// so those estimates no longer over-count co-resident siblings; the
+    /// exact count here remains the debug-grade answer, the estimates the
+    /// cheap one.) This is a debug surface, so the materialize-then-count cost is
     /// acceptable (mirrors `local_scan`'s browse-keys view); `byte_size` is
     /// summed from the same materialized pairs, no second engine call needed.
     async fn raft_view(&self, tablet: TabletId) -> admin::CpRaftView {
@@ -619,6 +666,12 @@ impl CpGroup {
                     key_count,
                     byte_size,
                     quiesced: $n.is_quiesced(),
+                    // Overlaid by `admin::raftkv_view` from the data role's
+                    // split-build mirror (ADR 0050 rung 4); this constructor
+                    // has no `ClientCtx` to read it from.
+                    split_rows_shipped: None,
+                    split_converged: None,
+                    split_phase: None,
                 }
             };
         }
@@ -1024,6 +1077,14 @@ pub(crate) enum SnapshotRead {
 /// longer than a steady-state op. No happy-path cost: `cp_route` returns as soon as
 /// a leader is reachable; the cap only bounds the wait when the group is forming.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// ADR 0050 rung 5: the retryable refusal every mutating propose helper
+/// returns for a frozen split parent (post-`Freeze`, pre-cutover). Ends in
+/// `"; retry"` (the house retryability convention) so every existing client
+/// retry loop re-resolves routing; distinct wording so tests/admin can tell
+/// frozen from a fence/stale-routing refusal.
+const FROZEN_REFUSAL: &str =
+    "tablet frozen for split cutover (ADR 0050); a child will serve this range shortly; retry";
 /// How long [`ClientCtx::cp_forward`] backs off between retry passes when every
 /// candidate replica refused a forwarded op with `leader_hint=none` — i.e. the
 /// tablet's group has no elected leader *yet* (a split-child/first-provision
@@ -1297,6 +1358,29 @@ pub enum ClientRequest {
     /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
     /// only through the `Forwarded` arm.
     ClearBackfillCursor { tablet: u64, index: String },
+    /// **Internal split-build seed RPC — never sent bare, only wrapped in
+    /// [`Forwarded`](Self::Forwarded)** (ADR 0050 Train B rung 4): propose
+    /// one `KvCommand::SeedBatch` chunk — `(kind, logical key,
+    /// value-or-tombstone, MVCC version)` rows — into `tablet`'s (a
+    /// `Building` split child's) own Raft group, applied as
+    /// version-carrying merges. The **one** production sender is the
+    /// split-build driver (`index_drain::split_driver_tick` via
+    /// `ClientCtx::seed_child_rows`), running on the *parent* tablet's
+    /// leader node — a child's own leader can live anywhere (fork F5,
+    /// placement-chosen homes), so this needs the identical one-hop
+    /// forward/leader-resolution machinery every other CP op has.
+    /// Addressed by `tablet` directly, mirroring
+    /// [`ForceSeal`](Self::ForceSeal) (a `Building` child is deliberately
+    /// unroutable by key). Bare delivery is refused for the same reason
+    /// `KindWrite`'s is: an arbitrary caller must never install raw rows
+    /// at arbitrary versions into a tablet's scopes. Not a `MetaCommand`,
+    /// so `is_relayable_command` does not apply; real handling lives in
+    /// `cp_serve_forwarded`'s match, reached only through the `Forwarded`
+    /// arm.
+    SeedRows {
+        tablet: u64,
+        rows: Vec<animus_cp_data::SeedRow>,
+    },
     /// **Internal evaluate-at-leader write RPC — never sent bare, only
     /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0046 "evaluate at
     /// leader", U3, tracked against `docs/adr-tablet-log-model` #222): the
@@ -1648,6 +1732,7 @@ fn surface_of(request: &ClientRequest) -> Surface {
         | ClientRequest::TriggerAutoSplit { .. }
         | ClientRequest::StreamHotRead { .. }
         | ClientRequest::ClearBackfillCursor { .. }
+        | ClientRequest::SeedRows { .. }
         | ClientRequest::KindWriteItem { .. }
         | ClientRequest::TxnPrepare { .. }
         | ClientRequest::TxnDecide { .. }
@@ -1755,7 +1840,13 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // `RegisterCpAddr` (a follower-connected node has no other way to
             // reach the control leader).
             | MetaCommand::RegisterNodeAddrs { .. }
-            | MetaCommand::SplitTablet { .. }
+            // Copy-based split workflow (ADR 0050): `trigger_split` proposes
+            // `BeginSplit` from whichever node's admin/auto-split surface
+            // fired it, and the split driver (B4/B5) proposes `CutoverSplit`
+            // from the parent's own leader node — both need the identical
+            // follower-connected relay path `SplitTablet` already has.
+            | MetaCommand::BeginSplit { .. }
+            | MetaCommand::CutoverSplit { .. }
             // Provision-at-create (ADR 0023): a `CreateTable` on a follower-connected
             // client relays the table's tablet creation + RF policy to the control
             // leader. Scoped to one tablet per table by the state machine's guard.
@@ -2677,6 +2768,7 @@ impl BoundNode {
             segment_store,
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
+            split_builds: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -2722,22 +2814,24 @@ impl BoundNode {
             let on_teardown = move |tablet: TabletId| {
                 teardown_edge.unregister_raftkv(tablet, base_id.clone());
             };
-            match storage {
-                SharedEngine::Lsm(lsm) => CpReconciler::Lsm(Reconciler::new(
-                    hook_env,
-                    lsm,
+            // ADR 0050 rung 1: the reconciler no longer receives the node's
+            // shared engine — it opens ONE PRIVATE ENGINE PER HOSTED TABLET
+            // through the factory seam (the node's `storage` above now backs
+            // only the control plane's system keyspace, ADR 0038).
+            match &storage {
+                SharedEngine::Lsm(_) => CpReconciler::Lsm(Reconciler::new(
+                    hook_env.clone(),
+                    LsmTabletFactory { env: hook_env },
                     my_id.clone(),
-                    table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
                     },
                     on_teardown,
                 )),
-                SharedEngine::Mem(mem) => CpReconciler::Mem(Reconciler::new(
+                SharedEngine::Mem(_) => CpReconciler::Mem(Reconciler::new(
                     hook_env,
-                    mem,
+                    MemoryTabletEngines::new(),
                     my_id.clone(),
-                    table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
                         host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
                     },
@@ -3810,6 +3904,7 @@ impl BoundDataNode {
             segment_store,
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
+            split_builds: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             control,
@@ -3846,22 +3941,24 @@ impl BoundDataNode {
             let on_teardown = move |tablet: TabletId| {
                 teardown_edge.unregister_raftkv(tablet, base_id.clone());
             };
-            match storage {
-                SharedEngine::Lsm(lsm) => CpReconciler::Lsm(Reconciler::new(
-                    hook_env,
-                    lsm,
+            // ADR 0050 rung 1: the reconciler no longer receives the node's
+            // shared engine — it opens ONE PRIVATE ENGINE PER HOSTED TABLET
+            // through the factory seam (the node's `storage` above now backs
+            // only the control plane's system keyspace, ADR 0038).
+            match &storage {
+                SharedEngine::Lsm(_) => CpReconciler::Lsm(Reconciler::new(
+                    hook_env.clone(),
+                    LsmTabletFactory { env: hook_env },
                     my_id.clone(),
-                    table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
                     },
                     on_teardown,
                 )),
-                SharedEngine::Mem(mem) => CpReconciler::Mem(Reconciler::new(
+                SharedEngine::Mem(_) => CpReconciler::Mem(Reconciler::new(
                     hook_env,
-                    mem,
+                    MemoryTabletEngines::new(),
                     my_id.clone(),
-                    table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
                         host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
                     },
@@ -4472,6 +4569,10 @@ fn build_segment_store(
 /// fine: every access is a quick lock/mutate/drop with no `.await` held
 /// across it, the same discipline `ClientCtx::metrics_history` already
 /// uses.
+/// One `/admin/raftkv` split-build mirror entry (ADR 0050):
+/// `(rows_shipped, converged, phase)`.
+pub(crate) type SplitBuildView = (u64, bool, &'static str);
+
 #[derive(Clone, Default)]
 pub(crate) struct ChangeRateTracker {
     inner: Arc<Mutex<BTreeMap<TabletId, RateSample>>>,
@@ -4590,6 +4691,15 @@ struct DataRole {
     /// rate` trigger (`auto_split_loop`). See [`ChangeRateTracker`]'s own
     /// doc for the full design.
     pub(crate) change_rates: ChangeRateTracker,
+    /// ADR 0050 Train B rung 4: this node's own per-parent-tablet split-build
+    /// progress — `(rows shipped, build converged)` — written by
+    /// `index_drain`'s split-driver arm on the parent's leader node, read by
+    /// `/admin/raftkv` (`CpRaftView.split_rows_shipped`/`split_converged`).
+    /// Driver-local observability only, NEVER correctness state: a leader
+    /// change starts a fresh entry on the new leader's node (the build
+    /// re-runs idempotently), and B5's freeze/cutover decisions read the
+    /// tail's own convergence directly, not this mirror.
+    pub(crate) split_builds: Arc<Mutex<BTreeMap<u64, SplitBuildView>>>,
 }
 
 /// Shared context for the client request server and the DynamoDB/CQL endpoints:
@@ -5087,44 +5197,6 @@ impl ClientCtx {
         e.ends_with("; retry")
     }
 
-    /// Serve a linearizable **get** on a known-leader local handle, enforcing
-    /// the **read-side scope pre-check** (ADR 0033 — the read dual of
-    /// [`cp_put_local`](Self::cp_put_local)'s pre-propose range check) and the
-    /// served/absent disambiguation.
-    ///
-    /// `Ok(None)` is a genuinely **served** absent. `Err("…; retry")` covers
-    /// the two conditions that must never be reported as absence: (1) the
-    /// group's live `scope_range()` does not contain `key` — this routing
-    /// resolution raced a split's narrow, so this group
-    /// does not (or does not *yet*) own the key, and serving from its engine
-    /// could return absent-or-stale for data another group is authoritative
-    /// for; (2) the ReadIndex barrier failed (deposed / mid-election leader)
-    /// — nothing can be concluded about the key at all. Both were previously
-    /// collapsed into "absent" (`Value(None)`), which read exactly like data
-    /// loss from the outside — a regression caught under a real
-    /// multi-process deployment, before tablet merge was removed entirely
-    /// (split-only tablets).
-    ///
-    /// **Test-only since ADR 0018 §2/PR4** (`split_fence_tests`'s stale-scope
-    /// regression, which drives a raw `CpGroup` handle with no `ClientCtx`
-    /// around it): every real call site now goes through
-    /// [`cp_get_local_resolving`](Self::cp_get_local_resolving) instead,
-    /// which additionally chases a foreign intent (needs `&self` for the
-    /// cross-tablet `TxnStatus` round trip this associated function has no
-    /// way to make).
-    #[cfg(test)]
-    async fn cp_get_local(leader: &CpGroup, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
-        if !leader.scope_range().contains(key) {
-            return Err(format!(
-                "key {key:?} outside tablet's current range (stale routing, likely a split crossover); retry"
-            ));
-        }
-        match leader.linearizable_get_served(key).await {
-            Some(v) => Ok(v),
-            None => Err("CP group leader moved; retry".into()),
-        }
-    }
-
     /// As [`cp_get_local`](Self::cp_get_local), but additionally chases a
     /// **foreign intent** (ADR 0018 §2/PR4 — a multi-participant
     /// transaction's intent whose covering record lives on a *different*
@@ -5540,6 +5612,21 @@ impl ClientCtx {
     /// The **known-leader** local half of [`cp_kind_write_raw`](Self::
     /// cp_kind_write_raw): fence pre-check, propose, then confirm on the
     /// batch's **last** write — `Some(value)` for a put, `None` for a
+    /// ADR 0050 rung 5: the shared pre-propose freeze refusal. A frozen
+    /// split parent (post-`KvCommand::Freeze`, pre-cutover/retire) refuses
+    /// every mutating propose with this retryable error, so the caller's
+    /// ordinary retry loop re-resolves routing and lands on a child once
+    /// `CutoverSplit` activates them — the same client shape as an election
+    /// wait. Reads are deliberately NOT gated (a frozen parent's state IS
+    /// current until cutover). The apply-time whole-range seal remains the
+    /// backstop for the propose-vs-apply sliver.
+    fn frozen_refusal(leader: &CpGroup) -> Result<(), String> {
+        if leader.is_frozen() {
+            return Err(FROZEN_REFUSAL.into());
+        }
+        Ok(())
+    }
+
     /// tombstone (see `cp_kind_write_raw`'s doc for why the last write
     /// proves the whole entry). The ONE confirm implementation for a raw
     /// kind batch, shared by `cp_kind_write_raw`'s `Local` arm and
@@ -5549,11 +5636,98 @@ impl ClientCtx {
     /// CQL DELETE — the first raw batch whose base write is a tombstone —
     /// erred iff the connected node did not lead the tablet
     /// (leader-placement-bimodal; caught by `cql_clustering`).
+    /// Propose one split-build seed chunk on a **known-leader** local handle
+    /// of the child group and confirm it applied (ADR 0050 Train B rung 4).
+    ///
+    /// The ONE local implementation, shared by `cp_serve_forwarded`'s
+    /// `SeedRows` arm and `seed_child_rows`' own local branch — never two
+    /// copies (the A2-rebase lesson: one confirm implementation per RPC).
+    /// Confirmation is **by applied index**, not a value probe: seed rows
+    /// merge at *carried* versions, so a legitimately newer row on the child
+    /// (per-key LWW — a later tail pass already shipped a fresher version)
+    /// would make a value probe hang forever on a batch that correctly
+    /// no-opped.
+    async fn seed_rows_local(
+        leader: &CpGroup,
+        rows: Vec<animus_cp_data::SeedRow>,
+    ) -> Result<(), String> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        Self::frozen_refusal(leader)?;
+        let index = match leader.propose_seed_batch(rows) {
+            animus_control::ProposeResult::Accepted { index, .. } => index,
+            other => return Err(format!("seed batch not accepted: {other:?}; retry")),
+        };
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let mut poll = CP_CONFIRM_POLL_INIT;
+        while tokio::time::Instant::now() < deadline {
+            if leader.engine_applied_index() >= index {
+                return Ok(());
+            }
+            tokio::time::sleep(poll).await;
+            poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
+        }
+        Err("seed batch did not apply in time; retry".into())
+    }
+
+    /// Ship one seed chunk to a split child's group leader, wherever it
+    /// lives (ADR 0050 Train B rung 4): local if this node leads the child,
+    /// else one `Forwarded { SeedRows }` hop chased through the standard
+    /// hint machinery — the identical resolve/relay shape
+    /// `grow_stream_tablet` uses. Idempotent (a duplicate chunk re-merges
+    /// the same versions), so the caller may retry freely.
+    pub(crate) async fn seed_child_rows(
+        &self,
+        child: TabletId,
+        rows: Vec<animus_cp_data::SeedRow>,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            match self.resolve_cp_route(child) {
+                Some(CpRoute::Local(leader)) => {
+                    return Self::seed_rows_local(&leader, rows).await;
+                }
+                Some(CpRoute::Forward(addr)) => {
+                    let request = ClientRequest::Forwarded {
+                        request: Box::new(ClientRequest::SeedRows {
+                            tablet: child.0,
+                            rows: rows.clone(),
+                        }),
+                        traceparent: otel::current_traceparent(),
+                    };
+                    match self.relay(addr, request).await {
+                        ClientResponse::PutOk => return Ok(()),
+                        ClientResponse::Error(e)
+                            if topology::parse_not_leader_refusal(&e).is_some() => {} // stale hint, retry below
+                        ClientResponse::Error(e) => return Err(e),
+                        other => return Err(format!("unexpected seed reply: {other:?}")),
+                    }
+                }
+                Some(CpRoute::None) | None => {} // child group not settled yet, retry
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("seed: did not reach the child's leader in time; retry".into());
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
     async fn cp_kind_raw_local(
         leader: &CpGroup,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
+        // ADR 0050 rung 5: a frozen split parent refuses USER data (base/
+        // LSI writes) but not consumer bookkeeping (cursor/footprint-only
+        // batches — the GSI drain's own writes), which must keep flowing so
+        // the drain can finish the frozen log and release the cutover veto
+        // (the apply-time gate makes the identical distinction).
+        if writes.iter().any(|(kind, _, _)| {
+            *kind == animus_cp_data::KIND_BASE || *kind == animus_cp_data::KIND_LSI
+        }) {
+            Self::frozen_refusal(leader)?;
+        }
         let fence = leader.scope_range();
         for (_, key, _) in &writes {
             if !fence.contains(key) {
@@ -5566,7 +5740,7 @@ impl ClientCtx {
         else {
             return Ok(()); // empty batch is a no-op
         };
-        match leader.put_kind_batch_fenced(writes, change_log, Vec::new(), fence) {
+        match leader.put_kind_batch_conditioned(writes, change_log, Vec::new()) {
             ProposeResult::Accepted { .. } => {}
             other => return Err(format!("kind write not accepted: {other:?}")),
         }
@@ -5622,6 +5796,7 @@ impl ClientCtx {
         let Some((probe_key, probe_val)) = probe else {
             return Err("a kind batch must carry a base-kind write to confirm on".into());
         };
+        Self::frozen_refusal(leader)?;
         // Pre-propose range check, the same reasoning as `cp_batch_propose`:
         // a fenced-out entry applies as a no-op, and the probe below would then
         // just time out with a generic error instead of a clean routing error.
@@ -5631,7 +5806,7 @@ impl ClientCtx {
                 return Err("kind write outside this group's live range; retry".into());
             }
         }
-        match leader.put_kind_batch_fenced(writes, change_log, conditions, fence) {
+        match leader.put_kind_batch_conditioned(writes, change_log, conditions) {
             ProposeResult::Accepted { .. } => {}
             other => return Err(format!("kind write not accepted: {other:?}")),
         }
@@ -5684,6 +5859,7 @@ impl ClientCtx {
         leader: &CpGroup,
         group: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<Option<KvPair>, String> {
+        Self::frozen_refusal(leader)?;
         let probe = group.last().cloned();
         let fence = leader.scope_range();
         if let Some((bad_key, _)) = group.iter().find(|(k, _)| !fence.contains(k)) {
@@ -5691,7 +5867,7 @@ impl ClientCtx {
                 "key {bad_key:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
-        match leader.put_batch_fenced(group, fence) {
+        match leader.put_batch(group) {
             ProposeResult::Accepted { .. } => Ok(probe),
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
         }
@@ -5769,6 +5945,7 @@ impl ClientCtx {
         participant_spans: Vec<(String, KeyRange)>,
         pending_kind_writes: Vec<PendingKindWrite>,
     ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), String> {
+        Self::frozen_refusal(leader)?;
         if !pending_kind_writes.is_empty() {
             let meta = self.effective_metadata();
             let _rmw = self.data().rmw_lock.lock().await;
@@ -6028,6 +6205,7 @@ impl ClientCtx {
     ) -> Result<TxnOutcome, String> {
         match self.cp_route(table, &record_key).await {
             CpRoute::Local(leader) => {
+                Self::frozen_refusal(&leader)?;
                 if let Some(created_ts) = orphan_created_ts {
                     leader
                         .txn_abort_orphan(txn_id.clone(), record_key.clone(), created_ts)
@@ -6097,6 +6275,11 @@ impl ClientCtx {
         };
         match self.cp_route(table, &first).await {
             CpRoute::Local(leader) => {
+                // ADR 0050 rung 5 (fork F7): a resolve landing on a frozen
+                // parent is refused retryably — post-cutover the identical
+                // resolve re-routes to the child, which holds the copied
+                // intent + record and materializes at its own position.
+                Self::frozen_refusal(&leader)?;
                 leader.txn_resolve(txn_id, record_key, keys, outcome).await;
                 Ok(())
             }
@@ -7109,6 +7292,10 @@ impl ClientCtx {
         let mut ranges: Vec<KeyRange> = self
             .effective_metadata()
             .tablets_for_table(table)
+            // ADR 0050: a `Building` split child overlaps its still-serving
+            // parent — scanning both would double-serve (or serve a
+            // half-copied engine's slice of) the overlap.
+            .filter(|(_, t)| t.is_routable())
             .map(|(_, t)| t.range.clone())
             .filter(|r| {
                 // [r.start, r.end) overlaps [start, end), each upper bound optional.
@@ -7254,6 +7441,8 @@ impl ClientCtx {
         let mut ranges: Vec<KeyRange> = self
             .effective_metadata()
             .tablets_for_table(table)
+            // ADR 0050: skip `Building` children (see `cp_scan`'s own filter).
+            .filter(|(_, t)| t.is_routable())
             .map(|(_, t)| t.range.clone())
             .filter(|r| {
                 end.as_deref().is_none_or(|e| r.start.as_slice() < e)
@@ -7421,13 +7610,14 @@ impl ClientCtx {
     /// close; a write landing in it is *dropped* (a safe no-op that this loop
     /// times out on), never mis-applied.
     async fn cp_put_local(leader: &CpGroup, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
+        Self::frozen_refusal(leader)?;
         let fence = leader.scope_range();
         if !fence.contains(&key) {
             return Err(
                 "key outside tablet's current range (stale routing, likely a split crossover); retry".into(),
             );
         }
-        match leader.put_fenced(key.clone(), value.clone(), fence) {
+        match leader.put(key.clone(), value.clone()) {
             ProposeResult::Accepted { .. } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
                 let mut poll = CP_CONFIRM_POLL_INIT;
@@ -7459,13 +7649,14 @@ impl ClientCtx {
     /// the full hazard and why the pre-check, not just the embedded fence, is
     /// the actual guard).
     async fn cp_delete_local(leader: &CpGroup, key: Vec<u8>) -> Result<(), String> {
+        Self::frozen_refusal(leader)?;
         let fence = leader.scope_range();
         if !fence.contains(&key) {
             return Err(
                 "key outside tablet's current range (stale routing, likely a split crossover); retry".into(),
             );
         }
-        match leader.delete_fenced(key.clone(), fence) {
+        match leader.delete(key.clone()) {
             ProposeResult::Accepted { .. } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
                 let mut poll = CP_CONFIRM_POLL_INIT;
@@ -8043,6 +8234,21 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
+            // ADR 0050 Train B rung 4: the split-build seed RPC — addressed
+            // by `tablet` (a Building child, deliberately unroutable by
+            // key) directly, mirroring `ForceSeal` just above. One shared
+            // local implementation with `seed_child_rows`' own local
+            // branch (`seed_rows_local`), never a second confirm copy.
+            ClientRequest::SeedRows { tablet, rows } => {
+                let tablet = TabletId(tablet);
+                let Some(leader) = self.edge.cp_leader(tablet) else {
+                    return self.not_leader_refusal(Some(tablet));
+                };
+                match Self::seed_rows_local(&leader, rows).await {
+                    Ok(()) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
             // Growth PR3 (ADR 0042 §14): the manual-growth split-trigger
             // RPC — addressed by `tablet` directly, mirroring `ForceSeal`
             // just above. Materializes this tablet's own live pairs
@@ -8074,16 +8280,11 @@ impl ClientCtx {
                 let Some(leader) = self.edge.cp_leader(tablet) else {
                     return self.not_leader_refusal(Some(tablet));
                 };
-                // ADR 0044 phase-1 PR4: the hot_read scope-transition latch,
-                // sourced from `metadata_fresh()` — see
-                // `hot_read_scope_ok`'s own doc for why this narrows the ADR
-                // 0043 residual `effective_metadata()` alone left open (and
-                // for the accepted remaining sub-window it does not close).
-                let meta = self.metadata_fresh().await;
-                if let Err(e) = Self::hot_read_scope_ok(&meta, tablet, &leader) {
-                    return ClientResponse::Error(e);
-                }
-                let pairs = index_drain::hot_read(&meta, tablet, &leader, from_position, limit)
+                // The ADR 0048 scope-transition latch died with the mutable
+                // scope (ADR 0050 rung 7): ranges are immutable and a split
+                // retires the parent whole, so there is no transition window
+                // left to latch.
+                let pairs = index_drain::hot_read(&leader, from_position, limit)
                     .await
                     .into_iter()
                     .map(|(key, _, value)| (key, value))
@@ -9443,13 +9644,55 @@ impl SharedEngine {
     }
 }
 
-/// The `StorageScope` prefix confining `table`'s tablets on a node's shared
-/// engine: `escape(table)`. Order-preserving and prefix-free
-/// (`animus_tablet::escape`), so one table's keys can never collide with
-/// another's even though every table's tablets share one physical
-/// `LsmEngine`/`MemoryEngine` (ADR 0026/0028).
-fn table_scope_prefix(table: &str) -> Vec<u8> {
-    escape(table.as_bytes())
+/// A tablet's own LSM filename prefix on this node's `Disk` (ADR 0050 rung
+/// 1: per-tablet engines — naming is identity, the same mechanism
+/// `raftkv.wal.<tablet>` uses). The trailing `-` is load-bearing: it keeps
+/// `db-t5-*` from prefix-matching `db-t51-*`, and no tablet file ever
+/// collides with the node's own control/syskv engine (whose files are
+/// `db-MANIFEST`/`db-wal-*`/`db-sst-*` under the bare [`LSM_PREFIX`] — the
+/// `t` disambiguates).
+fn tablet_lsm_prefix(tablet: u64) -> String {
+    format!("{LSM_PREFIX}t{tablet}-")
+}
+
+/// The [`LsmEngine`] implementation of the per-tablet engine seam (ADR 0050
+/// rung 1): one private on-disk engine per hosted tablet, opened/probed/
+/// destroyed by filename prefix over this node's one `ProdEnv` disk.
+struct LsmTabletFactory {
+    env: ProdEnv,
+}
+
+#[async_trait::async_trait]
+impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactory {
+    async fn open(&self, tablet: TabletId) -> Result<LsmEngine<ProdEnv>, String> {
+        LsmEngine::open(self.env.clone(), &tablet_lsm_prefix(tablet.0))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn probe(&self, tablet: TabletId) -> bool {
+        // Durable engine state exists iff any file carries this tablet's own
+        // prefix — an `LsmEngine` writes its first file (a WAL segment) on
+        // the first write, so a never-written tablet correctly probes false.
+        let prefix = tablet_lsm_prefix(tablet.0);
+        self.env
+            .list()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|f| f.starts_with(&prefix))
+    }
+
+    async fn destroy(&self, tablet: TabletId) {
+        let prefix = tablet_lsm_prefix(tablet.0);
+        for f in self.env.list().await.unwrap_or_default() {
+            if f.starts_with(&prefix)
+                && let Err(e) = self.env.remove(&f).await
+            {
+                tracing::warn!(?e, file = %f, "deleting a reclaimed tablet's engine file");
+            }
+        }
+    }
 }
 
 /// This node's own tablet-host reconciler (ADR 0031 PR4) — wraps whichever
@@ -9587,7 +9830,6 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
         let view = MetadataView {
             tablets: meta.tablets,
             down,
-            split_parent: meta.split_parents,
         };
         reconciler.tick(&view).await;
     }
@@ -9834,6 +10076,67 @@ fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) -> (Ve
     (key, viable)
 }
 
+/// Choose the two `BeginSplit` children's replica sets (ADR 0050 fork F5:
+/// **fresh placement at mint** — children are born at their final homes, so
+/// the copy-based build is the only data movement a split ever makes).
+///
+/// Pure over the given `Metadata` snapshot: candidates are the `Active`
+/// members (the same liveness rule `Metadata::reconcile` applies), the
+/// parent's own placement policy carries RF/residency/spread, and per-node
+/// load is the current replica count across every tablet (seeded `0` for
+/// every candidate — a fresh member is a genuine minimum, matching
+/// `rebalance_step`'s rule). The second child's selection sees the first
+/// child's picks as load, so the two don't pile onto the same least-loaded
+/// nodes. A parent with no recorded policy (not a state `provision_tablet`
+/// produces, but reachable via a hand-built cluster) falls back to
+/// inheriting the parent's own replica set for both children — the
+/// pre-fork-F5 behavior, safe if never balanced.
+fn split_child_placement(meta: &Metadata, parent: TabletId) -> Result<[Vec<NodeId>; 2], String> {
+    let Some(parent_tablet) = meta.tablets.get(&parent) else {
+        return Err("no such tablet".into());
+    };
+    let Some(policy) = meta.policies.get(&parent) else {
+        return Ok([
+            parent_tablet.replicas.clone(),
+            parent_tablet.replicas.clone(),
+        ]);
+    };
+    let candidates: Vec<animus_control::Candidate> = meta
+        .members
+        .iter()
+        .filter(|(_, m)| m.status == NodeStatus::Active)
+        .map(|(id, m)| animus_control::Candidate::new(id.clone(), m.labels.clone()))
+        .collect();
+    let mut load: BTreeMap<NodeId, usize> =
+        candidates.iter().map(|c| (c.node.clone(), 0)).collect();
+    for t in meta.tablets.values() {
+        for r in &t.replicas {
+            if let Some(n) = load.get_mut(r) {
+                *n += 1;
+            }
+        }
+    }
+    // Placement can be under-satisfiable right now (a dev/single-node
+    // cluster whose recorded RF exceeds the live member count — the exact
+    // state `provision_tablet` already documents as legitimate, with repair
+    // self-healing once members exist). Fall back to inheriting the
+    // parent's own replica set then, exactly like the no-policy case above:
+    // best-effort placement now, `reconcile_placement` fixes the children
+    // up after cutover once they are `Active` again.
+    let pick = |load: &BTreeMap<NodeId, usize>| {
+        animus_control::select_replicas_balanced(&candidates, policy, load)
+            .unwrap_or_else(|_| parent_tablet.replicas.clone())
+    };
+    let left = pick(&load);
+    for r in &left {
+        if let Some(n) = load.get_mut(r) {
+            *n += 1;
+        }
+    }
+    let right = pick(&load);
+    Ok([left, right])
+}
+
 /// The leader-driven **automatic split trigger**: on each tick, for every tablet
 /// whose CP group this node currently **leads**, take the leader's **cheap
 /// estimates** ([`CpGroup::approx_key_count`]/[`CpGroup::approx_bytes`] —
@@ -9883,7 +10186,15 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
         // token-alignment check below (ADR 0042 §14) shares one snapshot
         // with the tablet-list read, rather than paying a second clone.
         let meta = ctx.effective_metadata();
-        let tablets: Vec<TabletId> = meta.tablets.keys().copied().collect();
+        // ADR 0050: only an `Active` tablet is auto-splittable — a
+        // `Splitting` parent is already mid-workflow (one split at a time)
+        // and a `Building` child is still being seeded.
+        let tablets: Vec<TabletId> = meta
+            .tablets
+            .iter()
+            .filter(|(_, t)| t.state == TabletState::Active)
+            .map(|(&id, _)| id)
+            .collect();
         for tablet in tablets {
             if matches!(last_triggered.get(&tablet), Some(at) if at.elapsed() < AUTO_SPLIT_COOLDOWN)
             {
@@ -10059,6 +10370,19 @@ fn byte_weighted_median(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
 const STREAM_GROW_NO_SPLIT_POINT: &str =
     "tablet has fewer than 2 distinct keys — no legal interior split point";
 
+/// Expected per-tablet skip [`ClientCtx::grow_stream`] reports for a tablet
+/// already inside the ADR 0050 split workflow — a `Splitting` parent (its
+/// split is already in flight, so this call performs nothing for it) or a
+/// `Building` child (unsplittable until activation). Reported *instead of*
+/// calling [`ClientCtx::grow_stream_tablet`] at all: routing a median read
+/// at a mid-split tablet is wasted work, and `trigger_split`'s own
+/// idempotent `PutOk` for a `Splitting` parent would otherwise be counted
+/// by the admin summary as a split *this call* performed (Train B rung 6;
+/// was rung 3's noted "mid-split cosmetic"). A skip, never a failure —
+/// classified alongside [`STREAM_GROW_NO_SPLIT_POINT`]/
+/// [`SPLIT_KEY_NOT_TOKEN_VIABLE`] by `admin::action_stream_grow`.
+const STREAM_GROW_MID_SPLIT: &str = "tablet is mid-split — its split workflow is already in flight";
+
 /// Materialize `group`'s own live pairs and compute their byte-weighted
 /// median (ADR 0034's [`byte_weighted_median`]) — the same key
 /// `auto_split_loop` computes for a byte-configured cluster, reused here for
@@ -10144,6 +10468,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::TriggerAutoSplit { .. } => "trigger_auto_split",
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
         ClientRequest::ClearBackfillCursor { .. } => "clear_backfill_cursor",
+        ClientRequest::SeedRows { .. } => "seed_rows",
         ClientRequest::Get { .. } => "get",
         ClientRequest::GetSnapshot { .. } => "get_snapshot",
         ClientRequest::Scan { .. } => "scan",
@@ -10382,6 +10707,11 @@ async fn handle_request(
              `Forwarded`"
                 .into(),
         ),
+        ClientRequest::SeedRows { .. } => ClientResponse::Error(
+            "this request is an internal split-build seed RPC and must be sent wrapped in \
+             `Forwarded`"
+                .into(),
+        ),
         ClientRequest::ClearBackfillCursor { .. } => ClientResponse::Error(
             "this request is an internal backfill-cursor-cleanup RPC and must be sent wrapped \
              in `Forwarded`"
@@ -10452,18 +10782,22 @@ impl ClientCtx {
         self.effective_metadata().has_table_schema(table)
     }
 
-    /// Split CP `tablet` at `split_key`: a **single, atomic** control-plane
-    /// command (`MetaCommand::SplitTablet`, epoch-CAS gated exactly like
-    /// `CasTabletReplicas`). The source tablet's range narrows to `[lo,
-    /// split_key)` and a new sibling tablet is minted covering `[split_key, ∞)`
-    /// — both served by the **same** replicas' existing per-node shared engine
-    /// (ADR 0026/0028: one LSM tree per node, confined by [`StorageScope`]), so
-    /// no data moves and there is no second, data-plane step that can fail
-    /// independently. The per-node tablet-host reconciler (ADR 0031 PR4) then
-    /// forms the new sibling's Raft group on every replica (a fresh
-    /// whole-voter formation, identical to a brand-new table's tablet) —
-    /// orphaned, leaderless metadata-only tablets are structurally impossible
-    /// now, since commit of this one command is the whole operation.
+    /// Kick off a **copy-based split** of `tablet` at `split_key` (ADR 0050):
+    /// propose `MetaCommand::BeginSplit` — parent to `Splitting` (still fully
+    /// serving), two `Building` children minted at **placement-chosen final
+    /// homes** (fork F5, [`split_child_placement`]) — and confirm by
+    /// observing the parent's own state become `Splitting` (state-based,
+    /// replacing the old zero-copy epoch-advance confirm: a rebalance's
+    /// `CasTabletReplicas` also bumps the epoch, so an epoch advance alone
+    /// proves nothing about a split; observing the state does, and on a
+    /// stray epoch bump the loop re-arms its CAS instead of mis-reporting).
+    ///
+    /// **Asynchronous by design**: success means *the split workflow
+    /// started* — the split driver (ADR 0050 stages 2–4, later rungs of
+    /// this train) seeds the children and performs the freeze/cutover; this
+    /// call never waits for that. Calling on a tablet already `Splitting`
+    /// returns success immediately ("already in flight" — the caller's
+    /// intent is accomplished-in-progress, and kickoff is idempotent).
     ///
     /// Routed to the control leader (relayable, [`is_relayable_command`]), so
     /// this works from any node the client happens to be connected to.
@@ -10485,64 +10819,63 @@ impl ClientCtx {
         // exists on the real cluster. The CAS only protects against
         // staleness *after* a read succeeds; it can't rescue a read that
         // never has anything to see.
-        let Some(initial_epoch) = self
-            .effective_metadata()
-            .tablets
-            .get(&tablet)
-            .map(|t| t.epoch)
-        else {
-            return ClientResponse::Error("no such tablet".into());
+        let mut initial_epoch = match self.effective_metadata().tablets.get(&tablet) {
+            None => return ClientResponse::Error("no such tablet".into()),
+            Some(t) if t.state == TabletState::Splitting => {
+                // Already mid-workflow: kickoff is idempotent.
+                return ClientResponse::PutOk;
+            }
+            Some(t) if t.state == TabletState::Building => {
+                return ClientResponse::Error(
+                    "tablet is a Building split child - not splittable".into(),
+                );
+            }
+            Some(t) => t.epoch,
         };
         let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
         let mut next_propose_at = tokio::time::Instant::now();
         loop {
-            // Confirmed: this tablet's own epoch has advanced past what we
-            // initially observed. The CAS-gated apply arm only ever bumps a
-            // tablet's epoch on a REAL, committed split of that exact
-            // tablet (`source.epoch = source.epoch.next()`), so this is
-            // true iff *some* split of THIS tablet — ours, or a racing
-            // proposer's that happened to land first (harmless: the
-            // operation the caller wanted, "this tablet is now split," is
-            // accomplished either way) — has actually landed. Deliberately
-            // **not** `tablets.contains_key(&new_id)` (the bug this
-            // rewrite fixes, found building growth PR3's multi-tablet
-            // `POST /admin/stream/grow`): `new_id` is computed fresh below
-            // from a possibly-stale `effective_metadata()` snapshot — on a
-            // lagging-mirror node in particular, two *different*
-            // `SplitTablet` proposals (splitting two different source
-            // tablets, issued in quick succession by `ClientCtx::
-            // grow_stream`'s per-tablet loop) can independently compute the
-            // identical `new_id` from equally-stale reads. The control
-            // leader's own apply-time check (`new tablet id already
-            // exists`) correctly rejects the second one — but a
-            // confirmation that only asks "does a tablet with this id
-            // exist now" can't tell that rejected proposal apart from its
-            // own success once the FIRST proposal's commit replicates
-            // here, silently reporting `PutOk` for a split that never
-            // actually happened. Checking THIS tablet's own epoch instead
-            // is robust regardless of which `new_id` a later, corrected
-            // retry (below) ends up minting.
+            // Confirmed: the parent's own STATE became `Splitting` — the one
+            // transition only a committed `BeginSplit` of this exact tablet
+            // performs (ours, or a racing proposer's that landed first —
+            // harmless: "this tablet's split workflow is running" is what
+            // the caller wanted either way). Deliberately state-based, not
+            // the old epoch-advance confirm: a rebalance's
+            // `CasTabletReplicas` also bumps a tablet's epoch, so an epoch
+            // advance alone can't distinguish "my split landed" from "an
+            // unrelated placement move landed"; a stray epoch bump instead
+            // RE-ARMS the CAS below so the next propose attempt carries the
+            // fresh epoch rather than being rejected forever. (The old
+            // confirm's own hazard — two proposers computing one `new_id`
+            // from equally-stale reads — still shapes the id choice below:
+            // child ids are recomputed fresh from the allocator on every
+            // attempt, never once up front.)
             let meta = self.effective_metadata();
-            match meta.tablets.get(&tablet).map(|t| t.epoch) {
+            match meta.tablets.get(&tablet) {
                 None => return ClientResponse::Error("no such tablet".into()),
-                Some(epoch) if epoch != initial_epoch => return ClientResponse::PutOk,
+                Some(t) if t.state == TabletState::Splitting => return ClientResponse::PutOk,
+                Some(t) if t.epoch != initial_epoch => {
+                    // An unrelated epoch bump (rebalance/repair CAS): re-arm.
+                    initial_epoch = t.epoch;
+                }
                 Some(_) => {}
             }
             if tokio::time::Instant::now() >= deadline {
-                return ClientResponse::Error("split did not commit in time".into());
+                return ClientResponse::Error("split did not begin in time".into());
             }
             if tokio::time::Instant::now() >= next_propose_at {
-                // The new tablet id comes from the **monotonic allocator**
+                // Child ids come from the **monotonic allocator**
                 // (`next_free_tablet_id`, ADR 0023 — the same allocator
                 // provisioning uses), *not* `max(existing ids) + 1`, which
                 // could re-mint a freed id after a `DropTableTablets`.
                 // Recomputed fresh on **every** propose attempt (not once
-                // up front) — the actual fix for the collision race
-                // described above: a later attempt, once this node's own
+                // up front) — the collision-race fix inherited from the old
+                // confirm's rewrite: a later attempt, once this node's own
                 // metadata has caught up, sees the allocator floor moved
-                // past whatever else was created meanwhile and mints a
-                // genuinely free id instead of repeating a doomed one.
-                let new_id = meta.next_free_tablet_id();
+                // past whatever else was created meanwhile and mints
+                // genuinely free ids instead of repeating doomed ones.
+                let left_id = meta.next_free_tablet_id();
+                let right_id = TabletId(left_id.0 + 1);
                 // F11 (ADR 0042 §14, Fork D): this is the ONE choke point
                 // every split proposer funnels through — `auto_split_loop`,
                 // `POST /admin/tablet/split` (`admin::action_split`), and
@@ -10563,12 +10896,20 @@ impl ClientCtx {
                         .incr(Metric::StreamSplitSingleTokenSkipped);
                     return ClientResponse::Error(SPLIT_KEY_NOT_TOKEN_VIABLE.into());
                 }
-                tracing::Span::current().record("new_id", new_id.0);
-                let cmd = MetaCommand::SplitTablet {
-                    tablet,
+                tracing::Span::current().record("new_id", left_id.0);
+                // Fork F5: children are minted at placement-chosen final
+                // homes — the one data movement of a copy-based split is the
+                // build itself, so the mint must pick the real destinations.
+                let children_replicas = match split_child_placement(&meta, tablet) {
+                    Ok(sets) => sets,
+                    Err(e) => return ClientResponse::Error(e),
+                };
+                let [left_replicas, right_replicas] = children_replicas;
+                let cmd = MetaCommand::BeginSplit {
+                    parent: tablet,
                     expected_epoch: initial_epoch,
                     split_key: aligned_key,
-                    new_id,
+                    children: [(left_id, left_replicas), (right_id, right_replicas)],
                 };
                 let sent = self.propose_schema(&cmd).await;
                 next_propose_at = tokio::time::Instant::now()
@@ -11150,13 +11491,26 @@ impl ClientCtx {
         if meta.table_stream(table).is_none() {
             return Err(format!("table `{table}` has no stream enabled"));
         }
-        let tablets: Vec<TabletId> = meta.tablets_for_table(table).map(|(id, _)| *id).collect();
+        let tablets: Vec<(TabletId, TabletState)> = meta
+            .tablets_for_table(table)
+            .map(|(id, t)| (*id, t.state))
+            .collect();
         if tablets.is_empty() {
             return Err(format!("table `{table}` has no tablets yet"));
         }
         let mut results = Vec::with_capacity(tablets.len());
-        for tablet in tablets {
-            let response = self.grow_stream_tablet(tablet).await;
+        for (tablet, state) in tablets {
+            // A mid-split tablet is classified up front (`STREAM_GROW_MID_
+            // SPLIT`), never routed to: a `Splitting` parent's workflow is
+            // already running (kicking it again is an idempotent no-op that
+            // the summary would miscount as a fresh split), and a `Building`
+            // child refuses splits until activation anyway.
+            let response = match state {
+                TabletState::Active => self.grow_stream_tablet(tablet).await,
+                TabletState::Splitting | TabletState::Building => {
+                    ClientResponse::Error(STREAM_GROW_MID_SPLIT.into())
+                }
+            };
             results.push((tablet, response));
         }
         Ok(results)
@@ -11272,37 +11626,6 @@ impl ClientCtx {
     /// still shows the pre-split width, so this check passes and a hot-read
     /// can still observe the fabrication class ADR 0043 describes. Full
     /// closure of this sub-window would need a per-read control-leader
-    /// round trip on every `hot_read` call — rejected as disproportionate in
-    /// the #220 analysis for the same reason a per-write round trip was
-    /// rejected there. The accepted remaining exposure is bounded to the
-    /// control apply task's own catch-up latency (milliseconds under normal
-    /// load), not the reconciler's (much longer) tick cadence — see ADR
-    /// 0048's residual section for the full accounting, and the D8 e2e
-    /// adjudicator (`streams_e2e.rs::
-    /// auto_split_mid_stream_with_live_consumer_across_every_node`)'s own
-    /// doc for how a distinct-`eventID` failure there should be read against
-    /// this specific remaining window rather than assumed to be the
-    /// pre-latch bug recurring wholesale.
-    fn hot_read_scope_ok(meta: &Metadata, tablet: TabletId, group: &CpGroup) -> Result<(), String> {
-        let Some(t) = meta.tablets.get(&tablet) else {
-            // Dropped/reclaimed table — the caller's own absence handling
-            // (an empty/error reply upstream) applies; not this latch's
-            // concern.
-            return Ok(());
-        };
-        let live = group.scope_range();
-        if live != t.range && live.contains_range(&t.range) {
-            // This node's live scope is strictly wider than the freshest
-            // known declared range: a split-driven narrow this node's own
-            // reconciler owes is outstanding. Refuse retryably rather than
-            // risk serving a record that, per `meta`, already belongs to a
-            // split-off sibling (which will itself answer for it once
-            // hosted) — the fabrication class this latch exists to prevent.
-            return Err("tablet scope transitioning (split narrow pending); retry".into());
-        }
-        Ok(())
-    }
-
     /// Fetch up to `limit` of `tablet`'s own open-shard hot records with
     /// packed HLC strictly greater than `from_position` (ADR 0042 §7/§8,
     /// PR6's `GetRecords` open-shard path) — the internal `ClientRequest::
@@ -11323,26 +11646,14 @@ impl ClientCtx {
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
-                    // ADR 0044 phase-1 PR4: the hot_read scope-transition
-                    // latch (see `hot_read_scope_ok`'s own doc) — a
-                    // retryable refusal here re-enters this same loop
-                    // (re-resolving routing fresh next pass) rather than
-                    // ever risking a stale-wide answer.
-                    let meta = self.metadata_fresh().await;
-                    if let Err(e) = Self::hot_read_scope_ok(&meta, tablet, &leader) {
-                        if tokio::time::Instant::now() >= deadline {
-                            return Err(e);
-                        }
-                        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
-                        continue;
-                    }
-                    return Ok(
-                        index_drain::hot_read(&meta, tablet, &leader, from_position, limit)
-                            .await
-                            .into_iter()
-                            .map(|(key, _, value)| (key, value))
-                            .collect(),
-                    );
+                    // The ADR 0048 scope-transition latch died with the
+                    // mutable scope (ADR 0050 rung 7) — immutable ranges
+                    // leave no transition window to latch.
+                    return Ok(index_drain::hot_read(&leader, from_position, limit)
+                        .await
+                        .into_iter()
+                        .map(|(key, _, value)| (key, value))
+                        .collect());
                 }
                 Some(CpRoute::Forward(addr)) => {
                     let request = ClientRequest::Forwarded {
@@ -12986,385 +13297,6 @@ pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io:
     let msg = serde_json::from_slice(&buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(msg))
-}
-
-/// Regression tests for the ADR 0028 write-fence pre-propose check
-/// (`cp_put_local`/`cp_delete_local`/`cp_batch_propose`). These live **inside**
-/// the crate (as opposed to `tests/*.rs`, a separate crate) specifically to
-/// reach the private `CpGroup`/`ClientCtx` handles a real stale-routed write
-/// needs to be driven directly against a specific tablet's group — nothing
-/// under `tests/` can construct this scenario, since `cp_route`'s normal
-/// resolution reads this node's own (freshly polled) `Metadata` and would
-/// simply route a post-split write to the correct child on its own.
-#[cfg(test)]
-mod split_fence_tests {
-    use std::net::SocketAddr;
-    use std::time::Duration;
-
-    use crate::config::NodeRole;
-    use crate::{
-        ClientCtx, ClientRequest, ClientResponse, ClusterConfig, RoleAddrs, read_frame, run_node,
-        write_frame,
-    };
-    use serde_json::Value;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-    use tokio::time::{sleep, timeout};
-
-    fn free_addrs(count: usize) -> Vec<SocketAddr> {
-        let ls: Vec<std::net::TcpListener> = (0..count)
-            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-            .collect();
-        ls.iter().map(|l| l.local_addr().unwrap()).collect()
-    }
-
-    /// Minimal admin HTTP `POST`, mirroring `tests/admin_endpoint.rs`'s helper
-    /// (duplicated rather than shared, since this module lives in a different
-    /// compilation unit than the `tests/` integration crate).
-    async fn admin_post(addr: SocketAddr, path: &str, body: &str) -> (u16, Value) {
-        let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
-        let request = format!(
-            "POST {path} HTTP/1.0\r\n\
-             Host: animus\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {body}",
-            body.len(),
-        );
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .expect("send request");
-        stream.flush().await.expect("flush");
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await.expect("read response");
-        let text = String::from_utf8(raw).expect("utf8 response");
-        let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-        let status: u16 = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse().ok())
-            .expect("status line");
-        let value = serde_json::from_str(payload).unwrap_or(Value::Null);
-        (status, value)
-    }
-
-    /// A write for a key that a split has just handed off to a CHILD tablet,
-    /// driven directly against the **PARENT**'s own `RaftKvNode` handle — the
-    /// exact shape of the crossover-window hazard ADR 0028 §3 describes: a node
-    /// whose `Metadata` view has not yet observed the split still resolves the
-    /// key to the parent's (now too-wide) group via `cp_route`'s `Local`
-    /// branch. Before this fix, `cp_put_local` stamped `KeyRange::whole()` and
-    /// proposed unconditionally, so the parent's group would accept and apply
-    /// the write onto the shared engine's physical key the child now owns — a
-    /// silent shadow/corruption of the child's data. This test bypasses
-    /// `cp_route` entirely (fetching the parent's group handle directly via
-    /// `edge.local_cp`) to drive exactly that write, and asserts it is
-    /// rejected — not silently accepted — and never lands in the shared
-    /// physical key on the parent's own storage.
-    ///
-    /// **What this proves and does not prove:** it proves the pre-propose
-    /// range check itself — given a write for an out-of-range key handed
-    /// directly to a narrowed group's local helper, the write errors instead
-    /// of being falsely acked, and the rejected value never reaches the
-    /// shared engine (read back, for lack of a scope-range-aware read
-    /// primitive, via the parent's own scope-oblivious `local_get`). It does
-    /// **not** reproduce the full end-to-end race (a *live* node
-    /// actually routing a real client request to the parent because its own
-    /// cached `Metadata` genuinely lags the split) — that race depends on
-    /// timing between the control-plane replication of `SplitTablet` and a
-    /// concurrent client request that is not reliably forceable in a test.
-    /// Driving the write directly against the parent's handle is the
-    /// deterministic substitute: it exercises the identical code path
-    /// (`ClientCtx::cp_put_local` against a `CpGroup`) a stale `cp_route`
-    /// resolution would have handed the same key to.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn stale_routed_write_for_a_split_childs_key_is_rejected_not_lost() {
-        timeout(Duration::from_secs(60), async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let addrs = free_addrs(6);
-            let config = ClusterConfig {
-                nodes: vec![RoleAddrs {
-                    id: crate::config::node_id(0),
-                    role: NodeRole::Both,
-                    internal: addrs[0],
-                    client: addrs[1],
-                    dynamo: addrs[2],
-                    cql: addrs[3],
-                    admin: addrs[4],
-                    intra: addrs[5],
-                }],
-            };
-            let node = run_node(&config, 0, dir.path().join("node-0"))
-                .await
-                .expect("bind + start a single-node cluster");
-
-            timeout(Duration::from_secs(10), async {
-                loop {
-                    if node.is_control_leader() {
-                        return;
-                    }
-                    sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .expect("the sole node did not become control leader");
-
-            // Seed the bootstrap tablet with keys spanning the eventual split
-            // point, through the real client API.
-            let mut stream = TcpStream::connect(node.client_addr())
-                .await
-                .expect("connect to client port");
-            for i in 0..10u32 {
-                let key = format!("key{i:02}").into_bytes();
-                let value = format!("v{i}").into_bytes();
-                write_frame(
-                    &mut stream,
-                    &ClientRequest::Put {
-                        key,
-                        value,
-                        table: "kv".to_string(),
-                    },
-                )
-                .await
-                .expect("send put");
-                let resp: ClientResponse = read_frame(&mut stream)
-                    .await
-                    .expect("read reply")
-                    .expect("a reply");
-                assert!(
-                    matches!(resp, ClientResponse::PutOk),
-                    "put failed: {resp:?}"
-                );
-            }
-
-            let parent_tablet = *node
-                .metadata()
-                .tablets
-                .keys()
-                .next()
-                .expect("the bootstrap tablet exists");
-
-            let (status, split_resp) = admin_post(
-                node.admin_addr(),
-                "/admin/tablet/split",
-                &format!(r#"{{"tablet":{},"split_key":"key05"}}"#, parent_tablet.0),
-            )
-            .await;
-            assert_eq!(status, 200, "split committed: {split_resp}");
-
-            timeout(Duration::from_secs(15), async {
-                loop {
-                    if node.metadata().tablets.len() >= 2 {
-                        return;
-                    }
-                    sleep(Duration::from_millis(50)).await;
-                }
-            })
-            .await
-            .expect("split did not produce two tablets");
-
-            // `key07` is `>= "key05"`, so the split handed it to the child.
-            let child_key = b"key07".to_vec();
-
-            // Fetch the PARENT's own group handle directly, bypassing
-            // `cp_route`'s normal (now-fresh) resolution — the deterministic
-            // stand-in for "a node whose routing decision is stale."
-            let parent = node
-                .edge
-                .local_cp(parent_tablet)
-                .expect("this node hosts the parent tablet's group");
-
-            // Sanity: the parent's own live scope really has narrowed past the
-            // child key, so the pre-check below is exercising the real thing.
-            // `narrow_scope` is applied by the per-node tablet-host
-            // reconciler's `NarrowScope` action (ADR 0031 PR4), triggered by
-            // the split's commit but not synchronous with it, so poll for it.
-            timeout(Duration::from_secs(10), async {
-                loop {
-                    if !parent.scope_range().contains(&child_key) {
-                        return;
-                    }
-                    sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .expect("the parent's scope never narrowed past the split key");
-
-            let result =
-                ClientCtx::cp_put_local(&parent, child_key.clone(), b"corrupt".to_vec()).await;
-            assert!(
-                result.is_err(),
-                "a write for a child-range key driven at the parent must be \
-                 rejected, not silently acked: {result:?}"
-            );
-
-            // The READ-side dual (ADR 0033): a linearizable get for the same
-            // child-range key driven at the parent's handle — the exact shape
-            // a stale routing resolution would produce — must surface as a
-            // retryable error (so the caller re-resolves and reaches the
-            // child), never as a served answer. Serving it would return a
-            // value NOT linearized against the child group's writes (the
-            // child's leader may be on another node whose writes this engine
-            // hasn't applied yet) — a false "absent" indistinguishable from
-            // data loss.
-            let read = ClientCtx::cp_get_local(&parent, &child_key).await;
-            match read {
-                Err(e) => assert!(
-                    ClientCtx::read_should_retry(&e),
-                    "the stale-scope read error must be retryable: {e}"
-                ),
-                Ok(v) => panic!(
-                    "a read for a child-range key driven at the parent must be \
-                     a retryable error, never a served answer: {v:?}"
-                ),
-            }
-            // And the scan flavor: a window reaching past the parent's
-            // narrowed scope must error retryably, not silently truncate.
-            let scan = ClientCtx::cp_scan_local(&parent, b"key00", Some(b"key09"), None).await;
-            match scan {
-                Err(e) => assert!(
-                    ClientCtx::read_should_retry(&e),
-                    "the stale-scope scan error must be retryable: {e}"
-                ),
-                Ok(p) => panic!(
-                    "a scan window past the parent's narrowed scope must be a \
-                     retryable error, never a (truncated) result: {p:?}"
-                ),
-            }
-
-            // The physical key `key07` was written (as `v7`) during the initial
-            // seed, before the split — its bytes never move (ADR 0028: a split
-            // narrows the *scope*, not the data), so `local_get` (which is
-            // scope-*range*-oblivious, reading by physical key regardless of
-            // which tablet currently logically owns that range) still finds
-            // the pre-split value at that shared physical location. The actual
-            // safety property under test is that the REJECTED write's value
-            // never landed there — i.e. this node's own parent-side storage
-            // was never mutated to `corrupt`, which would have been the
-            // shadow/corruption this fix exists to prevent.
-            assert_ne!(
-                parent.local_get(&child_key).await,
-                Some(b"corrupt".to_vec()),
-                "the rejected write must never land in the shared engine, even \
-                 read back through the parent's own (too-wide) scope"
-            );
-            assert_eq!(
-                parent.local_get(&child_key).await,
-                Some(b"v7".to_vec()),
-                "key07's pre-split value must be untouched by the rejected write"
-            );
-
-            node.shutdown();
-        })
-        .await
-        .expect("test timed out");
-    }
-}
-
-/// ADR 0044 phase-1 PR4: unit coverage for the hot_read scope-transition
-/// latch (`ClientCtx::hot_read_scope_ok`) in isolation — the function is a
-/// private associate of `ClientCtx` (no `pub`), so this lives in-crate like
-/// `split_fence_tests` above rather than under `tests/`, which can't reach
-/// it. Deterministic: `hot_read_scope_ok` is a pure comparison given a
-/// `Metadata` snapshot and a live `CpGroup`'s own `scope_range()`, no real
-/// cluster bring-up needed. The end-to-end, real-race evidence that this
-/// narrows the ADR 0043 residual (see `hot_read_scope_ok`'s own doc for the
-/// control-apply-lag sub-window it does not close) is `tests/streams_e2e.rs`'s
-/// `auto_split_mid_stream_with_live_consumer_across_every_node` (D8), the
-/// historical adjudicator for this exact fabrication class (distinct-
-/// `eventID` duplicates straddling a split boundary) — still the live
-/// signal for the accepted remaining window, not just the pre-latch bug.
-#[cfg(test)]
-mod hot_read_latch_tests {
-    use std::time::Duration;
-
-    use animus_control::Metadata;
-    use animus_cp_data::{RaftKvNode, StorageScope};
-    use animus_env::{ProdEnv, nid};
-    use animus_storage::MemoryEngine;
-    use animus_tablet::{KeyRange, Tablet, TabletId};
-    use tokio::time::sleep;
-
-    use crate::{ClientCtx, CpGroup};
-
-    /// A lone single-voter group over a real (loopback) `ProdEnv` — self-
-    /// elects immediately (`initial_formation`-shaped: `all_nodes` is just
-    /// this one id), scoped to `range`.
-    async fn lone_group(range: KeyRange) -> CpGroup {
-        let dir = tempfile::tempdir().unwrap();
-        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), dir.path())
-            .await
-            .expect("bind");
-        let scope = StorageScope::new(b"t".to_vec(), range);
-        let node: RaftKvNode<ProdEnv, MemoryEngine> =
-            RaftKvNode::start_hosted(env, vec![nid(0)], MemoryEngine::new(), scope, 1);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !node.is_leader() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "single-voter group never elected itself leader"
-            );
-            sleep(Duration::from_millis(10)).await;
-        }
-        CpGroup::Mem(node)
-    }
-
-    fn meta_with_range(tablet: TabletId, range: KeyRange) -> Metadata {
-        let mut meta = Metadata::default();
-        meta.tablets.insert(
-            tablet,
-            Tablet::new_for_table(tablet, "t", range, vec![nid(0)]),
-        );
-        meta
-    }
-
-    /// The exact scenario the latch exists to catch: metadata already
-    /// reflects a post-split narrower declared range, but this node's own
-    /// reconciler has not yet locally executed `narrow_scope` — the live
-    /// scope is still the pre-split wide range.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn refuses_retryably_while_the_live_scope_is_wider_than_the_declared_range() {
-        let tablet = TabletId(1);
-        let group = lone_group(KeyRange::whole()).await;
-        let meta = meta_with_range(tablet, KeyRange::new(b"".to_vec(), Some(b"m".to_vec())));
-        let err = ClientCtx::hot_read_scope_ok(&meta, tablet, &group)
-            .expect_err("a wider-than-declared live scope must refuse retryably");
-        assert!(
-            err.ends_with("; retry"),
-            "the refusal must use this crate's established retryable-error shape (`read_should_retry`): {err}"
-        );
-    }
-
-    /// Once the reconciler's own `narrow_scope` has executed (the live scope
-    /// now matches the declared range), the latch must not refuse.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn allows_once_the_live_scope_matches_the_declared_range() {
-        let tablet = TabletId(1);
-        let range = KeyRange::new(b"".to_vec(), Some(b"m".to_vec()));
-        let group = lone_group(range.clone()).await;
-        let meta = meta_with_range(tablet, range);
-        assert!(
-            ClientCtx::hot_read_scope_ok(&meta, tablet, &group).is_ok(),
-            "a live scope that already matches the declared range must not be refused"
-        );
-    }
-
-    /// A dropped/reclaimed tablet (absent from `Metadata` entirely) is not
-    /// this latch's concern — the caller's own absence handling applies.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_dropped_tablet_is_not_this_latchs_concern() {
-        let tablet = TabletId(1);
-        let group = lone_group(KeyRange::whole()).await;
-        let meta = Metadata::default();
-        assert!(
-            ClientCtx::hot_read_scope_ok(&meta, tablet, &group).is_ok(),
-            "an absent tablet must fall through, not be refused by this latch"
-        );
-    }
 }
 
 /// Unit tests for [`byte_weighted_median`] (ADR 0034) — a private free

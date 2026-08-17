@@ -20,6 +20,7 @@ name = "animusd"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 animus-env.workspace = true
 animus-control.workspace = true
 animus-cp-data.workspace = true

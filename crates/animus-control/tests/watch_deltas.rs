@@ -142,12 +142,22 @@ fn run_scenario(seed: u64) {
             "after initial commands",
         );
 
+        // Copy-based split round (ADR 0050): tablet 1 retires; children 2/3.
         let split_key = vec![128u8];
-        nodes[leader].propose(MetaCommand::SplitTablet {
-            tablet: TabletId(1),
+        nodes[leader].propose(MetaCommand::BeginSplit {
+            parent: TabletId(1),
             expected_epoch: Epoch::INITIAL,
             split_key,
-            new_id: TabletId(2),
+            children: [
+                (TabletId(2), vec![nid(10), nid(11)]),
+                (TabletId(3), vec![nid(10), nid(11)]),
+            ],
+        });
+        sim.run_for(Duration::from_secs(1));
+        nodes[leader].propose(MetaCommand::CutoverSplit {
+            parent: TabletId(1),
+            expected_epoch: Epoch::INITIAL.next(),
+            cutover_wall_ms: 1_700_000_000_000,
         });
         sim.run_for(Duration::from_secs(1));
         last_seen = assert_delta_matches_full_fetch(

@@ -49,7 +49,7 @@ fn group(seed: u64) -> (Simulator, KvNode) {
         sim.env(nid(0)),
         vec![nid(0)],
         MemoryEngine::new(),
-        StorageScope::new(escape(b"users"), KeyRange::whole()),
+        StorageScope::new(KeyRange::whole()),
     );
     (sim, node)
 }
@@ -185,7 +185,7 @@ fn abort_restores_prior_value_and_materializes_nothing() {
     let change_prefix = logical(pk, b"\x02");
 
     // A prior committed value the abort must restore.
-    match node.put_fenced(base.clone(), b"prior".to_vec(), KeyRange::whole()) {
+    match node.put(base.clone(), b"prior".to_vec()) {
         animus_control::ProposeResult::Accepted { .. } => {}
         other => panic!("prior put rejected: {other:?} (seed={seed})"),
     }
@@ -309,7 +309,7 @@ fn leader_kill_between_stage_and_resolve_recovers_from_the_intent_alone() {
         sim.env(id.clone()),
         vec![id.clone()],
         engine.clone(),
-        StorageScope::new(escape(b"users"), KeyRange::whole()),
+        StorageScope::new(KeyRange::whole()),
     );
     sim.run_for(ELECT);
 
@@ -347,7 +347,7 @@ fn leader_kill_between_stage_and_resolve_recovers_from_the_intent_alone() {
         sim.env(id.clone()),
         vec![id.clone()],
         engine.clone(),
-        StorageScope::new(escape(b"users"), KeyRange::whole()),
+        StorageScope::new(KeyRange::whole()),
     );
     sim.run_for(ELECT);
 
@@ -384,128 +384,19 @@ fn leader_kill_between_stage_and_resolve_recovers_from_the_intent_alone() {
     );
 }
 
-/// ADR 0046 A1: resolving a kind-bearing write is fenced whole-or-nothing —
-/// if the derived kind keys have (per a split, simulated here by narrowing
-/// the group's own scope between stage and resolve) moved off this group's
-/// current range, the resolve must reject entirely rather than partially
-/// materialize, and the sibling that now owns the range must be able to
-/// pick it up from the SAME durable intent (shared engine, ADR 0028).
-#[test]
-fn resolve_of_a_kind_bearing_write_is_fenced_whole_or_nothing_and_succeeds_on_the_right_sibling() {
-    let seed = 0x4600_0005;
-    let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let node_id = nid(0);
-
-    let pk = b"erin";
-    let token = partition_token(pk);
-    let base = logical(pk, b"");
-    let lsi = logical(pk, b"\x01lsi");
-    let change_prefix = logical(pk, b"\x02");
-
-    // Group A starts owning the WHOLE range (pre-split shape).
-    let a: KvNode = RaftKvNode::start_hosted(
-        sim.env(node_id.clone()),
-        vec![node_id.clone()],
-        engine.clone(),
-        StorageScope::new(escape(b"users"), KeyRange::whole()),
-        1,
-    );
-    sim.run_for(ELECT);
-
-    let write = kind_bearing_write(pk, b"v5".to_vec(), b"lsi-row-5".to_vec());
-    let n = a.clone();
-    let (txn_id, record_key, _outcome) = drive(&mut sim, a.env(), SETTLE, async move {
-        n.txn_stage_anchor(TABLE, vec![write], Vec::new(), Vec::new())
-            .await
-    })
-    .flatten()
-    .unwrap_or_else(|| panic!("txn_stage_anchor did not complete (seed={seed})"));
-
-    let n = a.clone();
-    let (txn_id_c, record_key_c) = (txn_id.clone(), record_key.clone());
-    let commit_ts = drive(&mut sim, a.env(), SETTLE, async move {
-        n.txn_commit_at_least(txn_id_c, record_key_c, txn_id.ts)
-            .await
-    })
-    .flatten()
-    .unwrap_or_else(|| panic!("commit did not complete (seed={seed})"));
-
-    // Simulate the split's `NarrowScope`: A now owns only what's strictly
-    // below `erin`'s own token — `erin`'s data (base, LSI, change) has
-    // moved to a sibling.
-    a.narrow_scope(KeyRange::new(Vec::new(), Some(token.to_vec())));
-
-    // A's own resolve is fenced out whole-or-nothing: nothing materializes.
-    let n = a.clone();
-    let (txn_id_ra, record_key_ra, base_ra) = (txn_id.clone(), record_key.clone(), base.clone());
-    let a_resolve = drive(&mut sim, a.env(), SETTLE, async move {
-        n.txn_resolve(
-            txn_id_ra,
-            record_key_ra,
-            vec![base_ra],
-            TxnOutcome::Committed { commit_ts },
-        )
-        .await
-    })
-    .flatten();
-    assert!(
-        a_resolve.is_some(),
-        "the TxnResolve entry itself still applies (whole-or-nothing is an apply-time \
-         no-op, not a propose-time rejection) (seed={seed})"
-    );
-    assert_eq!(
-        block_on(a.local_get_kind(KIND_LSI, &lsi)),
-        None,
-        "A must not materialize a kind write for a key that has moved off its own range \
-         (seed={seed})"
-    );
-
-    // The sibling now owning `erin`'s token, sharing the SAME engine and
-    // prefix (ADR 0028) — including the anchor's own record, which sat
-    // inside `erin`'s own token range and moved along with it.
-    let b: KvNode = RaftKvNode::start_hosted(
-        sim.env(node_id),
-        vec![nid(0)],
-        engine,
-        StorageScope::new(escape(b"users"), KeyRange::new(token.to_vec(), None)),
-        2,
-    );
-    sim.run_for(ELECT);
-
-    let n = b.clone();
-    let (txn_id_rb, record_key_rb, base_rb) = (txn_id.clone(), record_key.clone(), base.clone());
-    let b_resolve = drive(&mut sim, b.env(), SETTLE, async move {
-        n.txn_resolve(
-            txn_id_rb,
-            record_key_rb,
-            vec![base_rb],
-            TxnOutcome::Committed { commit_ts },
-        )
-        .await
-    })
-    .flatten();
-    let resolve_ts =
-        b_resolve.unwrap_or_else(|| panic!("B's resolve did not complete (seed={seed})"));
-
-    assert_eq!(
-        block_on(b.local_get(&base)),
-        Some(b"v5".to_vec()),
-        "the correct post-split sibling must resolve the base row (seed={seed})"
-    );
-    assert_eq!(
-        block_on(b.local_get_kind(KIND_LSI, &lsi)),
-        Some(b"lsi-row-5".to_vec()),
-        "...and materialize the LSI row too, from the SAME durable intent A already staged \
-         (seed={seed})"
-    );
-    let ck = change_key(&change_prefix, resolve_ts);
-    assert_eq!(
-        block_on(b.local_get_kind(KIND_CHANGE, &ck)),
-        Some(b"change-record".to_vec()),
-        "...and the change record, keyed at B's own resolve ts (seed={seed})"
-    );
-}
+// TOMBSTONE (ADR 0050 Train B rung 2): two cells died here with the
+// live-narrowable scope — `resolve_of_a_kind_bearing_write_is_fenced_whole_
+// or_nothing_and_succeeds_on_the_right_sibling` and `a_kind_write_key_
+// outside_fence_blocks_the_whole_resolve_even_though_the_base_key_is_in_
+// fence`. Both simulated a zero-copy split by narrowing a group's scope
+// between stage and resolve (shared engine, sibling picks up the SAME
+// durable intent) — structurally inexpressible under per-tablet engines
+// with immutable ranges. The whole-or-nothing fence check itself
+// (`resolved.iter().flatten()`) survives, inert, until the Train B deletion
+// sweep; the copy-based split's own txn corpus (rung B4+, fork F7: intents
+// COPY to children, resolves chase by key) replaces the moved-off-range
+// scenario with the real successor mechanism. Pre-pivot cells retrievable
+// from git history.
 
 /// ADR 0046's binding decision: `KindBatch`'s apply arm and `TxnResolve`'s
 /// commit branch must share ONE materialization helper, never two
@@ -587,98 +478,6 @@ fn kind_batch_and_txn_resolve_materialize_byte_identical_rows_for_identical_payl
     let _ = change_value;
 }
 
-/// A narrower proof than the split scenario above: even when the BASE key
-/// alone still falls inside the resolve's own fence, a kind-write key that
-/// doesn't must still block the *entire* resolve (whole-or-nothing) —
-/// exercising specifically the new `resolved.iter().flatten()` fence
-/// coverage this PR adds over `TxnResolve`'s pre-existing base-keys-only
-/// check (`txn.rs`'s documented residual: a split's cut point is not
-/// token-aligned, so this narrow-but-real edge case must fail SAFE — no
-/// partial materialization — rather than silently writing an LSI row this
-/// group's own current range doesn't cover).
-#[test]
-fn a_kind_write_key_outside_fence_blocks_the_whole_resolve_even_though_the_base_key_is_in_fence() {
-    let seed = 0x4600_0007;
-    let (mut sim, node) = group(seed);
-    sim.run_for(ELECT);
-
-    let pk = b"grace";
-    let base = logical(pk, b"");
-    let lsi = logical(pk, b"\x01lsi");
-    let write = kind_bearing_write(pk, b"v7".to_vec(), b"lsi-row-7".to_vec());
-    assert!(lsi > base, "test setup: lsi key must sort after base key");
-
-    let n = node.clone();
-    let (txn_id, record_key, _outcome) = drive(&mut sim, node.env(), SETTLE, async move {
-        n.txn_stage_anchor(TABLE, vec![write], Vec::new(), Vec::new())
-            .await
-    })
-    .flatten()
-    .unwrap_or_else(|| panic!("txn_stage_anchor did not complete (seed={seed})"));
-
-    let n = node.clone();
-    let (txn_id_c, record_key_c) = (txn_id.clone(), record_key.clone());
-    let commit_ts = drive(&mut sim, node.env(), SETTLE, async move {
-        n.txn_commit_at_least(txn_id_c, record_key_c, txn_id.ts)
-            .await
-    })
-    .flatten()
-    .unwrap_or_else(|| panic!("commit did not complete (seed={seed})"));
-
-    // Narrow so the cut sits strictly BETWEEN the base key and the LSI key
-    // — a shape a token-aligned split never produces, but the exact
-    // documented residual `txn.rs` flags. `base` is still in fence; `lsi`
-    // is not.
-    let mut cut = base.clone();
-    cut.push(0x01);
-    assert!(
-        base < cut && cut <= lsi,
-        "test setup: cut must separate base from lsi"
-    );
-    node.narrow_scope(KeyRange::new(Vec::new(), Some(cut)));
-
-    let n = node.clone();
-    let (txn_id_r, record_key_r, base_r) = (txn_id.clone(), record_key.clone(), base.clone());
-    let resolved = drive(&mut sim, node.env(), SETTLE, async move {
-        n.txn_resolve(
-            txn_id_r,
-            record_key_r,
-            vec![base_r],
-            TxnOutcome::Committed { commit_ts },
-        )
-        .await
-    })
-    .flatten();
-    assert!(
-        resolved.is_some(),
-        "the TxnResolve entry itself still applies — the whole-or-nothing rejection is an \
-         apply-time no-op (seed={seed})"
-    );
-
-    // Note: `local_get` is deliberately NOT the probe for the base key here
-    // — it serves a **read-time-resolved** value the moment the record is
-    // known-`Committed`, regardless of whether the per-key resolve write
-    // itself physically landed (`resolve_once_step`'s doc; see
-    // `fenced_commands.rs`'s identical caveat). The LSI scope has no such
-    // resolution step (`local_get_kind`'s doc: kind scopes only ever hold
-    // committed values, read as-is) — so it is the one probe that can tell
-    // "materialized" from "not," and it must show nothing.
-    assert_eq!(
-        block_on(node.local_get_kind(KIND_LSI, &lsi)),
-        None,
-        "the LSI row must never materialize once its key is out of this group's fence, even \
-         though the base key that carries it is still in fence (seed={seed})"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// ADR 0049 §3 — the TxnStage stage marker (Train A rung 3)
-// ---------------------------------------------------------------------------
-
-/// `kind_bearing_write` plus an ADR 0049 §3 stage marker sharing the same
-/// change-key prefix, exactly as `animusd::dynamo::eval_kind_txn_write`
-/// stages one (the resolve record and the stage marker share one per-item
-/// prefix; their apply-completed HLC suffixes keep the keys distinct).
 fn stage_bearing_write(pk: &[u8], base_value: Vec<u8>, lsi_value: Vec<u8>) -> TxnWrite {
     let change_prefix = logical(pk, b"\x02");
     let mut w = kind_bearing_write(pk, base_value, lsi_value);
@@ -842,7 +641,7 @@ fn an_aborted_stages_marker_remains_a_harmless_dirty_hint() {
     let base = logical(pk, b"");
     let change_prefix = logical(pk, b"\x02");
 
-    match node.put_fenced(base.clone(), b"prior".to_vec(), KeyRange::whole()) {
+    match node.put(base.clone(), b"prior".to_vec()) {
         animus_control::ProposeResult::Accepted { .. } => {}
         other => panic!("prior put rejected: {other:?} (seed={seed})"),
     }

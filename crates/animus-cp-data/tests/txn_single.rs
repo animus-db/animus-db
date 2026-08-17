@@ -419,14 +419,13 @@ fn stage_into_a_sealed_range_is_rejected_wholesale() {
         sim.env(nid(0)),
         vec![nid(0)],
         MemoryEngine::new(),
-        StorageScope::new(b"T:".to_vec(), KeyRange::whole()),
+        StorageScope::new(KeyRange::whole()),
     );
     let mut sim = sim;
     sim.run_for(ELECT);
 
-    // Seal the whole (current) scope range before staging anything.
-    let sealed_range = node.scope_range();
-    let sealed = node.propose_seal(sealed_range);
+    // Freeze the group (the whole-range terminal seal) before staging.
+    let sealed = node.propose_freeze();
     assert!(matches!(sealed, ProposeResult::Accepted { .. }));
     sim.run_for(ELECT);
 
@@ -435,8 +434,7 @@ fn stage_into_a_sealed_range_is_rejected_wholesale() {
     let n = node.clone();
     let (kk1, kk2) = (k1.clone(), k2.clone());
     // The stage still *proposes* successfully (a seal is checked at apply,
-    // not propose — the same fence-miss doctrine `fenced_commands.rs`
-    // exercises for `Put`/`Batch`/`Cas`): `txn_stage` reports
+    // not propose): `txn_stage` reports
     // `Some((txn_id, record_key))` once the entry has committed and
     // applied, even though apply silently no-ops every write in it.
     let staged = drive(&mut sim, node.env(), SETTLE, async move {

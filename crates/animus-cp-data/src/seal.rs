@@ -1,33 +1,26 @@
-//! Range-seal markers (ADR 0018 §2 amendment, PR2): the structural
-//! replacement for the retired `version_floor` cross-group-LWW fix.
+//! The **freeze marker** (ADR 0050 rung 5; formerly the ADR 0018 §2
+//! range-seal's marker — the zero-copy split's own `KvCommand::Seal`
+//! proposer was deleted in the Train B rung-7 sweep, and this module's
+//! durable-marker core is what [`KvCommand::Freeze`](crate::KvCommand::
+//! Freeze) inherited from it).
 //!
-//! `version_floor` made *any* successor-group write beat *any* source-group
-//! write structurally (by construction of the version number itself), even a
-//! write still in the source's own commit pipeline that applies **late**
-//! (after the successor already started serving). HLC witnessing alone can't
-//! close that residual race — a witness can only react to what it has
-//! already seen, and the in-flight write hasn't been seen by anyone yet — and
-//! a timing bound is forbidden as a *correctness* mechanism (ADR 0017 §3).
+//! The mechanism is **ordering-based**: the split-build driver proposes a
+//! `Freeze` through the parent group's **own** Raft log. Every replica
+//! applies its log in the same order, so every replica agrees on the exact
+//! log position the group became frozen — and any mutating entry ordered
+//! *after* it is rejected at apply (`crate::apply_and_compact`'s sealed-set
+//! gate), regardless of the timestamp embedded in that entry (an entry can
+//! only be *ordered* after the freeze by genuinely committing after it in
+//! this group's own log, so "later-ordered" and "higher-timestamped"
+//! coincide within one group). This is the apply-time backstop behind the
+//! propose-side [`is_frozen`](crate::RaftKvNode::is_frozen) refusal.
 //!
-//! The replacement is **ordering-based**: when a source tablet hands off a
-//! range (a split's `NarrowScope`), its own leader proposes a
-//! [`KvCommand::Seal`](crate::KvCommand::Seal) for exactly that
-//! range through its **own** Raft log. Every replica of that group applies
-//! its log in the same order, so every replica agrees on the exact log
-//! position the range became sealed — and any mutating entry ordered *after*
-//! the seal, for a key inside the sealed range, is rejected at apply
-//! (`crate::apply_and_compact`), regardless of how far behind the timestamp
-//! embedded in that entry happens to be (an entry can only be *ordered*
-//! after the seal by genuinely committing after it in this group's own Raft
-//! log — see `crate::MAX_APPLIED_TS_DOC` — so "later-ordered" and
-//! "higher-timestamped" coincide within one group). This closes the wide-fence
-//! residual: a leader that hasn't yet learned about the split can still only
-//! append to the *same* log the seal already occupies a position in.
-//!
-//! The seal's durable witness for a **successor** group (a split child) is a
-//! **marker key written directly into the shared engine**, deliberately
-//! **outside every `StorageScope`** (ADR 0026/0028) so a co-hosted successor
-//! can observe it with no scope machinery of its own.
+//! The durable witness is a **marker key written directly into the engine**
+//! (deliberately outside every kind scope — see the disjointness proof on
+//! [`seal_marker_key`]), because log compaction can truncate the `Freeze`
+//! entry itself long before its rejection duty is done: the sealed set is
+//! rebuilt from the marker at group start, which is also what re-latches
+//! `is_frozen` across a restart.
 
 use animus_control::syskv::RESERVED_NAMESPACE;
 use animus_tablet::{KeyRange, escape};
@@ -213,34 +206,30 @@ mod tests {
     }
 
     #[test]
-    fn key_disjoint_from_table_scope_prefixes() {
-        // A real table's StorageScope prefix is escape(table_name); none of
-        // these can ever equal or prefix-match the seal marker's own key,
-        // by the injective/prefix-free argument in this module's doc.
-        for table in ["", "users", "__animus_system_backup", "orders"] {
-            let table_prefix = escape(table.as_bytes());
-            let marker = seal_marker_key(7, &r(b"a", Some(b"z")));
-            assert!(
-                !marker.starts_with(&table_prefix) || table_prefix.is_empty(),
-                "marker key must not fall inside table {table:?}'s own scope"
-            );
-            // The only way `table_prefix` could be empty is `StorageScope::whole()`,
-            // which never comes from `escape` (whole() uses a raw empty Vec,
-            // not escape("")) — so real table prefixes are always non-empty
-            // and this assertion has teeth for every case above.
-            assert!(!table_prefix.is_empty() || table.is_empty());
-        }
+    fn key_disjoint_from_every_kind_scope() {
+        // F2b (ADR 0050 rung 2): a kind scope's physical keys lead with a
+        // kind byte (0x00..=0x04); the seal marker's key leads with
+        // `escape(RESERVED_NAMESPACE)`'s first byte, `b'_'` = 0x5F. First
+        // bytes alone keep a marker physically resident in a tablet's
+        // private engine invisible to every kind scope's strip — the
+        // pre-pivot table-prefix disjointness argument, one level lower.
+        let marker = seal_marker_key(7, &r(b"a", Some(b"z")));
+        assert_eq!(marker[0], 0x5F, "marker keys lead with escape('__…')");
+        assert!(
+            crate::ALL_KINDS.iter().all(|&k| k < 0x5F),
+            "every kind byte must sort below the reserved-namespace lead byte"
+        );
     }
 
     #[test]
-    fn reserved_namespace_prefix_never_equals_an_escaped_table_name() {
-        // escape("") == [0,0], which IS the legacy whole-keyspace tablet's
-        // StorageScope prefix under animusd::table_scope_prefix(""). Confirm
-        // our reserved namespace's escape does NOT collide with it.
-        let empty_table_prefix = escape(b"");
+    fn reserved_namespace_escape_is_stable() {
+        // The 0x5F-lead claim above is only as good as `escape`'s shape:
+        // escape emits the input's own first byte first (0x00 doubling never
+        // changes byte zero of a non-empty input), so the namespace's `_`
+        // lead survives escaping verbatim.
         let ns_prefix = escape(RESERVED_NAMESPACE.as_bytes());
-        assert_ne!(empty_table_prefix, ns_prefix);
-        assert!(!ns_prefix.starts_with(&empty_table_prefix) || empty_table_prefix.is_empty());
+        assert_eq!(ns_prefix[0], b'_');
+        assert_ne!(escape(b""), ns_prefix);
     }
 
     #[test]

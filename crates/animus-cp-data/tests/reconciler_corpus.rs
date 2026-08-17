@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::ProposeResult;
-use animus_cp_data::host::{MetadataView, Reconciler};
+use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{RaftKvNode, StorageScope};
 use animus_env::{Clock, EnvExt, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
@@ -74,15 +74,10 @@ const SCENARIO_STEP: Duration = Duration::from_secs(1);
 // Small builders (mirrors `tests/reconciler.rs`'s helpers).
 // ---------------------------------------------------------------------------
 
-fn prefix_for(table: &str) -> Vec<u8> {
-    table.as_bytes().to_vec()
-}
-
-/// ADR 0041 §3: a group's physical prefix is its parent scope's prefix plus the
-/// row-kind byte — ordinary data is `KIND_BASE`.
+/// F2b (ADR 0050 rung 2): a group's physical key is its row-kind byte plus
+/// the logical key — no table prefix, no tablet identity in the bytes.
 fn physical(key: &[u8]) -> Vec<u8> {
-    let mut out = prefix_for(TABLE);
-    out.push(animus_cp_data::KIND_BASE);
+    let mut out = vec![animus_cp_data::KIND_BASE];
     out.extend_from_slice(key);
     out
 }
@@ -128,7 +123,6 @@ fn view_with_down(
     MetadataView {
         tablets: tablets.into_iter().map(|t| (t.id, t)).collect(),
         down: down.into_iter().collect(),
-        ..Default::default()
     }
 }
 
@@ -149,7 +143,11 @@ fn name_seed(name: &str) -> u64 {
 
 struct ClusterNode {
     reconciler: Recon,
-    storage: MemoryEngine,
+    /// ADR 0050 rung 1: the node's per-tablet engine registry — one private
+    /// `MemoryEngine` per tablet, opened/destroyed by the reconciler through
+    /// the `EngineFactory` seam. `Cluster::storage(id, tablet)` reads a
+    /// specific tablet's own engine.
+    engines: MemoryTabletEngines,
     hosted_log: Arc<Mutex<Vec<TabletId>>>,
     teardown_log: Arc<Mutex<Vec<TabletId>>>,
 }
@@ -168,27 +166,27 @@ impl Cluster {
     }
 
     fn add_node(&mut self, id: NodeId) {
-        self.add_node_with_storage(id, MemoryEngine::new());
+        self.add_node_with_storage(id, MemoryTabletEngines::new());
     }
 
     /// Add (or, after [`crash_restart`](Self::crash_restart), re-add) a node
-    /// with a specific `storage` handle — reusing the SAME `MemoryEngine`
-    /// object across a restart is how this corpus models a durable engine
-    /// (`LsmEngine` in production) surviving a process crash: `MemoryEngine`
-    /// is a plain heap structure, untouched by `Simulator::stop`'s disk model,
-    /// so keeping the same clone alive across the restart is the correct
+    /// with a specific per-tablet engine registry — reusing the SAME
+    /// [`MemoryTabletEngines`] object across a restart is how this corpus
+    /// models durable engines (`LsmEngine` in production) surviving a
+    /// process crash: the registry (and every `MemoryEngine` in it) is a
+    /// plain heap structure, untouched by `Simulator::stop`'s disk model, so
+    /// keeping the same clone alive across the restart is the correct
     /// stand-in without needing to model on-disk persistence for this corpus
     /// (that is `raftkv_linearizable.rs`'s job, over the LSM engine tier).
-    fn add_node_with_storage(&mut self, id: NodeId, storage: MemoryEngine) {
+    fn add_node_with_storage(&mut self, id: NodeId, engines: MemoryTabletEngines) {
         let hosted_log: Arc<Mutex<Vec<TabletId>>> = Arc::new(Mutex::new(Vec::new()));
         let teardown_log: Arc<Mutex<Vec<TabletId>>> = Arc::new(Mutex::new(Vec::new()));
         let hl = Arc::clone(&hosted_log);
         let tl = Arc::clone(&teardown_log);
         let reconciler: Recon = Reconciler::new(
             self.sim.env(id.clone()),
-            storage.clone(),
+            engines.clone(),
             id.clone(),
-            prefix_for,
             move |t, _n| hl.lock().unwrap().push(t),
             move |t| tl.lock().unwrap().push(t),
         );
@@ -196,7 +194,7 @@ impl Cluster {
             id,
             ClusterNode {
                 reconciler,
-                storage,
+                engines,
                 hosted_log,
                 teardown_log,
             },
@@ -209,12 +207,12 @@ impl Cluster {
     /// disk, per `stop`'s contract), then this node's `Reconciler` is dropped
     /// and rebuilt fresh (`LocalState::default()`, empty `hosted` map) —
     /// exactly as a real process restart re-derives its lifecycle state from
-    /// scratch — reusing the SAME `MemoryEngine` (see
+    /// scratch — reusing the SAME [`MemoryTabletEngines`] registry (see
     /// [`add_node_with_storage`](Self::add_node_with_storage)'s doc).
     fn crash_restart(&mut self, id: NodeId) {
         self.sim.stop(id.clone());
-        let storage = self.nodes.remove(&id).expect("node exists").storage;
-        self.add_node_with_storage(id, storage);
+        let engines = self.nodes.remove(&id).expect("node exists").engines;
+        self.add_node_with_storage(id, engines);
     }
 
     async fn tick(&mut self, id: NodeId, view: &MetadataView) {
@@ -236,8 +234,12 @@ impl Cluster {
         &self.nodes[&id].reconciler
     }
 
-    fn storage(&self, id: NodeId) -> &MemoryEngine {
-        &self.nodes[&id].storage
+    /// `tablet`'s own private engine on node `id` (ADR 0050 rung 1) —
+    /// get-or-create through the same registry the reconciler opens from, so
+    /// a destroyed tablet's engine reads back EMPTY (fresh), which is
+    /// exactly what the erased-data assertions mean now.
+    fn storage(&self, id: NodeId, tablet: TabletId) -> MemoryEngine {
+        self.nodes[&id].engines.engine(tablet)
     }
 
     fn hosted_log(&self, id: NodeId) -> Vec<TabletId> {
@@ -558,10 +560,11 @@ fn scenario_cells() -> Vec<Scenario> {
             "fresh_two_replica_group_hosts_on_both_nodes",
             scenario_fresh_two_replica
         ),
-        scenario!(
-            "split_narrows_source_hosts_sibling_no_double_count",
-            scenario_split_narrow_sibling
-        ),
+        // PARKED (ADR 0050 Train B): `split_narrows_source_hosts_sibling_no_
+        // double_count` — the zero-copy split-narrow lifecycle it exercises
+        // is disabled during the storage pivot and its machinery is deleted
+        // when the copy-based split lands; the scenario fn is kept (dead)
+        // until the deletion rung sweeps it.
         scenario!(
             "rebalance_off_releases_with_bounded_erase_sparing_sibling",
             scenario_rebalance_off_release
@@ -611,27 +614,22 @@ fn scenario_cells() -> Vec<Scenario> {
             "partition_during_removal_blocks_release_until_healed",
             scenario_partition_blocks_release
         ),
-        scenario!(
-            "split_then_immediate_release_zero_ticks_spares_sibling",
-            scenario_split_then_immediate_release
-        ),
+        // PARKED (ADR 0050 Train B): `split_then_immediate_release_zero_
+        // ticks_spares_sibling` — zero-copy split-narrow shape, see above.
         scenario!(
             "re_add_after_exclusion_cancels_pending_release",
             scenario_re_add_cancels_release
         ),
-        // --- ADR 0018 §2 amendment fix (the split_cluster.rs livelock) ---------
-        scenario!(
-            "narrow_seal_survives_a_late_promotion_after_narrowing_as_a_follower",
-            scenario_narrow_seal_survives_a_late_promotion
-        ),
+        // PARKED (ADR 0050 Train B): `narrow_seal_survives_a_late_promotion_
+        // after_narrowing_as_a_follower` (the ADR 0018 §2 split_cluster.rs
+        // livelock fix) and `quiesce_races_a_split_seal_handoff` — both
+        // exercise the zero-copy split's seal/narrow handoff, disabled during
+        // the storage pivot; deleted with their machinery in the deletion
+        // rung.
         // --- ADR 0044 phase-1 PR4 (wake-on-demand + fork H) ---------------------
         scenario!(
             "quiesced_group_wakes_when_a_replica_goes_down",
             scenario_quiesced_group_wakes_when_a_replica_goes_down
-        ),
-        scenario!(
-            "quiesce_races_a_split_seal_handoff",
-            scenario_quiesce_races_a_split_seal_handoff
         ),
     ]
 }
@@ -715,71 +713,23 @@ fn scenario_fresh_two_replica(seed: u64) {
 
 const BOUNDARY: &[u8] = b"m";
 
-fn scenario_split_narrow_sibling(seed: u64) {
-    run(seed, |sim| async move {
-        let env = sim.env(a());
-        let mut c = Cluster::new(sim);
-        c.add_node(a());
-
-        let v1 = view([tablet(1, b"", None, vec![a()])]);
-        c.tick(a(), &v1).await;
-        env.sleep(Duration::from_secs(2)).await;
-
-        let h1 = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
-        for i in 0..5u64 {
-            h1.put(
-                format!("a{i:02}").into_bytes(),
-                format!("lo{i}").into_bytes(),
-            );
-            h1.put(
-                format!("z{i:02}").into_bytes(),
-                format!("hi{i}").into_bytes(),
-            );
-        }
-        env.sleep(Duration::from_secs(1)).await;
-
-        // Narrow the source to the lower half (the split's source-side effect).
-        let v2 = view([tablet(1, b"", Some(BOUNDARY), vec![a()])]);
-        c.tick(a(), &v2).await;
-        assert_eq!(
-            h1.scope_range(),
-            KeyRange::new(b"".to_vec(), Some(BOUNDARY.to_vec()))
-        );
-
-        // Host the sibling covering the upper half — has_data finds the "z.."
-        // keys already present, so it forms as a fresh, full-voter tablet.
-        let v3 = view([
-            tablet(1, b"", Some(BOUNDARY), vec![a()]),
-            tablet(2, BOUNDARY, None, vec![a()]),
-        ]);
-        c.tick(a(), &v3).await;
-        env.sleep(Duration::from_secs(2)).await;
-
-        let h2 = c.node(a()).hosted_node(TabletId(2)).unwrap().clone();
-        assert!(h2.is_leader(), "the fresh sibling must self-elect");
-        for i in 0..5u64 {
-            assert_eq!(
-                h1.local_get(format!("a{i:02}").as_bytes()).await,
-                Some(format!("lo{i}").into_bytes()),
-                "source tablet must still see its own (lower-half) data"
-            );
-            assert_eq!(
-                h2.local_get(format!("z{i:02}").as_bytes()).await,
-                Some(format!("hi{i}").into_bytes()),
-                "sibling tablet must see its own (upper-half) data — no double count"
-            );
-        }
-
-        assert_hosted_converged(&c, a(), [TabletId(1), TabletId(2)]);
-        assert_idempotent(&mut c, a(), &v3).await;
-    });
-}
+// DELETED (ADR 0050 Train B rung 7): the zero-copy split-narrow scenario
+// that lived here modeled `NarrowScope`/`ProposeSeal`/`split_parent`
+// machinery removed with the copy-based split pivot. Successor coverage:
+// the lifecycle e2es (`animusd/tests/split_lifecycle.rs`,
+// `split_build.rs`, `freeze.rs`'s corpus cells) and this corpus's own
+// crash/release/reclaim scenarios, which run against per-tablet engines.
 
 // ---------------------------------------------------------------------------
-// Scenario 4: rebalance-off — narrow, host a co-hosted sibling, a REAL
-// membership removal excludes this node from tablet 1's group, then the
-// release-confirm dampener fires and erases ONLY tablet 1's (narrow) range —
-// the sibling-sparing invariant.
+// Scenario 4: rebalance-off — two co-hosted tablets of ONE table each hold
+// the SAME logical key in their own private engines (ADR 0050 rung 1: the
+// per-tablet-engine independence that was physically impossible on the
+// shared engine, where the second write would collide on the same physical
+// key), then a REAL membership removal excludes this node from tablet 1's
+// group, the release-confirm dampener fires, and tablet 1's engine is
+// destroyed whole — the sibling's engine (same table, same logical keys)
+// survives untouched: sibling-sparing is structural now, not bounded-erase
+// discipline.
 // ---------------------------------------------------------------------------
 
 fn scenario_rebalance_off_release(seed: u64) {
@@ -794,13 +744,14 @@ fn scenario_rebalance_off_release(seed: u64) {
         env.sleep(Duration::from_secs(2)).await;
 
         // b(): a genuine second voter, constructed directly (this scenario only
-        // needs a real second voter, not a second node's full lifecycle).
+        // needs a real second voter, not a second node's full lifecycle) — on
+        // its own node, with its own private engine for tablet 1.
         let b_storage = MemoryEngine::new();
         let hb = KvNode::start_hosted(
             other_env,
             vec![a(), b()],
             b_storage,
-            StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
+            StorageScope::new(KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
@@ -814,18 +765,17 @@ fn scenario_rebalance_off_release(seed: u64) {
             );
             leader.put(
                 format!("z{i:02}").into_bytes(),
-                format!("hi{i}").into_bytes(),
+                format!("t1z{i}").into_bytes(),
             );
         }
         env.sleep(Duration::from_secs(2)).await;
 
-        // Narrow tablet 1 (the split's source-side effect) then host the
-        // co-hosted sibling covering the upper half.
-        let v2 = view([tablet(1, b"", Some(BOUNDARY), vec![a(), b()])]);
-        c.tick(a(), &v2).await;
+        // Host tablet 2 — same table, overlapping range, on the SAME node.
+        // Its own engine starts EMPTY (no zero-copy inheritance); it then
+        // writes the SAME logical keys with different values.
         let v3 = view([
-            tablet(1, b"", Some(BOUNDARY), vec![a(), b()]),
-            tablet(2, BOUNDARY, None, vec![a()]),
+            tablet(1, b"", None, vec![a(), b()]),
+            tablet(2, b"", None, vec![a()]),
         ]);
         c.tick(a(), &v3).await;
         env.sleep(Duration::from_secs(2)).await;
@@ -833,16 +783,29 @@ fn scenario_rebalance_off_release(seed: u64) {
         let h2 = c.node(a()).hosted_node(TabletId(2)).unwrap().clone();
         assert_eq!(
             h2.local_get(b"z00").await,
-            Some(b"hi0".to_vec()),
-            "sanity: sibling data present before release"
+            None,
+            "a fresh sibling's private engine must start EMPTY - no zero-copy inheritance"
         );
+        for i in 0..5u64 {
+            h2.put(
+                format!("z{i:02}").into_bytes(),
+                format!("hi{i}").into_bytes(),
+            );
+        }
+        env.sleep(Duration::from_secs(1)).await;
+
+        // THE rung-1 teeth: the same logical key holds two different values
+        // in the two tablets' own engines, independently readable — on the
+        // shared engine this was one physical key (last-writer-wins).
+        assert_present(&c.storage(a(), TabletId(1)), &physical(b"z00"), b"t1z0").await;
+        assert_present(&c.storage(a(), TabletId(2)), &physical(b"z00"), b"hi0").await;
 
         remove_replica_for_real(&env, &ha, a(), &hb, b(), [b()].into_iter().collect()).await;
 
         // Drive the release-confirm dampener to completion.
         let v4 = view([
-            tablet(1, b"", Some(BOUNDARY), vec![b()]),
-            tablet(2, BOUNDARY, None, vec![a()]),
+            tablet(1, b"", None, vec![b()]),
+            tablet(2, b"", None, vec![a()]),
         ]);
         for _ in 0..10 {
             c.tick(a(), &v4).await;
@@ -854,14 +817,22 @@ fn scenario_rebalance_off_release(seed: u64) {
         assert_eq!(c.teardown_log(a()), vec![TabletId(1)]);
         assert_all_stopped(&[ha]);
 
+        // Tablet 1's engine was destroyed whole (reads back fresh/empty);
+        // the co-hosted sibling's engine — same table, same logical keys —
+        // is completely untouched.
         for i in 0..5u64 {
             assert_absent(
-                c.storage(a()),
+                &c.storage(a(), TabletId(1)),
                 &physical(format!("a{i:02}").into_bytes().as_slice()),
             )
             .await;
+            assert_absent(
+                &c.storage(a(), TabletId(1)),
+                &physical(format!("z{i:02}").into_bytes().as_slice()),
+            )
+            .await;
             assert_present(
-                c.storage(a()),
+                &c.storage(a(), TabletId(2)),
                 &physical(format!("z{i:02}").into_bytes().as_slice()),
                 format!("hi{i}").into_bytes().as_slice(),
             )
@@ -896,7 +867,7 @@ fn scenario_drop_table_reclaim(seed: u64) {
         assert_hosted_converged(&c, a(), []);
         assert_eq!(c.teardown_log(a()), vec![TabletId(1)]);
         assert_all_stopped(&[h1]);
-        assert_absent(c.storage(a()), &physical(b"k")).await;
+        assert_absent(&c.storage(a(), TabletId(1)), &physical(b"k")).await;
 
         assert_idempotent(&mut c, a(), &v2).await;
     });
@@ -1271,7 +1242,7 @@ fn scenario_replay_epoch_flicker(seed: u64) {
             other_env,
             vec![a(), b()],
             b_storage,
-            StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
+            StorageScope::new(KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
@@ -1342,7 +1313,7 @@ fn scenario_replay_absent_then_present(seed: u64) {
         let h1 = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
         h1.put(b"k".to_vec(), b"v".to_vec());
         env.sleep(Duration::from_secs(1)).await;
-        assert_present(c.storage(a()), &physical(b"k"), b"v").await;
+        assert_present(&c.storage(a(), TabletId(1)), &physical(b"k"), b"v").await;
 
         // a() transient "absent" view (e.g. the caller ticked mid control-plane
         // WAL replay, before recovery reached the tablet's re-creation entry).
@@ -1351,7 +1322,7 @@ fn scenario_replay_absent_then_present(seed: u64) {
         assert_hosted_converged(&c, a(), []);
         assert_eq!(c.teardown_log(a()), vec![TabletId(1)]);
         assert_all_stopped(&[h1]);
-        assert_absent(c.storage(a()), &physical(b"k")).await;
+        assert_absent(&c.storage(a(), TabletId(1)), &physical(b"k")).await;
 
         // The tablet "reappears" (replay catches up to its final, settled
         // state) — a brand-new Host, with no memory of the erased data.
@@ -1396,7 +1367,7 @@ fn scenario_partition_blocks_release(seed: u64) {
             other_env,
             vec![a(), b()],
             b_storage,
-            StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
+            StorageScope::new(KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
@@ -1459,7 +1430,7 @@ fn scenario_partition_blocks_release(seed: u64) {
             c.teardown_log(a()).is_empty(),
             "release must not fire while partitioned"
         );
-        assert_present(c.storage(a()), &physical(b"k0"), b"v0").await;
+        assert_present(&c.storage(a(), TabletId(1)), &physical(b"k0"), b"v0").await;
 
         // Heal — the removal entry finally reaches a(), then release proceeds.
         sim2.heal(a(), b());
@@ -1491,94 +1462,12 @@ fn scenario_partition_blocks_release(seed: u64) {
 // possibly stale-wide `scope_range()` fact).
 // ---------------------------------------------------------------------------
 
-fn scenario_split_then_immediate_release(seed: u64) {
-    run(seed, |sim| async move {
-        let env = sim.env(a());
-        let other_env = sim.env(b());
-        let mut c = Cluster::new(sim);
-        c.add_node(a());
-
-        let v1 = view([tablet(1, b"", None, vec![a(), b()])]);
-        c.tick(a(), &v1).await;
-        env.sleep(Duration::from_secs(2)).await;
-
-        let b_storage = MemoryEngine::new();
-        let hb = KvNode::start_hosted(
-            other_env,
-            vec![a(), b()],
-            b_storage,
-            StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
-            1,
-        );
-        env.sleep(Duration::from_secs(2)).await;
-        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
-        for i in 0..5u64 {
-            let leader = if ha.is_leader() { &ha } else { &hb };
-            leader.put(
-                format!("a{i:02}").into_bytes(),
-                format!("lo{i}").into_bytes(),
-            );
-            leader.put(
-                format!("z{i:02}").into_bytes(),
-                format!("hi{i}").into_bytes(),
-            );
-        }
-        env.sleep(Duration::from_secs(1)).await;
-
-        // Host the sibling (co-hosted, upper half) BEFORE the removal — this
-        // node keeps replicating it after tablet 1 is released.
-        let v_with_sibling = view([
-            tablet(1, b"", None, vec![a(), b()]), // tablet 1 still WIDE (pre-split) here
-            tablet(2, BOUNDARY, None, vec![a()]),
-        ]);
-        c.tick(a(), &v_with_sibling).await;
-        env.sleep(Duration::from_secs(2)).await;
-        let h2 = c.node(a()).hosted_node(TabletId(2)).unwrap().clone();
-        assert_eq!(h2.local_get(b"z00").await, Some(b"hi0".to_vec()));
-
-        // The real removal completes WHILE tablet 1's scope is still WIDE —
-        // a()'s reconciler never got a chance to run NarrowScope for it (once
-        // excluded, `plan_join_host` returns None and phase 1 skips it
-        // entirely — see `plan`'s Phase 1 doc).
-        remove_replica_for_real(&env, &ha, a(), &hb, b(), [b()].into_iter().collect()).await;
-        assert_eq!(
-            ha.scope_range(),
-            KeyRange::whole(),
-            "sanity: tablet 1's live scope is still stale-wide at the moment of exclusion"
-        );
-
-        // In ONE leap, this node's view shows tablet 1 BOTH narrowed (the
-        // split committed) AND excluding it — zero ticks in between.
-        let v_final = view([
-            tablet(1, b"", Some(BOUNDARY), vec![b()]),
-            tablet(2, BOUNDARY, None, vec![a()]),
-        ]);
-        for _ in 0..8 {
-            c.tick(a(), &v_final).await;
-            env.sleep(Duration::from_millis(50)).await;
-        }
-
-        assert_hosted_converged(&c, a(), [TabletId(2)]);
-        assert_eq!(c.teardown_log(a()), vec![TabletId(1)]);
-        assert_all_stopped(&[ha]);
-
-        for i in 0..5u64 {
-            assert_absent(
-                c.storage(a()),
-                &physical(format!("a{i:02}").into_bytes().as_slice()),
-            )
-            .await;
-            assert_present(
-                c.storage(a()),
-                &physical(format!("z{i:02}").into_bytes().as_slice()),
-                format!("hi{i}").into_bytes().as_slice(),
-            )
-            .await;
-        }
-
-        assert_idempotent(&mut c, a(), &v_final).await;
-    });
-}
+// DELETED (ADR 0050 Train B rung 7): the zero-copy split-narrow scenario
+// that lived here modeled `NarrowScope`/`ProposeSeal`/`split_parent`
+// machinery removed with the copy-based split pivot. Successor coverage:
+// the lifecycle e2es (`animusd/tests/split_lifecycle.rs`,
+// `split_build.rs`, `freeze.rs`'s corpus cells) and this corpus's own
+// crash/release/reclaim scenarios, which run against per-tablet engines.
 
 // ---------------------------------------------------------------------------
 // Scenario 18: a re-add after exclusion cancels a pending release outright
@@ -1601,7 +1490,7 @@ fn scenario_re_add_cancels_release(seed: u64) {
             other_env,
             vec![a(), b()],
             b_storage,
-            StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
+            StorageScope::new(KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
@@ -1664,104 +1553,12 @@ fn scenario_re_add_cancels_release(seed: u64) {
 // condition re-derived fresh every tick, independent of local scope state.
 // ---------------------------------------------------------------------------
 
-fn scenario_narrow_seal_survives_a_late_promotion(seed: u64) {
-    run(seed, |sim| async move {
-        let env = sim.env(a());
-        let mut c = Cluster::new(sim);
-        c.add_node(a());
-        c.add_node(b());
-
-        let v1 = view([tablet(1, b"", None, vec![a(), b()])]);
-        c.tick_all(&[a(), b()], &v1).await;
-        env.sleep(Duration::from_secs(2)).await; // elect
-
-        let h1a = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
-        let h1b = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
-        let (leader0_id, leader0, follower_id, follower) = if h1a.is_leader() {
-            (a(), h1a.clone(), b(), h1b.clone())
-        } else {
-            assert!(h1b.is_leader(), "tablet 1 must have elected some leader");
-            (b(), h1b.clone(), a(), h1a.clone())
-        };
-
-        // The split's atomic control-plane effect (ADR 0028): the source
-        // narrows AND the fresh child appears in the SAME view, with
-        // provenance recorded — mirrors `MetaCommand::SplitTablet`'s single
-        // apply exactly (unlike `scenario_split_narrow_sibling`'s
-        // deliberately staged introduction, which isn't required to be
-        // atomic since it only exercises `plan`'s reaction one step at a
-        // time).
-        let v2 = MetadataView {
-            tablets: [
-                tablet(1, b"", Some(BOUNDARY), vec![a(), b()]),
-                tablet(2, BOUNDARY, None, vec![a(), b()]),
-            ]
-            .into_iter()
-            .map(|t| (t.id, t))
-            .collect(),
-            split_parent: [(TabletId(2), TabletId(1))].into_iter().collect(),
-            ..Default::default()
-        };
-
-        // Tick ONLY the follower — it narrows its own scope unconditionally
-        // (regardless of leadership) but, correctly, proposes nothing (not
-        // leader). The leader is never ticked with `v2` at all here.
-        c.tick(follower_id.clone(), &v2).await;
-        assert_eq!(
-            follower.scope_range(),
-            KeyRange::new(b"".to_vec(), Some(BOUNDARY.to_vec())),
-            "the follower must still narrow its own scope locally"
-        );
-        assert!(
-            c.node(follower_id.clone())
-                .hosted_node(TabletId(2))
-                .is_none(),
-            "the child must not host until the parent's seal is observed"
-        );
-
-        // Force a REAL leadership change: remove the ORIGINAL leader from
-        // tablet 1's Raft config outright, leaving the follower — the one
-        // that already narrowed while it was NOT leader — as the sole
-        // remaining voter (hence trivially its new leader).
-        remove_replica_for_real(
-            &env,
-            &leader0,
-            leader0_id.clone(),
-            &follower,
-            follower_id.clone(),
-            [follower_id.clone()].into_iter().collect(),
-        )
-        .await;
-        assert!(follower.is_leader(), "the sole remaining voter must lead");
-
-        // Tick the (now-leader, already-narrowed) follower again with the
-        // SAME view. Its own local scope already matches `v2`'s target
-        // range, so a one-shot "propose only as a side effect of narrowing"
-        // design has nothing left to trigger on — this is the exact
-        // regression: `pending_seals` must instead keep naming this range
-        // until a covering seal is actually observed, independent of local
-        // scope state, so this now-leader tick finally proposes it.
-        let mut child_hosted = false;
-        for _ in 0..20 {
-            c.tick(follower_id.clone(), &v2).await;
-            env.sleep(Duration::from_millis(200)).await;
-            if c.node(follower_id.clone())
-                .hosted_node(TabletId(2))
-                .is_some()
-            {
-                child_hosted = true;
-                break;
-            }
-        }
-        assert!(
-            child_hosted,
-            "the split's child never hosted — the promoted replica never proposed the \
-             parent's range-seal (the split_cluster.rs regression)"
-        );
-
-        assert_hosted_converged(&c, follower_id, [TabletId(1), TabletId(2)]);
-    });
-}
+// DELETED (ADR 0050 Train B rung 7): the zero-copy split-narrow scenario
+// that lived here modeled `NarrowScope`/`ProposeSeal`/`split_parent`
+// machinery removed with the copy-based split pivot. Successor coverage:
+// the lifecycle e2es (`animusd/tests/split_lifecycle.rs`,
+// `split_build.rs`, `freeze.rs`'s corpus cells) and this corpus's own
+// crash/release/reclaim scenarios, which run against per-tablet engines.
 
 // ---------------------------------------------------------------------------
 // ADR 0044 phase-1 PR4: wake-on-demand + fork H (proactive wake on `down`).
@@ -1864,79 +1661,12 @@ fn scenario_quiesced_group_wakes_when_a_replica_goes_down(seed: u64) {
     });
 }
 
-/// Quiescence must not interfere with an in-flight split: a quiesced
-/// source's own `narrow_scope` is a pure local mutation the reconciler
-/// performs directly (no Raft round trip, unaffected by whether the
-/// consensus loop currently ticks), and its `ProposeSeal` action relies on
-/// the pre-existing wake-on-propose plumbing to transparently un-quiesce the
-/// group for its own seal proposal.
-fn scenario_quiesce_races_a_split_seal_handoff(seed: u64) {
-    run(seed, |sim| async move {
-        let env = sim.env(a());
-        let mut c = Cluster::new(sim);
-        c.add_node(a());
-
-        let v1 = view([tablet(1, b"", None, vec![a()])]);
-        c.tick(a(), &v1).await;
-        env.sleep(Duration::from_secs(2)).await;
-
-        let h1 = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
-        h1.enable_quiescence(RECONCILER_QUIESCE_AFTER);
-        for i in 0..5u64 {
-            h1.put(
-                format!("a{i:02}").into_bytes(),
-                format!("lo{i}").into_bytes(),
-            );
-            h1.put(
-                format!("z{i:02}").into_bytes(),
-                format!("hi{i}").into_bytes(),
-            );
-        }
-
-        let quiesced = wait_until(&env, 150, Duration::from_millis(50), || h1.is_quiesced()).await;
-        assert!(
-            quiesced,
-            "the source tablet should quiesce while idle, even with a split about to land"
-        );
-
-        // The split lands: narrow the source. This must take effect on a
-        // currently-quiesced group.
-        let v2 = view([tablet(1, b"", Some(BOUNDARY), vec![a()])]);
-        c.tick(a(), &v2).await;
-        assert_eq!(
-            h1.scope_range(),
-            KeyRange::new(b"".to_vec(), Some(BOUNDARY.to_vec())),
-            "a quiesced group's own reconciler must still narrow its scope on a split"
-        );
-
-        let v3 = view([
-            tablet(1, b"", Some(BOUNDARY), vec![a()]),
-            tablet(2, BOUNDARY, None, vec![a()]),
-        ]);
-        c.tick(a(), &v3).await;
-        env.sleep(Duration::from_secs(2)).await;
-
-        let h2 = c.node(a()).hosted_node(TabletId(2)).unwrap().clone();
-        assert!(
-            h2.is_leader(),
-            "the fresh sibling must self-elect even though its source quiesced"
-        );
-        for i in 0..5u64 {
-            assert_eq!(
-                h1.local_get(format!("a{i:02}").as_bytes()).await,
-                Some(format!("lo{i}").into_bytes()),
-                "source tablet must still see its own (lower-half) data"
-            );
-            assert_eq!(
-                h2.local_get(format!("z{i:02}").as_bytes()).await,
-                Some(format!("hi{i}").into_bytes()),
-                "sibling tablet must see its own (upper-half) data — no double count"
-            );
-        }
-        assert_hosted_converged(&c, a(), [TabletId(1), TabletId(2)]);
-        assert_idempotent(&mut c, a(), &v3).await;
-    });
-}
+// DELETED (ADR 0050 Train B rung 7): the zero-copy split-narrow scenario
+// that lived here modeled `NarrowScope`/`ProposeSeal`/`split_parent`
+// machinery removed with the copy-based split pivot. Successor coverage:
+// the lifecycle e2es (`animusd/tests/split_lifecycle.rs`,
+// `split_build.rs`, `freeze.rs`'s corpus cells) and this corpus's own
+// crash/release/reclaim scenarios, which run against per-tablet engines.
 
 // ---------------------------------------------------------------------------
 // The tests.

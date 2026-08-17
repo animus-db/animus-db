@@ -227,28 +227,33 @@ async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
 
 /// Mirrors `cp_txn.rs`'s identical helper.
 async fn split_and_settle(nodes: &[Node], addr: SocketAddr, table: &str, split_key: &[u8]) {
-    let resp = call(
+    // ADR 0050 (Train B rung 5+): drive the REAL copy-based workflow via the
+    // public kickoff; the driver builds, freezes, and cuts over on its own.
+    match call(
         addr,
         ClientRequest::SplitTablet {
             tablet: 1,
             split_key: split_key.to_vec(),
         },
     )
-    .await;
-    assert!(
-        matches!(resp, ClientResponse::PutOk),
-        "split trigger rejected: {resp:?}"
-    );
-    timeout(Duration::from_secs(20), async {
+    .await
+    {
+        ClientResponse::PutOk => {}
+        other => panic!("split kickoff refused: {other:?}"),
+    }
+    timeout(Duration::from_secs(30), async {
         loop {
-            if nodes.iter().all(|n| n.metadata().tablets.len() == 2) {
+            if nodes.iter().all(|n| {
+                let m = n.metadata();
+                m.tablets.len() == 2 && !m.tablets.contains_key(&animus_tablet::TabletId(1))
+            }) {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("split was not recorded in the tablet map within 20s");
+    .expect("the split workflow did not cut over within 30s");
 
     let probe_key = [split_key, b"zzz-probe"].concat();
     put_until_ok(addr, table, &probe_key, b"probe").await;

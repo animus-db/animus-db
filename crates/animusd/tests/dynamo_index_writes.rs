@@ -37,28 +37,11 @@ use std::time::Duration;
 
 use animus_dynamo::{AttributeValue, storage_key};
 use animus_tablet::partition_token;
-use animusd::{ClientRequest, ClientResponse, Node, bind_cluster, read_frame, start_cluster};
+use animusd::{Node, bind_cluster, start_cluster};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
-
-/// One `ClientRequest`/`ClientResponse` round trip over the plain
-/// length-prefixed client protocol — used only to drive `SplitTablet`; no
-/// such op exists on the DynamoDB wire. Mirrors `dynamo_index_scan.rs`'s
-/// identical helper.
-async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .expect("connect to client port");
-    animusd::write_frame(&mut stream, &req)
-        .await
-        .expect("send request");
-    read_frame(&mut stream)
-        .await
-        .expect("read reply")
-        .expect("a reply")
-}
 
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
@@ -381,46 +364,70 @@ async fn transact_write_items_maintains_lsi_and_gsi_across_a_split_table() {
     .await;
     assert_eq!(status, 200, "CreateTable(indexed) failed: {body}");
 
-    // `CreateTable` alone does not provision the table's first tablet
-    // (`cp_write`/`cp_delete`'s own documented non-auto-provisioning
-    // contract) — a throwaway seed write forces it into existence before
-    // `SplitTablet` can target it by id.
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.PutItem",
-        r#"{"TableName":"indexed","Item":{"id":{"S":"seed"},"sk":{"S":"a"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "seed PutItem failed: {body}");
-
-    // Split strictly between "p1" and "p2"'s own tokens (mirrors
-    // `dynamo_index_scan.rs`'s identical split-key construction) so the
-    // transaction's two items genuinely land on different tablets.
-    let token_p1 = partition_token(&storage_key(&AttributeValue::S("p1".into()), None));
-    let token_p2 = partition_token(&storage_key(&AttributeValue::S("p2".into()), None));
-    let split_key = token_p1.max(token_p2).to_vec();
-    let resp = call(
-        nodes[0].client_addr(),
-        ClientRequest::SplitTablet {
-            tablet: 1,
-            split_key,
-        },
-    )
-    .await;
-    assert!(
-        matches!(resp, ClientResponse::PutOk),
-        "split did not commit: {resp:?}"
-    );
+    // Wait for the table's bootstrap tablet — `CreateTable` provisions it.
     timeout(Duration::from_secs(20), async {
         loop {
-            if nodes[0].metadata().tablets.len() >= 2 {
+            if nodes.iter().any(|n| {
+                n.metadata()
+                    .tablets
+                    .contains_key(&animus_tablet::TabletId(1))
+            }) {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("split was not recorded within 20s");
+    .expect("bootstrap tablet was never provisioned");
+
+    // Split strictly between "p1" and "p2"'s own tokens (mirrors
+    // `dynamo_index_scan.rs`'s identical split-key construction) so the
+    // transaction's two items genuinely land on different tablets.
+    //
+    // ADR 0050 (Train B rung 5+): drive the REAL workflow via the public
+    // kickoff on the client protocol (the driver cuts over on its own).
+    let token_p1 = partition_token(&storage_key(&AttributeValue::S("p1".into()), None));
+    let token_p2 = partition_token(&storage_key(&AttributeValue::S("p2".into()), None));
+    let split_key = token_p1.max(token_p2).to_vec();
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect client port");
+        let msg = serde_json::to_vec(&animusd::ClientRequest::SplitTablet {
+            tablet: 1,
+            split_key,
+        })
+        .unwrap();
+        stream
+            .write_all(&(msg.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&msg).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut len = [0u8; 4];
+        stream.read_exact(&mut len).await.unwrap();
+        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+        stream.read_exact(&mut buf).await.unwrap();
+        let resp: animusd::ClientResponse = serde_json::from_slice(&buf).unwrap();
+        assert!(
+            matches!(resp, animusd::ClientResponse::PutOk),
+            "split kickoff refused: {resp:?}"
+        );
+    }
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if nodes.iter().all(|n| {
+                let m = n.metadata();
+                m.tablets.len() == 2 && !m.tablets.contains_key(&animus_tablet::TabletId(1))
+            }) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the split workflow did not cut over within 30s");
 
     // The transaction: one Put per partition, each setting both the LSI's
     // `alt` sort attribute and the GSI's `tag` hash attribute.

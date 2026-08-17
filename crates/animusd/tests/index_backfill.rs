@@ -234,11 +234,20 @@ async fn index_backfill_converges_to_active_once_every_tablet_reports() {
     // real ≥2-tablet completion set, not a degenerate single-tablet one.
     call(
         client,
-        ClientRequest::ProposeSchema(MetaCommand::SplitTablet {
-            tablet: TabletId(500),
+        ClientRequest::ProposeSchema(MetaCommand::BeginSplit {
+            parent: TabletId(500),
             expected_epoch: Epoch::INITIAL,
             split_key: b"m".to_vec(),
-            new_id: TabletId(501),
+            children: [(TabletId(501), Vec::new()), (TabletId(502), Vec::new())],
+        }),
+    )
+    .await;
+    call(
+        client,
+        ClientRequest::ProposeSchema(MetaCommand::CutoverSplit {
+            parent: TabletId(500),
+            expected_epoch: Epoch::INITIAL.next(),
+            cutover_wall_ms: 1_000,
         }),
     )
     .await;
@@ -251,15 +260,15 @@ async fn index_backfill_converges_to_active_once_every_tablet_reports() {
         }
     })
     .await
-    .expect("SplitTablet did not commit in 10s");
+    .expect("split round did not commit in 10s");
 
-    // Only one of the two tablets reports — must not flip.
+    // Only one of the two (post-cutover) tablets reports — must not flip.
     call(
         client,
         ClientRequest::ProposeSchema(MetaCommand::MarkIndexBackfilled {
             table: "bf_t".into(),
             index: "by_email".into(),
-            tablet: TabletId(500),
+            tablet: TabletId(501),
         }),
     )
     .await;
@@ -271,7 +280,7 @@ async fn index_backfill_converges_to_active_once_every_tablet_reports() {
         ClientRequest::ProposeSchema(MetaCommand::MarkIndexBackfilled {
             table: "bf_t".into(),
             index: "by_email".into(),
-            tablet: TabletId(501),
+            tablet: TabletId(502),
         }),
     )
     .await;
@@ -366,11 +375,20 @@ async fn a_tablet_that_appears_before_the_flip_blocks_it_until_it_also_reports()
     // true — from this point on, completion needs the child too.
     call(
         client,
-        ClientRequest::ProposeSchema(MetaCommand::SplitTablet {
-            tablet: TabletId(600),
+        ClientRequest::ProposeSchema(MetaCommand::BeginSplit {
+            parent: TabletId(600),
             expected_epoch: Epoch::INITIAL,
             split_key: b"m".to_vec(),
-            new_id: TabletId(601),
+            children: [(TabletId(601), Vec::new()), (TabletId(602), Vec::new())],
+        }),
+    )
+    .await;
+    call(
+        client,
+        ClientRequest::ProposeSchema(MetaCommand::CutoverSplit {
+            parent: TabletId(600),
+            expected_epoch: Epoch::INITIAL.next(),
+            cutover_wall_ms: 1_000,
         }),
     )
     .await;
@@ -383,10 +401,10 @@ async fn a_tablet_that_appears_before_the_flip_blocks_it_until_it_also_reports()
         }
     })
     .await
-    .expect("SplitTablet did not commit in 10s");
+    .expect("split round did not commit in 10s");
 
-    // The child has not reported — must not flip, however long the parent's
-    // own report has had to be observed.
+    // Neither child has reported — must not flip, however long the retired
+    // parent's own (now-irrelevant) report has had to be observed.
     assert_no_premature_flip(
         &nodes,
         "bf_split_t",
@@ -395,13 +413,31 @@ async fn a_tablet_that_appears_before_the_flip_blocks_it_until_it_also_reports()
     )
     .await;
 
-    // The child reports — now it converges.
+    // One child reports — still must not flip (its sibling hasn't).
     call(
         client,
         ClientRequest::ProposeSchema(MetaCommand::MarkIndexBackfilled {
             table: "bf_split_t".into(),
             index: "by_email".into(),
             tablet: TabletId(601),
+        }),
+    )
+    .await;
+    assert_no_premature_flip(
+        &nodes,
+        "bf_split_t",
+        "by_email",
+        Duration::from_millis(1500),
+    )
+    .await;
+
+    // The second child reports — now it converges.
+    call(
+        client,
+        ClientRequest::ProposeSchema(MetaCommand::MarkIndexBackfilled {
+            table: "bf_split_t".into(),
+            index: "by_email".into(),
+            tablet: TabletId(602),
         }),
     )
     .await;

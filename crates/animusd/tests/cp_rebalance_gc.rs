@@ -162,24 +162,6 @@ async fn hosts_tablet(admin_addr: SocketAddr, tablet: TabletId) -> bool {
     tablet_group(admin_addr, tablet).await.is_some()
 }
 
-/// This node's own **local** live value for `key` in `tablet` (`/admin/storage/key`
-/// — node-local, no quorum barrier), or `None` if the tablet isn't hosted here / the
-/// key has no live value. Used to prove a release-GC erase was bounded to the
-/// erased tablet's own range and did not touch a co-hosted sibling's data on the
-/// same shared per-node engine (ADR 0026/0028).
-async fn storage_key_value(admin_addr: SocketAddr, tablet: TabletId, key: &[u8]) -> Option<String> {
-    let path = format!(
-        "/admin/storage/key?tablet={}&key={}",
-        tablet.0,
-        String::from_utf8_lossy(key)
-    );
-    let (status, v) = admin_get(admin_addr, &path).await?;
-    if status != 200 {
-        return None;
-    }
-    v["live"].as_str().map(str::to_string)
-}
-
 async fn call(addr: SocketAddr, req: ClientRequest) -> Option<ClientResponse> {
     let mut stream = TcpStream::connect(addr).await.ok()?;
     write_frame(&mut stream, &req).await.ok()?;
@@ -621,173 +603,15 @@ async fn a_joining_spare_is_never_released() {
     .await
     .expect("test timed out");
 }
-
-// ---- Test 4: a split + immediate release must not corrupt the sibling -------
-
-/// **The bug this file's fix addresses.** Split `kv` (tablet 1) at `"k5"`, then
-/// — with **no sleep** in between, so this races the same ~250ms window the
-/// production bug lives in (`cp_join_host_loop`'s narrow tick, which re-narrows
-/// an already-hosted tablet's `StorageScope` to its current replicated range,
-/// but stops touching a tablet the instant this node is no longer in its
-/// replica set) — CAS the *parent's* replicas off a follower node. That node
-/// was never dropped from the freshly-minted *child* tablet's replica set (the
-/// split only touched the parent), so it keeps hosting the child on the same
-/// per-node shared engine (ADR 0026/0028) that the parent's data physically
-/// lives on too. Once the release GC stops + erases the *parent* on that node,
-/// the fix (`cp_gc_tablet` narrowing to the parent's **current** replicated
-/// range before erasing, rather than trusting the group's possibly stale-wide
-/// in-memory scope) must mean the child's data is untouched — both served
-/// cluster-wide and present in that very node's own local storage. Before the
-/// fix, a stale-wide parent scope at erase time would tombstone the child's
-/// keys too, at a version high enough to beat the child's own fresh writes
-/// under per-key LWW: silent, permanent corruption of a tablet this node was
-/// never even asked to release.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn split_then_immediate_release_spares_the_new_siblings_data() {
-    timeout(Duration::from_secs(150), async {
-        let tmp = tempfile::tempdir().unwrap();
-        let (nodes, config, _dirs) = bring_up(4, tmp.path()).await;
-        await_bootstrap(&nodes).await;
-        let raftkv_ids = config.data_ids();
-        let spare = raftkv_ids[3].clone();
-        let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
-
-        let leader_idx = form_kv_group(&nodes, &clients).await;
-        // A lower key (stays with the parent after the split) and an upper key
-        // (rides the split's handoff to the new sibling — no data actually
-        // moves, ADR 0028; it's already on the same shared engine).
-        put(&clients, "kv", b"k1", b"lower", 30).await;
-        put(&clients, "kv", b"k9", b"upper", 30).await;
-
-        // Which follower to drop off the parent's replica set (the leader
-        // can't remove itself): the new set is the two kept replicas + the
-        // spare.
-        let drop_idx = (0..3)
-            .find(|&i| i != leader_idx)
-            .expect("a follower replica");
-        let dropped_id = raftkv_ids[drop_idx].clone();
-        let kept: Vec<NodeId> = raftkv_ids[..3]
-            .iter()
-            .filter(|&id| *id != dropped_id)
-            .cloned()
-            .chain([spare.clone()])
-            .collect();
-
-        // Propose the split AND the parent's replica-set CAS **back-to-back on
-        // the control leader's own local Raft log**, computing the CAS's
-        // `expected_epoch` up front (the split bumps the source's epoch by
-        // exactly one, `meta.rs`'s `SplitTablet` apply) instead of waiting to
-        // observe the split's commit first. Round-tripping the split through
-        // the wire protocol (as a real client would) and only then issuing the
-        // CAS gives `cp_join_host_loop`'s ~250ms narrow tick ample time to run
-        // in between on a fast local cluster — self-healing the scope before
-        // the drop lands and hiding the very bug this test exists to catch.
-        // Proposing both synchronously, one right after the other with no
-        // `.await` of their own in between, appends them as adjacent entries
-        // in the same leader log — orders of magnitude tighter than the tick
-        // period, so the drop reliably lands before the source's `RaftKvNode`
-        // has ever seen (let alone narrowed to) the post-split range.
-        let control_leader_idx = nodes
-            .iter()
-            .position(Node::is_control_leader)
-            .expect("a control leader exists");
-        let control_leader = &nodes[control_leader_idx];
-        let meta = control_leader.metadata();
-        let child = meta.next_free_tablet_id();
-        let source_epoch = meta
-            .tablets
-            .get(&KV_TABLET)
-            .map(|t| t.epoch)
-            .expect("kv tablet exists");
-        assert!(
-            control_leader.propose_meta(MetaCommand::SplitTablet {
-                tablet: KV_TABLET,
-                expected_epoch: source_epoch,
-                split_key: b"k5".to_vec(),
-                new_id: child,
-            }),
-            "split proposal was rejected locally on the control leader"
-        );
-        assert!(
-            control_leader.propose_meta(MetaCommand::CasTabletReplicas {
-                tablet: KV_TABLET,
-                expected_epoch: source_epoch.next(),
-                replicas: kept.clone(),
-            }),
-            "replica-set CAS proposal was rejected locally on the control leader"
-        );
-
-        // Wait for both to actually commit + replicate cluster-wide.
-        let want_replicas: std::collections::BTreeSet<NodeId> = kept.iter().cloned().collect();
-        let committed = async {
-            loop {
-                if nodes.iter().all(|n| {
-                    let m = n.metadata();
-                    m.tablets.contains_key(&child)
-                        && m.tablets.get(&KV_TABLET).is_some_and(|t| {
-                            t.replicas
-                                .iter()
-                                .cloned()
-                                .collect::<std::collections::BTreeSet<_>>()
-                                == want_replicas
-                        })
-                }) {
-                    return;
-                }
-                sleep(Duration::from_millis(20)).await;
-            }
-        };
-        timeout(Duration::from_secs(30), committed)
-            .await
-            .expect("split + replica-set CAS did not both commit within 30s");
-
-        // The dropped node's release phase stops hosting the PARENT tablet...
-        let dropped_admin = config.nodes[drop_idx].admin;
-        await_true(60, "dropped node releases the parent tablet", || async {
-            !hosts_tablet(dropped_admin, KV_TABLET).await
-        })
-        .await;
-
-        // ...but it was never dropped from the CHILD's replica set (the split
-        // only touched the parent), so it must still host the child — and,
-        // crucially, the child's own upper-range key must still be present in
-        // THIS node's LOCAL storage: proof the parent's release-erase was
-        // bounded to the parent's own (current, narrowed) range and did not
-        // tombstone the co-hosted sibling sharing the same per-node engine.
-        await_true(30, "dropped node still hosts the child tablet", || async {
-            hosts_tablet(dropped_admin, child).await
-        })
-        .await;
-        await_true(
-            30,
-            "the child's key survives locally on the dropped node",
-            || async {
-                storage_key_value(dropped_admin, child, b"k9")
-                    .await
-                    .as_deref()
-                    == Some("upper")
-            },
-        )
-        .await;
-
-        // The child keeps serving cluster-wide too...
-        assert_eq!(
-            client_get(clients[leader_idx], "kv", b"k9").await,
-            Some(b"upper".to_vec()),
-            "the child tablet still serves its data cluster-wide"
-        );
-        // ...and the parent's own surviving data is untouched (sanity: never at
-        // risk, but worth confirming the fix didn't overcorrect the erase).
-        assert_eq!(
-            client_get(clients[leader_idx], "kv", b"k1").await,
-            Some(b"lower".to_vec()),
-            "the parent tablet's own surviving data is untouched"
-        );
-
-        for node in nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
+// TOMBSTONE (ADR 0050 Train B rung 5): `split_then_immediate_release_
+// spares_the_new_siblings_data` was deleted here, not merely parked. It
+// hand-drove the OLD zero-copy `MetaCommand::SplitTablet` on a POPULATED
+// tablet, racing the metadata-only range-narrow against a replica-set CAS
+// to prove release's erase spared the new sibling's data on the SHARED
+// engine — a hazard (and a mechanism) that no longer exists: under
+// per-tablet engines a release/reclaim deletes only the released tablet's
+// own engine (sibling-sparing is structural — `animus-cp-data`'s
+// reconciler teeth + corpus scenario 4), and a populated-tablet split is
+// the rung-3..5 copy-based workflow, whose release-during-build safety is
+// `tests/split_build.rs`'s driver-kill e2e. The old command survives only
+// as an empty-table topology fixture until the B7 sweep deletes it.

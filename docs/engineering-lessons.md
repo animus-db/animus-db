@@ -1983,27 +1983,11 @@ debugging anything that feels like it might have happened before.
   investigation, 2026-08-15.)
 - **A value a child inherits from a parent that keeps mutating must be
   frozen at the inheritance event, never derived live from the parent's
-  current state.** `Metadata::effective_stream_shard_watermark`/
-  `stream_shard_parent_id` (ADR 0042 §8/ADR 0043 §A4/§A6) used to walk
-  `split_parents` to the parent tablet's *current* seal chain on every
-  call — correct only so long as the parent never sealed again before the
-  child did. The moment it did, the parent's later (necessarily higher)
-  end-HLC retroactively became the child's own effective watermark too,
-  making a pre-split backlog the child had physically inherited in place
-  (ADR 0043 §A4's shared-storage split design) look already-sealed before
-  the child ever sealed it itself — a silent, permanent loss, invisible
-  unless the child happened to seal first (the race that let this ship
-  undetected through round 3). The fix (PR1) captures the parent's stream
-  state **once**, at the instant `MetaCommand::SplitTablet` applies, into
-  a frozen `Metadata::stream_split_basis` entry — a single-hop lookup
-  thereafter, not a live walk. **Corollary: a test comment that
-  acknowledges a derivation's time-dependency (e.g. "this assertion must
-  run before the parent seals again, since X is derived live") is a
-  signal to fix the derivation, not to order the test around it** — the
-  pre-fix `stream_lineage_corpus.rs::scenario_split_mid_stream` had
-  exactly such a comment, naming its own ordering constraint, for months
-  before this bug was found and its literal inverse
-  (`split_then_parent_seals_first`) written as the regression.
+  current state.** (Mechanism — `Metadata::stream_split_basis`, the zero-copy
+  split's watermark inheritance — deleted in ADR 0050 Train B rung 7:
+  copy-based split children are born with empty change logs, so no consumer
+  offset crosses a split at all, the strictly stronger successor invariant.
+  Full entry archived verbatim in `docs/engineering-lessons-archive.md`.)
 - **A test-drain helper polling both a "closed epoch, replay from
   `TRIM_HORIZON`" path and a "current open tail, resume from last
   position" path must resume the SAME iterator when an epoch transitions
@@ -2153,88 +2137,18 @@ debugging anything that feels like it might have happened before.
   (ADR 0042/0043 as-built amendments); red-then-green repro:
   `animus-test`'s `stream_lineage_corpus.rs::
   dueling_seals_orphan_hot_range`.
-- **A corpus convention that always narrows a split's scope synchronously
-  with (or before) the `SplitTablet` apply can only ever test the FIXED
-  ordering — it structurally cannot express the real race where the local,
-  un-replicated scope-narrow lags the control-plane commit.** Found
-  2026-08-15 investigating the D8 duplication flake above (the mirror-image
-  DUPLICATION direction of #216's own loss bug — same watermark machinery,
-  opposite symptom): `stream_lineage_corpus.rs`'s `scenario_split_mid_
-  stream`/`scenario_split_then_parent_seals_first` both call
-  `n.narrow_scope(..)` on the parent's nodes in the test script itself,
-  strictly before (or as part of the same step as) applying
-  `MetaCommand::SplitTablet` — modelling `animus_cp_data::host::HostAction::
-  NarrowScope` as if it always lands atomically with the control commit
-  that triggers it. In production it does not: `SplitTablet` commits only
-  to the control Raft; `RaftKvNode::narrow_scope` is a separate, local,
-  per-node action the tablet-host reconciler applies only once it next
-  notices the metadata change (event-driven watch or a 500ms fallback) —
-  and nothing synchronizes that against a *different* background loop
-  (`animusd::index_drain::change_consumer_loop`'s 200ms seal tick) reading
-  the same tablet's still-wide `pending_changes()` in the meantime. The
-  parent's seal in that window physically captures records that, per the
-  metadata just committed, already belong to the split-off child; the
-  child's own first seal — whose watermark is `Metadata::stream_split_
-  basis`, deliberately frozen *before* that racing parent seal (the exact
-  mechanism #216 added to fix the loss direction) — has no way to learn the
-  parent already covered them, and re-seals the same physical records
-  (never deleted by a seal, only by a later trim) into its own epoch 0:
-  the same packed HLC delivered twice, caught by `verify_lineage`'s
-  `seen_hlcs` set once a scenario actually drives the two seals in this
-  order (`scenario_split_then_parent_reseals_before_scope_narrows`, a new
-  cell proving the mechanism). General form: when a corpus's own helper
-  always performs two steps of a protocol in the same call/in a fixed
-  order because "that's how the test drives it," check whether production
-  ever lets them land in the *other* order or with a delay between them —
-  a convention baked into every existing scenario can hide an entire bug
-  class from hundreds of seeds, exactly as it did here (and as the sibling
-  `dueling_seals_orphan_hot_range` cell's own two-snapshot scripting had to
-  be added by hand for the *other* seal-store race the ordinary corpus
-  couldn't reach either). **Fixed 2026-08-15**: `seal_now`, the hot-trim
-  arm, and the open-shard hot-read path (`animusd::index_drain`) now fence
-  their `pending_changes()` candidate set to the tablet's current
-  metadata-declared range (`in_declared_range`, ADR 0028's write-fence
-  idiom applied to the seal arm's read side) — see ADR 0043 §A4's own
-  "split-seal range-fence amendment" for the full as-built writeup.
-- **A cache-fed fence cannot protect against the cache itself being
-  stale — only the state machine's own `apply` sees the true, current
-  state, and only it can arbitrate.** The direct follow-up to the lesson
-  above, found while empirically verifying that fix in production: the
-  range fence just described reads `ctx.effective_metadata()`, which for
-  every real deployment shape resolves to `RaftNode::metadata()` — a clone
-  of a cache an *async apply task* (ADR 0038) populates, decoupled from the
-  Raft log's own commit index. That cache can lag the true, already-
-  committed `SplitTablet` on the SAME node running the seal arm,
-  independent of whether the physical scope has narrowed — and since the
-  tablet-host reconciler that drives `narrow_scope` reads the identical
-  cache to decide when to act, the fence and the physical scope it exists
-  to backstop can BOTH be consulting the same stale snapshot at once. In
-  that specific sub-window the fence provides zero protection, because
-  it's checking against the exact source that let the physical scope stay
-  wide in the first place — confirmed empirically, not just by reasoning:
-  the real D8 e2e test still showed the duplication after the fence alone
-  shipped, at a rate not clearly distinguishable from noise across two
-  matched before/after samples (do the comparison, don't eyeball "seems
-  better"). **Fixed 2026-08-15**: `MetaCommand::SealStreamShard` gained an
-  `expected_range` stamp, checked by `Metadata::apply` itself (mirroring
-  the existing epoch-CAS idiom on `SplitTablet`/`CasTabletReplicas`) —
-  since `apply` runs strictly sequentially in Raft commit order, a
-  proposal fenced against a range a racing, earlier-committed `SplitTablet`
-  has already superseded is rejected regardless of any node's own cache
-  freshness; no read, however fresh, can substitute for checking against
-  the state actually being mutated. General form: **when a proposal-side
-  check reads any replicated/cached state to decide "is this still
-  valid," ask whether that same state can lag the fact the check exists to
-  catch — if so, the check is a useful first-line filter (cheaper, catches
-  the common case, avoids wasted round trips) but never the authoritative
-  backstop; that has to live at the point of actual, sequential commit
-  (a state-machine `apply` arm, a CAS), not a read anywhere upstream of
-  it.** A residual can remain even after this: `hot_read`'s own open-tail
-  serve has no apply-time backstop available at all (reads don't go
-  through `apply`), so it stays a first-line-only, permanently incomplete
-  fence — accepted, deferred to the ADR 0044 quiescence work, rather than
-  chased with more read-side cleverness that would just move the same
-  staleness window somewhere else.
+- **A corpus convention that models a distributed transition as atomic can
+  only ever test the FIXED ordering — it structurally cannot express the
+  real race where a local, un-replicated effect lags the replicated
+  commit; and a cache-fed fence cannot protect against the cache itself
+  being stale — only the state machine's own `apply` arbitrates.**
+  (Mechanisms — the zero-copy split's `narrow_scope` lag window,
+  `in_declared_range`, and the `SealStreamShard` `expected_range` CAS —
+  deleted in ADR 0050 Train B rung 7: ranges are immutable and a split
+  retires its parent whole, so the transition window itself no longer
+  exists. Both full entries archived verbatim in
+  `docs/engineering-lessons-archive.md`; the apply-arbitrates half lives
+  on in `Freeze`'s own apply-time backstop.)
 - **A lineage-walk drain helper that captures its tablet set once, before
   the drain starts, cannot see a split that lands DURING the drain — and a
   "cascading" (third-generation) split is exactly the case a single
@@ -2404,6 +2318,21 @@ debugging anything that feels like it might have happened before.
   names an expected perf envelope ("low single-digit percent"), build the
   measurement into the train as a gate — this one paid for itself on its
   first run.
+- **A test that uses a production feature as mere INFRASTRUCTURE (not as
+  the thing under test) breaks the moment that feature is gated — audit
+  which is which before parking anything.** When ADR 0050's storage pivot
+  disabled the zero-copy split surface, every `cp_txn`/`dynamo_txn`/
+  recovery test went red at once — not because their subject (2PC across
+  Raft groups) broke, but because their shared harness split an EMPTY
+  table purely to get a two-group topology. The fix was not parking the
+  binaries (which would have thrown away all transaction coverage) but
+  re-sourcing the topology at the layer that owns it: propose the
+  metadata command directly (`Node::propose_meta`), sound precisely
+  because the table is still empty (nothing to inherit). Only tests whose
+  SUBJECT was the disabled mechanism (split-of-populated-tablet e2e) got
+  parked. General form: for each red test under a feature gate, ask "does
+  this test *test* the feature, or merely *use* it to build a fixture?" —
+  the second kind wants a fixture rewrite, never an `#[ignore]`.
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
@@ -6142,6 +6071,23 @@ debugging anything that feels like it might have happened before.
   own follower-connected regression
   (`cql::cql_kind_write_tests::cql_whole_partition_delete_serves_from_every_node`,
   red on the two-implementation code with exactly the diagnosed refusal).
+- **A change-log consumer's resume cursor must be a commit-order (HLC)
+  watermark, never a key-position cursor** (ADR 0050 rung 4, the
+  split-build tail). `pending_changes`' key order is prefix-then-HLC, NOT
+  commit order — a later write to a *lower* prefix inserts *below* any
+  key-position cursor and is skipped forever. The sealer learned this once
+  (its load-bearing re-sort in `seal_now`, recorded only as a code
+  comment); the split-build driver re-made the identical mistake with a
+  "resume after the last key I saw" cursor, caught red by its own e2e
+  (`split_build.rs`, 4 of 16 racing writes silently missing while the
+  build reported converged). Within one tablet, HLC order IS commit order
+  (`assert_ts_monotonic`), so filtering the scan by a packed-HLC watermark
+  (the key's own trailing 8 bytes) is complete where any key cursor is
+  not. Advance the watermark only after the tick's work fully succeeds, or
+  a failed ship loses its dirty set. General form: before giving any
+  key-ordered scan a positional resume cursor, ask what order NEW entries
+  arrive in — if insertion order ≠ scan order, a positional cursor is a
+  silent-loss bug.
 
 ### Parallel-agent orchestration
 - **`gh stack checkout <N>` silently switches the CURRENT worktree's checked-
@@ -6744,3 +6690,77 @@ debugging anything that feels like it might have happened before.
   observing state-plus-deletions, and the deleter should export the
   deletion count as a real metric (it is genuine operational observability,
   not test scaffolding).
+
+- **Regression cells that model a mechanism at the primitive level die
+  with the mechanism — delete them WITH a tombstone naming where the
+  replacement coverage lands, never silently** (ADR 0050 Train B rung 2,
+  2026-08-16). F2b's immutable ranges deleted `narrow_scope`, which ~10
+  test cells across four binaries used to *model* the zero-copy split
+  (narrow + sibling-over-shared-rows) — including the #216/#220 data-loss
+  and duplication regressions, the highest-value cells in the streams
+  corpus. They could not be adapted (the seam they defend is structurally
+  unrepresentable now), so the honest move is deletion plus an in-file
+  tombstone stating (1) which cells died, (2) why they cannot be
+  re-expressed, (3) which surviving tests carry any still-live property,
+  and (4) which future rung rebuilds coverage on the successor mechanism.
+  A parked `#[ignore]` is NOT available for this class — ignored tests
+  still compile, and the API they call is gone; deleting without the
+  tombstone would make the coverage loss invisible to the very review
+  that must weigh it. Corollary: when a pivot disables a feature
+  mid-train, every corpus that exercised the feature's *defense stack*
+  (not just its happy path) needs an explicit disposition line in the
+  rung report — coverage debt is tracked like code debt.
+
+- **A freeze/quiesce-class gate must classify its writers, or it deadlocks
+  the drain-before-retire ordering it exists to enable** (ADR 0050 Train B
+  rung 5, 2026-08-17). The split-cutover freeze first rejected *every*
+  write on the frozen parent — but the cutover's own vetoes wait for the
+  GSI drain and backfill seeder to finish consuming that parent, and
+  finishing requires those consumers to WRITE (cursor rows, footprints,
+  synthetic seed records). Result: a structural deadlock — the gate blocked
+  the very progress it was waiting on, caught red by the revived
+  split-during-backfill e2e. The general form: any "stop the world, let
+  consumers drain, then retire" sequence has two writer classes — user
+  data (the thing being frozen) and consumer bookkeeping (the thing that
+  measures drain progress) — and the gate is only sound if it blocks the
+  first class alone. Corollary found the same day: run NO consumer arms at
+  all on a not-yet-serving (`Building`) replica-to-be — its bookkeeping
+  rows can land in a *sibling's* scope (the token-truncated cursor-key
+  shape) and poison the sibling's own min-over-rows watermark.
+
+- **Writes with no change record are invisible to every change-log-derived
+  copy/tail — inventory them before trusting O(delta)** (ADR 0050 Train B
+  rung 5, 2026-08-17). Transaction decisions (`TxnCommit`/`TxnAbort`) and
+  resolves rewrite base rows without emitting any change record (ADR 0049
+  gave every *client* mutation a record; these apply-side rewrites predate
+  that contract). The split build's change-log tail therefore structurally
+  misses them: a child could inherit a stale `Pending` txn record for an
+  acked-committed transaction, and in-doubt recovery would later abort it —
+  silent acked-write loss. The v1 answer is a full final-image re-scan of
+  the frozen parent (state transfer, not log transfer — immune to signal
+  gaps by construction); the O(delta) restoration (apply-side markers for
+  signal-less rewrites) is a named follow-up. General form: before building
+  anything on "the change log sees every mutation," grep every apply arm
+  that calls the engine and list the ones that bypass record emission —
+  the tail is only as complete as that list is empty.
+
+- **A catch-up convergence predicate needs a liveness bound, and the load
+  that breaks it is *sustained*, not bursty — bench with a continuous
+  writer** (ADR 0050 Train B rung 8, 2026-08-17). The split driver's
+  "converged = the latest tail pass shipped zero new records" was green
+  through every e2e (their racing writes were finite bursts) and
+  structurally un-satisfiable under a continuous sequential writer: every
+  200ms tick's pass found that tick's own fresh writes, so the hot tablet
+  — exactly the one that needs splitting — could never freeze. The rung-8
+  bench (a *continuous* writer, not a burst) found it on its first run;
+  the fix is a bounded chase (`SPLIT_MAX_TAIL_PASSES`) because the
+  workflow's correctness never depended on the lag being zero — only the
+  cutover blip's size did. Same run, same shape one layer down: the
+  unfiltered final image re-shipped the whole table *inside the freeze
+  window* (blip scaling with table size, not write rate) — fixed by a
+  pre-bulk version floor. General form: for any "quiesce then flip"
+  workflow, ask (1) can the quiesce condition ever be satisfied under
+  worst-case sustained load, and (2) what inside the flip window scales
+  with total size rather than recent activity; a bench with a
+  continuous-load client answers both where burst-shaped e2es answer
+  neither.

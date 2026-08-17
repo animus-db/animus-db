@@ -441,32 +441,40 @@ async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
 /// until the control plane's tablet map records two tablets and the new
 /// upper half is genuinely servable — mirrors `cp_plane.rs`'s
 /// `cp_tablet_splits_and_both_halves_serve`.
+///
+/// ADR 0050 (Train B rung 5+): drives the REAL copy-based workflow via the
+/// public kickoff (`ClientRequest::SplitTablet` → `trigger_split` →
+/// `BeginSplit`), then waits for the driver's own build → freeze → cutover
+/// to retire the parent — populated tables included (the build copies).
 async fn split_and_settle(nodes: &[Node], addr: SocketAddr, table: &str, split_key: &[u8]) {
-    let resp = call(
+    match call(
         addr,
         ClientRequest::SplitTablet {
             tablet: 1,
             split_key: split_key.to_vec(),
         },
     )
-    .await;
-    assert!(
-        matches!(resp, ClientResponse::PutOk),
-        "split trigger rejected: {resp:?}"
-    );
-    timeout(Duration::from_secs(20), async {
+    .await
+    {
+        ClientResponse::PutOk => {}
+        other => panic!("split kickoff refused: {other:?}"),
+    }
+    timeout(Duration::from_secs(30), async {
         loop {
-            if nodes.iter().all(|n| n.metadata().tablets.len() == 2) {
+            if nodes.iter().all(|n| {
+                let m = n.metadata();
+                m.tablets.len() == 2 && !m.tablets.contains_key(&animus_tablet::TabletId(1))
+            }) {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("split was not recorded in the tablet map within 20s");
+    .expect("the split workflow did not cut over within 30s");
 
     // Confirm the new (upper) group actually serves before relying on it —
-    // read a key we know landed there.
+    // write a key we know lands there.
     let probe_key = [split_key, b"zzz-probe"].concat();
     put_until_ok(addr, table, &probe_key, b"probe").await;
 }

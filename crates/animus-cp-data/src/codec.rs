@@ -113,7 +113,23 @@ const MAGIC: u8 = 0xCB;
 /// `change_log` uses (`put_change_log`/`read_change_log` — never a second
 /// copy). Same house convention: a clean bump, no cross-version
 /// compatibility.
-const VERSION: u8 = 18;
+/// `19` (ADR 0050 Train B rung 4): new `KvCommand::SeedBatch` (tag 13) — the
+/// split-build driver's version-carrying row-transfer command (see the
+/// variant's own doc). Rows are `(kind, logical, Option<value>, version)`
+/// with the standard `fence`/`ts` tail.
+/// `20` (ADR 0050 Train B rung 5): new `KvCommand::Freeze` (tag 14) — the
+/// split-cutover freeze, a bare `ts` (no fence, no keys; see the variant's
+/// own doc). Same house convention: a clean bump, no cross-version
+/// compatibility.
+/// `21` (ADR 0050 Train B rung 7, the deletion sweep): the `fence: KeyRange`
+/// field is **deleted from every variant that carried it** — with immutable
+/// tablet ranges (rung 2) and route-time `Active` filtering (rung 3), a
+/// stamped fence and the group's own range could never again disagree, so
+/// the field was pure inert bytes on every entry. `KvCommand::Seal` (tag 6)
+/// is deleted with its last proposer (the reconciler's zero-copy handoff
+/// seal); its durable-marker core lives on as `Freeze`'s own marker (see
+/// `seal.rs`). Same house convention: a clean bump.
+const VERSION: u8 = 21;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -422,33 +438,25 @@ fn read_change_logs(c: &mut Cursor<'_>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Decod
 
 fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
     match c {
-        KvCommand::Put {
-            key,
-            value,
-            fence,
-            ts,
-        } => {
+        KvCommand::Put { key, value, ts } => {
             put_u8(out, 0);
             put_bytes(out, key);
             put_bytes(out, value);
-            put_key_range(out, fence);
             put_ts(out, *ts);
         }
-        KvCommand::Batch { puts, fence, ts } => {
+        KvCommand::Batch { puts, ts } => {
             put_u8(out, 1);
             out.extend_from_slice(&(puts.len() as u32).to_be_bytes());
             for (k, v) in puts {
                 put_bytes(out, k);
                 put_bytes(out, v);
             }
-            put_key_range(out, fence);
             put_ts(out, *ts);
         }
         KvCommand::KindBatch {
             writes,
             change_log,
             conditions,
-            fence,
             ts,
         } => {
             put_u8(out, 12);
@@ -459,37 +467,43 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
                 put_bytes(out, k);
                 put_opt_bytes(out, expected);
             }
-            put_key_range(out, fence);
             put_ts(out, *ts);
         }
-        KvCommand::Delete { key, fence, ts } => {
+        KvCommand::SeedBatch { rows, ts } => {
+            put_u8(out, 13);
+            out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+            for (kind, logical, value, version) in rows {
+                put_u8(out, *kind);
+                put_bytes(out, logical);
+                put_opt_bytes(out, value);
+                out.extend_from_slice(&version.to_be_bytes());
+            }
+            put_ts(out, *ts);
+        }
+        KvCommand::Delete { key, ts } => {
             put_u8(out, 2);
             put_bytes(out, key);
-            put_key_range(out, fence);
             put_ts(out, *ts);
         }
         KvCommand::Cas {
             key,
             expected,
             value,
-            fence,
             ts,
         } => {
             put_u8(out, 3);
             put_bytes(out, key);
             put_opt_bytes(out, expected);
             put_bytes(out, value);
-            put_key_range(out, fence);
             put_ts(out, *ts);
         }
         KvCommand::NoOp => put_u8(out, 5),
-        KvCommand::Seal { range, ts } => {
-            put_u8(out, 6);
-            put_key_range(out, range);
-            put_ts(out, *ts);
-        }
         KvCommand::ReadCeiling { ts } => {
             put_u8(out, 7);
+            put_ts(out, *ts);
+        }
+        KvCommand::Freeze { ts } => {
+            put_u8(out, 14);
             put_ts(out, *ts);
         }
         KvCommand::TxnStage {
@@ -500,7 +514,6 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             writes,
             spans,
             conditions,
-            fence,
             ts,
         } => {
             put_u8(out, 8);
@@ -532,7 +545,6 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
                 put_bytes(out, k);
                 put_opt_bytes(out, expected);
             }
-            put_key_range(out, fence);
             put_ts(out, *ts);
         }
         KvCommand::TxnCommit {
@@ -562,7 +574,6 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             record_key,
             keys,
             outcome,
-            fence,
             ts,
         } => {
             put_u8(out, 11);
@@ -573,7 +584,6 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
                 put_bytes(out, k);
             }
             put_txn_outcome(out, outcome);
-            put_key_range(out, fence);
             put_ts(out, *ts);
         }
     }
@@ -584,7 +594,6 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
         0 => KvCommand::Put {
             key: c.bytes()?,
             value: c.bytes()?,
-            fence: read_key_range(c)?,
             ts: read_ts(c)?,
         },
         1 => {
@@ -595,7 +604,6 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             }
             KvCommand::Batch {
                 puts,
-                fence: read_key_range(c)?,
                 ts: read_ts(c)?,
             }
         }
@@ -611,28 +619,22 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 writes,
                 change_log,
                 conditions,
-                fence: read_key_range(c)?,
                 ts: read_ts(c)?,
             }
         }
         2 => KvCommand::Delete {
             key: c.bytes()?,
-            fence: read_key_range(c)?,
             ts: read_ts(c)?,
         },
         3 => KvCommand::Cas {
             key: c.bytes()?,
             expected: c.opt_bytes()?,
             value: c.bytes()?,
-            fence: read_key_range(c)?,
             ts: read_ts(c)?,
         },
         5 => KvCommand::NoOp,
-        6 => KvCommand::Seal {
-            range: read_key_range(c)?,
-            ts: read_ts(c)?,
-        },
         7 => KvCommand::ReadCeiling { ts: read_ts(c)? },
+        14 => KvCommand::Freeze { ts: read_ts(c)? },
         8 => {
             let txn_id = read_txn_id(c)?;
             let record_key = c.bytes()?;
@@ -675,7 +677,6 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 writes,
                 spans,
                 conditions,
-                fence: read_key_range(c)?,
                 ts: read_ts(c)?,
             }
         }
@@ -704,7 +705,21 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 record_key,
                 keys,
                 outcome,
-                fence: read_key_range(c)?,
+                ts: read_ts(c)?,
+            }
+        }
+        13 => {
+            let n = c.u32()?;
+            let mut rows = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let kind = c.u8()?;
+                let logical = c.bytes()?;
+                let value = c.opt_bytes()?;
+                let version = c.u64()?;
+                rows.push((kind, logical, value, version));
+            }
+            KvCommand::SeedBatch {
+                rows,
                 ts: read_ts(c)?,
             }
         }
@@ -1044,7 +1059,6 @@ mod tests {
                 command: KvCommand::Put {
                     key: b"k".to_vec(),
                     value: vec![0, 255, 128],
-                    fence: KeyRange::whole(),
                     ts: ts(1, 0),
                 },
                 config: None,
@@ -1057,7 +1071,6 @@ mod tests {
                         (b"a".to_vec(), b"1".to_vec()),
                         (Vec::new(), Vec::new()), // empty key/value survive
                     ],
-                    fence: KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())),
                     ts: ts(2, 5),
                 },
                 config: Some([1, 2, 3].into_iter().map(nid).collect()),
@@ -1079,7 +1092,6 @@ mod tests {
                         (b"base-key".to_vec(), Some(b"old-v".to_vec())),
                         (b"other-key".to_vec(), None), // must be absent
                     ],
-                    fence: KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())),
                     ts: ts(2, 6),
                 },
                 config: None,
@@ -1091,8 +1103,22 @@ mod tests {
                     key: b"c".to_vec(),
                     expected: None,
                     value: b"v".to_vec(),
-                    fence: KeyRange::whole(),
                     ts: ts(3, 0),
+                },
+                config: None,
+            },
+            LogEntry {
+                term: 4,
+                index: 21,
+                // ADR 0050 rung 4 (version 19): a split-build seed chunk —
+                // a value row, a tombstone row, distinct kinds, carried
+                // versions.
+                command: KvCommand::SeedBatch {
+                    rows: vec![
+                        (0, b"seed-base".to_vec(), Some(b"raw-bytes".to_vec()), 42),
+                        (1, b"seed-lsi".to_vec(), None, 7),
+                    ],
+                    ts: ts(3, 1),
                 },
                 config: None,
             },
@@ -1103,7 +1129,6 @@ mod tests {
                     key: b"c".to_vec(),
                     expected: Some(b"old".to_vec()),
                     value: b"new".to_vec(),
-                    fence: KeyRange::new(b"a".to_vec(), None),
                     ts: ts(4, 1),
                 },
                 config: None,
@@ -1113,17 +1138,7 @@ mod tests {
                 index: 21,
                 command: KvCommand::Delete {
                     key: b"d".to_vec(),
-                    fence: KeyRange::whole(),
                     ts: ts(5, 0),
-                },
-                config: None,
-            },
-            LogEntry {
-                term: 5,
-                index: 22,
-                command: KvCommand::Seal {
-                    range: KeyRange::new(b"m".to_vec(), Some(b"z".to_vec())),
-                    ts: ts(6, 2),
                 },
                 config: None,
             },
@@ -1169,7 +1184,6 @@ mod tests {
                         (b"k1".to_vec(), Some(b"expected1".to_vec())),
                         (b"k2".to_vec(), None), // must be absent
                     ],
-                    fence: KeyRange::whole(),
                     ts: ts(8, 1),
                 },
                 config: None,
@@ -1231,7 +1245,6 @@ mod tests {
                     outcome: crate::txn::TxnOutcome::Committed {
                         commit_ts: ts(9, 0),
                     },
-                    fence: KeyRange::whole(),
                     ts: ts(9, 2),
                 },
                 config: None,
@@ -1368,7 +1381,6 @@ mod tests {
                 command: KvCommand::Put {
                     key: b"key".to_vec(),
                     value: value.clone(),
-                    fence: KeyRange::whole(),
                     ts: ts(1, 0),
                 },
                 config: None,

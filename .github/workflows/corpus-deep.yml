@@ -27,6 +27,18 @@ on:
         description: "Seeds per structural cell (ANIMUS_BACKFILL_SEEDS, ADR 0045 backfill fault corpus)"
         required: false
         default: "40"
+      split_seeds:
+        description: "Seeds per structural cell (ANIMUS_SPLIT_SEEDS, ADR 0050 split-build corpus)"
+        required: false
+        default: "40"
+      reconciler_seeds:
+        description: "Seeds per scenario (ANIMUS_RECONCILER_SEEDS, ADR 0031 reconciler lifecycle corpus)"
+        required: false
+        default: "40"
+      quiesce_seeds:
+        description: "Seeds per property (ANIMUS_QUIESCE_SEEDS, ADR 0048 quiescence corpus)"
+        required: false
+        default: "40"
 
 env:
   CARGO_TERM_COLOR: always
@@ -82,3 +94,25 @@ jobs:
         env:
           ANIMUS_BACKFILL_SEEDS: ${{ github.event.inputs.backfill_seeds || '40' }}
         run: cargo test -p animus-test --test backfill_fault_corpus -- --nocapture
+
+      # ADR 0050's copy-based split-build corpus: SeedBatch idempotence +
+      # child-replica crash/partition/duplicate-delivery during a build,
+      # scaled to depth. Each cell is a pure function of its seed.
+      - name: deep split-build corpus (ADR 0050 seed/convergence)
+        env:
+          ANIMUS_SPLIT_SEEDS: ${{ github.event.inputs.split_seeds || '40' }}
+        run: cargo test -p animus-cp-data --test seed_batch -- --nocapture
+
+      # ADR 0031's reconciler lifecycle corpus (post-ADR 0050 lifecycle
+      # scenarios: Building host, cutover, reclaim, crash/restart over
+      # per-tablet engines), scaled to depth.
+      - name: deep reconciler lifecycle corpus (ADR 0031/0050)
+        env:
+          ANIMUS_RECONCILER_SEEDS: ${{ github.event.inputs.reconciler_seeds || '40' }}
+        run: cargo test -p animus-cp-data --test reconciler_corpus -- --nocapture
+
+      # ADR 0048's quiescence property corpus, scaled to depth.
+      - name: deep quiescence corpus (ADR 0048)
+        env:
+          ANIMUS_QUIESCE_SEEDS: ${{ github.event.inputs.quiesce_seeds || '40' }}
+        run: cargo test -p animus-cp-data --test quiescence -- --nocapture

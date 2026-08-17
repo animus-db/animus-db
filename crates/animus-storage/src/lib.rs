@@ -300,6 +300,30 @@ pub trait StorageEngine: Clone + Send + Sync {
     /// holds the value (ADR 0010).
     async fn entries_with_tombstones(&self) -> Result<Vec<(Key, Option<Value>, Version)>>;
 
+    /// [`entries_with_tombstones`](StorageEngine::entries_with_tombstones)'s
+    /// range-scoped sibling: every key in `[start, end)`'s latest record
+    /// **including tombstones**, ordered by key (ADR 0050: the split-build
+    /// driver's bulk/tail passes need a bounded tombstone-retaining read —
+    /// a delete during the build must ship to the child as a tombstone at
+    /// its version, which [`scan`](StorageEngine::scan) filters out).
+    ///
+    /// The **default implementation is correct but not cheap** (filters the
+    /// whole-keyspace `entries_with_tombstones` by range — the
+    /// [`merge_batch`](StorageEngine::merge_batch) precedent); both bundled
+    /// engines override it with a genuinely bounded read.
+    async fn scan_with_tombstones(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Key, Option<Value>, Version)>> {
+        Ok(self
+            .entries_with_tombstones()
+            .await?
+            .into_iter()
+            .filter(|(k, _, _)| k.as_slice() >= start && k.as_slice() < end)
+            .collect())
+    }
+
     /// A range-scoped **byte** estimate for `[start, end)` (`end == None` is
     /// unbounded above, matching the rest of this trait's range methods) — the
     /// footprint (key bytes + value bytes) of every live key in the range

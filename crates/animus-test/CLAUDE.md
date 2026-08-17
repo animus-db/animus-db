@@ -275,9 +275,20 @@ The Accord-targeted suite exercises `check_cycles` under contention:
   `ProdEnv` e2e (`animusd/tests/streams_e2e.rs`) and the existing
   `animusd/tests/dynamo_streams.rs` cover "what does an in-flight poll see
   mid-stream" instead.
-- **Seven frozen named cells** (`quiet_table_rollover`,
-  `hot_table_size_seals`, `split_mid_stream`, `kill_sealing_leader`,
-  `store_outage_then_heal`, `disable_grace_drain`, `combined_chaos`) plus a
+- **Frozen named cells** (`quiet_table_rollover`, `hot_table_size_seals`,
+  `kill_sealing_leader`, `store_outage_then_heal`, `disable_grace_drain`;
+  the five zero-copy-split cells — `split_mid_stream`, the #216/#220
+  regressions, `combined_chaos` — died in ADR 0050 Train B rung 2 with the
+  in-place lineage they modeled, see the file's tombstone; their
+  copy-based successors landed in rung 6: `copy_split_children_born_empty`
+  (sealed history + backlog → final seal → cutover-frozen `split_lineage`
+  → children with EMPTY change logs sealing their own epoch 0,
+  exactly-once across the walk) and
+  `copy_split_endgame_survives_seal_faults` (the final seal crashing
+  between `put` and catalog commit, then a store outage, then healing —
+  the identical epoch lands on retry; the fidelity boundary — the animusd
+  driver itself is `split_build.rs`/`streams_e2e.rs`'s subject — is
+  stated in the cells' own section doc) plus a
   dedicated `durability_invariant_holds_at_every_kill_point` scenario
   (ADR 0042 §9, D9): a scripted seal lifecycle with a modeled crash between
   the segment `put` and the catalog commit, asserting every acked write
@@ -313,15 +324,13 @@ The Accord-targeted suite exercises `check_cycles` under contention:
   The full-stack, exact-GSI-content counterpart is the deterministic
   `ProdEnv` test `animusd/tests/backfill_seeder.rs::
   split_during_backfill_converges_with_correct_final_gsi`.
-- **Seven frozen named cells**: `single_tablet_backfill_converges`,
-  `concurrent_split_during_backfill` (checks Fork A directly — the left
-  child's cursor row is byte-identical across the split, the right child's
-  reads empty), `split_after_tablet_already_reported_done` (a tablet
-  splits *after* reporting done; the aggregator's fresh-tablet-map-read
-  discipline still blocks the flip until the new child reports too, via
-  the real seeder mirror, not a hand-driven mark), `live_writes_race_the_
-  sweep`, `leader_kill_mid_sweep`, `two_indexes_creating_independently`,
-  `drop_table_mid_backfill`. Depth knob `ANIMUS_BACKFILL_SEEDS` (default
+- **Frozen named cells**: `single_tablet_backfill_converges`,
+  `live_writes_race_the_sweep`, `leader_kill_mid_sweep`,
+  `two_indexes_creating_independently`, `drop_table_mid_backfill` (the two
+  zero-copy-split cells — `concurrent_split_during_backfill`,
+  `split_after_tablet_already_reported_done` — died in ADR 0050 Train B
+  rung 2, see the file's tombstone; split-during-backfill returns on the
+  copy-based mechanism in the cutover rungs). Depth knob `ANIMUS_BACKFILL_SEEDS` (default
   1 = the frozen cells; held green at `=40` in well under a second,
   matching `corpus-deep.yml`'s nightly tier).
 - **A real, previously-undetected bug this corpus found on its very first

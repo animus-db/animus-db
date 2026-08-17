@@ -41,7 +41,10 @@ pub(crate) fn tablet_for_key<'a>(
     key: &[u8],
 ) -> Option<TabletId> {
     tablets
-        .filter(|(_, t)| t.range.contains(key))
+        // ADR 0050: a `Building` split child is unroutable — its range
+        // overlaps its still-serving parent's, so without this filter the
+        // iteration-order winner could be a half-copied engine.
+        .filter(|(_, t)| t.is_routable() && t.range.contains(key))
         .map(|(id, _)| *id)
         .next()
 }

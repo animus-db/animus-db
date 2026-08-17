@@ -85,6 +85,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_STREAM_SEEDS=K` | 1 | DynamoDB Streams lineage-walk corpus depth (`animus-test`, ADR 0042/0043) |
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | secondary-index backfill fault-injection corpus depth (`animus-test`, ADR 0045) |
 | `ANIMUS_QUIESCE_SEEDS=K` | 1 | idle-tablet-group quiescence corpus depth (`animus-cp-data`, ADR 0044 phase 1) |
+| `ANIMUS_SPLIT_SEEDS=K` | 1 | split-build `SeedBatch` corpus depth (`animus-cp-data`, ADR 0050 Train B) |
 | `ANIMUS_BENCH_{KEYS,GETS,SCAN,VALUE_BYTES,APPLY_BATCH}` | — | `engine_bench` workload tuning |
 
 The deep corpus tier (`ANIMUS_CORPUS_SEEDS=40 ANIMUS_CORPUS_FULL=1`) runs
@@ -154,18 +155,24 @@ truth; this map is just for navigation.
   Raft group with a single leader serving **linearizable** single-tablet
   reads/writes/scans, durable on a real `StorageEngine`; reuses the control
   plane's sync `RaftCore` with a KV state machine; ReadIndex reads, compaction +
-  streaming `InstallSnapshot`, single-server membership change. All of a node's
-  tablets share **one engine**, scoped by `StorageScope` (ADR 0028), with
-  apply-time key fences. The per-node **tablet-host reconciler** (`host` module,
-  ADR 0031) is the one event-driven loop that hosts/releases/reclaims/absorbs
-  tablet groups from replicated `Metadata`.
+  streaming `InstallSnapshot`, single-server membership change. Each hosted
+  tablet has its **own private engine** (ADR 0050; keys `kind || logical`,
+  identity in the engine's file namespace — the shared-engine
+  `StorageScope`/fence machinery of ADR 0028 is gone). The per-node
+  **tablet-host reconciler** (`host` module, ADR 0031) is the one
+  event-driven loop that hosts/reconfigures/releases/reclaims tablet
+  groups (and their engines) from replicated `Metadata`.
 - **Partitioning & keys** — `animus-tablet` (ADR 0022, 0023). Every data-plane
   key leads with a Murmur3 **hash-ring token** over the partition key; tablets
   are **table-scoped** (a table's tablets partition its own ring; no table
   prefix in keys). The escape/token primitives live here and must match the
   wire edges byte-for-byte.
-- **Tablet lifecycle** — split is a **single control-plane command** with
-  apply-time fences, no data-plane half (ADR 0028); auto-split triggers on
+- **Tablet lifecycle** — split is a **copy-based background workflow**
+  (ADR 0050): `BeginSplit` mints two `Building` children at
+  placement-chosen homes, a driver on the parent's leader copies + tails,
+  a terminal `Freeze` stops writes, `CutoverSplit` activates the children
+  and retires the parent (children born with empty change logs; lineage
+  frozen in `split_lineage`); auto-split triggers on
   **bytes** (ADR 0034, `animusd`); **tablets are split-only** — merge has
   been removed entirely (ADR 0044, supersedes ADR 0033); dropped tables'
   data is reclaimed by a convergent **GC** (ADR 0024). Tablet ids are never

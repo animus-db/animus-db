@@ -63,7 +63,7 @@ use animus_cp_data::{KIND_BASE, RaftKvNode, StorageScope, TxnOutcome, TxnWrite, 
 use animus_env::{Env, EnvExt, Nanos, Rng, SegmentStore, nid};
 use animus_sim::{SimEnv, SimSegmentStore, Simulator};
 use animus_storage::MemoryEngine;
-use animus_tablet::{KeyRange, TabletId};
+use animus_tablet::{KeyRange, TabletId, TabletState};
 use futures::executor::block_on;
 use std::sync::{Arc, Mutex};
 
@@ -110,12 +110,14 @@ fn for_each_seed(name: &str, mut body: impl FnMut(u64)) {
 
 // --- tablet-group harness ----------------------------------------------
 
-/// A tablet's 3-replica Raft group, sharing each node's own per-node engine
-/// with every other tablet that node hosts (ADR 0028 — the same "one shared
-/// engine per node" discipline `narrow_scope.rs`/`cross_group_lww.rs` use).
+/// A tablet's 3-replica Raft group. Since ADR 0050 rung 1/2 an engine is
+/// **private to one tablet** (keys are `kind || logical`, no table/tablet
+/// prefix) — so every scenario passes each group its OWN fresh `engines()`
+/// map; two groups sharing one engine would collide byte-identically now
+/// (the pre-pivot "one shared engine per node" comment this replaces
+/// described ADR 0028's world).
 struct Group {
     id: TabletId,
-    range: KeyRange,
     nodes: Vec<KvNode>,
 }
 
@@ -141,12 +143,12 @@ fn start_group(
                 sim.env(nid(n)),
                 ids.clone(),
                 engines[&n].clone(),
-                StorageScope::new(TABLE.as_bytes().to_vec(), range.clone()),
+                StorageScope::new(range.clone()),
                 id.0,
             )
         })
         .collect();
-    Group { id, range, nodes }
+    Group { id, nodes }
 }
 
 /// Waits for exactly one leader among `live` node indices, bounded — panics
@@ -170,11 +172,10 @@ fn elect(sim: &mut Simulator, group: &Group, live: &[usize], seed: u64) -> usize
 }
 
 fn propose_write(group: &Group, leader: usize, item_key: &[u8], record: &[u8]) -> u64 {
-    match group.nodes[leader].put_kind_batch_fenced(
+    match group.nodes[leader].put_kind_batch_conditioned(
         vec![(KIND_BASE, item_key.to_vec(), Some(record.to_vec()))],
         vec![(item_key.to_vec(), record.to_vec())],
         Vec::new(),
-        group.range.clone(),
     ) {
         animus_control::ProposeResult::Accepted { index } => index,
         other => panic!("leader rejected a write: {other:?}"),
@@ -350,7 +351,7 @@ fn seal_now(
     wall_ms: u64,
     skip_commit: bool,
 ) -> Option<u64> {
-    let watermark = meta.effective_stream_shard_watermark(group.id).unwrap_or(0);
+    let watermark = meta.stream_shard_watermark(group.id).unwrap_or(0);
     // Split-seal range-fence amendment (ADR 0043 §A3/§A4/§A6, 2026-08-15):
     // mirrors `index_drain::seal_now`'s own fence exactly, same reason —
     // `pending_changes()` is bounded only by this group's *physical* scope,
@@ -422,18 +423,6 @@ fn seal_now(
     if skip_commit {
         return None; // modelled crash before catalog commit
     }
-    // Split-seal range-fence CAS (2026-08-15, ADR 0043 §A3/§A4): fetched
-    // fresh from `meta` at this exact call — mirrors `index_drain::
-    // seal_now`'s own `ctx.effective_metadata()` re-fetch on every call.
-    // Deliberately NOT `group.range`, a static field this harness never
-    // updates after `start_group`: using it here would silently desync from
-    // whatever the calling scenario has since done to `meta` (a
-    // `SplitTablet` apply), which is exactly the staleness this CAS exists
-    // to catch, not to reintroduce via the test's own scripting shortcut.
-    let expected_range = meta
-        .tablets
-        .get(&group.id)
-        .map_or_else(KeyRange::whole, |t| t.range.clone());
     let outcome = meta.apply(&MetaCommand::SealStreamShard {
         table: TABLE.into(),
         label: LABEL.into(),
@@ -445,7 +434,6 @@ fn seal_now(
         seal_wall_ms: wall_ms,
         replicas: Vec::new(),
         object_id: seg_id,
-        expected_range,
     });
     matches!(outcome, ApplyOutcome::Applied).then_some(epoch)
 }
@@ -483,7 +471,7 @@ fn collect_tablet_records(
             all.push((r.source_key, r.packed_hlc, r.change_record));
         }
     }
-    let watermark = meta.effective_stream_shard_watermark(group.id).unwrap_or(0);
+    let watermark = meta.stream_shard_watermark(group.id).unwrap_or(0);
     let mut hot: Vec<(Vec<u8>, u64, Vec<u8>)> = block_on(group.nodes[leader].pending_changes())
         .into_iter()
         .filter_map(|(k, v)| {
@@ -570,23 +558,6 @@ fn base_meta() -> Metadata {
         "enabling the stream must apply"
     );
     m
-}
-
-/// Registers `id` in the tablet map so `MetaCommand::SplitTablet` has a row
-/// to CAS against (`SealStreamShard` itself needs no tablet-map entry — only
-/// the table's schema/stream, which `base_meta` already provides).
-fn create_tablet(meta: &mut Metadata, id: TabletId, range: KeyRange) {
-    let outcome = meta.apply(&MetaCommand::CreateTablet {
-        tablet: id,
-        table: Some(TABLE.into()),
-        range,
-        replicas: NODES.iter().copied().map(nid).collect(),
-    });
-    assert_eq!(
-        outcome,
-        ApplyOutcome::Applied,
-        "tablet registration must apply"
-    );
 }
 
 fn key(i: usize) -> Vec<u8> {
@@ -686,685 +657,22 @@ fn hot_table_size_seals() {
     for_each_seed("hot_table_size_seals", scenario_hot_table_size_seals);
 }
 
-// --- cell 3: split_mid_stream --------------------------------------------
-
-// F11 (ADR 0042 §14, growth PR2): `MetaCommand::SplitTablet`'s apply arm now
-// rejects a non-token-aligned split key on a streamed table, so this must be
-// exactly `TOKEN_BYTES` (8) long — widened from the original 5-byte
-// `b"k0500"` by a fixed suffix rather than changed in its leading digits, so
-// every ordering relationship this file relies on relative to `key(i)`
-// (`format!("k{i:04}")`, always 5 bytes) is unchanged: `"k0500\0\0\0"` is a
-// strict extension of `"k0500"`, so it still compares strictly between
-// `key(3)` = `"k0003"` and `key(600)` = `"k0600"` exactly as `b"k0500"` did.
-const BOUNDARY: &[u8] = b"k0500\0\0\0";
-
-fn scenario_split_mid_stream(seed: u64) {
-    let mut sim = Simulator::new(seed);
-    let engines = engines();
-    let mut meta = base_meta();
-    create_tablet(&mut meta, TabletId(3), KeyRange::whole());
-    let parent = start_group(&sim, &engines, TabletId(3), KeyRange::whole());
-    let live = [0, 1, 2];
-    sim.run_for(Duration::from_secs(2));
-    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
-    let mut journal = BTreeMap::new();
-
-    // A handful of left-side keys, a handful of right-side keys, and one
-    // "straddling" right-side key (`shared_key`) written once before the
-    // split and once after — the case that exercises per-item order across
-    // a lineage boundary.
-    for i in 0..4 {
-        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"L", seed); // left
-    }
-    for i in 600..604 {
-        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"R", seed); // right
-    }
-    let shared_key = key(700);
-    write_and_journal(
-        &mut sim,
-        &parent,
-        &live,
-        &mut journal,
-        &shared_key,
-        b"before",
-        seed,
-    );
-
-    // Seal the parent's epoch 0 before splitting, so the split boundary
-    // lands cleanly on a sealed watermark (ADR 0043 §A4's own "closes at its
-    // last sealed position").
-    let leader = elect(&mut sim, &parent, &live, seed);
-    let sealed = seal_now(&mut meta, &store, &parent, leader, 1_000, false);
-    assert_eq!(
-        sealed,
-        Some(0),
-        "[seed={seed}] parent must seal epoch 0 before the split"
-    );
-
-    // The split itself: narrow the parent's live scope, record split
-    // provenance in the catalog, and start a fresh sibling group over the
-    // SAME per-node engines (ADR 0028 shared storage — the sibling's own
-    // `KIND_CHANGE` scope, once widened to its range, transparently exposes
-    // whatever right-range records already physically exist).
-    let parent_epoch = meta
-        .tablets
-        .get(&parent.id)
-        .map_or(animus_tablet::Epoch::INITIAL, |t| t.epoch);
-    let sibling_id = TabletId(4);
-    for n in &parent.nodes {
-        n.narrow_scope(KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec())));
-    }
-    let outcome = meta.apply(&MetaCommand::SplitTablet {
-        tablet: parent.id,
-        expected_epoch: parent_epoch,
-        split_key: BOUNDARY.to_vec(),
-        new_id: sibling_id,
-    });
-    assert_eq!(
-        outcome,
-        ApplyOutcome::Applied,
-        "[seed={seed}] split must apply"
-    );
-    let sibling = start_group(
-        &sim,
-        &engines,
-        sibling_id,
-        KeyRange::new(BOUNDARY.to_vec(), None),
-    );
-    sim.run_for(Duration::from_secs(2));
-
-    // Continued writes on both sides, including the second write for the
-    // straddling key — which must now land on the sibling.
-    for i in 4..8 {
-        write_and_journal(
-            &mut sim,
-            &parent,
-            &[0, 1, 2],
-            &mut journal,
-            &key(i),
-            b"L2",
-            seed,
-        );
-    }
-    for i in 610..614 {
-        write_and_journal(
-            &mut sim,
-            &sibling,
-            &[0, 1, 2],
-            &mut journal,
-            &key(i),
-            b"R2",
-            seed,
-        );
-    }
-    write_and_journal(
-        &mut sim,
-        &sibling,
-        &[0, 1, 2],
-        &mut journal,
-        &shared_key,
-        b"after",
-        seed,
-    );
-
-    // Seal the sibling's own epoch 0 FIRST, and check its lineage link right
-    // here — `stream_shard_parent_id` is derived, not stored (ADR 0043
-    // §A8), from "the parent tablet's own CURRENT last sealed shard," so
-    // this assertion must run before the parent (which, post-split, is
-    // simply the *left child* continuing under the same tablet id — not a
-    // separate entity — and is free to go on sealing its own later epochs)
-    // seals again and moves what "current last" means.
-    let sibling_leader = elect(&mut sim, &sibling, &[0, 1, 2], seed);
-    seal_now(&mut meta, &store, &sibling, sibling_leader, 2_100, false);
-    let sibling_epoch0_parent = meta.stream_shard_parent_id(sibling.id, 0);
-    let parent_last_shard = segment::shard_id(parent.id.0, 0);
-    assert_eq!(
-        sibling_epoch0_parent,
-        Some(parent_last_shard),
-        "[seed={seed}] sibling's epoch-0 ParentShardId must name the parent's last sealed shard"
-    );
-
-    let parent_leader = elect(&mut sim, &parent, &[0, 1, 2], seed);
-    seal_now(&mut meta, &store, &parent, parent_leader, 2_000, false);
-
-    // Parent-before-child: the lineage discipline itself.
-    verify_lineage(
-        &meta,
-        &store,
-        &[(&parent, parent_leader), (&sibling, sibling_leader)],
-        &journal,
-        seed,
-    );
-}
-
-#[test]
-fn split_mid_stream() {
-    for_each_seed("split_mid_stream", scenario_split_mid_stream);
-}
-
-// --- cell 3b: split_then_parent_seals_first (PR1 frozen-basis bugfix) ----
-
-/// PR1 bugfix regression (ADR 0042 §8/ADR 0043 §A4/§A6) — the **inverse** of
-/// `scenario_split_mid_stream`'s deliberate ordering above. That scenario
-/// seals the parent *before* splitting ("so the split boundary lands
-/// cleanly on a sealed watermark") and seals the *sibling* first
-/// afterward, with its own comment naming exactly why: `stream_shard_
-/// parent_id`/`effective_stream_shard_watermark` used to be derived live
-/// from the parent's *current* chain, so letting the parent seal again
-/// after the split would retroactively move what "the parent's last sealed
-/// shard" means out from under an already-answered child. **A test comment
-/// acknowledging a derivation's time-dependency is a signal to fix the
-/// derivation, not to order the test around it** — this cell is that fix's
-/// own regression test, driving the ordering the old comment had to avoid.
-///
-/// Setup: a non-empty, still-**unsealed** backlog on both sides of the
-/// future split boundary — the parent never seals before splitting at all.
-/// After the split, the **parent** seals its own narrowed scope again
-/// first (its `hlc_range.1` necessarily lands above every pre-split HLC,
-/// since the shared engine's HLC/version space — ADR 0018 §2's amendment —
-/// only ever advances, never resets per tablet), and only *then* does the
-/// **sibling** seal its own epoch 0.
-///
-/// Before the PR1 fix, `effective_stream_shard_watermark(sibling)` walked
-/// to the parent's live chain and picked up that inflated post-split
-/// watermark, so the sibling's first seal silently filtered its entire
-/// inherited backlog out (`hlc <= watermark`) — and since the *hot-tail*
-/// read path uses the identical effective watermark, the backlog was never
-/// delivered via the open shard either: a total, silent loss.
-/// `verify_lineage`'s write-journal diff catches exactly this (delivered
-/// count < journal count). After the fix (the frozen `stream_split_basis`,
-/// `None` here since the parent had never sealed anything before the
-/// split), the sibling's watermark never moves regardless of what the
-/// parent seals afterward, and every record is delivered exactly once.
-fn scenario_split_then_parent_seals_first(seed: u64) {
-    let mut sim = Simulator::new(seed);
-    let engines = engines();
-    let mut meta = base_meta();
-    create_tablet(&mut meta, TabletId(11), KeyRange::whole());
-    let parent = start_group(&sim, &engines, TabletId(11), KeyRange::whole());
-    let live = [0, 1, 2];
-    sim.run_for(Duration::from_secs(2));
-    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
-    let mut journal = BTreeMap::new();
-
-    // Left- and right-side backlog, still unsealed at split time — unlike
-    // `scenario_split_mid_stream`, the parent never seals before splitting.
-    for i in 0..4 {
-        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"L", seed);
-    }
-    for i in 600..604 {
-        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"R", seed);
-    }
-
-    let parent_epoch = meta
-        .tablets
-        .get(&parent.id)
-        .map_or(animus_tablet::Epoch::INITIAL, |t| t.epoch);
-    let sibling_id = TabletId(12);
-    for n in &parent.nodes {
-        n.narrow_scope(KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec())));
-    }
-    let outcome = meta.apply(&MetaCommand::SplitTablet {
-        tablet: parent.id,
-        expected_epoch: parent_epoch,
-        split_key: BOUNDARY.to_vec(),
-        new_id: sibling_id,
-    });
-    assert_eq!(
-        outcome,
-        ApplyOutcome::Applied,
-        "[seed={seed}] split must apply"
-    );
-    let sibling = start_group(
-        &sim,
-        &engines,
-        sibling_id,
-        KeyRange::new(BOUNDARY.to_vec(), None),
-    );
-    sim.run_for(Duration::from_secs(2));
-
-    // More left-side writes on the parent's own narrowed scope, then seal
-    // the PARENT first — its `hlc_range.1` lands strictly above every
-    // pre-split HLC.
-    for i in 4..8 {
-        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"L2", seed);
-    }
-    let parent_leader = elect(&mut sim, &parent, &live, seed);
-    let sealed = seal_now(&mut meta, &store, &parent, parent_leader, 2_000, false);
-    assert_eq!(
-        sealed,
-        Some(0),
-        "[seed={seed}] the parent's own first post-split seal must apply"
-    );
-
-    // A couple more right-side writes on the sibling, THEN the sibling
-    // seals its own epoch 0 — last, and only now. Its inherited pre-split
-    // backlog (600..603) must still be in it.
-    for i in 610..612 {
-        write_and_journal(
-            &mut sim,
-            &sibling,
-            &live,
-            &mut journal,
-            &key(i),
-            b"R2",
-            seed,
-        );
-    }
-    let sibling_leader = elect(&mut sim, &sibling, &live, seed);
-    // Deliberately not asserted against `Some(0)` here: under the
-    // unfixed code this call can legitimately return `None` (nothing left
-    // past the — wrongly inflated — watermark to seal), which is itself
-    // part of the loss this cell exists to catch. `verify_lineage` below is
-    // the real assertion either way.
-    let _ = seal_now(&mut meta, &store, &sibling, sibling_leader, 2_100, false);
-
-    // Parent-before-child: the lineage discipline itself. This is where an
-    // unfixed `effective_stream_shard_watermark` shows up as a diff: the
-    // 600..603 backlog present in `journal` but never delivered by either
-    // shard.
-    verify_lineage(
-        &meta,
-        &store,
-        &[(&parent, parent_leader), (&sibling, sibling_leader)],
-        &journal,
-        seed,
-    );
-}
-
-#[test]
-fn split_then_parent_seals_first() {
-    for_each_seed(
-        "split_then_parent_seals_first",
-        scenario_split_then_parent_seals_first,
-    );
-}
-
-// --- cell 3c: split_then_parent_reseals_before_scope_narrows (DUPLICATION,
-// INVESTIGATION ONLY — proves the mechanism, not yet a fix) ----------------
-
-/// Reproduces a DISTINCT bug from `scenario_split_then_parent_seals_first`'s
-/// PR1 loss fix above — the **mirror-image DUPLICATION direction**, found
-/// 2026-08-15 by the D8 e2e diagnostic
-/// (`animusd/tests/streams_e2e.rs::auto_split_mid_stream_with_live_consumer_across_every_node`).
-///
-/// Every existing split cell in this file (`scenario_split_mid_stream`,
-/// `scenario_split_then_parent_seals_first`) calls `n.narrow_scope(..)` on
-/// the parent's own nodes **synchronously with, in fact strictly before,**
-/// applying `MetaCommand::SplitTablet` to `meta` — modelling the reconciler's
-/// local scope-narrow action as if it always lands atomically with the
-/// control-plane split commit. **In production it does not**: `SplitTablet`
-/// commits only to the control Raft (`Metadata`); each node's own
-/// `RaftKvNode::narrow_scope` is a *separate*, purely local, un-replicated
-/// action (`animus_cp_data::host::HostAction::NarrowScope`, `host.rs`'s
-/// `plan()`), applied only when that node's own tablet-host reconciler next
-/// notices the metadata change (event-driven watch or a 500ms fallback
-/// tick). Nothing synchronizes that against the parent's own seal arm's next
-/// tick (`animusd::index_drain::seal_tick`, every 200ms) — this cell drives
-/// exactly that window.
-///
-/// Setup mirrors `scenario_split_then_parent_seals_first` (unsealed backlog
-/// on both sides of the future boundary, parent never seals before
-/// splitting) but after applying `SplitTablet` — freezing
-/// `stream_split_basis` for the sibling, per PR1/#216 — the parent's own
-/// nodes' live `StorageScope` is left WIDE across its own next seal.
-/// `RaftKvNode::pending_changes` (mirrored here by this file's own
-/// `seal_now`/`Group::nodes[..]`) is a raw scan bounded by that live scope
-/// alone, not by anything metadata-aware (`animus-cp-data/src/lib.rs`'s
-/// `pending_changes`/`StorageScope::physical_bounds`) — so the parent's seal
-/// physically picks up the right-side backlog that, per the split just
-/// committed, already belongs to the sibling's range. Only *afterward* does
-/// this cell narrow the parent's scope (modelling the reconciler catching
-/// up) and start the sibling.
-///
-/// The sibling's own first seal reads its frozen `stream_split_basis`
-/// watermark — frozen at the instant of the split, strictly BEFORE the
-/// parent's racing seal above ever ran, so it has no way to know that seal
-/// already covered part of the backlog the sibling physically inherited
-/// (ADR 0028: no data movement, same shared engine). Its own
-/// `pending_changes` scan finds those same physical records still present
-/// (sealing never deletes — only `trim_janitor` does, gated on the
-/// **sibling's own** watermark, which hasn't advanced yet) and re-seals them
-/// into its own epoch 0: the same packed HLC delivered by both the parent's
-/// epoch **and** the sibling's epoch 0. `verify_lineage`'s `seen_hlcs` set
-/// catches this directly ("delivered more than once — violates
-/// exactly-once").
-///
-/// **This cell is expected to FAIL on current `main` (post-#216) — that is
-/// the point.** See `docs/engineering-lessons.md`'s and the
-/// `split-seal-duplication-bug` investigation memory for the root-cause
-/// writeup; no fix has landed yet, so this stays a `#[should_panic]`-free
-/// regression-in-waiting rather than a `#[test]` the gates run green today.
-/// A fix should make this pass by construction, not by loosening the
-/// assertion.
-#[allow(clippy::too_many_lines)]
-fn scenario_split_then_parent_reseals_before_scope_narrows(seed: u64) {
-    let mut sim = Simulator::new(seed);
-    let engines = engines();
-    let mut meta = base_meta();
-    create_tablet(&mut meta, TabletId(21), KeyRange::whole());
-    let parent = start_group(&sim, &engines, TabletId(21), KeyRange::whole());
-    let live = [0, 1, 2];
-    sim.run_for(Duration::from_secs(2));
-    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
-    let mut journal = BTreeMap::new();
-
-    // Left- and right-side backlog, still unsealed at split time — like
-    // `scenario_split_then_parent_seals_first`, the parent never seals
-    // before splitting.
-    for i in 0..4 {
-        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"L", seed);
-    }
-    for i in 600..604 {
-        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"R", seed);
-    }
-
-    // The control-plane split commits — freezing the sibling's
-    // `stream_split_basis` from the parent's pre-mutation state (`None`,
-    // since the parent has never sealed) — but the parent's own nodes' live
-    // scope is deliberately left WIDE here: the reconciler hasn't caught up
-    // yet, the real-world window this cell exists to prove.
-    let parent_epoch = meta
-        .tablets
-        .get(&parent.id)
-        .map_or(animus_tablet::Epoch::INITIAL, |t| t.epoch);
-    let sibling_id = TabletId(22);
-    let outcome = meta.apply(&MetaCommand::SplitTablet {
-        tablet: parent.id,
-        expected_epoch: parent_epoch,
-        split_key: BOUNDARY.to_vec(),
-        new_id: sibling_id,
-    });
-    assert_eq!(
-        outcome,
-        ApplyOutcome::Applied,
-        "[seed={seed}] split must apply"
-    );
-
-    // The parent's seal arm races the (not-yet-run) reconciler: it seals
-    // NOW, before its own scope has narrowed, so `pending_changes()` still
-    // returns the right-side (600..603) backlog too — records that, per the
-    // split metadata already committed above, belong to the sibling.
-    let parent_leader = elect(&mut sim, &parent, &live, seed);
-    let sealed = seal_now(&mut meta, &store, &parent, parent_leader, 2_000, false);
-    assert_eq!(
-        sealed,
-        Some(0),
-        "[seed={seed}] the parent's racing seal (still on its wide scope) must apply"
-    );
-
-    // Only NOW does the reconciler catch up: narrow the parent's own nodes
-    // and start the sibling with its correctly narrow scope from birth —
-    // exactly like every other split cell does, just too late to matter.
-    for n in &parent.nodes {
-        n.narrow_scope(KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec())));
-    }
-    let sibling = start_group(
-        &sim,
-        &engines,
-        sibling_id,
-        KeyRange::new(BOUNDARY.to_vec(), None),
-    );
-    sim.run_for(Duration::from_secs(2));
-
-    // The sibling seals its own epoch 0 — its frozen watermark predates the
-    // parent's racing seal above, so it can't know that seal already
-    // covered part of what it's about to re-discover on the shared engine.
-    let sibling_leader = elect(&mut sim, &sibling, &live, seed);
-    let _ = seal_now(&mut meta, &store, &sibling, sibling_leader, 2_100, false);
-
-    // Parent-before-child, exactly as every other cell in this file checks
-    // it: this is where the duplication surfaces as a `seen_hlcs` collision
-    // ("delivered more than once"), not as a count mismatch — the total
-    // count would actually look inflated (over, not under), the D8 e2e
-    // symptom's own signature.
-    verify_lineage(
-        &meta,
-        &store,
-        &[(&parent, parent_leader), (&sibling, sibling_leader)],
-        &journal,
-        seed,
-    );
-}
-
-#[test]
-fn split_then_parent_reseals_before_scope_narrows() {
-    for_each_seed(
-        "split_then_parent_reseals_before_scope_narrows",
-        scenario_split_then_parent_reseals_before_scope_narrows,
-    );
-}
-
-// --- cell 3d: split_then_parent_seals_against_stale_cached_metadata (the
-// SECOND staleness layer, ADR 0043 §A3/§A4 CAS amendment) -----------------
-
-/// The metadata-CACHE-staleness sibling of `scenario_split_then_parent_
-/// reseals_before_scope_narrows` above: that cell modelled the PHYSICAL
-/// scope lagging a split (`RaftKvNode::narrow_scope`'s own local, un-
-/// replicated lag); this one models the DIFFERENT staleness layer found
-/// while verifying that cell's own fix in production (the D8 e2e
-/// diagnostic, 2026-08-15) — the sealer's own `Metadata` READ (`ctx.
-/// effective_metadata()`, backed by the ADR 0038 async apply-task cache)
-/// can ITSELF be stale relative to the true, already-committed
-/// `SplitTablet` on the SAME node, independent of whether the physical
-/// scope has narrowed. A metadata-range fence computed against a stale
-/// read (Fork A, `in_declared_range`) cannot see past this: the fence and
-/// the tablet's own physical scope can both agree with each other while
-/// BOTH being stale relative to the SAME just-committed split. Only an
-/// apply-time check against the TRUE, sequentially-applied state (never a
-/// cache) closes it — this cell proves exactly that check
-/// (`Metadata::apply`'s `SealStreamShard` `expected_range` CAS).
-///
-/// Script: clone `meta` into `stale_view` BEFORE the split (the sealer's
-/// own cached snapshot); apply `SplitTablet` only to the AUTHORITATIVE
-/// `meta`; compute the parent's seal candidates/watermark/`expected_range`
-/// entirely from `stale_view` (still wide) but PROPOSE the resulting
-/// command against the AUTHORITATIVE `meta` — exactly the sequence a real
-/// node's seal arm produces when its own metadata cache hasn't caught up
-/// to a split the control Raft has already committed. Without the CAS,
-/// this proposal applies, duplicating whatever the sibling later seals;
-/// with it, `Metadata::apply` sees the TRUE post-split range and rejects
-/// it outright, regardless of what `stale_view` believed — proven by
-/// temporarily short-circuiting the CAS check (red) and restoring it
-/// (green), the same "teeth proof" technique `negative_control.rs`-style
-/// corpora use elsewhere in this repo.
-fn scenario_split_then_parent_seals_against_stale_cached_metadata(seed: u64) {
-    let mut sim = Simulator::new(seed);
-    let engines = engines();
-    let mut meta = base_meta();
-    create_tablet(&mut meta, TabletId(31), KeyRange::whole());
-    let parent = start_group(&sim, &engines, TabletId(31), KeyRange::whole());
-    let live = [0, 1, 2];
-    sim.run_for(Duration::from_secs(2));
-    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
-    let mut journal = BTreeMap::new();
-
-    // Left- and right-side backlog, unsealed at split time.
-    for i in 0..4 {
-        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"L", seed);
-    }
-    for i in 600..604 {
-        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"R", seed);
-    }
-
-    // The sealer's own cached snapshot, taken BEFORE the split — stands in
-    // for a node whose ADR 0038 apply-task cache hasn't caught up to the
-    // (about to commit) split yet.
-    let stale_view = meta.clone();
-
-    // The control-plane split commits, on the AUTHORITATIVE view only.
-    let parent_epoch = meta
-        .tablets
-        .get(&parent.id)
-        .map_or(animus_tablet::Epoch::INITIAL, |t| t.epoch);
-    let sibling_id = TabletId(32);
-    let outcome = meta.apply(&MetaCommand::SplitTablet {
-        tablet: parent.id,
-        expected_epoch: parent_epoch,
-        split_key: BOUNDARY.to_vec(),
-        new_id: sibling_id,
-    });
-    assert_eq!(
-        outcome,
-        ApplyOutcome::Applied,
-        "[seed={seed}] split must apply"
-    );
-
-    // The parent's seal arm runs entirely against its STALE cached view:
-    // watermark, candidate records (the group's own physical scope is ALSO
-    // still wide — this scenario never calls `narrow_scope` at all,
-    // modelling the same node not having caught up on either axis), and
-    // `expected_range` all come from `stale_view`, never the authoritative
-    // `meta`.
-    let parent_leader = elect(&mut sim, &parent, &live, seed);
-    let stale_watermark = stale_view
-        .effective_stream_shard_watermark(parent.id)
-        .unwrap_or(0);
-    let mut records: Vec<(Vec<u8>, u64, Vec<u8>)> =
-        block_on(parent.nodes[parent_leader].pending_changes())
-            .into_iter()
-            .filter_map(|(k, v)| {
-                let hlc = record_hlc_suffix(&k)?;
-                (hlc > stale_watermark).then_some((k, hlc, v))
-            })
-            .collect();
-    records.sort_by_key(|(_, hlc, _)| *hlc);
-    assert!(
-        !records.is_empty(),
-        "[seed={seed}] the parent's stale-view scan must still see the full pre-split backlog"
-    );
-    let stale_epoch = current_open_epoch(&stale_view, parent.id);
-    let stale_hlc_range = (stale_watermark, records.last().expect("checked above").1);
-    let stale_count = records.len() as u64;
-    let seg_records: Vec<segment::SegmentRecord> = records
-        .iter()
-        .map(|(k, hlc, v)| segment::SegmentRecord {
-            source_key: k.clone(),
-            packed_hlc: *hlc,
-            change_record: v.clone(),
-        })
-        .collect();
-    let header = segment::SegmentHeader {
-        table: TABLE.into(),
-        label: LABEL.into(),
-        shard_id: segment::shard_id(parent.id.0, stale_epoch),
-        tablet: parent.id.0,
-        epoch: stale_epoch,
-        parent_shard_id: stale_view.stream_shard_parent_id(parent.id, stale_epoch),
-        hlc_range: stale_hlc_range,
-        count: stale_count,
-        seal_wall_ms: 2_000,
-    };
-    let bytes = segment::encode(&header, &seg_records);
-    let env = parent.nodes[parent_leader].env();
-    let seg_id = segment::segment_object_id(
-        TABLE,
-        LABEL,
-        parent.id.0,
-        stale_epoch,
-        env.node_id().as_str(),
-        parent.nodes[parent_leader].term(),
-        env.next_u64(),
-    );
-    block_on(store.put(&seg_id, &bytes)).expect("segment store put succeeds regardless");
-
-    // The proposal itself, built ENTIRELY from the stale view — including
-    // its own `expected_range` (still `whole()`, the pre-split range) —
-    // but applied against the AUTHORITATIVE `meta`, which has already
-    // committed the split. This is the exact sequence a real racing node
-    // produces.
-    let stale_range = stale_view
-        .tablets
-        .get(&parent.id)
-        .map_or_else(KeyRange::whole, |t| t.range.clone());
-    let outcome = meta.apply(&MetaCommand::SealStreamShard {
-        table: TABLE.into(),
-        label: LABEL.into(),
-        tablet: parent.id,
-        epoch: stale_epoch,
-        view_type: StreamViewType::NewAndOldImages,
-        hlc_range: stale_hlc_range,
-        count: stale_count,
-        seal_wall_ms: 2_000,
-        replicas: Vec::new(),
-        object_id: seg_id,
-        expected_range: stale_range,
-    });
-    assert_eq!(
-        outcome,
-        ApplyOutcome::Rejected(
-            "declared range stale — a split raced this seal, retry with the current range"
-        ),
-        "[seed={seed}] the parent's stale-metadata-view seal must be rejected by the range CAS"
-    );
-    assert!(
-        !meta.stream_shards.contains_key(&(parent.id, stale_epoch)),
-        "[seed={seed}] a rejected seal must never land in the catalog"
-    );
-
-    // The reconciler catches up: narrow the parent's own PHYSICAL scope now
-    // (mirroring `narrow_scope`'s real, separate, un-replicated timing).
-    // This scenario is deliberately isolating the metadata-CACHE-staleness
-    // layer/CAS above from the DIFFERENT, already-known, accepted hot_read
-    // open-tail residual (ADR 0043's own doc amendment) — without this, the
-    // parent's own still-wide-physical-scope hot tail would independently
-    // re-surface the right-side backlog via `collect_tablet_records`'
-    // unbounded watermark-only read below, which is that OTHER residual,
-    // not the one this cell exists to prove.
-    for n in &parent.nodes {
-        n.narrow_scope(KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec())));
-    }
-
-    // Only NOW does the sibling get hosted, with the authoritative
-    // (already-split) metadata — its own seal reads fresh, correctly-
-    // scoped state throughout, and seals its own epoch 0 exactly once.
-    let sibling = start_group(
-        &sim,
-        &engines,
-        sibling_id,
-        KeyRange::new(BOUNDARY.to_vec(), None),
-    );
-    sim.run_for(Duration::from_secs(2));
-    let sibling_leader = elect(&mut sim, &sibling, &live, seed);
-    let sealed = seal_now(&mut meta, &store, &sibling, sibling_leader, 2_100, false);
-    assert_eq!(
-        sealed,
-        Some(0),
-        "[seed={seed}] the sibling's own first seal must apply"
-    );
-
-    // The parent gets a fresh chance to seal its OWN left-side backlog,
-    // this time with the shared `seal_now` helper's own fresh (and
-    // correctly-scoped) read — proving the rejection above was a genuine
-    // retry-next-tick, never a permanent wedge.
-    let parent_leader2 = elect(&mut sim, &parent, &live, seed);
-    let resealed = seal_now(&mut meta, &store, &parent, parent_leader2, 2_200, false);
-    assert_eq!(
-        resealed,
-        Some(0),
-        "[seed={seed}] the parent's own retry, now correctly scoped, must apply"
-    );
-
-    // Exactly-once end to end: the left-side backlog sealed exactly once
-    // (the parent's correctly-scoped retry, never the rejected stale
-    // attempt), the right-side backlog exactly once (the sibling) — no
-    // duplication survives.
-    verify_lineage(
-        &meta,
-        &store,
-        &[(&parent, parent_leader2), (&sibling, sibling_leader)],
-        &journal,
-        seed,
-    );
-}
-
-#[test]
-fn split_then_parent_seals_against_stale_cached_metadata() {
-    for_each_seed(
-        "split_then_parent_seals_against_stale_cached_metadata",
-        scenario_split_then_parent_seals_against_stale_cached_metadata,
-    );
-}
+// TOMBSTONE (ADR 0050 Train B rung 2): five split cells died here —
+// `split_mid_stream`, `split_then_parent_seals_first` (the #216
+// frozen-basis loss regression), `split_then_parent_reseals_before_scope_
+// narrows` + `split_then_parent_seals_against_stale_cached_metadata` (the
+// #220 duplication regressions, physical-scope-lag and metadata-cache-lag
+// layers), and `combined_chaos`. All modeled the ZERO-COPY split's
+// in-place lineage: `narrow_scope` on the parent's own nodes + a sibling
+// group inheriting the same physical rows — `narrow_scope` no longer
+// exists (immutable ranges), sibling tablets no longer share engines, and
+// the machinery those cells regression-tested (`stream_split_basis`
+// inheritance, `in_declared_range`, the `SealStreamShard` range-CAS) is
+// production-unreachable while the old split is disabled and is deleted
+// outright in the Train B sweep. The copy-based split's own lineage cells
+// (children born with EMPTY change logs, parent's final seal at freeze,
+// `split_lineage` frozen at cutover) replace them in the cutover rungs.
+// Pre-pivot cells retrievable from git history.
 
 // --- cell 4: kill_sealing_leader ------------------------------------------
 
@@ -1496,7 +804,7 @@ fn scenario_disable_grace_drain(seed: u64) {
         block_on(group.nodes[leader].pending_changes())
             .into_iter()
             .filter_map(|(k, _)| record_hlc_suffix(&k))
-            .all(|hlc| hlc <= meta.effective_stream_shard_watermark(group.id).unwrap_or(0)),
+            .all(|hlc| hlc <= meta.stream_shard_watermark(group.id).unwrap_or(0)),
         "[seed={seed}] nothing should remain above the watermark after a final seal"
     );
 
@@ -1542,7 +850,7 @@ fn scenario_disable_grace_drain(seed: u64) {
         ApplyOutcome::Applied,
         "[seed={seed}] re-enable must apply"
     );
-    let watermark = meta.effective_stream_shard_watermark(group.id).unwrap_or(0);
+    let watermark = meta.stream_shard_watermark(group.id).unwrap_or(0);
     let outcome = meta.apply(&MetaCommand::SealStreamShard {
         table: TABLE.into(),
         label: LABEL2.into(),
@@ -1555,7 +863,6 @@ fn scenario_disable_grace_drain(seed: u64) {
         replicas: Vec::new(),
         object_id: format!("{TABLE}/{LABEL2}/{}/test", group.id.0),
         // No `CreateTablet` in this scenario — permissive (absent tablet).
-        expected_range: KeyRange::whole(),
     });
     // An empty shard is never sealed in production (`seal_now` never calls
     // `SealStreamShard` for an empty scan) — this hand-built row exists only
@@ -1574,115 +881,6 @@ fn scenario_disable_grace_drain(seed: u64) {
 #[test]
 fn disable_grace_drain() {
     for_each_seed("disable_grace_drain", scenario_disable_grace_drain);
-}
-
-// --- cell 7: combined_chaos -----------------------------------------------
-
-fn scenario_combined_chaos(seed: u64) {
-    let mut sim = Simulator::new(seed);
-    let engines = engines();
-    let mut meta = base_meta();
-    create_tablet(&mut meta, TabletId(8), KeyRange::whole());
-    let parent = start_group(&sim, &engines, TabletId(8), KeyRange::whole());
-    let mut live = vec![0, 1, 2];
-    sim.run_for(Duration::from_secs(2));
-    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
-    let mut journal = BTreeMap::new();
-
-    for i in 0..3 {
-        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"a", seed);
-    }
-    let leader = elect(&mut sim, &parent, &live, seed);
-    let sealed = seal_now(&mut meta, &store, &parent, leader, 1_000, false);
-    assert_eq!(sealed, Some(0));
-
-    // Leader kill mid-stream.
-    let dying = elect(&mut sim, &parent, &live, seed);
-    sim.crash(nid(NODES[dying]));
-    live.retain(|&i| i != dying);
-    for i in 3..6 {
-        write_and_journal(&mut sim, &parent, &live, &mut journal, &key(i), b"b", seed);
-    }
-
-    // Split.
-    let parent_epoch = meta
-        .tablets
-        .get(&parent.id)
-        .map_or(animus_tablet::Epoch::INITIAL, |t| t.epoch);
-    let sibling_id = TabletId(9);
-    for &i in &live {
-        parent.nodes[i].narrow_scope(KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec())));
-    }
-    meta.apply(&MetaCommand::SplitTablet {
-        tablet: parent.id,
-        expected_epoch: parent_epoch,
-        split_key: BOUNDARY.to_vec(),
-        new_id: sibling_id,
-    });
-    let sibling = start_group(
-        &sim,
-        &engines,
-        sibling_id,
-        KeyRange::new(BOUNDARY.to_vec(), None),
-    );
-    sim.run_for(Duration::from_secs(2));
-    let sibling_live = [0, 1, 2];
-
-    for i in 600..604 {
-        write_and_journal(
-            &mut sim,
-            &sibling,
-            &sibling_live,
-            &mut journal,
-            &key(i),
-            b"c",
-            seed,
-        );
-    }
-
-    // Store outage during the sibling's own first seal attempt, then heal.
-    store.set_unavailable_until(Nanos(u64::MAX));
-    let sibling_leader = elect(&mut sim, &sibling, &sibling_live, seed);
-    let sealed = seal_now(&mut meta, &store, &sibling, sibling_leader, 2_000, false);
-    assert_eq!(
-        sealed, None,
-        "[seed={seed}] the outage must block the sibling's seal"
-    );
-    store.clear_unavailable();
-    for i in 604..607 {
-        write_and_journal(
-            &mut sim,
-            &sibling,
-            &sibling_live,
-            &mut journal,
-            &key(i),
-            b"d",
-            seed,
-        );
-    }
-    let sibling_leader = elect(&mut sim, &sibling, &sibling_live, seed);
-    let sealed = seal_now(&mut meta, &store, &sibling, sibling_leader, 3_000, false);
-    assert_eq!(
-        sealed,
-        Some(0),
-        "[seed={seed}] sealing must succeed once healed"
-    );
-
-    let parent_leader = elect(&mut sim, &parent, &live, seed);
-    seal_now(&mut meta, &store, &parent, parent_leader, 4_000, false);
-
-    verify_lineage(
-        &meta,
-        &store,
-        &[(&parent, parent_leader), (&sibling, sibling_leader)],
-        &journal,
-        seed,
-    );
-}
-
-#[test]
-fn combined_chaos() {
-    for_each_seed("combined_chaos", scenario_combined_chaos);
 }
 
 // --- D9: the durability-invariant kill-point scenario ---------------------
@@ -1908,7 +1106,7 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
     // `index_drain::seal_now`'s own sequence up through its `pending_
     // changes()` read (`animusd/src/index_drain.rs:944-960`), before its
     // (real, K-way replicated, hence slow) `put_sealed` call.
-    let watermark_slow = meta.effective_stream_shard_watermark(group.id).unwrap_or(0);
+    let watermark_slow = meta.stream_shard_watermark(group.id).unwrap_or(0);
     let mut slow_records: Vec<(Vec<u8>, u64, Vec<u8>)> =
         block_on(group.nodes[slow_leader].pending_changes())
             .into_iter()
@@ -1967,7 +1165,7 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
         "[seed={seed}] the fast attempt seals epoch 0 covering both batches"
     );
     let fast_watermark = meta
-        .effective_stream_shard_watermark(group.id)
+        .stream_shard_watermark(group.id)
         .expect("fast attempt just committed a watermark");
     let fast_seg_id = meta.stream_shards[&(group.id, 0)].object_id.clone();
 
@@ -2026,7 +1224,6 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
         // No `CreateTablet` in this scenario at all — the range CAS reads
         // as permissive (absent tablet); `whole()` is never actually
         // checked, same as this scenario's other unaffected assertions.
-        expected_range: KeyRange::whole(),
     });
     assert_eq!(
         slow_outcome,
@@ -2034,7 +1231,7 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
         "[seed={seed}] the catalog must reject the slow attempt's differing content"
     );
     assert_eq!(
-        meta.effective_stream_shard_watermark(group.id),
+        meta.stream_shard_watermark(group.id),
         Some(fast_watermark),
         "[seed={seed}] the catalog's committed watermark must be untouched by the rejected proposal"
     );
@@ -2129,5 +1326,346 @@ fn transactional_writes_exactly_once_and_ordered() {
     for_each_seed(
         "transactional_writes_exactly_once_and_ordered",
         scenario_transactional_writes_exactly_once_and_ordered,
+    );
+}
+
+// --- cells 9/10: the copy-based split's lineage (ADR 0050 Train B rung 6) --
+//
+// The successors the rung-2 tombstone above promises: the ZERO-COPY split
+// cells died with `narrow_scope`/the shared engine; these model the
+// COPY-BASED workflow's lineage contract instead — children born with
+// EMPTY change logs, the parent's final seal capturing its entire backlog
+// before cutover, and `split_lineage` frozen at `CutoverSplit` apply.
+//
+// **Fidelity boundary, stated honestly** (the corpus-green-≠-port lesson):
+// the animusd split *driver*'s own sequencing/idempotence is NOT under
+// test here — `animusd/tests/split_build.rs`/`freeze.rs` and the cascade
+// e2e are that gate. What these cells prove at the primitive level, under
+// seed-varied write interleavings, is that the pieces the driver composes
+// (the `BeginSplit`/`CutoverSplit` apply arms, the seal path, the frozen
+// `split_lineage` parent-id derivation, and per-tablet private engines)
+// preserve exactly-once + per-item order across a split — including under
+// a seal-attempt crash and a store outage (cell 10). The parent's freeze
+// is modeled by simply issuing no further writes to it (the `Freeze`
+// command's own refusal mechanics are `animus-cp-data/tests/freeze.rs`'s
+// subject, not lineage's).
+
+/// An exactly-8-byte item key for the split cells: `BeginSplit`'s apply arm
+/// keeps the F11 token-alignment seatbelt for a streamed table (a split key
+/// must sit on its own `TOKEN_BYTES` boundary — ADR 0042 §14), so both the
+/// split key and the keys it partitions use a full-token shape here, unlike
+/// `key`'s shorter 5-byte form the non-split cells keep.
+fn key8(i: usize) -> Vec<u8> {
+    format!("sk{i:06}").into_bytes()
+}
+
+/// One completed copy-based split of `parent_group` at `split_key`,
+/// applied to `meta` the way the driver's endgame does: `BeginSplit` →
+/// (writes already stopped) → the parent's FINAL seal (whole backlog) →
+/// `CutoverSplit`. Returns the two child ids. Panics (naming the seed) if
+/// any step's apply is rejected.
+fn complete_copy_split(
+    meta: &mut Metadata,
+    store: &SimSegmentStore,
+    sim: &mut Simulator,
+    parent_group: &Group,
+    split_key: &[u8],
+    wall_ms: u64,
+    seed: u64,
+) -> (TabletId, TabletId) {
+    let left = meta.next_free_tablet_id();
+    let right = TabletId(left.0 + 1);
+    let replicas: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let epoch = meta.tablets[&parent_group.id].epoch;
+    let outcome = meta.apply(&MetaCommand::BeginSplit {
+        parent: parent_group.id,
+        expected_epoch: epoch,
+        split_key: split_key.to_vec(),
+        children: [(left, replicas.clone()), (right, replicas)],
+    });
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied,
+        "[seed={seed}] BeginSplit must apply"
+    );
+
+    // The parent's final seal: everything still pending, one shard. A
+    // quiet parent (no unsealed backlog) legitimately seals nothing —
+    // the driver's own endgame has the same branch.
+    let leader = elect(sim, parent_group, &[0, 1, 2], seed);
+    let _ = seal_now(meta, store, parent_group, leader, wall_ms, false);
+    let watermark = meta.stream_shard_watermark(parent_group.id).unwrap_or(0);
+    let still_pending = block_on(parent_group.nodes[leader].pending_changes())
+        .into_iter()
+        .filter_map(|(k, _)| record_hlc_suffix(&k))
+        .any(|hlc| hlc > watermark);
+    assert!(
+        !still_pending,
+        "[seed={seed}] the final seal must leave nothing past the watermark"
+    );
+
+    let epoch = meta.tablets[&parent_group.id].epoch;
+    let outcome = meta.apply(&MetaCommand::CutoverSplit {
+        parent: parent_group.id,
+        expected_epoch: epoch,
+        cutover_wall_ms: wall_ms + 1,
+    });
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied,
+        "[seed={seed}] CutoverSplit must apply"
+    );
+    (left, right)
+}
+
+// --- cell 9: copy_split_children_born_empty ------------------------------
+
+/// The copy-based split's core lineage contract (ADR 0050 / ADR 0043 §A4 as
+/// rewritten): sealed history + an unsealed backlog on the parent → the
+/// parent's final seal captures the whole backlog → cutover freezes
+/// `split_lineage` → both children start with **empty** change logs, seal
+/// their own epoch 0, and the full walk (parent chain, then each child's)
+/// delivers every journaled record exactly once, in per-item order.
+fn scenario_copy_split_children_born_empty(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut meta = base_meta();
+    let parent_engines = engines();
+    let parent = start_group(&sim, &parent_engines, TabletId(7), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let replicas: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let outcome = meta.apply(&MetaCommand::CreateTablet {
+        tablet: TabletId(7),
+        table: Some(TABLE.into()),
+        range: KeyRange::whole(),
+        replicas,
+    });
+    assert_eq!(outcome, ApplyOutcome::Applied, "[seed={seed}] CreateTablet");
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    // Sealed history: a seed-varied batch, routine-sealed as epoch 0.
+    let pre = 2 + (seed % 3) as usize;
+    for i in 0..pre {
+        write_and_journal(
+            &mut sim,
+            &parent,
+            &live,
+            &mut journal,
+            &key8(i),
+            b"v0",
+            seed,
+        );
+    }
+    let leader = elect(&mut sim, &parent, &live, seed);
+    let sealed = seal_now(&mut meta, &store, &parent, leader, 1_000, false);
+    assert_eq!(sealed, Some(0), "[seed={seed}] routine seal of epoch 0");
+
+    // Unsealed backlog, one write transactional (the stage-marker path
+    // rides the same log; its resolve-materialized record must arrive
+    // exactly once through the FINAL seal, not the routine one).
+    for i in 0..pre {
+        write_and_journal(
+            &mut sim,
+            &parent,
+            &live,
+            &mut journal,
+            &key8(i),
+            b"v1",
+            seed,
+        );
+    }
+    write_txn_and_journal(
+        &mut sim,
+        &parent,
+        &live,
+        &mut journal,
+        &txn_key(0),
+        b"t1",
+        seed,
+    );
+
+    let (left_id, right_id) = complete_copy_split(
+        &mut meta,
+        &store,
+        &mut sim,
+        &parent,
+        b"sk000002",
+        2_000,
+        seed,
+    );
+
+    // The lineage is frozen at cutover: both children's epoch-0 parent is
+    // the parent's FINAL sealed shard, the parent is gone from the map,
+    // and the children are Active.
+    let final_epoch = meta
+        .stream_shards
+        .range((TabletId(7), 0)..=(TabletId(7), u64::MAX))
+        .next_back()
+        .map(|((_, e), _)| *e)
+        .expect("parent must have sealed shards");
+    let expected_parent = segment::shard_id(7, final_epoch);
+    for child in [left_id, right_id] {
+        assert_eq!(
+            meta.stream_shard_parent_id(child, 0).as_deref(),
+            Some(expected_parent.as_str()),
+            "[seed={seed}] child {child:?} epoch-0 lineage must be the parent's final shard"
+        );
+        assert_eq!(
+            meta.tablets[&child].state,
+            TabletState::Active,
+            "[seed={seed}] cutover must activate the children"
+        );
+    }
+    assert!(
+        !meta.tablets.contains_key(&TabletId(7)),
+        "[seed={seed}] cutover must remove the parent"
+    );
+
+    // Children: PRIVATE empty engines (per-tablet storage), empty change
+    // logs — nothing inherited, the tombstone's own named property.
+    let left_engines = engines();
+    let right_engines = engines();
+    let left = start_group(
+        &sim,
+        &left_engines,
+        left_id,
+        KeyRange::new(Vec::new(), Some(b"sk000002".to_vec())),
+    );
+    let right = start_group(
+        &sim,
+        &right_engines,
+        right_id,
+        KeyRange::new(b"sk000002".to_vec(), None),
+    );
+    sim.run_for(Duration::from_secs(2));
+    for (child, name) in [(&left, "left"), (&right, "right")] {
+        let l = elect(&mut sim, child, &live, seed);
+        assert!(
+            block_on(child.nodes[l].pending_changes()).is_empty(),
+            "[seed={seed}] the {name} child must be born with an EMPTY change log"
+        );
+    }
+
+    // Post-cutover writes route by range; each child seals its own epoch 0.
+    write_and_journal(&mut sim, &left, &live, &mut journal, &key8(0), b"v2", seed);
+    write_and_journal(&mut sim, &right, &live, &mut journal, &key8(3), b"v2", seed);
+    let ll = elect(&mut sim, &left, &live, seed);
+    let rl = elect(&mut sim, &right, &live, seed);
+    assert_eq!(
+        seal_now(&mut meta, &store, &left, ll, 3_000, false),
+        Some(0),
+        "[seed={seed}] the left child's first seal must be its own epoch 0"
+    );
+    assert_eq!(
+        seal_now(&mut meta, &store, &right, rl, 3_000, false),
+        Some(0),
+        "[seed={seed}] the right child's first seal must be its own epoch 0"
+    );
+
+    verify_lineage(
+        &meta,
+        &store,
+        &[(&parent, leader), (&left, ll), (&right, rl)],
+        &journal,
+        seed,
+    );
+}
+
+#[test]
+fn copy_split_children_born_empty() {
+    for_each_seed(
+        "copy_split_children_born_empty",
+        scenario_copy_split_children_born_empty,
+    );
+}
+
+// --- cell 10: copy_split_endgame_survives_seal_crash_and_outage ----------
+
+/// The driver endgame's fault surface at the primitive level: the parent's
+/// final seal first "crashes" between the segment `put` and the catalog
+/// commit (`skip_commit` — the D9 kill point), then retries into a store
+/// outage, then heals and lands. Cutover only after the successful seal;
+/// exactly-once must hold across the whole ordeal (the retried seal
+/// recomputes the identical epoch; the orphaned first `put` is invisible
+/// to the walk — reaped in production by the segment janitor's sub-case
+/// (a), which needs no tablet liveness).
+fn scenario_copy_split_endgame_survives_seal_faults(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut meta = base_meta();
+    let parent_engines = engines();
+    let parent = start_group(&sim, &parent_engines, TabletId(9), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let replicas: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let outcome = meta.apply(&MetaCommand::CreateTablet {
+        tablet: TabletId(9),
+        table: Some(TABLE.into()),
+        range: KeyRange::whole(),
+        replicas: replicas.clone(),
+    });
+    assert_eq!(outcome, ApplyOutcome::Applied, "[seed={seed}] CreateTablet");
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+    let n = 2 + (seed % 4) as usize;
+    for i in 0..n {
+        write_and_journal(&mut sim, &parent, &live, &mut journal, &key8(i), b"w", seed);
+    }
+
+    // BeginSplit lands; the final seal's first attempt crashes after the
+    // `put` (no catalog row), the second hits an outage, the third lands.
+    let left_id = meta.next_free_tablet_id();
+    let right_id = TabletId(left_id.0 + 1);
+    let epoch = meta.tablets[&TabletId(9)].epoch;
+    let outcome = meta.apply(&MetaCommand::BeginSplit {
+        parent: TabletId(9),
+        expected_epoch: epoch,
+        split_key: b"sk000001".to_vec(),
+        children: [(left_id, replicas.clone()), (right_id, replicas)],
+    });
+    assert_eq!(outcome, ApplyOutcome::Applied, "[seed={seed}] BeginSplit");
+
+    let leader = elect(&mut sim, &parent, &live, seed);
+    assert_eq!(
+        seal_now(&mut meta, &store, &parent, leader, 1_000, true),
+        None,
+        "[seed={seed}] the crashed attempt must commit nothing"
+    );
+    store.set_unavailable_until(Nanos(u64::MAX));
+    assert_eq!(
+        seal_now(&mut meta, &store, &parent, leader, 1_100, false),
+        None,
+        "[seed={seed}] the outage attempt must commit nothing"
+    );
+    store.clear_unavailable();
+    assert_eq!(
+        seal_now(&mut meta, &store, &parent, leader, 1_200, false),
+        Some(0),
+        "[seed={seed}] the healed retry must land the identical epoch"
+    );
+
+    let epoch = meta.tablets[&TabletId(9)].epoch;
+    let outcome = meta.apply(&MetaCommand::CutoverSplit {
+        parent: TabletId(9),
+        expected_epoch: epoch,
+        cutover_wall_ms: 1_300,
+    });
+    assert_eq!(outcome, ApplyOutcome::Applied, "[seed={seed}] CutoverSplit");
+    assert_eq!(
+        meta.stream_shard_parent_id(left_id, 0).as_deref(),
+        Some(segment::shard_id(9, 0).as_str()),
+        "[seed={seed}] the frozen lineage must name the retried seal's shard"
+    );
+
+    verify_lineage(&meta, &store, &[(&parent, leader)], &journal, seed);
+}
+
+#[test]
+fn copy_split_endgame_survives_seal_faults() {
+    for_each_seed(
+        "copy_split_endgame_survives_seal_faults",
+        scenario_copy_split_endgame_survives_seal_faults,
     );
 }

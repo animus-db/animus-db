@@ -15,9 +15,10 @@ types. v1 (ADR 0019) is **CP-only**; the leaderless AP `data`/`coord` roles are
 gone. Streams implementation notes: [`docs/streams-notes.md`](../../docs/streams-notes.md).
 
 **`lib.rs` is ~6800 lines** — grep for the symbol, don't scroll. It also holds
-two in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
-can't reach: `split_fence_tests` (lib.rs:6452) and `auto_split_median_tests`
-(lib.rs:6725). `index_drain.rs` has a third, `gsi_drain_cursor_tests`, and
+in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
+can't reach — e.g. `auto_split_median_tests` (`split_fence_tests` and
+`hot_read_latch_tests` were deleted with their fence/latch subjects in the
+ADR 0050 Train B rung-7 sweep). `index_drain.rs` has a third, `gsi_drain_cursor_tests`, and
 `dynamo.rs` a fourth, `stream_write_path_tests` (ADR 0042), for the same
 reason (see each file's own entry below).
 
@@ -62,6 +63,12 @@ reason (see each file's own entry below).
   `stream_shards` catalog. The module's own 80-line `//!` doc has the full
   design (including the load-bearing epoch-derivation guard and the
   convergent drop-table cascade); see also `docs/streams-notes.md`.
+  **Retired-tablet rule (ADR 0050 rung 6)**: a cutover-removed split
+  parent's shards expire by ORDINARY retention — the drop-table
+  retention-zero rule keys on the table's *schema* (still live via the
+  children), never tablet presence, and the max-epoch pin applies to live
+  tablets only (a retired chain can never seal again) — both halves
+  red-proven in `tests/stream_janitor.rs::retired_parents_*`.
 - **`index_backfill.rs`** (ADR 0045 §4) — the secondary-index
   **backfill-completion aggregator**: another control-plane-**leader**-only
   background loop (`index_backfill_loop`), same self-gating idiom as
@@ -151,6 +158,44 @@ reason (see each file's own entry below).
 help) prints the full invocation reference (durable LSM backend by
 default; `--ephemeral` selects the volatile memory engine). Notes not
 obvious from `--help` alone:
+
+**The split-build driver** (ADR 0050 Train B rung 4) is a
+`change_consumer_loop` arm: for a `Splitting` parent this node leads, it
+wakes the group, holds the quiesce veto, **holds trim** (metadata-derived —
+the `!splitting` gates on the marker branch and `trim_janitor`; driver
+liveness never gates it), bulk-copies BASE+LSI+FOOTPRINT (never
+CHANGE/CURSOR) into the two `Building` children via
+`ClientCtx::seed_child_rows` (local-or-`Forwarded{SeedRows}`, one confirm
+implementation `seed_rows_local`, confirm-by-applied-index), then tails the
+parent's change log by **packed-HLC watermark** (never a key-position
+cursor — see the engineering-lessons entry) at token granularity (or full
+prefix for sub-token raw keys). Progress mirrors to
+`ctx.data().split_builds` → `/admin/raftkv`'s
+`split_rows_shipped`/`split_converged`/`split_phase`. **Rung 5 completes the
+workflow**: at convergence — caught up, OR `SPLIT_MAX_TAIL_PASSES` (25)
+post-bulk chasing passes elapsed (the rung-8 liveness bound: a
+continuously-written parent must still freeze; see the engineering-lessons
+entry) — the driver proposes `KvCommand::Freeze` on the parent (terminal
+whole-range seal; USER data only — consumer bookkeeping writes stay
+allowed so the vetoes below can converge, see the engineering-lessons
+entry), then in ONE tick (rung 8: each phase-per-tick boundary was pure
+write-blip): final tail drain to zero → the **final image** (a re-scan
+ship of the frozen parent *filtered by the pre-bulk version floor* — txn
+decisions/resolves are signal-less writes an O(delta) tail misses, and
+apply order == HLC order makes every bulk-missed rewrite out-version the
+floor; deliberately not `latest_version()`, which the read-ceiling marker
+future-shifts; gated on the apply task reaching the freeze-window commit
+floor) → streams final seal
+(`seal_now`, no size/age gate) → GSI-drain veto (`"gsi"` cursor ≥ max
+pending record) → backfill veto (`MarkIndexBackfilled` for every
+`Creating` index) → proposes `CutoverSplit` until the parent leaves the
+map (the reconciler then `Reclaim`s it everywhere). A stale-routed write
+to a frozen parent gets the retryable `FROZEN_REFUSAL` from every local
+write/txn helper (`frozen_refusal`; bookkeeping-only kind batches exempt).
+A `Building` child runs **no consumer arms at all** (its token-truncated
+cursor key would land in the parent's scope and poison the parent's
+min-over-rows watermark). E2e: `tests/split_build.rs` (full workflow +
+racing txns + post-freeze leader kill).
 
 `--auto-split K` (key count), `--auto-split-bytes B` (byte size), and
 `--auto-split-change-rate RATE` (streamed tables only, ADR 0042 §14 Fork F —
@@ -256,17 +301,16 @@ forwarded dual of the local path's `RouteDecision::Wait`. Gated on the tablet
 being resolvable so an unmappable op still fails fast. Regression:
 `tests/cluster_split.rs::single_shot_first_write_through_control_node_succeeds`.
 
-**Write fences (ADR 0028)**: `cp_put_local`/`cp_delete_local`/`cp_batch_propose`
-each (1) **pre-check** the target group's live `RaftKvNode::scope_range()` and
-reject before proposing if any key falls outside it (returning a routing-failure
-error so the caller re-resolves and reaches the correct child), and (2) **stamp**
-that range as the proposed entry's `fence` (`put_fenced`/etc.). The pre-check is
-load-bearing: a fenced-out entry still commits as a no-op, so a confirm keyed on a
-coarser signal would falsely-ack; the embedded fence only covers the sliver
-between pre-check and apply. `cp_get_local`/`cp_scan_local` run the read-side dual
-(ADR 0033): a read resolving to a group whose live scope doesn't cover the
-request errors retryably rather than serving a false "absent" (for scans, avoids a
-silent truncation). See the in-crate `split_fence_tests`.
+**Write fences are GONE (ADR 0050 Train B rung 7).** A tablet's declared
+range is immutable from birth, so the per-entry `fence` fields, the
+pre-propose `scope_range()` checks, and the `*_fenced` proposers were all
+deleted; the plain `put`/`put_batch`/`put_kind_batch_conditioned`/`delete`/
+`cas` proposers are the only shapes left. What replaces the fence's job:
+route-time filtering (`Building` tablets unroutable, `Active`-only serving)
+plus the frozen split parent's retryable refusal (`frozen_refusal` +
+`KvCommand::Freeze`'s apply-time whole-range seal backstop). One cheap
+pre-propose key∈declared-range guard survives in the kind-write path purely
+as a routing-bug tripwire (immutable range, no lock).
 
 ## Multi-participant transactions (ADR 0018 §2)
 
@@ -512,15 +556,42 @@ byte-weighted median in one action (`ClientCtx::grow_stream` →
 led by a different node than the one serving the admin request is reached
 via the internal, relayable `ClientRequest::TriggerAutoSplit` RPC (mirrors
 `ForceSeal`'s shape — addressed by tablet id, refused bare, handled only in
-`cp_serve_forwarded`). A per-tablet skip (Fork E's single-token limit, or
-an empty/singleton tablet) is reported in that tablet's own response entry,
+`cp_serve_forwarded`). A per-tablet skip (Fork E's single-token limit, an
+empty/singleton tablet, or — since ADR 0050 rung 6 — a mid-split tablet:
+a `Splitting` parent or `Building` child classifies up front as
+`STREAM_GROW_MID_SPLIT`, never routed to and never miscounted as a split
+this call performed) is reported in that tablet's own response entry,
 never escalated into a whole-call failure. `animus admin stream-grow
 <admin-addr> <table>` is the CLI form.
 
-**Split** (ADR 0028, `MetaCommand::SplitTablet`, epoch-CAS gated) is a
-single atomic control-plane command with no data-plane half — narrows the
-source's range and mints a sibling on the same shared engine. Exposed via
-`POST /admin/tablet/split` + `ClientRequest::SplitTablet` (relayable).
+**Split is the ADR 0050 copy-based workflow's METADATA half (Train B rung
+3)**: `trigger_split` — still the one choke point every surface calls —
+now proposes `MetaCommand::BeginSplit` (parent → `Splitting`, still fully
+serving; two `Building` children minted at **placement-chosen final
+homes**, fork F5 via `split_child_placement` →
+`animus_control::select_replicas_balanced`, falling back to inheriting
+the parent's replicas when the recorded RF exceeds the live member count —
+the same self-heal-later stance `provision_tablet` takes) and confirms by
+observing the parent's own **state** become `Splitting` — never the old
+epoch-advance (a rebalance CAS also bumps the epoch; a stray bump re-arms
+the CAS instead). Kickoff is **asynchronous and idempotent**: success
+means the workflow *started*; a `Splitting` parent returns success
+immediately; a `Building` child refuses ("not splittable"). Routing
+serves only `is_routable()` tablets (`Building` children overlap their
+un-narrowed parent, so the `tablet_for_key`/scan-fan-out filters are
+load-bearing); auto-split skips non-`Active` tablets; placement
+(reconcile + rebalance) is frozen for the whole mid-split set. **The
+workflow STOPS at this rung** — no driver/copy/freeze/cutover callers yet
+(B4/B5), so a started split parks at parent-`Splitting` +
+children-`Building` indefinitely; per-tablet `state` rides
+`/admin/status`'s serialized `Metadata` (the split-status surface —
+no new endpoint). The old zero-copy `MetaCommand::SplitTablet` is deleted
+(Train B rung 7) — test topology fixtures propose a real
+`BeginSplit`+`CutoverSplit` round instead (sound on an EMPTY table:
+children activate over nothing, the parent retires). E2e:
+`tests/split_lifecycle.rs` (3-node, follower-connected kickoff = the
+`BeginSplit` relay regression) and `admin_endpoint.rs::
+admin_split_kicks_off_the_copy_based_workflow`.
 (Merge — `MetaCommand::MergeTablets` and the reconciler's `WidenScope`/
 `Absorb` reaction — was removed entirely by ADR 0044, superseding ADR
 0033.)
@@ -528,13 +599,13 @@ source's range and mints a sibling on the same shared engine. Exposed via
 **`ClientCtx::trigger_split` is the ONE choke point every split proposer
 calls** (`auto_split_loop`, `admin::action_split`, and
 `ClientRequest::SplitTablet`'s handler — nothing else ever builds a
-`MetaCommand::SplitTablet`), which is where F11 (ADR 0042 §14) rounds a
+`MetaCommand::BeginSplit`), which is where F11 (ADR 0042 §14) rounds a
 streamed table's split key down to its own 8-byte token boundary
 (`align_split_key`, private to `lib.rs`, unit-tested in
 `align_split_key_tests`) — a manual split can no longer separate one
 partition's records across sibling tablets the way it could before growth
 PR2 moved the rounding out of `auto_split_loop` alone.
-`MetaCommand::SplitTablet`'s own apply arm independently re-checks token
+`MetaCommand::BeginSplit`'s own apply arm independently re-checks token
 alignment on a streamed table as the ADR 0028 fence-idiom seatbelt (never
 the primary enforcement). A token-rounded key that collapses onto the
 target tablet's own `range.start` (a single very hot partition token owning
@@ -562,10 +633,10 @@ would orphan it forever. The three steps run in a load-bearing order: (1)
 read `metadata_fresh` and drop each **global** index's hidden table's
 tablets via the same `MetaCommand::DropTableTablets` the base table itself
 uses; (2) drop the base schema; (3) drop the base table's own tablets (base
-+ colocated **LSI** rows + change log + footprints — all four
-`StorageScope` kinds share one tablet group, so `CpGroup::erase_scope`
-iterating `kind_scopes` reclaims every one; an LSI needs no separate
-cascade step). A crash between any two steps leaves a state a re-run of
++ colocated **LSI** rows + change log + footprints — every kind lives in
+the tablet's own private engine, so the reconciler's `Reclaim` deleting
+that engine's files reclaims every kind at once (ADR 0050 rung 1); an LSI
+needs no separate cascade step). A crash between any two steps leaves a state a re-run of
 `drop_table` completes, since every step is independently idempotent.
 **Belt-and-suspenders second sweep**: the GSI drain (`index_drain.rs`)
 provisions a hidden table's first tablet lazily and can race a drop, so
@@ -624,27 +695,11 @@ crate's `CLAUDE.md`. This crate's own contribution:
   except a locally-woken quiesced follower's "are you still there?" check.
   `host::Reconciler::tick`'s own proactive wake (fork H, on a `Down`
   replica) lives in `animus-cp-data`.
-- **The `hot_read` scope-transition latch** (narrows the ADR 0043
-  residual): `hot_read_scope_ok` (`lib.rs`) refuses retryably
-  (`"...; retry"`) whenever a group's **live** `scope_range()` is wider than
-  the tablet's range per a **freshly fetched** `metadata_fresh()` — never
-  `effective_metadata()`/`metadata_cached()`, the cache-lag
-  `in_declared_range`'s own pre-existing filter (`index_drain.rs`) could
-  not close on its own. Both `hot_read` call sites (`ClientRequest::
-  StreamHotRead`'s handler, `ClientCtx::read_stream_hot_records`) gate on
-  it before ever calling `index_drain::hot_read`. **Does not fully close
-  the residual**: on a `ControlHandle::Local` node (the common case),
-  `metadata_fresh()` is itself the ADR 0038 published cache a local,
-  asynchronous control apply task maintains — in the sub-window between a
-  `SplitTablet` committing and that apply task catching this node's cache
-  up to it, the declared range and the live scope are stale *together*, so
-  this check passes and the fabrication class can still surface (the same
-  layer-2 structure the #220 write-side investigation found). See ADR 0048
-  for the full accounting, why this — a live cross-check, not a
-  periodically-refreshed flag — is nonetheless the sound design where a
-  literal "reconciler-maintained latch" would not have been, and why full
-  closure (a per-read control-leader round trip) was rejected as
-  disproportionate.
+- **The `hot_read` scope-transition latch is GONE (ADR 0050 Train B rung
+  7)** — together with the residual it narrowed: a tablet's range is
+  immutable and a split retires its parent whole (its group refuses via the
+  freeze, then tears down), so no scope-transition window exists for an
+  open-tail read to race. `hot_read` takes only the group handle now.
 - **Quiesce veto**: `change_consumer_loop` (`index_drain.rs`) computes
   `!group.pending_changes().await.is_empty()` once per led tablet per tick
   and calls `CpGroup::set_quiesce_veto` with it — held while the change log
@@ -692,8 +747,7 @@ private `CpGroup` access) covers the veto end to end
 (`hot_backlog_holds_the_quiesce_veto_until_the_hot_tail_trims`) and the
 sweeper-skip regression
 (`a_rewoken_tablet_is_picked_back_up_by_every_sweeper_within_one_interval`);
-`lib.rs`'s own `hot_read_latch_tests` module covers the latch's
-retryable-refusal shape; `tests/cp_quiescence.rs` is the critical
+ `tests/cp_quiescence.rs` is the critical
 `ProdEnv` leader-kill liveness regression
 (`write_after_leader_kill_of_a_quiesced_group_converges`) — the one
 property `SimEnv` structurally cannot prove.
@@ -1139,11 +1193,18 @@ route below the edge through the same `ClientCtx` CP primitives.
   checks"). See ADR 0037 (and ADR 0040's amendment on it) for the full
   design, and `docs/engineering-lessons.md` for the id-space-mismatch and
   self-registration/admin-action-clobber war stories.
-- **The CP group is durable by default** — one shared `LsmEngine` over the node's
-  one internal env (ADR 0040 PR1), cloned into every tablet's `RaftKvNode`; acked
-  writes survive restart. Files use a flat filename prefix (`LSM_PREFIX = "db-"`),
-  not a subdirectory (`ProdEnv`'s disk doesn't create intermediate dirs).
-  Node-start entry points are async+fallible (`io::Result`).
+- **The CP group is durable by default** — and since ADR 0050 Train B rung
+  1, **each hosted tablet gets its OWN private `LsmEngine`** (filename
+  prefix `tablet_lsm_prefix(t)` = `db-t{t}-`; the trailing `-` keeps
+  `db-t5-*` from prefix-matching `db-t51-*`), opened/probed/destroyed by
+  the reconciler through `host::EngineFactory` (`LsmTabletFactory` here).
+  The node's own `LSM_PREFIX = "db-"` engine now backs **only** the
+  control plane's system keyspace (ADR 0038). Files use flat filename
+  prefixes, not subdirectories (`ProdEnv`'s disk doesn't create
+  intermediate dirs). Idle per-tablet engines cost ~1 KB RSS each and
+  spawn nothing (`animus-storage/tests/idle_engine_cost.rs` — the ADR
+  0050 gating measurement). Node-start entry points are async+fallible
+  (`io::Result`).
 - **`Node::shutdown()` is a graceful teardown** — aborts the listener tasks and
   `ProdEnv::shutdown()`s the node's one internal env, freeing all six ports
   (ADR 0040 PR1's `internal`/`client`/`dynamo`/`cql`/`admin` stride, plus ADR
@@ -1179,8 +1240,8 @@ route below the edge through the same `ClientCtx` CP primitives.
 tests that poll with timeouts, not deterministic assertions (this crate has
 no `SimEnv` — it is the assembly/wire layer over the two sim-tested crates
 below it). The restart tests run both incarnations in the same runtime,
-calling `Node::shutdown()` between them. Two in-crate `#[cfg(test)] mod`s
-(`split_fence_tests`, `auto_split_median_tests`) live in `lib.rs` itself
+calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
+(`auto_split_median_tests`) live in `lib.rs` itself
 because they need private handles (a raw `CpGroup`/the private
 `byte_weighted_median` helper) that no external `tests/` file can reach;
 `index_drain.rs`'s own `gsi_drain_cursor_tests` is a third (run via `cargo

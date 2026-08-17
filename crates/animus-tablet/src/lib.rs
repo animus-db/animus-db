@@ -25,8 +25,6 @@ use animus_env::NodeId;
 use animus_env::nid;
 use serde::{Deserialize, Serialize};
 
-pub mod split_basis;
-
 /// Width, in bytes, of a [`partition_token`] — a big-endian `u64`.
 pub const TOKEN_BYTES: usize = 8;
 
@@ -260,13 +258,6 @@ impl KeyRange {
         };
         Some((left, right))
     }
-
-    /// Whether this range is immediately followed by `next` (`self.end ==
-    /// next.start`), so the two can be merged into one contiguous range.
-    #[must_use]
-    pub fn abuts(&self, next: &KeyRange) -> bool {
-        self.end.as_deref() == Some(next.start.as_slice())
-    }
 }
 
 /// A table name — the catalog identifier a tablet is scoped to. A bare string;
@@ -301,6 +292,30 @@ pub struct Tablet {
     pub replicas: Vec<NodeId>,
     /// The current placement epoch.
     pub epoch: Epoch,
+    /// The tablet's lifecycle state (ADR 0050). `#[serde(default)]` keeps
+    /// pre-lifecycle snapshots loading as `Active`.
+    #[serde(default)]
+    pub state: TabletState,
+}
+
+/// A tablet's lifecycle state (ADR 0050, copy-based splits).
+///
+/// - `Active` — the steady state: routable, rebalance-eligible, splittable.
+/// - `Building` — a split child being seeded by the split driver: hosted (its
+///   group runs, its engine fills) but **unroutable** and frozen for
+///   placement until `CutoverSplit` activates it.
+/// - `Splitting` — a split parent mid-workflow: still fully serving (reads
+///   AND writes, until the B5 freeze) but frozen for placement and not
+///   re-splittable; removed from the tablet map at cutover.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TabletState {
+    /// Routable, rebalance-eligible, splittable — the steady state.
+    #[default]
+    Active,
+    /// A split child under construction: hosted but unroutable.
+    Building,
+    /// A split parent mid-workflow: serving, but frozen for placement.
+    Splitting,
 }
 
 impl Tablet {
@@ -341,7 +356,19 @@ impl Tablet {
             range,
             replicas,
             epoch: Epoch::INITIAL,
+            state: TabletState::default(),
         }
+    }
+
+    /// Whether client routing may serve keys from this tablet (ADR 0050): an
+    /// `Active` tablet always; a `Splitting` parent still serves (reads AND
+    /// writes) until the split workflow's freeze/cutover; a `Building` split
+    /// child never does — its range **overlaps its parent's** (the parent's
+    /// range is not narrowed at `BeginSplit`), so routing to it would serve
+    /// a half-copied engine.
+    #[must_use]
+    pub fn is_routable(&self) -> bool {
+        !matches!(self.state, TabletState::Building)
     }
 
     /// Whether this tablet can serve keys of `table`: a table-scoped tablet serves
@@ -421,7 +448,6 @@ mod tests {
         assert!(!left.contains(b"m"));
         assert!(right.contains(b"m") && right.contains(b"z"));
         // The two halves are adjacent and recombine to the whole keyspace.
-        assert!(left.abuts(&right));
     }
 
     #[test]
@@ -438,19 +464,6 @@ mod tests {
         assert!(r.split_at(b"a").is_none(), "split before start");
         assert!(r.split_at(b"e").is_none(), "split after end");
         assert!(r.split_at(b"c").is_some());
-    }
-
-    #[test]
-    fn abuts_only_when_contiguous() {
-        let a = KeyRange::new(b"a".to_vec(), Some(b"m".to_vec()));
-        let b = KeyRange::new(b"m".to_vec(), Some(b"z".to_vec()));
-        let gap = KeyRange::new(b"n".to_vec(), Some(b"z".to_vec()));
-        assert!(a.abuts(&b));
-        assert!(!a.abuts(&gap));
-        assert!(
-            !KeyRange::whole().abuts(&b),
-            "unbounded-above range abuts nothing"
-        );
     }
 
     #[test]

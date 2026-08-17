@@ -119,6 +119,22 @@ pub(crate) struct CpRaftView {
     /// specifically to surface that the feature is working, the operator's
     /// own diagnostic.
     pub(crate) quiesced: bool,
+    /// ADR 0050 Train B rung 4: rows shipped so far by this node's own
+    /// split-build driver for this (`Splitting`) parent tablet — `None`
+    /// unless a build is in flight and led here. Observability only (a
+    /// leader change restarts the count with the re-run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) split_rows_shipped: Option<u64>,
+    /// Whether that build's tail has converged (bulk done + latest tail
+    /// pass found nothing new). B5's freeze reads the tail directly; this
+    /// mirror is for operators.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) split_converged: Option<bool>,
+    /// Rung 5: the endgame step the build last parked at (`"build"`,
+    /// `"freeze"`, `"final-drain"`, `"final-seal"`, `"gsi-veto"`,
+    /// `"backfill-veto"`, `"cutover"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) split_phase: Option<&'static str>,
 }
 
 /// One entry of a group's `pending: BTreeMap<TxnId, (record_key, created_ts)>`
@@ -563,7 +579,23 @@ fn raft_view(ctx: &ClientCtx) -> Value {
 async fn raftkv_view(ctx: &ClientCtx) -> Value {
     let mut groups: Vec<CpRaftView> = Vec::new();
     for (t, g) in ctx.edge.hosted_groups() {
-        groups.push(g.raft_view(t).await);
+        let mut view = g.raft_view(t).await;
+        // ADR 0050 rung 4: overlay this node's own split-build progress (a
+        // data-role field; absent on a control-only node, which hosts no
+        // groups and never reaches this loop body anyway).
+        if let Some(data) = ctx.data_opt()
+            && let Some((rows, converged, phase)) = data
+                .split_builds
+                .lock()
+                .expect("split_builds poisoned")
+                .get(&t.0)
+                .copied()
+        {
+            view.split_rows_shipped = Some(rows);
+            view.split_converged = Some(converged);
+            view.split_phase = Some(phase);
+        }
+        groups.push(view);
     }
     json!({ "hosts_cp": !groups.is_empty(), "groups": groups })
 }
@@ -993,10 +1025,7 @@ async fn system_table(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 fn system_table_id_is_numeric(kind: syskv::EntityKind) -> bool {
     matches!(
         kind,
-        syskv::EntityKind::Tablet
-            | syskv::EntityKind::Policy
-            | syskv::EntityKind::SplitParent
-            | syskv::EntityKind::StreamSplitBasis
+        syskv::EntityKind::Tablet | syskv::EntityKind::Policy | syskv::EntityKind::SplitLineage
     )
 }
 
@@ -1063,9 +1092,9 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         // A `StreamShardRow` (ADR 0042 §3) — `serde_json` passthrough like
         // every other JSON-encoded entity kind above.
         | syskv::EntityKind::StreamShard
-        // A `StreamSplitBasis` (ADR 0042 §8/ADR 0043 §A4/§A6, PR1 bugfix) —
-        // same JSON passthrough convention.
-        | syskv::EntityKind::StreamSplitBasis => {
+        // A `SplitLineage` (ADR 0050 fork F9) — same JSON passthrough
+        // convention.
+        | syskv::EntityKind::SplitLineage => {
             serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
         }
         syskv::EntityKind::Counter => match <[u8; 8]>::try_from(value) {
@@ -1075,10 +1104,6 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         // Presence-only, like `Keyspace` (ADR 0045 §4: the value is always
         // empty — the row's existence is the fact).
         syskv::EntityKind::Keyspace | syskv::EntityKind::IndexBackfill => Value::Null,
-        syskv::EntityKind::SplitParent => match <[u8; 8]>::try_from(value) {
-            Ok(bytes) => json!(u64::from_be_bytes(bytes).to_string()),
-            Err(_) => Value::Null,
-        },
     }
 }
 
@@ -1254,7 +1279,8 @@ async fn action_stream_grow(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
                 }
                 ClientResponse::Error(e)
                     if e == crate::SPLIT_KEY_NOT_TOKEN_VIABLE
-                        || e == crate::STREAM_GROW_NO_SPLIT_POINT =>
+                        || e == crate::STREAM_GROW_NO_SPLIT_POINT
+                        || e == crate::STREAM_GROW_MID_SPLIT =>
                 {
                     skipped_count += 1;
                     ("skipped", Some(e))

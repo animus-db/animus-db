@@ -234,10 +234,9 @@ struct Topology {
 impl Topology {
     fn start(sim: &Simulator) -> Topology {
         let mut nodes = Vec::with_capacity(NUM_GROUPS);
-        for g in 0..NUM_GROUPS {
+        for ids in GROUP_IDS.iter().take(NUM_GROUPS) {
             let engine = MemoryEngine::new();
-            let ids = GROUP_IDS[g];
-            let scope = StorageScope::new(TABLES[g].as_bytes().to_vec(), KeyRange::whole());
+            let scope = StorageScope::new(KeyRange::whole());
             let group_nodes: Vec<Node> = ids
                 .iter()
                 .map(|&id| {
