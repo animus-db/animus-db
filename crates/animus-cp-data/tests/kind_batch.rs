@@ -49,7 +49,7 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
                 sim.env(nid(id)),
                 NODES.iter().copied().map(nid).collect(),
                 MemoryEngine::new(),
-                StorageScope::new(escape(b"users"), KeyRange::whole()),
+                StorageScope::new(KeyRange::whole()),
             )
         })
         .collect();

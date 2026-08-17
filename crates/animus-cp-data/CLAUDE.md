@@ -155,9 +155,11 @@ to the engine — the same sync-core/async-driver split as `animus-consensus`'s
 ### lib.rs API
 
 `RaftKvNode<E, S>` is the running tablet-group node (start/propose/read
-methods); `StorageScope` (ADR 0026/0028) confines a node's physical key
-access within a possibly node-shared `StorageEngine` (a `prefix` plus a
-live-narrowable `range`); `KvCommand::KindBatch` (ADR 0041 §3) is the
+methods); `StorageScope` (ADR 0050 rung 2, F2b) is a thin **kind-scoping**
+helper over a tablet's own private engine (a kind-byte `prefix` plus the
+tablet's **immutable** declared `range` — physical keys are
+`[kind] || logical`, no table or tablet bytes); `KvCommand::KindBatch`
+(ADR 0041 §3) is the
 multi-kind atomic batch backing materialized secondary indexes and the
 change log; **transactions** (ADR 0018 §2) are covered in Key invariants
 below. See the crate's rustdoc for the full method/accessor inventory.
@@ -165,11 +167,13 @@ Four rules that aren't derivable from a doc comment:
 
 - **A group owns a scope *set*, not one scope.** `with_kind(kind)` derives a
   sibling scope per row kind (`KIND_BASE`/`KIND_LSI`/`KIND_CHANGE`/
-  `KIND_FOOTPRINT`/`KIND_CURSOR`) over the *same* `Arc<Mutex<KeyRange>>`, so
-  one `narrow`/`widen` moves every kind at once. **`StorageScope::whole()`
-  is no longer an identity transform** — its base-kind scope prefixes one
-  `KIND_BASE` byte, so *any* group's physical key is `prefix || kind ||
-  logical`. **Anything reading a group's bytes straight off the engine must
+  `KIND_FOOTPRINT`/`KIND_CURSOR`), each carrying the same immutable
+  declared range (`narrow`/`widen` died with the zero-copy split, ADR
+  0050). **`StorageScope::whole()` is not an identity transform** — its
+  base-kind scope prefixes one `KIND_BASE` byte, so *any* group's physical
+  key is `[kind] || logical` (engine-global reserved-namespace markers lead
+  `0x5F` and match no kind). **Anything reading a group's bytes straight off
+  the engine must
   go through `RaftKvNode::physical_key(kind, key)` rather than assembling
   `prefix || key` itself** — hard-coding the layout was correct only while
   a group had exactly one scope, and four tests broke on exactly that
@@ -212,9 +216,9 @@ State once here; cross-referenced from the sections below.
     four points: WAL recovery, every received `AppendEntries`
     (`witness_append_entries`, before `RaftCore::handle` — every entry,
     accepted or not, since a redundant witness is always safe), snapshot
-    install, and group start (off the shared engine's own
-    `latest_version()`, which alone covers a restart or a co-hosted
-    sibling's already-present data).
+    install, and group start (off the tablet's own engine's
+    `latest_version()`, which alone covers a restart's already-present
+    data).
   - **The range seal** (`seal.rs`) closes the one residual witnessing alone
     cannot: an in-flight write from a source-group leader that hasn't yet
     observed a split, still in its own commit pipeline when the handoff
@@ -646,14 +650,15 @@ resolve is now moot).
   `animusd/tests/cp_plane.rs::single_write_latency_is_low` (median ~52ms →
   ~11ms).
 - **Unbounded scans must not fall through to `entries()`.** `local_scan`'s
-  `end: None` branch (used by `/admin/raftkv`'s `raft_view`, by `erase_scope()`
-  teardown, and transparently by `linearizable_scan` — the real DynamoDB
-  `Scan`/CQL full-table path) derives a bounded upper bound from
-  `physical_bounds` instead. `entries()` scans the **whole shared engine** (ADR
-  0028), so on a node hosting several tablets every unbounded scan cost
-  O(hosted tablets × whole node engine) — live-observed as `/admin/raftkv`
-  hanging for 20s+ on a grown, auto-split cluster. `entries()` remains the
-  fallback only for `StorageScope::whole()` (no finite bound).
+  `end: None` branch (used by `/admin/raftkv`'s `raft_view`, by teardown, and
+  transparently by `linearizable_scan` — the real DynamoDB `Scan`/CQL
+  full-table path) derives a bounded upper bound from `physical_bounds`
+  instead — post-F2b always finite for a kind scope (`[kind] .. [kind+1]`).
+  The engine is the tablet's own now (ADR 0050), so the historical
+  O(hosted tablets × node engine) blow-up can't recur, but the bounded
+  idiom stays: `entries()` would still walk sibling kinds and the
+  reserved-namespace markers. `entries()` remains the fallback only for the
+  un-prefixed parent scope (no finite bound).
 - Distinct WAL file (`raftkv.wal`) from the control plane's `raft.wal`, so a
   node can host both planes. The name is exported (`animus_cp_data::WAL`) so
   the drop-table GC (ADR 0024) can delete a stopped group's WAL.

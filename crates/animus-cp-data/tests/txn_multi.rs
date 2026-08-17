@@ -34,16 +34,16 @@ const SETTLE: Duration = Duration::from_secs(2);
 
 type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
 
-fn scope(prefix: &[u8]) -> StorageScope {
-    StorageScope::new(prefix.to_vec(), KeyRange::whole())
+fn scope(_prefix: &[u8]) -> StorageScope {
+    StorageScope::new(KeyRange::whole())
 }
 
-fn start_group(
-    sim: &Simulator,
-    ids: &[u64; 3],
-    engine: MemoryEngine,
-    prefix: &[u8],
-) -> Vec<KvNode> {
+fn start_group(sim: &Simulator, ids: &[u64; 3], prefix: &[u8]) -> Vec<KvNode> {
+    // ADR 0050 rung 1: each tablet group holds its own private engine (the
+    // pre-pivot version prefix-separated all groups on one shared engine —
+    // impossible under F2b's unprefixed keys). Replicas of ONE group still
+    // share a clone (the sim-idiom for per-replica durable state).
+    let engine = MemoryEngine::new();
     ids.iter()
         .map(|&id| {
             RaftKvNode::start_scoped(
@@ -349,9 +349,8 @@ fn run_txn(
 fn two_participant_commit_is_atomic_across_both_groups_and_every_replica() {
     let seed = 0x7A01;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
     sim.run_for(ELECT);
 
     let la = leader(&nodes_a, seed, "A");
@@ -391,10 +390,9 @@ fn two_participant_commit_is_atomic_across_both_groups_and_every_replica() {
 fn three_participant_commit_lands_on_all_three_groups() {
     let seed = 0x7A02;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"t1:");
-    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"t2:");
-    let nodes_c = start_group(&sim, &GROUP_C, engine.clone(), b"t3:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"t1:");
+    let nodes_b = start_group(&sim, &GROUP_B, b"t2:");
+    let nodes_c = start_group(&sim, &GROUP_C, b"t3:");
     sim.run_for(ELECT);
 
     let la = leader(&nodes_a, seed, "A");
@@ -432,9 +430,8 @@ fn three_participant_commit_lands_on_all_three_groups() {
 fn abort_restores_every_staged_participants_prior_value() {
     let seed = 0x7A03;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
     sim.run_for(ELECT);
 
     let la = leader(&nodes_a, seed, "A");
@@ -504,9 +501,8 @@ fn abort_restores_every_staged_participants_prior_value() {
 fn foreign_intent_resolves_via_the_anchor_records_status() {
     let seed = 0x7A04;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
     sim.run_for(ELECT);
 
     let la = leader(&nodes_a, seed, "A");
@@ -588,9 +584,8 @@ fn foreign_intent_resolves_via_the_anchor_records_status() {
 fn participant_stage_into_a_sealed_range_is_a_true_no_op() {
     let seed = 0x7A05;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
     sim.run_for(ELECT);
 
     let la = leader(&nodes_a, seed, "A");
@@ -660,9 +655,8 @@ fn participant_stage_into_a_sealed_range_is_a_true_no_op() {
 fn participant_leader_kill_during_prepare_converges_to_a_clean_abort() {
     let seed = 0x7A06;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
     sim.run_for(ELECT);
 
     let la = leader(&nodes_a, seed, "A");
@@ -726,8 +720,8 @@ fn two_participant_commit_is_reproducible_across_seeds() {
     for seed in [0x7B01u64, 0x7B02, 0x7B03, 0x7B04, 0x7B05] {
         let mut sim = Simulator::new(seed);
         let engine = MemoryEngine::new();
-        let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-        let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+        let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+        let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
         sim.run_for(ELECT);
 
         let la = leader(&nodes_a, seed, "A");
@@ -768,9 +762,8 @@ fn two_participant_commit_is_reproducible_across_seeds() {
 fn kind_bearing_participant_materializes_its_lsi_row_and_change_record_at_resolve() {
     let seed = 0x7A10;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
     sim.run_for(ELECT);
 
     let la = leader(&nodes_a, seed, "A");

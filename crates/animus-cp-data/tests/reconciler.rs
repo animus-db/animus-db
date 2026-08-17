@@ -31,15 +31,10 @@ const OTHER: u64 = 301;
 const TABLE: &str = "t";
 type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
 
-fn prefix_for(table: &str) -> Vec<u8> {
-    table.as_bytes().to_vec()
-}
-
-/// ADR 0041 §3: a group's physical prefix is its parent scope's prefix
-/// (`prefix_for(TABLE)`) plus the row-kind byte — ordinary data is `KIND_BASE`.
+/// F2b (ADR 0050 rung 2): a group's physical key is its row-kind byte plus
+/// the logical key — no table prefix, no tablet identity in the bytes.
 fn physical(key: &[u8]) -> Vec<u8> {
-    let mut out = prefix_for(TABLE);
-    out.push(animus_cp_data::KIND_BASE);
+    let mut out = vec![animus_cp_data::KIND_BASE];
     out.extend_from_slice(key);
     out
 }
@@ -132,7 +127,6 @@ fn reconciler_hosts_releases_and_spares_a_co_hosted_siblings_own_engine() {
             task_env.clone(),
             reconciler_engines,
             nid(BASE),
-            prefix_for,
             move |tablet, _node| h_log.lock().unwrap().push(tablet),
             move |tablet| t_log.lock().unwrap().push(tablet),
         );
@@ -150,7 +144,7 @@ fn reconciler_hosts_releases_and_spares_a_co_hosted_siblings_own_engine() {
             other_env,
             vec![nid(BASE), nid(OTHER)],
             other_storage,
-            StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
+            StorageScope::new(KeyRange::whole()),
             1,
         );
         task_env.sleep(Duration::from_secs(2)).await; // let both sides settle

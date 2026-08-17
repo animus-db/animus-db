@@ -737,10 +737,6 @@ pub struct Reconciler<E: Env, S: StorageEngine> {
     /// [`LocalState::hosted`], but holding the live handle, not just the id).
     hosted: BTreeMap<TabletId, RaftKvNode<E, S>>,
     state: LocalState,
-    /// `table name -> StorageScope` prefix (`animusd`'s `escape(table)`) —
-    /// supplied by the caller so this crate never duplicates the wire-edge
-    /// key-escaping convention (see `StorageScope`'s own doc).
-    prefix_for: PrefixFn,
     /// Mirror a fresh (or re-registered-after-a-timed-out-teardown) hosting
     /// into the caller's own routing registry. Called once per successful
     /// [`HostAction::Host`], and again if a `Release`/`Reclaim` teardown times
@@ -760,9 +756,6 @@ pub struct Reconciler<E: Env, S: StorageEngine> {
     quiesce_after: Option<Duration>,
 }
 
-/// `table name -> StorageScope` prefix hook — see [`Reconciler`]'s
-/// `prefix_for` field doc.
-type PrefixFn = Box<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
 /// Fresh/re-registered-hosting mirror hook — see [`Reconciler`]'s `on_host`
 /// field doc.
 type OnHostFn<E, S> = Box<dyn Fn(TabletId, &RaftKvNode<E, S>) + Send + Sync>;
@@ -778,17 +771,15 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// hosted tablet gets its **own private engine**, opened via
     /// `factory.open(tablet)` at host time and destroyed (files deleted) at
     /// release/reclaim. `base_id` is this node's identity in a tablet's
-    /// replica set. `prefix_for` maps a table name to its `StorageScope`
-    /// prefix (the caller's own escaping convention — this crate never
-    /// invents one); `on_host`/`on_teardown` mirror hosting changes into the
-    /// caller's own routing registry, letting `Reconciler` stay the single
-    /// writer of hosting state while the caller's registry becomes a
-    /// read-only mirror.
+    /// replica set. (F2b: physical keys carry no table prefix, so the old
+    /// `prefix_for` table-escaping seam is gone.) `on_host`/`on_teardown`
+    /// mirror hosting changes into the caller's own routing registry, letting
+    /// `Reconciler` stay the single writer of hosting state while the
+    /// caller's registry becomes a read-only mirror.
     pub fn new(
         env: E,
         factory: impl EngineFactory<S> + 'static,
         base_id: NodeId,
-        prefix_for: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static,
         on_host: impl Fn(TabletId, &RaftKvNode<E, S>) + Send + Sync + 'static,
         on_teardown: impl Fn(TabletId) + Send + Sync + 'static,
     ) -> Self {
@@ -799,7 +790,6 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             base_id,
             hosted: BTreeMap::new(),
             state: LocalState::default(),
-            prefix_for: Box::new(prefix_for),
             on_host: Box::new(on_host),
             on_teardown: Box::new(on_teardown),
             quiesce_after: None,
@@ -898,9 +888,18 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     }
                 }
                 HostAction::NarrowScope { tablet, range } => {
-                    if let Some(node) = self.hosted.get(&tablet) {
-                        node.narrow_scope(range);
-                    }
+                    // ADR 0050 rung 2: a tablet's range is immutable and the
+                    // zero-copy split that narrowed a live scope is disabled,
+                    // so this action is structurally unplannable now
+                    // (`gather_facts` reads the same immutable range
+                    // `Metadata` declares — they can never disagree). The
+                    // variant survives, inert, until the Train B deletion
+                    // sweep removes the whole zero-copy lifecycle.
+                    tracing::warn!(
+                        tablet = tablet.0,
+                        ?range,
+                        "NarrowScope planned for an immutable-range tablet — inert (ADR 0050)"
+                    );
                 }
                 HostAction::Host {
                     tablet,
@@ -1004,18 +1003,11 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             let has_data = if self.factory.probe(tablet).await {
                 match self.ensure_engine(tablet).await {
                     Some(engine) => {
-                        let scope = StorageScope::new(
-                            (self.prefix_for)(t.table.as_deref().unwrap_or_default()),
-                            t.range.clone(),
-                        );
-                        // ADR 0041 §3: ask the **base**-kind scope. `scope`
-                        // here is the parent, whose prefix every kind sits
-                        // under — stripping it would leave a leading kind
-                        // byte ahead of the token and the range check would
-                        // be meaningless. Base rows are also the right signal
-                        // for the reforming-vs-fresh-join question this
-                        // answers: the other kinds only ever exist alongside
-                        // base rows.
+                        let scope = StorageScope::new(t.range.clone());
+                        // ADR 0041 §3: ask the **base**-kind scope. Base rows
+                        // are the right signal for the reforming-vs-fresh-join
+                        // question this answers: the other kinds only ever
+                        // exist alongside base rows.
                         scope.with_kind(crate::KIND_BASE).has_data(&engine).await
                     }
                     None => false,
@@ -1062,7 +1054,10 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         &mut self,
         view: &MetadataView,
         tablet: TabletId,
-        table: &str,
+        // Unused since F2b removed the table prefix from physical keys; the
+        // parameter stays because `HostAction::Host` still carries the table
+        // (plan-output shape, swept in the Train B deletion rung).
+        _table: &str,
         range: KeyRange,
         initial_formation: bool,
     ) {
@@ -1075,7 +1070,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         let Some(engine) = self.ensure_engine(tablet).await else {
             return;
         };
-        let scope = StorageScope::new((self.prefix_for)(table), range);
+        let scope = StorageScope::new(range);
         let full: Vec<NodeId> = t.replicas.clone();
         let others: Vec<NodeId> = full
             .iter()

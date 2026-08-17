@@ -530,8 +530,12 @@ with a `PARKED (ADR 0050 ...)` reason until the copy-based workflow lands
 in this train's later rungs. The pre-pivot design for reference:
 (ADR 0028, `MetaCommand::SplitTablet`, epoch-CAS gated) a
 single atomic control-plane command with no data-plane half — narrows the
-source's range and mints a sibling on the same shared engine. Exposed via
-`POST /admin/tablet/split` + `ClientRequest::SplitTablet` (relayable).
+source's range and mints a sibling over the same physical rows.
+**DISABLED since ADR 0050 Train B rung 1** (`SPLIT_DISABLED`): zero-copy
+split cannot run across per-tablet private engines; every split surface
+(`POST /admin/tablet/split` + `ClientRequest::SplitTablet`, auto-split,
+stream-grow) returns `SPLIT_DISABLED_MSG` until the copy-based split
+workflow lands in this train's later rungs.
 (Merge — `MetaCommand::MergeTablets` and the reconciler's `WidenScope`/
 `Absorb` reaction — was removed entirely by ADR 0044, superseding ADR
 0033.)
@@ -573,10 +577,10 @@ would orphan it forever. The three steps run in a load-bearing order: (1)
 read `metadata_fresh` and drop each **global** index's hidden table's
 tablets via the same `MetaCommand::DropTableTablets` the base table itself
 uses; (2) drop the base schema; (3) drop the base table's own tablets (base
-+ colocated **LSI** rows + change log + footprints — all four
-`StorageScope` kinds share one tablet group, so `CpGroup::erase_scope`
-iterating `kind_scopes` reclaims every one; an LSI needs no separate
-cascade step). A crash between any two steps leaves a state a re-run of
++ colocated **LSI** rows + change log + footprints — every kind lives in
+the tablet's own private engine, so the reconciler's `Reclaim` deleting
+that engine's files reclaims every kind at once (ADR 0050 rung 1); an LSI
+needs no separate cascade step). A crash between any two steps leaves a state a re-run of
 `drop_table` completes, since every step is independently idempotent.
 **Belt-and-suspenders second sweep**: the GSI drain (`index_drain.rs`)
 provisions a hidden table's first tablet lazily and can race a drop, so

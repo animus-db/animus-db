@@ -48,16 +48,14 @@ const PAST_GRACE: Duration = Duration::from_secs(6);
 
 type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
 
-fn scope(prefix: &[u8]) -> StorageScope {
-    StorageScope::new(prefix.to_vec(), KeyRange::whole())
+fn scope(_prefix: &[u8]) -> StorageScope {
+    StorageScope::new(KeyRange::whole())
 }
 
-fn start_group(
-    sim: &Simulator,
-    ids: &[u64; 3],
-    engine: MemoryEngine,
-    prefix: &[u8],
-) -> Vec<KvNode> {
+fn start_group(sim: &Simulator, ids: &[u64; 3], prefix: &[u8]) -> Vec<KvNode> {
+    // ADR 0050 rung 1: each tablet group holds its own private engine;
+    // replicas of ONE group share a clone (per-replica durable-state idiom).
+    let engine = MemoryEngine::new();
     ids.iter()
         .map(|&id| {
             RaftKvNode::start_scoped(
@@ -382,9 +380,8 @@ fn push(
 fn push_commits_when_every_participant_staged_and_grace_elapsed() {
     let seed = 0x9A01;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
     sim.run_for(ELECT);
 
     let la = leader(&nodes_a, seed, "A");
@@ -455,9 +452,8 @@ fn push_commits_when_every_participant_staged_and_grace_elapsed() {
 fn push_aborts_when_a_participant_never_staged() {
     let seed = 0x9A02;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
     sim.run_for(ELECT);
 
     let la = leader(&nodes_a, seed, "A");
@@ -518,8 +514,7 @@ fn push_aborts_when_a_participant_never_staged() {
 fn a_recovery_abort_beats_a_late_coordinator_commit_with_no_assert() {
     let seed = 0x9A03;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
     sim.run_for(ELECT);
     let la = leader(&nodes_a, seed, "A");
     let ka = key(1, b":order");
@@ -588,8 +583,7 @@ fn a_recovery_abort_beats_a_late_coordinator_commit_with_no_assert() {
 fn duelling_recoverers_converge_on_one_decision_with_no_assert() {
     let seed = 0x9A04;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
     sim.run_for(ELECT);
     let la = leader(&nodes_a, seed, "A");
     let ka = key(1, b":order");
@@ -649,9 +643,8 @@ fn duelling_recoverers_converge_on_one_decision_with_no_assert() {
 fn push_declines_before_grace_elapses() {
     let seed = 0x9A05;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
     sim.run_for(ELECT);
     let la = leader(&nodes_a, seed, "A");
     let lb = leader(&nodes_b, seed, "B");
@@ -725,9 +718,8 @@ fn push_declines_before_grace_elapses() {
 fn push_aborts_an_orphan_intent_with_no_record_anywhere() {
     let seed = 0x9A08;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
     sim.run_for(ELECT);
 
     let la = leader(&nodes_a, seed, "A");
@@ -860,9 +852,11 @@ fn push_aborts_an_orphan_intent_with_no_record_anywhere() {
 fn pending_txns_reflects_applies_across_restart() {
     let seed = 0x9A06;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
     let id = nid(GROUP_A[0]);
     let ka = key(1, b":order");
+    // This replica's own durable engine — reused across the restart below
+    // (the sim idiom for per-replica durable state; NOT cross-group sharing).
+    let engine = MemoryEngine::new();
 
     let node: KvNode = RaftKvNode::start_scoped(
         sim.env(id.clone()),
@@ -948,8 +942,8 @@ fn recovery_commit_is_reproducible_across_seeds() {
     for seed in [0x9B01u64, 0x9B02, 0x9B03, 0x9B04, 0x9B05] {
         let mut sim = Simulator::new(seed);
         let engine = MemoryEngine::new();
-        let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-        let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+        let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+        let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
         sim.run_for(ELECT);
 
         let la = leader(&nodes_a, seed, "A");
@@ -1031,8 +1025,7 @@ fn recovery_commit_is_reproducible_across_seeds() {
 fn duelling_commits_at_different_timestamps_the_second_is_a_no_op_never_a_panic() {
     let seed = 0x9C01;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
     sim.run_for(ELECT);
     let la = leader(&nodes_a, seed, "A");
     let ka = key(1, b":order");
@@ -1105,7 +1098,7 @@ fn duelling_commits_at_different_timestamps_are_reproducible_across_seeds() {
     for seed in [0x9C11u64, 0x9C12, 0x9C13, 0x9C14, 0x9C15] {
         let mut sim = Simulator::new(seed);
         let engine = MemoryEngine::new();
-        let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+        let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
         sim.run_for(ELECT);
         let la = leader(&nodes_a, seed, "A");
         let ka = key(1, b":order");
@@ -1158,9 +1151,8 @@ fn duelling_commits_at_different_timestamps_are_reproducible_across_seeds() {
 fn duelling_commits_resolve_every_participant_consistently_never_torn() {
     let seed = 0x9C21;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
-    let nodes_b = start_group(&sim, &GROUP_B, engine.clone(), b"accounts:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
+    let nodes_b = start_group(&sim, &GROUP_B, b"accounts:");
     sim.run_for(ELECT);
     let la = leader(&nodes_a, seed, "A");
     let lb = leader(&nodes_b, seed, "B");
@@ -1353,8 +1345,7 @@ fn duelling_commits_resolve_every_participant_consistently_never_torn() {
 fn stage_over_a_foreign_pending_intent_no_ops_then_a_pushed_retry_succeeds() {
     let seed = 0xB16C;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
     sim.run_for(ELECT);
     let la = leader(&nodes_a, seed, "A");
     let ka = key(1, b":order");
@@ -1481,8 +1472,7 @@ fn stage_over_a_foreign_pending_intent_no_ops_then_a_pushed_retry_succeeds() {
 fn abort_restore_never_meets_another_transactions_intent() {
     let seed = 0xB16D;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
     sim.run_for(ELECT);
     let la = leader(&nodes_a, seed, "A");
     let ka = key(1, b":order");
@@ -1598,8 +1588,7 @@ fn abort_restore_never_meets_another_transactions_intent() {
 fn a_resolve_carrying_the_wrong_outcome_no_ops_against_the_anchors_own_record() {
     let seed = 0xB16E;
     let mut sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
-    let nodes_a = start_group(&sim, &GROUP_A, engine.clone(), b"orders:");
+    let nodes_a = start_group(&sim, &GROUP_A, b"orders:");
     sim.run_for(ELECT);
     let la = leader(&nodes_a, seed, "A");
     let ka = key(1, b":order");

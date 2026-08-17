@@ -213,34 +213,30 @@ mod tests {
     }
 
     #[test]
-    fn key_disjoint_from_table_scope_prefixes() {
-        // A real table's StorageScope prefix is escape(table_name); none of
-        // these can ever equal or prefix-match the seal marker's own key,
-        // by the injective/prefix-free argument in this module's doc.
-        for table in ["", "users", "__animus_system_backup", "orders"] {
-            let table_prefix = escape(table.as_bytes());
-            let marker = seal_marker_key(7, &r(b"a", Some(b"z")));
-            assert!(
-                !marker.starts_with(&table_prefix) || table_prefix.is_empty(),
-                "marker key must not fall inside table {table:?}'s own scope"
-            );
-            // The only way `table_prefix` could be empty is `StorageScope::whole()`,
-            // which never comes from `escape` (whole() uses a raw empty Vec,
-            // not escape("")) — so real table prefixes are always non-empty
-            // and this assertion has teeth for every case above.
-            assert!(!table_prefix.is_empty() || table.is_empty());
-        }
+    fn key_disjoint_from_every_kind_scope() {
+        // F2b (ADR 0050 rung 2): a kind scope's physical keys lead with a
+        // kind byte (0x00..=0x04); the seal marker's key leads with
+        // `escape(RESERVED_NAMESPACE)`'s first byte, `b'_'` = 0x5F. First
+        // bytes alone keep a marker physically resident in a tablet's
+        // private engine invisible to every kind scope's strip — the
+        // pre-pivot table-prefix disjointness argument, one level lower.
+        let marker = seal_marker_key(7, &r(b"a", Some(b"z")));
+        assert_eq!(marker[0], 0x5F, "marker keys lead with escape('__…')");
+        assert!(
+            crate::ALL_KINDS.iter().all(|&k| k < 0x5F),
+            "every kind byte must sort below the reserved-namespace lead byte"
+        );
     }
 
     #[test]
-    fn reserved_namespace_prefix_never_equals_an_escaped_table_name() {
-        // escape("") == [0,0], which IS the legacy whole-keyspace tablet's
-        // StorageScope prefix under animusd::table_scope_prefix(""). Confirm
-        // our reserved namespace's escape does NOT collide with it.
-        let empty_table_prefix = escape(b"");
+    fn reserved_namespace_escape_is_stable() {
+        // The 0x5F-lead claim above is only as good as `escape`'s shape:
+        // escape emits the input's own first byte first (0x00 doubling never
+        // changes byte zero of a non-empty input), so the namespace's `_`
+        // lead survives escaping verbatim.
         let ns_prefix = escape(RESERVED_NAMESPACE.as_bytes());
-        assert_ne!(empty_table_prefix, ns_prefix);
-        assert!(!ns_prefix.starts_with(&empty_table_prefix) || empty_table_prefix.is_empty());
+        assert_eq!(ns_prefix[0], b'_');
+        assert_ne!(escape(b""), ns_prefix);
     }
 
     #[test]

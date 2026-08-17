@@ -43,26 +43,6 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
     (sim, nodes)
 }
 
-/// Like [`group`], but every node starts with a real (non-`whole`) scoped
-/// `StorageScope` — the shape `animusd`'s `cp_join_host` constructs a tablet's
-/// `RaftKvNode` with — so [`RaftKvNode::narrow_scope`]/[`RaftKvNode::scope_range`]
-/// exercise the same live-narrowable range a real split narrows.
-fn scoped_group(seed: u64) -> (Simulator, Vec<KvNode>) {
-    let sim = Simulator::new(seed);
-    let nodes = NODES
-        .iter()
-        .map(|&id| {
-            RaftKvNode::start_scoped(
-                sim.env(nid(id)),
-                NODES.iter().copied().map(nid).collect(),
-                MemoryEngine::new(),
-                StorageScope::new(b"T:".to_vec(), KeyRange::whole()),
-            )
-        })
-        .collect();
-    (sim, nodes)
-}
-
 /// Only consider nodes in `live` — a stopped node's core is frozen and keeps
 /// reporting its last state, so a halted former leader would otherwise still
 /// show `is_leader() == true` and be double-counted alongside its successor.
@@ -323,32 +303,38 @@ fn fence_decision_is_per_entry_not_retroactively_reconsidered() {
 }
 
 /// `RaftKvNode::scope_range` (ADR 0028 write-fence wiring, PR2's additive
-/// accessor): a caller reads the group's own **live** `StorageScope` range and
-/// stamps it as a proposed command's fence — the exact pattern `animusd`'s
-/// `cp_put_local`/`cp_delete_local`/`cp_batch_propose` use before proposing a
-/// real CP write. Narrow the scope after start (as a real single-command
-/// split would on the source tablet's already-hosted `RaftKvNode`, via
-/// `narrow_scope`), confirm `scope_range()` reflects it, then confirm a
-/// `put_fenced` stamped from that reading applies as a no-op on every replica
-/// for a since-handed-off key while a still-owned key applies normally — the
-/// narrowed-scope leader's fenced put for an out-of-range key is a no-op
-/// everywhere.
+/// accessor): a caller reads the group's own declared `StorageScope` range
+/// and stamps it as a proposed command's fence — the exact pattern
+/// `animusd`'s `cp_put_local`/`cp_delete_local`/`cp_batch_propose` use before
+/// proposing a real CP write. (ADR 0050: the range is immutable from birth —
+/// the pre-pivot version of this test narrowed a live scope mid-flight; the
+/// fence-gates-apply property it proved is unchanged, now against a group
+/// *born* with the narrow declared range.) A `put_fenced` stamped from
+/// `scope_range()` applies as a no-op on every replica for a key outside the
+/// declared range while an in-range key applies normally.
 #[test]
-fn scope_range_reflects_narrowing_and_a_fence_stamped_from_it_gates_apply() {
+fn a_fence_stamped_from_the_declared_range_gates_apply() {
     let seed = 0xFE9;
-    let (mut sim, nodes) = scoped_group(seed);
+    let sim = Simulator::new(seed);
+    let nodes: Vec<KvNode> = NODES
+        .iter()
+        .map(|&id| {
+            RaftKvNode::start_scoped(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+                StorageScope::new(lower_half()),
+            )
+        })
+        .collect();
+    let mut sim = sim;
     sim.run_for(Duration::from_secs(2));
     let l = leader(&nodes, &[0, 1, 2], seed);
 
-    // Every replica narrows its own scope, as the join-host loop's
-    // `narrow_scope` call does on a real split's source tablet.
-    for n in &nodes {
-        n.narrow_scope(lower_half());
-    }
     assert_eq!(
         nodes[l].scope_range(),
         lower_half(),
-        "scope_range() must reflect the narrowed range (seed={seed})"
+        "scope_range() must reflect the declared range (seed={seed})"
     );
 
     // Stamp the group's own live scope_range() as the fence, exactly as
@@ -413,27 +399,28 @@ const SETTLE: Duration = Duration::from_millis(300);
 /// per-key resolve write itself ever physically landed — see
 /// `resolve_once_step`'s doc) — only a raw read off the shared engine can
 /// distinguish "still a `Pending` intent" from "actually resolved."
-fn two_tablets_sharing_one_engine(seed: u64) -> (Simulator, KvNode, KvNode, MemoryEngine) {
+fn two_tablets(seed: u64) -> (Simulator, KvNode, KvNode, MemoryEngine, MemoryEngine) {
     let sim = Simulator::new(seed);
-    let engine = MemoryEngine::new();
+    // ADR 0050 rung 1/2: sibling tablets of one table hold their own private
+    // engines (the pre-pivot shared-engine construction is gone — under F2b
+    // keys, two same-table groups on one engine would collide byte-for-byte).
+    let engine_a = MemoryEngine::new();
+    let engine_b = MemoryEngine::new();
     let a: KvNode = RaftKvNode::start_hosted(
         sim.env(nid(0)),
         vec![nid(0)],
-        engine.clone(),
-        StorageScope::new(
-            b"T:".to_vec(),
-            KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec())),
-        ),
+        engine_a.clone(),
+        StorageScope::new(KeyRange::new(Vec::new(), Some(BOUNDARY.to_vec()))),
         1,
     );
     let b: KvNode = RaftKvNode::start_hosted(
         sim.env(nid(0)),
         vec![nid(0)],
-        engine.clone(),
-        StorageScope::new(b"T:".to_vec(), KeyRange::new(BOUNDARY.to_vec(), None)),
+        engine_b.clone(),
+        StorageScope::new(KeyRange::new(BOUNDARY.to_vec(), None)),
         2,
     );
-    (sim, a, b, engine)
+    (sim, a, b, engine_a, engine_b)
 }
 
 /// The envelope tag byte every apply-path write prefixes a value with
@@ -488,28 +475,30 @@ fn drive<T: Send + 'static>(
 /// A `TxnResolve` misrouted to the wrong tablet's group — the exact shape
 /// `ClientCtx::recovery_resolve`'s pre-fix table-only grouping could produce
 /// for a split table — is rejected by its own embedded `fence`, exactly like
-/// `Put`/`Batch`/`Delete`/`Cas` above, rather than silently applying onto the
-/// other tablet's shared physical key. The correct tablet's own resolve still
+/// `Put`/`Batch`/`Delete`/`Cas` above. Under per-tablet engines (ADR 0050)
+/// the misroute can no longer corrupt the owning tablet's physical key (the
+/// engines are disjoint); the fence's remaining job is keeping the misrouted
+/// entry from depositing a spurious row in the *wrong* tablet's own engine —
+/// both halves asserted below. The correct tablet's own resolve still
 /// succeeds normally.
 #[test]
 fn txn_resolve_misrouted_to_the_wrong_tablet_is_rejected_by_its_own_fence() {
     let seed = 0xFE10;
-    let (mut sim, a, b, engine) = two_tablets_sharing_one_engine(seed);
+    let (mut sim, a, b, engine_a, engine_b) = two_tablets(seed);
     sim.run_for(Duration::from_secs(2)); // elect (single voter, both groups)
 
     // `b_key` belongs to tablet B's own range (`>= BOUNDARY`) and leads with
     // the 8-byte partition token `txn_stage_anchor` requires (ADR 0022).
-    // `physical_key` is the shared engine's real address for it: `prefix ||
-    // KIND_BASE || logical` (a group's physical key always carries the
-    // row-kind byte, ADR 0041 §3 — see `RaftKvNode::physical_key`'s doc) —
-    // both groups' `StorageScope`s share the `b"T:"` prefix (ADR 0028), so
-    // this is the same address regardless of which group writes to it.
+    // `physical_key` is a tablet engine's real address for it: `[KIND_BASE]
+    // || logical` (F2b — a group's physical key carries the row-kind byte
+    // and nothing else, see `RaftKvNode::physical_key`'s doc) — the same
+    // bytes in either group's own engine.
     let b_key = {
         let mut k = vec![0xffu8; animus_tablet::TOKEN_BYTES];
         k.extend_from_slice(b"b");
         k
     };
-    let physical_key = [b"T:".as_slice(), &[KIND_BASE], b_key.as_slice()].concat();
+    let physical_key = [[KIND_BASE].as_slice(), b_key.as_slice()].concat();
 
     let b_env = b.env().clone();
     let n = b.clone();
@@ -531,9 +520,9 @@ fn txn_resolve_misrouted_to_the_wrong_tablet_is_rejected_by_its_own_fence() {
         "B's own anchor stage must land cleanly (seed={seed})"
     );
     assert_eq!(
-        raw_envelope_tag(&engine, &physical_key),
+        raw_envelope_tag(&engine_b, &physical_key),
         RawEnvelopeTag::Intent,
-        "the stage must leave b_key as an unresolved intent (seed={seed})"
+        "the stage must leave b_key as an unresolved intent in B's own engine (seed={seed})"
     );
 
     let n = b.clone();
@@ -546,7 +535,7 @@ fn txn_resolve_misrouted_to_the_wrong_tablet_is_rejected_by_its_own_fence() {
     .expect("B's own commit applies");
     let committed = TxnOutcome::Committed { commit_ts };
     assert_eq!(
-        raw_envelope_tag(&engine, &physical_key),
+        raw_envelope_tag(&engine_b, &physical_key),
         RawEnvelopeTag::Intent,
         "committing the anchor's own record must not itself touch b_key — only a \
          real per-key resolve does (seed={seed})"
@@ -574,11 +563,16 @@ fn txn_resolve_misrouted_to_the_wrong_tablet_is_rejected_by_its_own_fence() {
          its effect on the key, not whether the entry itself lands (seed={seed})"
     );
     assert_eq!(
-        raw_envelope_tag(&engine, &physical_key),
+        raw_envelope_tag(&engine_b, &physical_key),
         RawEnvelopeTag::Intent,
-        "A's own fence excludes b_key — the misrouted resolve must leave the physical \
-         intent untouched (both groups share the same physical key here, ADR 0028, so \
-         this also proves it wasn't silently corrupted with A's own clock) (seed={seed})"
+        "B's intent must be untouched by a resolve applied in a different group \
+         (structural under private engines) (seed={seed})"
+    );
+    assert_eq!(
+        raw_envelope_tag(&engine_a, &physical_key),
+        RawEnvelopeTag::Absent,
+        "A's own fence excludes b_key — the misrouted resolve must not deposit a \
+         spurious row in A's own engine either (seed={seed})"
     );
 
     // The correct resolve, from B's own group (whose fence covers b_key),
@@ -594,7 +588,7 @@ fn txn_resolve_misrouted_to_the_wrong_tablet_is_rejected_by_its_own_fence() {
         "B's own correct resolve applies (seed={seed})"
     );
     assert_eq!(
-        raw_envelope_tag(&engine, &physical_key),
+        raw_envelope_tag(&engine_b, &physical_key),
         RawEnvelopeTag::Committed,
         "the correctly-routed resolve must still land normally (seed={seed})"
     );

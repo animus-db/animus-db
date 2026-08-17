@@ -69,7 +69,7 @@ use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
     WalRecordView,
 };
-use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId, escape};
+use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -484,9 +484,10 @@ impl CpGroup {
 
     /// The node's `raftkv` env this group runs on. Since ADR 0026 Stage B every
     /// tablet a node hosts shares this **same** env (stream-addressed, not a
-    /// distinct per-tablet id/env) — used to identify *this node's* handle in the
-    /// shared edge registry (`node_id()`), not to locate per-tablet files (the
-    /// engine is shared too; see [`LSM_PREFIX`]).
+    /// distinct per-tablet id/env) — used to identify *this node's* handle in
+    /// the shared edge registry (`node_id()`). Per-tablet files are located by
+    /// the engine factory's own `db-t{t}-` naming (ADR 0050 rung 1), not by
+    /// env identity.
     fn env(&self) -> &ProdEnv {
         match self {
             CpGroup::Lsm(n) => n.env(),
@@ -578,14 +579,12 @@ impl CpGroup {
     /// call the identical `RaftKvNode` accessors, so a local macro keeps it DRY.
     /// `key_count`/`byte_size` are this tablet's own **exact,
     /// `StorageScope`-scoped** count/total ([`local_pairs`](Self::local_pairs))
-    /// — *not* the cheap, unscoped [`approx_key_count`](Self::approx_key_count)
-    /// / scoped-but-approximate [`approx_bytes`](Self::approx_bytes) estimates
-    /// `auto_split_loop` uses as a fast gate. `approx_key_count` reads the whole
-    /// shared engine and so reports every co-resident tablet's combined count —
-    /// a node hosts more than one tablet on the same engine as soon as it hosts
-    /// a split's parent + child (ADR 0028), which is why the unscoped estimate
-    /// showed a mid-split tablet's row as the *node's* total rather than its own
-    /// subset. This is a debug surface, so the materialize-then-count cost is
+    /// — *not* the cheap [`approx_key_count`](Self::approx_key_count) /
+    /// [`approx_bytes`](Self::approx_bytes) estimates `auto_split_loop` uses
+    /// as a fast gate. (Since ADR 0050 rung 1 the engine is the tablet's own,
+    /// so those estimates no longer over-count co-resident siblings; the
+    /// exact count here remains the debug-grade answer, the estimates the
+    /// cheap one.) This is a debug surface, so the materialize-then-count cost is
     /// acceptable (mirrors `local_scan`'s browse-keys view); `byte_size` is
     /// summed from the same materialized pairs, no second engine call needed.
     async fn raft_view(&self, tablet: TabletId) -> admin::CpRaftView {
@@ -2731,7 +2730,6 @@ impl BoundNode {
                     hook_env.clone(),
                     LsmTabletFactory { env: hook_env },
                     my_id.clone(),
-                    table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
                     },
@@ -2741,7 +2739,6 @@ impl BoundNode {
                     hook_env,
                     MemoryTabletEngines::new(),
                     my_id.clone(),
-                    table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
                         host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
                     },
@@ -3859,7 +3856,6 @@ impl BoundDataNode {
                     hook_env.clone(),
                     LsmTabletFactory { env: hook_env },
                     my_id.clone(),
-                    table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
                     },
@@ -3869,7 +3865,6 @@ impl BoundDataNode {
                     hook_env,
                     MemoryTabletEngines::new(),
                     my_id.clone(),
-                    table_scope_prefix,
                     move |tablet, node: &RaftKvNode<ProdEnv, MemoryEngine>| {
                         host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
                     },
@@ -9451,15 +9446,6 @@ impl SharedEngine {
     }
 }
 
-/// The `StorageScope` prefix confining `table`'s tablets on a node's shared
-/// engine: `escape(table)`. Order-preserving and prefix-free
-/// (`animus_tablet::escape`), so one table's keys can never collide with
-/// another's even though every table's tablets share one physical
-/// `LsmEngine`/`MemoryEngine` (ADR 0026/0028).
-fn table_scope_prefix(table: &str) -> Vec<u8> {
-    escape(table.as_bytes())
-}
-
 /// ADR 0050 (Train B rung 1): the old zero-copy split is disabled for the
 /// duration of the storage pivot — flipped back off (and then deleted with
 /// the mechanism it gates) when the copy-based split workflow lands in this
@@ -13393,7 +13379,7 @@ mod hot_read_latch_tests {
         let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), dir.path())
             .await
             .expect("bind");
-        let scope = StorageScope::new(b"t".to_vec(), range);
+        let scope = StorageScope::new(range);
         let node: RaftKvNode<ProdEnv, MemoryEngine> =
             RaftKvNode::start_hosted(env, vec![nid(0)], MemoryEngine::new(), scope, 1);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

@@ -237,37 +237,32 @@ impl Future for WakePending<'_> {
 }
 
 /// The physical key-space a `RaftKvNode`'s group is confined to within a
-/// possibly-**shared** `StorageEngine` (ADR 0028): every physical key this
-/// group ever writes is `prefix || key`, and a read is bounded to physical
-/// keys whose stripped (post-prefix) suffix falls inside `range`. `prefix`
-/// identifies the *table* (stable across splits — many sibling tablets of one
-/// table share a prefix), `range` the *tablet's own sub-portion* within it
-/// (the same range recorded in the control plane's `Metadata`).
+/// this tablet's own **private** `StorageEngine` (ADR 0050 Train B): every
+/// physical key this group ever writes is `[kind] || logical_key` (F2b) — no
+/// table prefix, no tablet identity in the bytes, because a private engine
+/// holds exactly one tablet of exactly one table (identity lives in the
+/// engine's file namespace, `host::EngineFactory`). What survives here is
+/// **kind scoping** (ADR 0041 §3): a group owns one scope per row kind, and a
+/// kind scope's `prefix` is its single kind byte.
 ///
-/// [`whole`](Self::whole) — empty prefix, the whole keyspace — makes every
-/// physical-key operation an identity transform, used by the plain-client
-/// `ClientRequest` path (which has no table concept) and by every test that
-/// doesn't need multi-tenant scoping.
+/// `range` is the tablet's **declared** [`KeyRange`] — **immutable from
+/// birth** (ADR 0050: a tablet's range never changes; a split builds new
+/// tablets rather than narrowing this one). It no longer bounds any physical
+/// access — the engine itself is the boundary — and is retained only as the
+/// group's own copy of its `Metadata`-declared range for the pre-propose
+/// routing check ([`RaftKvNode::scope_range`]) and the fence stamped on
+/// proposals (both scheduled for the Train B deletion sweep once the
+/// route-time `Active` filter replaces them).
 ///
-/// **`range` is live-narrowable** ([`narrow`](Self::narrow)), not fixed at
-/// construction: when this tablet is later the *source* of a (control-plane,
-/// single-command) split, its own range shrinks while its physical data does
-/// **not** move — the handed-off portion stays physically resident under the
-/// same `prefix` until the new sibling tablet's own writes/GC reclaim it. A
-/// stale, too-wide `range` is harmless for a caller-bounded read (the
-/// physical scan is already bounded by the caller's own up-to-date
-/// `Metadata`-derived bounds), but it is **not** harmless for
-/// [`engine_image`] — an unbounded, self-contained snapshot capture with no
-/// caller-supplied bounds — which would otherwise ship the already-handed-off
-/// portion to a new replica joining this (shrunk) tablet's group, duplicating
-/// data a *different* Raft group is now the sole authority for. All clones of
-/// a `StorageScope` share the same live `range` (an `Arc`), so narrowing the
-/// copy held by the driver task also narrows the one `RaftKvNode` itself
-/// holds.
+/// Engine-global marker keys (`seal.rs`/`ceiling.rs`/the syskv namespace)
+/// stay structurally disjoint from every kind scope: they lead with
+/// `escape(RESERVED_NAMESPACE)`'s first byte (`b'_'` = `0x5F`), while a kind
+/// scope's keys lead with a kind byte (`0x00..=0x04`) — see
+/// `seal.rs`'s disjointness tests.
 #[derive(Clone, Debug)]
 pub struct StorageScope {
     prefix: Vec<u8>,
-    range: Arc<Mutex<KeyRange>>,
+    range: KeyRange,
 }
 
 /// Row-kind scope selector: base item rows — the ADR 0022 keyspace.
@@ -308,179 +303,127 @@ pub const ALL_KINDS: [u8; 5] = [
 pub type KindWrite = (u8, Vec<u8>, Option<Vec<u8>>);
 
 /// The sibling scope set a tablet group owns, derived from its **parent**
-/// scope (`escape(table)` + this tablet's range), indexed by kind selector.
-///
-/// Every entry shares the parent's one live `KeyRange`
-/// ([`StorageScope::with_kind`]), so narrowing any of them narrows all.
+/// scope (this tablet's immutable declared range; F2b — no table prefix),
+/// indexed by kind selector. Each entry's physical prefix is its one kind
+/// byte ([`StorageScope::with_kind`]).
 fn kind_scopes(parent: &StorageScope) -> [StorageScope; ALL_KINDS.len()] {
     ALL_KINDS.map(|kind| parent.with_kind(kind))
 }
 
 impl StorageScope {
-    /// No prefix, the whole keyspace — every physical-key operation is an
-    /// identity transform (today's dedicated-engine behavior).
+    /// The whole keyspace — the default for every plain constructor and for
+    /// tests that don't model a declared range. (Post-F2b this is **not** an
+    /// identity transform: the group's kind scopes still prefix their kind
+    /// byte.)
     #[must_use]
     pub fn whole() -> Self {
-        Self {
-            prefix: Vec::new(),
-            range: Arc::new(Mutex::new(KeyRange::whole())),
-        }
+        Self::new(KeyRange::whole())
     }
 
-    /// A scope confined to `prefix || range` within a shared engine.
+    /// The parent scope of one tablet's private engine, carrying its
+    /// **immutable** declared `range`. Kind scopes derive from it via
+    /// [`with_kind`](Self::with_kind); the parent itself has no prefix and is
+    /// never used for physical access directly.
     #[must_use]
-    pub fn new(prefix: Vec<u8>, range: KeyRange) -> Self {
+    pub fn new(range: KeyRange) -> Self {
         Self {
-            prefix,
-            range: Arc::new(Mutex::new(range)),
+            prefix: Vec::new(),
+            range,
         }
     }
 
     /// A **sibling scope of the same tablet group**, holding a different row
-    /// kind (ADR 0041 §3): the prefix extended by `kind`, over **the very same
-    /// live `KeyRange`** — literally the same `Arc`, so one
-    /// [`narrow`](Self::narrow) moves every kind at once and a split can
-    /// never leave two kinds disagreeing about what this tablet owns.
+    /// kind (ADR 0041 §3): the prefix extended by `kind`, over a clone of the
+    /// same immutable declared range.
     ///
-    /// Every kind of one tablet is `prefix || [kind]`, so two kinds differ in
-    /// their final byte at equal length and neither prefixes the other; two
-    /// *tables* are already separated one level up by `escape`'s own
-    /// prefix-freedom. That is what lets the kinds share an engine without a
-    /// discriminator inside the logical key — which they must, because
-    /// [`RaftKvNode::txn_stage`] asserts a logical key leads with the ADR 0022
-    /// partition token and derives every transaction intent span from it.
+    /// Every kind of one tablet is `[kind] || logical`, so two kinds differ
+    /// in their lead byte and neither prefixes the other. The kind byte is
+    /// what lets the kinds share one engine without a discriminator inside
+    /// the logical key — which they must, because [`RaftKvNode::txn_stage`]
+    /// asserts a logical key leads with the ADR 0022 partition token and
+    /// derives every transaction intent span from it.
     #[must_use]
     pub fn with_kind(&self, kind: u8) -> Self {
         let mut prefix = self.prefix.clone();
         prefix.push(kind);
         Self {
             prefix,
-            range: Arc::clone(&self.range),
+            range: self.range.clone(),
         }
     }
 
-    /// Update this scope's live range (see the type doc) — every clone of
-    /// this `StorageScope` observes the change immediately. A raw setter: the
-    /// caller (which watches `Metadata` for this tablet's current range) is
-    /// trusted to only call this when the new range is actually correct for
-    /// this tablet right now — a narrowing (a split source,
-    /// `RaftKvNode::narrow_scope`) in every production path; a **widening**
-    /// (`RaftKvNode::widen_scope`) has no production caller now that tablets
-    /// are split-only, but both call through this one setter, and the
-    /// direction is enforced (or intentionally not enforced) by the caller,
-    /// not here.
-    pub fn narrow(&self, new_range: KeyRange) {
-        *self.range.lock().expect("storage scope range poisoned") = new_range;
-    }
-
-    /// A snapshot of this scope's current live range (see the type doc). The
-    /// range can narrow again the instant after this call returns — this is
-    /// a point-in-time read, not a held lock — so a caller using it as a
-    /// pre-propose fence-check (ADR 0028 write-fence wiring, `animusd`'s
-    /// `cp_put_local`/`cp_delete_local`/`cp_batch_propose`) still needs the
-    /// *proposed* command's own embedded `fence` (stamped from this same
-    /// read) to cover the residual race between this read and the entry's
-    /// actual apply.
+    /// This tablet's declared range — immutable from construction (ADR 0050;
+    /// the live-narrowable range died with the zero-copy split). Read by the
+    /// pre-propose routing check ([`RaftKvNode::scope_range`]) and stamped as
+    /// the fence on proposals; both are inert-but-present until the Train B
+    /// deletion sweep.
     #[must_use]
     pub fn range(&self) -> KeyRange {
-        self.range
-            .lock()
-            .expect("storage scope range poisoned")
-            .clone()
+        self.range.clone()
     }
 
-    /// The physical storage key for logical `key`.
+    /// The physical storage key for logical `key`: `prefix || key` — post-F2b
+    /// the prefix is exactly this scope's kind byte.
     fn physical(&self, key: &[u8]) -> Vec<u8> {
         let mut out = self.prefix.clone();
         out.extend_from_slice(key);
         out
     }
 
-    /// If `physical_key` belongs to this scope — starts with `prefix`, and
-    /// the stripped suffix falls inside the *current* `range` — the stripped
-    /// logical key, else `None`. The read-side counterpart of
-    /// [`physical`](Self::physical), used wherever a shared-engine
-    /// scan/snapshot must not leak another tenant's keys.
+    /// If `physical_key` belongs to this kind scope — starts with its kind
+    /// byte — the stripped logical key, else `None`. The read-side
+    /// counterpart of [`physical`](Self::physical). (The pre-F2b range check
+    /// is gone: a private engine physically cannot hold another tablet's
+    /// rows, and the declared range is immutable, so prefix membership alone
+    /// decides. Engine-global marker keys lead `0x5F` and never match a kind
+    /// byte.)
     fn strip_in_range<'a>(&self, physical_key: &'a [u8]) -> Option<&'a [u8]> {
-        let logical = physical_key.strip_prefix(self.prefix.as_slice())?;
-        let range = self.range.lock().expect("storage scope range poisoned");
-        range.contains(logical).then_some(logical)
+        physical_key.strip_prefix(self.prefix.as_slice())
     }
 
-    /// Whether `storage` currently holds any live data in this scope.
+    /// Whether `storage` currently holds any live data in this kind scope.
     ///
-    /// On a *dedicated* (non-shared) engine, "does this tablet already have
-    /// data" (e.g. a real on-disk `LsmEngine`'s own version counter) is what
-    /// distinguishes a node **reforming** a group it already hosted before a
-    /// restart (start with the full voter config — it may need to elect
-    /// immediately) from one **joining fresh** as a reconciler-placed spare
-    /// (start as a quiet non-voter). On a *shared* engine there is no
-    /// per-tablet dedicated store left to ask, so this scoped presence check
-    /// is the direct replacement: it reads only this scope's own physical
-    /// range, never a sibling tenant's.
+    /// "Does this tablet already have data" is what distinguishes a node
+    /// **reforming** a group it already hosted before a restart (start with
+    /// the full voter config — it may need to elect immediately) from one
+    /// **joining fresh** as a reconciler-placed spare (start as a quiet
+    /// non-voter). Post-F2b the engine is private and the kind prefix's
+    /// physical bounds are always finite (`[kind] .. [kind + 1]`), so this is
+    /// one bounded scan — the pre-B2 whole-engine `entries()` fallback for an
+    /// unbounded range is gone.
     #[must_use]
     pub async fn has_data<S: StorageEngine>(&self, storage: &S) -> bool {
-        let range = self
-            .range
-            .lock()
-            .expect("storage scope range poisoned")
-            .clone();
         // ADR 0018 §2/PR3: a txn-record marker key (`txn::is_record_key`)
         // is internal bookkeeping, not user data — a tablet holding only a
         // record (an in-flight transaction, no other writes ever landed)
         // must still read as "no data" for the reforming-vs-fresh-join
         // decision this presence check exists for.
-        match &range.end {
-            Some(end) => {
-                let physical_start = self.physical(&range.start);
-                let physical_end = self.physical(end);
-                storage
-                    .scan(&physical_start, &physical_end)
-                    .await
-                    .map(|rows| {
-                        rows.iter().any(|(k, _)| {
-                            self.strip_in_range(k)
-                                .is_some_and(|logical| !txn::is_record_key(logical))
-                        })
-                    })
-                    .unwrap_or(false)
-            }
-            // Open-ended range: no finite physical upper bound to scan, so
-            // fall back to the same whole-engine-then-filter shape `engine_image`
-            // already uses for the unbounded case.
-            None => storage
-                .entries()
-                .await
-                .map(|rows| {
-                    rows.iter().any(|(k, _)| {
-                        self.strip_in_range(k)
-                            .is_some_and(|logical| !txn::is_record_key(logical))
-                    })
-                })
-                .unwrap_or(false),
-        }
+        let (start, end) = self.physical_bounds();
+        let rows = match end {
+            Some(end) => storage.scan(&start, &end).await,
+            // Only `StorageScope::whole()`'s parent scope (no prefix at all)
+            // has no finite bound; a kind scope's never hits this.
+            None => storage.entries().await,
+        };
+        rows.map(|rows| {
+            rows.iter().any(|(k, _)| {
+                self.strip_in_range(k)
+                    .is_some_and(|logical| !txn::is_record_key(logical))
+            })
+        })
+        .unwrap_or(false)
     }
 
-    /// This scope's own physical `(start, end)` bounds, for a caller that
-    /// needs a **bounded** physical range even when the logical range is
-    /// unbounded above (ADR 0034 — [`RaftKvNode::approx_bytes`]'s periodic
-    /// hot-path gate, which must stay cheap and must never fall back to a
-    /// whole-engine scan the way [`has_data`](Self::has_data) tolerates as a
-    /// one-time hosting-decision cost).
+    /// This kind scope's own physical `(start, end)` bounds, for every
+    /// caller that needs a **bounded** physical range even when the declared
+    /// logical range is unbounded above (the common "one big not-yet-split
+    /// tablet" case).
     ///
     /// `start` is always `physical(range.start)`. `end` is `physical(end)`
-    /// when the logical range has one; when it doesn't (the common
-    /// "one big not-yet-split tablet" case — a fresh table's first tablet
-    /// covers its own whole prefix), it is instead the **prefix upper
-    /// bound**: the smallest physical key strictly greater than every key
-    /// under this scope's `prefix` (increment the last byte below `0xFF`,
-    /// dropping every trailing `0xFF` byte first — the standard
-    /// range-scan-over-a-prefix idiom). This keeps the physical range
-    /// confined to this scope's own prefix — never a sibling tenant sharing
-    /// the same engine (ADR 0026/0028) — instead of degrading to "the rest of
-    /// the keyspace." Only `StorageScope::whole()` (no prefix at all) or an
-    /// astronomically unlikely all-`0xFF` prefix yields `end: None`, i.e.
-    /// genuinely unbounded.
+    /// when the logical range has one; when it doesn't, it is the **prefix
+    /// upper bound** — post-F2b simply `[kind + 1]`, always finite for a
+    /// kind scope (kind bytes top out at `0x04`). Only the un-prefixed
+    /// parent scope yields `end: None`.
     #[must_use]
     pub(crate) fn physical_bounds(&self) -> (Vec<u8>, Option<Vec<u8>>) {
         let range = self.range();
@@ -1336,9 +1279,9 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// separation, cross-group ordering now comes from **witnessing**
     /// (`Hlc::witness`, at WAL recovery, on every received entry, on
     /// snapshot install, and — the one witness this field's own
-    /// construction performs — at group start, off the shared engine's
-    /// `latest_version()`) plus, for the residual in-flight-write race
-    /// witnessing alone can't close, the **range seal** (`seal.rs`).
+    /// construction performs — at group start, off this tablet's own
+    /// engine's `latest_version()`) plus, for the residual in-flight-write
+    /// race witnessing alone can't close, the **range seal** (`seal.rs`).
     hlc: Arc<Hlc>,
     /// The per-tablet **read-timestamp cache** (ADR 0018 §2/PR2b,
     /// `ts_cache.rs`): leader-local, in-memory, best-effort write-conflict
@@ -1438,11 +1381,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         )
     }
 
-    /// Like [`start`](Self::start), but the group is confined to `scope` within
-    /// `storage` (see [`StorageScope`]'s doc) — the seam a future caller uses to
-    /// share one physical engine across several tablets. `storage.clone()` must
-    /// be the SAME shared engine handle every co-resident group on this node
-    /// was started with; `scope` is what keeps them from colliding.
+    /// Like [`start`](Self::start), but with an explicit `scope` (see
+    /// [`StorageScope`]'s doc). Since ADR 0050 rung 1 `storage` is this
+    /// tablet's own **private** engine; `scope` carries the tablet's
+    /// immutable declared range and derives the per-kind key prefixes.
     pub fn start_scoped(env: E, all_nodes: Vec<NodeId>, storage: S, scope: StorageScope) -> Self {
         let metrics = env.metrics();
         Self::start_inner(env, all_nodes, storage, metrics, scope, PRIMARY_STREAM)
@@ -3122,45 +3064,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         });
     }
 
-    /// Update this group's live [`StorageScope`] range (see its doc) —
-    /// typically called by a caller watching the control plane's replicated
-    /// `Metadata` for this tablet's current range, whenever it narrows (e.g.
-    /// this tablet was the source of a single-command split). A no-op for the
-    /// default [`StorageScope::whole()`] scope, since nothing needs bounding
-    /// there.
-    pub fn narrow_scope(&self, new_range: KeyRange) {
-        self.scope.narrow(new_range);
-    }
-
-    /// Update this group's live [`StorageScope`] range to a **wider** range —
-    /// the dual of [`narrow_scope`](Self::narrow_scope). Tablets are
-    /// split-only (merge, the only production caller of this setter, was
-    /// removed by ADR 0044, which supersedes ADR 0033): no live reconciler
-    /// action calls this today, but the raw mechanism — widening a group's
-    /// scope over data already physically present on the same node-shared
-    /// engine under the same table prefix, exactly as `narrow_scope` does in
-    /// the other direction — stays a distinctly-named, distinctly-documented
-    /// entry point rather than folded into `narrow_scope` itself, so a
-    /// reader auditing every `StorageScope` mutation site doesn't have to
-    /// re-derive "is this specific call safe to widen" from context each
-    /// time. Kept exercised directly by `tests/cursor_scope.rs` as a raw
-    /// primitive, with no production caller.
-    pub fn widen_scope(&self, new_range: KeyRange) {
-        self.scope.narrow(new_range);
-    }
-
-    /// This group's own current [`StorageScope`] range (see its doc) — a
-    /// point-in-time snapshot, additive accessor (ADR 0028 write-fence
-    /// wiring). Lets a caller (e.g. `animusd`'s `cp_put_local`/
-    /// `cp_delete_local`/`cp_batch_propose`) both **pre-check** a key against
-    /// this group's live scope *before* proposing (so a stale-routed,
-    /// out-of-range write errors instead of being silently accepted as a
-    /// fenced-out no-op — see those callers' doc for why the pre-check
-    /// matters even though the fence itself also protects apply) and stamp
-    /// the *same* range as the proposed command's own `fence` (`put_fenced`/
-    /// `delete_fenced`/`put_batch_fenced`), so every replica's apply makes
-    /// the identical accept/reject decision regardless of how far it has
-    /// independently progressed observing a concurrent split.
+    /// This group's **immutable** declared [`StorageScope`] range (ADR 0050:
+    /// a tablet's range never changes; `narrow_scope`/`widen_scope` died with
+    /// the zero-copy split). Still read by `animusd`'s pre-propose routing
+    /// checks and stamped as proposals' `fence` — both inert-but-present
+    /// (ranges no longer mutate, so check and fence always agree) until the
+    /// Train B deletion sweep replaces them with the route-time `Active`
+    /// filter.
     #[must_use]
     pub fn scope_range(&self) -> KeyRange {
         self.scope.range()
@@ -3922,12 +3832,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // request and every `erase_scope()` teardown (rebalance `Release`,
         // drop-table `Reclaim`) paid a full-engine scan just to find this one
         // tablet's own handful of keys.
-        // Both branches physically bound/filter to `self.scope` — on a
-        // possibly-shared engine, `entries()` in particular would otherwise
-        // return every other tenant's keys too (see `StorageScope`'s doc).
-        // Under the default (whole) scope this is byte-for-byte the prior
-        // behavior: `physical` is the identity and `strip_in_range` always
-        // succeeds.
+        // Both branches bound/filter to `self.scope`'s kind prefix — the
+        // engine is this tablet's own (ADR 0050), so the filter's remaining
+        // job is separating this kind's rows from sibling kinds' and from
+        // the engine-global reserved-namespace markers.
         let raw: Vec<(Vec<u8>, animus_storage::VersionedValue)> = match end {
             Some(e) => self
                 .storage
@@ -6239,13 +6147,13 @@ async fn flush_pending<S: StorageEngine>(
 /// scope, so the receiver can re-prefix it under its own scope set.
 pub(crate) type ImageEntry = (u8, Vec<u8>, Option<Vec<u8>>, u64);
 
-/// Serialize this scope's contents (including tombstones) as the snapshot
-/// image shipped to a lagging follower. Bounded to `scope` (prefix **and**
-/// range — see `StorageScope`'s doc): on a shared engine, an unbounded dump
-/// would leak every other tenant's keys into this tablet's snapshot **and**
-/// duplicate them into whichever engine receives it, corrupting a group that
-/// never agreed to those writes through its own Raft log. Under the default
-/// (whole) scope this is byte-for-byte the prior unbounded behavior.
+/// Serialize this tablet's contents (including tombstones) as the snapshot
+/// image shipped to a lagging follower. Since ADR 0050 rung 1 the engine is
+/// the tablet's own private one, so the whole-engine walk IS the tablet's
+/// own data; the kind scopes classify each row by kind byte and exclude the
+/// engine-global reserved-namespace markers (which lead `0x5F`, matching no
+/// kind — each replica re-derives its own markers at apply, exactly as
+/// before).
 /// Every logical key currently physically present in one `scope` — **raw**,
 /// bypassing both the record-key filter and the value-envelope resolution
 /// [`RaftKvNode::local_scan`] applies. The only caller is
@@ -6862,25 +6770,22 @@ async fn apply_loop<E: Env, S: StorageEngine>(
 #[cfg(test)]
 mod kind_scope_tests {
     use super::*;
-    use animus_tablet::escape;
 
-    /// A table's parent scope, as `animusd::table_scope_prefix` builds it.
-    fn table_scope(name: &[u8]) -> StorageScope {
-        StorageScope::new(escape(name), KeyRange::whole())
+    /// A tablet's parent scope (F2b: no table prefix — a private engine holds
+    /// exactly one tablet of one table).
+    fn table_scope(_name: &[u8]) -> StorageScope {
+        StorageScope::whole()
     }
 
     #[test]
-    fn sibling_scopes_share_one_live_range() {
-        let parent = table_scope(b"users");
-        let base = parent.with_kind(KIND_BASE);
-        let log = parent.with_kind(KIND_CHANGE);
-
-        // Narrowing through *any* handle moves every kind: a split must never
-        // leave two kinds disagreeing about what this tablet owns (ADR 0041 §3).
-        let narrowed = KeyRange::new(b"m".to_vec(), Some(b"n".to_vec()));
-        base.narrow(narrowed.clone());
-        assert_eq!(log.range(), narrowed);
-        assert_eq!(parent.range(), narrowed);
+    fn sibling_scopes_carry_the_same_immutable_range() {
+        let range = KeyRange::new(b"m".to_vec(), Some(b"n".to_vec()));
+        let parent = StorageScope::new(range.clone());
+        // Every kind reports the one declared range; nothing can move it
+        // (ADR 0050: `narrow` died with the zero-copy split).
+        assert_eq!(parent.with_kind(KIND_BASE).range(), range);
+        assert_eq!(parent.with_kind(KIND_CHANGE).range(), range);
+        assert_eq!(parent.range(), range);
     }
 
     #[test]
@@ -6905,16 +6810,74 @@ mod kind_scope_tests {
         }
     }
 
+    /// The rung-B4 seed path's foundation (ADR 0050): an `engine_image` of
+    /// one tablet's private engine installs **byte-identically** — keys,
+    /// values, tombstones, MVCC versions — into a different tablet's own
+    /// engine through that tablet's own kind scopes.
     #[test]
-    fn one_tables_kinds_never_collide_with_another_tables() {
-        let logical = b"logical".to_vec();
-        let users = table_scope(b"users").with_kind(KIND_CHANGE);
-        // `users2`'s raw name has `users`' as a prefix on purpose — `escape`'s
-        // prefix-freedom one level up is what keeps the two tables apart, and
-        // appending a kind byte must not undo it.
-        let users2 = table_scope(b"users2").with_kind(KIND_CHANGE);
-        assert_eq!(users2.strip_in_range(&users.physical(&logical)), None);
-        assert_eq!(users.strip_in_range(&users2.physical(&logical)), None);
+    fn engine_image_round_trips_byte_identically_into_another_tablets_engine() {
+        use animus_storage::{MemoryEngine, StorageEngine};
+        futures::executor::block_on(async {
+            let src = MemoryEngine::new();
+            let src_scopes = kind_scopes(&StorageScope::whole());
+            // Rows across three kinds + a tombstone, at distinct versions.
+            type SeedRow = (u8, &'static [u8], Option<&'static [u8]>, u64);
+            let rows: [SeedRow; 4] = [
+                (KIND_BASE, b"k1", Some(b"v1"), 7),
+                (KIND_LSI, b"k1", Some(b"lsi"), 8),
+                (KIND_CHANGE, b"c1", Some(b"rec"), 9),
+                (KIND_BASE, b"gone", None, 10),
+            ];
+            for (kind, key, value, version) in rows {
+                let physical = src_scopes[kind as usize].physical(key);
+                match value {
+                    Some(v) => {
+                        src.merge(&physical, v, version).await.unwrap();
+                    }
+                    None => {
+                        src.merge_tombstone(&physical, version).await.unwrap();
+                    }
+                }
+            }
+
+            let image = engine_image(&src, &src_scopes).await;
+            let dst = MemoryEngine::new();
+            let dst_scopes = kind_scopes(&StorageScope::new(KeyRange::new(
+                Vec::new(),
+                Some(b"zzzz".to_vec()),
+            )));
+            install_engine_image(&dst, &dst_scopes, &image).await;
+
+            let mut src_rows = src.entries_with_tombstones().await.unwrap();
+            let mut dst_rows = dst.entries_with_tombstones().await.unwrap();
+            src_rows.sort();
+            dst_rows.sort();
+            assert_eq!(
+                src_rows, dst_rows,
+                "the installed engine must be byte-identical to the source"
+            );
+        });
+    }
+
+    #[test]
+    fn engine_global_marker_keys_never_match_any_kind_scope() {
+        // F2b's load-bearing disjointness: a kind scope's keys lead with a
+        // kind byte (0x00..=0x04); the engine-global marker keys
+        // (`seal.rs`/`ceiling.rs`/syskv) lead with
+        // `escape(RESERVED_NAMESPACE)`'s first byte, `b'_'` = 0x5F. A marker
+        // physically resident in a tablet's private engine must be invisible
+        // to every kind scope's strip (`engine_image`, `has_data`, scans).
+        let marker_key =
+            animus_tablet::escape(animus_control::syskv::RESERVED_NAMESPACE.as_bytes());
+        assert_eq!(marker_key[0], 0x5F);
+        let parent = StorageScope::whole();
+        for &kind in &ALL_KINDS {
+            assert_eq!(
+                parent.with_kind(kind).strip_in_range(&marker_key),
+                None,
+                "kind {kind:#04x} must not claim a reserved-namespace marker key"
+            );
+        }
     }
 
     #[test]
@@ -6980,17 +6943,20 @@ mod pr5_orphan_and_resurrection_tests {
         let engine = MemoryEngine::new();
         let id_a = nid(9001);
         let id_b = nid(9011);
+        // ADR 0050: each tablet holds its own private engine (the pre-pivot
+        // version scoped two tables onto one shared engine — incidental to
+        // this scenario's substance, which is txn orphan-abort convergence).
         let node_a: KvNode = RaftKvNode::start_scoped(
             sim.env(id_a.clone()),
             vec![id_a.clone()],
             engine.clone(),
-            StorageScope::new(b"orders:".to_vec(), KeyRange::whole()),
+            StorageScope::whole(),
         );
         let node_b: KvNode = RaftKvNode::start_scoped(
             sim.env(id_b.clone()),
             vec![id_b.clone()],
-            engine.clone(),
-            StorageScope::new(b"accounts:".to_vec(), KeyRange::whole()),
+            MemoryEngine::new(),
+            StorageScope::whole(),
         );
         sim.run_for(Duration::from_secs(2)); // elect (single voter each)
 

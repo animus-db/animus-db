@@ -419,7 +419,7 @@ fn stage_into_a_sealed_range_is_rejected_wholesale() {
         sim.env(nid(0)),
         vec![nid(0)],
         MemoryEngine::new(),
-        StorageScope::new(b"T:".to_vec(), KeyRange::whole()),
+        StorageScope::new(KeyRange::whole()),
     );
     let mut sim = sim;
     sim.run_for(ELECT);

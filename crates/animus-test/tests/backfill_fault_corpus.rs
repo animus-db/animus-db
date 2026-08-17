@@ -147,7 +147,7 @@ fn start_group(
                 sim.env(nid(n)),
                 ids.clone(),
                 engines[&n].clone(),
-                animus_cp_data::StorageScope::new(TABLE.as_bytes().to_vec(), range.clone()),
+                animus_cp_data::StorageScope::new(range.clone()),
                 id.0,
             )
         })
@@ -236,26 +236,6 @@ fn base_partition_prefix_end(key: &[u8]) -> Option<usize> {
 /// Mirrors `animusd::index_drain::backfill_tag`.
 fn backfill_tag(index_name: &str) -> String {
     format!("backfill:{index_name}")
-}
-
-/// `n` candidate item ids, sorted by their *actual* data-plane key (never by
-/// id string), split at the median into `(boundary, left_ids, right_ids)` —
-/// the same key-prediction technique `dynamo_txn.rs::create_table_pre_split`
-/// uses, adapted here to also hand back which side each candidate landed on.
-fn split_candidates(n: usize) -> (Vec<u8>, Vec<String>, Vec<String>) {
-    let mut candidates: Vec<(String, Vec<u8>)> = (0..n)
-        .map(|i| {
-            let id = format!("p{i:04}");
-            let key = base_key(&id);
-            (id, key)
-        })
-        .collect();
-    candidates.sort_by(|a, b| a.1.cmp(&b.1));
-    let mid = candidates.len() / 2;
-    let boundary = candidates[mid].1.clone();
-    let left = candidates[..mid].iter().map(|(id, _)| id.clone()).collect();
-    let right = candidates[mid..].iter().map(|(id, _)| id.clone()).collect();
-    (boundary, left, right)
 }
 
 // --- write helpers ----------------------------------------------------------
@@ -622,261 +602,17 @@ fn single_tablet_backfill_converges() {
     );
 }
 
-// --- cell 2: concurrent_split_during_backfill --------------------------------
-
-fn scenario_concurrent_split_during_backfill(seed: u64) {
-    let mut sim = Simulator::new(seed);
-    let engines = engines();
-    let mut meta = base_meta(TABLE);
-    create_tablet(&mut meta, TabletId(1), KeyRange::whole(), TABLE);
-    create_index(&mut meta, TABLE, "by-email", "email");
-    let parent = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
-    let live = [0, 1, 2];
-    sim.run_for(Duration::from_secs(2));
-
-    let (boundary, left_ids, right_ids) = split_candidates(24);
-    let leader = elect(&mut sim, &parent, &live, seed);
-    for id in left_ids.iter().chain(right_ids.iter()) {
-        write_pre_existing_row(&mut sim, &parent.nodes[leader], &parent.range, id, seed);
-    }
-
-    let tag = backfill_tag("by-email");
-    // Exactly one tick before the split: since `SEED_BATCH == 3` and the 24
-    // candidates are sorted by their real data-plane key with the split
-    // boundary at the median (index 12), the 3 smallest-keyed partitions
-    // seeded here are guaranteed to fall strictly below the boundary — the
-    // left child's cursor is therefore guaranteed non-empty at split time,
-    // making the "resume" claim below unconditionally checkable rather than
-    // seed-dependent.
-    let leader = elect(&mut sim, &parent, &live, seed);
-    let (seeded, reached_end) = backfill_seed_tick(
-        &mut sim,
-        &parent.nodes[leader],
-        &parent.range,
-        &tag,
-        SEED_BATCH,
-        seed,
-    );
-    assert_eq!(
-        seeded, SEED_BATCH,
-        "[seed={seed}] pre-split tick must seed a full batch"
-    );
-    assert!(
-        !reached_end,
-        "[seed={seed}] one tick over 24 partitions at batch 3 must not reach the end"
-    );
-
-    let left_range = KeyRange::new(Vec::new(), Some(boundary.clone()));
-    let right_range = KeyRange::new(boundary.clone(), None);
-    let left_cursor_key = cursor::cursor_key(&left_range.start, &tag);
-    let right_cursor_key = cursor::cursor_key(&right_range.start, &tag);
-
-    let leader = elect(&mut sim, &parent, &live, seed);
-    let left_cursor_before_split =
-        block_on(parent.nodes[leader].local_get_kind(KIND_CURSOR, &left_cursor_key));
-    assert!(
-        left_cursor_before_split.is_some(),
-        "[seed={seed}] the left range's cursor must already exist pre-split (the parent's own progress)"
-    );
-
-    // The split itself (ADR 0028/0044): narrow the parent's own live scope on
-    // every replica, record split provenance in the catalog, and start a
-    // fresh sibling group over the SAME per-node engines (shared storage —
-    // the sibling's own KIND_BASE/KIND_CHANGE/KIND_CURSOR scopes, once
-    // widened to its range, transparently expose whatever right-range
-    // records already physically exist).
-    let parent_epoch = meta
-        .tablets
-        .get(&parent.id)
-        .map_or(animus_tablet::Epoch::INITIAL, |t| t.epoch);
-    let sibling_id = TabletId(2);
-    for n in &parent.nodes {
-        n.narrow_scope(left_range.clone());
-    }
-    let outcome = meta.apply(&MetaCommand::SplitTablet {
-        tablet: parent.id,
-        expected_epoch: parent_epoch,
-        split_key: boundary.clone(),
-        new_id: sibling_id,
-    });
-    assert_eq!(
-        outcome,
-        ApplyOutcome::Applied,
-        "[seed={seed}] split must apply"
-    );
-    let sibling = start_group(&sim, &engines, sibling_id, right_range.clone());
-    sim.run_for(Duration::from_secs(2));
-
-    // Fork A, checked directly: the left child's cursor survives the split
-    // byte-for-byte unchanged; the right child's own cursor key reads empty.
-    let leader = elect(&mut sim, &parent, &live, seed);
-    let left_cursor_after_split =
-        block_on(parent.nodes[leader].local_get_kind(KIND_CURSOR, &left_cursor_key));
-    assert_eq!(
-        left_cursor_after_split, left_cursor_before_split,
-        "[seed={seed}] the left child's cursor must be UNCHANGED by the split (Fork A: resume)"
-    );
-    let sibling_leader = elect(&mut sim, &sibling, &[0, 1, 2], seed);
-    let right_cursor_at_birth =
-        block_on(sibling.nodes[sibling_leader].local_get_kind(KIND_CURSOR, &right_cursor_key));
-    assert!(
-        right_cursor_at_birth.is_none(),
-        "[seed={seed}] the right child's cursor must read empty immediately post-split (Fork A: restart from scratch)"
-    );
-
-    // Both children must independently converge; neither may flip the index
-    // alone.
-    drive_sweep_to_completion(&mut sim, &parent, &live, &left_range, &tag, seed);
-    mark_backfilled(&mut meta, TABLE, "by-email", parent.id);
-    assert!(
-        !maybe_flip_active(&mut meta, TABLE, "by-email"),
-        "[seed={seed}] must not flip while the right child has not reported"
-    );
-
-    drive_sweep_to_completion(&mut sim, &sibling, &[0, 1, 2], &right_range, &tag, seed);
-    mark_backfilled(&mut meta, TABLE, "by-email", sibling.id);
-    assert!(
-        maybe_flip_active(&mut meta, TABLE, "by-email"),
-        "[seed={seed}] must flip once both children have reported"
-    );
-    assert_eq!(
-        index_status(&meta, TABLE, "by-email"),
-        Some(IndexStatus::Active)
-    );
-
-    let leader = elect(&mut sim, &parent, &live, seed);
-    assert_full_coverage(&parent.nodes[leader], seed, "left child after split");
-    let sibling_leader = elect(&mut sim, &sibling, &[0, 1, 2], seed);
-    assert_full_coverage(
-        &sibling.nodes[sibling_leader],
-        seed,
-        "right child after split",
-    );
-}
-
-#[test]
-fn concurrent_split_during_backfill() {
-    for_each_seed(
-        "concurrent_split_during_backfill",
-        scenario_concurrent_split_during_backfill,
-    );
-}
-
-// --- cell 3: split_after_tablet_already_reported_done ------------------------
-
-/// The named "split of a tablet that already reported done" dimension: a
-/// single tablet completes its **entire** sweep and reports
-/// `MarkIndexBackfilled` while it is still the table's only tablet — then
-/// splits. The right child inherits (physically, via shared storage) rows
-/// that were *already* covered pre-split, but its own tablet id has never
-/// reported — the aggregator's fresh-tablet-map-read discipline
-/// (`animusd::index_backfill::index_backfill_tick`'s own doc: "a tablet that
-/// appears after some others have already reported must still block the
-/// flip until it reports too") must still hold, and the real seeder mirror,
-/// not a hand-driven `MarkIndexBackfilled`, must be the one to produce the
-/// child's own report (restarting from scratch and harmlessly re-covering
-/// already-dirty partitions, per idempotence).
-fn scenario_split_after_tablet_already_reported_done(seed: u64) {
-    let mut sim = Simulator::new(seed);
-    let engines = engines();
-    let mut meta = base_meta(TABLE);
-    create_tablet(&mut meta, TabletId(1), KeyRange::whole(), TABLE);
-    create_index(&mut meta, TABLE, "by-email", "email");
-    let parent = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
-    let live = [0, 1, 2];
-    sim.run_for(Duration::from_secs(2));
-
-    let (boundary, left_ids, right_ids) = split_candidates(16);
-    let leader = elect(&mut sim, &parent, &live, seed);
-    for id in left_ids.iter().chain(right_ids.iter()) {
-        write_pre_existing_row(&mut sim, &parent.nodes[leader], &parent.range, id, seed);
-    }
-
-    let tag = backfill_tag("by-email");
-    drive_sweep_to_completion(&mut sim, &parent, &live, &parent.range, &tag, seed);
-    mark_backfilled(&mut meta, TABLE, "by-email", parent.id);
-    assert!(
-        maybe_flip_active(&mut meta, TABLE, "by-email"),
-        "[seed={seed}] the only tablet has fully reported — must flip"
-    );
-    assert_eq!(
-        index_status(&meta, TABLE, "by-email"),
-        Some(IndexStatus::Active)
-    );
-
-    // Re-open the index for a fresh backfill pass would be a different
-    // scenario (drop+recreate) — here the point is purely the split-after-
-    // done aggregation hazard, so force the index back to `Creating` the
-    // same way `SetIndexStatus` always would (this file's `create_index`
-    // helper's own path), simulating "the table now has a *second*,
-    // concurrently-declared index" would work too, but re-using the same
-    // index name keeps the scenario's assertions about `by-email`
-    // unambiguous.
-    let outcome = meta.apply(&MetaCommand::SetIndexStatus {
-        table: TABLE.into(),
-        index: "by-email".into(),
-        status: IndexStatus::Creating,
-    });
-    assert_eq!(outcome, ApplyOutcome::Applied);
-
-    let left_range = KeyRange::new(Vec::new(), Some(boundary.clone()));
-    let right_range = KeyRange::new(boundary.clone(), None);
-    let parent_epoch = meta
-        .tablets
-        .get(&parent.id)
-        .map_or(animus_tablet::Epoch::INITIAL, |t| t.epoch);
-    let sibling_id = TabletId(2);
-    for n in &parent.nodes {
-        n.narrow_scope(left_range.clone());
-    }
-    let outcome = meta.apply(&MetaCommand::SplitTablet {
-        tablet: parent.id,
-        expected_epoch: parent_epoch,
-        split_key: boundary.clone(),
-        new_id: sibling_id,
-    });
-    assert_eq!(
-        outcome,
-        ApplyOutcome::Applied,
-        "[seed={seed}] split must apply"
-    );
-    let sibling = start_group(&sim, &engines, sibling_id, right_range.clone());
-    sim.run_for(Duration::from_secs(2));
-
-    // The sibling has physically-inherited, already-covered base rows but
-    // has never itself reported — must block the flip even though the
-    // parent (still the same tablet id, already marked done from before the
-    // reopen) technically still has a stale `index_backfill` row.
-    assert!(
-        !maybe_flip_active(&mut meta, TABLE, "by-email"),
-        "[seed={seed}] a freshly-appeared child that has never reported must block the flip"
-    );
-
-    // The real seeder mirror, run against the sibling, produces its own
-    // report — restarting from scratch (its cursor reads empty) and
-    // harmlessly re-marking rows the parent's earlier pass already covered.
-    drive_sweep_to_completion(&mut sim, &sibling, &[0, 1, 2], &right_range, &tag, seed);
-    mark_backfilled(&mut meta, TABLE, "by-email", sibling.id);
-    assert!(
-        maybe_flip_active(&mut meta, TABLE, "by-email"),
-        "[seed={seed}] must flip once the child reports too"
-    );
-
-    let sibling_leader = elect(&mut sim, &sibling, &[0, 1, 2], seed);
-    assert_full_coverage(
-        &sibling.nodes[sibling_leader],
-        seed,
-        "child of an already-done parent",
-    );
-}
-
-#[test]
-fn split_after_tablet_already_reported_done() {
-    for_each_seed(
-        "split_after_tablet_already_reported_done",
-        scenario_split_after_tablet_already_reported_done,
-    );
-}
+// TOMBSTONE (ADR 0050 Train B rung 2): two split cells died here —
+// `concurrent_split_during_backfill` (Fork A: the left child's cursor row
+// byte-identical across the split, the right child reading empty) and
+// `split_after_tablet_already_reported_done`. Both modeled the ZERO-COPY
+// split (`narrow_scope` + a sibling group inheriting the same physical
+// rows in place) — inexpressible under per-tablet engines with immutable
+// ranges. Split-during-backfill remains a REAL scenario class under the
+// copy-based split (ADR 0050): children restart their sweeps from scratch
+// over their own copied rows — its corpus cells are rebuilt on the new
+// mechanism in the cutover rungs, where a split can actually run again.
+// Pre-pivot cells retrievable from git history.
 
 // --- cell 4: live_writes_race_the_sweep --------------------------------------
 

@@ -74,15 +74,10 @@ const SCENARIO_STEP: Duration = Duration::from_secs(1);
 // Small builders (mirrors `tests/reconciler.rs`'s helpers).
 // ---------------------------------------------------------------------------
 
-fn prefix_for(table: &str) -> Vec<u8> {
-    table.as_bytes().to_vec()
-}
-
-/// ADR 0041 §3: a group's physical prefix is its parent scope's prefix plus the
-/// row-kind byte — ordinary data is `KIND_BASE`.
+/// F2b (ADR 0050 rung 2): a group's physical key is its row-kind byte plus
+/// the logical key — no table prefix, no tablet identity in the bytes.
 fn physical(key: &[u8]) -> Vec<u8> {
-    let mut out = prefix_for(TABLE);
-    out.push(animus_cp_data::KIND_BASE);
+    let mut out = vec![animus_cp_data::KIND_BASE];
     out.extend_from_slice(key);
     out
 }
@@ -193,7 +188,6 @@ impl Cluster {
             self.sim.env(id.clone()),
             engines.clone(),
             id.clone(),
-            prefix_for,
             move |t, _n| hl.lock().unwrap().push(t),
             move |t| tl.lock().unwrap().push(t),
         );
@@ -814,7 +808,7 @@ fn scenario_rebalance_off_release(seed: u64) {
             other_env,
             vec![a(), b()],
             b_storage,
-            StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
+            StorageScope::new(KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
@@ -1305,7 +1299,7 @@ fn scenario_replay_epoch_flicker(seed: u64) {
             other_env,
             vec![a(), b()],
             b_storage,
-            StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
+            StorageScope::new(KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
@@ -1430,7 +1424,7 @@ fn scenario_partition_blocks_release(seed: u64) {
             other_env,
             vec![a(), b()],
             b_storage,
-            StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
+            StorageScope::new(KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
@@ -1544,7 +1538,7 @@ fn scenario_split_then_immediate_release(seed: u64) {
             other_env,
             vec![a(), b()],
             b_storage,
-            StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
+            StorageScope::new(KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;
@@ -1641,7 +1635,7 @@ fn scenario_re_add_cancels_release(seed: u64) {
             other_env,
             vec![a(), b()],
             b_storage,
-            StorageScope::new(prefix_for(TABLE), KeyRange::whole()),
+            StorageScope::new(KeyRange::whole()),
             1,
         );
         env.sleep(Duration::from_secs(2)).await;

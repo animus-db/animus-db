@@ -14,11 +14,8 @@ use futures::executor::block_on;
 #[test]
 fn empty_engine_has_no_data_bounded_and_unbounded() {
     let engine = MemoryEngine::new();
-    let bounded = StorageScope::new(
-        b"T:".to_vec(),
-        KeyRange::new(Vec::new(), Some(b"m".to_vec())),
-    );
-    let unbounded = StorageScope::new(b"T:".to_vec(), KeyRange::whole());
+    let bounded = StorageScope::new(KeyRange::new(Vec::new(), Some(b"m".to_vec())));
+    let unbounded = StorageScope::new(KeyRange::whole());
     assert!(!block_on(bounded.has_data(&engine)));
     assert!(!block_on(unbounded.has_data(&engine)));
 }
@@ -29,10 +26,7 @@ fn empty_engine_has_no_data_bounded_and_unbounded() {
 #[test]
 fn engine_with_a_key_in_range_has_data_bounded_and_unbounded() {
     let engine = MemoryEngine::new();
-    let bounded = StorageScope::new(
-        b"T:".to_vec(),
-        KeyRange::new(Vec::new(), Some(b"m".to_vec())),
-    );
+    let bounded = StorageScope::new(KeyRange::new(Vec::new(), Some(b"m".to_vec())));
     block_on(async {
         engine
             .merge(b"T:a", b"v", 1)
@@ -41,7 +35,7 @@ fn engine_with_a_key_in_range_has_data_bounded_and_unbounded() {
     });
     assert!(block_on(bounded.has_data(&engine)));
 
-    let unbounded = StorageScope::new(b"U:".to_vec(), KeyRange::whole());
+    let unbounded = StorageScope::new(KeyRange::whole());
     block_on(async {
         engine
             .merge(b"U:z", b"v", 2)
@@ -51,36 +45,42 @@ fn engine_with_a_key_in_range_has_data_bounded_and_unbounded() {
     assert!(block_on(unbounded.has_data(&engine)));
 }
 
-/// A scope must never report data present because a **sibling** tenant
-/// (different prefix, or same prefix but a disjoint range) happens to hold
-/// some — the whole point of scoping a shared engine.
+/// A kind scope must never report data present because a **sibling kind**
+/// or an engine-global reserved-namespace marker happens to hold rows in
+/// this tablet's own private engine (F2b: the engine is the tablet — the
+/// pre-pivot sibling-*tenant* exclusions died with the shared engine; kind
+/// and marker exclusion are what remain load-bearing).
 #[test]
-fn has_data_never_sees_a_sibling_scopes_data() {
+fn has_data_never_counts_a_sibling_kinds_rows_or_a_marker() {
     let engine = MemoryEngine::new();
-    // Different table prefix entirely.
-    block_on(async {
-        engine
-            .merge(b"OTHER:x", b"v", 1)
-            .await
-            .expect("seed write succeeds");
-    });
-    let mine = StorageScope::new(b"MINE:".to_vec(), KeyRange::whole());
-    assert!(!block_on(mine.has_data(&engine)));
+    let base = StorageScope::new(KeyRange::whole()).with_kind(animus_cp_data::KIND_BASE);
 
-    // Same table prefix, but a disjoint tablet range (a post-split sibling).
+    // A cursor-kind row (0x04 lead) — bookkeeping, not base data.
     block_on(async {
         engine
-            .merge(b"MINE:z", b"v", 2) // >= "m", outside the "lo" range below
+            .merge(b"\x04some-cursor-row", b"v", 1)
             .await
             .expect("seed write succeeds");
     });
-    let lo_half = StorageScope::new(
-        b"MINE:".to_vec(),
-        KeyRange::new(Vec::new(), Some(b"m".to_vec())),
-    );
+    // An engine-global reserved-namespace marker (0x5F lead).
+    block_on(async {
+        engine
+            .merge(b"_animus-style-marker", b"v", 2)
+            .await
+            .expect("seed write succeeds");
+    });
     assert!(
-        !block_on(lo_half.has_data(&engine)),
-        "a sibling tablet's data under the same table prefix must not count as \
-         this tablet's own"
+        !block_on(base.has_data(&engine)),
+        "sibling-kind rows and reserved-namespace markers must not count as \
+         this tablet's base data"
     );
+
+    // A real base-kind row flips it.
+    block_on(async {
+        engine
+            .merge(b"\x00k", b"v", 3)
+            .await
+            .expect("seed write succeeds");
+    });
+    assert!(block_on(base.has_data(&engine)));
 }
