@@ -23,6 +23,12 @@
 //!   LSI diff needs it to clean up the stale row. Before the fix, `needs_old`
 //!   was gated only on the condition/`ALL_OLD` check, so an unconditional
 //!   replace/delete silently left the old LSI row behind.
+//! - `cross_node_racing_unconditional_puts_never_orphan_an_lsi_row` /
+//!   `cross_node_racing_transactional_and_plain_puts_never_orphan_an_lsi_row`
+//!   — the ADR 0046 U3 evaluate-at-leader red→green repro and its issue-#266
+//!   mixed twin (a transactional participant racing plain writes of the same
+//!   item through different nodes); see each test's own doc for the full
+//!   story.
 //!
 //! Mirrors `dynamo_documents.rs`/`dynamo_gsi_drain.rs`: a 3-node in-process
 //! cluster driven by the actual DynamoDB JSON protocol over hand-written
@@ -753,6 +759,68 @@ async fn hammer_puts(
     HammerOutcome { acked, failed }
 }
 
+/// [`hammer_puts`]'s deadline-bounded generalization, for the mixed
+/// transactional/plain race below: keep issuing whatever request `body_for`
+/// builds (its argument is the iteration counter, for distinct `alt` tags)
+/// until `deadline` passes. Wall-clock-bounded rather than
+/// iteration-bounded, deliberately: under the mixed workload a plain write
+/// that loses its OCC-seatbelt race to a transactional intent correctly
+/// no-ops at apply and its confirm-poll then eats the full `CLIENT_TIMEOUT`
+/// (the documented no-new-outcome-channel contract), so per-iteration cost
+/// varies by two orders of magnitude and an iteration count either
+/// under-exercises fast runs or blows the suite's time budget on contended
+/// ones. Same non-200 tolerance as `hammer_puts` (`HammerOutcome`'s doc) —
+/// under this mix a canceled transaction or a timed-out blocked put is an
+/// *expected, correct* outcome, and the final assertion only ever reads
+/// converged state.
+/// `pause` inserts a small gap between iterations: with two back-to-back
+/// loops every write of either loop collides with the other's in-flight
+/// span, and — because a blocked funnel write holds the leader's `rmw_lock`
+/// across its whole confirm-poll timeout — nearly the entire wall budget
+/// then drains into serialized stalls, leaving too few *committed* writes
+/// for the health gates to distinguish "contended but alive" from "broken."
+/// A modest stagger keeps collisions frequent (the windows under test are
+/// tens of milliseconds wide) while letting enough writes land in between.
+async fn hammer_until(
+    addr: SocketAddr,
+    target: &str,
+    deadline: tokio::time::Instant,
+    pause: Duration,
+    mut body_for: impl FnMut(u32) -> String,
+) -> HammerOutcome {
+    let mut acked = 0;
+    let mut failed = 0;
+    let mut i = 0;
+    while tokio::time::Instant::now() < deadline {
+        let body = body_for(i);
+        i += 1;
+        let (status, _resp_body) = dynamo(addr, target, &body).await;
+        if status == 200 {
+            acked += 1;
+        } else {
+            failed += 1;
+        }
+        if !pause.is_zero() {
+            sleep(pause).await;
+        }
+    }
+    HammerOutcome { acked, failed }
+}
+
+/// Serializes the two cross-node hammer tests (test threads run in
+/// parallel by default): each brings up its own 3-node cluster and
+/// saturates the box with deliberately-contended same-item writes, and
+/// when they overlap, the mixed test's already-slow contended phase (a
+/// blocked funnel write holds the leader's `rmw_lock` across its whole
+/// confirm-poll timeout) starves to near-zero committed writes. A shared
+/// async mutex costs only this file's two heavy tests their concurrency,
+/// unlike a binary-wide `--test-threads=1`.
+static HAMMER_SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+fn hammer_serial() -> &'static tokio::sync::Mutex<()> {
+    HAMMER_SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// A few sequential `PutItem`s from EACH node against a key the real race
 /// below never touches (`id = "warmup"`, vs. the race's own `"shared"`),
 /// each retried on a non-200 for up to 5s — settling the freshly created
@@ -877,6 +945,7 @@ async fn await_settled_alt(addr: SocketAddr, key_json: &str) -> String {
 /// row names a `alt` the base item no longer holds).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_node_racing_unconditional_puts_never_orphan_an_lsi_row() {
+    let _serial = hammer_serial().lock().await;
     let dir = tempfile::tempdir().unwrap();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
@@ -968,6 +1037,191 @@ async fn cross_node_racing_unconditional_puts_never_orphan_an_lsi_row() {
         "expected exactly one live LSI row for partition `shared`, got {} \
          (an orphan stale row from a cross-node racing diff) — base item alt={base_alt}, \
          rows={items:?}",
+        items.len()
+    );
+    let row_alt = item_alt(&items[0]).expect("LSI row must carry alt");
+    assert_eq!(
+        row_alt, base_alt,
+        "the one surviving LSI row's alt ({row_alt}) must match the base item's own current \
+         alt ({base_alt}) — a mismatch means the surviving row is itself stale"
+    );
+}
+
+/// **Issue #266: the cross-node orphan-row interleaving with a transactional
+/// participant** — the mixed twin of
+/// `cross_node_racing_unconditional_puts_never_orphan_an_lsi_row` above. One
+/// loop hammers unconditional `PutItem`s through `nodes[0]` (the ADR 0046 U3
+/// evaluate-at-leader funnel + `KindBatch.conditions` OCC seatbelt); the
+/// other hammers single-action `TransactWriteItems` `Put`s of the SAME item
+/// through `nodes[1]` (leader-side `eval_kind_txn_write`, the C1 mandatory
+/// own-key OCC, materialize-at-resolve — with `txn_resolver_loop`'s recovery
+/// push, which never takes `rmw_lock`, live in the background throughout).
+/// This drives exactly the residual windows the issue names: a funnel
+/// write's evaluate→apply gap straddling a `TxnStage`'s intent (the seatbelt
+/// must observe the intent and no-op the stale diff whole), and a stage's
+/// eval→apply gap straddling a funnel commit (the C1 OCC must reject the
+/// stage whole, kind payload included) — either guard failing open leaves a
+/// stale LSI row nothing ever reconciles. The primitive-level deterministic
+/// pin of the same interleaving is `animus-cp-data`'s `txn_kind_writes.rs::
+/// a_conditioned_kind_batch_racing_the_stage_resolve_window_never_orphans_
+/// an_lsi_row`; this test is the real-cluster, genuinely-cross-node
+/// counterpart (`SimEnv` cannot express two edge nodes — `animusd` has no
+/// sim seam — so per the house convention this rides `ProdEnv` and asserts
+/// on converged state).
+///
+/// Same shape as the plain-hammer test throughout: settle first, tolerate
+/// per-write transient outcomes (a canceled transaction is a *correct*
+/// outcome under this mix), health-gate that enough writes actually landed
+/// to have exercised contention, then assert on converged state read from a
+/// third node: exactly ONE live LSI row, matching the settled base item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_node_racing_transactional_and_plain_puts_never_orphan_an_lsi_row() {
+    let _serial = hammer_serial().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr_a = nodes[0].dynamo_addr();
+    let addr_b = nodes[1].dynamo_addr();
+    let addr_c = nodes[2].dynamo_addr();
+
+    let (status, body) = dynamo(
+        addr_a,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"race_txn",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
+                         {"AttributeName":"sk","KeyType":"RANGE"}],
+            "LocalSecondaryIndexes":[
+                {"IndexName":"by-alt",
+                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
+                              {"AttributeName":"alt","KeyType":"RANGE"}]}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+
+    settle_tablet_routing(addr_a, addr_b, "race_txn").await;
+
+    // Wall-clock-bounded, not iteration-bounded — see `hammer_until`'s doc
+    // for why a fixed iteration count can't hold this workload to a sane
+    // suite budget. Env-tunable for red-run sweeps, like RACE_ITERATIONS
+    // above.
+    let seconds: u64 = std::env::var("RACE_TXN_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(75);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+
+    let (outcome_plain, outcome_txn) = tokio::join!(
+        hammer_until(
+            addr_a,
+            "DynamoDB_20120810.PutItem",
+            deadline,
+            // The stagger that keeps the run legible — see `hammer_until`'s
+            // doc. On the transactional loop the 2PC round trips are a
+            // natural pause already.
+            Duration::from_millis(25),
+            |i| format!(
+                r#"{{"TableName":"race_txn","Item":{{"id":{{"S":"shared"}},"sk":{{"S":"x"}},"alt":{{"S":"P-{i:05}"}}}}}}"#
+            )
+        ),
+        hammer_until(
+            addr_b,
+            "DynamoDB_20120810.TransactWriteItems",
+            deadline,
+            Duration::ZERO,
+            |i| format!(
+                r#"{{"TransactItems":[{{"Put":{{"TableName":"race_txn","Item":{{"id":{{"S":"shared"}},"sk":{{"S":"x"}},"alt":{{"S":"T-{i:05}"}}}}}}}}]}}"#
+            )
+        ),
+    );
+    eprintln!(
+        "mixed hammer outcome over {seconds}s: plain {} acked ({} failed), transactional \
+         {} acked ({} failed)",
+        outcome_plain.acked, outcome_plain.failed, outcome_txn.acked, outcome_txn.failed
+    );
+    // Non-vacuousness top-up rather than hard ack floors on the contended
+    // phase: under same-item contention most of either loop's wall budget
+    // is *correctly* spent in blocked-write timeouts and canceled
+    // transactions (each of which itself exercised the guards under test),
+    // and how many writes actually commit in a fixed window varies wildly
+    // with machine load — a hard floor there flakes without indicating
+    // anything wrong. What must NOT be vacuous is each path's ability to
+    // land writes at all: after the contended phase, each side that
+    // committed fewer than 3 writes gets a short *sequential* top-up
+    // (no concurrent hammer left to collide with, so these complete
+    // quickly on a healthy cluster), still moving the base/LSI state
+    // through both write paths before the final converged check.
+    for (label, target, acked, tag) in [
+        (
+            "plain",
+            "DynamoDB_20120810.PutItem",
+            outcome_plain.acked,
+            "PX",
+        ),
+        (
+            "transactional",
+            "DynamoDB_20120810.TransactWriteItems",
+            outcome_txn.acked,
+            "TX",
+        ),
+    ] {
+        let mut acked = acked;
+        for i in 0..30u32 {
+            if acked >= 3 {
+                break;
+            }
+            let item = format!(
+                r#""Item":{{"id":{{"S":"shared"}},"sk":{{"S":"x"}},"alt":{{"S":"{tag}-{i:05}"}}}}"#
+            );
+            let body = if tag == "PX" {
+                format!(r#"{{"TableName":"race_txn",{item}}}"#)
+            } else {
+                format!(r#"{{"TransactItems":[{{"Put":{{"TableName":"race_txn",{item}}}}}]}}"#)
+            };
+            let (status, _) = dynamo(addr_b, target, &body).await;
+            if status == 200 {
+                acked += 1;
+            }
+        }
+        assert!(
+            acked >= 3,
+            "the {label} write path could not land even 3 writes (contended phase + 30 \
+             sequential top-up attempts) — the cluster looks unhealthy beyond ordinary \
+             contention"
+        );
+    }
+
+    let base_alt = await_settled_alt(
+        addr_c,
+        r#"{"TableName":"race_txn","Key":{"id":{"S":"shared"},"sk":{"S":"x"}}}"#,
+    )
+    .await;
+
+    // The whole-partition LSI scan is the orphan detector, exactly as in the
+    // plain-hammer test: a second row means a stale diff (from either
+    // write path) survived; a mismatch means the one surviving row is stale.
+    let (status, body) = dynamo(
+        addr_c,
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"race_txn","IndexName":"by-alt",
+            "KeyConditionExpression":"id = :i",
+            "ExpressionAttributeValues":{":i":{"S":"shared"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "LSI query failed: {body}");
+    let query_reply: Value = serde_json::from_str(&body).expect("Query reply is valid JSON");
+    let items = query_reply["Items"]
+        .as_array()
+        .expect("Items is an array")
+        .clone();
+    assert_eq!(
+        items.len(),
+        1,
+        "expected exactly one live LSI row for partition `shared`, got {} \
+         (an orphan stale row from a cross-node racing diff with a transactional participant) \
+         — base item alt={base_alt}, rows={items:?}",
         items.len()
     );
     let row_alt = item_alt(&items[0]).expect("LSI row must carry alt");
