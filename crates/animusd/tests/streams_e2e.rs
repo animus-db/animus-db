@@ -227,8 +227,18 @@ async fn get_shard_iterator(
     let body = format!(
         r#"{{"StreamArn":"{stream_arn}","ShardId":"{shard_id}","ShardIteratorType":"{iterator_type}"}}"#
     );
-    let (status, resp) = dynamo(addr, "DynamoDBStreams_20120810.GetShardIterator", &body).await;
-    assert_eq!(status, 200, "GetShardIterator failed: {resp}");
+    // Retry-on-500, same as `dynamo_retrying` below: this drain-path helper
+    // can race a still-in-flight tablet split (a `Splitting`/`Building`
+    // group mid-election surfaces as a documented, bounded "not the leader
+    // here; leader_hint=none" 500) exactly like the soak's own write path
+    // does, just on the read side.
+    let resp = dynamo_retrying(
+        addr,
+        "DynamoDBStreams_20120810.GetShardIterator",
+        &body,
+        "GetShardIterator",
+    )
+    .await;
     json(&resp)["ShardIterator"]
         .as_str()
         .unwrap_or_else(|| panic!("no ShardIterator in: {resp}"))
@@ -237,8 +247,14 @@ async fn get_shard_iterator(
 
 async fn get_records(addr: SocketAddr, iterator: &str) -> (Vec<Value>, Option<String>) {
     let body = format!(r#"{{"ShardIterator":"{iterator}"}}"#);
-    let (status, resp) = dynamo(addr, "DynamoDBStreams_20120810.GetRecords", &body).await;
-    assert_eq!(status, 200, "GetRecords failed: {resp}");
+    // Same retry-on-500 rationale as `get_shard_iterator` above.
+    let resp = dynamo_retrying(
+        addr,
+        "DynamoDBStreams_20120810.GetRecords",
+        &body,
+        "GetRecords",
+    )
+    .await;
     let v = json(&resp);
     let records = v["Records"].as_array().cloned().unwrap_or_default();
     let next = v["NextShardIterator"].as_str().map(str::to_owned);
@@ -254,6 +270,59 @@ async fn describe_stream(addr: SocketAddr, stream_arn: &str) -> String {
     .await;
     assert_eq!(status, 200, "DescribeStream failed: {resp}");
     resp
+}
+
+/// A bounded retry-on-500 wrapper around [`dynamo`] for the ADR 0050 fork F8
+/// **documented** sub-second retryable write blip at freeze→cutover: a
+/// request landing inside that window surfaces as a Dynamo 500 carrying
+/// `"tablet frozen for split cutover (ADR 0050); a child will serve this
+/// range shortly; retry"` — a real DynamoDB client retries a 500, and so
+/// must this one. Modeled on `split_build.rs::put`'s retry shape (bounded
+/// deadline, fixed backoff). Any *non*-500 status, or deadline expiry with
+/// the blip still ongoing, still fails loudly — this only masks the one
+/// documented transient, never a genuine error.
+async fn dynamo_retrying(addr: SocketAddr, target: &str, body: &str, what: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (status, resp) = dynamo(addr, target, body).await;
+        if status == 200 {
+            return resp;
+        }
+        if status == 500 && tokio::time::Instant::now() < deadline {
+            sleep(Duration::from_millis(150)).await;
+            continue;
+        }
+        panic!("{what} failed (status {status}) after retrying: {resp}");
+    }
+}
+
+/// As [`dynamo_retrying`], but for `TransactWriteItems` specifically:
+/// DynamoDB's own wire convention maps a cancelled transaction to **HTTP
+/// 400** `TransactionCanceledException`, never 500 — so the identical ADR
+/// 0050 F8 freeze→cutover blip surfaces through the transact path with a
+/// different status code than a plain `PutItem`/`Query` sees
+/// (`"txn prepare: stage on table ... was rejected (a stale route, an
+/// already-sealed/out-of-fence range, or a concurrent in-doubt-recovery
+/// decision); retry"`). Retry that specific documented shape too; any other
+/// `TransactionCanceledException` (a genuine condition-check failure, e.g.)
+/// still fails loudly, since only this one's own message says "retry".
+async fn dynamo_retrying_transact(addr: SocketAddr, body: &str, what: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (status, resp) = dynamo(addr, "DynamoDB_20120810.TransactWriteItems", body).await;
+        if status == 200 {
+            return resp;
+        }
+        let retryable = status == 500
+            || (status == 400
+                && resp.contains("TransactionCanceledException")
+                && resp.contains("retry"));
+        if retryable && tokio::time::Instant::now() < deadline {
+            sleep(Duration::from_millis(150)).await;
+            continue;
+        }
+        panic!("{what} failed (status {status}) after retrying: {resp}");
+    }
 }
 
 /// The full, *current* set of tablet ids the stream's shard list spans —
@@ -1059,11 +1128,24 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     // — from *each* node's own answer, not just node 0.
     let child_shard = segment::shard_id(child.0, 0);
     for (i, node) in nodes.iter().enumerate() {
-        let body = describe_stream(node.dynamo_addr(), &stream_arn).await;
-        assert!(
-            body.contains(&child_shard),
-            "node {i}'s DescribeStream must list the split child's own shard: {body}"
-        );
+        // Converged-or-timeout: a follower whose apply/mirror lags the
+        // cutover by a tick can legitimately answer `DescribeStream` without
+        // the child yet (an eventually-replicated view, not a bug) — poll
+        // this one node's own answer to convergence instead of a one-shot
+        // assert on the very first reply, then run the follow-on content
+        // assertions against that converged body.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let body = loop {
+            let body = describe_stream(node.dynamo_addr(), &stream_arn).await;
+            if body.contains(&child_shard) {
+                break body;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node {i}'s DescribeStream never listed the split child's own shard within 30s: {body}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        };
         let needle = format!("\"ShardId\":\"{child_shard}\"");
         let pos = body.find(&needle).unwrap_or_else(|| {
             panic!("node {i}: child shard {child_shard} missing from DescribeStream: {body}")
@@ -2309,45 +2391,51 @@ async fn multi_split_soak_streamed_gsi_table_under_mixed_load() {
         for i in 0..120usize {
             let issuer = &nodes[i % nodes.len()];
             let id = format!("e{i:04}");
-            let (status, body) = dynamo(
+            // Retry on a Dynamo 500: a request landing inside a freeze→
+            // cutover window surfaces the ADR 0050 F8 documented retryable
+            // refusal exactly like AWS's own transient-error contract. Only
+            // record the id in `ids` once the request has actually
+            // succeeded, so a retried Put's bookkeeping stays exactly-once
+            // (the retried Put itself is idempotent).
+            dynamo_retrying(
                 issuer.dynamo_addr(),
                 "DynamoDB_20120810.PutItem",
                 &format!(
                     r#"{{"TableName":"soak","Item":{{"id":{{"S":"{id}"}},"tag":{{"S":"t{}"}},"body":{{"S":"{filler}"}}}}}}"#,
                     i % 4
                 ),
+                &format!("PutItem({id})"),
             )
             .await;
-            assert_eq!(status, 200, "PutItem({id}) failed: {body}");
             ids.push(id);
             if i % 10 == 9 {
                 let (a, b) = (format!("x{i:04}a"), format!("x{i:04}b"));
-                let (status, body) = dynamo(
+                dynamo_retrying_transact(
                     issuer.dynamo_addr(),
-                    "DynamoDB_20120810.TransactWriteItems",
                     &format!(
                         r#"{{"TransactItems":[
                             {{"Put":{{"TableName":"soak","Item":{{"id":{{"S":"{a}"}},"tag":{{"S":"t0"}}}}}}}},
                             {{"Put":{{"TableName":"soak","Item":{{"id":{{"S":"{b}"}},"tag":{{"S":"t1"}}}}}}}}]}}"#
                     ),
+                    &format!("transact({a},{b})"),
                 )
                 .await;
-                assert_eq!(status, 200, "transact({a},{b}) failed: {body}");
                 ids.push(a);
                 ids.push(b);
             }
             if i % 15 == 14 {
                 // A live GSI read mid-workflow — result content converges
-                // later; mid-flight it only has to serve.
-                let (status, _) = dynamo(
+                // later; mid-flight it only has to serve (retried past the
+                // same documented cutover blip).
+                dynamo_retrying(
                     issuer.dynamo_addr(),
                     "DynamoDB_20120810.Query",
                     r#"{"TableName":"soak","IndexName":"by-tag",
                         "KeyConditionExpression":"tag = :t",
                         "ExpressionAttributeValues":{":t":{"S":"t0"}}}"#,
+                    "mid-flight GSI query",
                 )
                 .await;
-                assert_eq!(status, 200, "mid-flight GSI query failed");
             }
         }
         let expected = ids.len();
