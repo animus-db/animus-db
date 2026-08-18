@@ -15,11 +15,27 @@
 //! pre-existing rows while the stream is live — concurrent live writes are
 //! also issued while the backfill is in flight, mirroring
 //! `tests/backfill_seeder.rs`'s "live writes racing the sweep" scenario, to
-//! prove the fix filters *only* seed markers, never a real write. Drains
-//! `GetRecords` on the table's one open (never-sealed, tiny cluster) shard to
-//! convergence and asserts (a) zero delivered records have the phantom
-//! shape (empty `Keys`, no images) and (b) every real write — pre-existing
-//! and concurrent alike — is delivered exactly once, no more, no less.
+//! prove the fix filters *only* seed markers, never a real write.
+//!
+//! **Both `GetRecords` serve paths get their own test** (issue #267's ask —
+//! the filter is one shared predicate, `ChangeRecord::consumer_hidden`, but
+//! a shared predicate only proves the paths *agree*, not that each is
+//! actually reached with a seed record in hand):
+//!
+//! - [`backfill_seed_markers_never_surface_as_phantom_stream_events`] pins
+//!   the **open-tail** path: seal knobs tuned to never fire, so the table's
+//!   one open shard serves every record straight from the hot change log.
+//! - [`backfill_seed_markers_never_surface_from_sealed_shards_either`] pins
+//!   the **sealed** path: aggressive seal knobs so the seal arm sweeps the
+//!   whole log — seed markers included, by design ("hiding is a serve-time
+//!   decision", `docs/streams-notes.md`) — into sealed segments, and the
+//!   walk converges only once every real event is served from a *sealed*
+//!   shard's segment decode (`dynamo_streams::get_records_sealed`).
+//!
+//! Each test drains its shard lineage to convergence and asserts (a) zero
+//! delivered records have the phantom shape (empty `Keys`, no images) and
+//! (b) every real write — pre-existing and concurrent alike — is delivered
+//! exactly once, no more, no less.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -43,6 +59,18 @@ use tokio::time::{Instant, sleep, timeout};
 fn no_seal_knobs() -> StreamSealKnobs {
     StreamSealKnobs {
         seal_bytes: 1_000_000,
+        seal_age: Duration::from_secs(3600),
+    }
+}
+
+/// The sealed-path test's dual: seals almost immediately on any pending
+/// byte (`tests/dynamo_streams.rs`'s own `tiny_seal_knobs` convention), so
+/// the backfill's seed markers — which the sealer deliberately seals
+/// alongside real records — end up inside sealed segments and the phantom
+/// question moves to `get_records_sealed`'s segment decode.
+fn tiny_seal_knobs() -> StreamSealKnobs {
+    StreamSealKnobs {
+        seal_bytes: 1,
         seal_age: Duration::from_secs(3600),
     }
 }
@@ -246,6 +274,71 @@ fn count_for_id(records: &[Value], id: &str) -> usize {
         .count()
 }
 
+/// The phantom shape: an empty `Keys` (or, equivalently, neither image
+/// present) must never appear in a delivered record — that is exactly and
+/// only what an unfiltered backfill seed marker decodes to.
+fn assert_no_phantom_shape(records: &[Value]) {
+    for r in records {
+        let keys = r["dynamodb"]["Keys"]
+            .as_object()
+            .unwrap_or_else(|| panic!("record has no `Keys` object at all: {r}"));
+        assert!(
+            !keys.is_empty(),
+            "phantom event with an empty `Keys` field surfaced: {r}"
+        );
+        let has_image =
+            r["dynamodb"].get("OldImage").is_some() || r["dynamodb"].get("NewImage").is_some();
+        assert!(
+            has_image,
+            "phantom event with no image at all surfaced: {r}"
+        );
+    }
+}
+
+/// One full `TRIM_HORIZON` walk of the stream's current shard lineage,
+/// with the delivered events split by which serve path produced them:
+/// events read from shards `DescribeStream` reported **sealed** (an
+/// `EndingSequenceNumber` present — `get_records_sealed`'s segment decode)
+/// vs from the still-open tail (the hot-read path). A shard that seals
+/// between the describe and its own drain is served through the sealed
+/// resolution regardless (the iterator-survives-seal property) — it is
+/// only *attributed* to the open bucket, which the caller's convergence
+/// condition (open bucket empty) makes moot on the walk that decides.
+async fn walk_lineage(addr: SocketAddr, stream_arn: &str) -> (Vec<Value>, Vec<Value>) {
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDBStreams_20120810.DescribeStream",
+        &format!(r#"{{"StreamArn":"{stream_arn}"}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeStream failed: {body}");
+    let shards = json(&body)["StreamDescription"]["Shards"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut sealed_events: Vec<Value> = Vec::new();
+    let mut open_events: Vec<Value> = Vec::new();
+    for shard in &shards {
+        let shard_id = shard["ShardId"].as_str().expect("ShardId");
+        let is_sealed = shard["SequenceNumberRange"]["EndingSequenceNumber"].is_string();
+        let mut it = Some(get_shard_iterator(addr, stream_arn, shard_id).await);
+        while let Some(iterator) = it {
+            let (records, next) = get_records(addr, &iterator).await;
+            let drained = records.is_empty();
+            if is_sealed {
+                sealed_events.extend(records);
+            } else {
+                open_events.extend(records);
+            }
+            // A sealed shard drains to a null iterator; an open shard
+            // returns the same position on an empty poll — one empty poll
+            // ends it either way.
+            it = if drained { None } else { next };
+        }
+    }
+    (sealed_events, open_events)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backfill_seed_markers_never_surface_as_phantom_stream_events() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -312,24 +405,8 @@ async fn backfill_seed_markers_never_surface_as_phantom_stream_events() {
 
     let delivered = drain_open_shard_to_convergence(addr, &iterator).await;
 
-    // (a) The phantom shape: an empty `Keys` (or, equivalently, neither
-    // image present) must never appear — that is exactly and only what an
-    // unfiltered backfill seed marker decodes to.
-    for r in &delivered {
-        let keys = r["dynamodb"]["Keys"]
-            .as_object()
-            .unwrap_or_else(|| panic!("record has no `Keys` object at all: {r}"));
-        assert!(
-            !keys.is_empty(),
-            "phantom event with an empty `Keys` field surfaced: {r}"
-        );
-        let has_image =
-            r["dynamodb"].get("OldImage").is_some() || r["dynamodb"].get("NewImage").is_some();
-        assert!(
-            has_image,
-            "phantom event with no image at all surfaced: {r}"
-        );
-    }
+    // (a) The phantom shape must never appear — see `assert_no_phantom_shape`.
+    assert_no_phantom_shape(&delivered);
 
     // (b) Every real write, and only real writes, delivered exactly once:
     // 5 pre-existing inserts + 2 new inserts + 1 modify + 1 delete = 9. A
@@ -341,6 +418,112 @@ async fn backfill_seed_markers_never_surface_as_phantom_stream_events() {
         "expected exactly 9 real events, got {}: {delivered:#?}",
         delivered.len()
     );
+    for id in &pre_existing {
+        let want = if id == "p0" || id == "p1" { 2 } else { 1 };
+        assert_eq!(
+            count_for_id(&delivered, id),
+            want,
+            "wrong delivery count for pre-existing partition {id}: {delivered:#?}"
+        );
+    }
+    assert_eq!(count_for_id(&delivered, "p5"), 1, "{delivered:#?}");
+    assert_eq!(count_for_id(&delivered, "p6"), 1, "{delivered:#?}");
+
+    for n in &nodes {
+        n.shutdown();
+    }
+}
+
+/// The **sealed** serve path's dual of the test above (issue #267): with
+/// `tiny_seal_knobs` the seal arm sweeps the change log — the backfill's
+/// seed markers included, deliberately ("hiding is a serve-time decision",
+/// `docs/streams-notes.md`) — into sealed segments, so an unfiltered seed
+/// marker would surface through `get_records_sealed`'s segment decode
+/// rather than the open tail's hot read. Identical scenario (pre-existing
+/// rows, stream live, GSI added mid-flight, concurrent writes racing the
+/// sweep); the walk converges only once every real event is served from a
+/// *sealed* shard and the open tail is empty — proving the sealed branch
+/// filtered the seed markers while delivering every real write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backfill_seed_markers_never_surface_from_sealed_shards_either() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
+    await_bootstrap(&nodes).await;
+    let addr = nodes[0].dynamo_addr();
+    let table = "orders_sealed";
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        &format!(
+            r#"{{"TableName":"{table}",
+                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                "StreamSpecification":{{"StreamEnabled":true,
+                    "StreamViewType":"NEW_AND_OLD_IMAGES"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+    let label = field(&body, "LatestStreamLabel");
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{label}");
+
+    // Five pre-existing partitions, written *before* the GSI (and its
+    // backfill) ever exist — exactly what `backfill_seed_tick` sweeps.
+    let pre_existing: Vec<String> = (0..5).map(|i| format!("p{i}")).collect();
+    for id in &pre_existing {
+        put_item(addr, table, id, &format!("cat-{id}")).await;
+    }
+
+    // Add the GSI over the real `UpdateTable` wire path — this starts
+    // `backfill_seed_tick` seeding one image-less marker per pre-existing
+    // partition, racing the aggressive seal arm.
+    create_index_via_wire(addr, table, "by-cat", "cat").await;
+
+    // Genuine concurrent writes racing both the backfill sweep and the seal
+    // arm — every one must be delivered; the filter must eat only seed
+    // markers.
+    put_item(addr, table, "p5", "cat-p5").await;
+    put_item(addr, table, "p6", "cat-p6").await;
+    put_item(addr, table, "p0", "cat-p0-updated").await; // MODIFY on p0
+    delete_item(addr, table, "p1").await; // REMOVE on p1
+
+    await_index_active(&nodes, table, "by-cat").await;
+
+    // Converge: with `seal_bytes: 1` every pending record — real and seeded
+    // alike — is eventually sealed, so the walk must end with all 9 real
+    // events served from sealed shards and the open tail empty. Judged by
+    // repeated full-lineage walks (the house converged-or-timeout idiom):
+    // a transiently short count just re-polls; a count *past* 9 can only
+    // mean a phantom leaked (or a real event was double-delivered) and
+    // fails immediately rather than timing out ambiguously.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let delivered = loop {
+        let (sealed, open) = walk_lineage(addr, &stream_arn).await;
+        assert_no_phantom_shape(&sealed);
+        assert_no_phantom_shape(&open);
+        assert!(
+            sealed.len() + open.len() <= 9,
+            "more events than the 9 real writes were delivered — a seed \
+             marker leaked through a serve path, or a real event was \
+             double-delivered: sealed={sealed:#?} open={open:#?}"
+        );
+        if sealed.len() == 9 && open.is_empty() {
+            break sealed;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "the lineage never converged to all 9 real events sealed \
+                 within 60s (sealed={}, open={})",
+                sealed.len(),
+                open.len()
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
+
+    // Every real write, and only real writes, delivered exactly once — the
+    // same accounting as the open-path test, now entirely off sealed
+    // segments that physically contain the seed markers.
     for id in &pre_existing {
         let want = if id == "p0" || id == "p1" { 2 } else { 1 };
         assert_eq!(
