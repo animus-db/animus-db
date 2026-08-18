@@ -114,12 +114,32 @@ pub struct DiskConfig {
     /// a garbled, not merely truncated, final record. No effect on files whose
     /// tear kept zero bytes, and never touches previously durable bytes.
     pub corrupt_on_crash: bool,
+    /// Extra virtual-time latency injected into every `append`/`sync` call
+    /// (issue #279 — modelling a slow real disk, e.g. to reproduce a livelock
+    /// where a driver task blocks on a slow `fsync` past an election
+    /// timeout). `None` (default) injects nothing, so a run with no configured
+    /// delay is byte-identical to one on a `SimEnv` build predating this
+    /// field. Unlike [`error_threshold`](Self::error_threshold)/
+    /// [`torn_tail_on_crash`](Self::torn_tail_on_crash), this is a fixed
+    /// latency, not a seed-sampled fault — it draws no RNG and perturbs no
+    /// trace event ordering beyond the timer it schedules, so it composes
+    /// cleanly with the other knobs.
+    sync_delay: Option<Duration>,
 }
 
 impl DiskConfig {
     /// Set the independent per-op disk error probability in `[0.0, 1.0]`.
     pub fn set_error_prob(&mut self, p: f64) {
         self.error_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
+    }
+
+    /// Inject `dur` of extra virtual-time latency into every subsequent
+    /// `append`/`sync` call on this config (global or per-node — see
+    /// [`Simulator::set_disk_config`]/[`Simulator::set_disk_config_for`]).
+    /// Mirrors [`set_error_prob`](Self::set_error_prob)'s shape: a plain
+    /// setter, no RNG involved.
+    pub fn set_sync_delay(&mut self, dur: Duration) {
+        self.sync_delay = Some(dur);
     }
 }
 
@@ -979,28 +999,53 @@ impl Network for SimEnv {
 #[async_trait::async_trait]
 impl Disk for SimEnv {
     async fn append(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
-        let mut st = self.shared.lock();
-        if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "append", file) {
-            return Err(e);
+        // Sample the configured latency (if any) inside this block, while
+        // still holding `st`, then let the guard drop at the block's close —
+        // *before* awaiting `sleep` below. A nested block (not a manual
+        // `drop(st)`) is what actually convinces the `Send`-future analysis
+        // the non-`Send` `MutexGuard` doesn't live across the `.await`,
+        // mirroring `Clock::sleep`'s own two-step "read shared state, then
+        // await" pattern above (`sleep` re-locks `self.shared` internally, so
+        // holding `st` across the `.await` would also deadlock).
+        let delay = {
+            let mut st = self.shared.lock();
+            if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "append", file) {
+                return Err(e);
+            }
+            let key = (self.node_id.clone(), file.to_owned());
+            st.disks
+                .entry(key)
+                .or_default()
+                .buffered
+                .extend_from_slice(bytes);
+            st.disk_cfg_for(&self.node_id).sync_delay
+        };
+        if let Some(dur) = delay {
+            self.sleep(dur).await;
         }
-        let key = (self.node_id.clone(), file.to_owned());
-        st.disks
-            .entry(key)
-            .or_default()
-            .buffered
-            .extend_from_slice(bytes);
         Ok(())
     }
 
     async fn sync(&self, file: &str) -> std::io::Result<()> {
-        let mut st = self.shared.lock();
-        if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "sync", file) {
-            return Err(e);
-        }
-        let key = (self.node_id.clone(), file.to_owned());
-        if let Some(f) = st.disks.get_mut(&key) {
-            let mut buffered = std::mem::take(&mut f.buffered);
-            f.durable.append(&mut buffered);
+        // See `append`'s identical comment: sample inside this block, then let
+        // `st` drop at its close, before awaiting — so a configured
+        // `sync_delay` models a real fsync's latency (the caller doesn't get
+        // control back until it elapses) without holding `self.shared` across
+        // the `.await`.
+        let delay = {
+            let mut st = self.shared.lock();
+            if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "sync", file) {
+                return Err(e);
+            }
+            let key = (self.node_id.clone(), file.to_owned());
+            if let Some(f) = st.disks.get_mut(&key) {
+                let mut buffered = std::mem::take(&mut f.buffered);
+                f.durable.append(&mut buffered);
+            }
+            st.disk_cfg_for(&self.node_id).sync_delay
+        };
+        if let Some(dur) = delay {
+            self.sleep(dur).await;
         }
         Ok(())
     }

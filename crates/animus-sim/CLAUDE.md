@@ -17,9 +17,12 @@ function of one seed. This is the substrate every distributed test runs on.
   (process exit), `set_net_config(NetConfig)` (delay/jitter/drop),
   `set_disk_config(DiskConfig)` / `set_disk_config_for(node, ..)` (disk faults:
   per-op injected `io::Error`s on `append`/`sync`/`read`/`read_at`/`replace`,
-  torn un-synced tails on crash, byte corruption of the torn region), and
-  `corrupt_durable(node, file, offset)` (flip one durable byte — at-rest
-  corruption of synced data, e.g. to hit an SSTable's per-block CRC).
+  torn un-synced tails on crash, byte corruption of the torn region, and
+  `DiskConfig::set_sync_delay` — a fixed extra virtual-time latency on every
+  `append`/`sync`, issue #279's slow-disk livelock repro; unlike the other
+  knobs it draws no RNG, so it's a plain fixed cost, not a seed-sampled
+  fault), and `corrupt_durable(node, file, offset)` (flip one durable byte —
+  at-rest corruption of synced data, e.g. to hit an SSTable's per-block CRC).
 - Observability: `trace()` / `trace_lines()`, `now()`, `seed()`.
 - Clock skew (ADR 0018 §2 sim support): `set_clock_skew_for(node, skew_nanos)`
   — a per-node signed-nanosecond offset applied only to that node's own

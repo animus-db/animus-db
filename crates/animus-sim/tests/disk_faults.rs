@@ -13,7 +13,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_env::{Disk, EnvExt, Network, nid};
+use animus_env::{Clock, Disk, EnvExt, Network, nid};
 use animus_sim::{DiskConfig, Simulator};
 
 /// A workload that interleaves disk ops with network sends. The sends draw RNG
@@ -335,6 +335,67 @@ fn corrupt_on_crash_flips_one_byte_in_the_retained_region() {
         }
     }
     assert!(saw_corruption, "no seed produced a retained+corrupted byte");
+}
+
+/// `DiskConfig::set_sync_delay` (issue #279): a configured delay actually
+/// delays `sync`'s (and `append`'s) completion in virtual time, and a run
+/// with no delay configured takes none.
+#[test]
+fn sync_delay_actually_delays_a_sync_in_sim_time() {
+    let seed = 0xD15C_0006;
+    let mut sim = Simulator::new(seed);
+    let mut cfg = DiskConfig::default();
+    cfg.set_sync_delay(Duration::from_millis(400));
+    sim.set_disk_config(cfg);
+
+    let elapsed = Arc::new(Mutex::new(None));
+    {
+        let env = sim.env(nid(0));
+        let out = Arc::clone(&elapsed);
+        env.clone().spawn_task(async move {
+            env.append("wal", b"hello").await.unwrap();
+            let before = env.now();
+            env.sync("wal").await.unwrap();
+            let after = env.now();
+            *out.lock().unwrap() = Some(after.0.saturating_sub(before.0));
+        });
+        // `append` and `sync` are each delayed 400ms, so the task needs up to
+        // ~800ms of virtual time to reach the `sync` measurement.
+        sim.run_for(Duration::from_millis(1000));
+    }
+    let nanos = elapsed.lock().unwrap().expect("task must have run");
+    assert!(
+        nanos >= Duration::from_millis(400).as_nanos() as u64,
+        "seed={seed}: sync must not resolve before its configured delay elapses (got {nanos}ns)"
+    );
+}
+
+/// With no `sync_delay` configured, `sync` resolves without advancing virtual
+/// time at all (matches every pre-existing test's assumption).
+#[test]
+fn no_sync_delay_configured_takes_no_virtual_time() {
+    let seed = 0xD15C_0007;
+    let mut sim = Simulator::new(seed);
+    sim.set_disk_config(DiskConfig::default());
+
+    let elapsed = Arc::new(Mutex::new(None));
+    {
+        let env = sim.env(nid(0));
+        let out = Arc::clone(&elapsed);
+        env.clone().spawn_task(async move {
+            env.append("wal", b"hello").await.unwrap();
+            let before = env.now();
+            env.sync("wal").await.unwrap();
+            let after = env.now();
+            *out.lock().unwrap() = Some(after.0.saturating_sub(before.0));
+        });
+        sim.run();
+    }
+    assert_eq!(
+        elapsed.lock().unwrap().expect("task must have run"),
+        0,
+        "seed={seed}: an unconfigured sync_delay must not advance virtual time"
+    );
 }
 
 /// `corrupt_durable` flips exactly the addressed durable byte (no RNG), and
