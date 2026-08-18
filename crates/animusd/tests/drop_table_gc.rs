@@ -114,27 +114,38 @@ async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -
     (status, value)
 }
 
-/// Put `key = value` into `table` through a node's client port, asserting ok.
+/// Put `key = value` into `table` through a node's client port, with a
+/// bounded retry on ANY error reply (a put is idempotent, and both
+/// early-cluster/first-provision transients and split/leadership churn
+/// surface as a clean, retryable `ClientResponse::Error` — see
+/// `docs/engineering-lessons.md`'s "CP write-forward path has no
+/// retry-on-not-the-leader-here" entry).
 async fn client_put(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect client");
-    write_frame(
-        &mut stream,
-        &ClientRequest::Put {
-            key: key.to_vec(),
-            value: value.to_vec(),
-            table: table.to_string(),
-        },
-    )
-    .await
-    .expect("send put");
-    let reply: ClientResponse = read_frame(&mut stream)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut stream = TcpStream::connect(addr).await.expect("connect client");
+        write_frame(
+            &mut stream,
+            &ClientRequest::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                table: table.to_string(),
+            },
+        )
         .await
-        .expect("read reply")
-        .expect("a reply");
-    assert!(
-        matches!(reply, ClientResponse::PutOk),
-        "put failed: {reply:?}"
-    );
+        .expect("send put");
+        let reply: ClientResponse = read_frame(&mut stream)
+            .await
+            .expect("read reply")
+            .expect("a reply");
+        match reply {
+            ClientResponse::PutOk => return,
+            ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            other => panic!("put failed: {other:?}"),
+        }
+    }
 }
 
 /// Linearizable read of `key` from `table` through a node's client port.

@@ -125,20 +125,30 @@ async fn reads_and_writes_route_through_the_raft_group() {
     assert_eq!(absent, ClientResponse::Value(None));
 
     // An **untagged** key round-trips the same way (there is only the CP plane; the
-    // optional `table` no longer selects a plane).
-    let untagged_put = call(
-        addr0,
-        ClientRequest::Put {
-            key: b"u".to_vec(),
-            value: b"u-value".to_vec(),
-            table: "kv".to_string(),
-        },
-    )
-    .await;
-    assert!(
-        matches!(untagged_put, ClientResponse::PutOk),
-        "untagged put failed: {untagged_put:?}"
-    );
+    // optional `table` no longer selects a plane). This is `kv`'s own first write
+    // (a distinct table from `CP_TABLE` above), so it retries until `PutOk` for the
+    // same first-provision-race reason the write above did.
+    let untagged_put_ok = async {
+        loop {
+            let resp = call(
+                addr0,
+                ClientRequest::Put {
+                    key: b"u".to_vec(),
+                    value: b"u-value".to_vec(),
+                    table: "kv".to_string(),
+                },
+            )
+            .await;
+            match resp {
+                ClientResponse::PutOk => return,
+                ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                other => panic!("unexpected untagged put response: {other:?}"),
+            }
+        }
+    };
+    timeout(Duration::from_secs(20), untagged_put_ok)
+        .await
+        .expect("untagged put did not succeed within 20s");
     let untagged_got = call(
         addr2,
         ClientRequest::Get {

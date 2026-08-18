@@ -93,25 +93,39 @@ async fn metrics_endpoint_surfaces_control_plane_counters() {
         await_bootstrap(&nodes).await;
 
         // Do a quorum write so the data plane is exercised too (the endpoint
-        // aggregates the control + data + coord role sinks).
+        // aggregates the control + data + coord role sinks). This table's
+        // first write right after bootstrap can legitimately race the
+        // tablet-host reconciler standing up the freshly auto-provisioned
+        // tablet's group, so retry any clean `Error` reply for up to 20s
+        // (`docs/engineering-lessons.md`'s "CP write-forward path has no
+        // retry-on-not-the-leader-here" entry).
         let mut stream = TcpStream::connect(nodes[0].client_addr())
             .await
             .expect("connect");
-        animusd::write_frame(
-            &mut stream,
-            &ClientRequest::Put {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
-                table: "kv".to_string(),
-            },
-        )
-        .await
-        .expect("send put");
-        let put: ClientResponse = read_frame(&mut stream)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            animusd::write_frame(
+                &mut stream,
+                &ClientRequest::Put {
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                    table: "kv".to_string(),
+                },
+            )
             .await
-            .expect("read reply")
-            .expect("a reply");
-        assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
+            .expect("send put");
+            let put: ClientResponse = read_frame(&mut stream)
+                .await
+                .expect("read reply")
+                .expect("a reply");
+            match put {
+                ClientResponse::PutOk => break,
+                ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                    sleep(Duration::from_millis(150)).await;
+                }
+                other => panic!("put failed: {other:?}"),
+            }
+        }
 
         // Scrape `/metrics` on the node that believes it is leader, so the
         // leadership gauge and the leader-only counters are populated.

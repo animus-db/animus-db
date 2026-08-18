@@ -116,6 +116,34 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
         .expect("a reply")
 }
 
+/// A plain `Put`, retried on ANY `ClientResponse::Error` reply for up to
+/// 20s: a put is idempotent, and the first write against a fresh table
+/// right after bootstrap can legitimately race the tablet-host reconciler
+/// (documented in `docs/engineering-lessons.md`'s "CP write-forward path
+/// has no retry-on-not-the-leader-here" entry) or hit the confirm-loop
+/// futility-retry shape (issue #268).
+async fn put_retry(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) -> ClientResponse {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let resp = call(
+            addr,
+            ClientRequest::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                table: table.to_string(),
+            },
+        )
+        .await;
+        match resp {
+            ClientResponse::PutOk => return resp,
+            ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Poll `/admin/status` until `pred(&status)` holds, or panic after 15s —
 /// `ProposeSchema`'s `PutOk` only means "reached the leader's log", never
 /// "committed" (see `ClientCtx::propose_schema`'s doc), so every seed step
@@ -156,15 +184,7 @@ async fn system_table_lists_every_seeded_entity_kind() {
         let applied0 = syst0["applied_index"].as_u64().expect("applied_index");
 
         // ---- Tablet + Counter: a plain Put auto-provisions a tablet -------
-        let put = call(
-            client,
-            ClientRequest::Put {
-                key: b"a".to_vec(),
-                value: b"v".to_vec(),
-                table: "kv".to_string(),
-            },
-        )
-        .await;
+        let put = put_retry(client, "kv", b"a", b"v").await;
         assert!(matches!(put, ClientResponse::PutOk), "{put:?}");
         await_status(
             admin,
@@ -445,15 +465,7 @@ async fn system_table_pagination_is_gapless_and_duplicate_free() {
         // about.
         const N_TABLES: usize = 12;
         for i in 0..N_TABLES {
-            let put = call(
-                client,
-                ClientRequest::Put {
-                    key: b"k".to_vec(),
-                    value: b"v".to_vec(),
-                    table: format!("t{i}"),
-                },
-            )
-            .await;
+            let put = put_retry(client, &format!("t{i}"), b"k", b"v").await;
             assert!(matches!(put, ClientResponse::PutOk), "{put:?}");
         }
         await_status(

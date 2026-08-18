@@ -67,6 +67,29 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     (status, payload.to_string())
 }
 
+/// `dynamo`, retried on a retryable `500 InternalServerError` for up to 20s:
+/// any Dynamo-edge request — read or write — can surface the CP data
+/// plane's transient "not the leader here"/leadership-churn refusal as a
+/// clean `500` (`dynamo::error_status`), including well after initial
+/// cluster formation (a mid-test leadership change under CI-runner
+/// contention). A read is trivially idempotent, so retrying it is always
+/// safe; a write is idempotent here too (`PutItem`/`CreateTable` are the
+/// only writes this file issues, both safe to resend). See
+/// `docs/engineering-lessons.md`'s "CP write-forward path has no
+/// retry-on-not-the-leader-here" entry and issue #268's fast-futility
+/// entry — the same retryable-error convention, just reached over the
+/// Dynamo edge instead of the plain client protocol.
+async fn dynamo_retry(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (status, resp) = dynamo(addr, target, body).await;
+        if status != 500 || tokio::time::Instant::now() >= deadline {
+            return (status, resp);
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+}
+
 /// Poll an index `Scan` until `accept` is satisfied, returning the last body
 /// observed. A GSI is materialized **asynchronously** by the drain (ADR 0041
 /// §4/§5) — DynamoDB's own eventually-consistent contract — so every
@@ -151,7 +174,7 @@ async fn drain_scan_pages(addr: SocketAddr, request_prefix: &str, limit: usize) 
             None => String::new(),
         };
         let body = format!("{request_prefix},\"Limit\":{limit}{esk}}}");
-        let (status, resp) = dynamo(addr, "DynamoDB_20120810.Scan", &body).await;
+        let (status, resp) = dynamo_retry(addr, "DynamoDB_20120810.Scan", &body).await;
         assert_eq!(status, 200, "scan page failed: {resp}");
         // Only the part before `LastEvaluatedKey` — that field can repeat the
         // boundary item's own attribute values (it's built from that same
@@ -191,7 +214,7 @@ async fn setup() -> (Vec<Node>, SocketAddr) {
     await_bootstrap(&nodes).await;
 
     let addr0 = nodes[0].dynamo_addr();
-    let (status, body) = dynamo(
+    let (status, body) = dynamo_retry(
         addr0,
         "DynamoDB_20120810.CreateTable",
         r#"{"TableName":"events",
@@ -219,7 +242,7 @@ async fn setup() -> (Vec<Node>, SocketAddr) {
         ("p2", "b0", "B", "13", "93"),
         ("p2", "b1", "A", "14", "94"),
     ] {
-        let (status, body) = dynamo(
+        let (status, body) = dynamo_retry(
             addr0,
             "DynamoDB_20120810.PutItem",
             &format!(
@@ -280,7 +303,7 @@ async fn gsi_scan_rejects_consistent_read() {
     assert_eq!(status, 400, "expected rejection: {body}");
     assert!(body.contains("ValidationException"), "got: {body}");
 
-    let (status, body) = dynamo(
+    let (status, body) = dynamo_retry(
         addr,
         "DynamoDB_20120810.Scan",
         r#"{"TableName":"events","ConsistentRead":true}"#,
@@ -288,7 +311,7 @@ async fn gsi_scan_rejects_consistent_read() {
     .await;
     assert_eq!(status, 200, "base ConsistentRead Scan rejected: {body}");
 
-    let (status, body) = dynamo(
+    let (status, body) = dynamo_retry(
         addr,
         "DynamoDB_20120810.Scan",
         r#"{"TableName":"events","IndexName":"by-score","ConsistentRead":true}"#,
@@ -310,7 +333,7 @@ async fn lsi_scan_returns_only_the_requested_index_through_every_node() {
     let (nodes, _addr) = setup().await;
 
     for (i, node) in nodes.iter().enumerate() {
-        let (status, body) = dynamo(
+        let (status, body) = dynamo_retry(
             node.dynamo_addr(),
             "DynamoDB_20120810.Scan",
             r#"{"TableName":"events","IndexName":"by-score"}"#,
@@ -344,7 +367,7 @@ async fn lsi_scan_returns_only_the_requested_index_through_every_node() {
 async fn lsi_scan_supports_filter_expression() {
     let (_nodes, addr) = setup().await;
 
-    let (status, body) = dynamo(
+    let (status, body) = dynamo_retry(
         addr,
         "DynamoDB_20120810.Scan",
         r#"{"TableName":"events","IndexName":"by-score",

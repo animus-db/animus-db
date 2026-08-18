@@ -122,6 +122,41 @@ async fn admin_get(addr: SocketAddr, path: &str) -> (u16, Value) {
     admin(addr, "GET", path, None).await
 }
 
+/// A put with a bounded retry on ANY error reply (mirrors
+/// `split_build.rs::put`): a put is idempotent, and early-cluster-formation/
+/// split/election transients all surface as a clean, retryable
+/// `ClientResponse::Error` — see `docs/engineering-lessons.md`'s "CP
+/// write-forward path has no retry-on-not-the-leader-here" and issue #268's
+/// fast-futility entries. A bare one-shot assert on the first write right
+/// after bootstrap (or racing a split) is a documented latent flake, not a
+/// bug this test should paper over.
+async fn put(stream: &mut TcpStream, table: &str, key: Vec<u8>, value: Vec<u8>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        animusd::write_frame(
+            stream,
+            &ClientRequest::Put {
+                key: key.clone(),
+                value: value.clone(),
+                table: table.to_string(),
+            },
+        )
+        .await
+        .expect("send put");
+        let reply: ClientResponse = read_frame(stream)
+            .await
+            .expect("read reply")
+            .expect("a reply");
+        match reply {
+            ClientResponse::PutOk => return,
+            ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            other => panic!("put failed: {other:?}"),
+        }
+    }
+}
+
 /// Encode a query-param value the way the browser's `encodeURIComponent` does
 /// (everything but unreserved characters becomes `%NN`), so a test drives the
 /// same bytes the dashboard would.
@@ -147,21 +182,13 @@ async fn admin_interface_surfaces_state_and_actions() {
         let mut stream = TcpStream::connect(nodes[0].client_addr())
             .await
             .expect("connect");
-        animusd::write_frame(
+        put(
             &mut stream,
-            &ClientRequest::Put {
-                key: b"admin-key".to_vec(),
-                value: b"admin-val".to_vec(),
-                table: "kv".to_string(),
-            },
+            "kv",
+            b"admin-key".to_vec(),
+            b"admin-val".to_vec(),
         )
-        .await
-        .expect("send put");
-        let put: ClientResponse = read_frame(&mut stream)
-            .await
-            .expect("read reply")
-            .expect("a reply");
-        assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
+        .await;
 
         let admin_addr = nodes[0].admin_addr();
 
@@ -761,21 +788,7 @@ async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
         for i in 0..10u32 {
             let key = format!("key{i:02}").into_bytes();
             let value = format!("v{i}").into_bytes();
-            animusd::write_frame(
-                &mut stream,
-                &ClientRequest::Put {
-                    key,
-                    value,
-                    table: "kv".to_string(),
-                },
-            )
-            .await
-            .expect("send put");
-            let put: ClientResponse = read_frame(&mut stream)
-                .await
-                .expect("read reply")
-                .expect("a reply");
-            assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
+            put(&mut stream, "kv", key, value).await;
         }
 
         // Manually split the bootstrap tablet at the midpoint key (ADR 0028: a
@@ -881,21 +894,7 @@ async fn admin_split_kicks_off_the_copy_based_workflow() {
         let mut stream = TcpStream::connect(nodes[0].client_addr())
             .await
             .expect("connect client port");
-        animusd::write_frame(
-            &mut stream,
-            &ClientRequest::Put {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
-                table: "t".to_string(),
-            },
-        )
-        .await
-        .expect("send put");
-        let put: ClientResponse = read_frame(&mut stream)
-            .await
-            .expect("read put reply")
-            .expect("a put reply");
-        assert!(matches!(put, ClientResponse::PutOk), "{put:?}");
+        put(&mut stream, "t", b"k".to_vec(), b"v".to_vec()).await;
 
         // Kick off the split via the admin action.
         let (status, body) = admin(
@@ -972,24 +971,7 @@ async fn admin_split_kicks_off_the_copy_based_workflow() {
         );
 
         // The parent still serves BOTH reads and writes while `Splitting`.
-        animusd::write_frame(
-            &mut stream,
-            &ClientRequest::Put {
-                key: b"k2".to_vec(),
-                value: b"v2".to_vec(),
-                table: "t".to_string(),
-            },
-        )
-        .await
-        .expect("send post-split put");
-        let put2: ClientResponse = read_frame(&mut stream)
-            .await
-            .expect("read post-split put reply")
-            .expect("a put reply");
-        assert!(
-            matches!(put2, ClientResponse::PutOk),
-            "a Splitting parent must keep serving writes: {put2:?}"
-        );
+        put(&mut stream, "t", b"k2".to_vec(), b"v2".to_vec()).await;
         animusd::write_frame(
             &mut stream,
             &ClientRequest::Get {

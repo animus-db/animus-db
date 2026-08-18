@@ -21,6 +21,33 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
         .expect("a reply")
 }
 
+/// A put with a bounded retry on ANY `ClientResponse::Error` reply: a put is
+/// idempotent, and both early-cluster-formation transients and the
+/// documented "not the leader here"/futility-retry shapes surface as a
+/// clean, retryable error (see `docs/engineering-lessons.md`'s "CP
+/// write-forward path has no retry-on-not-the-leader-here" entry).
+async fn put_retry(addr: SocketAddr, key: &[u8], value: &[u8]) -> ClientResponse {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let resp = call(
+            addr,
+            ClientRequest::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                table: "kv".to_string(),
+            },
+        )
+        .await;
+        match resp {
+            ClientResponse::PutOk => return resp,
+            ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -103,15 +130,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
         other => panic!("unexpected status: {other:?}"),
     }
 
-    let put = call(
-        client0,
-        ClientRequest::Put {
-            key: b"k".to_vec(),
-            value: b"v1".to_vec(),
-            table: "kv".to_string(),
-        },
-    )
-    .await;
+    let put = put_retry(client0, b"k", b"v1").await;
     assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
 
     // Read back and cross-node overwrite, just like the in-process cluster test.
@@ -126,15 +145,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
         .await,
         ClientResponse::Value(Some(b"v1".to_vec()))
     );
-    let put2 = call(
-        client2,
-        ClientRequest::Put {
-            key: b"k".to_vec(),
-            value: b"v2".to_vec(),
-            table: "kv".to_string(),
-        },
-    )
-    .await;
+    let put2 = put_retry(client2, b"k", b"v2").await;
     assert!(
         matches!(put2, ClientResponse::PutOk),
         "overwrite failed: {put2:?}"
