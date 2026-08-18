@@ -8,6 +8,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The hard, single-attempt, per-push gate: deterministic SimEnv suites only.
+  # Real-thread ProdEnv tests are excluded (see `prod-liveness` below) — they
+  # need dedicated cores that this 2-vCPU shared runner can't give a job also
+  # building/testing the rest of the workspace, and were starving here one
+  # distinct victim per run (issues #280/#286).
   gates:
     name: gates
     runs-on: ubuntu-latest
@@ -49,6 +54,10 @@ jobs:
       - name: rustfmt (cargo fmt --all --check)
         run: cargo fmt --all --check
 
+      # `--all-features` here (unlike the plain `cargo test` below) turns on
+      # every crate's opt-in `prod-heavy` feature too, so the real-thread test
+      # binaries gated behind it (see `prod-liveness`) still get type-checked
+      # on every push even though this job never runs them.
       - name: clippy (-D warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -63,8 +72,20 @@ jobs:
       # Bound in-binary test parallelism to match the cores while keeping
       # some overlap; if wall-time grows too much the alternative is a
       # larger (more-core) self-hosted runner rather than raising this back.
-      - name: test (--workspace)
-        run: cargo test --workspace -- --test-threads=2
+      #
+      # `--exclude animusd` drops that crate's 66 real-thread integration
+      # binaries plus its real-thread `--lib` tests (`prod-liveness` below
+      # covers all of it instead). The other 6 scattered real-thread
+      # binaries (`animus-control`/`animus-cp-data`/`animus-storage`/
+      # `animus-consensus`) are excluded structurally, not by name here: each
+      # is declared as an explicit `[[test]] required-features =
+      # ["prod-heavy"]` target in its crate's Cargo.toml, and this plain
+      # `cargo test` (no `--features`) never turns that feature on, so Cargo
+      # skips building/running them. That makes the split compile-visible
+      # instead of a hand-maintained exclude list that silently drifts as
+      # tests are added (see docs/engineering-lessons.md).
+      - name: test (--workspace --exclude animusd)
+        run: cargo test --workspace --exclude animusd -- --test-threads=2
 
       # cargo-deny can't run in the local dev sandbox (not installed); CI is
       # where this gate actually executes. The pinned action installs cargo-deny
@@ -73,3 +94,78 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # The retried real-thread ProdEnv tier (issues #280/#286).
+  #
+  # Real-thread liveness/concurrency properties (election timing, group
+  # commit, lock-free races) can only be observed over genuine OS threads —
+  # SimEnv proves logic and ordering, not real-thread liveness (see
+  # CLAUDE.md's Testing section). On this repo's 2-vCPU shared runners those
+  # tests' timing/convergence budgets are contended by everything else on the
+  # box, so a bounded retry (2 attempts) is a stopgap for runner-class
+  # starvation, not a license to ignore failures: the house doctrine still
+  # applies — "a flaky ProdEnv integration test is a real bug", not a
+  # determinism hole. A test that fails BOTH attempts blocks merge exactly
+  # like `gates`; the retry only absorbs transient contention, never a
+  # reproducible failure. Runs in parallel with `gates`, both required.
+  prod-liveness:
+    name: prod-liveness
+    needs: []
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          df -h /
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+
+      # All of `animusd`: 66 real-thread integration test binaries plus its
+      # `--lib` tests (confirm_futility_tests, dynamo.rs, index_drain.rs,
+      # halted_shutdown_tests are real-thread too).
+      - name: test animusd (--lib --tests, 2 attempts)
+        run: |
+          for attempt in 1 2; do
+            if cargo test -p animusd --lib --tests -- --test-threads=1; then
+              exit 0
+            fi
+            echo "::warning::animusd prod-liveness tests failed on attempt ${attempt}/2"
+          done
+          exit 1
+
+      # The 6 scattered real-thread binaries outside animusd, each gated
+      # behind its crate's opt-in `prod-heavy` feature (see `gates`'s test
+      # step comment).
+      - name: test scattered prod-heavy binaries (2 attempts)
+        run: |
+          for attempt in 1 2; do
+            if cargo test -p animus-control --features prod-heavy \
+                 --test prod_liveness --test control_membership_prod \
+                 -- --test-threads=1 \
+               && cargo test -p animus-cp-data --features prod-heavy \
+                 --test prod_concurrent_ts_monotonic \
+                 -- --test-threads=1 \
+               && cargo test -p animus-storage --features prod-heavy \
+                 --test lsm_concurrent --test idle_engine_cost \
+                 -- --test-threads=1 \
+               && cargo test -p animus-consensus --features prod-heavy \
+                 --test accord_concurrent \
+                 -- --test-threads=1; then
+              exit 0
+            fi
+            echo "::warning::scattered prod-heavy tests failed on attempt ${attempt}/2"
+          done
+          exit 1
