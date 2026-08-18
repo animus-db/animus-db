@@ -2770,6 +2770,18 @@ pub(crate) enum KindWriteOutcome {
 /// same generic error every other silent no-op produces (deliberately no
 /// new outcome channel here either, matching `KvCommand::KindBatch`'s own
 /// documented choice).
+///
+/// **`rmw_lock` is scoped to read + evaluate only (issue #285)** — it is
+/// dropped before `cp_kind_local`'s propose/confirm-poll runs, mirroring
+/// `ClientCtx::txn_stage_local`'s identical scoping. Holding it across the
+/// confirm-poll used to serialize *every* evaluated write on this node
+/// behind whichever one's confirm happened to be slow (apply backlog can
+/// stretch that wait to seconds even with the #268 fast-fail), for no
+/// correctness benefit: the OCC seatbelt above is what actually keeps two
+/// racing evaluators of the same item safe, and it already has to work
+/// lock-free (`txn_resolver_loop` never takes this lock either). Narrowing
+/// the scope trades a few more retried OCC misses under genuine same-key
+/// contention for not stalling unrelated items' writes.
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
 pub(crate) async fn kind_write_item_at_leader(
     ctx: &ClientCtx,
@@ -2782,43 +2794,61 @@ pub(crate) async fn kind_write_item_at_leader(
     condition: Option<&ConditionExpression>,
 ) -> Result<KindWriteOutcome, WireError> {
     let base_key = item_key(pk, sk);
-    let _rmw = ctx.data().rmw_lock.lock().await;
-    let raw_old = ctx
-        .cp_get_local_resolving(leader, &base_key)
-        .await
-        .map_err(|e| internal(&format!("leader-side old-image read failed: {e}")))?;
-    let old = match &raw_old {
-        Some(bytes) => wire::decode_stored_item(bytes)?,
-        None => None,
-    };
-    if let Some(cond) = condition
-        && !cond.evaluate(old.as_ref())
-    {
-        return Ok(KindWriteOutcome::ConditionFailed);
-    }
-    let new = match &op {
-        KindWriteOp::Put(item) => Some(item.clone()),
-        KindWriteOp::Delete => None,
-        KindWriteOp::Update { key_item, actions } => {
-            let base = old.clone().unwrap_or_else(|| key_item.clone());
-            Some(wire::apply_update(base, actions))
+    // `rmw_lock` is scoped to read + evaluate only (issue #285) — it must
+    // NOT still be held across the `cp_kind_local` propose/confirm-poll
+    // below, which can run for a while under apply backlog even with the
+    // #268 `confirm_wait_is_futile` fast-fail. Correctness does not depend
+    // on this lock: the apply-time OCC seatbelt (`seatbelt`, built from
+    // this block's own `raw_old` and checked byte-for-byte against the
+    // actual committed value on every replica) is what actually makes two
+    // racing evaluators of the same item safe, exactly as it already must
+    // for `txn_resolver_loop`'s recovery pushes, which never take this lock
+    // at all. This lock is only a same-node collision-rate optimization —
+    // narrowing its scope trades a few more retried OCC misses under real
+    // contention for not stalling every *other* item's write behind one
+    // slow confirm-poll. See `ClientCtx::txn_stage_local` for the identical
+    // scoping this mirrors.
+    let (old, new, writes, change_log, seatbelt) = {
+        let _rmw = ctx.data().rmw_lock.lock().await;
+        let raw_old = ctx
+            .cp_get_local_resolving(leader, &base_key)
+            .await
+            .map_err(|e| internal(&format!("leader-side old-image read failed: {e}")))?;
+        let old = match &raw_old {
+            Some(bytes) => wire::decode_stored_item(bytes)?,
+            None => None,
+        };
+        if let Some(cond) = condition
+            && !cond.evaluate(old.as_ref())
+        {
+            return Ok(KindWriteOutcome::ConditionFailed);
         }
+        let new = match &op {
+            KindWriteOp::Put(item) => Some(item.clone()),
+            KindWriteOp::Delete => None,
+            KindWriteOp::Update { key_item, actions } => {
+                let base = old.clone().unwrap_or_else(|| key_item.clone());
+                Some(wire::apply_update(base, actions))
+            }
+        };
+        let value = match &new {
+            Some(item) => wire::encode_stored_item(item),
+            None => wire::encode_tombstone(),
+        };
+        let (writes, change_log) = kind_writes_for_item(
+            meta,
+            table,
+            pk,
+            sk,
+            &base_key,
+            value.clone(),
+            old.as_ref(),
+            new.as_ref(),
+        );
+        let seatbelt = vec![(base_key, raw_old)];
+        (old, new, writes, change_log, seatbelt)
+        // `_rmw` drops here — released before the propose/confirm below.
     };
-    let value = match &new {
-        Some(item) => wire::encode_stored_item(item),
-        None => wire::encode_tombstone(),
-    };
-    let (writes, change_log) = kind_writes_for_item(
-        meta,
-        table,
-        pk,
-        sk,
-        &base_key,
-        value.clone(),
-        old.as_ref(),
-        new.as_ref(),
-    );
-    let seatbelt = vec![(base_key, raw_old)];
     ClientCtx::cp_kind_local(leader, writes, vec![change_log], seatbelt)
         .await
         .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;

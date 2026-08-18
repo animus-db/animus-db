@@ -2615,6 +2615,34 @@ debugging anything that feels like it might have happened before.
   9): size the multiplier against the attempt's own worst-case bound, not
   against how long the property takes to converge when nothing is
   contended. (`animusd/tests/data_only.rs`.)
+- **A regression test for "does one writer's held lock stall an unrelated
+  writer" is more reliably proven by a structural ordering check than by an
+  absolute wall-clock threshold** (issue #285). The first design measured
+  the unrelated write's elapsed time against a fixed millisecond bound —
+  but on a resource-constrained sandbox, real backlog-induced apply lag
+  turned out to have high, non-linear variance run to run (the *same*
+  filler-flood configuration measured anywhere from ~150ms to over
+  `CLIENT_TIMEOUT`, 10s, depending on ambient scheduler contention from
+  concurrently-running sibling tests), and generous-but-fixed thresholds
+  either passed spuriously under light backlog or risked flaking under
+  heavy contention. The property under test doesn't actually need a
+  number: `!slow_task.is_finished()` at the exact instant the unrelated
+  write returns is a **hard ordering guarantee**, not a timing race —
+  pre-fix, the unrelated write literally cannot even acquire the node-wide
+  lock until the slow task's entire call (including its confirm-poll) has
+  already returned and dropped the guard, so it can never observe the slow
+  task as still in flight; post-fix, the slow task keeps grinding through
+  its backlogged confirm well after releasing the lock, so the unrelated
+  write routinely finishes first. Keep a loose absolute ceiling alongside
+  it only as a hang guard (generous enough to never be the discriminating
+  assertion), not as the property being proven. General form: when a
+  regression is fundamentally about *ordering* (did A block on B, or not),
+  prefer asserting the ordering directly (`JoinHandle::is_finished`, a
+  shared flag, a channel) over inferring it from a wall-clock threshold —
+  the latter only ever approximates the former, and approximates it worse
+  the more the environment's real-time behavior varies.
+  (`crates/animusd/src/lib.rs::confirm_futility_tests::
+  an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_confirm_wait`.)
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
@@ -6427,6 +6455,32 @@ debugging anything that feels like it might have happened before.
   concurrent waiter is now possible, the primitive itself needs to become
   multi-waiter, not merely re-documented. (`crates/animus-control/src/
   node.rs`, `crates/animusd/src/lib.rs::watch_metadata`.)
+- **A confirm-wait fast-fail bounds per-attempt latency but doesn't make it
+  safe to hold a serialization lock across the wait — when a lock is
+  provably redundant with an apply-time check, scope it to read+eval only**
+  (issue #285). `dynamo::kind_write_item_at_leader` held `ctx.data().
+  rmw_lock` (one lock per node, shared by every table/tablet this node
+  leads) across its own read *and* the full `cp_kind_local` propose+
+  confirm-poll — so one item's slow confirm (apply backlog stretches this
+  even with the #268 `confirm_wait_is_futile` fast-fail, which only bounds
+  *this* attempt, not how long that attempt takes to even resolve under
+  load) stalled every *other* evaluated write on the node behind it, not
+  just racing writes of the *same* item. The lock was never the thing
+  making concurrent writes of one item safe in the first place — the
+  apply-time OCC seatbelt (`KindBatch.conditions`, checked byte-for-byte
+  against the actual committed value on every replica) already had to work
+  lock-free, since `txn_resolver_loop`'s recovery pushes never take this
+  lock at all. Once a lock is provably redundant with an apply-time check
+  like this, its only remaining job is a same-node collision-rate
+  optimization, so it only ever needs to span the read+evaluate that
+  produces the value the check is *based on* — never the propose/confirm
+  that verifies it. **The scoping pattern already existed one function
+  away**: `ClientCtx::txn_stage_local` takes the identical `rmw_lock` only
+  around its own read+evaluate loop, dropping it before staging — grep
+  sibling functions touching the same lock/primitive for an already-
+  established narrower scoping before assuming a wider one is the
+  house convention just because it's what you found first.
+  (`crates/animusd/src/dynamo.rs::kind_write_item_at_leader`.)
 
 ### Parallel-agent orchestration
 - **`gh stack checkout <N>` silently switches the CURRENT worktree's checked-

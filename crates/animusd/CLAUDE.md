@@ -818,7 +818,15 @@ route below the edge through the same `ClientCtx` CP primitives.
   conditions` OCC seatbelt (PR1, `animus-cp-data`) closes the one residual
   the lock alone can't: a `txn_resolver_loop` recovery push never takes
   `rmw_lock` — real now that `TransactWriteItems` participates on these
-  tables too (see below).
+  tables too (see below). **`rmw_lock` is scoped to read+evaluate only
+  (issue #285)** — `kind_write_item_at_leader` drops it before proposing,
+  mirroring `txn_stage_local`'s identical scoping just below; it used to
+  span the whole `cp_kind_local` propose+confirm-poll too, so one item's
+  slow confirm (apply backlog) stalled every *other* evaluated write on the
+  node behind it, not just racing writers of the same item — the seatbelt
+  above is what actually keeps concurrent writers of one item safe, and it
+  already has to work lock-free for the `txn_resolver_loop` case, so the
+  lock never needed the wider span for correctness.
   **The plain-table half of the old named gap is closed (ADR 0049)**: a
   plain table's conditioned `PutItem`/`DeleteItem` and `UpdateItem` now
   route through this same leader funnel (constant-true gate, below), so
