@@ -11,12 +11,12 @@
 //! bounded (no runaway term growth) and settles to one stable leader
 //! afterward.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use animus_control::{MetaCommand, NodeStatus, RaftNode};
+use animus_control::{MetaCommand, NodeStatus, ProposeResult, RaftNode};
 use animus_env::{Env, NodeId, ProdEnv, nid};
 use animus_storage::MemoryEngine;
 use tokio::time::{Instant, sleep, timeout};
@@ -48,6 +48,35 @@ async fn wait_for_leader(nodes: &[&RaftNode<ProdEnv>]) -> usize {
         sleep(Duration::from_millis(50)).await;
     }
     panic!("no leader elected within budget");
+}
+
+/// Propose `change_membership` on the current leader, retrying on a transient
+/// `NotLeader` refusal for up to ~15s, re-resolving the current leader before
+/// every attempt. `RaftCore::change_membership` collapses every rejection
+/// reason into `NotLeader` — including two that are routine right after
+/// `wait_for_leader` returns, not bugs: the current-term-commit gate not yet
+/// satisfied (a freshly elected leader's own no-op hasn't committed yet; its
+/// own doc says "a caller simply retries after the no-op commits — one round
+/// trip after election") and the one-change-in-flight guard, plus a stray
+/// leadership transition from real-thread scheduling jitter between the
+/// `wait_for_leader` check and this call. Returns the accepted config
+/// entry's own log index and the index (into `nodes`) of the leader that
+/// accepted it, so the caller can keep driving that same node afterward.
+async fn change_membership_retry(
+    nodes: &[&RaftNode<ProdEnv>],
+    voters: BTreeSet<NodeId>,
+) -> (usize, u64) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let leader_idx = wait_for_leader(nodes).await;
+        match nodes[leader_idx].change_membership(voters.clone()) {
+            ProposeResult::Accepted { index } => return (leader_idx, index),
+            ProposeResult::NotLeader { .. } if Instant::now() < deadline => {
+                sleep(Duration::from_millis(50)).await;
+            }
+            other => panic!("change_membership rejected past the 15s retry budget: {other:?}"),
+        }
+    }
 }
 
 /// Grows a real 3-node control group to 5 (two sequential single-server
@@ -111,17 +140,10 @@ async fn grow_three_to_five_under_real_time_stays_live() {
             vec![nid(0), nid(1), nid(2), nid(3)],
             MemoryEngine::new(),
         );
-        let leader_idx = wait_for_leader(&original).await;
+        let (leader_idx, target) =
+            change_membership_retry(&original, [0u64, 1, 2, 3].into_iter().map(nid).collect())
+                .await;
         let leader = original[leader_idx];
-        assert!(
-            matches!(
-                leader.change_membership([0u64, 1, 2, 3].into_iter().map(nid).collect()),
-                animus_control::ProposeResult::Accepted { .. }
-            ),
-            "growing 3 -> 4 should be accepted as a single-server delta"
-        );
-
-        let target = leader.last_log_index();
         let mut caught_up = false;
         for _ in 0..200 {
             leader.flush().await;
@@ -141,17 +163,10 @@ async fn grow_three_to_five_under_real_time_stays_live() {
             vec![nid(0), nid(1), nid(2), nid(3), nid(4)],
             MemoryEngine::new(),
         );
-        let leader_idx = wait_for_leader(&quartet).await;
+        let (leader_idx, target) =
+            change_membership_retry(&quartet, [0u64, 1, 2, 3, 4].into_iter().map(nid).collect())
+                .await;
         let leader = quartet[leader_idx];
-        assert!(
-            matches!(
-                leader.change_membership([0u64, 1, 2, 3, 4].into_iter().map(nid).collect()),
-                animus_control::ProposeResult::Accepted { .. }
-            ),
-            "growing 4 -> 5 should be accepted as a single-server delta"
-        );
-
-        let target = leader.last_log_index();
         let mut caught_up = false;
         for _ in 0..200 {
             leader.flush().await;
