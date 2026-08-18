@@ -415,7 +415,12 @@ async fn await_bootstrap(nodes: &[Node]) {
 }
 
 async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
-    timeout(Duration::from_secs(25), async {
+    // Remember each failed attempt's error so a timeout names WHAT kept
+    // failing (issue #268's first diagnostic gap: "25s put timeout" alone
+    // doesn't say whether provisioning, routing, or the commit stalled).
+    let last_err = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = std::sync::Arc::clone(&last_err);
+    timeout(Duration::from_secs(25), async move {
         loop {
             match call(
                 addr,
@@ -428,13 +433,21 @@ async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
             .await
             {
                 ClientResponse::PutOk => return,
-                ClientResponse::Error(_) => sleep(Duration::from_millis(150)).await,
+                ClientResponse::Error(e) => {
+                    *seen.lock().unwrap() = e;
+                    sleep(Duration::from_millis(150)).await
+                }
                 other => panic!("unexpected put response: {other:?}"),
             }
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("put {table}/{key:?} did not succeed in 25s"));
+    .unwrap_or_else(|_| {
+        panic!(
+            "put {table}/{key:?} did not succeed in 25s (last error: {})",
+            last_err.lock().unwrap()
+        )
+    });
 }
 
 /// Split the bootstrap tablet (id 1) of `table` at `split_key`, waiting

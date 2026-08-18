@@ -6828,3 +6828,62 @@ debugging anything that feels like it might have happened before.
   with total size rather than recent activity; a bench with a
   continuous-load client answers both where burst-shaped e2es answer
   neither.
+
+- **"Sweep for the retry-amplification shape" has to be re-run every time a
+  new hand-rolled propose loop lands — the sweep's own corollary caught its
+  third instance** (issue #268, 2026-08-17). `ClientCtx::provision_tablet`
+  re-proposed `CreateTablet`/`SetTabletPolicy` on every 50ms poll tick for
+  its whole 10s commit budget, exactly the unpaced shape `propose_and_await`
+  fixed one layer up ("the pattern's most common instance was hiding one
+  layer below") — measured at 264 `CreateTablet` + 240 `SetTabletPolicy`
+  proposals for six tables' worth of first-put provisioning under a
+  deliberately slowed (~80ms-fsync) disk, each duplicate a real control-log
+  append fsynced and replicated under exactly the slow-commit conditions
+  that made the wait long. On a starved 2-vCPU CI runner this
+  self-amplification is what turned "commit is slow" into "provision burns
+  its whole 10s budget, twice in a row" — the direct mechanism behind
+  cp_txn.rs's 25s seed-put flake. Fixed with the same
+  `SCHEMA_PROPOSE_PATIENCE` pacing (inline, not via `propose_and_await`,
+  because the create arm must re-derive its allocator id + replica set
+  fresh per proposal — the `trigger_split` stale-allocator lesson — and the
+  needed command switches to `SetTabletPolicy` mid-loop); regression:
+  `tests/provision_propose_pacing.rs`, which pins the leader's own log
+  growth while provisioning grinds against a quorumless control plane.
+  **Known remaining instances of the shape, deliberately left for their own
+  PR** (they are not on the flake's path): `dynamo.rs`'s seven hand-rolled
+  propose-then-poll loops (`create_table`'s schema + per-index waits,
+  `enable_stream`/`disable_stream`, `create_index`, `set_index_status`,
+  `drop_table_index`) — all fixed-command loops that could ride
+  `propose_and_await` directly — and, pathological-state-only,
+  `detect_loop`'s per-tick re-propose of an uncommittable liveness
+  transition (visible while a control plane has lost quorum, i.e. while
+  nothing can commit anyway; bounded by member count per tick).
+
+- **A propose-then-confirm loop must end its wait the moment confirmation
+  is provably futile, not "wait out the client timeout, which is correct"**
+  (issue #268, 2026-08-17). The CP write confirm loops (`cp_put_local`/
+  `cp_delete_local`/`cp_batch_local`/`cp_kind_local`/`cp_kind_raw_local`)
+  polled value-equality for the full 10s `CLIENT_TIMEOUT` whenever an
+  *accepted* entry's effect never appeared — a deposed leader's truncated
+  entry, a freeze/seal apply-time no-op, a failed `KindBatch` condition.
+  Each such attempt is a 10s client-visible stall, and the caller's retry
+  then starts another: under the brief election churn a starved CI
+  runner's slow fsyncs produce, two stacked burns exceeded cp_txn.rs's
+  whole 25s put budget (observed live as an 11s "kind batch did not apply
+  in time" attempt whose immediate retry succeeded in milliseconds).
+  `animus-cp-data`'s own `wait_stage_outcome` already had the right shape
+  (`!is_leader()` bails immediately); the animusd confirm loops now share
+  it via `ClientCtx::confirm_wait_is_futile` — futile once
+  `engine_applied_index() >= accepted_index` without the effect (sound
+  because the apply task advances `engine_applied` only after merges are
+  readable, and any re-elected leader's no-op pushes apply past a
+  truncated index promptly) or once `!is_leader()`. **The coarse signal
+  only ever ends a wait with a retryable error, never acks one** — success
+  still requires exact effect equality (the false-ack hazard
+  `cp_put_local`'s doc spells out is unchanged). Regression:
+  `confirm_futility_tests` (in-crate, `cargo test -p animusd --lib`) — a
+  condition-failed `KindBatch` no-ops at apply and must surface as a fast
+  `"; retry"` error, not a 10s generic timeout. General form: when a
+  confirm poll can distinguish "still in flight" from "can no longer
+  land," burning the full timeout on the latter converts transient churn
+  into stacked client stalls that read as unavailability.
