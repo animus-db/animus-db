@@ -297,7 +297,7 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn schema_ddl_via_a_data_node_relays_and_commits() {
-    timeout(Duration::from_secs(90), async {
+    timeout(Duration::from_secs(150), async {
         let dir = tempfile::tempdir().unwrap();
         let (control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
         await_leader(&control_nodes).await;
@@ -311,7 +311,13 @@ async fn schema_ddl_via_a_data_node_relays_and_commits() {
             table: "data_ddl_t".into(),
             schema: TableSchema::simple("id", ColumnType::String),
         };
-        timeout(Duration::from_secs(20), async {
+        // 60s, not 20: a fresh data-only node starts with no leader hint, so
+        // each attempt can fall all the way to broadcast and legitimately
+        // stall up to the full CLIENT_TIMEOUT (10s) relay-hop worst case on a
+        // starved 2-vCPU runner — a 20s budget is barely 2x one such attempt.
+        // Same runner-aware treatment as split_cluster.rs's split-completion
+        // budgets and backfill_seeder.rs's CONVERGE_BUDGET.
+        timeout(Duration::from_secs(60), async {
             loop {
                 let _ = call(
                     // ADR 0047: `ProposeSchema` is intra-only.
@@ -329,7 +335,7 @@ async fn schema_ddl_via_a_data_node_relays_and_commits() {
             }
         })
         .await
-        .expect("data-node-issued schema did not relay + commit in 20s");
+        .expect("data-node-issued schema did not relay + commit in 60s");
 
         // Every data node's own mirror converges to the same schema too
         // (`ControlHandle::Remote::metadata_cached()`), not just the control
