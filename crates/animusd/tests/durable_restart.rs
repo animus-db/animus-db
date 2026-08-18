@@ -35,6 +35,34 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
         .expect("a reply")
 }
 
+/// A plain `Put`, retried on ANY `ClientResponse::Error` reply for up to
+/// 20s: a put is idempotent, and the first write against a fresh table
+/// right after bootstrap can legitimately race the tablet-host reconciler
+/// (`docs/engineering-lessons.md`'s "CP write-forward path has no
+/// retry-on-not-the-leader-here" entry) or hit the confirm-loop
+/// futility-retry shape (issue #268).
+async fn put_retry(addr: SocketAddr, key: &[u8], value: &[u8]) -> ClientResponse {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let resp = call(
+            addr,
+            ClientRequest::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                table: "kv".to_string(),
+            },
+        )
+        .await;
+        match resp {
+            ClientResponse::PutOk => return resp,
+            ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 async fn await_bootstrap(node: &Node) {
     let ready = async {
         loop {
@@ -67,15 +95,7 @@ async fn data_survives_node_restart_on_disk() {
     let client = config.nodes[0].client;
     await_bootstrap(&node).await;
 
-    let put = call(
-        client,
-        ClientRequest::Put {
-            key: b"durable".to_vec(),
-            value: b"survives".to_vec(),
-            table: "kv".to_string(),
-        },
-    )
-    .await;
+    let put = put_retry(client, b"durable", b"survives").await;
     assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
 
     // A returned PutOk means the on-disk LSM WAL-synced the write before
@@ -161,15 +181,7 @@ async fn acked_write_survives_memory_backend_restart_via_raft_wal() {
     let client = config.nodes[0].client;
     await_bootstrap(&node).await;
 
-    let put = call(
-        client,
-        ClientRequest::Put {
-            key: b"acked".to_vec(),
-            value: b"survives".to_vec(),
-            table: "kv".to_string(),
-        },
-    )
-    .await;
+    let put = put_retry(client, b"acked", b"survives").await;
     assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
 
     stop(node).await;

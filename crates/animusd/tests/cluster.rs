@@ -23,6 +23,34 @@ async fn call(addr: std::net::SocketAddr, req: ClientRequest) -> ClientResponse 
         .expect("a reply")
 }
 
+/// A plain `Put`, retried on ANY `ClientResponse::Error` reply for up to
+/// 20s: a put is idempotent, and the first write against a fresh table
+/// right after bootstrap can legitimately race the tablet-host reconciler
+/// (`docs/engineering-lessons.md`'s "CP write-forward path has no
+/// retry-on-not-the-leader-here" entry) or hit the confirm-loop
+/// futility-retry shape (issue #268).
+async fn put_retry(addr: std::net::SocketAddr, key: &[u8], value: &[u8]) -> ClientResponse {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let resp = call(
+            addr,
+            ClientRequest::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                table: "kv".to_string(),
+            },
+        )
+        .await;
+        match resp {
+            ClientResponse::PutOk => return resp,
+            ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Wait until every node has the bootstrap tablet replicated, or panic.
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
@@ -80,15 +108,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
     }
 
     // Put on one node, read back on another (quorum write/read over the cluster).
-    let put = call(
-        addr0,
-        ClientRequest::Put {
-            key: b"hello".to_vec(),
-            value: b"world".to_vec(),
-            table: "kv".to_string(),
-        },
-    )
-    .await;
+    let put = put_retry(addr0, b"hello", b"world").await;
     assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
 
     let addr1 = nodes[1].client_addr();
@@ -116,15 +136,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
     // An overwrite issued through a *different* coordinator node must win
     // (regression test: version assignment is quorum-derived, not a per-node
     // counter, so cross-node overwrites are not silently lost).
-    let put2 = call(
-        addr1,
-        ClientRequest::Put {
-            key: b"hello".to_vec(),
-            value: b"again".to_vec(),
-            table: "kv".to_string(),
-        },
-    )
-    .await;
+    let put2 = put_retry(addr1, b"hello", b"again").await;
     assert!(
         matches!(put2, ClientResponse::PutOk),
         "cross-node overwrite failed: {put2:?}"

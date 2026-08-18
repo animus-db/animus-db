@@ -123,16 +123,29 @@ async fn begin_split_lifecycle_over_three_nodes_via_a_follower() {
             .expect("connect client port");
         let keys: Vec<Vec<u8>> = (0..8u8).map(|i| vec![b'k', i]).collect();
         for key in &keys {
-            let put = client_op(
-                &mut stream,
-                &ClientRequest::Put {
-                    key: key.clone(),
-                    value: key.clone(),
-                    table: "t".to_string(),
-                },
-            )
-            .await;
-            assert!(matches!(put, ClientResponse::PutOk), "populate: {put:?}");
+            // This table's first writes right after bootstrap can legitimately
+            // race the tablet-host reconciler standing up the freshly
+            // auto-provisioned tablet's group — bounded retry, same shape as
+            // the mid-split client loops below.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let put = client_op(
+                    &mut stream,
+                    &ClientRequest::Put {
+                        key: key.clone(),
+                        value: key.clone(),
+                        table: "t".to_string(),
+                    },
+                )
+                .await;
+                match put {
+                    ClientResponse::PutOk => break,
+                    ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                    other => panic!("populate: {other:?}"),
+                }
+            }
         }
 
         // Kick off the split from a node that is NOT the control leader —

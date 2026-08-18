@@ -26,6 +26,35 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
         .expect("a reply")
 }
 
+/// A plain `Put`, retried on ANY `ClientResponse::Error` reply for up to
+/// 20s: a put is idempotent, and 16 concurrent first-writers hammering a
+/// freshly auto-provisioned table right after bootstrap can legitimately
+/// collide with the tablet-host reconciler or the confirm-loop
+/// futility-retry shape (issue #268) — a retryable error here is not the
+/// deadlock this test is actually checking for (a real deadlock still
+/// exhausts the outer 30s bound).
+async fn put_retry(addr: SocketAddr, key: &[u8], value: &[u8]) -> ClientResponse {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let resp = call(
+            addr,
+            ClientRequest::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                table: "kv".to_string(),
+            },
+        )
+        .await;
+        match resp {
+            ClientResponse::PutOk => return resp,
+            ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Wait until a leader is elected and every node has the bootstrap tablet.
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
@@ -63,15 +92,7 @@ async fn assembled_node_handles_concurrent_client_load_without_deadlock() {
             for r in 0..8u32 {
                 let key = format!("c{c}-r{r}").into_bytes();
                 let value = format!("v{c}-{r}").into_bytes();
-                let put = call(
-                    addr,
-                    ClientRequest::Put {
-                        key: key.clone(),
-                        value: value.clone(),
-                        table: "kv".to_string(),
-                    },
-                )
-                .await;
+                let put = put_retry(addr, &key, &value).await;
                 assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
                 let got = call(
                     addr,

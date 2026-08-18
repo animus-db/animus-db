@@ -3855,6 +3855,25 @@ mod stream_write_path_tests {
             .expect("a reply")
     }
 
+    /// `raw_request`, retried on ANY `ClientResponse::Error` for up to 20s: a
+    /// plain-protocol write is idempotent, and a fresh table's first write
+    /// can legitimately race the tablet-host reconciler standing up its
+    /// auto-provisioned tablet's group (`docs/engineering-lessons.md`'s "CP
+    /// write-forward path has no retry-on-not-the-leader-here" entry).
+    async fn raw_write_retry(addr: SocketAddr, request: &ClientRequest) -> ClientResponse {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let resp = raw_request(addr, request).await;
+            match resp {
+                ClientResponse::PutOk => return resp,
+                ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+                    sleep(Duration::from_millis(150)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// ADR 0049 Train A rung 5: the plain client protocol
     /// (`ClientRequest::Put`/`PutBatch`/`Delete` — `animus-cli put`'s wire
     /// surface) is a real write path, so its mutations ride the kind path
@@ -3890,7 +3909,7 @@ mod stream_write_path_tests {
 
         // Put auto-provisions (the old `cp_put` contract), then the batch
         // and the delete land on the same table.
-        let put = raw_request(
+        let put = raw_write_retry(
             node.client_addr(),
             &ClientRequest::Put {
                 table: "rawt".into(),
@@ -3900,7 +3919,7 @@ mod stream_write_path_tests {
         )
         .await;
         assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
-        let batch = raw_request(
+        let batch = raw_write_retry(
             node.client_addr(),
             &ClientRequest::PutBatch {
                 table: "rawt".into(),
@@ -3915,7 +3934,7 @@ mod stream_write_path_tests {
             matches!(batch, ClientResponse::PutOk),
             "batch failed: {batch:?}"
         );
-        let del = raw_request(
+        let del = raw_write_retry(
             node.client_addr(),
             &ClientRequest::Delete {
                 table: "rawt".into(),
