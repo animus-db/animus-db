@@ -32,6 +32,32 @@
 //! proposes a `ReadCeiling` via `ensure_ceiling_above`) at once. Against the
 //! unfixed code this reliably panics (`assert_ts_monotonic`) within a few
 //! seconds; confirmed by temporarily reverting the fix and re-running.
+//!
+//! **Harness note (issue #278 item 6): the load-generation helpers below must
+//! be election-tolerant, independently of the property above.** 24 concurrent
+//! client tasks hammering a real 3-node group is itself enough CPU contention
+//! on a busy CI runner to blow the ADR 0017 driver's election timeout (the
+//! same starved-consensus-loop shape `propose_ordered` was built around), so
+//! a mid-test election is expected, not exceptional. The original harness got
+//! this wrong two ways: (1) it resolved the leader **once** at test start and
+//! every client task kept hammering that one handle for the rest of the run,
+//! so a deposed leader's `put`/`txn_write` calls degrade to `NotLeader` (or a
+//! panic) forever after; (2) it treated `put() -> Accepted{index}` plus
+//! `engine_applied_index() >= index` as proof the write **committed** — but
+//! `Accepted` only ever means "appended to the leader's own log," never
+//! "committed" (see the root `CLAUDE.md`'s standing lesson on this). After an
+//! election, the deposed leader's uncommitted entry is truncated and the new
+//! leader's own entries re-occupy that same index, so the index-advance wait
+//! passed while the write never actually landed — and the subsequent
+//! `linearizable_get` correctly returned `None`, which is the
+//! "did not return what was just put (left: None)" failure this item fixes.
+//! `put_then_confirm`/`txn_write_then_confirm` now take the whole `nodes`
+//! slice, re-resolve the current leader on every propose attempt and every
+//! confirm read, and confirm a write only by reading the expected value back
+//! (never by index-advance alone) — retrying the whole put/txn_write on a
+//! stale/absent confirmation, since retrying an already-landed write at the
+//! same key/value is idempotent. All of it is a bounded
+//! converged-or-timeout loop, never a fixed one-shot wait.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -43,9 +69,21 @@ use animus_cp_data::RaftKvNode;
 use animus_env::{Env, NodeId, ProdEnv, nid};
 use animus_storage::MemoryEngine;
 use animus_tablet::{escape, partition_token};
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 
 type KvNode = RaftKvNode<ProdEnv, MemoryEngine>;
+
+/// Per-operation deadline for `put_then_confirm`/`txn_write_then_confirm` —
+/// generous enough to absorb several elections' worth of retries under heavy
+/// contention, but still a bounded converged-or-timeout budget rather than an
+/// unbounded retry loop.
+const OP_DEADLINE: Duration = Duration::from_secs(20);
+/// How long a single propose attempt is given to confirm (by reading the
+/// value back) before falling back to re-resolving the leader and retrying
+/// the whole propose — covers the case where the entry we just appended gets
+/// truncated by an election before it commits.
+const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 fn unique_tmp_dir() -> std::path::PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -63,6 +101,22 @@ async fn leader_of(nodes: &[KvNode]) -> usize {
         sleep(Duration::from_millis(50)).await;
     }
     panic!("no leader elected within 10s");
+}
+
+/// Re-resolve whichever node currently believes it's the leader, bounded by
+/// `deadline` — never cached across calls, since a mid-test election can
+/// depose any previously-resolved leader at any time (see the module doc).
+async fn current_leader(nodes: &[KvNode], deadline: Instant) -> KvNode {
+    loop {
+        if let Some(n) = nodes.iter().find(|n| n.is_leader()) {
+            return n.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no leader found before the op deadline (repeated elections?)"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Start a real 3-node group over `ProdEnv` (bound loopback sockets, a
@@ -108,51 +162,99 @@ fn concurrent_key(client: u32, round: u32) -> Vec<u8> {
     out
 }
 
-/// Put `key`/`value` on `leader`, wait for it to actually engine-apply (not
-/// just commit), then read it back via a linearizable get and assert it
-/// matches — the read is what also exercises the `ReadCeiling`/write race,
-/// since every `linearizable_get` proposes a fresh ceiling when needed
-/// (`ensure_ceiling_above`).
-async fn put_then_confirm(leader: &KvNode, key: Vec<u8>, value: Vec<u8>) {
-    let index = match leader.put(key.clone(), value.clone()) {
-        ProposeResult::Accepted { index } => index,
-        other => panic!("put was not accepted by the leader: {other:?}"),
-    };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while leader.engine_applied_index() < index {
+/// Put `key`/`value` through the group's current leader and confirm the
+/// write actually **committed** by reading it back — never by index-advance
+/// alone, since `Accepted { index }` only means "appended to the leader's
+/// own log," not "committed" (see the module doc). Election-tolerant: both
+/// the propose and the confirm read re-resolve the current leader on every
+/// attempt, and a stale/absent confirmation retries the whole put (sound,
+/// since re-putting the same key/value is idempotent).
+async fn put_then_confirm(nodes: &[KvNode], key: Vec<u8>, value: Vec<u8>) {
+    let deadline = Instant::now() + OP_DEADLINE;
+    loop {
+        let leader = current_leader(nodes, deadline).await;
+        if matches!(
+            leader.put(key.clone(), value.clone()),
+            ProposeResult::Accepted { .. }
+        ) {
+            let confirm_deadline = std::cmp::min(deadline, Instant::now() + CONFIRM_WINDOW);
+            loop {
+                let reader = current_leader(nodes, deadline).await;
+                if reader.linearizable_get(&key).await.as_deref() == Some(value.as_slice()) {
+                    return;
+                }
+                if Instant::now() >= confirm_deadline {
+                    break; // fall through to re-resolve the leader and retry the put
+                }
+                sleep(POLL_INTERVAL).await;
+            }
+        }
         assert!(
-            tokio::time::Instant::now() < deadline,
-            "put at index {index} never engine-applied within 10s — the apply \
-             task most likely panicked (assert_ts_monotonic), see stderr"
+            Instant::now() < deadline,
+            "put_then_confirm for {key:?} did not converge within {OP_DEADLINE:?} \
+             (repeated leader churn, or the apply task panicked — assert_ts_monotonic, see stderr)"
         );
-        sleep(Duration::from_millis(5)).await;
     }
-    let got = leader.linearizable_get(&key).await;
-    assert_eq!(
-        got.as_deref(),
-        Some(value.as_slice()),
-        "linearizable_get for {key:?} did not return what was just put"
-    );
+}
+
+/// `txn_write` + a confirm-by-read-back, the txn analogue of
+/// `put_then_confirm` (ADR 0018 §2/PR3), extending this file's coverage to
+/// `TxnStage`/`TxnCommit`/`TxnResolve`, each of which mints and proposes its
+/// own `ts` through the identical `propose_ordered`/`propose_ordered_aux`
+/// critical section a plain `put` does. `txn_write` already returns `None`
+/// (rather than panicking) if the leader stepped down mid-transaction, so
+/// that case falls through to the same re-resolve-and-retry loop
+/// `put_then_confirm` uses — the whole write is idempotent to retry (same
+/// key/value), so a truncated attempt is always safe to redo against
+/// whichever node is leader now.
+async fn txn_write_then_confirm(nodes: &[KvNode], key: Vec<u8>, value: Vec<u8>) {
+    let deadline = Instant::now() + OP_DEADLINE;
+    loop {
+        let leader = current_leader(nodes, deadline).await;
+        let committed = leader
+            .txn_write("t", vec![(key.clone(), Some(value.clone()))])
+            .await
+            .is_some();
+        if committed {
+            let confirm_deadline = std::cmp::min(deadline, Instant::now() + CONFIRM_WINDOW);
+            loop {
+                let reader = current_leader(nodes, deadline).await;
+                if reader.linearizable_get(&key).await.as_deref() == Some(value.as_slice()) {
+                    return;
+                }
+                if Instant::now() >= confirm_deadline {
+                    break; // fall through to re-resolve the leader and retry txn_write
+                }
+                sleep(POLL_INTERVAL).await;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "txn_write_then_confirm for {key:?} did not converge within {OP_DEADLINE:?} \
+             (repeated leader churn, or the apply task panicked — assert_ts_monotonic, see stderr)"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_writes_and_reads_never_violate_ts_monotonicity() {
-    let (nodes, leader_idx) = start_group().await;
-    let leader = nodes[leader_idx].clone();
+    let (nodes, _leader_idx) = start_group().await;
 
     // Many concurrent client tasks, each its own real OS-scheduled tokio task
     // (the parallelism this race needs), each doing several put+get round
     // trips against distinct keys. High enough concurrency that, against the
-    // unfixed code, the mint/propose interleaving window reliably gets hit.
+    // unfixed code, the mint/propose interleaving window reliably gets hit —
+    // and, on a contended runner, high enough to reliably trigger a mid-test
+    // election too, which is exactly what `put_then_confirm` must tolerate.
     let all = async {
         let mut handles = Vec::new();
         for c in 0..24u32 {
-            let leader = leader.clone();
+            let nodes = nodes.clone();
             handles.push(tokio::spawn(async move {
                 for r in 0..10u32 {
                     let key = format!("k{c}-{r}").into_bytes();
                     let value = format!("v{c}-{r}").into_bytes();
-                    put_then_confirm(&leader, key, value).await;
+                    put_then_confirm(&nodes, key, value).await;
                 }
             }));
         }
@@ -172,26 +274,6 @@ async fn concurrent_writes_and_reads_never_violate_ts_monotonicity() {
     }
 }
 
-/// `txn_write` + a linearizable_get, waiting on the same "commit != apply"
-/// confirm-by-index discipline `put_then_confirm` does (via `txn_write`'s
-/// own internal `wait_applied`, so this just needs to await it) — the txn
-/// analogue of `put_then_confirm`, extending this file's coverage (ADR
-/// 0018 §2/PR3) to `TxnStage`/`TxnCommit`/`TxnResolve`, each of which mints
-/// and proposes its own `ts` through the identical `propose_ordered`/
-/// `propose_ordered_aux` critical section a plain `put` does.
-async fn txn_write_then_confirm(leader: &KvNode, key: Vec<u8>, value: Vec<u8>) {
-    leader
-        .txn_write("t", vec![(key.clone(), Some(value.clone()))])
-        .await
-        .expect("txn_write did not complete (leader stepped down?)");
-    let got = leader.linearizable_get(&key).await;
-    assert_eq!(
-        got.as_deref(),
-        Some(value.as_slice()),
-        "linearizable_get for {key:?} did not return what txn_write just committed"
-    );
-}
-
 /// The txn-command extension of
 /// `concurrent_writes_and_reads_never_violate_ts_monotonicity`: many
 /// concurrent client tasks each hammering `txn_write` (stage + commit +
@@ -204,18 +286,17 @@ async fn txn_write_then_confirm(leader: &KvNode, key: Vec<u8>, value: Vec<u8>) {
 /// test is the regression that the new commands didn't reopen it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_txn_writes_and_reads_never_violate_ts_monotonicity() {
-    let (nodes, leader_idx) = start_group().await;
-    let leader = nodes[leader_idx].clone();
+    let (nodes, _leader_idx) = start_group().await;
 
     let all = async {
         let mut handles = Vec::new();
         for c in 0..24u32 {
-            let leader = leader.clone();
+            let nodes = nodes.clone();
             handles.push(tokio::spawn(async move {
                 for r in 0..10u32 {
                     let key = concurrent_key(c, r);
                     let value = format!("v{c}-{r}").into_bytes();
-                    txn_write_then_confirm(&leader, key, value).await;
+                    txn_write_then_confirm(&nodes, key, value).await;
                 }
             }));
         }
