@@ -60,12 +60,14 @@ mod codec;
 pub mod cursor;
 pub mod hlc;
 pub mod host;
+mod persist_round;
 mod seal;
 pub mod segment;
 mod ts_cache;
 mod txn;
 
 use hlc::{Hlc, HlcTimestamp, bump_strictly_above};
+use persist_round::{GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake};
 use ts_cache::TsCache;
 pub use txn::{StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnWrite};
 
@@ -1505,6 +1507,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let propose_signal = Arc::new(ProposeSignal::default());
         let apply_signal = Arc::new(ApplySignal::default());
         let wake_signal = Arc::new(WakeSignal::default());
+        let persist = Arc::new(PersistProgress::default());
         // Group-start witnessing (ADR 0018 §2 amendment): fold in whatever
         // this (possibly shared, ADR 0026/0028) engine's highest MVCC
         // version already reflects, so this group's own future mints never
@@ -1577,6 +1580,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             propose_signal,
             apply_signal,
             wake_signal,
+            persist,
             metrics,
             scope,
             kind_scopes,
@@ -4568,15 +4572,24 @@ async fn persist_wal<E: Env>(
     wal_lock: &AsyncMutex<()>,
     apply_signal: &ApplySignal,
     halted: &AtomicBool,
+    progress: &PersistProgress,
 ) {
     let _wal = wal_lock.lock().await;
-    let (records, through) = {
+    // The round number is claimed in the *same* core-lock acquisition as the
+    // drain (issue #279): that is what lets the consensus loop ask "which round
+    // covers the mutation I just made?" and get an answer no concurrent
+    // compaction can invalidate between the question and the answer. An empty
+    // drain consumes no round — it persists nothing, and `PersistProgress::gate`
+    // relies on the latest round being the one that took the records.
+    let (records, through, round) = {
         let mut c = core.lock().expect("raftkv core poisoned");
-        (c.drain_persist(), c.last_log_index())
+        let (records, round) = persist_round::drain_for_round(&mut c, progress);
+        (records, c.last_log_index(), round)
     };
-    if records.is_empty() {
+    let Some(round) = round else {
+        debug_assert!(records.is_empty());
         return;
-    }
+    };
     for record in &records {
         if let Err(e) = env
             .append(wal, &PersistedState::encode_record(record))
@@ -4596,9 +4609,14 @@ async fn persist_wal<E: Env>(
         );
         return;
     }
-    core.lock()
-        .expect("raftkv core poisoned")
-        .mark_durable_through(through);
+    // Durable now: advance the log watermark and the round watermark under one
+    // acquisition, then release whatever the consensus loop buffered on this
+    // round (`complete_drain` wakes it).
+    {
+        let mut c = core.lock().expect("raftkv core poisoned");
+        c.mark_durable_through(through);
+        progress.complete_drain(round);
+    }
     apply_signal.notify();
 }
 
@@ -4881,6 +4899,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // bookkeeping, never touched by any other task.
     recovered_baseline_version: Version,
     suspicious_noop_log_budget: &mut u32,
+    // Issue #279: the shared persist-round counter. This task is the WAL's
+    // *second* drainer (its compaction rewrite), so it must number and complete
+    // the rounds it consumes or the consensus loop's buffered acks strand.
+    persist: &PersistProgress,
 ) -> bool {
     let mut did_work = false;
 
@@ -6206,19 +6228,35 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // consensus loop's accumulated pending append records are now
                 // redundant — drop them (`replay` is push-based, so re-appending
                 // them would duplicate entries). `wal_image` already captures the
-                // net durable state (snapshot + hard + log tail). Under this one
-                // lock hold, so no propose/append interleaves.
-                let _ = c.drain_persist();
-                (Some(buf), lli)
+                // net durable state (snapshot + hard + log tail), the current
+                // term/vote included. Under this one lock hold, so no
+                // propose/append interleaves.
+                //
+                // Issue #279: this drain is a **persist round like any other**,
+                // and claiming its number here — in the same lock hold as the
+                // drain itself — is what stops it stranding the consensus loop.
+                // The loop buffers a vote grant / append accept against "the next
+                // round to drain"; before this, compaction could silently be that
+                // drainer, the loop's own peek then saw nothing left to persist,
+                // no round was ever started, and the ack sat undelivered for
+                // seconds. Now compaction completes the round it consumed (after
+                // its `replace` lands, below), and the buffered acks go out.
+                let (_superseded, round) = persist_round::drain_for_round(&mut c, persist);
+                (Some((buf, round)), lli)
             }
         };
-        if let Some(bytes) = bytes {
+        if let Some((bytes, round)) = bytes {
             match env.replace(wal, &bytes).await {
                 Ok(()) => {
-                    // Physically durable now — advance the watermark.
-                    core.lock()
-                        .expect("raftkv core poisoned")
-                        .mark_durable_through(lli);
+                    // Physically durable now — advance both watermarks (the log
+                    // index, and the persist round this rewrite consumed) under
+                    // one acquisition, then let the consensus loop ship whatever
+                    // it buffered against that round.
+                    let mut c = core.lock().expect("raftkv core poisoned");
+                    c.mark_durable_through(lli);
+                    if let Some(round) = round {
+                        persist.complete_drain(round);
+                    }
                 }
                 // A shutdown that landed mid-rewrite (aborting tasks + dropping the
                 // data dir) can fail the `replace`; tolerate it only while halted —
@@ -6403,6 +6441,9 @@ struct DriveState<E: Env, S: StorageEngine> {
     propose_signal: Arc<ProposeSignal>,
     apply_signal: Arc<ApplySignal>,
     wake_signal: Arc<WakeSignal>,
+    /// Issue #279: persist-round accounting shared by this group's two WAL
+    /// drainers (the consensus loop and the apply task's compaction rewrite).
+    persist: Arc<PersistProgress>,
     metrics: MetricsHandle,
     /// The **base**-kind scope (ADR 0041 §3) — see [`RaftKvNode::scope`].
     scope: StorageScope,
@@ -6501,6 +6542,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         propose_signal,
         apply_signal,
         wake_signal,
+        persist,
         metrics,
         scope,
         kind_scopes,
@@ -6613,17 +6655,64 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         frozen,
         Arc::clone(&txn_tracker),
         Arc::clone(&apply_signal),
+        Arc::clone(&persist),
     ));
 
+    // Issue #279: the loop's own in-flight persist round, and the outbound
+    // messages held back until a round lands. Both are owned exclusively by this
+    // task — no other task can observe or mutate them — which is what makes the
+    // round bookkeeping correct by construction; see `persist_round`'s module
+    // doc for the two reverted attempts whose watermarks were sampled outside
+    // the lock hold that produced the mutation.
+    let mut persist_fut: Option<PersistFut<'_>> = None;
+    let mut gated = GatedOuts::default();
+
     loop {
-        // A requested shutdown exits *between* persist passes so the WAL is never
+        // A requested shutdown exits *between* persist rounds so the WAL is never
         // left mid-write; `stopped` (paired with the apply task's `apply_stopped`)
-        // tells the teardown path the artifacts are quiescent.
+        // tells the teardown path the artifacts are quiescent. An in-flight round
+        // is **awaited to completion**, never dropped: `abort()` is a request, not
+        // a guarantee, and `Reconciler::teardown` deletes this WAL the moment
+        // `is_stopped()` goes true. Anything still gated is discarded — a halted
+        // node ships nothing more, and its artifacts are about to be deleted.
         if halted.load(Ordering::SeqCst) {
+            if let Some(fut) = persist_fut.take() {
+                fut.await;
+            }
+            gated.clear();
             stopped.store(true, Ordering::SeqCst);
             return;
         }
-        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal, &halted).await;
+
+        // Start a round if this node owes the WAL anything and none is in flight.
+        // The pending records are whatever the previous iteration's step left, or
+        // what a proposer appended outside this loop (`propose_and_wake`). This is
+        // the loop's one round-start site, and — the whole point of issue #279 —
+        // the `append`/`fsync` it runs is raced *inside* the `select` below rather
+        // than blocking the loop before it, so heartbeats keep flowing and the
+        // election deadline keeps being re-armed while the disk is slow.
+        if persist_fut.is_none()
+            && core
+                .lock()
+                .expect("raftkv core poisoned")
+                .has_unflushed_wal()
+        {
+            persist_fut = Some(Box::pin(persist_wal(
+                &env,
+                &wal,
+                &core,
+                &wal_lock,
+                &apply_signal,
+                &halted,
+                &persist,
+            )));
+        }
+        // A group with an unfinished round or an undelivered ack must keep its
+        // timers: quiescence drops the timer arm entirely, so entering it here
+        // would leave a completing round (or the compaction rewrite that
+        // supersedes it) as the only wake source for messages a peer is waiting
+        // on. ORed into the existing veto inputs below.
+        let persist_veto = persist_fut.is_some() || !gated.is_empty();
 
         let now = env.now();
         // ADR 0044 phase-1 PR3: feed the one external input the core has no
@@ -6640,13 +6729,17 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             // a decided-but-unresolved record still owed a resolve) always
             // vetoes on its own; ORed with whatever external subsystem
             // (`animusd`'s `change_consumer_loop`) has set via
-            // `set_quiesce_veto`. Same lock acquisition, same once-per-
-            // iteration cadence as `quiesce_engine_caught_up` just above.
+            // `set_quiesce_veto`, and (issue #279) with this loop's own
+            // in-flight persist round / undelivered gated acks. Same lock
+            // acquisition, same once-per-iteration cadence as
+            // `quiesce_engine_caught_up` just above.
             let txn_veto = {
                 let t = txn_tracker.lock().expect("txn tracker poisoned");
                 !t.pending.is_empty() || !t.unresolved_decided.is_empty()
             };
-            c.set_quiesce_veto(txn_veto || external_quiesce_veto.load(Ordering::SeqCst));
+            c.set_quiesce_veto(
+                txn_veto || persist_veto || external_quiesce_veto.load(Ordering::SeqCst),
+            );
             (c.next_deadline(), c.is_quiesced())
         };
         // `None` (ADR 0044 phase-1 PR3 quiescence) drops the timer arm
@@ -6665,7 +6758,11 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         let before_commit = core.lock().expect("raftkv core poisoned").commit_index();
 
         // Each step yields outbound `KvWire` messages (Raft traffic and/or a read
-        // probe ack). Four wakeup sources race: an inbound message, the Raft timer
+        // probe ack) plus the persist round those messages must not outrun. Five
+        // wakeup sources race: **a persist round landing** (issue #279 — either
+        // this loop's own `fsync` finishing, or the apply task's compaction
+        // rewrite completing a round it drained, which is why the watermark is
+        // shared rather than loop-private), an inbound message, the Raft timer
         // deadline (absent — `None` — while quiesced, PR3), a **wake-on-propose**
         // signal — a proposer raising the flag so a freshly appended entry
         // replicates at once (ADR 0017 single-write latency), treated like an
@@ -6680,100 +6777,141 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             },
             recv_or_timer,
         );
-        let outs: Vec<(NodeId, KvWire)> = match select(
+        let stepped = select(
             ProposePending {
                 signal: &propose_signal,
             },
             wake_or_recv_or_timer,
-        )
-        .await
-        {
-            // Wake-on-propose: ship the new entry now (leader-only; empty otherwise).
-            Either::Left(((), _)) => {
-                let raft_outs = core
-                    .lock()
-                    .expect("raftkv core poisoned")
-                    .replicate_now(env.now());
-                raft_outs
-                    .into_iter()
-                    .map(|(to, m)| (to, KvWire::Raft(m)))
-                    .collect()
-            }
-            // Driver-level wake: looping back already re-checks `halted` and
-            // re-evaluates `next_deadline` (finding 4's hazard 1). It also
-            // covers a locally-woken **quiesced follower**'s "are you still
-            // there?" check (ADR 0044 phase-1 PR3, fork B) —
-            // `on_local_wake` is a no-op for every other state (not quiesced,
-            // or this node is the leader), so this arm stays inert exactly as
-            // it was in PR2 for a quiesced-leader wake or any wake on a
-            // ticking group.
-            Either::Right((Either::Left(((), _)), _)) => {
-                let entropy = env.next_u64();
-                let raft_outs = core
-                    .lock()
-                    .expect("raftkv core poisoned")
-                    .on_local_wake(env.now(), entropy);
-                raft_outs
-                    .into_iter()
-                    .map(|(to, m)| (to, KvWire::Raft(m)))
-                    .collect()
-            }
-            Either::Right((Either::Right((Either::Left((envelope, _)), _)), _)) => {
-                let entropy = env.next_u64();
-                match codec::decode_wire(&envelope.payload) {
-                    Ok(KvWire::Raft(msg)) => {
-                        // Witnessing point (ADR 0018 §2 amendment): every
-                        // command entry this replica receives — leader or
-                        // follower alike — before the core decides whether to
-                        // accept it (see `witness_append_entries`'s doc).
-                        witness_append_entries(&hlc, &msg, env.now());
-                        let raft_outs: Vec<Out<KvCommand>> = core
-                            .lock()
-                            .expect("raftkv core poisoned")
-                            .handle(envelope.from, msg, env.now(), entropy);
-                        raft_outs
-                            .into_iter()
-                            .map(|(to, m)| (to, KvWire::Raft(m)))
-                            .collect()
-                    }
-                    // A ReadProbe is answered iff we are still in the prober's term
-                    // (we have not moved on to help elect a newer leader). Not
-                    // consensus traffic — the core never sees it.
-                    Ok(KvWire::ReadProbe { term, epoch }) => {
-                        let same_term = core.lock().expect("raftkv core poisoned").term() == term;
-                        if same_term {
-                            vec![(envelope.from, KvWire::ReadProbeAck { term, epoch })]
-                        } else {
-                            Vec::new()
-                        }
-                    }
-                    Ok(KvWire::ReadProbeAck { term, epoch }) => {
-                        let mut r = reads.lock().expect("read state poisoned");
-                        if let Some((t, acks)) = r.pending.get_mut(&epoch)
-                            && *t == term
-                        {
-                            acks.insert(envelope.from);
-                        }
-                        Vec::new()
-                    }
-                    Err(err) => {
-                        tracing::warn!(?err, "undecodable raftkv message dropped");
-                        Vec::new()
-                    }
+        );
+        // The persist arm is polled first, so a landed round releases its acks
+        // ahead of taking on more work.
+        let persist_arm = PersistArm::new(&persist, persist_fut.as_mut(), gated.min_round());
+        let mut own_round_done = false;
+        let (outs, gate): (Vec<(NodeId, KvWire)>, Option<u64>) =
+            match select(persist_arm, stepped).await {
+                // A round landed. Nothing to step: the release below ships
+                // whatever was waiting on it.
+                Either::Left((wake, _)) => {
+                    own_round_done = wake == PersistWake::OwnRoundDone;
+                    (Vec::new(), None)
                 }
-            }
-            Either::Right((Either::Right((Either::Right(((), _)), _)), _)) => {
-                let entropy = env.next_u64();
-                let raft_outs = core
-                    .lock()
-                    .expect("raftkv core poisoned")
-                    .tick(env.now(), entropy);
-                raft_outs
-                    .into_iter()
-                    .map(|(to, m)| (to, KvWire::Raft(m)))
-                    .collect()
-            }
-        };
+                Either::Right((stepped, _)) => match stepped {
+                    // Wake-on-propose: ship the new entry now (leader-only; empty otherwise).
+                    Either::Left(((), _)) => {
+                        let (raft_outs, gate) = {
+                            let mut c = core.lock().expect("raftkv core poisoned");
+                            let outs = c.replicate_now(env.now());
+                            // The gate is read in the **same lock acquisition** as
+                            // the step that made the mutation — the one detail
+                            // both reverted attempts got wrong (see
+                            // `persist_round`'s module doc).
+                            (outs, persist.gate(c.has_unflushed_wal()))
+                        };
+                        (
+                            raft_outs
+                                .into_iter()
+                                .map(|(to, m)| (to, KvWire::Raft(m)))
+                                .collect(),
+                            gate,
+                        )
+                    }
+                    // Driver-level wake: looping back already re-checks `halted` and
+                    // re-evaluates `next_deadline` (finding 4's hazard 1). It also
+                    // covers a locally-woken **quiesced follower**'s "are you still
+                    // there?" check (ADR 0044 phase-1 PR3, fork B) —
+                    // `on_local_wake` is a no-op for every other state (not quiesced,
+                    // or this node is the leader), so this arm stays inert exactly as
+                    // it was in PR2 for a quiesced-leader wake or any wake on a
+                    // ticking group.
+                    Either::Right((Either::Left(((), _)), _)) => {
+                        let entropy = env.next_u64();
+                        let (raft_outs, gate) = {
+                            let mut c = core.lock().expect("raftkv core poisoned");
+                            let outs = c.on_local_wake(env.now(), entropy);
+                            (outs, persist.gate(c.has_unflushed_wal()))
+                        };
+                        (
+                            raft_outs
+                                .into_iter()
+                                .map(|(to, m)| (to, KvWire::Raft(m)))
+                                .collect(),
+                            gate,
+                        )
+                    }
+                    Either::Right((Either::Right((Either::Left((envelope, _)), _)), _)) => {
+                        let entropy = env.next_u64();
+                        match codec::decode_wire(&envelope.payload) {
+                            Ok(KvWire::Raft(msg)) => {
+                                // Witnessing point (ADR 0018 §2 amendment): every
+                                // command entry this replica receives — leader or
+                                // follower alike — before the core decides whether to
+                                // accept it (see `witness_append_entries`'s doc).
+                                witness_append_entries(&hlc, &msg, env.now());
+                                let (raft_outs, gate): (Vec<Out<KvCommand>>, Option<u64>) = {
+                                    let mut c = core.lock().expect("raftkv core poisoned");
+                                    let outs = c.handle(envelope.from, msg, env.now(), entropy);
+                                    (outs, persist.gate(c.has_unflushed_wal()))
+                                };
+                                (
+                                    raft_outs
+                                        .into_iter()
+                                        .map(|(to, m)| (to, KvWire::Raft(m)))
+                                        .collect(),
+                                    gate,
+                                )
+                            }
+                            // A ReadProbe is answered iff we are still in the prober's term
+                            // (we have not moved on to help elect a newer leader). Not
+                            // consensus traffic — the core never sees it, and it makes no
+                            // durable claim, so it never waits on a round.
+                            Ok(KvWire::ReadProbe { term, epoch }) => {
+                                let same_term =
+                                    core.lock().expect("raftkv core poisoned").term() == term;
+                                if same_term {
+                                    (
+                                        vec![(envelope.from, KvWire::ReadProbeAck { term, epoch })],
+                                        None,
+                                    )
+                                } else {
+                                    (Vec::new(), None)
+                                }
+                            }
+                            Ok(KvWire::ReadProbeAck { term, epoch }) => {
+                                let mut r = reads.lock().expect("read state poisoned");
+                                if let Some((t, acks)) = r.pending.get_mut(&epoch)
+                                    && *t == term
+                                {
+                                    acks.insert(envelope.from);
+                                }
+                                (Vec::new(), None)
+                            }
+                            Err(err) => {
+                                tracing::warn!(?err, "undecodable raftkv message dropped");
+                                (Vec::new(), None)
+                            }
+                        }
+                    }
+                    Either::Right((Either::Right((Either::Right(((), _)), _)), _)) => {
+                        let entropy = env.next_u64();
+                        let (raft_outs, gate) = {
+                            let mut c = core.lock().expect("raftkv core poisoned");
+                            let outs = c.tick(env.now(), entropy);
+                            (outs, persist.gate(c.has_unflushed_wal()))
+                        };
+                        (
+                            raft_outs
+                                .into_iter()
+                                .map(|(to, m)| (to, KvWire::Raft(m)))
+                                .collect(),
+                            gate,
+                        )
+                    }
+                },
+            };
+        // Safe only here: the `select` above (which borrows it) has been dropped.
+        if own_round_done {
+            persist_fut = None;
+        }
 
         let (after_commit, install_pending, is_quiesced_now) = {
             let c = core.lock().expect("raftkv core poisoned");
@@ -6807,13 +6945,48 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         }
         record_kv_outbound(&metrics, &outs);
 
-        // Durability before action: persist (fsync) before shipping responses, so a
-        // granted vote / appended entry is on disk before its message goes out.
-        // Engine apply happens independently on the apply task.
-        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal, &halted).await;
-
-        for (to, wire) in outs {
+        // Durability before action, message by message (issue #279). A step that
+        // owes the WAL nothing (`gate` is `None`) ships everything at once, as
+        // before. Otherwise only the messages that make a durability claim —
+        // vote grants, append accepts, and the rest of the non-allowlisted set —
+        // wait for their round; replication, heartbeats and pre-vote traffic go
+        // out immediately, which is what keeps a group alive across a slow
+        // `fsync`. Engine apply happens independently on the apply task.
+        let (immediate, held): (Vec<_>, Vec<_>) = match gate {
+            None => (outs, Vec::new()),
+            Some(_) => outs
+                .into_iter()
+                .partition(|(_, wire)| persist_round::ships_before_durable(wire)),
+        };
+        if let Some(round) = gate {
+            gated.push(round, held);
+        }
+        for (to, wire) in immediate {
             env.send_stream(to, stream, codec::encode_wire(&wire)).await;
+        }
+        // Whatever round landed — this loop's own `fsync` or the apply task's
+        // compaction rewrite — releases the acks that were waiting on it.
+        for (to, wire) in gated.release(persist.durable()) {
+            env.send_stream(to, stream, codec::encode_wire(&wire)).await;
+        }
+        // Safety net, and the reason a stranded ack is structurally impossible
+        // rather than merely unlikely (issue #279's second bug): if this node
+        // owes the WAL nothing *and* no round is in flight, then everything on
+        // disk already backs every message still held — whichever task drained
+        // it, and whether or not the round number lines up. Release the lot.
+        // Without this, any drain that failed to number its round would leave
+        // its buffer waiting on a round with no drainer, for as long as it took
+        // an unrelated later write to start one (measured at 10.1s).
+        if !gated.is_empty() {
+            let settled = {
+                let c = core.lock().expect("raftkv core poisoned");
+                persist.fully_durable(c.has_unflushed_wal())
+            };
+            if settled && persist_fut.is_none() {
+                for (to, wire) in gated.release(u64::MAX) {
+                    env.send_stream(to, stream, codec::encode_wire(&wire)).await;
+                }
+            }
         }
     }
 }
@@ -6851,6 +7024,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     frozen: Arc<AtomicBool>,
     txn_tracker: Arc<Mutex<TxnTracker>>,
     apply_signal: Arc<ApplySignal>,
+    persist: Arc<PersistProgress>,
 ) {
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
@@ -6897,6 +7071,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &txn_tracker,
             recovered_baseline_version,
             &mut suspicious_noop_log_budget,
+            &persist,
         )
         .await;
         if !did_work {

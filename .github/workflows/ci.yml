@@ -157,6 +157,7 @@ jobs:
                  -- --test-threads=1 \
                && cargo test -p animus-cp-data --features prod-heavy \
                  --test prod_concurrent_ts_monotonic \
+                 --test prod_compaction_persist_round \
                  -- --test-threads=1 \
                && cargo test -p animus-storage --features prod-heavy \
                  --test lsm_concurrent --test idle_engine_cost \

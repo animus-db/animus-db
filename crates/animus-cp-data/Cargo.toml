@@ -52,3 +52,11 @@ tokio.workspace = true
 name = "prod_concurrent_ts_monotonic"
 path = "tests/prod_concurrent_ts_monotonic.rs"
 required-features = ["prod-heavy"]
+
+# Real-thread `ProdEnv` test (issue #279): the consensus loop's persist rounds
+# race the apply task's compaction rewrite for the WAL, which only genuine
+# OS-thread parallelism exercises. Same `required-features` gating as above.
+[[test]]
+name = "prod_compaction_persist_round"
+path = "tests/prod_compaction_persist_round.rs"
+required-features = ["prod-heavy"]
