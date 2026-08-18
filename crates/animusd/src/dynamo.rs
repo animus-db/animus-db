@@ -3562,13 +3562,29 @@ mod stream_write_path_tests {
         .expect("node did not become control leader in time");
     }
 
+    /// Bring up a single node, retrying against the documented port-TOCTOU
+    /// race (`docs/engineering-lessons.md`): `single_node_config()`'s
+    /// `free_addrs` probe releases its ports before the real bind, so
+    /// another test binary can steal one under `cargo test --workspace`
+    /// contention. Each attempt allocates a **fresh** config.
     async fn single_node(dir: &Path) -> Node {
-        let config = single_node_config();
-        let node = run_node(&config, 0, dir.join("node-0"))
-            .await
-            .expect("bring up single node");
-        await_control_leader(&node).await;
-        node
+        let mut last_err = None;
+        for attempt in 0..16 {
+            let config = single_node_config();
+            match run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
+                Ok(node) => {
+                    await_control_leader(&node).await;
+                    return node;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        panic!(
+            "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
+        );
     }
 
     /// Mirrors `index_drain::gsi_drain_cursor_tests`'s identical helper — a
