@@ -287,12 +287,24 @@ local group to elect (never forwards to a non-leader, including itself, during
 election). **One-hop invariant**: the receiver (`cp_serve_forwarded`) never
 re-forwards.
 
-**Hinted-retry forwarding** (`ClientCtx::cp_forward`, the single choke point for
-every forward): a "not the leader here" refusal carries the refusing node's own
+**Hinted-retry forwarding** (`ClientCtx::forward_to_tablet_leader`, the single
+choke point for every forward — `cp_forward` is its (table, key)-resolving
+wrapper, and every **tablet-id-addressed** internal RPC (`SeedRows`,
+`ForceSeal`, `TriggerAutoSplit`, `ClearBackfillCursor`, `StreamHotRead`) calls
+it directly): a "not the leader here" refusal carries the refusing node's own
 leader hint (`topology::format_not_leader_refusal`, a plain string suffix so old
-and new binaries interoperate); `cp_forward` chases it — retry at the hint if
+and new binaries interoperate); the chase retries at the hint if
 untried, else at another of the tablet's known replicas, bounded to one pass over
-{hint} ∪ replicas within the overall `CLIENT_TIMEOUT`.
+{hint} ∪ replicas within the overall `CLIENT_TIMEOUT`. The tablet-addressed
+RPCs used to relay once and re-resolve from scratch instead — which never
+converges when the calling node hosts **no replica** of the target tablet
+(the fallback deterministically re-picks the first metadata replica; the
+split driver seeding an off-node fork-F5 child spun on exactly this forever,
+parking the split — see `docs/engineering-lessons.md`). A new tablet-addressed
+RPC must forward through this choke point, and its test suite needs a caller
+hosting no replica of the target, which only a cluster larger than RF can
+produce (`tests/split_build.rs::
+split_completes_when_a_child_lives_off_the_parent_leader_node`).
 
 **Election-wait backoff (PR #106)**: when *every* candidate refuses with
 `leader_hint=none` (the group is mid-election — a split-child/first-provision
