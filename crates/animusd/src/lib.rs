@@ -13720,12 +13720,26 @@ mod confirm_futility_tests {
         .expect("seed put did not succeed in 20s");
     }
 
+    /// Bring up a single node, retrying against the documented port-TOCTOU
+    /// race (`docs/engineering-lessons.md`): `single_node_config()`'s
+    /// `free_addrs` probe releases its ports before the real bind, so
+    /// another test binary can steal one under `cargo test --workspace`
+    /// contention. Each attempt allocates a **fresh** config.
     async fn single_node(dir: &Path) -> (Node, ClusterConfig) {
-        let config = single_node_config();
-        let node = run_node(&config, 0, dir.join("node-0"))
-            .await
-            .expect("bring up single node");
-        (node, config)
+        let mut last_err = None;
+        for attempt in 0..16 {
+            let config = single_node_config();
+            match run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
+                Ok(node) => return (node, config),
+                Err(e) => {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        panic!(
+            "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
+        );
     }
 
     /// **The futility early-exit (issue #268).** A `KindBatch` whose own-key

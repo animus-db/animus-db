@@ -2245,13 +2245,29 @@ mod gsi_drain_cursor_tests {
         .expect("node did not become control leader in time");
     }
 
+    /// Bring up a single node, retrying against the documented port-TOCTOU
+    /// race (`docs/engineering-lessons.md`): `single_node_config()`'s
+    /// `free_addrs` probe releases its ports before the real bind, so
+    /// another test binary can steal one under `cargo test --workspace`
+    /// contention. Each attempt allocates a **fresh** config.
     async fn single_node(dir: &Path) -> Node {
-        let config = single_node_config();
-        let node = run_node(&config, 0, dir.join("node-0"))
-            .await
-            .expect("bring up single node");
-        await_control_leader(&node).await;
-        node
+        let mut last_err = None;
+        for attempt in 0..16 {
+            let config = single_node_config();
+            match run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
+                Ok(node) => {
+                    await_control_leader(&node).await;
+                    return node;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        panic!(
+            "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
+        );
     }
 
     /// One DynamoDB JSON request over the real HTTP wire (mirroring
@@ -2598,9 +2614,30 @@ mod gsi_drain_cursor_tests {
     async fn crash_mid_reconcile_recovers_without_skipping_or_corrupting_the_gsi() {
         timeout(Duration::from_secs(90), async {
             let dir = tempfile::tempdir().expect("tempdir");
-            let node_dir = dir.path().join("node-0");
-            let config = single_node_config();
-            let node = run_node(&config, 0, &node_dir).await.expect("bring up");
+            // Initial bring-up: retry against the documented port-TOCTOU
+            // race (`docs/engineering-lessons.md`) with a fresh config +
+            // dir each attempt.
+            let mut last_err = None;
+            let mut brought_up = None;
+            for attempt in 0..16 {
+                let node_dir = dir.path().join(format!("node-{attempt}"));
+                let config = single_node_config();
+                match run_node(&config, 0, &node_dir).await {
+                    Ok(node) => {
+                        brought_up = Some((node, config, node_dir));
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+            let (node, config, node_dir) = brought_up.unwrap_or_else(|| {
+                panic!(
+                    "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
+                )
+            });
             await_control_leader(&node).await;
 
             let table = "orders";
@@ -2612,9 +2649,24 @@ mod gsi_drain_cursor_tests {
             sleep(Duration::from_millis(20)).await;
             node.shutdown_graceful().await;
 
-            let node2 = run_node(&config, 0, &node_dir)
-                .await
-                .expect("restart on the same dir");
+            // Same-address restart: this must reuse the captured
+            // config/dir (that's the property under test), so — unlike the
+            // bring-up above — it retries the rebind itself within a
+            // bounded wall-clock deadline instead of reallocating ports
+            // (the `restart_same_addrs` idiom, `tests/support/mod.rs`).
+            let restart_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let node2 = loop {
+                match run_node(&config, 0, &node_dir).await {
+                    Ok(node2) => break node2,
+                    Err(e) => {
+                        assert!(
+                            tokio::time::Instant::now() < restart_deadline,
+                            "restart on the same dir/addresses did not rebind: {e}"
+                        );
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            };
             await_control_leader(&node2).await;
 
             for id in &ids {
@@ -2795,23 +2847,39 @@ mod stream_sealer_tests {
     }
 
     /// A single combined node, DynamoDB Streams sealer knobs set to `knobs`
-    /// (never the production defaults) — see the module doc.
+    /// (never the production defaults) — see the module doc. Retries
+    /// against the documented port-TOCTOU race
+    /// (`docs/engineering-lessons.md`) with a fresh config each attempt.
     async fn single_node_with_streams(dir: &Path, knobs: StreamSealKnobs) -> Node {
-        let config = single_node_config();
-        let node = run_node_with_streams(
-            &config,
-            0,
-            dir.join("node-0"),
-            StorageBackend::default(),
-            Duration::from_secs(600),
-            knobs,
-            SegmentStoreConfig::default(),
-            crate::DEFAULT_STREAM_RETENTION,
-        )
-        .await
-        .expect("bring up single node with stream knobs");
-        await_control_leader(&node).await;
-        node
+        let mut last_err = None;
+        for attempt in 0..16 {
+            let config = single_node_config();
+            match run_node_with_streams(
+                &config,
+                0,
+                dir.join(format!("node-{attempt}")),
+                StorageBackend::default(),
+                Duration::from_secs(600),
+                knobs,
+                SegmentStoreConfig::default(),
+                crate::DEFAULT_STREAM_RETENTION,
+            )
+            .await
+            {
+                Ok(node) => {
+                    await_control_leader(&node).await;
+                    return node;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        panic!(
+            "could not bring up single node with stream knobs after retries \
+             (ports kept getting stolen): {last_err:?}"
+        );
     }
 
     /// Like [`single_node_with_streams`], but also opts the node's
@@ -2830,11 +2898,37 @@ mod stream_sealer_tests {
         auto_split_bytes: Option<u64>,
         quiesce_after: Duration,
     ) -> Node {
-        let config = single_node_config();
-        let addrs = config.nodes[0].clone();
-        let bound = Node::bind(crate::config::node_id(0), addrs, dir.join("node-0"))
+        // `Node::bind` is where the port-TOCTOU race
+        // (`docs/engineering-lessons.md`) actually bites — retry with a
+        // fresh config each attempt.
+        let mut last_err = None;
+        let mut bound_state = None;
+        for attempt in 0..16 {
+            let config = single_node_config();
+            let addrs = config.nodes[0].clone();
+            match Node::bind(
+                crate::config::node_id(0),
+                addrs,
+                dir.join(format!("node-{attempt}")),
+            )
             .await
-            .expect("bind");
+            {
+                Ok(bound) => {
+                    bound_state = Some((bound, config));
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        let (bound, config) = bound_state.unwrap_or_else(|| {
+            panic!(
+                "could not bind single node with streams+quiescence after retries \
+                 (ports kept getting stolen): {last_err:?}"
+            )
+        });
         let mut client_route = std::collections::BTreeMap::new();
         client_route.insert(crate::config::node_id(0), config.nodes[0].client);
         let mut intra_route = std::collections::BTreeMap::new();
@@ -3559,14 +3653,36 @@ mod stream_sealer_tests {
     async fn f11_end_to_end_auto_split_on_a_streamed_table_lands_a_token_aligned_boundary() {
         timeout(Duration::from_secs(60), async {
             let dir = tempfile::tempdir().expect("tempdir");
-            let config = single_node_config();
-            let bound = crate::Node::bind(
-                crate::config::node_id(0),
-                config.nodes[0].clone(),
-                dir.path().join("node-0"),
-            )
-            .await
-            .expect("bind");
+            // `Node::bind` is where the port-TOCTOU race
+            // (`docs/engineering-lessons.md`) actually bites — retry with a
+            // fresh config each attempt.
+            let mut last_err = None;
+            let mut bound_state = None;
+            for attempt in 0..16 {
+                let config = single_node_config();
+                match crate::Node::bind(
+                    crate::config::node_id(0),
+                    config.nodes[0].clone(),
+                    dir.path().join(format!("node-{attempt}")),
+                )
+                .await
+                {
+                    Ok(bound) => {
+                        bound_state = Some((bound, config));
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+            let (bound, config) = bound_state.unwrap_or_else(|| {
+                panic!(
+                    "could not bind single node after retries (ports kept getting \
+                     stolen): {last_err:?}"
+                )
+            });
             let node = bound
                 .start_with_streams(
                     config.peer_book(),

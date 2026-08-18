@@ -24,6 +24,18 @@ the ADR 0050 Train B rung-7 sweep). `index_drain.rs` has another,
 `gsi_drain_cursor_tests`, and `dynamo.rs` another, `stream_write_path_tests`
 (ADR 0042), for the same reason (see each file's own entry below).
 
+**Every in-crate bring-up retries the port-TOCTOU race (issue #278 item
+3).** Since these mods can't reach `tests/support`, each hand-rolls its own
+`free_addrs`/`single_node`-shaped fixtures — and each must independently
+carry the bounded fresh-config retry documented in
+`docs/engineering-lessons.md` (the same idiom `tests/split_build.rs::bring_up`
+uses), or it panics `AddrInUse` under `cargo test --workspace` contention. A
+same-address restart (`gsi_drain_cursor_tests::
+crash_mid_reconcile_recovers_without_skipping_or_corrupting_the_gsi`) instead
+retries the rebind itself on a bounded deadline, mirroring
+`tests/support/mod.rs::restart_same_addrs` — it can't reallocate ports since
+reusing the captured config is the point of the test.
+
 ## Module map (`src/`)
 
 - **`lib.rs`** (~6800 lines) — the node assembly and everything

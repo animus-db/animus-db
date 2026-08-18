@@ -1162,22 +1162,74 @@ mod cql_kind_write_tests {
             .unwrap_or_else(|| panic!("metric {name} absent from /metrics"))
     }
 
+    /// Bring up a single node, retrying against the documented port-TOCTOU
+    /// race (`docs/engineering-lessons.md`): `single_node_config()`'s
+    /// `free_addrs` probe releases its ports before the real bind, so
+    /// another test binary can steal one under `cargo test --workspace`
+    /// contention. Each attempt allocates a **fresh** config.
     async fn single_node(dir: &Path) -> Node {
-        let config = single_node_config();
-        let node = run_node(&config, 0, dir.join("node-0"))
-            .await
-            .expect("bring up single node");
-        timeout(Duration::from_secs(10), async {
-            loop {
-                if node.is_control_leader() {
-                    return;
+        let mut last_err = None;
+        for attempt in 0..16 {
+            let config = single_node_config();
+            match run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
+                Ok(node) => {
+                    timeout(Duration::from_secs(10), async {
+                        loop {
+                            if node.is_control_leader() {
+                                return;
+                            }
+                            sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .expect("node did not become control leader in time");
+                    return node;
                 }
-                sleep(Duration::from_millis(20)).await;
+                Err(e) => {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
             }
-        })
-        .await
-        .expect("node did not become control leader in time");
-        node
+        }
+        panic!(
+            "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
+        );
+    }
+
+    /// Bring up an `n`-node cluster, one process per node, retrying the
+    /// (allocate-fresh-ports + start-all) unit against the same port-TOCTOU
+    /// race as [`single_node`] — the canonical shape also used by
+    /// `tests/split_build.rs::bring_up`. On a partial failure, shut down
+    /// whatever already started before retrying with fresh addresses.
+    async fn bring_up_cluster(n: usize, dir: &Path) -> Vec<Node> {
+        let mut last_err = None;
+        for attempt in 0..16 {
+            let config = cluster_config(n);
+            let mut nodes = Vec::new();
+            let mut failed = None;
+            for i in 0..n {
+                match run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
+                    Ok(node) => nodes.push(node),
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            match failed {
+                None => return nodes,
+                Some(e) => {
+                    for node in &nodes {
+                        node.shutdown_graceful().await;
+                    }
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        panic!(
+            "could not bring up cluster after retries (ports kept getting stolen): {last_err:?}"
+        );
     }
 
     async fn await_group(node: &Node, table: &str) -> crate::CpGroup {
@@ -1282,15 +1334,7 @@ mod cql_kind_write_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cql_whole_partition_delete_serves_from_every_node() {
         let dir = tempfile::TempDir::new().unwrap();
-        let config = cluster_config(3);
-        let mut nodes = Vec::new();
-        for i in 0..3 {
-            nodes.push(
-                run_node(&config, i, dir.path().join(format!("node-{i}")))
-                    .await
-                    .expect("bring up cluster node"),
-            );
-        }
+        let nodes = bring_up_cluster(3, dir.path()).await;
         timeout(Duration::from_secs(20), async {
             loop {
                 if nodes.iter().any(Node::is_control_leader) {
