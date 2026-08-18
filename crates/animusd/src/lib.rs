@@ -530,6 +530,19 @@ impl CpGroup {
         }
     }
 
+    /// Whether [`shutdown`](Self::shutdown) has latched this group's
+    /// `halted` flag — the durability-assert tolerance gate `persist_wal`/
+    /// `flush_pending` check (`animus-cp-data`'s `CLAUDE.md`), distinct from
+    /// [`is_stopped`](Self::is_stopped) (whether the driver has actually
+    /// exited yet). See [`RaftKvNode::is_halted`].
+    #[cfg(test)]
+    fn is_halted(&self) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.is_halted(),
+            CpGroup::Mem(n) => n.is_halted(),
+        }
+    }
+
     /// The node's `raftkv` env this group runs on. Since ADR 0026 Stage B every
     /// tablet a node hosts shares this **same** env (stream-addressed, not a
     /// distinct per-tablet id/env) — used to identify *this node's* handle in
@@ -3037,6 +3050,8 @@ impl BoundNode {
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
+            #[cfg(test)]
+            test_ctx: ctx,
         })
     }
 }
@@ -3086,6 +3101,18 @@ pub struct Node {
     /// populated — every deployment shape binds and (from `intra/2-cutover`
     /// onward) serves it.
     intra_addr: SocketAddr,
+    /// Test-only: a clone of this node's own [`ClientCtx`] (the exact one
+    /// `spawn_common_tail` built and handed to this node's listeners/
+    /// background loops), so an in-crate test module can call a
+    /// `ClientCtx`-scoped `pub(crate)` primitive (e.g.
+    /// [`dynamo::kind_write_item_at_leader`]) directly — sharing this node's
+    /// real `rmw_lock`/routing/edge state, not a hand-rolled stand-in — the
+    /// same reason `confirm_futility_tests` already reaches into `node.edge`.
+    /// `#[cfg(test)]`-only: no production cost, and no confusion with the
+    /// single source of truth for a live connection's own `ClientCtx`
+    /// (`serve_requests`' per-connection clone).
+    #[cfg(test)]
+    test_ctx: ClientCtx,
 }
 
 impl Node {
@@ -3261,6 +3288,14 @@ impl Node {
         self.raft.metadata_cached()
     }
 
+    /// Test-only: this node's own `ClientCtx` — see the `test_ctx` field's
+    /// doc for why an in-crate test needs the real one rather than a
+    /// hand-built stand-in.
+    #[cfg(test)]
+    pub(crate) fn ctx_for_test(&self) -> ClientCtx {
+        self.test_ctx.clone()
+    }
+
     /// Propose a control-plane [`MetaCommand`] on this node's control replica,
     /// returning whether it was accepted (i.e. this node is the leader). The
     /// interim admin hook for cluster metadata operations the wire edges do not
@@ -3303,7 +3338,20 @@ impl Node {
     /// [`shutdown_and_wait`](Self::shutdown_and_wait) instead — plain `shutdown`
     /// remains for callers that only need the node to stop (most simulated-crash
     /// tests never rebind the killed node's own address in the same process).
+    ///
+    /// **Latches every hosted CP group's `halted` flag first** (issue #282):
+    /// unlike [`shutdown_graceful`](Self::shutdown_graceful), this bare path has
+    /// no grace period at all before the hard `task.abort()`/`ProdEnv::shutdown()`
+    /// below, so a killed node's driver can land mid-WAL-I/O with `halted` still
+    /// unset — the exact window `persist_wal`'s/`flush_pending`'s halted-gated
+    /// assert (`animus-cp-data`'s `CLAUDE.md`) otherwise turns into an
+    /// unconditional panic on a racing I/O hiccup, indistinguishable from a real
+    /// durability fault. [`ClusterEdgeState::halt_hosted_cp_groups`] is a plain
+    /// atomic store plus two wakes per group — cheap, synchronous, no wait for
+    /// `is_stopped()` — so it costs this fire-and-forget path nothing and keeps
+    /// its contract (request the stop, don't wait for it) intact.
     pub fn shutdown(&self) {
+        self.edge.halt_hosted_cp_groups();
         for task in &self.tasks {
             task.abort();
         }
@@ -3328,7 +3376,12 @@ impl Node {
     /// rebind-retry bound. [`shutdown_graceful`](Self::shutdown_graceful) —
     /// what every restart test already calls before rebinding — uses this
     /// instead of the plain `shutdown` for exactly this reason.
+    ///
+    /// Latches every hosted CP group's `halted` flag first, exactly like
+    /// [`shutdown`](Self::shutdown) — see that method's doc; this path
+    /// hard-aborts the same driver tasks, just with an added wait afterward.
     pub async fn shutdown_and_wait(&self) {
+        self.edge.halt_hosted_cp_groups();
         for task in &self.tasks {
             task.abort();
         }
@@ -3377,6 +3430,36 @@ impl Node {
         }
         self.edge.shutdown_all_cp_groups().await;
         self.shutdown_and_wait().await;
+    }
+}
+
+/// Panic-unwind safety net (issue #279's panic half): a test that panics
+/// mid-poll (a converged-or-timeout assert, say) drops its `Vec<Node>` with
+/// no explicit `shutdown()` call at all, and the `#[tokio::test(multi_thread)]`
+/// runtime's own teardown then hard-cancels every still-live driver task —
+/// including one sitting mid-`tokio::fs` op — moments later, with nothing
+/// having latched any hosted CP group's `halted` flag first. That is the
+/// identical unconditional-panic window bare [`Node::shutdown`]'s own doc
+/// describes, just reached by a runtime's implicit teardown instead of an
+/// explicit call.
+///
+/// Latching here closes it the same way: synchronously, unconditionally, and
+/// first — before anything else in this drop glue (or the runtime's own
+/// later cancellation) can touch a driver task.
+/// [`ClusterEdgeState::halt_hosted_cp_groups`] is safe to call from `Drop`
+/// specifically because it bottoms out in `RaftKvNode::shutdown`, which is a
+/// plain `AtomicBool` store plus two `Notify` wakes — no `.await`, no lock
+/// held across one, no dependency on a live tokio runtime (`Drop` can run
+/// inside or outside one), so it can never block or panic here.
+///
+/// Deliberately does **not** abort this node's own tasks or tear down its
+/// envs — unlike `shutdown()`, a `Node` dropped without an explicit
+/// `shutdown()` call still leaves its tasks running exactly as before this
+/// fix (see `shutdown()`'s own doc); only the durability assert those tasks
+/// can now safely race against an eventual abrupt stop is fixed.
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.edge.halt_hosted_cp_groups();
     }
 }
 
@@ -3659,6 +3742,8 @@ impl BoundControlNode {
             cql_addr: None,
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
+            #[cfg(test)]
+            test_ctx: ctx,
         })
     }
 }
@@ -4062,6 +4147,8 @@ impl BoundDataNode {
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
+            #[cfg(test)]
+            test_ctx: ctx,
         })
     }
 }
@@ -4182,22 +4269,31 @@ impl ClusterEdgeState {
         Some(group)
     }
 
-    /// Gracefully halt every CP group registered here (process shutdown, not
-    /// drop-table GC — see [`shutdown_graceful`](Node::shutdown_graceful)). A raw
-    /// `ProdEnv::shutdown()` hard-`abort()`s the CP-data driver/apply tasks, which
-    /// can land mid-`storage.merge(..).await` inside `apply_and_compact` and
-    /// surface as a `tokio::fs` background-task panic
-    /// (`Backend("background task failed")`/`Backend("task was cancelled")`) when
-    /// the runtime's blocking pool is torn down underneath it. `CpGroup::shutdown`
-    /// only latches a flag the driver observes *between* full apply passes, so we
-    /// must poll [`is_stopped`](CpGroup::is_stopped) before the caller proceeds to
-    /// abort anything else — the same shutdown-then-wait shape the per-node
-    /// tablet-host reconciler's own teardown uses (ADR 0031 PR4) before deleting a
-    /// dropped tablet's files. Snapshots the handles out of the
-    /// lock first (never hold a `std::sync::Mutex` guard across `.await`). Bounded
-    /// by `CP_GC_STOP_TIMEOUT`; a group that doesn't stop in time is logged and
-    /// left for the subsequent hard abort (the process is exiting either way).
-    async fn shutdown_all_cp_groups(&self) {
+    /// Synchronously latch **every** locally-registered CP group's `halted`
+    /// flag (`CpGroup::shutdown` — a plain atomic store plus two `Notify`
+    /// wakes, no I/O, no `.await`) and hand back the snapshot this took, so
+    /// a caller that also needs to wait for the driver to actually exit
+    /// (`shutdown_all_cp_groups`, below) can reuse it without a second lock
+    /// round trip.
+    ///
+    /// This is the one shared first step **every** path that can abruptly
+    /// stop a group's driver needs before it touches that driver at all
+    /// (issues #282/#279): the graceful process teardown below, bare
+    /// [`Node::shutdown`]/[`shutdown_and_wait`](Node::shutdown_and_wait)
+    /// (a raw `task.abort()` + `ProdEnv::shutdown()`, the doc-blessed "kill
+    /// node N" fault-injection idiom with no grace period at all), and
+    /// [`Node`]'s `Drop` impl (a panicking test's `Vec<Node>` unwind, which
+    /// leaves the driver tasks for the test runtime's own teardown to
+    /// hard-cancel later, mid-I/O, with nothing having latched `halted` at
+    /// all). Without this latch, an abruptly-cancelled driver can land
+    /// inside `persist_wal`/`flush_pending`'s halted-gated I/O-error assert
+    /// (`animus-cp-data`'s `CLAUDE.md`) with `halted` still `false` — an
+    /// unconditional panic indistinguishable from a genuine live durability
+    /// fault. Deliberately does **not** poll `is_stopped()` — that wait is
+    /// this method's own caller's job when it needs one; every bare-abort
+    /// caller above wants fire-and-forget, exactly like `CpGroup::shutdown`
+    /// itself already promises.
+    fn halt_hosted_cp_groups(&self) -> Vec<CpGroup> {
         let groups: Vec<CpGroup> = self
             .raftkv
             .lock()
@@ -4209,6 +4305,25 @@ impl ClusterEdgeState {
         for group in &groups {
             group.shutdown();
         }
+        groups
+    }
+
+    /// Gracefully halt every CP group registered here (process shutdown, not
+    /// drop-table GC — see [`shutdown_graceful`](Node::shutdown_graceful)). A raw
+    /// `ProdEnv::shutdown()` hard-`abort()`s the CP-data driver/apply tasks, which
+    /// can land mid-`storage.merge(..).await` inside `apply_and_compact` and
+    /// surface as a `tokio::fs` background-task panic
+    /// (`Backend("background task failed")`/`Backend("task was cancelled")`) when
+    /// the runtime's blocking pool is torn down underneath it. [`halt_hosted_cp_groups`](
+    /// Self::halt_hosted_cp_groups) only latches a flag the driver observes *between*
+    /// full apply passes, so we must poll [`is_stopped`](CpGroup::is_stopped) before
+    /// the caller proceeds to abort anything else — the same shutdown-then-wait shape
+    /// the per-node tablet-host reconciler's own teardown uses (ADR 0031 PR4) before
+    /// deleting a dropped tablet's files. Bounded by `CP_GC_STOP_TIMEOUT`; a group
+    /// that doesn't stop in time is logged and left for the subsequent hard abort
+    /// (the process is exiting either way).
+    async fn shutdown_all_cp_groups(&self) {
+        let groups = self.halt_hosted_cp_groups();
         let deadline = tokio::time::Instant::now() + CP_GC_STOP_TIMEOUT;
         for group in &groups {
             while !group.is_stopped() {
@@ -5528,6 +5643,23 @@ impl ClientCtx {
     /// [`ClientRequest::KindWriteItem`]'s doc for why this closes the
     /// cross-node LSI/change-record orphan race `index_aware_write`'s
     /// design had.
+    ///
+    /// **Retries the retryable freeze refusal (issue #288).** A tablet mid
+    /// split-cutover freeze (`FROZEN_REFUSAL`, ADR 0050 rung 5) refuses
+    /// every mutating propose with a `"; retry"`-suffixed error *before*
+    /// ever proposing — from `kind_write_item_at_leader`'s own pre-propose
+    /// check when local, or the forwarded leader's identical check when not
+    /// — so it's cheap and safe to retry. Mirrors [`cp_read`](Self::cp_read)'s
+    /// deadline-bounded loop: bounded by [`CLIENT_TIMEOUT`], re-resolving
+    /// `cp_route` every attempt (essential — after cutover the key routes to
+    /// a child tablet, not the frozen parent), retrying only while
+    /// [`read_should_retry`](Self::read_should_retry) matches the error.
+    /// Before this fix a client writing during a split's freeze window got a
+    /// terminal error instead of the write succeeding once the child
+    /// activates a moment later. The retry loop lives *outside*
+    /// `kind_write_item_at_leader`'s own `rmw_lock` scope (issue #285 narrowed
+    /// that lock to read+evaluate only), so retrying here — including the
+    /// sleep between attempts — never pins the lock across the wait.
     pub(crate) async fn cp_kind_write_item(
         &self,
         meta: &Metadata,
@@ -5539,40 +5671,65 @@ impl ClientCtx {
     ) -> Result<dynamo::KindWriteOutcome, animus_dynamo::wire::WireError> {
         // Auto-provision the table's tablet on first write (ADR 0023), as
         // `cp_kind_write` does — an indexed/streamed table's first item write
-        // can race its own `CreateTable`'s tablet provisioning.
+        // can race its own `CreateTable`'s tablet provisioning. Stays
+        // outside the retry loop below: provisioning is itself idempotent,
+        // so re-checking it every retry pass would just be a wasted
+        // metadata read once the tablet exists.
         if !self.effective_metadata().has_table_tablet(table) {
             self.provision_tablet(table)
                 .await
                 .map_err(|e| dynamo::internal(&e))?;
         }
         let base_key = dynamo::item_key(pk, sk);
-        match self.cp_route(table, &base_key).await {
-            CpRoute::Local(leader) => {
-                dynamo::kind_write_item_at_leader(self, &leader, meta, table, pk, sk, op, condition)
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            let err = match self.cp_route(table, &base_key).await {
+                CpRoute::Local(leader) => {
+                    match dynamo::kind_write_item_at_leader(
+                        self,
+                        &leader,
+                        meta,
+                        table,
+                        pk,
+                        sk,
+                        op.clone(),
+                        condition,
+                    )
                     .await
-            }
-            CpRoute::Forward(addr) => {
-                let request = ClientRequest::KindWriteItem {
-                    table: table.to_owned(),
-                    pk: pk.clone(),
-                    sk: sk.cloned(),
-                    op,
-                    condition: condition.cloned(),
-                };
-                match self.cp_forward(table, &base_key, addr, request).await {
-                    ClientResponse::KindWriteOk { old, new } => {
-                        Ok(dynamo::KindWriteOutcome::Ok { old, new })
+                    {
+                        Ok(outcome) => return Ok(outcome),
+                        Err(e) => e,
                     }
-                    ClientResponse::ConditionFailed => {
-                        Ok(dynamo::KindWriteOutcome::ConditionFailed)
-                    }
-                    ClientResponse::Error(e) => Err(dynamo::internal(&e)),
-                    other => Err(dynamo::internal(&format!(
-                        "unexpected reply to forwarded kind write item: {other:?}"
-                    ))),
                 }
+                CpRoute::Forward(addr) => {
+                    let request = ClientRequest::KindWriteItem {
+                        table: table.to_owned(),
+                        pk: pk.clone(),
+                        sk: sk.cloned(),
+                        op: op.clone(),
+                        condition: condition.cloned(),
+                    };
+                    match self.cp_forward(table, &base_key, addr, request).await {
+                        ClientResponse::KindWriteOk { old, new } => {
+                            return Ok(dynamo::KindWriteOutcome::Ok { old, new });
+                        }
+                        ClientResponse::ConditionFailed => {
+                            return Ok(dynamo::KindWriteOutcome::ConditionFailed);
+                        }
+                        ClientResponse::Error(e) => dynamo::internal(&e),
+                        other => {
+                            return Err(dynamo::internal(&format!(
+                                "unexpected reply to forwarded kind write item: {other:?}"
+                            )));
+                        }
+                    }
+                }
+                CpRoute::None => dynamo::internal("no CP group leader reachable"),
+            };
+            if !Self::read_should_retry(&err.message) || tokio::time::Instant::now() >= deadline {
+                return Err(err);
             }
-            CpRoute::None => Err(dynamo::internal("no CP group leader reachable")),
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -5594,6 +5751,16 @@ impl ClientCtx {
     /// "this batch is durable" signal last (the GSI drain's cursor-row bump,
     /// the trim janitor's final deletion) gets it confirmed, not merely an
     /// earlier entry in the same batch.
+    ///
+    /// **Retries the retryable freeze refusal (issue #288)** — the fast/
+    /// marker-write arm's own share of the gap: this primitive backs plain
+    /// (unindexed, unstreamed) Dynamo writes, CQL's partition writes, and the
+    /// raw client protocol, none of which used to retry `FROZEN_REFUSAL`
+    /// either. Same shape as [`cp_kind_write_item`](Self::cp_kind_write_item)'s
+    /// identical fix: a deadline-bounded loop mirroring
+    /// [`cp_read`](Self::cp_read), re-resolving `cp_route` every attempt so a
+    /// post-cutover retry lands on the child tablet, retrying only while
+    /// [`read_should_retry`](Self::read_should_retry) matches the error.
     pub(crate) async fn cp_kind_write_raw(
         &self,
         table: &str,
@@ -5603,20 +5770,36 @@ impl ClientCtx {
         let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
         };
-        match self.cp_route(table, &first).await {
-            CpRoute::Local(leader) => Self::cp_kind_raw_local(&leader, writes, change_log).await,
-            CpRoute::Forward(addr) => {
-                let request = ClientRequest::KindWrite {
-                    table: table.to_owned(),
-                    writes,
-                    change_log,
-                };
-                Self::ok_or_err(
-                    self.cp_forward(table, &first, addr, request).await,
-                    "forwarded CP kind write",
-                )
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            let err = match self.cp_route(table, &first).await {
+                CpRoute::Local(leader) => {
+                    match Self::cp_kind_raw_local(&leader, writes.clone(), change_log.clone()).await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(e) => e,
+                    }
+                }
+                CpRoute::Forward(addr) => {
+                    let request = ClientRequest::KindWrite {
+                        table: table.to_owned(),
+                        writes: writes.clone(),
+                        change_log: change_log.clone(),
+                    };
+                    match Self::ok_or_err(
+                        self.cp_forward(table, &first, addr, request).await,
+                        "forwarded CP kind write",
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => e,
+                    }
+                }
+                CpRoute::None => "no CP group leader reachable".to_string(),
+            };
+            if !Self::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+                return Err(err);
             }
-            CpRoute::None => Err("no CP group leader reachable".into()),
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -13655,7 +13838,7 @@ mod auto_split_median_tests {
 mod confirm_futility_tests {
     use std::net::SocketAddr;
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tokio::time::{sleep, timeout};
 
@@ -13816,6 +13999,371 @@ mod confirm_futility_tests {
         .expect("an ordinary write after the futile one still confirms");
 
         node.shutdown();
+    }
+
+    /// Regression for issue #285: `dynamo::kind_write_item_at_leader` used to
+    /// hold `ctx.data().rmw_lock` across the whole `cp_kind_local` propose+
+    /// confirm-poll, not just its own read+evaluate — so one item's slow
+    /// confirm (apply backlog stretches this even with the #268 fast-fail
+    /// above) stalled *every other* evaluated write on the node behind it,
+    /// including a write to a completely unrelated tablet.
+    ///
+    /// A `ConditionExpression` failure can't reproduce this: it returns
+    /// (`ConditionFailed`) before `cp_kind_local` is ever called, so the
+    /// lock is released at the same point regardless of the fix — the bug
+    /// is specifically about the propose+confirm phase, which a failed
+    /// eval-time condition never reaches. To exercise it for real we need a
+    /// write whose **read** is fast but whose **propose+confirm** is slow: a
+    /// continuous filler flood against the write's own tablet, running for
+    /// the whole test, gives exactly that — the flood's own commits keep
+    /// growing the tablet's apply backlog throughout the window, but the
+    /// target write's read starts essentially at once (the group is
+    /// otherwise idle), typically resolving before much backlog has built
+    /// up, while its subsequent confirm-poll (for the entry the flood keeps
+    /// pushing behind) has to wait out however much is still queued.
+    ///
+    /// A second, wholly unrelated tablet (its own independent Raft group and
+    /// apply pipeline — no flood) then proves the point: pre-fix, a write to
+    /// it queues behind the node-wide lock held for the first write's entire
+    /// read+propose+confirm; post-fix the lock is released the moment the
+    /// first write's read+evaluate finishes, so the second write is
+    /// unaffected by the first write's still-ongoing confirm-poll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_confirm_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _config) = single_node(dir.path()).await;
+        let ctx = node.ctx_for_test();
+
+        ctx.provision_tablet("rmw_285_a")
+            .await
+            .expect("provisioning table A");
+        ctx.provision_tablet("rmw_285_b")
+            .await
+            .expect("provisioning table B");
+        let meta = node.metadata();
+        let tablet_a = *meta
+            .tablets_for_table("rmw_285_a")
+            .next()
+            .expect("table A has a tablet")
+            .0;
+        let tablet_b = *meta
+            .tablets_for_table("rmw_285_b")
+            .next()
+            .expect("table B has a tablet")
+            .0;
+        let group_a = node
+            .edge
+            .local_cp(tablet_a)
+            .expect("this node hosts table A's tablet");
+        let group_b = node
+            .edge
+            .local_cp(tablet_b)
+            .expect("this node hosts table B's tablet");
+        // `provision_tablet` alone does not wait for the group to actually
+        // elect (its own doc: an ordinary caller's routed op does that via
+        // `cp_route`) — poll rather than assert immediately.
+        for group in [&group_a, &group_b] {
+            timeout(Duration::from_secs(10), async {
+                while !group.is_leader() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("tablet group did not elect a local leader in time");
+        }
+
+        // A continuous filler flood against table A's own tablet ONLY, for a
+        // fixed wall-clock window long enough to outlast both writes below.
+        // `put_kind_batch_conditioned` is a synchronous, non-blocking
+        // propose (append-only, no confirm wait), so this keeps landing
+        // fresh committed-but-unapplied entries in group A's own log for the
+        // whole window regardless of how fast its apply task drains them.
+        let flood_deadline = Instant::now() + Duration::from_millis(1800);
+        let mut flood_tasks = Vec::new();
+        for lane in 0..3u32 {
+            let group_a = group_a.clone();
+            flood_tasks.push(tokio::spawn(async move {
+                let filler = vec![7u8; 2048];
+                let mut i: u64 = 0;
+                while Instant::now() < flood_deadline {
+                    let key = format!("rmw-285-filler-{lane}-{i:08}").into_bytes();
+                    let _ = group_a.put_kind_batch_conditioned(
+                        vec![(animus_cp_data::KIND_BASE, key, Some(filler.clone()))],
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    i += 1;
+                    // A real (short) sleep, not just `yield_now`: this flood
+                    // only needs to keep group A's own apply queue
+                    // non-empty, not to saturate a worker thread — the
+                    // node's own background tasks (its apply loop included,
+                    // for BOTH groups) share this same runtime and must get
+                    // real wall-clock scheduling slots too, or the whole
+                    // process slows down and the test stops isolating the
+                    // lock from ordinary scheduler contention (measured:
+                    // a bare `yield_now` flood starved group B's own apply
+                    // task for seconds, nothing to do with the lock at all).
+                    // Deliberately modest total volume (a few thousand small
+                    // entries, not tens of thousands): heavy enough to make
+                    // a held-lock write to group B queue for a clearly
+                    // observable stretch, light enough that the backlogged
+                    // write's own confirm reliably lands within
+                    // `CLIENT_TIMEOUT` (10s) even under CI contention.
+                    sleep(Duration::from_micros(500)).await;
+                }
+            }));
+        }
+
+        let mut item_a = animus_dynamo::Item::new();
+        item_a.insert(
+            "pk".to_string(),
+            animus_dynamo::AttributeValue::S("slow-item".to_string()),
+        );
+        let pk_a = animus_dynamo::AttributeValue::S("slow-item".to_string());
+        let slow = tokio::spawn({
+            let ctx = ctx.clone();
+            let group_a = group_a.clone();
+            let meta = meta.clone();
+            async move {
+                crate::dynamo::kind_write_item_at_leader(
+                    &ctx,
+                    &group_a,
+                    &meta,
+                    "rmw_285_a",
+                    &pk_a,
+                    None,
+                    crate::KindWriteOp::Put(item_a),
+                    None,
+                )
+                .await
+            }
+        });
+
+        // Give the slow write's own read a head start before the flood has
+        // built up much backlog, so its read tends to resolve fast and the
+        // slowness lands on its propose+confirm instead — not load-bearing
+        // for correctness (the assertion below is about the *second*
+        // write), just makes the scenario reliably reproduce the bug this
+        // regresses.
+        sleep(Duration::from_millis(10)).await;
+
+        let mut item_b = animus_dynamo::Item::new();
+        item_b.insert(
+            "pk".to_string(),
+            animus_dynamo::AttributeValue::S("unrelated-item".to_string()),
+        );
+        let pk_b = animus_dynamo::AttributeValue::S("unrelated-item".to_string());
+        let started = Instant::now();
+        let outcome = timeout(
+            Duration::from_secs(60),
+            crate::dynamo::kind_write_item_at_leader(
+                &ctx,
+                &group_b,
+                &meta,
+                "rmw_285_b",
+                &pk_b,
+                None,
+                crate::KindWriteOp::Put(item_b),
+                None,
+            ),
+        )
+        .await
+        .expect("the unrelated write must not need the outer 60s safety timeout")
+        .expect("the unrelated write must itself succeed");
+        let elapsed = started.elapsed();
+        eprintln!("DIAG: unrelated write (group B) took {elapsed:?}");
+        assert!(
+            matches!(outcome, crate::dynamo::KindWriteOutcome::Ok { .. }),
+            "the unrelated write must actually land, not just return some outcome"
+        );
+
+        // The structural, load-independent half of this regression: group A's
+        // slow task must still be RUNNING at the instant the unrelated write
+        // (group B) returns. This is a hard ordering guarantee, not a timing
+        // race — pre-fix, `rmw_lock` is one node-wide lock, so the unrelated
+        // write cannot even *start* its own read until the slow task's whole
+        // call (read+evaluate+propose+confirm) returns and drops the guard;
+        // by construction it can therefore never observe the slow task as
+        // still in flight. Post-fix, the slow task keeps grinding through its
+        // own backlogged confirm-poll (below) well after releasing the lock,
+        // so the unrelated write — unblocked once the slow task's own
+        // read+evaluate finishes — routinely finishes first.
+        assert!(
+            !slow.is_finished(),
+            "the backlogged write (group A) must still be in flight when the unrelated write \
+             (group B) returns — pre-fix, the unrelated write cannot even start until the \
+             backlogged write's ENTIRE call (including its confirm-poll) has already \
+             returned and released the node-wide rmw_lock, so it could never observe this"
+        );
+        // A loose sanity ceiling — not the load-bearing assertion above, just
+        // a guard against a genuine hang (this write should never need
+        // anywhere near CLIENT_TIMEOUT once its own read+evaluate resolves).
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the unrelated write took implausibly long even accounting for CI noise: {elapsed:?}"
+        );
+
+        let slow_started = Instant::now();
+        slow.await
+            .expect("slow task panicked")
+            .expect("the backlogged write must itself eventually succeed too");
+        eprintln!(
+            "DIAG: slow task (group A) finished {:?} after the unrelated write returned",
+            slow_started.elapsed()
+        );
+        for t in flood_tasks {
+            let _ = t.await;
+        }
+        node.shutdown();
+    }
+}
+
+/// Regression for issues #282/#279's fix: bare [`Node::shutdown`] and
+/// [`Node`]'s `Drop` impl both latch every hosted CP group's `halted` flag —
+/// see each's own doc for the full rationale. This module needs
+/// `CpGroup::is_halted` (`#[cfg(test)]`-only, no external `tests/` binary can
+/// reach a private `CpGroup`) and `node.edge.local_cp`, hence in-crate like
+/// `confirm_futility_tests` above; `ProdEnv` has no fault-injection knob (that
+/// lives only in `animus_sim::SimEnv`), so this doesn't attempt to race a real
+/// disk fault — the deterministic proof that a halted-latched group tolerates
+/// one lives in `animus-cp-data`'s `tests/shutdown.rs`. This just proves the
+/// latch itself actually reaches every hosted group on both paths, and that
+/// neither path panics doing it.
+#[cfg(test)]
+mod halted_shutdown_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use tokio::time::sleep;
+
+    use crate::config::NodeRole;
+    use crate::{ClusterConfig, Node, RoleAddrs, run_node};
+
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn single_node_config() -> ClusterConfig {
+        let addrs = free_addrs(6);
+        ClusterConfig {
+            nodes: vec![RoleAddrs {
+                id: crate::config::node_id(0),
+                role: NodeRole::Both,
+                internal: addrs[0],
+                client: addrs[1],
+                dynamo: addrs[2],
+                cql: addrs[3],
+                admin: addrs[4],
+                intra: addrs[5],
+            }],
+        }
+    }
+
+    /// Bring up a single node, retrying against the documented port-TOCTOU
+    /// race (`docs/engineering-lessons.md`), mirroring
+    /// `confirm_futility_tests::single_node`.
+    async fn single_node(dir: &Path) -> Node {
+        let mut last_err = None;
+        for attempt in 0..16 {
+            let config = single_node_config();
+            match run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
+                Ok(node) => return node,
+                Err(e) => {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        panic!(
+            "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
+        );
+    }
+
+    /// Seed a put so the single-voter group provisions its first tablet and
+    /// elects, then return that tablet's locally-hosted group handle.
+    async fn provision_and_get_group(node: &Node) -> crate::CpGroup {
+        use crate::{ClientRequest, ClientResponse, read_frame, write_frame};
+
+        let client = node.client_addr();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let mut stream = tokio::net::TcpStream::connect(client)
+                    .await
+                    .expect("connect");
+                write_frame(
+                    &mut stream,
+                    &ClientRequest::Put {
+                        key: b"seed".to_vec(),
+                        value: b"seed".to_vec(),
+                        table: "halt_t".to_string(),
+                    },
+                )
+                .await
+                .expect("send");
+                match read_frame(&mut stream)
+                    .await
+                    .expect("read")
+                    .expect("a reply")
+                {
+                    ClientResponse::PutOk => return,
+                    ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                    other => panic!("unexpected put response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("seed put did not succeed in 20s");
+
+        let tablet = *node
+            .metadata()
+            .tablets_for_table("halt_t")
+            .next()
+            .expect("seed put provisioned a tablet")
+            .0;
+        node.edge
+            .local_cp(tablet)
+            .expect("this single-voter node hosts the tablet")
+    }
+
+    /// Bare `Node::shutdown()` — the doc-blessed "kill node N" idiom — must
+    /// latch `halted` on every hosted CP group before it returns, with no
+    /// panic and no wait for the driver to actually stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bare_shutdown_latches_halted_on_every_hosted_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = single_node(dir.path()).await;
+        let group = provision_and_get_group(&node).await;
+
+        assert!(
+            !group.is_halted(),
+            "a freshly-provisioned group must not start out halted"
+        );
+        node.shutdown();
+        assert!(
+            group.is_halted(),
+            "bare Node::shutdown() must latch halted on every hosted group"
+        );
+    }
+
+    /// Dropping a `Node` that was never explicitly `shutdown()` (a panic
+    /// mid-test unwinding its `Vec<Node>`, per issue #279's panic half) must
+    /// latch `halted` on every hosted CP group too, via `Node`'s `Drop` impl.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_an_unshutdown_node_latches_halted_on_every_hosted_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = single_node(dir.path()).await;
+        let group = provision_and_get_group(&node).await;
+
+        assert!(!group.is_halted());
+        drop(node);
+        assert!(
+            group.is_halted(),
+            "dropping an un-shutdown Node must latch halted via its Drop impl"
+        );
     }
 }
 

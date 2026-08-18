@@ -2565,6 +2565,140 @@ debugging anything that feels like it might have happened before.
   a bypass-the-check source is portable, a same-task-progress source is not
   (short of new pre-emption machinery this codebase doesn't have). Documented,
   not test-covered, in `animus-cp-data/CLAUDE.md`'s driver-split section.
+- **A shared bring-up helper must borrow the caller's `TempDir` (or return
+  its guard), never own-and-drop one internally** (issue #273).
+  `dynamo_index_scan.rs::setup()` created `tempfile::tempdir()` locally and
+  returned only `(nodes, addr)` — the guard dropped at the end of `setup()`,
+  `remove_dir_all`-ing the data tree out from under the still-running 3-node
+  LSM cluster the caller kept using, so a background WAL write later panicked
+  `"wal group-commit sync failed"`. Every other bring-up helper in the suite
+  already took `dir: &Path` from a caller-held guard; this was the one
+  offender, found by a full sweep, not a pattern to assume is safe elsewhere.
+  **The issue #278 halted-gated WAL tolerance does NOT retroactively make
+  this safe**: that tolerance only applies while a driver loop's own
+  `halted` latch is set (a deliberate shutdown in progress), and this
+  cluster is never shut down — `halted` stays false the whole time, so the
+  fault surfaces as the loud, unconditional durability panic, not the
+  tolerated teardown case. Fixed by returning `(TempDir, Vec<Node>, SocketAddr)`
+  and binding the guard at every call site (`let (_dir, nodes, addr) =
+  setup().await;`). (`animusd/tests/dynamo_index_scan.rs`.)
+- **A retry keyed on HTTP status code is strictly more robust than one keyed
+  on a message substring, because distinct exhaustion points at the same
+  call site share the status long after they diverge in wording** (issue
+  #287). `streams_e2e.rs`'s `dynamo_retrying` (added by the issue #278 fix)
+  retries any 500 unconditionally; the cascade-split lineage test's own
+  `put` closure still asserted `status == 200` in one shot, and PR #294's
+  retrofit of `dynamo_retrying` across this file's soak tests missed it.
+  The CI failure this produced wasn't even the documented freeze→cutover
+  blip `dynamo_retrying`'s own doc comment names — it was a *different*
+  transient (`"CP kind write did not commit in time"`, a confirm-timeout
+  under runner starvation) that happens to also surface as a 500, and the
+  status-keyed retry absorbed it without needing to know its message at
+  all. **General rule**: when retrofitting a proven retry helper across a
+  file, grep every remaining single-shot status assert in that file, not
+  just the one test the CI failure report named — a helper's own doc
+  comment naming one root cause doesn't mean it's the only one the retry
+  will end up masking, and that's a feature of status-code keying, not a
+  bug to narrow away. (`animusd/tests/streams_e2e.rs`.)
+- **A converged-or-timeout poll's budget needs headroom over the worst-case
+  duration of a SINGLE retry attempt when that attempt rides a network-hop
+  timeout, not just headroom over healthy wall-clock** (issue #281).
+  `data_only.rs`'s `schema_ddl_via_a_data_node_relays_and_commits` retried
+  `ProposeSchema` every 100ms inside a 20s poll — but a freshly-started
+  data-only node has no leader hint yet, so a single attempt can
+  legitimately fall all the way to broadcast and stall for the full 10s
+  `CLIENT_TIMEOUT` before the next iteration even starts. A 20s budget is
+  barely 2x one such worst-case attempt, not a real margin, and a starved
+  CI runner routinely needs more than one. Same runner-aware-budget idiom
+  as `split_cluster.rs`'s 30s→90s split-completion polls and
+  `backfill_seeder.rs`'s 60s→180s `CONVERGE_BUDGET` (both issue #278 item
+  9): size the multiplier against the attempt's own worst-case bound, not
+  against how long the property takes to converge when nothing is
+  contended. (`animusd/tests/data_only.rs`.)
+- **A regression test for "does one writer's held lock stall an unrelated
+  writer" is more reliably proven by a structural ordering check than by an
+  absolute wall-clock threshold** (issue #285). The first design measured
+  the unrelated write's elapsed time against a fixed millisecond bound —
+  but on a resource-constrained sandbox, real backlog-induced apply lag
+  turned out to have high, non-linear variance run to run (the *same*
+  filler-flood configuration measured anywhere from ~150ms to over
+  `CLIENT_TIMEOUT`, 10s, depending on ambient scheduler contention from
+  concurrently-running sibling tests), and generous-but-fixed thresholds
+  either passed spuriously under light backlog or risked flaking under
+  heavy contention. The property under test doesn't actually need a
+  number: `!slow_task.is_finished()` at the exact instant the unrelated
+  write returns is a **hard ordering guarantee**, not a timing race —
+  pre-fix, the unrelated write literally cannot even acquire the node-wide
+  lock until the slow task's entire call (including its confirm-poll) has
+  already returned and dropped the guard, so it can never observe the slow
+  task as still in flight; post-fix, the slow task keeps grinding through
+  its backlogged confirm well after releasing the lock, so the unrelated
+  write routinely finishes first. Keep a loose absolute ceiling alongside
+  it only as a hang guard (generous enough to never be the discriminating
+  assertion), not as the property being proven. General form: when a
+  regression is fundamentally about *ordering* (did A block on B, or not),
+  prefer asserting the ordering directly (`JoinHandle::is_finished`, a
+  shared flag, a channel) over inferring it from a wall-clock threshold —
+  the latter only ever approximates the former, and approximates it worse
+  the more the environment's real-time behavior varies.
+  (`crates/animusd/src/lib.rs::confirm_futility_tests::
+  an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_confirm_wait`.)
+- **An unthrottled continuous write flood against an INDEXED table racing a
+  background convergence process can make that process livelock rather than
+  exercise it** (issue #288). A first draft of the freeze-window regression
+  ran 6 concurrent max-speed `PutItem` loops (fresh TCP connection per
+  request, no pacing) against a table with a GSI, from just before a
+  split's kickoff until cutover — and the split never converged within a
+  90s budget, because split cutover itself gates on the GSI drain's own
+  veto (it must catch up to the max pending change record before a parent
+  can retire, `docs/streams-notes.md`), and the flood was generating new
+  change-log backlog faster than the drain could clear it — a genuine
+  live-lock, not a hang. It also incidentally triggered a real engine-level
+  I/O error on the sandbox under that load. Pacing the flood down to 2
+  lanes with a 20ms delay between attempts fixed both: the split converged
+  in ~17s instead of timing out at 90s, and the test still reliably covers
+  the (sub-second, ADR 0050 rung 8's F8 contract) freeze window with dense
+  enough probing. General form: a test that races a continuous write flood
+  against a background convergence loop must pace the flood below that
+  loop's own throughput, especially when the convergence condition itself
+  depends on catching up to the write volume — "hammer as fast as possible
+  until X happens" silently assumes X's own progress is independent of the
+  hammering, which is false whenever X is gated on draining exactly what's
+  being hammered in. (`crates/animusd/tests/split_build.rs::
+  probe_put_item_until_stopped`.)
+
+- **Real-thread `ProdEnv` liveness/concurrency tests and deterministic
+  `SimEnv` suites need different CI contracts, and the split enforcing that
+  must be structural, not a hand-maintained list (issues #280/#286,
+  2026-08-18).** `ci.yml`'s single `gates` job ran the whole workspace's
+  `cargo test` on a 2-vCPU shared runner; the real-thread tests (`animusd`'s
+  66 integration binaries + its real-thread `--lib` tests, plus 6 scattered
+  binaries in `animus-control`/`animus-cp-data`/`animus-storage`/
+  `animus-consensus`) blow their timing/convergence budgets under
+  contention from everything else the job builds/runs, starving a different
+  victim almost every run. Splitting them into a separate, bounded-retry
+  `prod-liveness` job needed a way to keep them out of the deterministic
+  `gates` job's plain `cargo test` that can't silently drift as tests are
+  added later — a YAML exclude list naming test files by hand is exactly
+  the kind of "two places must agree" hazard this file already warns about
+  generally. Fix: give each of the 4 non-`animusd` crates an opt-in,
+  default-off `prod-heavy` Cargo feature and declare each real-thread
+  binary as an explicit `[[test]] required-features = ["prod-heavy"]`
+  target — a plain `cargo test` (no `--features`) then skips building or
+  running them automatically (verified directly: `cargo test -p
+  animus-storage` builds and runs every other binary in the crate but
+  neither `lsm_concurrent` nor `idle_engine_cost`, both of which build and
+  run once `--features prod-heavy` is passed), while `clippy --all-features`
+  still type-checks them on every push. A new real-thread test added later
+  without this treatment simply runs inside `gates` and re-creates the
+  starvation — the fix converts "don't forget to exclude it" into a
+  compile-visible property (an un-gated binary is *always* in the plain
+  `cargo test` run) instead of a rule someone has to remember. The retried
+  tier is a stopgap for runner-class starvation, not a waiver: a test
+  failing both attempts still blocks merge, per this file's standing
+  "a flaky `ProdEnv` integration test is a real bug" rule.
+  (`.github/workflows/ci.yml`, `crates/{animus-control,animus-cp-data,
+  animus-storage,animus-consensus}/Cargo.toml`.)
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
@@ -6346,6 +6480,95 @@ debugging anything that feels like it might have happened before.
   when an API reply means "you can now use X", the reply path must itself
   exercise X the way a client would; auto-provision paths whose own next
   op already rides the waiting machinery (`cp_route`) need no such gate.
+- **A primitive documented "single-waiter by design" is a silent
+  lost-wakeup hazard waiting for its second consumer — audit every consumer
+  before sharing its handle, or better, make it multi-waiter the moment a
+  second one shows up** (issue #276, 2026-08-18). `animus-control`'s
+  `MetadataWatch` (ADR 0031) started as a single `AtomicWaker`-backed
+  watermark, correct for its one designed caller (the per-node reconciler)
+  and documented as such on the type and in the ADR. ADR 0035 PR5 later
+  handed the very same handle to a second, independent concurrent consumer
+  — a combined-mode node's `WatchMetadata` RPC long-poll — without anyone
+  re-checking the single-waiter contract. `AtomicWaker::register` silently
+  *evicts* whatever waker was previously registered rather than erroring or
+  queuing, so the reconciler loop's own periodic re-registration (every
+  `RECONCILE_FALLBACK_INTERVAL`) would evict a parked long-poll's waker; the
+  evicted waiter never got woken by the real commit and only ever resolved
+  via its own independent fallback timeout (8s). The result reads as
+  **bounded-but-large latency**, not a crash or a wrong answer — exactly
+  the shape that gets misread as scheduler contention or CI runner
+  slowness instead of a lost wakeup, because the symptom (a slow-but-legal
+  reply) has its own innocent-looking explanation and the fallback timeout
+  makes it *look* like the safety net working as intended. Fix: made
+  `MetadataWatch` genuinely multi-waiter (a `Mutex<BTreeMap<u64, Waker>>`
+  slot registry, one slot per parked `changed()` future, removed on
+  `Drop`) instead of trying to re-establish single-consumer discipline by
+  convention or a doc comment, since the next handle-sharing change would
+  just break it again the same way. General form: when a change hands an
+  existing "intentionally single-waiter" handle to any additional caller —
+  even one that looks read-only, even one added for an unrelated feature —
+  grep every existing consumer of that handle first; if more than one
+  concurrent waiter is now possible, the primitive itself needs to become
+  multi-waiter, not merely re-documented. (`crates/animus-control/src/
+  node.rs`, `crates/animusd/src/lib.rs::watch_metadata`.)
+- **A confirm-wait fast-fail bounds per-attempt latency but doesn't make it
+  safe to hold a serialization lock across the wait — when a lock is
+  provably redundant with an apply-time check, scope it to read+eval only**
+  (issue #285). `dynamo::kind_write_item_at_leader` held `ctx.data().
+  rmw_lock` (one lock per node, shared by every table/tablet this node
+  leads) across its own read *and* the full `cp_kind_local` propose+
+  confirm-poll — so one item's slow confirm (apply backlog stretches this
+  even with the #268 `confirm_wait_is_futile` fast-fail, which only bounds
+  *this* attempt, not how long that attempt takes to even resolve under
+  load) stalled every *other* evaluated write on the node behind it, not
+  just racing writes of the *same* item. The lock was never the thing
+  making concurrent writes of one item safe in the first place — the
+  apply-time OCC seatbelt (`KindBatch.conditions`, checked byte-for-byte
+  against the actual committed value on every replica) already had to work
+  lock-free, since `txn_resolver_loop`'s recovery pushes never take this
+  lock at all. Once a lock is provably redundant with an apply-time check
+  like this, its only remaining job is a same-node collision-rate
+  optimization, so it only ever needs to span the read+evaluate that
+  produces the value the check is *based on* — never the propose/confirm
+  that verifies it. **The scoping pattern already existed one function
+  away**: `ClientCtx::txn_stage_local` takes the identical `rmw_lock` only
+  around its own read+evaluate loop, dropping it before staging — grep
+  sibling functions touching the same lock/primitive for an already-
+  established narrower scoping before assuming a wider one is the
+  house convention just because it's what you found first.
+  (`crates/animusd/src/dynamo.rs::kind_write_item_at_leader`.)
+- **A `"; retry"`-suffix convention is opt-in per caller, not a property of
+  the error itself — unifying call sites onto a shared primitive can
+  silently drop a retry loop that used to live at a since-deleted higher
+  layer** (issue #288). `FROZEN_REFUSAL` (ADR 0050's split-cutover freeze
+  refusal) is emitted deliberately in the house `"; retry"` shape, and the
+  low-level primitives that can hit it (`cp_kind_local`, `cp_kind_raw_
+  local`, `seed_rows_local`) all return it correctly. But *retrying* on
+  that suffix is something each caller has to opt into by actually writing
+  a loop — it doesn't happen automatically just because the string ends
+  the right way. `ClientCtx::cp_kind_write_item`/`cp_kind_write_raw` (the
+  two caller-facing entry points every Dynamo/CQL/raw-protocol write funnels
+  through since ADR 0049's write-path unification) were each a single
+  `cp_route` + one attempt, no loop at all — so a write racing a split's
+  freeze window got a terminal 500 instead of the retry every *other*
+  retryable-error caller in this file performs. The bug likely predates
+  the unification: an older, now-deleted higher layer plausibly retried
+  this for the plain-write path, and folding every write shape onto one
+  shared low-level primitive (rung 1 of ADR 0049) preserved the primitive's
+  own correct error shape while dropping whatever retry loop used to wrap
+  it above. **Audit method that would have caught this**: don't trust a
+  doc comment's claim about retry behavior (or an issue's own premise —
+  this one *also* wrongly assumed the plain-write arm already retried,
+  when it never had coverage either way) — trace each entry point down to
+  its terminal single-attempt primitive and grep for an actual `loop { ...
+  }` shape wrapping the call, the same discipline `cp_read`'s own
+  deadline-bounded loop already demonstrates as the house pattern. A
+  refactor that unifies several call sites onto one shared implementation
+  is exactly the moment a caller-side concern (retry, backoff, dedup) that
+  lived above the old, now-deleted per-shape code paths is most likely to
+  quietly vanish — grep for it explicitly rather than assuming the
+  unification preserved it.
+  (`crates/animusd/src/lib.rs::cp_kind_write_item`, `cp_kind_write_raw`.)
 
 ### Parallel-agent orchestration
 - **`gh stack checkout <N>` silently switches the CURRENT worktree's checked-
@@ -7189,3 +7412,60 @@ debugging anything that feels like it might have happened before.
   bring-up shape gets copied wherever a private handle forces an in-crate
   test module, and each copy is independently exposed.
   (`crates/animusd/src/{cql,dynamo,index_drain,lib}.rs`.)
+
+- **A halted-gated durability assert must audit every path that can
+  abruptly stop the guarded driver, not just the one path someone
+  remembered to wire it into** (issues #282/#279, 2026-08-18).
+  `animus-cp-data`'s WAL/apply I/O tolerance (`persist_wal`/
+  `flush_pending`) hard-panics on a live I/O error and tolerates one only
+  while a group's `halted: AtomicBool` is set — but that flag latches via
+  `RaftKvNode::shutdown()`, a distinct concept from `animusd::Node::
+  shutdown()` (raw task-abort, the doc-blessed "kill node N"
+  fault-injection idiom), and only `Node::shutdown_graceful` (the restart-
+  test path, via `shutdown_all_cp_groups`) called it. Two much more common
+  ways to abruptly stop a node never did: bare `Node::shutdown()` itself
+  only `task.abort()`ed and tore down the env, and `Node` had no `Drop`
+  impl at all, so a test that panics mid-poll and drops its `Vec<Node>`
+  left every hosted driver task for the `#[tokio::test(multi_thread)]`
+  runtime's own teardown to hard-cancel later, mid-I/O — with `halted`
+  never latched either way. Both windows turn a routine kill or panic
+  unwind racing an I/O hiccup into an unconditional panic
+  indistinguishable from a genuine live durability fault. Fix: factor the
+  latch step out (`ClusterEdgeState::halt_hosted_cp_groups` — a cheap,
+  synchronous snapshot-and-store over every locally-registered group, no
+  wait for the driver to actually stop) and call it first from bare
+  `shutdown()`/`shutdown_and_wait()` too, plus from a new `Drop for Node`
+  that does nothing else — deliberately preserving the pre-existing
+  "dropping a `Node` without `shutdown()` leaves its tasks running"
+  contract, since only the assert those still-live tasks can now safely
+  race is what needed fixing. Safe to call from `Drop` specifically
+  because `RaftKvNode::shutdown()` bottoms out in a plain `AtomicBool`
+  store plus two `Notify` wakes: no I/O, no lock held across an `.await`,
+  no dependency on a live tokio runtime (`Drop` can run inside or outside
+  one) — verify this before ever calling anything from `Drop`, since most
+  async primitives are not this safe. General form: when a correctness
+  assert is gated on a flag latched by some "graceful shutdown" call, grep
+  every way the guarded resource can be torn down — an explicit graceful
+  call, a bare/forceful kill idiom, AND an implicit `Drop` from a panic
+  unwind — not just the one call site whichever earlier fix's test
+  happened to exercise. (`crates/animus-cp-data/tests/shutdown.rs`,
+  `crates/animusd/src/lib.rs`.)
+- **In a sequential multi-agent delivery chain, an implementation agent
+  that ends its turn to "wait" for its own background command stalls the
+  chain even though the harness auto-resumes it on completion** — the
+  orchestrator cannot assume "no further message" means "still working";
+  it must treat every completion notification as a checkpoint to verify
+  the working tree/commit state directly rather than trusting the agent's
+  last message, and agent briefs must say explicitly that a background
+  command's completion re-invokes the agent and it must then continue to
+  the end of the task, not stop again to wait.
+- **A long chain of `cargo build`/`cargo test` runs across feature variants
+  in one session can exhaust a fixed disk allowance mid-chain, and the
+  failure it produces looks exactly like a compile bug, not a disk
+  problem** — an ENOSPC-killed `rustc` surfaces as a plain nonzero exit
+  (often 101) with truncated/garbled output, the same shape as a real
+  compile error, so a session that hasn't been tracking free space burns
+  time debugging source code that was never broken. Check free disk space
+  before diagnosing a surprise compile failure that shows up late in a
+  session, especially right after a `--all-features`/multi-crate build
+  sweep.

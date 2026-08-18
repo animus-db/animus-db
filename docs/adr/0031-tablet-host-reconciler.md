@@ -23,6 +23,23 @@
   plane's async apply task after it publishes its cache — not from the
   consensus driver loop directly — since `Metadata` is no longer applied
   in-core. Every consumer here (the reconciler's trigger) is unaffected.
+- **2026-08-18 note (issue #276):** `MetadataWatch`'s single-waiter design
+  (§trigger, below) turned out not to survive ADR 0035 PR5: a combined-mode
+  node's `ControlHandle::Local` hands the very same `MetadataWatch` clone to
+  *two* independent concurrent consumers — this ADR's own reconciler loop
+  and each inbound `WatchMetadata` RPC's long-poll (`ClientCtx::
+  watch_metadata`) — and the single `AtomicWaker` only remembers the most
+  recently registered waker. The reconciler's own periodic re-registration
+  (on every `RECONCILE_FALLBACK_INTERVAL` fallback tick) would silently evict
+  a parked long-poll's waker, which then only ever resolved via its own
+  8-second server-side timeout instead of waking on the real commit —
+  bounded-but-large latency, easily misread as scheduler/runner slowness
+  rather than a lost wakeup. Fixed in `animus-control` by making
+  `MetadataWatch` genuinely multi-waiter (a small `Mutex<BTreeMap<u64,
+  Waker>>` slot registry instead of one `AtomicWaker`); no caller changed.
+  See `docs/engineering-lessons.md` for the generalized lesson and the
+  "Costs and risks" / §trigger sections below, updated in place rather than
+  left describing the old, no-longer-true contract.
 - **Date:** 2026-08-07
 
 ## Context
@@ -178,11 +195,13 @@ is a `fetch_max` plus a wake **only when the watermark actually advanced**, so
 calling it defensively at multiple points in the loop costs nothing extra on
 the (common) "nothing changed this iteration" case.
 
-`MetadataWatch` is deliberately single-waiter, mirroring `ProposeSignal`: an
+`MetadataWatch` was originally single-waiter, mirroring `ProposeSignal`: an
 `AtomicWaker` only remembers the most recently registered waker, so two
-concurrent callers of `changed()` would starve one of them. This matches the
-intended consumer exactly — one `Reconciler` task per node — and is
-documented on the type rather than hidden.
+concurrent callers of `changed()` would starve one of them. That matched the
+intended consumer at the time — one `Reconciler` task per node — and was
+documented on the type rather than hidden. **This is no longer true — see the
+2026-08-18 note above**: it is now multi-waiter (a small per-future slot
+registry), because a second concurrent consumer did in fact show up.
 
 ## Consequences
 
@@ -216,13 +235,19 @@ primitive):
   whole lifecycle raises the stakes of a bug in the shared planner —
   mitigated by keeping the planner **pure** (PR3) so it is unit-testable
   exhaustively without any `Env`, and by the PR5 fault-injection corpus.
-- **`MetadataWatch` is single-waiter by design**, not a general-purpose
-  broadcast/pub-sub primitive — a future consumer needing more than one
-  independent watcher on one `RaftNode` would need its own instance (cheap:
-  `RaftNode::metadata_watch()` returns a fresh clone sharing the same
-  underlying cursor, so multiple *clones* are fine as long as only one task at
-  a time calls `changed()` on any given clone's lineage) or a genuine
-  broadcast primitive, which this PR does not build.
+- **`MetadataWatch` was single-waiter by design** — not a general-purpose
+  broadcast/pub-sub primitive — with the stated assumption that a second
+  independent watcher on one `RaftNode` would need its own instance (a fresh
+  `RaftNode::metadata_watch()` clone). **That assumption broke (2026-08-18,
+  issue #276, see the note above): ADR 0035 PR5 handed the very same clone to
+  a second concurrent consumer** (each inbound `WatchMetadata` RPC's
+  long-poll, alongside this ADR's own reconciler loop), producing a genuine
+  lost-wakeup — the RPC's waker got silently evicted by the reconciler's own
+  periodic re-registration, so it only ever resolved via its own 8-second
+  server-side timeout. The fix made `MetadataWatch` itself multi-waiter (a
+  small per-future slot registry) rather than trying to re-establish
+  single-consumer discipline by convention, which the next handle-sharing
+  change would just break again.
 - **A metadata-watch wake is bounded by the driver's own flush cadence, same
   as today.** The control plane does not have `animus-cp-data`'s
   wake-on-propose optimization (`ProposeSignal` there wakes the *consensus*

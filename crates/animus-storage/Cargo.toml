@@ -11,6 +11,15 @@ description = "AnimusDB StorageEngine trait + in-memory implementation."
 [lints]
 workspace = true
 
+# Off by default. Gates the real-thread (`#[tokio::test(flavor =
+# "multi_thread")]`) `ProdEnv` liveness/concurrency test binaries below, so a
+# plain `cargo test -p animus-storage` (the CI `gates` job) never schedules
+# them — they need dedicated cores to avoid the 2-vCPU shared-runner
+# starvation tracked in issue #286/#280. `prod-liveness` in ci.yml runs them
+# explicitly via `--features prod-heavy`.
+[features]
+prod-heavy = []
+
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace = true
@@ -31,3 +40,17 @@ tokio = { workspace = true }
 [[bench]]
 name = "engine_bench"
 harness = false
+
+# Real-thread `ProdEnv` tests (issue #286/#280): explicit `[[test]]` stanzas so
+# `required-features` can gate them off the default `cargo test` run. Adding
+# these does not disable Cargo's autodiscovery of the crate's other
+# `tests/*.rs` binaries (autotests stays on).
+[[test]]
+name = "lsm_concurrent"
+path = "tests/lsm_concurrent.rs"
+required-features = ["prod-heavy"]
+
+[[test]]
+name = "idle_engine_cost"
+path = "tests/idle_engine_cost.rs"
+required-features = ["prod-heavy"]

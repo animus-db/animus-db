@@ -205,7 +205,7 @@ async fn drain_scan_pages(addr: SocketAddr, request_prefix: &str, limit: usize) 
 /// | p1 | a2 | A   | 12    | 92   |
 /// | p2 | b0 | B   | 13    | 93   |
 /// | p2 | b1 | A   | 14    | 94   |
-async fn setup() -> (Vec<Node>, SocketAddr) {
+async fn setup() -> (tempfile::TempDir, Vec<Node>, SocketAddr) {
     let dir = tempfile::tempdir().unwrap();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
@@ -254,7 +254,7 @@ async fn setup() -> (Vec<Node>, SocketAddr) {
         .await;
         assert_eq!(status, 200, "PutItem({pk},{sk}) failed: {body}");
     }
-    (nodes, addr0)
+    (dir, nodes, addr0)
 }
 
 /// (a) A GSI `Scan` returns every index row, walked across pages via
@@ -263,7 +263,7 @@ async fn setup() -> (Vec<Node>, SocketAddr) {
 /// now-stable data collecting every distinct item exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gsi_scan_paginates_and_drains_all_rows() {
-    let (_nodes, addr) = setup().await;
+    let (_dir, _nodes, addr) = setup().await;
 
     // Wait for the drain to materialize all 5 rows before pagination-testing
     // against them (pagination correctness is a separate concern from the
@@ -292,7 +292,7 @@ async fn gsi_scan_paginates_and_drains_all_rows() {
 /// accepted (both already linearizable here).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gsi_scan_rejects_consistent_read() {
-    let (_nodes, addr) = setup().await;
+    let (_dir, _nodes, addr) = setup().await;
 
     let (status, body) = dynamo(
         addr,
@@ -330,7 +330,7 @@ async fn gsi_scan_rejects_consistent_read() {
 /// `cp_scan_kind_table`'s forwarded `KindScan` path per tablet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lsi_scan_returns_only_the_requested_index_through_every_node() {
-    let (nodes, _addr) = setup().await;
+    let (_dir, nodes, _addr) = setup().await;
 
     for (i, node) in nodes.iter().enumerate() {
         let (status, body) = dynamo_retry(
@@ -365,7 +365,7 @@ async fn lsi_scan_returns_only_the_requested_index_through_every_node() {
 /// (never the sibling LSI's), `Count` only the matches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lsi_scan_supports_filter_expression() {
-    let (_nodes, addr) = setup().await;
+    let (_dir, _nodes, addr) = setup().await;
 
     let (status, body) = dynamo_retry(
         addr,
@@ -453,7 +453,7 @@ async fn await_true<F: Fn() -> bool>(secs: u64, what: &str, cond: F) {
 /// leaner per-page payload underneath.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lsi_scan_with_limit_paginates_identically_across_a_split_table() {
-    let (nodes, addr) = setup().await;
+    let (_dir, nodes, addr) = setup().await;
 
     // A split point strictly between the `p1` and `p2` partitions' own
     // token-prefixed keys (ADR 0022/0023): `partition_token` hashes a

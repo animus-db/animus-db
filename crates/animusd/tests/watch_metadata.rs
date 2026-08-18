@@ -32,7 +32,7 @@ use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
-use support::bring_up_split;
+use support::{bring_up_split, start_single_node};
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -135,6 +135,106 @@ async fn control_node_wakes_the_watch_on_a_real_commit_not_the_server_timeout() 
     for node in control_nodes.iter().chain(data_nodes.iter()) {
         node.shutdown_graceful().await;
     }
+}
+
+/// Regression for issue #276: a **combined-mode** node hands the same
+/// `Arc<MetadataWatchInner>` to two independent concurrent consumers — its
+/// own `tablet_host_reconciler_loop` (which re-registers a fresh `changed()`
+/// future every `RECONCILE_FALLBACK_INTERVAL`, 500ms, whenever nothing wakes
+/// it sooner) and each inbound `WatchMetadata` long-poll. Under the old
+/// single-slot `AtomicWaker`, the reconciler's own periodic re-registration
+/// deterministically evicted a long-poll's waker the moment the fallback
+/// timer ticked — so a commit landing after that would only ever be
+/// observed via the long-poll's own `WATCH_METADATA_SERVER_TIMEOUT` (8s)
+/// fallback, not the wake. This proves both consumers now wake independently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn combined_node_reconciler_and_long_poll_both_wake_on_one_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _config) = start_single_node(dir.path(), animusd::StorageBackend::Lsm).await;
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if node.is_control_leader() {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("single combined node never became leader");
+    let addr = node.intra_addr(); // ADR 0047: WatchMetadata/ProposeSchema are intra-only
+
+    // Let bootstrap's own commits (self-registration, address-book entries)
+    // settle before capturing `watermark0` — otherwise a long-poll parked at
+    // a watermark that is already stale resolves on its very first poll
+    // (`current > last_seen` already holds), never actually exercising the
+    // wake-while-parked path this test exists to prove.
+    let watermark0 = timeout(Duration::from_secs(10), async {
+        let mut last = watermark_of(&call(addr, ClientRequest::Status).await);
+        loop {
+            sleep(Duration::from_millis(200)).await;
+            let now = watermark_of(&call(addr, ClientRequest::Status).await);
+            if now == last {
+                return now;
+            }
+            last = now;
+        }
+    })
+    .await
+    .expect("bootstrap watermark never settled");
+
+    let watch_task = tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let reply = call(
+            addr,
+            ClientRequest::WatchMetadata {
+                last_seen: watermark0,
+            },
+        )
+        .await;
+        (started.elapsed(), reply)
+    });
+
+    // Let the long-poll actually connect and register on the node's shared
+    // `MetadataWatch`, then sit past at least one full
+    // `RECONCILE_FALLBACK_INTERVAL` (500ms) so the reconciler loop's own
+    // fallback tick fires and re-registers its own `changed()` future on the
+    // very same watch — on the old single-slot `AtomicWaker` this
+    // deterministically evicts the long-poll's registration before the
+    // commit below ever lands.
+    sleep(Duration::from_millis(900)).await;
+
+    let propose_reply = call(
+        addr,
+        ClientRequest::ProposeSchema(MetaCommand::CreateKeyspace {
+            keyspace: "combined_multi_waiter_wake_test".into(),
+        }),
+    )
+    .await;
+    assert!(
+        matches!(propose_reply, ClientResponse::PutOk),
+        "CreateKeyspace propose was rejected: {propose_reply:?}"
+    );
+
+    let (elapsed, reply) = timeout(Duration::from_secs(10), watch_task)
+        .await
+        .expect("watch task did not finish within 10s")
+        .expect("watch task panicked");
+    let watermark1 = watermark_of(&reply);
+    assert!(
+        watermark1 > watermark0,
+        "watch resolved without the watermark advancing ({watermark0} -> {watermark1})"
+    );
+    // Well under the 8s server-side park bound (WATCH_METADATA_SERVER_TIMEOUT):
+    // a long-poll whose waker was evicted by the reconciler's own
+    // re-registration would only ever resolve near that timeout.
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "watch took {elapsed:?} to wake on a real commit — looks like the \
+         reconciler loop's concurrent registration evicted the long-poll's \
+         own waker (issue #276), falling through toward the 8s server timeout"
+    );
+
+    node.shutdown_graceful().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

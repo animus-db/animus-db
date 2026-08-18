@@ -206,6 +206,13 @@ pending record) → backfill veto (`MarkIndexBackfilled` for every
 map (the reconciler then `Reclaim`s it everywhere). A stale-routed write
 to a frozen parent gets the retryable `FROZEN_REFUSAL` from every local
 write/txn helper (`frozen_refusal`; bookkeeping-only kind batches exempt).
+**Both `ClientCtx::cp_kind_write_item` (the evaluated arm) and
+`cp_kind_write_raw` (the fast/marker arm) retry this internally** (issue
+#288: pre-fix, neither had a retry loop at all — every Dynamo/CQL/raw-
+protocol write funnels through one of these two since ADR 0049's write-path
+unification, so a write racing the freeze window got a terminal 500
+instead of the write landing on the child a moment later), mirroring
+`cp_read`'s deadline-bounded loop and re-resolving `cp_route` each attempt.
 A `Building` child runs **no consumer arms at all** (its token-truncated
 cursor key would land in the parent's scope and poison the parent's
 min-over-rows watermark). E2e: `tests/split_build.rs` (full workflow +
@@ -818,7 +825,15 @@ route below the edge through the same `ClientCtx` CP primitives.
   conditions` OCC seatbelt (PR1, `animus-cp-data`) closes the one residual
   the lock alone can't: a `txn_resolver_loop` recovery push never takes
   `rmw_lock` — real now that `TransactWriteItems` participates on these
-  tables too (see below).
+  tables too (see below). **`rmw_lock` is scoped to read+evaluate only
+  (issue #285)** — `kind_write_item_at_leader` drops it before proposing,
+  mirroring `txn_stage_local`'s identical scoping just below; it used to
+  span the whole `cp_kind_local` propose+confirm-poll too, so one item's
+  slow confirm (apply backlog) stalled every *other* evaluated write on the
+  node behind it, not just racing writers of the same item — the seatbelt
+  above is what actually keeps concurrent writers of one item safe, and it
+  already has to work lock-free for the `txn_resolver_loop` case, so the
+  lock never needed the wider span for correctness.
   **The plain-table half of the old named gap is closed (ADR 0049)**: a
   plain table's conditioned `PutItem`/`DeleteItem` and `UpdateItem` now
   route through this same leader funnel (constant-true gate, below), so
@@ -1253,6 +1268,29 @@ route below the edge through the same `ClientCtx` CP primitives.
   `full_split_cluster_restart_recovers_metadata_and_data` flake under `cargo test
   --workspace`; see `docs/engineering-lessons.md`'s "abort() is a request, not a
   guarantee" entry.
+- **Every path that abruptly stops a node's driver tasks — bare
+  `shutdown()`/`shutdown_and_wait()`, and dropping a `Node` that was never
+  explicitly shut down — first latches every hosted CP group's `halted`
+  flag via `ClusterEdgeState::halt_hosted_cp_groups`** (issues #282/#279):
+  `animus-cp-data`'s WAL/apply I/O tolerance (`persist_wal`/`flush_pending`)
+  hard-panics on a live I/O error and only tolerates one while a group's
+  `halted: AtomicBool` is set, and that flag used to latch **only** on the
+  graceful path (`shutdown_graceful` → `shutdown_all_cp_groups`) — a bare
+  kill (the doc-blessed fault-injection idiom above) or a panicking test's
+  `Vec<Node>` unwind (`Node` had no `Drop` impl at all) could abort a
+  driver mid-I/O with `halted` still `false`, turning a routine kill/panic
+  race into an unconditional panic indistinguishable from a genuine live
+  durability fault. `halt_hosted_cp_groups` is cheap and safe to call from
+  anywhere, including `Drop` (it bottoms out in `RaftKvNode::shutdown`, a
+  plain `AtomicBool` store plus two `Notify` wakes — no I/O, no `.await`,
+  no runtime dependency). **`Drop for Node` latches and nothing else** —
+  it deliberately does not abort tasks or tear down envs, so the "dropping
+  a `Node` without `shutdown()` leaves tasks running" behavior two
+  paragraphs up is unchanged; only the durability assert those still-live
+  tasks can now safely race against an eventual abrupt stop is fixed.
+  Regression: `halted_shutdown_tests` (in-crate, `cargo test -p animusd
+  --lib`) and `animus-cp-data`'s
+  `tests/shutdown.rs::a_halted_followers_incoming_write_tolerates_a_wal_fault_with_no_panic`.
 - **A merged-across-nodes admin view must carry each item's own identity** —
   `/admin/raftkv`'s `CpRaftView::node` carries the real hosting node id because the
   dashboard merges every node's response; the answering server isn't a reliable
@@ -1301,7 +1339,11 @@ token alignment, needing `CpGroup`'s private `pending_changes`/
 `approx_bytes_kind`/`cursor_min_watermark` and, to confirm a segment
 genuinely landed, a second `FsSegmentStore` handle at the exact
 `<node dir>/segments` path the default store roots its own local building
-block at.
+block at. `lib.rs`'s own `halted_shutdown_tests` is a sixth — the
+issues #282/#279 regression above, needing the same private `CpGroup`
+(specifically its `#[cfg(test)]`-only `is_halted`) to prove bare
+`Node::shutdown()` and `Node`'s `Drop` impl both latch every hosted
+group's `halted` flag.
 
 One binary per behavior; the file names describe them (`ls
 crates/animusd/tests/`) — covering combined/control-only/data-only/split

@@ -467,18 +467,26 @@ per-tablet CP data plane (`animus-cp-data`).
   `env.metrics()`; use `start_with_metrics` to thread a handle a sim test can
   read (`SimEnv::metrics()` is the no-op default, so no `animus-sim` change).
 
-- **`MetadataWatch` (ADR 0031).** The `AtomicWaker`-based wake-a-parked-task
-  pattern (like `animus-cp-data`'s `ProposeSignal`), adapted to notify an
-  *external* caller rather than the driver's own loop. Two points to remember if
-  you touch or copy it: (1) it carries a **monotonic watermark** (`AtomicU64`,
-  the observed `last_applied()`), not a one-shot consumed flag — `changed()`
-  re-checks `current > last_seen` fresh every poll, so there is no
-  wake-before-park race (a change that already happened resolves on the first
-  poll). (2) It is bumped from the **driver loop** (`drive`), not the proposer,
-  via `fetch_max` at exactly the points `last_applied` (gated by the same
-  role-aware frontier `metadata()` uses) can have moved — so defensive calls on
-  no-op iterations are free. It is **single-waiter** (one intended consumer: the
-  per-node reconciler). Don't add a propose-side wake here the way
+- **`MetadataWatch` (ADR 0031).** A wake-a-parked-task pattern (like
+  `animus-cp-data`'s `ProposeSignal`), adapted to notify an *external* caller
+  rather than the driver's own loop. Three points to remember if you touch or
+  copy it: (1) it carries a **monotonic watermark** (`AtomicU64`, the observed
+  `last_applied()`), not a one-shot consumed flag — `changed()` re-checks
+  `current > last_seen` fresh every poll, so there is no wake-before-park race
+  (a change that already happened resolves on the first poll). (2) It is
+  bumped from the **driver loop** (`drive`), not the proposer, via `fetch_max`
+  at exactly the points `last_applied` (gated by the same role-aware frontier
+  `metadata()` uses) can have moved — so defensive calls on no-op iterations
+  are free. (3) It is **multi-waiter** — a `Mutex<BTreeMap<u64, Waker>>`
+  registry keyed by a per-`changed()`-future slot id, not a single
+  `AtomicWaker`: any number of concurrent callers (across any number of
+  handle clones) park independently, and `bump` wakes all of them. It used to
+  be single-waiter (one `AtomicWaker`, one intended consumer: the per-node
+  reconciler) until ADR 0035 PR5 started handing the same handle to a second
+  concurrent consumer (each inbound `WatchMetadata` RPC's long-poll) — see
+  `docs/engineering-lessons.md` for the lost-wakeup that produced (issue
+  #276) and why the fix is multi-waiter, not a single-consumer contract
+  restored by convention. Don't add a propose-side wake here the way
   `animus-cp-data` did — a metadata-watch caller only ever waits to learn when
   `metadata()` *could* reflect a change, and that visibility is bound by the
   driver's flush cadence anyway.

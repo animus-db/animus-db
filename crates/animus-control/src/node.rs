@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -16,7 +16,6 @@ use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId};
 use animus_storage::{MergeOp, StorageEngine};
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
-use futures::task::AtomicWaker;
 
 use crate::delta_ring::DeltaRing;
 use crate::detector::FailureDetector;
@@ -126,19 +125,29 @@ const ORPHAN_SWEEP_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_ORPHAN_SWEEP_AFTER: Duration = Duration::from_secs(600);
 
 /// Executor-agnostic "applied index advanced" notification (ADR 0031 §trigger):
-/// lets a caller (the future per-node `TabletHostReconciler`) react to a
-/// `Metadata` change as soon as it becomes visible, instead of polling on a
-/// fixed timer. A cloneable handle — every clone observes the same underlying
-/// cursor — but, mirroring `animus-cp-data`'s `ProposeSignal`, it is built for
-/// a **single** parked waiter at a time: `AtomicWaker` only remembers the most
-/// recently registered waker, so a second concurrent call to
-/// [`changed`](MetadataWatch::changed) would starve the first. That is exactly
-/// the shape ADR 0031 needs (one reconciler task per node).
+/// lets a caller (the per-node `TabletHostReconciler`) react to a `Metadata`
+/// change as soon as it becomes visible, instead of polling on a fixed timer.
+/// A cloneable handle — every clone observes the same underlying cursor.
+///
+/// **Multi-waiter.** Any number of concurrent [`changed`](MetadataWatch::changed)
+/// callers — across any number of clones of this handle — park independently:
+/// each returned [`MetadataChanged`] future owns its own slot in a small
+/// registry, so registering one waiter's waker can never evict another's, and
+/// [`bump`](MetadataWatch::bump) wakes every currently-registered waiter, not
+/// just the most recent. This mattered in practice: ADR 0035 PR5 started
+/// handing the same handle to two independent concurrent consumers on a
+/// combined-mode node (the tablet-host reconciler loop and each inbound
+/// `WatchMetadata` RPC's long-poll) — see `docs/engineering-lessons.md` for
+/// the lost-wakeup this produced under the single-waiter predecessor
+/// (`AtomicWaker`, which only remembers the most recently registered waker).
 ///
 /// No tokio-only primitive (`Notify`/`watch`) is used, so this is fully
-/// `SimEnv`-deterministic: a synchronous `wake()` marks the parked task ready
+/// `SimEnv`-deterministic: a synchronous `wake()` marks each parked task ready
 /// for the next run-loop poll, with no wall clock involved. It works
-/// identically over a real tokio `ProdEnv`.
+/// identically over a real tokio `ProdEnv`. Registration/removal use a short,
+/// `.await`-free `std::sync::Mutex` critical section (never held across a
+/// poll), so this stays safe to drive under `SimEnv`'s single-threaded
+/// executor as well as real threads.
 #[derive(Clone, Default)]
 pub struct MetadataWatch(Arc<MetadataWatchInner>);
 
@@ -150,8 +159,14 @@ struct MetadataWatchInner {
     /// (`min(commit_index, durable_index)` on the leader, `commit_index` on a
     /// follower — see `raft.rs::apply`) can move. Monotonic: only ever raised.
     applied: AtomicU64,
-    /// The most recently parked waiter's waker (if any).
-    waker: AtomicWaker,
+    /// Every currently-parked waiter's waker, keyed by the per-future slot id
+    /// [`MetadataWatch::changed`] mints for it. `bump` drains and wakes the
+    /// whole map; a [`MetadataChanged`] removes its own entry on `Drop` so an
+    /// abandoned long-poll (e.g. a dropped RPC connection) never leaks a slot.
+    wakers: Mutex<BTreeMap<u64, Waker>>,
+    /// Monotonic source of the slot ids handed out by
+    /// [`MetadataWatch::changed`]. Only ever incremented.
+    next_slot: AtomicU64,
 }
 
 impl MetadataWatch {
@@ -170,16 +185,19 @@ impl MetadataWatch {
     /// `last_seen` before this future is even created, the very first poll
     /// resolves immediately.
     pub fn changed(&self, last_seen: u64) -> MetadataChanged<'_> {
+        let slot = self.0.next_slot.fetch_add(1, Ordering::Relaxed);
         MetadataChanged {
             watch: self,
             last_seen,
+            slot,
         }
     }
 
     /// Raise the watermark to `index` (a no-op if `index` is not an advance —
     /// e.g. a stale call from a driver iteration that changed nothing) and
-    /// wake a parked waiter only when it actually moved. Called by the driver
-    /// wherever a flush could have advanced client-visible state.
+    /// wake **every** currently-parked waiter, only when it actually moved.
+    /// Called by the driver wherever a flush could have advanced client-visible
+    /// state.
     ///
     /// **Public since ADR 0035 PR5**: a data-only node's `RemoteControlClient`
     /// (`animusd`) owns its own disconnected `MetadataWatch` and drives it
@@ -190,31 +208,84 @@ impl MetadataWatch {
     pub fn bump(&self, index: u64) {
         let prev = self.0.applied.fetch_max(index, Ordering::AcqRel);
         if index > prev {
-            self.0.waker.wake();
+            // Drain the registry before waking: a woken waiter re-registers
+            // its own fresh slot on its next poll (if still pending), so
+            // there is no need to retain entries here, and waking happens
+            // outside the lock to keep the critical section short.
+            let woken =
+                std::mem::take(&mut *self.0.wakers.lock().expect("MetadataWatch wakers poisoned"));
+            for (_, waker) in woken {
+                waker.wake();
+            }
         }
+    }
+
+    /// Number of waiters currently parked on this watch. Test-only: used to
+    /// prove a dropped [`MetadataChanged`] doesn't leak its registry slot.
+    #[cfg(test)]
+    fn registered_waiters(&self) -> usize {
+        self.0
+            .wakers
+            .lock()
+            .expect("MetadataWatch wakers poisoned")
+            .len()
     }
 }
 
-/// The future returned by [`MetadataWatch::changed`].
+/// The future returned by [`MetadataWatch::changed`]. Owns one slot in its
+/// watch's waker registry for its whole lifetime — minted in `changed`,
+/// removed on `Drop` (whether it resolved, was cancelled, or was simply
+/// abandoned mid-poll) — so it never leaks and never collides with any other
+/// concurrent waiter's slot.
 pub struct MetadataChanged<'a> {
     watch: &'a MetadataWatch,
     last_seen: u64,
+    slot: u64,
 }
 
 impl Future for MetadataChanged<'_> {
     type Output = u64;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u64> {
-        // Register before checking — the `AtomicWaker` discipline that avoids
-        // a lost wakeup: if `bump` races in right after our check but before
-        // we park, the freshly registered waker still catches it.
-        self.watch.0.waker.register(cx.waker());
+        // Register this waiter's own slot before checking — the same
+        // register-before-check discipline the old single-slot `AtomicWaker`
+        // used, just keyed per-future now: if `bump` races in right after our
+        // check but before we park, the freshly registered waker still
+        // catches it, and registering here can never evict any *other*
+        // waiter's slot.
+        self.watch
+            .0
+            .wakers
+            .lock()
+            .expect("MetadataWatch wakers poisoned")
+            .insert(self.slot, cx.waker().clone());
         let current = self.watch.0.applied.load(Ordering::Acquire);
         if current > self.last_seen {
+            // Deregister immediately: a resolved future has nothing left to
+            // be woken for, so leaving its slot behind would only cost
+            // `bump` a wasted `wake()` on every future advance until `Drop`
+            // eventually cleans it up anyway.
+            self.watch
+                .0
+                .wakers
+                .lock()
+                .expect("MetadataWatch wakers poisoned")
+                .remove(&self.slot);
             Poll::Ready(current)
         } else {
             Poll::Pending
         }
+    }
+}
+
+impl Drop for MetadataChanged<'_> {
+    fn drop(&mut self) {
+        self.watch
+            .0
+            .wakers
+            .lock()
+            .expect("MetadataWatch wakers poisoned")
+            .remove(&self.slot);
     }
 }
 
@@ -516,8 +587,9 @@ impl<E: Env> RaftNode<E> {
 
     /// A cloneable handle to this node's applied-index watch (ADR 0031): call
     /// [`MetadataWatch::changed`] to be notified as soon as `metadata()` could
-    /// have changed, instead of polling on a fixed timer. See [`MetadataWatch`]'s
-    /// doc for the single-waiter caveat.
+    /// have changed, instead of polling on a fixed timer. Multi-waiter — see
+    /// [`MetadataWatch`]'s doc — so this is safe to hand to more than one
+    /// concurrent consumer.
     #[must_use]
     pub fn metadata_watch(&self) -> MetadataWatch {
         self.watch.clone()
@@ -1979,6 +2051,126 @@ mod tests {
             ring.writes_since(0, last_applied),
             None,
             "a caller stuck before the ring's own window falls back to a full fetch"
+        );
+    }
+
+    /// A `Waker` that just flags whether it was ever woken, so a test can
+    /// assert on wake delivery without needing a real executor.
+    struct WakeFlag(std::sync::atomic::AtomicBool);
+
+    impl std::task::Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl WakeFlag {
+        fn woken(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn test_waker() -> (Waker, Arc<WakeFlag>) {
+        let flag = Arc::new(WakeFlag(std::sync::atomic::AtomicBool::new(false)));
+        let waker = Waker::from(flag.clone());
+        (waker, flag)
+    }
+
+    /// Two independent `changed()` callers on one [`MetadataWatch`] must
+    /// *both* be woken by a single `bump()`. Red on the old single-slot
+    /// `AtomicWaker`: registering the second waiter's waker would have
+    /// evicted the first's, so only the most recently registered waiter
+    /// would ever wake — exactly the ADR 0035 PR5 reconciler-loop-vs-
+    /// `WatchMetadata`-long-poll collision (issue #276).
+    #[test]
+    fn bump_wakes_every_registered_waiter_not_just_the_most_recent() {
+        let watch = MetadataWatch::default();
+
+        let (waker_a, woken_a) = test_waker();
+        let (waker_b, woken_b) = test_waker();
+        let mut cx_a = Context::from_waker(&waker_a);
+        let mut cx_b = Context::from_waker(&waker_b);
+
+        let mut fut_a = watch.changed(0);
+        let mut fut_b = watch.changed(0);
+
+        // Park both: register-before-check means each poll registers its own
+        // slot before observing `applied == 0 == last_seen`, so both return
+        // Pending.
+        assert_eq!(Pin::new(&mut fut_a).poll(&mut cx_a), Poll::Pending);
+        assert_eq!(Pin::new(&mut fut_b).poll(&mut cx_b), Poll::Pending);
+        assert_eq!(watch.registered_waiters(), 2);
+
+        watch.bump(1);
+
+        assert!(woken_a.woken(), "the first-registered waiter must be woken");
+        assert!(
+            woken_b.woken(),
+            "the second-registered waiter must ALSO be woken -- a single-slot \
+             AtomicWaker would have evicted the first registration and only \
+             woken this one, or vice versa depending on registration order"
+        );
+
+        // Both resolve on their next poll.
+        assert_eq!(Pin::new(&mut fut_a).poll(&mut cx_a), Poll::Ready(1));
+        assert_eq!(Pin::new(&mut fut_b).poll(&mut cx_b), Poll::Ready(1));
+    }
+
+    /// A `changed()` future dropped before `bump()` (e.g. an abandoned
+    /// `WatchMetadata` long-poll whose client disconnected) must remove its
+    /// own slot from the registry — no leak — and must not prevent a
+    /// surviving waiter from being woken.
+    #[test]
+    fn dropped_waiter_does_not_leak_its_slot_or_block_the_survivor() {
+        let watch = MetadataWatch::default();
+
+        let (waker_survivor, woken_survivor) = test_waker();
+        let (waker_dropped, _woken_dropped) = test_waker();
+        let mut cx_survivor = Context::from_waker(&waker_survivor);
+        let mut cx_dropped = Context::from_waker(&waker_dropped);
+
+        let mut fut_survivor = watch.changed(0);
+        assert_eq!(
+            Pin::new(&mut fut_survivor).poll(&mut cx_survivor),
+            Poll::Pending
+        );
+
+        {
+            let mut fut_dropped = watch.changed(0);
+            assert_eq!(
+                Pin::new(&mut fut_dropped).poll(&mut cx_dropped),
+                Poll::Pending
+            );
+            assert_eq!(
+                watch.registered_waiters(),
+                2,
+                "both waiters hold a slot while both are still parked"
+            );
+        } // fut_dropped drops here without ever resolving.
+
+        assert_eq!(
+            watch.registered_waiters(),
+            1,
+            "the dropped waiter's slot must be reclaimed, not leaked"
+        );
+
+        watch.bump(1);
+
+        assert!(
+            woken_survivor.woken(),
+            "the surviving waiter must still be woken after the other one dropped"
+        );
+        assert_eq!(
+            Pin::new(&mut fut_survivor).poll(&mut cx_survivor),
+            Poll::Ready(1)
+        );
+        assert_eq!(
+            watch.registered_waiters(),
+            0,
+            "the survivor's own slot is gone too once it resolves and drops"
         );
     }
 }
