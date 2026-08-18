@@ -565,7 +565,19 @@ demand the identical action, so no disambiguation is needed.
     loop `persist_wal` (drain records → append + `fsync` → `mark_durable_
     through`, under `wal_lock`) → `select(recv, timer, propose-wake)` → step
     the core → `persist_wal` again → send. It does **no** engine apply, so it
-    always heartbeats/acks within the election timeout.
+    always heartbeats/acks within the election timeout. **`persist_wal` is
+    halted-gated** (issue #278 item 1, mirroring the apply task's `env.replace`
+    compaction-error handling immediately below): an `env.append`/`env.sync`
+    error is tolerated — no `mark_durable_through`, no `apply_signal` notify,
+    the driver's own top-of-loop `halted` check (woken by `shutdown()`'s
+    `wake_signal.notify()`) exits the loop on its next pass — **iff** `halted`
+    is already set (a `shutdown()` racing a still-pending append/sync, or a
+    test's `TempDir` deleting the WAL out from under a still-running loop);
+    while running, the identical error stays a hard panic (a live leader's WAL
+    fault is a genuine durability fault — crash-stop-before-ack). Regression:
+    `tests/shutdown.rs::a_halted_nodes_pending_write_tolerates_a_wal_fault_
+    with_no_panic` (a `DiskConfig` fault + a `put`-then-`shutdown()` synchronous
+    beat, deterministically racing the two).
   - **Apply task** (`apply_loop` → `apply_and_compact`): install received
     snapshots, `drain_apply` → `merge`/`merge_tombstone` in commit order, and
     compact — all off the consensus loop. When idle it races a new

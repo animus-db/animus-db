@@ -480,7 +480,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
     await_value(&core_clients, &hosted_table, b"post-remove", b"ok", 30).await;
 
     // 10. Stop the removed node's process.
-    joined.shutdown();
+    joined.shutdown_graceful().await;
     sleep(Duration::from_millis(200)).await;
 
     // 11. Rejoin with the SAME index at a FRESH dir — proving id reuse after
@@ -513,9 +513,9 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
 
     await_value(&[rejoined.client_addr()], &hosted_table, b"jk0", b"jv0", 30).await;
 
-    rejoined.shutdown();
+    rejoined.shutdown_graceful().await;
     for node in core_nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -652,7 +652,7 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
     // Give the survivors' reconcilers a further beat to settle.
     sleep(Duration::from_secs(3)).await;
 
-    joined_nodes[0].shutdown();
+    joined_nodes[0].shutdown_graceful().await;
 
     let mut survivor_admin: Vec<SocketAddr> = core_admin.clone();
     survivor_admin.push(joined_ids[1].1.admin);
@@ -723,9 +723,9 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
         "every tablet should be repaired back to its configured replica count"
     );
 
-    joined_nodes[1].shutdown();
+    joined_nodes[1].shutdown_graceful().await;
     for node in core_nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -884,8 +884,8 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
         );
     }
 
-    joined.shutdown();
+    joined.shutdown_graceful().await;
     for node in core_nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

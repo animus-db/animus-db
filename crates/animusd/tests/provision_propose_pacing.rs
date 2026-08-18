@@ -174,6 +174,6 @@ async fn provisioning_against_a_quorumless_control_plane_does_not_spam_proposals
     );
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

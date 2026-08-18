@@ -374,7 +374,7 @@ async fn transact_write_items_commits_atomically_across_a_split_table() {
     }
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -437,7 +437,7 @@ async fn failing_condition_check_cancels_the_whole_transaction() {
     }
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -550,7 +550,7 @@ async fn transact_get_items_never_observes_a_torn_pair_under_concurrent_writes()
     );
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -661,7 +661,7 @@ async fn concurrent_transact_write_items_on_a_shared_key_resolve_one_winner() {
     );
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -800,7 +800,7 @@ async fn admin_txns_shows_a_pending_record_then_clears_after_recovery() {
     assert_eq!(got, ClientResponse::Value(Some(b"pending-value".to_vec())));
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -890,7 +890,7 @@ async fn cross_node_racing_own_key_conditional_writes_resolve_exactly_one_winner
     );
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -973,7 +973,7 @@ async fn own_key_condition_failure_cancels_a_multi_tablet_transaction_wholly() {
     );
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -1031,6 +1031,6 @@ async fn own_key_condition_completes_quickly_with_no_recovery_grace_stall() {
     );
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

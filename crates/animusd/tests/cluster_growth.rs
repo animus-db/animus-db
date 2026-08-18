@@ -423,7 +423,7 @@ async fn cluster_grows_from_three_to_five_and_rebalances() {
     .await;
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -621,7 +621,7 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
     assert_eq!(down_count, 1, "the killed original node should read Down");
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -737,6 +737,6 @@ async fn growth_node_observes_metadata_promptly_via_watch() {
     );
 
     for node in growth_nodes.iter().chain(base_nodes.iter()) {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

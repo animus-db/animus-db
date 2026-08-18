@@ -2471,6 +2471,52 @@ debugging anything that feels like it might have happened before.
   reviewing) a retry-on-status-code test helper.
   (`animusd/tests/streams_e2e.rs::dynamo_retrying_transact`, issue #278.)
 
+- **A per-test `Node::shutdown()` teardown (plain, non-draining abort) racing
+  a still-in-flight driver I/O op surfaces as a noisy `tokio-rt-worker` panic
+  that has nothing to do with the test's own assertions — `Node::shutdown_
+  graceful` (or `shutdown_and_wait`) exists precisely to close this window
+  and should be the default choice for ordinary end-of-test cleanup; plain
+  `shutdown()` is for a *deliberate* fault (a documented "kill node N",
+  "crash the leader", or "the process goes away without decommissioning"
+  scenario) where the abrupt, non-cooperative abort is the point. Sweeping a
+  test tree for this: a `for node in &nodes { node.shutdown(); }` (or single
+  final call) at the very end of a test body, with nothing observing that
+  node afterward, is teardown — swap it. A `nodes[kill_idx].shutdown()` (or
+  similarly-named) mid-test, with a comment about killing/crashing a node and
+  the test continuing to assert against the *survivors*, is a deliberate
+  fault injection — leave it. A `stop()`/`restart_same_addrs`-style helper
+  used before rebinding the same addresses needs the graceful form
+  regardless (see this file's own "long-poll request in flight at kill"
+  entry and `animusd/CLAUDE.md`'s `Node::shutdown()` gotcha for why a bare
+  `shutdown()` doesn't reliably free ports either). issue #278 item 1
+  (`crates/animus-cp-data/src/lib.rs::persist_wal`,
+  `animusd/tests/backfill_seeder.rs` and the crate's whole `tests/` tree).
+- **A driver loop's own hard-`.expect()` on a durability I/O op should be
+  gated by the same halted/shutdown latch its sibling error-handling site
+  already uses, not panic unconditionally** — mirror the existing idiom
+  (`animus-cp-data`'s apply-task compaction path already tolerated
+  `env.replace` failing *only while `halted`*) rather than inventing a new
+  shape. The two failure classes need to stay distinguishable: while running,
+  the identical I/O error is a genuine durability fault and must stay a loud
+  panic (crash-stop-before-ack); while halted, the same error is an artifact
+  of the teardown itself (an aborted task's blocking-pool op surfacing
+  `"background task failed"`, or a test's `TempDir` deleting the file out
+  from under a still-draining loop) and should be tolerated — return early
+  with **no** durability bookkeeping advanced (never claim a write is durable
+  that never landed) and let the caller's own halted-check exit the loop on
+  its next pass. **This is deterministically regression-testable under
+  `SimEnv`** despite looking like a real-thread race: `animus-sim`'s
+  `DiskConfig::set_error_prob(1.0)` (via `Simulator::set_disk_config_for`)
+  forces every subsequent disk op on one node to fail, and since `SimEnv`
+  only polls a node's driver task inside `run_for`/`run_until`, two
+  *synchronous* calls back-to-back from the test body — mint a pending write,
+  then latch `halted` — are guaranteed to land before the driver is next
+  polled, so its next `persist_wal`-shaped pass finds the fault and the
+  latch together, deterministically, no thread races or timing sleeps
+  needed. Proof the test has teeth: temporarily reverting the fix reproduces
+  the exact pre-fix panic message. (`animus-cp-data/tests/shutdown.rs::
+  a_halted_nodes_pending_write_tolerates_a_wal_fault_with_no_panic`.)
+
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
   symbol + every consumer + every test asserting the behavior), not by

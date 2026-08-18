@@ -102,8 +102,8 @@ async fn data_node_failure_is_detected() {
         .await
         .expect("the crashed CP node was not marked Down within 30s");
 
-    nodes[0].shutdown();
-    nodes[1].shutdown();
+    nodes[0].shutdown_graceful().await;
+    nodes[1].shutdown_graceful().await;
 }
 
 // ---- Test 2: CP group follows the replicated replica set --------------------
@@ -182,7 +182,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
             return (nodes, cfg);
         }
         for node in &nodes {
-            node.shutdown();
+            node.shutdown_graceful().await;
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -296,7 +296,7 @@ async fn cp_group_follows_tablet_replica_set() {
         .expect("CP group did not reconfigure to the new replica set within 60s");
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -461,6 +461,6 @@ async fn failure_auto_replaces_replica_onto_spare() {
     await_value(&survivor_clients, b"k2", b"v2", 30).await;
 
     for &i in &survivors {
-        nodes[i].shutdown();
+        nodes[i].shutdown_graceful().await;
     }
 }

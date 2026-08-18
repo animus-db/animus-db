@@ -98,6 +98,6 @@ async fn assembled_node_handles_concurrent_client_load_without_deadlock() {
         .expect("concurrent client load did not complete in 30s (possible deadlock)");
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

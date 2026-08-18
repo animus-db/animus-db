@@ -166,7 +166,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
             return (nodes, cfg);
         }
         for node in &nodes {
-            node.shutdown();
+            node.shutdown_graceful().await;
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -347,6 +347,6 @@ async fn cluster_grown_to_five_nodes_rebalances_existing_tablets() {
     );
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

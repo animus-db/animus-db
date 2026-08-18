@@ -7,12 +7,16 @@
 //! `animusd` process being stopped and restarted.
 //!
 //! The incarnations run in the **same tokio runtime**: between them,
-//! [`Node::shutdown`] aborts the node's spawned protocols (Raft driver, replica
-//! serve loop, the internal accept loops) and its client/dynamo/cql listeners,
-//! freeing all six listener ports so the replacement can rebind the same
-//! addresses — a clean teardown → rebind → recover cycle. (Before `shutdown`
-//! existed, dropping a `Node` left those detached tasks running, so the test had
-//! to spin up a fresh runtime per incarnation to abort them.) Like the other
+//! [`Node::shutdown_graceful`] cooperatively drains the node's spawned protocols
+//! (Raft driver, replica serve loop, the internal accept loops) and its
+//! client/dynamo/cql listeners, freeing all six listener ports so the
+//! replacement can rebind the same addresses — a clean teardown → rebind →
+//! recover cycle. (Before `shutdown` existed, dropping a `Node` left those
+//! detached tasks running, so the test had to spin up a fresh runtime per
+//! incarnation to abort them; a bare `shutdown` frees the ports but doesn't wait
+//! for the driver tasks to actually stop, so a same-address restart needs the
+//! graceful/awaited form — see `animusd/CLAUDE.md`'s `Node::shutdown()` entry.)
+//! Like the other
 //! `animusd` tests this uses real TCP/time and is non-deterministic by design
 //! (the ProdEnv edge).
 
@@ -52,7 +56,7 @@ async fn await_bootstrap(node: &Node) {
 /// Stop a node cleanly and give the OS a moment to release its now-aborted
 /// listeners' ports, so the replacement can rebind the same addresses.
 async fn stop(node: Node) {
-    node.shutdown();
+    node.shutdown_graceful().await;
     drop(node);
     sleep(Duration::from_millis(200)).await;
 }

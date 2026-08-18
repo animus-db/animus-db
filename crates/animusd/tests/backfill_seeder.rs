@@ -359,7 +359,7 @@ async fn backfill_seeder_materializes_every_pre_existing_row_then_flips_active()
     }
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -442,7 +442,7 @@ async fn live_writes_during_backfill_converge_to_the_correct_final_gsi() {
     await_gsi_hit(dynamo_addr, table, "by-g", "g", "g-p10", "p10").await;
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -519,7 +519,7 @@ async fn two_indexes_creating_simultaneously_converge_independently() {
     }
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -634,7 +634,7 @@ async fn a_crash_and_restart_mid_backfill_still_converges() {
         .await;
     }
 
-    node2.shutdown();
+    node2.shutdown_graceful().await;
 }
 
 /// The data-plane key `dynamo.rs::item_key` computes for a simple
@@ -807,6 +807,6 @@ async fn split_during_backfill_converges_with_correct_final_gsi() {
     }
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }

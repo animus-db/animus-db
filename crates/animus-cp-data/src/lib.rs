@@ -4549,12 +4549,25 @@ fn record_kv_outbound(metrics: &MetricsHandle, outs: &[(NodeId, KvWire)]) {
 /// entries for the apply task to merge — a transition the follower-side in-line
 /// apply (on `AppendEntries`, gated on `commit_index` alone) doesn't need, but this
 /// leader-side one does.
+///
+/// **Halted-gated error tolerance** (mirrors the compaction path's `env.replace`
+/// handling below): a `shutdown()` that lands mid-append/sync — aborting tasks and
+/// tearing down the env, or a test's `TempDir` deleting the WAL file out from under
+/// a still-running loop — can surface as an `env.append`/`env.sync` error here.
+/// Tolerated **only** while `halted` is set: this returns early with **no**
+/// `mark_durable_through` (never mark durability that didn't happen) and no
+/// `apply_signal` notify, leaving the driver's own top-of-loop `halted` check
+/// (which `shutdown()`'s `wake_signal.notify()` promptly wakes) to exit the loop —
+/// so a tolerated error can't spin the loop hot or ack anything. A failure while
+/// *not* halted is a real durability fault on a live leader (crash-stop-before-ack)
+/// and stays exactly as loud as before: a hard panic.
 async fn persist_wal<E: Env>(
     env: &E,
     wal: &str,
     core: &Arc<Mutex<KvCore>>,
     wal_lock: &AsyncMutex<()>,
     apply_signal: &ApplySignal,
+    halted: &AtomicBool,
 ) {
     let _wal = wal_lock.lock().await;
     let (records, through) = {
@@ -4565,11 +4578,24 @@ async fn persist_wal<E: Env>(
         return;
     }
     for record in &records {
-        env.append(wal, &PersistedState::encode_record(record))
+        if let Err(e) = env
+            .append(wal, &PersistedState::encode_record(record))
             .await
-            .expect("raftkv wal append");
+        {
+            assert!(
+                halted.load(Ordering::SeqCst),
+                "raftkv wal append failed while running: {e}"
+            );
+            return;
+        }
     }
-    env.sync(wal).await.expect("raftkv wal sync");
+    if let Err(e) = env.sync(wal).await {
+        assert!(
+            halted.load(Ordering::SeqCst),
+            "raftkv wal sync failed while running: {e}"
+        );
+        return;
+    }
     core.lock()
         .expect("raftkv core poisoned")
         .mark_durable_through(through);
@@ -6580,7 +6606,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             stopped.store(true, Ordering::SeqCst);
             return;
         }
-        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal).await;
+        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal, &halted).await;
 
         let now = env.now();
         // ADR 0044 phase-1 PR3: feed the one external input the core has no
@@ -6767,7 +6793,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         // Durability before action: persist (fsync) before shipping responses, so a
         // granted vote / appended entry is on disk before its message goes out.
         // Engine apply happens independently on the apply task.
-        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal).await;
+        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal, &halted).await;
 
         for (to, wire) in outs {
             env.send_stream(to, stream, codec::encode_wire(&wire)).await;

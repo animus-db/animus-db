@@ -72,7 +72,7 @@ async fn await_bootstrap(node: &Node) {
 }
 
 async fn stop(node: Node) {
-    node.shutdown();
+    node.shutdown_graceful().await;
     drop(node);
     sleep(Duration::from_millis(200)).await;
 }

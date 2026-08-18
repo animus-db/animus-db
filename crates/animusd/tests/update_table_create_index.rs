@@ -476,7 +476,7 @@ async fn update_table_create_via_a_non_leader_node_converges_on_every_node() {
         .expect("relayed GSI never converged to the expected 2 rows");
 
         for n in &nodes {
-            n.shutdown();
+            n.shutdown_graceful().await;
         }
     })
     .await

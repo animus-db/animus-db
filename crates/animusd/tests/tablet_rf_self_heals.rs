@@ -186,6 +186,6 @@ async fn tablet_provisioned_undersized_on_a_small_cluster_self_heals_after_growt
     .await;
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

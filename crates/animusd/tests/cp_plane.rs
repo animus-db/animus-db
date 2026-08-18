@@ -153,7 +153,7 @@ async fn reads_and_writes_route_through_the_raft_group() {
     );
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -201,7 +201,7 @@ async fn cp_member_addresses_register_and_replicate() {
         .expect("CP member addresses did not register + replicate within 20s");
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -329,7 +329,7 @@ async fn cp_tablet_splits_and_both_halves_serve() {
     assert_eq!(new_upper, ClientResponse::Value(Some(b"upper2".to_vec())));
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -431,7 +431,7 @@ async fn single_write_latency_is_low() {
     );
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -519,7 +519,7 @@ async fn tablet_auto_splits_when_it_grows() {
     }
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -692,7 +692,7 @@ async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
     );
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -817,6 +817,6 @@ async fn already_split_tablet_splits_again_once_it_regrows() {
     }
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }

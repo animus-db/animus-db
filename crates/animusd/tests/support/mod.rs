@@ -152,7 +152,7 @@ pub async fn bring_up_deadline(
             return (nodes, config);
         }
         for node in &nodes {
-            node.shutdown();
+            node.shutdown_graceful().await;
         }
         assert!(
             tokio::time::Instant::now() < hard_deadline,
@@ -217,7 +217,7 @@ pub async fn grow_deadline(
             return (nodes, expanded);
         }
         for node in &nodes {
-            node.shutdown();
+            node.shutdown_graceful().await;
         }
         assert!(
             tokio::time::Instant::now() < hard_deadline,
