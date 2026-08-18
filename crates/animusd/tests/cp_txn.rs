@@ -226,7 +226,7 @@ async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
     }
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -332,7 +332,7 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
     }
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -571,7 +571,7 @@ async fn multi_tablet_txn_commits_atomically_across_a_split_table() {
     }
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -646,7 +646,7 @@ async fn txn_through_every_node_including_followers_succeeds() {
     }
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -737,7 +737,7 @@ async fn concurrent_transactions_are_individually_atomic() {
     }
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -821,6 +821,6 @@ async fn violated_precondition_aborts_the_whole_transaction() {
     );
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

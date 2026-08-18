@@ -430,7 +430,7 @@ async fn backfill_seed_markers_never_surface_as_phantom_stream_events() {
     assert_eq!(count_for_id(&delivered, "p6"), 1, "{delivered:#?}");
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -536,6 +536,6 @@ async fn backfill_seed_markers_never_surface_from_sealed_shards_either() {
     assert_eq!(count_for_id(&delivered, "p6"), 1, "{delivered:#?}");
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }

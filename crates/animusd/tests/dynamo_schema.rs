@@ -495,7 +495,7 @@ async fn create_table_index_replicates_to_second_node() {
     assert!(body.contains(r#""id":{"S":"u1"}"#), "id missing: {body}");
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 

@@ -188,7 +188,7 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
     }
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -260,7 +260,7 @@ async fn batch_write_on_a_non_leader_node_is_forwarded() {
     }
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -328,6 +328,6 @@ async fn second_table_forwards_across_processes() {
     }
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

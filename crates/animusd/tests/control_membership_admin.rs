@@ -261,7 +261,7 @@ async fn bring_up_combined(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
             return (nodes, config);
         }
         for node in &nodes {
-            node.shutdown();
+            node.shutdown_graceful().await;
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -437,9 +437,9 @@ async fn grow_control_group_converges_everywhere() {
             .unwrap_or_else(|_| panic!("node at {a} never converged to voters {{0,1,2,4}}"));
     }
 
-    grown.shutdown();
+    grown.shutdown_graceful().await;
     for node in control_nodes.into_iter().chain(data_nodes) {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -491,7 +491,7 @@ async fn add_control_member_collision_shapes() {
     }
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -662,7 +662,7 @@ async fn remove_control_voter_refusals_transfer_and_quorum_warnings() {
     }
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -814,9 +814,9 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
         .await
         .expect("the runtime-added voter never saw the new leader's proposal replicate");
 
-    grown.shutdown();
+    grown.shutdown_graceful().await;
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -906,7 +906,7 @@ async fn removing_a_live_voter_while_another_is_already_dead_is_refused_without_
     );
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -972,7 +972,7 @@ async fn removing_a_live_voter_while_another_is_already_dead_succeeds_with_force
     );
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -999,7 +999,7 @@ async fn removing_the_actually_dead_voter_itself_needs_no_force() {
     );
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -1030,7 +1030,7 @@ async fn removing_a_voter_when_every_remaining_voter_is_alive_is_never_refused()
     );
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -1138,7 +1138,7 @@ async fn concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error() 
     );
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -1190,7 +1190,7 @@ async fn omitted_node_add_mints_an_id_and_converges_to_a_live_voter() {
         .unwrap_or_else(|_| panic!("minted voter {minted} never converged to a live voter"));
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -1309,6 +1309,6 @@ async fn concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters()
         .unwrap_or_else(|_| panic!("second minted voter {second_id} never converged"));
 
     for node in nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

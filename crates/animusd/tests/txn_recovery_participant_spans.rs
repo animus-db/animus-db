@@ -423,7 +423,7 @@ async fn anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_
     );
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -578,6 +578,6 @@ async fn recovery_resolve_correctly_commits_both_tablets_of_a_two_tablet_transac
     );
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

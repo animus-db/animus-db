@@ -401,7 +401,7 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     // 8. Rejoin: shut the joined node down, then join again at the same
     // index/addresses/dir — recovers and serves, no collision-guard error
     // (an identical address book is a rejoin, not a conflict).
-    joined.shutdown();
+    joined.shutdown_graceful().await;
     sleep(Duration::from_millis(200)).await;
     let rejoined = rejoin_same(
         &core_intra,
@@ -414,8 +414,8 @@ async fn node_joins_via_seed_with_no_expanded_config() {
     await_value(&[rejoined.client_addr()], &hosted_table, b"k1", b"v1", 30).await;
     await_value(&[rejoined.client_addr()], &hosted_table, b"k2", b"v2", 30).await;
 
-    rejoined.shutdown();
+    rejoined.shutdown_graceful().await;
     for node in core_nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

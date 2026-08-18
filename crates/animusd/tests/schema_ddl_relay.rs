@@ -219,7 +219,7 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
     );
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -364,6 +364,6 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
     );
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }

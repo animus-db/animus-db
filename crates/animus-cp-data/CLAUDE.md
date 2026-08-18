@@ -565,10 +565,41 @@ demand the identical action, so no disambiguation is needed.
     loop `persist_wal` (drain records → append + `fsync` → `mark_durable_
     through`, under `wal_lock`) → `select(recv, timer, propose-wake)` → step
     the core → `persist_wal` again → send. It does **no** engine apply, so it
-    always heartbeats/acks within the election timeout.
+    always heartbeats/acks within the election timeout. **`persist_wal` is
+    halted-gated** (issue #278 item 1, mirroring the apply task's `env.replace`
+    compaction-error handling immediately below): an `env.append`/`env.sync`
+    error is tolerated — no `mark_durable_through`, no `apply_signal` notify,
+    the driver's own top-of-loop `halted` check (woken by `shutdown()`'s
+    `wake_signal.notify()`) exits the loop on its next pass — **iff** `halted`
+    is already set (a `shutdown()` racing a still-pending append/sync, or a
+    test's `TempDir` deleting the WAL out from under a still-running loop);
+    while running, the identical error stays a hard panic (a live leader's WAL
+    fault is a genuine durability fault — crash-stop-before-ack). Regression:
+    `tests/shutdown.rs::a_halted_nodes_pending_write_tolerates_a_wal_fault_
+    with_no_panic` (a `DiskConfig` fault + a `put`-then-`shutdown()` synchronous
+    beat, deterministically racing the two).
   - **Apply task** (`apply_loop` → `apply_and_compact`): install received
     snapshots, `drain_apply` → `merge`/`merge_tombstone` in commit order, and
-    compact — all off the consensus loop. When idle it races a new
+    compact — all off the consensus loop. **`flush_pending`'s `merge_batch`
+    call is halted-gated too** (issue #278 item 1 follow-up, the identical
+    idiom): `apply_and_compact`'s effects loop calls it up to ten times per
+    pass (the `Cas`/`Freeze`/`ReadCeiling`/conditioned-`KindBatch`
+    ordering-hygiene drains, plus the trailing flush) with no re-check of
+    `halted` between them, so a `shutdown()` racing an in-flight `merge_batch`
+    mid-pass is the same class of teardown-artifact error as `persist_wal`'s
+    — tolerated iff `halted`, a hard panic otherwise (a live apply failure can
+    silently leave the engine short a committed write, so this stays loud).
+    No dedicated regression: unlike `persist_wal`'s pending-write queue (a
+    bare synchronous `core` write bypassing the driver loop's own check
+    entirely, so a `put`-then-`shutdown()` beat reaches it deterministically),
+    `apply_and_compact`'s work source (`drain_apply`) only becomes non-empty
+    through the *apply task's own prior progress*, and its effects loop —
+    once entered, after that same iteration's own `halted` check already
+    passed — runs uninterrupted to completion under `SimEnv` (disk ops
+    resolve without yielding), so there is no reachable window for an
+    external test driver to inject `halted` between the check and this
+    call the way `persist_wal`'s regression does. Covered structurally by
+    the identical, already-proven idiom instead. When idle it races a new
     `ApplySignal` (ADR 0044 phase-1 PR1, same shape as `ProposeSignal` below)
     against a long `APPLY_SAFETY_POLL` (250ms) rather than spinning on the old
     unconditional 5ms `APPLY_IDLE_POLL` — the consensus loop raises it at

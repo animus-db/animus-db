@@ -510,7 +510,7 @@ async fn in_flight_backfill_is_cancelled_by_a_concurrent_drop() {
         .await;
 
         for n in &nodes {
-            n.shutdown();
+            n.shutdown_graceful().await;
         }
     })
     .await
@@ -643,7 +643,7 @@ async fn create_drop_recreate_same_index_name_backfills_from_scratch() {
         }
 
         for n in &nodes {
-            n.shutdown();
+            n.shutdown_graceful().await;
         }
     })
     .await

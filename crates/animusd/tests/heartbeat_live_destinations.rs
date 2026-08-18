@@ -345,6 +345,6 @@ async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
         sleep(Duration::from_millis(150)).await;
     }
 
-    grown.shutdown();
-    node0.shutdown();
+    grown.shutdown_graceful().await;
+    node0.shutdown_graceful().await;
 }

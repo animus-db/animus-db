@@ -519,8 +519,8 @@ async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffi
             await_value(&data_clients, "membership_t", &key, &value, 20).await;
         }
 
-        grown.shutdown();
-        replacement.shutdown();
+        grown.shutdown_graceful().await;
+        replacement.shutdown_graceful().await;
         for (i, n) in control_nodes.into_iter().enumerate() {
             if i != dead_original {
                 n.shutdown_graceful().await;

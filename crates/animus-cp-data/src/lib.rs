@@ -4549,12 +4549,25 @@ fn record_kv_outbound(metrics: &MetricsHandle, outs: &[(NodeId, KvWire)]) {
 /// entries for the apply task to merge — a transition the follower-side in-line
 /// apply (on `AppendEntries`, gated on `commit_index` alone) doesn't need, but this
 /// leader-side one does.
+///
+/// **Halted-gated error tolerance** (mirrors the compaction path's `env.replace`
+/// handling below): a `shutdown()` that lands mid-append/sync — aborting tasks and
+/// tearing down the env, or a test's `TempDir` deleting the WAL file out from under
+/// a still-running loop — can surface as an `env.append`/`env.sync` error here.
+/// Tolerated **only** while `halted` is set: this returns early with **no**
+/// `mark_durable_through` (never mark durability that didn't happen) and no
+/// `apply_signal` notify, leaving the driver's own top-of-loop `halted` check
+/// (which `shutdown()`'s `wake_signal.notify()` promptly wakes) to exit the loop —
+/// so a tolerated error can't spin the loop hot or ack anything. A failure while
+/// *not* halted is a real durability fault on a live leader (crash-stop-before-ack)
+/// and stays exactly as loud as before: a hard panic.
 async fn persist_wal<E: Env>(
     env: &E,
     wal: &str,
     core: &Arc<Mutex<KvCore>>,
     wal_lock: &AsyncMutex<()>,
     apply_signal: &ApplySignal,
+    halted: &AtomicBool,
 ) {
     let _wal = wal_lock.lock().await;
     let (records, through) = {
@@ -4565,11 +4578,24 @@ async fn persist_wal<E: Env>(
         return;
     }
     for record in &records {
-        env.append(wal, &PersistedState::encode_record(record))
+        if let Err(e) = env
+            .append(wal, &PersistedState::encode_record(record))
             .await
-            .expect("raftkv wal append");
+        {
+            assert!(
+                halted.load(Ordering::SeqCst),
+                "raftkv wal append failed while running: {e}"
+            );
+            return;
+        }
     }
-    env.sync(wal).await.expect("raftkv wal sync");
+    if let Err(e) = env.sync(wal).await {
+        assert!(
+            halted.load(Ordering::SeqCst),
+            "raftkv wal sync failed while running: {e}"
+        );
+        return;
+    }
     core.lock()
         .expect("raftkv core poisoned")
         .mark_durable_through(through);
@@ -5040,7 +5066,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 let conditions_ok = if conditions.is_empty() {
                     true
                 } else {
-                    flush_pending(storage, &mut pending, metrics).await;
+                    flush_pending(storage, &mut pending, metrics, halted).await;
                     let mut ok = true;
                     for (key, expected) in &conditions {
                         let raw = storage
@@ -5112,7 +5138,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 assert_ts_monotonic(max_applied_ts, ts);
                 // Drain the pending run so the CAS read observes every earlier
                 // committed write in this apply pass.
-                flush_pending(storage, &mut pending, metrics).await;
+                flush_pending(storage, &mut pending, metrics, halted).await;
                 // A sealed-out CAS never reads/writes storage — it is
                 // recorded as `false` ("did not swap"), the same outcome shape a
                 // proposer already handles for an ordinary `expected` mismatch, so
@@ -5184,7 +5210,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // set is rebuilt from it at group start, which is also
                     // what re-latches `frozen` across a restart). Flush the
                     // pending run first, `Seal`'s ordering hygiene.
-                    flush_pending(storage, &mut pending, metrics).await;
+                    flush_pending(storage, &mut pending, metrics, halted).await;
                     let whole = KeyRange::whole();
                     let marker_key = seal::seal_marker_key(tablet, &whole);
                     storage
@@ -5211,7 +5237,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // module's doc for the full argument. Flush the pending run
                 // first, matching `Seal`'s ordering hygiene above.
                 committed_ceiling.fetch_max(hlc::pack(ts), Ordering::SeqCst);
-                flush_pending(storage, &mut pending, metrics).await;
+                flush_pending(storage, &mut pending, metrics, halted).await;
                 let marker_key = ceiling::ceiling_marker_key(tablet);
                 storage
                     .merge(
@@ -5346,7 +5372,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // observes every earlier committed write in this same
                 // apply pass.
                 let condition_failure: Option<Vec<u8>> = if all_in_fence && !conditions.is_empty() {
-                    flush_pending(storage, &mut pending, metrics).await;
+                    flush_pending(storage, &mut pending, metrics, halted).await;
                     let mut failure = None;
                     for (key, expected) in &conditions {
                         let raw = storage
@@ -5385,7 +5411,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 };
                 let stage_ok = all_in_fence && condition_failure.is_none();
                 if stage_ok {
-                    flush_pending(storage, &mut pending, metrics).await;
+                    flush_pending(storage, &mut pending, metrics, halted).await;
                     let version = hlc::pack(ts);
                     for w in &writes {
                         // ADR 0046 A1: the derived kind-writes/change-log
@@ -5509,7 +5535,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
-                flush_pending(storage, &mut pending, metrics).await;
+                flush_pending(storage, &mut pending, metrics, halted).await;
                 let physical_record = scope.physical(&record_key);
                 let current = storage
                     .get(&physical_record)
@@ -5638,7 +5664,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 orphan_created_ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
-                flush_pending(storage, &mut pending, metrics).await;
+                flush_pending(storage, &mut pending, metrics, halted).await;
                 let physical_record = scope.physical(&record_key);
                 let current = storage
                     .get(&physical_record)
@@ -5744,7 +5770,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
-                flush_pending(storage, &mut pending, metrics).await;
+                flush_pending(storage, &mut pending, metrics, halted).await;
                 // ADR 0018 §2/PR5: this group can only ever observe a
                 // resolve for a `txn_id` it itself anchors (see
                 // `TxnTracker::unresolved_decided`'s doc for the documented,
@@ -6102,7 +6128,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     }
     // Apply any trailing Put/Delete run under one final sync. Only now does the
     // engine reflect every index in this pass.
-    flush_pending(storage, &mut pending, metrics).await;
+    flush_pending(storage, &mut pending, metrics, halted).await;
     // Publish the watermark: the engine now holds all effects through `max_index`,
     // so linearizable reads may serve up to it and compaction may snapshot up to it.
     if max_index > 0 {
@@ -6214,20 +6240,37 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
 
 /// Apply and clear an accumulated run of per-key LWW merges under a single WAL
 /// `fsync` (see the apply loop). A no-op when the run is empty.
+///
+/// **Halted-gated error tolerance** (issue #278 item 1 follow-up, the identical
+/// idiom `persist_wal`/the compaction path above use): `apply_and_compact`'s
+/// top-of-`apply_loop` `halted` check only gates *starting* a pass — the effects
+/// loop that calls this function up to ten times per pass (once per `Cas`/
+/// `Freeze`/`ReadCeiling`/conditioned-`KindBatch` ordering-hygiene drain, plus
+/// the trailing flush) does not re-check `halted` between merges, so a
+/// `shutdown()` racing a still-in-flight `merge_batch` mid-pass can surface the
+/// identical class of teardown-artifact I/O error `persist_wal` tolerates. On
+/// error: tolerated (no `pending` restore — the caller is discarding this pass
+/// on the same halt anyway) iff `halted` is already set; a live group's
+/// identical failure stays a hard panic (durable-before-visible: an apply
+/// failure while running means the engine may now be silently missing a
+/// committed write, so this must never be softened into a swallowed error).
 async fn flush_pending<S: StorageEngine>(
     storage: &S,
     pending: &mut Vec<MergeOp>,
     metrics: &MetricsHandle,
+    halted: &AtomicBool,
 ) {
     if pending.is_empty() {
         return;
     }
     metrics.incr(Metric::CpApplyBatchRuns);
     metrics.incr_by(Metric::CpApplyBatchSizeSum, pending.len() as u64);
-    storage
-        .merge_batch(std::mem::take(pending))
-        .await
-        .expect("raftkv apply merge batch");
+    if let Err(e) = storage.merge_batch(std::mem::take(pending)).await {
+        assert!(
+            halted.load(Ordering::SeqCst),
+            "raftkv apply merge batch failed while running: {e}"
+        );
+    }
 }
 
 /// One key's snapshot entry: `(row kind, key, value-or-tombstone, version)`.
@@ -6580,7 +6623,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             stopped.store(true, Ordering::SeqCst);
             return;
         }
-        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal).await;
+        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal, &halted).await;
 
         let now = env.now();
         // ADR 0044 phase-1 PR3: feed the one external input the core has no
@@ -6767,7 +6810,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         // Durability before action: persist (fsync) before shipping responses, so a
         // granted vote / appended entry is on disk before its message goes out.
         // Engine apply happens independently on the apply task.
-        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal).await;
+        persist_wal(&env, &wal, &core, &wal_lock, &apply_signal, &halted).await;
 
         for (to, wire) in outs {
             env.send_stream(to, stream, codec::encode_wire(&wire)).await;

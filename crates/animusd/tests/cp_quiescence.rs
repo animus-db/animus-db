@@ -244,7 +244,7 @@ async fn write_after_leader_kill_of_a_quiesced_group_converges() {
 
     for (i, node) in nodes.iter().enumerate() {
         if i != leader_idx {
-            node.shutdown();
+            node.shutdown_graceful().await;
         }
     }
 }
@@ -296,6 +296,6 @@ async fn quiescence_enabled_does_not_disrupt_ordinary_traffic() {
     }
 
     for node in &nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }

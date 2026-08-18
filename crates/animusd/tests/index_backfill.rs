@@ -287,7 +287,7 @@ async fn index_backfill_converges_to_active_once_every_tablet_reports() {
     await_index_status(&nodes, "bf_t", "by_email", IndexStatus::Active, 10).await;
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -444,7 +444,7 @@ async fn a_tablet_that_appears_before_the_flip_blocks_it_until_it_also_reports()
     await_index_status(&nodes, "bf_split_t", "by_email", IndexStatus::Active, 10).await;
 
     for n in &nodes {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }
 
@@ -545,6 +545,6 @@ async fn control_only_leader_drives_the_flip() {
     .await;
 
     for n in control_nodes.iter().chain(data_nodes.iter()) {
-        n.shutdown();
+        n.shutdown_graceful().await;
     }
 }

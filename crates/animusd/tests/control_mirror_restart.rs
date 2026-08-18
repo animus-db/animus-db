@@ -189,7 +189,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
     }
     // Let the apply task catch up before shutting down.
     sleep(Duration::from_millis(500)).await;
-    node.shutdown();
+    node.shutdown_graceful().await;
     sleep(Duration::from_millis(200)).await;
 
     let mirrored_before = read_mirror_from_disk(&node_dir).await;
@@ -228,7 +228,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
     // survived the restart with its pre-restart content intact AND that it
     // kept mirroring afterward.
     sleep(Duration::from_millis(500)).await;
-    node.shutdown();
+    node.shutdown_graceful().await;
     sleep(Duration::from_millis(200)).await;
 
     let mirrored_after = read_mirror_from_disk(&node_dir).await;

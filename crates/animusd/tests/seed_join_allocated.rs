@@ -294,9 +294,9 @@ async fn no_node_join_becomes_active_and_gets_a_replica() {
     put(&core_clients, &hosted_table, b"k2", b"v2", 30).await;
     await_value(&[joined.client_addr()], &hosted_table, b"k2", b"v2", 30).await;
 
-    joined.shutdown();
+    joined.shutdown_graceful().await;
     for node in core_nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -344,10 +344,10 @@ async fn two_concurrent_allocated_joins_get_distinct_ids() {
     await_active(&core_nodes, &id_a, 20).await;
     await_active(&core_nodes, &id_b, 20).await;
 
-    node_a.shutdown();
-    node_b.shutdown();
+    node_a.shutdown_graceful().await;
+    node_b.shutdown_graceful().await;
     for node in core_nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -476,9 +476,9 @@ async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
     .await
     .unwrap_or_else(|_| panic!("old allocated id {old_id} was never pruned after removal"));
 
-    second.shutdown();
+    second.shutdown_graceful().await;
     for node in core_nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
 
@@ -514,8 +514,8 @@ async fn follower_connected_seed_completes_the_allocate_node_id_round_trip() {
 
     await_active(&core_nodes, &joined_id, 20).await;
 
-    joined.shutdown();
+    joined.shutdown_graceful().await;
     for node in core_nodes {
-        node.shutdown();
+        node.shutdown_graceful().await;
     }
 }
