@@ -530,6 +530,19 @@ impl CpGroup {
         }
     }
 
+    /// Whether [`shutdown`](Self::shutdown) has latched this group's
+    /// `halted` flag — the durability-assert tolerance gate `persist_wal`/
+    /// `flush_pending` check (`animus-cp-data`'s `CLAUDE.md`), distinct from
+    /// [`is_stopped`](Self::is_stopped) (whether the driver has actually
+    /// exited yet). See [`RaftKvNode::is_halted`].
+    #[cfg(test)]
+    fn is_halted(&self) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.is_halted(),
+            CpGroup::Mem(n) => n.is_halted(),
+        }
+    }
+
     /// The node's `raftkv` env this group runs on. Since ADR 0026 Stage B every
     /// tablet a node hosts shares this **same** env (stream-addressed, not a
     /// distinct per-tablet id/env) — used to identify *this node's* handle in
@@ -3303,7 +3316,20 @@ impl Node {
     /// [`shutdown_and_wait`](Self::shutdown_and_wait) instead — plain `shutdown`
     /// remains for callers that only need the node to stop (most simulated-crash
     /// tests never rebind the killed node's own address in the same process).
+    ///
+    /// **Latches every hosted CP group's `halted` flag first** (issue #282):
+    /// unlike [`shutdown_graceful`](Self::shutdown_graceful), this bare path has
+    /// no grace period at all before the hard `task.abort()`/`ProdEnv::shutdown()`
+    /// below, so a killed node's driver can land mid-WAL-I/O with `halted` still
+    /// unset — the exact window `persist_wal`'s/`flush_pending`'s halted-gated
+    /// assert (`animus-cp-data`'s `CLAUDE.md`) otherwise turns into an
+    /// unconditional panic on a racing I/O hiccup, indistinguishable from a real
+    /// durability fault. [`ClusterEdgeState::halt_hosted_cp_groups`] is a plain
+    /// atomic store plus two wakes per group — cheap, synchronous, no wait for
+    /// `is_stopped()` — so it costs this fire-and-forget path nothing and keeps
+    /// its contract (request the stop, don't wait for it) intact.
     pub fn shutdown(&self) {
+        self.edge.halt_hosted_cp_groups();
         for task in &self.tasks {
             task.abort();
         }
@@ -3328,7 +3354,12 @@ impl Node {
     /// rebind-retry bound. [`shutdown_graceful`](Self::shutdown_graceful) —
     /// what every restart test already calls before rebinding — uses this
     /// instead of the plain `shutdown` for exactly this reason.
+    ///
+    /// Latches every hosted CP group's `halted` flag first, exactly like
+    /// [`shutdown`](Self::shutdown) — see that method's doc; this path
+    /// hard-aborts the same driver tasks, just with an added wait afterward.
     pub async fn shutdown_and_wait(&self) {
+        self.edge.halt_hosted_cp_groups();
         for task in &self.tasks {
             task.abort();
         }
@@ -3377,6 +3408,36 @@ impl Node {
         }
         self.edge.shutdown_all_cp_groups().await;
         self.shutdown_and_wait().await;
+    }
+}
+
+/// Panic-unwind safety net (issue #279's panic half): a test that panics
+/// mid-poll (a converged-or-timeout assert, say) drops its `Vec<Node>` with
+/// no explicit `shutdown()` call at all, and the `#[tokio::test(multi_thread)]`
+/// runtime's own teardown then hard-cancels every still-live driver task —
+/// including one sitting mid-`tokio::fs` op — moments later, with nothing
+/// having latched any hosted CP group's `halted` flag first. That is the
+/// identical unconditional-panic window bare [`Node::shutdown`]'s own doc
+/// describes, just reached by a runtime's implicit teardown instead of an
+/// explicit call.
+///
+/// Latching here closes it the same way: synchronously, unconditionally, and
+/// first — before anything else in this drop glue (or the runtime's own
+/// later cancellation) can touch a driver task.
+/// [`ClusterEdgeState::halt_hosted_cp_groups`] is safe to call from `Drop`
+/// specifically because it bottoms out in `RaftKvNode::shutdown`, which is a
+/// plain `AtomicBool` store plus two `Notify` wakes — no `.await`, no lock
+/// held across one, no dependency on a live tokio runtime (`Drop` can run
+/// inside or outside one), so it can never block or panic here.
+///
+/// Deliberately does **not** abort this node's own tasks or tear down its
+/// envs — unlike `shutdown()`, a `Node` dropped without an explicit
+/// `shutdown()` call still leaves its tasks running exactly as before this
+/// fix (see `shutdown()`'s own doc); only the durability assert those tasks
+/// can now safely race against an eventual abrupt stop is fixed.
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.edge.halt_hosted_cp_groups();
     }
 }
 
@@ -4182,22 +4243,31 @@ impl ClusterEdgeState {
         Some(group)
     }
 
-    /// Gracefully halt every CP group registered here (process shutdown, not
-    /// drop-table GC — see [`shutdown_graceful`](Node::shutdown_graceful)). A raw
-    /// `ProdEnv::shutdown()` hard-`abort()`s the CP-data driver/apply tasks, which
-    /// can land mid-`storage.merge(..).await` inside `apply_and_compact` and
-    /// surface as a `tokio::fs` background-task panic
-    /// (`Backend("background task failed")`/`Backend("task was cancelled")`) when
-    /// the runtime's blocking pool is torn down underneath it. `CpGroup::shutdown`
-    /// only latches a flag the driver observes *between* full apply passes, so we
-    /// must poll [`is_stopped`](CpGroup::is_stopped) before the caller proceeds to
-    /// abort anything else — the same shutdown-then-wait shape the per-node
-    /// tablet-host reconciler's own teardown uses (ADR 0031 PR4) before deleting a
-    /// dropped tablet's files. Snapshots the handles out of the
-    /// lock first (never hold a `std::sync::Mutex` guard across `.await`). Bounded
-    /// by `CP_GC_STOP_TIMEOUT`; a group that doesn't stop in time is logged and
-    /// left for the subsequent hard abort (the process is exiting either way).
-    async fn shutdown_all_cp_groups(&self) {
+    /// Synchronously latch **every** locally-registered CP group's `halted`
+    /// flag (`CpGroup::shutdown` — a plain atomic store plus two `Notify`
+    /// wakes, no I/O, no `.await`) and hand back the snapshot this took, so
+    /// a caller that also needs to wait for the driver to actually exit
+    /// (`shutdown_all_cp_groups`, below) can reuse it without a second lock
+    /// round trip.
+    ///
+    /// This is the one shared first step **every** path that can abruptly
+    /// stop a group's driver needs before it touches that driver at all
+    /// (issues #282/#279): the graceful process teardown below, bare
+    /// [`Node::shutdown`]/[`shutdown_and_wait`](Node::shutdown_and_wait)
+    /// (a raw `task.abort()` + `ProdEnv::shutdown()`, the doc-blessed "kill
+    /// node N" fault-injection idiom with no grace period at all), and
+    /// [`Node`]'s `Drop` impl (a panicking test's `Vec<Node>` unwind, which
+    /// leaves the driver tasks for the test runtime's own teardown to
+    /// hard-cancel later, mid-I/O, with nothing having latched `halted` at
+    /// all). Without this latch, an abruptly-cancelled driver can land
+    /// inside `persist_wal`/`flush_pending`'s halted-gated I/O-error assert
+    /// (`animus-cp-data`'s `CLAUDE.md`) with `halted` still `false` — an
+    /// unconditional panic indistinguishable from a genuine live durability
+    /// fault. Deliberately does **not** poll `is_stopped()` — that wait is
+    /// this method's own caller's job when it needs one; every bare-abort
+    /// caller above wants fire-and-forget, exactly like `CpGroup::shutdown`
+    /// itself already promises.
+    fn halt_hosted_cp_groups(&self) -> Vec<CpGroup> {
         let groups: Vec<CpGroup> = self
             .raftkv
             .lock()
@@ -4209,6 +4279,25 @@ impl ClusterEdgeState {
         for group in &groups {
             group.shutdown();
         }
+        groups
+    }
+
+    /// Gracefully halt every CP group registered here (process shutdown, not
+    /// drop-table GC — see [`shutdown_graceful`](Node::shutdown_graceful)). A raw
+    /// `ProdEnv::shutdown()` hard-`abort()`s the CP-data driver/apply tasks, which
+    /// can land mid-`storage.merge(..).await` inside `apply_and_compact` and
+    /// surface as a `tokio::fs` background-task panic
+    /// (`Backend("background task failed")`/`Backend("task was cancelled")`) when
+    /// the runtime's blocking pool is torn down underneath it. [`halt_hosted_cp_groups`](
+    /// Self::halt_hosted_cp_groups) only latches a flag the driver observes *between*
+    /// full apply passes, so we must poll [`is_stopped`](CpGroup::is_stopped) before
+    /// the caller proceeds to abort anything else — the same shutdown-then-wait shape
+    /// the per-node tablet-host reconciler's own teardown uses (ADR 0031 PR4) before
+    /// deleting a dropped tablet's files. Bounded by `CP_GC_STOP_TIMEOUT`; a group
+    /// that doesn't stop in time is logged and left for the subsequent hard abort
+    /// (the process is exiting either way).
+    async fn shutdown_all_cp_groups(&self) {
+        let groups = self.halt_hosted_cp_groups();
         let deadline = tokio::time::Instant::now() + CP_GC_STOP_TIMEOUT;
         for group in &groups {
             while !group.is_stopped() {
@@ -13816,6 +13905,155 @@ mod confirm_futility_tests {
         .expect("an ordinary write after the futile one still confirms");
 
         node.shutdown();
+    }
+}
+
+/// Regression for issues #282/#279's fix: bare [`Node::shutdown`] and
+/// [`Node`]'s `Drop` impl both latch every hosted CP group's `halted` flag —
+/// see each's own doc for the full rationale. This module needs
+/// `CpGroup::is_halted` (`#[cfg(test)]`-only, no external `tests/` binary can
+/// reach a private `CpGroup`) and `node.edge.local_cp`, hence in-crate like
+/// `confirm_futility_tests` above; `ProdEnv` has no fault-injection knob (that
+/// lives only in `animus_sim::SimEnv`), so this doesn't attempt to race a real
+/// disk fault — the deterministic proof that a halted-latched group tolerates
+/// one lives in `animus-cp-data`'s `tests/shutdown.rs`. This just proves the
+/// latch itself actually reaches every hosted group on both paths, and that
+/// neither path panics doing it.
+#[cfg(test)]
+mod halted_shutdown_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use tokio::time::sleep;
+
+    use crate::config::NodeRole;
+    use crate::{ClusterConfig, Node, RoleAddrs, run_node};
+
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn single_node_config() -> ClusterConfig {
+        let addrs = free_addrs(6);
+        ClusterConfig {
+            nodes: vec![RoleAddrs {
+                id: crate::config::node_id(0),
+                role: NodeRole::Both,
+                internal: addrs[0],
+                client: addrs[1],
+                dynamo: addrs[2],
+                cql: addrs[3],
+                admin: addrs[4],
+                intra: addrs[5],
+            }],
+        }
+    }
+
+    /// Bring up a single node, retrying against the documented port-TOCTOU
+    /// race (`docs/engineering-lessons.md`), mirroring
+    /// `confirm_futility_tests::single_node`.
+    async fn single_node(dir: &Path) -> Node {
+        let mut last_err = None;
+        for attempt in 0..16 {
+            let config = single_node_config();
+            match run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
+                Ok(node) => return node,
+                Err(e) => {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        panic!(
+            "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
+        );
+    }
+
+    /// Seed a put so the single-voter group provisions its first tablet and
+    /// elects, then return that tablet's locally-hosted group handle.
+    async fn provision_and_get_group(node: &Node) -> crate::CpGroup {
+        use crate::{ClientRequest, ClientResponse, read_frame, write_frame};
+
+        let client = node.client_addr();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let mut stream = tokio::net::TcpStream::connect(client)
+                    .await
+                    .expect("connect");
+                write_frame(
+                    &mut stream,
+                    &ClientRequest::Put {
+                        key: b"seed".to_vec(),
+                        value: b"seed".to_vec(),
+                        table: "halt_t".to_string(),
+                    },
+                )
+                .await
+                .expect("send");
+                match read_frame(&mut stream)
+                    .await
+                    .expect("read")
+                    .expect("a reply")
+                {
+                    ClientResponse::PutOk => return,
+                    ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                    other => panic!("unexpected put response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("seed put did not succeed in 20s");
+
+        let tablet = *node
+            .metadata()
+            .tablets_for_table("halt_t")
+            .next()
+            .expect("seed put provisioned a tablet")
+            .0;
+        node.edge
+            .local_cp(tablet)
+            .expect("this single-voter node hosts the tablet")
+    }
+
+    /// Bare `Node::shutdown()` — the doc-blessed "kill node N" idiom — must
+    /// latch `halted` on every hosted CP group before it returns, with no
+    /// panic and no wait for the driver to actually stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bare_shutdown_latches_halted_on_every_hosted_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = single_node(dir.path()).await;
+        let group = provision_and_get_group(&node).await;
+
+        assert!(
+            !group.is_halted(),
+            "a freshly-provisioned group must not start out halted"
+        );
+        node.shutdown();
+        assert!(
+            group.is_halted(),
+            "bare Node::shutdown() must latch halted on every hosted group"
+        );
+    }
+
+    /// Dropping a `Node` that was never explicitly `shutdown()` (a panic
+    /// mid-test unwinding its `Vec<Node>`, per issue #279's panic half) must
+    /// latch `halted` on every hosted CP group too, via `Node`'s `Drop` impl.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_an_unshutdown_node_latches_halted_on_every_hosted_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = single_node(dir.path()).await;
+        let group = provision_and_get_group(&node).await;
+
+        assert!(!group.is_halted());
+        drop(node);
+        assert!(
+            group.is_halted(),
+            "dropping an un-shutdown Node must latch halted via its Drop impl"
+        );
     }
 }
 

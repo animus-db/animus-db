@@ -190,3 +190,65 @@ fn a_halted_nodes_pending_write_tolerates_a_wal_fault_with_no_panic() {
          (seed={seed})"
     );
 }
+
+/// **The animusd issues #282/#279 fix's own load-bearing assumption**: bare
+/// `Node::shutdown()`/`Drop` (`animusd`, which has no `SimEnv`, so cannot
+/// exercise the real race itself) latch `halted` on *every* locally hosted
+/// CP group, not just a leading one — because a hard-killed or panic-unwound
+/// process has no way to know in advance which of its hosted groups happen to
+/// be leading at that instant. This proves the halted-gate mechanism this
+/// fix leans on holds for a **follower** too: `persist_wal` runs identically
+/// on every replica (a follower persists its own copy of each entry as it
+/// arrives via `AppendEntries`), so a follower racing a disk fault right
+/// after being halted must tolerate it exactly like a leader racing one after
+/// its own local `put` does above — never panic.
+///
+/// Unlike the leader case above, a follower can't queue a pending write with
+/// a direct synchronous call — the write only reaches it over the network,
+/// which only progresses inside `run_for`. So this arms the fault and the
+/// halt on the follower *before* the leader ever proposes, then proposes and
+/// drives the sim: the follower's own halted latch stays set the whole time,
+/// so whenever `AppendEntries` for the new entry arrives and its own
+/// `persist_wal` pass hits the injected fault, halted is unquestionably
+/// already true (a stronger guarantee than a tight race, and the shape a
+/// process-level kill actually produces — halted latches once, well before
+/// the process's I/O has any chance to fail).
+#[test]
+fn a_halted_followers_incoming_write_tolerates_a_wal_fault_with_no_panic() {
+    let seed = 0xF011;
+    let (mut sim, nodes) = group(seed);
+    sim.run_for(Duration::from_secs(2)); // elect
+
+    let l = leader(&nodes, &[0, 1, 2], seed);
+    let follower = (0..3).find(|&i| i != l).expect("a follower exists");
+
+    // Every append/sync/read/read_at/replace on the follower's node now
+    // fails.
+    let mut fault = DiskConfig::default();
+    fault.set_error_prob(1.0);
+    sim.set_disk_config_for(nid(follower as u64), fault);
+
+    // Halt the follower before it has seen the write at all — mirroring what
+    // a bare-killed process's `halt_hosted_cp_groups` does to every hosted
+    // group, leader or not, before any of their drivers gets to run again.
+    nodes[follower].shutdown();
+
+    // The leader proposes and replicates normally (its own disk is fine); the
+    // halted follower's own persist_wal pass for the incoming entry must hit
+    // the injected fault and tolerate it rather than panic.
+    put(&nodes, &[l], seed, b"k", b"v");
+    sim.run_for(Duration::from_secs(2));
+
+    assert!(
+        nodes[follower].is_stopped(),
+        "the halted follower's driver must exit despite the injected disk fault (seed={seed})"
+    );
+
+    // The live majority (leader + the other follower) is unaffected.
+    assert_eq!(
+        block_on(nodes[l].local_get(b"k")),
+        Some(b"v".to_vec()),
+        "the live leader must still commit + apply despite the halted follower's tolerated \
+         fault (seed={seed})"
+    );
+}

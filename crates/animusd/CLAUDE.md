@@ -1253,6 +1253,29 @@ route below the edge through the same `ClientCtx` CP primitives.
   `full_split_cluster_restart_recovers_metadata_and_data` flake under `cargo test
   --workspace`; see `docs/engineering-lessons.md`'s "abort() is a request, not a
   guarantee" entry.
+- **Every path that abruptly stops a node's driver tasks — bare
+  `shutdown()`/`shutdown_and_wait()`, and dropping a `Node` that was never
+  explicitly shut down — first latches every hosted CP group's `halted`
+  flag via `ClusterEdgeState::halt_hosted_cp_groups`** (issues #282/#279):
+  `animus-cp-data`'s WAL/apply I/O tolerance (`persist_wal`/`flush_pending`)
+  hard-panics on a live I/O error and only tolerates one while a group's
+  `halted: AtomicBool` is set, and that flag used to latch **only** on the
+  graceful path (`shutdown_graceful` → `shutdown_all_cp_groups`) — a bare
+  kill (the doc-blessed fault-injection idiom above) or a panicking test's
+  `Vec<Node>` unwind (`Node` had no `Drop` impl at all) could abort a
+  driver mid-I/O with `halted` still `false`, turning a routine kill/panic
+  race into an unconditional panic indistinguishable from a genuine live
+  durability fault. `halt_hosted_cp_groups` is cheap and safe to call from
+  anywhere, including `Drop` (it bottoms out in `RaftKvNode::shutdown`, a
+  plain `AtomicBool` store plus two `Notify` wakes — no I/O, no `.await`,
+  no runtime dependency). **`Drop for Node` latches and nothing else** —
+  it deliberately does not abort tasks or tear down envs, so the "dropping
+  a `Node` without `shutdown()` leaves tasks running" behavior two
+  paragraphs up is unchanged; only the durability assert those still-live
+  tasks can now safely race against an eventual abrupt stop is fixed.
+  Regression: `halted_shutdown_tests` (in-crate, `cargo test -p animusd
+  --lib`) and `animus-cp-data`'s
+  `tests/shutdown.rs::a_halted_followers_incoming_write_tolerates_a_wal_fault_with_no_panic`.
 - **A merged-across-nodes admin view must carry each item's own identity** —
   `/admin/raftkv`'s `CpRaftView::node` carries the real hosting node id because the
   dashboard merges every node's response; the answering server isn't a reliable
@@ -1301,7 +1324,11 @@ token alignment, needing `CpGroup`'s private `pending_changes`/
 `approx_bytes_kind`/`cursor_min_watermark` and, to confirm a segment
 genuinely landed, a second `FsSegmentStore` handle at the exact
 `<node dir>/segments` path the default store roots its own local building
-block at.
+block at. `lib.rs`'s own `halted_shutdown_tests` is a sixth — the
+issues #282/#279 regression above, needing the same private `CpGroup`
+(specifically its `#[cfg(test)]`-only `is_halted`) to prove bare
+`Node::shutdown()` and `Node`'s `Drop` impl both latch every hosted
+group's `halted` flag.
 
 One binary per behavior; the file names describe them (`ls
 crates/animusd/tests/`) — covering combined/control-only/data-only/split
