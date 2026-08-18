@@ -255,6 +255,16 @@ truth; this map is just for navigation.
   is reproducible from a seed.
 - Higher layers define their own message enums and (de)serialize with
   `serde_json` over the `Vec<u8>` payloads the `Network` moves.
+- **Agent sessions delegate heavy work to Sonnet subagents** (maintainer
+  standing instruction): unless the task says otherwise, an orchestrating
+  Claude session on this repo hands code exploration, implementation/
+  delivery, and any other token-intensive work to Sonnet subagents (one
+  investigation agent per issue, one implementation agent per change),
+  keeping the main session for planning, cross-agent synthesis, review,
+  verification, and GitHub interactions. Brief each subagent with the
+  relevant crate guides, the lessons-log sections, and an explicit
+  validation gate; verify its committed state on completion rather than
+  trusting its report alone.
 
 ## Engineering practices
 
