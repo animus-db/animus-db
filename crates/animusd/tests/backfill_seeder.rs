@@ -241,11 +241,21 @@ async fn await_row_count(addr: SocketAddr, table: &str, want: usize, what: &str)
             sleep(Duration::from_millis(100)).await;
         }
     };
-    if timeout(Duration::from_secs(60), converged).await.is_err() {
+    if timeout(CONVERGE_BUDGET, converged).await.is_err() {
         let got = *last.lock().unwrap();
         panic!("{what}: `{table}` never reached {want} rows (last saw {got:?})");
     }
 }
+
+/// Budget for this file's converged-or-timeout polls (`await_row_count` /
+/// `await_gsi_query`). Sized runner-aware, like `split_cluster.rs`'s split
+/// budgets: `split_during_backfill_converges_with_correct_final_gsi` takes
+/// ~25s healthy on idle cores, so its old 60s budget had barely 2x headroom —
+/// and on the oversubscribed 2-core CI runners, election churn ("CP group
+/// leader moved; retry") repeatedly ate all of it (four gates trips on
+/// 2026-08-18 alone, across unrelated PRs). Passing runs exit the poll on
+/// convergence, so raising this costs nothing when healthy.
+const CONVERGE_BUDGET: Duration = Duration::from_secs(180);
 
 /// Poll a GSI `Query` until `accept` is satisfied (a GSI is eventually
 /// consistent by contract).
@@ -262,9 +272,9 @@ async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> 
             sleep(Duration::from_millis(100)).await;
         }
     };
-    if timeout(Duration::from_secs(60), converged).await.is_err() {
+    if timeout(CONVERGE_BUDGET, converged).await.is_err() {
         panic!(
-            "GSI query never converged within 60s (last saw: {})",
+            "GSI query never converged within {CONVERGE_BUDGET:?} (last saw: {})",
             last.lock().unwrap()
         );
     }
