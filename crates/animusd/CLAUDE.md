@@ -760,7 +760,13 @@ route below the edge through the same `ClientCtx` CP primitives.
 - **DynamoDB** (`dynamo.rs`, `RoleAddrs.dynamo`) — decodes `X-Amz-Target` +
   AttributeValue-JSON via `animus_dynamo::wire`. `CreateTable` proposes its
   key schema **and** GSI/LSI *definitions* into the replicated catalog (ADR
-  0013) and waits for commit; a node reconciles its local registry from
+  0013) and waits for commit — and, before acking, for the provisioned
+  tablet's group to actually **serve** (`ClientCtx::await_table_serveable`,
+  a linearizable probe read; ADR 0023's 2026-08-17 amendment — the 200 must
+  not hand the client the group's formation/election window; the CQL
+  `CREATE TABLE` edge shares the same helper; regression:
+  `tests/create_table_ready.rs`, whose readiness assertion is one-shot at
+  ack time on purpose); a node reconciles its local registry from
   `Metadata::table_indexes` — the registry holds only *definition*
   bookkeeping, never index entries (there is no in-memory index at all). An
   indexed/streamed table's `PutItem`/`DeleteItem`/`UpdateItem` commits the

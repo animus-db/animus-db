@@ -100,3 +100,25 @@ Staged (one logical change per PR), on top of ADR 0022's token:
 5. **Per-table scan fan-out**; **drop-table teardown** *(done — ADR 0024:
    `DropTableTablets` + the per-node GC loop reclaim the table's groups and
    on-disk data)*.
+
+## Amendment (2026-08-17): create acks wait for serveability
+
+Provision-at-create originally acked once the `CreateTableSchema` +
+`CreateTablet` (+ policy) commits were observed — but the tablet's Raft group
+forms and elects **asynchronously** (each replica's tablet-host reconciler,
+ADR 0031), so the ack raced the formation window: a client's
+immediately-following first write only landed via the election-wait machinery
+(`cp_forward`'s backoff pass / the local `RouteDecision::Wait`) and, under
+unlucky timing, burned much of `CLIENT_TIMEOUT` or failed outright.
+
+**The create-ack contract is now: a success reply from `CreateTable`
+(DynamoDB) / `CREATE TABLE` (CQL) additionally means the table's tablet group
+is elected and serving.** Both edges call `ClientCtx::await_table_serveable`
+before replying — a linearizable probe read routed through the ordinary
+`cp_read` machinery, converged-or-timeout (a ReadIndex success requires an
+elected leader with confirmed quorum contact, so it also implies a first
+write commits promptly). First-*write* auto-provision paths are unchanged:
+their own op already rides `cp_route`'s wait, so they need no extra gate.
+Regression: `crates/animusd/tests/create_table_ready.rs` (the readiness
+assertion is one-shot at ack time, deliberately — the property is "already
+true when the 200 arrives").

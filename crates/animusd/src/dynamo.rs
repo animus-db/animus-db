@@ -823,6 +823,17 @@ async fn create_table(
     ctx.provision_tablet(table)
         .await
         .map_err(|e| internal(&e))?;
+    // A 200 from `CreateTable` must mean an immediately-following first write
+    // serves promptly. `provision_tablet` confirms only the *metadata* commit —
+    // the tablet's Raft group forms and elects asynchronously (the per-node
+    // tablet-host reconciler, ADR 0031) — so acking here would hand the client
+    // the formation window: their first write would ride the election-wait
+    // machinery and, under unlucky timing, burn much of `CLIENT_TIMEOUT` or
+    // fail outright. Wait for the group to actually serve (a linearizable
+    // probe read, converged-or-timeout) before replying.
+    ctx.await_table_serveable(table)
+        .await
+        .map_err(|e| internal(&e))?;
     // Reconcile the cluster's registry to the **replicated** index set (rebuilding
     // the edge-local Query/Scan key index + GSI machinery from the catalog, not from
     // the request's declarations — so the source of truth is the committed catalog).

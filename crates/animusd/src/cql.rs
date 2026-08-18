@@ -612,6 +612,15 @@ async fn run_statement(
                     if let Err(msg) = ctx.provision_tablet(&control_name).await {
                         return response::error(stream, response::ERR_SERVER, &msg);
                     }
+                    // A CREATED result must mean the client's first INSERT serves
+                    // promptly — same ack-vs-tablet-ready race as the DynamoDB
+                    // edge's `CreateTable` (see `ClientCtx::await_table_serveable`):
+                    // the metadata commit above races the group's asynchronous
+                    // formation/election, so wait for it to actually serve before
+                    // replying.
+                    if let Err(msg) = ctx.await_table_serveable(&control_name).await {
+                        return response::error(stream, response::ERR_SERVER, &msg);
+                    }
                     response::schema_change_result(stream, "CREATED", "TABLE", &keyspace, &ct.table)
                 }
                 Err(msg) => response::error(stream, response::ERR_INVALID, &msg),

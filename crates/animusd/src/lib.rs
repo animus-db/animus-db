@@ -8036,6 +8036,59 @@ impl ClientCtx {
         }
     }
 
+    /// Wait until `table`'s just-provisioned tablet can actually **serve** a
+    /// request, by issuing a linearizable probe read through the ordinary
+    /// [`cp_read`](Self::cp_read) routing machinery (ReadIndex on the group
+    /// leader, local or forwarded) until it succeeds — a converged-or-timeout
+    /// poll, never a fixed sleep.
+    ///
+    /// [`provision_tablet`](Self::provision_tablet) deliberately confirms only
+    /// the **metadata** commit; the tablet's Raft group then forms and elects
+    /// asynchronously (each replica's tablet-host reconciler, ADR 0031). A
+    /// caller that *acks table creation to a client* (the DynamoDB
+    /// `CreateTable` / CQL `CREATE TABLE` edges) must call this before
+    /// replying, or the ack races the formation window: the client's
+    /// immediately-following first write only lands via the election-wait
+    /// machinery (`cp_forward`'s backoff pass / the local
+    /// `RouteDecision::Wait`) and, under unlucky timing, can burn much of its
+    /// own `CLIENT_TIMEOUT` or fail outright. First-*write* auto-provision
+    /// paths (`cp_kind_write_item`, `fast_marker_write`, …) need no such call
+    /// — their own op routes through `cp_route`, which already waits.
+    ///
+    /// The probe key is the empty key: a freshly-provisioned table has one
+    /// tablet over the whole ring (`KeyRange::whole()`), whose range contains
+    /// every key, so the probe routes to it without minting a token-prefixed
+    /// key — and a served read of an absent key still proves the full path
+    /// (leader elected, ReadIndex barrier satisfied) that a first write needs.
+    /// A ReadIndex success requires the leader to confirm quorum contact, so
+    /// "readable" here implies "can commit a write promptly" too.
+    ///
+    /// On timeout the table + tablet already exist (both commits confirmed
+    /// upstream) — the error only means the group did not become serveable
+    /// within the budget, exactly the state a retried data op's own routing
+    /// wait would then contend with.
+    pub(crate) async fn await_table_serveable(&self, table: &str) -> Result<(), String> {
+        // One `cp_read` is already internally bounded (`cp_route`'s wait and
+        // `cp_forward`'s election backoff are both capped by `CLIENT_TIMEOUT`),
+        // but it can surface a non-retryable-shaped transient early (e.g. a
+        // forwarding hop's transport error mid-formation) — so wrap it in the
+        // house converged-or-timeout retry loop with its own overall deadline.
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            let err = match self.cp_read(table, Vec::new()).await {
+                Ok(_) => return Ok(()),
+                Err(e) => e,
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "table `{table}` was created but its tablet did not become \
+                     serveable in time: {err}"
+                ));
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
     /// Serve a **forwarded** CP op locally: this node must lead the op's tablet (it
     /// does not re-forward — bounding routing to one hop). The op's `(table, key)`
     /// resolves to its owning tablet, then to that tablet's leader on this node.
