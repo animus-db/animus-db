@@ -669,6 +669,28 @@ debugging anything that feels like it might have happened before.
   surfaced it, at low depth every run happened to avoid the race window.
   (`animus-cp-data/tests/reconciler_corpus.rs::remove_replica_for_real`,
   `scenario_partition_blocks_release`.)
+- **A liveness test's *background workload* must be a well-behaved Raft
+  client too, whenever its convergence assert demands every command commit —
+  fire-and-forget proposing is only acceptable when the assert doesn't count
+  the commands.** The sustained-churn `ProdEnv` liveness test dripped 300
+  `propose(..)` calls with the result discarded, then asserted all 300
+  members converged; one mid-churn leadership transition (explicitly within
+  the test's own `MAX_TRANSITIONS` tolerance!) silently dropped the ~34
+  commands proposed across it — `NotLeader` returns were never retried, and
+  appended-but-superseded entries have no propose-time signal at all — so
+  all three nodes sat flat at 266/300 for the entire 20s budget (issue
+  #269). The flat-count shape is the diagnostic: slow I/O shows *progress*
+  across the poll; identical, motionless counts mean the commands were never
+  committed, and no budget bump can fix that. The fix is the two-sided
+  client discipline the production entries above already prescribe, applied
+  to the workload loop: retry `NotLeader` against the re-resolved leader
+  (never-accepted, retry is free), and confirm commits against the acting
+  leader's *applied* state, re-proposing what it lacks (accepted-unconfirmed
+  — safe here because the command is idempotent). Note the tension this
+  resolved: a test that *tolerates* N leadership transitions while asserting
+  exact convergence is inconsistent unless its proposer survives those
+  transitions. (`animus-control/tests/prod_liveness.rs::
+  sustained_metadata_churn_over_a_real_engine_stays_live`.)
 - **`RaftKvNode::linearizable_get`/`linearizable_scan` only ever serve on the
   confirmed leader — calling them on a follower returns `None` unconditionally
   (the ReadIndex ban unconditionally fails for a non-leader), not a slow or
@@ -2351,6 +2373,28 @@ debugging anything that feels like it might have happened before.
   never engages, that tuning is the test's own blind spot — add the dual
   with the knobs inverted (`animusd`
   `tests/stream_backfill_seed_filter.rs`, the paired open/sealed tests).
+- **When a filed race note "does not reproduce," the deliverable is a test
+  pinning the specific guard arm that closes it — found by asking "which
+  exact check makes each interleaving in the note impossible?", then
+  red-proving that check** (2026-08-17, issue #266). A planning-time note
+  flagged a residual cross-node LSI orphan-row race beyond the ADR 0046 U3
+  funnel; re-verifying against the landed `TxnStage` stack showed three
+  guards jointly close it — `KindBatch.conditions`' unresolved-intent arm
+  (an intent is never a match), `TxnStage`'s C1 mandatory own-key OCC +
+  foreign-intent block, and `TxnResolve` materializing kind writes from
+  the intent-on-the-key only while that intent still stands. But the
+  first of those arms — the one the note's own scenario turns on — had
+  ZERO coverage (`kind_batch_conditions.rs` only ever exercised
+  committed-value/absence conditions), so "closed" rested on code
+  reading alone. The pinning test was cheap (stage an intent, land a
+  stale conditioned batch astride it, resolve, assert exactly one
+  derived row), and sabotaging the arm (`Intent => true`) proved it red.
+  General form: "verified closed" without a red-provable test for the
+  closing check is a claim about today's tree, not a regression
+  guarantee — and the *arm-level* gap hides easily because the
+  surrounding mechanism is otherwise well-tested.
+  (`animus-cp-data/tests/txn_kind_writes.rs`,
+  `animusd/tests/dynamo_index_writes.rs`.)
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
@@ -6106,6 +6150,32 @@ debugging anything that feels like it might have happened before.
   key-ordered scan a positional resume cursor, ask what order NEW entries
   arrive in — if insertion order ≠ scan order, a positional cursor is a
   silent-loss bug.
+- **A success ack that confirms a metadata commit does not confirm the
+  asynchronous machinery that commit triggers — a client-facing "created"
+  reply must wait for *serveability*, not hand the client the formation
+  window.** `CreateTable`'s 200 (DynamoDB edge; CQL's `CREATED` result had
+  the identical shape) waited only for the `CreateTableSchema`/
+  `CreateTablet` commits; the tablet's Raft group then forms and elects
+  asynchronously (each replica's tablet-host reconciler → election, ≥ one
+  election timeout), so a client's immediately-following first write landed
+  inside that window and only succeeded via the election-wait machinery
+  (`cp_forward`'s backoff pass / the local `RouteDecision::Wait`) — burning
+  much of `CLIENT_TIMEOUT`, or failing outright, under unlucky timing. The
+  root fix is a converged-or-timeout wait on the *served* property itself
+  (`ClientCtx::await_table_serveable`: a linearizable probe read through
+  the ordinary routing machinery — ReadIndex success implies an elected
+  leader with quorum contact, so "readable" covers "can commit a write
+  promptly" too), never a longer client timeout, and never a wait on a
+  *proxy* (leader-hint gossip, reconciler state) that can diverge from what
+  a real routed request experiences. The regression test's load-bearing
+  assertion is deliberately **one-shot at ack time**
+  (`tests/create_table_ready.rs`): the property under test is "already
+  true when the reply arrives", so a poll there would mask exactly the
+  race being pinned — the inverse of the usual converged-or-timeout rule,
+  which governs *eventual* properties, not ack-implied ones. General form:
+  when an API reply means "you can now use X", the reply path must itself
+  exercise X the way a client would; auto-provision paths whose own next
+  op already rides the waiting machinery (`cp_route`) need no such gate.
 
 ### Parallel-agent orchestration
 - **`gh stack checkout <N>` silently switches the CURRENT worktree's checked-
@@ -6820,3 +6890,62 @@ debugging anything that feels like it might have happened before.
   with total size rather than recent activity; a bench with a
   continuous-load client answers both where burst-shaped e2es answer
   neither.
+
+- **"Sweep for the retry-amplification shape" has to be re-run every time a
+  new hand-rolled propose loop lands — the sweep's own corollary caught its
+  third instance** (issue #268, 2026-08-17). `ClientCtx::provision_tablet`
+  re-proposed `CreateTablet`/`SetTabletPolicy` on every 50ms poll tick for
+  its whole 10s commit budget, exactly the unpaced shape `propose_and_await`
+  fixed one layer up ("the pattern's most common instance was hiding one
+  layer below") — measured at 264 `CreateTablet` + 240 `SetTabletPolicy`
+  proposals for six tables' worth of first-put provisioning under a
+  deliberately slowed (~80ms-fsync) disk, each duplicate a real control-log
+  append fsynced and replicated under exactly the slow-commit conditions
+  that made the wait long. On a starved 2-vCPU CI runner this
+  self-amplification is what turned "commit is slow" into "provision burns
+  its whole 10s budget, twice in a row" — the direct mechanism behind
+  cp_txn.rs's 25s seed-put flake. Fixed with the same
+  `SCHEMA_PROPOSE_PATIENCE` pacing (inline, not via `propose_and_await`,
+  because the create arm must re-derive its allocator id + replica set
+  fresh per proposal — the `trigger_split` stale-allocator lesson — and the
+  needed command switches to `SetTabletPolicy` mid-loop); regression:
+  `tests/provision_propose_pacing.rs`, which pins the leader's own log
+  growth while provisioning grinds against a quorumless control plane.
+  **Known remaining instances of the shape, deliberately left for their own
+  PR** (they are not on the flake's path): `dynamo.rs`'s seven hand-rolled
+  propose-then-poll loops (`create_table`'s schema + per-index waits,
+  `enable_stream`/`disable_stream`, `create_index`, `set_index_status`,
+  `drop_table_index`) — all fixed-command loops that could ride
+  `propose_and_await` directly — and, pathological-state-only,
+  `detect_loop`'s per-tick re-propose of an uncommittable liveness
+  transition (visible while a control plane has lost quorum, i.e. while
+  nothing can commit anyway; bounded by member count per tick).
+
+- **A propose-then-confirm loop must end its wait the moment confirmation
+  is provably futile, not "wait out the client timeout, which is correct"**
+  (issue #268, 2026-08-17). The CP write confirm loops (`cp_put_local`/
+  `cp_delete_local`/`cp_batch_local`/`cp_kind_local`/`cp_kind_raw_local`)
+  polled value-equality for the full 10s `CLIENT_TIMEOUT` whenever an
+  *accepted* entry's effect never appeared — a deposed leader's truncated
+  entry, a freeze/seal apply-time no-op, a failed `KindBatch` condition.
+  Each such attempt is a 10s client-visible stall, and the caller's retry
+  then starts another: under the brief election churn a starved CI
+  runner's slow fsyncs produce, two stacked burns exceeded cp_txn.rs's
+  whole 25s put budget (observed live as an 11s "kind batch did not apply
+  in time" attempt whose immediate retry succeeded in milliseconds).
+  `animus-cp-data`'s own `wait_stage_outcome` already had the right shape
+  (`!is_leader()` bails immediately); the animusd confirm loops now share
+  it via `ClientCtx::confirm_wait_is_futile` — futile once
+  `engine_applied_index() >= accepted_index` without the effect (sound
+  because the apply task advances `engine_applied` only after merges are
+  readable, and any re-elected leader's no-op pushes apply past a
+  truncated index promptly) or once `!is_leader()`. **The coarse signal
+  only ever ends a wait with a retryable error, never acks one** — success
+  still requires exact effect equality (the false-ack hazard
+  `cp_put_local`'s doc spells out is unchanged). Regression:
+  `confirm_futility_tests` (in-crate, `cargo test -p animusd --lib`) — a
+  condition-failed `KindBatch` no-ops at apply and must surface as a fast
+  `"; retry"` error, not a 10s generic timeout. General form: when a
+  confirm poll can distinguish "still in flight" from "can no longer
+  land," burning the full timeout on the latter converts transient churn
+  into stacked client stalls that read as unavailability.

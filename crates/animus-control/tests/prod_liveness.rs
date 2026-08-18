@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use animus_control::{MetaCommand, NodeStatus, RaftNode};
+use animus_control::{MetaCommand, NodeStatus, ProposeResult, RaftNode};
 use animus_env::{Env, NodeId, ProdEnv, nid};
 use animus_storage::{LsmEngine, MemoryEngine};
 use tokio::time::{sleep, timeout};
@@ -225,6 +225,16 @@ const CHURN_INTERVAL: Duration = Duration::from_millis(10);
 /// (the tighter "stayed stable throughout," not just "didn't run away"
 /// signal); and (b) every node's published cache converges on all churned
 /// commands within a bounded deadline.
+///
+/// Because (b) demands **every** churned command commit, the churn drip must
+/// be a *well-behaved Raft client*, not a fire-and-forget one (issue #269,
+/// the lessons-log retry discipline): a `NotLeader` return is retried
+/// against the re-resolved leader, and a proposal `Accepted` by a leader
+/// deposed before replicating it (appended-but-superseded — invisible at
+/// propose time) is caught and re-proposed by the confirm-and-repair pass
+/// in the convergence loop below. A leadership transition mid-churn is
+/// within this test's tolerances (`MAX_TRANSITIONS`), so losing the
+/// handful of commands proposed across one must not fail convergence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn sustained_metadata_churn_over_a_real_engine_stays_live() {
     const MAX_TERM_DELTA: u64 = 20;
@@ -291,43 +301,94 @@ async fn sustained_metadata_churn_over_a_real_engine_stays_live() {
         let mut transitions = 0u32;
         let mut last_leader_term = term_start;
         for i in 0..CHURN_COMMANDS {
-            if !nodes[leader_idx].is_leader() {
-                leader_idx = leader_of(&nodes)
-                    .await
-                    .unwrap_or_else(|| panic!("no leader mid-churn at command {i}"));
-            }
-            let term_now = nodes[leader_idx].term();
-            if term_now != last_leader_term {
-                transitions += 1;
-                last_leader_term = term_now;
-            }
-            nodes[leader_idx].propose(MetaCommand::UpsertMember {
+            let cmd = MetaCommand::UpsertMember {
                 node: nid(1_000 + i),
                 labels: BTreeMap::new(),
                 // `Joining`, not `Active` — see `fat_member`'s doc above:
                 // the failure detector never judges this status, so this
                 // pure churn workload can't trip an unrelated `Down` storm.
                 status: NodeStatus::Joining,
-            });
+            };
+            // Fold the whole "find leader → propose" sequence into one
+            // bounded retry poll (lessons log): leadership can move *between*
+            // the `is_leader()` check and the propose, and an armed transfer
+            // freezes proposals on a still-leader — both surface as
+            // `NotLeader`, a routine race to retry through, not a failure.
+            let mut accepted = false;
+            for _attempt in 0..100 {
+                if !nodes[leader_idx].is_leader() {
+                    leader_idx = leader_of(&nodes)
+                        .await
+                        .unwrap_or_else(|| panic!("no leader mid-churn at command {i}"));
+                }
+                let term_now = nodes[leader_idx].term();
+                if term_now != last_leader_term {
+                    transitions += 1;
+                    last_leader_term = term_now;
+                }
+                match nodes[leader_idx].propose(cmd.clone()) {
+                    ProposeResult::Accepted { .. } => {
+                        accepted = true;
+                        break;
+                    }
+                    ProposeResult::NotLeader { .. } => sleep(Duration::from_millis(50)).await,
+                }
+            }
+            assert!(
+                accepted,
+                "churn command {i} was never accepted by any leader"
+            );
             sleep(CHURN_INTERVAL).await;
         }
         let churn_secs = churn_started.elapsed().as_secs_f64();
         let term_after_churn = nodes.iter().map(|n| n.term()).max().unwrap();
         let delta = term_after_churn.saturating_sub(term_start);
 
-        // --- Convergence: every node's apply-task-published cache reflects
-        // all CHURN_COMMANDS churned members within a bounded deadline —
-        // real engine I/O (fsync/compaction) is slower than `MemoryEngine`,
-        // so this budget is generous (20s) to stay non-flaky on a busy box.
+        // --- Convergence + repair: every node's apply-task-published cache
+        // reflects all CHURN_COMMANDS churned members within a bounded
+        // deadline — real engine I/O (fsync/compaction) is slower than
+        // `MemoryEngine`, so this budget is generous (20s) to stay non-flaky
+        // on a busy box.
+        //
+        // `Accepted` means "appended on the then-leader," never "committed"
+        // (lessons log): a proposal appended just before a leadership
+        // transition can be superseded and vanish with no signal at propose
+        // time (issue #269 — all three nodes flat at 266/300 for the full
+        // budget after exactly one mid-churn transition). The well-behaved
+        // client's answer is confirm-and-repair: watch the *current
+        // leader's* applied cache and re-propose whatever it still lacks.
+        // `UpsertMember` is idempotent, so re-proposing a committed-but-not-
+        // yet-applied member is harmless; the ~500ms cadence gives a merely
+        // slow apply task time to publish before being re-proposed at.
         let convergence_started = std::time::Instant::now();
         let mut converged = false;
-        for _ in 0..400 {
+        let mut repairs = 0u64;
+        for round in 0..400u32 {
             if nodes
                 .iter()
                 .all(|n| n.metadata().members.len() as u64 >= CHURN_COMMANDS)
             {
                 converged = true;
                 break;
+            }
+            if round % 10 == 9
+                && let Some(li) = nodes.iter().position(|n| n.is_leader())
+            {
+                let present = nodes[li].metadata().members;
+                for i in 0..CHURN_COMMANDS {
+                    if !present.contains_key(&nid(1_000 + i))
+                        && matches!(
+                            nodes[li].propose(MetaCommand::UpsertMember {
+                                node: nid(1_000 + i),
+                                labels: BTreeMap::new(),
+                                status: NodeStatus::Joining,
+                            }),
+                            ProposeResult::Accepted { .. }
+                        )
+                    {
+                        repairs += 1;
+                    }
+                }
             }
             sleep(Duration::from_millis(50)).await;
         }
@@ -338,7 +399,8 @@ async fn sustained_metadata_churn_over_a_real_engine_stays_live() {
             "sustained real-engine churn: {CHURN_COMMANDS} commands over {churn_secs:.2}s, \
              control term Δ{delta} (start={term_start}, after={term_after_churn}), \
              {transitions} leadership transition(s) observed during churn, \
-             converged={converged} in {convergence_secs:.2}s (member counts={member_counts:?})"
+             converged={converged} in {convergence_secs:.2}s with {repairs} repair \
+             re-proposal(s) (member counts={member_counts:?})"
         );
 
         assert!(

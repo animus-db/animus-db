@@ -1049,6 +1049,17 @@ enum CpRoute {
     None,
 }
 
+/// How a [`ClientCtx::poll_probe`] confirm wait ended: the probed effect
+/// appeared (`Confirmed`), the wait became provably futile before the
+/// deadline (`Superseded` — see [`ClientCtx::confirm_wait_is_futile`]), or
+/// the deadline elapsed with the accepted entry still plausibly in flight
+/// (`TimedOut`).
+enum ProbeWait {
+    Confirmed,
+    Superseded,
+    TimedOut,
+}
+
 /// The point-in-time outcome of
 /// [`ClientCtx::cp_get_local_snapshot`]/[`ClientCtx::cp_read_snapshot`] (ADR
 /// 0018 §2, the torn-pair-fix stack's PR2 amendment) — see those methods'
@@ -5740,10 +5751,11 @@ impl ClientCtx {
         else {
             return Ok(()); // empty batch is a no-op
         };
-        match leader.put_kind_batch_conditioned(writes, change_log, Vec::new()) {
-            ProposeResult::Accepted { .. } => {}
+        let accepted_index = match leader.put_kind_batch_conditioned(writes, change_log, Vec::new())
+        {
+            ProposeResult::Accepted { index } => index,
             other => return Err(format!("kind write not accepted: {other:?}")),
-        }
+        };
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         // The same exponential confirm back-off `cp_put_local` uses — NOT the
         // drain's old flat 10ms sleep. This is a client hot path since ADR
@@ -5755,6 +5767,18 @@ impl ClientCtx {
         while tokio::time::Instant::now() < deadline {
             if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
                 return Ok(());
+            }
+            if Self::confirm_wait_is_futile(leader, accepted_index) {
+                // Close the probe-vs-apply race: the entry may have applied
+                // between the probe above and the futility read.
+                if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
+                    return Ok(());
+                }
+                return Err(
+                    "kind batch superseded before its effect appeared (leadership churn \
+                     or an apply-time no-op); retry"
+                        .into(),
+                );
             }
             tokio::time::sleep(poll).await;
             poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
@@ -5806,15 +5830,24 @@ impl ClientCtx {
                 return Err("kind write outside this group's live range; retry".into());
             }
         }
-        match leader.put_kind_batch_conditioned(writes, change_log, conditions) {
-            ProposeResult::Accepted { .. } => {}
+        let accepted_index = match leader.put_kind_batch_conditioned(writes, change_log, conditions)
+        {
+            ProposeResult::Accepted { index } => index,
             other => return Err(format!("kind write not accepted: {other:?}")),
-        }
+        };
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-        if Self::poll_probe(leader, &probe_key, &probe_val, deadline).await {
-            Ok(())
-        } else {
-            Err("CP kind write did not commit in time".into())
+        match Self::poll_probe(leader, accepted_index, &probe_key, &probe_val, deadline).await {
+            ProbeWait::Confirmed => Ok(()),
+            // A failed own-key `conditions` entry lands here too: the entry
+            // applies as a silent no-op (see `KindBatch.conditions`' doc in
+            // `animus-cp-data`), so "superseded" is the caller's cue to
+            // re-read and re-evaluate — the ordinary OCC retry round.
+            ProbeWait::Superseded => Err(
+                "CP kind write superseded before its effect appeared (leadership churn, an \
+                 apply-time no-op, or a failed write condition); retry"
+                    .into(),
+            ),
+            ProbeWait::TimedOut => Err("CP kind write did not commit in time".into()),
         }
     }
 
@@ -5858,7 +5891,7 @@ impl ClientCtx {
     fn cp_batch_propose(
         leader: &CpGroup,
         group: Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<Option<KvPair>, String> {
+    ) -> Result<Option<(u64, KvPair)>, String> {
         Self::frozen_refusal(leader)?;
         let probe = group.last().cloned();
         let fence = leader.scope_range();
@@ -5868,26 +5901,74 @@ impl ClientCtx {
             ));
         }
         match leader.put_batch(group) {
-            ProposeResult::Accepted { .. } => Ok(probe),
+            ProposeResult::Accepted { index } => Ok(probe.map(|p| (index, p))),
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
         }
     }
 
+    /// Whether waiting any longer for `accepted_index`'s effect to appear can
+    /// still succeed — the confirm-side dual of `RaftKvNode::
+    /// wait_stage_outcome`'s own `!is_leader()` bail (ADR 0018 §2). Two
+    /// futility signals, either of which ends the wait:
+    ///
+    /// - **The group has applied past the accepted entry's own log index
+    ///   without the probed effect appearing** (the caller re-probes once
+    ///   after this returns `true`, closing the probe-vs-apply race):
+    ///   whatever occupied that log position either no-opped at apply (a
+    ///   freeze/seal miss, a failed `KindBatch` condition) or is a different
+    ///   entry entirely (the accepted one was truncated by a leadership
+    ///   change, and the new leader's election no-op has already applied
+    ///   past it). Either way the effect will never appear from *this*
+    ///   propose — only a fresh retry can land it. Sound because the apply
+    ///   task advances `engine_applied` only after the entries it covers are
+    ///   merged and readable (see `animus-cp-data`'s apply-loop doc).
+    /// - **This node no longer leads the group**: the accepted entry may yet
+    ///   commit under the new leader (a retry is then a harmless idempotent
+    ///   duplicate — per-key LWW converges), or it may have been truncated —
+    ///   this node cannot tell which within bounded time, and the caller's
+    ///   retry re-resolves routing to wherever the leader now is.
+    ///
+    /// These confirm loops used to poll out the full [`CLIENT_TIMEOUT`] in
+    /// both states ("we time out, which is correct: the write did not
+    /// commit") — correct, but a 10s client-visible stall *per attempt*
+    /// under leadership churn, which is exactly what a resource-starved CI
+    /// runner's slow fsyncs produce (issue #268: two such burns exceed a
+    /// test's whole 25s put budget; the stall also hits real clients). A
+    /// futile wait now fails fast with the house retryable-error shape so
+    /// the caller's own retry loop makes progress instead. **Success still
+    /// requires exact effect equality** — this coarser signal only ever ends
+    /// a wait, never acks one (the false-ack hazard `cp_put_local`'s doc
+    /// spells out).
+    fn confirm_wait_is_futile(leader: &CpGroup, accepted_index: u64) -> bool {
+        leader.engine_applied_index() >= accepted_index || !leader.is_leader()
+    }
+
     /// Poll `leader`'s local engine for `probe_key` to reflect `probe_val` until
     /// `deadline` — the durable-before-ack confirm wait shared by every CP write
-    /// path (mirrors [`cp_put_local`](Self::cp_put_local)).
+    /// path (mirrors [`cp_put_local`](Self::cp_put_local)). Ends early, with
+    /// [`ProbeWait::Superseded`], once [`confirm_wait_is_futile`](Self::
+    /// confirm_wait_is_futile) says the accepted entry's effect can no longer
+    /// appear.
     async fn poll_probe(
         leader: &CpGroup,
+        accepted_index: u64,
         probe_key: &[u8],
         probe_val: &[u8],
         deadline: tokio::time::Instant,
-    ) -> bool {
+    ) -> ProbeWait {
         loop {
             if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
-                return true;
+                return ProbeWait::Confirmed;
+            }
+            if Self::confirm_wait_is_futile(leader, accepted_index) {
+                // Close the probe-vs-apply race before giving up.
+                if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
+                    return ProbeWait::Confirmed;
+                }
+                return ProbeWait::Superseded;
             }
             if tokio::time::Instant::now() >= deadline {
-                return false;
+                return ProbeWait::TimedOut;
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
@@ -5904,14 +5985,19 @@ impl ClientCtx {
         leader: &CpGroup,
         group: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
-        let Some((probe_key, probe_val)) = Self::cp_batch_propose(leader, group)? else {
+        let Some((accepted_index, (probe_key, probe_val))) = Self::cp_batch_propose(leader, group)?
+        else {
             return Ok(());
         };
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-        if Self::poll_probe(leader, &probe_key, &probe_val, deadline).await {
-            Ok(())
-        } else {
-            Err("CP batch write did not commit in time".into())
+        match Self::poll_probe(leader, accepted_index, &probe_key, &probe_val, deadline).await {
+            ProbeWait::Confirmed => Ok(()),
+            ProbeWait::Superseded => Err(
+                "CP batch write superseded before its effect appeared (leadership churn or an \
+                 apply-time no-op); retry"
+                    .into(),
+            ),
+            ProbeWait::TimedOut => Err("CP batch write did not commit in time".into()),
         }
     }
 
@@ -7580,8 +7666,11 @@ impl ClientCtx {
     /// (durable-before-visible in `animus-cp-data`), so the leader's local read
     /// reflecting our value means it is durable. A per-write quorum barrier would
     /// not scale under concurrent load. (If we lose leadership before commit, the
-    /// entry is truncated and never appears locally → we time out, which is
-    /// correct: the write did not commit.)
+    /// entry may be truncated and never appear locally — the confirm loop then
+    /// ends early via [`confirm_wait_is_futile`](Self::confirm_wait_is_futile)
+    /// with a retryable error rather than polling out the whole
+    /// [`CLIENT_TIMEOUT`]: the write did not confirm, and the caller's retry
+    /// re-resolves routing.)
     ///
     /// **Pre-propose range check (ADR 0028 write fences).** `cp_route` can hand
     /// us a `Local` leader off a stale `Metadata` view during a split's
@@ -7594,9 +7683,11 @@ impl ClientCtx {
     /// success on a coarser signal than exact value equality (e.g. "has this
     /// index applied yet" — a no-op still advances that watermark) it would
     /// **falsely ack** a write that never actually landed anywhere. This confirm
-    /// loop happens to poll value equality, which degrades that hazard to "waits
-    /// out `CLIENT_TIMEOUT` and returns an error" rather than a false ack — but
-    /// that is a property of *this* poll, not a defense to rely on, so the
+    /// loop polls value equality (success is never keyed on the coarser
+    /// applied-index signal — [`confirm_wait_is_futile`](Self::
+    /// confirm_wait_is_futile) only ever ends a wait *early with an error*),
+    /// which degrades that hazard to "returns a retryable error" rather than a
+    /// false ack — but that is a property of *this* poll, not a defense to rely on, so the
     /// explicit pre-check below is the actual guard: reject an out-of-range key
     /// **before proposing at all**, in the same `Err` shape as the `NotLeader`
     /// case, so the caller (`cp_write`) sees an ordinary routing failure and its
@@ -7618,12 +7709,23 @@ impl ClientCtx {
             );
         }
         match leader.put(key.clone(), value.clone()) {
-            ProposeResult::Accepted { .. } => {
+            ProposeResult::Accepted { index } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
                 let mut poll = CP_CONFIRM_POLL_INIT;
                 loop {
                     if leader.local_get(&key).await.as_deref() == Some(value.as_slice()) {
                         return Ok(());
+                    }
+                    if Self::confirm_wait_is_futile(leader, index) {
+                        // Close the probe-vs-apply race before giving up.
+                        if leader.local_get(&key).await.as_deref() == Some(value.as_slice()) {
+                            return Ok(());
+                        }
+                        return Err(
+                            "CP write superseded before its effect appeared (leadership churn \
+                             or an apply-time no-op); retry"
+                                .into(),
+                        );
                     }
                     if tokio::time::Instant::now() >= deadline {
                         return Err("CP write did not commit in time".into());
@@ -7657,12 +7759,23 @@ impl ClientCtx {
             );
         }
         match leader.delete(key.clone()) {
-            ProposeResult::Accepted { .. } => {
+            ProposeResult::Accepted { index } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
                 let mut poll = CP_CONFIRM_POLL_INIT;
                 loop {
                     if leader.local_get(&key).await.is_none() {
                         return Ok(());
+                    }
+                    if Self::confirm_wait_is_futile(leader, index) {
+                        // Close the probe-vs-apply race before giving up.
+                        if leader.local_get(&key).await.is_none() {
+                            return Ok(());
+                        }
+                        return Err(
+                            "CP delete superseded before its effect appeared (leadership churn \
+                             or an apply-time no-op); retry"
+                                .into(),
+                        );
                     }
                     if tokio::time::Instant::now() >= deadline {
                         return Err("CP delete did not commit in time".into());
@@ -7962,6 +8075,28 @@ impl ClientCtx {
     /// one `CreateTablet` per table, so concurrent callers converge on one tablet.
     pub(crate) async fn provision_tablet(&self, table: &str) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        // Propose-side patience (the `propose_and_await` discipline — see the
+        // retry-amplification entries in `docs/engineering-lessons.md`): the
+        // *poll* below stays at `SCHEMA_POLL_INTERVAL` so a commit is observed
+        // promptly, but a command believed to have reached a leader's log is
+        // not re-proposed until `SCHEMA_PROPOSE_PATIENCE` elapses. This loop
+        // used to re-propose on every 50ms poll tick, appending a duplicate
+        // control-log entry each time — harmless to apply (`CreateTablet` is
+        // first-committer-wins per table) but real WAL/replication/apply work
+        // piled onto the control plane under exactly the slow-commit
+        // conditions that make this wait long in the first place (measured on
+        // a deliberately slowed disk: a six-table concurrent bring-up
+        // proposed `CreateTablet` 264 times and `SetTabletPolicy` 240 times
+        // for what should be ~6+6 — the self-amplification behind issue
+        // #268's 25s seed-put flake on starved CI runners). It cannot simply
+        // ride `propose_and_await`: the create arm must re-derive its tablet
+        // id and replica set from fresh metadata per proposal (the
+        // `trigger_split` stale-allocator lesson), and the needed command
+        // switches to `SetTabletPolicy` once the tablet exists — hence an
+        // inline pacer, reset on the phase switch so the policy proposal is
+        // not held back by the create proposal's own patience window.
+        let mut next_propose_at = tokio::time::Instant::now();
+        let mut last_proposed_create: Option<bool> = None;
         loop {
             // Fresh, not `metadata_cached()` (ADR 0035 PR4): the "no tablet
             // yet" branch below picks the tablet's *initial* replica set from
@@ -8004,11 +8139,22 @@ impl ClientCtx {
                 if meta.policies.contains_key(&tablet) {
                     return Ok(());
                 }
-                self.propose_schema(&MetaCommand::SetTabletPolicy {
-                    tablet,
-                    policy: Some(PlacementPolicy::simple("cp-rf", MAX_REPLICATION_FACTOR)),
-                })
-                .await;
+                let now = tokio::time::Instant::now();
+                if last_proposed_create != Some(false) || now >= next_propose_at {
+                    let sent = self
+                        .propose_schema(&MetaCommand::SetTabletPolicy {
+                            tablet,
+                            policy: Some(PlacementPolicy::simple("cp-rf", MAX_REPLICATION_FACTOR)),
+                        })
+                        .await;
+                    last_proposed_create = Some(false);
+                    next_propose_at = now
+                        + if sent {
+                            SCHEMA_PROPOSE_PATIENCE
+                        } else {
+                            Duration::ZERO
+                        };
+                }
             } else {
                 // No tablet yet: pick the first min(N, RF) Active CP members and
                 // propose its creation toward the control leader.
@@ -8019,18 +8165,86 @@ impl ClientCtx {
                     .map(|(id, _)| id.clone())
                     .collect();
                 replicas.truncate(MAX_REPLICATION_FACTOR);
-                if !replicas.is_empty() {
-                    self.propose_schema(&MetaCommand::CreateTablet {
-                        tablet: meta.next_free_tablet_id(),
-                        table: Some(table.to_owned()),
-                        range: KeyRange::whole(),
-                        replicas,
-                    })
-                    .await;
+                let now = tokio::time::Instant::now();
+                if !replicas.is_empty()
+                    && (last_proposed_create != Some(true) || now >= next_propose_at)
+                {
+                    // The id and replica set are re-derived fresh per
+                    // (re)proposal, never captured once outside the loop — a
+                    // stale allocator-derived id is the `trigger_split`
+                    // collision lesson (`docs/engineering-lessons.md`).
+                    let sent = self
+                        .propose_schema(&MetaCommand::CreateTablet {
+                            tablet: meta.next_free_tablet_id(),
+                            table: Some(table.to_owned()),
+                            range: KeyRange::whole(),
+                            replicas,
+                        })
+                        .await;
+                    last_proposed_create = Some(true);
+                    next_propose_at = now
+                        + if sent {
+                            SCHEMA_PROPOSE_PATIENCE
+                        } else {
+                            Duration::ZERO
+                        };
                 }
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err("table tablet did not provision in time".into());
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Wait until `table`'s just-provisioned tablet can actually **serve** a
+    /// request, by issuing a linearizable probe read through the ordinary
+    /// [`cp_read`](Self::cp_read) routing machinery (ReadIndex on the group
+    /// leader, local or forwarded) until it succeeds — a converged-or-timeout
+    /// poll, never a fixed sleep.
+    ///
+    /// [`provision_tablet`](Self::provision_tablet) deliberately confirms only
+    /// the **metadata** commit; the tablet's Raft group then forms and elects
+    /// asynchronously (each replica's tablet-host reconciler, ADR 0031). A
+    /// caller that *acks table creation to a client* (the DynamoDB
+    /// `CreateTable` / CQL `CREATE TABLE` edges) must call this before
+    /// replying, or the ack races the formation window: the client's
+    /// immediately-following first write only lands via the election-wait
+    /// machinery (`cp_forward`'s backoff pass / the local
+    /// `RouteDecision::Wait`) and, under unlucky timing, can burn much of its
+    /// own `CLIENT_TIMEOUT` or fail outright. First-*write* auto-provision
+    /// paths (`cp_kind_write_item`, `fast_marker_write`, …) need no such call
+    /// — their own op routes through `cp_route`, which already waits.
+    ///
+    /// The probe key is the empty key: a freshly-provisioned table has one
+    /// tablet over the whole ring (`KeyRange::whole()`), whose range contains
+    /// every key, so the probe routes to it without minting a token-prefixed
+    /// key — and a served read of an absent key still proves the full path
+    /// (leader elected, ReadIndex barrier satisfied) that a first write needs.
+    /// A ReadIndex success requires the leader to confirm quorum contact, so
+    /// "readable" here implies "can commit a write promptly" too.
+    ///
+    /// On timeout the table + tablet already exist (both commits confirmed
+    /// upstream) — the error only means the group did not become serveable
+    /// within the budget, exactly the state a retried data op's own routing
+    /// wait would then contend with.
+    pub(crate) async fn await_table_serveable(&self, table: &str) -> Result<(), String> {
+        // One `cp_read` is already internally bounded (`cp_route`'s wait and
+        // `cp_forward`'s election backoff are both capped by `CLIENT_TIMEOUT`),
+        // but it can surface a non-retryable-shaped transient early (e.g. a
+        // forwarding hop's transport error mid-formation) — so wrap it in the
+        // house converged-or-timeout retry loop with its own overall deadline.
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            let err = match self.cp_read(table, Vec::new()).await {
+                Ok(_) => return Ok(()),
+                Err(e) => e,
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "table `{table}` was created but its tablet did not become \
+                     serveable in time: {err}"
+                ));
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
@@ -13391,6 +13605,165 @@ mod auto_split_median_tests {
         let pairs = vec![pair("a", 100_000), pair("b", 1), pair("c", 1)];
         let split = byte_weighted_median(&pairs);
         assert_ne!(split, b"a".to_vec(), "must not return the first key");
+    }
+}
+
+/// Regression tests for [`ClientCtx::confirm_wait_is_futile`] (issue #268) —
+/// in-crate because they need a private [`CpGroup`] handle and the
+/// `pub(crate)` [`ClientCtx::cp_kind_local`], which no external `tests/`
+/// file can reach (the same reason `gsi_drain_cursor_tests` lives inside
+/// `index_drain.rs`). Run via `cargo test -p animusd --lib`.
+#[cfg(test)]
+mod confirm_futility_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use tokio::time::{sleep, timeout};
+
+    use crate::config::NodeRole;
+    use crate::{
+        ClientCtx, ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, read_frame,
+        run_node, write_frame,
+    };
+
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn single_node_config() -> ClusterConfig {
+        let addrs = free_addrs(6);
+        ClusterConfig {
+            nodes: vec![RoleAddrs {
+                id: crate::config::node_id(0),
+                role: NodeRole::Both,
+                internal: addrs[0],
+                client: addrs[1],
+                dynamo: addrs[2],
+                cql: addrs[3],
+                admin: addrs[4],
+                intra: addrs[5],
+            }],
+        }
+    }
+
+    async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        write_frame(&mut stream, &req).await.expect("send");
+        read_frame(&mut stream)
+            .await
+            .expect("read")
+            .expect("a reply")
+    }
+
+    async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                match call(
+                    addr,
+                    ClientRequest::Put {
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                        table: table.to_string(),
+                    },
+                )
+                .await
+                {
+                    ClientResponse::PutOk => return,
+                    ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                    other => panic!("unexpected put response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("seed put did not succeed in 20s");
+    }
+
+    async fn single_node(dir: &Path) -> (Node, ClusterConfig) {
+        let config = single_node_config();
+        let node = run_node(&config, 0, dir.join("node-0"))
+            .await
+            .expect("bring up single node");
+        (node, config)
+    }
+
+    /// **The futility early-exit (issue #268).** A `KindBatch` whose own-key
+    /// condition fails applies as a silent no-op (`KindBatch.conditions`,
+    /// `animus-cp-data`) — the probed effect never appears even though the
+    /// accepted entry committed and applied fine. Pre-fix, `cp_kind_local`'s
+    /// confirm loop polled value equality for the whole `CLIENT_TIMEOUT`
+    /// (10s) before erring — the exact per-attempt burn that let brief
+    /// leadership churn on a starved CI runner stack two 10s stalls into one
+    /// 25s client budget (the cp_txn.rs seed-put flake). Post-fix the loop
+    /// notices `engine_applied_index()` passed the accepted entry without
+    /// its effect and errs immediately, in the house retryable shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_condition_failed_kind_batch_fails_fast_with_a_retryable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, config) = single_node(dir.path()).await;
+        let client = config.nodes[0].client;
+
+        // Seed put: provisions the table's first tablet and proves the
+        // single-voter group elected and serves.
+        put_until_ok(client, "cf_t", b"cf-seed", b"seed").await;
+        let tablet = *node
+            .metadata()
+            .tablets_for_table("cf_t")
+            .next()
+            .expect("seed put provisioned a tablet")
+            .0;
+        let group = node
+            .edge
+            .local_cp(tablet)
+            .expect("this node hosts the tablet");
+        assert!(group.is_leader(), "single-voter group leads locally");
+
+        // A batch guarded by a condition that cannot hold (the key was never
+        // written): accepted + applied as a no-op, effect never appears.
+        let started = tokio::time::Instant::now();
+        let err = ClientCtx::cp_kind_local(
+            &group,
+            vec![(
+                animus_cp_data::KIND_BASE,
+                b"cf-target".to_vec(),
+                Some(b"must-not-land".to_vec()),
+            )],
+            Vec::new(),
+            vec![(b"cf-guard".to_vec(), Some(b"wrong-expected".to_vec()))],
+        )
+        .await
+        .expect_err("a condition-failed kind batch must not confirm");
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.ends_with("; retry"),
+            "the failure must carry the house retryable shape so caller loops re-route: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a provably-futile confirm wait must end fast (pre-fix: polled out the whole \
+             10s CLIENT_TIMEOUT): took {elapsed:?}"
+        );
+
+        // The early exit fired on the no-op, not on a broken group: an
+        // ordinary unconditioned write through the same path still confirms.
+        ClientCtx::cp_kind_local(
+            &group,
+            vec![(
+                animus_cp_data::KIND_BASE,
+                b"cf-after".to_vec(),
+                Some(b"lands".to_vec()),
+            )],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("an ordinary write after the futile one still confirms");
+
+        node.shutdown();
     }
 }
 

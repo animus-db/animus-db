@@ -672,7 +672,18 @@ seatbelt (new in this amendment's companion PR1, `animus-cp-data` codec
 v15) covers the one gap the leader-side lock alone can't: a transaction
 resolver's recovery push, which never takes `rmw_lock` — unreachable today
 (a transaction is rejected outright on an indexed/streamed table) but real
-once that restriction lifts.
+once that restriction lifts. *(As-built note, issue #266: that restriction
+lifted the same day — the `TxnStage` kind-writes stack, ADR 0018's
+2026-08-16 amendment — making the resolver push live. The residual
+cross-node orphan-row race flagged during that stack's planning was
+re-verified against the landed tree and does **not** reproduce: the
+seatbelt's unresolved-intent arm, the stack's C1 mandatory own-key OCC,
+and materialize-at-resolve's intent-still-stands gate jointly close every
+interleaving. Pinned by `animus-cp-data`'s `txn_kind_writes.rs::
+a_conditioned_kind_batch_racing_the_stage_resolve_window_never_orphans_an_
+lsi_row` (seed-reproducible, red-proven against a sabotaged intent arm)
+and `animusd`'s `dynamo_index_writes.rs::cross_node_racing_transactional_
+and_plain_puts_never_orphan_an_lsi_row`.)*
 
 **Named gap, deliberately not closed here**: a *plain* (unindexed,
 unstreamed) table's `PutItem`/`DeleteItem` `ConditionExpression`,
