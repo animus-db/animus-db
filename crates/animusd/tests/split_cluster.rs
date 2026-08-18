@@ -334,7 +334,10 @@ async fn split_over_a_split_deployment() {
         .await;
         assert_eq!(status, 200, "split trigger: {body}");
 
-        await_true(30, "split produced two tablets", || {
+        // 90s, not 30: a copy-based split (ADR 0050) is an O(data) background build,
+        // and on 2-core CI runners it repeatedly outlived a 30s budget (issue #278
+        // item 9, three observed instances) - a runner-aware budget, not a flake mask.
+        await_true(90, "split produced two tablets", || {
             table_tablets(&data_nodes[0], "split_merge_t").len() == 2
         })
         .await;
@@ -1228,7 +1231,10 @@ async fn decommission_racing_a_tablet_split_converges_with_no_data_loss() {
         put(&data_clients, "cross_t", b"b", b"v-b2", 20).await;
         put(&data_clients, "cross_t", b"y", b"v-y2", 20).await;
 
-        await_true(30, "split produced two tablets", || {
+        // 90s, not 30: a copy-based split (ADR 0050) is an O(data) background build,
+        // and on 2-core CI runners it repeatedly outlived a 30s budget (issue #278
+        // item 9, three observed instances) - a runner-aware budget, not a flake mask.
+        await_true(90, "split produced two tablets", || {
             table_tablets(&data_nodes[0], "cross_t").len() == 2
         })
         .await;
