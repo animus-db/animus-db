@@ -2102,13 +2102,13 @@ async fn cascade_split_walks_the_grandparent_chain_with_closed_shard_shape() {
             for i in from..upto {
                 let id = format!("c{i:04}");
                 let issuer = &nodes[i % nodes.len()];
-                let (status, body) = dynamo(
+                dynamo_retrying(
                     issuer.dynamo_addr(),
                     "DynamoDB_20120810.PutItem",
                     &format!(r#"{{"TableName":"casc","Item":{{"id":{{"S":"{id}"}}}}}}"#),
+                    &format!("PutItem({id})"),
                 )
                 .await;
-                assert_eq!(status, 200, "PutItem({id}) failed: {body}");
                 n += 1;
             }
             n
