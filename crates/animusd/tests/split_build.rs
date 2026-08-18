@@ -14,6 +14,8 @@
 //! times out red.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animusd::{ClientRequest, ClientResponse, Node, read_frame};
@@ -993,6 +995,223 @@ async fn split_completes_when_a_child_lives_off_the_parent_leader_node() {
                 "key {key:?} lost across an off-leader-child split"
             );
         }
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// One DynamoDB JSON request over a fresh HTTP/1.1 connection → `(status,
+/// body)` — mirrors `dynamo_index_writes.rs`'s helper. Deliberately a
+/// **single attempt, no client-side retry** (unlike `put`/`put_in` above),
+/// since issues #285/#288's regressions are specifically about what the
+/// *server* does with one request that lands mid-freeze — a client-side
+/// retry loop here would mask a missing server-side one.
+async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    let req = format!(
+        "POST / HTTP/1.1\r\nHost: x\r\nX-Amz-Target: {target}\r\n\
+         Connection: close\r\n\
+         Content-Type: application/x-amz-json-1.0\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.expect("read");
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+    (status, body.to_owned())
+}
+
+/// Fire single-attempt `PutItem`s against `table` continuously (several
+/// concurrent connections, no delay, unique keys) until `stop` is raised,
+/// recording every non-200 reply. Shared by both issue #288 regressions
+/// below — the only difference between them is which table (indexed vs
+/// plain) the caller creates beforehand, which selects `cp_kind_write_item`'s
+/// evaluated arm vs `cp_kind_write_raw`'s fast arm.
+async fn probe_put_item_until_stopped(
+    addr: SocketAddr,
+    table: &str,
+    stop: Arc<AtomicBool>,
+) -> (u64, Vec<(u16, String)>) {
+    let counter = Arc::new(AtomicU64::new(0));
+    let bad = Arc::new(Mutex::new(Vec::new()));
+    let mut probers = Vec::new();
+    // Two lanes, paced (not a max-speed hammer): dense enough to reliably
+    // cover the (sub-second, ADR 0050 rung 8's F8 contract) freeze window,
+    // gentle enough not to become the bottleneck itself — an unthrottled
+    // flood against an INDEXED table can outpace the GSI drain, and cutover
+    // itself waits on the drain's own veto (it must catch up before a
+    // parent can retire), so hammering harder here can make the split
+    // never converge rather than proving anything about issue #288.
+    for _ in 0..2u32 {
+        let table = table.to_owned();
+        let stop = Arc::clone(&stop);
+        let counter = Arc::clone(&counter);
+        let bad = Arc::clone(&bad);
+        probers.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                let i = counter.fetch_add(1, Ordering::Relaxed);
+                let body = format!(
+                    r#"{{"TableName":"{table}","Item":{{"pk":{{"S":"k{i}"}},"g":{{"S":"v"}}}}}}"#
+                );
+                match timeout(
+                    Duration::from_secs(12),
+                    dynamo(addr, "DynamoDB_20120810.PutItem", &body),
+                )
+                .await
+                {
+                    Ok((200, _)) => {}
+                    Ok((status, resp)) => bad.lock().unwrap().push((status, resp)),
+                    Err(_) => bad
+                        .lock()
+                        .unwrap()
+                        .push((0, "PutItem timed out (12s)".into())),
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        }));
+    }
+    for p in probers {
+        let _ = p.await;
+    }
+    let total = counter.load(Ordering::Relaxed);
+    let bad = Arc::try_unwrap(bad)
+        .expect("every prober has finished")
+        .into_inner()
+        .unwrap();
+    (total, bad)
+}
+
+/// Issue #288: a client `PutItem` against an **indexed** table (the
+/// evaluated arm, `ClientCtx::cp_kind_write_item` → `dynamo::
+/// kind_write_item_at_leader`) racing a split's freeze window must succeed
+/// once the child activates, not surface the retryable `FROZEN_REFUSAL` as a
+/// terminal 500 — `cp_kind_write_item` did a single `cp_route` + one attempt
+/// with no retry loop at all pre-fix.
+///
+/// Two concurrent single-attempt (no client-side retry) `PutItem` streams
+/// hammer the table continuously from just before kickoff until the split
+/// cuts over, covering the whole build→freeze→cutover window (whose freeze
+/// sub-window is deliberately kept sub-second, ADR 0050 rung 8's F8
+/// contract) without needing to guess its exact timing. Pre-fix, whichever
+/// attempt's routing landed on the still-frozen parent got a bare 500;
+/// post-fix every attempt succeeds — a fresh `cp_route` resolution on the
+/// server's own internal retry lands it on the activated child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn indexed_put_item_racing_the_freeze_window_retries_to_success() {
+    timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let addr = nodes[0].dynamo_addr();
+
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"idx288",
+                "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                "GlobalSecondaryIndexes":[
+                    {"IndexName":"by-g",
+                     "KeySchema":[{"AttributeName":"g","KeyType":"HASH"}],
+                     "Projection":{"ProjectionType":"ALL"}}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+
+        let parent = sole_tablet_of(&nodes[0], "idx288");
+        let stop = Arc::new(AtomicBool::new(false));
+        let probing = tokio::spawn(probe_put_item_until_stopped(
+            addr,
+            "idx288",
+            Arc::clone(&stop),
+        ));
+        // Give the probers a moment to actually be in flight before the
+        // split starts, so the whole build→freeze→cutover window — not just
+        // its tail — sees continuous write pressure.
+        sleep(Duration::from_millis(50)).await;
+
+        kickoff_tablet(&nodes[0], parent, "k\\u0004").await;
+        await_cutover_of(&nodes[0], "idx288", parent, Duration::from_secs(90)).await;
+
+        stop.store(true, Ordering::Relaxed);
+        let (total, bad) = probing.await.expect("prober task panicked");
+        assert!(
+            total > 0,
+            "no PutItem attempt ever completed — test setup problem"
+        );
+        assert!(
+            bad.is_empty(),
+            "an indexed PutItem racing the freeze window must retry to success, never a \
+             terminal error: {bad:?}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Issue #288's symmetric fast-arm coverage: a plain (unindexed,
+/// unstreamed) table's `PutItem` — `dynamo::fast_marker_write` →
+/// `ClientCtx::cp_kind_write_raw`, the "fast/marker" arm also used by CQL
+/// and the raw client protocol — racing the identical freeze window. This
+/// path had no coverage either way before (the issue's premise that plain
+/// writes already retried across a split was itself mistaken — ADR 0049's
+/// funnel unification dropped the old higher-layer retry along with the
+/// evaluated arm's). Same shape as the indexed test above, just a plain
+/// table (no `GlobalSecondaryIndexes`) so `PutItem` takes the fast arm
+/// instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_put_item_racing_the_freeze_window_retries_to_success() {
+    timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let addr = nodes[0].dynamo_addr();
+
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"plain288",
+                "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+
+        let parent = sole_tablet_of(&nodes[0], "plain288");
+        let stop = Arc::new(AtomicBool::new(false));
+        let probing = tokio::spawn(probe_put_item_until_stopped(
+            addr,
+            "plain288",
+            Arc::clone(&stop),
+        ));
+        sleep(Duration::from_millis(50)).await;
+
+        kickoff_tablet(&nodes[0], parent, "k\\u0004").await;
+        await_cutover_of(&nodes[0], "plain288", parent, Duration::from_secs(90)).await;
+
+        stop.store(true, Ordering::Relaxed);
+        let (total, bad) = probing.await.expect("prober task panicked");
+        assert!(
+            total > 0,
+            "no PutItem attempt ever completed — test setup problem"
+        );
+        assert!(
+            bad.is_empty(),
+            "a plain-table PutItem racing the freeze window must retry to success, never a \
+             terminal error: {bad:?}"
+        );
 
         for node in &nodes {
             node.shutdown_graceful().await;

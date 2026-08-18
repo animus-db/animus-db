@@ -5643,6 +5643,23 @@ impl ClientCtx {
     /// [`ClientRequest::KindWriteItem`]'s doc for why this closes the
     /// cross-node LSI/change-record orphan race `index_aware_write`'s
     /// design had.
+    ///
+    /// **Retries the retryable freeze refusal (issue #288).** A tablet mid
+    /// split-cutover freeze (`FROZEN_REFUSAL`, ADR 0050 rung 5) refuses
+    /// every mutating propose with a `"; retry"`-suffixed error *before*
+    /// ever proposing — from `kind_write_item_at_leader`'s own pre-propose
+    /// check when local, or the forwarded leader's identical check when not
+    /// — so it's cheap and safe to retry. Mirrors [`cp_read`](Self::cp_read)'s
+    /// deadline-bounded loop: bounded by [`CLIENT_TIMEOUT`], re-resolving
+    /// `cp_route` every attempt (essential — after cutover the key routes to
+    /// a child tablet, not the frozen parent), retrying only while
+    /// [`read_should_retry`](Self::read_should_retry) matches the error.
+    /// Before this fix a client writing during a split's freeze window got a
+    /// terminal error instead of the write succeeding once the child
+    /// activates a moment later. The retry loop lives *outside*
+    /// `kind_write_item_at_leader`'s own `rmw_lock` scope (issue #285 narrowed
+    /// that lock to read+evaluate only), so retrying here — including the
+    /// sleep between attempts — never pins the lock across the wait.
     pub(crate) async fn cp_kind_write_item(
         &self,
         meta: &Metadata,
@@ -5654,40 +5671,65 @@ impl ClientCtx {
     ) -> Result<dynamo::KindWriteOutcome, animus_dynamo::wire::WireError> {
         // Auto-provision the table's tablet on first write (ADR 0023), as
         // `cp_kind_write` does — an indexed/streamed table's first item write
-        // can race its own `CreateTable`'s tablet provisioning.
+        // can race its own `CreateTable`'s tablet provisioning. Stays
+        // outside the retry loop below: provisioning is itself idempotent,
+        // so re-checking it every retry pass would just be a wasted
+        // metadata read once the tablet exists.
         if !self.effective_metadata().has_table_tablet(table) {
             self.provision_tablet(table)
                 .await
                 .map_err(|e| dynamo::internal(&e))?;
         }
         let base_key = dynamo::item_key(pk, sk);
-        match self.cp_route(table, &base_key).await {
-            CpRoute::Local(leader) => {
-                dynamo::kind_write_item_at_leader(self, &leader, meta, table, pk, sk, op, condition)
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            let err = match self.cp_route(table, &base_key).await {
+                CpRoute::Local(leader) => {
+                    match dynamo::kind_write_item_at_leader(
+                        self,
+                        &leader,
+                        meta,
+                        table,
+                        pk,
+                        sk,
+                        op.clone(),
+                        condition,
+                    )
                     .await
-            }
-            CpRoute::Forward(addr) => {
-                let request = ClientRequest::KindWriteItem {
-                    table: table.to_owned(),
-                    pk: pk.clone(),
-                    sk: sk.cloned(),
-                    op,
-                    condition: condition.cloned(),
-                };
-                match self.cp_forward(table, &base_key, addr, request).await {
-                    ClientResponse::KindWriteOk { old, new } => {
-                        Ok(dynamo::KindWriteOutcome::Ok { old, new })
+                    {
+                        Ok(outcome) => return Ok(outcome),
+                        Err(e) => e,
                     }
-                    ClientResponse::ConditionFailed => {
-                        Ok(dynamo::KindWriteOutcome::ConditionFailed)
-                    }
-                    ClientResponse::Error(e) => Err(dynamo::internal(&e)),
-                    other => Err(dynamo::internal(&format!(
-                        "unexpected reply to forwarded kind write item: {other:?}"
-                    ))),
                 }
+                CpRoute::Forward(addr) => {
+                    let request = ClientRequest::KindWriteItem {
+                        table: table.to_owned(),
+                        pk: pk.clone(),
+                        sk: sk.cloned(),
+                        op: op.clone(),
+                        condition: condition.cloned(),
+                    };
+                    match self.cp_forward(table, &base_key, addr, request).await {
+                        ClientResponse::KindWriteOk { old, new } => {
+                            return Ok(dynamo::KindWriteOutcome::Ok { old, new });
+                        }
+                        ClientResponse::ConditionFailed => {
+                            return Ok(dynamo::KindWriteOutcome::ConditionFailed);
+                        }
+                        ClientResponse::Error(e) => dynamo::internal(&e),
+                        other => {
+                            return Err(dynamo::internal(&format!(
+                                "unexpected reply to forwarded kind write item: {other:?}"
+                            )));
+                        }
+                    }
+                }
+                CpRoute::None => dynamo::internal("no CP group leader reachable"),
+            };
+            if !Self::read_should_retry(&err.message) || tokio::time::Instant::now() >= deadline {
+                return Err(err);
             }
-            CpRoute::None => Err(dynamo::internal("no CP group leader reachable")),
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -5709,6 +5751,16 @@ impl ClientCtx {
     /// "this batch is durable" signal last (the GSI drain's cursor-row bump,
     /// the trim janitor's final deletion) gets it confirmed, not merely an
     /// earlier entry in the same batch.
+    ///
+    /// **Retries the retryable freeze refusal (issue #288)** — the fast/
+    /// marker-write arm's own share of the gap: this primitive backs plain
+    /// (unindexed, unstreamed) Dynamo writes, CQL's partition writes, and the
+    /// raw client protocol, none of which used to retry `FROZEN_REFUSAL`
+    /// either. Same shape as [`cp_kind_write_item`](Self::cp_kind_write_item)'s
+    /// identical fix: a deadline-bounded loop mirroring
+    /// [`cp_read`](Self::cp_read), re-resolving `cp_route` every attempt so a
+    /// post-cutover retry lands on the child tablet, retrying only while
+    /// [`read_should_retry`](Self::read_should_retry) matches the error.
     pub(crate) async fn cp_kind_write_raw(
         &self,
         table: &str,
@@ -5718,20 +5770,36 @@ impl ClientCtx {
         let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
         };
-        match self.cp_route(table, &first).await {
-            CpRoute::Local(leader) => Self::cp_kind_raw_local(&leader, writes, change_log).await,
-            CpRoute::Forward(addr) => {
-                let request = ClientRequest::KindWrite {
-                    table: table.to_owned(),
-                    writes,
-                    change_log,
-                };
-                Self::ok_or_err(
-                    self.cp_forward(table, &first, addr, request).await,
-                    "forwarded CP kind write",
-                )
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            let err = match self.cp_route(table, &first).await {
+                CpRoute::Local(leader) => {
+                    match Self::cp_kind_raw_local(&leader, writes.clone(), change_log.clone()).await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(e) => e,
+                    }
+                }
+                CpRoute::Forward(addr) => {
+                    let request = ClientRequest::KindWrite {
+                        table: table.to_owned(),
+                        writes: writes.clone(),
+                        change_log: change_log.clone(),
+                    };
+                    match Self::ok_or_err(
+                        self.cp_forward(table, &first, addr, request).await,
+                        "forwarded CP kind write",
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => e,
+                    }
+                }
+                CpRoute::None => "no CP group leader reachable".to_string(),
+            };
+            if !Self::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+                return Err(err);
             }
-            CpRoute::None => Err("no CP group leader reachable".into()),
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 

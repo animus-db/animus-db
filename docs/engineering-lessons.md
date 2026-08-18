@@ -2643,6 +2643,29 @@ debugging anything that feels like it might have happened before.
   the more the environment's real-time behavior varies.
   (`crates/animusd/src/lib.rs::confirm_futility_tests::
   an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_confirm_wait`.)
+- **An unthrottled continuous write flood against an INDEXED table racing a
+  background convergence process can make that process livelock rather than
+  exercise it** (issue #288). A first draft of the freeze-window regression
+  ran 6 concurrent max-speed `PutItem` loops (fresh TCP connection per
+  request, no pacing) against a table with a GSI, from just before a
+  split's kickoff until cutover — and the split never converged within a
+  90s budget, because split cutover itself gates on the GSI drain's own
+  veto (it must catch up to the max pending change record before a parent
+  can retire, `docs/streams-notes.md`), and the flood was generating new
+  change-log backlog faster than the drain could clear it — a genuine
+  live-lock, not a hang. It also incidentally triggered a real engine-level
+  I/O error on the sandbox under that load. Pacing the flood down to 2
+  lanes with a 20ms delay between attempts fixed both: the split converged
+  in ~17s instead of timing out at 90s, and the test still reliably covers
+  the (sub-second, ADR 0050 rung 8's F8 contract) freeze window with dense
+  enough probing. General form: a test that races a continuous write flood
+  against a background convergence loop must pace the flood below that
+  loop's own throughput, especially when the convergence condition itself
+  depends on catching up to the write volume — "hammer as fast as possible
+  until X happens" silently assumes X's own progress is independent of the
+  hammering, which is false whenever X is gated on draining exactly what's
+  being hammered in. (`crates/animusd/tests/split_build.rs::
+  probe_put_item_until_stopped`.)
 
 ### Code patterns
 - **A cross-crate deletion stack must be grouped by MECHANISM (producer
@@ -6481,6 +6504,38 @@ debugging anything that feels like it might have happened before.
   established narrower scoping before assuming a wider one is the
   house convention just because it's what you found first.
   (`crates/animusd/src/dynamo.rs::kind_write_item_at_leader`.)
+- **A `"; retry"`-suffix convention is opt-in per caller, not a property of
+  the error itself — unifying call sites onto a shared primitive can
+  silently drop a retry loop that used to live at a since-deleted higher
+  layer** (issue #288). `FROZEN_REFUSAL` (ADR 0050's split-cutover freeze
+  refusal) is emitted deliberately in the house `"; retry"` shape, and the
+  low-level primitives that can hit it (`cp_kind_local`, `cp_kind_raw_
+  local`, `seed_rows_local`) all return it correctly. But *retrying* on
+  that suffix is something each caller has to opt into by actually writing
+  a loop — it doesn't happen automatically just because the string ends
+  the right way. `ClientCtx::cp_kind_write_item`/`cp_kind_write_raw` (the
+  two caller-facing entry points every Dynamo/CQL/raw-protocol write funnels
+  through since ADR 0049's write-path unification) were each a single
+  `cp_route` + one attempt, no loop at all — so a write racing a split's
+  freeze window got a terminal 500 instead of the retry every *other*
+  retryable-error caller in this file performs. The bug likely predates
+  the unification: an older, now-deleted higher layer plausibly retried
+  this for the plain-write path, and folding every write shape onto one
+  shared low-level primitive (rung 1 of ADR 0049) preserved the primitive's
+  own correct error shape while dropping whatever retry loop used to wrap
+  it above. **Audit method that would have caught this**: don't trust a
+  doc comment's claim about retry behavior (or an issue's own premise —
+  this one *also* wrongly assumed the plain-write arm already retried,
+  when it never had coverage either way) — trace each entry point down to
+  its terminal single-attempt primitive and grep for an actual `loop { ...
+  }` shape wrapping the call, the same discipline `cp_read`'s own
+  deadline-bounded loop already demonstrates as the house pattern. A
+  refactor that unifies several call sites onto one shared implementation
+  is exactly the moment a caller-side concern (retry, backoff, dedup) that
+  lived above the old, now-deleted per-shape code paths is most likely to
+  quietly vanish — grep for it explicitly rather than assuming the
+  unification preserved it.
+  (`crates/animusd/src/lib.rs::cp_kind_write_item`, `cp_kind_write_raw`.)
 
 ### Parallel-agent orchestration
 - **`gh stack checkout <N>` silently switches the CURRENT worktree's checked-

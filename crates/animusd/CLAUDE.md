@@ -206,6 +206,13 @@ pending record) → backfill veto (`MarkIndexBackfilled` for every
 map (the reconciler then `Reclaim`s it everywhere). A stale-routed write
 to a frozen parent gets the retryable `FROZEN_REFUSAL` from every local
 write/txn helper (`frozen_refusal`; bookkeeping-only kind batches exempt).
+**Both `ClientCtx::cp_kind_write_item` (the evaluated arm) and
+`cp_kind_write_raw` (the fast/marker arm) retry this internally** (issue
+#288: pre-fix, neither had a retry loop at all — every Dynamo/CQL/raw-
+protocol write funnels through one of these two since ADR 0049's write-path
+unification, so a write racing the freeze window got a terminal 500
+instead of the write landing on the child a moment later), mirroring
+`cp_read`'s deadline-bounded loop and re-resolving `cp_route` each attempt.
 A `Building` child runs **no consumer arms at all** (its token-truncated
 cursor key would land in the parent's scope and poison the parent's
 min-over-rows watermark). E2e: `tests/split_build.rs` (full workflow +
