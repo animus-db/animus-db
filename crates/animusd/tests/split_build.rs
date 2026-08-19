@@ -380,6 +380,92 @@ async fn full_split_workflow_cutover_completes_with_no_lost_writes() {
     .expect("test timed out");
 }
 
+/// The build must not pay a consensus round per row it has ALREADY
+/// copied. The bulk pass ships in `SEED_CHUNK_BYTES` batches, but the tail
+/// used to start from a zero watermark — so its first pass treated every
+/// change record in the log as dirty and re-shipped the whole table, one
+/// `SeedBatch` (hence one Raft entry, plus a forwarded hop for an off-node
+/// child) per partition key. Measured on a 20,000-key split before this
+/// was fixed: ~6,000 no-op entries per child and ~85% of the build's wall
+/// clock, with the children's key counts flat the entire time.
+///
+/// The teeth: a quiet table (no writes during the build — the racing-write
+/// case is `full_split_workflow_cutover_completes_with_no_lost_writes`)
+/// must cut over having spent a number of child Raft entries set by the
+/// image's BYTE size, not by its row count. Each `SeedBatch` is exactly
+/// one entry, so a child's `commit_index` at cutover is a direct meter:
+/// `N` rows of ~28 bytes fit one chunk per side, so anything near `N / 2`
+/// means the row-by-row tail is back. Red on the pre-fix tip
+/// (~`N / 2` entries per child), green after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_build_tail_does_not_re_ship_the_bulk_image_row_by_row() {
+    /// Rows written before the split. Each becomes its own dirty unit (a
+    /// sub-token raw key is its own lineage), which is what made the
+    /// pre-fix tail cost one round-trip apiece.
+    const N: usize = 600;
+    /// Every seeded row fits in a single `SEED_CHUNK_BYTES` chunk per
+    /// child, so the split's whole entry cost is a handful of ships plus
+    /// each group's own formation/bookkeeping entries. Generous enough to
+    /// absorb those; far below the ~`N / 2` a row-by-row tail spends.
+    const MAX_CHILD_ENTRIES: u64 = 64;
+
+    timeout(Duration::from_secs(180), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        // Keys `[k, i % 8, i / 8]`: the split key `[k,4]` puts half on each
+        // side, and every one of them is a distinct dirty unit.
+        let mut stream = TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect client port");
+        for i in 0..N {
+            let key = vec![b'k', (i % 8) as u8, (i / 8) as u8];
+            put(&mut stream, key, vec![b'v', (i % 251) as u8]).await;
+        }
+
+        kickoff(&nodes).await;
+        let (left, right) = await_cutover(&nodes[0], Duration::from_secs(120)).await;
+
+        // Sample immediately at cutover: the children are Active from here
+        // on, so their own consumer arms would slowly add entries of their
+        // own and blur what this measures.
+        let groups = all_groups(&nodes, &[]).await;
+        for child in [left, right] {
+            let entries = groups
+                .iter()
+                .find(|g| {
+                    g["tablet"].as_u64() == Some(child) && g["is_leader"].as_bool() == Some(true)
+                })
+                .and_then(|g| g["commit_index"].as_u64())
+                .unwrap_or_else(|| panic!("no leader group for child {child}: {groups:?}"));
+            assert!(
+                entries <= MAX_CHILD_ENTRIES,
+                "child {child} took {entries} Raft entries to receive a {N}-row split — the tail \
+                 is shipping row-by-row again (bulk-image bytes fit one chunk; budget \
+                 {MAX_CHILD_ENTRIES})"
+            );
+        }
+
+        // The cheaper tail must still be a COMPLETE one: every pre-split
+        // row survives the cutover.
+        for i in 0..N {
+            let key = vec![b'k', (i % 8) as u8, (i / 8) as u8];
+            assert_eq!(
+                get(&mut stream, key.clone()).await,
+                Some(vec![b'v', (i % 251) as u8]),
+                "pre-split key {key:?} lost across cutover"
+            );
+        }
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// Kill the node leading the parent AFTER the freeze has been observed
 /// (`split_phase` past `"build"`): the freeze is engine-durable, so the
 /// re-led driver resumes the endgame idempotently and the survivors

@@ -602,6 +602,16 @@ pub(crate) struct SplitBuild {
     /// pending set — O(pending) per tick, accepted for the build's bounded
     /// duration; an O(delta) commit-ordered read is a named B-final
     /// optimization.
+    ///
+    /// **Starts at the parent's highest change HLC as of the pre-bulk
+    /// pass, not at 0** (captured beside `bulk_version_floor`): every row
+    /// those records describe is in the bulk image by construction, so a
+    /// zero start made the first tail pass re-ship the WHOLE table one
+    /// dirty unit at a time — measured at ~6,000 no-op consensus rounds
+    /// per child on a 20,000-key split, ~85% of the build's wall clock,
+    /// with the children's key counts flat throughout. The tail's job is
+    /// the delta written *during* the build, and that is now what it
+    /// costs.
     tail_hlc: u64,
     /// Rows shipped so far (observability only).
     rows_shipped: u64,
@@ -715,6 +725,15 @@ async fn split_driver_tick(
                 }
             }
             build.bulk_version_floor = Some(floor);
+            // The tail's own starting watermark, captured in the SAME
+            // pre-pass and for the same reason (see `tail_hlc`'s doc): the
+            // bulk image below covers every write whose change record
+            // already exists here, so re-shipping those rows one dirty unit
+            // at a time is pure duplicated work. Must be read STRICTLY
+            // BEFORE the bulk scan — a write applied after this read gets
+            // an HLC above it (`assert_ts_monotonic`), so the tail still
+            // catches everything the bulk image may have missed.
+            build.tail_hlc = max_change_hlc(group).await;
             for kind in SEED_KINDS {
                 let rows = group.seed_rows_kind(kind as usize, None).await;
                 for (child, range) in &children {
@@ -909,6 +928,15 @@ async fn split_driver_tick(
     Ok(())
 }
 
+/// One seed row's wire/payload cost against the [`SEED_CHUNK_BYTES`]
+/// budget: the kind byte, the logical key, the value, and a fixed
+/// allowance for the carried version plus framing. Shared by [`ship`]'s own
+/// chunking and [`tail_pass`]'s cross-unit accumulator so the two agree on
+/// what "a full chunk" means.
+fn seed_row_bytes(logical: &[u8], value: Option<&Vec<u8>>) -> usize {
+    1 + logical.len() + value.map_or(0, Vec::len) + 16
+}
+
 /// Ship `rows` (already filtered to one child) in bounded chunks
 /// (ADR 0050 rung 4 — see [`SEED_CHUNK_BYTES`]).
 async fn ship(
@@ -920,7 +948,7 @@ async fn ship(
     let mut chunk: Vec<animus_cp_data::SeedRow> = Vec::new();
     let mut bytes = 0usize;
     for row in rows {
-        bytes += 1 + row.1.len() + row.2.as_ref().map_or(0, |v| v.len()) + 16;
+        bytes += seed_row_bytes(&row.1, row.2.as_ref());
         chunk.push(row);
         if bytes >= SEED_CHUNK_BYTES {
             let n = chunk.len() as u64;
@@ -961,32 +989,36 @@ async fn tail_pass(
     build: &mut SplitBuild,
 ) -> Result<bool, String> {
     let changes = group.pending_changes().await;
-    let fresh: Vec<&Vec<u8>> = changes
+    let fresh: Vec<(&Vec<u8>, u64)> = changes
         .iter()
-        .filter(|(logical, _)| logical.len() >= 8)
-        .map(|(logical, _)| logical)
-        .filter(|logical| {
-            let mut hlc_bytes = [0u8; 8];
-            hlc_bytes.copy_from_slice(&logical[logical.len() - 8..]);
-            u64::from_be_bytes(hlc_bytes) > build.tail_hlc
-        })
+        .filter_map(|(logical, _)| Some((logical, packed_hlc(logical)?)))
+        .filter(|(_, hlc)| *hlc > build.tail_hlc)
         .collect();
     if fresh.is_empty() {
         return Ok(false);
     }
     let mut dirty: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut max_hlc = build.tail_hlc;
-    for logical in fresh {
-        let prefix = &logical[..logical.len() - 8];
+    for (logical, hlc) in fresh {
+        let prefix = &logical[..logical.len() - HLC_BYTES];
         if prefix.len() >= 8 {
             dirty.insert(prefix[..8].to_vec());
         } else if !prefix.is_empty() {
             dirty.insert(prefix.to_vec());
         }
-        let mut hlc_bytes = [0u8; 8];
-        hlc_bytes.copy_from_slice(&logical[logical.len() - 8..]);
-        max_hlc = max_hlc.max(u64::from_be_bytes(hlc_bytes));
+        max_hlc = max_hlc.max(hlc);
     }
+    // Per-child accumulator: a dirty unit's rows are a handful of bytes, so
+    // shipping each unit on its own — as this pass originally did — bought
+    // one whole consensus round (plus, for a child off this node, a
+    // forwarded hop) per partition key, while the bulk pass moved thousands
+    // of rows per round. Batching across units to the same
+    // [`SEED_CHUNK_BYTES`] budget the bulk pass uses collapses that to the
+    // same rounds-per-megabyte cost. Semantics are unchanged: a `SeedBatch`
+    // is idempotent at its carried versions, and chunk boundaries already
+    // cut across rows on the bulk path, so nothing depends on one unit's
+    // rows sharing an entry.
+    let mut pending: BTreeMap<TabletId, (Vec<animus_cp_data::SeedRow>, usize)> = BTreeMap::new();
     for unit in dirty {
         // The child whose range contains the unit's first key owns every
         // row under it (F11 token alignment for tokenized tables; a raw
@@ -1011,17 +1043,58 @@ async fn tail_pass(
                     .filter(|(l, _, _)| l.starts_with(&unit))
                     .collect(),
             };
-            let rows: Vec<_> = rows
-                .into_iter()
-                .map(|(l, v, ver)| (kind, l, v, ver))
-                .collect();
-            ship(ctx, *child, rows, &mut build.rows_shipped).await?;
+            // Buffer, and flush only once this child's buffer is worth a
+            // consensus round (the trailing partial batches go out below).
+            let batch = {
+                let (buf, bytes) = pending.entry(*child).or_insert_with(|| (Vec::new(), 0));
+                for (logical, value, version) in rows {
+                    *bytes += seed_row_bytes(&logical, value.as_ref());
+                    buf.push((kind, logical, value, version));
+                }
+                if *bytes >= SEED_CHUNK_BYTES {
+                    *bytes = 0;
+                    std::mem::take(buf)
+                } else {
+                    Vec::new()
+                }
+            };
+            if !batch.is_empty() {
+                ship(ctx, *child, batch, &mut build.rows_shipped).await?;
+            }
         }
+    }
+    for (child, (rows, _)) in pending {
+        ship(ctx, child, rows, &mut build.rows_shipped).await?;
     }
     // Only past every successful ship: a failed tick re-derives the same
     // dirty units next tick from the unmoved watermark.
     build.tail_hlc = max_hlc;
     Ok(true)
+}
+
+/// The trailing packed HLC of a change record's logical key
+/// (`prefix || hlc`, ADR 0049) — `None` for a key too short to carry one.
+/// The tail's watermark unit: raw big-endian packed bits, the same
+/// encoding [`SplitBuild::tail_hlc`] holds.
+fn packed_hlc(logical: &[u8]) -> Option<u64> {
+    let suffix = logical
+        .len()
+        .checked_sub(HLC_BYTES)
+        .map(|n| &logical[n..])?;
+    Some(u64::from_be_bytes(suffix.try_into().ok()?))
+}
+
+/// The highest packed HLC over a group's current change log, `0` for an
+/// empty one — the split build's pre-bulk tail watermark (see its capture
+/// site in [`split_driver_tick`]).
+async fn max_change_hlc(group: &CpGroup) -> u64 {
+    group
+        .pending_changes()
+        .await
+        .iter()
+        .filter_map(|(logical, _)| packed_hlc(logical))
+        .max()
+        .unwrap_or(0)
 }
 
 /// The exclusive upper bound of "every key starting with `prefix`": the
