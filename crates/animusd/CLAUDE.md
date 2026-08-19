@@ -1359,12 +1359,12 @@ route below the edge through the same `ClientCtx` CP primitives.
   optimization is unsound both ways — using a log index as the floor
   systematically under-filters (every real row's HLC version dwarfs any
   plausible index, so the final image would degenerate back into the
-  unfiltered whole-table re-ship rung 8 fixed) and, under `SimEnv` where
-  wall-clock advances slowly relative to log-entry throughput, could
-  over-filter (a log index exceeding an early row's small `wall_ms`,
-  skipping a rewrite that needed re-shipping) — the exact "floor too high"
-  hazard the `bulk_version_floor` doc comment warns against for
-  `latest_version()`. No code changed; the pre-pass scan stays.
+  unfiltered whole-table re-ship rung 8 fixed) — a known regression bought
+  for no saved scan. The two are simply different value spaces and neither
+  bounds the other, which is the rule to remember; note this driver runs
+  only over `ProdEnv` (`animusd` has no `animus-sim` dependency), so
+  simulated-clock reasoning does not apply to it either way. No code
+  changed; the pre-pass scan stays.
 - Several gotchas here are instances of cross-cutting lessons — port-TOCTOU
   bring-up retries (`support::restart_same_addrs`), "a flaky `ProdEnv` test is a
   real bug", restart-test discipline (poll for catch-up, not leadership),

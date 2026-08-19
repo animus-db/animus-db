@@ -632,14 +632,20 @@ for `bulk_version_floor`:
   silently degenerate back into the unfiltered whole-table re-ship rung 8's
   own fix (above) exists to prevent — no scan saved, and the exact
   regression this train already paid down.
-- **Under `SimEnv` it can over-filter, which is the unsound direction.**
-  The simulated clock and the Raft log advance on independent schedules; a
-  build's log index can exceed an early row's small `wall_ms` faster than
-  the row's own HLC catches up, so a log-index floor could sit *above* a
-  genuinely-early version and cause the final image to skip a row that
-  needed re-shipping — exactly the "floor too high" hazard
-  `bulk_version_floor`'s own doc comment names as the reason it is
-  deliberately not `latest_version()`.
+  That alone disqualifies it: the substitution costs a known regression
+  and buys nothing.
+
+The first draft of this amendment also claimed the substitution could
+*over-filter* under `SimEnv` (a log index outrunning an early row's small
+`wall_ms`, putting the floor above a genuinely-early version — the "floor
+too high" hazard `bulk_version_floor`'s doc comment names for
+`latest_version()`). **That claim was wrong and is withdrawn:** the split
+driver lives in `animusd`, which has no `animus-sim` dependency and no
+`SimEnv` tier at all (this crate is the `ProdEnv` assembly layer), so the
+driver never runs under a simulated clock. The general rule — a Raft log
+index and a packed-HLC version are different value spaces and neither
+bounds the other — stands on its own; the concrete failure here is
+under-filtering, and one sound reason is enough.
 
 No code changed: the pre-pass scan (`index_drain.rs::split_driver_tick`,
 the `for kind in SEED_KINDS { ... floor = floor.max(ver) ... }` block)
