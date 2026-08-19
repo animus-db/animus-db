@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -21,7 +21,9 @@ use tokio::sync::{Mutex, mpsc};
 
 #[cfg(test)]
 use crate::nid;
-use crate::{Clock, Disk, Env, Envelope, MetricsHandle, Nanos, Network, NodeId, Rng, Spawner};
+use crate::{
+    Clock, Disk, Env, Envelope, MetricsHandle, Nanos, Network, NodeId, Rng, Spawner, UnixMillis,
+};
 
 /// A production environment for a single node.
 ///
@@ -399,6 +401,19 @@ impl Clock for ProdEnv {
                 .elapsed()
                 .as_nanos()
                 .min(u128::from(u64::MAX)) as u64,
+        )
+    }
+
+    fn wall_now(&self) -> UnixMillis {
+        // The host's real calendar clock, read fresh every call so an NTP
+        // correction is picked up rather than baked in at bind time. A
+        // pre-epoch system clock (only reachable if the host is grossly
+        // misconfigured) reads as 0 rather than panicking; nothing here is
+        // load-bearing for timing (see `Clock::wall_now`'s contract).
+        UnixMillis(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis().min(u128::from(u64::MAX)) as u64),
         )
     }
 

@@ -1522,6 +1522,7 @@ async fn backfill_seed_tick(
             seeded: true,
             marker: false,
             staged: false,
+            ttl_expired: false,
         }
         .encode();
         seed_change_log_record(group, prefix.clone(), record).await?;
@@ -3078,6 +3079,7 @@ mod stream_sealer_tests {
                 crate::DEFAULT_STREAM_RETENTION,
                 None,
                 quiesce_after,
+                crate::ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
             )
             .await
             .expect("bring up single node with streams + quiescence");

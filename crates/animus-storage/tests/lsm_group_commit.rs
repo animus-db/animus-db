@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use animus_env::{
-    BoxFuture, Clock, Disk, Env, EnvExt, Envelope, Nanos, Network, NodeId, Rng, Spawner, nid,
+    BoxFuture, Clock, Disk, Env, EnvExt, Envelope, Nanos, Network, NodeId, Rng, Spawner,
+    UnixMillis, nid,
 };
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, MergeOp, StorageEngine};
@@ -269,6 +270,9 @@ impl Disk for CrashEnv {
 impl Clock for CrashEnv {
     fn now(&self) -> Nanos {
         self.inner.now()
+    }
+    fn wall_now(&self) -> UnixMillis {
+        self.inner.wall_now()
     }
     async fn sleep(&self, dur: Duration) {
         self.inner.sleep(dur).await;

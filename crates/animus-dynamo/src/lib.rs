@@ -27,6 +27,7 @@ pub mod index;
 pub mod registry;
 pub mod schema;
 pub mod streams_wire;
+pub mod ttl;
 pub mod wire;
 
 pub use condition::{ConditionExpression, SortKeyCondition};
@@ -38,6 +39,7 @@ pub use registry::{
     GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, RegistryError, SchemaRegistry,
     SecondaryIndex,
 };
+pub use ttl::{MAX_PAST_EXPIRY_SECS, expires_at, is_expired};
 
 /// A DynamoDB-style attribute value (a useful subset). Beyond the scalar
 /// types (`S`/`N`/`B`/`BOOL`/`NULL`), this carries the **document** types

@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use animus_env::{
     BoxFuture, Clock, Disk, Env, Envelope, Nanos, Network, NodeId, PRIMARY_STREAM, Rng as RngTrait,
-    Spawner,
+    Spawner, UnixMillis,
 };
 use futures::task::ArcWake;
 use rand::{RngCore, SeedableRng};
@@ -903,6 +903,16 @@ impl Clock for SimEnv {
         Nanos(apply_clock_skew(st.clock, skew))
     }
 
+    fn wall_now(&self) -> UnixMillis {
+        // A pure function of virtual time: a fixed epoch base plus however far
+        // this node's (skewed) monotonic reading has advanced. So the calendar
+        // time a TTL sweep sees is as seed-reproducible as everything else
+        // (ADR 0003), *and* `set_clock_skew_for` skews the wall clock exactly
+        // as it skews the monotonic one — which is what a real node with a
+        // wrong clock does, and what a TTL reaper has to tolerate.
+        UnixMillis(SIM_WALL_EPOCH_MS.saturating_add(self.now().0 / 1_000_000))
+    }
+
     async fn sleep(&self, dur: Duration) {
         let deadline = self.shared.lock().clock.saturating_add(dur_nanos(dur));
         Sleep {
@@ -1208,6 +1218,22 @@ impl Future for Recv {
         }
     }
 }
+
+/// The wall-clock instant a simulation run's virtual timeline starts at:
+/// **2020-01-01T00:00:00Z**, in milliseconds since the Unix epoch.
+///
+/// `SimEnv`'s [`Clock::wall_now`] is this base plus elapsed virtual time, which
+/// is what keeps calendar time inside the determinism seam (ADR 0003/0051). It
+/// is deliberately a fixed constant rather than the host's clock at run start:
+/// a run's wall-clock readings must be a pure function of its seed, so two runs
+/// of the same seed on different days agree. Tests that need an "expired" or
+/// "not yet expired" TTL value compute it from here rather than from
+/// `SystemTime::now`.
+///
+/// The base is far enough past the epoch that a test can set a *negative*
+/// per-node clock skew (`set_clock_skew_for`) without the wall clock
+/// saturating at 0.
+pub const SIM_WALL_EPOCH_MS: u64 = 1_577_836_800_000;
 
 fn dur_nanos(d: Duration) -> u64 {
     d.as_nanos().min(u128::from(u64::MAX)) as u64

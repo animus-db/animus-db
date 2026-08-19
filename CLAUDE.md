@@ -112,7 +112,13 @@ through the `Env` seam.** In every crate except `animus-env`'s `ProdEnv` and
 test code:
 
 - No wall clock — use `env.now()` / `env.sleep()`, never `std::time` or
-  `tokio::time`.
+  `tokio::time`. The **one** exception is `env.wall_now()` (ADR 0051), which
+  returns calendar time for interpreting externally-supplied absolute
+  timestamps — a DynamoDB TTL attribute and nothing else so far. It is still
+  inside the seam (`SimEnv` derives it from virtual time, so it stays
+  seed-reproducible), but it is **never** for timing: every deadline,
+  timeout, election, and backoff keeps using `env.now()`, which cannot step
+  backwards.
 - No raw task spawning — use `env.spawn_task(..)`, never `tokio::spawn`.
 - No real I/O — use `env.send`/`recv` and `env.append`/`sync`/`read`, never
   `std::net`/`std::fs`/`tokio::{net,fs}`.
@@ -213,6 +219,13 @@ truth; this map is just for navigation.
   already-populated table (ADR 0045): the new index goes through a
   `Creating`/`Active`/`Deleting` lifecycle, backfilled by reusing the ADR
   0041 drain over the table's pre-existing rows.
+  **DynamoDB TTL** (`UpdateTimeToLive`/`DescribeTimeToLive`, ADR 0051): a
+  table declares one attribute holding an absolute epoch second, replicated
+  as a `TtlSpec` in the catalog; a per-node leader-gated reaper
+  (`animusd::ttl_reaper`) deletes expired items through the ADR 0049
+  kind-write path, so index/stream/change-log maintenance is inherited
+  rather than reimplemented. Reads are **AWS-faithful** — an expired item
+  stays visible until it is reaped, deliberately not filtered.
 - **Observability & operations** — metrics seam (`animus-env`, ADR 0015,
   additive/no-op under sim); OTLP tracing (`animusd::otel`, ADR 0027, opt-in);
   the admin/debug HTTP-JSON interface (`animusd::admin`, ADR 0020, pure

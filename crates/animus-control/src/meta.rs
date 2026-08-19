@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{
     IndexDef, IndexStatus, SchemaCatalog, StreamSpec, StreamViewType, TableName, TableSchema,
+    TtlSpec,
 };
 
 /// The default a [`StreamShardRow`]/[`MetaCommand::SealStreamShard`]'s
@@ -676,6 +677,30 @@ pub enum MetaCommand {
     SetTableStream {
         table: TableName,
         spec: Option<StreamSpec>,
+    },
+    /// Enable, reconfigure, or disable a table's **DynamoDB-style TTL**
+    /// configuration (ADR 0051). Rejected if the table has no schema.
+    ///
+    /// Unlike [`MetaCommand::SetTableStream`], TTL mints no identity label
+    /// (see [`TtlSpec`]'s own doc for why), so the apply semantics are
+    /// simpler and deliberately **not** modeled on the stream command's
+    /// enabled-already-rejects-re-enable shape:
+    /// - `spec: Some(new_spec)` where `new_spec` equals the currently
+    ///   recorded spec (including the disabled → same-attribute-name
+    ///   re-enable case) is a **no-op** — idempotent, since there is no
+    ///   label to go stale.
+    /// - `spec: Some(new_spec)` that names a *different* attribute than
+    ///   what is currently recorded — including changing it in place while
+    ///   already enabled — is **applied**: a live attribute-name change is
+    ///   a legal DynamoDB `UpdateTimeToLive` call, not an error.
+    /// - `spec: None` is a **no-op** if TTL is already disabled, else
+    ///   applied.
+    ///
+    /// Because this is a replicated `MetaCommand`, the TTL configuration is
+    /// durable and agreed cluster-wide, like the rest of the catalog.
+    SetTableTtl {
+        table: TableName,
+        spec: Option<TtlSpec>,
     },
     /// Record a sealed stream shard segment in the replicated catalog (ADR
     /// 0042 §3/§9, ADR 0043 §A3/§A8) — the tablet leader's own commit of a
@@ -1502,6 +1527,20 @@ impl Metadata {
                 }
                 ApplyOutcome::Applied
             }
+            MetaCommand::SetTableTtl { table, spec } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                if schema.ttl == *spec {
+                    // Covers both idempotent shapes at once: re-enabling
+                    // with the same attribute name, and disabling when
+                    // already disabled (`spec` and `schema.ttl` both
+                    // `None`).
+                    return ApplyOutcome::NoOp;
+                }
+                schema.ttl = spec.clone();
+                ApplyOutcome::Applied
+            }
             MetaCommand::SealStreamShard {
                 table,
                 label,
@@ -1902,6 +1941,15 @@ impl Metadata {
     #[must_use]
     pub fn table_stream(&self, table: &str) -> Option<&StreamSpec> {
         self.schemas.get(table).and_then(|s| s.stream.as_ref())
+    }
+
+    /// This table's DynamoDB-style TTL configuration (ADR 0051), if enabled.
+    /// `None` for an unknown table or one with no TTL declared. A read
+    /// accessor for the wire adapters that consume the replicated catalog,
+    /// mirroring [`table_stream`](Self::table_stream) exactly.
+    #[must_use]
+    pub fn table_ttl(&self, table: &str) -> Option<&TtlSpec> {
+        self.schemas.get(table).and_then(|s| s.ttl.as_ref())
     }
 
     /// `tablet`'s own catalog rows for `(table, label)`, in ascending epoch
@@ -4136,6 +4184,153 @@ mod tests {
             )
         );
         assert!(!m.node_addrs.contains_key(&nid(905)));
+    }
+
+    // --- ADR 0051 TTL catalog ------------------------------------------
+
+    fn ttl_spec(attribute_name: &str) -> TtlSpec {
+        TtlSpec {
+            attribute_name: attribute_name.to_owned(),
+        }
+    }
+
+    /// Enabling TTL on a table with a schema records the spec, `Applied`.
+    #[test]
+    fn set_table_ttl_enables_and_records_the_spec() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableTtl {
+                table: "orders".to_owned(),
+                spec: Some(ttl_spec("expiresAt")),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.schemas.get("orders").unwrap().ttl,
+            Some(ttl_spec("expiresAt"))
+        );
+    }
+
+    /// Re-enabling with the identical attribute name is idempotent — unlike
+    /// `SetTableStream`, TTL mints no label, so there is nothing that goes
+    /// stale on a repeat enable.
+    #[test]
+    fn set_table_ttl_re_enable_with_same_attribute_is_noop() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableTtl {
+                table: "orders".to_owned(),
+                spec: Some(ttl_spec("expiresAt")),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableTtl {
+                table: "orders".to_owned(),
+                spec: Some(ttl_spec("expiresAt")),
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(
+            m.schemas.get("orders").unwrap().ttl,
+            Some(ttl_spec("expiresAt"))
+        );
+    }
+
+    /// Changing the attribute name in place — no disable/re-enable round
+    /// trip required — is a legal live `UpdateTimeToLive` and is `Applied`,
+    /// recording the new name.
+    #[test]
+    fn set_table_ttl_change_attribute_in_place_applies() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableTtl {
+                table: "orders".to_owned(),
+                spec: Some(ttl_spec("expiresAt")),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableTtl {
+                table: "orders".to_owned(),
+                spec: Some(ttl_spec("ttlSeconds")),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.schemas.get("orders").unwrap().ttl,
+            Some(ttl_spec("ttlSeconds"))
+        );
+    }
+
+    /// Disabling clears the spec (`Applied`); disabling again is a no-op.
+    #[test]
+    fn set_table_ttl_disable_then_disable_again_is_noop() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableTtl {
+                table: "orders".to_owned(),
+                spec: Some(ttl_spec("expiresAt")),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableTtl {
+                table: "orders".to_owned(),
+                spec: None,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.schemas.get("orders").unwrap().ttl, None);
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableTtl {
+                table: "orders".to_owned(),
+                spec: None,
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(m.schemas.get("orders").unwrap().ttl, None);
+    }
+
+    /// `SetTableTtl` against a table with no schema is `Rejected`.
+    #[test]
+    fn set_table_ttl_rejects_unknown_table() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableTtl {
+                table: "no-such-table".to_owned(),
+                spec: Some(ttl_spec("expiresAt")),
+            }),
+            ApplyOutcome::Rejected("no such table schema")
+        );
     }
 
     // --- ADR 0042/0043 stream-shard catalog ---------------------------

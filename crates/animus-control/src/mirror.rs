@@ -266,7 +266,10 @@ pub fn apply_and_derive_mirror(
         // ADR 0042: a stream (de)configuration is part of the table's schema
         // entry, so it mirrors identically to an index/mode change — the
         // whole (already-mutated) schema, re-serialized.
-        | MetaCommand::SetTableStream { table, .. } => {
+        | MetaCommand::SetTableStream { table, .. }
+        // ADR 0051: TTL is likewise part of the table's schema entry, so it
+        // mirrors exactly the same way.
+        | MetaCommand::SetTableTtl { table, .. } => {
             if let Some(schema) = meta.schemas.get(table) {
                 writes.push(put_json(syskv::schema_key(table), schema));
             }
@@ -1061,6 +1064,36 @@ mod tests {
         let command = MetaCommand::SetTableMode {
             table: "orders".to_string(),
             mode: crate::ReplicationMode::Ap,
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![put_json(
+                syskv::schema_key("orders"),
+                meta.schemas.get("orders").unwrap()
+            )]
+        );
+    }
+
+    /// ADR 0051: TTL is part of the table's schema entry, so it mirrors
+    /// identically to a mode change — the whole (already-mutated) schema,
+    /// re-serialized under the same `schema_key`.
+    #[test]
+    fn set_table_ttl_writes_the_updated_schema() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let command = MetaCommand::SetTableTtl {
+            table: "orders".to_string(),
+            spec: Some(crate::schema::TtlSpec {
+                attribute_name: "expiresAt".to_string(),
+            }),
         };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);

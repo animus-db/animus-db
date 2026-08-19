@@ -157,11 +157,20 @@ per-tablet CP data plane (`animus-cp-data`).
 - **`schema.rs`** — the replicated **table-schema catalog** (ADR 0013), all
   plain data (no I/O/clock/RNG): `TableSchema`, `ColumnType`,
   `SchemaCatalog`, `IndexDef`/`IndexKind`/`IndexProjection` (the replicated
-  GSI/LSI *shape*, not its entry data), and `StreamSpec` (a table's
-  DynamoDB Streams config, ADR 0042 §2/§4). See the module's own doc
-  comments for the type/accessor inventory. **`StreamViewType` is a
+  GSI/LSI *shape*, not its entry data), `StreamSpec` (a table's
+  DynamoDB Streams config, ADR 0042 §2/§4), and `TtlSpec` (a table's
+  DynamoDB-style TTL config, ADR 0051: just `attribute_name` — the item
+  attribute holding an absolute Unix epoch second; the control plane never
+  interprets an item, so it stores only the declaration). See the module's
+  own doc comments for the type/accessor inventory. **`StreamViewType` is a
   read-time projection only** — a shard record always stores both images
   regardless (ADR 0043), so a view-type change never needs a backfill.
+  **`TtlSpec` mints no identity label** (unlike `StreamSpec`'s `label`), so
+  `MetaCommand::SetTableTtl`'s idempotency rule is the opposite of
+  `SetTableStream`'s: re-enabling with the same attribute is a `NoOp`, and
+  changing the attribute in place (no disable/re-enable round trip) is
+  `Applied` — see the variant's own doc before copying `SetTableStream`'s
+  shape for a future replicated-config command that also has no label.
 
 - **`persist.rs`** — `WalRecord`, `PersistedState` (durability/recovery; the
   write/compact/recover flow is diagrammed in `docs/wal.md`). **`Metadata` is

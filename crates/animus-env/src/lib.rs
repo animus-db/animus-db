@@ -270,11 +270,64 @@ pub struct Envelope {
     pub payload: Vec<u8>,
 }
 
+/// A **wall-clock** instant: milliseconds since the Unix epoch (1970-01-01
+/// UTC).
+///
+/// Deliberately a separate type from [`Nanos`], which is monotonic-only and
+/// carries no calendar meaning. The two are not interchangeable and neither
+/// converts into the other: `Nanos` answers "how long since this env started",
+/// `UnixMillis` answers "what time is it". Reach for this **only** where a
+/// calendar timestamp is part of an external contract the database does not
+/// get to define — a DynamoDB TTL attribute is an absolute epoch second chosen
+/// by the client (ADR 0051), so no monotonic reading can interpret it. System
+/// timing (timeouts, elections, retries, backoff) must keep using
+/// [`Clock::now`]: it is monotonic, and a wall clock can jump backwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct UnixMillis(pub u64);
+
+impl UnixMillis {
+    /// Whole seconds since the epoch (truncating) — the unit DynamoDB's TTL
+    /// attribute itself is denominated in.
+    #[must_use]
+    pub fn as_secs(self) -> u64 {
+        self.0 / 1_000
+    }
+
+    /// A wall-clock instant from whole epoch seconds (saturating).
+    #[must_use]
+    pub fn from_secs(secs: u64) -> Self {
+        UnixMillis(secs.saturating_mul(1_000))
+    }
+
+    /// Saturating addition of a [`Duration`].
+    #[must_use]
+    pub fn saturating_add(self, dur: Duration) -> UnixMillis {
+        UnixMillis(
+            self.0
+                .saturating_add(dur.as_millis().min(u128::from(u64::MAX)) as u64),
+        )
+    }
+}
+
 /// Monotonic clock and sleeping.
 #[async_trait::async_trait]
 pub trait Clock: Send + Sync {
     /// The current monotonic instant.
     fn now(&self) -> Nanos;
+
+    /// The current **wall-clock** time (see [`UnixMillis`]).
+    ///
+    /// This is the one seam through which calendar time enters the system, and
+    /// it is still a seam: under simulation it is a pure function of the run's
+    /// virtual clock (a fixed epoch base plus elapsed virtual time, plus any
+    /// per-node clock skew), so a TTL sweep stays as reproducible from its seed
+    /// as everything else (ADR 0003). Under production it is the host's real
+    /// clock and may therefore jump — forwards or backwards — with NTP.
+    ///
+    /// **Never** use this for timing. Deadlines, timeouts, elections, backoff,
+    /// and every other interval measurement use [`now`](Clock::now); a
+    /// backwards wall-clock step must never be able to stall the system.
+    fn wall_now(&self) -> UnixMillis;
 
     /// Sleep until at least `dur` of (virtual or real) time has elapsed.
     async fn sleep(&self, dur: Duration);

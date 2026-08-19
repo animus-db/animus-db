@@ -16,6 +16,7 @@ use animusd::{
     ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, ReplicationMode, TableSchema,
     read_frame,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
@@ -362,6 +363,131 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
             .is_some_and(|(_, row)| row.expired),
         "rejected ExpireStreamShards must not have marked the row"
     );
+
+    for n in &nodes {
+        n.shutdown_graceful().await;
+    }
+}
+
+/// One DynamoDB request over a fresh HTTP/1.1 connection → `(status, body)` —
+/// mirrors `dynamo_schema.rs`'s identical helper (this file only needs it
+/// for the one TTL regression below, so it isn't worth sharing via
+/// `support`).
+async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
+    let request = format!(
+        "POST / HTTP/1.1\r\n\
+         Host: animus\r\n\
+         X-Amz-Target: {target}\r\n\
+         Content-Type: application/x-amz-json-1.0\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len(),
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send request");
+    stream.flush().await.expect("flush");
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .expect("read full response");
+    let text = String::from_utf8(raw).expect("utf8 response");
+    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    (status, payload.to_string())
+}
+
+/// ADR 0051's own instance of the `is_relayable_command` regression class
+/// this whole file exists for: `UpdateTimeToLive` issued against a DynamoDB
+/// listener on a node that is **not** the control-plane leader must still
+/// commit — `MetaCommand::SetTableTtl` must be on the relay allowlist, or
+/// this times out on exactly this shape (works only when the connected
+/// node happens to be the leader).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn update_time_to_live_on_a_follower_is_relayed_to_the_leader() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(3, dir.path()).await;
+
+    let leader = nodes.iter().position(Node::is_control_leader).unwrap();
+    let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
+
+    // Create the table against the leader (already covered elsewhere) so
+    // the regression below is scoped to `UpdateTimeToLive` alone.
+    let create = MetaCommand::CreateTableSchema {
+        table: "ttl_relay_t".into(),
+        schema: TableSchema::simple("id", ColumnType::String),
+    };
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let _ = call(
+                config.nodes[leader].intra,
+                ClientRequest::ProposeSchema(create.clone()),
+            )
+            .await;
+            if nodes[leader].metadata().has_table_schema("ttl_relay_t") {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("CreateTableSchema did not commit in 20s");
+
+    // The regression: `UpdateTimeToLive`, issued against the FOLLOWER's own
+    // DynamoDB listener, must relay to the leader and replicate everywhere.
+    let follower_dynamo = config.nodes[follower].dynamo;
+    let (status, body) = timeout(Duration::from_secs(20), async {
+        loop {
+            let (status, body) = dynamo(
+                follower_dynamo,
+                "DynamoDB_20120810.UpdateTimeToLive",
+                r#"{"TableName":"ttl_relay_t","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}}"#,
+            )
+            .await;
+            if status == 200 {
+                return (status, body);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("follower-issued UpdateTimeToLive did not commit via relay in 20s");
+    assert_eq!(status, 200, "body: {body}");
+    assert!(body.contains("\"AttributeName\":\"expiresAt\""), "{body}");
+    assert!(body.contains("\"Enabled\":true"), "{body}");
+
+    // It replicated to *every* node's own replicated catalog.
+    for (i, n) in nodes.iter().enumerate() {
+        assert_eq!(
+            n.metadata()
+                .table_ttl("ttl_relay_t")
+                .map(|t| t.attribute_name.as_str()),
+            Some("expiresAt"),
+            "node {i}: TTL spec missing after follower-relayed UpdateTimeToLive"
+        );
+    }
+
+    // `DescribeTimeToLive` against the (different) follower reads the same
+    // committed spec back — a pure catalog read, no relay involved.
+    let (status, body) = dynamo(
+        follower_dynamo,
+        "DynamoDB_20120810.DescribeTimeToLive",
+        r#"{"TableName":"ttl_relay_t"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "body: {body}");
+    assert!(body.contains("\"TimeToLiveStatus\":\"ENABLED\""), "{body}");
+    assert!(body.contains("\"AttributeName\":\"expiresAt\""), "{body}");
 
     for n in &nodes {
         n.shutdown_graceful().await;

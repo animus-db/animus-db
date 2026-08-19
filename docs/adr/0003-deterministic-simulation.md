@@ -1,6 +1,17 @@
 # ADR 0003 — Deterministic simulation testing and the `Env` seam
 
 - **Status:** Accepted
+- **2026-08-19 note:** [ADR 0051](0051-dynamodb-ttl.md) (accepted, implemented)
+  adds `Clock::wall_now()` — the first **calendar-time** reading in the
+  codebase, admitted for DynamoDB TTL, whose timestamps are absolute epoch
+  seconds chosen by the client and so cannot be interpreted by any monotonic
+  reading. This does not weaken the guarantee below: under `SimEnv` the wall
+  clock is a fixed epoch base plus elapsed *virtual* time (plus the existing
+  per-node `set_clock_skew_for` offset), so it stays a pure function of the
+  run's seed. It is a derived reading **inside** the seam, not a hole in it.
+  `Nanos` remains the only clock for timing — deadlines, timeouts, elections,
+  backoff — and the two types are deliberately not interconvertible; see ADR
+  0051 §1.
 - **Date:** 2026-08-01
 
 ## Context

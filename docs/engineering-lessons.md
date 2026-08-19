@@ -6744,6 +6744,75 @@ debugging anything that feels like it might have happened before.
   ship where a wall-clock assertion would just go flaky.
   (`crates/animusd/src/index_drain.rs::tail_pass`, `split_driver_tick`.)
 
+- **Adding a variant to `animus-dynamo::wire::Operation` breaks `animusd`'s
+  exhaustive `match op { .. }` dispatch by construction — that's a downstream
+  crate's job to fix, not a sign your pure-crate slice failed (2026-08-19).**
+  Building ADR 0051 TTL's `Operation::UpdateTimeToLive`/
+  `DescribeTimeToLive` in `animus-dynamo` (a crate deliberately kept
+  dependency-free of `animusd`) left `cargo build --workspace --all-targets`
+  failing on `crates/animusd/src/dynamo.rs`'s non-exhaustive `match` with a
+  clear `E0004` naming exactly the two new variants. This is the expected,
+  narrow shape of the split: a pure-crate agent adds the wire vocabulary,
+  a separate `animusd`-owning agent wires it up; a compile error whose
+  *only* content is "new match arm needed" in a crate you were told not to
+  touch is a handoff marker, not a regression to chase — confirm the error
+  names only your new variants (nothing pre-existing broke) and report it
+  rather than reaching into the other crate. The reusable check: `git status`
+  before troubleshooting a cross-crate build break in a parallel-agent tree
+  — if the crate the error is in shows as untouched while sibling crates
+  show real diffs, the owning agent for that crate simply hasn't landed the
+  consuming change yet.
+- **`clippy::collapsible_if` on a nested nullable check often wants an
+  `if cond && let Some(x) = opt { .. }` let-chain, not a manual flatten
+  (2026-08-19).** `describe_time_to_live_response`'s `if enabled { if let
+  Some(name) = attr { .. } } }` tripped `collapsible_if` under `-D warnings`;
+  clippy's own suggested fix (`if enabled && let Some(name) = &attr { .. }`)
+  compiles cleanly on this workspace's toolchain (let-chains are stable
+  here) and is both shorter and more direct than restructuring the logic by
+  hand — read the lint's `help:` suggestion before reaching for a manual
+  rewrite, it's frequently already the answer.
+- **A small pure bridge struct (mirroring `StreamDescription`'s existing
+  precedent) is the right way to hand a distributed-system layer's real
+  state into a pure crate's response encoder, without adding a dependency
+  the crate doesn't already have.** `wire::TtlDescription` (ADR 0051) is
+  filled in by `animusd`, which holds the replicated catalog's actual TTL
+  configuration; `animus-dynamo` never needs `animus_control` types to
+  render `DescribeTimeToLive`'s JSON. Before inventing a new response-input
+  shape, check whether an existing sibling (`StreamDescription`,
+  `index_statuses`'s side-channel) already establishes the pattern — it
+  usually does, and matching it keeps the crate's encoders uniform.
+  (`crates/animus-dynamo/src/wire.rs`.)
+- **A read-without-waking background loop (ADR 0048) has real, pre-existing
+  building blocks — verify against the source before assuming a wake is
+  unavoidable, don't just gate it and hope.** Building the TTL reaper
+  (ADR 0051 §6, `crates/animusd/src/ttl_reaper.rs`) needed a scan that
+  never wakes a quiesced `CpGroup`. Rather than trust the ADR's prose,
+  reading `animus-cp-data`'s actual source confirmed `local_get_kind`/
+  `local_scan_kind`/`pending_changes` are pure `self.storage.{get,scan}`
+  calls with **no** path anywhere near `RaftKvNode::wake`/`WakeSignal`/
+  `RaftCore` — they never touch the consensus loop at all, so they
+  structurally cannot reset a group's idle-activity clock. That made the
+  "scan without waking, wake only to act" design directly buildable with
+  existing primitives, not a new mechanism. The general rule: before
+  reporting a documented contract undeliverable (or silently violating it),
+  read the primitive's own implementation — a `local_*`-prefixed accessor
+  in this codebase is a strong (but still worth confirming) naming signal
+  that it bypasses the network/consensus path entirely.
+- **Widening a shared write-path helper's signature (e.g. adding a new
+  trailing `bool`/enum discriminator) must be grepped across the *whole*
+  crate, not just `tests/*.rs` — an in-crate `#[cfg(test)] mod` at the
+  bottom of `lib.rs`/`dynamo.rs`/`index_drain.rs` calls the same private
+  function and is invisible to a search scoped to the external test
+  tree.** Threading `ChangeRecord::ttl_expired`/`kind_write_item_at_leader`'s
+  new `ttl_expired: bool` parameter (ADR 0051 §7) had five real call
+  sites, not the four a `crates/animusd/tests/` grep alone would find —
+  the fifth pair lived in `lib.rs`'s own `rmw_285_a`/`rmw_285_b`
+  in-crate regression module (issue #285, see this crate's own `CLAUDE.md`
+  for why those tests can't live in `tests/`). `grep -rn
+  "kind_write_item_at_leader(" crates/animusd/src/` (source, not just
+  `tests/`) is what actually finds every call site of a `pub(crate)`
+  helper this crate's own module-map documents as having in-crate test
+  consumers.
 - **An introspection surface whose cost scales with the data it describes
   needs an explicit answer to "what happens when something polls this every
   few seconds?" — because a dashboard eventually will** (2026-08-19).
@@ -7787,3 +7856,31 @@ debugging anything that feels like it might have happened before.
   before diagnosing a surprise compile failure that shows up late in a
   session, especially right after a `--all-features`/multi-crate build
   sweep.
+- **When several agents edit the same workspace in parallel, a
+  workspace-wide `cargo build`/`clippy` failure needs its error message
+  read, not just its exit code, before deciding whose slice broke it**
+  (TTL catalog slice, ADR 0051, 2026-08-19). Building `--workspace
+  --all-targets` while sibling agents have half-finished edits elsewhere
+  in the tree routinely fails for reasons that have nothing to do with
+  your own change — e.g. an `error[E0004]: non-exhaustive patterns` on
+  `animus-dynamo`'s `Operation` enum while implementing a `MetaCommand`
+  addition in `animus-control` is a different agent's wire-adapter slice
+  mid-edit, not a fallout from the `MetaCommand`/schema change. Confirm
+  scope by grepping the error for your own new symbol names and by
+  building/testing your own crate in isolation (`cargo build -p <crate>
+  --all-targets`, `cargo test -p <crate>`) as the real gate — that must be
+  genuinely green — and report the cross-crate failure verbatim rather
+  than "fixing" code another agent is still writing.
+- **Adding a variant to a replicated config command that, unlike its
+  closest precedent, mints no identity label changes its idempotency
+  rule, not just its payload shape** — modeling DynamoDB TTL's
+  `MetaCommand::SetTableTtl` directly on `SetTableStream` would have made
+  a same-attribute re-enable an error, because `SetTableStream` rejects
+  re-enabling specifically to protect its minted `label` from going
+  stale. TTL has no label to protect, so the correct rule is the opposite:
+  re-enabling with the same value is a no-op, and changing the value in
+  place (no disable/re-enable round trip) is `Applied` — both are real,
+  legal DynamoDB operations. When cloning the shape of an existing
+  replicated command for a new field, check *why* each of its rejects
+  exists before copying it, not just what the reject is guarding on the
+  surface.

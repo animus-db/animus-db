@@ -151,7 +151,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjection, IndexStatus};
-use animus_control::{MetaCommand, Metadata, ReplicationMode};
+use animus_control::{MetaCommand, Metadata, ReplicationMode, TtlSpec};
 use animus_cp_data::{KIND_BASE, KIND_LSI};
 use animus_dynamo::wire::{
     self, Operation, Projection, ReturnValues, TransactAction, TransactGet, WireError, WriteRequest,
@@ -711,7 +711,96 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             run_transact(ctx, meta, &actions).await
         }
         Operation::TransactGetItems { gets } => run_transact_get(ctx, meta, &gets).await,
+        Operation::UpdateTimeToLive {
+            table,
+            attribute_name,
+            enabled,
+        } => update_time_to_live(ctx, &table, &attribute_name, enabled).await,
+        Operation::DescribeTimeToLive { table } => describe_time_to_live(ctx, meta, &table),
     }
+}
+
+/// `UpdateTimeToLive` (ADR 0051): declare, change, or disable a table's TTL
+/// attribute — the same commit-wait shape [`enable_stream`]/
+/// [`disable_stream`] already use, just against `MetaCommand::SetTableTtl`
+/// instead of `SetTableStream`. Unlike a stream's minted `label`, `TtlSpec`
+/// carries no identity, so re-enabling with the same attribute name (or
+/// changing it in place while already enabled) both commit cleanly with no
+/// disable-first requirement — see that command's own doc.
+///
+/// AWS requires `AttributeName` even on a disable call and validates it
+/// matches the table's currently-enabled attribute; we do too, but **only**
+/// when TTL is *currently* enabled — there is nothing to mismatch against
+/// otherwise, and disabling an already-disabled table is always a catalog
+/// no-op regardless of the supplied name (`MetaCommand::SetTableTtl`'s own
+/// apply-time rule).
+async fn update_time_to_live(
+    ctx: &ClientCtx,
+    table: &str,
+    attribute_name: &str,
+    enabled: bool,
+) -> Result<String, WireError> {
+    let meta = metadata_fresh(ctx).await;
+    if !meta.has_table_schema(table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    if !enabled
+        && let Some(current) = meta.table_ttl(table)
+        && current.attribute_name != attribute_name
+    {
+        return Err(WireError::validation(format!(
+            "TimeToLiveSpecification.AttributeName `{attribute_name}` does not match table \
+             `{table}`'s currently-enabled TTL attribute `{}`",
+            current.attribute_name
+        )));
+    }
+    let spec = enabled.then(|| TtlSpec {
+        attribute_name: attribute_name.to_owned(),
+    });
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::SetTableTtl {
+            table: table.to_owned(),
+            spec: spec.clone(),
+        })
+        .await;
+        if metadata_fresh(ctx).await.table_ttl(table) == spec.as_ref() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "UpdateTimeToLive did not commit to the control plane in time \
+                 (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+    Ok(wire::update_time_to_live_response(attribute_name, enabled))
+}
+
+/// `DescribeTimeToLive` (ADR 0051): a pure read of the replicated catalog,
+/// mirroring [`describe_table`]'s shape exactly. `ctx` is unused (every
+/// input comes from `meta`) but kept for signature symmetry with the other
+/// operation handlers.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_time_to_live(
+    _ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+) -> Result<String, WireError> {
+    if !meta.has_table_schema(table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    let ttl = meta.table_ttl(table);
+    let desc = wire::TtlDescription {
+        enabled: ttl.is_some(),
+        attribute_name: ttl.map(|t| t.attribute_name.clone()),
+    };
+    Ok(wire::describe_time_to_live_response(&desc))
 }
 
 /// Propose `table`'s key schema **and each declared secondary-index definition**
@@ -2782,6 +2871,10 @@ pub(crate) enum KindWriteOutcome {
 /// lock-free (`txn_resolver_loop` never takes this lock either). Narrowing
 /// the scope trades a few more retried OCC misses under genuine same-key
 /// contention for not stalling unrelated items' writes.
+/// `ttl_expired` (ADR 0051 §7): `true` only for the TTL reaper's own delete
+/// — stamps the resulting change record's `userIdentity` as the service
+/// principal (see [`kind_writes_for_item`]'s doc) instead of leaving it a
+/// client write. Every ordinary caller passes `false`.
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
 pub(crate) async fn kind_write_item_at_leader(
     ctx: &ClientCtx,
@@ -2792,6 +2885,7 @@ pub(crate) async fn kind_write_item_at_leader(
     sk: Option<&AttributeValue>,
     op: KindWriteOp,
     condition: Option<&ConditionExpression>,
+    ttl_expired: bool,
 ) -> Result<KindWriteOutcome, WireError> {
     let base_key = item_key(pk, sk);
     // `rmw_lock` is scoped to read + evaluate only (issue #285) — it must
@@ -2844,6 +2938,7 @@ pub(crate) async fn kind_write_item_at_leader(
             value.clone(),
             old.as_ref(),
             new.as_ref(),
+            ttl_expired,
         );
         let seatbelt = vec![(base_key, raw_old)];
         (old, new, writes, change_log, seatbelt)
@@ -2955,6 +3050,10 @@ pub(crate) async fn eval_kind_txn_write(
         value.clone(),
         old.as_ref(),
         new.as_ref(),
+        // A transactional write never carries the TTL reaper's own service
+        // identity (ADR 0051 §7) — the reaper deletes through
+        // `kind_write_item_at_leader` directly, never `cp_txn`.
+        false,
     );
     // The base row itself rides as `TxnWrite::key`/`value`, not inside
     // `kind_writes` — strip it out (it's always `writes[0]` by
@@ -3213,6 +3312,7 @@ fn marker_record(partition_prefix: &[u8], base_sk: Vec<u8>, staged: bool) -> (Ve
         seeded: false,
         marker: true,
         staged,
+        ttl_expired: false,
     };
     (partition_prefix.to_vec(), record.encode())
 }
@@ -3351,6 +3451,13 @@ mod txn_resolve_awaited_tests {
 /// image-less *marker* record instead (ADR 0049 §1,
 /// `table_change_records_carry_images`) — same key, same apply-time HLC
 /// completion, no images.
+///
+/// `ttl_expired` (ADR 0051 §7) stamps the resulting change record's own
+/// [`ChangeRecord::ttl_expired`] flag — `true` only for the TTL reaper's own
+/// delete (`ttl_reaper::ttl_reaper_loop`, via [`kind_write_item_at_leader`]),
+/// `false` for every ordinary client write and every transactional write
+/// ([`eval_kind_txn_write`]'s own call always passes `false`, since a
+/// transaction never carries a service identity).
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
 fn kind_writes_for_item(
     meta: &Metadata,
@@ -3361,6 +3468,7 @@ fn kind_writes_for_item(
     base_value: Vec<u8>,
     old: Option<&Item>,
     new: Option<&Item>,
+    ttl_expired: bool,
 ) -> IndexedWrite {
     let indexes = meta.table_indexes(table);
     let base = schema_for(meta, table);
@@ -3412,6 +3520,7 @@ fn kind_writes_for_item(
         seeded: false,
         marker: !carries_images,
         staged: false,
+        ttl_expired,
     };
     let change_log = (
         token_prefixed(pk, &dynamo_index::change_prefix(pk)),
