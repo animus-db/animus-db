@@ -164,17 +164,17 @@ per-tablet CP data plane (`animus-cp-data`).
   regardless (ADR 0043), so a view-type change never needs a backfill.
 
 - **`persist.rs`** — `WalRecord`, `PersistedState` (durability/recovery; the
-  write/compact/recover flow is diagrammed in `docs/wal.md`).
-  `encode_snapshot_record_from_blob` encodes the WAL `Snapshot` line **reusing
-  the core's cached serialized image** (`snapshot_blob`, via `serde_json`
-  `RawValue`) — for an in-core state machine this serializes its whole state
-  once per compaction, not twice, guarded by
-  `snapshot_record_blob_reuse_round_trips`. **`Metadata` is `DRIVER_APPLIED`
-  (ADR 0038), so its WAL `Snapshot` record's `metadata` field is always the
-  meaningless `Metadata::default()`** (the real durable state lives in the
-  system-keyspace engine) — this reuse path is exercised by this crate's
-  other `DRIVER_APPLIED` uses (`driver_applied_sm.rs`'s toy state machine)
-  and by `animus-cp-data`'s identical-shaped `KvState`, not by `Metadata`.
+  write/compact/recover flow is diagrammed in `docs/wal.md`). **`Metadata` is
+  `DRIVER_APPLIED` (ADR 0038), so its WAL `Snapshot` record's `metadata` field
+  is always the meaningless `Metadata::default()`** (the real durable state
+  lives in the system-keyspace engine). An earlier blob-reuse snapshot encoder
+  (`encode_snapshot_record_from_blob`/`RaftCore::encoded_wal_image`) that
+  serialized an in-core state machine's snapshot once instead of twice was
+  deleted (unreachable since ADR 0038 made every real state machine in this
+  workspace `DRIVER_APPLIED`, so its own `!S::DRIVER_APPLIED` assert could
+  never pass outside a toy test machine) — the live compaction path
+  (`node.rs`'s `meta_apply_and_compact`) has only ever called plain
+  `wal_image()`/`encode_record`.
 
 - **`detector.rs`** — `FailureDetector` (ADR 0012): a pure, unit-tested
   interval+timeout liveness detector. No clock, no RNG.
@@ -413,9 +413,7 @@ per-tablet CP data plane (`animus-cp-data`).
     so no whole-tablet image is retained at rest (regression:
     `driver_applied_sm.rs::caught_up_node_reships_non_empty_snapshot`).
 
-  The compaction serialize reuses the cached blob for the WAL record too
-  (`encode_snapshot_record_from_blob`), so compaction serializes `Metadata`
-  once. Liveness teeth:
+  Liveness teeth:
   `install_snapshot.rs::large_snapshot_ships_in_o_chunk_time_not_o_state` +
   `tests/prod_liveness.rs`.
 
