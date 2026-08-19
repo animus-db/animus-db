@@ -320,6 +320,38 @@ per-tablet CP data plane (`animus-cp-data`).
   `futures::select`, drawing `entropy` every iteration for randomized election
   timeouts.
 
+- **The WAL `fsync` is raced inside that `select`, not awaited before it
+  (issue #279).** `drive` used to `persist_wal` → `select` → step →
+  `persist_wal` → send, both persists inline. That livelocks the control group
+  whenever an `fsync` outlasts the 150 ms `election_base`: the blocked loop
+  sends no heartbeats and re-arms no election deadline, followers campaign, each
+  leadership change's no-op commit makes more persist work, repeat. The control
+  group is not a bystander to the workload that surfaced this in the data plane
+  — it is one of the replicas `fsync`ing concurrently during a
+  split-during-backfill. Now only the messages that make a **durability claim**
+  wait for their persist round (`RequestVoteResp{granted}`,
+  `AppendEntriesResp{success}`, `RequestVote`, `InstallSnapshotResp`);
+  `AppendEntries`/heartbeats and pre-vote traffic ship at once, which is what
+  keeps the group alive. The accounting lives in **`persist_round.rs`, shared
+  with `animus-cp-data`'s driver** — read its module doc before touching any of
+  this. Two things specific to this plane:
+  - **Three drainers, not two.** The consensus loop, the apply task's
+    compaction rewrite, and the *public* `RaftNode::flush` (a graceful
+    shutdown calls it from outside the driver). All three go through
+    `persist_round::drain_for_round`, which is the only sanctioned drain
+    precisely so a third or fourth one cannot take records without numbering
+    the round that covers them.
+  - **`flush`'s old doc claimed "the driver is parked, so this is the sole WAL
+    writer".** That precondition is void now and is the exact shape of hazard
+    the engineering-lessons log warns about: when a synchronous step becomes
+    concurrent, every other writer's unstated "…while the loop is blocked" is
+    load-bearing and must be re-examined.
+  - This plane never quiesces (ADR 0048 fork G), so the timer arm is always
+    present and the loop's `fully_durable` release is re-evaluated at least
+    once per heartbeat interval — a belt the data plane does not have.
+  Regression: `tests/slow_disk_no_livelock.rs` (verified red on the pre-fix
+  driver across four seeds: 2/10 proposals accepted, the group leaderless).
+
 - **One apply model, generic across both planes (ADR 0017, cut over to
   `Metadata` by ADR 0038 PR3).** `StateMachine::DRIVER_APPLIED = true` is now
   set for **both** `Metadata` (this crate) and the data plane's `KvState`
@@ -502,4 +534,14 @@ differential oracles, runtime control-membership change (ADR 0037) and its
 liveness guard, the ADR 0040 registration CAS and orphan sweep, placement/
 failure-detection/schema-catalog/metrics end-to-end scenarios, and
 `prod_liveness.rs`'s real-thread `ProdEnv` smoke tests for properties
-`SimEnv`'s virtual clock can't see.
+`SimEnv`'s virtual clock can't see, and `slow_disk_no_livelock.rs`'s
+slow-`fsync` driver-liveness regression (issue #279, via
+`DiskConfig::set_sync_delay`).
+
+**Test-design gotcha this file's own history records**: do not drive load with
+`UpsertMember` for node ids that will never heartbeat. The leader's orphan
+sweep (ADR 0040 PR6) then proposes a `RemoveMember` the state machine rejects
+every tick, flooding the log with hundreds of entries — the first draft of
+`slow_disk_no_livelock.rs` measured that churn's throughput instead of the
+property it meant to. `CreateTableSchema` is inert: nothing in the driver
+reacts to it.

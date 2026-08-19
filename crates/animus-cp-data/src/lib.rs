@@ -44,6 +44,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use animus_control::persist_round::{
+    self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake,
+};
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
 use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId, PRIMARY_STREAM};
@@ -60,14 +63,12 @@ mod codec;
 pub mod cursor;
 pub mod hlc;
 pub mod host;
-mod persist_round;
 mod seal;
 pub mod segment;
 mod ts_cache;
 mod txn;
 
 use hlc::{Hlc, HlcTimestamp, bump_strictly_above};
-use persist_round::{GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake};
 use ts_cache::TsCache;
 pub use txn::{StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnWrite};
 
@@ -6956,7 +6957,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             None => (outs, Vec::new()),
             Some(_) => outs
                 .into_iter()
-                .partition(|(_, wire)| persist_round::ships_before_durable(wire)),
+                .partition(|(_, wire)| ships_before_durable(wire)),
         };
         if let Some(round) = gate {
             gated.push(round, held);
@@ -7504,5 +7505,21 @@ mod pr5_orphan_and_resurrection_tests {
             wall_ms: 1_000,
             logical: 0,
         }
+    }
+}
+
+/// Whether an outbound [`KvWire`] may ship before its persist round is durable
+/// (issue #279) — this plane's thin wrapper over the shared
+/// [`persist_round::ships_before_durable`] policy.
+///
+/// The consensus traffic decision is the shared one, so the two planes can
+/// never drift on which Raft messages make a durability claim. Only this
+/// crate's own **non-consensus** variants are decided here:
+/// `ReadProbe`/`ReadProbeAck` are a ReadIndex barrier the `RaftCore` never even
+/// sees, carry no state claim, and so are never held back.
+fn ships_before_durable(wire: &KvWire) -> bool {
+    match wire {
+        KvWire::ReadProbe { .. } | KvWire::ReadProbeAck { .. } => true,
+        KvWire::Raft(msg) => persist_round::ships_before_durable(msg),
     }
 }
