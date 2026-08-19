@@ -516,6 +516,43 @@ per-node concurrent-build caps/IO throttling; SSTable-level seed cloning;
 per-tablet admin storage introspection (`/admin/storage/lsm` shows only
 the syskv engine today).
 
+## Amendment (2026-08-19b) — the two children are shipped concurrently
+
+The bulk pass (and the final image, and the tail's trailing flush) shipped
+to child A, awaited its commit, then shipped to child B. The children are
+two independent Raft groups at placement-chosen homes (fork F5), routinely
+on disjoint node sets, so each child's replicas sat idle for exactly as
+long as the other child's chunk took to commit. `ship` now returns its row
+count instead of accumulating into a borrowed counter — one `&mut` into
+`SplitBuild` was what serialized them at the borrow checker — and
+`ship_all` runs one ship per child under `try_join_all`.
+
+Failure semantics are deliberately unchanged: the first error is surfaced
+and the sibling future dropped, which at worst abandons a confirm-wait for
+a chunk that may still commit. That is precisely the state a crashed
+driver leaves behind, and the same property makes it safe — a `SeedBatch`
+merges at its carried versions, so the next tick re-ships it as a no-op.
+Covered by `tests/split_build.rs::split_survives_losing_one_childs_leader_
+mid_build`, which kills a node leading one `Building` child mid-build (the
+driver stays healthy; only the ship fails) and asserts cutover still
+completes with every acked key intact.
+
+**Measured honestly: this is worth ~0.6s of a ~6s build, not the ~2x the
+shape suggests.** Quiet-parent A/B, 20,000 rows over 5 data nodes, debug
+build, n=6 per side: median 6.05s serial vs 5.25s concurrent (13%), mean
+6.13s vs 5.67s (8%), stdev ~0.85s on both — **the delta is within one
+standard deviation, so it is a direction, not a demonstrated speedup.**
+The size is what the cost model predicts: at this scale the ships are only
+~1.2s of the build, so halving them saves ~0.6s.
+
+That points at what actually dominates a quiet build, and it is not the
+wire: **three full engine scans of the tablet** — the version-floor
+pre-pass, the bulk scan, and the final image — each materializing every
+row of all three copy kinds. Collapsing the pre-pass into the bulk scan
+(it exists only to bound a version floor) and making the final image
+read only rows above that floor without a whole-scope scan are the next
+real wins, and are named here rather than attempted.
+
 ## Amendment (2026-08-19) — the tail's cost is the delta, not the table
 
 Reported from a dev cluster (`--cluster-control 3 --cluster-data 5
