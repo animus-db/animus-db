@@ -425,3 +425,65 @@ Status note above. Cross-tablet transactions remain the one genuinely open item
 This ADR builds on ADR 0016 (the pluggable-replication decision) and ADR 0009
 (the in-house Raft it extends); the control plane (ADR 0001) remains the metadata
 authority and is unchanged.
+
+## Amendment (2026-08-18, driver liveness II — WAL persistence off the loop)
+
+**Context.** The original driver-liveness fix above moved engine apply and
+compaction off the consensus loop, because a ~180–300 ms batch of LSM merges on
+the loop blew the 150 ms `election_base` and produced a leader-election storm.
+The WAL `append`+`fsync` was deliberately *kept* on the loop, on the reasoning
+that a granted vote / accepted append must be durable before its response goes
+out, and that a local `fsync` is fast enough to stay inside the election budget.
+That rationale lived only in `drive()`'s doc comment — this ADR never recorded
+it — so this amendment records both it and its failure.
+
+**What went wrong (issue #279).** On shared/virtualised CI disks the `fsync`
+assumption does not hold, and the failure is a livelock, not slowness: while the
+loop blocks on `fsync` it sends no heartbeats as leader and re-arms no election
+deadline as follower, so followers campaign; every resulting leadership change
+commits a no-op, which makes more persist work on every replica; the group never
+settles. ADR 0050's per-tablet private engines multiply the effect — a split
+mid-backfill has parent + two children + the GSI's hidden-table tablet + the
+control plane all `fsync`ing at once, × 3 replicas — which is why it reproduced
+only under split-during-backfill, as a full-budget wall of `"CP group leader
+moved; retry"`.
+
+**Decision.** The consensus loop no longer awaits its own persist. The drain →
+`append` → `fsync` sequence is raced as a fifth arm of the loop's existing
+`select` (no new task — the two reverted attempts recorded on the issue proved
+per-group task overhead was not the problem, and a loop-owned future makes the
+round state single-owner). Outbound messages are split rather than uniformly
+delayed: replication (`AppendEntries`, heartbeats included), pre-vote traffic,
+`InstallSnapshot` chunks and the liveness signals ship immediately, because none
+of them makes a durability claim — the leader's own client-visible state is
+separately gated by `min(commit_index, durable_index)`. Everything that does make
+one — `RequestVoteResp { granted }`, `AppendEntriesResp { success }`,
+`RequestVote` (a candidate counts its own vote), `InstallSnapshotResp` — waits for
+the persist round covering the step that produced it. The allowlist is written as
+an allowlist, so a message added later is held back by default.
+
+**Consequences worth naming.**
+
+- Durability accounting is by **round**, not by log index: a vote-only persist
+  moves no index at all, so `mark_durable_through`/`durable_index` cannot express
+  "this batch is now durable" for a buffered vote grant.
+- The WAL has **two** drainers (the loop and the apply task's compaction
+  rewrite), and the second one was where both earlier attempts failed. Compaction
+  drains the loop's pending records and discards them — correct while the loop
+  drained synchronously, fatal once it does not. Both drainers now go through one
+  shared helper that numbers the round it drains, and the loop additionally
+  releases its whole buffer whenever nothing is pending and no round is in
+  flight, which is sound regardless of round numbering.
+- Quiescence (ADR 0048) gains a veto: a group with an in-flight round or an
+  undelivered gated message must keep its timers, since dropping the timer arm
+  would leave the round completion as the only wake source.
+- `shutdown()` now drains an in-flight round to completion before setting
+  `stopped` — teardown deletes the WAL as soon as `is_stopped()` goes true, and
+  aborting a future mid-`fsync` is a request, not a guarantee.
+
+Regressions: `animus-cp-data/tests/slow_disk_no_livelock.rs` (`SimEnv`, using
+`DiskConfig::set_sync_delay`; verified red on the pre-fix tree across four seeds)
+and `animus-cp-data/tests/prod_compaction_persist_round.rs` (real threads,
+compaction competing with the loop). The end-to-end gate is
+`animusd/tests/backfill_seeder.rs::split_during_backfill_converges_with_correct_final_gsi`
+run repeatedly in isolation — the check both reverted attempts failed.

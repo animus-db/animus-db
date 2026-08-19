@@ -562,10 +562,29 @@ demand the identical action, so no disambiguation is needed.
   campaigned → a **leader-election storm** that truncated in-flight writes and
   collapsed throughput to ~15/s. Now:
   - **Consensus loop** (`drive`): recover from WAL, spawn the apply task, then
-    loop `persist_wal` (drain records → append + `fsync` → `mark_durable_
-    through`, under `wal_lock`) → `select(recv, timer, propose-wake)` → step
-    the core → `persist_wal` again → send. It does **no** engine apply, so it
-    always heartbeats/acks within the election timeout. **`persist_wal` is
+    loop: start a persist round if the core owes the WAL anything and none is in
+    flight → `select(persist-round, propose-wake, driver-wake, recv, timer)` →
+    step the core → send. It does **no** engine apply, so it always
+    heartbeats/acks within the election timeout.
+
+    **The `fsync` is raced inside that `select`, not awaited before it (issue
+    #279, ADR 0017's 2026-08-18 amendment).** It used to be `persist_wal` →
+    `select` → step → `persist_wal` → send, with both persists awaited inline —
+    which livelocked a group whenever an `fsync` outlasted the 150 ms
+    `election_base` (blocked loop → no heartbeats, no election-deadline re-arm →
+    followers campaign → each leadership change's no-op commit makes more
+    persist work → repeat). Now only the messages that make a **durability
+    claim** wait: `RequestVoteResp{granted}`, `AppendEntriesResp{success}`,
+    `RequestVote` (a candidate counts its own vote) and `InstallSnapshotResp` are
+    buffered against their persist round; `AppendEntries`/heartbeats, pre-vote
+    traffic, `InstallSnapshot` chunks, `TimeoutNow`/`Quiesce`/`WakeRequest` and
+    `ReadProbe`(`Ack`) ship at once. `persist_round.rs` owns the accounting —
+    read its module doc before touching any of this, especially the "Two layers"
+    section: the WAL has **two** drainers (this loop and the apply task's
+    compaction rewrite), the interleaving that bit the two reverted fix attempts
+    is a microsecond window no wall-clock test can hit, and the defect is closed
+    structurally instead (one shared `drain_for_round`, plus a `fully_durable`
+    release that needs no round number to be right). **`persist_wal` is
     halted-gated** (issue #278 item 1, mirroring the apply task's `env.replace`
     compaction-error handling immediately below): an `env.append`/`env.sync`
     error is tolerated — no `mark_durable_through`, no `apply_signal` notify,
@@ -619,6 +638,10 @@ demand the identical action, so no disambiguation is needed.
     `engine_applied` via `snapshot_upto` (not `last_applied`, which the engine
     hasn't merged) and **discards the consensus loop's pending records** in the
     same locked block (`replay` is push-based → re-appending would duplicate).
+    That discard is also a **persist round** now (issue #279): it goes through
+    `persist_round::drain_for_round` like the loop's own drain and completes the
+    round once its `env.replace` lands, or the acks the loop buffered against
+    those records would wait on a round with no drainer.
     Compaction is skipped while `halted`. `is_stopped()` requires *both* tasks
     stopped (`stopped && apply_stopped`) before the GC deletes artifacts.
   - This is also where `engine_applied` vs `last_applied` (Key invariants)
@@ -677,7 +700,10 @@ demand the identical action, so no disambiguation is needed.
     tablet whose change log was non-empty on its last sweep) hold the group
     awake; ORed, once per consensus-loop iteration, with this crate's own
     in-memory check that `TxnTracker` (`pending`/`unresolved_decided`) is
-    empty — a group with a live 2PC intent or an undelivered resolve can
+    empty — and (issue #279) with the loop's own in-flight persist round or
+    undelivered gated acks, since quiescence drops the timer arm entirely and
+    would otherwise leave a round completion as the only wake source for a
+    message a peer is waiting on — a group with a live 2PC intent or an undelivered resolve can
     never quiesce out from under `txn_resolver_loop`. Both together make
     "quiesced ⇒ nothing new for the sweeper" a sound invariant for
     `animusd`'s own sweeper-skip (below).
@@ -750,14 +776,16 @@ demand the identical action, so no disambiguation is needed.
 
 ## Tests
 
-`cargo test -p animus-cp-data`. All but one of the 26 test binaries drive
+`cargo test -p animus-cp-data`. All but two of the 28 test binaries drive
 `SimEnv` — use `run_for`/`run_until`, never `run()` (the driver has perpetual
 heartbeat/election timers). Linearizable reads are async (a read-barrier probe
 round), so drive them as spawned tasks + `run_for`, and never `block_on` a
 `tick()` whose planned action tears a group down (`Reconciler::teardown` polls
-`env.sleep()` internally). The one exception is `prod_concurrent_ts_monotonic.rs`
-(below) — a real-thread `ProdEnv` test, deliberately, because the race it
-guards is provably unreachable under `SimEnv`'s single-threaded scheduler.
+`env.sleep()` internally). Two exceptions are real-thread `ProdEnv` tests, deliberately, because what they
+cover is unreachable under `SimEnv`'s single-threaded scheduler:
+`prod_concurrent_ts_monotonic.rs` (below) and `prod_compaction_persist_round.rs`
+(issue #279 — the consensus loop's buffered acks while compaction competes for
+the WAL; its module doc is explicit about the one thing it cannot force).
 There is also one **in-crate** `#[cfg(test)] mod` at the bottom of `lib.rs`
 (`pr5_orphan_and_resurrection_tests`, ADR 0018 §2) — `cargo test
 -p animus-cp-data --lib` runs it; it needs `pub(crate)` access
