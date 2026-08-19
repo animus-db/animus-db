@@ -2701,6 +2701,72 @@ debugging anything that feels like it might have happened before.
   animus-storage,animus-consensus}/Cargo.toml`.)
 
 ### Code patterns
+- **A "claim now, confirm later" state machine needs a release on *every*
+  failure exit of the executor, not just the one the original design happened
+  to handle (2026-08-19).** `animus-cp-data`'s tablet-host reconciler splits a
+  pure `plan()` from an async executor: `plan` inserts a tablet into
+  `LocalState::hosted` the instant it decides to emit `HostAction::Host`, and
+  `tick` commits that state *before* running the actions. The teardown half of
+  the discipline was built correctly and documented at length — a
+  `Reclaim`/`Release` claim survives until the executor calls
+  `confirm_torn_down`, so a timed-out driver shutdown is simply re-planned next
+  tick. The host half had no such release: `host()`'s two early returns (the
+  tablet gone from `Metadata`, or `EngineFactory::open` failing on real disk
+  I/O) established no live handle and undid no claim, so `plan`'s own
+  idempotence gate (`!next.hosted.contains(&tablet)`) then swallowed the
+  tablet **permanently** — a phantom replica, degraded RF, no operator signal
+  beyond one `warn!`, recoverable only by restarting the process. The doc
+  comment two lines above the failure asserted the opposite ("`plan` re-emits
+  it next tick"), which is the tell: prose describing a recovery path is not
+  evidence the path exists. It survived because the sim-only `EngineFactory`
+  always returned `Ok`, so no test could reach the branch at all — a fallible
+  seam whose test double cannot fail is an untested seam. The mirror hole sat
+  in `teardown()`, which returned early when no live handle existed without
+  confirming, so a zombie claim re-planned its teardown forever. **The general
+  check**: for any optimistic claim a pure planner takes ahead of an async
+  executor, enumerate *every* way the executor can fail to land the action and
+  confirm each one either completes the claim or releases it — and give the
+  fault a test double that can actually inject the failure.
+  (`crates/animus-cp-data/src/host.rs::{plan, Reconciler::host,
+  Reconciler::teardown, LocalState::release_unconfirmed_host}`,
+  `tests/reconciler.rs::reconciler_recovers_a_tablet_after_a_transient_engine_open_failure`.)
+- **An engine precondition that was "impossible for a well-behaved caller"
+  stops being impossible the moment the caller is a client — match the error
+  variant, don't `.expect()` it (2026-08-19).** `animusd`'s admin
+  `GET /admin/system-table` builds its scan lower bound by concatenating the
+  client's `after` cursor (unvalidated base64url) with a `0x00` suffix, then
+  scanned with `.expect("system-keyspace engine scan")`. Both `LsmEngine::scan`
+  and `MemoryEngine::scan` return `StorageError::InvalidRange` when
+  `start > end`, and the reserved namespace's end bound is a short ASCII-only
+  value — so any cursor decoding above it (e.g. base64url of `0xFF`) panicked
+  the request task, while the sibling `kind` parameter three lines up already
+  returned a clean 400 for the same class of hand-crafted input. Note the
+  contrast that makes this a pattern and not a one-off: `RaftKvNode`'s own
+  `local_scan` deliberately does `.scan(..).ok()`, swallowing `InvalidRange` as
+  an empty result — the codebase had already decided how to treat this error at
+  its other call sites, and this one endpoint hadn't followed. **The rule**:
+  wherever a `StorageEngine` scan bound is *derived from* bytes that crossed a
+  wire edge, treat `InvalidRange` as client input reaching a precondition, and
+  match the specific variant so a genuine backend fault still fails loudly
+  rather than being blanket-caught into a 400.
+  (`crates/animusd/src/admin.rs::system_table`.)
+- **A runtime `assert!` on a type-level trait constant is a reachability claim
+  the compiler will not check for you — grep the impls (2026-08-19).**
+  `animus-control`'s `RaftCore::encoded_wal_image` /
+  `PersistedState::encode_snapshot_record_from_blob` existed to serialize
+  `Metadata` once per compaction instead of twice, guarded by
+  `assert!(!S::DRIVER_APPLIED, ..)`. ADR 0038 then made both real state
+  machines in the workspace (`Metadata`, `KvState`) `DRIVER_APPLIED = true`,
+  which quietly made the pair unreachable — yet nothing flagged it: the
+  functions still compiled, were still `pub`, and still had a passing unit test
+  that constructed its own toy implementor with the "wrong" constant. Two
+  cheap detectors: `grep -rn "DRIVER_APPLIED"` across every `impl` (including
+  test files) settles reachability faster than tracing call sites forward, and
+  when a doc comment cites a specific guard test as evidence a mechanism is
+  exercised, **check the test exists** — this one cited
+  `wal_compaction.rs::encoded_image_matches_wal_image_encoding`, which had
+  never existed anywhere in the repo. A cited-but-phantom test is worse than no
+  citation: it buys a reader's trust for free.
 - **A defect whose trigger is a microsecond-wide thread interleaving cannot
   be closed by a test — make it unrepresentable, and say so where the test
   would have been (issue #279, 2026-08-18).** Decoupling the CP-data
@@ -3481,10 +3547,15 @@ debugging anything that feels like it might have happened before.
   self-sustaining storm during any large-state catch-up (the control-plane twin of
   PR #16's CP-data apply/compaction storm). Fix: **cache the serialized image once
   when `snapshot_index` advances and slice it per chunk** (O(chunk)). But the naive
-  cache *doubled* compaction cost — the blob serialize **plus** the WAL `Snapshot`
-  record's own metadata serialize — so reuse the cached bytes for the WAL too
-  (`serde_json` `RawValue` embeds the pre-serialized image verbatim; byte-identical,
-  guarded by a round-trip test). Two morals: (1) the cache must be pinned to
+  cache looked like it *doubled* compaction cost — the blob serialize **plus** the
+  WAL `Snapshot` record's own metadata serialize — so a follow-on optimization
+  reused the cached bytes for the WAL too (`serde_json` `RawValue` embedding the
+  pre-serialized image verbatim). That half never actually shipped live and was
+  **deleted on 2026-08-19**: ADR 0038 made `Metadata` `DRIVER_APPLIED` before it
+  saw production traffic, and such a state machine's WAL `Snapshot` record carries
+  only a default placeholder (the real state lives in the engine), so there was no
+  large field there to double-serialize in the first place. The caching half below
+  is the part that mattered. Two morals: (1) the cache must be pinned to
   `snapshot_index`'s state, serialized **eagerly at snapshot time** (in-core
   `metadata` advances past the base between compactions, so lazy-at-ship would ship
   a state *ahead of* its claimed index → the follower double-applies its log tail);
@@ -3493,8 +3564,7 @@ debugging anything that feels like it might have happened before.
   (`install_snapshot.rs::large_snapshot_ships_in_o_chunk_time_not_o_state`: fix ~ms
   vs regression ~46s), because a *live* `ProdEnv` cluster catch-up races
   leadership/AppendEntries and won't reliably traverse a long chunk-stream.
-  (`animus-control` `raft.rs::snapshot_chunk_for`/`snapshot_upto`/`encoded_wal_image`,
-  `persist.rs::encode_snapshot_record_from_blob`.)
+  (`animus-control` `raft.rs::snapshot_chunk_for`/`snapshot_upto`.)
 - **When mirroring a fix onto a *sibling* subsystem, assess honestly — the sibling
   may have a *different-shaped* version of the hazard, or a bounded one not worth the
   same risky refactor.** PR #16 moved CP-data's async **engine apply + compaction**
@@ -6641,6 +6711,29 @@ debugging anything that feels like it might have happened before.
   (`crates/animusd/src/lib.rs::cp_kind_write_item`, `cp_kind_write_raw`.)
 
 ### Parallel-agent orchestration
+- **Parallel agents share one `target/` dir; three concurrent
+  `--all-targets` builds exhaust the session disk (2026-08-19).** Fanning three
+  implementation agents across disjoint crates avoids *source* conflicts but
+  not *build* conflicts: each ran its own `cargo build --workspace
+  --all-targets` in the same `target/`, which grew past 22 GB and hit ENOSPC —
+  killing builds mid-link (`ld terminated with signal 7`), producing a
+  transient compile error in one agent from another's half-written file, and
+  eventually filling the harness's own scratch filesystem so that even `df`
+  could not run. Deletes still succeed when writes don't, and
+  `target/debug/incremental` is the cheapest large thing to drop first.
+  **Rules for a parallel fan-out on this repo**: give each agent a
+  crate-scoped gate (`cargo clippy -p <crate>`, `cargo test -p <crate>`) and
+  keep the one workspace-wide `--all-targets` build for the orchestrator to
+  run *serially* at the end; set `CARGO_PROFILE_DEV_DEBUG=0` for validation
+  passes (debug info dominates target size and changes nothing the gates
+  check); and tell agents to stop and report on ENOSPC rather than polling for
+  space, since a blocked agent burns its context waiting on a condition only
+  the orchestrator can clear. The orchestrator should also re-run every gate
+  itself afterwards — an agent whose build was killed by someone else's disk
+  usage will honestly report "inconclusive," and two of the three fixes here
+  reached the working tree never having been compiled (one did not: a
+  `MutexGuard` held across an `.await` in a new fault-injection test made the
+  future non-`Send`, which only the serial re-run caught).
 - **A hand-rolled two-PR stack strands its top PR if the base merges first —
   use `gh-stack` (or retarget to `main` before merging), and verify the
   default branch actually received the change (issue #279, 2026-08-19).**
