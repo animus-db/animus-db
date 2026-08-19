@@ -29,11 +29,7 @@ animus-placement.workspace = true
 # per-key-LWW primitive the leaderful CP data plane's own apply path uses.
 animus-storage.workspace = true
 serde.workspace = true
-# `raw_value`: compaction embeds the cached, already-serialized snapshot image
-# (`snapshot_blob`) into the WAL `Snapshot` record via `RawValue` so the (large)
-# `Metadata` is serialized **once** per compaction, not twice (once to ship, once
-# for the WAL) — see `persist.rs::encode_snapshot_record_from_blob`.
-serde_json = { workspace = true, features = ["raw_value"] }
+serde_json.workspace = true
 futures.workspace = true
 tracing.workspace = true
 

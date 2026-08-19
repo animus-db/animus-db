@@ -515,7 +515,18 @@ ADR 0050 Train B rung-7 sweep.
   when emitting a fallible teardown (`Reclaim`/`Release`) — real teardown
   is async and can time out. The caller calls
   `LocalState::confirm_torn_down` once its own teardown actually
-  completes; until then the next `plan` re-plans the same action.
+  completes; until then the next `plan` re-plans the same action. The
+  identical discipline runs in reverse for `Host`: `plan` inserts the
+  claim into `LocalState::hosted` optimistically, before any live handle
+  exists, so `Reconciler::host` must call `LocalState::
+  release_unconfirmed_host` when it skips the action (an
+  `EngineFactory::open` I/O failure, or the tablet vanishing from
+  `Metadata` before execution) — otherwise the claim is permanent and
+  `plan` never re-emits `Host` for a tablet this node in fact never
+  hosted (a silent, permanent RF degradation with no operator signal;
+  fixed as part of the same change that closed `teardown`'s mirror hole,
+  below). Regression: `tests/reconciler.rs::
+  reconciler_recovers_a_tablet_after_a_transient_engine_open_failure`.
 - **`Reconciler::tick(&mut self, view: &MetadataView)` is the whole
   per-tick contract**: gather `TabletFacts` from its own hosted nodes
   (`gather_facts`), call `plan` exactly once, then execute the returned

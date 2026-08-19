@@ -263,7 +263,16 @@ pub fn parse_statement(cql: &str) -> Result<Statement, QueryError> {
 /// (documented).
 fn parse_batch(raw: &str) -> Result<Statement, QueryError> {
     // Strip the `BEGIN [UNLOGGED|LOGGED|COUNTER] BATCH` prefix and the trailing
-    // `APPLY BATCH`, then split the middle on `;` into member statements.
+    // `APPLY BATCH`, then split the middle on unquoted `;` into member
+    // statements. `find`/`rfind` (not a quote-aware scan) are safe here even
+    // though a member's own text literal could coincidentally contain the
+    // substring "batch"/"apply": the grammar requires the real `BATCH`
+    // keyword to be the *first* thing in `raw` (nothing precedes
+    // `BEGIN [modifier] BATCH`) and the real `APPLY` keyword to be the
+    // *last* (nothing legitimately follows `APPLY BATCH`), and any literal
+    // occurrence sits strictly between those two extremes — so leftmost/
+    // rightmost search always lands on the genuine keyword, never inside a
+    // literal.
     let lower = raw.to_ascii_lowercase();
     let begin = lower
         .find("batch")
@@ -276,7 +285,10 @@ fn parse_batch(raw: &str) -> Result<Statement, QueryError> {
     }
     let body = &raw[begin + "batch".len()..apply];
     let mut statements = Vec::new();
-    for piece in body.split(';') {
+    // Quote-aware split — unlike the plain `body.split(';')` this replaced,
+    // a `;` inside a single-quoted text literal (e.g. `VALUES (1, 'a;b')`)
+    // does not split a member in two.
+    for piece in split_unquoted_semicolons(body) {
         let piece = piece.trim();
         if piece.is_empty() {
             continue;
@@ -847,6 +859,40 @@ fn tokenize(input: &str) -> Vec<String> {
     tokens
 }
 
+/// Split `s` on unquoted top-level `;` characters, honoring the **same**
+/// single-quoted-string escaping rule [`tokenize`]'s quote arm applies
+/// (`'...'`, with `''` as an escaped quote) — so a `;` inside a text literal
+/// (e.g. `VALUES (1, 'a;b')`) is never mistaken for a `BATCH` member
+/// separator. Used only by [`parse_batch`], which needs the raw member
+/// substrings (to recursively call [`parse_statement`] on each), not a
+/// token list — so this can't just reuse [`tokenize`] outright (it discards
+/// whitespace and does not treat `;` as a delimiter at all). Keep this in
+/// sync with `tokenize`'s quote handling if that rule ever changes.
+fn split_unquoted_semicolons(s: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut in_quote = false;
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if in_quote {
+            if c == '\'' {
+                if chars.peek().is_some_and(|&(_, n)| n == '\'') {
+                    chars.next(); // `''` inside a string is an escaped quote.
+                } else {
+                    in_quote = false;
+                }
+            }
+        } else if c == '\'' {
+            in_quote = true;
+        } else if c == ';' {
+            pieces.push(&s[start..i]);
+            start = i + 1; // `;` is one ASCII byte.
+        }
+    }
+    pieces.push(&s[start..]);
+    pieces
+}
+
 /// Build the data-plane (engine) key for a partition (ADR 0023):
 /// `partition_token(pk_bytes) || pk_bytes`.
 ///
@@ -1096,6 +1142,33 @@ mod tests {
         assert!(matches!(b.statements[0], Statement::Insert(_)));
         assert!(matches!(b.statements[1], Statement::Update(_)));
         assert!(matches!(b.statements[2], Statement::Delete(_)));
+    }
+
+    /// Regression: a BATCH member's own text literal containing a `;` used
+    /// to split the member in two (raw `body.split(';')`, bypassing the
+    /// quote-aware `tokenize`), wrongly rejecting an otherwise-valid batch.
+    #[test]
+    fn batch_member_semicolon_inside_a_literal_does_not_split_the_member() {
+        let s = parse_statement(
+            "BEGIN BATCH \
+             INSERT INTO t (id, note) VALUES (1, 'a;b'); \
+             APPLY BATCH",
+        )
+        .unwrap();
+        let Statement::Batch(b) = s else {
+            panic!("expected batch")
+        };
+        assert_eq!(b.statements.len(), 1);
+        let Statement::Insert(ins) = &b.statements[0] else {
+            panic!("expected insert");
+        };
+        assert_eq!(
+            ins.values[1],
+            Term::Literal {
+                text: "a;b".to_owned(),
+                quoted: true,
+            }
+        );
     }
 
     #[test]

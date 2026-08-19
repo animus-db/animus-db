@@ -648,52 +648,6 @@ where
         image
     }
 
-    /// The compact WAL image **already encoded to bytes**, identical to encoding
-    /// [`wal_image`](Self::wal_image) record-by-record — but the (dominant) snapshot
-    /// record reuses the cached `snapshot_blob` (via
-    /// [`PersistedState::encode_snapshot_record_from_blob`]) so the state is
-    /// serialized **once** per compaction, not twice (once into the blob for
-    /// `InstallSnapshot`, once for the WAL). The control-plane driver's `compact_wal`
-    /// calls this; the byte-equality with `wal_image` encoding is guarded by
-    /// `wal_compaction.rs::encoded_image_matches_wal_image_encoding`.
-    ///
-    /// **In-core only:** for an in-core state machine `snapshot_blob ==
-    /// serialize(metadata@snapshot_index)`, so reusing it for the WAL `metadata`
-    /// field is exact. A `DRIVER_APPLIED` plane's blob is its *engine* image (not
-    /// `serialize(state)`), and it has its own driver/compaction, so it must not use
-    /// this — asserted below.
-    #[must_use]
-    pub fn encoded_wal_image(&self) -> Vec<u8> {
-        assert!(
-            !S::DRIVER_APPLIED,
-            "encoded_wal_image reuses snapshot_blob as the serialized state image, \
-             which only holds for an in-core state machine"
-        );
-        let mut bytes = Vec::new();
-        if self.snapshot_index > 0 {
-            let blob = self
-                .snapshot_blob
-                .as_deref()
-                .expect("snapshot_blob is Some when snapshot_index > 0 (in-core invariant)");
-            bytes.extend(PersistedState::<C, S>::encode_snapshot_record_from_blob(
-                blob,
-                self.snapshot_index,
-                self.snapshot_term,
-                &self.snapshot_config,
-            ));
-        }
-        bytes.extend(PersistedState::<C, S>::encode_record(&WalRecord::Hard {
-            term: self.current_term,
-            voted_for: self.voted_for.clone(),
-        }));
-        for entry in &self.log {
-            bytes.extend(PersistedState::<C, S>::encode_record(&WalRecord::Append(
-                entry.clone(),
-            )));
-        }
-        bytes
-    }
-
     /// Snapshot the applied state and **truncate** the log prefix it covers:
     /// advance the snapshot base to `last_applied` and drop entries through it.
     /// No-op if nothing new has been applied. Sets the snapshot-dirty flag so the

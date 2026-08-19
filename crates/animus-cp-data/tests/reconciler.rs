@@ -15,10 +15,11 @@
 //! actually stop) — such a call must be spawned and driven via `run_for`,
 //! never bare `block_on`'d, or it hangs forever with no panic.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
+use animus_cp_data::host::{EngineFactory, MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{RaftKvNode, StorageScope};
 use animus_env::{Clock, EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
@@ -337,4 +338,163 @@ fn reconciler_hosts_releases_and_spares_a_co_hosted_siblings_own_engine() {
             "co-hosted sibling tablet 2's key z{i:02} must survive tablet 1's release"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fault injection: `EngineFactory::open` failures.
+// ---------------------------------------------------------------------------
+
+/// An [`EngineFactory`] wrapper that fails `open` for a chosen tablet a fixed
+/// number of times before delegating to a real [`MemoryTabletEngines`] —
+/// standing in for a real `EngineFactory::open` I/O failure (`animusd`'s
+/// `LsmTabletFactory::open` does real disk I/O and can genuinely fail), which
+/// `MemoryTabletEngines` alone (always `Ok`) can never exercise. `probe`/
+/// `destroy` always delegate straight through — only `open` is faulty.
+#[derive(Clone, Default)]
+struct FaultyTabletEngines {
+    inner: MemoryTabletEngines,
+    fail_remaining: Arc<Mutex<BTreeMap<u64, u32>>>,
+}
+
+impl FaultyTabletEngines {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// `tablet`'s next `n` `open` calls fail before the (n+1)th succeeds.
+    fn fail_open_n_times(&self, tablet: TabletId, n: u32) {
+        self.fail_remaining
+            .lock()
+            .expect("fail_remaining poisoned")
+            .insert(tablet.0, n);
+    }
+}
+
+#[async_trait::async_trait]
+impl EngineFactory<MemoryEngine> for FaultyTabletEngines {
+    async fn open(&self, tablet: TabletId) -> Result<MemoryEngine, String> {
+        // The guard must not survive into the `await` below — an
+        // `EngineFactory` future has to stay `Send`, and a `MutexGuard`
+        // isn't. A plain `drop(remaining)` is not enough: the generator
+        // still captures the binding's storage across the suspend point,
+        // so scope the whole lock instead.
+        {
+            let mut remaining = self.fail_remaining.lock().expect("fail_remaining poisoned");
+            if let Some(n) = remaining.get_mut(&tablet.0)
+                && *n > 0
+            {
+                *n -= 1;
+                return Err(format!("injected open failure for tablet {}", tablet.0));
+            }
+        }
+        self.inner.open(tablet).await
+    }
+
+    async fn probe(&self, tablet: TabletId) -> bool {
+        self.inner.probe(tablet).await
+    }
+
+    async fn destroy(&self, tablet: TabletId) {
+        self.inner.destroy(tablet).await;
+    }
+}
+
+/// ADR 0031 PR4 fault-injection regression: a transient `EngineFactory::open`
+/// failure must not strand a phantom claim in `LocalState::hosted` forever.
+/// Before the fix, `plan`'s phase-1 gate (`!next.hosted.contains(&tablet)`)
+/// would never re-emit `Host` for a tablet whose claim `host()` inserted
+/// optimistically but never actually backed with a live handle — a silent,
+/// permanent RF degradation with no operator signal. `host()` now calls
+/// `LocalState::release_unconfirmed_host` on a factory failure, so `plan`
+/// genuinely retries every tick, and the tablet recovers the moment the
+/// factory starts succeeding again.
+#[test]
+fn reconciler_recovers_a_tablet_after_a_transient_engine_open_failure() {
+    let seed = 0x0FA0_77EC;
+    let mut sim = Simulator::new(seed);
+    let base_env = sim.env(nid(BASE));
+
+    let engines = FaultyTabletEngines::new();
+    engines.fail_open_n_times(TabletId(1), 2);
+    let reconciler_engines = engines.clone();
+
+    let done = Arc::new(Mutex::new(false));
+    let hosted_after_first_failure = Arc::new(Mutex::new(None));
+    let hosted_after_second_failure = Arc::new(Mutex::new(None));
+    let claim_after_second_failure = Arc::new(Mutex::new(None));
+    let hosted_after_recovery = Arc::new(Mutex::new(None));
+    let done2 = Arc::clone(&done);
+    let hf1 = Arc::clone(&hosted_after_first_failure);
+    let hf2 = Arc::clone(&hosted_after_second_failure);
+    let cf2 = Arc::clone(&claim_after_second_failure);
+    let hr = Arc::clone(&hosted_after_recovery);
+    let task_env = base_env.clone();
+
+    base_env.clone().spawn_task(async move {
+        let mut reconciler: Reconciler<SimEnv, MemoryEngine> = Reconciler::new(
+            task_env.clone(),
+            reconciler_engines,
+            nid(BASE),
+            |_t, _n| {},
+            |_t| {},
+        );
+
+        // A fresh, single-replica tablet placed on this node from tick one.
+        let v = view([tablet(1, b"", None, vec![BASE])]);
+
+        // Tick 1: the factory's first injected failure — Host must be
+        // skipped, with no live handle established.
+        reconciler.tick(&v).await;
+        *hf1.lock().unwrap() = Some(reconciler.hosted_node(TabletId(1)).is_some());
+
+        // Tick 2: the factory's second (last) injected failure — same
+        // outcome, and critically the claim must NOT be stranded: `plan`
+        // must still consider this tablet unhosted, or it would never be
+        // retried again.
+        reconciler.tick(&v).await;
+        *hf2.lock().unwrap() = Some(reconciler.hosted_node(TabletId(1)).is_some());
+        *cf2.lock().unwrap() = Some(reconciler.local_state().hosted.contains(&TabletId(1)));
+
+        // Tick 3: the factory now succeeds — proving the claim really was
+        // released (not just stuck), `plan` re-emits `Host` and it lands.
+        reconciler.tick(&v).await;
+        task_env.sleep(Duration::from_secs(2)).await; // elect (single voter)
+        *hr.lock().unwrap() = Some(reconciler.hosted_node(TabletId(1)).is_some());
+
+        *done2.lock().unwrap() = true;
+    });
+
+    poll_until(
+        &mut sim,
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        "the fault-recovery scenario task never completed",
+        || *done.lock().unwrap(),
+    );
+
+    assert_eq!(
+        *hosted_after_first_failure.lock().unwrap(),
+        Some(false),
+        "a factory failure must not host the tablet"
+    );
+    assert_eq!(
+        *hosted_after_second_failure.lock().unwrap(),
+        Some(false),
+        "a second consecutive factory failure must still not host the tablet"
+    );
+    assert_eq!(
+        *claim_after_second_failure.lock().unwrap(),
+        Some(false),
+        "the claim must be released after a failed Host, not stranded in LocalState::hosted"
+    );
+    assert_eq!(
+        *hosted_after_recovery.lock().unwrap(),
+        Some(true),
+        "the reconciler must recover the tablet once the factory starts succeeding"
+    );
+
+    // The tablet's engine genuinely holds durable state now (the third,
+    // successful open) — a real recovery, not just a live handle with no
+    // backing store.
+    assert!(block_on(engines.probe(TabletId(1))));
 }

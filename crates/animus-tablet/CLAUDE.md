@@ -28,8 +28,6 @@ successor invariant).
   from the wire adapters (`animus-dynamo`/`animus-cql` carry their own copies)
   and must match them **byte-for-byte** — the duplication keeps this crate
   dependency-light while the adapters stay pure.
-- `table_key_block(&str) -> KeyRange` — a table's whole key block
-  `[escape(table), block_end)`, used where a table-scoped range is needed.
 
 ## Tablets & ranges
 
@@ -77,4 +75,4 @@ successor invariant).
 `cargo test -p animus-tablet` — inline unit tests for `contains`/
 `contains_range`, `split_at` bounds, token determinism + fixed width,
 the Murmur3 empty-input spec anchor, token spread across ring octants,
-table-scoped `serves_table`, and `table_key_block` isolation.
+and table-scoped `serves_table`.

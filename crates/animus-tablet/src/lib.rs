@@ -143,27 +143,6 @@ pub fn escape(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The half-open [`KeyRange`] of `table`'s **whole key block** (ADR 0023): every
-/// data key of `table` starts with `escape(table_name)` (the wire adapters encode
-/// `escape(table) || …`), and because the escape is prefix-free no other table's
-/// keys fall in it. So the block is `[escape(table), block_end)` where `block_end`
-/// is the escaped prefix with its trailing `0x00` bumped to `0x01` — the first key
-/// past the table. This is exactly the range a full-table `Scan` walks; a
-/// table-scoped tablet covers this block (or, once table-scoped rings exist, a
-/// sub-range of it).
-#[must_use]
-pub fn table_key_block(table_name: &str) -> KeyRange {
-    let start = escape(table_name.as_bytes());
-    let mut end = start.clone();
-    // The escape always ends `0x00 0x00`; bump the final byte to `0x01` for the
-    // first key strictly past this table's block.
-    *end.last_mut().expect("an escaped prefix is non-empty") = 0x01;
-    KeyRange {
-        start,
-        end: Some(end),
-    }
-}
-
 /// Stable identifier for a tablet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TabletId(pub u64);
@@ -496,7 +475,7 @@ mod tests {
 
     #[test]
     fn table_scoped_tablet_serves_only_its_table() {
-        let t = Tablet::new_for_table(TabletId(1), "users", table_key_block("users"), vec![nid(1)]);
+        let t = Tablet::new_for_table(TabletId(1), "users", KeyRange::whole(), vec![nid(1)]);
         assert_eq!(t.table.as_deref(), Some("users"));
         assert!(t.serves_table("users"));
         assert!(!t.serves_table("orders"));
@@ -504,25 +483,5 @@ mod tests {
         let legacy = Tablet::new(TabletId(2), KeyRange::whole(), vec![nid(1)]);
         assert_eq!(legacy.table, None);
         assert!(legacy.serves_table("users") && legacy.serves_table("orders"));
-    }
-
-    #[test]
-    fn table_block_contains_that_tables_keys_only() {
-        let users = table_key_block("users");
-        // A `users` data key is `escape("users") || within`.
-        let mut k = escape(b"users");
-        k.extend_from_slice(b"alice");
-        assert!(users.contains(&k));
-        // A different table's key (escape is prefix-free) is outside the block.
-        let mut other = escape(b"user"); // a prefix-like neighbour
-        other.extend_from_slice(b"x");
-        assert!(!users.contains(&other));
-        let mut orders = escape(b"orders");
-        orders.extend_from_slice(b"1");
-        assert!(!users.contains(&orders));
-        // Two distinct tables' blocks never overlap.
-        let orders_block = table_key_block("orders");
-        assert!(!users.contains(&orders_block.start));
-        assert!(!orders_block.contains(&users.start));
     }
 }
