@@ -2254,9 +2254,13 @@ mod system_table_tests {
     /// reserved namespace's own end bound used to panic the request task
     /// (`engine.scan(start, end)` returns `Err(InvalidRange)` when `start >
     /// end`, and `after` is unvalidated client-supplied base64url) — now a
-    /// clean 400 instead.
+    /// clean 400 instead. The valid-cursor case rides the **same** node
+    /// deliberately: bringing a node up is by far the expensive part, and
+    /// this binary also carries wall-clock-sensitive liveness tests
+    /// (`confirm_futility_tests`) that share the runner with whatever else
+    /// is in flight, so one bring-up serves both assertions rather than two.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn out_of_range_after_cursor_returns_a_clean_error_instead_of_panicking() {
+    async fn after_cursor_is_validated_not_panicked_on() {
         let dir = tempfile::tempdir().unwrap();
         let node = single_node(dir.path()).await;
         let ctx = node.ctx_for_test();
@@ -2266,27 +2270,17 @@ mod system_table_tests {
         // bounds`), so `scan_start > ns_end` deterministically.
         let bogus_after = base64url_encode(&[0xFF; 8]);
         let (status, body) = system_table(&ctx, &format!("after={bogus_after}")).await;
-
         assert_eq!(status, 400, "body: {body}");
         assert!(
             body.get("error").is_some(),
             "expected an error field, got {body}"
         );
-    }
 
-    /// A well-formed `after` right at the start of the reserved namespace
-    /// (the empty-bytes cursor) is NOT out of range — this is the ordinary,
-    /// valid-input path, proving the fix didn't turn a legitimate cursor
-    /// into a 400 too.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn in_range_after_cursor_still_returns_a_page() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = single_node(dir.path()).await;
-        let ctx = node.ctx_for_test();
-
+        // A well-formed `after` at the start of the reserved namespace (the
+        // empty-bytes cursor) is NOT out of range — the ordinary valid-input
+        // path, proving the fix didn't turn a legitimate cursor into a 400.
         let after = base64url_encode(&[]);
         let (status, body) = system_table(&ctx, &format!("after={after}")).await;
-
         assert_eq!(status, 200, "body: {body}");
         assert_eq!(body["available"], true);
     }
