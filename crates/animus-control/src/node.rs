@@ -22,6 +22,7 @@ use crate::detector::FailureDetector;
 use crate::meta::{Member, MetaCommand, Metadata, NodeStatus, PlacementView};
 use crate::mirror::{self, KeyWrite};
 use crate::persist::PersistedState;
+use crate::persist_round::{self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake};
 use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
 use crate::syskv;
 
@@ -346,6 +347,10 @@ pub struct RaftNode<E: Env> {
     /// tasks write `raft.wal`. Also held by [`flush`](Self::flush) for the
     /// same reason.
     wal_lock: Arc<AsyncMutex<()>>,
+    /// Issue #279: persist-round accounting shared by this node's three WAL
+    /// drainers — the consensus loop, the apply task's compaction rewrite, and
+    /// the public [`RaftNode::flush`].
+    persist: Arc<PersistProgress>,
     /// Observability sink (ADR 0015). The driver loops record control-plane
     /// counters into it (elections, append-entries, snapshot installs, failure
     /// detector transitions) and keep the leadership gauge current. Cheap to
@@ -447,6 +452,7 @@ impl<E: Env> RaftNode<E> {
         let engine_applied = Arc::new(AtomicU64::new(0));
         let delta_ring = Arc::new(Mutex::new(delta_ring));
         let wal_lock = Arc::new(AsyncMutex::new(()));
+        let persist = Arc::new(PersistProgress::default());
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -456,6 +462,7 @@ impl<E: Env> RaftNode<E> {
             detector: Arc::clone(&detector),
             watch: watch.clone(),
             wal_lock: Arc::clone(&wal_lock),
+            persist: Arc::clone(&persist),
             metrics: metrics.clone(),
         };
         env.spawn_task(drive(
@@ -470,6 +477,7 @@ impl<E: Env> RaftNode<E> {
             engine_applied,
             delta_ring,
             wal_lock,
+            persist,
         ));
         // The placement reconciler runs alongside the driver; it only ever
         // *proposes* on the core (no I/O of its own), and proposals are honored
@@ -569,15 +577,24 @@ impl<E: Env> RaftNode<E> {
     /// (already client-visible, already acked) command is not yet durable on disk.
     /// A graceful teardown calls this **before** stopping the driver so a clean
     /// shutdown does not lose an acked command (see `animusd`'s
-    /// `Node::shutdown_graceful`). Because the driver is parked at that point, this
-    /// is the sole WAL writer.
+    /// `Node::shutdown_graceful`).
+    ///
+    /// This used to justify itself with "because the driver is parked at that
+    /// point, this is the sole WAL writer". That is no longer the argument, and
+    /// it was never the durable one: since issue #279 the driver's own `fsync`
+    /// is raced inside its `select`, so it can be mid-round while this runs.
+    /// Safety now rests on the mechanism every drainer shares — `wal_lock`
+    /// serialises the I/O, and going through
+    /// [`persist_round::drain_for_round`] means this drain numbers its own
+    /// round, so any ack the loop buffered against these records is released by
+    /// this call's completion rather than stranded by it.
     ///
     /// NOTE: this does **not** close the *crash* window — a `kill -9` between apply
     /// and the next flush still loses the entry. Making the commit itself durable
     /// *before* it becomes client-visible is the proper fix, tracked as a follow-up
     /// (ADR 0009 — see the root CLAUDE.md engineering-practices note).
     pub async fn flush(&self) -> usize {
-        persist_wal(&self.env, &self.core, &self.wal_lock).await
+        persist_wal(&self.env, &self.core, &self.wal_lock, &self.persist).await
     }
 
     /// This node's environment handle.
@@ -793,8 +810,9 @@ pub async fn heartbeat_loop<E: Env>(env: E, control: Vec<NodeId>) {
 }
 
 /// The per-node **consensus loop** (ADR 0038 PR3): recover durable state,
-/// spawn the async apply task, then repeatedly persist the WAL, wait for the
-/// next message or timer, hand it to the core, persist again, and ship
+/// spawn the async apply task, then repeatedly start a persist round if the core
+/// owes the WAL anything, wait for a landed round / the next message / the timer,
+/// hand it to the core, and ship
 /// whatever the core wants sent. Does **no** system-keyspace engine I/O
 /// itself — that (and WAL compaction) is [`meta_apply_loop`]'s job on a
 /// separate task, so a slow engine merge/compaction/snapshot-image build can
@@ -815,6 +833,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     engine_applied: Arc<AtomicU64>,
     delta_ring: Arc<Mutex<DeltaRing>>,
     wal_lock: Arc<AsyncMutex<()>>,
+    persist: Arc<PersistProgress>,
 ) {
     // Recover from the WAL before serving anything.
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -842,11 +861,31 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         delta_ring,
         watch,
         Arc::clone(&wal_lock),
+        Arc::clone(&persist),
     ));
 
+    // Issue #279: the loop's own in-flight persist round, and the outbound
+    // messages held back until a round lands. Both are owned exclusively by this
+    // task, which is what makes the round bookkeeping correct by construction —
+    // see `persist_round`'s module doc, especially its "Two layers" section.
+    let mut persist_fut: Option<PersistFut<'_>> = None;
+    let mut gated: GatedOuts<RaftMsg> = GatedOuts::default();
+
     loop {
-        // Persist anything queued out-of-band (e.g. a client `propose`).
-        persist_wal(&env, &core, &wal_lock).await;
+        // Start a round if the core owes the WAL anything and none is in flight.
+        // The pending records are whatever the previous iteration's step left, or
+        // what a client `propose` appended out-of-band. This is the loop's one
+        // round-start site, and — the point of issue #279 — the `append`/`fsync`
+        // it runs is raced *inside* the `select` below rather than awaited before
+        // it, so this node keeps heartbeating (as leader) and keeps re-arming its
+        // election deadline (as follower) while the disk is slow.
+        if persist_fut.is_none() && core.lock().expect("raft core poisoned").has_unflushed_wal() {
+            // `persist_wal`'s record count is `flush`'s return value, not this
+            // loop's business — drop it so the boxed future matches `PersistFut`.
+            persist_fut = Some(Box::pin(async {
+                persist_wal(&env, &core, &wal_lock, &persist).await;
+            }));
+        }
 
         let now = env.now();
         let deadline = core.lock().expect("raft core poisoned").next_deadline();
@@ -871,52 +910,71 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
             (c.role(), c.term())
         };
 
-        let outs = match select(env.recv(), timer).await {
-            Either::Left((envelope, _)) => {
-                let entropy = env.next_u64();
-                match serde_json::from_slice::<RaftMsg>(&envelope.payload) {
-                    // A heartbeat is not consensus traffic (ADR 0012): record it
-                    // in the failure detector and don't hand it to the core. The
-                    // `now` we observe at is `Env`-supplied, so the recorded
-                    // instant is deterministic.
-                    Ok(RaftMsg::Heartbeat { node }) => {
-                        detector
-                            .lock()
-                            .expect("detector poisoned")
-                            .observe(node, env.now());
-                        Vec::new()
-                    }
-                    Ok(msg) => {
-                        // A follower rejecting an `AppendEntries` surfaces as an
-                        // outbound `AppendEntriesResp { success: false }`, so the
-                        // "rejected" counter is recorded from the core's output
-                        // (`record_outbound`) where the rejection is produced —
-                        // not from the inbound message.
-                        let outs = core.lock().expect("raft core poisoned").handle(
-                            envelope.from,
-                            msg,
-                            env.now(),
-                            entropy,
-                        );
-                        record_outbound(&metrics, &outs);
-                        outs
-                    }
-                    Err(err) => {
-                        tracing::warn!(?err, "undecodable raft message dropped");
-                        Vec::new()
+        // The persist arm is polled first, so a landed round releases its acks
+        // ahead of taking on more work. Resolving it never cancels the `fsync`:
+        // the future lives in this task's own local and is only borrowed here.
+        let persist_arm = PersistArm::new(&persist, persist_fut.as_mut(), gated.min_round());
+        let mut own_round_done = false;
+        let (outs, gate): (Vec<(NodeId, RaftMsg)>, Option<u64>) =
+            match select(persist_arm, select(env.recv(), timer)).await {
+                // A round landed. Nothing to step: the release below ships whatever
+                // was waiting on it.
+                Either::Left((wake, _)) => {
+                    own_round_done = wake == PersistWake::OwnRoundDone;
+                    (Vec::new(), None)
+                }
+                Either::Right((Either::Left((envelope, _)), _)) => {
+                    let entropy = env.next_u64();
+                    match serde_json::from_slice::<RaftMsg>(&envelope.payload) {
+                        // A heartbeat is not consensus traffic (ADR 0012): record it
+                        // in the failure detector and don't hand it to the core. The
+                        // `now` we observe at is `Env`-supplied, so the recorded
+                        // instant is deterministic.
+                        Ok(RaftMsg::Heartbeat { node }) => {
+                            detector
+                                .lock()
+                                .expect("detector poisoned")
+                                .observe(node, env.now());
+                            (Vec::new(), None)
+                        }
+                        Ok(msg) => {
+                            // A follower rejecting an `AppendEntries` surfaces as an
+                            // outbound `AppendEntriesResp { success: false }`, so the
+                            // "rejected" counter is recorded from the core's output
+                            // (`record_outbound`) where the rejection is produced —
+                            // not from the inbound message.
+                            let (outs, gate) = {
+                                let mut c = core.lock().expect("raft core poisoned");
+                                let outs = c.handle(envelope.from, msg, env.now(), entropy);
+                                // The gate is read in the **same lock acquisition**
+                                // as the step that made the mutation — the detail
+                                // both reverted attempts at this fix got wrong.
+                                (outs, persist.gate(c.has_unflushed_wal()))
+                            };
+                            record_outbound(&metrics, &outs);
+                            (outs, gate)
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "undecodable raft message dropped");
+                            (Vec::new(), None)
+                        }
                     }
                 }
-            }
-            Either::Right(((), _)) => {
-                let entropy = env.next_u64();
-                let outs = core
-                    .lock()
-                    .expect("raft core poisoned")
-                    .tick(env.now(), entropy);
-                record_outbound(&metrics, &outs);
-                outs
-            }
-        };
+                Either::Right((Either::Right(((), _)), _)) => {
+                    let entropy = env.next_u64();
+                    let (outs, gate) = {
+                        let mut c = core.lock().expect("raft core poisoned");
+                        let outs = c.tick(env.now(), entropy);
+                        (outs, persist.gate(c.has_unflushed_wal()))
+                    };
+                    record_outbound(&metrics, &outs);
+                    (outs, gate)
+                }
+            };
+        // Safe only here: the `select` that borrowed it has been dropped.
+        if own_round_done {
+            persist_fut = None;
+        }
 
         // Attribute role/term transitions to election metrics + keep the
         // leadership gauge current.
@@ -934,11 +992,44 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         // up whatever that makes newly `drain_apply`-able on its own schedule;
         // a follower may have already advanced it on commit inside `handle`
         // above (no durability gate there).
-        persist_wal(&env, &core, &wal_lock).await;
-
-        for (to, msg) in outs {
+        let (immediate, held): (Vec<_>, Vec<_>) = match gate {
+            None => (outs, Vec::new()),
+            Some(_) => outs
+                .into_iter()
+                .partition(|(_, msg)| persist_round::ships_before_durable(msg)),
+        };
+        if let Some(round) = gate {
+            gated.push(round, held);
+        }
+        for (to, msg) in immediate {
             let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
             env.send(to, bytes).await;
+        }
+        // Whatever round landed — this loop's own `fsync`, the apply task's
+        // compaction rewrite, or a `RaftNode::flush` from a graceful shutdown —
+        // releases the acks that were waiting on it.
+        for (to, msg) in gated.release(persist.durable()) {
+            let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
+            env.send(to, bytes).await;
+        }
+        // Safety net making a stranded ack structurally impossible rather than
+        // merely unlikely: if the core owes the WAL nothing *and* no round is in
+        // flight, everything on disk already backs every message still held —
+        // whichever of the three drainers put it there, and whether or not its
+        // round number lines up. This plane has a second belt: it never quiesces
+        // (ADR 0048 fork G), so the timer arm is always present and this is
+        // re-evaluated at least once per heartbeat interval regardless of wakes.
+        if !gated.is_empty() {
+            let settled = {
+                let c = core.lock().expect("raft core poisoned");
+                persist.fully_durable(c.has_unflushed_wal())
+            };
+            if settled && persist_fut.is_none() {
+                for (to, msg) in gated.release(u64::MAX) {
+                    let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
+                    env.send(to, bytes).await;
+                }
+            }
         }
     }
 }
@@ -964,6 +1055,7 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
     delta_ring: Arc<Mutex<DeltaRing>>,
     watch: MetadataWatch,
     wal_lock: Arc<AsyncMutex<()>>,
+    persist: Arc<PersistProgress>,
 ) {
     // Rebuild this task's own owned `Metadata` from whatever the engine
     // already durably holds (empty on a fresh engine; a prior run's content
@@ -1006,6 +1098,7 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
             &delta_ring,
             &watch,
             &wal_lock,
+            &persist,
             &mut shadow,
             &mut watermark,
         )
@@ -1031,6 +1124,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     delta_ring: &Arc<Mutex<DeltaRing>>,
     watch: &MetadataWatch,
     wal_lock: &AsyncMutex<()>,
+    persist: &PersistProgress,
     shadow: &mut Metadata,
     watermark: &mut u64,
 ) -> bool {
@@ -1170,15 +1264,25 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
                 // the consensus loop's own accumulated pending append
                 // records are now redundant (`replay` is push-based —
                 // re-appending them would duplicate entries).
-                let _ = c.drain_persist();
-                (Some(buf), lli)
+                //
+                // Issue #279: this discard is a **persist round like any
+                // other**, numbered here in the same lock hold as the drain.
+                // While the loop's own `fsync` was inline, silently stealing
+                // its pending records was harmless — the loop could not be
+                // mid-anything, it was blocked. Now it can be, so a drain that
+                // took records without numbering them would leave the acks
+                // buffered against them waiting on a round with no drainer.
+                let (_superseded, round) = persist_round::drain_for_round(&mut c, persist);
+                (Some((buf, round)), lli)
             }
         };
-        if let Some(bytes) = bytes {
+        if let Some((bytes, round)) = bytes {
             env.replace(WAL, &bytes).await.expect("wal compaction");
-            core.lock()
-                .expect("raft core poisoned")
-                .mark_durable_through(lli);
+            let mut c = core.lock().expect("raft core poisoned");
+            c.mark_durable_through(lli);
+            if let Some(round) = round {
+                persist.complete_drain(round);
+            }
         }
         did_work = true;
     }
@@ -1692,30 +1796,36 @@ async fn persist_wal<E: Env>(
     env: &E,
     core: &Arc<Mutex<RaftCore>>,
     wal_lock: &AsyncMutex<()>,
+    progress: &PersistProgress,
 ) -> usize {
     let _wal = wal_lock.lock().await;
     // Capture the log high-water under the same lock as the drain: after we sync
     // the drained records, every entry up to here is durable. Entries appended
     // after this point ride the next flush.
-    let (records, through) = {
+    let (records, through, round) = {
         let mut core = core.lock().expect("raft core poisoned");
-        let records = core.drain_persist();
-        (records, core.last_log_index())
+        let (records, round) = persist_round::drain_for_round(&mut core, progress);
+        (records, core.last_log_index(), round)
     };
-    if records.is_empty() {
+    let Some(round) = round else {
+        debug_assert!(records.is_empty());
         return 0;
-    }
+    };
     for record in &records {
         env.append(WAL, &PersistedState::encode_record(record))
             .await
             .expect("wal append");
     }
     env.sync(WAL).await.expect("wal sync");
-    // The records are now durable: advance the watermark (which applies any
-    // now-durable committed entries). Only after this is the proposal observable.
-    core.lock()
-        .expect("raft core poisoned")
-        .mark_durable_through(through);
+    // The records are now durable: advance both watermarks under one acquisition
+    // — the log index (which applies any now-durable committed entries) and the
+    // persist round (which releases whatever `drive` buffered against it). Only
+    // after this is the proposal observable.
+    {
+        let mut core = core.lock().expect("raft core poisoned");
+        core.mark_durable_through(through);
+        progress.complete_drain(round);
+    }
     records.len()
 }
 
@@ -1900,6 +2010,7 @@ mod tests {
             &delta_ring,
             &watch,
             &wal_lock,
+            &PersistProgress::default(),
             &mut shadow,
             &mut watermark,
         )
@@ -1979,6 +2090,7 @@ mod tests {
             &delta_ring,
             &watch,
             &wal_lock,
+            &PersistProgress::default(),
             &mut shadow,
             &mut watermark,
         )

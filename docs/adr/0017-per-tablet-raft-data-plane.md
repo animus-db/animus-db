@@ -487,3 +487,42 @@ and `animus-cp-data/tests/prod_compaction_persist_round.rs` (real threads,
 compaction competing with the loop). The end-to-end gate is
 `animusd/tests/backfill_seeder.rs::split_during_backfill_converges_with_correct_final_gsi`
 run repeatedly in isolation — the check both reverted attempts failed.
+
+### Addendum (2026-08-19): the control plane's driver, same fix
+
+The amendment above was written for `animus-cp-data`'s per-tablet driver
+because that is where the livelock was observed. `animus-control`'s own
+`RaftNode` driver had the **byte-identical** defect — `drive` awaited
+`persist_wal` inline, twice per iteration, and its compaction rewrite
+drained-and-discarded the loop's pending records the same way — and was simply
+never the one caught failing. It is not a bystander to the workload that
+surfaced this: during a split-during-backfill the control group is one of the
+replicas `fsync`ing concurrently, and a control group that loses its leader
+takes metadata, placement and failure detection with it. A `SimEnv` regression
+with an injected 400 ms `sync` delay reproduces it directly on the pre-fix
+driver: 2 of 10 proposals accepted, the group leaderless for the whole window,
+deterministic across four seeds.
+
+Two things this half added beyond a copy of the data-plane change:
+
+- **The mechanism moved to `animus-control::persist_round`**, generic over the
+  core's command and state machine, and both drivers now share it. The
+  outbound-message policy in particular (`ships_before_durable`) is one
+  function, not one per plane — two copies of a durability rule start identical
+  and diverge the first time either is touched alone (ADR 0046 principle 5).
+  The data plane keeps a three-line wrapper for its own non-consensus wire
+  variants (`ReadProbe`/`ReadProbeAck`), which the shared policy never sees.
+- **The control plane has a third drainer**: `RaftNode::flush`, a *public*
+  method a graceful shutdown calls from outside the driver. Its doc justified
+  itself with "because the driver is parked at that point, this is the sole WAL
+  writer" — a precondition decoupling voids. It goes through the shared
+  `drain_for_round` like the other two, which is exactly what makes a third (or
+  fourth) drainer safe to add: the round-claiming primitive is module-private,
+  so taking records without numbering them does not compile.
+
+Not carried over: the halted-exit drain (this driver has no `halted` latch — the
+loop runs until its task is dropped) and the quiescence veto (the control plane
+never quiesces, ADR 0048 fork G). The latter is also a small belt this plane has
+and the data plane does not: its timer arm is always present, so the loop's
+`fully_durable` release is re-evaluated at least once per heartbeat interval
+regardless of any wake.

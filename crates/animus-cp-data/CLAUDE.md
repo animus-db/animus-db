@@ -578,9 +578,11 @@ demand the identical action, so no disambiguation is needed.
     `RequestVote` (a candidate counts its own vote) and `InstallSnapshotResp` are
     buffered against their persist round; `AppendEntries`/heartbeats, pre-vote
     traffic, `InstallSnapshot` chunks, `TimeoutNow`/`Quiesce`/`WakeRequest` and
-    `ReadProbe`(`Ack`) ship at once. `persist_round.rs` owns the accounting —
-    read its module doc before touching any of this, especially the "Two layers"
-    section: the WAL has **two** drainers (this loop and the apply task's
+    `ReadProbe`(`Ack`) ship at once. **`animus_control::persist_round` owns the
+    accounting, shared with the control plane's own driver** (this crate keeps
+    only a three-line `ships_before_durable` wrapper for `KvWire`'s
+    non-consensus variants) — read its module doc before touching any of this,
+    especially the "Two layers" section: the WAL has **two** drainers (this loop and the apply task's
     compaction rewrite), the interleaving that bit the two reverted fix attempts
     is a microsecond window no wall-clock test can hit, and the defect is closed
     structurally instead (one shared `drain_for_round`, plus a `fully_durable`

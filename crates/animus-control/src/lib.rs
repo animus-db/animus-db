@@ -32,6 +32,8 @@ pub mod meta;
 pub mod mirror;
 pub mod node;
 pub mod persist;
+/// Persist-round accounting shared by both planes' Raft drivers (issue #279).
+pub mod persist_round;
 pub mod raft;
 pub mod schema;
 pub mod shared_wal;

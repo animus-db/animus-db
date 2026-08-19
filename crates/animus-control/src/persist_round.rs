@@ -1,10 +1,17 @@
-//! Persist-round accounting for the per-tablet consensus loop (issue #279).
+//! Persist-round accounting for a Raft driver's consensus loop (issue #279).
+//!
+//! Shared by **both planes' drivers** — `animus-cp-data`'s per-tablet
+//! `RaftKvNode` and this crate's own `RaftNode` — because both drive the same
+//! sync [`RaftCore`] the same way and both hit the same defect. It lives here,
+//! beside the core, so the two can never drift into subtly different
+//! durability rules; the outbound-message policy in particular
+//! ([`ships_before_durable`]) is one function, not one per plane.
 //!
 //! # Why this exists
 //!
-//! `drive()` used to call `persist_wal` (drain → `append` → **`fsync`**) inline,
-//! twice per iteration, *before* it could return to its `select` over
-//! recv/timer/propose/wake. ADR 0017 moved engine apply + compaction off that
+//! A driver's consensus loop used to call `persist_wal` (drain → `append` →
+//! **`fsync`**) inline, twice per iteration, *before* it could return to its
+//! `select` over recv/timer/(propose/wake). ADR 0017 moved engine apply + compaction off that
 //! loop for exactly this reason — a step that blocks past the 150 ms
 //! `election_base` stops the node heartbeating (as leader) and stops it
 //! re-arming its election deadline (as follower) — but the WAL `fsync` was
@@ -17,7 +24,9 @@
 //! private engine and WAL, a split mid-backfill multiplies the concurrently
 //! `fsync`ing groups (parent + two children + the GSI's hidden-table tablet +
 //! the control plane, × 3 replicas), which is why the livelock reproduced only
-//! under split-during-backfill.
+//! under split-during-backfill — and why the control group, one of those
+//! concurrent `fsync`ers, is exposed to exactly the same failure even though
+//! it was not the one observed failing.
 //!
 //! The fix is *not* "persist faster" and *not* a bigger election timeout — a
 //! budget never fixes a livelock. It is to let the loop keep servicing
@@ -32,11 +41,16 @@
 //! sequence:
 //!
 //! * the consensus loop's own `persist_wal`, now raced inside `select` rather
-//!   than awaited inline; and
+//!   than awaited inline;
 //! * the apply task's **compaction rewrite**, which drains the loop's pending
 //!   records and discards them (its `wal_image` rewrite supersedes them —
 //!   `RaftCore::wal_image` re-emits the current hard state and the whole log
-//!   tail), making them durable when its `env.replace` completes.
+//!   tail), making them durable when its `env.replace` completes; and
+//! * in the control plane only, `RaftNode::flush` — a **public** drain a
+//!   graceful shutdown calls from outside the driver. Its doc used to justify
+//!   itself with "because the driver is parked at that point, this is the sole
+//!   WAL writer", which is precisely the kind of "safe while the loop is
+//!   blocked" precondition decoupling invalidates.
 //!
 //! [`PersistProgress`] numbers those rounds: `drained` counts rounds that have
 //! taken records, `durable` counts rounds whose I/O has completed. Both
@@ -67,7 +81,8 @@
 //! 1. **[`drain_for_round`] is the only sanctioned drain.** `begin_drain` is
 //!    private to this module, so a drainer physically cannot take records
 //!    without numbering the round that covers them. That is the bug attempt #2
-//!    shipped, made uncompilable.
+//!    shipped, made uncompilable — and it is what makes adding a third or
+//!    fourth drainer (the control plane has three) safe by construction.
 //! 2. **[`PersistProgress::fully_durable`] is the loop's unconditional safety
 //!    net.** Independently of any round number: if nothing is pending *and* no
 //!    round is in flight, every record this node holds is on disk, so anything
@@ -87,17 +102,16 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use animus_control::WalRecord;
-use animus_control::raft::RaftMsg;
 use animus_env::NodeId;
 use futures::task::AtomicWaker;
 
-use crate::{KvCommand, KvCore, KvState, KvWire};
+use crate::persist::WalRecord;
+use crate::raft::{RaftCore, RaftMsg, StateMachine};
 
 /// A consensus-loop-owned boxed persist future. Boxed because the loop must
 /// hold it *across* iterations (that is the point — the `fsync` outlives the
 /// `select` that started it) and its concrete type is unnameable.
-pub(crate) type PersistFut<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+pub type PersistFut<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// Shared round accounting for one tablet group, written by both drainers (the
 /// consensus loop's `persist_wal` and the apply task's compaction rewrite) and
@@ -112,7 +126,7 @@ pub(crate) type PersistFut<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 /// [`durable`](Self::durable) alone is a free-standing read (the loop's
 /// release step, which can only ever be conservative).
 #[derive(Default)]
-pub(crate) struct PersistProgress {
+pub struct PersistProgress {
     /// Rounds that have drained records. Bumped by [`begin_drain`](Self::begin_drain).
     drained: AtomicU64,
     /// Rounds whose records are durable. Bumped by
@@ -156,7 +170,7 @@ impl PersistProgress {
     /// as long as some drain's I/O is in flight. When both are clear, a buffered
     /// message's records are on disk no matter which task put them there or
     /// whether it numbered the round correctly.
-    pub(crate) fn fully_durable(&self, dirty: bool) -> bool {
+    pub fn fully_durable(&self, dirty: bool) -> bool {
         !dirty && self.durable() >= self.drained()
     }
 
@@ -165,13 +179,13 @@ impl PersistProgress {
     /// lock, in the same acquisition as the round's `mark_durable_through`**,
     /// and only after the I/O actually succeeded — never mark durability that
     /// did not happen.
-    pub(crate) fn complete_drain(&self, round: u64) {
+    pub fn complete_drain(&self, round: u64) {
         self.durable.fetch_max(round, Ordering::AcqRel);
         self.waker.wake();
     }
 
     /// The highest round known durable.
-    pub(crate) fn durable(&self) -> u64 {
+    pub fn durable(&self) -> u64 {
         self.durable.load(Ordering::Acquire)
     }
 
@@ -194,7 +208,7 @@ impl PersistProgress {
     ///   (`drain_persist` optimistically marks the hard state persisted at drain
     ///   time, and `durable_index` never moves for a vote-only round).
     /// * neither — nothing is owed and nothing is in flight: ship now.
-    pub(crate) fn gate(&self, dirty: bool) -> Option<u64> {
+    pub fn gate(&self, dirty: bool) -> Option<u64> {
         let drained = self.drained();
         if dirty {
             Some(drained + 1)
@@ -221,10 +235,14 @@ impl PersistProgress {
 /// unrepresentable; the caller's remaining duty is to
 /// [`complete_drain`](PersistProgress::complete_drain) the returned round once
 /// its I/O is durable, and never before.
-pub(crate) fn drain_for_round(
-    core: &mut KvCore,
+pub fn drain_for_round<C, S>(
+    core: &mut RaftCore<C, S>,
     progress: &PersistProgress,
-) -> (Vec<WalRecord<KvCommand, KvState>>, Option<u64>) {
+) -> (Vec<WalRecord<C, S>>, Option<u64>)
+where
+    C: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+    S: StateMachine<C>,
+{
     let records = core.drain_persist();
     let round = (!records.is_empty()).then(|| progress.begin_drain());
     (records, round)
@@ -238,14 +256,23 @@ pub(crate) fn drain_for_round(
 /// Batches are pushed in step order with non-decreasing rounds, so the queue is
 /// sorted by round and a release is a prefix drain — arrival order is preserved
 /// within and across batches.
-#[derive(Default)]
-pub(crate) struct GatedOuts {
-    waiting: Vec<(u64, Vec<(NodeId, KvWire)>)>,
+pub struct GatedOuts<M> {
+    waiting: Vec<(u64, Vec<(NodeId, M)>)>,
 }
 
-impl GatedOuts {
+impl<M> Default for GatedOuts<M> {
+    // Derived `Default` would demand `M: Default`, which no wire enum has a
+    // reason to implement — an empty queue needs nothing of its element type.
+    fn default() -> Self {
+        Self {
+            waiting: Vec::new(),
+        }
+    }
+}
+
+impl<M> GatedOuts<M> {
     /// Hold `outs` until `round` is durable. Empty batches are dropped.
-    pub(crate) fn push(&mut self, round: u64, outs: Vec<(NodeId, KvWire)>) {
+    pub fn push(&mut self, round: u64, outs: Vec<(NodeId, M)>) {
         if outs.is_empty() {
             return;
         }
@@ -257,18 +284,18 @@ impl GatedOuts {
     }
 
     /// The earliest round anything is waiting on — what [`PersistArm`] watches.
-    pub(crate) fn min_round(&self) -> Option<u64> {
+    pub fn min_round(&self) -> Option<u64> {
         self.waiting.first().map(|(r, _)| *r)
     }
 
     /// Whether anything is still held back (feeds the quiesce veto: a group with
     /// undelivered acks must not stop its timers).
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.waiting.is_empty()
     }
 
     /// Take every batch whose round is now durable, in arrival order.
-    pub(crate) fn release(&mut self, durable: u64) -> Vec<(NodeId, KvWire)> {
+    pub fn release(&mut self, durable: u64) -> Vec<(NodeId, M)> {
         let keep = self.waiting.iter().position(|(r, _)| *r > durable);
         let released: Vec<_> = match keep {
             Some(0) => return Vec::new(),
@@ -280,14 +307,14 @@ impl GatedOuts {
 
     /// Drop everything still held back — for the halted exit only. A halted node
     /// ships nothing more, and teardown deletes the WAL and engine regardless.
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.waiting.clear();
     }
 }
 
 /// Why [`PersistArm`] resolved.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PersistWake {
+pub enum PersistWake {
     /// The loop's own persist future finished; drop it and re-evaluate.
     OwnRoundDone,
     /// A round completed (possibly the apply task's compaction rewrite) and the
@@ -304,14 +331,14 @@ pub(crate) enum PersistWake {
 /// local and is merely borrowed for the poll, so a `Durable` wake in the middle
 /// of the loop's own `fsync` leaves that `fsync` running and it is re-polled on
 /// the next iteration.
-pub(crate) struct PersistArm<'a, 'f> {
+pub struct PersistArm<'a, 'f> {
     progress: &'a PersistProgress,
     own: Option<&'a mut PersistFut<'f>>,
     round: Option<u64>,
 }
 
 impl<'a, 'f> PersistArm<'a, 'f> {
-    pub(crate) fn new(
+    pub fn new(
         progress: &'a PersistProgress,
         own: Option<&'a mut PersistFut<'f>>,
         round: Option<u64>,
@@ -367,8 +394,11 @@ impl Future for PersistArm<'_, '_> {
 /// * `InstallSnapshot` chunks — the image was durable when compaction built it.
 /// * `TimeoutNow`, `Quiesce`, `WakeRequest`, `Heartbeat` — liveness signals
 ///   carrying no state claim.
-/// * `ReadProbe`/`ReadProbeAck` — a ReadIndex barrier, not log traffic; the core
-///   never even sees these.
+///
+/// A plane whose wire enum wraps `RaftMsg` alongside non-consensus traffic
+/// decides those variants itself — `animus-cp-data`'s `ReadProbe`/`ReadProbeAck`
+/// are a ReadIndex barrier the core never even sees, so they ship immediately
+/// without consulting this function.
 ///
 /// Everything else waits. In particular `RequestVoteResp { granted: true }` (a
 /// server must never cast two votes in one term across a crash-restart),
@@ -381,34 +411,37 @@ impl Future for PersistArm<'_, '_> {
 /// Note this only matters when the step was `dirty` at all — a message from a
 /// step that changed nothing durable ships immediately whatever it is, because
 /// [`PersistProgress::gate`] returns `None`.
-pub(crate) fn ships_before_durable(wire: &KvWire) -> bool {
-    match wire {
-        KvWire::ReadProbe { .. } | KvWire::ReadProbeAck { .. } => true,
-        KvWire::Raft(msg) => matches!(
-            msg,
-            RaftMsg::AppendEntries { .. }
-                | RaftMsg::PreVote { .. }
-                | RaftMsg::PreVoteResp { .. }
-                | RaftMsg::InstallSnapshot { .. }
-                | RaftMsg::TimeoutNow { .. }
-                | RaftMsg::Quiesce { .. }
-                | RaftMsg::WakeRequest { .. }
-                | RaftMsg::Heartbeat { .. }
-        ),
-    }
+pub fn ships_before_durable<C>(msg: &RaftMsg<C>) -> bool {
+    matches!(
+        msg,
+        RaftMsg::AppendEntries { .. }
+            | RaftMsg::PreVote { .. }
+            | RaftMsg::PreVoteResp { .. }
+            | RaftMsg::InstallSnapshot { .. }
+            | RaftMsg::TimeoutNow { .. }
+            | RaftMsg::Quiesce { .. }
+            | RaftMsg::WakeRequest { .. }
+            | RaftMsg::Heartbeat { .. }
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meta::MetaCommand;
 
-    fn wire(term: u64) -> KvWire {
-        KvWire::ReadProbe { term, epoch: 0 }
+    type Msg = RaftMsg<MetaCommand>;
+
+    fn msg(term: u64) -> Msg {
+        RaftMsg::PreVoteResp {
+            term,
+            granted: true,
+        }
     }
 
-    fn outs(n: u64) -> Vec<(NodeId, KvWire)> {
+    fn outs(n: u64) -> Vec<(NodeId, Msg)> {
         (0..n)
-            .map(|i| (NodeId::new_unchecked(format!("n{i}")), wire(i)))
+            .map(|i| (NodeId::new_unchecked(format!("n{i}")), msg(i)))
             .collect()
     }
 
@@ -469,7 +502,8 @@ mod tests {
         assert!(p.durable() < stranded, "the awaited round never arrives");
         assert!(
             p.fully_durable(false),
-            "with pending empty and no round in flight the node owes nothing,              so a buffered ack must be releasable"
+            "with pending empty and no round in flight the node owes nothing, \
+             so a buffered ack must be releasable"
         );
     }
 
@@ -484,7 +518,7 @@ mod tests {
 
     #[test]
     fn release_drains_the_durable_prefix_in_arrival_order() {
-        let mut g = GatedOuts::default();
+        let mut g: GatedOuts<Msg> = GatedOuts::default();
         g.push(1, outs(2));
         g.push(3, outs(1));
         assert_eq!(g.min_round(), Some(1));
@@ -502,7 +536,7 @@ mod tests {
 
     #[test]
     fn release_frees_nothing_below_the_earliest_round() {
-        let mut g = GatedOuts::default();
+        let mut g: GatedOuts<Msg> = GatedOuts::default();
         g.push(5, outs(1));
         assert!(g.release(4).is_empty());
         assert_eq!(g.min_round(), Some(5));
@@ -510,7 +544,7 @@ mod tests {
 
     #[test]
     fn empty_batches_never_occupy_a_slot() {
-        let mut g = GatedOuts::default();
+        let mut g: GatedOuts<Msg> = GatedOuts::default();
         g.push(1, Vec::new());
         assert!(g.is_empty());
         assert_eq!(g.min_round(), None);
@@ -518,7 +552,7 @@ mod tests {
 
     #[test]
     fn clear_drops_everything_for_the_halted_exit() {
-        let mut g = GatedOuts::default();
+        let mut g: GatedOuts<Msg> = GatedOuts::default();
         g.push(1, outs(3));
         g.clear();
         assert!(g.is_empty());
@@ -527,7 +561,7 @@ mod tests {
 
     #[test]
     fn replication_and_pre_vote_ship_before_durability_but_acks_do_not() {
-        let ships = |m: RaftMsg<crate::KvCommand>| ships_before_durable(&KvWire::Raft(m));
+        let ships = |m: Msg| ships_before_durable(&m);
         assert!(ships(RaftMsg::AppendEntries {
             term: 1,
             leader: NodeId::new_unchecked("a"),
@@ -546,9 +580,8 @@ mod tests {
             term: 1,
             granted: true
         }));
-        assert!(ships_before_durable(&KvWire::ReadProbe {
-            term: 1,
-            epoch: 0
+        assert!(ships(RaftMsg::Heartbeat {
+            node: NodeId::new_unchecked("a")
         }));
 
         assert!(!ships(RaftMsg::RequestVote {
