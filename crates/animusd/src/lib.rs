@@ -659,28 +659,46 @@ impl CpGroup {
 
     /// This group's Raft state for the `/admin/raftkv` view. The two engine arms
     /// call the identical `RaftKvNode` accessors, so a local macro keeps it DRY.
-    /// `key_count`/`byte_size` are this tablet's own **exact,
-    /// `StorageScope`-scoped** count/total ([`local_pairs`](Self::local_pairs))
-    /// — *not* the cheap [`approx_key_count`](Self::approx_key_count) /
-    /// [`approx_bytes`](Self::approx_bytes) estimates `auto_split_loop` uses
-    /// as a fast gate. (Since ADR 0050 rung 1 the engine is the tablet's own,
-    /// so those estimates no longer over-count co-resident siblings; the
-    /// exact count here remains the debug-grade answer, the estimates the
-    /// cheap one.) This is a debug surface, so the materialize-then-count cost is
-    /// acceptable (mirrors `local_scan`'s browse-keys view); `byte_size` is
-    /// summed from the same materialized pairs, no second engine call needed.
-    async fn raft_view(&self, tablet: TabletId) -> admin::CpRaftView {
+    ///
+    /// **`key_count`/`byte_size` are the cheap
+    /// [`approx_key_count`](Self::approx_key_count) /
+    /// [`approx_bytes`](Self::approx_bytes) estimates unless `exact` is set**
+    /// (`GET /admin/raftkv?exact=1`), in which case they are this tablet's
+    /// own exact count/total from [`local_pairs`](Self::local_pairs).
+    ///
+    /// The default flipped to the estimates because this route is **polled**,
+    /// not merely browsed: the Console fetches it from every node every 5s by
+    /// default, and materializing every hosted tablet's rows per request costs
+    /// O(dataset) per node per poll. Measured on a 20,000-row table mid-split,
+    /// that polling inflated the split's own build ~9× (41.8s vs 4.5s) — an
+    /// observer that materially perturbs what it observes. The estimates are
+    /// what `auto_split_loop` itself gates on, so the Console's
+    /// over-threshold pills now agree with the trigger that will actually
+    /// fire, and `?exact=1` still answers precisely for one deliberate look.
+    ///
+    /// Two honest differences in the default, both documented on
+    /// `admin::CpRaftView`: `approx_key_count` is `None` on the memory
+    /// backend (no cheap counter — the field renders as "—"), and
+    /// `approx_bytes` is **base-scoped** (ADR 0034) where the exact sum
+    /// covers every kind in the tablet's engine.
+    async fn raft_view(&self, tablet: TabletId, exact: bool) -> admin::CpRaftView {
         // Since ADR 0026 Stage B / ADR 0028 a tablet's CP group member id **is**
         // simply the base `raftkv` id — no more derived-id translation needed.
         let node = self.env().node_id();
-        let pairs = self.local_pairs().await;
-        let key_count = Some(pairs.len());
-        let byte_size = Some(
-            pairs
-                .iter()
-                .map(|(k, v)| (k.len() + v.len()) as u64)
-                .sum::<u64>(),
-        );
+        let (key_count, byte_size) = if exact {
+            let pairs = self.local_pairs().await;
+            (
+                Some(pairs.len()),
+                Some(
+                    pairs
+                        .iter()
+                        .map(|(k, v)| (k.len() + v.len()) as u64)
+                        .sum::<u64>(),
+                ),
+            )
+        } else {
+            (self.approx_key_count(), Some(self.approx_bytes().await))
+        };
         macro_rules! view {
             ($n:expr) => {
                 admin::CpRaftView {

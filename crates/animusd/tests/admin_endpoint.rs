@@ -767,12 +767,147 @@ async fn admin_seed_writes_synthetic_keys() {
     .expect("test timed out");
 }
 
-/// Regression: `/admin/raftkv`'s `key_count` must be scoped to each tablet's own
-/// `StorageScope` range, not the shared engine's combined total. A node hosts
-/// more than one tablet on the same engine as soon as it hosts a split's parent
-/// + child (ADR 0028); before the fix, `key_count` read the whole shared engine
+/// Regression (2026-08-19): `/admin/raftkv` is **polled** — the Console
+/// fetches it from every node on its auto-refresh interval (5s by default) —
+/// so its default response must not materialize every hosted tablet's rows.
+/// It used to: `key_count`/`byte_size` came from `local_pairs()`, an
+/// O(dataset) scan per hosted group per request. Measured on a live
+/// 20,000-row cluster, polling this route every 3s inflated a split's own
+/// build from 4.5s to 41.8s (~9x) — an observer that materially perturbs
+/// what it observes.
+///
+/// The teeth use the LSM's own `storage_sstable_block_reads` counter as the
+/// cost meter rather than wall-clock, which would be flaky under CI
+/// contention: a materializing read of flushed data must read SSTable
+/// blocks, and a metadata-only estimate must not. Both windows are the same
+/// shape and duration, so whatever background work the node's own loops do
+/// lands in both and cancels out of the comparison; only the route's own
+/// cost differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_raftkv_default_does_not_materialize_the_dataset() {
+    /// Enough rows that one materializing scan is unmistakable in block
+    /// reads, few enough that seeding stays quick.
+    const N: usize = 2_000;
+    /// Polls per window — mirrors an operator leaving the Tablets tab open.
+    const POLLS: usize = 10;
+
+    timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let a = nodes[0].admin_addr();
+
+        let (s, ct) = admin(
+            a,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"big",
+                    "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                    "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable big: {ct}");
+        let (s, seeded) = admin(
+            a,
+            "POST",
+            "/admin/data/seed",
+            Some(&format!(
+                r#"{{"table":"big","count":{N},"key_prefix":"seed:","value_bytes":64}}"#
+            )),
+        )
+        .await;
+        assert_eq!(s, 200, "seed: {seeded}");
+
+        // Flush every hosted group so the rows live in SSTables, not the
+        // memtable — otherwise even the exact scan reads no blocks and the
+        // meter below cannot tell the two paths apart.
+        let (_, rk) = admin_get(a, "/admin/raftkv").await;
+        for g in rk["groups"].as_array().cloned().unwrap_or_default() {
+            let tablet = g["tablet"].as_u64().expect("group has a tablet id");
+            let (s, f) = admin(
+                a,
+                "POST",
+                "/admin/storage/flush",
+                Some(&format!(r#"{{"tablet":{tablet}}}"#)),
+            )
+            .await;
+            assert_eq!(s, 200, "flush tablet {tablet}: {f}");
+        }
+
+        async fn block_reads(a: SocketAddr) -> u64 {
+            let (_, m) = admin_get(a, "/admin/metrics").await;
+            m["counters"]["storage_sstable_block_reads"]
+                .as_u64()
+                .expect("the LSM block-read counter is exported")
+        }
+
+        let base = block_reads(a).await;
+        for _ in 0..POLLS {
+            let (s, _) = admin_get(a, "/admin/raftkv").await;
+            assert_eq!(s, 200, "default raftkv poll");
+        }
+        let after_cheap = block_reads(a).await;
+        for _ in 0..POLLS {
+            let (s, _) = admin_get(a, "/admin/raftkv?exact=1").await;
+            assert_eq!(s, 200, "exact raftkv poll");
+        }
+        let after_exact = block_reads(a).await;
+
+        let cheap = after_cheap - base;
+        let exact = after_exact - after_cheap;
+        eprintln!(
+            "raftkv cost over {N} flushed rows: {POLLS} default polls = {cheap} SSTable block \
+             reads, {POLLS} `?exact=1` polls = {exact}"
+        );
+        assert!(
+            exact > cheap * 4 + 50,
+            "the default `/admin/raftkv` must not materialize the dataset: {POLLS} default \
+             polls read {cheap} SSTable blocks vs {exact} for the same number of `?exact=1` \
+             polls over {N} flushed rows — the default is scanning again"
+        );
+
+        // The cheap path still answers, and `?exact=1` still answers exactly.
+        let (_, cheap_view) = admin_get(a, "/admin/raftkv").await;
+        let (_, exact_view) = admin_get(a, "/admin/raftkv?exact=1").await;
+        let sum = |v: &Value| -> u64 {
+            v["groups"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|g| g["key_count"].as_u64())
+                .sum()
+        };
+        assert!(
+            sum(&cheap_view) > 0,
+            "the LSM backend has a cheap key-count estimate: {cheap_view}"
+        );
+        assert!(
+            sum(&exact_view) >= N as u64,
+            "`?exact=1` counts every seeded row (plus bookkeeping kinds): {exact_view}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Regression: `/admin/raftkv?exact=1`'s `key_count` must be scoped to each
+/// tablet's own range, not the node's combined total. A node hosts more than
+/// one tablet as soon as it hosts a split's parent + child (ADR 0028); before
+/// the fix, `key_count` read the whole shared engine
 /// (`CpGroup::approx_key_count`), so both halves' rows showed the *node's*
 /// combined total rather than their own subset.
+///
+/// Asks for `?exact=1` explicitly: the polled default is now the cheap
+/// estimate (see `admin_raftkv_default_does_not_materialize_the_dataset`),
+/// and this test's exact-total assertion is precisely what the exact path
+/// exists to answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
     timeout(Duration::from_secs(60), async {
@@ -820,7 +955,7 @@ async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
         let counts: std::collections::BTreeMap<u64, u64> =
             timeout(Duration::from_secs(15), async {
                 loop {
-                    let (_, raftkv) = admin_get(admin_addr, "/admin/raftkv").await;
+                    let (_, raftkv) = admin_get(admin_addr, "/admin/raftkv?exact=1").await;
                     let groups = raftkv["groups"].as_array().cloned().unwrap_or_default();
                     // Post-cutover + reclaim (ADR 0050 rung 5): exactly the
                     // two children remain — the parent's group (tablet 1)

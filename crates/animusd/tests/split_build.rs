@@ -1090,6 +1090,128 @@ async fn split_completes_when_a_child_lives_off_the_parent_leader_node() {
     .expect("test timed out");
 }
 
+/// The concurrent-ship error path: the bulk pass now ships to both children
+/// at once (`ship_all`/`try_join_all`), so a failure against ONE child also
+/// cancels the sibling's in-flight future. Killing a node that leads one
+/// child mid-build exercises exactly that — the ship to the dead child's
+/// group errors, the sibling ship is dropped wherever it happened to be,
+/// and the tick fails.
+///
+/// The build must still converge: `SeedBatch` merges at carried versions,
+/// so re-running the whole bulk pass next tick re-ships everything
+/// idempotently once the child's group re-elects out of its surviving two
+/// replicas. Asserted end to end — cutover completes and every acked key
+/// survives.
+///
+/// Racy by nature (the kill may land before the build starts or after it
+/// finishes), so it degrades exactly the way
+/// `driver_kill_after_freeze_resumes_and_completes` does: completion and
+/// no-loss are asserted on every path, and the run prints which one it took.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_survives_losing_one_childs_leader_mid_build() {
+    /// Enough rows that the bulk pass is a real window to land a kill in,
+    /// few enough that writing them through the client protocol is quick.
+    const N: usize = 400;
+
+    timeout(Duration::from_secs(300), async {
+        let dir = tempfile::tempdir().unwrap();
+        // 5 nodes vs RF 3: children get placement-chosen homes (fork F5), so
+        // a child leader that is neither node 0 nor the parent's own leader
+        // exists to be killed.
+        let (nodes, _config) = bring_up(5, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let mut stream = TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect client port");
+        let all_keys: Vec<Vec<u8>> = (0..N)
+            .map(|i| vec![b'k', (i % 8) as u8, (i / 8) as u8])
+            .collect();
+        for key in &all_keys {
+            put(&mut stream, key.clone(), key.clone()).await;
+        }
+
+        kickoff(&nodes).await;
+
+        // Find a live node that leads one of the two `Building` children and
+        // does NOT lead the parent — killing the parent's own leader tests
+        // driver re-lead, which the sibling test above already covers; here
+        // the driver must stay healthy and have its ship fail underneath it.
+        // Node 0 is excluded: this test's client stream and observer admin
+        // endpoint live there.
+        //
+        // Same per-node-view idiom as that sibling: each node's own
+        // `/admin/raftkv` reports the groups *it* hosts, so the index into
+        // `nodes` is known without mapping ids back and forth.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut victim: Option<usize> = None;
+        loop {
+            let (_, st) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
+            if !st["tablets"]
+                .as_object()
+                .is_some_and(|t| t.contains_key("1"))
+            {
+                break; // the build outran the search — degrade
+            }
+            for (i, node) in nodes.iter().enumerate().skip(1) {
+                let (_, view) = admin(node.admin_addr(), "GET", "/admin/raftkv", None).await;
+                let groups = view["groups"].as_array().cloned().unwrap_or_default();
+                let leads_parent = groups.iter().any(|g| {
+                    g["tablet"].as_u64() == Some(1) && g["is_leader"].as_bool() == Some(true)
+                });
+                let leads_child = groups.iter().any(|g| {
+                    g["tablet"].as_u64().is_some_and(|t| t != 1)
+                        && g["is_leader"].as_bool() == Some(true)
+                });
+                if leads_child && !leads_parent {
+                    victim = Some(i);
+                    break;
+                }
+            }
+            if victim.is_some() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no node ever led a Building child without also leading the parent"
+            );
+            sleep(Duration::from_millis(30)).await;
+        }
+
+        match victim {
+            Some(i) => {
+                println!("killing node {i}, leader of a Building child, mid-build");
+                nodes[i].shutdown();
+            }
+            None => println!(
+                "cutover completed before a killable child leader was observed - \
+                 degrading to a plain completion check"
+            ),
+        }
+
+        // Whatever happened, the workflow converges.
+        let (left, right) = await_cutover(&nodes[0], Duration::from_secs(180)).await;
+        println!("cutover completed to children {left}/{right}");
+
+        // Every acked key survives the kill and the re-run bulk pass.
+        for key in &all_keys {
+            assert_eq!(
+                get(&mut stream, key.clone()).await,
+                Some(key.clone()),
+                "key {key:?} lost across a split whose child leader was killed mid-build"
+            );
+        }
+
+        for (i, node) in nodes.iter().enumerate() {
+            if Some(i) != victim {
+                node.shutdown_graceful().await;
+            }
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// One DynamoDB JSON request over a fresh HTTP/1.1 connection → `(status,
 /// body)` — mirrors `dynamo_index_writes.rs`'s helper. Deliberately a
 /// **single attempt, no client-side retry** (unlike `put`/`put_in` above),

@@ -98,19 +98,23 @@ pub(crate) struct CpRaftView {
     pub(crate) snapshot_index: u64,
     pub(crate) log_len: usize,
     pub(crate) voters: Vec<NodeId>,
-    /// This tablet's exact, `StorageScope`-scoped live key count
-    /// (`CpGroup::raft_view`, via `local_pairs`) — distinct from the cheap,
-    /// unscoped estimate `auto_split_loop` checks against `--auto-split K`
-    /// (`CpGroup::approx_key_count`), which reads the whole shared engine and
-    /// so double-counts a co-resident sibling tablet (e.g. right after a
-    /// split). Always `Some` — both backends can be scanned.
+    /// This tablet's live key count — **the cheap, non-materializing
+    /// `CpGroup::approx_key_count` estimate by default**, the exact
+    /// `local_pairs` count under `?exact=1` (see `CpGroup::raft_view` for
+    /// why the polled default must not materialize). The estimate is the
+    /// very number `auto_split_loop` checks against `--auto-split K`, so
+    /// the Console's over-threshold pill agrees with the trigger that will
+    /// actually fire; it errs toward over-counting by design. `None` on the
+    /// **memory** backend, which has no cheap counter — `?exact=1` answers
+    /// there (and on either backend) precisely.
     pub(crate) key_count: Option<usize>,
-    /// This tablet's exact, `StorageScope`-scoped total byte size (sum of
-    /// `key.len() + value.len()` over the same `local_pairs` scan `key_count`
-    /// reads — no extra engine call) — the ADR 0034 dual of `key_count`:
-    /// distinct from the cheap, non-materializing estimate `auto_split_loop`
-    /// gates on (`CpGroup::approx_bytes`), which is scoped but approximate.
-    /// Always `Some` — both backends can be scanned.
+    /// This tablet's total byte size — **the cheap `CpGroup::approx_bytes`
+    /// estimate by default** (ADR 0034's own auto-split gate, on either
+    /// backend), the exact sum of `key.len() + value.len()` over
+    /// `local_pairs` under `?exact=1`. The two differ in scope as well as
+    /// precision: the estimate is **base-scoped** (ADR 0034 deliberately
+    /// excludes change-log churn), while the exact sum covers every kind in
+    /// the tablet's own engine.
     pub(crate) byte_size: Option<u64>,
     /// Whether this replica currently considers its group quiesced (ADR
     /// 0044 phase-1 PR7). A pure, frozen-accessor read — building this view
@@ -346,7 +350,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
             serde_json::to_value(ctx.effective_metadata()).unwrap_or(Value::Null),
         ),
         ("GET", "/admin/raft") => (200, raft_view(ctx)),
-        ("GET", "/admin/raftkv") => (200, raftkv_view(ctx).await),
+        ("GET", "/admin/raftkv") => (200, raftkv_view(ctx, q).await),
         ("GET", "/admin/txns") => (200, txns_view(ctx).await),
         ("GET", "/admin/storage/lsm") => storage_lsm(ctx, q).await,
         ("GET", "/admin/storage/control") => storage_control(ctx).await,
@@ -576,10 +580,20 @@ fn raft_view(ctx: &ClientCtx) -> Value {
     })
 }
 
-async fn raftkv_view(ctx: &ClientCtx) -> Value {
+/// `GET /admin/raftkv[?exact=1]` — this node's own per-hosted-tablet CP Raft
+/// view. `key_count`/`byte_size` are the **cheap estimates** by default and
+/// the exact materialized count/total under `?exact=1`; see
+/// `CpGroup::raft_view`'s own doc for why the polled default must not
+/// materialize (this route is fetched from every node every 5s by the
+/// Console, and the exact path costs O(dataset) per node per poll).
+async fn raftkv_view(ctx: &ClientCtx, q: &str) -> Value {
+    let exact = matches!(
+        http::query_param(q, "exact").as_deref(),
+        Some("1") | Some("true")
+    );
     let mut groups: Vec<CpRaftView> = Vec::new();
     for (t, g) in ctx.edge.hosted_groups() {
-        let mut view = g.raft_view(t).await;
+        let mut view = g.raft_view(t, exact).await;
         // ADR 0050 rung 4: overlay this node's own split-build progress (a
         // data-role field; absent on a control-only node, which hosts no
         // groups and never reaches this loop body anyway).

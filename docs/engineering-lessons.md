@@ -6813,6 +6813,66 @@ debugging anything that feels like it might have happened before.
   `tests/`) is what actually finds every call site of a `pub(crate)`
   helper this crate's own module-map documents as having in-crate test
   consumers.
+- **An introspection surface whose cost scales with the data it describes
+  needs an explicit answer to "what happens when something polls this every
+  few seconds?" — because a dashboard eventually will** (2026-08-19).
+  `/admin/raftkv` computed `key_count`/`byte_size` by materializing every
+  hosted tablet's rows per request. Its own doc comment blessed this —
+  "this is a debug surface, so the materialize-then-count cost is
+  acceptable" — and that was *true when written*, for a human occasionally
+  curling a route. It stopped being true when the Console started fetching
+  the same route from every node on a 5s auto-refresh, and nothing
+  re-examined the original judgement, because the cost lives in one file
+  and the polling lives in another. Measured: with a 20,000-row table
+  mid-split, polling it every 3s stretched the split's build from 4.5s to
+  41.8s (~9x). **The pathology is specifically an observer that perturbs
+  what it observes** — the operator watching a slow split was making it
+  slower, and every "why is this slow?" measurement taken through that
+  surface was measuring partly itself. I hit this as a *debugging* failure
+  before finding it as a bug: my own sampler polled the same route, so my
+  first published wall-clock numbers for an unrelated fix were ~2x
+  inflated and had to be corrected afterward. **Rules.** (1) When you add
+  or bless an O(dataset) read on a debug route, write down what polls it;
+  if the answer is "a UI, on a timer," it needs a cheap default and an
+  opt-in exact path (`?exact=1`), not a comment saying the cost is
+  acceptable. (2) When measuring anything, account for your own
+  instrument: prefer counters the system already maintains
+  (`storage_sstable_block_reads` made this both diagnosable and testable)
+  over polling a rich endpoint in a loop, and when you must poll, measure
+  the same workload unpolled to size your own footprint. (3) A cheap
+  estimate that the *enforcement* path already uses (here `auto_split_loop`'s
+  own `approx_key_count`/`approx_bytes`) is often the better default even
+  ignoring cost, because it makes the UI agree with the mechanism instead
+  of showing a truer number the system never acts on.
+  (`crates/animusd/src/lib.rs::CpGroup::raft_view`, `admin.rs::raftkv_view`.)
+- **Before claiming a parallelization's speedup, measure what fraction of
+  the work you are actually parallelizing — "these two are independent, so
+  it's ~2x" is a statement about the code shape, not about the clock**
+  (2026-08-19). The split build shipped to its two children serially; they
+  are two independent Raft groups at disjoint homes, so making the ships
+  concurrent looked like a clean ~2x on the copy, and that is what I told
+  the maintainer before measuring. Quiet-parent A/B at 20,000 rows, n=6 per
+  side: median 6.05s -> 5.25s, mean 6.13s -> 5.67s, stdev ~0.85s on both —
+  **a real direction, but inside one standard deviation, so not a
+  demonstrated speedup at all.** The cost model explains it exactly: the
+  ships were only ~1.2s of a ~6s build, so halving them buys ~0.6s, and
+  what actually dominates is three *full engine scans* of the tablet (the
+  version-floor pre-pass, the bulk scan, the final image). **The rules.**
+  (1) Estimate the serialized component's share of total time BEFORE
+  writing the parallel version; if you cannot, say "unknown" rather than
+  quoting a ratio derived from the shape. (2) Pick the benchmark that
+  isolates the phase you changed — the repo's existing split bench drives a
+  continuous writer, which pins every run to `SPLIT_MAX_TAIL_PASSES` and
+  made the change measure as *literally zero* (8.06s vs 8.08s); only a
+  quiet-parent run could see it at all. (3) n=1 is not a measurement when
+  the run-to-run spread is comparable to the effect: the same binary
+  produced 5.0s and 34.6s on consecutive runs until the concurrent-writer
+  confound was removed. (4) Ship the honest number, including when it
+  undercuts your own earlier estimate — the change here is still worth
+  making (it removes a structural serialization and its fault test covers a
+  previously untested cancellation path), but selling it as a 2x win would
+  have been false.
+  (`crates/animusd/src/index_drain.rs::ship_all`.)
 
 ### Parallel-agent orchestration
 - **Parallel agents share one `target/` dir; three concurrent
