@@ -2563,6 +2563,52 @@ async fn multi_split_soak_streamed_gsi_table_under_mixed_load() {
             deadline,
         )
         .await;
+        // Issue #298 (unresolved): this soak has been sighted delivering
+        // fewer records than were written (e.g. 142/144), root cause
+        // unknown — possibly a real exactly-once bug, so this is
+        // deliberately NOT retried or loosened. On a deficit ONLY, dump a
+        // permanent, concise diagnostic so the next CI occurrence is
+        // self-diagnosing rather than needing another investigation round.
+        // The per-tablet closed-chain length is the load-bearing datum: the
+        // prior #298 sighting showed only one tablet had a non-zero closed
+        // chain, which is what redirected suspicion from the seal/Freeze
+        // path to the open (never-sealed) tail.
+        if delivered.len() != expected {
+            let meta = nodes[1].metadata();
+            let want_ids: BTreeSet<&String> = ids.iter().collect();
+            let delivered_ids: BTreeSet<String> = delivered
+                .iter()
+                .filter_map(|r| r["dynamodb"]["Keys"]["id"]["S"].as_str())
+                .map(str::to_owned)
+                .collect();
+            let missing: Vec<&String> = want_ids
+                .into_iter()
+                .filter(|id| !delivered_ids.contains(*id))
+                .collect();
+            let by_event_id: Vec<(String, String)> = delivered
+                .iter()
+                .map(|r| {
+                    let id = r["dynamodb"]["Keys"]["id"]["S"]
+                        .as_str()
+                        .unwrap_or("?")
+                        .to_owned();
+                    let event_id = r["eventID"].as_str().unwrap_or("?").to_owned();
+                    (id, event_id)
+                })
+                .collect();
+            let live: BTreeSet<TabletId> = tablets_for(&meta, "soak").into_iter().collect();
+            let retired_set: BTreeSet<TabletId> = retired.iter().copied().collect();
+            let mut closed_chain_len: BTreeMap<TabletId, usize> = BTreeMap::new();
+            for &(tablet, _epoch) in meta.stream_shards.keys() {
+                *closed_chain_len.entry(tablet).or_insert(0) += 1;
+            }
+            eprintln!(
+                "DIAGNOSTIC (issue #298) delivered={}/{expected} missing_ids={missing:?} \
+                 delivered_id_event_id={by_event_id:?} live_tablets={live:?} \
+                 retired_tablets={retired_set:?} closed_chain_len_per_tablet={closed_chain_len:?}",
+                delivered.len(),
+            );
+        }
         assert_eq!(
             delivered.len(),
             expected,
