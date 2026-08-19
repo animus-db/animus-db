@@ -299,6 +299,7 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
             cql: free(),
             admin: free(),
             intra: free(),
+            console: free(),
         }
     };
     let config = animusd::ClusterConfig { nodes: vec![addrs] };

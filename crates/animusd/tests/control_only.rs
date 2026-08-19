@@ -56,17 +56,18 @@ async fn bring_up_control(n: usize, dir: &std::path::Path) -> (Vec<Node>, animus
         // binds four of them (internal, client, admin, intra) — `RoleAddrs::
         // dynamo`/`cql` aren't `Option`, and matching the six-port stride (ADR
         // 0047) keeps this config trivially comparable to a combined-mode one.
-        let addrs = free_addrs(n * 6);
+        let addrs = free_addrs(n * 7);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Control,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                cql: addrs[6 * i + 3],
-                admin: addrs[6 * i + 4],
-                intra: addrs[6 * i + 5],
+                internal: addrs[7 * i],
+                client: addrs[7 * i + 1],
+                dynamo: addrs[7 * i + 2],
+                cql: addrs[7 * i + 3],
+                admin: addrs[7 * i + 4],
+                intra: addrs[7 * i + 5],
+                console: addrs[7 * i + 6],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -385,28 +386,30 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
         // trio's voter set, and it mirrors the trio's `Metadata` via
         // `remote_metadata_sync_loop`.
         let (control_nodes, config, data_node) = 'bring_up: loop {
-            let addrs = free_addrs(4 * 6);
+            let addrs = free_addrs(4 * 7);
             let mut nodes_cfg: Vec<animusd::RoleAddrs> = (0..3)
                 .map(|i| animusd::RoleAddrs {
                     id: animusd::config::node_id(i),
                     role: animusd::config::NodeRole::Control,
-                    internal: addrs[6 * i],
-                    client: addrs[6 * i + 1],
-                    dynamo: addrs[6 * i + 2],
-                    cql: addrs[6 * i + 3],
-                    admin: addrs[6 * i + 4],
-                    intra: addrs[6 * i + 5],
+                    internal: addrs[7 * i],
+                    client: addrs[7 * i + 1],
+                    dynamo: addrs[7 * i + 2],
+                    cql: addrs[7 * i + 3],
+                    admin: addrs[7 * i + 4],
+                    intra: addrs[7 * i + 5],
+                    console: addrs[7 * i + 6],
                 })
                 .collect();
             nodes_cfg.push(animusd::RoleAddrs {
                 id: animusd::config::node_id(3),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[18],
-                client: addrs[19],
-                dynamo: addrs[20],
-                cql: addrs[21],
-                admin: addrs[22],
-                intra: addrs[23],
+                internal: addrs[21],
+                client: addrs[22],
+                dynamo: addrs[23],
+                cql: addrs[24],
+                admin: addrs[25],
+                intra: addrs[26],
+                console: addrs[27],
             });
             let config = animusd::ClusterConfig { nodes: nodes_cfg };
 

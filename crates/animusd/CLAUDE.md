@@ -48,12 +48,22 @@ reusing the captured config is the point of the test.
 - **`config.rs`** — `ClusterConfig`/`RoleAddrs` (per-process deployment
   config; every entry names its own **`id: NodeId`** rather than deriving
   it from position — `from_json` hard-errors on a duplicate) and the
-  **six-port stride** (ADR 0047: `base_port + 6*i + {internal,client,dynamo,
-  cql,admin,intra}` — `intra` appended at offset 5, the client/intra-cluster
-  RPC port split). `generate`/`generate_split` mint `"n{i}"`, **zero-padded** once
-  the cluster has ≥ 10 nodes so lexicographic id order stays == numeric
-  index order (`"n10" < "n2"` otherwise) — below that threshold ids stay
-  the plain unpadded `"n{i}"` every existing test already assumes.
+  **seven-port stride** (ADR 0047 + ADR 0052: `base_port + 7*i +
+  {internal,client,dynamo,cql,admin,intra,console}` — `intra` at offset 5
+  (the client/intra-cluster RPC port split), `console` at offset 6 (the
+  AnimusDB Data Console, ADR 0052 — a DynamoDB-shaped data app on its own
+  port, deliberately separate from the operator dashboard the admin port
+  serves; bound on combined/data-only nodes, never control-only, which
+  hosts no CP-data tablet). `generate`/`generate_split` mint `"n{i}"`,
+  **zero-padded** once the cluster has ≥ 10 nodes so lexicographic id order
+  stays == numeric index order (`"n10" < "n2"` otherwise) — below that
+  threshold ids stay the plain unpadded `"n{i}"` every existing test
+  already assumes. **A future 8th port**: add the field to `RoleAddrs`
+  first (no default), then let `cargo build -p animusd --all-targets`'s
+  `error[E0063]: missing field` output enumerate every one of the ~60
+  literal construction sites across `src/`+`tests/` — don't trust a grep
+  pass to have found them all (see `docs/engineering-lessons.md`'s
+  2026-08-19 "Code patterns" entry on this exact port addition).
 - **`control_handle.rs`** — the `ControlHandle` seam (ADR 0035 PR1):
   `Local(RaftNode<ProdEnv>)` for a node with real control Raft, vs.
   `Remote(RemoteControlClient)` for a data-only node reaching a separate control
@@ -203,7 +213,7 @@ reusing the captured config is the point of the test.
   read-only `GET` views + gated `POST` actions + the dashboard's data-write
   surface; also serves the SPA static assets.
 - **`http.rs`** — shared hand-rolled HTTP/1.1 helpers (request parser + response
-  writers) used by both `dynamo.rs` and `admin.rs`.
+  writers) used by `dynamo.rs`, `admin.rs`, and `console.rs`.
 - **`otel.rs`** — OTLP/HTTP distributed-tracing seam (ADR 0027); opt-in, no-op
   unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Scoped to this crate only.
 - **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** — the
@@ -215,7 +225,33 @@ reusing the captured config is the point of the test.
   (`ClientCtx::data()` panics / a routing timeout) documented rather than
   fixed — design (label resolution, live-tail poller, the
   `/admin/data/dynamo` proxy it rides, and the control-only role-gating
-  details) is in `docs/streams-notes.md`.
+  details) is in `docs/streams-notes.md`. **Not the same thing as
+  `console.rs`** (below) despite the naming overlap — this is the
+  **operator** surface (cluster health/placement/Raft/storage) on the
+  admin port; see `console.rs`'s own entry and ADR 0052's "Naming,
+  deliberately addressed" for the full disambiguation.
+- **`console.rs`** + **`console.html`** + **`console.css`** — the AnimusDB
+  **Data Console** (ADR 0052): a DynamoDB-shaped data app for application
+  developers, on its own dedicated port (`RoleAddrs.console`) — never the
+  admin port (documented no-auth, trusted-interface-only, ADR 0020) and
+  never a route on the DynamoDB wire listener. Bound on combined and
+  data-only nodes only; a control-only node hosts no CP-data tablet, so it
+  binds none (`BoundControlNode::start_control_with` passes `None` into
+  `spawn_common_tail`'s `console_listener` parameter). **This module takes
+  no `ClientCtx`** — a structural enforcement, not just a documented rule,
+  of the console's one defining constraint: it must never surface
+  cluster-shaped state (nodes, replicas, tablets, Raft, quorum, leaders,
+  placement, health). As of this PR it serves a minimal placeholder shell
+  only (`include_str!`'d HTML/CSS, an asset route, a `/console/ui/*`
+  deep-link prefix mirroring `admin::is_ui_path`'s shape) — no JSON
+  endpoints exist yet; later PRs in the same stack add the real screens
+  (tables list, table page, create-table form), each reading through
+  `ClientCtx`'s existing CP primitives the way `dynamo.rs`/`cql.rs` already
+  do, which is also the point at which this module will need its own
+  `ClientCtx` and the "no `ClientCtx`" property above will need
+  re-examining, not silently assumed to still hold. See ADR 0052 for the
+  full design (including why the console does *not* join the replicated
+  `NodeAddrs` book — no other node ever needs to resolve it).
 
 ## CLI reference
 
@@ -333,6 +369,14 @@ system-keyspace engine, since `Metadata` is `StateMachine::DRIVER_APPLIED`
 and this engine is the durable home of the control plane's async apply
 task's published cache (see `animus-control/CLAUDE.md`'s `node.rs`/
 `mirror.rs` entries).
+
+**Console binding (ADR 0052) follows the same split as `dynamo`/`cql`**:
+combined and data-only bind `RoleAddrs.console` (real CP-data tablets to
+show); control-only does not (`Node::bind_control` never reads
+`addrs.console` at all, and `BoundControlNode::start_control_with` passes
+`None` for `spawn_common_tail`'s `console_listener` — `Node::console_addr()`
+panics there, mirroring `dynamo_addr()`/`cql_addr()`'s existing
+control-only-panics contract).
 
 ## Request routing (CP)
 
@@ -1366,10 +1410,12 @@ route below the edge through the same `ClientCtx` CP primitives.
   0050 gating measurement). Node-start entry points are async+fallible
   (`io::Result`).
 - **`Node::shutdown()` is a graceful teardown** — aborts the listener tasks and
-  `ProdEnv::shutdown()`s the node's one internal env, freeing all six ports
-  (ADR 0040 PR1's `internal`/`client`/`dynamo`/`cql`/`admin` stride, plus ADR
-  0047's `intra` — the pre-ADR-0040 stride was six too, but split across two
-  role envs instead of one node/one port-block) so a replacement can rebind
+  `ProdEnv::shutdown()`s the node's one internal env, freeing all seven ports
+  on a combined/data-only node (ADR 0040 PR1's `internal`/`client`/`dynamo`/
+  `cql`/`admin` stride, plus ADR 0047's `intra` and ADR 0052's `console` — the
+  pre-ADR-0040 stride was six too, but split across two role envs instead of
+  one node/one port-block; a control-only node frees five, since it never
+  binds `dynamo`/`cql`/`console`) so a replacement can rebind
   the same addresses/dir. Dropping a `Node` without it leaves tasks running.
   **It's fire-and-forget (`abort()` then return), not a guarantee those ports are
   free the instant it returns** — see `animus-env/CLAUDE.md`'s `ProdEnv::shutdown()`

@@ -1,0 +1,37 @@
+/* AnimusDB Data Console (ADR 0052) — placeholder shell styling. Deliberately
+   tiny: this PR ships plumbing only, not the real UI. System font stacks
+   only, matching the operator dashboard's own no-external-fonts/CDN rule
+   (ADR 0021 §1). */
+:root {
+  --bg: #0a0c0f; --surface: #12151a; --border: rgba(255,255,255,0.09);
+  --text: #eceef0; --text2: rgba(236,238,240,0.75);
+  --accent: oklch(72% 0.15 250);
+  --font-ui: -apple-system, "Segoe UI", system-ui, Roboto, sans-serif;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fbfaf7; --surface: #ffffff; --border: rgba(20,20,15,0.1);
+    --text: #1a1a17; --text2: rgba(26,26,23,0.75);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: var(--font-ui);
+}
+.topbar {
+  display: flex; align-items: baseline; gap: 0.5rem;
+  padding: 0.9rem 1.25rem; border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.topbar .name { font-weight: 600; }
+.topbar .tag { color: var(--text2); font-size: 0.9rem; }
+main {
+  max-width: 42rem; margin: 3rem auto; padding: 0 1.25rem;
+}
+h1 { font-size: 1.4rem; margin-bottom: 1rem; }
+p { line-height: 1.5; color: var(--text2); }
+p.notice {
+  border: 1px solid var(--border); border-radius: 0.5rem;
+  padding: 0.9rem 1rem; background: var(--surface);
+}

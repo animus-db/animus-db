@@ -394,3 +394,16 @@ follow-up it fulfils), ADR 0018 (the transaction state it will visualize), ADR
 0015 (the observe-only / aggregate-live discipline), and ADR 0003 (which it sits
 *outside* of, as a `ProdEnv` I/O edge). The control plane (ADR 0001) remains the
 metadata authority the dashboard reads.
+
+## Amendment (2026-08-19, ADR 0052) — naming disambiguation
+
+This dashboard is internally called "the AnimusDB Console" (this file's own
+source comments, the page `<title>`) — a name [ADR 0052](0052-data-console-port.md)'s
+**AnimusDB Data Console** now sits next to, on a different port, for a
+different audience. The two are deliberately distinct: this dashboard stays
+the **operator** surface — cluster health, placement, Raft, storage — on the
+admin port, exactly as this ADR describes; the Data Console is an
+**application-developer** surface — tables and items only, structurally
+barred from showing anything this dashboard shows — on its own new port.
+Neither renames nor merges into the other; see ADR 0052's own "Naming,
+deliberately addressed" section for the full reasoning.

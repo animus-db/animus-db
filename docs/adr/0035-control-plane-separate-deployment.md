@@ -457,3 +457,27 @@ placement label — every deployment shape this ADR actually established
 Streams. This paragraph is kept, struck through in spirit if not in
 Markdown, purely so a reader who remembers the round-2 design can find the
 explicit retraction rather than wondering whether it silently rotted.
+
+## Amendment (2026-08-19, ADR 0052) — a seventh port, the AnimusDB Data Console
+
+[ADR 0052](0052-data-console-port.md) adds the **AnimusDB Data Console**: a
+DynamoDB-shaped data app for application developers, deliberately separate
+from the operator dashboard ADR 0021 already serves on the admin port (that
+port is documented no-auth, trusted-interface-only — the wrong trust
+boundary for a surface meant for a different audience). It gets its own
+port rather than sharing the admin or DynamoDB listeners, the same
+reasoning [ADR 0047](0047-intra-node-port.md) used to split node-to-node
+RPC traffic off the client port.
+
+The port-stride table this ADR's own "amended by ADR 0040" note above
+describes (five ports, one `id`/`internal` address) is stale twice over by
+now — ADR 0047 made it six (`+ intra`), and ADR 0052 makes it **seven**
+(`+ console`, `RoleAddrs::console`, stride offset 6). The three deployment
+shapes' console-binding rule follows the exact same split as `dynamo`/`cql`
+already use: **combined** and **data-only** bind it (both host real
+CP-data tablets, the console's subject matter); **control-only** does
+**not** (it hosts no tablet, so there is nothing for the console to show —
+see ADR 0052's own "Which deployment shapes serve it" for the full
+reasoning). No other target-topology bullet in this ADR changes — this is
+an additive port, not a new shape or a change to the two existing roles'
+own responsibilities.

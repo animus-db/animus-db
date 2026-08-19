@@ -43,6 +43,7 @@ pub use animus_control::{
 };
 
 mod admin;
+mod console;
 mod control_handle;
 mod cql;
 mod cql_client;
@@ -2224,6 +2225,21 @@ pub struct RoleAddrs {
     /// ephemeral loopback port.
     #[serde(default = "default_ephemeral_addr")]
     pub admin: SocketAddr,
+    /// The **AnimusDB Console** (ADR 0052) — a DynamoDB-shaped data app for
+    /// application developers, deliberately separate from the operator
+    /// dashboard the admin port serves (ADR 0021): it must never surface
+    /// cluster-shaped state (nodes, replicas, tablets, Raft, quorum,
+    /// leaders, placement, health). It gets its **own** port rather than
+    /// riding the admin listener (documented no-auth, trusted-interface-only,
+    /// ADR 0020) or the DynamoDB listener (a wire protocol, not an HTTP app) —
+    /// the same reasoning ADR 0047 used to split node-to-node RPC off the
+    /// client port. Bound on combined and data-only nodes (both host CP-data
+    /// tablets, the console's actual subject matter); **not** bound on a
+    /// control-only node (ADR 0035) — it hosts no tablet, so it has nothing
+    /// for the console to show. No default (a deliberate clean break,
+    /// matching `intra`'s own no-default convention — no live deployments to
+    /// keep back-compat with).
+    pub console: SocketAddr,
 }
 
 /// Fallback endpoint for configs written before a field existed: an ephemeral
@@ -2259,6 +2275,11 @@ pub struct BoundNode {
     /// sequence.
     intra_listener: TcpListener,
     intra_addr: SocketAddr,
+    /// The AnimusDB Data Console's own listener (ADR 0052) — a combined node
+    /// hosts CP-data tablets, so it always binds one; see
+    /// [`console`](crate::console)'s module doc.
+    console_listener: TcpListener,
+    console_addr: SocketAddr,
 }
 
 /// A node's identity + bound addresses, captured for the admin `/admin/config`
@@ -2352,6 +2373,7 @@ fn spawn_common_tail(
     client_listener: TcpListener,
     admin_listener: TcpListener,
     intra_listener: TcpListener,
+    console_listener: Option<TcpListener>,
     control_storage: Option<SharedEngine>,
     env: ProdEnv,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
@@ -2438,6 +2460,15 @@ fn spawn_common_tail(
     )));
     // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020).
     tasks.push(tokio::spawn(admin::serve(admin_listener, ctx.clone())));
+    // The AnimusDB Data Console (ADR 0052) — `None` on a control-only node
+    // (it hosts no CP-data tablet, so it has nothing for the console to
+    // show; see `BoundControlNode::start_control_with`, the only caller that
+    // passes `None`). Deliberately takes no `ClientCtx`: this listener
+    // serves static bytes only, structurally unable to reach any cluster
+    // state even by accident — see `console`'s module doc.
+    if let Some(console_listener) = console_listener {
+        tasks.push(tokio::spawn(console::serve(console_listener)));
+    }
 
     (ctx, tasks)
 }
@@ -2871,6 +2902,7 @@ impl BoundNode {
             self.client_listener,
             self.admin_listener,
             self.intra_listener,
+            Some(self.console_listener),
             Some(storage.clone()),
             self.env.clone(),
         );
@@ -3127,6 +3159,7 @@ impl BoundNode {
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
+            console_addr: Some(self.console_addr),
             #[cfg(test)]
             test_ctx: ctx,
         })
@@ -3178,6 +3211,10 @@ pub struct Node {
     /// populated — every deployment shape binds and (from `intra/2-cutover`
     /// onward) serves it.
     intra_addr: SocketAddr,
+    /// `None` on a control-only node (ADR 0052) — the AnimusDB Data Console
+    /// listener is never bound there (it hosts no CP-data tablet). See
+    /// [`console_addr`](Self::console_addr)'s doc.
+    console_addr: Option<SocketAddr>,
     /// Test-only: a clone of this node's own [`ClientCtx`] (the exact one
     /// `spawn_common_tail` built and handed to this node's listeners/
     /// background loops), so an in-crate test module can call a
@@ -3219,6 +3256,8 @@ impl Node {
         let admin_addr = admin_listener.local_addr()?;
         let intra_listener = TcpListener::bind(addrs.intra).await?;
         let intra_addr = intra_listener.local_addr()?;
+        let console_listener = TcpListener::bind(addrs.console).await?;
+        let console_addr = console_listener.local_addr()?;
         Ok(BoundNode {
             id,
             env,
@@ -3234,13 +3273,17 @@ impl Node {
             admin_addr,
             intra_listener,
             intra_addr,
+            console_listener,
+            console_addr,
         })
     }
 
     /// Bind a **control-only** node's listeners (ADR 0035 PR3): the internal
     /// `ProdEnv` (control Raft only — it hosts no tablet, so no stream ever
     /// rides above 0) plus the client + admin TCP listeners only — no
-    /// dynamo/cql listeners.
+    /// dynamo/cql listeners, and (ADR 0052) no console listener either: a
+    /// control-only node hosts no CP-data tablet, so it has nothing the
+    /// console could show — see [`console`](crate::console)'s module doc.
     ///
     /// # Errors
     /// Propagates any bind / directory-creation failure.
@@ -3275,7 +3318,9 @@ impl Node {
     /// `ProdEnv` (every per-tablet Raft group this node hosts, plus its own
     /// failure-detection heartbeats to the control group — no local control
     /// `RaftCore` at all, `Node::bind_control`'s exact dual) plus the
-    /// client/dynamo/cql/admin TCP listeners.
+    /// client/dynamo/cql/admin/console TCP listeners — a data-only node hosts
+    /// real CP-data tablets, so it binds the console listener (ADR 0052) just
+    /// like a combined node.
     ///
     /// # Errors
     /// Propagates any bind / directory-creation failure.
@@ -3297,6 +3342,8 @@ impl Node {
         let admin_addr = admin_listener.local_addr()?;
         let intra_listener = TcpListener::bind(addrs.intra).await?;
         let intra_addr = intra_listener.local_addr()?;
+        let console_listener = TcpListener::bind(addrs.console).await?;
+        let console_addr = console_listener.local_addr()?;
         Ok(BoundDataNode {
             id,
             env,
@@ -3312,6 +3359,8 @@ impl Node {
             admin_addr,
             intra_listener,
             intra_addr,
+            console_listener,
+            console_addr,
         })
     }
 
@@ -3348,6 +3397,16 @@ impl Node {
     /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
     pub fn intra_addr(&self) -> SocketAddr {
         self.intra_addr
+    }
+
+    /// The address the AnimusDB Data Console listens on (ADR 0052).
+    ///
+    /// # Panics
+    /// If this node has no data role — see [`dynamo_addr`](Self::dynamo_addr)'s
+    /// doc; the console has nothing to show on a control-only node either.
+    pub fn console_addr(&self) -> SocketAddr {
+        self.console_addr
+            .expect("console_addr: this node has no data role (ADR 0035 PR3 control-only)")
     }
 
     /// Whether this node's control replica currently believes it is leader.
@@ -3773,6 +3832,7 @@ impl BoundControlNode {
             self.client_listener,
             self.admin_listener,
             self.intra_listener,
+            None, // ADR 0052: a control-only node hosts no CP-data tablet, so it binds no console listener.
             Some(control_storage),
             sync_env.clone(),
         );
@@ -3819,6 +3879,7 @@ impl BoundControlNode {
             cql_addr: None,
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
+            console_addr: None, // ADR 0052: a control-only node hosts no CP-data tablet.
             #[cfg(test)]
             test_ctx: ctx,
         })
@@ -3848,6 +3909,11 @@ pub struct BoundDataNode {
     admin_addr: SocketAddr,
     intra_listener: TcpListener,
     intra_addr: SocketAddr,
+    /// The AnimusDB Data Console's own listener (ADR 0052) — a data-only
+    /// node hosts real CP-data tablets, so it always binds one; see
+    /// [`console`](crate::console)'s module doc.
+    console_listener: TcpListener,
+    console_addr: SocketAddr,
 }
 
 impl BoundDataNode {
@@ -3869,6 +3935,11 @@ impl BoundDataNode {
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
     pub fn admin_addr(&self) -> SocketAddr {
         self.admin_addr
+    }
+
+    /// The address the AnimusDB Data Console listens on (ADR 0052).
+    pub fn console_addr(&self) -> SocketAddr {
+        self.console_addr
     }
 
     /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
@@ -4099,6 +4170,7 @@ impl BoundDataNode {
             self.client_listener,
             self.admin_listener,
             self.intra_listener,
+            Some(self.console_listener),
             // A data-only node has no local control role at all (ADR 0035) —
             // no system-keyspace engine to surface (ADR 0038 PR4).
             None,
@@ -4234,6 +4306,7 @@ impl BoundDataNode {
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
+            console_addr: Some(self.console_addr),
             #[cfg(test)]
             test_ctx: ctx,
         })
@@ -12260,6 +12333,7 @@ pub async fn bind_cluster(
             cql: addr(),
             admin: addr(),
             intra: addr(),
+            console: addr(),
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
         nodes.push(node);
@@ -12758,6 +12832,7 @@ pub async fn start_split_cluster_with_growth(
             cql: ephemeral(),
             admin: ephemeral(),
             intra: ephemeral(),
+            console: ephemeral(),
         };
         control_bound.push(
             Node::bind_control(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?,
@@ -12774,6 +12849,7 @@ pub async fn start_split_cluster_with_growth(
             cql: ephemeral(),
             admin: ephemeral(),
             intra: ephemeral(),
+            console: ephemeral(),
         };
         data_bound
             .push(Node::bind_data(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?);
@@ -14052,7 +14128,7 @@ mod confirm_futility_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(6);
+        let addrs = free_addrs(7);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -14063,6 +14139,7 @@ mod confirm_futility_tests {
                 cql: addrs[3],
                 admin: addrs[4],
                 intra: addrs[5],
+                console: addrs[6],
             }],
         }
     }
@@ -14446,7 +14523,7 @@ mod halted_shutdown_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(6);
+        let addrs = free_addrs(7);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -14457,6 +14534,7 @@ mod halted_shutdown_tests {
                 cql: addrs[3],
                 admin: addrs[4],
                 intra: addrs[5],
+                console: addrs[6],
             }],
         }
     }

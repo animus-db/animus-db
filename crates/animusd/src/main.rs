@@ -497,12 +497,13 @@ async fn run_single(
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;
     println!(
-        "animusd: node {index}/{} up (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
+        "animusd: node {index}/{} up (CP) — client {} — dynamo http {} — cql {} — admin http://{} — console http://{}",
         config.len(),
         node.client_addr(),
         node.dynamo_addr(),
         node.cql_addr(),
         node.admin_addr(),
+        node.console_addr(),
     );
     println!("animusd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
@@ -643,12 +644,13 @@ async fn run_data_config(
         .await
         .map_err(|e| format!("failed to start data node {index}: {e}"))?;
     println!(
-        "animusd: data node {index}/{} up (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
+        "animusd: data node {index}/{} up (CP) — client {} — dynamo http {} — cql {} — admin http://{} — console http://{}",
         config.len(),
         node.client_addr(),
         node.dynamo_addr(),
         node.cql_addr(),
         node.admin_addr(),
+        node.console_addr(),
     );
     println!("animusd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
@@ -697,6 +699,7 @@ async fn run_data_join(
         cql: p(3),
         admin: p(4),
         intra: p(5),
+        console: p(6),
     };
     let dir_name = id
         .as_ref()
@@ -709,11 +712,12 @@ async fn run_data_join(
         .await
         .map_err(|e| format!("failed to join as a data node: {e}"))?;
     println!(
-        "animusd: data node joined (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
+        "animusd: data node joined (CP) — client {} — dynamo http {} — cql {} — admin http://{} — console http://{}",
         node.client_addr(),
         node.dynamo_addr(),
         node.cql_addr(),
         node.admin_addr(),
+        node.console_addr(),
     );
     println!("animusd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
@@ -791,6 +795,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         cql: p(3),
         admin: p(4),
         intra: p(5),
+        console: p(6),
     };
     let dir_name = id
         .as_ref()
@@ -802,11 +807,12 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         .await
         .map_err(|e| format!("failed to join: {e}"))?;
     println!(
-        "animusd: node joined (CP) — client {} — dynamo http {} — cql {} — admin http://{}",
+        "animusd: node joined (CP) — client {} — dynamo http {} — cql {} — admin http://{} — console http://{}",
         node.client_addr(),
         node.dynamo_addr(),
         node.cql_addr(),
         node.admin_addr(),
+        node.console_addr(),
     );
     println!("animusd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
@@ -871,11 +877,12 @@ async fn run_in_process_cluster(
     }
     for (i, node) in nodes.iter().enumerate() {
         println!(
-            "  node {i}: client {} — dynamo http {} — cql {} — admin http://{}",
+            "  node {i}: client {} — dynamo http {} — cql {} — admin http://{} — console http://{}",
             node.client_addr(),
             node.dynamo_addr(),
             node.cql_addr(),
             node.admin_addr(),
+            node.console_addr(),
         );
     }
     println!("animusd: ready — Ctrl-C to stop");
@@ -949,11 +956,12 @@ async fn run_in_process_split_cluster(
     }
     for (i, node) in nodes.iter().skip(control_n).enumerate() {
         println!(
-            "  data node {i}: client {} — dynamo http {} — cql {} — admin http://{}",
+            "  data node {i}: client {} — dynamo http {} — cql {} — admin http://{} — console http://{}",
             node.client_addr(),
             node.dynamo_addr(),
             node.cql_addr(),
             node.admin_addr(),
+            node.console_addr(),
         );
     }
     println!("animusd: ready — Ctrl-C to stop");

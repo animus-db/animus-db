@@ -150,7 +150,7 @@ async fn join_control_nonvoter(
     dir: &Path,
 ) -> (Node, RoleAddrs) {
     for attempt in 0..16 {
-        let raw = support::free_addrs(6);
+        let raw = support::free_addrs(7);
         let addrs = RoleAddrs {
             id: nid(new_control_id),
             role: NodeRole::Control,
@@ -160,6 +160,7 @@ async fn join_control_nonvoter(
             cql: raw[3],
             admin: raw[4],
             intra: raw[5],
+            console: raw[6],
         };
         let bound = match animusd::Node::bind_control(
             nid(new_control_id),

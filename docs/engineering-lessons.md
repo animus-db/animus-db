@@ -7041,8 +7041,50 @@ debugging anything that feels like it might have happened before.
   bug's own "usually fine" margin. When a mechanism's safety argument contains
   the words "much larger than", make the comparison executable. (#302,
   `crates/animusd/src/{lib,main}.rs`, 2026-08-20.)
+- **Adding a required (no-default) field to a struct with dozens of literal
+  construction sites: let the compiler enumerate them, don't grep-and-hope
+  (2026-08-19, ADR 0052's `RoleAddrs::console` port).** `RoleAddrs` (the
+  per-node listener-address struct, ADR 0047's `intra` port set the
+  no-`#[serde(default)]` precedent this field followed) has ~60 literal
+  `RoleAddrs { .. }` construction sites across `animusd`'s `src/` and
+  `tests/` — a grep for `RoleAddrs {` finds most of them, but a grep for the
+  *stride arithmetic* (`6 * i`, `free_addrs(n * 6)`, hardcoded offsets like a
+  hand-computed `addrs[18]` for node index 3) is exactly the kind of
+  multi-shape, easy-to-undercount search the root `CLAUDE.md`'s "grep every
+  gating match site" lesson already warns about — and this field additionally
+  needed the *stride itself* to change (6 → 7), not just one new field
+  line, so a per-site fix also had to renumber every sibling offset in the
+  same literal. The reliable sequencing: add the field to the struct
+  definition **first** (with no default), then run `cargo build -p animusd
+  --all-targets` and fix every `error[E0063]: missing field` site the
+  compiler actually reports — repeating until clean. This is exhaustive by
+  construction (a missed site is a compile error, not a silent gap) where a
+  grep pass can only ever be "probably complete." A generic per-site fixup
+  script (regex over the fixed six-field block shape, deriving the seventh
+  field's expression from the sixth's) handled ~30 of the ~32 remaining test
+  files in one pass; the two genuine outliers — a hand-computed hardcoded
+  multi-node offset block, and the struct's own `generate`/`generate_split`
+  functions building the stride formula directly — still needed a human
+  read, which the compiler-driven approach surfaced as compile errors as
+  reliably as everything else, rather than as something a grep could have
+  silently missed entirely.
 
 ### Parallel-agent orchestration
+- **A single long-lived session can exhaust the disk on `target/` alone, with
+  no parallel fan-out involved (2026-08-19)** — a solo `cargo build
+  --workspace --all-targets` on this repo hit `rustc-LLVM ERROR: IO failure …
+  No space left on device` and `ld terminated with signal 7 [Bus error]` with
+  `target/debug` alone at 30 GB against a filesystem reporting single-digit
+  megabytes free (despite a large nominal size — the real quota is much
+  smaller than `df`'s `Size` column implies on this harness). `cargo clean`
+  reclaimed the full 30 GB in seconds and the rebuild succeeded; there was no
+  need to hunt for a partial/targeted clean. **Rule:** if `cargo
+  build`/`test`/`clippy` fails with an I/O or linker error whose message
+  mentions space (not a compile error), check `df -h` before debugging the
+  "failure" as if it were a code problem, and prefer a full `cargo clean`
+  over trying to selectively prune `target/` — the incremental cache is the
+  overwhelming majority of the size and buys little across a full rebuild
+  anyway.
 - **Parallel agents share one `target/` dir; three concurrent
   `--all-targets` builds exhaust the session disk (2026-08-19).** Fanning three
   implementation agents across disjoint crates avoids *source* conflicts but
