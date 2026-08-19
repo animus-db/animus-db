@@ -602,6 +602,25 @@ where
         std::mem::take(&mut self.pending)
     }
 
+    /// Whether a [`drain_persist`](Self::drain_persist) right now would yield
+    /// anything — a **read-only peek**, mirroring
+    /// [`has_pending_install`](Self::has_pending_install)'s peek-not-drain
+    /// discipline (a driver that decides off this must not consume the state it
+    /// is deciding about).
+    ///
+    /// Both halves matter, and the second is easy to miss: log entries land in
+    /// `pending` eagerly at append time, but a **term/vote change is captured
+    /// lazily**, by `checkpoint_hard` *inside* `drain_persist` — so a node that
+    /// has just granted a vote and appended nothing has an empty `pending` and
+    /// is nonetheless un-persisted. A driver that races persistence against its
+    /// own message loop (`animus-cp-data`'s consensus loop, issue #279) uses
+    /// this to decide whether the step it just took still owes the WAL
+    /// anything, and must therefore see the vote.
+    pub fn has_unflushed_wal(&self) -> bool {
+        !self.pending.is_empty()
+            || (self.current_term, self.voted_for.clone()) != self.persisted_hard
+    }
+
     /// A minimal write-ahead-log image that replays to exactly the current
     /// durable state: the snapshot (if any), the current hard state, and the log
     /// tail. The driver writes this in place of the accumulated history during
