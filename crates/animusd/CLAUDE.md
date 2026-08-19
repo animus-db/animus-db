@@ -180,7 +180,17 @@ the `!splitting` gates on the marker branch and `trim_janitor`; driver
 liveness never gates it), bulk-copies BASE+LSI+FOOTPRINT (never
 CHANGE/CURSOR) into the two `Building` children via
 `ClientCtx::seed_child_rows` (local-or-`Forwarded{SeedRows}`, one confirm
-implementation `seed_rows_local`, confirm-by-applied-index), then tails the
+implementation `seed_rows_local`, confirm-by-applied-index) — **one ship
+per child, concurrently** (`ship_all`/`try_join_all`; `ship` returns its
+row count rather than taking `&mut build.rows_shipped`, which is what used
+to serialize them at the borrow checker). A failure cancels the sibling's
+in-flight future, which is safe for the same reason a crashed driver is:
+`SeedBatch` merges at carried versions, so the next tick re-ships as a
+no-op (`tests/split_build.rs::split_survives_losing_one_childs_leader_mid_
+build` kills a child's leader mid-build to prove it). Worth ~0.6s of a ~6s
+build, not the ~2x the shape suggests — the ships are a minority of the
+cost; **three full engine scans** (version-floor pre-pass, bulk scan, final
+image) dominate a quiet build and are the named next win, then tails the
 parent's change log by **packed-HLC watermark** (never a key-position
 cursor — see the engineering-lessons entry) at token granularity (or full
 prefix for sub-token raw keys). **The tail costs the DELTA, not the table

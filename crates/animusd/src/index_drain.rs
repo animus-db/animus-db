@@ -736,14 +736,18 @@ async fn split_driver_tick(
             build.tail_hlc = max_change_hlc(group).await;
             for kind in SEED_KINDS {
                 let rows = group.seed_rows_kind(kind as usize, None).await;
-                for (child, range) in &children {
-                    let child_rows: Vec<_> = rows
-                        .iter()
-                        .filter(|(logical, _, _)| range.contains(logical))
-                        .map(|(l, v, ver)| (kind, l.clone(), v.clone(), *ver))
-                        .collect();
-                    ship(ctx, *child, child_rows, &mut build.rows_shipped).await?;
-                }
+                let batches = children
+                    .iter()
+                    .map(|(child, range)| {
+                        let child_rows: Vec<_> = rows
+                            .iter()
+                            .filter(|(logical, _, _)| range.contains(logical))
+                            .map(|(l, v, ver)| (kind, l.clone(), v.clone(), *ver))
+                            .collect();
+                        (*child, child_rows)
+                    })
+                    .collect();
+                ship_all(ctx, batches, &mut build.rows_shipped).await?;
             }
             build.bulk_done = true;
         }
@@ -839,14 +843,18 @@ async fn split_driver_tick(
         let floor = build.bulk_version_floor.unwrap_or(0);
         for kind in SEED_KINDS {
             let rows = group.seed_rows_kind(kind as usize, None).await;
-            for (child, range) in &children {
-                let child_rows: Vec<_> = rows
-                    .iter()
-                    .filter(|(logical, _, ver)| *ver > floor && range.contains(logical))
-                    .map(|(l, v, ver)| (kind, l.clone(), v.clone(), *ver))
-                    .collect();
-                ship(ctx, *child, child_rows, &mut build.rows_shipped).await?;
-            }
+            let batches = children
+                .iter()
+                .map(|(child, range)| {
+                    let child_rows: Vec<_> = rows
+                        .iter()
+                        .filter(|(logical, _, ver)| *ver > floor && range.contains(logical))
+                        .map(|(l, v, ver)| (kind, l.clone(), v.clone(), *ver))
+                        .collect();
+                    (*child, child_rows)
+                })
+                .collect();
+            ship_all(ctx, batches, &mut build.rows_shipped).await?;
         }
         build.final_image_done = true;
         build.phase = "final-image";
@@ -938,13 +946,19 @@ fn seed_row_bytes(logical: &[u8], value: Option<&Vec<u8>>) -> usize {
 }
 
 /// Ship `rows` (already filtered to one child) in bounded chunks
-/// (ADR 0050 rung 4 — see [`SEED_CHUNK_BYTES`]).
+/// (ADR 0050 rung 4 — see [`SEED_CHUNK_BYTES`]), returning how many rows
+/// went out.
+///
+/// **Returns the count rather than accumulating into a borrowed counter**
+/// so that ships to *different* children can run concurrently
+/// ([`ship_all`]) — one `&mut` into `SplitBuild` would serialize them at
+/// the borrow checker before they ever reached the network.
 async fn ship(
     ctx: &ClientCtx,
     child: TabletId,
     rows: Vec<animus_cp_data::SeedRow>,
-    shipped: &mut u64,
-) -> Result<(), String> {
+) -> Result<u64, String> {
+    let mut shipped = 0u64;
     let mut chunk: Vec<animus_cp_data::SeedRow> = Vec::new();
     let mut bytes = 0usize;
     for row in rows {
@@ -954,15 +968,47 @@ async fn ship(
             let n = chunk.len() as u64;
             ctx.seed_child_rows(child, std::mem::take(&mut chunk))
                 .await?;
-            *shipped += n;
+            shipped += n;
             bytes = 0;
         }
     }
     if !chunk.is_empty() {
         let n = chunk.len() as u64;
         ctx.seed_child_rows(child, chunk).await?;
-        *shipped += n;
+        shipped += n;
     }
+    Ok(shipped)
+}
+
+/// Ship one batch **per child, concurrently**, and fold the row counts into
+/// `shipped` once they all land (ADR 0050).
+///
+/// A split's two children are two independent Raft groups, at
+/// placement-chosen homes (fork F5) that are frequently two *different*
+/// nodes — so shipping to them one after the other left each child's
+/// replica set idle for exactly as long as the other child's chunk took to
+/// commit. The copy is the dominant cost of a split, and this halves its
+/// wall clock without moving a single byte more.
+///
+/// Failure semantics are deliberately unchanged: `try_join_all` surfaces
+/// the first error and drops the sibling future, which at worst abandons a
+/// confirm-wait for a chunk that may still commit. That is exactly the
+/// state a crashed driver leaves behind, and the same thing makes it safe —
+/// a `SeedBatch` merges at its carried versions, so the next tick's re-run
+/// (from an empty [`SplitBuild`] after a re-lead, or from the unmoved tail
+/// watermark otherwise) re-ships it as a no-op.
+async fn ship_all(
+    ctx: &ClientCtx,
+    batches: Vec<(TabletId, Vec<animus_cp_data::SeedRow>)>,
+    shipped: &mut u64,
+) -> Result<(), String> {
+    let counts = futures::future::try_join_all(
+        batches
+            .into_iter()
+            .map(|(child, rows)| ship(ctx, child, rows)),
+    )
+    .await?;
+    *shipped += counts.iter().sum::<u64>();
     Ok(())
 }
 
@@ -1059,13 +1105,21 @@ async fn tail_pass(
                 }
             };
             if !batch.is_empty() {
-                ship(ctx, *child, batch, &mut build.rows_shipped).await?;
+                build.rows_shipped += ship(ctx, *child, batch).await?;
             }
         }
     }
-    for (child, (rows, _)) in pending {
-        ship(ctx, child, rows, &mut build.rows_shipped).await?;
-    }
+    // The trailing partial batches — one per child, so they go out
+    // concurrently like every other per-child ship.
+    ship_all(
+        ctx,
+        pending
+            .into_iter()
+            .map(|(child, (rows, _))| (child, rows))
+            .collect(),
+        &mut build.rows_shipped,
+    )
+    .await?;
     // Only past every successful ship: a failed tick re-derives the same
     // dirty units next tick from the unmoved watermark.
     build.tail_hlc = max_hlc;
