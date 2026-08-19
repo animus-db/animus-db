@@ -515,3 +515,52 @@ commit-ordered tail read; presplit at `CreateTable`; `CancelSplit`;
 per-node concurrent-build caps/IO throttling; SSTable-level seed cloning;
 per-tablet admin storage introspection (`/admin/storage/lsm` shows only
 the syskv engine today).
+
+## Amendment (2026-08-19) — the tail's cost is the delta, not the table
+
+Reported from a dev cluster (`--cluster-control 3 --cluster-data 5
+--auto-split 4000`, 20,000 seeded rows): the split "worked but was
+painfully slow." Measured on the parent's leader, the build copied all
+20,000 rows in **4 s** and then spent **70 more seconds** appending
+~6,000 Raft entries *per child* while both children's key counts stayed
+completely flat — ~85% of the build's wall clock re-copying rows it
+already had. Two independent causes in `tail_pass`, both fixed here:
+
+1. **The tail shipped one `SeedBatch` per dirty unit.** `ship()` was
+   called inside the per-unit loop, so every partition key bought its own
+   consensus round + apply-confirm (plus a forwarded hop for an off-node
+   child) — while the bulk pass batched to `SEED_CHUNK_BYTES` and moved
+   thousands of rows per round. The tail now accumulates rows per child
+   across units and flushes on the same byte budget. Nothing depends on
+   one unit's rows sharing an entry (a `SeedBatch` is idempotent at its
+   carried versions, and the bulk path's chunk boundaries already cut
+   across rows); F11's *which child* rule is a routing question and is
+   untouched.
+2. **`tail_hlc` started at 0.** The first tail pass therefore classified
+   every change record in the (trim-held) log as fresh and re-shipped the
+   whole table one unit at a time — every merge an idempotent no-op. It
+   is now captured in the same pre-pass that computes
+   `bulk_version_floor`, by the same monotonicity argument that floor
+   already rests on: the record set read *before* the bulk scan describes
+   rows the bulk image contains by construction, and any write applied
+   after that read carries a strictly higher HLC
+   (`assert_ts_monotonic`), so the tail still sees everything the image
+   could have missed. The endgame's final image (signal-less txn
+   decisions/resolves) is unchanged and still backstops the classes no
+   change record announces.
+
+Measured after, same 20,000-row cluster: **~8 Raft entries per child
+instead of ~6,000**, `split_rows_shipped` 32,000 → 20,500, freeze at 42 s
+instead of 85 s, and the full two-generation cascade to 8 tablets in 56 s
+instead of 93 s — with all 20,000 keys present at the end. The build is
+now bounded by real data movement (one 256 KB chunk per round) plus
+whatever was genuinely written during it.
+
+Cause 1 was a plain oversight, not a stated trade-off; cause 2 was the
+unstated cost of a conservative watermark. The O(pending) *scan* per tail
+pass the rung-4 notes accepted is unchanged and its follow-up above still
+stands — this amendment removes the per-row consensus rounds and the
+redundant whole-table re-ship, not the re-scan. Regression:
+`tests/split_build.rs::split_build_tail_does_not_re_ship_the_bulk_image_
+row_by_row` (a child's own `commit_index` at cutover as the batch-size
+meter — 302 entries for a 600-row split before, ≤64 budget after).

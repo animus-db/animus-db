@@ -183,7 +183,19 @@ CHANGE/CURSOR) into the two `Building` children via
 implementation `seed_rows_local`, confirm-by-applied-index), then tails the
 parent's change log by **packed-HLC watermark** (never a key-position
 cursor — see the engineering-lessons entry) at token granularity (or full
-prefix for sub-token raw keys). Progress mirrors to
+prefix for sub-token raw keys). **The tail costs the DELTA, not the table
+(2026-08-19 amendment):** its watermark starts at the parent's highest
+change HLC as of the pre-bulk pass (captured beside `bulk_version_floor`,
+under the same monotonicity argument) rather than at 0 — a zero start made
+the first pass re-ship every row the bulk image already held — and it
+batches rows per child across dirty units to the same `SEED_CHUNK_BYTES`
+budget the bulk pass uses, instead of one `SeedBatch` (hence one consensus
+round, plus a forwarded hop for an off-node child) per partition key.
+Before the fix, a 20,000-row split spent ~6,000 no-op Raft entries per
+child and ~85% of its wall clock re-copying; a child's `commit_index`
+growth per row received is the batch-size meter that shows it, and is what
+`tests/split_build.rs::split_build_tail_does_not_re_ship_the_bulk_image_
+row_by_row` asserts on. Progress mirrors to
 `ctx.data().split_builds` → `/admin/raftkv`'s
 `split_rows_shipped`/`split_converged`/`split_phase`. **Rung 5 completes the
 workflow**: at convergence — caught up, OR `SPLIT_MAX_TAIL_PASSES` (25)
