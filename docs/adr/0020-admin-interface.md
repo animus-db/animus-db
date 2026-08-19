@@ -212,6 +212,47 @@ address (printed at startup alongside client/dynamo/cql).
   engine for a tablet; cluster-wide views are assembled client-side by scraping
   each replica (same model as `/metrics`).
 
+## Amendment (2026-08-19) — a polled observer must not materialize
+
+`GET /admin/raftkv`'s `key_count`/`byte_size` were the tablet's **exact**
+count/total, read by materializing every hosted tablet's rows per request
+(`CpGroup::local_pairs`). That was written as a browse-grade debug surface
+("the materialize-then-count cost is acceptable"), and it stopped being
+true the moment ADR 0021's Console started polling it: the dashboard fetches
+this route from **every node** on its auto-refresh interval — 5s by default —
+so an open Tablets tab costs O(dataset) per node every 5s, forever.
+
+Measured on a live 5-node cluster splitting a 20,000-row table: polling
+this route every 3s inflated the split's own build from **4.5s to 41.8s**
+(~9x), and the whole seed→8-tablet cascade from 23.3s to 57.4s. The
+observer was changing what it observed by roughly an order of magnitude —
+and an operator watching a slow split was, by watching, making it slower.
+
+**`key_count`/`byte_size` are now the cheap `approx_key_count`/
+`approx_bytes` estimates by default; `?exact=1` selects the old
+materializing path.** Three consequences, all deliberate:
+
+- The estimates are exactly what `auto_split_loop` gates on, so the
+  Console's over-threshold pills now agree with the trigger that will
+  actually fire — previously the pill compared an exact count against a
+  threshold evaluated on an estimate.
+- `approx_key_count` is `None` on the memory backend (no cheap counter), so
+  an `--ephemeral` dev cluster renders "—" in the Keys column until asked
+  for `?exact=1`. Accepted: the durable backend is the one that matters
+  here, and the exact answer is one query parameter away.
+- `approx_bytes` is base-scoped (ADR 0034) where the exact sum covers every
+  kind in the tablet's engine, so the two differ in meaning as well as
+  precision. Documented on the field rather than papered over.
+
+The general rule this instance argues for: **an introspection surface
+whose cost scales with the data it describes needs an explicit answer to
+"what happens when something polls this every few seconds?"** — because a
+dashboard eventually will. Regression:
+`tests/admin_endpoint.rs::admin_raftkv_default_does_not_materialize_the_dataset`,
+which meters the LSM's own `storage_sstable_block_reads` rather than wall
+clock (10 default polls over 2,000 flushed rows: **0 block reads**; 10
+`?exact=1` polls: 550).
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.
