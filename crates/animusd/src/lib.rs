@@ -53,6 +53,7 @@ mod http;
 mod index_backfill;
 mod segment_janitor;
 mod topology;
+mod ttl_reaper;
 
 use control_handle::{ControlHandle, RemoteControlClient};
 
@@ -318,6 +319,26 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.local_scan_kind(kind, start, end, None).await,
             CpGroup::Mem(n) => n.local_scan_kind(kind, start, end, None).await,
+        }
+    }
+
+    /// As [`local_scan_kind_bounded`](Self::local_scan_kind_bounded), but
+    /// with a real row cap threaded through — the TTL reaper's own per-tick
+    /// scan bound (`ttl_reaper.rs`, ADR 0051 §4/§6: a local, non-waking
+    /// read, capped so one huge TTL-enabled table's tablet cannot
+    /// monopolize one tick). See [`RaftKvNode::local_scan_kind`]'s own
+    /// `limit` doc — a per-tablet cap on the *returned* rows, not scan
+    /// pushdown.
+    pub(crate) async fn local_scan_kind_capped(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self {
+            CpGroup::Lsm(n) => n.local_scan_kind(kind, start, end, Some(limit)).await,
+            CpGroup::Mem(n) => n.local_scan_kind(kind, start, end, Some(limit)).await,
         }
     }
 
@@ -1850,6 +1871,11 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // a follower-connected `CreateTable`/`UpdateTable` must reach the
             // control leader.
             | MetaCommand::SetTableStream { .. }
+            // DynamoDB-style TTL configuration (ADR 0051): schema-catalog
+            // class, same relay reason as `SetTableStream`/`SetTableMode` — a
+            // follower-connected `UpdateTimeToLive` must reach the control
+            // leader.
+            | MetaCommand::SetTableTtl { .. }
             // Stream-shard catalog commit (ADR 0042/0043): a tablet leader's
             // own seal proposal, from wherever that leader actually runs —
             // see this function's own doc for why `ExpireStreamShards` is
@@ -2572,6 +2598,7 @@ impl BoundNode {
             stream_retention,
             None,
             Duration::ZERO,
+            ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         )
         .await
     }
@@ -2587,6 +2614,14 @@ impl BoundNode {
     /// change_rate`]'s own doc for why this needs its own signal at all
     /// (the base-scoped byte/key thresholds structurally can't see
     /// change-log churn).
+    ///
+    /// `ttl_sweep_interval` (ADR 0051) is the TTL reaper's own sweep cadence
+    /// — see `ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL`'s doc for why it
+    /// defaults to a minute. Every caller above `start_with_growth` in this
+    /// layered stack passes that default; a test that needs a fast sweep
+    /// calls this method (or `run_node_with_ttl_sweep_interval`) directly,
+    /// the same "widen the innermost layer, mint a thin test-facing
+    /// wrapper" convention `quiesce_after` established.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_growth(
         self,
@@ -2606,6 +2641,7 @@ impl BoundNode {
         stream_retention: Duration,
         auto_split_change_rate: Option<u64>,
         quiesce_after: Duration,
+        ttl_sweep_interval: Duration,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         // The initial (static) peer book + an env clone, kept for the
@@ -2991,6 +3027,16 @@ impl BoundNode {
         // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
         // — a node that leads no tablet does nothing each tick.
         tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
+
+        // The TTL reaper (ADR 0051 §4/§6): deletes items whose declared TTL
+        // has passed, on every led tablet of a TTL-enabled table. Same
+        // "run everywhere, self-gate per tablet on `group.is_leader()`"
+        // shape as the GSI drain just above — see `ttl_reaper.rs`'s own
+        // module doc for the quiescence/conditional-delete contracts.
+        tasks.push(tokio::spawn(ttl_reaper::ttl_reaper_loop(
+            ctx.clone(),
+            ttl_sweep_interval,
+        )));
 
         // The segment janitor (ADR 0043 §A9, round-3 PR7): retention +
         // replica repair over the whole stream-shard catalog. Control-
@@ -4117,6 +4163,16 @@ impl BoundDataNode {
         // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
         // — a node that leads no tablet does nothing each tick.
         tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
+
+        // The TTL reaper (ADR 0051 §4/§6) — same shape as the GSI drain
+        // just above. No test-tunable interval knob on this data-only path
+        // yet (mirrors `quiesce_after`'s own documented gap for
+        // `start_data_with_growth`, `animusd/CLAUDE.md`'s Quiescence
+        // section) — always the production default.
+        tasks.push(tokio::spawn(ttl_reaper::ttl_reaper_loop(
+            ctx.clone(),
+            ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        )));
 
         if auto_split_threshold.is_some()
             || auto_split_bytes_threshold.is_some()
@@ -5694,6 +5750,11 @@ impl ClientCtx {
                         sk,
                         op.clone(),
                         condition,
+                        // Ordinary client write — never the TTL reaper's own
+                        // service identity (ADR 0051 §7; the reaper never
+                        // calls through this routed helper — see
+                        // `ttl_reaper.rs`).
+                        false,
                     )
                     .await
                     {
@@ -8551,6 +8612,11 @@ impl ClientCtx {
                     sk.as_ref(),
                     op,
                     condition.as_ref(),
+                    // `ClientRequest::KindWriteItem` is always a forwarded
+                    // *client* write (ADR 0051 §7) — the TTL reaper only
+                    // ever acts on a tablet it already leads, so it never
+                    // forwards through this arm.
+                    false,
                 )
                 .await
                 {
@@ -12512,6 +12578,12 @@ async fn start_cluster_inner(
                 stream_retention,
                 auto_split_change_rate,
                 quiesce_after,
+                // `--cluster N` has no ttl-sweep-interval knob of its own
+                // yet (mirrors `stream_retention`'s own layered-stack
+                // precedent for a not-yet-CLI-exposed knob) — production
+                // default; a test that needs a fast sweep uses the
+                // per-process `run_node_with_ttl_sweep_interval` instead.
+                ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
             )
             .await?;
         nodes.push(node);
@@ -12843,7 +12915,9 @@ pub async fn run_node_with_streams(
 /// CP groups into quiescence (ADR 0044 phase-1 PR7) with the given idle
 /// threshold — `Duration::ZERO` (every other entry point above) disables it
 /// entirely, zero behavior change. `--config FILE --node I`'s
-/// `--quiesce-after SECS` CLI flag threads through here.
+/// `--quiesce-after SECS` CLI flag threads through here. Defaults
+/// [`run_node_with_streams_quiesce_and_ttl_sweep_interval`]'s own
+/// `ttl_sweep_interval` to [`ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL`].
 ///
 /// # Errors
 /// As [`run_node_with`].
@@ -12858,6 +12932,46 @@ pub async fn run_node_with_streams_and_quiesce_after(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
+) -> std::io::Result<Node> {
+    run_node_with_streams_quiesce_and_ttl_sweep_interval(
+        config,
+        index,
+        dir,
+        backend,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        quiesce_after,
+        ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+    )
+    .await
+}
+
+/// Like [`run_node_with_streams_and_quiesce_after`], but also exposes the
+/// TTL reaper's own sweep interval (ADR 0051) instead of pinning it at
+/// [`ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL`] — the same layered-wrapper
+/// convention `_with_orphan_sweep_after`/`_and_quiesce_after` already
+/// established (`animusd/CLAUDE.md`'s engineering-lessons entry): every
+/// existing call site above keeps compiling and behaving identically; a
+/// test that needs a fast TTL sweep (this codebase's own testing
+/// discipline — never wait out a real minute) calls this directly, or its
+/// single-knob convenience sibling [`run_node_with_ttl_sweep_interval`].
+///
+/// # Errors
+/// As [`run_node_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    quiesce_after: Duration,
+    ttl_sweep_interval: Duration,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -12901,8 +13015,41 @@ pub async fn run_node_with_streams_and_quiesce_after(
             stream_retention,
             None,
             quiesce_after,
+            ttl_sweep_interval,
         )
         .await
+}
+
+/// Like [`run_node_with`], but with a test-tunable TTL reaper sweep
+/// interval (ADR 0051) instead of [`ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL`]
+/// — the single-knob convenience shape [`run_node_with_orphan_sweep_after`]
+/// establishes for its own knob, so a TTL end-to-end test doesn't need to
+/// spell out every other layer's default explicitly. Every other knob stays
+/// at its production default (no quiescence, the default orphan-sweep
+/// grace, production stream-seal/segment-store/retention settings).
+///
+/// # Errors
+/// As [`run_node_with`].
+pub async fn run_node_with_ttl_sweep_interval(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    ttl_sweep_interval: Duration,
+) -> std::io::Result<Node> {
+    run_node_with_streams_quiesce_and_ttl_sweep_interval(
+        config,
+        index,
+        dir,
+        backend,
+        DEFAULT_ORPHAN_SWEEP_AFTER,
+        StreamSealKnobs::default(),
+        SegmentStoreConfig::default(),
+        DEFAULT_STREAM_RETENTION,
+        Duration::ZERO,
+        ttl_sweep_interval,
+    )
+    .await
 }
 
 /// Start node `index` from `config` as a **control-only** node (ADR 0035
@@ -14134,6 +14281,7 @@ mod confirm_futility_tests {
                     None,
                     crate::KindWriteOp::Put(item_a),
                     None,
+                    false,
                 )
                 .await
             }
@@ -14165,6 +14313,7 @@ mod confirm_futility_tests {
                 None,
                 crate::KindWriteOp::Put(item_b),
                 None,
+                false,
             ),
         )
         .await

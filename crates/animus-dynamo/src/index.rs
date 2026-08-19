@@ -517,6 +517,20 @@ pub struct ChangeRecord {
     /// `#[serde(default)]` like its two siblings.
     #[serde(default)]
     pub staged: bool,
+    /// `true` for a delete the **TTL reaper** produced (ADR 0051 §7,
+    /// `animusd::ttl_reaper`) rather than a client `DeleteItem` — a real,
+    /// consumer-**visible** stream event carrying both images exactly like
+    /// an ordinary delete (unlike [`seeded`](Self::seeded)/
+    /// [`marker`](Self::marker)/[`staged`](Self::staged), so this flag is
+    /// deliberately absent from [`consumer_hidden`](Self::consumer_hidden)).
+    /// It exists purely so the Streams read path can render the record's
+    /// `userIdentity` as `{"PrincipalId": "dynamodb.amazonaws.com", "Type":
+    /// "Service"}` — real DynamoDB's own documented way for a consumer to
+    /// distinguish a system-driven TTL expiry from a user delete (the
+    /// "archive expired items to cold storage" pattern). `#[serde(default)]`
+    /// so every pre-existing record decodes as a real client write.
+    #[serde(default)]
+    pub ttl_expired: bool,
 }
 
 impl ChangeRecord {
@@ -802,6 +816,7 @@ mod tests {
             seeded: false,
             marker: false,
             staged: false,
+            ttl_expired: false,
         };
         assert_eq!(insert.event_name(), "INSERT");
         assert_eq!(
@@ -816,6 +831,7 @@ mod tests {
             seeded: false,
             marker: false,
             staged: false,
+            ttl_expired: false,
         };
         assert_eq!(modify.event_name(), "MODIFY");
 
@@ -826,6 +842,7 @@ mod tests {
             seeded: false,
             marker: false,
             staged: false,
+            ttl_expired: false,
         };
         assert_eq!(remove.event_name(), "REMOVE");
         assert_eq!(ChangeRecord::decode(b"garbage"), None);
@@ -840,11 +857,31 @@ mod tests {
             seeded: false,
             marker: false,
             staged: true,
+            ttl_expired: false,
         };
         assert!(stage_marker.consumer_hidden());
         assert_eq!(
             ChangeRecord::decode(&stage_marker.encode()).as_ref(),
             Some(&stage_marker)
+        );
+
+        // ADR 0051 §7: a TTL-reaper delete is a REAL, consumer-visible
+        // event (both images ride along exactly like an ordinary delete) —
+        // `ttl_expired` must never make `consumer_hidden()` true.
+        let ttl_delete = ChangeRecord {
+            base_sk: Vec::new(),
+            old_image: Some([("a".to_owned(), s("1"))].into_iter().collect()),
+            new_image: None,
+            seeded: false,
+            marker: false,
+            staged: false,
+            ttl_expired: true,
+        };
+        assert!(!ttl_delete.consumer_hidden());
+        assert_eq!(ttl_delete.event_name(), "REMOVE");
+        assert_eq!(
+            ChangeRecord::decode(&ttl_delete.encode()).as_ref(),
+            Some(&ttl_delete)
         );
     }
 

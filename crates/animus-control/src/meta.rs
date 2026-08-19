@@ -1943,6 +1943,15 @@ impl Metadata {
         self.schemas.get(table).and_then(|s| s.stream.as_ref())
     }
 
+    /// This table's DynamoDB-style TTL configuration (ADR 0051), if enabled.
+    /// `None` for an unknown table or one with no TTL declared. A read
+    /// accessor for the wire adapters that consume the replicated catalog,
+    /// mirroring [`table_stream`](Self::table_stream) exactly.
+    #[must_use]
+    pub fn table_ttl(&self, table: &str) -> Option<&TtlSpec> {
+        self.schemas.get(table).and_then(|s| s.ttl.as_ref())
+    }
+
     /// `tablet`'s own catalog rows for `(table, label)`, in ascending epoch
     /// order (ADR 0042 §2/§3) — the chain a `DescribeStream`/lineage-walk
     /// consumer needs for one tablet. `BTreeMap<(TabletId, u64), _>`'s own

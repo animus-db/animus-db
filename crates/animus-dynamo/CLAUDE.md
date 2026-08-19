@@ -68,8 +68,10 @@ comment for its full type/method inventory.
   (strictly-less-than "now", not less-or-equal — an expiry equal to "now" has
   not yet expired). We are **AWS-faithful on reads**: nothing here filters a
   `GetItem`/`Query`/`Scan` result — an expired item stays visible until a
-  background reaper (`animusd`, driven by `env.now()`) deletes it; this
-  module is exactly the predicate that reaper calls. A TTL attribute of the
+  background reaper (`animusd::ttl_reaper`, driven by `env.wall_now()` —
+  **never** `env.now()`, which is monotonic-since-start and carries no
+  calendar meaning) deletes it; this module is exactly the predicate that
+  reaper calls. A TTL attribute of the
   wrong type (anything but `N`) is silently never-expiring, matching AWS,
   which ignores rather than errors. `N` values are parsed under a
   deliberately narrow grammar (`-?[0-9]+(\.[0-9]+)?`, truncated toward

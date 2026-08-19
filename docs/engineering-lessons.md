@@ -6782,6 +6782,37 @@ debugging anything that feels like it might have happened before.
   `index_statuses`'s side-channel) already establishes the pattern — it
   usually does, and matching it keeps the crate's encoders uniform.
   (`crates/animus-dynamo/src/wire.rs`.)
+- **A read-without-waking background loop (ADR 0048) has real, pre-existing
+  building blocks — verify against the source before assuming a wake is
+  unavoidable, don't just gate it and hope.** Building the TTL reaper
+  (ADR 0051 §6, `crates/animusd/src/ttl_reaper.rs`) needed a scan that
+  never wakes a quiesced `CpGroup`. Rather than trust the ADR's prose,
+  reading `animus-cp-data`'s actual source confirmed `local_get_kind`/
+  `local_scan_kind`/`pending_changes` are pure `self.storage.{get,scan}`
+  calls with **no** path anywhere near `RaftKvNode::wake`/`WakeSignal`/
+  `RaftCore` — they never touch the consensus loop at all, so they
+  structurally cannot reset a group's idle-activity clock. That made the
+  "scan without waking, wake only to act" design directly buildable with
+  existing primitives, not a new mechanism. The general rule: before
+  reporting a documented contract undeliverable (or silently violating it),
+  read the primitive's own implementation — a `local_*`-prefixed accessor
+  in this codebase is a strong (but still worth confirming) naming signal
+  that it bypasses the network/consensus path entirely.
+- **Widening a shared write-path helper's signature (e.g. adding a new
+  trailing `bool`/enum discriminator) must be grepped across the *whole*
+  crate, not just `tests/*.rs` — an in-crate `#[cfg(test)] mod` at the
+  bottom of `lib.rs`/`dynamo.rs`/`index_drain.rs` calls the same private
+  function and is invisible to a search scoped to the external test
+  tree.** Threading `ChangeRecord::ttl_expired`/`kind_write_item_at_leader`'s
+  new `ttl_expired: bool` parameter (ADR 0051 §7) had five real call
+  sites, not the four a `crates/animusd/tests/` grep alone would find —
+  the fifth pair lived in `lib.rs`'s own `rmw_285_a`/`rmw_285_b`
+  in-crate regression module (issue #285, see this crate's own `CLAUDE.md`
+  for why those tests can't live in `tests/`). `grep -rn
+  "kind_write_item_at_leader(" crates/animusd/src/` (source, not just
+  `tests/`) is what actually finds every call site of a `pub(crate)`
+  helper this crate's own module-map documents as having in-crate test
+  consumers.
 
 ### Parallel-agent orchestration
 - **Parallel agents share one `target/` dir; three concurrent

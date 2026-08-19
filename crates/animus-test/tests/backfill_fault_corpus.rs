@@ -272,6 +272,7 @@ fn write_base_row_live(sim: &mut Simulator, node: &KvNode, _range: &KeyRange, pk
         seeded: false,
         marker: false,
         staged: false,
+        ttl_expired: false,
     }
     .encode();
     let result = node.put_kind_batch_conditioned(
@@ -331,6 +332,7 @@ fn backfill_seed_tick(
             seeded: true,
             marker: false,
             staged: false,
+            ttl_expired: false,
         }
         .encode();
         let result =

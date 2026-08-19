@@ -145,6 +145,57 @@ reusing the captured config is the point of the test.
   index's own stale scan position (see the function's own doc and
   `docs/engineering-lessons.md`'s "convergent per-name cursor... can
   silently poison a same-named recreation" entry).
+- **`ttl_reaper.rs`** (ADR 0051) — the DynamoDB-style **TTL reaper**: a
+  per-node background loop, spawned everywhere `index_drain::
+  change_consumer_loop` is (combined + data-only; see the module map
+  bullets above for the two exact spawn sites), that deletes items whose
+  declared TTL attribute has passed on every tablet this node **leads** of
+  a TTL-enabled table. Deletes through `dynamo::kind_write_item_at_leader`
+  (`KindWriteOp::Delete`) — the identical primitive `DeleteItem` uses — so
+  GSI/LSI rows, the change-log record, and the stream image all fall out of
+  the ADR 0049 universal kind-write path for free; this module owns only
+  the scan. **Quiescence (ADR 0048)**: the scan itself
+  (`CpGroup::local_scan_kind_capped`, a new thin forwarder alongside
+  `local_scan_kind_bounded`) is a pure local engine read — verified against
+  `animus-cp-data`'s source to never touch `RaftKvNode::wake`/
+  `WakeSignal` — so a quiesced, nothing-expired tablet costs one idle LSM
+  scan per sweep and stays quiesced; `group.wake()` (idempotent, cheap on
+  every state) is called only once an expired item is actually found, right
+  before the delete proposes. **Every delete is conditional** on the exact
+  `AttributeValue` the sweep observed for the TTL attribute
+  (`ConditionExpression::Equals`), so a client's concurrent TTL
+  refresh/removal makes the delete no-op (`KindWriteOutcome::
+  ConditionFailed`, a routine outcome, not an error) instead of racing it.
+  Bounded per tick by `TTL_SCAN_BATCH` rows per led tablet via a
+  **driver-local** resume cursor (`BTreeMap<TabletId, Vec<u8>>`, the same
+  ownership discipline `change_consumer_loop`'s own `first_hot_seen`/
+  `marker_bytes_seen` memos use) — no durable `KIND_CURSOR` row, since an
+  interrupted sweep simply resumes (or, on a crash/leader change, safely
+  restarts from scratch — every decision here is idempotent). Sweep
+  cadence: `DEFAULT_TTL_SWEEP_INTERVAL` (a minute — see its own doc for
+  why, mirroring `index_drain.rs`'s `INDEX_DRAIN_INTERVAL` doc style) is
+  threaded through the same layered-wrapper convention as `quiesce_after`/
+  `stream_retention`: `BoundNode::start_with_growth`'s own trailing
+  parameter, defaulted by every wrapper above it, with
+  `run_node_with_ttl_sweep_interval`/`run_node_with_streams_quiesce_and_
+  ttl_sweep_interval` as the test-facing entry points (a real minute would
+  make any e2e test glacial) — **no `--ttl-sweep-interval` CLI flag exists
+  yet** (a documented gap, the same shape as `quiesce_after`'s own
+  not-yet-wired split-deployment paths) and the data-only spawn site has no
+  override at all, always the production default. A TTL deletion's change
+  record carries `ChangeRecord::ttl_expired: true` (ADR 0051 §7), threaded
+  through `kind_write_item_at_leader`/`kind_writes_for_item`'s own trailing
+  `ttl_expired: bool` parameter (every other caller passes `false`) —
+  `streams_wire::stream_record_json` renders it as a record-level
+  `userIdentity: {"PrincipalId": "dynamodb.amazonaws.com", "Type":
+  "Service"}`, absent entirely for an ordinary client write. E2e:
+  `tests/dynamo_ttl.rs` (enable/disable + `DescribeTimeToLive`, the
+  AWS-faithful immediate-visibility-then-eventual-reap contract, future/
+  wrong-type/5-year-window never-expire cases, the conditional-delete
+  outcome, and the stream `userIdentity`); the follower-relay regression
+  for `UpdateTimeToLive` (`MetaCommand::SetTableTtl` on the
+  `is_relayable_command` allowlist) lives in `tests/schema_ddl_relay.rs`,
+  alongside its sibling DDL-relay tests.
 - **`cql.rs`** (~42 KB) — the CQL (Cassandra) v4 binary-protocol edge.
 - **`cql_client.rs`** — a minimal loopback CQL client the admin dashboard's CQL
   editor uses (`POST /admin/data/cql`) to drive this node's own CQL port.
@@ -1016,6 +1067,26 @@ route below the edge through the same `ClientCtx` CP primitives.
   round** is discarded, never partially compared. See the ADR amendment
   for the full incident and `docs/engineering-lessons.md` for a residual,
   unrelated write-side bug this investigation surfaced but did not fix.
+
+  **DynamoDB-style TTL (ADR 0051).** `UpdateTimeToLive`/`DescribeTimeToLive`
+  ride the same replicated-catalog shape as streams/indexes:
+  `dynamo::update_time_to_live` proposes `MetaCommand::SetTableTtl` (`Some`
+  to enable/change, `None` to disable) and commit-waits exactly like
+  `enable_stream`/`disable_stream`; `dynamo::describe_time_to_live` is a
+  pure `meta.table_ttl(table)` read, mirroring `describe_table`. Unlike a
+  stream's minted `label`, `TtlSpec` has no identity — re-enabling with the
+  same attribute is a catalog no-op and changing it in place needs no
+  disable first (see `MetaCommand::SetTableTtl`'s own doc, `animus-control`)
+  — so `update_time_to_live` only validates client-side that a **disable**
+  call's `AttributeName` matches the *currently-enabled* one, and only when
+  something is currently enabled (nothing to mismatch against otherwise).
+  The actual deletion is a background loop, not this wire path — see
+  `ttl_reaper.rs`'s own module-map entry above (quiescence contract,
+  conditional delete, the reaper's `userIdentity` threading through
+  `kind_write_item_at_leader`/`kind_writes_for_item`'s trailing
+  `ttl_expired: bool`). `MetaCommand::SetTableTtl` is on the
+  `is_relayable_command` allowlist beside `SetTableStream` — regression:
+  `tests/schema_ddl_relay.rs`.
 - **CQL v4** (`cql.rs`, `RoleAddrs.cql`) — `STARTUP`/`OPTIONS` handshake +
   `QUERY`/`PREPARE`/`EXECUTE` via the pure `animus_cql` crate. `CREATE TABLE`
   proposes a typed schema into the replicated catalog (incl. clustering/
@@ -1363,7 +1434,14 @@ deployment shapes and growth/decommission, control-plane and CP-data-plane
 membership change, the DynamoDB/CQL/admin/dashboard wire edges (including
 the ADR 0041 secondary-index and ADR 0018 transaction suites), the ADR
 0042/0043 streams surface end to end (`docs/streams-notes.md` has the
-streams-specific test notes), restart/durability across every deployment
-shape, and the `WatchMetadata`/system-table/OTel/metrics support surfaces.
+streams-specific test notes), the ADR 0051 TTL surface end to end
+(`dynamo_ttl.rs` — enable/disable/describe, the AWS-faithful
+immediate-visibility-then-eventual-reap contract, the future/wrong-type/
+5-year-safety-window never-expire cases, the conditional-delete outcome,
+and the stream `userIdentity`; its own follower-relay regression for
+`UpdateTimeToLive` lives beside the rest of `schema_ddl_relay.rs`'s DDL
+suite, not in `dynamo_ttl.rs` itself), restart/durability across every
+deployment shape, and the `WatchMetadata`/system-table/OTel/metrics support
+surfaces.
 `support/mod.rs` holds the shared bring-up helpers (port-TOCTOU retries,
 split-cluster bring-up).

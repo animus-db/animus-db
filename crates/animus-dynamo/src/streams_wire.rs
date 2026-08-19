@@ -437,6 +437,14 @@ pub fn keys_from_images(
 /// Build one `Records[]` entry (ADR 0042 §3, the AWS `Record` shape) from a
 /// decoded [`ChangeRecord`] at shard `shard_id`/sequence number
 /// `packed_hlc`, projected per `view_type`.
+///
+/// **`userIdentity` (ADR 0051 §7)**: present, at the record's own top level
+/// (alongside `dynamodb`, not inside it — AWS's real shape), only when
+/// [`ChangeRecord::ttl_expired`] is set — `{"PrincipalId":
+/// "dynamodb.amazonaws.com", "Type": "Service"}`, matching real DynamoDB's
+/// own documented way for a consumer to tell a TTL expiry from a client
+/// `DeleteItem`. Absent entirely for every other record (an ordinary client
+/// write has no `userIdentity` in real DynamoDB either).
 #[must_use]
 pub fn stream_record_json(
     shard_id: &str,
@@ -496,6 +504,15 @@ pub fn stream_record_json(
     r.insert("eventSource".into(), Value::String("aws:dynamodb".into()));
     r.insert("awsRegion".into(), Value::String("animus".into()));
     r.insert("dynamodb".into(), Value::Object(dynamodb));
+    if record.ttl_expired {
+        let mut identity = Map::new();
+        identity.insert(
+            "PrincipalId".into(),
+            Value::String("dynamodb.amazonaws.com".into()),
+        );
+        identity.insert("Type".into(), Value::String("Service".into()));
+        r.insert("userIdentity".into(), Value::Object(identity));
+    }
     Value::Object(r)
 }
 
@@ -697,6 +714,7 @@ mod tests {
             seeded: false,
             marker: false,
             staged: false,
+            ttl_expired: false,
         };
         let v = stream_record_json(
             "shardId-1-0",
@@ -717,6 +735,37 @@ mod tests {
         assert!(v["dynamodb"]["NewImage"].is_object());
         assert!(v["dynamodb"]["OldImage"].is_null());
         assert!(v["dynamodb"]["Keys"].is_object());
+        // ADR 0051 §7: an ordinary client write carries no `userIdentity` at all.
+        assert!(v.get("userIdentity").is_none());
+    }
+
+    /// ADR 0051 §7: a TTL-reaper delete's record carries `userIdentity` at
+    /// the record's own top level (siblings with `dynamodb`, not inside
+    /// it) — the documented AWS way a stream consumer tells a TTL expiry
+    /// from a client `DeleteItem`.
+    #[test]
+    fn stream_record_json_carries_service_user_identity_for_a_ttl_delete() {
+        let record = ChangeRecord {
+            base_sk: Vec::new(),
+            old_image: Some(Item::from([("pk".to_string(), s("alice"))])),
+            new_image: None,
+            seeded: false,
+            marker: false,
+            staged: false,
+            ttl_expired: true,
+        };
+        let v = stream_record_json(
+            "shardId-1-0",
+            99,
+            &record,
+            StreamViewType::NewAndOldImages,
+            "pk",
+            None,
+            1_700_000_000_000,
+        );
+        assert_eq!(v["eventName"], "REMOVE");
+        assert_eq!(v["userIdentity"]["PrincipalId"], "dynamodb.amazonaws.com");
+        assert_eq!(v["userIdentity"]["Type"], "Service");
     }
 
     #[test]
@@ -728,6 +777,7 @@ mod tests {
             seeded: false,
             marker: false,
             staged: false,
+            ttl_expired: false,
         };
         let v = stream_record_json(
             "shardId-1-0",
