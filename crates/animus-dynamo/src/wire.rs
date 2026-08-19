@@ -16,7 +16,11 @@
 //! `DescribeTable` (ADR 0042 §2), `PutItem`, `GetItem`, `DeleteItem`, `Query`,
 //! `Scan`, `UpdateItem`, `BatchWriteItem`, `TransactWriteItems` (atomic, ADR
 //! 0018 §2/PR7), `TransactGetItems` (a consistent multi-key read, ADR 0018 §2/
-//! PR7). AttributeValue types: the scalars `S` (string), `N` (number, carried
+//! PR7), `UpdateTimeToLive` / `DescribeTimeToLive` (ADR 0051 — decode/encode
+//! only; the expiry predicate itself is [`crate::ttl`], and the background
+//! reaper is `animusd`'s).
+//!
+//! AttributeValue types: the scalars `S` (string), `N` (number, carried
 //! as text), `B` (binary, base64), `BOOL`, `NULL`; the document types `M` (map)
 //! and `L` (list); and the set types `SS`/`NS`/`BS` — matching
 //! [`AttributeValue`]. `PutItem` / `DeleteItem` accept a small
@@ -105,6 +109,23 @@ pub struct StreamDescription {
     pub view_type: StreamViewType,
     /// This stream's current label (ADR 0042 §4).
     pub label: String,
+}
+
+/// A table's TTL configuration for a `DescribeTimeToLive` response (ADR
+/// 0051) — the same small pure-bridge-type precedent as
+/// [`StreamDescription`]: `animusd` holds the replicated catalog's real TTL
+/// state and fills this in, so this crate never needs an `animus_control`
+/// dependency for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TtlDescription {
+    /// Whether TTL is currently enabled on the table.
+    pub enabled: bool,
+    /// The declared TTL attribute name. Present alongside `enabled: true`;
+    /// `describe_time_to_live_response` omits `AttributeName` from the
+    /// rendered JSON whenever `enabled` is `false`, matching AWS, regardless
+    /// of what this field holds (a table may still remember its last
+    /// attribute name after disabling).
+    pub attribute_name: Option<String>,
 }
 
 /// The `X-Amz-Target` service+version prefix DynamoDB clients send.
@@ -470,6 +491,28 @@ pub enum Operation {
         /// The keys to read, in request order (the response echoes this order).
         gets: Vec<TransactGet>,
     },
+    /// `UpdateTimeToLive` (ADR 0051): declare, change, or disable a table's
+    /// TTL attribute. AWS requires `AttributeName` even when `enabled` is
+    /// `false` — a disable call must still name the attribute being
+    /// disabled, which AWS validates matches the currently-enabled one. This
+    /// layer decodes and passes both fields through unchanged; whether a
+    /// disable's `attribute_name` must match the table's current one is
+    /// `animusd`'s call (it holds the replicated catalog this crate never
+    /// sees).
+    UpdateTimeToLive {
+        /// Target table name.
+        table: String,
+        /// The TTL attribute name.
+        attribute_name: String,
+        /// Whether TTL is being enabled (`true`) or disabled (`false`).
+        enabled: bool,
+    },
+    /// `DescribeTimeToLive` (ADR 0051): a pure read of a table's TTL
+    /// configuration (`animusd` supplies it from the replicated catalog).
+    DescribeTimeToLive {
+        /// Target table name.
+        table: String,
+    },
 }
 
 impl Operation {
@@ -487,7 +530,9 @@ impl Operation {
             | Operation::DeleteItem { table, .. }
             | Operation::Query { table, .. }
             | Operation::Scan { table, .. }
-            | Operation::UpdateItem { table, .. } => Some(table),
+            | Operation::UpdateItem { table, .. }
+            | Operation::UpdateTimeToLive { table, .. }
+            | Operation::DescribeTimeToLive { table, .. } => Some(table),
             Operation::BatchWriteItem { .. }
             | Operation::TransactWriteItems { .. }
             | Operation::TransactGetItems { .. } => None,
@@ -661,6 +706,10 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "BatchWriteItem" => decode_batch_write(obj),
         "TransactWriteItems" => decode_transact_write(obj),
         "TransactGetItems" => decode_transact_get(obj),
+        "UpdateTimeToLive" => decode_update_time_to_live(obj),
+        "DescribeTimeToLive" => Ok(Operation::DescribeTimeToLive {
+            table: table_name(obj)?,
+        }),
         _ => Err(WireError::unknown_operation(target)),
     }
 }
@@ -1266,6 +1315,33 @@ fn decode_index_updates(obj: &Map<String, Value>) -> Result<IndexUpdate, WireErr
              `Delete` (no `Update` — no throughput model)",
         )),
     }
+}
+
+/// Decode an `UpdateTimeToLive` request (ADR 0051): `TableName` plus a
+/// `TimeToLiveSpecification` object carrying both `Enabled` and
+/// `AttributeName` — both required by AWS, matched here exactly (AWS
+/// requires `AttributeName` even on a disable call, since it must name the
+/// attribute being disabled).
+fn decode_update_time_to_live(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table = table_name(obj)?;
+    let spec = obj
+        .get("TimeToLiveSpecification")
+        .and_then(Value::as_object)
+        .ok_or_else(|| WireError::validation("missing object field `TimeToLiveSpecification`"))?;
+    let enabled = spec
+        .get("Enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| WireError::validation("`TimeToLiveSpecification` missing `Enabled`"))?;
+    let attribute_name = spec
+        .get("AttributeName")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("`TimeToLiveSpecification` missing `AttributeName`"))?
+        .to_owned();
+    Ok(Operation::UpdateTimeToLive {
+        table,
+        attribute_name,
+        enabled,
+    })
 }
 
 /// Decode the optional `ConditionExpression` + `ExpressionAttributeValues` of a
@@ -2096,6 +2172,54 @@ fn index_desc(name: &str, key_schema: Vec<Value>, status: IndexStatus) -> Value 
         g.insert("Backfilling".into(), Value::Bool(true));
     }
     Value::Object(g)
+}
+
+/// The JSON body for a successful `UpdateTimeToLive` (ADR 0051):
+/// `{"TimeToLiveSpecification": {"Enabled": bool, "AttributeName": ".."}}`
+/// — AWS's own contract is to echo back exactly the spec that was applied,
+/// not a separately-recomputed description, so this takes the same
+/// `attribute_name`/`enabled` pair `decode_update_time_to_live` produced
+/// rather than a [`TtlDescription`].
+#[must_use]
+pub fn update_time_to_live_response(attribute_name: &str, enabled: bool) -> String {
+    let mut spec = Map::new();
+    spec.insert("Enabled".into(), Value::Bool(enabled));
+    spec.insert(
+        "AttributeName".into(),
+        Value::String(attribute_name.to_owned()),
+    );
+    let mut obj = Map::new();
+    obj.insert("TimeToLiveSpecification".into(), Value::Object(spec));
+    serde_json::to_string(&Value::Object(obj)).expect("update-ttl response serializes")
+}
+
+/// The JSON body for a successful `DescribeTimeToLive` (ADR 0051):
+/// `{"TimeToLiveDescription": {"TimeToLiveStatus": "ENABLED"|"DISABLED",
+/// "AttributeName": ".."}}`. `AttributeName` is **omitted entirely** when
+/// the status is `DISABLED` — matching AWS, which never renders a null/empty
+/// `AttributeName` for a disabled table.
+///
+/// **Deliberate simplification**: real DynamoDB's `TimeToLiveStatus`
+/// vocabulary also includes the transient `ENABLING`/`DISABLING` values for
+/// an asynchronous change still in flight. This adapter's `UpdateTimeToLive`
+/// takes effect synchronously (there is no async TTL-enable pipeline here),
+/// so only `ENABLED`/`DISABLED` are ever produced — see the crate guide's
+/// "Still deferred" section.
+#[must_use]
+pub fn describe_time_to_live_response(desc: &TtlDescription) -> String {
+    let mut inner = Map::new();
+    inner.insert(
+        "TimeToLiveStatus".into(),
+        Value::String(if desc.enabled { "ENABLED" } else { "DISABLED" }.into()),
+    );
+    if desc.enabled
+        && let Some(name) = &desc.attribute_name
+    {
+        inner.insert("AttributeName".into(), Value::String(name.clone()));
+    }
+    let mut obj = Map::new();
+    obj.insert("TimeToLiveDescription".into(), Value::Object(inner));
+    serde_json::to_string(&Value::Object(obj)).expect("describe-ttl response serializes")
 }
 
 /// DynamoDB's own `SCREAMING_SNAKE_CASE` rendering of an [`IndexStatus`].
@@ -3358,5 +3482,148 @@ mod tests {
             i.projection,
             IndexProjection::Include(vec!["x".into(), "y".into()])
         );
+    }
+
+    // --- UpdateTimeToLive / DescribeTimeToLive (ADR 0051) -----------------
+
+    #[test]
+    fn decodes_update_time_to_live_enable() {
+        let body = br#"{"TableName":"t","TimeToLiveSpecification":
+            {"Enabled":true,"AttributeName":"expiresAt"}}"#;
+        match decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap() {
+            Operation::UpdateTimeToLive {
+                table,
+                attribute_name,
+                enabled,
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(attribute_name, "expiresAt");
+                assert!(enabled);
+            }
+            other => panic!("expected UpdateTimeToLive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_update_time_to_live_disable() {
+        // AWS requires `AttributeName` even to disable — it must name the
+        // currently-enabled attribute.
+        let body = br#"{"TableName":"t","TimeToLiveSpecification":
+            {"Enabled":false,"AttributeName":"expiresAt"}}"#;
+        match decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap() {
+            Operation::UpdateTimeToLive {
+                table,
+                attribute_name,
+                enabled,
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(attribute_name, "expiresAt");
+                assert!(!enabled);
+            }
+            other => panic!("expected UpdateTimeToLive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_time_to_live_rejects_missing_table_name() {
+        let body = br#"{"TimeToLiveSpecification":{"Enabled":true,"AttributeName":"ttl"}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn update_time_to_live_rejects_missing_specification() {
+        let body = br#"{"TableName":"t"}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn update_time_to_live_rejects_a_mistyped_specification() {
+        let body = br#"{"TableName":"t","TimeToLiveSpecification":"not-an-object"}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn update_time_to_live_rejects_missing_enabled() {
+        let body = br#"{"TableName":"t","TimeToLiveSpecification":{"AttributeName":"ttl"}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn update_time_to_live_rejects_missing_attribute_name() {
+        let body = br#"{"TableName":"t","TimeToLiveSpecification":{"Enabled":true}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn decodes_describe_time_to_live() {
+        let body = br#"{"TableName":"t"}"#;
+        match decode_request("DynamoDB_20120810.DescribeTimeToLive", body).unwrap() {
+            Operation::DescribeTimeToLive { table } => assert_eq!(table, "t"),
+            other => panic!("expected DescribeTimeToLive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_time_to_live_rejects_missing_table_name() {
+        let err = decode_request("DynamoDB_20120810.DescribeTimeToLive", b"{}").unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn update_time_to_live_response_shape() {
+        let body = update_time_to_live_response("expiresAt", true);
+        assert!(body.contains("\"TimeToLiveSpecification\""));
+        assert!(body.contains("\"Enabled\":true"));
+        assert!(body.contains("\"AttributeName\":\"expiresAt\""));
+
+        let body = update_time_to_live_response("expiresAt", false);
+        assert!(body.contains("\"Enabled\":false"));
+        // The response still echoes the requested spec, including the
+        // attribute name on a disable — AWS's own contract.
+        assert!(body.contains("\"AttributeName\":\"expiresAt\""));
+    }
+
+    #[test]
+    fn describe_time_to_live_response_enabled_includes_attribute_name() {
+        let desc = TtlDescription {
+            enabled: true,
+            attribute_name: Some("expiresAt".into()),
+        };
+        let body = describe_time_to_live_response(&desc);
+        assert!(body.contains("\"TimeToLiveDescription\""));
+        assert!(body.contains("\"TimeToLiveStatus\":\"ENABLED\""));
+        assert!(body.contains("\"AttributeName\":\"expiresAt\""));
+    }
+
+    /// The single most important shape assertion in this response: AWS omits
+    /// `AttributeName` entirely (not `null`, not `""`) once TTL is disabled.
+    #[test]
+    fn describe_time_to_live_response_disabled_omits_attribute_name() {
+        let desc = TtlDescription {
+            enabled: false,
+            attribute_name: Some("expiresAt".into()),
+        };
+        let body = describe_time_to_live_response(&desc);
+        assert!(body.contains("\"TimeToLiveStatus\":\"DISABLED\""));
+        assert!(
+            !body.contains("AttributeName"),
+            "AttributeName must be omitted when DISABLED: {body}"
+        );
+    }
+
+    #[test]
+    fn describe_time_to_live_response_disabled_with_no_remembered_name() {
+        let desc = TtlDescription {
+            enabled: false,
+            attribute_name: None,
+        };
+        let body = describe_time_to_live_response(&desc);
+        assert!(body.contains("\"TimeToLiveStatus\":\"DISABLED\""));
+        assert!(!body.contains("AttributeName"));
     }
 }

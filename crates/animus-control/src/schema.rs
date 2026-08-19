@@ -134,6 +134,47 @@ pub struct StreamSpec {
     pub label: String,
 }
 
+/// A table's replicated **DynamoDB-style TTL** configuration (ADR 0051), when
+/// enabled.
+///
+/// [`attribute_name`](TtlSpec::attribute_name) names an item attribute that,
+/// when present, holds an **absolute Unix epoch second** as a DynamoDB `N`
+/// (never milliseconds, never a relative duration — the same convention
+/// DynamoDB itself uses). The control plane records **only this
+/// declaration** — which attribute a table's items *may* carry an
+/// expiration timestamp in — and never inspects an item itself; whatever
+/// component actually deletes expired items (the wire edge / a background
+/// sweep, outside this crate's scope) is the one that reads the attribute
+/// and compares it against wall-clock time.
+///
+/// Consequently an item is "not expired" by simple absence of a positive
+/// determination, not by an explicit check here: an item whose
+/// `attribute_name` attribute is missing, is present but not a number (the
+/// wrong DynamoDB type), or names a future instant is never treated as
+/// expired. Only an item whose named attribute is a number in the past is a
+/// candidate for expiry. This mirrors DynamoDB's own documented behavior and
+/// keeps the control plane's job purely declarative — identical in spirit to
+/// [`StreamSpec`]: the catalog stores the *shape* of the feature, never
+/// interprets data.
+///
+/// Unlike [`StreamSpec`], a `TtlSpec` mints no identity label — there is
+/// nothing here analogous to a stream's `(table, label)` pair, since TTL has
+/// no downstream consumer that needs to distinguish "generations" of a
+/// table's TTL configuration. That is also why re-enabling TTL with the same
+/// attribute name is idempotent (a `NoOp`) rather than rejected the way
+/// re-enabling an already-enabled stream is — see
+/// [`MetaCommand::SetTableTtl`](crate::meta::MetaCommand::SetTableTtl)'s own
+/// doc for the full apply semantics, including that changing the attribute
+/// name in place (no disable/re-enable round trip required) is a legal
+/// DynamoDB operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TtlSpec {
+    /// The item attribute name that, when present as a numeric (`N`)
+    /// attribute, holds an absolute Unix epoch second past which the item is
+    /// eligible for expiry.
+    pub attribute_name: String,
+}
+
 /// The lifecycle status of a secondary index (ADR 0045): whether it is still
 /// being backfilled, fully materialized and queryable, or being torn down.
 ///
@@ -278,6 +319,14 @@ pub struct TableSchema {
     /// `MetaCommand::SetTableStream` (so it replicates).
     #[serde(default)]
     pub stream: Option<StreamSpec>,
+    /// This table's DynamoDB-style TTL configuration (ADR 0051), if enabled.
+    /// `None` for a table with no TTL (the common case, and every schema
+    /// persisted before this field existed — `#[serde(default)]`, additive
+    /// like `indexes`/`mode`/`stream`). Mutated only through
+    /// `MetaCommand::SetTableTtl` (so it replicates); see [`TtlSpec`] for
+    /// what the control plane does and does not do with it.
+    #[serde(default)]
+    pub ttl: Option<TtlSpec>,
 }
 
 /// Why a [`TableSchema`] was rejected as malformed.
@@ -314,6 +363,7 @@ impl TableSchema {
             indexes: Vec::new(),
             mode: ReplicationMode::default(),
             stream: None,
+            ttl: None,
         }
     }
 
@@ -338,6 +388,7 @@ impl TableSchema {
             indexes: Vec::new(),
             mode: ReplicationMode::default(),
             stream: None,
+            ttl: None,
         }
     }
 
@@ -358,6 +409,7 @@ impl TableSchema {
             indexes: Vec::new(),
             mode: ReplicationMode::default(),
             stream: None,
+            ttl: None,
         }
     }
 
@@ -794,5 +846,33 @@ mod tests {
         let decoded: IndexDef = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.status, IndexStatus::Creating);
         assert_eq!(decoded, creating);
+    }
+
+    /// A `TableSchema` JSON blob predating the `ttl` field (no `ttl` key at
+    /// all — the shape of every schema record written before ADR 0051)
+    /// still deserializes, via `#[serde(default)]`, as `ttl: None` — the
+    /// same additive contract `indexes`/`mode`/`stream` already carry. A
+    /// round-trip through a *populated* `ttl` also proves the field rides
+    /// the wire at all once present.
+    #[test]
+    fn table_schema_without_a_ttl_field_deserializes_as_none() {
+        let json = r#"{
+            "partition_key": "id",
+            "clustering_keys": [],
+            "columns": [{"name": "id", "ty": "String"}]
+        }"#;
+        let schema: TableSchema = serde_json::from_str(json).expect("ttl-less TableSchema decodes");
+        assert_eq!(schema.ttl, None);
+        assert_eq!(schema, TableSchema::simple("id", ColumnType::String));
+
+        // And a populated ttl rides the wire unchanged, round-tripping.
+        let mut with_ttl = TableSchema::simple("id", ColumnType::String);
+        with_ttl.ttl = Some(TtlSpec {
+            attribute_name: "expiresAt".to_string(),
+        });
+        let encoded = serde_json::to_string(&with_ttl).unwrap();
+        let decoded: TableSchema = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.ttl, with_ttl.ttl);
+        assert_eq!(decoded, with_ttl);
     }
 }

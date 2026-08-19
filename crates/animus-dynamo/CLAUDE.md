@@ -49,7 +49,8 @@ comment for its full type/method inventory.
 - `wire` — the DynamoDB JSON translation (`decode_request` →
   `Operation`, covering CreateTable/Put/Get/Delete/Query/Scan/UpdateItem/
   BatchWriteItem/TransactWriteItems/TransactGetItems/UpdateTable/
-  DescribeTable, plus the response encoders). One gotcha: `GetItem`/`Query`/
+  DescribeTable/UpdateTimeToLive/DescribeTimeToLive, plus the response
+  encoders). One gotcha: `GetItem`/`Query`/
   `Scan` decode `ConsistentRead` **but this crate never enforces it** —
   whether `true` is legal depends on an index's replicated *kind* (GSI vs
   LSI), which lives in the control-plane catalog this crate never sees, so
@@ -61,6 +62,25 @@ comment for its full type/method inventory.
   stays dependency-light by re-deriving small byte-shape functions instead
   of pulling in a whole sibling crate, the same precedent its other
   cross-crate duplications follow.
+- `ttl` (ADR 0051) — the pure DynamoDB-TTL expiry predicate: `expires_at`
+  (an item's declared expiry epoch second under a table's TTL attribute, or
+  `None` when the attribute is absent or not a usable `N`) and `is_expired`
+  (strictly-less-than "now", not less-or-equal — an expiry equal to "now" has
+  not yet expired). We are **AWS-faithful on reads**: nothing here filters a
+  `GetItem`/`Query`/`Scan` result — an expired item stays visible until a
+  background reaper (`animusd`, driven by `env.now()`) deletes it; this
+  module is exactly the predicate that reaper calls. A TTL attribute of the
+  wrong type (anything but `N`) is silently never-expiring, matching AWS,
+  which ignores rather than errors. `N` values are parsed under a
+  deliberately narrow grammar (`-?[0-9]+(\.[0-9]+)?`, truncated toward
+  zero) — **exponent notation (`1.7e9`) is a valid DynamoDB `N` in general
+  but is NOT accepted as a TTL value here** (documented non-expiry, not a
+  misparse); a negative value folds to `Some(0)` rather than wrapping into
+  the `u64` return type. The load-bearing safety property is
+  `MAX_PAST_EXPIRY_SECS` (5 years, matching AWS): an expiry further in the
+  past than that is treated as **not expired** — the guard against a client
+  writing milliseconds instead of seconds and having the reaper read that as
+  "expire immediately" across a whole table.
 
 ## What's non-obvious
 
@@ -211,7 +231,10 @@ comment for its full type/method inventory.
   arithmetic, `TransactWriteItems`/`TransactGetItems` idempotency tokens
   (`ClientRequestToken`) and full per-action `CancellationReasons` fidelity
   (ADR 0018 §2/PR7 shipped atomicity itself; these wire-fidelity details
-  remain simplified). The
+  remain simplified). `DescribeTimeToLive`'s `TimeToLiveStatus` (ADR 0051)
+  only ever renders `ENABLED`/`DISABLED`, never AWS's transient
+  `ENABLING`/`DISABLING` — this adapter's `UpdateTimeToLive` takes effect
+  synchronously, so there is no in-flight state to report. The
   `Scan`/`Query` `FilterExpression` reuses the `ConditionExpression` predicate
   subset (`attribute_exists`/`attribute_not_exists`/`a = :v`), not the fuller
   filter grammar. `animus-cql` would map onto the same core the same way.
@@ -233,9 +256,12 @@ comment for its full type/method inventory.
 ## Tests
 
 `cargo test -p animus-dynamo` — `item_api.rs` over `MemoryEngine`, plus unit
-tests for `wire`/`streams_wire`/`condition`/`registry`/`schema`/`index`
+tests for `wire`/`streams_wire`/`condition`/`registry`/`schema`/`index`/`ttl`
 (JSON decode/encode, the index key-layout invariants, iterator-token
-round-trip, response-shape encoders). The rejection of `ConsistentRead` on
+round-trip, response-shape encoders, and `ttl`'s expiry-boundary table —
+absent/wrong-type attributes, future/past/equal-to-now, fractional
+truncation, the negative-value fold, and both sides of the
+`MAX_PAST_EXPIRY_SECS` window). The rejection of `ConsistentRead` on
 a GSI `Query`/`Scan` is `animusd`-only (this crate never sees the
 replicated catalog needed to know an index's kind) and is end-to-end
 tested in `animusd`'s `tests/dynamo_consistent_read.rs`/
