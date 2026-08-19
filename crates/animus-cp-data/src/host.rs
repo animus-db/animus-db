@@ -212,7 +212,14 @@ pub struct LocalState {
     /// [`LocalState::confirm_torn_down`]) only once it has confirmed the
     /// corresponding teardown fully completed; until then, the next `plan`
     /// call keeps re-planning the same `Reclaim`/`Release` action, exactly
-    /// like the real loop retrying on a later tick.
+    /// like the real loop retrying on a later tick. The same discipline runs
+    /// in reverse for a just-emitted `Host`: `plan` inserts the tablet here
+    /// optimistically, before the executor has actually stood up a live
+    /// handle, so a `host()` that skips the action (an `EngineFactory::open`
+    /// failure, or the tablet vanishing from `Metadata` before execution)
+    /// must call [`LocalState::release_unconfirmed_host`] to undo that insert
+    /// — otherwise the claim is permanent and `plan` never re-emits `Host`
+    /// for a tablet this node in fact never hosted.
     pub hosted: BTreeSet<TabletId>,
     /// The release-GC epoch-stability dampener (ADR 0029): `tablet -> (epoch
     /// observed, consecutive confirming ticks)`. Mirrors `pending_release`.
@@ -231,6 +238,24 @@ impl LocalState {
     pub fn confirm_torn_down(&mut self, tablet: TabletId) {
         self.hosted.remove(&tablet);
         self.pending_release.remove(&tablet);
+    }
+
+    /// Record that a planned [`HostAction::Host`] for `tablet` did **not**
+    /// actually establish a live handle (the executor's `host()` skipped it —
+    /// today, `EngineFactory::open` failing, or the tablet having vanished
+    /// from `Metadata` between `plan` and execution). [`plan`] itself already
+    /// added `tablet` to [`hosted`](Self::hosted) the instant it decided to
+    /// emit the action (it has no way to know execution will fail); this
+    /// undoes exactly that insert so the phase-1 gate
+    /// (`!next.hosted.contains(&tablet)`) stops treating the tablet as
+    /// already hosted and the next `plan` call re-emits `Host` for it. Mirrors
+    /// [`confirm_torn_down`](Self::confirm_torn_down)'s "the executor
+    /// confirms completion" discipline, applied to the other end of the
+    /// lifecycle: a claim in [`hosted`](Self::hosted) isn't real until a live
+    /// handle actually backs it, exactly as a `Reclaim`/`Release` claim isn't
+    /// cleared until its teardown actually completes.
+    pub fn release_unconfirmed_host(&mut self, tablet: TabletId) {
+        self.hosted.remove(&tablet);
     }
 }
 
@@ -721,10 +746,10 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     }
                 }
                 HostAction::Release { tablet } => {
-                    self.teardown(tablet, TeardownKind::Release).await;
+                    self.teardown(tablet).await;
                 }
                 HostAction::Reclaim { tablet } => {
-                    self.teardown(tablet, TeardownKind::Reclaim).await;
+                    self.teardown(tablet).await;
                 }
             }
         }
@@ -807,6 +832,13 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// there is no in-flight "claimed but not yet registered" window to dedup
     /// against — unlike the old `minted`-claim-set loop, `self.hosted` is
     /// authoritative the instant this returns.
+    ///
+    /// Either early-return below leaves this tablet **not** in `self.hosted`
+    /// (no live handle was ever created), so both call
+    /// [`LocalState::release_unconfirmed_host`] to undo `plan`'s optimistic
+    /// claim insert — otherwise the phase-1 gate
+    /// (`!next.hosted.contains(&tablet)`) would treat the tablet as already
+    /// hosted forever and `plan` would never re-emit `Host` for it.
     async fn host(
         &mut self,
         view: &MetadataView,
@@ -815,12 +847,14 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         initial_formation: bool,
     ) {
         let Some(t) = view.tablets.get(&tablet) else {
+            self.state.release_unconfirmed_host(tablet);
             return;
         };
         // ADR 0050 rung 1: open (or re-open) this tablet's own private
-        // engine. A factory failure skips the host; `plan` re-emits it next
-        // tick.
+        // engine. A factory failure skips the host and releases the claim
+        // (above); `plan` re-emits it next tick.
         let Some(engine) = self.ensure_engine(tablet).await else {
+            self.state.release_unconfirmed_host(tablet);
             return;
         };
         let scope = StorageScope::new(range);
@@ -851,14 +885,32 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// from the caller's routing registry first, shut the driver down and
     /// wait for it to actually stop (never touch data under a live driver),
     /// then **delete the tablet's own engine files** (ADR 0050 rung 1 — both
-    /// kinds; the engine is private, so whole-engine deletion is the erase)
-    /// and its WAL file, and only then confirm the teardown to [`LocalState`]
-    /// and drop the local handle. A timeout waiting for the driver to stop
-    /// re-registers the handle (so routing keeps working) and leaves
-    /// `state`/`hosted` untouched — `plan` re-emits the identical action
-    /// next tick.
-    async fn teardown(&mut self, tablet: TabletId, kind: TeardownKind) {
+    /// actions reduce to the identical deletion since the engine is private,
+    /// so whole-engine deletion is the erase either way — there is no
+    /// behavioral fork left to take a `kind` parameter for) and its WAL file,
+    /// and only then confirm the teardown to [`LocalState`] and drop the
+    /// local handle. A timeout waiting for the driver to stop re-registers
+    /// the handle (so routing keeps working) and leaves `state`/`hosted`
+    /// untouched — `plan` re-emits the identical action next tick.
+    ///
+    /// `self.hosted.remove(&tablet)` returning `None` means a **zombie
+    /// claim**: [`LocalState::hosted`] (or a caller's stale `plan` input)
+    /// names a tablet with no live handle here, and nothing else ever
+    /// populates `self.hosted` — so there is no driver to shut down and
+    /// nothing to wait on. Best-effort cleanup still runs (a previous
+    /// `host()` attempt may have left partial engine/WAL files on disk before
+    /// failing to establish a handle) and the claim is confirmed torn down
+    /// immediately, so `plan` stops re-emitting a teardown action that could
+    /// otherwise never make progress.
+    async fn teardown(&mut self, tablet: TabletId) {
         let Some(node) = self.hosted.remove(&tablet) else {
+            tracing::warn!(
+                tablet = tablet.0,
+                "reconciler: tearing down a tablet with no live handle (zombie claim)"
+            );
+            (self.on_teardown)(tablet);
+            self.erase_tablet_files(tablet).await;
+            self.state.confirm_torn_down(tablet);
             return;
         };
         (self.on_teardown)(tablet);
@@ -877,14 +929,25 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             self.env.sleep(RECLAIM_STOP_POLL).await;
         }
 
-        // ADR 0050 rung 1: a tablet's engine is private, so BOTH teardown
-        // kinds reduce to deleting its files whole — instant, real space
-        // reclaim, no `merge_tombstone` sweep (the shared-engine
-        // sibling-sparing bound this used to need died with the shared
-        // engine, Train B rung 7).
-        let _ = kind;
-        self.engines.remove(&tablet);
+        // ADR 0050 rung 1: a tablet's engine is private, so teardown reduces
+        // to deleting its files whole — instant, real space reclaim, no
+        // `merge_tombstone` sweep (the shared-engine sibling-sparing bound
+        // this used to need died with the shared engine, Train B rung 7).
         drop(node);
+        self.erase_tablet_files(tablet).await;
+        self.state.confirm_torn_down(tablet);
+    }
+
+    /// Delete `tablet`'s own engine files (ADR 0050 rung 1 — the engine is
+    /// private, so whole-engine deletion is the erase) and its WAL file.
+    /// Shared by both [`teardown`](Self::teardown) paths: the normal
+    /// stopped-driver path and the zombie-claim path, which has no driver to
+    /// wait on but may still need to clean up files a failed `host()` left
+    /// behind. Both `factory.destroy`/`env.remove` are documented
+    /// idempotent/tolerant of nothing existing, so this is safe to call even
+    /// when no files were ever written.
+    async fn erase_tablet_files(&mut self, tablet: TabletId) {
+        self.engines.remove(&tablet);
         self.factory.destroy(tablet).await;
         if let Err(e) = self.env.remove(&wal_file(tablet.0)).await {
             tracing::warn!(
@@ -893,23 +956,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 "reconciler: removing the tablet's WAL"
             );
         }
-
-        self.state.confirm_torn_down(tablet);
     }
-}
-
-/// How [`Reconciler::teardown`] should treat a group's data once its driver
-/// has stopped — the two ways a hosted tablet's lifecycle can end. ADR 0050
-/// rung 1: both now end in deleting the tablet's own private engine files
-/// whole; the distinction is kept for intent/logging (release = moved off
-/// this node while the tablet lives elsewhere; reclaim = the table was
-/// dropped), not for a behavioral fork.
-enum TeardownKind {
-    /// [`HostAction::Release`] — moved off this node while the tablet still
-    /// exists elsewhere.
-    Release,
-    /// [`HostAction::Reclaim`] — the tablet's whole table was dropped.
-    Reclaim,
 }
 
 #[cfg(test)]
@@ -1491,6 +1538,82 @@ mod tests {
 
         assert!(!state.hosted.contains(&TabletId(1)));
         assert!(!state.pending_release.contains_key(&TabletId(1)));
+    }
+
+    // === LocalState::release_unconfirmed_host ===============================
+
+    #[test]
+    fn release_unconfirmed_host_drops_the_claim_so_plan_re_emits_host() {
+        // Mirrors `plan`'s own phase-1 insert: a fresh tablet is claimed
+        // optimistically, before any executor has actually stood it up.
+        let v = view([(1, tablet(1, b"", None, vec![base()]))]);
+        let (actions, next) = plan(&v, &BTreeMap::new(), &LocalState::default(), base());
+        assert!(matches!(actions[0], HostAction::Host { tablet, .. } if tablet == TabletId(1)));
+        assert!(next.hosted.contains(&TabletId(1)));
+
+        // The executor's `host()` failed to establish a live handle (an
+        // `EngineFactory::open` I/O error) and releases the claim.
+        let mut released = next;
+        released.release_unconfirmed_host(TabletId(1));
+        assert!(!released.hosted.contains(&TabletId(1)));
+
+        // The next `plan` call must genuinely re-emit `Host` — the whole
+        // point of releasing the claim — not silently swallow it forever
+        // (the bug this method exists to close).
+        let (actions2, _next2) = plan(&v, &BTreeMap::new(), &released, base());
+        assert_eq!(
+            actions2,
+            vec![HostAction::Host {
+                tablet: TabletId(1),
+                range: KeyRange::whole(),
+                initial_formation: true,
+            }],
+            "plan must re-emit Host once the failed claim is released"
+        );
+    }
+
+    // === Reconciler::teardown: the zombie-claim backstop =====================
+    //
+    // `LocalState::hosted` naming a tablet with no live handle in
+    // `Reconciler::hosted` is, by construction, otherwise unreachable through
+    // the public `tick()` API today (`host()` itself now releases an
+    // unconfirmed claim on failure via `release_unconfirmed_host` above) — so
+    // this exercises the defensive backstop directly via crate-private field
+    // access, the same way `lib.rs`'s `pr5_orphan_and_resurrection_tests`
+    // builds a scenario the public API cannot express.
+
+    #[test]
+    fn teardown_clears_a_zombie_claim_with_no_live_handle() {
+        let sim = animus_sim::Simulator::new(0x2A11_0C0D_u64);
+        let env = sim.env(base());
+        let mut reconciler: Reconciler<animus_sim::SimEnv, MemoryEngine> = Reconciler::new(
+            env,
+            MemoryTabletEngines::new(),
+            base(),
+            |_t, _n| {},
+            |_t| {},
+        );
+        // Simulate the only way this shape can arise: a claim recorded with
+        // no corresponding entry in `self.hosted` (the live-handle map).
+        reconciler.state.hosted.insert(TabletId(1));
+        reconciler
+            .state
+            .pending_release
+            .insert(TabletId(1), (Epoch::INITIAL, 2));
+
+        futures::executor::block_on(reconciler.teardown(TabletId(1)));
+
+        assert!(
+            !reconciler.local_state().hosted.contains(&TabletId(1)),
+            "a zombie claim must be confirmed torn down, not re-planned forever"
+        );
+        assert!(
+            !reconciler
+                .local_state()
+                .pending_release
+                .contains_key(&TabletId(1)),
+            "confirm_torn_down must also clear any leftover pending_release entry"
+        );
     }
 
     #[test]

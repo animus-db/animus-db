@@ -61,7 +61,7 @@ use animus_control::syskv;
 use animus_dynamo::wire::{base64url_decode, base64url_encode};
 use animus_dynamo::{AttributeValue, Item};
 use animus_env::NodeId;
-use animus_storage::WalRecordView;
+use animus_storage::{StorageError, WalRecordView};
 use animus_tablet::{TOKEN_BYTES, TabletId};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -98,19 +98,23 @@ pub(crate) struct CpRaftView {
     pub(crate) snapshot_index: u64,
     pub(crate) log_len: usize,
     pub(crate) voters: Vec<NodeId>,
-    /// This tablet's exact, `StorageScope`-scoped live key count
-    /// (`CpGroup::raft_view`, via `local_pairs`) — distinct from the cheap,
-    /// unscoped estimate `auto_split_loop` checks against `--auto-split K`
-    /// (`CpGroup::approx_key_count`), which reads the whole shared engine and
-    /// so double-counts a co-resident sibling tablet (e.g. right after a
-    /// split). Always `Some` — both backends can be scanned.
+    /// This tablet's live key count — **the cheap, non-materializing
+    /// `CpGroup::approx_key_count` estimate by default**, the exact
+    /// `local_pairs` count under `?exact=1` (see `CpGroup::raft_view` for
+    /// why the polled default must not materialize). The estimate is the
+    /// very number `auto_split_loop` checks against `--auto-split K`, so
+    /// the Console's over-threshold pill agrees with the trigger that will
+    /// actually fire; it errs toward over-counting by design. `None` on the
+    /// **memory** backend, which has no cheap counter — `?exact=1` answers
+    /// there (and on either backend) precisely.
     pub(crate) key_count: Option<usize>,
-    /// This tablet's exact, `StorageScope`-scoped total byte size (sum of
-    /// `key.len() + value.len()` over the same `local_pairs` scan `key_count`
-    /// reads — no extra engine call) — the ADR 0034 dual of `key_count`:
-    /// distinct from the cheap, non-materializing estimate `auto_split_loop`
-    /// gates on (`CpGroup::approx_bytes`), which is scoped but approximate.
-    /// Always `Some` — both backends can be scanned.
+    /// This tablet's total byte size — **the cheap `CpGroup::approx_bytes`
+    /// estimate by default** (ADR 0034's own auto-split gate, on either
+    /// backend), the exact sum of `key.len() + value.len()` over
+    /// `local_pairs` under `?exact=1`. The two differ in scope as well as
+    /// precision: the estimate is **base-scoped** (ADR 0034 deliberately
+    /// excludes change-log churn), while the exact sum covers every kind in
+    /// the tablet's own engine.
     pub(crate) byte_size: Option<u64>,
     /// Whether this replica currently considers its group quiesced (ADR
     /// 0044 phase-1 PR7). A pure, frozen-accessor read — building this view
@@ -346,7 +350,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
             serde_json::to_value(ctx.effective_metadata()).unwrap_or(Value::Null),
         ),
         ("GET", "/admin/raft") => (200, raft_view(ctx)),
-        ("GET", "/admin/raftkv") => (200, raftkv_view(ctx).await),
+        ("GET", "/admin/raftkv") => (200, raftkv_view(ctx, q).await),
         ("GET", "/admin/txns") => (200, txns_view(ctx).await),
         ("GET", "/admin/storage/lsm") => storage_lsm(ctx, q).await,
         ("GET", "/admin/storage/control") => storage_control(ctx).await,
@@ -576,10 +580,20 @@ fn raft_view(ctx: &ClientCtx) -> Value {
     })
 }
 
-async fn raftkv_view(ctx: &ClientCtx) -> Value {
+/// `GET /admin/raftkv[?exact=1]` — this node's own per-hosted-tablet CP Raft
+/// view. `key_count`/`byte_size` are the **cheap estimates** by default and
+/// the exact materialized count/total under `?exact=1`; see
+/// `CpGroup::raft_view`'s own doc for why the polled default must not
+/// materialize (this route is fetched from every node every 5s by the
+/// Console, and the exact path costs O(dataset) per node per poll).
+async fn raftkv_view(ctx: &ClientCtx, q: &str) -> Value {
+    let exact = matches!(
+        http::query_param(q, "exact").as_deref(),
+        Some("1") | Some("true")
+    );
     let mut groups: Vec<CpRaftView> = Vec::new();
     for (t, g) in ctx.edge.hosted_groups() {
-        let mut view = g.raft_view(t).await;
+        let mut view = g.raft_view(t, exact).await;
         // ADR 0050 rung 4: overlay this node's own split-build progress (a
         // data-role field; absent on a control-only node, which hosts no
         // groups and never reaches this loop body anyway).
@@ -916,7 +930,12 @@ async fn storage_scan(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 /// because `syskv`'s keys are prefix-free (`syskv`'s own
 /// `no_two_distinct_entity_keys_prefix_one_another` test): no other key can
 /// start with `after`'s bytes, so appending `0x00` steps past it with no gap
-/// and no chance of re-showing it on the next page.
+/// and no chance of re-showing it on the next page. `after` is otherwise
+/// **unvalidated** client-supplied base64url — a crafted value decoding past
+/// the reserved namespace's own end bound makes `scan_start > ns_end`, which
+/// is handled as a clean 400 (see the scan call below), not a panic. (The
+/// `applied_index` watermark read just above is a fixed, non-`after`-derived
+/// key, so it carries no equivalent client-input exposure.)
 async fn system_table(ctx: &ClientCtx, q: &str) -> (u16, Value) {
     let Some(engine) = &ctx.control_storage else {
         return (200, json!({"available": false}));
@@ -961,10 +980,21 @@ async fn system_table(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 
     // The load-bearing whole-reserved-namespace RANGE scan — see this
     // function's doc for why this must never become `engine.entries()`.
-    let pairs = engine
-        .scan(&scan_start, &ns_end)
-        .await
-        .expect("system-keyspace engine scan");
+    // `scan_start` is derived from the client-supplied `after` cursor
+    // (unvalidated base64url), so `start > end` (`StorageError::
+    // InvalidRange`) is reachable with a crafted cursor, not just an engine
+    // bug — a clean 400, the same "bad hand-crafted input" contract `kind`
+    // already gets above, not a panic that would take down the request task.
+    let pairs = match engine.scan(&scan_start, &ns_end).await {
+        Ok(pairs) => pairs,
+        Err(StorageError::InvalidRange) => {
+            return (
+                400,
+                json!({"error": "invalid `after` cursor: past the end of the system keyspace"}),
+            );
+        }
+        Err(e) => panic!("system-keyspace engine scan: {e}"),
+    };
 
     let mut items: Vec<Value> = Vec::new();
     let mut truncated = false;
@@ -2167,5 +2197,105 @@ mod tests {
             parse_key_display("seed-0000042:x"),
             b"seed-0000042:x".to_vec()
         );
+    }
+}
+
+/// A second in-crate test module (mirrors `lib.rs`'s `confirm_futility_tests`/
+/// `auto_split_median_tests` idiom): `system_table` needs a real `ClientCtx`
+/// backed by a live control-plane system-keyspace engine, which only a real
+/// node bring-up provides — no external `tests/` file can reach the
+/// `pub(crate)`, `#[cfg(test)]`-only `Node::ctx_for_test`.
+#[cfg(test)]
+mod system_table_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use animus_dynamo::wire::base64url_encode;
+    use tokio::time::sleep;
+
+    use crate::config::NodeRole;
+    use crate::{ClusterConfig, RoleAddrs, run_node};
+
+    use super::*;
+
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn single_node_config() -> ClusterConfig {
+        let addrs = free_addrs(6);
+        ClusterConfig {
+            nodes: vec![RoleAddrs {
+                id: crate::config::node_id(0),
+                role: NodeRole::Both,
+                internal: addrs[0],
+                client: addrs[1],
+                dynamo: addrs[2],
+                cql: addrs[3],
+                admin: addrs[4],
+                intra: addrs[5],
+            }],
+        }
+    }
+
+    /// Bring up a single combined node, retrying against the documented
+    /// port-TOCTOU race (`docs/engineering-lessons.md`): `free_addrs`'s probe
+    /// releases its ports before the real bind, so another test binary can
+    /// steal one under `cargo test --workspace` contention. Each attempt
+    /// allocates a **fresh** config.
+    async fn single_node(dir: &Path) -> crate::Node {
+        let mut last_err = None;
+        for attempt in 0..16 {
+            let config = single_node_config();
+            match run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
+                Ok(node) => return node,
+                Err(e) => {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        panic!(
+            "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
+        );
+    }
+
+    /// Regression: a crafted `after` cursor decoding to bytes past the
+    /// reserved namespace's own end bound used to panic the request task
+    /// (`engine.scan(start, end)` returns `Err(InvalidRange)` when `start >
+    /// end`, and `after` is unvalidated client-supplied base64url) — now a
+    /// clean 400 instead. The valid-cursor case rides the **same** node
+    /// deliberately: bringing a node up is by far the expensive part, and
+    /// this binary also carries wall-clock-sensitive liveness tests
+    /// (`confirm_futility_tests`) that share the runner with whatever else
+    /// is in flight, so one bring-up serves both assertions rather than two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_cursor_is_validated_not_panicked_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = single_node(dir.path()).await;
+        let ctx = node.ctx_for_test();
+
+        // Every byte 0xFF: guaranteed to sort past the reserved namespace's
+        // own (ASCII-bytes-only) escaped end bound (`syskv::reserved_scan_
+        // bounds`), so `scan_start > ns_end` deterministically.
+        let bogus_after = base64url_encode(&[0xFF; 8]);
+        let (status, body) = system_table(&ctx, &format!("after={bogus_after}")).await;
+        assert_eq!(status, 400, "body: {body}");
+        assert!(
+            body.get("error").is_some(),
+            "expected an error field, got {body}"
+        );
+
+        // A well-formed `after` at the start of the reserved namespace (the
+        // empty-bytes cursor) is NOT out of range — the ordinary valid-input
+        // path, proving the fix didn't turn a legitimate cursor into a 400.
+        let after = base64url_encode(&[]);
+        let (status, body) = system_table(&ctx, &format!("after={after}")).await;
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(body["available"], true);
     }
 }

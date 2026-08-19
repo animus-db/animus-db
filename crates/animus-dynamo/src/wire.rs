@@ -694,7 +694,15 @@ fn decode_update_item(obj: &Map<String, Value>) -> Result<Operation, WireError> 
 /// Decode a DynamoDB `UpdateExpression` (the supported subset). Recognized
 /// clauses are `SET a = :v, b = :w` and `REMOVE c, d`, in either order; the
 /// attribute names may use `#alias` placeholders and the values `:placeholder`s.
-/// `ADD`/`DELETE` clauses are rejected (deferred).
+/// `ADD`/`DELETE` clauses are rejected (deferred). Non-whitespace text before
+/// the first recognized clause keyword is rejected too — e.g. `"foo SET x =
+/// :v"` — rather than silently dropped, which would otherwise apply only the
+/// `SET` and never surface the leading garbage. **Known remaining gap**: an
+/// *unaliased* top-level attribute literally named `set`/`remove`/`add`/
+/// `delete` (e.g. `SET set = :v`) still misparses, since this is a substring
+/// keyword scan, not a real tokenizer — a compliant SDK always aliases a
+/// reserved word via `#name`, so this is accepted as a documented, low-risk
+/// limitation rather than reworked into a fuller parser here.
 fn decode_update_expression(
     obj: &Map<String, Value>,
     expr: &str,
@@ -720,6 +728,15 @@ fn decode_update_expression(
     if spans.is_empty() {
         return Err(WireError::validation(format!(
             "unsupported `UpdateExpression` `{expr}` (supported clauses: SET, REMOVE)"
+        )));
+    }
+    // Reject any non-whitespace text before the first recognized clause
+    // keyword — e.g. `UpdateExpression: "foo SET x = :v"` — instead of
+    // silently dropping it and applying only the recognized part.
+    let (first_at, _, _) = spans[0];
+    if !expr[..first_at].trim().is_empty() {
+        return Err(WireError::validation(format!(
+            "`UpdateExpression` `{expr}` has unrecognized text before its first clause"
         )));
     }
     let mut actions = Vec::new();
@@ -3220,6 +3237,33 @@ mod tests {
             ]
         );
         assert_eq!(return_values, UpdateReturnValues::AllNew);
+    }
+
+    /// Leading whitespace before `SET` is fine — only non-whitespace leading
+    /// text is rejected.
+    #[test]
+    fn decodes_update_item_with_leading_whitespace() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"   SET x = :v",
+            "ExpressionAttributeValues":{":v":{"S":"y"}}}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(actions, vec![UpdateAction::Set("x".into(), s("y"))]);
+    }
+
+    /// Regression: unrecognized leading text before the first clause keyword
+    /// used to be silently dropped (`"foo SET x = :v"` applied only `SET x =
+    /// :v`) instead of being rejected.
+    #[test]
+    fn rejects_update_expression_with_leading_garbage() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"foo SET x = :v",
+            "ExpressionAttributeValues":{":v":{"S":"y"}}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
     }
 
     #[test]

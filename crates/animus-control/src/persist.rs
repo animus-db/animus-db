@@ -135,54 +135,6 @@ where
         bytes
     }
 
-    /// Encode a [`WalRecord::Snapshot`] line **reusing `metadata_json`** — the
-    /// already-serialized state image (the core's cached `snapshot_blob`) — for the
-    /// large `metadata` field, so the state is serialized **once** per compaction
-    /// rather than twice (once to cache/ship, once for the WAL). The bytes are
-    /// identical to `encode_record(&WalRecord::Snapshot { .. })` (a `RawValue`
-    /// embeds `metadata_json` verbatim, and JSON object field order is immaterial to
-    /// the decoder); the round-trip is guarded by
-    /// `snapshot_record_blob_reuse_round_trips`. `metadata_json` MUST be valid JSON
-    /// for `S` — it always is, since it comes from `serde_json::to_vec::<S>`.
-    #[must_use]
-    pub fn encode_snapshot_record_from_blob(
-        metadata_json: &[u8],
-        last_index: u64,
-        last_term: u64,
-        config: &Option<BTreeSet<NodeId>>,
-    ) -> Vec<u8> {
-        use serde_json::value::RawValue;
-
-        // Mirror of `WalRecord::Snapshot`'s fields, with `metadata` as a pre-serialized
-        // `RawValue`. A newtype variant wrapping a struct serializes to the identical
-        // externally-tagged `{"Snapshot":{..}}` form as the struct variant does.
-        #[derive(serde::Serialize)]
-        struct SnapshotFields<'a> {
-            metadata: &'a RawValue,
-            last_index: u64,
-            last_term: u64,
-            config: &'a Option<BTreeSet<NodeId>>,
-        }
-        #[derive(serde::Serialize)]
-        enum SnapshotRecord<'a> {
-            Snapshot(SnapshotFields<'a>),
-        }
-
-        let metadata = RawValue::from_string(
-            String::from_utf8(metadata_json.to_vec()).expect("snapshot blob is UTF-8 JSON"),
-        )
-        .expect("snapshot blob is valid JSON");
-        let record = SnapshotRecord::Snapshot(SnapshotFields {
-            metadata: &metadata,
-            last_index,
-            last_term,
-            config,
-        });
-        let mut bytes = serde_json::to_vec(&record).expect("snapshot record serializes");
-        bytes.push(b'\n');
-        bytes
-    }
-
     /// Decode the WAL bytes back into records, ignoring a trailing partial line
     /// (a write torn by a crash — its effect was never acted on).
     pub fn decode(bytes: &[u8]) -> Vec<WalRecord<C, S>> {
@@ -273,58 +225,6 @@ where
 mod tests {
     use super::*;
     use crate::meta::{MetaCommand, NodeStatus};
-
-    /// The blob-reuse snapshot encoder must produce **byte-identical** output to the
-    /// normal `encode_record(&WalRecord::Snapshot { .. })`, so compaction can reuse
-    /// the cached serialized state (`snapshot_blob`) for the WAL and serialize the
-    /// (large) `Metadata` only once per compaction. This guards against `WalRecord::
-    /// Snapshot` field drift silently corrupting the WAL: if a field is added/renamed/
-    /// reordered, the hand-mirrored encoder diverges and this fails.
-    #[test]
-    fn snapshot_record_blob_reuse_round_trips() {
-        let mut meta = Metadata::default();
-        for i in 0..50u64 {
-            meta.apply(&MetaCommand::UpsertMember {
-                node: nid(i),
-                labels: std::collections::BTreeMap::from([("rack".to_string(), format!("r{i}"))]),
-                status: NodeStatus::Active,
-            });
-        }
-        let last_index = 123u64;
-        let last_term = 7u64;
-        let config: Option<BTreeSet<NodeId>> =
-            Some(BTreeSet::from([0, 1, 2]).into_iter().map(nid).collect());
-
-        // The cached `snapshot_blob` is `serde_json::to_vec(&metadata)`.
-        let blob = serde_json::to_vec(&meta).unwrap();
-
-        let via_reuse = PersistedState::<MetaCommand, Metadata>::encode_snapshot_record_from_blob(
-            &blob, last_index, last_term, &config,
-        );
-        let via_serialize =
-            PersistedState::<MetaCommand, Metadata>::encode_record(&WalRecord::Snapshot {
-                metadata: meta.clone(),
-                last_index,
-                last_term,
-                config: config.clone(),
-            });
-
-        assert_eq!(
-            via_reuse, via_serialize,
-            "blob-reuse snapshot encoding diverged from the serialized WalRecord — \
-             WalRecord::Snapshot fields likely changed; update encode_snapshot_record_from_blob"
-        );
-
-        // And it decodes back to the original state (a real round trip).
-        let replayed =
-            PersistedState::<MetaCommand, Metadata>::replay(
-                PersistedState::<MetaCommand, Metadata>::decode(&via_reuse),
-            );
-        let (state, idx, term) = replayed.snapshot.expect("snapshot present");
-        assert_eq!(state, meta);
-        assert_eq!((idx, term), (last_index, last_term));
-        assert_eq!(replayed.snapshot_config, config);
-    }
 
     // --- tagged / multiplexed WAL (PR1 of the single-command-split redesign) ---
 
