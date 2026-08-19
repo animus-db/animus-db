@@ -601,3 +601,60 @@ redundant whole-table re-ship, not the re-scan. Regression:
 `tests/split_build.rs::split_build_tail_does_not_re_ship_the_bulk_image_
 row_by_row` (a child's own `commit_index` at cutover as the batch-size
 meter — 302 entries for a 600-row split before, ≤64 budget after).
+
+## Amendment (2026-08-19) — investigated and rejected: replacing the
+## version-floor pre-pass with `engine_applied_index()`
+
+The build's three full engine scans (version-floor pre-pass, bulk copy,
+final image, `index_drain.rs::split_driver_tick`) were flagged as a
+measured cost: on a quiet 20,000-row split the pre-pass alone materializes
+every `KIND_BASE`/`KIND_LSI`/`KIND_FOOTPRINT` row purely to compute a
+`u64` (`SplitBuild::bulk_version_floor`). The proposed fix — drop the scan
+and read `group.engine_applied_index()` instead, on the premise that "the
+Raft log index is the MVCC version" (a line that was, at the time, still
+standing in `crates/animusd/CLAUDE.md`) — was investigated and rejected
+**before any code changed**, because that premise is stale: ADR 0018
+§2/PR2 (2026-08-11, well before this ADR) retired the interim
+`version_floor`-scaled Raft-index encoding and made the engine's MVCC
+version a **packed HLC commit timestamp** — `hlc::pack(ts) = (wall_ms <<
+20) | logical`, minted by the proposing leader at *propose* time and
+carried in the `KvCommand` itself (`animus-cp-data/src/hlc.rs`,
+`KvCommand`'s own doc comment). A group's `engine_applied_index()` is a
+Raft log index — a small monotonic entry count — which is not the same
+value space as a row's packed-HLC version at all, so it cannot stand in
+for `bulk_version_floor`:
+
+- **Under any real (`ProdEnv`) workload it under-filters.** `wall_ms` is
+  milliseconds since the `Env` clock's epoch shifted left 20 bits; even a
+  freshly-started cluster's HLC versions dwarf any plausible log index
+  within the first tick. Using the index as the floor would make `ver >
+  floor` true for essentially every real row, so the final image would
+  silently degenerate back into the unfiltered whole-table re-ship rung 8's
+  own fix (above) exists to prevent — no scan saved, and the exact
+  regression this train already paid down.
+  That alone disqualifies it: the substitution costs a known regression
+  and buys nothing.
+
+The first draft of this amendment also claimed the substitution could
+*over-filter* under `SimEnv` (a log index outrunning an early row's small
+`wall_ms`, putting the floor above a genuinely-early version — the "floor
+too high" hazard `bulk_version_floor`'s doc comment names for
+`latest_version()`). **That claim was wrong and is withdrawn:** the split
+driver lives in `animusd`, which has no `animus-sim` dependency and no
+`SimEnv` tier at all (this crate is the `ProdEnv` assembly layer), so the
+driver never runs under a simulated clock. The general rule — a Raft log
+index and a packed-HLC version are different value spaces and neither
+bounds the other — stands on its own; the concrete failure here is
+under-filtering, and one sound reason is enough.
+
+No code changed: the pre-pass scan (`index_drain.rs::split_driver_tick`,
+the `for kind in SEED_KINDS { ... floor = floor.max(ver) ... }` block)
+stays as the sound source of the floor. The stale premise itself was
+corrected in the same change (`crates/animusd/CLAUDE.md`'s "CP writes need
+no client-assigned version" gotcha). The version-floor scan's actual cost
+remains open: a cheaper *sound* substitute — e.g. a per-copy-kind running
+max maintained incrementally by the apply path, so no read-only pass is
+needed at all — is a named follow-up, not attempted here (it changes the
+apply path's bookkeeping, a materially larger and riskier change than a
+drop-in read substitution, and deserves its own fork review rather than
+being folded into a "just read something O(1) instead" task).

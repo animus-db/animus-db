@@ -221,7 +221,14 @@ decisions/resolves are signal-less writes an O(delta) tail misses, and
 apply order == HLC order makes every bulk-missed rewrite out-version the
 floor; deliberately not `latest_version()`, which the read-ceiling marker
 future-shifts; gated on the apply task reaching the freeze-window commit
-floor) → streams final seal
+floor) → streams final seal — **the pre-bulk floor costs its own full
+engine scan and is deliberately NOT `group.engine_applied_index()`, a
+Raft log index that is not the same value space as a row's packed-HLC
+MVCC version** (ADR 0018 §2/PR2; see the "CP writes need no
+client-assigned version" gotcha below and ADR 0050's 2026-08-19
+"investigated and rejected" amendment — that substitution was considered
+for this exact scan and found unsound both directions, not merely
+unoptimized)
 (`seal_now`, no size/age gate) → GSI-drain veto (`"gsi"` cursor ≥ max
 pending record) → backfill veto (`MarkIndexBackfilled` for every
 `Creating` index) → proposes `CutoverSplit` until the parent leaves the
@@ -1334,8 +1341,30 @@ route below the edge through the same `ClientCtx` CP primitives.
   metering `storage_sstable_block_reads` rather than wall clock. Any new
   O(dataset) admin read needs the same question asked of it (ADR 0020's
   2026-08-19 amendment).
-- **CP writes need no client-assigned version** — the Raft log index *is* the MVCC
-  version, so per-key LWW reproduces the agreed order.
+- **CP writes need no client-assigned version — but the MVCC version is a
+  packed HLC commit timestamp, NOT the Raft log index (stale text corrected
+  2026-08-19).** ADR 0018 §2/PR2 (2026-08-11) retired the interim
+  `version_floor`-scaled Raft-index scheme; every mutating `KvCommand`
+  carries a leader-minted `ts: HlcTimestamp`, and the engine version at apply
+  is `hlc::pack(ts) = (wall_ms << 20) | logical` (`animus-cp-data`'s
+  `hlc.rs`, `KvCommand`'s own doc comment). Per-key LWW still reproduces the
+  agreed order — commit order and HLC order coincide within one group
+  (`assert_ts_monotonic`) — but **a group's `engine_applied_index()` (a Raft
+  log index: single/low-thousands under any real workload) is not
+  comparable to a row's packed-HLC version (wall-clock milliseconds shifted
+  left 20 bits: astronomically larger) — never substitute one for the
+  other as a version floor/ceiling.** Caught investigating the split
+  driver's `bulk_version_floor` pre-pass (`index_drain.rs`): the tempting
+  "skip the version-floor scan, read `engine_applied_index()` instead"
+  optimization is unsound both ways — using a log index as the floor
+  systematically under-filters (every real row's HLC version dwarfs any
+  plausible index, so the final image would degenerate back into the
+  unfiltered whole-table re-ship rung 8 fixed) — a known regression bought
+  for no saved scan. The two are simply different value spaces and neither
+  bounds the other, which is the rule to remember; note this driver runs
+  only over `ProdEnv` (`animusd` has no `animus-sim` dependency), so
+  simulated-clock reasoning does not apply to it either way. No code
+  changed; the pre-pass scan stays.
 - Several gotchas here are instances of cross-cutting lessons — port-TOCTOU
   bring-up retries (`support::restart_same_addrs`), "a flaky `ProdEnv` test is a
   real bug", restart-test discipline (poll for catch-up, not leadership),
