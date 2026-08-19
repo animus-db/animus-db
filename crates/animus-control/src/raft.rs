@@ -478,6 +478,34 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // and a later PR only needs to *set* this via `set_quiesce_veto`, not
     // restructure the predicate.
     quiesce_veto: bool,
+    // Freshness stamp for `quiesce_veto` (issue #302 fix): the log index an
+    // external veto holder's *observation* of its own obligation state is
+    // valid through, in the SAME index space as `commit_index`/
+    // `last_applied` (for the `DRIVER_APPLIED` KV state machine these are
+    // literally the engine's own applied-index counter — see
+    // `RaftKvNode::engine_applied_index`'s doc). `set_quiesce_veto` is fed
+    // once per driver-loop iteration, but its *content* can lag: an
+    // external sweeper (`animusd`'s `change_consumer_loop`) only re-examines
+    // a tablet's own obligation state (e.g. its change log) once every
+    // `INDEX_DRAIN_INTERVAL`, not every driver iteration, so a `false` veto
+    // can describe a state that a write committed *after* the sweep has
+    // since falsified. `quiesce_entry_ok` additionally requires
+    // `quiesce_veto_fresh_through >= commit_index` — i.e. no entry has
+    // committed since the last real observation — closing that staleness
+    // window exactly rather than by a timing margin. Defaults `u64::MAX`
+    // (deliberately, not `0`): a subsystem that never calls
+    // `set_quiesce_veto` for a given tablet at all (e.g. a `Building` split
+    // child, which structurally can never accumulate a change-log
+    // obligation — see `index_drain.rs`'s own doc) must behave exactly as
+    // before this fix: no freshness requirement, matching the pre-fix
+    // always-`false`/always-fine veto for that class of tablet. Only a
+    // caller that has *actually* set the veto at least once narrows this
+    // below `u64::MAX`, and only real per-tablet log-index values ever flow
+    // through — this sentinel is never observed as "current" by a tablet an
+    // external sweeper is genuinely responsible for, as long as that
+    // sweeper's own cadence is no slower than `quiesce_after` (see
+    // `animusd`'s `--quiesce-after` validation).
+    quiesce_veto_fresh_through: u64,
 }
 
 impl<C, S> RaftCore<C, S>
@@ -536,6 +564,7 @@ where
             last_activity: now,
             quiesce_engine_caught_up: true,
             quiesce_veto: false,
+            quiesce_veto_fresh_through: u64::MAX,
         };
         core.reset_election_timer(now, entropy);
         core
@@ -2097,8 +2126,11 @@ where
     /// - the two external inputs a `DRIVER_APPLIED` driver feeds in once per
     ///   loop iteration: the apply task has caught the engine up
     ///   (`quiesce_engine_caught_up`), and no subsystem holds the quiesce veto
-    ///   (`quiesce_veto`, fork D — always `false` in this PR; a later PR wires
-    ///   a real veto holder without needing to touch this predicate's shape).
+    ///   (`quiesce_veto`, fork D), **freshly enough**
+    ///   (`quiesce_veto_fresh_through >= commit_index`, issue #302 — see that
+    ///   field's own doc for why a bare boolean isn't sound on its own: an
+    ///   external veto holder's observation can predate a write that
+    ///   committed after it last looked).
     fn quiesce_entry_ok(&self, now: Nanos) -> bool {
         let Some(quiesce_after) = self.quiesce_after else {
             return false;
@@ -2121,6 +2153,7 @@ where
             && !self.snapshot_needed
             && self.quiesce_engine_caught_up
             && !self.quiesce_veto
+            && self.quiesce_veto_fresh_through >= self.commit_index
     }
 
     /// Broadcast [`RaftMsg::Quiesce`] once to every voter — the leader-side
@@ -2243,13 +2276,21 @@ where
         self.quiesce_engine_caught_up = caught_up;
     }
 
-    /// External input (ADR 0044 phase-1 PR3, fork D): whether some subsystem
-    /// currently holds the quiesce veto. Always `false` in this PR — no
-    /// caller sets it yet (a later PR wires a real veto holder, e.g. the txn
-    /// tracker or the change-log sweeper, without needing to restructure
-    /// `quiesce_entry_ok`).
-    pub fn set_quiesce_veto(&mut self, veto: bool) {
+    /// External input (ADR 0044 phase-1 PR3, fork D; freshness added by the
+    /// issue #302 fix): whether some subsystem currently holds the quiesce
+    /// veto, and the log index its observation is valid through — see
+    /// `quiesce_veto_fresh_through`'s own doc for the freshness contract a
+    /// caller must uphold (in short: read your own "as of" index BEFORE
+    /// making the observation that decides `veto`, never after, or a
+    /// concurrent apply can make the recorded freshness a false promise).
+    /// `fresh_through` only matters when `veto` is `false`, since `veto ==
+    /// true` already blocks `quiesce_entry_ok` outright; a caller with no
+    /// natural index to report (e.g. an in-core, always-synchronous veto
+    /// source that never goes stale between calls) may simply pass
+    /// `u64::MAX`.
+    pub fn set_quiesce_veto(&mut self, veto: bool, fresh_through: u64) {
         self.quiesce_veto = veto;
+        self.quiesce_veto_fresh_through = fresh_through;
     }
 
     /// Un-quiesce trigger for a local mutating action that has no `now` of its

@@ -231,7 +231,26 @@ use crate::{ClientCtx, CpGroup, IndexStatus, MetaCommand};
 /// How often each node sweeps the tablet groups it leads for pending change
 /// records. A plain fixed interval, matching `txn_resolver_loop`'s own shape —
 /// this is background convergence work, not a latency-sensitive path.
-const INDEX_DRAIN_INTERVAL: Duration = Duration::from_millis(200);
+///
+/// **Also a quiescence correctness floor (issue #302 fix), not just a
+/// latency knob.** `RaftCore::quiesce_entry_ok`'s freshness clause only
+/// blocks a *stale* observation — it does nothing for a tablet that has
+/// never been observed at all (see `RaftCore::quiesce_veto_fresh_through`'s
+/// doc for why that sentinel must default to "no constraint"). The
+/// remaining soundness argument is structural, not observational: this loop
+/// is a single, continuously-running `loop { sleep(INDEX_DRAIN_INTERVAL);
+/// for tablet in hosted { .. } }`, so any tablet present in `hosted_groups()`
+/// gets its first real observation within one `INDEX_DRAIN_INTERVAL` of
+/// becoming eligible — regardless of when the tablet itself was created,
+/// since the loop's own period is what bounds the wait, not the tablet's
+/// age. `quiesce_entry_ok`'s pre-existing idle-clock clause already can't
+/// fire before `quiesce_after` has elapsed since the group's own last
+/// activity, so as long as `quiesce_after >= INDEX_DRAIN_INTERVAL`
+/// (`animusd::MIN_QUIESCE_AFTER`, validated on `--quiesce-after`), at least
+/// one real sweep is *guaranteed* to have landed before quiescing is even
+/// attempted — closing the "never yet swept" gap the freshness clause
+/// alone leaves open, by construction rather than by margin.
+pub(crate) const INDEX_DRAIN_INTERVAL: Duration = Duration::from_millis(200);
 
 /// The consumer tag the GSI drain's own reconcile cursor writes (ADR 0042
 /// §7/§8) — the only cursor tag left as of round 3 (the stream half of the
@@ -349,6 +368,19 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             if !group.is_leader() {
                 continue;
             }
+            // ADR 0048/issue #302 fix: a lower bound on the engine-applied
+            // index every veto observation below is valid through. Read
+            // ONCE, here, before any of this tick's async engine
+            // reads/scans for this tablet — `engine_applied_index()` only
+            // ever advances, so an earlier read stays a safe (if slightly
+            // conservative) lower bound for everything read afterward this
+            // same tick, and every `set_quiesce_veto` call below reuses it
+            // so they stay mutually consistent. Reading it *after* a scan
+            // instead would be unsound: a write that commits and applies
+            // between the scan and that later read would be silently
+            // absent from the scan yet counted as "observed" — see
+            // `RaftKvNode::set_quiesce_veto`'s doc for the full contract.
+            let veto_fresh_through = group.engine_applied_index();
             // ADR 0050 Train B rung 4: the split-build driver arm. Runs for
             // a `Splitting` parent this node leads, BEFORE the quiesced
             // skip — a parent that quiesced idle before `BeginSplit`
@@ -365,7 +397,7 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
                 .is_some_and(|t| t.state == TabletState::Splitting);
             if splitting {
                 group.wake();
-                group.set_quiesce_veto(true);
+                group.set_quiesce_veto(true, veto_fresh_through);
                 let build = split_builds.entry(tablet).or_default();
                 if let Err(e) = split_driver_tick(&ctx, &meta, tablet, &group, build).await {
                     tracing::debug!(tablet = tablet.0, error = %e, "split build: tick failed");
@@ -497,7 +529,7 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
                 }
                 let bytes = group.approx_bytes_kind(KIND_CHANGE).await;
                 if bytes == 0 {
-                    group.set_quiesce_veto(false);
+                    group.set_quiesce_veto(false, veto_fresh_through);
                     marker_bytes_seen.remove(&tablet);
                     continue;
                 }
@@ -506,11 +538,11 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
                     // Actively written, still small: markers exist, so the
                     // veto holds; the trim waits for a quiet tick (or the
                     // floor) so it never contends with the live writes.
-                    group.set_quiesce_veto(true);
+                    group.set_quiesce_veto(true, veto_fresh_through);
                     continue;
                 }
                 let pending = !group.pending_changes().await.is_empty();
-                group.set_quiesce_veto(pending);
+                group.set_quiesce_veto(pending, veto_fresh_through);
                 if !pending {
                     continue;
                 }
@@ -534,7 +566,7 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             let hot_backlog_present = !group.pending_changes().await.is_empty();
             // `|| splitting`: the split driver's own hold (above) must not be
             // released by an empty-backlog sweep mid-build.
-            group.set_quiesce_veto(hot_backlog_present || splitting);
+            group.set_quiesce_veto(hot_backlog_present || splitting, veto_fresh_through);
             // `drain_tablet` is GSI-specific (it reconciles GSI rows and
             // advances the `"gsi"` cursor) — never call it for a
             // streamed-but-unindexed table, or it would write a spurious

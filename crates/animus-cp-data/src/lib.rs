@@ -1400,6 +1400,18 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// Defaults `false` — zero behavior change for every caller that never
     /// touches it.
     external_quiesce_veto: Arc<AtomicBool>,
+    /// Freshness stamp for `external_quiesce_veto` (issue #302 fix): the
+    /// value of [`engine_applied_index`](Self::engine_applied_index) the
+    /// external caller's own observation is valid through — see
+    /// [`set_quiesce_veto`](Self::set_quiesce_veto)'s doc for the contract.
+    /// Fed to [`RaftCore::set_quiesce_veto`] alongside the bool, once per
+    /// consensus-loop iteration, so `quiesce_entry_ok` can reject a `false`
+    /// veto that describes engine content older than what's since
+    /// committed. Defaults `u64::MAX` — matches `RaftCore`'s own
+    /// never-engaged sentinel, so a caller that never calls
+    /// `set_quiesce_veto` for this group imposes no freshness requirement
+    /// at all (identical to pre-fix behavior).
+    external_quiesce_veto_fresh_through: Arc<AtomicU64>,
 }
 
 impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
@@ -1534,6 +1546,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // ordering.
         let txn_tracker = Arc::new(Mutex::new(TxnTracker::default()));
         let external_quiesce_veto = Arc::new(AtomicBool::new(false));
+        // See the field's own doc: `u64::MAX` is the "never engaged" sentinel,
+        // not `0` — a caller that never calls `set_quiesce_veto` for this
+        // group must impose no freshness requirement at all.
+        let external_quiesce_veto_fresh_through = Arc::new(AtomicU64::new(u64::MAX));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -1561,6 +1577,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             last_absorbed_term,
             txn_tracker: Arc::clone(&txn_tracker),
             external_quiesce_veto: Arc::clone(&external_quiesce_veto),
+            external_quiesce_veto_fresh_through: Arc::clone(&external_quiesce_veto_fresh_through),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -1591,6 +1608,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             frozen,
             txn_tracker,
             external_quiesce_veto,
+            external_quiesce_veto_fresh_through,
         }));
         node
     }
@@ -1666,8 +1684,28 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// part) inside the consensus loop, once per iteration — see that
     /// loop's own doc. Idempotent, safe to call every tick regardless of
     /// current state.
-    pub fn set_quiesce_veto(&self, held: bool) {
+    ///
+    /// **`fresh_through` (issue #302 fix) is a freshness contract, not an
+    /// optional annotation.** It must be [`engine_applied_index`](Self::
+    /// engine_applied_index) read by the caller **before** whatever
+    /// observation decided `held` (e.g. before scanning
+    /// [`pending_changes`](Self::pending_changes)) — never after, and never
+    /// the result of the scan itself. Reading it first gives a valid
+    /// *lower* bound: a concurrent apply between the read and the scan can
+    /// only make the true state fresher than what's recorded, never make a
+    /// stale observation look fresher than it was. Reading it *after* the
+    /// scan is unsound — a write that commits and applies in that window
+    /// would be silently missing from the scan yet still counted as
+    /// "observed," reopening exactly the staleness race this parameter
+    /// exists to close (see `RaftCore::quiesce_veto_fresh_through`'s own
+    /// doc for the full invariant). A caller with no natural index to
+    /// report may pass [`engine_applied_index`](Self::engine_applied_index)
+    /// itself (i.e. "as of right now") if it has just performed a
+    /// synchronous, uninterrupted check with no `.await` in between.
+    pub fn set_quiesce_veto(&self, held: bool, fresh_through: u64) {
         self.external_quiesce_veto.store(held, Ordering::SeqCst);
+        self.external_quiesce_veto_fresh_through
+            .store(fresh_through, Ordering::SeqCst);
     }
 
     /// Whether [`shutdown`](Self::shutdown) has been requested.
@@ -6456,6 +6494,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     frozen: Arc<AtomicBool>,
     txn_tracker: Arc<Mutex<TxnTracker>>,
     external_quiesce_veto: Arc<AtomicBool>,
+    external_quiesce_veto_fresh_through: Arc<AtomicU64>,
 }
 
 /// One split-build seed row (ADR 0050 Train B rung 4): `(kind index into
@@ -6553,6 +6592,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         frozen,
         txn_tracker,
         external_quiesce_veto,
+        external_quiesce_veto_fresh_through,
     } = st;
 
     let wal = wal_file(stream);
@@ -6738,8 +6778,19 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                 let t = txn_tracker.lock().expect("txn tracker poisoned");
                 !t.pending.is_empty() || !t.unresolved_decided.is_empty()
             };
+            // Freshness (issue #302 fix): `txn_veto`/`persist_veto` are both
+            // computed synchronously right here from always-current
+            // in-memory state, so they need no freshness bound of their
+            // own — only the external sweeper's own observation
+            // (`external_quiesce_veto`, refreshed on its own ~200ms cadence
+            // by `animusd`'s `change_consumer_loop`, not this loop's) can be
+            // stale. `RaftCore::quiesce_entry_ok` only consults this value
+            // when the OR'd veto is false, at which point it is exactly the
+            // bound that matters: "as of what index did the last real
+            // observation of this tablet's own obligation state land."
             c.set_quiesce_veto(
                 txn_veto || persist_veto || external_quiesce_veto.load(Ordering::SeqCst),
+                external_quiesce_veto_fresh_through.load(Ordering::SeqCst),
             );
             (c.next_deadline(), c.is_quiesced())
         };

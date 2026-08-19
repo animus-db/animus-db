@@ -232,13 +232,87 @@ fn quiesce_entry_blocked_by_a_held_veto() {
     let mut core = elect_leader();
     ack_all(&mut core, nid(1));
     ack_all(&mut core, nid(2));
-    core.set_quiesce_veto(true);
+    core.set_quiesce_veto(true, u64::MAX);
     core.enable_quiescence(Duration::from_millis(1));
 
     let outs = tick_past_heartbeat(&mut core, NOW);
     assert!(
         !core.is_quiesced(),
         "a held veto (fork D) must block quiescence entry"
+    );
+    assert!(!outs.is_empty());
+}
+
+/// Issue #302 regression: the exact shape of the stale-veto race. An
+/// external veto holder (in production, `animusd`'s `change_consumer_loop`)
+/// observes this tablet's own obligation state and reports "nothing owed" —
+/// but as of an index a write has since moved past. A bare boolean can't
+/// tell that observation apart from a genuinely fresh one; this pins the
+/// freshness clause that does. Fails (wrongly quiesces) against the
+/// pre-fix `quiesce_entry_ok`, which had no freshness clause at all — see
+/// this crate's own delivery notes for the stash/restore proof.
+#[test]
+fn quiesce_entry_blocked_by_a_stale_veto_freshness() {
+    let mut core = elect_leader();
+    ack_all(&mut core, nid(1));
+    ack_all(&mut core, nid(2));
+    // The external sweeper's own "as of" index right now — the election
+    // no-op alone, nothing else committed yet.
+    let stale_fresh_through = core.commit_index();
+
+    // A write lands and commits — the very obligation a stale veto would
+    // miss (a change-log record, in production; here just any command).
+    let ProposeResult::Accepted { .. } = core.propose(MetaCommand::NoOp) else {
+        panic!("propose should be accepted");
+    };
+    ack_all(&mut core, nid(1));
+    ack_all(&mut core, nid(2));
+    assert!(
+        core.commit_index() > stale_fresh_through,
+        "the new write must have advanced commit past the sweep's own index"
+    );
+
+    // The external veto reports "nothing owed", but as of the STALE index —
+    // exactly what a sweep that ran before this write committed would
+    // report, with no further sweep before quiescence would otherwise fire.
+    core.set_quiesce_veto(false, stale_fresh_through);
+    core.enable_quiescence(Duration::from_millis(1));
+
+    let outs = tick_past_heartbeat(&mut core, NOW);
+    assert!(
+        !core.is_quiesced(),
+        "a veto observation that predates a since-committed write must \
+         block quiescence entry, even though the veto's own boolean reads \
+         false"
+    );
+    assert!(!outs.is_empty());
+}
+
+/// The dual of the test above: once a sweep genuinely re-observes this
+/// tablet at (or after) the latest committed index, the group quiesces
+/// normally. The freshness clause closes a real staleness window — it does
+/// not turn the veto into a second permanent block.
+#[test]
+fn quiesce_entry_succeeds_once_the_veto_freshness_catches_up() {
+    let mut core = elect_leader();
+    ack_all(&mut core, nid(1));
+    ack_all(&mut core, nid(2));
+    let ProposeResult::Accepted { .. } = core.propose(MetaCommand::NoOp) else {
+        panic!("propose should be accepted");
+    };
+    ack_all(&mut core, nid(1));
+    ack_all(&mut core, nid(2));
+
+    // A fresh sweep, run AFTER the write committed: reports "nothing owed"
+    // as of the current (post-write) commit index.
+    core.set_quiesce_veto(false, core.commit_index());
+    core.enable_quiescence(Duration::from_millis(1));
+
+    let outs = tick_past_heartbeat(&mut core, NOW);
+    assert!(
+        core.is_quiesced(),
+        "a veto observation as fresh as the current commit index must not \
+         block quiescence"
     );
     assert!(!outs.is_empty());
 }
