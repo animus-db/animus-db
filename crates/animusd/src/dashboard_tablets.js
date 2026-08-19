@@ -1,9 +1,16 @@
 "use strict";
 // The Tablets view: a filterable list (by table, by derived status) with
-// replica-role dots, current leader, exact live key count and byte size (ADR
-// 0034 — each with its own over-auto-split-threshold indicator, since either
-// `--auto-split K` or `--auto-split-bytes B` independently fires a split), and
-// status. Clicking a row opens a right-side detail panel: raft group members
+// replica-role dots, current leader, ESTIMATED live key count and byte size
+// (ADR 0034 — each with its own over-auto-split-threshold indicator, since
+// either `--auto-split K` or `--auto-split-bytes B` independently fires a
+// split), and status. The counts are estimates on purpose: this view polls
+// every node's `/admin/raftkv` on the auto-refresh interval, and the exact
+// count materializes every hosted tablet's rows per request — an observer
+// that measurably slows what it observes (it inflated a 20,000-row split's
+// build ~9x). They are the very counters auto-split gates on, so a pill here
+// agrees with the trigger that will fire; `/admin/raftkv?exact=1` is the
+// deliberate one-off precise answer. `Keys` is blank on the memory backend,
+// which has no cheap counter. Clicking a row opens a right-side detail panel: raft group members
 // (from data already fetched) plus storage-engine stats fetched on demand
 // from a single node (/admin/storage/lsm) only for the selected tablet's
 // leader — not for every row. No election-history section: this codebase
@@ -94,7 +101,7 @@ function renderTablets() {
     </tr>`;
   }).join("");
   $("tb-body").innerHTML = bodyRows ? `<table>
-    <thead><tr><th>Tablet</th><th>Table</th><th>Keys</th><th>Size</th><th>Leader</th><th>Replicas</th><th>Status</th></tr></thead>
+    <thead><tr><th>Tablet</th><th>Table</th><th title="Estimate \u2014 the same cheap counter --auto-split gates on. Exact: /admin/raftkv?exact=1">Keys ~</th><th title="Estimate, base-scoped (ADR 0034) \u2014 the same counter --auto-split-bytes gates on. Exact: /admin/raftkv?exact=1">Size ~</th><th>Leader</th><th>Replicas</th><th>Status</th></tr></thead>
     <tbody>${bodyRows}</tbody></table>` : `<div class="empty">no tablets match this filter</div>`;
 
   document.querySelectorAll("#tb-body tr[data-id]").forEach((tr) =>

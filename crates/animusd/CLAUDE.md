@@ -1307,6 +1307,23 @@ route below the edge through the same `ClientCtx` CP primitives.
   `/admin/raftkv`'s `CpRaftView::node` carries the real hosting node id because the
   dashboard merges every node's response; the answering server isn't a reliable
   attribution once combined.
+- **`/admin/raftkv` is POLLED, so its default must not materialize
+  (2026-08-19).** The Console fetches it from every node on its auto-refresh
+  interval (5s default), so `key_count`/`byte_size` are the cheap
+  `CpGroup::approx_key_count`/`approx_bytes` estimates — the very counters
+  `auto_split_loop` gates on, so the Tablets view's over-threshold pills
+  agree with the trigger that will fire. `?exact=1` selects the old
+  materializing `local_pairs` path for one deliberate look. It used to
+  materialize unconditionally: on a 20,000-row table mid-split, polling the
+  route every 3s inflated the split's own build ~9x (41.8s vs 4.5s) — an
+  observer that perturbs what it observes. `key_count` is `None` on the
+  memory backend (no cheap counter) and `approx_bytes` is base-scoped (ADR
+  0034) where the exact sum spans every kind — both documented on
+  `CpRaftView`'s fields. Regression:
+  `tests/admin_endpoint.rs::admin_raftkv_default_does_not_materialize_the_dataset`,
+  metering `storage_sstable_block_reads` rather than wall clock. Any new
+  O(dataset) admin read needs the same question asked of it (ADR 0020's
+  2026-08-19 amendment).
 - **CP writes need no client-assigned version** — the Raft log index *is* the MVCC
   version, so per-key LWW reproduces the agreed order.
 - Several gotchas here are instances of cross-cutting lessons — port-TOCTOU
