@@ -88,6 +88,10 @@
 //! growth-combination wrapper to receive it yet); passed to the standalone
 //! `control`/`data`/`join` subcommands it is rejected outright as an unknown
 //! argument (each parses its own flag set independently of `run`'s).
+//! **A nonzero value below `animusd::MIN_QUIESCE_AFTER` (200ms, the
+//! change-consumer sweep interval — issue #302 fix) is rejected at parse
+//! time**, since it can reopen the stale-veto quiescence race the fix
+//! closes; see that constant's own doc.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -313,6 +317,18 @@ async fn run(args: &[String]) -> Result<(), String> {
         stream_retention_secs.map_or(animusd::DEFAULT_STREAM_RETENTION, Duration::from_secs);
     let segment_store_config = parse_segment_store(segment_store.as_deref())?;
     let quiesce_after = quiesce_after_duration(quiesce_after);
+    // See `animusd::MIN_QUIESCE_AFTER`'s own doc (issue #302 fix): a nonzero
+    // `--quiesce-after` shorter than `change_consumer_loop`'s own sweep
+    // interval can reopen the stale-veto quiescence race the fix closes.
+    // `0` (disable quiescence entirely) is exempt.
+    if !quiesce_after.is_zero() && quiesce_after < animusd::MIN_QUIESCE_AFTER {
+        return Err(format!(
+            "--quiesce-after must be at least {} ms (animusd's change-consumer \
+             sweep interval) or 0 to disable quiescence entirely; got {} ms",
+            animusd::MIN_QUIESCE_AFTER.as_millis(),
+            quiesce_after.as_millis()
+        ));
+    }
 
     if cluster_control.is_some() || cluster_data.is_some() {
         if config_path.is_some() || cluster.is_some() {

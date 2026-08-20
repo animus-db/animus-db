@@ -437,11 +437,14 @@ impl CpGroup {
     }
 
     /// ADR 0044 phase-1 PR5, fork D: hold or release this group's external
-    /// quiesce veto. See [`RaftKvNode::set_quiesce_veto`].
-    fn set_quiesce_veto(&self, held: bool) {
+    /// quiesce veto. `fresh_through` is a freshness contract (issue #302
+    /// fix) — see [`RaftKvNode::set_quiesce_veto`]'s doc before passing
+    /// anything other than an `engine_applied_index()` read strictly
+    /// *before* the observation that decided `held`.
+    fn set_quiesce_veto(&self, held: bool, fresh_through: u64) {
         match self {
-            CpGroup::Lsm(n) => n.set_quiesce_veto(held),
-            CpGroup::Mem(n) => n.set_quiesce_veto(held),
+            CpGroup::Lsm(n) => n.set_quiesce_veto(held, fresh_through),
+            CpGroup::Mem(n) => n.set_quiesce_veto(held, fresh_through),
         }
     }
 
@@ -2922,6 +2925,16 @@ impl BoundNode {
         // `Duration::ZERO` (every existing call site) disables it entirely —
         // zero behavior change. Data-plane groups only (fork G).
         if !quiesce_after.is_zero() {
+            // See `MIN_QUIESCE_AFTER`'s own doc for the full argument. The
+            // CLI's own parser is the primary enforcement (a release build
+            // still refuses a misconfigured `--quiesce-after`); this is the
+            // second-layer belt for any other caller reaching this method.
+            debug_assert!(
+                quiesce_after >= MIN_QUIESCE_AFTER,
+                "quiesce_after ({quiesce_after:?}) must be at least \
+                 MIN_QUIESCE_AFTER ({MIN_QUIESCE_AFTER:?}) or 0 to disable \
+                 quiescence — see that constant's own doc"
+            );
             reconciler.enable_quiescence(quiesce_after);
         }
 
@@ -4504,6 +4517,24 @@ impl Default for StreamSealKnobs {
 /// default; a test constructs a tiny value directly (this codebase's house
 /// testing discipline — see [`StreamSealKnobs::default`]'s own precedent).
 pub const DEFAULT_STREAM_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// **The `--quiesce-after` correctness floor (issue #302 fix).** A nonzero
+/// `quiesce_after` shorter than this can reintroduce the stale-veto race the
+/// fix closes: `RaftCore::quiesce_entry_ok`'s freshness clause only rejects
+/// an observation that's gone stale *since it was made* — it has no teeth
+/// against a tablet `change_consumer_loop` has never observed at all (see
+/// that field's own doc for why the "never engaged" sentinel must impose no
+/// constraint). The remaining soundness argument is structural: the loop's
+/// own period bounds how long a hosted tablet can go unobserved, so as long
+/// as `quiesce_after` gives it at least one full period of headroom before
+/// the group's *own* idle-clock clause could first fire, at least one real
+/// sweep is guaranteed to have landed first. `0` (disabling quiescence
+/// entirely) is exempt — this floor only constrains a genuinely-enabled
+/// value. `main`'s CLI parsing rejects a smaller `--quiesce-after` outright;
+/// `Node::start_with_growth` `debug_assert`s it too, as a second layer for
+/// any caller that reaches `enable_quiescence` without going through the
+/// CLI (a test, or a future embedder).
+pub const MIN_QUIESCE_AFTER: Duration = index_drain::INDEX_DRAIN_INTERVAL;
 
 /// This node's stream-shard [`SegmentStore`](animus_env::SegmentStore) handle
 /// (ADR 0043 §A7b) — either the **default**

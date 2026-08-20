@@ -1010,6 +1010,22 @@ debugging anything that feels like it might have happened before.
   the mutating call there, rather than snapshotting a target once. See
   `crates/animusd/tests/control_membership_admin.rs::
   remove_control_voter_refusals_transfer_and_quorum_warnings`.
+  **This exact anti-pattern reappeared** in a newer sibling in the same file
+  (`runtime_added_voter_survives_leadership_change_to_a_different_original_voter`,
+  ADR 0037 PR4), and flaked CI on `main` — failing *both* attempts of the
+  retried `prod-liveness` tier. It regressed to the one-shot shape because the
+  transfer was only *scaffolding* for that test's real subject (address
+  propagation after a runtime-added voter), not the property under test: when a
+  test forces a leadership transfer merely as setup, it still needs the
+  poll-and-retry-the-mutating-call shape above, or the scaffolding becomes the
+  flake. What makes the one-shot call unsafe is invisible from the call site —
+  `RaftCore::transfer_leadership` arms a deadline of one *raw, un-randomized*
+  `election_base` (150ms, not the `[base, 2*base)` range followers draw from),
+  `tick()` clears it silently with no log or metric, and the admin action's own
+  5s poll never re-arms, so a dropped transfer and an in-flight one are
+  indistinguishable to the caller (both surface as HTTP 409). Those two
+  product-side gaps are tracked in #313.
+  (`crates/animusd/tests/control_membership_admin.rs`, 2026-08-20.)
 - **A failure-detector/liveness accessor keyed to one id space (raftkv ids)
   will silently return a wrong-but-plausible answer if called with an id
   from a *different* id space (control ids) — it never panics, it just lies.**
@@ -2699,6 +2715,73 @@ debugging anything that feels like it might have happened before.
   "a flaky `ProdEnv` integration test is a real bug" rule.
   (`.github/workflows/ci.yml`, `crates/{animus-control,animus-cp-data,
   animus-storage,animus-consensus}/Cargo.toml`.)
+- **A streams test that bursts several writes and then reads only
+  `DescribeStream`'s `shards[0]` is asserting on a seal-timing coincidence, not
+  on exactly-once delivery.** The age-trigger seal arm sweeps on the hard-coded
+  200ms `INDEX_DRAIN_INTERVAL` tick, so a test whose `seal_age` is only a small
+  multiple of that (300ms) can have its burst straddle a tick under real
+  WAL-fsync-bound write latency and correctly produce *two* shards — a closed
+  one plus an open tail holding the last write(s). Reading only the first then
+  reports "must see every record exactly once" failing, which reads exactly
+  like a product exactly-once bug but is the product behaving correctly (the
+  missing record is always the *last-written* one — that signature is the
+  tell). Walk the whole chain `DescribeStream` returns, including the trailing
+  open shard, as `get_records_walks_the_shard_chain_and_drains_the_open_tail`
+  already did. Do **not** "fix" it by enlarging `seal_age` or asserting a shard
+  count: both only shrink the window, and the shard count is legitimate
+  timing-dependent product behavior a test must not fight. Confirmed by walking
+  the full chain and recovering every record, proving nothing was lost.
+  (`crates/animusd/tests/dynamo_streams.rs`, issue-less flake off `main`,
+  2026-08-20.)
+- **A guard of the shape `if !still_exists(x) { skip }` placed immediately
+  before unbounded-latency async I/O against `x` is a probability reducer, not
+  a safety check** — the object can change state in the gap, and where the
+  callee already re-validates itself fresh on every call (the right design),
+  the caller's pre-check is an optimization only. The caller must still treat
+  the callee's own authoritative "no longer valid" answer as an *expected
+  outcome*, not a fatal one. A streams-lineage walker computed the next shard
+  id client-side from a locally-cached `Metadata` snapshot, checked
+  `tablets.contains_key`, then made two async round trips before `GetRecords`
+  landed; a split cutover retiring the tablet in that gap made the
+  speculatively-guessed epoch one that never existed, so the server's 400
+  `TrimmedDataAccessException` was the *correct* answer and the test panicked
+  on it. Note the scoping rule that came with the fix: handle such an expected
+  terminal error **at the one call site that can legitimately provoke it**,
+  never by widening a shared retry/allowlist helper — the same status on a
+  transactional-write path still means a real bug. (#299,
+  `crates/animusd/tests/streams_e2e.rs`, 2026-08-20.)
+- **"Green locally under `yes`-loop contention" does not refute a hosted-runner
+  flake — the two starvations are different in *shape*, not just degree.**
+  Across four independent investigations into CI flakes, ~340 local executions
+  under heavy synthetic load (CPU burners, 2-core `taskset` pinning, parallel
+  same-binary runs) reproduced almost none of them. Raw thread oversubscription
+  on a multi-core box is round-robined fairly by CFS and mostly yields *slower
+  average* scheduling; a GitHub-hosted 2-vCPU runner throttles via cgroup
+  CPU-bandwidth quota, which produces hard periodic full-stop stalls once the
+  quota is exhausted. Races needing a single >100ms stall of one specific task
+  surface readily under the latter and rarely under the former. Practical
+  consequences: (a) do not treat "N clean local runs" as evidence a CI flake is
+  fixed — say what it does and does not show; (b) prefer a cgroup-quota-
+  throttled repro (`systemd-run --scope -p CPUQuota=…`, or a manual cgroup v2
+  write) over busy-loops when trying to reproduce one; (c) a `yes`-loop repro
+  campaign will happily trip *different* real bugs than the one under
+  investigation — verify the failure signature matches before counting it as
+  evidence. (2026-08-20.)
+- **An intermittent deficit that resists root-causing should get a permanent
+  on-failure diagnostic landed as its own commit, *before* any fix attempt.**
+  Weakening or retrying the assertion would destroy the evidence; a speculative
+  fix would be unfalsifiable. Land instead a dump that fires only on the
+  failure path and captures whatever distinguishes the competing hypotheses —
+  for a streams exactly-once deficit that is the missing ids, the shard each
+  delivered record arrived under, live vs retired tablets, and **the per-tablet
+  closed-chain length**. That last datum had already, once, redirected an
+  investigation out of the wrong subsystem entirely (the seal/`Freeze` path)
+  toward the right one (the open, never-sealed tail) — and it was recorded only
+  in a *comment* on a predecessor issue, not in the issue body that inherited
+  the investigation. Corollary: when an issue cites a prior issue or comment as
+  its evidentiary basis, fetch that comment; an issue body is not a complete
+  transcript of its own history. (#298,
+  `crates/animusd/tests/streams_e2e.rs`, 2026-08-20.)
 
 ### Code patterns
 - **A "claim now, confirm later" state machine needs a release on *every*
@@ -6911,6 +6994,53 @@ debugging anything that feels like it might have happened before.
   client-assigned version" entry) and recorded the rejected optimization
   (ADR 0050's 2026-08-19 "investigated and rejected" amendment) so it
   isn't re-attempted on the same false premise.
+- **A cross-task veto fed by a periodic sweep needs a freshness contract
+  expressed in the same value space the consumer already gates on — a
+  wall-clock stamp compared against an activity marker is not equivalent, even
+  when the arithmetic looks right.** `RaftCore`'s quiesce veto (ADR 0048 fork
+  D) was a bare `AtomicBool` refreshed by `animusd`'s 200ms
+  `change_consumer_loop`; a write landing between one sweep's observation and
+  the next left a stale `false` in place, and `RaftCore` had no way to know it,
+  so an idle-looking group could quiesce while still owing stream work. Two
+  traps sat in the obvious fixes. First, the natural stamp — record the sweep's
+  `Nanos`, require it `>= last_activity` — is **unsound**, because
+  `last_activity` is bumped at *propose* time while the sweep observes *applied
+  engine content*: a sweep racing that gap passes the check while describing
+  pre-write state. The sound version indexes the observation in the checker's
+  own coordinate space (`engine_applied_index()` compared against
+  `commit_index`). Second, a valid lower bound requires reading that index
+  **before** the scan it bounds; reading it after is symmetrically unsound, as
+  a write committing in between would be absent from the scan yet counted as
+  observed. General rule: when bridging an async-observed fact into a sync
+  invariant check, version the observation in the checker's coordinates, and
+  read the version before the observation. (#302,
+  `crates/animus-control/src/raft.rs`, `crates/animus-cp-data/src/lib.rs`,
+  `crates/animusd/src/index_drain.rs`, 2026-08-20.)
+- **"Never observed" and "observed but stale" are different states, and
+  collapsing them by defaulting a new freshness field to `0` silently regresses
+  every category the observer structurally never visits.** Adding the quiesce
+  freshness gate uniformly with a `0` default would have permanently blocked
+  quiescence for `Building` split children and hidden GSI-table tablets —
+  categories `change_consumer_loop` already, deliberately, never sweeps — thus
+  destroying ADR 0048's whole wakeup-reduction win, in a way the invariant test
+  ("a group with a non-empty change log must never quiesce") could never catch,
+  because it only asserts the *safety* direction. A `u64::MAX` sentinel ("no
+  constraint") preserves prior behavior for the unvisited. Before tightening
+  any invariant fed by a periodic sweeper, enumerate which categories that
+  sweeper skips and argue each one's safety explicitly; a stricter rule applied
+  to a component that never receives the signal is a liveness regression, not a
+  safety win. (#302, `crates/animus-control/src/raft.rs`, 2026-08-20.)
+- **A margin that a design silently depends on must be enforced in code, or it
+  is just the original bug one layer down.** The quiesce veto's safety in
+  production rested on an unstated 25x ratio between `--quiesce-after` (5s
+  default) and the hard-coded 200ms sweep interval; nothing enforced it, and
+  the test that exposed #302 used a 1.5x ratio. The fix pairs the correctness
+  change with an enforced floor (`animusd::MIN_QUIESCE_AFTER`, validated on the
+  CLI flag and `debug_assert`ed at node start), which also turns the test's
+  tight knob into a genuine regression guard rather than a restatement of the
+  bug's own "usually fine" margin. When a mechanism's safety argument contains
+  the words "much larger than", make the comparison executable. (#302,
+  `crates/animusd/src/{lib,main}.rs`, 2026-08-20.)
 
 ### Parallel-agent orchestration
 - **Parallel agents share one `target/` dir; three concurrent

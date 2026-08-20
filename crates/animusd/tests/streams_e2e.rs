@@ -261,6 +261,49 @@ async fn get_records(addr: SocketAddr, iterator: &str) -> (Vec<Value>, Option<St
     (records, next)
 }
 
+/// [`get_records`]'s poll outcome, distinguishing a delivered page from a
+/// terminal trim — see [`get_records_allow_trim`].
+enum RecordsPoll {
+    Delivered(Vec<Value>, Option<String>),
+    /// The shard iterator's epoch never existed and never will
+    /// (`TrimmedDataAccessException`, 400).
+    Trimmed,
+}
+
+/// As [`get_records`], but surfaces a terminal `TrimmedDataAccessException`
+/// (400) to the caller instead of panicking on it. Used ONLY by
+/// `drain_all_tablets_lineage`'s speculative open-tail poll: that poll
+/// computes the epoch to mint from a locally-cached `Metadata` snapshot and
+/// guards it with an `if !tablets.contains_key(&tablet)` check, but a real
+/// split cutover can retire the tablet in the two async round trips between
+/// that check and this call reaching the server (`GetShardIterator` then
+/// `GetRecords`) — the speculatively-guessed epoch then never existed, and
+/// the server's 400 is the CORRECT answer, not a bug. Deliberately NOT
+/// folded into `dynamo_retrying`'s general retry allowlist: that wrapper is
+/// shared with the transactional-write and closed-epoch-read paths, where
+/// an unexpected 400 still indicates a real bug and must keep panicking.
+async fn get_records_allow_trim(addr: SocketAddr, iterator: &str) -> RecordsPoll {
+    let body = format!(r#"{{"ShardIterator":"{iterator}"}}"#);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (status, resp) = dynamo(addr, "DynamoDBStreams_20120810.GetRecords", &body).await;
+        if status == 200 {
+            let v = json(&resp);
+            let records = v["Records"].as_array().cloned().unwrap_or_default();
+            let next = v["NextShardIterator"].as_str().map(str::to_owned);
+            return RecordsPoll::Delivered(records, next);
+        }
+        if status == 400 && resp.contains("TrimmedDataAccessException") {
+            return RecordsPoll::Trimmed;
+        }
+        if status == 500 && tokio::time::Instant::now() < deadline {
+            sleep(Duration::from_millis(150)).await;
+            continue;
+        }
+        panic!("GetRecords failed (status {status}) after retrying: {resp}");
+    }
+}
+
 async fn describe_stream(addr: SocketAddr, stream_arn: &str) -> String {
     let (status, resp) = dynamo(
         addr,
@@ -612,26 +655,51 @@ async fn drain_all_tablets_lineage(
                 open_epoch.insert(tablet, epoch);
             }
             let iterator = open_iterator.get(&tablet).expect("just ensured").clone();
-            let (records, next) = get_records(dynamo_addr, &iterator).await;
-            collected.extend(records);
-            match next {
-                Some(next) => {
-                    open_iterator.insert(tablet, next);
+            match get_records_allow_trim(dynamo_addr, &iterator).await {
+                RecordsPoll::Delivered(records, next) => {
+                    collected.extend(records);
+                    match next {
+                        Some(next) => {
+                            open_iterator.insert(tablet, next);
+                        }
+                        None => {
+                            // Identical race to `drain_tablet_lineage`'s fix
+                            // above: this tablet's epoch sealed between
+                            // mint/last-poll and this call, so this response
+                            // is that epoch's final, fully-exhausted read,
+                            // already folded into `records`. Advance this
+                            // tablet's own cursor past it now and drop the
+                            // now-spent iterator, rather than leaving
+                            // `open_epoch`/`open_iterator` pointed at it —
+                            // the next pass's closed-epoch loop would
+                            // otherwise "resume" an iterator with nothing
+                            // left to give and re-deliver exactly what was
+                            // just collected. Each tablet's own cascade of
+                            // splits/seals hits this independently, so this
+                            // must self-correct per tablet, not just once.
+                            *next_epoch.get_mut(&tablet).expect("tracked tablet") += 1;
+                            open_epoch.remove(&tablet);
+                            open_iterator.remove(&tablet);
+                        }
+                    }
                 }
-                None => {
-                    // Identical race to `drain_tablet_lineage`'s fix above:
-                    // this tablet's epoch sealed between mint/last-poll and
-                    // this call, so this response is that epoch's final,
-                    // fully-exhausted read, already folded into `records`.
-                    // Advance this tablet's own cursor past it now and drop
-                    // the now-spent iterator, rather than leaving
-                    // `open_epoch`/`open_iterator` pointed at it — the next
-                    // pass's closed-epoch loop would otherwise "resume" an
-                    // iterator with nothing left to give and re-deliver
-                    // exactly what was just collected. Each tablet's own
-                    // cascade of splits/seals hits this independently, so
-                    // this must self-correct per tablet, not just once.
-                    *next_epoch.get_mut(&tablet).expect("tracked tablet") += 1;
+                RecordsPoll::Trimmed => {
+                    // The `tablets.contains_key` check above is a stale
+                    // local-`Metadata` snapshot, not a live guarantee: a
+                    // real split cutover can retire this tablet in the two
+                    // async round trips between that check and this call
+                    // reaching the server (`get_shard_iterator` then this
+                    // `GetRecords`). The speculatively-guessed epoch then
+                    // never existed and never will — TrimmedDataAccess is
+                    // the CORRECT answer, not a bug. Every closed epoch this
+                    // tablet ever had was already drained by the
+                    // closed-epoch loop above (a retired parent's chain
+                    // ends at its final sealed epoch), and its children were
+                    // already folded into `tracked` via `stream_tablet_ids`
+                    // at the top of this pass — so dropping this tablet's
+                    // own bookkeeping here loses nothing.
+                    tracked.remove(&tablet);
+                    next_epoch.remove(&tablet);
                     open_epoch.remove(&tablet);
                     open_iterator.remove(&tablet);
                 }
@@ -2495,6 +2563,52 @@ async fn multi_split_soak_streamed_gsi_table_under_mixed_load() {
             deadline,
         )
         .await;
+        // Issue #298 (unresolved): this soak has been sighted delivering
+        // fewer records than were written (e.g. 142/144), root cause
+        // unknown — possibly a real exactly-once bug, so this is
+        // deliberately NOT retried or loosened. On a deficit ONLY, dump a
+        // permanent, concise diagnostic so the next CI occurrence is
+        // self-diagnosing rather than needing another investigation round.
+        // The per-tablet closed-chain length is the load-bearing datum: the
+        // prior #298 sighting showed only one tablet had a non-zero closed
+        // chain, which is what redirected suspicion from the seal/Freeze
+        // path to the open (never-sealed) tail.
+        if delivered.len() != expected {
+            let meta = nodes[1].metadata();
+            let want_ids: BTreeSet<&String> = ids.iter().collect();
+            let delivered_ids: BTreeSet<String> = delivered
+                .iter()
+                .filter_map(|r| r["dynamodb"]["Keys"]["id"]["S"].as_str())
+                .map(str::to_owned)
+                .collect();
+            let missing: Vec<&String> = want_ids
+                .into_iter()
+                .filter(|id| !delivered_ids.contains(*id))
+                .collect();
+            let by_event_id: Vec<(String, String)> = delivered
+                .iter()
+                .map(|r| {
+                    let id = r["dynamodb"]["Keys"]["id"]["S"]
+                        .as_str()
+                        .unwrap_or("?")
+                        .to_owned();
+                    let event_id = r["eventID"].as_str().unwrap_or("?").to_owned();
+                    (id, event_id)
+                })
+                .collect();
+            let live: BTreeSet<TabletId> = tablets_for(&meta, "soak").into_iter().collect();
+            let retired_set: BTreeSet<TabletId> = retired.iter().copied().collect();
+            let mut closed_chain_len: BTreeMap<TabletId, usize> = BTreeMap::new();
+            for &(tablet, _epoch) in meta.stream_shards.keys() {
+                *closed_chain_len.entry(tablet).or_insert(0) += 1;
+            }
+            eprintln!(
+                "DIAGNOSTIC (issue #298) delivered={}/{expected} missing_ids={missing:?} \
+                 delivered_id_event_id={by_event_id:?} live_tablets={live:?} \
+                 retired_tablets={retired_set:?} closed_chain_len_per_tablet={closed_chain_len:?}",
+                delivered.len(),
+            );
+        }
         assert_eq!(
             delivered.len(),
             expected,

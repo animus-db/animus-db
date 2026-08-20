@@ -915,30 +915,55 @@ async fn limit_pagination_drains_a_sealed_shard_exactly_once() {
     .await;
     assert_eq!(status, 200, "{body}");
     let v = json(&body);
-    let shards = v["StreamDescription"]["Shards"].as_array().unwrap();
-    let shard0 = shards[0]["ShardId"].as_str().unwrap().to_owned();
-    assert!(
-        shards[0]["SequenceNumberRange"]["EndingSequenceNumber"].is_string(),
-        "{body}"
-    );
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap().clone();
 
-    let mut token = get_shard_iterator(addr, &stream_arn, &shard0, "TRIM_HORIZON", None).await;
+    // The age trigger (INDEX_DRAIN_INTERVAL, a 200ms tick) races this
+    // test's own seal_age (300ms): under load, write latency can stretch
+    // enough that the burst straddles a seal tick and lands in TWO shards
+    // (a closed epoch0 holding most of the backlog, plus an open epoch1
+    // tail holding the rest) instead of one. That is legitimate,
+    // timing-dependent product behavior — DescribeStream correctly
+    // reports every shard it produced, so the walk below drains ALL of
+    // them (oldest-first, as DescribeStream already orders them),
+    // mirroring the open-tail idiom
+    // `get_records_walks_the_shard_chain_and_drains_the_open_tail` uses.
+    // Narrowing to shards[0] alone is what made the last-written record
+    // go missing — don't re-narrow it.
     let mut seen: Vec<String> = Vec::new();
-    loop {
-        let (records, next) = get_records(addr, &token, Some(2)).await;
-        for r in &records {
-            let id = r["dynamodb"]["Keys"]["id"]["S"]
-                .as_str()
-                .unwrap_or_else(|| panic!("no id in {r:?}"))
-                .to_owned();
-            seen.push(id);
-        }
-        match next {
-            Some(n) => token = n,
-            None => break,
-        }
-        if seen.len() > ids.len() {
-            panic!("paginated past the expected record count: {seen:?}");
+    for shard in &shards {
+        let shard_id = shard["ShardId"].as_str().unwrap();
+        let is_open = shard["SequenceNumberRange"]["EndingSequenceNumber"].is_null();
+        let mut token = get_shard_iterator(addr, &stream_arn, shard_id, "TRIM_HORIZON", None).await;
+        let mut empty_polls = 0;
+        loop {
+            let (records, next) = get_records(addr, &token, Some(2)).await;
+            if records.is_empty() {
+                empty_polls += 1;
+                assert!(
+                    empty_polls < 200,
+                    "shard {shard_id} never delivered the remaining records: seen={seen:?}"
+                );
+            } else {
+                empty_polls = 0;
+            }
+            for r in &records {
+                let id = r["dynamodb"]["Keys"]["id"]["S"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("no id in {r:?}"))
+                    .to_owned();
+                seen.push(id);
+            }
+            if seen.len() > ids.len() {
+                panic!("paginated past the expected record count: {seen:?}");
+            }
+            match next {
+                // The open tail never nulls (F4/§7): stop once it has
+                // delivered everything the closed shard(s) didn't, rather
+                // than polling it forever.
+                Some(_) if is_open && seen.len() == ids.len() => break,
+                Some(n) => token = n,
+                None => break,
+            }
         }
     }
     seen.sort();

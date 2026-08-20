@@ -242,8 +242,22 @@ consensus-loop iteration:
   instant a sweep finds it empty.
 
 This is the invariant PR6 depends on: "quiesced ⇒ this group's `TxnTracker`
-and change log are both empty" is true by construction, not by
-observation.
+and change log are both empty." **As originally shipped this was claimed
+true by construction, not by observation — that claim was false** (issue
+#302; see the 2026-08-19 amendment below for the incident and the fix). A
+bare boolean veto is exactly an *observation*, and a stale one (a sweep
+that ran before a write landed) could let a group quiesce with a
+genuinely non-empty change log. It is true by construction now: the
+external veto carries a **freshness stamp** (`RaftKvNode::set_quiesce_veto
+(bool, u64)`, threaded through to `RaftCore::quiesce_veto_fresh_through`)
+naming the log index the observation is valid through, and
+`quiesce_entry_ok` additionally requires that index be at least the
+current `commit_index` — i.e. no entry has committed since the sweep last
+looked. That closes the staleness window by construction (a stale
+observation is rejected on its own terms, not merely made improbable by a
+timing margin), while a tablet the sweeper structurally never visits (a
+`Building` split child, a hidden GSI table) still imposes no freshness
+requirement at all, matching this ADR's original design exactly.
 
 ### Sweeper skip (PR6, the fleet-scale CPU win)
 
@@ -364,8 +378,10 @@ this stack. Phase 1 was built to hand it a clean seam:
   --auto-split-bytes`-manufactured ~50-tablet fleet, diffing `GET
   /metrics` over a 60s idle window before/after). If a future deployment's
   own soak testing finds 5s too aggressive, the fix is lowering the
-  constant or defaulting to `0` — never the mechanism itself, which is
-  correct at any threshold `> 0`.
+  constant or defaulting to `0` — **never below `animusd::
+  MIN_QUIESCE_AFTER` (the `change_consumer_loop` sweep interval, 200ms),
+  which the CLI now rejects outright (2026-08-19 amendment, issue #302)**;
+  the mechanism itself is correct at any threshold at or above that floor.
 - Phase 2 (heartbeat amortization, roadmap item 2) remains unscheduled;
   the constraints above are what this phase leaves it to build against.
   Roadmap items 3 (asymmetric replicas) and 4 (fleet-scale amortization)
@@ -374,3 +390,130 @@ this stack. Phase 1 was built to hand it a clean seam:
   and `animusd/CLAUDE.md` (the new mechanisms/knobs), root `CLAUDE.md`'s
   knob table (no new env var — `--quiesce-after` is a CLI flag, not a
   `ANIMUS_*` test knob), and `docs/engineering-lessons.md`.
+
+## Amendment (2026-08-19, stale-veto quiescence race — issue #302 fix)
+
+### The bug
+
+The "Quiesce vetoes" section above originally claimed "quiesced ⇒ this
+group's `TxnTracker` and change log are both empty" was true **by
+construction, not by observation**. It was not: the external veto
+(`RaftKvNode::set_quiesce_veto(bool)`) was a bare `AtomicBool`, refreshed
+once per `change_consumer_loop` sweep (`animusd::index_drain`,
+`INDEX_DRAIN_INTERVAL` = 200ms hard-coded, no override) — and a bare
+boolean carries no notion of *when* it was last true. The race: a sweep at
+`T` observes an empty change log and clears the veto; a write lands at `T
++ ε`, bumping `last_activity` (so the pre-existing idle-clock clause still
+eventually permits quiescing) but leaving the now-stale `false` veto
+untouched until the *next* sweep. If `quiesce_entry_ok` is evaluated
+before that next sweep runs, it quiesces on a change log that is not
+actually empty.
+
+This was not self-correcting: `change_consumer_loop` skips a `is_quiesced()`
+tablet outright (the PR6 sweeper-skip, justified by the very invariant this
+bug falsified), so once a group wrongly quiesced on a stale veto, the one
+task that would ever refresh that veto stopped visiting it. Production was
+safe only by an unstated margin (`DEFAULT_QUIESCE_AFTER_SECS` = 5s against
+the 200ms sweep, 25×); a test-tuned `quiesce_after` of 300ms (1.5×) tripped
+it, surfacing as
+`animusd::index_drain::stream_sealer_tests::
+hot_backlog_holds_the_quiesce_veto_until_the_hot_tail_trims` failing its
+"a group with a non-empty change log must never quiesce" assertion.
+
+### The fix: a freshness stamp in the log-index space, not a wall-clock one
+
+The design sketched during triage was a `Nanos` timestamp compared against
+`last_activity`. That is unsound on its own: `last_activity` is bumped at
+**propose** time (`note_local_activity`, called the instant a command is
+appended locally), not at **apply** time — so a sweep that runs strictly
+between a write's propose and its actual merge into the engine can record
+a `fresh_through` timestamp that is chronologically after the propose (so
+it passes a `fresh_through >= last_activity` check) while still describing
+pre-write engine content. The shipped fix instead stamps freshness in the
+**Raft log-index space** `commit_index`/`last_applied`/`engine_applied_
+index()` already share for this `DRIVER_APPLIED` state machine:
+
+- `RaftCore` gained `quiesce_veto_fresh_through: u64` alongside
+  `quiesce_veto: bool`; `set_quiesce_veto(veto, fresh_through)` sets both.
+  `quiesce_entry_ok` additionally requires `quiesce_veto_fresh_through >=
+  commit_index`.
+- `RaftKvNode::set_quiesce_veto(held, fresh_through)` requires the caller's
+  `fresh_through` be `engine_applied_index()` read **before** the
+  observation that decided `held` (e.g. before scanning
+  `pending_changes()`) — a valid lower bound, since a concurrent apply
+  between that read and the scan can only make the true state *fresher*
+  than recorded, never the reverse. Reading it after the scan is unsound
+  for the identical reason the naive timestamp design was.
+- `animusd::index_drain::change_consumer_loop` captures
+  `engine_applied_index()` once per led tablet per tick, before any of
+  that tick's scans, and reuses it for every `set_quiesce_veto` call that
+  tick.
+
+Why this closes the race exactly rather than probabilistically: at the
+instant `quiesce_entry_ok` evaluates true, `commit_index == last_log_index`
+(nothing outstanding) and `quiesce_engine_caught_up` (the apply task has
+merged everything up to `last_applied`) already hold — so the engine's
+*true* content at that instant covers everything up to `commit_index`. If
+`fresh_through < commit_index`, some entry has committed since the
+recorded observation, and quiescing is correctly refused until a fresh
+sweep re-observes. If `fresh_through >= commit_index`, no entry has
+committed since — the observation is provably still current.
+
+### The critical risk: not regressing the sweeper-skip's fleet-scale win
+
+A naive "no quiesce without a fresh sweep" rule would starve any tablet
+`change_consumer_loop` structurally never visits — a `Building` split
+child (runs no consumer arms at all; SEED_KINDS excludes `KIND_CHANGE`, so
+it cannot accumulate a change-log obligation in the first place) and a
+hidden GSI-table tablet (`is_index_table_name`, `continue`d before any
+veto call, unchanged pre-fix behavior). The default sentinel is
+`u64::MAX` (RaftCore) / `u64::MAX` (`RaftKvNode`) — "never engaged, no
+freshness requirement at all" — not `0`, so a tablet the sweeper never
+touches behaves byte-identically to before this fix: it can quiesce
+whenever every *other* clause holds, exactly as today.
+
+The one residual gap this leaves — a genuinely swept-eligible tablet that
+has never yet had its *first* sweep — is closed structurally rather than
+by a new race: `change_consumer_loop` is a single continuously-running
+`loop { sleep(INDEX_DRAIN_INTERVAL); for tablet in hosted { .. } }`, so any
+tablet present in `hosted_groups()` gets observed within one
+`INDEX_DRAIN_INTERVAL` of becoming eligible, independent of the tablet's
+own age. Since `quiesce_entry_ok`'s pre-existing idle-clock clause cannot
+fire before `quiesce_after` has elapsed since the group's own last
+activity, `quiesce_after >= INDEX_DRAIN_INTERVAL` guarantees at least one
+real sweep lands before quiescing is even attempted. This is now an
+enforced constant, `animusd::MIN_QUIESCE_AFTER`: `main`'s CLI parser
+rejects a smaller nonzero `--quiesce-after` outright, and
+`Node::start_with_growth` carries a `debug_assert` as a second layer for
+any caller that reaches `enable_quiescence` without going through the CLI.
+`0` (disable quiescence entirely) is exempt from the floor.
+
+### Alternative considered and rejected: never skip the sweep while quiesced
+
+Simply removing `change_consumer_loop`'s `if group.is_quiesced() {
+continue; }` short-circuit would also stop the staleness from becoming
+permanent (a wrongly-quiesced group's veto would be corrected within one
+more sweep interval). It was rejected: it does not close the *initial*
+false-quiesce window at all (only limits how long it lasts), and it costs
+back exactly the per-tablet LSM-scan savings PR6 exists for — "Sweeper
+skip," above, is explicit that PR6, not PR5, is where the actual
+fleet-scale CPU win lands. The freshness-stamp fix closes the race
+directly, at zero cost to an idle fleet, and lets PR6's skip stay exactly
+as designed.
+
+### Regression coverage
+
+`crates/animus-control/tests/quiescence.rs::
+quiesce_entry_blocked_by_a_stale_veto_freshness` pins the race at the
+`RaftCore` level — sync, I/O-free, no `SimEnv`/wall clock needed — proven
+red against the pre-fix predicate; its dual,
+`quiesce_entry_succeeds_once_the_veto_freshness_catches_up`, proves the
+fix is not a second permanent block. The pre-existing
+`hot_backlog_holds_the_quiesce_veto_until_the_hot_tail_trims` and
+`plain_table_markers_trim_to_empty_and_the_tablet_quiesces`
+(`animusd::index_drain::stream_sealer_tests`) — issue #302's two CI
+victims — now pass stably at the original `quiesce_after` = 300ms test
+knob (1.5× the sweep interval), which is sound rather than merely lucky
+under this fix: `MIN_QUIESCE_AFTER` = 200ms is the floor, so 300ms carries
+real (if modest) headroom, and the invariant no longer depends on timing
+luck to hold.

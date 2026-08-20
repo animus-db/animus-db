@@ -754,24 +754,49 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
     // the set, so it can never be the smallest-other-than-`adder`) — then
     // reports the transfer via an error rather than completing the removal,
     // so the live voter set stays exactly `{0,1,2,3}`; only leadership moves.
-    let (status, _body) = remove_control_member(admin_addrs[adder], adder as u64).await;
-    assert_eq!(
-        status, 409,
-        "self-removal should report the transfer, not silently succeed"
-    );
-
-    // Wait for a DIFFERENT original voter to report itself leader.
-    let wait_for_new_leader = async {
-        loop {
-            if let Some(i) = (0..3).find(|&i| i != adder && nodes[i].is_control_leader()) {
-                return i;
-            }
-            sleep(Duration::from_millis(50)).await;
+    //
+    // A single one-shot call only ARMS the attempt: `transfer_leadership`
+    // sets a `transfer_deadline` of `now + election_base` (the raw
+    // un-randomized 150ms default), and `tick()` silently clears it with no
+    // signal if the handoff — up to 4 network round trips, including
+    // waiting up to 100ms for the next heartbeat tick — doesn't land in
+    // that window; nothing then re-arms it. A one-shot call + pure
+    // effect-poll can therefore watch a leader that was never going to
+    // change. So, like `remove_control_voter_refusals_transfer_and_quorum_
+    // warnings`'s own leader-self-removal above, this retries the mutating
+    // call itself — re-issued against whichever original voter currently
+    // reports itself leader (re-arming a fresh attempt) — until a
+    // DIFFERENT original voter reports itself leader, bounded overall.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let new_leader_idx: usize = loop {
+        if let Some(i) = (0..3).find(|&i| i != adder && nodes[i].is_control_leader()) {
+            break i;
         }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("leadership never transferred to a different original voter within 30s");
+        }
+        let Some(current_leader_idx) = (0..3).find(|&i| nodes[i].is_control_leader()) else {
+            // Mid-election among the originals; nobody to (re-)arm a
+            // transfer through yet.
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let (status, body) =
+            remove_control_member(admin_addrs[current_leader_idx], adder as u64).await;
+        assert_eq!(
+            status, 409,
+            "self-removal should report the transfer, not silently succeed: {body}"
+        );
+        let msg = body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            msg.contains("leader"),
+            "expected a leadership-transfer refusal, got: {msg}"
+        );
+        sleep(Duration::from_millis(100)).await;
     };
-    let new_leader_idx = timeout(Duration::from_secs(15), wait_for_new_leader)
-        .await
-        .expect("leadership never transferred to a different original voter");
     assert_ne!(new_leader_idx, adder, "leadership should have moved");
 
     // The config is unaffected by the transfer alone — still all 4 voters.
