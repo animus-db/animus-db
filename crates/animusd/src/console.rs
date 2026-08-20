@@ -41,8 +41,40 @@
 //! doc for why passing DynamoDB's wire shape straight through is the right
 //! call here even though every other endpoint in this module projects.
 //!
-//! The Stream tab and the create-table form are still follow-up PRs in this
-//! stack — see `is_shell_path`'s doc.
+//! **This PR (the Stream data tab) adds the table page's third and final
+//! tab** — a table's DynamoDB Streams shards and the records inside them
+//! ([`ConsoleBackend::stream_shards`]/[`ConsoleBackend::get_shard_iterator`]/
+//! [`ConsoleBackend::get_stream_records`], built on the real
+//! `ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords` wire
+//! operations, same "reuse the real wire path" rule as every mutating
+//! endpoint before it). **This is the PR where the "never show cluster
+//! shape" rule gets genuinely sharp**, because a DynamoDB Streams shard is
+//! *implemented* as a seal epoch of one tablet's own change log (ADR
+//! 0042/0043) — so the question is no longer "does this field mention a
+//! tablet" but "does this field, even though it never says the word
+//! `tablet`, still let a viewer reconstruct tablet-level cluster shape."
+//! [`ShardSummary::shard_id`] is deliberately surfaced anyway: it embeds a
+//! tablet id and a seal epoch as digits (`shardId-<tablet>-<epoch>`,
+//! `animus_cp_data::segment::shard_id`'s own format), but it is *also*
+//! DynamoDB's own public wire identifier — a real client receives exactly
+//! this string from `DescribeStream` and passes it straight back to
+//! `GetShardIterator`, so an application developer debugging their own
+//! stream needs to see and copy it regardless of what it happens to encode
+//! underneath. What stays off this type, on purpose, is anything that
+//! would tell a viewer *which node* serves a shard, *how many replicas*
+//! back it, or *whether it's currently leaderless* — none of which is
+//! DynamoDB wire vocabulary and none of which this module or its trait
+//! signatures ever have in scope to leak in the first place (no
+//! `TabletId`/`NodeId`/replica-set type crosses this trait). See
+//! [`ConsoleBackend::stream_shards`]'s own doc for the "no stream enabled"
+//! honest-empty-answer decision and ADR 0052's Stream-tab amendment for the
+//! full reasoning, including why a shard's own `ParentShardId` lineage is
+//! surfaced (the same public-contract argument as the id itself) while a
+//! seal's `replicas`/`object_id` (ADR 0042 §10, genuinely storage-internal)
+//! never reaches [`ShardSummary`] at all.
+//!
+//! The create-table form is still a follow-up PR in this stack — see
+//! `is_shell_path`'s doc.
 //!
 //! Embedded at compile time (`include_str!`), no bundler/build step/external
 //! assets — the same constraints `dashboard.rs` documents for the operator
@@ -360,6 +392,121 @@ pub(crate) struct DeleteItemRequest {
     pub(crate) key: WireItem,
 }
 
+/// One shard of a table's stream (ADR 0042 §2/ADR 0043 §A4), console-shaped
+/// for the Stream data tab's shard list. See the module doc for the full
+/// reasoning on why `shard_id`/`parent_shard_id` are safe to surface even
+/// though they encode a tablet id and a seal epoch: both are DynamoDB's own
+/// public wire vocabulary (a real client sees exactly these from
+/// `DescribeStream`), not anything this type adds. What is deliberately
+/// **absent**: which node/replica currently serves the shard, whether it's
+/// currently leaderless, and the seal's own storage-internal `object_id`/
+/// `replicas` (ADR 0042 §10) — none of that is DynamoDB wire vocabulary,
+/// and none of it is ever in scope to leak here (this type has no
+/// `TabletId`/`NodeId`/replica-set field to begin with).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct ShardSummary {
+    pub(crate) shard_id: String,
+    pub(crate) parent_shard_id: Option<String>,
+    /// The packed-HLC sequence number (ADR 0042 §5) this shard's own
+    /// records start at, as the same decimal string DynamoDB's own
+    /// `SequenceNumberRange.StartingSequenceNumber` already carries.
+    pub(crate) starting_sequence_number: String,
+    /// `None` for the one currently-open (still-growing) shard a live
+    /// tablet has; `Some` once sealed.
+    pub(crate) ending_sequence_number: Option<String>,
+}
+
+/// A request to page through a table's stream shard list (`GET
+/// .../stream/shards[?exclusive_start_shard_id=...]`) — the shard-list
+/// sibling of [`ScanItemsRequest`]'s own `ExclusiveStartKey` walk, over
+/// `DescribeStream`'s real `ExclusiveStartShardId`/`LastEvaluatedShardId`
+/// pagination (ADR 0042 §3: "a busy tablet churns roughly a shard a
+/// seal-age interval," so a long-lived streamed table's shard count is a
+/// real, unbounded-over-time list, not a small fixed one). Plain `GET` with
+/// a query parameter, unlike the Items tab's scan/query (`POST`, ADR 0052
+/// PR4's own doc): a shard id is always a flat string, never a nested
+/// `AttributeValue` object, so it has a clean query-string encoding.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StreamShardsRequest {
+    pub(crate) exclusive_start_shard_id: Option<String>,
+}
+
+/// One page of a table's stream shards (`GET .../stream/shards`) — the
+/// **honest "no stream enabled" answer lives here**, as data, not as an
+/// error: `enabled: false` with an empty `shards` list and a `200`, never a
+/// `404`/`ConsoleError`. A table with no stream is the common case (ADR
+/// 0052's own brief), and the Stream data tab must say so plainly rather
+/// than rendering what would otherwise look like a broken, permanently-
+/// empty grid — the same "found-or-not-found 200" discipline
+/// [`ConsoleBackend::get_item`] already established for a missing item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct StreamShardsPage {
+    pub(crate) enabled: bool,
+    /// `Some` exactly when `enabled` — the DynamoDB wire label
+    /// (`NEW_AND_OLD_IMAGES`/`NEW_IMAGE`/`OLD_IMAGE`/`KEYS_ONLY`), same
+    /// vocabulary as [`StreamSummary::view_type`].
+    pub(crate) view_type: Option<String>,
+    /// `Some` exactly when `enabled` — DynamoDB's own synthetic stream ARN
+    /// (`arn:aws:dynamodb:animus:0:table/<table>/stream/<label>`), the same
+    /// public identifier `DescribeTable`'s `LatestStreamArn` already
+    /// surfaces. Threaded back into [`GetShardIteratorRequest`] so the
+    /// backend never has to re-derive "which stream" from a bare shard id.
+    pub(crate) stream_arn: Option<String>,
+    pub(crate) shards: Vec<ShardSummary>,
+    pub(crate) last_evaluated_shard_id: Option<String>,
+}
+
+/// A request to mint a shard iterator (`POST .../stream/iterator`).
+/// `iterator_type` is one of DynamoDB's own four values — a genuinely
+/// closed set (`TRIM_HORIZON`/`LATEST`/`AT_SEQUENCE_NUMBER`/
+/// `AFTER_SEQUENCE_NUMBER`), so `console.js` renders a real control for it,
+/// never a free-text guess (the module doc's standing rule on closed sets
+/// vs. free text). `sequence_number` is required exactly when
+/// `iterator_type` needs one — checked by the same wire decoder
+/// (`animus_dynamo::streams_wire::decode_request`) a real
+/// `GetShardIterator` call already enforces, so the console adds no second
+/// validation rule to keep in sync.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct GetShardIteratorRequest {
+    pub(crate) shard_id: String,
+    pub(crate) iterator_type: String,
+    #[serde(default)]
+    pub(crate) sequence_number: Option<String>,
+}
+
+/// A request to read one page of stream records (`POST
+/// .../stream/records`) — `shard_iterator` is the opaque token a prior
+/// [`ConsoleBackend::get_shard_iterator`] or
+/// [`ConsoleBackend::get_stream_records`] call returned; walking a shard by
+/// feeding each page's `next_shard_iterator` back in here is the Stream
+/// tab's honest paging equivalent of the Items tab's `ExclusiveStartKey`
+/// walk (ADR 0052 PR4) — never a fake offset, and never re-derived
+/// client-side.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct GetStreamRecordsRequest {
+    pub(crate) shard_iterator: String,
+    #[serde(default)]
+    pub(crate) limit: Option<u32>,
+}
+
+/// One page of stream records — DynamoDB's own `Record` wire shape
+/// (`eventID`/`eventName`/`dynamodb: {Keys, OldImage, NewImage, ...}`, and
+/// — when a record is a TTL-reaper delete (ADR 0051 §7) —
+/// `userIdentity: {"PrincipalId": "dynamodb.amazonaws.com", "Type":
+/// "Service"}`) passed straight through, exactly the same "no console-only
+/// projection" call [`WireItem`] already made for an item and for the
+/// identical reason: a stream record has no fixed console shape to project
+/// onto without either inventing a lossy one or badly reinventing
+/// DynamoDB's own record format. `console.rs` never interprets a record's
+/// contents, only moves it between the wire and the HTTP body;
+/// `console.js` is where `userIdentity`'s presence actually gets rendered
+/// as "deleted by TTL expiry" — see that file's own doc.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct StreamRecordsPage {
+    pub(crate) records: Vec<serde_json::Value>,
+    pub(crate) next_shard_iterator: Option<String>,
+}
+
 /// The narrow, console-shaped seam for every endpoint beyond the tables
 /// list — see the module doc for why this is a trait (not another bare
 /// closure) and why widening it is still safe: every method's signature is
@@ -427,6 +574,35 @@ pub(crate) trait ConsoleBackend: Send + Sync {
 
     /// Delete one item by its full key.
     async fn delete_item(&self, table: &str, key: WireItem) -> Result<(), ConsoleError>;
+
+    /// One page of `table`'s stream shard list — the Stream data tab's
+    /// landing read. `Ok` with `enabled: false` (never a [`ConsoleError`])
+    /// when the table has no stream; see [`StreamShardsPage`]'s own doc.
+    /// `Err` with a `404` only when `table` itself doesn't exist.
+    async fn stream_shards(
+        &self,
+        table: &str,
+        req: StreamShardsRequest,
+    ) -> Result<StreamShardsPage, ConsoleError>;
+
+    /// Mint a shard iterator for one of `table`'s stream shards — the
+    /// Stream tab's "start reading here" action, given a shard id (from
+    /// [`stream_shards`](Self::stream_shards)) and one of the four closed
+    /// iterator types.
+    async fn get_shard_iterator(
+        &self,
+        table: &str,
+        req: GetShardIteratorRequest,
+    ) -> Result<String, ConsoleError>;
+
+    /// Read one page of records for a previously-minted shard iterator —
+    /// the Stream tab's record viewer, walked forward via each page's own
+    /// `next_shard_iterator` (see [`GetStreamRecordsRequest`]'s doc).
+    async fn get_stream_records(
+        &self,
+        table: &str,
+        req: GetStreamRecordsRequest,
+    ) -> Result<StreamRecordsPage, ConsoleError>;
 }
 
 /// Accept loop for the console HTTP endpoint. One task per connection,
@@ -500,7 +676,8 @@ async fn route(
     }
 
     if let Some(table_route) = parse_table_api_route(path) {
-        return table_api_response(method, table_route, &request.body, backend).await;
+        return table_api_response(method, table_route, &request.query, &request.body, backend)
+            .await;
     }
 
     if method != "GET" {
@@ -518,6 +695,7 @@ async fn route(
 async fn table_api_response(
     method: &str,
     route: TableApiRoute,
+    query: &str,
     body: &[u8],
     backend: &dyn ConsoleBackend,
 ) -> (u16, &'static str, String) {
@@ -618,6 +796,37 @@ async fn table_api_response(
                 Err(e) => (e.status, "application/json", error_json(&e.message)),
             }
         }
+        ("GET", TableApiRoute::StreamShards(table)) => {
+            let req = StreamShardsRequest {
+                exclusive_start_shard_id: http::query_param(query, "exclusive_start_shard_id"),
+            };
+            match backend.stream_shards(&table, req).await {
+                Ok(page) => (200, "application/json", stream_shards_json(&page)),
+                Err(e) => (e.status, "application/json", error_json(&e.message)),
+            }
+        }
+        ("POST", TableApiRoute::StreamIterator(table)) => {
+            match parse_json_body::<GetShardIteratorRequest>(body) {
+                Ok(req) => match backend.get_shard_iterator(&table, req).await {
+                    Ok(it) => (
+                        200,
+                        "application/json",
+                        wrap_json("shard_iterator", serde_json::Value::String(it)),
+                    ),
+                    Err(e) => (e.status, "application/json", error_json(&e.message)),
+                },
+                Err(e) => (e.status, "application/json", error_json(&e.message)),
+            }
+        }
+        ("POST", TableApiRoute::StreamRecords(table)) => {
+            match parse_json_body::<GetStreamRecordsRequest>(body) {
+                Ok(req) => match backend.get_stream_records(&table, req).await {
+                    Ok(page) => (200, "application/json", stream_records_json(&page)),
+                    Err(e) => (e.status, "application/json", error_json(&e.message)),
+                },
+                Err(e) => (e.status, "application/json", error_json(&e.message)),
+            }
+        }
         _ => (405, "application/json", error_json("method not allowed")),
     }
 }
@@ -649,6 +858,12 @@ enum TableApiRoute {
     ItemsPut(String),
     /// `/console/api/tables/{name}/items/delete` — `POST` (delete one item by key).
     ItemsDelete(String),
+    /// `/console/api/tables/{name}/stream/shards` — `GET` (paginated shard list).
+    StreamShards(String),
+    /// `/console/api/tables/{name}/stream/iterator` — `POST` (mint a shard iterator).
+    StreamIterator(String),
+    /// `/console/api/tables/{name}/stream/records` — `POST` (read one page of records).
+    StreamRecords(String),
 }
 
 /// Parse a path under [`TABLES_API_PREFIX`] into a [`TableApiRoute`], or
@@ -674,6 +889,9 @@ fn parse_table_api_route(path: &str) -> Option<TableApiRoute> {
             "items/get" => Some(TableApiRoute::ItemsGet(table)),
             "items/put" => Some(TableApiRoute::ItemsPut(table)),
             "items/delete" => Some(TableApiRoute::ItemsDelete(table)),
+            "stream/shards" => Some(TableApiRoute::StreamShards(table)),
+            "stream/iterator" => Some(TableApiRoute::StreamIterator(table)),
+            "stream/records" => Some(TableApiRoute::StreamRecords(table)),
             _ => tail.strip_prefix("gsi/").and_then(|index| {
                 (!index.is_empty())
                     .then(|| TableApiRoute::GsiNamed(table, http::percent_decode(index)))
@@ -707,6 +925,18 @@ fn table_detail_json(detail: &TableDetail) -> String {
 /// [`table_detail_json`] uses.
 fn items_page_json(page: &ItemsPage) -> String {
     serde_json::to_string(page).unwrap_or_else(|_| "{\"items\":[],\"scanned_count\":0}".to_string())
+}
+
+/// Encode a [`StreamShardsPage`] as the top-level response body for
+/// `stream/shards` — same bare-object convention as [`items_page_json`].
+fn stream_shards_json(page: &StreamShardsPage) -> String {
+    serde_json::to_string(page).unwrap_or_else(|_| "{\"enabled\":false,\"shards\":[]}".to_string())
+}
+
+/// Encode a [`StreamRecordsPage`] as the top-level response body for
+/// `stream/records` — same bare-object convention as [`items_page_json`].
+fn stream_records_json(page: &StreamRecordsPage) -> String {
+    serde_json::to_string(page).unwrap_or_else(|_| "{\"records\":[]}".to_string())
 }
 
 /// Wrap one JSON value under `key` — the `{"gsi": ...}`/`{"stream":
@@ -809,6 +1039,18 @@ mod tests {
         assert!(matches!(
             parse_table_api_route("/console/api/tables/orders/items/delete"),
             Some(TableApiRoute::ItemsDelete(t)) if t == "orders"
+        ));
+        assert!(matches!(
+            parse_table_api_route("/console/api/tables/orders/stream/shards"),
+            Some(TableApiRoute::StreamShards(t)) if t == "orders"
+        ));
+        assert!(matches!(
+            parse_table_api_route("/console/api/tables/orders/stream/iterator"),
+            Some(TableApiRoute::StreamIterator(t)) if t == "orders"
+        ));
+        assert!(matches!(
+            parse_table_api_route("/console/api/tables/orders/stream/records"),
+            Some(TableApiRoute::StreamRecords(t)) if t == "orders"
         ));
         assert!(parse_table_api_route("/console/api/tables/orders/items").is_none());
         assert!(parse_table_api_route("/console/api/tables/orders/items/bogus").is_none());
@@ -1108,5 +1350,118 @@ mod tests {
     fn get_item_request_decodes_a_bare_key_object() {
         let req: GetItemRequest = serde_json::from_str(r#"{"key":{"id":{"S":"o1"}}}"#).unwrap();
         assert_eq!(req.key["id"]["S"], "o1");
+    }
+
+    /// The no-stream-enabled answer is a plain `200` with `enabled: false`
+    /// and an empty shard list, never a `404`/error shape — the property
+    /// most worth pinning for the common case (ADR 0052's own brief).
+    #[test]
+    fn stream_shards_page_no_stream_is_a_plain_disabled_answer() {
+        let page = StreamShardsPage {
+            enabled: false,
+            view_type: None,
+            stream_arn: None,
+            shards: Vec::new(),
+            last_evaluated_shard_id: None,
+        };
+        let value: serde_json::Value = serde_json::from_str(&stream_shards_json(&page)).unwrap();
+        assert_eq!(value["enabled"], false);
+        assert!(value["shards"].as_array().unwrap().is_empty());
+        assert!(value["stream_arn"].is_null());
+    }
+
+    /// A shard's own id/parent-lineage round-trip untouched — the module
+    /// doc's "surfaced deliberately" property — and, the property that
+    /// actually matters most here: nothing about which node/replica backs
+    /// the shard leaks in alongside it.
+    #[test]
+    fn stream_shards_page_serializes_console_shaped_fields_only() {
+        let page = StreamShardsPage {
+            enabled: true,
+            view_type: Some("NEW_AND_OLD_IMAGES".into()),
+            stream_arn: Some("arn:aws:dynamodb:animus:0:table/orders/stream/L1".into()),
+            shards: vec![
+                ShardSummary {
+                    shard_id: "shardId-7-0".into(),
+                    parent_shard_id: None,
+                    starting_sequence_number: "0".into(),
+                    ending_sequence_number: Some("1000".into()),
+                },
+                ShardSummary {
+                    shard_id: "shardId-7-1".into(),
+                    parent_shard_id: Some("shardId-7-0".into()),
+                    starting_sequence_number: "1000".into(),
+                    ending_sequence_number: None,
+                },
+            ],
+            last_evaluated_shard_id: None,
+        };
+        let body = stream_shards_json(&page);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["shards"][0]["shard_id"], "shardId-7-0");
+        assert_eq!(value["shards"][1]["parent_shard_id"], "shardId-7-0");
+        assert!(value["shards"][0]["ending_sequence_number"].is_string());
+        assert!(value["shards"][1]["ending_sequence_number"].is_null());
+
+        let text = body.to_ascii_lowercase();
+        for forbidden in [
+            "\"node",
+            "\"tablet",
+            "\"replica",
+            "\"raft",
+            "\"leader",
+            "\"quorum",
+            "\"placement",
+            "\"health",
+            "\"epoch",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "found cluster-shaped key `{forbidden}` in {text}"
+            );
+        }
+    }
+
+    /// A page of stream records round-trips DynamoDB's own `Record` shape
+    /// untouched, `userIdentity` included when present — the record-viewer
+    /// sibling of `items_page_serializes_the_wire_item_shape_untouched`.
+    #[test]
+    fn stream_records_page_serializes_the_wire_record_shape_untouched() {
+        let record = serde_json::json!({
+            "eventID": "shardId-7-0-42",
+            "eventName": "REMOVE",
+            "eventVersion": "1.1",
+            "eventSource": "aws:dynamodb",
+            "awsRegion": "animus",
+            "dynamodb": {"Keys": {"id": {"S": "o1"}}, "SequenceNumber": "42"},
+            "userIdentity": {"PrincipalId": "dynamodb.amazonaws.com", "Type": "Service"},
+        });
+        let page = StreamRecordsPage {
+            records: vec![record],
+            next_shard_iterator: Some("tok".into()),
+        };
+        let body = stream_records_json(&page);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["records"][0]["eventName"], "REMOVE");
+        assert_eq!(
+            value["records"][0]["userIdentity"]["PrincipalId"],
+            "dynamodb.amazonaws.com"
+        );
+        assert_eq!(value["next_shard_iterator"], "tok");
+    }
+
+    #[test]
+    fn get_shard_iterator_request_decodes_with_and_without_sequence_number() {
+        let req: GetShardIteratorRequest =
+            serde_json::from_str(r#"{"shard_id":"shardId-1-0","iterator_type":"LATEST"}"#).unwrap();
+        assert_eq!(req.shard_id, "shardId-1-0");
+        assert_eq!(req.iterator_type, "LATEST");
+        assert!(req.sequence_number.is_none());
+
+        let req: GetShardIteratorRequest = serde_json::from_str(
+            r#"{"shard_id":"shardId-1-0","iterator_type":"AT_SEQUENCE_NUMBER","sequence_number":"42"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.sequence_number.as_deref(), Some("42"));
     }
 }

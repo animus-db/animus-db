@@ -4,9 +4,10 @@
   PR ships"); PR2 (see the 2026-08-20 amendment below) ships the tables-list
   screen and this listener's first JSON endpoint; PR3 (see the second
   2026-08-20 amendment below) ships a table's own page, Config tab; PR4 (see
-  the third 2026-08-20 amendment below) ships that page's Items tab. The
-  Stream tab and the create-table form remain follow-up PRs in the same
-  stack.
+  the third 2026-08-20 amendment below) ships that page's Items tab; PR5
+  (see the fourth 2026-08-20 amendment below) ships that page's third and
+  final tab, Stream data. The create-table form remains the one follow-up
+  PR left in the same stack.
 - **Date:** 2026-08-19
 - **Amends:** [ADR 0035](0035-control-plane-separate-deployment.md) (owns the
   deployment shapes and their port contracts — gains a seventh port and a
@@ -442,3 +443,186 @@ to query by from the replicated catalog server-side (mirroring how
 rather than asking the client to know or type them — the same
 `GET`/`POST`-body split every other DynamoDB operation on this adapter
 already uses for `Scan`/`Query`'s own `IndexName` parameter.
+
+## Amendment (2026-08-20, PR5 — the table page's Stream data tab)
+
+This stack's fifth PR ships the table page's third and final tab: a table's
+DynamoDB Streams shards, and the records inside them — built on the real
+`ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords` wire
+operations (`crate::dynamo::execute_routed(self,
+"DynamoDBStreams_20120810.<Op>", ..)`, the exact same function every
+mutating Config-tab endpoint already calls for the `DynamoDB_20120810.*`
+service, ADR 0052 PR3's own "reuse the real wire path" rule extended to the
+sibling Streams service). Tab order and wording, per the maintainer's exact
+spec: **Config, Items, Stream data**. Same routing idiom as PR4
+(`/console/ui/tables/{name}/stream`, a real route, not a same-page toggle) —
+Config/Items/Stream data are three genuinely different data-fetching
+screens, the same reasoning PR4's own amendment already gave for Items, and
+nothing about adding a third tab changes it.
+
+### This is the PR where "never show cluster state" gets genuinely sharp
+
+Every earlier tab's "no cluster shape" argument was easy: a `TableSummary`/
+`TableDetail`/`WireItem` simply has no tablet/replica/node field to leak in
+the first place. The Stream data tab is different, and worth reasoning
+about explicitly rather than just asserting a choice, because **a DynamoDB
+Streams shard is *implemented* as a seal epoch of one tablet's own change
+log** (ADR 0042 §2, ADR 0043): `ShardId` is literally
+`shardId-<tabletId>-<epoch>` (`animus_cp_data::segment::shard_id`). So the
+question this PR actually has to answer isn't "does this field mention a
+tablet" — it's "does this field, even though it never says the word
+`tablet`, still let a viewer reconstruct cluster shape."
+
+**The shard id itself, and its `ParentShardId` lineage, are surfaced
+anyway — deliberately, not by oversight.** The reasoning: a shard id is
+**DynamoDB's own public wire contract**, not this console's invention. A
+real DynamoDB client receives exactly this string from `DescribeStream` and
+passes it straight back to `GetShardIterator`; an AWS user routinely copies
+a shard id out of the console or a log line to debug a consumer. The
+console's whole reason to exist is to give an application developer the
+same debugging vocabulary a real DynamoDB client already has (this ADR's
+original "an application developer's mental model is 'my tables and my
+items,' the same one DynamoDB itself gives them" — a shard id is squarely
+inside that mental model, DynamoDB's own, not a peek behind it). Refusing
+to show it would not protect the cluster-shape boundary; it would just make
+the tab useless for the one workflow it exists to support ("why did my row
+vanish, which shard is it in, let me read that shard's records"), while a
+motivated reader could still infer the same tablet/epoch facts from timing
+or from the admin port anyway if they had operator access — the boundary
+this ADR protects is *audience*, not *obfuscating public identifiers a real
+client already gets*.
+
+**What stays off every response, and why it's structurally impossible to
+add by accident.** None of `ConsoleBackend`'s three new methods
+(`stream_shards`/`get_shard_iterator`/`get_stream_records`) or their
+request/response types (`ShardSummary`, `StreamShardsPage`,
+`GetShardIteratorRequest`, `GetStreamRecordsRequest`, `StreamRecordsPage`)
+have a `TabletId`/`NodeId`/replica-set field anywhere in their signatures —
+`console.rs` still imports no such type (same structural enforcement PR1
+established, restated here because Streams is exactly the subsystem where
+it earns its keep). Concretely, the things a shard id's digits do **not**
+buy a viewer, because nothing here ever computes or forwards them:
+
+- **Which node hosts the tablet, or which node is its Raft leader.** A
+  shard id names a tablet's own identity, never its current placement —
+  placement is looked up separately (`Metadata.tablets`/`node_addrs`), and
+  no code path in this PR ever touches that lookup.
+- **How many replicas back it, or their addresses.** A seal's own catalog
+  row (`StreamShardRow`) carries `replicas`/`object_id` — genuinely
+  storage-internal detail the durability/superset-slice machinery (ADR 0042
+  §9/§10) depends on — and neither field is read by, or reachable from, any
+  method this PR adds.
+- **Whether the tablet is currently leaderless, mid-election, or
+  mid-split.** None of that state is in scope for a `DescribeStream`/
+  `GetRecords` call to begin with; this PR adds no new read of it.
+
+The practical test applied to every field before it was added: *would a
+real, unmodified DynamoDB client ever see this on the wire?* A shard id,
+its parent lineage, a sequence number, a view type, a stream ARN, a
+record's `eventName`/`Keys`/images/`userIdentity` — yes, all of them,
+verified against this ADR's own compatibility target. A tablet's node
+assignment, replica count, or leadership state — never; DynamoDB Streams
+has no such concept for a client to see, and this adapter's console
+doesn't invent one to show it either.
+
+### The no-stream-enabled answer is data, not an error
+
+A table with no stream is the common case (this ADR's own PR4 precedent:
+"an application developer who wants to look at *their own* tables" — most
+tables, most of the time, have no stream turned on). `stream_shards`
+returns a plain `200` with `enabled: false` and an empty shard list, never
+a `404`/`ConsoleError` — the same "found-or-not-found 200" discipline PR4's
+`get_item` established for a missing key, generalized here to a missing
+*feature* rather than a missing *row*. `console.js` renders this as a
+plain message pointing at the Config tab's Settings section (where the
+stream toggle actually lives), never an empty grid with headers and no
+rows that would read as broken rather than simply off.
+
+### Paging: the shard list gets `DescribeStream`'s own real pagination; records get the honest `NextShardIterator` walk
+
+Unlike PR4's `Query` gap (no pagination existed to thread through at all),
+`DescribeStream` genuinely does paginate on this adapter
+(`ExclusiveStartShardId`/`LastEvaluatedShardId`, ADR 0042 §3 — "a busy
+tablet churns roughly a shard a seal-age interval," so a long-lived
+streamed table's shard count is a real, unbounded-over-time list). PR5
+threads that through rather than fetching every page server-side in a
+loop: `GET .../stream/shards[?exclusive_start_shard_id=...]`, with a "Load
+more shards" button carrying the previous page's own returned
+`last_evaluated_shard_id` forward — a flat string, so (unlike `Scan`'s
+`ExclusiveStartKey`, a nested `AttributeValue` object) it fits cleanly in a
+query parameter rather than needing `Scan`'s `POST`-with-a-body shape.
+
+A shard's own records page over `GetShardIterator`/`GetRecords`'s real
+`NextShardIterator` contract — the record-viewer equivalent of PR4's
+`ExclusiveStartKey` walk, and just as load-bearing to get right: "Load more
+records" always resends the previous page's own returned iterator, never a
+client-computed position. A `null` `next_shard_iterator` (real DynamoDB's
+own "this shard is exhausted" signal, ADR 0042 §2/§6 — which, per §7's own
+"never invalidates an open-shard iterator" contract, only a **sealed**
+shard's iterator actually reaches; an open shard's `GetRecords` always
+returns a non-null iterator, "nothing new yet, poll again") renders as
+"shard drained" rather than being silently treated the same as "poll
+again later."
+
+### The iterator-type control is a real closed-set control; a sequence number stays free text
+
+Per this repo's standing design rule ("never offer a closed picker for
+something that is genuinely free text, and never a free-text guess at a
+genuinely closed set"): `ShardIteratorType` is one of exactly four values
+(`TRIM_HORIZON`/`LATEST`/`AT_SEQUENCE_NUMBER`/`AFTER_SEQUENCE_NUMBER`,
+`animus_dynamo::streams_wire::ShardIteratorType`'s own closed enum), so
+`console.js` renders it with the same segmented control the Config tab's
+stream-view-type picker already uses — never a text input a typo could
+silently misroute. A sequence number (required only for the `AT_`/`AFTER_`
+pair) stays a plain text input: it is a genuine value, not a member of a
+small fixed set — the decimal packed-HLC string (ADR 0042 §5) a developer
+copies out of an already-shown record's own `Sequence #` column, the exact
+same "closed set gets a real control, a value stays text" line this ADR's
+PR3/PR4 amendments already drew for stream view type vs. attribute name and
+for `SortKeyQuery`'s three shapes vs. a key's raw value.
+
+### `userIdentity` is real and worth surfacing — verified before rendering, not assumed
+
+ADR 0051 §7 documents a TTL-reaper delete's stream record carrying
+`userIdentity: {"PrincipalId": "dynamodb.amazonaws.com", "Type":
+"Service"}` at the record's own top level. Before rendering it, this PR
+verified the field is genuinely populated end-to-end — `ChangeRecord::
+ttl_expired` set by the reaper's own kind-write path, threaded through
+`streams_wire::stream_record_json` (present only when `ttl_expired`, absent
+for every ordinary client write) — rather than assuming the ADR prose alone
+proved it wired up. Confirmed both by the pre-existing unit test
+(`streams_wire::tests::stream_record_json_carries_service_user_identity_
+for_a_ttl_delete`) and by this PR's own end-to-end regression
+(`console_stream.rs::ttl_deletion_carries_the_service_user_identity_
+through_the_console`, which forces a real TTL expiry + reap and reads the
+resulting `REMOVE` record's `userIdentity` back through the console port).
+`console::StreamRecordsPage::records` passes DynamoDB's own `Record` wire
+shape straight through unprojected — the same "no fixed console shape to
+project onto" call PR4's `WireItem` already made, for the identical reason
+(a stream record has no catalog to narrow from any more than an item
+does) — so `userIdentity` reaches `console.js` exactly as the real wire
+produces it; `console.js` renders its presence as a small "TTL expiry"
+badge next to the event pill, exactly the fact a developer debugging "why
+did my row vanish" needs and exactly the field real DynamoDB Streams uses
+to convey it.
+
+### Scope: the current stream only, deliberately, not the disable-grace-window pair
+
+ADR 0042 §4/§11 (F12-b) lets a just-disabled stream and a freshly
+re-enabled one coexist in `ListStreams`/`DescribeStream` for as long as the
+old label's catalog rows haven't yet aged out — real wire-compatibility
+behavior a driver library must handle correctly. The Stream data tab
+deliberately does **not** surface that pair: `stream_shards`/
+`get_shard_iterator` resolve against `Metadata::table_stream`, which is
+`Some` only for a table's *current* enabled stream, `None` the instant it's
+disabled (grace window or not). This is a scope decision, not a
+rediscovered gap — the console's audience is a developer debugging their
+*currently enabled* stream, and a browsable "here's your stream from two
+enables ago, mid-retention-sweep" view is a real but genuinely separate
+feature with its own UI questions (which of possibly several labels is
+"the" one to show first?) that nothing in this PR's brief asked for. The
+raw wire's own grace-window behavior is unaffected — a driver library
+hitting the DynamoDB Streams service directly still gets the full
+ADR 0042 §4/§11 contract; only this console tab's own view is narrower.
+Revisit if a future task specifically asks for it.
+

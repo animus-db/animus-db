@@ -2875,6 +2875,147 @@ impl console::ConsoleBackend for ClientCtx {
         }
         Ok(())
     }
+
+    async fn stream_shards(
+        &self,
+        table: &str,
+        req: console::StreamShardsRequest,
+    ) -> Result<console::StreamShardsPage, console::ConsoleError> {
+        let meta = self.effective_metadata();
+        if !meta.has_table_schema(table) {
+            return Err(console::ConsoleError::new(404, "no such table"));
+        }
+        let Some(spec) = meta.table_stream(table) else {
+            // The honest "no stream enabled" answer — see
+            // `console::StreamShardsPage`'s own doc: a plain `200`, never a
+            // `404`/error, since a table with no stream is the common case.
+            return Ok(console::StreamShardsPage {
+                enabled: false,
+                view_type: None,
+                stream_arn: None,
+                shards: Vec::new(),
+                last_evaluated_shard_id: None,
+            });
+        };
+        let stream_arn = animus_dynamo::wire::stream_arn(table, &spec.label);
+        let mut body = serde_json::json!({ "StreamArn": stream_arn });
+        if let Some(start) = &req.exclusive_start_shard_id {
+            body["ExclusiveStartShardId"] = serde_json::Value::String(start.clone());
+        }
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) = crate::dynamo::execute_routed(
+            self,
+            "DynamoDBStreams_20120810.DescribeStream",
+            &payload,
+        )
+        .await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+            console::ConsoleError::new(500, format!("malformed DescribeStream response: {e}"))
+        })?;
+        let sd = &value["StreamDescription"];
+        let shards = sd["Shards"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|s| console::ShardSummary {
+                shard_id: s["ShardId"].as_str().unwrap_or_default().to_string(),
+                parent_shard_id: s["ParentShardId"].as_str().map(str::to_string),
+                starting_sequence_number: s["SequenceNumberRange"]["StartingSequenceNumber"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                ending_sequence_number: s["SequenceNumberRange"]["EndingSequenceNumber"]
+                    .as_str()
+                    .map(str::to_string),
+            })
+            .collect();
+        Ok(console::StreamShardsPage {
+            enabled: true,
+            view_type: Some(stream_view_type_label(spec.view_type).to_string()),
+            stream_arn: Some(stream_arn),
+            shards,
+            last_evaluated_shard_id: sd["LastEvaluatedShardId"].as_str().map(str::to_string),
+        })
+    }
+
+    async fn get_shard_iterator(
+        &self,
+        table: &str,
+        req: console::GetShardIteratorRequest,
+    ) -> Result<String, console::ConsoleError> {
+        let meta = self.effective_metadata();
+        if !meta.has_table_schema(table) {
+            return Err(console::ConsoleError::new(404, "no such table"));
+        }
+        let Some(spec) = meta.table_stream(table) else {
+            return Err(console::ConsoleError::new(
+                400,
+                "this table has no stream enabled",
+            ));
+        };
+        let stream_arn = animus_dynamo::wire::stream_arn(table, &spec.label);
+        let mut body = serde_json::json!({
+            "StreamArn": stream_arn,
+            "ShardId": req.shard_id,
+            "ShardIteratorType": req.iterator_type,
+        });
+        if let Some(seq) = &req.sequence_number {
+            body["SequenceNumber"] = serde_json::Value::String(seq.clone());
+        }
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) = crate::dynamo::execute_routed(
+            self,
+            "DynamoDBStreams_20120810.GetShardIterator",
+            &payload,
+        )
+        .await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+            console::ConsoleError::new(500, format!("malformed GetShardIterator response: {e}"))
+        })?;
+        value["ShardIterator"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| console::ConsoleError::new(500, "GetShardIterator returned no iterator"))
+    }
+
+    async fn get_stream_records(
+        &self,
+        _table: &str,
+        req: console::GetStreamRecordsRequest,
+    ) -> Result<console::StreamRecordsPage, console::ConsoleError> {
+        // No `table`/label check here: `req.shard_iterator` is an opaque
+        // token this same backend's `get_shard_iterator` already minted
+        // against a resolved `StreamArn`, and the real `GetRecords` wire
+        // path (`dynamo_streams::get_records`) independently re-validates
+        // the token's own label against the catalog — a second check here
+        // would just duplicate that gate, not add one.
+        let mut body = serde_json::json!({ "ShardIterator": req.shard_iterator });
+        if let Some(limit) = req.limit {
+            body["Limit"] = serde_json::Value::from(limit);
+        }
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDBStreams_20120810.GetRecords", &payload)
+                .await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+            console::ConsoleError::new(500, format!("malformed GetRecords response: {e}"))
+        })?;
+        let records = value["Records"].as_array().cloned().unwrap_or_default();
+        let next_shard_iterator = value["NextShardIterator"].as_str().map(str::to_string);
+        Ok(console::StreamRecordsPage {
+            records,
+            next_shard_iterator,
+        })
+    }
 }
 
 /// Decode a `Scan`/`Query` wire response body (`{"Items": [...], "Count": n,

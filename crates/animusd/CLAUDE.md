@@ -238,8 +238,8 @@ reusing the captured config is the point of the test.
   and data-only nodes only; a control-only node hosts no CP-data tablet, so
   it binds none (`BoundControlNode::start_control_with` passes `None` into
   `spawn_common_tail`'s `console_listener` parameter). **This module still
-  takes no `ClientCtx` (PR2's tables-list screen, PR3's Config tab, and
-  PR4's Items tab)** —
+  takes no `ClientCtx` (PR2's tables-list screen, PR3's Config tab, PR4's
+  Items tab, and PR5's Stream data tab)** —
   a structural enforcement, not just a documented rule, of the console's one
   defining constraint: it must never surface cluster-shaped state (nodes,
   replicas, tablets, Raft, quorum, leaders, placement, health). PR2 added
@@ -318,12 +318,51 @@ reusing the captured config is the point of the test.
   `query_items` resolves the partition/sort attribute names to query by
   from the replicated catalog server-side, the same way `add_gsi`/
   `table_detail` already read it, rather than asking the client to know or
-  type them. The Stream tab and the create-table form are still follow-up
-  PRs in the same stack, each adding their own narrow projection type/
-  `ConsoleBackend` method the same way every PR so far has — never
-  widening `console.rs`'s inputs back toward `ClientCtx`. See ADR 0052 for
-  the full design (including why the console does *not* join the
-  replicated `NodeAddrs` book — no other node ever needs to resolve it).
+  type them. **PR5 (the table page's Stream data tab, its third and final
+  tab) widens `ConsoleBackend` a third time — three more methods
+  (`stream_shards`/`get_shard_iterator`/`get_stream_records`), same
+  discipline again**: every one built on the real `ListStreams`/
+  `DescribeStream`/`GetShardIterator`/`GetRecords` wire operations
+  (`crate::dynamo::execute_routed(self, "DynamoDBStreams_20120810.<Op>",
+  ..)`, the streams sibling of the `DynamoDB_20120810.*` target every
+  earlier PR's mutation already routes through). **This is the PR where
+  the "never show cluster state" rule gets genuinely sharp**: a DynamoDB
+  Streams shard is *implemented* as a seal epoch of one tablet's own
+  change log (ADR 0042/0043), so `console::ShardSummary::shard_id`
+  literally embeds a tablet id and a seal epoch
+  (`shardId-<tablet>-<epoch>`) as digits. It is surfaced anyway — the id is
+  DynamoDB's own public wire identifier, not this console's invention; a
+  real client already receives exactly this string from `DescribeStream`
+  and passes it back to `GetShardIterator`, so hiding it would make the
+  tab useless for the "why did my row vanish" debugging it exists for. What
+  never crosses `ConsoleBackend`'s new methods, structurally (no
+  `TabletId`/`NodeId`/replica-set type in any of their signatures): which
+  node/replica currently serves a shard, and a seal's own storage-internal
+  `object_id`/`replicas` (ADR 0042 §10). A table with no stream gets the
+  same "honest empty answer, not an error" treatment PR4's `get_item`
+  established for a missing key: `stream_shards` returns `enabled: false`
+  with a `200`, and `console.js` renders a plain "no stream enabled"
+  message pointing at the Config tab's Settings section rather than a
+  grid that looks broken. The shard list paginates over `DescribeStream`'s
+  own real `ExclusiveStartShardId`/`LastEvaluatedShardId` contract (a `GET`
+  with a query param, since a shard id — unlike `Scan`'s `ExclusiveStartKey`
+  — is a flat string); a shard's records page over `GetShardIterator`/
+  `GetRecords`'s own `NextShardIterator` walk, the honest paging equivalent
+  of PR4's `ExclusiveStartKey` walk. `console::StreamRecordsPage::records`
+  passes DynamoDB's own `Record` wire shape straight through, unprojected —
+  the same "no fixed console shape to project onto" call PR4's `WireItem`
+  already made, now including a TTL-reaper delete's `userIdentity` (ADR
+  0051 §7) when present, which `console.js` renders as a small "TTL expiry"
+  badge next to the event pill. See ADR 0052's fourth 2026-08-20 amendment
+  for the full reasoning, including the "closed set gets a real control"
+  call for the iterator-type picker (`TRIM_HORIZON`/`LATEST`/
+  `AT_SEQUENCE_NUMBER`/`AFTER_SEQUENCE_NUMBER`, DynamoDB's own closed set)
+  and why the Stream tab scopes to a table's *current* stream only,
+  deliberately not the disable-grace-window pair ADR 0042 §4/§11 lets
+  coexist on the raw wire. The create-table form remains the one follow-up
+  left in this stack. See ADR 0052 for the full design (including why the
+  console does *not* join the replicated `NodeAddrs` book — no other node
+  ever needs to resolve it).
 
 ## CLI reference
 

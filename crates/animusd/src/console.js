@@ -82,13 +82,17 @@
     return TABLES_ROUTE_PREFIX + encodeURIComponent(name);
   }
 
-  // The table page's Items tab has its own real URL, one path segment past
-  // the table's own (`.../tables/{name}/items`) — see the table-page routing
-  // section's own comment for why this, rather than a shared-page
-  // pushState-driven tab strip (`dashboard_core.js::activateTab`'s idiom),
-  // is the tab-switch mechanism here.
+  // The table page's Items and Stream data tabs each have their own real
+  // URL, one path segment past the table's own (`.../tables/{name}/items`,
+  // `.../tables/{name}/stream`) — see the table-page routing section's own
+  // comment for why this, rather than a shared-page pushState-driven tab
+  // strip (`dashboard_core.js::activateTab`'s idiom), is the tab-switch
+  // mechanism here.
   function tableItemsHref(name) {
     return tableHref(name) + "/items";
+  }
+  function tableStreamHref(name) {
+    return tableHref(name) + "/stream";
   }
 
   // Nulls (the LSI "structurally absent" case) always sort last, in either
@@ -327,20 +331,20 @@
 
   let TABLE_DETAIL = null;
 
-  // The table page has two tabs — Config (this PR's predecessor, PR3;
-  // default) and Items (this PR). Each is its own real URL
-  // (`tableHref`/`tableItemsHref`) rather than one shared page toggling
-  // sections via `dashboard_core.js::activateTab`'s pushState idiom: unlike
-  // that dashboard's tabs (which all share one already-fetched status blob)
-  // or this same page's own Settings/Indexes/Danger-zone jump nav (which
-  // all share one `table_detail` fetch and just scroll within it), Config
-  // and Items are genuinely different data-fetching screens — Items makes
-  // its own `scan`/`query` calls Config never touches. A real navigation
-  // keeps that boundary explicit, costs nothing extra (both routes serve
-  // the identical static shell, `console::is_shell_path`), and makes
-  // "Config is the default tab" a structural fact of the URL space (arriving
-  // at the bare `tableHref` always renders Config) rather than client state
-  // that could start on the wrong tab.
+  // The table page has three tabs — Config (PR3; default), Items (PR4), and
+  // Stream data (this PR). Each is its own real URL
+  // (`tableHref`/`tableItemsHref`/`tableStreamHref`) rather than one shared
+  // page toggling sections via `dashboard_core.js::activateTab`'s pushState
+  // idiom: unlike that dashboard's tabs (which all share one already-fetched
+  // status blob) or this same page's own Settings/Indexes/Danger-zone jump
+  // nav (which all share one `table_detail` fetch and just scroll within
+  // it), Config/Items/Stream data are genuinely different data-fetching
+  // screens — each makes its own calls the others never touch. A real
+  // navigation keeps that boundary explicit, costs nothing extra (every
+  // route serves the identical static shell, `console::is_shell_path`), and
+  // makes "Config is the default tab" a structural fact of the URL space
+  // (arriving at the bare `tableHref` always renders Config) rather than
+  // client state that could start on the wrong tab.
   async function renderTablePage(name, tab) {
     app.innerHTML = `<p class="loading">Loading ${esc(name)}…</p>`;
     try {
@@ -363,13 +367,17 @@
         <nav class="tab-strip">
           <a class="tab-link${tab === "config" ? " active" : ""}" href="${tableHref(name)}">Config</a>
           <a class="tab-link${tab === "items" ? " active" : ""}" href="${tableItemsHref(name)}">Items</a>
+          <a class="tab-link${tab === "stream" ? " active" : ""}" href="${tableStreamHref(name)}">Stream data</a>
         </nav>
         <div id="table-tab-content"></div>
       </div>`;
+    const content = document.getElementById("table-tab-content");
     if (tab === "items") {
-      renderItemsTab(document.getElementById("table-tab-content"));
+      renderItemsTab(content);
+    } else if (tab === "stream") {
+      renderStreamTab(content);
     } else {
-      renderConfigTab(document.getElementById("table-tab-content"));
+      renderConfigTab(content);
     }
   }
 
@@ -1037,6 +1045,20 @@
     return parts.join(", ");
   }
 
+  // The Stream tab's sibling of `attributePreview` above: every attribute of
+  // a raw attribute map (a stream record's `Keys`/`OldImage`/`NewImage`, none
+  // of which have a "key attribute to skip" the way an item row does), same
+  // honest-compact rendering (`renderAttributeValueCompact` — never a
+  // fabricated type).
+  function attributeMapPreview(map) {
+    if (!map) return '<span class="dash">—</span>';
+    const parts = Object.keys(map)
+      .sort()
+      .map((name) => `${esc(name)}=${renderAttributeValueCompact(map[name])}`);
+    if (parts.length === 0) return '<span class="dash">—</span>';
+    return parts.join(", ");
+  }
+
   function itemKeyOf(item, keys) {
     const key = {};
     if (item[keys.pk] !== undefined) key[keys.pk] = item[keys.pk];
@@ -1289,6 +1311,296 @@
     }
   }
 
+  // ---- the table page: Stream data tab (this PR) --------------------------
+  //
+  // A table's DynamoDB Streams shards and the records inside them, built on
+  // the real `ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords`
+  // wire operations (`console.rs`'s `stream_shards`/`get_shard_iterator`/
+  // `get_stream_records`) — same "reuse the real wire path" rule as every
+  // other mutating/reading endpoint in this app.
+  //
+  // A **shard id is deliberately rendered as-is**, unabbreviated and
+  // copyable: it looks like `shardId-<tablet>-<epoch>`, but it is DynamoDB's
+  // own public wire identifier — a real client receives exactly this string
+  // from `DescribeStream` and passes it straight back to
+  // `GetShardIterator`, so a developer debugging their own stream needs to
+  // see and copy it, the same way they'd copy a partition key value. See
+  // `console.rs`'s own module doc for the line this module draws between
+  // "DynamoDB wire vocabulary" (a shard id, its `ParentShardId` lineage, a
+  // sequence number — all shown here) and actual cluster shape (which
+  // node/replica serves it — never shown, and never even reaches this
+  // script, since `console.rs`'s response types have no such field to send).
+  //
+  // The **iterator type control is a real segmented control**, not a
+  // free-text guess: DynamoDB's four (`TRIM_HORIZON`/`LATEST`/
+  // `AT_SEQUENCE_NUMBER`/`AFTER_SEQUENCE_NUMBER`) are a genuinely closed
+  // set, the same "closed set gets a real control" rule the Add-GSI/Query
+  // forms already follow elsewhere in this app. A sequence number itself
+  // (when `AT_`/`AFTER_` needs one) stays a plain text input — it's a value
+  // a developer copies from an already-shown record's own `Sequence #`
+  // column, not a closed set.
+  //
+  // **Paging a shard's records is the honest `NextShardIterator` walk**
+  // (ADR 0042 §6), the record-viewer equivalent of the Items tab's
+  // `ExclusiveStartKey` walk: "Load more records" always sends the
+  // previous page's own returned iterator, never a fake offset, and a
+  // `null` `NextShardIterator` renders as "shard drained" rather than
+  // silently going quiet. The shard *list* itself paginates the same
+  // honest way, over `DescribeStream`'s own real
+  // `ExclusiveStartShardId`/`LastEvaluatedShardId` contract.
+  //
+  // **TTL-deleted records are called out** (ADR 0051 §7): a record whose
+  // `userIdentity` is present (`{"PrincipalId": "dynamodb.amazonaws.com",
+  // "Type": "Service"}`) was deleted by the TTL reaper, not a client
+  // `DeleteItem` — exactly the fact a developer debugging "why did my row
+  // vanish" needs, and exactly the field real DynamoDB Streams uses to
+  // convey it, so it is rendered as a badge rather than left for the
+  // developer to notice buried in a raw record dump.
+
+  let STREAM_STATE = null;
+
+  function streamApiPath(tail) {
+    return tableApiPath(TABLE_DETAIL.name, `stream/${tail}`);
+  }
+
+  function renderStreamTab(root) {
+    STREAM_STATE = {
+      shards: [],
+      lastShardId: null,
+      viewType: null,
+      selectedShardId: null,
+      iterator: null,
+      records: [],
+    };
+    root.innerHTML = `<div class="stream-tab"><div id="stream-body"><p class="loading">Loading stream…</p></div></div>`;
+    loadStreamShards(false);
+  }
+
+  async function loadStreamShards(loadMore) {
+    const bodyEl = document.getElementById("stream-body");
+    try {
+      const qs =
+        loadMore && STREAM_STATE.lastShardId
+          ? `?exclusive_start_shard_id=${encodeURIComponent(STREAM_STATE.lastShardId)}`
+          : "";
+      const page = await getJSON(streamApiPath("shards") + qs);
+      if (!page.enabled) {
+        renderStreamDisabled(bodyEl);
+        return;
+      }
+      STREAM_STATE.shards = loadMore ? STREAM_STATE.shards.concat(page.shards) : page.shards;
+      STREAM_STATE.lastShardId = page.last_evaluated_shard_id;
+      STREAM_STATE.viewType = page.view_type;
+      if (!loadMore) renderStreamEnabledShell(bodyEl);
+      renderShardRows();
+    } catch (e) {
+      bodyEl.innerHTML = `<p class="err-line">Couldn't load the stream: ${esc(String(e.message || e))}</p>`;
+    }
+  }
+
+  // The honest "no stream" answer — a plain message pointing at where to
+  // turn one on, never an empty grid that looks broken (this PR's own
+  // design brief; `console::StreamShardsPage`'s doc makes the same call
+  // server-side: `enabled: false` is data, not an error).
+  function renderStreamDisabled(el) {
+    el.innerHTML = `
+      <div class="empty-state stream-disabled">
+        No stream enabled on this table.
+        <div class="hint">Turn one on from <a href="${tableHref(TABLE_DETAIL.name)}#settings">Config → Settings</a>.</div>
+      </div>`;
+  }
+
+  function renderStreamEnabledShell(el) {
+    el.innerHTML = `
+      <div class="fact-strip">
+        <div class="fact"><span class="fact-label">View type</span><span class="fact-value view-type">${esc(STREAM_STATE.viewType)}</span></div>
+      </div>
+      <h2>Shards</h2>
+      <div class="items-card">
+        <div class="table-scroll"><table class="items-table">
+          <thead><tr><th>Shard ID</th><th>Parent</th><th>Status</th><th></th></tr></thead>
+          <tbody id="shards-body"></tbody>
+        </table></div>
+      </div>
+      <div class="items-footer">
+        <span class="muted" id="shards-count"></span>
+        <button type="button" class="btn-edit hidden" id="shards-load-more">Load more shards</button>
+      </div>
+      <h2>Records</h2>
+      <div id="records-panel" class="records-panel">
+        <p class="muted">Select a shard above to read its records.</p>
+      </div>`;
+    document.getElementById("shards-load-more").addEventListener("click", () => loadStreamShards(true));
+  }
+
+  function shardStatusPill(open) {
+    return open
+      ? '<span class="status-pill shard-pill-open">Open</span>'
+      : '<span class="status-pill shard-pill-closed">Closed</span>';
+  }
+
+  function shardRowHtml(s) {
+    const open = s.ending_sequence_number == null;
+    return `
+      <tr>
+        <td class="mono">${esc(s.shard_id)}</td>
+        <td class="mono">${s.parent_shard_id ? esc(s.parent_shard_id) : '<span class="dash">—</span>'}</td>
+        <td>${shardStatusPill(open)}</td>
+        <td><button type="button" class="btn-edit" data-view-shard="${esc(s.shard_id)}">View records</button></td>
+      </tr>`;
+  }
+
+  function renderShardRows() {
+    const body = document.getElementById("shards-body");
+    const count = document.getElementById("shards-count");
+    if (!body) return;
+    if (STREAM_STATE.shards.length === 0) {
+      body.innerHTML = `<tr><td colspan="4"><div class="empty-state">No shards yet.</div></td></tr>`;
+    } else {
+      body.innerHTML = STREAM_STATE.shards.map(shardRowHtml).join("");
+    }
+    const n = STREAM_STATE.shards.length;
+    count.textContent = `${n} shard${n === 1 ? "" : "s"} loaded`;
+    document.getElementById("shards-load-more").classList.toggle("hidden", !STREAM_STATE.lastShardId);
+    body.querySelectorAll("[data-view-shard]").forEach((btn) => {
+      btn.addEventListener("click", () => selectShard(btn.dataset.viewShard));
+    });
+  }
+
+  const ITERATOR_TYPES = ["TRIM_HORIZON", "LATEST", "AT_SEQUENCE_NUMBER", "AFTER_SEQUENCE_NUMBER"];
+
+  function selectShard(shardId) {
+    STREAM_STATE.selectedShardId = shardId;
+    STREAM_STATE.iterator = null;
+    STREAM_STATE.records = [];
+    renderRecordsPanel();
+  }
+
+  function renderRecordsPanel() {
+    const el = document.getElementById("records-panel");
+    el.innerHTML = `
+      <div class="stream-controls">
+        <span class="mono shard-selected">${esc(STREAM_STATE.selectedShardId)}</span>
+        <div class="field">Start position${segmented("stream-iter-type", ITERATOR_TYPES, "TRIM_HORIZON")}</div>
+        <div class="field hidden" id="stream-seq-field">Sequence number
+          <input type="text" id="stream-seq-value" class="attr-input" placeholder="from a record's Sequence #" autocomplete="off">
+        </div>
+        <button type="button" class="btn-save" id="stream-read-btn">Read records</button>
+      </div>
+      <p class="err-line hidden" id="stream-records-err"></p>
+      <div class="items-card">
+        <div class="table-scroll"><table class="items-table">
+          <thead><tr><th>Event</th><th>Keys</th><th>Old image</th><th>New image</th><th>Sequence #</th><th>When</th></tr></thead>
+          <tbody id="records-body"><tr><td colspan="6"><div class="empty-state">Choose a start position and read records.</div></td></tr></tbody>
+        </table></div>
+      </div>
+      <div class="items-footer">
+        <span class="muted" id="records-count"></span>
+        <button type="button" class="btn-edit hidden" id="records-load-more">Load more records</button>
+      </div>`;
+    wireSegmented(el);
+    el.querySelectorAll('.segmented[data-field="stream-iter-type"] .seg-opt').forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const t = segmentedValue(el, "stream-iter-type");
+        const needsSeq = t === "AT_SEQUENCE_NUMBER" || t === "AFTER_SEQUENCE_NUMBER";
+        document.getElementById("stream-seq-field").classList.toggle("hidden", !needsSeq);
+      });
+    });
+    document.getElementById("stream-read-btn").addEventListener("click", () => startReadingShard(el));
+    document.getElementById("records-load-more").addEventListener("click", () => fetchRecords(true));
+  }
+
+  async function startReadingShard(scope) {
+    const errEl = document.getElementById("stream-records-err");
+    errEl.classList.add("hidden");
+    const iterType = segmentedValue(scope, "stream-iter-type") || "TRIM_HORIZON";
+    const seqInput = document.getElementById("stream-seq-value");
+    const seq = seqInput ? seqInput.value.trim() : "";
+    if ((iterType === "AT_SEQUENCE_NUMBER" || iterType === "AFTER_SEQUENCE_NUMBER") && !seq) {
+      errEl.textContent = "A sequence number is required for this start position.";
+      errEl.classList.remove("hidden");
+      return;
+    }
+    const readBtn = document.getElementById("stream-read-btn");
+    readBtn.disabled = true;
+    try {
+      const req = { shard_id: STREAM_STATE.selectedShardId, iterator_type: iterType };
+      if (seq) req.sequence_number = seq;
+      const resp = await postJSON(streamApiPath("iterator"), req);
+      STREAM_STATE.iterator = resp.shard_iterator;
+      STREAM_STATE.records = [];
+      await fetchRecords(false);
+    } catch (e) {
+      errEl.textContent = String(e.message || e);
+      errEl.classList.remove("hidden");
+    } finally {
+      readBtn.disabled = false;
+    }
+  }
+
+  async function fetchRecords(loadMore) {
+    const errEl = document.getElementById("stream-records-err");
+    errEl.classList.add("hidden");
+    try {
+      const resp = await postJSON(streamApiPath("records"), { shard_iterator: STREAM_STATE.iterator });
+      STREAM_STATE.records = loadMore ? STREAM_STATE.records.concat(resp.records) : resp.records;
+      // A `null` `next_shard_iterator` is DynamoDB's own "this shard is
+      // exhausted" signal (ADR 0042 §2/§6) — rendered as "shard drained"
+      // below, never silently treated as "try again later" the way a
+      // still-open shard's temporary "nothing new yet" would be.
+      STREAM_STATE.iterator = resp.next_shard_iterator;
+      renderRecordRows();
+      document.getElementById("records-load-more").classList.toggle("hidden", !STREAM_STATE.iterator);
+      const n = STREAM_STATE.records.length;
+      const drained = STREAM_STATE.iterator ? "" : " — shard drained";
+      document.getElementById("records-count").textContent = `${n} record${n === 1 ? "" : "s"} loaded${drained}`;
+    } catch (e) {
+      errEl.textContent = String(e.message || e);
+      errEl.classList.remove("hidden");
+    }
+  }
+
+  function eventPill(name) {
+    const cls = name === "INSERT" ? "pill-active" : name === "REMOVE" ? "pill-deleting" : "pill-creating";
+    return `<span class="status-pill ${cls}">${esc(name || "?")}</span>`;
+  }
+
+  // The one place `userIdentity`'s presence turns into something a
+  // developer actually notices (ADR 0051 §7) — see this section's own
+  // header comment.
+  function ttlBadge(record) {
+    return record.userIdentity
+      ? '<span class="status-pill shard-pill-ttl" title="Deleted by DynamoDB TTL expiry, not a client DeleteItem">TTL expiry</span>'
+      : "";
+  }
+
+  function recordRowHtml(r) {
+    const dd = r.dynamodb || {};
+    const when =
+      typeof dd.ApproximateCreationDateTime === "number"
+        ? new Date(dd.ApproximateCreationDateTime * 1000).toLocaleString()
+        : '<span class="dash">—</span>';
+    return `
+      <tr>
+        <td>${eventPill(r.eventName)} ${ttlBadge(r)}</td>
+        <td class="attrs-preview">${attributeMapPreview(dd.Keys)}</td>
+        <td class="attrs-preview">${attributeMapPreview(dd.OldImage)}</td>
+        <td class="attrs-preview">${attributeMapPreview(dd.NewImage)}</td>
+        <td class="mono">${esc(dd.SequenceNumber || "")}</td>
+        <td>${when}</td>
+      </tr>`;
+  }
+
+  function renderRecordRows() {
+    const body = document.getElementById("records-body");
+    if (!body) return;
+    if (STREAM_STATE.records.length === 0) {
+      body.innerHTML = `<tr><td colspan="6"><div class="empty-state">No records in this range.</div></td></tr>`;
+      return;
+    }
+    body.innerHTML = STREAM_STATE.records.map(recordRowHtml).join("");
+  }
+
   // ---- routing -------------------------------------------------------------
 
   const path = normalizePath(window.location.pathname);
@@ -1297,13 +1609,14 @@
     if (rest === "new") {
       renderStub(rest);
     } else {
-      // `{name}` (Config, the default) or `{name}/items` (Items) — the only
-      // two shapes a real table page's own URL takes; see `renderTablePage`'s
-      // own comment for why this is a real route rather than a same-page tab
-      // toggle.
+      // `{name}` (Config, the default), `{name}/items` (Items), or
+      // `{name}/stream` (Stream data) — the only three shapes a real table
+      // page's own URL takes; see `renderTablePage`'s own comment for why
+      // this is a real route rather than a same-page tab toggle.
       const slash = rest.indexOf("/");
       const name = decodeURIComponent(slash === -1 ? rest : rest.slice(0, slash));
-      const tab = slash !== -1 && rest.slice(slash + 1) === "items" ? "items" : "config";
+      const tail = slash === -1 ? "" : rest.slice(slash + 1);
+      const tab = tail === "items" ? "items" : tail === "stream" ? "stream" : "config";
       renderTablePage(name, tab);
     }
   } else if (TABLE_LIST_ROUTES.has(path)) {
