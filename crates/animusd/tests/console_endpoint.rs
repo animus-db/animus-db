@@ -1,10 +1,15 @@
 //! End-to-end test of the AnimusDB Data Console's listener (ADR 0052) over
-//! real TCP (`ProdEnv`): this stack ships plumbing only, so this file proves
-//! exactly that plumbing — the placeholder shell 200s as `text/html`, its one
-//! static asset 200s, a `/console/ui/*` deep link returns the same shell, the
-//! bound port matches what the config says, and (the deliberate
-//! non-goal this ADR calls out) a **control-only** node never binds one at
-//! all. No JSON assertions here: this listener serves static bytes only.
+//! real TCP (`ProdEnv`): the shell 200s as `text/html` and names itself, both
+//! static assets (CSS + the PR2 tables-list JS) 200 with the right content
+//! type, a `/console/ui/*` deep link returns the identical shell (the
+//! client-side router in `console.js`, not the server, decides what that
+//! path renders), the bound port matches what the config says, and (the
+//! deliberate non-goal this ADR calls out) a **control-only** node never
+//! binds one at all. The tables-list **JSON endpoint's own projection
+//! correctness** (key shapes, GSI/LSI counts, stream/TTL, hidden-table
+//! exclusion, the no-cluster-shape property) is a separate concern, covered
+//! end to end in the sibling `tests/console_tables.rs` — this file only
+//! proves the endpoint exists and serves valid JSON.
 //!
 //! Real time + sockets, so it brings the cluster up with the documented
 //! port-TOCTOU bounded retry (`support::bring_up_split`/`support::
@@ -42,10 +47,12 @@ async fn raw(addr: SocketAddr, path: &str) -> (u16, String, String) {
     (status, head.to_string(), body.to_string())
 }
 
-/// The shell 200s as `text/html`, states plainly that it is the console and
-/// unbuilt, its one asset 200s, a deep link under `/console/ui/` returns the
-/// identical shell, and the bound port is exactly the one `RoleAddrs::console`
-/// named in the config — on a **combined** node.
+/// The shell 200s as `text/html` and names itself, both static assets 200,
+/// a deep link under `/console/ui/` returns the identical shell (the same
+/// static bytes — routing happens client-side), the tables JSON endpoint
+/// 200s with a valid `{"tables": [...]}` body, and the bound port is exactly
+/// the one `RoleAddrs::console` named in the config — on a **combined**
+/// node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn console_serves_shell_assets_and_deep_links_on_combined_node() {
     timeout(Duration::from_secs(30), async {
@@ -72,11 +79,11 @@ async fn console_serves_shell_assets_and_deep_links_on_combined_node() {
             "the shell names itself: {body}"
         );
         assert!(
-            body.to_ascii_lowercase().contains("not built yet"),
-            "the shell states plainly its screens are not built: {body}"
+            body.contains("console.js"),
+            "the shell loads the console's client-side app: {body}"
         );
 
-        // ---- its one static asset --------------------------------------
+        // ---- its static assets -----------------------------------------
         let (status, head, css) = raw(node.console_addr(), "/console/ui/console.css").await;
         assert_eq!(status, 200, "the stylesheet asset 200s");
         assert!(
@@ -84,6 +91,15 @@ async fn console_serves_shell_assets_and_deep_links_on_combined_node() {
             "the asset is text/css, headers:\n{head}"
         );
         assert!(!css.is_empty(), "the stylesheet has content");
+
+        let (status, head, js) = raw(node.console_addr(), "/console/ui/console.js").await;
+        assert_eq!(status, 200, "the tables-list JS asset 200s");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: text/javascript"),
+            "the asset is text/javascript, headers:\n{head}"
+        );
+        assert!(!js.is_empty(), "the script has content");
 
         // ---- a deep link returns the identical shell -------------------
         let (status, head, deep_body) = raw(node.console_addr(), "/console/ui/tables").await;
@@ -98,12 +114,24 @@ async fn console_serves_shell_assets_and_deep_links_on_combined_node() {
             "the deep link serves the exact same shell as the root"
         );
 
-        // ---- no JSON endpoints exist yet on this listener --------------
-        let (status, _, _) = raw(node.console_addr(), "/console/api/tables").await;
-        assert_eq!(
-            status, 404,
-            "this PR ships static bytes only — no JSON endpoint exists yet"
+        // ---- the tables-list JSON endpoint (PR2) ------------------------
+        let (status, head, api_body) = raw(node.console_addr(), "/console/api/tables").await;
+        assert_eq!(status, 200, "the tables endpoint 200s");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "the tables endpoint is JSON, headers:\n{head}"
         );
+        let parsed: serde_json::Value = serde_json::from_str(&api_body).expect("valid JSON body");
+        assert_eq!(
+            parsed["tables"],
+            serde_json::json!([]),
+            "a freshly-booted node has no tables yet: {api_body}"
+        );
+
+        // ---- an unknown path still 404s ---------------------------------
+        let (status, _, _) = raw(node.console_addr(), "/console/api/nonexistent").await;
+        assert_eq!(status, 404, "an unrecognized path still 404s");
 
         node.shutdown_graceful().await;
     })

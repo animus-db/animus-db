@@ -9,23 +9,12 @@
 <body>
 <header class="topbar">
   <div class="brand"><span class="name">animusd</span><span class="tag">data console</span></div>
+  <span class="spacer"></span>
+  <span class="scope-note">your tables &amp; items only — no cluster state</span>
 </header>
-<main>
-  <h1>AnimusDB Data Console</h1>
-  <p class="lede">
-    This is the AnimusDB Data Console — a DynamoDB-shaped view of your own
-    tables and items, for application development.
-  </p>
-  <p class="notice">
-    Its screens are <strong>not built yet</strong>. This placeholder only
-    proves the console has its own listener, separate from the operator
-    dashboard and its admin port.
-  </p>
-  <p class="scope">
-    By design, this console will never show cluster state — no nodes,
-    replicas, tablets, Raft, quorum, leaders, placement, or health. For
-    cluster operation, use the operator dashboard on the node's admin port.
-  </p>
+<main id="app">
+  <p class="loading">Loading AnimusDB Data Console…</p>
 </main>
+<script src="/console/ui/console.js"></script>
 </body>
 </html>

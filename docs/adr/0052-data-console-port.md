@@ -1,8 +1,9 @@
 # ADR 0052 — The AnimusDB Data Console: a separate app, a separate port
 
-- **Status:** Accepted — this stack ships the plumbing only (§Decision "What
-  this PR ships"); the console's actual screens (tables list, table page,
-  create-table form) are follow-up PRs in the same stack.
+- **Status:** Accepted — PR1 shipped the plumbing only (§Decision "What this
+  PR ships"); PR2 (see the 2026-08-20 amendment below) ships the tables-list
+  screen and this listener's first JSON endpoint. The table page and the
+  create-table form remain follow-up PRs in the same stack.
 - **Date:** 2026-08-19
 - **Amends:** [ADR 0035](0035-control-plane-separate-deployment.md) (owns the
   deployment shapes and their port contracts — gains a seventh port and a
@@ -212,3 +213,49 @@ above for why that would defeat the point of splitting them at all.
   stack that brings up a real node uses it.
 - No behavior change to any existing wire edge, the admin surface, or the
   operator dashboard — this is a pure addition.
+
+## Amendment (2026-08-20, PR2 — the tables-list screen and endpoint)
+
+This stack's second PR ships the console's first real screen (a dense
+tables-list) and, with it, this listener's first JSON endpoint: `GET
+/console/api/tables`. Two decisions worth recording, both direct
+consequences of this ADR's original "never shows cluster state" rule
+rather than new ones.
+
+**The endpoint returns a console-shaped projection, not `/admin/status`.**
+The obvious shortcut would have been to let the console read the same
+`Metadata` the admin surface's `/admin/status` already serializes whole —
+it already has everything a tables list needs (the schema catalog) sitting
+right next to everything this console must never show (nodes, tablets,
+replicas, Raft state, placement). That shortcut was rejected. The reason
+is the trust boundary this ADR draws, not merely a rendering preference:
+**cluster shape must never reach this browser at all, not just go
+unrendered by today's client code.** A JSON payload the client happens not
+to render today is still one dependency-bump or one "quick add a field"
+commit away from a leak — the boundary has to be enforced at the wire, the
+same way PR1 enforced "no `ClientCtx`" structurally rather than by
+convention in `console.rs` itself. So the endpoint is backed by a narrow,
+purpose-built projection instead: `console::TableSummary` (a name, typed
+key names, GSI/LSI counts, and two stream/TTL booleans — see
+`console.rs`'s own module doc), built by a `console::TableSnapshotFn`
+closure `lib.rs` constructs and hands to `console::serve` at startup.
+`console.rs` itself imports no `Metadata`/`TableSchema`/`IndexKind`/schema-
+catalog type at all; the one function that reads the schema catalog on the
+console's behalf (`lib.rs::console_table_summaries`) lives outside this
+module, so there is no cluster-shaped value ever in scope inside it to
+serialize by accident. The same discipline applies to every future console
+endpoint this stack adds — a new screen's data need is a new narrow
+projection type, never a wider handle back toward `ClientCtx`/`Metadata`.
+
+**Per-table item count and size are deliberately absent.** Both are
+things a real DynamoDB console shows, and both were considered for this
+screen. Neither exists today except as a client-side fan-out over every
+node's `/admin/raftkv` (summed across replicas, tablets, and nodes) — which
+would mean the console's very first JSON response leaking exactly the
+cluster shape this whole ADR exists to hide, just to answer a size
+question. The maintainer's call: these stay out until a real server-side
+rollup exists (a single aggregate the control plane or a leader computes
+and the console can read without seeing a single tablet), not before. This
+is a scope decision, not an oversight — do not add a fan-out to
+`/admin/*` from `console.rs`/`lib.rs`'s console-facing code to backfill
+these two fields.

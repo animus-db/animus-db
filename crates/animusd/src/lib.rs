@@ -2341,6 +2341,101 @@ pub(crate) struct AdminInfo {
     pub(crate) auto_split_bytes_threshold: Option<u64>,
 }
 
+/// Project the replicated schema catalog into the AnimusDB Data Console's own
+/// [`console::TableSummary`] rows (ADR 0052 PR2 — the tables-list screen's
+/// data source). Lives here, in `lib.rs` — not in `console.rs` — on purpose:
+/// this is the one function in the whole node that reads `Metadata`'s schema
+/// catalog on the console's behalf, so `console.rs` itself never needs to
+/// import `Metadata`/`TableSchema`/`IndexKind`/any other schema-catalog type,
+/// only the plain owned fields [`console::TableSummary`] is built from. See
+/// `console`'s own module doc for why that boundary is load-bearing, not
+/// incidental.
+fn console_table_summaries(metadata: &Metadata) -> Vec<console::TableSummary> {
+    metadata
+        .schemas
+        .iter()
+        // A GSI's hidden materialization table (`<base>$<index>`, ADR 0041)
+        // never actually gets a `Metadata::schemas` entry of its own — only
+        // its tablets exist once the drain lazily provisions them (see
+        // `admin.rs`'s own note on this) — but the filter is kept anyway as
+        // the same belt-and-suspenders discipline `ClientCtx::drop_table`'s
+        // own cascade uses: cheap, and it is what actually earns "excluded
+        // server-side" as a property a regression test can assert on, rather
+        // than resting on an invariant that holds elsewhere in the codebase
+        // today but that this function has no way to enforce if it changes.
+        .filter(|(name, _)| !animus_dynamo::index::is_index_table_name(name))
+        .map(|(name, schema)| {
+            let key_summary = |column_name: &str| console::KeySummary {
+                name: column_name.to_string(),
+                attribute_type: schema
+                    .column(column_name)
+                    .map(|c| animus_dynamo::schema::attribute_type_for(c.ty))
+                    .unwrap_or("S")
+                    .to_string(),
+            };
+            let partition_key = key_summary(&schema.partition_key);
+            // DynamoDB has at most one sort key — the one-element case of
+            // `clustering_keys` (`animus_dynamo::schema::to_dynamo` reads the
+            // same first element back out for the identical reason).
+            let sort_key = schema.clustering_keys.first().map(|sk| key_summary(sk));
+            let gsi_count = schema
+                .indexes
+                .iter()
+                .filter(|idx| idx.kind == animus_control::IndexKind::Global)
+                .count() as u32;
+            // An LSI shares the base partition key and adds an alternate
+            // sort key, so a table with no sort key structurally cannot have
+            // one — `None` here is that structural absence, not a count of
+            // zero; the console renders the two differently (a dash vs.
+            // `0`).
+            let lsi_count = sort_key.as_ref().map(|_| {
+                schema
+                    .indexes
+                    .iter()
+                    .filter(|idx| idx.kind == animus_control::IndexKind::Local)
+                    .count() as u32
+            });
+            let stream = console::StreamSummary {
+                enabled: schema.stream.is_some(),
+                view_type: schema
+                    .stream
+                    .as_ref()
+                    .map(|s| stream_view_type_label(s.view_type).to_string()),
+            };
+            let ttl = console::TtlSummary {
+                enabled: schema.ttl.is_some(),
+                attribute_name: schema.ttl.as_ref().map(|t| t.attribute_name.clone()),
+            };
+            console::TableSummary {
+                name: name.clone(),
+                partition_key,
+                sort_key,
+                gsi_count,
+                lsi_count,
+                stream,
+                ttl,
+            }
+        })
+        .collect()
+}
+
+/// An [`animus_control::StreamViewType`]'s DynamoDB wire label — the same
+/// vocabulary `StreamSpecification`/`DescribeStream` already use (ADR 0052:
+/// "explains that in DynamoDB's own vocabulary"). `animus_dynamo::wire`
+/// already has this exact mapping (`stream_view_type_str`), but it is
+/// `pub(crate)` to that crate; duplicating four match arms here follows the
+/// same precedent `animus-dynamo/CLAUDE.md` documents for its own
+/// `streams_wire` module re-deriving small byte-shape functions rather than
+/// widening a sibling crate's public surface for one caller.
+fn stream_view_type_label(view_type: animus_control::StreamViewType) -> &'static str {
+    match view_type {
+        animus_control::StreamViewType::NewAndOldImages => "NEW_AND_OLD_IMAGES",
+        animus_control::StreamViewType::NewImage => "NEW_IMAGE",
+        animus_control::StreamViewType::OldImage => "OLD_IMAGE",
+        animus_control::StreamViewType::KeysOnly => "KEYS_ONLY",
+    }
+}
+
 /// The common assembly tail shared by every node shape (ADR 0035 PR3):
 /// build the [`ClientCtx`] and spawn the tasks every node needs regardless of
 /// role — control-only ([`BoundControlNode::start_control_with`]), or
@@ -2463,11 +2558,18 @@ fn spawn_common_tail(
     // The AnimusDB Data Console (ADR 0052) — `None` on a control-only node
     // (it hosts no CP-data tablet, so it has nothing for the console to
     // show; see `BoundControlNode::start_control_with`, the only caller that
-    // passes `None`). Deliberately takes no `ClientCtx`: this listener
-    // serves static bytes only, structurally unable to reach any cluster
-    // state even by accident — see `console`'s module doc.
+    // passes `None`). Still takes no `ClientCtx` (PR2's tables-list screen):
+    // only a `console::TableSnapshotFn` closure, built right here from
+    // `ctx.effective_metadata()` + `console_table_summaries` (below) — so
+    // `console.rs` itself never sees `Metadata`/`ClientCtx`/any other
+    // cluster-shaped type, only the plain `TableSummary` rows this closure
+    // hands it. See `console`'s module doc for why that boundary matters.
     if let Some(console_listener) = console_listener {
-        tasks.push(tokio::spawn(console::serve(console_listener)));
+        let table_source: console::TableSnapshotFn = {
+            let ctx = ctx.clone();
+            Arc::new(move || console_table_summaries(&ctx.effective_metadata()))
+        };
+        tasks.push(tokio::spawn(console::serve(console_listener, table_source)));
     }
 
     (ctx, tasks)

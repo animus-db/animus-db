@@ -230,28 +230,45 @@ reusing the captured config is the point of the test.
   **operator** surface (cluster health/placement/Raft/storage) on the
   admin port; see `console.rs`'s own entry and ADR 0052's "Naming,
   deliberately addressed" for the full disambiguation.
-- **`console.rs`** + **`console.html`** + **`console.css`** — the AnimusDB
-  **Data Console** (ADR 0052): a DynamoDB-shaped data app for application
-  developers, on its own dedicated port (`RoleAddrs.console`) — never the
-  admin port (documented no-auth, trusted-interface-only, ADR 0020) and
-  never a route on the DynamoDB wire listener. Bound on combined and
-  data-only nodes only; a control-only node hosts no CP-data tablet, so it
-  binds none (`BoundControlNode::start_control_with` passes `None` into
-  `spawn_common_tail`'s `console_listener` parameter). **This module takes
-  no `ClientCtx`** — a structural enforcement, not just a documented rule,
-  of the console's one defining constraint: it must never surface
-  cluster-shaped state (nodes, replicas, tablets, Raft, quorum, leaders,
-  placement, health). As of this PR it serves a minimal placeholder shell
-  only (`include_str!`'d HTML/CSS, an asset route, a `/console/ui/*`
-  deep-link prefix mirroring `admin::is_ui_path`'s shape) — no JSON
-  endpoints exist yet; later PRs in the same stack add the real screens
-  (tables list, table page, create-table form), each reading through
-  `ClientCtx`'s existing CP primitives the way `dynamo.rs`/`cql.rs` already
-  do, which is also the point at which this module will need its own
-  `ClientCtx` and the "no `ClientCtx`" property above will need
-  re-examining, not silently assumed to still hold. See ADR 0052 for the
-  full design (including why the console does *not* join the replicated
-  `NodeAddrs` book — no other node ever needs to resolve it).
+- **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
+  — the AnimusDB **Data Console** (ADR 0052): a DynamoDB-shaped data app for
+  application developers, on its own dedicated port (`RoleAddrs.console`) —
+  never the admin port (documented no-auth, trusted-interface-only, ADR
+  0020) and never a route on the DynamoDB wire listener. Bound on combined
+  and data-only nodes only; a control-only node hosts no CP-data tablet, so
+  it binds none (`BoundControlNode::start_control_with` passes `None` into
+  `spawn_common_tail`'s `console_listener` parameter). **This module still
+  takes no `ClientCtx` (PR2, the tables-list screen)** — a structural
+  enforcement, not just a documented rule, of the console's one defining
+  constraint: it must never surface cluster-shaped state (nodes, replicas,
+  tablets, Raft, quorum, leaders, placement, health). PR2 added this
+  listener's first JSON endpoint, `GET /console/api/tables`, without
+  widening that boundary: `console::serve` takes a `console::
+  TableSnapshotFn` (`Arc<dyn Fn() -> Vec<console::TableSummary>>`) instead
+  of a `ClientCtx`/`Metadata` reference — a closure `lib.rs::
+  spawn_common_tail` builds from `ctx.effective_metadata()` and
+  `lib.rs::console_table_summaries` (the **one** function in the crate that
+  reads the schema catalog on the console's behalf; see ADR 0052's
+  2026-08-20 amendment for why that projection exists instead of reusing
+  `/admin/status`). `console.rs` itself imports no `Metadata`/
+  `TableSchema`/`IndexKind`/any schema-catalog type — only the plain owned
+  `TableSummary`/`KeySummary`/`StreamSummary`/`TtlSummary` structs. Item
+  count/size are deliberately absent from the projection (same ADR
+  amendment) pending a server-side rollup — do not fan out to `/admin/*`
+  from here to backfill them. `console.js` is the client-side app: a
+  `location.pathname`-based router (mirroring `dashboard_core.js::
+  activateTab`'s idiom, but via real `<a href>` navigation rather than
+  push-state, since there is only one built screen so far) rendering the
+  tables list from that endpoint, or a plain "not built yet" stub for a
+  `/console/ui/tables/<name>` deep link (the table page, PR3) — the server
+  serves the identical static shell for every `/console/ui/*` path
+  (`is_shell_path`, unchanged since PR1) regardless of which of those the
+  client then renders. The table page and the create-table form are still
+  follow-up PRs in the same stack, each adding their own narrow projection
+  type the same way this one was added — never widening `console.rs`'s
+  inputs back toward `ClientCtx`. See ADR 0052 for the full design
+  (including why the console does *not* join the replicated `NodeAddrs`
+  book — no other node ever needs to resolve it).
 
 ## CLI reference
 
