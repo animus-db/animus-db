@@ -2365,19 +2365,14 @@ fn console_table_summaries(metadata: &Metadata) -> Vec<console::TableSummary> {
         // today but that this function has no way to enforce if it changes.
         .filter(|(name, _)| !animus_dynamo::index::is_index_table_name(name))
         .map(|(name, schema)| {
-            let key_summary = |column_name: &str| console::KeySummary {
-                name: column_name.to_string(),
-                attribute_type: schema
-                    .column(column_name)
-                    .map(|c| animus_dynamo::schema::attribute_type_for(c.ty))
-                    .unwrap_or("S")
-                    .to_string(),
-            };
-            let partition_key = key_summary(&schema.partition_key);
+            let partition_key = console_key_summary(schema, &schema.partition_key);
             // DynamoDB has at most one sort key — the one-element case of
             // `clustering_keys` (`animus_dynamo::schema::to_dynamo` reads the
             // same first element back out for the identical reason).
-            let sort_key = schema.clustering_keys.first().map(|sk| key_summary(sk));
+            let sort_key = schema
+                .clustering_keys
+                .first()
+                .map(|sk| console_key_summary(schema, sk));
             let gsi_count = schema
                 .indexes
                 .iter()
@@ -2395,28 +2390,349 @@ fn console_table_summaries(metadata: &Metadata) -> Vec<console::TableSummary> {
                     .filter(|idx| idx.kind == animus_control::IndexKind::Local)
                     .count() as u32
             });
-            let stream = console::StreamSummary {
-                enabled: schema.stream.is_some(),
-                view_type: schema
-                    .stream
-                    .as_ref()
-                    .map(|s| stream_view_type_label(s.view_type).to_string()),
-            };
-            let ttl = console::TtlSummary {
-                enabled: schema.ttl.is_some(),
-                attribute_name: schema.ttl.as_ref().map(|t| t.attribute_name.clone()),
-            };
             console::TableSummary {
                 name: name.clone(),
                 partition_key,
                 sort_key,
                 gsi_count,
                 lsi_count,
-                stream,
-                ttl,
+                stream: console_stream_summary(schema),
+                ttl: console_ttl_summary(schema),
             }
         })
         .collect()
+}
+
+/// One column's name + declared DynamoDB `AttributeType`, console-shaped —
+/// the shared building block [`console_table_summaries`] and
+/// [`console_table_detail`] (ADR 0052 PR3) both use for every key attribute
+/// they render. An attribute absent from `schema.columns` (never declared —
+/// e.g. a just-added GSI's own hash attribute, which this adapter's
+/// `UpdateTable` decoder does not require an `AttributeDefinitions` entry
+/// for, unlike real DynamoDB) defaults to `"S"`, matching
+/// `schema_bridge`'s own missing-type default.
+fn console_key_summary(schema: &TableSchema, column_name: &str) -> console::KeySummary {
+    console::KeySummary {
+        name: column_name.to_string(),
+        attribute_type: schema
+            .column(column_name)
+            .map(|c| animus_dynamo::schema::attribute_type_for(c.ty))
+            .unwrap_or("S")
+            .to_string(),
+    }
+}
+
+/// The same projection for an *index* key attribute, which — unlike a base
+/// table's own key — may genuinely have no declared type to report. See
+/// [`console::IndexKeySummary`]: `IndexDef` stores only the attribute name,
+/// so a type exists only when that attribute is also a declared column of
+/// the base table. `None` (rather than [`console_key_summary`]'s `"S"`
+/// fallback) so the console renders a bare name instead of asserting a type
+/// nobody recorded.
+fn console_index_key_summary(schema: &TableSchema, column_name: &str) -> console::IndexKeySummary {
+    console::IndexKeySummary {
+        name: column_name.to_string(),
+        attribute_type: schema
+            .column(column_name)
+            .map(|c| animus_dynamo::schema::attribute_type_for(c.ty).to_string()),
+    }
+}
+
+/// A table's stream configuration, console-shaped — shared by
+/// [`console_table_summaries`]/[`console_table_detail`] and the
+/// [`console::ConsoleBackend`] impl below (a `set_stream` call re-reads the
+/// committed schema through this same projection rather than hand-building
+/// its own).
+fn console_stream_summary(schema: &TableSchema) -> console::StreamSummary {
+    console::StreamSummary {
+        enabled: schema.stream.is_some(),
+        view_type: schema
+            .stream
+            .as_ref()
+            .map(|s| stream_view_type_label(s.view_type).to_string()),
+    }
+}
+
+/// A table's TTL configuration, console-shaped — the `set_ttl` sibling of
+/// [`console_stream_summary`] above.
+fn console_ttl_summary(schema: &TableSchema) -> console::TtlSummary {
+    console::TtlSummary {
+        enabled: schema.ttl.is_some(),
+        attribute_name: schema.ttl.as_ref().map(|t| t.attribute_name.clone()),
+    }
+}
+
+/// An [`animus_control::IndexStatus`]'s DynamoDB wire label
+/// (`"CREATING"`/`"ACTIVE"`/`"DELETING"`) — `console.rs` never imports
+/// `IndexStatus` itself (see that module's doc), so this is where the
+/// translation happens, mirroring `stream_view_type_label`'s own precedent
+/// (`animus_dynamo::wire::index_status_str` has the identical mapping but is
+/// private to that crate).
+fn console_index_status_label(status: IndexStatus) -> &'static str {
+    match status {
+        IndexStatus::Creating => "CREATING",
+        IndexStatus::Active => "ACTIVE",
+        IndexStatus::Deleting => "DELETING",
+    }
+}
+
+/// One global secondary index, console-shaped — shared by
+/// [`console_table_detail`] (every GSI on a table) and the
+/// [`console::ConsoleBackend`] impl's `add_gsi` (the one just-created
+/// index).
+fn console_gsi_detail(schema: &TableSchema, idx: &animus_control::IndexDef) -> console::GsiDetail {
+    console::GsiDetail {
+        name: idx.name.clone(),
+        hash_attribute: console_index_key_summary(schema, &idx.hash_attribute),
+        sort_attribute: idx
+            .sort_attribute
+            .as_deref()
+            .map(|a| console_index_key_summary(schema, a)),
+        status: console_index_status_label(idx.status).to_string(),
+    }
+}
+
+/// Project one table's full configuration for the Data Console's table page
+/// Config tab (ADR 0052 PR3, `GET /console/api/tables/{name}`) — the
+/// `TableDetail`-shaped sibling of [`console_table_summaries`]'s per-table
+/// `TableSummary` (every count there becomes a full declaration here).
+/// `None` for a table with no schema, **including** a GSI's own hidden
+/// `<base>$<index>` materialization table — mirrors
+/// [`console_table_summaries`]'s own exclusion filter, since that table has
+/// no `Metadata::schemas` entry of its own to find in the first place
+/// (`meta.table_schema` already returns `None` for it; the explicit
+/// `is_index_table_name` check here is belt-and-suspenders, matching that
+/// function's own comment on why it keeps the filter despite the invariant
+/// holding elsewhere today).
+fn console_table_detail(meta: &Metadata, table: &str) -> Option<console::TableDetail> {
+    if animus_dynamo::index::is_index_table_name(table) {
+        return None;
+    }
+    let schema = meta.table_schema(table)?;
+    let partition_key = console_key_summary(schema, &schema.partition_key);
+    let sort_key = schema
+        .clustering_keys
+        .first()
+        .map(|sk| console_key_summary(schema, sk));
+    let gsis = schema
+        .indexes
+        .iter()
+        .filter(|idx| idx.kind == animus_control::IndexKind::Global)
+        .map(|idx| console_gsi_detail(schema, idx))
+        .collect();
+    let lsis = schema
+        .indexes
+        .iter()
+        .filter(|idx| idx.kind == animus_control::IndexKind::Local)
+        .map(|idx| {
+            // Always present for an LSI (`IndexDef`'s own invariant, enforced
+            // at decode time by `animus_dynamo::wire::decode_indexes`); the
+            // empty-string fallback is defense-in-depth only, never expected
+            // to render.
+            let sort_name = idx.sort_attribute.as_deref().unwrap_or_default();
+            console::LsiDetail {
+                name: idx.name.clone(),
+                sort_attribute: console_index_key_summary(schema, sort_name),
+            }
+        })
+        .collect();
+    Some(console::TableDetail {
+        name: table.to_string(),
+        partition_key,
+        sort_key,
+        gsis,
+        lsis,
+        stream: console_stream_summary(schema),
+        ttl: console_ttl_summary(schema),
+    })
+}
+
+/// Translate a `dynamo::execute_routed` failure (a DynamoDB wire error JSON
+/// body, `{"__type":..,"message":..}`) into a [`console::ConsoleError`] —
+/// every mutating [`console::ConsoleBackend`] method's error path, so the
+/// console surfaces the exact same status/message a real DynamoDB client
+/// hitting the same `UpdateTable`/`UpdateTimeToLive` call would see, per
+/// this PR's "reuse the existing execution path" rule (see `console.rs`'s
+/// module doc and ADR 0052's amendment). Falls back to the raw body text if
+/// it isn't the expected error shape (defensive only — `execute_routed`
+/// always returns one of these two shapes).
+fn console_wire_error(status: u16, body: &str) -> console::ConsoleError {
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.to_string());
+    console::ConsoleError::new(status, message)
+}
+
+/// The Data Console's mutating-endpoint seam (ADR 0052 PR3) —
+/// [`console::ConsoleBackend`]'s one implementor. Every method either reuses
+/// the same DynamoDB wire path the real edge/`/admin/data/dynamo` use
+/// (`crate::dynamo::execute_routed`, this PR's "reuse the existing
+/// execution path" rule) or, for `delete_table` (not a DynamoDB wire
+/// operation at all), the same [`ClientCtx::drop_table`] the admin
+/// dashboard's own drop-table action calls. See `console.rs`'s module doc
+/// for why widening this trait never widens what `console.rs` itself can
+/// see: every method here builds its request/response JSON and reads
+/// `Metadata` on the console's behalf, so no schema-catalog type ever
+/// crosses into that module.
+#[async_trait::async_trait]
+impl console::ConsoleBackend for ClientCtx {
+    async fn table_detail(&self, table: &str) -> Option<console::TableDetail> {
+        console_table_detail(&self.effective_metadata(), table)
+    }
+
+    async fn add_gsi(
+        &self,
+        table: &str,
+        req: console::AddGsiRequest,
+    ) -> Result<console::GsiDetail, console::ConsoleError> {
+        if req.index_name.trim().is_empty() {
+            return Err(console::ConsoleError::new(400, "index_name is required"));
+        }
+        if req.hash_attribute.trim().is_empty() {
+            return Err(console::ConsoleError::new(
+                400,
+                "hash_attribute is required",
+            ));
+        }
+        let mut key_schema = vec![serde_json::json!({
+            "AttributeName": req.hash_attribute, "KeyType": "HASH",
+        })];
+        if let Some(sort_attribute) = req
+            .sort_attribute
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            key_schema.push(serde_json::json!({
+                "AttributeName": sort_attribute, "KeyType": "RANGE",
+            }));
+        }
+        // Deliberately no `AttributeDefinitions`: this adapter's
+        // `GlobalSecondaryIndexUpdates` decoder never reads one (issue #319),
+        // so sending types here would look like it recorded them while the
+        // index read back untyped. See `console::AddGsiRequest`.
+        let body = serde_json::json!({
+            "TableName": table,
+            "GlobalSecondaryIndexUpdates": [
+                {"Create": {"IndexName": req.index_name, "KeySchema": key_schema}}
+            ],
+        });
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTable", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let meta = self.metadata_fresh().await;
+        let Some(schema) = meta.table_schema(table) else {
+            return Err(console::ConsoleError::new(
+                500,
+                "GSI committed but the table's schema is gone",
+            ));
+        };
+        meta.table_indexes(table)
+            .iter()
+            .find(|d| d.name == req.index_name)
+            .map(|idx| console_gsi_detail(schema, idx))
+            .ok_or_else(|| {
+                console::ConsoleError::new(500, "GSI committed but not found in the catalog")
+            })
+    }
+
+    async fn drop_gsi(&self, table: &str, index: &str) -> Result<(), console::ConsoleError> {
+        let body = serde_json::json!({
+            "TableName": table,
+            "GlobalSecondaryIndexUpdates": [ {"Delete": {"IndexName": index}} ],
+        });
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTable", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        Ok(())
+    }
+
+    async fn set_stream(
+        &self,
+        table: &str,
+        req: console::SetStreamRequest,
+    ) -> Result<console::StreamSummary, console::ConsoleError> {
+        let body = if req.enabled {
+            let Some(view_type) = req.view_type.as_deref().filter(|s| !s.trim().is_empty()) else {
+                return Err(console::ConsoleError::new(
+                    400,
+                    "view_type is required to enable a stream",
+                ));
+            };
+            serde_json::json!({
+                "TableName": table,
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": view_type},
+            })
+        } else {
+            serde_json::json!({
+                "TableName": table,
+                "StreamSpecification": {"StreamEnabled": false},
+            })
+        };
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTable", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let meta = self.metadata_fresh().await;
+        let Some(schema) = meta.table_schema(table) else {
+            return Err(console::ConsoleError::new(404, "no such table"));
+        };
+        Ok(console_stream_summary(schema))
+    }
+
+    async fn set_ttl(
+        &self,
+        table: &str,
+        req: console::SetTtlRequest,
+    ) -> Result<console::TtlSummary, console::ConsoleError> {
+        let Some(attribute_name) = req
+            .attribute_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return Err(console::ConsoleError::new(
+                400,
+                "attribute_name is required",
+            ));
+        };
+        let body = serde_json::json!({
+            "TableName": table,
+            "TimeToLiveSpecification": {"Enabled": req.enabled, "AttributeName": attribute_name},
+        });
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTimeToLive", &payload)
+                .await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let meta = self.metadata_fresh().await;
+        let Some(schema) = meta.table_schema(table) else {
+            return Err(console::ConsoleError::new(404, "no such table"));
+        };
+        Ok(console_ttl_summary(schema))
+    }
+
+    async fn delete_table(&self, table: &str) -> Result<(), console::ConsoleError> {
+        if !self.metadata_fresh().await.has_table_schema(table) {
+            return Err(console::ConsoleError::new(404, "no such table"));
+        }
+        self.drop_table(table.to_string())
+            .await
+            .map_err(|e| console::ConsoleError::new(409, e))
+    }
 }
 
 /// An [`animus_control::StreamViewType`]'s DynamoDB wire label — the same
@@ -2558,18 +2874,25 @@ fn spawn_common_tail(
     // The AnimusDB Data Console (ADR 0052) — `None` on a control-only node
     // (it hosts no CP-data tablet, so it has nothing for the console to
     // show; see `BoundControlNode::start_control_with`, the only caller that
-    // passes `None`). Still takes no `ClientCtx` (PR2's tables-list screen):
-    // only a `console::TableSnapshotFn` closure, built right here from
-    // `ctx.effective_metadata()` + `console_table_summaries` (below) — so
-    // `console.rs` itself never sees `Metadata`/`ClientCtx`/any other
-    // cluster-shaped type, only the plain `TableSummary` rows this closure
-    // hands it. See `console`'s module doc for why that boundary matters.
+    // passes `None`). Still takes no `ClientCtx` directly: a
+    // `console::TableSnapshotFn` closure (PR2's tables-list screen, built
+    // from `ctx.effective_metadata()` + `console_table_summaries` below) and
+    // — PR3's table page — an `Arc<dyn console::ConsoleBackend>` built from
+    // `ClientCtx`'s own impl of that trait just above. So `console.rs`
+    // itself never sees `Metadata`/`ClientCtx`/any other cluster-shaped
+    // type, only the plain console types those two seams hand it. See
+    // `console`'s module doc for why that boundary matters.
     if let Some(console_listener) = console_listener {
         let table_source: console::TableSnapshotFn = {
             let ctx = ctx.clone();
             Arc::new(move || console_table_summaries(&ctx.effective_metadata()))
         };
-        tasks.push(tokio::spawn(console::serve(console_listener, table_source)));
+        let backend: Arc<dyn console::ConsoleBackend> = Arc::new(ctx.clone());
+        tasks.push(tokio::spawn(console::serve(
+            console_listener,
+            table_source,
+            backend,
+        )));
     }
 
     (ctx, tasks)

@@ -2,8 +2,10 @@
 
 - **Status:** Accepted — PR1 shipped the plumbing only (§Decision "What this
   PR ships"); PR2 (see the 2026-08-20 amendment below) ships the tables-list
-  screen and this listener's first JSON endpoint. The table page and the
-  create-table form remain follow-up PRs in the same stack.
+  screen and this listener's first JSON endpoint; PR3 (see the second
+  2026-08-20 amendment below) ships a table's own page, Config tab. The
+  Items tab, the Stream tab, and the create-table form remain follow-up PRs
+  in the same stack.
 - **Date:** 2026-08-19
 - **Amends:** [ADR 0035](0035-control-plane-separate-deployment.md) (owns the
   deployment shapes and their port contracts — gains a seventh port and a
@@ -259,3 +261,96 @@ and the console can read without seeing a single tablet), not before. This
 is a scope decision, not an oversight — do not add a fan-out to
 `/admin/*` from `console.rs`/`lib.rs`'s console-facing code to backfill
 these two fields.
+
+## Amendment (2026-08-20, PR3 — the table page's Config tab)
+
+This stack's third PR ships the first screen that **mutates** anything: a
+table's own page, Config tab — its key schema (read-only), its GSIs
+(addable/droppable), its LSIs (read-only, create-time-only), its stream
+(enable/disable/view-type), its TTL (ADR 0051, enable/disable/attribute),
+and table deletion. Two decisions worth recording.
+
+**The injected seam widens from one closure to a small `ConsoleBackend`
+trait, but never in *kind*, only in *shape*.** PR2's `TableSnapshotFn` (a
+bare `Fn() -> Vec<TableSummary>`) is exactly right for a read that takes no
+parameters and cannot fail; it stays, untouched, for the tables list. The
+Config tab's six operations (`table_detail`, `add_gsi`, `drop_gsi`,
+`set_stream`, `set_ttl`, `delete_table`) each need a table name (and
+sometimes a request body) and can fail, so a single closure's shape no
+longer fits — an `async_trait::async_trait` trait
+(`console::ConsoleBackend`) does instead. The trait lives in `console.rs`
+itself, and every one of its method signatures is built entirely from
+plain, owned console types this PR adds alongside it (`TableDetail`,
+`GsiDetail`, `LsiDetail`, `AddGsiRequest`, `SetStreamRequest`,
+`SetTtlRequest`, `ConsoleError`) — never `ClientCtx`, `Metadata`,
+`TableSchema`, `IndexDef`, or any other cluster/schema-catalog type.
+`console.rs` imports none of those types before this PR and imports none
+of them after it either; only `lib.rs` (the trait's one implementor, on
+`ClientCtx`) ever has a schema-catalog type in scope while building a
+method's return value. The load-bearing property PR2 established — "the
+console never shows cluster state" enforced by what a module can even
+import, not by convention — survives the widening exactly because the
+widening happened in the *number and asynchrony* of the seam's operations,
+never in what crosses it.
+
+**Every mutation reuses the real DynamoDB wire path — `crate::
+dynamo::execute_routed` — instead of a parallel one, except the one
+operation that isn't a DynamoDB operation at all.** Adding/dropping a GSI
+and enabling/disabling/reconfiguring a stream are exactly `UpdateTable`
+calls (`GlobalSecondaryIndexUpdates`/`StreamSpecification`); setting TTL is
+exactly `UpdateTimeToLive`. `lib.rs`'s `ConsoleBackend` impl builds the
+identical JSON body a real DynamoDB client would send and calls
+`dynamo::execute_routed` — the same function the real DynamoDB listener's
+`dispatch` and the operator dashboard's `POST /admin/data/dynamo` already
+call — rather than re-deriving `MetaCommand::CreateTableIndex`/
+`SetTableStream`/`SetTableTtl` proposals directly. This is not merely
+convenient: it means the Config tab inherits every validation rule, every
+commit-wait discipline, and every future fix to those code paths for free,
+and it means a bug fixed once in `dynamo.rs`'s `create_index`/`drop_index`/
+`update_time_to_live` is fixed for all three callers (the wire edge, the
+admin dashboard, and now the console) rather than needing to be
+independently rediscovered in a console-only reimplementation. **Table
+deletion is the deliberate exception**: DynamoDB itself has no
+`DeleteTable` in this adapter's supported subset (see `crates/animus-dynamo/
+CLAUDE.md`), so there is no wire path to reuse — `delete_table` instead
+calls the same `ClientCtx::drop_table` the admin dashboard's own
+`action_drop_table` (`admin.rs`) calls, the console's equivalent of that
+existing admin-only primitive, exactly as this ADR's "What to implement"
+brief anticipated.
+
+A GSI and an LSI are rendered from **different types** (`GsiDetail` carries
+a lifecycle `status` and its own hash attribute; `LsiDetail` carries
+neither) rather than one shared row shape with optional fields — an LSI is
+a scope inside the table's own storage, not a separate materialized table,
+and has no lifecycle to report; collapsing the two into one type would let
+a future change accidentally add a "drop" affordance or a status pill to an
+LSI row, which is not a real DynamoDB operation. The UI mirrors this at the
+template level, not just the type level (`console.js`'s `gsiRowHtml`/
+`lsiRowHtml` are two separate functions).
+
+### An index key attribute's type is nullable, and the Add-GSI form asks for none
+
+A base table's own partition/sort key always has a declared `S`/`N`/`B`
+type: `CreateTable` requires it in `AttributeDefinitions` and the schema
+bridge turns those into the table's `ColumnDef`s. An **index** key
+attribute does not. `animus_control::IndexDef` stores only the attribute
+*name*, and this adapter's `UpdateTable` decoder for
+`GlobalSecondaryIndexUpdates` never reads `AttributeDefinitions` at all
+(issue #319) — so a GSI added to a live table has key attributes with no
+type recorded anywhere, while a GSI declared at `CreateTable` time on the
+same table does.
+
+The console models that difference instead of hiding it. `KeySummary`
+(base-table keys) keeps `attribute_type: String`; `IndexKeySummary` (GSI/LSI
+keys) uses `Option<String>`, and `console.js` renders `None` as a bare
+attribute name rather than a parenthesised type. The Add-GSI form asks for
+attribute *names* only — an earlier draft offered an `S`/`N`/`B` picker per
+key, which the backend faithfully forwarded and the decoder silently threw
+away, so the value came back as the fallback `S` no matter what was chosen:
+a control that cannot survive its own round trip. `add_gsi` correspondingly
+sends no `AttributeDefinitions`, since sending them would suggest they were
+recorded.
+
+Restoring the picker is the natural follow-up to #319, not a separate design
+question — this ADR's position is only that the console must not claim a type
+nobody stored.

@@ -41,8 +41,11 @@ pub(crate) fn query_param(query: &str, name: &str) -> Option<String> {
 }
 
 /// Minimal `application/x-www-form-urlencoded` value decoding: `+` → space and
-/// `%NN` → byte. Invalid escapes are passed through verbatim.
-fn percent_decode(s: &str) -> String {
+/// `%NN` → byte. Invalid escapes are passed through verbatim. `pub(crate)`
+/// (not module-private) since `console.rs`'s per-table path routing also
+/// needs it, for a table/index name that needed `encodeURIComponent` on the
+/// way in.
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

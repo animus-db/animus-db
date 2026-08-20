@@ -2784,6 +2784,60 @@ debugging anything that feels like it might have happened before.
   `crates/animusd/tests/streams_e2e.rs`, 2026-08-20.)
 
 ### Code patterns
+- **A single-closure injection seam that needs to grow into several
+  fallible, parameterized operations should become a small trait, not a
+  pile of more closures — but the widening must be audited to stay in
+  *shape* only, never in *kind* (2026-08-20, ADR 0052 PR3, the Data
+  Console's Config tab).** PR2 gave `console.rs` a `TableSnapshotFn`
+  (`Arc<dyn Fn() -> Vec<TableSummary>>`) as its one seam into `lib.rs`'s
+  cluster-aware world — exactly right for one parameterless, infallible
+  read. PR3 needed six more operations (a per-table detail read plus five
+  mutations), each needing a table name/request body and able to fail.
+  Bolting five more `Arc<dyn Fn...>` fields onto `serve`'s signature would
+  have worked mechanically but obscured the one property that actually
+  matters here: that every operation's signature is still built only from
+  plain owned types the seam itself declares, never the richer type the
+  other side of the boundary actually has in hand. An `async_trait` trait
+  (`ConsoleBackend`) makes that property easy to see and easy to keep
+  honest at every call site — one `impl` block, one place to check that no
+  method accepts or returns a cluster/schema-catalog type — where five
+  separate closures would have made the same audit five separate
+  fly-by-eye checks. The general form: when a seam must grow, prefer
+  promoting it to a trait over multiplying its closures, but the reason to
+  prefer the trait is auditability of the type boundary, not the trait
+  keyword itself — a trait whose methods leak the richer type back through
+  is no safer than the closures would have been. (`crates/animusd/src/
+  console.rs`, `crates/animusd/src/lib.rs`.)
+- **A wire adapter's `UpdateTable`-add-a-GSI decode path can silently
+  ignore attribute types even though the equivalent `CreateTable` path
+  requires them — check what a decoder actually reads before assuming its
+  request shape mirrors its sibling operation's (2026-08-20).** This
+  adapter's `GlobalSecondaryIndexUpdates` `Create` decoding
+  (`animus_dynamo::wire::decode_index_updates` → `decode_index_entry`)
+  reads `KeySchema` straight off the `Create` object itself and never looks
+  at a top-level `AttributeDefinitions` at all — unlike `CreateTable`,
+  where `AttributeDefinitions` feeds the base table's own `ColumnDef`
+  types. A new GSI's hash/sort attribute therefore gets no explicit type
+  recorded anywhere in the catalog; `IndexDef` stores only the attribute
+  *name*. Before building a feature on top of an existing wire operation,
+  read what its decoder actually consumes; a sibling operation's contract is
+  not evidence the one you're calling shares it. **And when the gap means a
+  UI control's value cannot survive its own round trip, remove the control —
+  do not paper over it with a default.** The Config tab's Add-GSI form
+  originally offered an `S`/`N`/`B` picker per key attribute; the pick was
+  accepted with a `200 OK` and read straight back as `S`, so the screen
+  contradicted itself within one interaction. Defaulting the *display* to
+  `"S"` would have hidden that, which is worse than the bug: an invented
+  value is indistinguishable from a recorded one. The fix was to delete the
+  picker, stop sending the `AttributeDefinitions` the decoder ignores, and
+  make the type explicitly nullable end-to-end (`console::IndexKeySummary`'s
+  `Option<String>`, rendered as a bare attribute name) so the absence is
+  visible rather than filled in. The decoder gap itself is issue #319 — an
+  incidental pre-existing bug, so its own change with its own test, per the
+  repo convention. General form: a fallback default is only honest when the
+  fallback is unreachable in practice; where it *is* reachable, model the
+  absence. (`crates/animus-dynamo/src/wire.rs`, `crates/animusd/src/
+  console.{rs,js}`.)
 - **A "claim now, confirm later" state machine needs a release on *every*
   failure exit of the executor, not just the one the original design happened
   to handle (2026-08-19).** `animus-cp-data`'s tablet-host reconciler splits a

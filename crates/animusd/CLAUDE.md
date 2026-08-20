@@ -238,11 +238,11 @@ reusing the captured config is the point of the test.
   and data-only nodes only; a control-only node hosts no CP-data tablet, so
   it binds none (`BoundControlNode::start_control_with` passes `None` into
   `spawn_common_tail`'s `console_listener` parameter). **This module still
-  takes no `ClientCtx` (PR2, the tables-list screen)** — a structural
-  enforcement, not just a documented rule, of the console's one defining
-  constraint: it must never surface cluster-shaped state (nodes, replicas,
-  tablets, Raft, quorum, leaders, placement, health). PR2 added this
-  listener's first JSON endpoint, `GET /console/api/tables`, without
+  takes no `ClientCtx` (PR2's tables-list screen, and PR3's table page)** —
+  a structural enforcement, not just a documented rule, of the console's one
+  defining constraint: it must never surface cluster-shaped state (nodes,
+  replicas, tablets, Raft, quorum, leaders, placement, health). PR2 added
+  this listener's first JSON endpoint, `GET /console/api/tables`, without
   widening that boundary: `console::serve` takes a `console::
   TableSnapshotFn` (`Arc<dyn Fn() -> Vec<console::TableSummary>>`) instead
   of a `ClientCtx`/`Metadata` reference — a closure `lib.rs::
@@ -250,22 +250,50 @@ reusing the captured config is the point of the test.
   `lib.rs::console_table_summaries` (the **one** function in the crate that
   reads the schema catalog on the console's behalf; see ADR 0052's
   2026-08-20 amendment for why that projection exists instead of reusing
-  `/admin/status`). `console.rs` itself imports no `Metadata`/
-  `TableSchema`/`IndexKind`/any schema-catalog type — only the plain owned
-  `TableSummary`/`KeySummary`/`StreamSummary`/`TtlSummary` structs. Item
-  count/size are deliberately absent from the projection (same ADR
-  amendment) pending a server-side rollup — do not fan out to `/admin/*`
-  from here to backfill them. `console.js` is the client-side app: a
-  `location.pathname`-based router (mirroring `dashboard_core.js::
-  activateTab`'s idiom, but via real `<a href>` navigation rather than
-  push-state, since there is only one built screen so far) rendering the
-  tables list from that endpoint, or a plain "not built yet" stub for a
-  `/console/ui/tables/<name>` deep link (the table page, PR3) — the server
-  serves the identical static shell for every `/console/ui/*` path
-  (`is_shell_path`, unchanged since PR1) regardless of which of those the
-  client then renders. The table page and the create-table form are still
-  follow-up PRs in the same stack, each adding their own narrow projection
-  type the same way this one was added — never widening `console.rs`'s
+  `/admin/status`). **PR3 (the table page's Config tab) needs more than
+  reads — it mutates a table's GSIs/stream/TTL and can delete the table —
+  so the seam widens from one closure to a small `async_trait`
+  `console::ConsoleBackend` trait** (`table_detail`/`add_gsi`/`drop_gsi`/
+  `set_stream`/`set_ttl`/`delete_table`), `serve`'s second parameter
+  alongside `TableSnapshotFn` (which stays exactly as PR2 left it — a
+  parameterless, infallible read has no reason to move onto the new trait).
+  The widening is in *shape* only, never in *kind*: every method still
+  takes and returns nothing but plain owned console types (`TableDetail`,
+  `GsiDetail`, `LsiDetail`, `AddGsiRequest`, `SetStreamRequest`,
+  `SetTtlRequest`, `ConsoleError`) — `console.rs` imports no `Metadata`/
+  `TableSchema`/`IndexKind`/`IndexDef`/any schema-catalog type before or
+  after PR3; `lib.rs`'s `impl console::ConsoleBackend for ClientCtx` (built
+  into an `Arc<dyn ConsoleBackend>` alongside the `TableSnapshotFn` closure
+  in `spawn_common_tail`) is the trait's one implementor and the only place
+  a schema-catalog type is ever in scope on the console's behalf — see ADR
+  0052's second 2026-08-20 amendment for the full design, including why
+  `add_gsi`/`drop_gsi`/`set_stream`/`set_ttl` build the same JSON body a
+  real DynamoDB client would and call `crate::dynamo::execute_routed` (the
+  identical function the real edge and `POST /admin/data/dynamo` already
+  call) rather than re-deriving `MetaCommand` proposals directly, while
+  `delete_table` — not a DynamoDB wire operation at all — calls the same
+  `ClientCtx::drop_table` `admin.rs::action_drop_table` does. A GSI and an
+  LSI render from two distinct types/templates (`GsiDetail`/`gsiRowHtml` vs.
+  `LsiDetail`/`lsiRowHtml`), never a shared shape with optional fields — an
+  LSI is a scope inside the table's own storage, not a separate
+  materialized table, has no lifecycle status, and can't be dropped.
+  `console.rs` imports no `Metadata`/`TableSchema`/`IndexKind`/any
+  schema-catalog type — only the plain owned console types both seams hand
+  it. Item count/size are still deliberately absent from the tables-list
+  projection (PR2's ADR amendment) pending a server-side rollup — do not
+  fan out to `/admin/*` from here to backfill them. `console.js` is the
+  client-side app: a `location.pathname`-based router (mirroring
+  `dashboard_core.js::activateTab`'s idiom, but via real `<a href>`
+  navigation rather than push-state) rendering the tables list, a table's
+  own page (Settings/Indexes/Danger-zone sections under one sticky
+  same-page jump nav — `#settings`/`#indexes`/`#danger`, a plain anchor,
+  not a route), or a plain "not built yet" stub for the create-table form's
+  `/console/ui/tables/new` — the server serves the identical static shell
+  for every `/console/ui/*` path (`is_shell_path`, unchanged since PR1)
+  regardless of which of those the client then renders. The Items tab, the
+  Stream tab, and the create-table form are still follow-up PRs in the same
+  stack, each adding their own narrow projection type/`ConsoleBackend`
+  method the same way this PR's were added — never widening `console.rs`'s
   inputs back toward `ClientCtx`. See ADR 0052 for the full design
   (including why the console does *not* join the replicated `NodeAddrs`
   book — no other node ever needs to resolve it).
