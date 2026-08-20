@@ -48,12 +48,22 @@ reusing the captured config is the point of the test.
 - **`config.rs`** — `ClusterConfig`/`RoleAddrs` (per-process deployment
   config; every entry names its own **`id: NodeId`** rather than deriving
   it from position — `from_json` hard-errors on a duplicate) and the
-  **six-port stride** (ADR 0047: `base_port + 6*i + {internal,client,dynamo,
-  cql,admin,intra}` — `intra` appended at offset 5, the client/intra-cluster
-  RPC port split). `generate`/`generate_split` mint `"n{i}"`, **zero-padded** once
-  the cluster has ≥ 10 nodes so lexicographic id order stays == numeric
-  index order (`"n10" < "n2"` otherwise) — below that threshold ids stay
-  the plain unpadded `"n{i}"` every existing test already assumes.
+  **seven-port stride** (ADR 0047 + ADR 0052: `base_port + 7*i +
+  {internal,client,dynamo,cql,admin,intra,console}` — `intra` at offset 5
+  (the client/intra-cluster RPC port split), `console` at offset 6 (the
+  AnimusDB Data Console, ADR 0052 — a DynamoDB-shaped data app on its own
+  port, deliberately separate from the operator dashboard the admin port
+  serves; bound on combined/data-only nodes, never control-only, which
+  hosts no CP-data tablet). `generate`/`generate_split` mint `"n{i}"`,
+  **zero-padded** once the cluster has ≥ 10 nodes so lexicographic id order
+  stays == numeric index order (`"n10" < "n2"` otherwise) — below that
+  threshold ids stay the plain unpadded `"n{i}"` every existing test
+  already assumes. **A future 8th port**: add the field to `RoleAddrs`
+  first (no default), then let `cargo build -p animusd --all-targets`'s
+  `error[E0063]: missing field` output enumerate every one of the ~60
+  literal construction sites across `src/`+`tests/` — don't trust a grep
+  pass to have found them all (see `docs/engineering-lessons.md`'s
+  2026-08-19 "Code patterns" entry on this exact port addition).
 - **`control_handle.rs`** — the `ControlHandle` seam (ADR 0035 PR1):
   `Local(RaftNode<ProdEnv>)` for a node with real control Raft, vs.
   `Remote(RemoteControlClient)` for a data-only node reaching a separate control
@@ -203,7 +213,7 @@ reusing the captured config is the point of the test.
   read-only `GET` views + gated `POST` actions + the dashboard's data-write
   surface; also serves the SPA static assets.
 - **`http.rs`** — shared hand-rolled HTTP/1.1 helpers (request parser + response
-  writers) used by both `dynamo.rs` and `admin.rs`.
+  writers) used by `dynamo.rs`, `admin.rs`, and `console.rs`.
 - **`otel.rs`** — OTLP/HTTP distributed-tracing seam (ADR 0027); opt-in, no-op
   unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Scoped to this crate only.
 - **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** — the
@@ -215,7 +225,179 @@ reusing the captured config is the point of the test.
   (`ClientCtx::data()` panics / a routing timeout) documented rather than
   fixed — design (label resolution, live-tail poller, the
   `/admin/data/dynamo` proxy it rides, and the control-only role-gating
-  details) is in `docs/streams-notes.md`.
+  details) is in `docs/streams-notes.md`. **Not the same thing as
+  `console.rs`** (below) despite the naming overlap — this is the
+  **operator** surface (cluster health/placement/Raft/storage) on the
+  admin port; see `console.rs`'s own entry and ADR 0052's "Naming,
+  deliberately addressed" for the full disambiguation.
+- **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
+  — the AnimusDB **Data Console** (ADR 0052): a DynamoDB-shaped data app for
+  application developers, on its own dedicated port (`RoleAddrs.console`) —
+  never the admin port (documented no-auth, trusted-interface-only, ADR
+  0020) and never a route on the DynamoDB wire listener. Bound on combined
+  and data-only nodes only; a control-only node hosts no CP-data tablet, so
+  it binds none (`BoundControlNode::start_control_with` passes `None` into
+  `spawn_common_tail`'s `console_listener` parameter). **This module still
+  takes no `ClientCtx` (PR2's tables-list screen, PR3's Config tab, PR4's
+  Items tab, and PR5's Stream data tab)** —
+  a structural enforcement, not just a documented rule, of the console's one
+  defining constraint: it must never surface cluster-shaped state (nodes,
+  replicas, tablets, Raft, quorum, leaders, placement, health). PR2 added
+  this listener's first JSON endpoint, `GET /console/api/tables`, without
+  widening that boundary: `console::serve` takes a `console::
+  TableSnapshotFn` (`Arc<dyn Fn() -> Vec<console::TableSummary>>`) instead
+  of a `ClientCtx`/`Metadata` reference — a closure `lib.rs::
+  spawn_common_tail` builds from `ctx.effective_metadata()` and
+  `lib.rs::console_table_summaries` (the **one** function in the crate that
+  reads the schema catalog on the console's behalf; see ADR 0052's
+  2026-08-20 amendment for why that projection exists instead of reusing
+  `/admin/status`). **PR3 (the table page's Config tab) needs more than
+  reads — it mutates a table's GSIs/stream/TTL and can delete the table —
+  so the seam widens from one closure to a small `async_trait`
+  `console::ConsoleBackend` trait** (`table_detail`/`add_gsi`/`drop_gsi`/
+  `set_stream`/`set_ttl`/`delete_table`), `serve`'s second parameter
+  alongside `TableSnapshotFn` (which stays exactly as PR2 left it — a
+  parameterless, infallible read has no reason to move onto the new trait).
+  The widening is in *shape* only, never in *kind*: every method still
+  takes and returns nothing but plain owned console types (`TableDetail`,
+  `GsiDetail`, `LsiDetail`, `AddGsiRequest`, `SetStreamRequest`,
+  `SetTtlRequest`, `ConsoleError`) — `console.rs` imports no `Metadata`/
+  `TableSchema`/`IndexKind`/`IndexDef`/any schema-catalog type before or
+  after PR3; `lib.rs`'s `impl console::ConsoleBackend for ClientCtx` (built
+  into an `Arc<dyn ConsoleBackend>` alongside the `TableSnapshotFn` closure
+  in `spawn_common_tail`) is the trait's one implementor and the only place
+  a schema-catalog type is ever in scope on the console's behalf — see ADR
+  0052's second 2026-08-20 amendment for the full design, including why
+  `add_gsi`/`drop_gsi`/`set_stream`/`set_ttl` build the same JSON body a
+  real DynamoDB client would and call `crate::dynamo::execute_routed` (the
+  identical function the real edge and `POST /admin/data/dynamo` already
+  call) rather than re-deriving `MetaCommand` proposals directly, while
+  `delete_table` — not a DynamoDB wire operation at all — calls the same
+  `ClientCtx::drop_table` `admin.rs::action_drop_table` does. A GSI and an
+  LSI render from two distinct types/templates (`GsiDetail`/`gsiRowHtml` vs.
+  `LsiDetail`/`lsiRowHtml`), never a shared shape with optional fields — an
+  LSI is a scope inside the table's own storage, not a separate
+  materialized table, has no lifecycle status, and can't be dropped.
+  `console.rs` imports no `Metadata`/`TableSchema`/`IndexKind`/any
+  schema-catalog type — only the plain owned console types both seams hand
+  it. Item count/size are still deliberately absent from the tables-list
+  projection (PR2's ADR amendment) pending a server-side rollup — do not
+  fan out to `/admin/*` from here to backfill them. `console.js` is the
+  client-side app: a `location.pathname`-based router (mirroring
+  `dashboard_core.js::activateTab`'s idiom, but via real `<a href>`
+  navigation rather than push-state) rendering the tables list, a table's
+  own page, or the create-table form (PR6) at `/console/ui/tables/new` —
+  the server serves the identical static shell for every `/console/ui/*`
+  path (`is_shell_path`, unchanged since PR1) regardless of which of those
+  the client then renders. **PR4 (the table
+  page's Items tab) widens `ConsoleBackend` a second time — five more
+  methods (`scan_items`/`query_items`/`get_item`/`put_item`/
+  `delete_item`), same shape/kind discipline as PR3's own widening** —
+  every one still takes/returns only plain owned console types. The one
+  new type worth its own note is `console::WireItem` (`serde_json::Map`,
+  DynamoDB's own `{"attr": {"S": "value"}}` shape): unlike every other type
+  in this module, an item is deliberately **not** projected into a
+  console-only shape — there is no fixed "console item shape" to project
+  onto (a DynamoDB row is schemaless beyond its declared key attributes), so
+  `WireItem` passes straight through every one of the five new methods;
+  `console.rs` never interprets an attribute name or value, only moves the
+  map between the wire and the HTTP body. See ADR 0052's third 2026-08-20
+  amendment for the full reasoning, including why the table page's two tabs
+  (Config, default; Items) are two real routes
+  (`/console/ui/tables/{name}` vs. `/console/ui/tables/{name}/items`) rather
+  than one shared-page pushState toggle — `console.js`'s own Settings/
+  Indexes/Danger-zone jump nav (`#settings`/`#indexes`/`#danger`, now
+  rendered by `renderConfigTab`, called from `renderTablePage`'s tab
+  dispatch) stays a plain same-page anchor, unchanged from PR3 — and why
+  `Query` (unlike `Scan`) has no "Load more": `animus_dynamo::wire::
+  decode_query` never parses a `Limit`/`ExclusiveStartKey` at all, a
+  pre-existing gap in the underlying wire layer this PR does not attempt to
+  paper over client-side. Scanning/querying a named GSI/LSI (`index_name`,
+  a real closed set from this same table's own `TableDetail.gsis`/`lsis` —
+  rendered with a `<select>`, never free text) fell out cleanly: `lib.rs`'s
+  `query_items` resolves the partition/sort attribute names to query by
+  from the replicated catalog server-side, the same way `add_gsi`/
+  `table_detail` already read it, rather than asking the client to know or
+  type them. **PR5 (the table page's Stream data tab, its third and final
+  tab) widens `ConsoleBackend` a third time — three more methods
+  (`stream_shards`/`get_shard_iterator`/`get_stream_records`), same
+  discipline again**: every one built on the real `ListStreams`/
+  `DescribeStream`/`GetShardIterator`/`GetRecords` wire operations
+  (`crate::dynamo::execute_routed(self, "DynamoDBStreams_20120810.<Op>",
+  ..)`, the streams sibling of the `DynamoDB_20120810.*` target every
+  earlier PR's mutation already routes through). **This is the PR where
+  the "never show cluster state" rule gets genuinely sharp**: a DynamoDB
+  Streams shard is *implemented* as a seal epoch of one tablet's own
+  change log (ADR 0042/0043), so `console::ShardSummary::shard_id`
+  literally embeds a tablet id and a seal epoch
+  (`shardId-<tablet>-<epoch>`) as digits. It is surfaced anyway — the id is
+  DynamoDB's own public wire identifier, not this console's invention; a
+  real client already receives exactly this string from `DescribeStream`
+  and passes it back to `GetShardIterator`, so hiding it would make the
+  tab useless for the "why did my row vanish" debugging it exists for. What
+  never crosses `ConsoleBackend`'s new methods, structurally (no
+  `TabletId`/`NodeId`/replica-set type in any of their signatures): which
+  node/replica currently serves a shard, and a seal's own storage-internal
+  `object_id`/`replicas` (ADR 0042 §10). A table with no stream gets the
+  same "honest empty answer, not an error" treatment PR4's `get_item`
+  established for a missing key: `stream_shards` returns `enabled: false`
+  with a `200`, and `console.js` renders a plain "no stream enabled"
+  message pointing at the Config tab's Settings section rather than a
+  grid that looks broken. The shard list paginates over `DescribeStream`'s
+  own real `ExclusiveStartShardId`/`LastEvaluatedShardId` contract (a `GET`
+  with a query param, since a shard id — unlike `Scan`'s `ExclusiveStartKey`
+  — is a flat string); a shard's records page over `GetShardIterator`/
+  `GetRecords`'s own `NextShardIterator` walk, the honest paging equivalent
+  of PR4's `ExclusiveStartKey` walk. `console::StreamRecordsPage::records`
+  passes DynamoDB's own `Record` wire shape straight through, unprojected —
+  the same "no fixed console shape to project onto" call PR4's `WireItem`
+  already made, now including a TTL-reaper delete's `userIdentity` (ADR
+  0051 §7) when present, which `console.js` renders as a small "TTL expiry"
+  badge next to the event pill. See ADR 0052's fourth 2026-08-20 amendment
+  for the full reasoning, including the "closed set gets a real control"
+  call for the iterator-type picker (`TRIM_HORIZON`/`LATEST`/
+  `AT_SEQUENCE_NUMBER`/`AFTER_SEQUENCE_NUMBER`, DynamoDB's own closed set)
+  and why the Stream tab scopes to a table's *current* stream only,
+  deliberately not the disable-grace-window pair ADR 0042 §4/§11 lets
+  coexist on the raw wire. **PR6 (the create-table form) ships the
+  console's last screen and widens `ConsoleBackend` a fourth and final
+  time — one more method, `create_table`** — completing the console's
+  three-screen set (tables list, a table's own page with its three tabs,
+  and the create-table form). `POST /console/api/tables`
+  (`console::CreateTableRequest` in, `console::TableDetail` out, same
+  `execute_routed`-reuse discipline as every mutation before it: a real
+  `CreateTable` call, plus a follow-up `UpdateTimeToLive` call for TTL,
+  since `CreateTable`'s own wire operation carries no TTL field) covers
+  table name, partition key (a real `S`/`N`/`B` control — `CreateTable`
+  genuinely records a **base table** key's declared type), an optional
+  sort key, any LSIs, any GSIs (with a projection), a stream, and TTL.
+  **LSIs are declarable *only* on this form** — `ConsoleBackend` has no
+  `add_lsi`/`drop_lsi` and never will, since a DynamoDB LSI is
+  create-time-only by DynamoDB's own contract, not a policy this console
+  chose (`console::CreateLsiRequest`'s own doc states this). Tracing
+  `CreateTable`'s own decoder for this PR found that an index's key
+  attribute gets **no** recorded type even when the index is declared at
+  `CreateTable` time — `schema::to_control` only ever builds a `ColumnDef`
+  for the base table's own partition/sort key, and `schema::
+  index_to_control` (used identically for every `CreateTable`-declared
+  index) never receives `key_types` at all — correcting PR3's own ADR text,
+  which had asserted the opposite without tracing it; `CreateGsiRequest`/
+  `CreateLsiRequest` accordingly ask for index key attribute *names* only,
+  same as the Add-GSI form. A projection genuinely *does* survive
+  (`decode_index_entry` parses `Projection` for every declared index
+  regardless of kind), so this PR adds a real `ALL`/`KEYS_ONLY`/`INCLUDE`
+  control plus a new `console::ProjectionSummary` field on `GsiDetail`
+  (rendered for every GSI, not just create-time ones). Two maintainer
+  corrections from earlier drafts, both now load-bearing: the sort-key
+  toggle that gates the LSI section defaults **on** (a blocked LSI section
+  with no visible way to unblock it was the exact defect flagged); stream-
+  enabled/TTL-enabled are `console.js`'s existing `toggleSwitch`, never a
+  segmented `ENABLED`/`DISABLED` pair (segmented stays reserved for the
+  form's genuinely closed sets — stream view type, GSI projection type).
+  See ADR 0052's fifth 2026-08-20 amendment for the full design, and the
+  fourth amendment (referenced above) plus that ADR generally for why the
+  console does *not* join the replicated `NodeAddrs` book — no other node
+  ever needs to resolve it.
 
 ## CLI reference
 
@@ -333,6 +515,14 @@ system-keyspace engine, since `Metadata` is `StateMachine::DRIVER_APPLIED`
 and this engine is the durable home of the control plane's async apply
 task's published cache (see `animus-control/CLAUDE.md`'s `node.rs`/
 `mirror.rs` entries).
+
+**Console binding (ADR 0052) follows the same split as `dynamo`/`cql`**:
+combined and data-only bind `RoleAddrs.console` (real CP-data tablets to
+show); control-only does not (`Node::bind_control` never reads
+`addrs.console` at all, and `BoundControlNode::start_control_with` passes
+`None` for `spawn_common_tail`'s `console_listener` — `Node::console_addr()`
+panics there, mirroring `dynamo_addr()`/`cql_addr()`'s existing
+control-only-panics contract).
 
 ## Request routing (CP)
 
@@ -1366,10 +1556,12 @@ route below the edge through the same `ClientCtx` CP primitives.
   0050 gating measurement). Node-start entry points are async+fallible
   (`io::Result`).
 - **`Node::shutdown()` is a graceful teardown** — aborts the listener tasks and
-  `ProdEnv::shutdown()`s the node's one internal env, freeing all six ports
-  (ADR 0040 PR1's `internal`/`client`/`dynamo`/`cql`/`admin` stride, plus ADR
-  0047's `intra` — the pre-ADR-0040 stride was six too, but split across two
-  role envs instead of one node/one port-block) so a replacement can rebind
+  `ProdEnv::shutdown()`s the node's one internal env, freeing all seven ports
+  on a combined/data-only node (ADR 0040 PR1's `internal`/`client`/`dynamo`/
+  `cql`/`admin` stride, plus ADR 0047's `intra` and ADR 0052's `console` — the
+  pre-ADR-0040 stride was six too, but split across two role envs instead of
+  one node/one port-block; a control-only node frees five, since it never
+  binds `dynamo`/`cql`/`console`) so a replacement can rebind
   the same addresses/dir. Dropping a `Node` without it leaves tasks running.
   **It's fire-and-forget (`abort()` then return), not a guarantee those ports are
   free the instant it returns** — see `animus-env/CLAUDE.md`'s `ProdEnv::shutdown()`

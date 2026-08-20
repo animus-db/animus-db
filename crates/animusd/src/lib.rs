@@ -43,6 +43,7 @@ pub use animus_control::{
 };
 
 mod admin;
+mod console;
 mod control_handle;
 mod cql;
 mod cql_client;
@@ -2224,6 +2225,21 @@ pub struct RoleAddrs {
     /// ephemeral loopback port.
     #[serde(default = "default_ephemeral_addr")]
     pub admin: SocketAddr,
+    /// The **AnimusDB Console** (ADR 0052) — a DynamoDB-shaped data app for
+    /// application developers, deliberately separate from the operator
+    /// dashboard the admin port serves (ADR 0021): it must never surface
+    /// cluster-shaped state (nodes, replicas, tablets, Raft, quorum,
+    /// leaders, placement, health). It gets its **own** port rather than
+    /// riding the admin listener (documented no-auth, trusted-interface-only,
+    /// ADR 0020) or the DynamoDB listener (a wire protocol, not an HTTP app) —
+    /// the same reasoning ADR 0047 used to split node-to-node RPC off the
+    /// client port. Bound on combined and data-only nodes (both host CP-data
+    /// tablets, the console's actual subject matter); **not** bound on a
+    /// control-only node (ADR 0035) — it hosts no tablet, so it has nothing
+    /// for the console to show. No default (a deliberate clean break,
+    /// matching `intra`'s own no-default convention — no live deployments to
+    /// keep back-compat with).
+    pub console: SocketAddr,
 }
 
 /// Fallback endpoint for configs written before a field existed: an ephemeral
@@ -2259,6 +2275,11 @@ pub struct BoundNode {
     /// sequence.
     intra_listener: TcpListener,
     intra_addr: SocketAddr,
+    /// The AnimusDB Data Console's own listener (ADR 0052) — a combined node
+    /// hosts CP-data tablets, so it always binds one; see
+    /// [`console`](crate::console)'s module doc.
+    console_listener: TcpListener,
+    console_addr: SocketAddr,
 }
 
 /// A node's identity + bound addresses, captured for the admin `/admin/config`
@@ -2320,6 +2341,981 @@ pub(crate) struct AdminInfo {
     pub(crate) auto_split_bytes_threshold: Option<u64>,
 }
 
+/// Project the replicated schema catalog into the AnimusDB Data Console's own
+/// [`console::TableSummary`] rows (ADR 0052 PR2 — the tables-list screen's
+/// data source). Lives here, in `lib.rs` — not in `console.rs` — on purpose:
+/// this is the one function in the whole node that reads `Metadata`'s schema
+/// catalog on the console's behalf, so `console.rs` itself never needs to
+/// import `Metadata`/`TableSchema`/`IndexKind`/any other schema-catalog type,
+/// only the plain owned fields [`console::TableSummary`] is built from. See
+/// `console`'s own module doc for why that boundary is load-bearing, not
+/// incidental.
+fn console_table_summaries(metadata: &Metadata) -> Vec<console::TableSummary> {
+    metadata
+        .schemas
+        .iter()
+        // A GSI's hidden materialization table (`<base>$<index>`, ADR 0041)
+        // never actually gets a `Metadata::schemas` entry of its own — only
+        // its tablets exist once the drain lazily provisions them (see
+        // `admin.rs`'s own note on this) — but the filter is kept anyway as
+        // the same belt-and-suspenders discipline `ClientCtx::drop_table`'s
+        // own cascade uses: cheap, and it is what actually earns "excluded
+        // server-side" as a property a regression test can assert on, rather
+        // than resting on an invariant that holds elsewhere in the codebase
+        // today but that this function has no way to enforce if it changes.
+        .filter(|(name, _)| !animus_dynamo::index::is_index_table_name(name))
+        .map(|(name, schema)| {
+            let partition_key = console_key_summary(schema, &schema.partition_key);
+            // DynamoDB has at most one sort key — the one-element case of
+            // `clustering_keys` (`animus_dynamo::schema::to_dynamo` reads the
+            // same first element back out for the identical reason).
+            let sort_key = schema
+                .clustering_keys
+                .first()
+                .map(|sk| console_key_summary(schema, sk));
+            let gsi_count = schema
+                .indexes
+                .iter()
+                .filter(|idx| idx.kind == animus_control::IndexKind::Global)
+                .count() as u32;
+            // An LSI shares the base partition key and adds an alternate
+            // sort key, so a table with no sort key structurally cannot have
+            // one — `None` here is that structural absence, not a count of
+            // zero; the console renders the two differently (a dash vs.
+            // `0`).
+            let lsi_count = sort_key.as_ref().map(|_| {
+                schema
+                    .indexes
+                    .iter()
+                    .filter(|idx| idx.kind == animus_control::IndexKind::Local)
+                    .count() as u32
+            });
+            console::TableSummary {
+                name: name.clone(),
+                partition_key,
+                sort_key,
+                gsi_count,
+                lsi_count,
+                stream: console_stream_summary(schema),
+                ttl: console_ttl_summary(schema),
+            }
+        })
+        .collect()
+}
+
+/// One column's name + declared DynamoDB `AttributeType`, console-shaped —
+/// the shared building block [`console_table_summaries`] and
+/// [`console_table_detail`] (ADR 0052 PR3) both use for every key attribute
+/// they render. An attribute absent from `schema.columns` (never declared —
+/// e.g. a just-added GSI's own hash attribute, which this adapter's
+/// `UpdateTable` decoder does not require an `AttributeDefinitions` entry
+/// for, unlike real DynamoDB) defaults to `"S"`, matching
+/// `schema_bridge`'s own missing-type default.
+fn console_key_summary(schema: &TableSchema, column_name: &str) -> console::KeySummary {
+    console::KeySummary {
+        name: column_name.to_string(),
+        attribute_type: schema
+            .column(column_name)
+            .map(|c| animus_dynamo::schema::attribute_type_for(c.ty))
+            .unwrap_or("S")
+            .to_string(),
+    }
+}
+
+/// The same projection for an *index* key attribute, which — unlike a base
+/// table's own key — may genuinely have no declared type to report. See
+/// [`console::IndexKeySummary`]: `IndexDef` stores only the attribute name,
+/// so a type exists only when that attribute is also a declared column of
+/// the base table. `None` (rather than [`console_key_summary`]'s `"S"`
+/// fallback) so the console renders a bare name instead of asserting a type
+/// nobody recorded.
+fn console_index_key_summary(schema: &TableSchema, column_name: &str) -> console::IndexKeySummary {
+    console::IndexKeySummary {
+        name: column_name.to_string(),
+        attribute_type: schema
+            .column(column_name)
+            .map(|c| animus_dynamo::schema::attribute_type_for(c.ty).to_string()),
+    }
+}
+
+/// A table's stream configuration, console-shaped — shared by
+/// [`console_table_summaries`]/[`console_table_detail`] and the
+/// [`console::ConsoleBackend`] impl below (a `set_stream` call re-reads the
+/// committed schema through this same projection rather than hand-building
+/// its own).
+fn console_stream_summary(schema: &TableSchema) -> console::StreamSummary {
+    console::StreamSummary {
+        enabled: schema.stream.is_some(),
+        view_type: schema
+            .stream
+            .as_ref()
+            .map(|s| stream_view_type_label(s.view_type).to_string()),
+    }
+}
+
+/// A table's TTL configuration, console-shaped — the `set_ttl` sibling of
+/// [`console_stream_summary`] above.
+fn console_ttl_summary(schema: &TableSchema) -> console::TtlSummary {
+    console::TtlSummary {
+        enabled: schema.ttl.is_some(),
+        attribute_name: schema.ttl.as_ref().map(|t| t.attribute_name.clone()),
+    }
+}
+
+/// An [`animus_control::IndexStatus`]'s DynamoDB wire label
+/// (`"CREATING"`/`"ACTIVE"`/`"DELETING"`) — `console.rs` never imports
+/// `IndexStatus` itself (see that module's doc), so this is where the
+/// translation happens, mirroring `stream_view_type_label`'s own precedent
+/// (`animus_dynamo::wire::index_status_str` has the identical mapping but is
+/// private to that crate).
+fn console_index_status_label(status: IndexStatus) -> &'static str {
+    match status {
+        IndexStatus::Creating => "CREATING",
+        IndexStatus::Active => "ACTIVE",
+        IndexStatus::Deleting => "DELETING",
+    }
+}
+
+/// An [`animus_control::IndexProjection`]'s console-shaped mirror — shared
+/// by [`console_gsi_detail`] and the create-table endpoint's own response
+/// (both read the projection back off the committed `IndexDef`, never
+/// re-echo what the client asked for, so a decode-time normalization —
+/// e.g. an omitted `Projection` defaulting to `ALL`, ADR 0052's create-table
+/// amendment — is reflected honestly).
+fn console_projection_summary(p: &animus_control::IndexProjection) -> console::ProjectionSummary {
+    match p {
+        animus_control::IndexProjection::All => console::ProjectionSummary {
+            projection_type: "ALL".to_string(),
+            non_key_attributes: None,
+        },
+        animus_control::IndexProjection::KeysOnly => console::ProjectionSummary {
+            projection_type: "KEYS_ONLY".to_string(),
+            non_key_attributes: None,
+        },
+        animus_control::IndexProjection::Include(names) => console::ProjectionSummary {
+            projection_type: "INCLUDE".to_string(),
+            non_key_attributes: Some(names.clone()),
+        },
+    }
+}
+
+/// One global secondary index, console-shaped — shared by
+/// [`console_table_detail`] (every GSI on a table) and the
+/// [`console::ConsoleBackend`] impl's `add_gsi`/`create_table` (the one
+/// just-created index).
+fn console_gsi_detail(schema: &TableSchema, idx: &animus_control::IndexDef) -> console::GsiDetail {
+    console::GsiDetail {
+        name: idx.name.clone(),
+        hash_attribute: console_index_key_summary(schema, &idx.hash_attribute),
+        sort_attribute: idx
+            .sort_attribute
+            .as_deref()
+            .map(|a| console_index_key_summary(schema, a)),
+        status: console_index_status_label(idx.status).to_string(),
+        projection: console_projection_summary(&idx.projection),
+    }
+}
+
+/// Project one table's full configuration for the Data Console's table page
+/// Config tab (ADR 0052 PR3, `GET /console/api/tables/{name}`) — the
+/// `TableDetail`-shaped sibling of [`console_table_summaries`]'s per-table
+/// `TableSummary` (every count there becomes a full declaration here).
+/// `None` for a table with no schema, **including** a GSI's own hidden
+/// `<base>$<index>` materialization table — mirrors
+/// [`console_table_summaries`]'s own exclusion filter, since that table has
+/// no `Metadata::schemas` entry of its own to find in the first place
+/// (`meta.table_schema` already returns `None` for it; the explicit
+/// `is_index_table_name` check here is belt-and-suspenders, matching that
+/// function's own comment on why it keeps the filter despite the invariant
+/// holding elsewhere today).
+fn console_table_detail(meta: &Metadata, table: &str) -> Option<console::TableDetail> {
+    if animus_dynamo::index::is_index_table_name(table) {
+        return None;
+    }
+    let schema = meta.table_schema(table)?;
+    let partition_key = console_key_summary(schema, &schema.partition_key);
+    let sort_key = schema
+        .clustering_keys
+        .first()
+        .map(|sk| console_key_summary(schema, sk));
+    let gsis = schema
+        .indexes
+        .iter()
+        .filter(|idx| idx.kind == animus_control::IndexKind::Global)
+        .map(|idx| console_gsi_detail(schema, idx))
+        .collect();
+    let lsis = schema
+        .indexes
+        .iter()
+        .filter(|idx| idx.kind == animus_control::IndexKind::Local)
+        .map(|idx| {
+            // Always present for an LSI (`IndexDef`'s own invariant, enforced
+            // at decode time by `animus_dynamo::wire::decode_indexes`); the
+            // empty-string fallback is defense-in-depth only, never expected
+            // to render.
+            let sort_name = idx.sort_attribute.as_deref().unwrap_or_default();
+            console::LsiDetail {
+                name: idx.name.clone(),
+                sort_attribute: console_index_key_summary(schema, sort_name),
+            }
+        })
+        .collect();
+    Some(console::TableDetail {
+        name: table.to_string(),
+        partition_key,
+        sort_key,
+        gsis,
+        lsis,
+        stream: console_stream_summary(schema),
+        ttl: console_ttl_summary(schema),
+    })
+}
+
+/// Translate a `dynamo::execute_routed` failure (a DynamoDB wire error JSON
+/// body, `{"__type":..,"message":..}`) into a [`console::ConsoleError`] —
+/// every mutating [`console::ConsoleBackend`] method's error path, so the
+/// console surfaces the exact same status/message a real DynamoDB client
+/// hitting the same `UpdateTable`/`UpdateTimeToLive` call would see, per
+/// this PR's "reuse the existing execution path" rule (see `console.rs`'s
+/// module doc and ADR 0052's amendment). Falls back to the raw body text if
+/// it isn't the expected error shape (defensive only — `execute_routed`
+/// always returns one of these two shapes).
+fn console_wire_error(status: u16, body: &str) -> console::ConsoleError {
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.to_string());
+    console::ConsoleError::new(status, message)
+}
+
+/// The three DynamoDB key `AttributeType`s (`S`/`N`/`B`) — every closed set
+/// the create-table form's key-attribute-type controls can send.
+fn is_valid_key_attribute_type(t: &str) -> bool {
+    matches!(t, "S" | "N" | "B")
+}
+
+/// The Data Console's mutating-endpoint seam (ADR 0052 PR3, widened by PR6's
+/// `create_table`) — [`console::ConsoleBackend`]'s one implementor. Every
+/// method either reuses the same DynamoDB wire path the real edge/
+/// `/admin/data/dynamo` use (`crate::dynamo::execute_routed`, this PR's
+/// "reuse the existing execution path" rule) or, for `delete_table` (not a
+/// DynamoDB wire operation at all), the same [`ClientCtx::drop_table`] the
+/// admin dashboard's own drop-table action calls. See `console.rs`'s module
+/// doc for why widening this trait never widens what `console.rs` itself can
+/// see: every method here builds its request/response JSON and reads
+/// `Metadata` on the console's behalf, so no schema-catalog type ever
+/// crosses into that module.
+#[async_trait::async_trait]
+impl console::ConsoleBackend for ClientCtx {
+    async fn create_table(
+        &self,
+        req: console::CreateTableRequest,
+    ) -> Result<console::TableDetail, console::ConsoleError> {
+        // -- client-side validation: every case that would otherwise reach
+        // the wire only to bounce back as a decode error gets a clear
+        // message here instead, and the two cases this PR's brief calls out
+        // by name (an LSI with no sort key attribute of its own, and a
+        // table declaring no sort key at all while still declaring an LSI)
+        // are both rejected before a single byte reaches `execute_routed`.
+        let table_name = req.table_name.trim();
+        if table_name.is_empty() {
+            return Err(console::ConsoleError::new(400, "table_name is required"));
+        }
+        if req.partition_key.name.trim().is_empty() {
+            return Err(console::ConsoleError::new(
+                400,
+                "partition key name is required",
+            ));
+        }
+        if !is_valid_key_attribute_type(&req.partition_key.attribute_type) {
+            return Err(console::ConsoleError::new(
+                400,
+                "partition key attribute_type must be S, N, or B",
+            ));
+        }
+        if let Some(sk) = &req.sort_key {
+            if sk.name.trim().is_empty() {
+                return Err(console::ConsoleError::new(400, "sort key name is required"));
+            }
+            if !is_valid_key_attribute_type(&sk.attribute_type) {
+                return Err(console::ConsoleError::new(
+                    400,
+                    "sort key attribute_type must be S, N, or B",
+                ));
+            }
+        }
+        for lsi in &req.lsis {
+            if lsi.index_name.trim().is_empty() {
+                return Err(console::ConsoleError::new(
+                    400,
+                    "LSI index_name is required",
+                ));
+            }
+            if lsi.sort_attribute.trim().is_empty() {
+                return Err(console::ConsoleError::new(
+                    400,
+                    format!("LSI `{}` needs a sort key attribute", lsi.index_name),
+                ));
+            }
+            if req.sort_key.is_none() {
+                return Err(console::ConsoleError::new(
+                    400,
+                    "declaring an LSI requires the table to have its own sort key",
+                ));
+            }
+        }
+        for gsi in &req.gsis {
+            if gsi.index_name.trim().is_empty() {
+                return Err(console::ConsoleError::new(
+                    400,
+                    "GSI index_name is required",
+                ));
+            }
+            if gsi.hash_attribute.trim().is_empty() {
+                return Err(console::ConsoleError::new(
+                    400,
+                    format!("GSI `{}` needs a hash attribute", gsi.index_name),
+                ));
+            }
+            if gsi.projection_type == "INCLUDE"
+                && gsi
+                    .projection_non_key_attributes
+                    .as_ref()
+                    .is_none_or(|a| a.is_empty())
+            {
+                return Err(console::ConsoleError::new(
+                    400,
+                    format!(
+                        "GSI `{}`'s INCLUDE projection needs at least one attribute",
+                        gsi.index_name
+                    ),
+                ));
+            }
+        }
+        if req.stream_enabled
+            && req
+                .stream_view_type
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+        {
+            return Err(console::ConsoleError::new(
+                400,
+                "stream_view_type is required to enable a stream",
+            ));
+        }
+        if req.ttl_enabled
+            && req
+                .ttl_attribute_name
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+        {
+            return Err(console::ConsoleError::new(
+                400,
+                "ttl_attribute_name is required to enable TTL",
+            ));
+        }
+
+        // -- build the real CreateTable wire body. Deliberately no
+        // `AttributeDefinitions` entry for any GSI/LSI key attribute — see
+        // `console::CreateTableRequest`'s own doc for why sending one would
+        // misrepresent what actually gets recorded.
+        let mut key_schema = vec![serde_json::json!({
+            "AttributeName": req.partition_key.name, "KeyType": "HASH",
+        })];
+        let mut attribute_definitions = vec![serde_json::json!({
+            "AttributeName": req.partition_key.name,
+            "AttributeType": req.partition_key.attribute_type,
+        })];
+        if let Some(sk) = &req.sort_key {
+            key_schema.push(serde_json::json!({
+                "AttributeName": sk.name, "KeyType": "RANGE",
+            }));
+            attribute_definitions.push(serde_json::json!({
+                "AttributeName": sk.name, "AttributeType": sk.attribute_type,
+            }));
+        }
+        let mut body = serde_json::json!({
+            "TableName": table_name,
+            "KeySchema": key_schema,
+            "AttributeDefinitions": attribute_definitions,
+        });
+        if !req.gsis.is_empty() {
+            let gsis: Vec<serde_json::Value> = req
+                .gsis
+                .iter()
+                .map(|g| {
+                    let mut key_schema = vec![serde_json::json!({
+                        "AttributeName": g.hash_attribute, "KeyType": "HASH",
+                    })];
+                    if let Some(sort) = g.sort_attribute.as_deref().filter(|s| !s.trim().is_empty())
+                    {
+                        key_schema.push(serde_json::json!({
+                            "AttributeName": sort, "KeyType": "RANGE",
+                        }));
+                    }
+                    let mut projection = serde_json::json!({ "ProjectionType": g.projection_type });
+                    if g.projection_type == "INCLUDE" {
+                        projection["NonKeyAttributes"] = serde_json::Value::Array(
+                            g.projection_non_key_attributes
+                                .clone()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        );
+                    }
+                    serde_json::json!({
+                        "IndexName": g.index_name,
+                        "KeySchema": key_schema,
+                        "Projection": projection,
+                    })
+                })
+                .collect();
+            body["GlobalSecondaryIndexes"] = serde_json::Value::Array(gsis);
+        }
+        if !req.lsis.is_empty() {
+            let lsis: Vec<serde_json::Value> = req
+                .lsis
+                .iter()
+                .map(|l| {
+                    serde_json::json!({
+                        "IndexName": l.index_name,
+                        "KeySchema": [
+                            {"AttributeName": req.partition_key.name, "KeyType": "HASH"},
+                            {"AttributeName": l.sort_attribute, "KeyType": "RANGE"},
+                        ],
+                    })
+                })
+                .collect();
+            body["LocalSecondaryIndexes"] = serde_json::Value::Array(lsis);
+        }
+        if req.stream_enabled {
+            body["StreamSpecification"] = serde_json::json!({
+                "StreamEnabled": true,
+                "StreamViewType": req.stream_view_type.as_deref().unwrap_or_default(),
+            });
+        }
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.CreateTable", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+
+        // The table now exists; TTL is not part of `CreateTable`'s own wire
+        // shape (`animus_dynamo::wire::Operation::CreateTable` carries no
+        // TTL field at all — ADR 0051's `UpdateTimeToLive` is a separate
+        // call even for a brand-new table), so enable it as a follow-up
+        // call, same shape `set_ttl` already uses.
+        if req.ttl_enabled {
+            let ttl_body = serde_json::json!({
+                "TableName": table_name,
+                "TimeToLiveSpecification": {
+                    "Enabled": true,
+                    "AttributeName": req.ttl_attribute_name.as_deref().unwrap_or_default(),
+                },
+            });
+            let payload = serde_json::to_vec(&ttl_body).unwrap_or_default();
+            let (status, resp_body) =
+                crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTimeToLive", &payload)
+                    .await;
+            if status != 200 {
+                return Err(console_wire_error(status, &resp_body));
+            }
+        }
+
+        let meta = self.metadata_fresh().await;
+        console_table_detail(&meta, table_name).ok_or_else(|| {
+            console::ConsoleError::new(500, "table created but not found in the catalog")
+        })
+    }
+
+    async fn table_detail(&self, table: &str) -> Option<console::TableDetail> {
+        console_table_detail(&self.effective_metadata(), table)
+    }
+
+    async fn add_gsi(
+        &self,
+        table: &str,
+        req: console::AddGsiRequest,
+    ) -> Result<console::GsiDetail, console::ConsoleError> {
+        if req.index_name.trim().is_empty() {
+            return Err(console::ConsoleError::new(400, "index_name is required"));
+        }
+        if req.hash_attribute.trim().is_empty() {
+            return Err(console::ConsoleError::new(
+                400,
+                "hash_attribute is required",
+            ));
+        }
+        let mut key_schema = vec![serde_json::json!({
+            "AttributeName": req.hash_attribute, "KeyType": "HASH",
+        })];
+        if let Some(sort_attribute) = req
+            .sort_attribute
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            key_schema.push(serde_json::json!({
+                "AttributeName": sort_attribute, "KeyType": "RANGE",
+            }));
+        }
+        // Deliberately no `AttributeDefinitions`: this adapter's
+        // `GlobalSecondaryIndexUpdates` decoder never reads one (issue #319),
+        // so sending types here would look like it recorded them while the
+        // index read back untyped. See `console::AddGsiRequest`.
+        let body = serde_json::json!({
+            "TableName": table,
+            "GlobalSecondaryIndexUpdates": [
+                {"Create": {"IndexName": req.index_name, "KeySchema": key_schema}}
+            ],
+        });
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTable", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let meta = self.metadata_fresh().await;
+        let Some(schema) = meta.table_schema(table) else {
+            return Err(console::ConsoleError::new(
+                500,
+                "GSI committed but the table's schema is gone",
+            ));
+        };
+        meta.table_indexes(table)
+            .iter()
+            .find(|d| d.name == req.index_name)
+            .map(|idx| console_gsi_detail(schema, idx))
+            .ok_or_else(|| {
+                console::ConsoleError::new(500, "GSI committed but not found in the catalog")
+            })
+    }
+
+    async fn drop_gsi(&self, table: &str, index: &str) -> Result<(), console::ConsoleError> {
+        let body = serde_json::json!({
+            "TableName": table,
+            "GlobalSecondaryIndexUpdates": [ {"Delete": {"IndexName": index}} ],
+        });
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTable", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        Ok(())
+    }
+
+    async fn set_stream(
+        &self,
+        table: &str,
+        req: console::SetStreamRequest,
+    ) -> Result<console::StreamSummary, console::ConsoleError> {
+        let body = if req.enabled {
+            let Some(view_type) = req.view_type.as_deref().filter(|s| !s.trim().is_empty()) else {
+                return Err(console::ConsoleError::new(
+                    400,
+                    "view_type is required to enable a stream",
+                ));
+            };
+            serde_json::json!({
+                "TableName": table,
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": view_type},
+            })
+        } else {
+            serde_json::json!({
+                "TableName": table,
+                "StreamSpecification": {"StreamEnabled": false},
+            })
+        };
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTable", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let meta = self.metadata_fresh().await;
+        let Some(schema) = meta.table_schema(table) else {
+            return Err(console::ConsoleError::new(404, "no such table"));
+        };
+        Ok(console_stream_summary(schema))
+    }
+
+    async fn set_ttl(
+        &self,
+        table: &str,
+        req: console::SetTtlRequest,
+    ) -> Result<console::TtlSummary, console::ConsoleError> {
+        let Some(attribute_name) = req
+            .attribute_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return Err(console::ConsoleError::new(
+                400,
+                "attribute_name is required",
+            ));
+        };
+        let body = serde_json::json!({
+            "TableName": table,
+            "TimeToLiveSpecification": {"Enabled": req.enabled, "AttributeName": attribute_name},
+        });
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTimeToLive", &payload)
+                .await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let meta = self.metadata_fresh().await;
+        let Some(schema) = meta.table_schema(table) else {
+            return Err(console::ConsoleError::new(404, "no such table"));
+        };
+        Ok(console_ttl_summary(schema))
+    }
+
+    async fn delete_table(&self, table: &str) -> Result<(), console::ConsoleError> {
+        if !self.metadata_fresh().await.has_table_schema(table) {
+            return Err(console::ConsoleError::new(404, "no such table"));
+        }
+        self.drop_table(table.to_string())
+            .await
+            .map_err(|e| console::ConsoleError::new(409, e))
+    }
+
+    async fn scan_items(
+        &self,
+        table: &str,
+        req: console::ScanItemsRequest,
+    ) -> Result<console::ItemsPage, console::ConsoleError> {
+        let mut body = serde_json::json!({ "TableName": table });
+        if let Some(index_name) = &req.index_name {
+            body["IndexName"] = serde_json::Value::String(index_name.clone());
+        }
+        if let Some(limit) = req.limit {
+            body["Limit"] = serde_json::Value::from(limit);
+        }
+        if let Some(key) = req.exclusive_start_key {
+            body["ExclusiveStartKey"] = serde_json::Value::Object(key);
+        }
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.Scan", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        console_parse_items_page(&resp_body)
+    }
+
+    async fn query_items(
+        &self,
+        table: &str,
+        req: console::QueryItemsRequest,
+    ) -> Result<console::ItemsPage, console::ConsoleError> {
+        let meta = self.effective_metadata();
+        let Some(schema) = meta.table_schema(table) else {
+            return Err(console::ConsoleError::new(404, "no such table"));
+        };
+        // Resolve the partition/sort attribute *names* to query by, server-side
+        // — `console.rs` never imports a schema-catalog type, so the client
+        // sends only the index name (a real closed set, from this same
+        // table's own `TableDetail`) and the raw key *values*, never a
+        // hand-typed attribute name. See `console::QueryItemsRequest`'s doc.
+        let (pk_name, sk_name) = match &req.index_name {
+            None => (
+                schema.partition_key.clone(),
+                schema.clustering_keys.first().cloned(),
+            ),
+            Some(index_name) => {
+                let Some(idx) = schema.indexes.iter().find(|i| &i.name == index_name) else {
+                    return Err(console::ConsoleError::new(404, "no such index"));
+                };
+                (idx.hash_attribute.clone(), idx.sort_attribute.clone())
+            }
+        };
+        let mut key_condition = format!("{pk_name} = :pk_value");
+        let mut expr_values = serde_json::Map::new();
+        expr_values.insert(":pk_value".to_string(), req.partition_value.clone());
+        if let Some(sort_condition) = &req.sort_condition {
+            let Some(sk_name) = &sk_name else {
+                return Err(console::ConsoleError::new(
+                    400,
+                    "this table/index has no sort key to condition on",
+                ));
+            };
+            match sort_condition {
+                console::SortKeyQuery::Equals { value } => {
+                    key_condition.push_str(&format!(" AND {sk_name} = :sk_value"));
+                    expr_values.insert(":sk_value".to_string(), value.clone());
+                }
+                console::SortKeyQuery::Between { lo, hi } => {
+                    key_condition.push_str(&format!(" AND {sk_name} BETWEEN :sk_lo AND :sk_hi"));
+                    expr_values.insert(":sk_lo".to_string(), lo.clone());
+                    expr_values.insert(":sk_hi".to_string(), hi.clone());
+                }
+                console::SortKeyQuery::BeginsWith { value } => {
+                    key_condition.push_str(&format!(" AND begins_with({sk_name}, :sk_value)"));
+                    expr_values.insert(":sk_value".to_string(), value.clone());
+                }
+            }
+        }
+        let mut body = serde_json::json!({
+            "TableName": table,
+            "KeyConditionExpression": key_condition,
+            "ExpressionAttributeValues": expr_values,
+        });
+        if let Some(index_name) = &req.index_name {
+            body["IndexName"] = serde_json::Value::String(index_name.clone());
+        }
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.Query", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        console_parse_items_page(&resp_body)
+    }
+
+    async fn get_item(
+        &self,
+        table: &str,
+        key: console::WireItem,
+    ) -> Result<Option<console::WireItem>, console::ConsoleError> {
+        let body = serde_json::json!({ "TableName": table, "Key": serde_json::Value::Object(key) });
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.GetItem", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+            console::ConsoleError::new(500, format!("malformed GetItem response: {e}"))
+        })?;
+        Ok(value.get("Item").and_then(|v| v.as_object().cloned()))
+    }
+
+    async fn put_item(
+        &self,
+        table: &str,
+        item: console::WireItem,
+    ) -> Result<(), console::ConsoleError> {
+        let body =
+            serde_json::json!({ "TableName": table, "Item": serde_json::Value::Object(item) });
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.PutItem", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        Ok(())
+    }
+
+    async fn delete_item(
+        &self,
+        table: &str,
+        key: console::WireItem,
+    ) -> Result<(), console::ConsoleError> {
+        let body = serde_json::json!({ "TableName": table, "Key": serde_json::Value::Object(key) });
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.DeleteItem", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        Ok(())
+    }
+
+    async fn stream_shards(
+        &self,
+        table: &str,
+        req: console::StreamShardsRequest,
+    ) -> Result<console::StreamShardsPage, console::ConsoleError> {
+        let meta = self.effective_metadata();
+        if !meta.has_table_schema(table) {
+            return Err(console::ConsoleError::new(404, "no such table"));
+        }
+        let Some(spec) = meta.table_stream(table) else {
+            // The honest "no stream enabled" answer — see
+            // `console::StreamShardsPage`'s own doc: a plain `200`, never a
+            // `404`/error, since a table with no stream is the common case.
+            return Ok(console::StreamShardsPage {
+                enabled: false,
+                view_type: None,
+                stream_arn: None,
+                shards: Vec::new(),
+                last_evaluated_shard_id: None,
+            });
+        };
+        let stream_arn = animus_dynamo::wire::stream_arn(table, &spec.label);
+        let mut body = serde_json::json!({ "StreamArn": stream_arn });
+        if let Some(start) = &req.exclusive_start_shard_id {
+            body["ExclusiveStartShardId"] = serde_json::Value::String(start.clone());
+        }
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) = crate::dynamo::execute_routed(
+            self,
+            "DynamoDBStreams_20120810.DescribeStream",
+            &payload,
+        )
+        .await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+            console::ConsoleError::new(500, format!("malformed DescribeStream response: {e}"))
+        })?;
+        let sd = &value["StreamDescription"];
+        let shards = sd["Shards"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|s| console::ShardSummary {
+                shard_id: s["ShardId"].as_str().unwrap_or_default().to_string(),
+                parent_shard_id: s["ParentShardId"].as_str().map(str::to_string),
+                starting_sequence_number: s["SequenceNumberRange"]["StartingSequenceNumber"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                ending_sequence_number: s["SequenceNumberRange"]["EndingSequenceNumber"]
+                    .as_str()
+                    .map(str::to_string),
+            })
+            .collect();
+        Ok(console::StreamShardsPage {
+            enabled: true,
+            view_type: Some(stream_view_type_label(spec.view_type).to_string()),
+            stream_arn: Some(stream_arn),
+            shards,
+            last_evaluated_shard_id: sd["LastEvaluatedShardId"].as_str().map(str::to_string),
+        })
+    }
+
+    async fn get_shard_iterator(
+        &self,
+        table: &str,
+        req: console::GetShardIteratorRequest,
+    ) -> Result<String, console::ConsoleError> {
+        let meta = self.effective_metadata();
+        if !meta.has_table_schema(table) {
+            return Err(console::ConsoleError::new(404, "no such table"));
+        }
+        let Some(spec) = meta.table_stream(table) else {
+            return Err(console::ConsoleError::new(
+                400,
+                "this table has no stream enabled",
+            ));
+        };
+        let stream_arn = animus_dynamo::wire::stream_arn(table, &spec.label);
+        let mut body = serde_json::json!({
+            "StreamArn": stream_arn,
+            "ShardId": req.shard_id,
+            "ShardIteratorType": req.iterator_type,
+        });
+        if let Some(seq) = &req.sequence_number {
+            body["SequenceNumber"] = serde_json::Value::String(seq.clone());
+        }
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) = crate::dynamo::execute_routed(
+            self,
+            "DynamoDBStreams_20120810.GetShardIterator",
+            &payload,
+        )
+        .await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+            console::ConsoleError::new(500, format!("malformed GetShardIterator response: {e}"))
+        })?;
+        value["ShardIterator"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| console::ConsoleError::new(500, "GetShardIterator returned no iterator"))
+    }
+
+    async fn get_stream_records(
+        &self,
+        _table: &str,
+        req: console::GetStreamRecordsRequest,
+    ) -> Result<console::StreamRecordsPage, console::ConsoleError> {
+        // No `table`/label check here: `req.shard_iterator` is an opaque
+        // token this same backend's `get_shard_iterator` already minted
+        // against a resolved `StreamArn`, and the real `GetRecords` wire
+        // path (`dynamo_streams::get_records`) independently re-validates
+        // the token's own label against the catalog — a second check here
+        // would just duplicate that gate, not add one.
+        let mut body = serde_json::json!({ "ShardIterator": req.shard_iterator });
+        if let Some(limit) = req.limit {
+            body["Limit"] = serde_json::Value::from(limit);
+        }
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDBStreams_20120810.GetRecords", &payload)
+                .await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+            console::ConsoleError::new(500, format!("malformed GetRecords response: {e}"))
+        })?;
+        let records = value["Records"].as_array().cloned().unwrap_or_default();
+        let next_shard_iterator = value["NextShardIterator"].as_str().map(str::to_string);
+        Ok(console::StreamRecordsPage {
+            records,
+            next_shard_iterator,
+        })
+    }
+}
+
+/// Decode a `Scan`/`Query` wire response body (`{"Items": [...], "Count": n,
+/// "ScannedCount": n[, "LastEvaluatedKey": {...}]}`) into an
+/// [`console::ItemsPage`] — shared by [`ConsoleBackend::scan_items`] and
+/// [`ConsoleBackend::query_items`] above (`animus_dynamo::wire::
+/// query_response` never emits `LastEvaluatedKey` at all, so this naturally
+/// yields `None` there — see [`console::ItemsPage`]'s own doc).
+fn console_parse_items_page(body: &str) -> Result<console::ItemsPage, console::ConsoleError> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| console::ConsoleError::new(500, format!("malformed items response: {e}")))?;
+    let items: Vec<console::WireItem> = value
+        .get("Items")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_object().cloned()).collect())
+        .unwrap_or_default();
+    let scanned_count = value
+        .get("ScannedCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(items.len() as u64);
+    let last_evaluated_key = value
+        .get("LastEvaluatedKey")
+        .and_then(|v| v.as_object().cloned());
+    Ok(console::ItemsPage {
+        items,
+        scanned_count,
+        last_evaluated_key,
+    })
+}
+
+/// An [`animus_control::StreamViewType`]'s DynamoDB wire label — the same
+/// vocabulary `StreamSpecification`/`DescribeStream` already use (ADR 0052:
+/// "explains that in DynamoDB's own vocabulary"). `animus_dynamo::wire`
+/// already has this exact mapping (`stream_view_type_str`), but it is
+/// `pub(crate)` to that crate; duplicating four match arms here follows the
+/// same precedent `animus-dynamo/CLAUDE.md` documents for its own
+/// `streams_wire` module re-deriving small byte-shape functions rather than
+/// widening a sibling crate's public surface for one caller.
+fn stream_view_type_label(view_type: animus_control::StreamViewType) -> &'static str {
+    match view_type {
+        animus_control::StreamViewType::NewAndOldImages => "NEW_AND_OLD_IMAGES",
+        animus_control::StreamViewType::NewImage => "NEW_IMAGE",
+        animus_control::StreamViewType::OldImage => "OLD_IMAGE",
+        animus_control::StreamViewType::KeysOnly => "KEYS_ONLY",
+    }
+}
+
 /// The common assembly tail shared by every node shape (ADR 0035 PR3):
 /// build the [`ClientCtx`] and spawn the tasks every node needs regardless of
 /// role — control-only ([`BoundControlNode::start_control_with`]), or
@@ -2352,6 +3348,7 @@ fn spawn_common_tail(
     client_listener: TcpListener,
     admin_listener: TcpListener,
     intra_listener: TcpListener,
+    console_listener: Option<TcpListener>,
     control_storage: Option<SharedEngine>,
     env: ProdEnv,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
@@ -2438,6 +3435,29 @@ fn spawn_common_tail(
     )));
     // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020).
     tasks.push(tokio::spawn(admin::serve(admin_listener, ctx.clone())));
+    // The AnimusDB Data Console (ADR 0052) — `None` on a control-only node
+    // (it hosts no CP-data tablet, so it has nothing for the console to
+    // show; see `BoundControlNode::start_control_with`, the only caller that
+    // passes `None`). Still takes no `ClientCtx` directly: a
+    // `console::TableSnapshotFn` closure (PR2's tables-list screen, built
+    // from `ctx.effective_metadata()` + `console_table_summaries` below) and
+    // — PR3's table page — an `Arc<dyn console::ConsoleBackend>` built from
+    // `ClientCtx`'s own impl of that trait just above. So `console.rs`
+    // itself never sees `Metadata`/`ClientCtx`/any other cluster-shaped
+    // type, only the plain console types those two seams hand it. See
+    // `console`'s module doc for why that boundary matters.
+    if let Some(console_listener) = console_listener {
+        let table_source: console::TableSnapshotFn = {
+            let ctx = ctx.clone();
+            Arc::new(move || console_table_summaries(&ctx.effective_metadata()))
+        };
+        let backend: Arc<dyn console::ConsoleBackend> = Arc::new(ctx.clone());
+        tasks.push(tokio::spawn(console::serve(
+            console_listener,
+            table_source,
+            backend,
+        )));
+    }
 
     (ctx, tasks)
 }
@@ -2871,6 +3891,7 @@ impl BoundNode {
             self.client_listener,
             self.admin_listener,
             self.intra_listener,
+            Some(self.console_listener),
             Some(storage.clone()),
             self.env.clone(),
         );
@@ -3127,6 +4148,7 @@ impl BoundNode {
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
+            console_addr: Some(self.console_addr),
             #[cfg(test)]
             test_ctx: ctx,
         })
@@ -3178,6 +4200,10 @@ pub struct Node {
     /// populated — every deployment shape binds and (from `intra/2-cutover`
     /// onward) serves it.
     intra_addr: SocketAddr,
+    /// `None` on a control-only node (ADR 0052) — the AnimusDB Data Console
+    /// listener is never bound there (it hosts no CP-data tablet). See
+    /// [`console_addr`](Self::console_addr)'s doc.
+    console_addr: Option<SocketAddr>,
     /// Test-only: a clone of this node's own [`ClientCtx`] (the exact one
     /// `spawn_common_tail` built and handed to this node's listeners/
     /// background loops), so an in-crate test module can call a
@@ -3219,6 +4245,8 @@ impl Node {
         let admin_addr = admin_listener.local_addr()?;
         let intra_listener = TcpListener::bind(addrs.intra).await?;
         let intra_addr = intra_listener.local_addr()?;
+        let console_listener = TcpListener::bind(addrs.console).await?;
+        let console_addr = console_listener.local_addr()?;
         Ok(BoundNode {
             id,
             env,
@@ -3234,13 +4262,17 @@ impl Node {
             admin_addr,
             intra_listener,
             intra_addr,
+            console_listener,
+            console_addr,
         })
     }
 
     /// Bind a **control-only** node's listeners (ADR 0035 PR3): the internal
     /// `ProdEnv` (control Raft only — it hosts no tablet, so no stream ever
     /// rides above 0) plus the client + admin TCP listeners only — no
-    /// dynamo/cql listeners.
+    /// dynamo/cql listeners, and (ADR 0052) no console listener either: a
+    /// control-only node hosts no CP-data tablet, so it has nothing the
+    /// console could show — see [`console`](crate::console)'s module doc.
     ///
     /// # Errors
     /// Propagates any bind / directory-creation failure.
@@ -3275,7 +4307,9 @@ impl Node {
     /// `ProdEnv` (every per-tablet Raft group this node hosts, plus its own
     /// failure-detection heartbeats to the control group — no local control
     /// `RaftCore` at all, `Node::bind_control`'s exact dual) plus the
-    /// client/dynamo/cql/admin TCP listeners.
+    /// client/dynamo/cql/admin/console TCP listeners — a data-only node hosts
+    /// real CP-data tablets, so it binds the console listener (ADR 0052) just
+    /// like a combined node.
     ///
     /// # Errors
     /// Propagates any bind / directory-creation failure.
@@ -3297,6 +4331,8 @@ impl Node {
         let admin_addr = admin_listener.local_addr()?;
         let intra_listener = TcpListener::bind(addrs.intra).await?;
         let intra_addr = intra_listener.local_addr()?;
+        let console_listener = TcpListener::bind(addrs.console).await?;
+        let console_addr = console_listener.local_addr()?;
         Ok(BoundDataNode {
             id,
             env,
@@ -3312,6 +4348,8 @@ impl Node {
             admin_addr,
             intra_listener,
             intra_addr,
+            console_listener,
+            console_addr,
         })
     }
 
@@ -3348,6 +4386,16 @@ impl Node {
     /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
     pub fn intra_addr(&self) -> SocketAddr {
         self.intra_addr
+    }
+
+    /// The address the AnimusDB Data Console listens on (ADR 0052).
+    ///
+    /// # Panics
+    /// If this node has no data role — see [`dynamo_addr`](Self::dynamo_addr)'s
+    /// doc; the console has nothing to show on a control-only node either.
+    pub fn console_addr(&self) -> SocketAddr {
+        self.console_addr
+            .expect("console_addr: this node has no data role (ADR 0035 PR3 control-only)")
     }
 
     /// Whether this node's control replica currently believes it is leader.
@@ -3773,6 +4821,7 @@ impl BoundControlNode {
             self.client_listener,
             self.admin_listener,
             self.intra_listener,
+            None, // ADR 0052: a control-only node hosts no CP-data tablet, so it binds no console listener.
             Some(control_storage),
             sync_env.clone(),
         );
@@ -3819,6 +4868,7 @@ impl BoundControlNode {
             cql_addr: None,
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
+            console_addr: None, // ADR 0052: a control-only node hosts no CP-data tablet.
             #[cfg(test)]
             test_ctx: ctx,
         })
@@ -3848,6 +4898,11 @@ pub struct BoundDataNode {
     admin_addr: SocketAddr,
     intra_listener: TcpListener,
     intra_addr: SocketAddr,
+    /// The AnimusDB Data Console's own listener (ADR 0052) — a data-only
+    /// node hosts real CP-data tablets, so it always binds one; see
+    /// [`console`](crate::console)'s module doc.
+    console_listener: TcpListener,
+    console_addr: SocketAddr,
 }
 
 impl BoundDataNode {
@@ -3869,6 +4924,11 @@ impl BoundDataNode {
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
     pub fn admin_addr(&self) -> SocketAddr {
         self.admin_addr
+    }
+
+    /// The address the AnimusDB Data Console listens on (ADR 0052).
+    pub fn console_addr(&self) -> SocketAddr {
+        self.console_addr
     }
 
     /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
@@ -4099,6 +5159,7 @@ impl BoundDataNode {
             self.client_listener,
             self.admin_listener,
             self.intra_listener,
+            Some(self.console_listener),
             // A data-only node has no local control role at all (ADR 0035) —
             // no system-keyspace engine to surface (ADR 0038 PR4).
             None,
@@ -4234,6 +5295,7 @@ impl BoundDataNode {
             cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
+            console_addr: Some(self.console_addr),
             #[cfg(test)]
             test_ctx: ctx,
         })
@@ -12260,6 +13322,7 @@ pub async fn bind_cluster(
             cql: addr(),
             admin: addr(),
             intra: addr(),
+            console: addr(),
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
         nodes.push(node);
@@ -12758,6 +13821,7 @@ pub async fn start_split_cluster_with_growth(
             cql: ephemeral(),
             admin: ephemeral(),
             intra: ephemeral(),
+            console: ephemeral(),
         };
         control_bound.push(
             Node::bind_control(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?,
@@ -12774,6 +13838,7 @@ pub async fn start_split_cluster_with_growth(
             cql: ephemeral(),
             admin: ephemeral(),
             intra: ephemeral(),
+            console: ephemeral(),
         };
         data_bound
             .push(Node::bind_data(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?);
@@ -14052,7 +15117,7 @@ mod confirm_futility_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(6);
+        let addrs = free_addrs(7);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -14063,6 +15128,7 @@ mod confirm_futility_tests {
                 cql: addrs[3],
                 admin: addrs[4],
                 intra: addrs[5],
+                console: addrs[6],
             }],
         }
     }
@@ -14446,7 +15512,7 @@ mod halted_shutdown_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(6);
+        let addrs = free_addrs(7);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -14457,6 +15523,7 @@ mod halted_shutdown_tests {
                 cql: addrs[3],
                 admin: addrs[4],
                 intra: addrs[5],
+                console: addrs[6],
             }],
         }
     }

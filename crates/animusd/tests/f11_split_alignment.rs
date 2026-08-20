@@ -58,17 +58,18 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
 /// identical doc comment).
 async fn bring_up(n: usize, dir: &Path) -> Vec<Node> {
     for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
+        let addrs = support::free_addrs(n * 7);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                cql: addrs[6 * i + 3],
-                admin: addrs[6 * i + 4],
-                intra: addrs[6 * i + 5],
+                internal: addrs[7 * i],
+                client: addrs[7 * i + 1],
+                dynamo: addrs[7 * i + 2],
+                cql: addrs[7 * i + 3],
+                admin: addrs[7 * i + 4],
+                intra: addrs[7 * i + 5],
+                console: addrs[7 * i + 6],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };

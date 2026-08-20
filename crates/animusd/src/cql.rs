@@ -1124,18 +1124,19 @@ mod cql_kind_write_tests {
     }
 
     fn cluster_config(n: usize) -> ClusterConfig {
-        let addrs = free_addrs(6 * n);
+        let addrs = free_addrs(7 * n);
         ClusterConfig {
             nodes: (0..n)
                 .map(|i| RoleAddrs {
                     id: crate::config::node_id(i),
                     role: NodeRole::Both,
-                    internal: addrs[6 * i],
-                    client: addrs[6 * i + 1],
-                    dynamo: addrs[6 * i + 2],
-                    cql: addrs[6 * i + 3],
-                    admin: addrs[6 * i + 4],
-                    intra: addrs[6 * i + 5],
+                    internal: addrs[7 * i],
+                    client: addrs[7 * i + 1],
+                    dynamo: addrs[7 * i + 2],
+                    cql: addrs[7 * i + 3],
+                    admin: addrs[7 * i + 4],
+                    intra: addrs[7 * i + 5],
+                    console: addrs[7 * i + 6],
                 })
                 .collect(),
         }

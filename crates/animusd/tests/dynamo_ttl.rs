@@ -38,7 +38,7 @@ const TEST_TTL_SWEEP_INTERVAL: Duration = Duration::from_millis(300);
 async fn start_single_node_fast_ttl(dir: &Path) -> (Node, ClusterConfig) {
     let mut last_err = None;
     for attempt in 0..10 {
-        let addrs = support::free_addrs(6);
+        let addrs = support::free_addrs(7);
         let config = ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: animusd::config::node_id(0),
@@ -49,6 +49,7 @@ async fn start_single_node_fast_ttl(dir: &Path) -> (Node, ClusterConfig) {
                 cql: addrs[3],
                 admin: addrs[4],
                 intra: addrs[5],
+                console: addrs[6],
             }],
         };
         match animusd::run_node_with_ttl_sweep_interval(

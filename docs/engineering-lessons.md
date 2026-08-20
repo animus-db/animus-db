@@ -2784,6 +2784,78 @@ debugging anything that feels like it might have happened before.
   `crates/animusd/tests/streams_e2e.rs`, 2026-08-20.)
 
 ### Code patterns
+- **A single-closure injection seam that needs to grow into several
+  fallible, parameterized operations should become a small trait, not a
+  pile of more closures — but the widening must be audited to stay in
+  *shape* only, never in *kind* (2026-08-20, ADR 0052 PR3, the Data
+  Console's Config tab).** PR2 gave `console.rs` a `TableSnapshotFn`
+  (`Arc<dyn Fn() -> Vec<TableSummary>>`) as its one seam into `lib.rs`'s
+  cluster-aware world — exactly right for one parameterless, infallible
+  read. PR3 needed six more operations (a per-table detail read plus five
+  mutations), each needing a table name/request body and able to fail.
+  Bolting five more `Arc<dyn Fn...>` fields onto `serve`'s signature would
+  have worked mechanically but obscured the one property that actually
+  matters here: that every operation's signature is still built only from
+  plain owned types the seam itself declares, never the richer type the
+  other side of the boundary actually has in hand. An `async_trait` trait
+  (`ConsoleBackend`) makes that property easy to see and easy to keep
+  honest at every call site — one `impl` block, one place to check that no
+  method accepts or returns a cluster/schema-catalog type — where five
+  separate closures would have made the same audit five separate
+  fly-by-eye checks. The general form: when a seam must grow, prefer
+  promoting it to a trait over multiplying its closures, but the reason to
+  prefer the trait is auditability of the type boundary, not the trait
+  keyword itself — a trait whose methods leak the richer type back through
+  is no safer than the closures would have been. (`crates/animusd/src/
+  console.rs`, `crates/animusd/src/lib.rs`.)
+- **A wire adapter's `UpdateTable`-add-a-GSI decode path can silently
+  ignore attribute types even though the equivalent `CreateTable` path
+  requires them — check what a decoder actually reads before assuming its
+  request shape mirrors its sibling operation's (2026-08-20).** This
+  adapter's `GlobalSecondaryIndexUpdates` `Create` decoding
+  (`animus_dynamo::wire::decode_index_updates` → `decode_index_entry`)
+  reads `KeySchema` straight off the `Create` object itself and never looks
+  at a top-level `AttributeDefinitions` at all — unlike `CreateTable`,
+  where `AttributeDefinitions` feeds the base table's own `ColumnDef`
+  types. A new GSI's hash/sort attribute therefore gets no explicit type
+  recorded anywhere in the catalog; `IndexDef` stores only the attribute
+  *name*. Before building a feature on top of an existing wire operation,
+  read what its decoder actually consumes; a sibling operation's contract is
+  not evidence the one you're calling shares it. **And when the gap means a
+  UI control's value cannot survive its own round trip, remove the control —
+  do not paper over it with a default.** The Config tab's Add-GSI form
+  originally offered an `S`/`N`/`B` picker per key attribute; the pick was
+  accepted with a `200 OK` and read straight back as `S`, so the screen
+  contradicted itself within one interaction. Defaulting the *display* to
+  `"S"` would have hidden that, which is worse than the bug: an invented
+  value is indistinguishable from a recorded one. The fix was to delete the
+  picker, stop sending the `AttributeDefinitions` the decoder ignores, and
+  make the type explicitly nullable end-to-end (`console::IndexKeySummary`'s
+  `Option<String>`, rendered as a bare attribute name) so the absence is
+  visible rather than filled in. The decoder gap itself is issue #319 — an
+  incidental pre-existing bug, so its own change with its own test, per the
+  repo convention. General form: a fallback default is only honest when the
+  fallback is unreachable in practice; where it *is* reachable, model the
+  absence. (`crates/animus-dynamo/src/wire.rs`, `crates/animusd/src/
+  console.{rs,js}`.)
+  **Follow-up (2026-08-20): the ADR text this same PR wrote asserted the
+  *sibling* `CreateTable` path did not share this gap — that assertion was
+  wrong, and nobody had traced it to find out.** The Config tab's own ADR
+  amendment claimed "a GSI declared at `CreateTable` time on the same table
+  [gets a type]"; the create-table-form PR (PR6) actually traced
+  `schema::to_control`/`index_to_control` before believing it, and found
+  the identical gap: `to_control` only builds a `ColumnDef` for the base
+  table's own partition/sort key, and `index_to_control` never receives
+  `key_types` for *any* index, `CreateTable`-declared or not. The lesson
+  generalizes past this one decoder: **an unverified claim about a sibling
+  code path, once written into an ADR or a doc comment, is exactly as
+  trustworthy as an unverified assumption — restating it in prose does not
+  make it checked.** A task that says "verify against the decoder, don't
+  assume it behaves like its sibling" applies even when the thing you'd be
+  trusting is this repo's own prior documentation of that sibling. Trace
+  the actual code for *every* new call site that offers a control backed by
+  it, even one an earlier PR's ADR text already described with apparent
+  confidence.
 - **A "claim now, confirm later" state machine needs a release on *every*
   failure exit of the executor, not just the one the original design happened
   to handle (2026-08-19).** `animus-cp-data`'s tablet-host reconciler splits a
@@ -7041,8 +7113,50 @@ debugging anything that feels like it might have happened before.
   bug's own "usually fine" margin. When a mechanism's safety argument contains
   the words "much larger than", make the comparison executable. (#302,
   `crates/animusd/src/{lib,main}.rs`, 2026-08-20.)
+- **Adding a required (no-default) field to a struct with dozens of literal
+  construction sites: let the compiler enumerate them, don't grep-and-hope
+  (2026-08-19, ADR 0052's `RoleAddrs::console` port).** `RoleAddrs` (the
+  per-node listener-address struct, ADR 0047's `intra` port set the
+  no-`#[serde(default)]` precedent this field followed) has ~60 literal
+  `RoleAddrs { .. }` construction sites across `animusd`'s `src/` and
+  `tests/` — a grep for `RoleAddrs {` finds most of them, but a grep for the
+  *stride arithmetic* (`6 * i`, `free_addrs(n * 6)`, hardcoded offsets like a
+  hand-computed `addrs[18]` for node index 3) is exactly the kind of
+  multi-shape, easy-to-undercount search the root `CLAUDE.md`'s "grep every
+  gating match site" lesson already warns about — and this field additionally
+  needed the *stride itself* to change (6 → 7), not just one new field
+  line, so a per-site fix also had to renumber every sibling offset in the
+  same literal. The reliable sequencing: add the field to the struct
+  definition **first** (with no default), then run `cargo build -p animusd
+  --all-targets` and fix every `error[E0063]: missing field` site the
+  compiler actually reports — repeating until clean. This is exhaustive by
+  construction (a missed site is a compile error, not a silent gap) where a
+  grep pass can only ever be "probably complete." A generic per-site fixup
+  script (regex over the fixed six-field block shape, deriving the seventh
+  field's expression from the sixth's) handled ~30 of the ~32 remaining test
+  files in one pass; the two genuine outliers — a hand-computed hardcoded
+  multi-node offset block, and the struct's own `generate`/`generate_split`
+  functions building the stride formula directly — still needed a human
+  read, which the compiler-driven approach surfaced as compile errors as
+  reliably as everything else, rather than as something a grep could have
+  silently missed entirely.
 
 ### Parallel-agent orchestration
+- **A single long-lived session can exhaust the disk on `target/` alone, with
+  no parallel fan-out involved (2026-08-19)** — a solo `cargo build
+  --workspace --all-targets` on this repo hit `rustc-LLVM ERROR: IO failure …
+  No space left on device` and `ld terminated with signal 7 [Bus error]` with
+  `target/debug` alone at 30 GB against a filesystem reporting single-digit
+  megabytes free (despite a large nominal size — the real quota is much
+  smaller than `df`'s `Size` column implies on this harness). `cargo clean`
+  reclaimed the full 30 GB in seconds and the rebuild succeeded; there was no
+  need to hunt for a partial/targeted clean. **Rule:** if `cargo
+  build`/`test`/`clippy` fails with an I/O or linker error whose message
+  mentions space (not a compile error), check `df -h` before debugging the
+  "failure" as if it were a code problem, and prefer a full `cargo clean`
+  over trying to selectively prune `target/` — the incremental cache is the
+  overwhelming majority of the size and buys little across a full rebuild
+  anyway.
 - **Parallel agents share one `target/` dir; three concurrent
   `--all-targets` builds exhaust the session disk (2026-08-19).** Fanning three
   implementation agents across disjoint crates avoids *source* conflicts but
@@ -8014,3 +8128,25 @@ debugging anything that feels like it might have happened before.
   replicated command for a new field, check *why* each of its rejects
   exists before copying it, not just what the reject is guarding on the
   surface.
+- **Follow-up to the disk-space entry above: when it genuinely is ENOSPC**
+  (real "No space left on device" errors from `rustc`/the linker, not a
+  garbled compile error), `rm -rf target` alone often doesn't create enough
+  headroom to finish a `--workspace --all-targets` build — this workspace's
+  ~90 `animusd` integration test binaries each statically link the same
+  large dependency set (tokio, opentelemetry, reqwest, icu\*, …) with full
+  debug info by default, and linking one of them can itself need several
+  hundred MB of scratch space. The fix that actually restores headroom
+  without touching the checked-in `Cargo.toml` (no `[profile]` section
+  exists there, so this is a machine-local, non-committed change): add
+  `[profile.dev]`/`[profile.test]` `debug = 0` (plus `incremental = false`
+  if the incremental cache itself is a large chunk of the growth) to
+  `$CARGO_HOME/config.toml` (e.g. `/root/.cargo/config.toml`) — Cargo reads
+  `[profile.*]` from config files, not only from a manifest — which cuts
+  every test binary to a fraction of its debuginfo-enabled size and turns a
+  session that can't link `cargo test --workspace` even once into one that
+  fits comfortably. Confirm it took effect via the build summary line
+  (`unoptimized` vs. `unoptimized + debuginfo`), and check `df -h` before
+  and after a `rm -rf target` — if avail space right after the wipe is
+  already within a few hundred MB of what one large link step needs, the
+  wipe bought too little margin and the very next build can ENOSPC again
+  mid-link.

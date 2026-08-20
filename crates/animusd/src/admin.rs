@@ -2227,7 +2227,7 @@ mod system_table_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(6);
+        let addrs = free_addrs(7);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -2238,6 +2238,7 @@ mod system_table_tests {
                 cql: addrs[3],
                 admin: addrs[4],
                 intra: addrs[5],
+                console: addrs[6],
             }],
         }
     }
