@@ -708,10 +708,25 @@ demand the identical action, so no disambiguation is needed.
   campaigning only if unanswered (fork B) — never a bare stale-timeout
   campaign, which would depose a healthy quiesced leader on every cold
   tablet's first touch.
-  - **Vetoes (fork D)**: `RaftKvNode::set_quiesce_veto(bool)` lets an
-    external subsystem (`animusd`'s `change_consumer_loop`, for a led
+  - **Vetoes (fork D)**: `RaftKvNode::set_quiesce_veto(held, fresh_through)`
+    lets an external subsystem (`animusd`'s `change_consumer_loop`, for a led
     tablet whose change log was non-empty on its last sweep) hold the group
-    awake; ORed, once per consensus-loop iteration, with this crate's own
+    awake. **`fresh_through` is not optional bookkeeping** (issue #302): a
+    bare boolean is only as fresh as the sweeper's own 200ms tick, so a write
+    landing between one sweep and the next left a stale `false` behind and a
+    group could quiesce still owing stream work. The caller passes the
+    `engine_applied_index()` it read **before** the scan that decided `held`,
+    and `quiesce_entry_ok` additionally requires `fresh_through >=
+    commit_index` — so a group cannot quiesce until a sweep has actually
+    observed it since the last commit. Reading the index *after* the scan
+    would be symmetrically unsound (a write committing in between would be
+    absent from the scan yet counted as observed), and a wall-clock stamp
+    compared against `last_activity` would be unsound too, since that marker
+    is bumped at *propose* time while the sweep observes *applied* content.
+    The default is `u64::MAX` — a true "never engaged, no constraint"
+    sentinel, so tablets the sweeper structurally never visits (`Building`
+    split children, hidden GSI-table tablets) keep quiescing exactly as
+    before. ORed, once per consensus-loop iteration, with this crate's own
     in-memory check that `TxnTracker` (`pending`/`unresolved_decided`) is
     empty — and (issue #279) with the loop's own in-flight persist round or
     undelivered gated acks, since quiescence drops the timer arm entirely and

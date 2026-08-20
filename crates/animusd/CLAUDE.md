@@ -815,15 +815,28 @@ crate's `CLAUDE.md`. This crate's own contribution:
   open-tail read to race. `hot_read` takes only the group handle now.
 - **Quiesce veto**: `change_consumer_loop` (`index_drain.rs`) computes
   `!group.pending_changes().await.is_empty()` once per led tablet per tick
-  and calls `CpGroup::set_quiesce_veto` with it — held while the change log
-  is non-empty, released the instant a sweep finds it empty.
+  and calls `CpGroup::set_quiesce_veto(held, fresh_through)` with it — held
+  while the change log is non-empty, released the instant a sweep finds it
+  empty. `fresh_through` is the tablet's `engine_applied_index()`, read
+  **once per tick before any of that tick's engine scans** and reused by
+  every `set_quiesce_veto` call in the tick, so the observations stay
+  mutually consistent and each is a valid lower bound (issue #302 — see
+  `animus-cp-data/CLAUDE.md`'s fork-D bullet for why reading it afterward,
+  or stamping wall-clock time instead, would both be unsound). The floor
+  `MIN_QUIESCE_AFTER` (= `INDEX_DRAIN_INTERVAL`) is validated on
+  `--quiesce-after` so a nonzero setting can never sit below the sweep
+  period that feeds the veto.
 - **Sweeper skip** (the fleet-scale CPU win — PR5's veto alone only stops
   pointless Raft timer/heartbeat/apply-poll activity, not these loops' own
   per-tablet LSM scans): `change_consumer_loop`, `txn_resolver_loop`, and
   `auto_split_loop` all skip a led tablet outright once `CpGroup::
   is_quiesced()` is true, rather than merely finding nothing to do. Sound
   by construction: the first two follow directly from the veto invariant
-  above; `auto_split_loop`'s skip is sound because a quiesced group's
+  above — note that soundness now rests on the veto's **freshness** clause,
+  not on the sweeper's own cadence, because before issue #302's fix the
+  argument was circular (a group that quiesced on a stale veto was then
+  skipped by the very loop that would have refreshed it, so the bad state
+  was sticky rather than self-correcting); `auto_split_loop`'s skip is sound because a quiesced group's
   bytes/key-count are provably static (no activity for `quiesce_after`
   means no write since it last quiesced) — whatever its last
   pre-quiescence tick already checked still holds. The skip is a strict,
