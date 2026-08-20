@@ -3,9 +3,10 @@
 - **Status:** Accepted — PR1 shipped the plumbing only (§Decision "What this
   PR ships"); PR2 (see the 2026-08-20 amendment below) ships the tables-list
   screen and this listener's first JSON endpoint; PR3 (see the second
-  2026-08-20 amendment below) ships a table's own page, Config tab. The
-  Items tab, the Stream tab, and the create-table form remain follow-up PRs
-  in the same stack.
+  2026-08-20 amendment below) ships a table's own page, Config tab; PR4 (see
+  the third 2026-08-20 amendment below) ships that page's Items tab. The
+  Stream tab and the create-table form remain follow-up PRs in the same
+  stack.
 - **Date:** 2026-08-19
 - **Amends:** [ADR 0035](0035-control-plane-separate-deployment.md) (owns the
   deployment shapes and their port contracts — gains a seventh port and a
@@ -354,3 +355,90 @@ recorded.
 Restoring the picker is the natural follow-up to #319, not a separate design
 question — this ADR's position is only that the console must not claim a type
 nobody stored.
+
+## Amendment (2026-08-20, PR4 — the table page's Items tab)
+
+This stack's fourth PR ships the table page's second tab: browse (`Scan`,
+paginated) or narrow (`Query`, by partition key and optionally a sort-key
+condition) a table's own rows, or one of its declared GSIs'/LSIs'; look up
+one row directly by its exact key (`Get`, base table only — real DynamoDB's
+own `GetItem` has no `IndexName`); and create/edit/delete one item at a
+time. Three decisions worth recording.
+
+**The tab strip is real navigation, not a shared-page pushState toggle.**
+The operator dashboard's own tab idiom (`dashboard_core.js::activateTab`)
+keeps one already-fetched status blob in memory and toggles which
+`<section>` is visible, syncing the URL with `history.pushState`/
+`replaceState` — the right shape there because every tab reads the same
+data. This console already established a different, deliberate convention
+for cross-screen navigation (this ADR's PR2/PR3 text, restated in
+`console.js`'s own header comment): real `<a href>`s and full page loads,
+reserving a same-page anchor nav for genuinely-one-fetch subsections (the
+Config tab's own Settings/Indexes/Danger-zone jump nav). Config and Items
+are not that: Items makes its own `scan`/`query` calls that Config never
+touches, so treating them as one shared-fetch page and toggling visibility
+would be modeling two different data screens as one. PR4 gives Items its
+own real URL, one path segment past the table's own
+(`/console/ui/tables/{name}/items`, vs. plain `/console/ui/tables/{name}`
+for Config) — both still served by the identical static shell
+(`console::is_shell_path` already matches any `/console/ui/*` prefix, so no
+server route changed), and `console.js`'s router picks the tab from the
+trailing path segment. This also makes "Config is the default tab" a
+structural fact of the URL space rather than client state that could start
+on the wrong tab: the tables-list row's link (`tableHref`, unchanged) always
+lands on the bare table URL, which the router treats as Config.
+
+**Items pass DynamoDB's own wire shape straight through — the one console
+type in this whole app that is not a narrower projection.** Every other
+type this module defines (`TableSummary`, `TableDetail`, `GsiDetail`, …)
+deliberately narrows the replicated catalog into a console-only shape, for
+the reasons ADR 0052's PR2 amendment gives. An item has no such catalog
+to narrow *from*: DynamoDB rows are schemaless beyond their declared key
+attributes, so there is no fixed "console item shape" to project onto
+without either inventing a lossy one (dropping attribute types, flattening
+nested `L`/`M` structures) or reinventing DynamoDB's own type system badly.
+`console::WireItem` (`{"attr": {"S": "value"}}`, the same shape a real
+DynamoDB client already sees) is passed through by every one of the five
+new `ConsoleBackend` methods (`scan_items`/`query_items`/`get_item`/
+`put_item`/`delete_item`); `console.rs` never interprets an attribute name
+or value, only moves the map between the wire and the HTTP body.
+`console.js`'s item editor is where this pays off directly: every DynamoDB
+wire type (`S`/`N`/`B`/`BOOL`/`NULL`/`L`/`M`/`SS`/`NS`/`BS` — a real closed
+set) gets its own editor or, for the four collection types, a "Raw (JSON)"
+textarea holding that one attribute's exact `AttributeValue` — never a
+partial recursive editor invented for this PR, and never a value the
+system did not actually record (this PR's own version of the rule PR3's
+`IndexKeySummary`/issue #319 fix already established). An attribute *name*
+stays the one genuinely free-text control in the whole tab, same rule as
+everywhere else in this console.
+
+**`Query` has no pagination on this adapter, and PR4 does not add it.**
+`Scan` paginates properly — DynamoDB's own `Limit`/`ExclusiveStartKey`/
+`LastEvaluatedKey` contract, threaded through unchanged
+(`console::ScanItemsRequest`/`ItemsPage`), with a "Load more" button
+carrying the previous page's `last_evaluated_key` forward, never a fake
+offset. `Query`, on inspection, cannot: `animus_dynamo::wire::decode_query`
+never parses a `Limit` or `ExclusiveStartKey` at all, and `animusd::dynamo::
+run_query` answers a whole partition in one native range scan with no cap.
+This is a pre-existing gap in the underlying wire layer that PR4 did not
+introduce and does not attempt to paper over client-side (a client-side-only
+"Load more" would silently re-issue the identical unbounded query and either
+return nothing new or duplicate the same rows) — `console::ItemsPage::
+last_evaluated_key` is simply always `None` for a `Query` result, and
+`console.js` never shows a "Load more" affordance in Query mode. A `Query`
+is scoped to one partition, which is normally small, so this is a real but
+minor gap; giving the DynamoDB `Query` operation itself real pagination is
+its own follow-up in `animus-dynamo`/`animusd::dynamo`, not a console-side
+fix.
+
+One extension included because it fell out cleanly rather than needing new
+machinery: scanning/querying a named GSI or LSI. `ScanItemsRequest`/
+`QueryItemsRequest` both carry an optional `index_name` (a real closed set —
+`console.js`'s Source `<select>` is populated from this same table's own
+`TableDetail.gsis`/`lsis`, never free text), and `lib.rs`'s
+`ConsoleBackend::query_items` resolves the partition/sort attribute *names*
+to query by from the replicated catalog server-side (mirroring how
+`add_gsi`/`table_detail` already read the catalog on the console's behalf)
+rather than asking the client to know or type them — the same
+`GET`/`POST`-body split every other DynamoDB operation on this adapter
+already uses for `Scan`/`Query`'s own `IndexName` parameter.

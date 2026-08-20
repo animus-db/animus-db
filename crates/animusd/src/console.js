@@ -82,6 +82,15 @@
     return TABLES_ROUTE_PREFIX + encodeURIComponent(name);
   }
 
+  // The table page's Items tab has its own real URL, one path segment past
+  // the table's own (`.../tables/{name}/items`) — see the table-page routing
+  // section's own comment for why this, rather than a shared-page
+  // pushState-driven tab strip (`dashboard_core.js::activateTab`'s idiom),
+  // is the tab-switch mechanism here.
+  function tableItemsHref(name) {
+    return tableHref(name) + "/items";
+  }
+
   // Nulls (the LSI "structurally absent" case) always sort last, in either
   // direction — the point of the distinction is to set those rows apart,
   // which a plain ascending/descending flip would defeat.
@@ -318,7 +327,21 @@
 
   let TABLE_DETAIL = null;
 
-  async function renderTablePage(name) {
+  // The table page has two tabs — Config (this PR's predecessor, PR3;
+  // default) and Items (this PR). Each is its own real URL
+  // (`tableHref`/`tableItemsHref`) rather than one shared page toggling
+  // sections via `dashboard_core.js::activateTab`'s pushState idiom: unlike
+  // that dashboard's tabs (which all share one already-fetched status blob)
+  // or this same page's own Settings/Indexes/Danger-zone jump nav (which
+  // all share one `table_detail` fetch and just scroll within it), Config
+  // and Items are genuinely different data-fetching screens — Items makes
+  // its own `scan`/`query` calls Config never touches. A real navigation
+  // keeps that boundary explicit, costs nothing extra (both routes serve
+  // the identical static shell, `console::is_shell_path`), and makes
+  // "Config is the default tab" a structural fact of the URL space (arriving
+  // at the bare `tableHref` always renders Config) rather than client state
+  // that could start on the wrong tab.
+  async function renderTablePage(name, tab) {
     app.innerHTML = `<p class="loading">Loading ${esc(name)}…</p>`;
     try {
       TABLE_DETAIL = await getJSON(tableApiPath(name));
@@ -337,15 +360,31 @@
           <a class="back-link" href="/console/ui/tables">← Tables</a>
           <h1>${esc(TABLE_DETAIL.name)}</h1>
         </div>
-        <nav class="jump-nav">
-          <a href="#settings">Settings</a>
-          <a href="#indexes">Indexes</a>
-          <a href="#danger">Danger zone</a>
+        <nav class="tab-strip">
+          <a class="tab-link${tab === "config" ? " active" : ""}" href="${tableHref(name)}">Config</a>
+          <a class="tab-link${tab === "items" ? " active" : ""}" href="${tableItemsHref(name)}">Items</a>
         </nav>
-        <section id="settings" class="config-section"></section>
-        <section id="indexes" class="config-section"></section>
-        <section id="danger" class="config-section"></section>
+        <div id="table-tab-content"></div>
       </div>`;
+    if (tab === "items") {
+      renderItemsTab(document.getElementById("table-tab-content"));
+    } else {
+      renderConfigTab(document.getElementById("table-tab-content"));
+    }
+  }
+
+  // -- Config tab: Settings / Indexes / Danger zone under one jump nav -----
+
+  function renderConfigTab(root) {
+    root.innerHTML = `
+      <nav class="jump-nav">
+        <a href="#settings">Settings</a>
+        <a href="#indexes">Indexes</a>
+        <a href="#danger">Danger zone</a>
+      </nav>
+      <section id="settings" class="config-section"></section>
+      <section id="indexes" class="config-section"></section>
+      <section id="danger" class="config-section"></section>`;
     renderSettingsSection();
     renderIndexesSection();
     renderDangerSection();
@@ -671,15 +710,601 @@
     });
   }
 
+  // ---- the table page: Items tab (this PR) --------------------------------
+  //
+  // Browse (Scan, paginated by DynamoDB's own ExclusiveStartKey/
+  // LastEvaluatedKey — "Load more" carries the last page's cursor forward,
+  // never a fake offset), Query (by partition key, plus a sort-key
+  // condition when the target has one), or Get (one item by its exact key)
+  // a table's own rows, or one of its declared GSIs'/LSIs' for Scan/Query
+  // (a real closed set — TABLE_DETAIL's own gsis/lsis — rendered with a
+  // <select>, never free text; Get is always base-table-only, matching
+  // real DynamoDB's own GetItem, which takes no IndexName). Every item
+  // round-trips in DynamoDB's own wire shape (`console::WireItem`) — see
+  // `console.rs`'s module doc for why that's deliberate, not a shortcut:
+  // the item editor below is what turns that shape into something a person
+  // can read and edit without ever fabricating a type the server didn't
+  // actually record.
+  //
+  // A key attribute (partition or sort, base table or index) is always
+  // scalar in DynamoDB (S/N/B) — so its *value* input offers a real S/N/B
+  // control (`keyValueInputHtml`), same as `console.rs`'s own doc reasons
+  // for `SortKeyQuery`. That is different from an ordinary item attribute's
+  // *type*, which is asked for with a plain `<select>` over the full closed
+  // wire-type set (`ATTR_TYPES`) precisely because — unlike a key — any of
+  // the eight actually applies. Neither is a free-text guess at a value that
+  // could be anything: an attribute *name* is the one thing in this whole UI
+  // that stays `<input type="text">`, because it's the one thing that
+  // genuinely is free text (any per-item attribute, undeclared anywhere in
+  // the catalog).
+
+  let ITEMS_STATE = null;
+
+  function itemsApiPath(tail) {
+    return tableApiPath(TABLE_DETAIL.name, `items/${tail}`);
+  }
+
+  // Item CRUD always targets the *base* table — DynamoDB has no direct
+  // write to a GSI/LSI, both are views materialized from base writes — so
+  // the key attributes an item is identified by are always the base table's
+  // own, regardless of which source (base/GSI/LSI) a row was scanned or
+  // queried from. AWS always includes the base table's key attributes in an
+  // index's own projection (needed to fetch the full item), which is the
+  // property this relies on.
+  function baseKeyNames() {
+    return {
+      pk: TABLE_DETAIL.partition_key.name,
+      sk: TABLE_DETAIL.sort_key ? TABLE_DETAIL.sort_key.name : null,
+    };
+  }
+
+  // The partition/sort attribute names to scan/query by for the currently
+  // selected source (`""` = base table, `"gsi:name"`/`"lsi:name"` = one of
+  // this table's own declared indexes).
+  function sourceKeyNames(sourceValue) {
+    if (!sourceValue) return baseKeyNames();
+    const [kind, name] = sourceValue.split(":");
+    const list = kind === "gsi" ? TABLE_DETAIL.gsis : TABLE_DETAIL.lsis;
+    const found = (list || []).find((x) => x.name === name);
+    if (!found) return baseKeyNames();
+    if (kind === "gsi") {
+      return {
+        pk: found.hash_attribute.name,
+        sk: found.sort_attribute ? found.sort_attribute.name : null,
+      };
+    }
+    // An LSI shares the base table's own partition key and adds its own
+    // alternate sort key.
+    return { pk: TABLE_DETAIL.partition_key.name, sk: found.sort_attribute.name };
+  }
+
+  function sourceOptionsHtml() {
+    const gsiOpts = (TABLE_DETAIL.gsis || [])
+      .map((g) => `<option value="gsi:${esc(g.name)}">GSI: ${esc(g.name)}</option>`)
+      .join("");
+    const lsiOpts = (TABLE_DETAIL.lsis || [])
+      .map((l) => `<option value="lsi:${esc(l.name)}">LSI: ${esc(l.name)}</option>`)
+      .join("");
+    return `<option value="">Base table</option>${gsiOpts}${lsiOpts}`;
+  }
+
+  // A key attribute's *value* input: a real S/N/B control (a key is always
+  // scalar in DynamoDB) plus a text box for the value itself. Returns the
+  // exact `{"S": "..."}`/`{"N": "..."}`/`{"B": "..."}` shape sent on the
+  // wire — never a guessed/defaulted type.
+  function keyValueInputHtml(cls) {
+    return `<span class="key-value-input ${cls}">
+      <select class="kv-type"><option value="S">S</option><option value="N">N</option><option value="B">B</option></select>
+      <input type="text" class="attr-input kv-value" autocomplete="off">
+    </span>`;
+  }
+  function readKeyValueInput(root, cls) {
+    const scope = root.querySelector(`.key-value-input.${cls}`);
+    const type = scope.querySelector(".kv-type").value;
+    const raw = scope.querySelector(".kv-value").value;
+    return { [type]: raw };
+  }
+
+  function renderItemsTab(root) {
+    ITEMS_STATE = { items: [], lastKey: null };
+    root.innerHTML = `
+      <div class="items-tab">
+        <div class="items-toolbar">
+          <label class="field">Source
+            <select id="items-source">${sourceOptionsHtml()}</select>
+          </label>
+          <div class="field">Mode${segmented("items-mode", ["Scan", "Query", "Get"], "Scan")}</div>
+          <div id="items-query-fields"></div>
+          <label class="field" id="items-limit-field">Limit
+            <input type="text" id="items-limit" class="attr-input" style="width:80px" value="25" autocomplete="off">
+          </label>
+          <div class="items-actions">
+            <button type="button" class="btn-save" id="items-run">Scan</button>
+            <button type="button" class="btn-new" id="items-new">+ New item</button>
+          </div>
+        </div>
+        <p class="err-line hidden" id="items-err"></p>
+        <div class="items-card">
+          <div class="table-scroll">
+            <table class="items-table">
+              <thead><tr id="items-head"></tr></thead>
+              <tbody id="items-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="items-footer">
+          <span class="muted" id="items-count"></span>
+          <button type="button" class="btn-edit hidden" id="items-load-more">Load more</button>
+        </div>
+      </div>
+      <div class="item-editor-overlay hidden" id="item-editor">
+        <div class="item-editor-card">
+          <h3 id="item-editor-title"></h3>
+          <div class="attr-rows" id="item-editor-rows"></div>
+          <button type="button" class="btn-edit" id="item-editor-add-attr">+ Add attribute</button>
+          <div class="edit-actions">
+            <button type="button" class="btn-save" id="item-editor-save">Save item</button>
+            <button type="button" class="btn-cancel" id="item-editor-cancel">Cancel</button>
+          </div>
+          <p class="err-line hidden" id="item-editor-err"></p>
+        </div>
+      </div>`;
+
+    wireSegmented(root);
+    document.getElementById("items-source").addEventListener("change", renderItemsQueryFields);
+    root.querySelectorAll('.segmented[data-field="items-mode"] .seg-opt').forEach((btn) => {
+      btn.addEventListener("click", renderItemsQueryFields);
+    });
+    document.getElementById("items-run").addEventListener("click", () => runItemsQuery(false));
+    document.getElementById("items-load-more").addEventListener("click", () => runItemsQuery(true));
+    document.getElementById("items-new").addEventListener("click", () => openItemEditor(null));
+    document.getElementById("item-editor-add-attr").addEventListener("click", addEditorRow);
+    document.getElementById("item-editor-cancel").addEventListener("click", closeItemEditor);
+    document.getElementById("item-editor-save").addEventListener("click", saveItemEditor);
+    wireEditorRowsDelegation();
+
+    renderItemsQueryFields();
+    renderItemsHead();
+    renderItemsRows();
+    runItemsQuery(false);
+  }
+
+  function renderItemsQueryFields() {
+    const el = document.getElementById("items-query-fields");
+    const mode = segmentedValue(document, "items-mode") || "Scan";
+    document.getElementById("items-run").textContent = mode;
+    document.getElementById("items-limit-field").classList.toggle("hidden", mode !== "Scan");
+    // GetItem is always a base-table operation in DynamoDB (no `IndexName`
+    // parameter exists on it) — the Source select only makes sense for
+    // Scan/Query, so disable it rather than silently ignoring whatever it's
+    // set to.
+    document.getElementById("items-source").disabled = mode === "Get";
+    if (mode === "Scan") {
+      el.innerHTML = "";
+      return;
+    }
+    if (mode === "Get") {
+      const keys = baseKeyNames();
+      el.innerHTML = `
+        <div class="field">Partition key (<span class="mono">${esc(keys.pk)}</span>)${keyValueInputHtml("items-pk")}</div>
+        ${
+          keys.sk
+            ? `<div class="field">Sort key (<span class="mono">${esc(keys.sk)}</span>)${keyValueInputHtml("items-sort-value")}</div>`
+            : ""
+        }`;
+      return;
+    }
+    const keys = sourceKeyNames(document.getElementById("items-source").value);
+    el.innerHTML = `
+      <div class="field">Partition key (<span class="mono">${esc(keys.pk)}</span>)${keyValueInputHtml("items-pk")}</div>
+      ${
+        keys.sk
+          ? `<div class="field">Sort key (<span class="mono">${esc(keys.sk)}</span>)${segmented(
+              "items-sort-op",
+              ["any", "=", "between", "begins_with"],
+              "any"
+            )}</div>
+             <div id="items-sort-values"></div>`
+          : ""
+      }`;
+    wireSegmented(el);
+    if (keys.sk) {
+      el.querySelectorAll('.segmented[data-field="items-sort-op"] .seg-opt').forEach((btn) => {
+        btn.addEventListener("click", renderItemsSortValueInputs);
+      });
+      renderItemsSortValueInputs();
+    }
+  }
+
+  function renderItemsSortValueInputs() {
+    const el = document.getElementById("items-sort-values");
+    const op = segmentedValue(document, "items-sort-op") || "any";
+    if (op === "any") {
+      el.innerHTML = "";
+    } else if (op === "between") {
+      el.innerHTML = `<div class="field-row-2">
+        <div class="field">From${keyValueInputHtml("items-sort-lo")}</div>
+        <div class="field">To${keyValueInputHtml("items-sort-hi")}</div>
+      </div>`;
+    } else {
+      el.innerHTML = `<div class="field">Value${keyValueInputHtml("items-sort-value")}</div>`;
+    }
+  }
+
+  async function runItemsQuery(loadMore) {
+    const errEl = document.getElementById("items-err");
+    const runBtn = document.getElementById("items-run");
+    errEl.classList.add("hidden");
+    runBtn.disabled = true;
+    const mode = segmentedValue(document, "items-mode") || "Scan";
+    const sourceValue = document.getElementById("items-source").value;
+    const indexName = sourceValue ? sourceValue.split(":").slice(1).join(":") : undefined;
+    try {
+      let page;
+      if (mode === "Get") {
+        const keys = baseKeyNames();
+        const key = { [keys.pk]: readKeyValueInput(document, "items-pk") };
+        if (keys.sk) key[keys.sk] = readKeyValueInput(document, "items-sort-value");
+        const resp = await postJSON(itemsApiPath("get"), { key });
+        page = { items: resp.item ? [resp.item] : [], last_evaluated_key: null };
+        loadMore = false;
+      } else if (mode === "Scan") {
+        const req = {};
+        if (indexName) req.index_name = indexName;
+        const limitRaw = document.getElementById("items-limit").value.trim();
+        if (limitRaw) req.limit = parseInt(limitRaw, 10);
+        if (loadMore && ITEMS_STATE.lastKey) req.exclusive_start_key = ITEMS_STATE.lastKey;
+        page = await postJSON(itemsApiPath("scan"), req);
+      } else {
+        const req = { partition_value: readKeyValueInput(document, "items-pk") };
+        if (indexName) req.index_name = indexName;
+        const op = segmentedValue(document, "items-sort-op") || "any";
+        if (op === "=") {
+          req.sort_condition = { kind: "equals", value: readKeyValueInput(document, "items-sort-value") };
+        } else if (op === "between") {
+          req.sort_condition = {
+            kind: "between",
+            lo: readKeyValueInput(document, "items-sort-lo"),
+            hi: readKeyValueInput(document, "items-sort-hi"),
+          };
+        } else if (op === "begins_with") {
+          req.sort_condition = {
+            kind: "begins_with",
+            value: readKeyValueInput(document, "items-sort-value"),
+          };
+        }
+        page = await postJSON(itemsApiPath("query"), req);
+        loadMore = false; // Query has no pagination on this adapter (see console.rs's ItemsPage doc)
+      }
+      ITEMS_STATE.items = loadMore ? ITEMS_STATE.items.concat(page.items) : page.items;
+      ITEMS_STATE.lastKey = page.last_evaluated_key || null;
+      renderItemsRows();
+      document.getElementById("items-load-more").classList.toggle("hidden", !ITEMS_STATE.lastKey);
+      const n = ITEMS_STATE.items.length;
+      document.getElementById("items-count").textContent = `${n} item${n === 1 ? "" : "s"} loaded`;
+    } catch (e) {
+      errEl.textContent = String(e.message || e);
+      errEl.classList.remove("hidden");
+    } finally {
+      runBtn.disabled = false;
+    }
+  }
+
+  function renderItemsHead() {
+    const keys = baseKeyNames();
+    document.getElementById("items-head").innerHTML = `
+      <th>${esc(keys.pk)}</th>
+      ${keys.sk ? `<th>${esc(keys.sk)}</th>` : ""}
+      <th>Attributes</th>
+      <th></th>`;
+  }
+
+  // A compact, honest rendering of one `AttributeValue` — every branch
+  // renders the tag that's actually there, never a fabricated one; an
+  // unrecognized shape (a decode failure server-side could never produce,
+  // but a hand-edited raw attribute in-flight to being saved could) renders
+  // as a literal dash rather than guessing.
+  function renderAttributeValueCompact(av) {
+    if (!av || typeof av !== "object") return '<span class="dash">—</span>';
+    if ("S" in av) return esc(av.S);
+    if ("N" in av) return esc(av.N);
+    if ("BOOL" in av) return av.BOOL ? "true" : "false";
+    if ("NULL" in av) return '<span class="muted">null</span>';
+    if ("B" in av) return '<span class="muted">(binary)</span>';
+    if ("SS" in av) return `<span class="muted">{${av.SS.length} strings}</span>`;
+    if ("NS" in av) return `<span class="muted">{${av.NS.length} numbers}</span>`;
+    if ("BS" in av) return `<span class="muted">{${av.BS.length} binaries}</span>`;
+    if ("L" in av) return `<span class="muted">[${av.L.length} items]</span>`;
+    if ("M" in av) return `<span class="muted">{${Object.keys(av.M).length} attrs}</span>`;
+    return '<span class="dash">—</span>';
+  }
+
+  // A compact one-line preview of every non-key attribute on `item` — the
+  // Items tab's answer to "items have no fixed column set" (see this
+  // section's own header comment): rather than a union-of-attributes table
+  // (sparse and ever-widening across a heterogeneous page) or an
+  // always-expanded row, one preview column carries a glance-level summary
+  // and the row's own Edit action is the full, honest view of every
+  // attribute (the item editor below, pre-filled from this exact row's
+  // already-loaded data — no extra `GetItem` round trip needed to edit what
+  // a scan/query just returned).
+  function attributePreview(item, keys) {
+    const parts = Object.keys(item)
+      .filter((name) => name !== keys.pk && name !== keys.sk)
+      .sort()
+      .map((name) => `${esc(name)}=${renderAttributeValueCompact(item[name])}`);
+    if (parts.length === 0) return '<span class="dash">—</span>';
+    return parts.join(", ");
+  }
+
+  function itemKeyOf(item, keys) {
+    const key = {};
+    if (item[keys.pk] !== undefined) key[keys.pk] = item[keys.pk];
+    if (keys.sk && item[keys.sk] !== undefined) key[keys.sk] = item[keys.sk];
+    return key;
+  }
+
+  function renderItemsRows() {
+    const body = document.getElementById("items-body");
+    const keys = baseKeyNames();
+    const cols = keys.sk ? 4 : 3;
+    if (ITEMS_STATE.items.length === 0) {
+      body.innerHTML = `<tr><td colspan="${cols}"><div class="empty-state">No items loaded. Run a scan or query above.</div></td></tr>`;
+      return;
+    }
+    body.innerHTML = ITEMS_STATE.items
+      .map(
+        (item, i) => `
+      <tr>
+        <td class="mono">${renderAttributeValueCompact(item[keys.pk])}</td>
+        ${keys.sk ? `<td class="mono">${renderAttributeValueCompact(item[keys.sk])}</td>` : ""}
+        <td class="attrs-preview">${attributePreview(item, keys)}</td>
+        <td class="row-actions">
+          <button type="button" class="btn-edit" data-edit-item="${i}">Edit</button>
+          <button type="button" class="btn-drop" data-delete-item="${i}">Delete</button>
+        </td>
+      </tr>`
+      )
+      .join("");
+    body.querySelectorAll("[data-edit-item]").forEach((btn) => {
+      btn.addEventListener("click", () => openItemEditor(ITEMS_STATE.items[Number(btn.dataset.editItem)]));
+    });
+    body.querySelectorAll("[data-delete-item]").forEach((btn) => {
+      btn.addEventListener("click", () => deleteItemRow(Number(btn.dataset.deleteItem), btn));
+    });
+  }
+
+  async function deleteItemRow(index, btn) {
+    const keys = baseKeyNames();
+    const key = itemKeyOf(ITEMS_STATE.items[index], keys);
+    if (!window.confirm("Delete this item? This cannot be undone.")) return;
+    btn.disabled = true;
+    try {
+      await postJSON(itemsApiPath("delete"), { key });
+      ITEMS_STATE.items.splice(index, 1);
+      renderItemsRows();
+      const n = ITEMS_STATE.items.length;
+      document.getElementById("items-count").textContent = `${n} item${n === 1 ? "" : "s"} loaded`;
+    } catch (e) {
+      btn.disabled = false;
+      window.alert(`Couldn't delete item: ${e.message || e}`);
+    }
+  }
+
+  // -- the item editor: create or edit one item's full attribute set -------
+  //
+  // Every DynamoDB wire type (S/N/B/BOOL/NULL/L/M/SS/NS/BS — a real closed
+  // set) gets a `<select>`; an attribute *name* stays free text (the one
+  // thing here that genuinely is). S/N/B/BOOL/NULL each get a purpose-built
+  // editor; the four collection types (L/M/SS/NS/BS) fall back to a "Raw
+  // (JSON)" textarea holding that one attribute's own `AttributeValue` JSON
+  // verbatim — editing exactly the wire bytes rather than a partial
+  // recursive editor this PR doesn't attempt, so the value shown is always
+  // the value that would actually be sent, never a lossy stand-in for it.
+  // Key attributes (partition/sort) always lead and are locked (name + type
+  // fixed) whenever an existing item is being edited: letting a key value
+  // change under "Edit" would silently `PutItem` a *second* item at the new
+  // key rather than rename this one, leaving the original behind — a
+  // dishonest edit affordance this form structurally can't offer. A brand
+  // new item's key rows stay editable (there is no existing identity to
+  // preserve yet).
+
+  const ATTR_TYPES = ["S", "N", "B", "BOOL", "NULL", "RAW"];
+
+  function decomposeAttributeValue(av) {
+    if (av && typeof av === "object") {
+      const keys = Object.keys(av);
+      if (keys.length === 1 && ["S", "N", "B", "BOOL", "NULL"].includes(keys[0])) {
+        const k = keys[0];
+        if (k === "BOOL") return { type: "BOOL", rawValue: av.BOOL === true };
+        if (k === "NULL") return { type: "NULL", rawValue: "" };
+        return { type: k, rawValue: String(av[k]) };
+      }
+    }
+    return { type: "RAW", rawValue: JSON.stringify(av === undefined ? null : av) };
+  }
+
+  // `locked` disables the value editor too, not just the name/type — a
+  // locked row is always a key attribute being edited (see `attrRowHtml`'s
+  // doc), and letting its *value* change while its name/type stay fixed
+  // would be exactly the same dishonest-edit trap under a different name:
+  // the save still goes through as a `PutItem` at this item's existing key,
+  // so a changed key value would silently write a second, different item
+  // rather than move this one.
+  function attrValueEditorHtml(type, rawValue, locked) {
+    if (type === "BOOL") {
+      // A locked BOOL value renders as an inert `<span>`, not the real
+      // `<button>` `toggleSwitch` produces — never expected in practice
+      // (a DynamoDB key attribute is always scalar S/N/B, never BOOL), kept
+      // only as defense-in-depth so a locked row can never be toggled by
+      // construction, not merely by convention.
+      const on = rawValue === true;
+      return locked
+        ? `<span class="toggle-switch${on ? " on" : ""}" aria-checked="${on}"><span class="knob"></span></span>`
+        : toggleSwitch("attr-value", on);
+    }
+    if (type === "NULL") return '<span class="muted">— (null)</span>';
+    if (type === "RAW") {
+      return `<textarea class="attr-input attr-raw" rows="2" placeholder='e.g. {"L":[{"S":"a"}]} or {"M":{"x":{"N":"1"}}}'${locked ? " readonly" : ""}>${esc(rawValue)}</textarea>`;
+    }
+    return `<input type="text" class="attr-input attr-scalar" value="${esc(rawValue)}" autocomplete="off"${locked ? " readonly" : ""}>`;
+  }
+
+  // A locked row is always a key attribute (partition or sort) on an
+  // existing item's edit form — name, type, AND value all fixed (see
+  // `attrValueEditorHtml`'s doc for why the value must be locked too). A
+  // brand-new item's key rows are never locked: there is no existing
+  // identity yet to protect.
+  function attrRowHtml(name, type, rawValue, locked) {
+    const typeOpts = ATTR_TYPES.map(
+      (t) => `<option value="${t}"${t === type ? " selected" : ""}>${t === "RAW" ? "Raw (JSON)" : t}</option>`
+    ).join("");
+    return `<div class="attr-row" data-locked="${locked ? "1" : "0"}">
+      <input type="text" class="attr-input attr-name" placeholder="attribute name" value="${esc(name)}" autocomplete="off"${locked ? " disabled" : ""}>
+      <select class="attr-type"${locked ? " disabled" : ""}>${typeOpts}</select>
+      <span class="attr-value">${attrValueEditorHtml(type, rawValue, locked)}</span>
+      ${locked ? '<span class="key-badge">key</span>' : '<button type="button" class="btn-drop" data-remove-row>Remove</button>'}
+    </div>`;
+  }
+
+  // Event delegation on the (static) rows container — wired exactly once
+  // per Items-tab render, so adding/removing rows never needs re-wiring
+  // (and can never double-wire) the rows that already exist.
+  function wireEditorRowsDelegation() {
+    const rowsEl = document.getElementById("item-editor-rows");
+    rowsEl.addEventListener("change", (e) => {
+      if (!e.target.classList.contains("attr-type")) return;
+      const row = e.target.closest(".attr-row");
+      // A disabled <select> never fires `change`, so `row` is never locked
+      // here — `locked: false` is simply what a freshly-typed-into row is.
+      row.querySelector(".attr-value").innerHTML = attrValueEditorHtml(e.target.value, "", false);
+    });
+    rowsEl.addEventListener("click", (e) => {
+      const toggle = e.target.closest(".toggle-switch");
+      if (toggle) {
+        if (toggle.closest(".attr-row")?.dataset.locked === "1") return;
+        const on = !toggle.classList.contains("on");
+        toggle.classList.toggle("on", on);
+        toggle.setAttribute("aria-checked", String(on));
+        return;
+      }
+      if (e.target.hasAttribute("data-remove-row")) {
+        e.target.closest(".attr-row").remove();
+      }
+    });
+  }
+
+  function addEditorRow() {
+    document
+      .getElementById("item-editor-rows")
+      .insertAdjacentHTML("beforeend", attrRowHtml("", "S", "", false));
+  }
+
+  function openItemEditor(item) {
+    const keys = baseKeyNames();
+    document.getElementById("item-editor-title").textContent = item ? "Edit item" : "New item";
+    document.getElementById("item-editor-err").classList.add("hidden");
+    const rowsHtml = [];
+    const pk = item ? decomposeAttributeValue(item[keys.pk]) : { type: "S", rawValue: "" };
+    rowsHtml.push(attrRowHtml(keys.pk, pk.type, pk.rawValue, !!item));
+    if (keys.sk) {
+      const sk = item ? decomposeAttributeValue(item[keys.sk]) : { type: "S", rawValue: "" };
+      rowsHtml.push(attrRowHtml(keys.sk, sk.type, sk.rawValue, !!item));
+    }
+    if (item) {
+      Object.keys(item)
+        .filter((name) => name !== keys.pk && name !== keys.sk)
+        .sort()
+        .forEach((name) => {
+          const d = decomposeAttributeValue(item[name]);
+          rowsHtml.push(attrRowHtml(name, d.type, d.rawValue, false));
+        });
+    }
+    document.getElementById("item-editor-rows").innerHTML = rowsHtml.join("");
+    document.getElementById("item-editor").classList.remove("hidden");
+  }
+
+  function closeItemEditor() {
+    document.getElementById("item-editor").classList.add("hidden");
+  }
+
+  // Reads every attribute row back into DynamoDB wire shape, or an error
+  // message on the first row that doesn't parse. A locked (key) row's
+  // inputs are all read-only/disabled (never editable — see
+  // `attrValueEditorHtml`'s doc), but a read-only input's `.value` still
+  // reads normally, so its current value round-trips into the saved item
+  // unchanged rather than being dropped.
+  function readEditorRows() {
+    const item = {};
+    let error = null;
+    document.querySelectorAll("#item-editor-rows .attr-row").forEach((row) => {
+      if (error) return;
+      const name = row.querySelector(".attr-name").value.trim();
+      const type = row.querySelector(".attr-type").value;
+      if (!name) {
+        error = "Every attribute needs a name.";
+        return;
+      }
+      if (type === "BOOL") {
+        const on = row.querySelector(".toggle-switch")?.classList.contains("on") || false;
+        item[name] = { BOOL: on };
+      } else if (type === "NULL") {
+        item[name] = { NULL: true };
+      } else if (type === "RAW") {
+        const raw = row.querySelector(".attr-raw").value;
+        try {
+          item[name] = JSON.parse(raw);
+        } catch (e) {
+          error = `Attribute "${name}": invalid JSON (${e.message})`;
+        }
+      } else {
+        item[name] = { [type]: row.querySelector(".attr-scalar").value };
+      }
+    });
+    return { item, error };
+  }
+
+  async function saveItemEditor() {
+    const errEl = document.getElementById("item-editor-err");
+    errEl.classList.add("hidden");
+    const { item, error } = readEditorRows();
+    if (error) {
+      errEl.textContent = error;
+      errEl.classList.remove("hidden");
+      return;
+    }
+    const saveBtn = document.getElementById("item-editor-save");
+    saveBtn.disabled = true;
+    try {
+      await postJSON(itemsApiPath("put"), { item });
+      closeItemEditor();
+      // Refresh from the server rather than guessing the item's place in
+      // the current page/sort order client-side.
+      await runItemsQuery(false);
+    } catch (e) {
+      errEl.textContent = String(e.message || e);
+      errEl.classList.remove("hidden");
+    } finally {
+      saveBtn.disabled = false;
+    }
+  }
+
   // ---- routing -------------------------------------------------------------
 
   const path = normalizePath(window.location.pathname);
   if (path.startsWith(TABLES_ROUTE_PREFIX)) {
-    const tail = decodeURIComponent(path.slice(TABLES_ROUTE_PREFIX.length));
-    if (tail === "new") {
-      renderStub(tail);
+    const rest = path.slice(TABLES_ROUTE_PREFIX.length);
+    if (rest === "new") {
+      renderStub(rest);
     } else {
-      renderTablePage(tail);
+      // `{name}` (Config, the default) or `{name}/items` (Items) — the only
+      // two shapes a real table page's own URL takes; see `renderTablePage`'s
+      // own comment for why this is a real route rather than a same-page tab
+      // toggle.
+      const slash = rest.indexOf("/");
+      const name = decodeURIComponent(slash === -1 ? rest : rest.slice(0, slash));
+      const tab = slash !== -1 && rest.slice(slash + 1) === "items" ? "items" : "config";
+      renderTablePage(name, tab);
     }
   } else if (TABLE_LIST_ROUTES.has(path)) {
     renderTablesList();

@@ -271,3 +271,79 @@ table.tables .view-type { display: block; color: var(--text3); font-size: 10.5px
 }
 .btn-danger:hover { filter: brightness(1.08); }
 .btn-danger:disabled { opacity: 0.45; cursor: default; }
+
+/* ---- table page tab strip (Config / Items) ---- */
+.tab-strip {
+  display: flex; gap: 4px; border-bottom: 1px solid var(--border);
+  margin-bottom: 18px;
+}
+.tab-strip .tab-link {
+  padding: 8px 14px; font-size: 12.5px; font-weight: 600; color: var(--text3);
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.tab-strip .tab-link:hover { color: var(--text2); }
+.tab-strip .tab-link.active { color: var(--text); border-bottom-color: var(--accent); }
+
+/* ---- Items tab ---- */
+.items-toolbar {
+  display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap;
+  padding: 14px 16px; margin-bottom: 12px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--surface2);
+}
+.items-toolbar .items-actions { display: flex; gap: 8px; margin-left: auto; align-self: flex-end; }
+.items-card {
+  border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+  overflow: hidden;
+}
+table.items-table { width: 100%; border-collapse: collapse; font-size: 12.5px; min-width: 640px; }
+table.items-table th, table.items-table td {
+  padding: 8px 14px; text-align: left; border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+table.items-table th {
+  color: var(--text3); font-weight: 600; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.04em;
+  position: sticky; top: 0; background: var(--surface);
+}
+table.items-table tbody tr:last-child td { border-bottom: none; }
+table.items-table tbody tr:hover { background: var(--surface2); }
+table.items-table .attrs-preview { color: var(--text2); max-width: 520px; }
+table.items-table .row-actions { display: flex; gap: 6px; white-space: nowrap; }
+
+.items-footer {
+  display: flex; align-items: center; gap: 12px; margin-top: 10px;
+}
+
+/* A key attribute's value input: a real S/N/B control (a key is always
+   scalar in DynamoDB) plus its value — never a picker for a free-text
+   attribute *name*, which stays a plain text input everywhere in this tab. */
+.key-value-input { display: inline-flex; gap: 6px; align-items: center; }
+.kv-type, .attr-type {
+  background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; font: 400 12px var(--font-ui); outline: none;
+}
+.key-value-input .kv-value { width: 160px; }
+
+/* ---- item editor overlay (create/edit one item) ---- */
+.item-editor-overlay {
+  position: fixed; inset: 0; z-index: 20; display: flex; align-items: flex-start;
+  justify-content: center; padding: 8vh 16px; background: rgba(0,0,0,0.45);
+  overflow-y: auto;
+}
+.item-editor-card {
+  width: 100%; max-width: 620px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 22px 24px; box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+}
+.item-editor-card h3 { margin: 0 0 14px; font-size: 1.02rem; }
+.attr-rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.attr-row {
+  display: grid; grid-template-columns: 1fr 110px 1fr auto; gap: 8px; align-items: center;
+}
+.attr-row .attr-name, .attr-row .attr-scalar { width: 100%; }
+.attr-row .attr-raw { width: 100%; font-family: var(--font-mono); font-size: 11.5px; resize: vertical; }
+.attr-row .attr-value { display: flex; align-items: center; }
+.key-badge {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em;
+  color: var(--text3); background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 999px; padding: 3px 8px; text-align: center;
+}

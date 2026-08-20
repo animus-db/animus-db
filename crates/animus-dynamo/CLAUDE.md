@@ -233,7 +233,16 @@ comment for its full type/method inventory.
   arithmetic, `TransactWriteItems`/`TransactGetItems` idempotency tokens
   (`ClientRequestToken`) and full per-action `CancellationReasons` fidelity
   (ADR 0018 §2/PR7 shipped atomicity itself; these wire-fidelity details
-  remain simplified). `DescribeTimeToLive`'s `TimeToLiveStatus` (ADR 0051)
+  remain simplified). **`Query` has no pagination at all** — unlike `Scan`,
+  `decode_query` never parses `Limit`/`ExclusiveStartKey`, and `animusd::
+  dynamo::run_query` answers a whole partition in one native range scan
+  with no cap; found while building the Data Console's Items tab (ADR 0052
+  PR4), which threads `Scan`'s real `Limit`/`ExclusiveStartKey`/
+  `LastEvaluatedKey` straight through but cannot offer the same for `Query`
+  and does not attempt to fake it client-side. Real DynamoDB paginates both
+  operations identically; giving `Query` the same contract `Scan` already
+  has is the natural follow-up here, not a console-side workaround.
+  `DescribeTimeToLive`'s `TimeToLiveStatus` (ADR 0051)
   only ever renders `ENABLED`/`DISABLED`, never AWS's transient
   `ENABLING`/`DISABLING` — this adapter's `UpdateTimeToLive` takes effect
   synchronously, so there is no in-flight state to report. The

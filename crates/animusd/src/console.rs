@@ -28,8 +28,21 @@
 //! type instead, the same way every method here was added — never to widen
 //! this module's inputs back toward `ClientCtx`.
 //!
-//! Two more screens (the Items tab, the Stream tab) and the create-table
-//! form are still follow-up PRs in this stack — see `is_shell_path`'s doc.
+//! **This PR (the Items tab) adds the table page's second tab** — browsing
+//! (`Scan`/`Query`, paginated by DynamoDB's own `ExclusiveStartKey`/
+//! `LastEvaluatedKey`), and creating/editing/deleting one item at a time.
+//! The seam stays [`ConsoleBackend`] (five more methods:
+//! [`ConsoleBackend::scan_items`]/[`ConsoleBackend::query_items`]/
+//! [`ConsoleBackend::get_item`]/[`ConsoleBackend::put_item`]/
+//! [`ConsoleBackend::delete_item`]) — no new kind of seam, same shape/kind
+//! discipline as PR3's widening. The one new type worth calling out is
+//! [`WireItem`]: unlike every other type in this module, an item is
+//! deliberately **not** projected into a console-only shape — see its own
+//! doc for why passing DynamoDB's wire shape straight through is the right
+//! call here even though every other endpoint in this module projects.
+//!
+//! The Stream tab and the create-table form are still follow-up PRs in this
+//! stack — see `is_shell_path`'s doc.
 //!
 //! Embedded at compile time (`include_str!`), no bundler/build step/external
 //! assets — the same constraints `dashboard.rs` documents for the operator
@@ -230,6 +243,123 @@ impl ConsoleError {
     }
 }
 
+/// One item (or key), in DynamoDB's own wire shape — `{"attr_name": {"S":
+/// "value"}}`, one `AttributeValue` tag (`S`/`N`/`B`/`BOOL`/`NULL`/`L`/`M`/
+/// `SS`/`NS`/`BS`) per attribute. **The Items tab (ADR 0052 PR4) passes this
+/// shape straight through rather than projecting it into a friendlier
+/// console-only type** — the same shape a real DynamoDB client already sees,
+/// so the console never has to invent (and keep in sync) a lossy translation
+/// of a data model this crate deliberately doesn't own. `console.rs` treats
+/// it as opaque JSON — it interprets no attribute name or value, only moves
+/// the map between the wire and the HTTP body; `console.js` is what renders
+/// it readably and is where the "never lie about a type" rule actually gets
+/// enforced (every attribute keeps its real tag; the UI never fabricates one
+/// the way an earlier Add-GSI draft did for index key types, issue #319).
+pub(crate) type WireItem = serde_json::Map<String, serde_json::Value>;
+
+/// A page of items (`GET`-shaped, but see [`ScanItemsRequest`]'s doc for why
+/// this and [`QueryItemsRequest`] are POST) from a `Scan` or `Query` —
+/// [`ConsoleBackend::scan_items`]/[`ConsoleBackend::query_items`]'s shared
+/// return shape. `scanned_count` and `last_evaluated_key` are DynamoDB's own
+/// pagination vocabulary (`ScannedCount`/`LastEvaluatedKey`), console-cased.
+/// `last_evaluated_key` is always `None` for a `Query` result: this
+/// adapter's `Query` operation has no `Limit`/`ExclusiveStartKey` of its own
+/// (`animus-dynamo`'s `wire::decode_query` never parses either) — a
+/// documented pre-existing gap in the underlying wire layer, not something
+/// this PR's console screen introduces or attempts to paper over. A `Query`
+/// is scoped to one partition, so an unpaginated single-shot read is the
+/// same tradeoff the real wire edge already made.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ItemsPage {
+    pub(crate) items: Vec<WireItem>,
+    pub(crate) scanned_count: u64,
+    pub(crate) last_evaluated_key: Option<WireItem>,
+}
+
+/// A `Scan` request (`POST .../items/scan`) — mirrors DynamoDB's own `Scan`
+/// parameters closely enough that [`ConsoleBackend::scan_items`] can forward
+/// them almost verbatim. **POST, not `GET`**, even though a scan doesn't
+/// mutate anything: `ExclusiveStartKey` is an arbitrary nested JSON object
+/// (an `AttributeValue` map), which has no clean `GET`-query-string
+/// encoding — the same reason DynamoDB's own `Scan`/`Query` are POST
+/// operations rather than `GET`s. `index_name` is a real closed set (one of
+/// the table's own declared GSI/LSI names, from this same table's
+/// [`TableDetail`]) — never free text, so `console.js` renders it with a
+/// `<select>`, not a text input.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct ScanItemsRequest {
+    #[serde(default)]
+    pub(crate) index_name: Option<String>,
+    #[serde(default)]
+    pub(crate) limit: Option<u32>,
+    #[serde(default)]
+    pub(crate) exclusive_start_key: Option<WireItem>,
+}
+
+/// A `Query`'s sort-key condition (`POST .../items/query`) — the same three
+/// shapes `animus_dynamo::wire::decode_sort_condition` accepts
+/// (`=`/`BETWEEN`/`begins_with`), so [`ConsoleBackend::query_items`] can
+/// build the identical `KeyConditionExpression` a real client would send.
+/// Every value here is a raw `AttributeValue` JSON object (`{"S": "..."}` /
+/// `{"N": "..."}` / `{"B": "..."}`) — a key attribute is always scalar in
+/// DynamoDB, so `console.js` offers a real `S`/`N`/`B` control for it (a
+/// closed set, unlike an attribute *name*), never a free-text guess at the
+/// type.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum SortKeyQuery {
+    Equals {
+        value: serde_json::Value,
+    },
+    Between {
+        lo: serde_json::Value,
+        hi: serde_json::Value,
+    },
+    BeginsWith {
+        value: serde_json::Value,
+    },
+}
+
+/// A `Query` request (`POST .../items/query`) — `partition_value` is
+/// required (a `Query` always narrows to one partition); `sort_condition` is
+/// present only when the caller chose to narrow further and the target
+/// (base table, or the named GSI/LSI) actually has a sort key. No
+/// `limit`/`exclusive_start_key` — see [`ItemsPage`]'s doc on why `Query`
+/// can't paginate on this adapter.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct QueryItemsRequest {
+    #[serde(default)]
+    pub(crate) index_name: Option<String>,
+    pub(crate) partition_value: serde_json::Value,
+    #[serde(default)]
+    pub(crate) sort_condition: Option<SortKeyQuery>,
+}
+
+/// `POST .../items/get` — a plain `GetItem` by key. A **found-or-not-found
+/// 200**, not a 404: mirrors real DynamoDB's own `GetItem` contract (an
+/// absent item is a normal, successful empty result, not an error) — see
+/// [`ConsoleBackend::get_item`]'s `Option` return.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct GetItemRequest {
+    pub(crate) key: WireItem,
+}
+
+/// `POST .../items/put` — create or wholesale-replace one item (DynamoDB's
+/// own `PutItem` semantics: the entire item is `item`, never a partial
+/// merge). Both the Items tab's "new item" and "edit" forms funnel through
+/// this one request shape; see `console.js`'s own doc on why an edit never
+/// lets the key attributes themselves change.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct PutItemRequest {
+    pub(crate) item: WireItem,
+}
+
+/// `POST .../items/delete` — a plain `DeleteItem` by key.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct DeleteItemRequest {
+    pub(crate) key: WireItem,
+}
+
 /// The narrow, console-shaped seam for every endpoint beyond the tables
 /// list — see the module doc for why this is a trait (not another bare
 /// closure) and why widening it is still safe: every method's signature is
@@ -271,6 +401,32 @@ pub(crate) trait ConsoleBackend: Send + Sync {
     /// `DeleteTable` in this adapter's supported subset, so this is the
     /// console's own delete primitive, same as the dashboard's.
     async fn delete_table(&self, table: &str) -> Result<(), ConsoleError>;
+
+    /// Run a `Scan` over `table` (or one of its GSIs/LSIs, via
+    /// [`ScanItemsRequest::index_name`]) — the Items tab's paginated browse.
+    async fn scan_items(
+        &self,
+        table: &str,
+        req: ScanItemsRequest,
+    ) -> Result<ItemsPage, ConsoleError>;
+
+    /// Run a `Query` against `table`'s partition key (or one of its
+    /// GSIs'/LSIs') — the Items tab's by-key lookup.
+    async fn query_items(
+        &self,
+        table: &str,
+        req: QueryItemsRequest,
+    ) -> Result<ItemsPage, ConsoleError>;
+
+    /// Fetch one item by its full key. `None` (not a [`ConsoleError`]) when
+    /// no such item exists — see [`GetItemRequest`]'s doc.
+    async fn get_item(&self, table: &str, key: WireItem) -> Result<Option<WireItem>, ConsoleError>;
+
+    /// Create or wholesale-replace one item.
+    async fn put_item(&self, table: &str, item: WireItem) -> Result<(), ConsoleError>;
+
+    /// Delete one item by its full key.
+    async fn delete_item(&self, table: &str, key: WireItem) -> Result<(), ConsoleError>;
 }
 
 /// Accept loop for the console HTTP endpoint. One task per connection,
@@ -413,6 +569,55 @@ async fn table_api_response(
             },
             Err(e) => (e.status, "application/json", error_json(&e.message)),
         },
+        ("POST", TableApiRoute::ItemsScan(table)) => {
+            match parse_json_body::<ScanItemsRequest>(body) {
+                Ok(req) => match backend.scan_items(&table, req).await {
+                    Ok(page) => (200, "application/json", items_page_json(&page)),
+                    Err(e) => (e.status, "application/json", error_json(&e.message)),
+                },
+                Err(e) => (e.status, "application/json", error_json(&e.message)),
+            }
+        }
+        ("POST", TableApiRoute::ItemsQuery(table)) => {
+            match parse_json_body::<QueryItemsRequest>(body) {
+                Ok(req) => match backend.query_items(&table, req).await {
+                    Ok(page) => (200, "application/json", items_page_json(&page)),
+                    Err(e) => (e.status, "application/json", error_json(&e.message)),
+                },
+                Err(e) => (e.status, "application/json", error_json(&e.message)),
+            }
+        }
+        ("POST", TableApiRoute::ItemsGet(table)) => match parse_json_body::<GetItemRequest>(body) {
+            Ok(req) => match backend.get_item(&table, req.key).await {
+                Ok(item) => (
+                    200,
+                    "application/json",
+                    wrap_json(
+                        "item",
+                        item.map(serde_json::Value::Object)
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                ),
+                Err(e) => (e.status, "application/json", error_json(&e.message)),
+            },
+            Err(e) => (e.status, "application/json", error_json(&e.message)),
+        },
+        ("POST", TableApiRoute::ItemsPut(table)) => match parse_json_body::<PutItemRequest>(body) {
+            Ok(req) => match backend.put_item(&table, req.item).await {
+                Ok(()) => (200, "application/json", ok_json()),
+                Err(e) => (e.status, "application/json", error_json(&e.message)),
+            },
+            Err(e) => (e.status, "application/json", error_json(&e.message)),
+        },
+        ("POST", TableApiRoute::ItemsDelete(table)) => {
+            match parse_json_body::<DeleteItemRequest>(body) {
+                Ok(req) => match backend.delete_item(&table, req.key).await {
+                    Ok(()) => (200, "application/json", ok_json()),
+                    Err(e) => (e.status, "application/json", error_json(&e.message)),
+                },
+                Err(e) => (e.status, "application/json", error_json(&e.message)),
+            }
+        }
         _ => (405, "application/json", error_json("method not allowed")),
     }
 }
@@ -434,6 +639,16 @@ enum TableApiRoute {
     Stream(String),
     /// `/console/api/tables/{name}/ttl` — `POST` (set TTL).
     Ttl(String),
+    /// `/console/api/tables/{name}/items/scan` — `POST` (paginated scan).
+    ItemsScan(String),
+    /// `/console/api/tables/{name}/items/query` — `POST` (query by key).
+    ItemsQuery(String),
+    /// `/console/api/tables/{name}/items/get` — `POST` (get one item by key).
+    ItemsGet(String),
+    /// `/console/api/tables/{name}/items/put` — `POST` (create/replace one item).
+    ItemsPut(String),
+    /// `/console/api/tables/{name}/items/delete` — `POST` (delete one item by key).
+    ItemsDelete(String),
 }
 
 /// Parse a path under [`TABLES_API_PREFIX`] into a [`TableApiRoute`], or
@@ -451,13 +666,18 @@ fn parse_table_api_route(path: &str) -> Option<TableApiRoute> {
     match parts.next() {
         None => Some(TableApiRoute::Table(table)),
         Some("gsi") => Some(TableApiRoute::Gsi(table)),
-        Some(tail) => match tail.strip_prefix("gsi/") {
-            Some(index) if !index.is_empty() => {
-                Some(TableApiRoute::GsiNamed(table, http::percent_decode(index)))
-            }
-            _ if tail == "stream" => Some(TableApiRoute::Stream(table)),
-            _ if tail == "ttl" => Some(TableApiRoute::Ttl(table)),
-            _ => None,
+        Some(tail) => match tail {
+            "stream" => Some(TableApiRoute::Stream(table)),
+            "ttl" => Some(TableApiRoute::Ttl(table)),
+            "items/scan" => Some(TableApiRoute::ItemsScan(table)),
+            "items/query" => Some(TableApiRoute::ItemsQuery(table)),
+            "items/get" => Some(TableApiRoute::ItemsGet(table)),
+            "items/put" => Some(TableApiRoute::ItemsPut(table)),
+            "items/delete" => Some(TableApiRoute::ItemsDelete(table)),
+            _ => tail.strip_prefix("gsi/").and_then(|index| {
+                (!index.is_empty())
+                    .then(|| TableApiRoute::GsiNamed(table, http::percent_decode(index)))
+            }),
         },
     }
 }
@@ -479,6 +699,14 @@ fn tables_json(tables: &[TableSummary]) -> String {
 /// resource, unlike the tables list — no wrapping key).
 fn table_detail_json(detail: &TableDetail) -> String {
     serde_json::to_string(detail).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Encode an [`ItemsPage`] as the top-level response body for `items/scan`/
+/// `items/query` — a bare object (`items`/`scanned_count`/
+/// `last_evaluated_key`), same "no extra wrapping key" convention
+/// [`table_detail_json`] uses.
+fn items_page_json(page: &ItemsPage) -> String {
+    serde_json::to_string(page).unwrap_or_else(|_| "{\"items\":[],\"scanned_count\":0}".to_string())
 }
 
 /// Wrap one JSON value under `key` — the `{"gsi": ...}`/`{"stream":
@@ -562,6 +790,28 @@ mod tests {
             parse_table_api_route("/console/api/tables/orders/ttl"),
             Some(TableApiRoute::Ttl(t)) if t == "orders"
         ));
+        assert!(matches!(
+            parse_table_api_route("/console/api/tables/orders/items/scan"),
+            Some(TableApiRoute::ItemsScan(t)) if t == "orders"
+        ));
+        assert!(matches!(
+            parse_table_api_route("/console/api/tables/orders/items/query"),
+            Some(TableApiRoute::ItemsQuery(t)) if t == "orders"
+        ));
+        assert!(matches!(
+            parse_table_api_route("/console/api/tables/orders/items/get"),
+            Some(TableApiRoute::ItemsGet(t)) if t == "orders"
+        ));
+        assert!(matches!(
+            parse_table_api_route("/console/api/tables/orders/items/put"),
+            Some(TableApiRoute::ItemsPut(t)) if t == "orders"
+        ));
+        assert!(matches!(
+            parse_table_api_route("/console/api/tables/orders/items/delete"),
+            Some(TableApiRoute::ItemsDelete(t)) if t == "orders"
+        ));
+        assert!(parse_table_api_route("/console/api/tables/orders/items").is_none());
+        assert!(parse_table_api_route("/console/api/tables/orders/items/bogus").is_none());
         // A table name that needed percent-encoding round-trips.
         assert!(matches!(
             parse_table_api_route("/console/api/tables/a%20b"),
@@ -776,5 +1026,87 @@ mod tests {
         let body = wrap_json("gsi", serde_json::json!({"name": "by-status"}));
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["gsi"]["name"], "by-status");
+    }
+
+    fn sample_wire_item() -> WireItem {
+        serde_json::json!({"id": {"S": "o1"}, "n": {"N": "3"}})
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    /// A page of items round-trips through JSON with the DynamoDB wire shape
+    /// left untouched (no attribute name/value ever rewritten) and no
+    /// cluster-shaped field anywhere — pinning [`WireItem`]'s "pass the wire
+    /// shape straight through" decision at the type level, the same way
+    /// [`table_summary_serializes_console_shaped_fields_only`] pins
+    /// [`TableSummary`].
+    #[test]
+    fn items_page_serializes_the_wire_item_shape_untouched() {
+        let page = ItemsPage {
+            items: vec![sample_wire_item()],
+            scanned_count: 1,
+            last_evaluated_key: Some(sample_wire_item()),
+        };
+        let body = items_page_json(&page);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["items"][0]["id"]["S"], "o1");
+        assert_eq!(value["items"][0]["n"]["N"], "3");
+        assert_eq!(value["scanned_count"], 1);
+        assert_eq!(value["last_evaluated_key"]["id"]["S"], "o1");
+
+        let text = body.to_ascii_lowercase();
+        for forbidden in [
+            "node",
+            "tablet",
+            "replica",
+            "raft",
+            "leader",
+            "quorum",
+            "placement",
+            "health",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "found cluster-shaped substring `{forbidden}` in {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn items_page_json_omits_last_evaluated_key_when_none() {
+        let page = ItemsPage {
+            items: vec![],
+            scanned_count: 0,
+            last_evaluated_key: None,
+        };
+        let value: serde_json::Value = serde_json::from_str(&items_page_json(&page)).unwrap();
+        assert!(value["last_evaluated_key"].is_null());
+        assert!(value["items"].as_array().unwrap().is_empty());
+    }
+
+    /// The three [`SortKeyQuery`] wire shapes a `Query` request body can
+    /// carry, tagged by `kind`.
+    #[test]
+    fn sort_key_query_decodes_every_shape() {
+        let eq: SortKeyQuery =
+            serde_json::from_str(r#"{"kind":"equals","value":{"S":"a"}}"#).unwrap();
+        assert!(
+            matches!(eq, SortKeyQuery::Equals { value } if value == serde_json::json!({"S":"a"}))
+        );
+
+        let between: SortKeyQuery =
+            serde_json::from_str(r#"{"kind":"between","lo":{"N":"1"},"hi":{"N":"9"}}"#).unwrap();
+        assert!(matches!(between, SortKeyQuery::Between { .. }));
+
+        let begins: SortKeyQuery =
+            serde_json::from_str(r#"{"kind":"begins_with","value":{"S":"pre"}}"#).unwrap();
+        assert!(matches!(begins, SortKeyQuery::BeginsWith { .. }));
+    }
+
+    #[test]
+    fn get_item_request_decodes_a_bare_key_object() {
+        let req: GetItemRequest = serde_json::from_str(r#"{"key":{"id":{"S":"o1"}}}"#).unwrap();
+        assert_eq!(req.key["id"]["S"], "o1");
     }
 }

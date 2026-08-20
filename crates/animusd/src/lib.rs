@@ -2733,6 +2733,176 @@ impl console::ConsoleBackend for ClientCtx {
             .await
             .map_err(|e| console::ConsoleError::new(409, e))
     }
+
+    async fn scan_items(
+        &self,
+        table: &str,
+        req: console::ScanItemsRequest,
+    ) -> Result<console::ItemsPage, console::ConsoleError> {
+        let mut body = serde_json::json!({ "TableName": table });
+        if let Some(index_name) = &req.index_name {
+            body["IndexName"] = serde_json::Value::String(index_name.clone());
+        }
+        if let Some(limit) = req.limit {
+            body["Limit"] = serde_json::Value::from(limit);
+        }
+        if let Some(key) = req.exclusive_start_key {
+            body["ExclusiveStartKey"] = serde_json::Value::Object(key);
+        }
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.Scan", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        console_parse_items_page(&resp_body)
+    }
+
+    async fn query_items(
+        &self,
+        table: &str,
+        req: console::QueryItemsRequest,
+    ) -> Result<console::ItemsPage, console::ConsoleError> {
+        let meta = self.effective_metadata();
+        let Some(schema) = meta.table_schema(table) else {
+            return Err(console::ConsoleError::new(404, "no such table"));
+        };
+        // Resolve the partition/sort attribute *names* to query by, server-side
+        // — `console.rs` never imports a schema-catalog type, so the client
+        // sends only the index name (a real closed set, from this same
+        // table's own `TableDetail`) and the raw key *values*, never a
+        // hand-typed attribute name. See `console::QueryItemsRequest`'s doc.
+        let (pk_name, sk_name) = match &req.index_name {
+            None => (
+                schema.partition_key.clone(),
+                schema.clustering_keys.first().cloned(),
+            ),
+            Some(index_name) => {
+                let Some(idx) = schema.indexes.iter().find(|i| &i.name == index_name) else {
+                    return Err(console::ConsoleError::new(404, "no such index"));
+                };
+                (idx.hash_attribute.clone(), idx.sort_attribute.clone())
+            }
+        };
+        let mut key_condition = format!("{pk_name} = :pk_value");
+        let mut expr_values = serde_json::Map::new();
+        expr_values.insert(":pk_value".to_string(), req.partition_value.clone());
+        if let Some(sort_condition) = &req.sort_condition {
+            let Some(sk_name) = &sk_name else {
+                return Err(console::ConsoleError::new(
+                    400,
+                    "this table/index has no sort key to condition on",
+                ));
+            };
+            match sort_condition {
+                console::SortKeyQuery::Equals { value } => {
+                    key_condition.push_str(&format!(" AND {sk_name} = :sk_value"));
+                    expr_values.insert(":sk_value".to_string(), value.clone());
+                }
+                console::SortKeyQuery::Between { lo, hi } => {
+                    key_condition.push_str(&format!(" AND {sk_name} BETWEEN :sk_lo AND :sk_hi"));
+                    expr_values.insert(":sk_lo".to_string(), lo.clone());
+                    expr_values.insert(":sk_hi".to_string(), hi.clone());
+                }
+                console::SortKeyQuery::BeginsWith { value } => {
+                    key_condition.push_str(&format!(" AND begins_with({sk_name}, :sk_value)"));
+                    expr_values.insert(":sk_value".to_string(), value.clone());
+                }
+            }
+        }
+        let mut body = serde_json::json!({
+            "TableName": table,
+            "KeyConditionExpression": key_condition,
+            "ExpressionAttributeValues": expr_values,
+        });
+        if let Some(index_name) = &req.index_name {
+            body["IndexName"] = serde_json::Value::String(index_name.clone());
+        }
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.Query", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        console_parse_items_page(&resp_body)
+    }
+
+    async fn get_item(
+        &self,
+        table: &str,
+        key: console::WireItem,
+    ) -> Result<Option<console::WireItem>, console::ConsoleError> {
+        let body = serde_json::json!({ "TableName": table, "Key": serde_json::Value::Object(key) });
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.GetItem", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+            console::ConsoleError::new(500, format!("malformed GetItem response: {e}"))
+        })?;
+        Ok(value.get("Item").and_then(|v| v.as_object().cloned()))
+    }
+
+    async fn put_item(
+        &self,
+        table: &str,
+        item: console::WireItem,
+    ) -> Result<(), console::ConsoleError> {
+        let body =
+            serde_json::json!({ "TableName": table, "Item": serde_json::Value::Object(item) });
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.PutItem", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        Ok(())
+    }
+
+    async fn delete_item(
+        &self,
+        table: &str,
+        key: console::WireItem,
+    ) -> Result<(), console::ConsoleError> {
+        let body = serde_json::json!({ "TableName": table, "Key": serde_json::Value::Object(key) });
+        let payload = serde_json::to_vec(&body).unwrap_or_default();
+        let (status, resp_body) =
+            crate::dynamo::execute_routed(self, "DynamoDB_20120810.DeleteItem", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+        Ok(())
+    }
+}
+
+/// Decode a `Scan`/`Query` wire response body (`{"Items": [...], "Count": n,
+/// "ScannedCount": n[, "LastEvaluatedKey": {...}]}`) into an
+/// [`console::ItemsPage`] — shared by [`ConsoleBackend::scan_items`] and
+/// [`ConsoleBackend::query_items`] above (`animus_dynamo::wire::
+/// query_response` never emits `LastEvaluatedKey` at all, so this naturally
+/// yields `None` there — see [`console::ItemsPage`]'s own doc).
+fn console_parse_items_page(body: &str) -> Result<console::ItemsPage, console::ConsoleError> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| console::ConsoleError::new(500, format!("malformed items response: {e}")))?;
+    let items: Vec<console::WireItem> = value
+        .get("Items")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_object().cloned()).collect())
+        .unwrap_or_default();
+    let scanned_count = value
+        .get("ScannedCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(items.len() as u64);
+    let last_evaluated_key = value
+        .get("LastEvaluatedKey")
+        .and_then(|v| v.as_object().cloned());
+    Ok(console::ItemsPage {
+        items,
+        scanned_count,
+        last_evaluated_key,
+    })
 }
 
 /// An [`animus_control::StreamViewType`]'s DynamoDB wire label — the same

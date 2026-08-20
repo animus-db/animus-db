@@ -238,7 +238,8 @@ reusing the captured config is the point of the test.
   and data-only nodes only; a control-only node hosts no CP-data tablet, so
   it binds none (`BoundControlNode::start_control_with` passes `None` into
   `spawn_common_tail`'s `console_listener` parameter). **This module still
-  takes no `ClientCtx` (PR2's tables-list screen, and PR3's table page)** —
+  takes no `ClientCtx` (PR2's tables-list screen, PR3's Config tab, and
+  PR4's Items tab)** —
   a structural enforcement, not just a documented rule, of the console's one
   defining constraint: it must never surface cluster-shaped state (nodes,
   replicas, tablets, Raft, quorum, leaders, placement, health). PR2 added
@@ -285,18 +286,44 @@ reusing the captured config is the point of the test.
   client-side app: a `location.pathname`-based router (mirroring
   `dashboard_core.js::activateTab`'s idiom, but via real `<a href>`
   navigation rather than push-state) rendering the tables list, a table's
-  own page (Settings/Indexes/Danger-zone sections under one sticky
-  same-page jump nav — `#settings`/`#indexes`/`#danger`, a plain anchor,
-  not a route), or a plain "not built yet" stub for the create-table form's
+  own page, or a plain "not built yet" stub for the create-table form's
   `/console/ui/tables/new` — the server serves the identical static shell
   for every `/console/ui/*` path (`is_shell_path`, unchanged since PR1)
-  regardless of which of those the client then renders. The Items tab, the
-  Stream tab, and the create-table form are still follow-up PRs in the same
-  stack, each adding their own narrow projection type/`ConsoleBackend`
-  method the same way this PR's were added — never widening `console.rs`'s
-  inputs back toward `ClientCtx`. See ADR 0052 for the full design
-  (including why the console does *not* join the replicated `NodeAddrs`
-  book — no other node ever needs to resolve it).
+  regardless of which of those the client then renders. **PR4 (the table
+  page's Items tab) widens `ConsoleBackend` a second time — five more
+  methods (`scan_items`/`query_items`/`get_item`/`put_item`/
+  `delete_item`), same shape/kind discipline as PR3's own widening** —
+  every one still takes/returns only plain owned console types. The one
+  new type worth its own note is `console::WireItem` (`serde_json::Map`,
+  DynamoDB's own `{"attr": {"S": "value"}}` shape): unlike every other type
+  in this module, an item is deliberately **not** projected into a
+  console-only shape — there is no fixed "console item shape" to project
+  onto (a DynamoDB row is schemaless beyond its declared key attributes), so
+  `WireItem` passes straight through every one of the five new methods;
+  `console.rs` never interprets an attribute name or value, only moves the
+  map between the wire and the HTTP body. See ADR 0052's third 2026-08-20
+  amendment for the full reasoning, including why the table page's two tabs
+  (Config, default; Items) are two real routes
+  (`/console/ui/tables/{name}` vs. `/console/ui/tables/{name}/items`) rather
+  than one shared-page pushState toggle — `console.js`'s own Settings/
+  Indexes/Danger-zone jump nav (`#settings`/`#indexes`/`#danger`, now
+  rendered by `renderConfigTab`, called from `renderTablePage`'s tab
+  dispatch) stays a plain same-page anchor, unchanged from PR3 — and why
+  `Query` (unlike `Scan`) has no "Load more": `animus_dynamo::wire::
+  decode_query` never parses a `Limit`/`ExclusiveStartKey` at all, a
+  pre-existing gap in the underlying wire layer this PR does not attempt to
+  paper over client-side. Scanning/querying a named GSI/LSI (`index_name`,
+  a real closed set from this same table's own `TableDetail.gsis`/`lsis` —
+  rendered with a `<select>`, never free text) fell out cleanly: `lib.rs`'s
+  `query_items` resolves the partition/sort attribute names to query by
+  from the replicated catalog server-side, the same way `add_gsi`/
+  `table_detail` already read it, rather than asking the client to know or
+  type them. The Stream tab and the create-table form are still follow-up
+  PRs in the same stack, each adding their own narrow projection type/
+  `ConsoleBackend` method the same way every PR so far has — never
+  widening `console.rs`'s inputs back toward `ClientCtx`. See ADR 0052 for
+  the full design (including why the console does *not* join the
+  replicated `NodeAddrs` book — no other node ever needs to resolve it).
 
 ## CLI reference
 
