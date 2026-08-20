@@ -6,8 +6,9 @@
   2026-08-20 amendment below) ships a table's own page, Config tab; PR4 (see
   the third 2026-08-20 amendment below) ships that page's Items tab; PR5
   (see the fourth 2026-08-20 amendment below) ships that page's third and
-  final tab, Stream data. The create-table form remains the one follow-up
-  PR left in the same stack.
+  final tab, Stream data; PR6 (see the fifth 2026-08-20 amendment below)
+  ships the create-table form, completing the console's screens — this
+  stack has no further follow-up PR planned.
 - **Date:** 2026-08-19
 - **Amends:** [ADR 0035](0035-control-plane-separate-deployment.md) (owns the
   deployment shapes and their port contracts — gains a seventh port and a
@@ -626,3 +627,133 @@ hitting the DynamoDB Streams service directly still gets the full
 ADR 0042 §4/§11 contract; only this console tab's own view is narrower.
 Revisit if a future task specifically asks for it.
 
+
+## Amendment (2026-08-20, PR6 — the create-table form)
+
+This stack's sixth and final PR ships the console's last screen: the
+create-table form behind the tables-list screen's own `+ New table` button
+(`/console/ui/tables/new`, previously a "not built yet" stub). One new
+endpoint, `POST /console/api/tables`
+([`console::ConsoleBackend::create_table`]), covers the whole of DynamoDB's
+`CreateTable` surface this adapter supports in one call: table name, the
+partition key (name + a real `S`/`N`/`B` type control), an optional sort key
+(same shape), any local secondary indexes, any global secondary indexes
+(each with its own hash key, optional sort key, and projection), a stream,
+and TTL — then navigates to the new table's own page on success. Same
+discipline as every PR before it: the request/response types
+(`CreateTableRequest` and its nested `CreateKeyAttribute`/`CreateLsiRequest`/
+`CreateGsiRequest`) are plain owned console types, and the endpoint reuses
+the real `CreateTable`/`UpdateTimeToLive` wire operations via
+`crate::dynamo::execute_routed` rather than a second write path (TTL is a
+separate follow-up call, same shape the Config tab's `set_ttl` already
+uses, because `CreateTable`'s own wire operation carries no TTL field at
+all).
+
+### LSIs are declarable *only* on this form, and that is a structural fact, not a policy choice
+
+A DynamoDB local secondary index is create-time-only: it shares the base
+table's own partition key, adds one alternate sort key, and can never be
+added or dropped after the table exists — there is no `CreateLocalSecondaryIndex`/
+`DeleteLocalSecondaryIndex` operation in DynamoDB at all, and this adapter
+does not invent one either (`animus_control::IndexKind::Local` GSI/LSI
+distinction; ADR 0045's whole convergent-add/drop cascade is GSI-only). So
+the create-table form is not merely *a* place an LSI can be declared — it
+is structurally the *only* place: `console::ConsoleBackend` has no
+`add_lsi`/`drop_lsi` method, and adding one would misrepresent DynamoDB's
+own contract. `console::CreateLsiRequest`'s own doc states this plainly for
+a reader who lands there without this ADR in hand.
+
+### What tracing `CreateTable`'s own decoder found about index key attribute types — a second instance of the #319 gap, previously untraced
+
+ADR 0052 PR3's own amendment already established that a GSI added through
+`UpdateTable` gets no recorded key-attribute type (issue #319, because
+`animus_dynamo::wire`'s `GlobalSecondaryIndexUpdates` decoder never reads
+`AttributeDefinitions`) — and its prose asserted, without having actually
+traced the `CreateTable` path, that "a GSI declared at `CreateTable` time on
+the same table does" get one. This PR traced it, per this ADR's own
+brief and the root `CLAUDE.md`'s standing rule ("never offer a control
+whose value cannot survive its own round trip — verify against the decoder,
+not against a sibling operation's contract"), and **that assertion turns
+out to be wrong**: `CreateTable`'s own decoder has the identical gap, for a
+structurally identical reason.
+
+Tracing `animus_dynamo::wire::decode_key_schema`/`decode_attribute_types`
+and the `animus_dynamo::schema` bridge confirms it precisely:
+`decode_attribute_types` does parse every entry of a `CreateTable`
+request's `AttributeDefinitions`, indexes and all — but `schema::to_control`
+(the function that turns those `(name, type)` pairs into the replicated
+catalog's typed `ColumnDef`s) builds a `ColumnDef` **only** for the base
+table's own `schema.partition_key`/`schema.sort_key`; every other entry in
+`key_types`, including one naming a GSI's or LSI's own key attribute, is
+silently never consulted. Separately, `schema::index_to_control` — the one
+function that turns a decoded `SecondaryIndex` (GSI or LSI) into the
+replicated `IndexDef`, called identically for every index a `CreateTable`
+declares — never receives `key_types` as a parameter at all, and
+`animus_control::IndexDef` itself has no type field to put one in even if
+it did. So an index's key attribute has **no recorded type anywhere in the
+catalog, regardless of whether the index was declared via `CreateTable` or
+added later via `UpdateTable`** — the only way `console_index_key_summary`
+(PR3's own `Option`-typed projection) ever resolves to `Some` for an index
+key attribute is the structural coincidence where that attribute's name is
+*also* the base table's own declared partition or sort key — true of every
+LSI's hash attribute (always, by construction — an LSI shares the base
+partition key), never true of an LSI's own alternate sort attribute or of
+an ordinary GSI's hash/sort attributes.
+
+The create-table form is built honest about this finding: `CreateGsiRequest`/
+`CreateLsiRequest` ask for index key attribute *names* only, exactly the same
+"no control whose value is discarded" call PR3 already made for the
+Add-GSI form, now confirmed to hold on the create path too.
+`crates/animusd/tests/console_create_table.rs::create_full_table_declares_everything_exactly`
+is the regression: it declares a GSI and an LSI at `CreateTable` time with
+key attribute names deliberately distinct from the base table's own (so
+nothing resolves a type by name coincidence), then re-fetches the table
+fresh through `GET /console/api/tables/{name}` and asserts every one of
+those index key attributes reads back `attribute_type: null` — the create-path
+sibling of the test PR3's own regression already runs for the `UpdateTable`
+path. This ADR's text above is corrected to match; issue #319's restoration
+of the picker, once it lands, should cover both paths (`CreateTable` and
+`UpdateTable`) rather than only the one originally filed against.
+
+One thing genuinely *does* survive a `CreateTable`-declared index intact,
+unlike a key attribute's type: its **projection**
+(`ALL`/`KEYS_ONLY`/`INCLUDE` + non-key attribute list). `decode_index_entry`
+parses `Projection` for every declared index (GSI or LSI) regardless of
+kind, and `schema::index_to_control`/`projection_to_control` carry it
+through to the replicated `IndexDef` untouched — a genuinely closed,
+durable set, unlike an index key attribute's type. So the create-table
+form's GSI projection control (a real `ALL`/`KEYS_ONLY`/`INCLUDE` segmented
+control, with a free-text non-key-attribute list shown only for `INCLUDE`)
+is not the same defect the type picker would have been — it is added here,
+along with a new `console::ProjectionSummary` field on `GsiDetail` (console-
+shaped: `projection_type` + an `Option` non-key-attribute list), so the
+Config tab's own GSI rows now render a projection too, for every GSI
+regardless of how it was declared. LSIs get no projection control on this
+form: DynamoDB defaults an unspecified `Projection` to `ALL`, and nothing
+in this PR's brief asked for one — `LsiDetail` is left unchanged.
+
+### The sort-key-gates-the-LSI-section flow, and the maintainer correction it exists to satisfy
+
+Direct feedback on an earlier round of this exact form: *"I don't see a way
+to add LSIs in the table creation form."* The earlier draft's mistake was
+subtle — gating the LSI section on the sort key being present is *correct*
+(an LSI structurally needs one), but the sort-key toggle defaulted **off**,
+so a blank form opened with the LSI section permanently blocked and no
+visible way to turn it on short of scrolling back up and guessing. The fix
+is not to remove the gate — it is to make the gated state never the
+*starting* state and, if reached anyway, never a dead end: the sort-key
+toggle now defaults **on** (`console.js::renderCreateTableForm`), so a
+blank form always has a live, immediate path to declaring an LSI; if a user
+manually switches the sort key off while LSI rows are still present, the
+LSI section's own blocked message points back at that same switch, which
+stays visible and live directly above it (never hidden behind another
+screen or a modal) rather than merely graying the section out with no
+stated way forward. The reviewer's second correction on the same earlier
+round — *"buttons to enable streams and TTL are weird"*, a two-chip
+`ENABLED`/`DISABLED` segmented pair used for a plain boolean where
+`console.js`'s existing `toggleSwitch` helper (added for the Config tab's
+own TTL/stream toggles, PR3) was the right control all along — is likewise
+not reintroduced: the create-table form's stream-enabled and TTL-enabled
+controls are both `toggleSwitch`, and the segmented control is reserved
+for the form's two genuinely closed sets (stream view type, GSI projection
+type).

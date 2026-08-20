@@ -234,18 +234,304 @@
     renderRows();
   }
 
-  // ---- a not-yet-built screen (the create-table form, PR6) ----------------
+  // ---- the create-table form ------------------------------------------------
+  //
+  // The console's last screen: table name, partition key (name + a real
+  // S/N/B control — `CreateTable` genuinely records a base-table key's
+  // type), an optional sort key (same shape), any LSIs (declarable **only**
+  // here — see `console.rs::CreateLsiRequest`'s own doc for why: DynamoDB
+  // LSIs are create-time-only), any GSIs (name, hash [+ sort] attribute,
+  // projection), a stream, and TTL. Every attribute *name* stays free text
+  // (the console's standing rule); every index key attribute stays
+  // name-only, no type control — tracing `CreateTable`'s own decoder found
+  // it never records one, not even here (`console.rs::CreateTableRequest`'s
+  // doc has the full trace) — so offering one would be a control whose
+  // value cannot survive its own round trip, the same defect issue #319
+  // already found on the Config tab's Add-GSI form.
+  //
+  // The sort-key toggle defaults **on** (not off): an earlier draft of this
+  // form gated the LSI section on the sort key being present — correct,
+  // since an LSI needs one — but defaulted the toggle off, so a blank form
+  // opened with the LSI section permanently blocked and no visible way to
+  // unblock it. Defaulting the toggle on means a blank form always has a
+  // live path to declaring an LSI; if a user later switches it off with
+  // LSI rows still present, the section's own blocked message still points
+  // straight back at the (still-visible, still-live) switch above it.
 
-  function renderStub(pathTail) {
-    app.innerHTML = `
-      <div class="stub">
-        <h1>${esc(pathTail === "new" ? "Create table" : pathTail)}</h1>
-        <p>The create-table form is not built yet.</p>
-        <a class="back" href="/console/ui/tables">← Back to tables</a>
+  function keyAttrFieldHtml(prefix, label, nameVal, typeVal) {
+    return `
+      <div class="field-row-2">
+        <label class="field">${esc(label)} attribute name
+          <input type="text" class="attr-input" id="${prefix}-name" placeholder="attribute name" autocomplete="off" value="${esc(nameVal)}">
+        </label>
+        <label class="field">Type
+          <select class="kv-type" id="${prefix}-type">
+            <option value="S"${typeVal === "S" ? " selected" : ""}>S</option>
+            <option value="N"${typeVal === "N" ? " selected" : ""}>N</option>
+            <option value="B"${typeVal === "B" ? " selected" : ""}>B</option>
+          </select>
+        </label>
       </div>`;
   }
 
-  // ---- the table page: Config tab (this PR) --------------------------------
+  function lsiFormRowHtml() {
+    return `
+      <div class="create-index-row" data-lsi-row>
+        <input type="text" class="attr-input" placeholder="index name" data-lsi-name autocomplete="off">
+        <input type="text" class="attr-input" placeholder="sort key attribute name" data-lsi-sort autocomplete="off">
+        <button type="button" class="btn-drop" data-remove-row>Remove</button>
+      </div>`;
+  }
+
+  const PROJECTION_TYPES = ["ALL", "KEYS_ONLY", "INCLUDE"];
+
+  function gsiFormRowHtml() {
+    return `
+      <div class="create-index-row create-index-row-gsi" data-gsi-row>
+        <div class="create-index-row-fields">
+          <input type="text" class="attr-input" placeholder="index name" data-gsi-name autocomplete="off">
+          <input type="text" class="attr-input" placeholder="hash attribute name" data-gsi-hash autocomplete="off">
+          <input type="text" class="attr-input" placeholder="sort attribute name (optional)" data-gsi-sort autocomplete="off">
+        </div>
+        <div class="create-index-row-fields">
+          <div class="field">Projection${segmented("gsi-projection-type", PROJECTION_TYPES, "ALL")}</div>
+          <input type="text" class="attr-input gsi-nonkey hidden" placeholder="non-key attributes, comma-separated" data-gsi-nonkey autocomplete="off">
+        </div>
+        <button type="button" class="btn-drop" data-remove-row>Remove</button>
+      </div>`;
+  }
+
+  function wireGsiRow(row) {
+    wireSegmented(row);
+    const nonKeyInput = row.querySelector(".gsi-nonkey");
+    row.querySelectorAll(`.segmented[data-field="gsi-projection-type"] .seg-opt`).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        nonKeyInput.classList.toggle("hidden", btn.dataset.value !== "INCLUDE");
+      });
+    });
+  }
+
+  function renderCreateTableForm() {
+    app.innerHTML = `
+      <div class="table-page create-table-page">
+        <div class="view-head">
+          <a class="back-link" href="/console/ui/tables">← Tables</a>
+          <h1>Create table</h1>
+        </div>
+        <form class="create-form" id="create-table-form">
+          <section class="config-section">
+            <h2>Table</h2>
+            <label class="field">Table name
+              <input type="text" class="attr-input" id="ct-name" placeholder="e.g. orders" autocomplete="off">
+            </label>
+          </section>
+
+          <section class="config-section">
+            <h2>Partition key</h2>
+            ${keyAttrFieldHtml("ct-pk", "Partition key", "", "S")}
+          </section>
+
+          <section class="config-section">
+            <h2>Sort key</h2>
+            <label class="field-row">${toggleSwitch("ct-sk-enabled", true)}<span>Table has a sort key</span></label>
+            <div id="ct-sk-fields">${keyAttrFieldHtml("ct-sk", "Sort key", "", "S")}</div>
+          </section>
+
+          <section class="config-section">
+            <h2>Local secondary indexes</h2>
+            <p class="section-note">An LSI shares the table's own partition key and adds an alternate sort key. Declarable only here — DynamoDB never allows adding or dropping an LSI after a table is created.</p>
+            <div class="index-list" id="ct-lsi-rows"></div>
+            <button type="button" class="btn-new" id="ct-add-lsi">+ Add LSI</button>
+            <p class="field-hint hidden" id="ct-lsi-blocked">Turn on “Table has a sort key” above to declare a local secondary index.</p>
+          </section>
+
+          <section class="config-section">
+            <h2>Global secondary indexes</h2>
+            <p class="section-note">A GSI is its own hash key (plus an optional sort key), backfilled asynchronously once the table exists.</p>
+            <div class="index-list" id="ct-gsi-rows"></div>
+            <button type="button" class="btn-new" id="ct-add-gsi">+ Add GSI</button>
+          </section>
+
+          <section class="config-section">
+            <h2>Stream</h2>
+            <label class="field-row">${toggleSwitch("ct-stream-enabled", false)}<span>Enabled</span></label>
+            <div class="field hidden" id="ct-stream-view-field">View type${segmented("ct-stream-view-type", STREAM_VIEW_TYPES, STREAM_VIEW_TYPES[0])}</div>
+          </section>
+
+          <section class="config-section">
+            <h2>TTL</h2>
+            <label class="field-row">${toggleSwitch("ct-ttl-enabled", false)}<span>Enabled</span></label>
+            <label class="field hidden" id="ct-ttl-attr-field">Attribute name
+              <input type="text" class="attr-input" id="ct-ttl-attr" placeholder="e.g. expiresAt" autocomplete="off">
+            </label>
+          </section>
+
+          <div class="edit-actions">
+            <button type="button" class="btn-save" id="ct-submit">Create table</button>
+            <a class="btn-cancel" href="/console/ui/tables">Cancel</a>
+          </div>
+          <p class="err-line hidden" id="ct-err"></p>
+        </form>
+      </div>`;
+    wireCreateTableForm();
+  }
+
+  function wireCreateTableForm() {
+    const form = document.getElementById("create-table-form");
+    wireSegmented(form);
+    wireToggles(form);
+
+    // Sort key on/off gates the sort-key fields and the LSI section's own
+    // "way out" — see this section's header comment for why the toggle
+    // itself defaults on rather than the section defaulting blocked.
+    const skToggle = form.querySelector('[data-field="ct-sk-enabled"]');
+    const skFields = document.getElementById("ct-sk-fields");
+    const addLsiBtn = document.getElementById("ct-add-lsi");
+    const lsiRows = document.getElementById("ct-lsi-rows");
+    const lsiBlocked = document.getElementById("ct-lsi-blocked");
+    function syncSortKeyUi() {
+      const on = skToggle.classList.contains("on");
+      skFields.classList.toggle("hidden", !on);
+      addLsiBtn.disabled = !on;
+      lsiRows.classList.toggle("hidden", !on);
+      lsiBlocked.classList.toggle("hidden", on);
+    }
+    skToggle.addEventListener("click", syncSortKeyUi);
+    syncSortKeyUi();
+
+    addLsiBtn.addEventListener("click", () => {
+      lsiRows.insertAdjacentHTML("beforeend", lsiFormRowHtml());
+    });
+    lsiRows.addEventListener("click", (e) => {
+      if (e.target.hasAttribute("data-remove-row")) {
+        e.target.closest("[data-lsi-row]").remove();
+      }
+    });
+
+    const gsiRows = document.getElementById("ct-gsi-rows");
+    document.getElementById("ct-add-gsi").addEventListener("click", () => {
+      gsiRows.insertAdjacentHTML("beforeend", gsiFormRowHtml());
+      wireGsiRow(gsiRows.lastElementChild);
+    });
+    gsiRows.addEventListener("click", (e) => {
+      if (e.target.hasAttribute("data-remove-row")) {
+        e.target.closest("[data-gsi-row]").remove();
+      }
+    });
+
+    const streamToggle = form.querySelector('[data-field="ct-stream-enabled"]');
+    const streamViewField = document.getElementById("ct-stream-view-field");
+    streamToggle.addEventListener("click", () => {
+      streamViewField.classList.toggle("hidden", !streamToggle.classList.contains("on"));
+    });
+
+    const ttlToggle = form.querySelector('[data-field="ct-ttl-enabled"]');
+    const ttlAttrField = document.getElementById("ct-ttl-attr-field");
+    ttlToggle.addEventListener("click", () => {
+      ttlAttrField.classList.toggle("hidden", !ttlToggle.classList.contains("on"));
+    });
+
+    document.getElementById("ct-submit").addEventListener("click", submitCreateTable);
+  }
+
+  async function submitCreateTable() {
+    const errEl = document.getElementById("ct-err");
+    const fail = (msg) => {
+      errEl.textContent = msg;
+      errEl.classList.remove("hidden");
+    };
+    errEl.classList.add("hidden");
+
+    const tableName = document.getElementById("ct-name").value.trim();
+    const pkName = document.getElementById("ct-pk-name").value.trim();
+    if (!tableName || !pkName) {
+      fail("Table name and partition key attribute name are both required.");
+      return;
+    }
+    const req = {
+      table_name: tableName,
+      partition_key: { name: pkName, attribute_type: document.getElementById("ct-pk-type").value },
+    };
+
+    const skOn = toggleValue(document.getElementById("create-table-form"), "ct-sk-enabled");
+    if (skOn) {
+      const skName = document.getElementById("ct-sk-name").value.trim();
+      if (!skName) {
+        fail("Sort key attribute name is required when the sort key is enabled.");
+        return;
+      }
+      req.sort_key = { name: skName, attribute_type: document.getElementById("ct-sk-type").value };
+    }
+
+    const lsis = [];
+    for (const row of document.querySelectorAll("#ct-lsi-rows [data-lsi-row]")) {
+      const indexName = row.querySelector("[data-lsi-name]").value.trim();
+      const sortAttribute = row.querySelector("[data-lsi-sort]").value.trim();
+      if (!indexName && !sortAttribute) continue; // an untouched blank row
+      if (!indexName || !sortAttribute) {
+        fail("Every LSI needs both an index name and a sort key attribute.");
+        return;
+      }
+      lsis.push({ index_name: indexName, sort_attribute: sortAttribute });
+    }
+    req.lsis = lsis;
+
+    const gsis = [];
+    for (const row of document.querySelectorAll("#ct-gsi-rows [data-gsi-row]")) {
+      const indexName = row.querySelector("[data-gsi-name]").value.trim();
+      const hashAttribute = row.querySelector("[data-gsi-hash]").value.trim();
+      const sortAttribute = row.querySelector("[data-gsi-sort]").value.trim();
+      const projectionType = segmentedValue(row, "gsi-projection-type") || "ALL";
+      if (!indexName && !hashAttribute) continue; // an untouched blank row
+      if (!indexName || !hashAttribute) {
+        fail("Every GSI needs both an index name and a hash attribute.");
+        return;
+      }
+      const gsi = { index_name: indexName, hash_attribute: hashAttribute, projection_type: projectionType };
+      if (sortAttribute) gsi.sort_attribute = sortAttribute;
+      if (projectionType === "INCLUDE") {
+        const names = row
+          .querySelector("[data-gsi-nonkey]")
+          .value.split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (names.length === 0) {
+          fail(`GSI “${indexName}”'s INCLUDE projection needs at least one non-key attribute.`);
+          return;
+        }
+        gsi.projection_non_key_attributes = names;
+      }
+      gsis.push(gsi);
+    }
+    req.gsis = gsis;
+
+    req.stream_enabled = toggleValue(document.getElementById("create-table-form"), "ct-stream-enabled");
+    if (req.stream_enabled) {
+      req.stream_view_type = segmentedValue(document.getElementById("create-table-form"), "ct-stream-view-type") || STREAM_VIEW_TYPES[0];
+    }
+
+    req.ttl_enabled = toggleValue(document.getElementById("create-table-form"), "ct-ttl-enabled");
+    if (req.ttl_enabled) {
+      const ttlAttr = document.getElementById("ct-ttl-attr").value.trim();
+      if (!ttlAttr) {
+        fail("TTL attribute name is required when TTL is enabled.");
+        return;
+      }
+      req.ttl_attribute_name = ttlAttr;
+    }
+
+    const submitBtn = document.getElementById("ct-submit");
+    submitBtn.disabled = true;
+    try {
+      const resp = await postJSON("/console/api/tables", req);
+      window.location.href = tableHref(resp.table.name);
+    } catch (e) {
+      fail(String(e.message || e));
+      submitBtn.disabled = false;
+    }
+  }
+
+  // ---- the table page: Config tab ------------------------------------------
   //
   // Three stacked sections — Settings, Indexes, Danger zone — under one
   // sticky jump nav, backed by the table-detail endpoint plus one mutating
@@ -1607,7 +1893,7 @@
   if (path.startsWith(TABLES_ROUTE_PREFIX)) {
     const rest = path.slice(TABLES_ROUTE_PREFIX.length);
     if (rest === "new") {
-      renderStub(rest);
+      renderCreateTableForm();
     } else {
       // `{name}` (Config, the default), `{name}/items` (Items), or
       // `{name}/stream` (Stream data) — the only three shapes a real table

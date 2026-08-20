@@ -73,8 +73,19 @@
 //! seal's `replicas`/`object_id` (ADR 0042 §10, genuinely storage-internal)
 //! never reaches [`ShardSummary`] at all.
 //!
-//! The create-table form is still a follow-up PR in this stack — see
-//! `is_shell_path`'s doc.
+//! **This PR (the create-table form) ships the console's last screen** —
+//! `POST /console/api/tables` ([`ConsoleBackend::create_table`]), the one
+//! endpoint that can declare an LSI at all (see [`CreateLsiRequest`]'s doc
+//! for why: DynamoDB LSIs are create-time-only, so this is structurally the
+//! only place in this whole console an LSI can ever be declared — no
+//! `add_lsi`/`drop_lsi` exists or ever will). Same discipline as every PR
+//! before it: [`CreateTableRequest`] and its nested types are plain owned
+//! console types, and the endpoint reuses the real `CreateTable`/
+//! `UpdateTimeToLive` wire operations via `crate::dynamo::execute_routed`
+//! rather than a second write path. See [`CreateTableRequest`]'s own doc for
+//! what tracing `CreateTable`'s decoder found about index key attribute
+//! types (the same gap issue #319 already found on the `UpdateTable` path,
+//! just previously untraced on this one).
 //!
 //! Embedded at compile time (`include_str!`), no bundler/build step/external
 //! assets — the same constraints `dashboard.rs` documents for the operator
@@ -111,14 +122,24 @@ pub(crate) struct KeySummary {
 
 /// One *index* key attribute's shape. Unlike [`KeySummary`] the type is
 /// `Option`: an index's key attribute has no declared type of its own
-/// anywhere in the catalog — `animus_control::IndexDef` stores only the
-/// attribute *name*. A type is therefore knowable only when that same
-/// attribute also happens to be a declared column of the base table, which
-/// is the case for an index declared at `CreateTable` (its attributes come
-/// in through `AttributeDefinitions`) and **not** the case for a GSI added
-/// later through `UpdateTable`, whose `GlobalSecondaryIndexUpdates` decoder
-/// ignores `AttributeDefinitions` entirely (issue #319). `None` renders as
-/// a bare attribute name rather than a fabricated `(S)`.
+/// anywhere in the catalog — `animus_control::IndexDef` has no type field
+/// at all, only the attribute *name*. A type is therefore knowable only
+/// when that same attribute also happens to be a declared column of the
+/// base table, and **the base table's own two key columns are the only
+/// columns there are**: `animus_dynamo::schema::to_control` builds a
+/// `ColumnDef` for `partition_key`/`sort_key` and nothing else, while
+/// `index_to_control` never receives `key_types` in the first place.
+///
+/// This holds on **both** declaration paths, which an earlier revision of
+/// this doc got wrong: it claimed a `CreateTable`-declared index kept its
+/// type because its attributes arrive in `AttributeDefinitions`. They do
+/// arrive — and then only the base table's own keys are looked up in them.
+/// So a `CreateTable` GSI's own hash key and an LSI's own sort attribute
+/// are just as untyped as a GSI added later through `UpdateTable`, whose
+/// `GlobalSecondaryIndexUpdates` decoder ignores `AttributeDefinitions`
+/// outright. Issue #319 covers both paths.
+///
+/// `None` renders as a bare attribute name rather than a fabricated `(S)`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct IndexKeySummary {
     pub(crate) name: String,
@@ -173,19 +194,35 @@ pub(crate) struct TableSummary {
 /// for it.
 pub(crate) type TableSnapshotFn = Arc<dyn Fn() -> Vec<TableSummary> + Send + Sync>;
 
+/// A secondary index's declared projection (DynamoDB's own closed set:
+/// `ALL`/`KEYS_ONLY`/`INCLUDE`), console-shaped. `non_key_attributes` is
+/// `Some` exactly when `projection_type` is `"INCLUDE"` — mirrors the
+/// `enabled`-gates-a-companion-field shape [`StreamSummary`]/[`TtlSummary`]
+/// already use. Unlike an index *key* attribute's type ([`IndexKeySummary`]),
+/// a projection genuinely is recorded in full for every index regardless of
+/// how it was declared (`CreateTable` or the Config tab's `add_gsi`) — see
+/// `lib.rs::console_projection_summary`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct ProjectionSummary {
+    pub(crate) projection_type: String,
+    pub(crate) non_key_attributes: Option<Vec<String>>,
+}
+
 /// One global secondary index, console-shaped for the table detail screen:
-/// its keys and its lifecycle status (ADR 0045) — never its hidden
-/// materialization table's own tablet/replica placement, which is exactly
-/// the cluster-shaped detail this console must never surface. `status` is a
-/// plain wire-label string (`"CREATING"`/`"ACTIVE"`/`"DELETING"`) rather than
-/// `animus_control::IndexStatus` itself — this module never imports that
-/// type at all (see the module doc); `lib.rs` renders the label.
+/// its keys, its projection, and its lifecycle status (ADR 0045) — never its
+/// hidden materialization table's own tablet/replica placement, which is
+/// exactly the cluster-shaped detail this console must never surface.
+/// `status` is a plain wire-label string (`"CREATING"`/`"ACTIVE"`/
+/// `"DELETING"`) rather than `animus_control::IndexStatus` itself — this
+/// module never imports that type at all (see the module doc); `lib.rs`
+/// renders the label.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct GsiDetail {
     pub(crate) name: String,
     pub(crate) hash_attribute: IndexKeySummary,
     pub(crate) sort_attribute: Option<IndexKeySummary>,
     pub(crate) status: String,
+    pub(crate) projection: ProjectionSummary,
 }
 
 /// One local secondary index, console-shaped: just its own alternate sort
@@ -254,6 +291,104 @@ pub(crate) struct SetTtlRequest {
     pub(crate) enabled: bool,
     #[serde(default)]
     pub(crate) attribute_name: Option<String>,
+}
+
+/// One key attribute declared on the create-table form: a name plus a
+/// declared DynamoDB `AttributeType` (`S`/`N`/`B`). Unlike an index's own key
+/// attribute ([`IndexKeySummary`]), a **base table's** partition/sort key
+/// genuinely gets its declared type recorded — `CreateTable`'s
+/// `AttributeDefinitions` — so this carries a real (non-`Option`) type, the
+/// same shape [`KeySummary`] already uses for a committed table.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct CreateKeyAttribute {
+    pub(crate) name: String,
+    pub(crate) attribute_type: String,
+}
+
+/// One local secondary index declared on the create-table form (`POST
+/// /console/api/tables`) — **the only place in this whole console an LSI can
+/// ever be declared**: DynamoDB LSIs are create-time-only, so there is no
+/// `add_lsi`/`drop_lsi` endpoint anywhere else (see [`LsiDetail`]'s own doc).
+/// No attribute type on `sort_attribute` — see [`CreateTableRequest`]'s own
+/// doc for why an index's key attribute type is never recorded, not even at
+/// `CreateTable` time.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct CreateLsiRequest {
+    pub(crate) index_name: String,
+    pub(crate) sort_attribute: String,
+}
+
+/// One global secondary index declared on the create-table form.
+/// `hash_attribute`/`sort_attribute` are free text (an attribute name is
+/// per-item, never a closed set, same rule as [`AddGsiRequest`]).
+/// `projection_type` is one of DynamoDB's own three values
+/// (`ALL`/`KEYS_ONLY`/`INCLUDE`) — a genuinely closed set, so the form
+/// offers a real control for it, unlike an attribute name/type;
+/// `projection_non_key_attributes` is required (non-empty) exactly when
+/// `projection_type` is `"INCLUDE"`. Unlike [`AddGsiRequest`], this **does**
+/// reach a durable projection: `CreateTable`'s `Projection` decodes and
+/// records for every declared index regardless of kind (see
+/// [`CreateTableRequest`]'s own doc).
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct CreateGsiRequest {
+    pub(crate) index_name: String,
+    pub(crate) hash_attribute: String,
+    #[serde(default)]
+    pub(crate) sort_attribute: Option<String>,
+    #[serde(default = "default_projection_type")]
+    pub(crate) projection_type: String,
+    #[serde(default)]
+    pub(crate) projection_non_key_attributes: Option<Vec<String>>,
+}
+
+fn default_projection_type() -> String {
+    "ALL".to_string()
+}
+
+/// A request to create a new table (`POST /console/api/tables`) — the
+/// create-table form's request body, and the one endpoint on this listener
+/// that can declare an LSI (see [`CreateLsiRequest`]'s own doc for why).
+///
+/// **What this form does *not* offer, and why**: an index (GSI or LSI) key
+/// attribute's own type. It would be natural to assume `CreateTable`
+/// behaves like the base table's own key (which genuinely does get a typed
+/// `AttributeDefinitions` entry, [`CreateKeyAttribute`]) — but tracing
+/// `animus_dynamo::wire::decode_key_schema`/`decode_attribute_types` and the
+/// `animus_dynamo::schema` bridge (`to_control`/`index_to_control`) shows
+/// otherwise: `to_control` builds a `ColumnDef` **only** for the base
+/// table's own `partition_key`/`sort_key`, and `index_to_control` (the one
+/// function that turns a decoded `SecondaryIndex` into the replicated
+/// `IndexDef`, called identically for every index `CreateTable` declares)
+/// never receives `key_types` at all — `IndexDef` itself has no type field
+/// to put one in regardless. So an index's key attribute has no recorded
+/// type **even when the index is declared at `CreateTable` time** — the
+/// same gap issue #319 already documented for `UpdateTable`'s
+/// `GlobalSecondaryIndexUpdates` path, just not previously traced for this
+/// one. `console_index_key_summary`'s `Option` therefore resolves to `Some`
+/// for an index key attribute only in the one structural coincidence where
+/// that attribute name is *also* the base table's own declared partition or
+/// sort key (true of every LSI's shared hash attribute, never true of its
+/// own alternate sort attribute or of an ordinary GSI's own hash/sort). This
+/// form asks for index key attribute *names* only, same as [`AddGsiRequest`]
+/// — never a control whose value cannot survive its own round trip.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct CreateTableRequest {
+    pub(crate) table_name: String,
+    pub(crate) partition_key: CreateKeyAttribute,
+    #[serde(default)]
+    pub(crate) sort_key: Option<CreateKeyAttribute>,
+    #[serde(default)]
+    pub(crate) lsis: Vec<CreateLsiRequest>,
+    #[serde(default)]
+    pub(crate) gsis: Vec<CreateGsiRequest>,
+    #[serde(default)]
+    pub(crate) stream_enabled: bool,
+    #[serde(default)]
+    pub(crate) stream_view_type: Option<String>,
+    #[serde(default)]
+    pub(crate) ttl_enabled: bool,
+    #[serde(default)]
+    pub(crate) ttl_attribute_name: Option<String>,
 }
 
 /// A console-shaped error: an HTTP status plus a human message — never a
@@ -516,6 +651,14 @@ pub(crate) struct StreamRecordsPage {
 /// one of these methods' return values.
 #[async_trait::async_trait]
 pub(crate) trait ConsoleBackend: Send + Sync {
+    /// Create a new table (`POST /console/api/tables`) — the create-table
+    /// form's one endpoint, covering the base key schema, any LSIs (this
+    /// request's own doc explains why they can *only* be declared here),
+    /// any GSIs, a stream, and TTL, all in one call. Routes through the
+    /// same real `CreateTable`/`UpdateTimeToLive` wire path every other
+    /// mutating endpoint on this listener uses (see `lib.rs`'s impl).
+    async fn create_table(&self, req: CreateTableRequest) -> Result<TableDetail, ConsoleError>;
+
     /// One table's full configuration, or `None` if no such table exists
     /// (rendered as a 404) — used by the table page's Config tab.
     async fn table_detail(&self, table: &str) -> Option<TableDetail>;
@@ -673,6 +816,19 @@ async fn route(
     if method == "GET" && path == TABLES_API_PATH {
         let summaries = tables();
         return (200, "application/json", tables_json(&summaries));
+    }
+    if method == "POST" && path == TABLES_API_PATH {
+        return match parse_json_body::<CreateTableRequest>(&request.body) {
+            Ok(req) => match backend.create_table(req).await {
+                Ok(detail) => (
+                    201,
+                    "application/json",
+                    wrap_json("table", serde_json::to_value(detail).unwrap_or_default()),
+                ),
+                Err(e) => (e.status, "application/json", error_json(&e.message)),
+            },
+            Err(e) => (e.status, "application/json", error_json(&e.message)),
+        };
     }
 
     if let Some(table_route) = parse_table_api_route(path) {
@@ -1194,6 +1350,10 @@ mod tests {
                 },
                 sort_attribute: None,
                 status: "CREATING".into(),
+                projection: ProjectionSummary {
+                    projection_type: "KEYS_ONLY".into(),
+                    non_key_attributes: None,
+                },
             }],
             lsis: vec![LsiDetail {
                 name: "by-score".into(),
@@ -1223,6 +1383,11 @@ mod tests {
         assert_eq!(json["gsis"][0]["name"], "by-status");
         assert_eq!(json["gsis"][0]["status"], "CREATING");
         assert!(json["gsis"][0]["sort_attribute"].is_null());
+        assert_eq!(
+            json["gsis"][0]["projection"]["projection_type"],
+            "KEYS_ONLY"
+        );
+        assert!(json["gsis"][0]["projection"]["non_key_attributes"].is_null());
         assert_eq!(json["lsis"][0]["name"], "by-score");
         assert_eq!(json["lsis"][0]["sort_attribute"]["name"], "score");
         assert!(
@@ -1463,5 +1628,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.sequence_number.as_deref(), Some("42"));
+    }
+
+    /// A minimal create-table request (partition key only — the common
+    /// case) decodes with every optional field defaulted away.
+    #[test]
+    fn create_table_request_decodes_the_minimal_shape() {
+        let req: CreateTableRequest = serde_json::from_str(
+            r#"{"table_name":"orders","partition_key":{"name":"order_id","attribute_type":"S"}}"#,
+        )
+        .unwrap();
+        assert_eq!(req.table_name, "orders");
+        assert_eq!(req.partition_key.name, "order_id");
+        assert!(req.sort_key.is_none());
+        assert!(req.lsis.is_empty());
+        assert!(req.gsis.is_empty());
+        assert!(!req.stream_enabled);
+        assert!(!req.ttl_enabled);
+    }
+
+    /// The full shape — sort key, an LSI, a GSI (with an `INCLUDE`
+    /// projection), a stream, and TTL — decodes every field, and a GSI's
+    /// `projection_type` defaults to `ALL` when the client omits it (the
+    /// same default DynamoDB's own `CreateTable` uses when `Projection` is
+    /// absent, `animus_dynamo::wire::decode_index_projection`).
+    #[test]
+    fn create_table_request_decodes_the_full_shape() {
+        let body = serde_json::json!({
+            "table_name": "orders",
+            "partition_key": {"name": "order_id", "attribute_type": "S"},
+            "sort_key": {"name": "created_at", "attribute_type": "N"},
+            "lsis": [{"index_name": "by-score", "sort_attribute": "score"}],
+            "gsis": [
+                {"index_name": "by-status", "hash_attribute": "status"},
+                {
+                    "index_name": "by-region",
+                    "hash_attribute": "region",
+                    "sort_attribute": "created_at",
+                    "projection_type": "INCLUDE",
+                    "projection_non_key_attributes": ["total"],
+                },
+            ],
+            "stream_enabled": true,
+            "stream_view_type": "NEW_AND_OLD_IMAGES",
+            "ttl_enabled": true,
+            "ttl_attribute_name": "expiresAt",
+        });
+        let req: CreateTableRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.sort_key.unwrap().attribute_type, "N");
+        assert_eq!(req.lsis[0].sort_attribute, "score");
+        assert_eq!(
+            req.gsis[0].projection_type, "ALL",
+            "omitted ⇒ ALL, DynamoDB's own default"
+        );
+        assert_eq!(req.gsis[1].projection_type, "INCLUDE");
+        assert_eq!(
+            req.gsis[1].projection_non_key_attributes,
+            Some(vec!["total".to_string()])
+        );
+        assert!(req.stream_enabled);
+        assert_eq!(req.stream_view_type.as_deref(), Some("NEW_AND_OLD_IMAGES"));
+        assert!(req.ttl_enabled);
+        assert_eq!(req.ttl_attribute_name.as_deref(), Some("expiresAt"));
     }
 }

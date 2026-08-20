@@ -286,10 +286,10 @@ reusing the captured config is the point of the test.
   client-side app: a `location.pathname`-based router (mirroring
   `dashboard_core.js::activateTab`'s idiom, but via real `<a href>`
   navigation rather than push-state) rendering the tables list, a table's
-  own page, or a plain "not built yet" stub for the create-table form's
-  `/console/ui/tables/new` — the server serves the identical static shell
-  for every `/console/ui/*` path (`is_shell_path`, unchanged since PR1)
-  regardless of which of those the client then renders. **PR4 (the table
+  own page, or the create-table form (PR6) at `/console/ui/tables/new` —
+  the server serves the identical static shell for every `/console/ui/*`
+  path (`is_shell_path`, unchanged since PR1) regardless of which of those
+  the client then renders. **PR4 (the table
   page's Items tab) widens `ConsoleBackend` a second time — five more
   methods (`scan_items`/`query_items`/`get_item`/`put_item`/
   `delete_item`), same shape/kind discipline as PR3's own widening** —
@@ -359,10 +359,45 @@ reusing the captured config is the point of the test.
   `AT_SEQUENCE_NUMBER`/`AFTER_SEQUENCE_NUMBER`, DynamoDB's own closed set)
   and why the Stream tab scopes to a table's *current* stream only,
   deliberately not the disable-grace-window pair ADR 0042 §4/§11 lets
-  coexist on the raw wire. The create-table form remains the one follow-up
-  left in this stack. See ADR 0052 for the full design (including why the
+  coexist on the raw wire. **PR6 (the create-table form) ships the
+  console's last screen and widens `ConsoleBackend` a fourth and final
+  time — one more method, `create_table`** — completing the console's
+  three-screen set (tables list, a table's own page with its three tabs,
+  and the create-table form). `POST /console/api/tables`
+  (`console::CreateTableRequest` in, `console::TableDetail` out, same
+  `execute_routed`-reuse discipline as every mutation before it: a real
+  `CreateTable` call, plus a follow-up `UpdateTimeToLive` call for TTL,
+  since `CreateTable`'s own wire operation carries no TTL field) covers
+  table name, partition key (a real `S`/`N`/`B` control — `CreateTable`
+  genuinely records a **base table** key's declared type), an optional
+  sort key, any LSIs, any GSIs (with a projection), a stream, and TTL.
+  **LSIs are declarable *only* on this form** — `ConsoleBackend` has no
+  `add_lsi`/`drop_lsi` and never will, since a DynamoDB LSI is
+  create-time-only by DynamoDB's own contract, not a policy this console
+  chose (`console::CreateLsiRequest`'s own doc states this). Tracing
+  `CreateTable`'s own decoder for this PR found that an index's key
+  attribute gets **no** recorded type even when the index is declared at
+  `CreateTable` time — `schema::to_control` only ever builds a `ColumnDef`
+  for the base table's own partition/sort key, and `schema::
+  index_to_control` (used identically for every `CreateTable`-declared
+  index) never receives `key_types` at all — correcting PR3's own ADR text,
+  which had asserted the opposite without tracing it; `CreateGsiRequest`/
+  `CreateLsiRequest` accordingly ask for index key attribute *names* only,
+  same as the Add-GSI form. A projection genuinely *does* survive
+  (`decode_index_entry` parses `Projection` for every declared index
+  regardless of kind), so this PR adds a real `ALL`/`KEYS_ONLY`/`INCLUDE`
+  control plus a new `console::ProjectionSummary` field on `GsiDetail`
+  (rendered for every GSI, not just create-time ones). Two maintainer
+  corrections from earlier drafts, both now load-bearing: the sort-key
+  toggle that gates the LSI section defaults **on** (a blocked LSI section
+  with no visible way to unblock it was the exact defect flagged); stream-
+  enabled/TTL-enabled are `console.js`'s existing `toggleSwitch`, never a
+  segmented `ENABLED`/`DISABLED` pair (segmented stays reserved for the
+  form's genuinely closed sets — stream view type, GSI projection type).
+  See ADR 0052's fifth 2026-08-20 amendment for the full design, and the
+  fourth amendment (referenced above) plus that ADR generally for why the
   console does *not* join the replicated `NodeAddrs` book — no other node
-  ever needs to resolve it).
+  ever needs to resolve it.
 
 ## CLI reference
 
