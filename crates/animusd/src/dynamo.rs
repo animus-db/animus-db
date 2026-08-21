@@ -423,6 +423,11 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             index_update,
         } => update_table(ctx, &table, stream, index_update).await,
         Operation::DescribeTable { table } => describe_table(ctx, meta, &table),
+        Operation::DeleteTable { table } => delete_table(ctx, &table).await,
+        Operation::ListTables {
+            exclusive_start_table_name,
+            limit,
+        } => list_tables(meta, exclusive_start_table_name.as_deref(), limit),
         Operation::PutItem {
             table,
             item,
@@ -1385,6 +1390,84 @@ fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<Stri
         &index_statuses,
         stream_desc.as_ref(),
     ))
+}
+
+/// `DeleteTable`: drop `table` from the replicated catalog and reclaim its
+/// tablets — [`ClientCtx::drop_table`], the same sink CQL `DROP TABLE` and
+/// the dashboard's delete button use (ADR 0024 GC). A missing table is a
+/// `ResourceNotFoundException`, matching real DynamoDB; `drop_table` itself
+/// is **idempotent** (a second call against an absent table is a silent
+/// no-op), so this explicit existence check up front is the only thing that
+/// makes a *repeat* `DeleteTable` return the right error instead of a false
+/// success. **Fresh, not [`metadata`]'s cached request-entry snapshot** (ADR
+/// 0035 PR1) — like [`create_table`]/[`update_time_to_live`], this is a
+/// mutating, commit-wait operation, so a table created moments ago on this
+/// same connection must never be missed.
+///
+/// The `TableDescription` echoed back is read **before** the drop actually
+/// runs (the fields describe the table as it stood the instant deletion was
+/// requested — real DynamoDB's own `DeleteTable` response contract, since
+/// there the drop is asynchronous too), reusing
+/// [`wire::delete_table_response`] — the same shared table-description
+/// builder [`describe_table`] wraps under `Table`, here wrapped under
+/// `TableDescription` with `TableStatus` overridden to `DELETING`.
+async fn delete_table(ctx: &ClientCtx, table: &str) -> Result<String, WireError> {
+    let meta = metadata_fresh(ctx).await;
+    let Some(control_schema) = meta.table_schema(table) else {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    };
+    let dynamo_schema = schema_bridge::to_dynamo(control_schema);
+    let key_types = schema_bridge::key_attribute_types(control_schema);
+    let index_defs = meta.table_indexes(table);
+    let indexes = schema_bridge::indexes_to_dynamo(index_defs);
+    let index_statuses: Vec<(String, IndexStatus)> = index_defs
+        .iter()
+        .map(|d| (d.name.clone(), d.status))
+        .collect();
+    let stream_desc = meta.table_stream(table).map(stream_description);
+    let response = wire::delete_table_response(
+        table,
+        &dynamo_schema,
+        &key_types,
+        &indexes,
+        &index_statuses,
+        stream_desc.as_ref(),
+    );
+    ctx.drop_table(table.to_owned())
+        .await
+        .map_err(|e| internal(&e))?;
+    Ok(response)
+}
+
+/// `ListTables`: every user-visible table name in ascending lexicographic
+/// order, paginated by `Limit`/`ExclusiveStartTableName`
+/// ([`wire::paginate_table_names`]'s contract). A materialized GSI's hidden
+/// table (`<base>$<index>`, ADR 0041 §1) is filtered out before pagination —
+/// `animus_dynamo::index::is_index_table_name`, the same predicate
+/// `console_table_summaries` (`lib.rs`, ADR 0052) uses for the Data
+/// Console's own tables-list screen — since it is an internal
+/// implementation detail, never a real client-declared table. `meta` is the
+/// request's cached snapshot ([`metadata`]), mirroring [`describe_table`]'s
+/// identical read-only discipline: a pure read needs no fresher view than
+/// the one [`run_operation`] already took for this request.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn list_tables(
+    meta: &Metadata,
+    exclusive_start_table_name: Option<&str>,
+    limit: Option<usize>,
+) -> Result<String, WireError> {
+    // `Metadata::table_schemas()` iterates its `BTreeMap` in ascending
+    // key order already, so this is already sorted — no extra sort needed.
+    let names: Vec<String> = meta
+        .table_schemas()
+        .map(|(name, _)| name.clone())
+        .filter(|name| !dynamo_index::is_index_table_name(name))
+        .collect();
+    let (page, last_evaluated) =
+        wire::paginate_table_names(&names, exclusive_start_table_name, limit);
+    Ok(wire::list_tables_response(&page, last_evaluated.as_deref()))
 }
 
 /// Mint a fresh DynamoDB Streams label (ADR 0042 §4): an ISO8601-ish

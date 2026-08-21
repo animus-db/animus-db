@@ -13,12 +13,15 @@
 //!
 //! Operations: `CreateTable`, `UpdateTable` (a `StreamSpecification` change,
 //! or — ADR 0045 §6 — a single `GlobalSecondaryIndexUpdates` element),
-//! `DescribeTable` (ADR 0042 §2), `PutItem`, `GetItem`, `DeleteItem`, `Query`,
-//! `Scan`, `UpdateItem`, `BatchWriteItem`, `TransactWriteItems` (atomic, ADR
-//! 0018 §2/PR7), `TransactGetItems` (a consistent multi-key read, ADR 0018 §2/
-//! PR7), `UpdateTimeToLive` / `DescribeTimeToLive` (ADR 0051 — decode/encode
-//! only; the expiry predicate itself is [`crate::ttl`], and the background
-//! reaper is `animusd`'s).
+//! `DescribeTable` (ADR 0042 §2), `DeleteTable` (drops the table and its
+//! tablets through the same sink CQL `DROP TABLE`/the dashboard use),
+//! `ListTables` (ascending name order, `Limit`/`ExclusiveStartTableName`
+//! paginated, a materialized GSI's hidden table filtered out), `PutItem`,
+//! `GetItem`, `DeleteItem`, `Query`, `Scan`, `UpdateItem`, `BatchWriteItem`,
+//! `TransactWriteItems` (atomic, ADR 0018 §2/PR7), `TransactGetItems` (a
+//! consistent multi-key read, ADR 0018 §2/PR7), `UpdateTimeToLive` /
+//! `DescribeTimeToLive` (ADR 0051 — decode/encode only; the expiry predicate
+//! itself is [`crate::ttl`], and the background reaper is `animusd`'s).
 //!
 //! AttributeValue types: the scalars `S` (string), `N` (number, carried
 //! as text), `B` (binary, base64), `BOOL`, `NULL`; the document types `M` (map)
@@ -371,6 +374,28 @@ pub enum Operation {
         /// Target table name.
         table: String,
     },
+    /// `DeleteTable`: drop `table` from the replicated catalog and reclaim
+    /// its tablets (`animusd`'s `ClientCtx::drop_table`, the same sink CQL
+    /// `DROP TABLE` and the dashboard's delete button use, ADR 0024 GC). A
+    /// missing table is a `ResourceNotFoundException`, decided at the
+    /// `animusd` edge (this crate never sees the replicated catalog).
+    DeleteTable {
+        /// Target table name.
+        table: String,
+    },
+    /// `ListTables`: table names in ascending lexicographic order, paginated
+    /// by `Limit` (default/cap 100) and `ExclusiveStartTableName` ("start
+    /// strictly after this name"). A materialized GSI's hidden table
+    /// (`<base>$<index>`, `animus_dynamo::index::index_table_name`) is
+    /// internal and never listed — filtered at the `animusd` edge, which
+    /// holds the replicated catalog this crate never sees.
+    ListTables {
+        /// Pagination cursor: list only names strictly greater than this one.
+        exclusive_start_table_name: Option<String>,
+        /// Max names to return this page (`None` = the default of 100; any
+        /// value is capped at 100, matching real DynamoDB).
+        limit: Option<usize>,
+    },
     /// `PutItem`: insert or replace `item` in `table`.
     PutItem {
         /// Target table name.
@@ -517,14 +542,15 @@ pub enum Operation {
 
 impl Operation {
     /// The single table this operation targets, if it has one. `BatchWriteItem`,
-    /// `TransactWriteItems`, and `TransactGetItems` span multiple tables, so
-    /// they return `None`.
+    /// `TransactWriteItems`, `TransactGetItems`, and `ListTables` span
+    /// multiple (or zero) tables, so they return `None`.
     #[must_use]
     pub fn table(&self) -> Option<&str> {
         match self {
             Operation::CreateTable { table, .. }
             | Operation::UpdateTable { table, .. }
             | Operation::DescribeTable { table, .. }
+            | Operation::DeleteTable { table, .. }
             | Operation::PutItem { table, .. }
             | Operation::GetItem { table, .. }
             | Operation::DeleteItem { table, .. }
@@ -535,7 +561,8 @@ impl Operation {
             | Operation::DescribeTimeToLive { table, .. } => Some(table),
             Operation::BatchWriteItem { .. }
             | Operation::TransactWriteItems { .. }
-            | Operation::TransactGetItems { .. } => None,
+            | Operation::TransactGetItems { .. }
+            | Operation::ListTables { .. } => None,
         }
     }
 }
@@ -664,6 +691,10 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "DescribeTable" => Ok(Operation::DescribeTable {
             table: table_name(obj)?,
         }),
+        "DeleteTable" => Ok(Operation::DeleteTable {
+            table: table_name(obj)?,
+        }),
+        "ListTables" => decode_list_tables(obj),
         "PutItem" => {
             let table = table_name(obj)?;
             let item = decode_item_field(obj, "Item")?;
@@ -1632,6 +1663,29 @@ fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     })
 }
 
+/// Decode a `ListTables` body: an optional `ExclusiveStartTableName`
+/// (pagination cursor) and an optional `Limit`, decoded exactly as `Scan`'s
+/// (any non-negative integer) — the default-100/cap-100 clamp is
+/// [`paginate_table_names`]'s job, not decode's.
+fn decode_list_tables(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let exclusive_start_table_name = obj
+        .get("ExclusiveStartTableName")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let limit = match obj.get("Limit") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| WireError::validation("`Limit` must be a non-negative integer"))?,
+        ),
+    };
+    Ok(Operation::ListTables {
+        exclusive_start_table_name,
+        limit,
+    })
+}
+
 fn decode_sort_condition(
     obj: &Map<String, Value>,
     clause: &str,
@@ -2134,14 +2188,56 @@ pub fn describe_table_response(
     stream: Option<&StreamDescription>,
 ) -> String {
     let mut desc = table_description_object(table, schema, indexes, index_statuses, stream);
+    desc.insert(
+        "AttributeDefinitions".into(),
+        Value::Array(attribute_definitions(schema, key_types)),
+    );
+    let mut obj = Map::new();
+    obj.insert("Table".into(), Value::Object(desc));
+    serde_json::to_string(&Value::Object(obj)).expect("describe-table response serializes")
+}
+
+/// The JSON body for a successful `DeleteTable`: the same
+/// [`table_description_object`] every other table-description response
+/// wraps (name, key schema, `AttributeDefinitions`, secondary indexes with
+/// their real status, stream config — the exact fields
+/// [`describe_table_response`] emits, populated from the same
+/// `animusd`-supplied catalog snapshot) with `TableStatus` overridden to
+/// `DELETING` — real DynamoDB's `DeleteTable` response, since the drop
+/// itself is asynchronous there (unlike this adapter's own synchronous
+/// cascade, ADR 0024). Wrapped under `TableDescription`, matching
+/// `CreateTable`/`UpdateTable` rather than `DescribeTable`'s `Table` key.
+#[must_use]
+pub fn delete_table_response(
+    table: &str,
+    schema: &TableSchema,
+    key_types: &[(String, String)],
+    indexes: &[SecondaryIndex],
+    index_statuses: &[(String, IndexStatus)],
+    stream: Option<&StreamDescription>,
+) -> String {
+    let mut desc = table_description_object(table, schema, indexes, index_statuses, stream);
+    desc.insert("TableStatus".into(), Value::String("DELETING".into()));
+    desc.insert(
+        "AttributeDefinitions".into(),
+        Value::Array(attribute_definitions(schema, key_types)),
+    );
+    let mut obj = Map::new();
+    obj.insert("TableDescription".into(), Value::Object(desc));
+    serde_json::to_string(&Value::Object(obj)).expect("delete-table response serializes")
+}
+
+/// The `AttributeDefinitions` array (partition key, plus sort key when
+/// composite) for `schema`, resolving each key attribute's declared type
+/// from `key_types` (defaulting to `S` when absent, mirroring
+/// `CreateTable`'s own decode). Shared by [`describe_table_response`] and
+/// [`delete_table_response`] — the two response shapes that echo it.
+fn attribute_definitions(schema: &TableSchema, key_types: &[(String, String)]) -> Vec<Value> {
     let mut attrs = vec![attribute_definition(&schema.partition_key, key_types)];
     if let Some(sk) = &schema.sort_key {
         attrs.push(attribute_definition(sk, key_types));
     }
-    desc.insert("AttributeDefinitions".into(), Value::Array(attrs));
-    let mut obj = Map::new();
-    obj.insert("Table".into(), Value::Object(desc));
-    serde_json::to_string(&Value::Object(obj)).expect("describe-table response serializes")
+    attrs
 }
 
 fn attribute_definition(name: &str, key_types: &[(String, String)]) -> Value {
@@ -2153,6 +2249,58 @@ fn attribute_definition(name: &str, key_types: &[(String, String)]) -> Value {
     e.insert("AttributeName".into(), Value::String(name.to_owned()));
     e.insert("AttributeType".into(), Value::String(ty.to_owned()));
     Value::Object(e)
+}
+
+/// The default and cap for `ListTables`'s `Limit`, matching real DynamoDB.
+pub const LIST_TABLES_MAX_LIMIT: usize = 100;
+
+/// Paginate a full, already-lexicographically-sorted table-name list per
+/// `ListTables`'s contract: skip past `exclusive_start_table_name` (start
+/// strictly after it — a binary search, valid because `names` is sorted),
+/// take at most `limit` (`None` defaults to [`LIST_TABLES_MAX_LIMIT`]; any
+/// value is capped at it, matching real DynamoDB), and report the page's
+/// last name as the pagination cursor **only when the listing was
+/// truncated** (matching DynamoDB — an untruncated page carries no
+/// `LastEvaluatedTableName`). `names` must already be the caller's *final*
+/// candidate set — already filtered by whatever policy decides which names
+/// to expose (`animusd::dynamo::list_tables` excludes a materialized GSI's
+/// hidden table before calling this).
+#[must_use]
+pub fn paginate_table_names(
+    names: &[String],
+    exclusive_start_table_name: Option<&str>,
+    limit: Option<usize>,
+) -> (Vec<String>, Option<String>) {
+    let limit = limit
+        .unwrap_or(LIST_TABLES_MAX_LIMIT)
+        .min(LIST_TABLES_MAX_LIMIT);
+    let start = exclusive_start_table_name
+        .map(|s| names.partition_point(|n| n.as_str() <= s))
+        .unwrap_or(0);
+    let remaining = &names[start..];
+    let truncated = remaining.len() > limit;
+    let page = remaining[..remaining.len().min(limit)].to_vec();
+    let last_evaluated = truncated.then(|| page.last().cloned()).flatten();
+    (page, last_evaluated)
+}
+
+/// The JSON body for a successful `ListTables`: `{"TableNames": [...]}`,
+/// plus `"LastEvaluatedTableName"` only when [`paginate_table_names`]
+/// reports the listing was truncated.
+#[must_use]
+pub fn list_tables_response(names: &[String], last_evaluated_table_name: Option<&str>) -> String {
+    let mut obj = Map::new();
+    obj.insert(
+        "TableNames".into(),
+        Value::Array(names.iter().cloned().map(Value::String).collect()),
+    );
+    if let Some(last) = last_evaluated_table_name {
+        obj.insert(
+            "LastEvaluatedTableName".into(),
+            Value::String(last.to_owned()),
+        );
+    }
+    serde_json::to_string(&Value::Object(obj)).expect("list-tables response serializes")
 }
 
 /// One index entry in a `TableDescription`/`Table`: name, key schema, and its
@@ -2475,6 +2623,51 @@ mod tests {
             Operation::DeleteItem { table, .. } => assert_eq!(table, "t"),
             other => panic!("expected DeleteItem, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decodes_delete_table_request() {
+        let body = br#"{"TableName":"t"}"#;
+        match decode_request("DynamoDB_20120810.DeleteTable", body).unwrap() {
+            Operation::DeleteTable { table } => assert_eq!(table, "t"),
+            other => panic!("expected DeleteTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_list_tables_request_with_all_fields() {
+        let body = br#"{"ExclusiveStartTableName":"foo","Limit":25}"#;
+        match decode_request("DynamoDB_20120810.ListTables", body).unwrap() {
+            Operation::ListTables {
+                exclusive_start_table_name,
+                limit,
+            } => {
+                assert_eq!(exclusive_start_table_name.as_deref(), Some("foo"));
+                assert_eq!(limit, Some(25));
+            }
+            other => panic!("expected ListTables, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_list_tables_request_with_no_fields() {
+        match decode_request("DynamoDB_20120810.ListTables", b"{}").unwrap() {
+            Operation::ListTables {
+                exclusive_start_table_name,
+                limit,
+            } => {
+                assert_eq!(exclusive_start_table_name, None);
+                assert_eq!(limit, None);
+            }
+            other => panic!("expected ListTables, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_list_tables_rejects_a_negative_limit() {
+        let body = br#"{"Limit":-1}"#;
+        let err = decode_request("DynamoDB_20120810.ListTables", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
@@ -3035,6 +3228,106 @@ mod tests {
         let body = create_table_response("t", &TableSchema::simple("id"), &[gsi], None);
         assert!(body.contains("\"IndexStatus\":\"ACTIVE\""));
         assert!(!body.contains("Backfilling"));
+    }
+
+    #[test]
+    fn delete_table_response_shape() {
+        let stream = StreamDescription {
+            view_type: StreamViewType::KeysOnly,
+            label: "lbl".into(),
+        };
+        let body = delete_table_response(
+            "t",
+            &TableSchema::composite("pk", "sk"),
+            &[("pk".into(), "S".into()), ("sk".into(), "N".into())],
+            &[],
+            &[],
+            Some(&stream),
+        );
+        // Wrapped under `TableDescription` (matching `CreateTable`/
+        // `UpdateTable`), not `DescribeTable`'s `Table`.
+        assert!(body.contains("\"TableDescription\""));
+        assert!(!body.starts_with("{\"Table\""));
+        assert!(body.contains("\"TableStatus\":\"DELETING\""));
+        assert!(!body.contains("\"TableStatus\":\"ACTIVE\""));
+        // Same descriptive fields `DescribeTable` emits.
+        assert!(body.contains("\"AttributeDefinitions\""));
+        assert!(body.contains("\"AttributeType\":\"N\""));
+        assert!(body.contains("\"StreamViewType\":\"KEYS_ONLY\""));
+        assert!(body.contains("\"TableName\":\"t\""));
+    }
+
+    #[test]
+    fn paginate_table_names_defaults_limit_to_100_and_caps_it() {
+        let names: Vec<String> = (0..150).map(|i| format!("t{i:03}")).collect();
+
+        // No `Limit` at all: default is 100, and since 150 > 100 the page is
+        // truncated.
+        let (page, last) = paginate_table_names(&names, None, None);
+        assert_eq!(page.len(), 100);
+        assert_eq!(page.first().unwrap(), "t000");
+        assert_eq!(page.last().unwrap(), "t099");
+        assert_eq!(last.as_deref(), Some("t099"));
+
+        // A `Limit` above 100 is capped at 100, not honored as-is.
+        let (page, last) = paginate_table_names(&names, None, Some(1000));
+        assert_eq!(page.len(), 100);
+        assert_eq!(last.as_deref(), Some("t099"));
+    }
+
+    #[test]
+    fn paginate_table_names_exclusive_start_table_name_positions_strictly_after() {
+        let names: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let (page, last) = paginate_table_names(&names, Some("b"), None);
+        // Strictly after "b": "b" itself is excluded.
+        assert_eq!(page, vec!["c".to_owned(), "d".to_owned()]);
+        assert_eq!(last, None);
+
+        // A start name equal to the last name yields an empty page.
+        let (page, last) = paginate_table_names(&names, Some("d"), None);
+        assert!(page.is_empty());
+        assert_eq!(last, None);
+
+        // A start name absent from the list still positions correctly
+        // (between "b" and "c").
+        let (page, _) = paginate_table_names(&names, Some("bb"), None);
+        assert_eq!(page, vec!["c".to_owned(), "d".to_owned()]);
+    }
+
+    #[test]
+    fn paginate_table_names_reports_last_evaluated_only_when_truncated() {
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_owned()).collect();
+
+        // The whole (small) list fits within the limit: no truncation, no
+        // `LastEvaluatedTableName`.
+        let (page, last) = paginate_table_names(&names, None, Some(10));
+        assert_eq!(page.len(), 3);
+        assert_eq!(last, None);
+
+        // A limit smaller than the candidate set truncates the page and
+        // reports the page's own last name as the cursor.
+        let (page, last) = paginate_table_names(&names, None, Some(2));
+        assert_eq!(page, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(last.as_deref(), Some("b"));
+
+        // A limit exactly matching the remaining count is NOT truncated.
+        let (page, last) = paginate_table_names(&names, None, Some(3));
+        assert_eq!(page.len(), 3);
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn list_tables_response_shape() {
+        let names = vec!["a".to_owned(), "b".to_owned()];
+        let body = list_tables_response(&names, None);
+        assert!(body.contains("\"TableNames\":[\"a\",\"b\"]"));
+        assert!(!body.contains("LastEvaluatedTableName"));
+
+        let body = list_tables_response(&names, Some("b"));
+        assert!(body.contains("\"LastEvaluatedTableName\":\"b\""));
     }
 
     #[test]

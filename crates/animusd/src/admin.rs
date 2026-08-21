@@ -1659,9 +1659,9 @@ struct DropTableReq {
 /// `POST /admin/data/drop-table {table}` — drop a table: remove its schema from
 /// the replicated catalog (ADR 0021 table management) **and** its tablets from
 /// the replicated map, which triggers every replica's GC loop to reclaim the
-/// table's data on disk (ADR 0024). Same sink as CQL `DROP TABLE`; idempotent.
-/// The DynamoDB wire has no `DeleteTable`, so this is the dashboard's delete
-/// primitive.
+/// table's data on disk (ADR 0024). Same sink as CQL `DROP TABLE` and the
+/// DynamoDB wire's own `DeleteTable` (`dynamo.rs::delete_table`); idempotent.
+/// This is the dashboard's delete primitive.
 async fn action_drop_table(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let req: DropTableReq = match parse_body(body) {
         Ok(r) => r,
