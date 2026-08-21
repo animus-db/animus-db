@@ -11,7 +11,7 @@ website/
   install.html    build, run a cluster, connect, deploy
   assets/
     site.css      design tokens (shared family with crates/animusd/src/dashboard.css)
-    site.js       theme toggle, mobile nav, copy buttons, docs scrollspy
+    site.js       theme switch (light/dark/system), mobile nav, copy buttons, docs scrollspy
     favicon.svg
   CNAME           custom domain: animusdb.io
   .nojekyll       Pages serves the files as-is
@@ -41,9 +41,9 @@ designed. When a capability lands or a gap closes, the pages that name it are:
 
 - `index.html` — the compatibility table and the status section
 - `docs.html` — `#api`, `#consistency`, and `#limits`
-- `install.html` — the CQL note and the ports table
+- `install.html` — the ports table
 
 The known-gap list (`docs.html#limits`) is the load-bearing one: it currently
 states no auth/TLS, no format compatibility between revisions, no backup/restore,
-CQL drivers cannot connect, no `BatchGetItem`/`DeleteTable`/`ListTables`, no
-tablet merge, and no Kubernetes operator.
+no `BatchGetItem`/`DeleteTable`/`ListTables`, no tablet merge, and no
+Kubernetes operator.

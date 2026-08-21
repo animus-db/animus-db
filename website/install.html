@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Install AnimusDB</title>
-<meta name="description" content="Build AnimusDB from source, run a cluster on your laptop, and connect with the AWS SDK, the aws CLI, cqlsh, or the animus CLI.">
+<meta name="description" content="Build AnimusDB from source, run a cluster on your laptop, and connect with the AWS SDK, the aws CLI, or the animus CLI.">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="canonical" href="https://animusdb.io/install.html">
 <meta property="og:title" content="Install AnimusDB">
@@ -31,20 +31,32 @@
       </svg>
       AnimusDB
     </a>
-    <button class="icon-btn nav-toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">
-      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
-    </button>
     <nav class="main">
       <a href="index.html">Overview</a>
       <a href="docs.html">Docs</a>
       <a href="install.html" aria-current="page">Install</a>
       <a href="https://github.com/animus-db/animus-db">GitHub</a>
-      <button class="icon-btn theme-btn" type="button" aria-label="Switch theme">
+    </nav>
+    <div class="theme-switch" role="group" aria-label="Theme">
+      <button type="button" data-theme-choice="light" aria-pressed="false" aria-label="Light theme">
         <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
           <circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"/>
         </svg>
       </button>
-    </nav>
+      <button type="button" data-theme-choice="dark" aria-pressed="false" aria-label="Dark theme">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M13.2 9.1A5.6 5.6 0 1 1 6.9 2.8a4.4 4.4 0 0 0 6.3 6.3Z"/>
+        </svg>
+      </button>
+      <button type="button" data-theme-choice="system" aria-pressed="false" aria-label="System theme">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="1.6" y="2.6" width="12.8" height="8.6" rx="1.4"/><path d="M5.6 14h4.8M8 11.2v2.8"/>
+        </svg>
+      </button>
+    </div>
+    <button class="icon-btn nav-toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
+    </button>
   </div>
 </header>
 
@@ -104,8 +116,6 @@
       <p>Optional, for talking to the database once it's up:</p>
       <ul>
         <li>The <strong>AWS CLI</strong> or any AWS SDK, for the DynamoDB endpoint.</li>
-        <li>A client that can send raw CQL <code>QUERY</code> frames, if you want to poke at the
-          CQL endpoint — <code>cqlsh</code> and full drivers do not connect yet (<a href="#connect">why</a>).</li>
       </ul>
     </section>
 
@@ -143,10 +153,10 @@
         <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">three nodes, one process</span></div>
 <pre><span class="p">$</span> <span class="k">./target/release/animusd --cluster 3</span>
 <span class="o">animusd: started 3-node cluster (CP)</span>
-<span class="o">  node 0: client 127.0.0.1:52104 — dynamo http 127.0.0.1:52105 — cql 127.0.0.1:52106</span>
+<span class="o">  node 0: client 127.0.0.1:52104 — dynamo http 127.0.0.1:52105</span>
 <span class="o">          — admin http://127.0.0.1:52107 — console http://127.0.0.1:52109</span>
-<span class="o">  node 1: client 127.0.0.1:52111 — dynamo http 127.0.0.1:52112 — cql 127.0.0.1:52113 …</span>
-<span class="o">  node 2: client 127.0.0.1:52118 — dynamo http 127.0.0.1:52119 — cql 127.0.0.1:52120 …</span>
+<span class="o">  node 1: client 127.0.0.1:52111 — dynamo http 127.0.0.1:52112 …</span>
+<span class="o">  node 2: client 127.0.0.1:52118 — dynamo http 127.0.0.1:52119 …</span>
 <span class="o">animusd: ready — Ctrl-C to stop</span></pre>
       </div>
       <div class="callout">
@@ -227,35 +237,6 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
   TableName: <span class="s">"orders"</span>,
   Item: { id: { S: <span class="s">"a-3"</span> }, total: { N: <span class="s">"7"</span> } },
 }));</pre>
-      </div>
-
-      <h3>CQL</h3>
-      <p>
-        The CQL endpoint speaks native protocol v4 — <code>STARTUP</code>, <code>OPTIONS</code>,
-        <code>QUERY</code>, <code>PREPARE</code> and <code>EXECUTE</code> — over a recognizer subset of
-        the CQL grammar:
-      </p>
-      <div class="code">
-        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">statements the CQL edge accepts</span></div>
-<pre><span class="k">CREATE KEYSPACE</span> shop;
-<span class="k">CREATE TABLE</span> shop.orders (id text, line int, total int, <span class="k">PRIMARY KEY</span> (id, line));
-<span class="k">INSERT INTO</span> shop.orders (id, line, total) <span class="k">VALUES</span> (<span class="s">'b-1'</span>, 1, 12);
-<span class="k">SELECT</span> * <span class="k">FROM</span> shop.orders <span class="k">WHERE</span> id = <span class="s">'b-1'</span>;
-<span class="k">UPDATE</span> shop.orders <span class="k">SET</span> total = 15 <span class="k">WHERE</span> id = <span class="s">'b-1'</span> <span class="k">AND</span> line = 1;
-<span class="k">DELETE FROM</span> shop.orders <span class="k">WHERE</span> id = <span class="s">'b-1'</span> <span class="k">AND</span> line = 1;
-<span class="k">BEGIN BATCH</span> … <span class="k">APPLY BATCH</span>;
-<span class="k">ALTER TABLE</span> shop.orders <span class="k">ADD</span> note text;
-<span class="k">DROP TABLE IF EXISTS</span> shop.orders;</pre>
-      </div>
-      <div class="callout warn">
-        <span class="label">cqlsh does not connect yet</span>
-        <p>
-          The cluster-metadata system tables (<code>system.local</code>, <code>system.peers</code>,
-          <code>system_schema.*</code>) are not implemented. <code>cqlsh</code> and full Cassandra
-          drivers query them while connecting, so they fail during handshake. Until those land, drive
-          the CQL edge with a client that sends <code>QUERY</code> frames directly. The DynamoDB
-          endpoint is the mature one.
-        </p>
       </div>
 
       <h3>The animus CLI</h3>
@@ -391,7 +372,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
             <tr><td>+0</td><td><code>7100</code></td><td>internal</td><td>Raft traffic between nodes</td><td><span class="pill no">Cluster-internal</span></td></tr>
             <tr><td>+1</td><td><code>7101</code></td><td>client</td><td>The native length-prefixed protocol the <code>animus</code> CLI speaks</td><td><span class="pill part">Trusted</span></td></tr>
             <tr><td>+2</td><td><code>7102</code></td><td>dynamo</td><td>DynamoDB JSON over HTTP, plus <code>GET /metrics</code></td><td><span class="pill part">Trusted</span></td></tr>
-            <tr><td>+3</td><td><code>7103</code></td><td>cql</td><td>CQL v4</td><td><span class="pill part">Trusted</span></td></tr>
+            <tr><td>+3</td><td><code>7103</code></td><td>(reserved)</td><td>Bound for a second wire protocol that these docs don't cover.</td><td><span class="pill no">Cluster-internal</span></td></tr>
             <tr><td>+4</td><td><code>7104</code></td><td>admin</td><td>Admin JSON API and the operator dashboard</td><td><span class="pill no">Cluster-internal</span></td></tr>
             <tr><td>+5</td><td><code>7105</code></td><td>intra</td><td>Node-to-node request forwarding and metadata mirroring; the address to <code>--seed</code></td><td><span class="pill no">Cluster-internal</span></td></tr>
             <tr><td>+6</td><td><code>7106</code></td><td>console</td><td>The data console (not bound on control-only nodes)</td><td><span class="pill no">Cluster-internal</span></td></tr>
@@ -400,7 +381,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
       </div>
       <p class="muted" style="margin-top:14px">
         Nothing authenticates callers yet, so "trusted" means a network you control. Keep the
-        internal, intra, admin and console ports off any externally reachable address.
+        internal, reserved, intra, admin and console ports off any externally reachable address.
       </p>
     </section>
 

@@ -1,33 +1,45 @@
 /* AnimusDB site behaviour — vanilla, no dependencies, no build step.
-   Four small things: theme toggle (persisted), mobile nav, copy-to-clipboard
-   on code blocks, and scrollspy for the docs sidebar. */
+   Four small things: theme switch (three-state, persisted), mobile nav,
+   copy-to-clipboard on code blocks, and scrollspy for the docs sidebar. */
 (function () {
   "use strict";
 
   // ---- theme -------------------------------------------------------------
+  // Three explicit, persisted states: "light", "dark", "system". System
+  // (also the default when nothing is stored) removes data-theme entirely
+  // and lets prefers-color-scheme decide.
   var STORE = "animusdb-theme";
   function stored() {
-    try { return localStorage.getItem(STORE); } catch (e) { return null; }
+    try {
+      var v = localStorage.getItem(STORE);
+      return (v === "light" || v === "dark") ? v : "system";
+    } catch (e) { return "system"; }
   }
-  function apply(theme) {
-    if (theme) { document.documentElement.setAttribute("data-theme", theme); }
+  function apply(choice) {
+    if (choice === "light" || choice === "dark") { document.documentElement.setAttribute("data-theme", choice); }
     else { document.documentElement.removeAttribute("data-theme"); }
   }
-  function current() {
-    var explicit = document.documentElement.getAttribute("data-theme");
-    if (explicit) return explicit;
-    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
-  }
+  // Applied immediately (before DOMContentLoaded, since this script is
+  // deferred but still runs pre-paint) so there is no flash of the wrong theme.
   apply(stored());
 
   document.addEventListener("DOMContentLoaded", function () {
-    var btn = document.querySelector(".theme-btn");
-    if (btn) {
-      btn.addEventListener("click", function () {
-        var next = current() === "dark" ? "light" : "dark";
-        apply(next);
-        try { localStorage.setItem(STORE, next); } catch (e) { /* private mode */ }
-        btn.setAttribute("aria-label", "Switch to " + (next === "dark" ? "light" : "dark") + " theme");
+    var switchEl = document.querySelector(".theme-switch");
+    if (switchEl) {
+      var choices = Array.prototype.slice.call(switchEl.querySelectorAll("button[data-theme-choice]"));
+      var syncPressed = function (active) {
+        choices.forEach(function (b) {
+          b.setAttribute("aria-pressed", String(b.getAttribute("data-theme-choice") === active));
+        });
+      };
+      syncPressed(stored());
+      choices.forEach(function (b) {
+        b.addEventListener("click", function () {
+          var choice = b.getAttribute("data-theme-choice");
+          apply(choice);
+          try { localStorage.setItem(STORE, choice); } catch (e) { /* private mode */ }
+          syncPressed(choice);
+        });
       });
     }
 

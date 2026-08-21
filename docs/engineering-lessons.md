@@ -2782,6 +2782,38 @@ debugging anything that feels like it might have happened before.
   its evidentiary basis, fetch that comment; an issue body is not a complete
   transcript of its own history. (#298,
   `crates/animusd/tests/streams_e2e.rs`, 2026-08-20.)
+- **Headless-Chromium verification of a static page (the `website/`
+  marketing site, or any HTML rendered headlessly): inject an inline
+  `<script>` into a *copy* of the page and read the result back out of
+  `--dump-dom`.** `--dump-dom` and `--virtual-time-budget` work fine; what
+  does *not* work is `--evaluate-on-load-file`, which **silently no-ops** —
+  the script never runs, the dumped DOM is the unmodified page, and there
+  is no error, so a check that "passes" may never have executed. Verify a
+  flag's effect once against a page whose title the script is supposed to
+  change before trusting it as a gate. The working recipe: copy the page
+  to a scratch dir, splice a `<script>` before `</head>` that writes the
+  measurement into `document.title` (e.g. `clientWidth`/`scrollWidth` for a
+  horizontal-overflow check), then
+  `chrome --headless --window-size=W,H --virtual-time-budget=2500
+  --dump-dom URL | grep -o '<title>[^<]*</title>'`. For anything needing
+  real interaction (clicking a theme switch, a mobile nav) or a
+  `prefers-color-scheme` override, drive the same pre-installed Chromium
+  through Playwright instead (`node` at `/opt/node22/bin/node`; the
+  package at `/opt/node22/lib/node_modules/playwright` is **not** on the
+  default module path, and `NODE_PATH` does not affect ESM resolution, so
+  import the absolute `/opt/node22/lib/node_modules/playwright/index.mjs`
+  or run from inside that directory), launching with `executablePath:
+  '/opt/pw-browsers/chromium-<rev>/chrome-linux/chrome'` and
+  `args: ['--no-sandbox', '--disable-gpu']`.
+- **A headless-Chromium screenshot narrower than ~485px is cropped, not a
+  layout bug.** The browser enforces a minimum window width, so
+  `--window-size=390,H` lays the page out at ~485px and captures a 390px
+  slice of it — content looks clipped at the right edge and a centered
+  container looks off-centre. Diagnosing that as responsive breakage sends
+  you chasing a bug that isn't there. Measure overflow numerically
+  (`scrollWidth` vs `clientWidth`, above) rather than trusting the
+  narrow-viewport image, and treat ~500px as the narrowest *trustworthy*
+  screenshot width. (website DynamoDB-focus pass, 2026-08-21.)
 
 ### Code patterns
 - **A single-closure injection seam that needs to grow into several
