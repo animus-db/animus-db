@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install AnimusDB</title>
+<meta name="description" content="Build AnimusDB from source, run a cluster on your laptop, and connect with the AWS SDK, the aws CLI, cqlsh, or the animus CLI.">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="canonical" href="https://animusdb.io/install.html">
+<meta property="og:title" content="Install AnimusDB">
+<meta property="og:description" content="Build from source, start a cluster, and connect with tools you already have.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<div class="banner">
+  <span class="dot"></span>
+  <b>Pre-alpha.</b> AnimusDB is under active development and is not ready for production data.
+  <a href="https://github.com/animus-db/animus-db">Follow along on GitHub&nbsp;→</a>
+</div>
+
+<header class="site">
+  <div class="wrap bar">
+    <a class="brand" href="index.html">
+      <svg width="24" height="24" viewBox="0 0 32 32" aria-hidden="true">
+        <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+          <path d="M16 5.5a10.5 10.5 0 0 1 9.09 5.25"/><path d="M25.09 21.25A10.5 10.5 0 0 1 16 26.5"/><path d="M6.91 21.25A10.5 10.5 0 0 1 6.91 10.75"/>
+        </g><circle cx="16" cy="16" r="3.1" fill="currentColor"/>
+      </svg>
+      AnimusDB
+    </a>
+    <button class="icon-btn nav-toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
+    </button>
+    <nav class="main">
+      <a href="index.html">Overview</a>
+      <a href="docs.html">Docs</a>
+      <a href="install.html" aria-current="page">Install</a>
+      <a href="https://github.com/animus-db/animus-db">GitHub</a>
+      <button class="icon-btn theme-btn" type="button" aria-label="Switch theme">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"/>
+        </svg>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="page-head">
+  <div class="wrap">
+    <span class="kicker">Install</span>
+    <h1>Get a cluster running</h1>
+    <p>
+      AnimusDB builds from source with Cargo. There are no packages or container images
+      yet — clone, build, run. About a minute of typing plus a compile.
+    </p>
+  </div>
+</div>
+
+<div class="wrap doc-layout">
+  <aside class="doc-nav">
+    <div class="cols">
+      <div>
+        <h4>Quick start</h4>
+        <a href="#prereqs">Prerequisites</a>
+        <a href="#build">Build from source</a>
+        <a href="#run">Run a cluster</a>
+        <a href="#connect">Connect to it</a>
+        <a href="#consoles">Open the consoles</a>
+      </div>
+      <div>
+        <h4>Real deployments</h4>
+        <a href="#multinode">Multi-node cluster</a>
+        <a href="#grow">Add and remove nodes</a>
+        <a href="#split">Split control and data</a>
+      </div>
+      <div>
+        <h4>Reference</h4>
+        <a href="#ports">Ports</a>
+        <a href="#flags">Common flags</a>
+        <a href="#data">Data directory</a>
+        <a href="#trouble">Troubleshooting</a>
+      </div>
+    </div>
+  </aside>
+
+  <div class="doc-body">
+
+    <section id="prereqs">
+      <h2>Prerequisites</h2>
+      <p>
+        A Rust toolchain and Git. The repository pins its toolchain, so <code>rustup</code>
+        will fetch the right compiler automatically the first time you build.
+      </p>
+      <ul>
+        <li><strong>Rust 1.96 or newer</strong> — install with <a href="https://rustup.rs">rustup</a>.</li>
+        <li><strong>Git</strong>, and a machine with a few gigabytes free for the build.</li>
+        <li>Linux or macOS. Windows is untested.</li>
+      </ul>
+      <p>Optional, for talking to the database once it's up:</p>
+      <ul>
+        <li>The <strong>AWS CLI</strong> or any AWS SDK, for the DynamoDB endpoint.</li>
+        <li>A client that can send raw CQL <code>QUERY</code> frames, if you want to poke at the
+          CQL endpoint — <code>cqlsh</code> and full drivers do not connect yet (<a href="#connect">why</a>).</li>
+      </ul>
+    </section>
+
+    <section id="build">
+      <h2>Build from source</h2>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">build</span></div>
+<pre><span class="p">$</span> <span class="k">git clone https://github.com/animus-db/animus-db.git</span>
+<span class="p">$</span> <span class="k">cd animus-db</span>
+<span class="p">$</span> <span class="k">cargo build --release</span></pre>
+      </div>
+      <p>That produces two binaries in <code>target/release</code>:</p>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th style="width:170px">Binary</th><th>What it is</th></tr></thead>
+          <tbody>
+            <tr><td><code>animusd</code></td><td>The node server. One process per node; it hosts the control plane, the data plane and every wire endpoint.</td></tr>
+            <tr><td><code>animus</code></td><td>The operator and client CLI — cluster status, simple get/put, and the whole <code>admin</code> subcommand tree.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted">
+        A debug build (<code>cargo build</code>) is fine for experimenting and compiles faster,
+        but is markedly slower at runtime. Use <code>--release</code> for anything you intend to measure.
+      </p>
+    </section>
+
+    <section id="run">
+      <h2>Run a cluster</h2>
+      <p>
+        The fastest way to see AnimusDB work is a whole cluster in one process. Nodes bind
+        OS-assigned ports and print them at startup.
+      </p>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">three nodes, one process</span></div>
+<pre><span class="p">$</span> <span class="k">./target/release/animusd --cluster 3</span>
+<span class="o">animusd: started 3-node cluster (CP)</span>
+<span class="o">  node 0: client 127.0.0.1:52104 — dynamo http 127.0.0.1:52105 — cql 127.0.0.1:52106</span>
+<span class="o">          — admin http://127.0.0.1:52107 — console http://127.0.0.1:52109</span>
+<span class="o">  node 1: client 127.0.0.1:52111 — dynamo http 127.0.0.1:52112 — cql 127.0.0.1:52113 …</span>
+<span class="o">  node 2: client 127.0.0.1:52118 — dynamo http 127.0.0.1:52119 — cql 127.0.0.1:52120 …</span>
+<span class="o">animusd: ready — Ctrl-C to stop</span></pre>
+      </div>
+      <div class="callout">
+        <span class="label">Keep the data, or don't</span>
+        <p>
+          State is written under a temporary directory by default. Pass <code>--dir ./cluster-data</code>
+          to keep it somewhere you choose, or <code>--ephemeral</code> to keep everything in memory
+          and discard it on exit.
+        </p>
+      </div>
+      <p>
+        Add <code>--auto-split-bytes 67108864</code> to watch tablets split as they grow, which is
+        the interesting behaviour to poke at on a laptop.
+      </p>
+    </section>
+
+    <section id="connect">
+      <h2>Connect to it</h2>
+      <p>
+        Any node accepts any request and routes it internally, so you can talk to whichever
+        one you like. The examples below use node 0's printed <strong>dynamo</strong> port.
+      </p>
+
+      <h3>The AWS CLI</h3>
+      <p>
+        There is no authentication yet, but the AWS CLI insists on credentials being present —
+        any placeholder values work.
+      </p>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">aws cli</span></div>
+<pre><span class="p">$</span> <span class="k">export AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local AWS_REGION=us-east-1</span>
+<span class="p">$</span> <span class="k">export ANIMUS=http://127.0.0.1:52105</span>
+
+<span class="p">$</span> <span class="k">aws dynamodb create-table --endpoint-url $ANIMUS</span> \
+    --table-name <span class="s">orders</span> \
+    --attribute-definitions <span class="s">AttributeName=id,AttributeType=S</span> \
+    --key-schema <span class="s">AttributeName=id,KeyType=HASH</span> \
+    --billing-mode <span class="s">PAY_PER_REQUEST</span>
+
+<span class="p">$</span> <span class="k">aws dynamodb put-item --endpoint-url $ANIMUS --table-name orders</span> \
+    --item <span class="s">'{"id": {"S": "a-1"}, "total": {"N": "42"}}'</span>
+
+<span class="p">$</span> <span class="k">aws dynamodb get-item --endpoint-url $ANIMUS --table-name orders</span> \
+    --key <span class="s">'{"id": {"S": "a-1"}}'</span>
+<span class="o">{ "Item": { "id": { "S": "a-1" }, "total": { "N": "42" } } }</span></pre>
+      </div>
+
+      <h3>Python (boto3)</h3>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">boto3</span></div>
+<pre><span class="k">import</span> boto3
+
+db = boto3.resource(
+    <span class="s">"dynamodb"</span>,
+    endpoint_url=<span class="s">"http://127.0.0.1:52105"</span>,
+    region_name=<span class="s">"us-east-1"</span>,
+    aws_access_key_id=<span class="s">"local"</span>,
+    aws_secret_access_key=<span class="s">"local"</span>,
+)
+
+table = db.Table(<span class="s">"orders"</span>)
+table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, <span class="s">"total"</span>: 99})
+<span class="k">print</span>(table.get_item(Key={<span class="s">"id"</span>: <span class="s">"a-2"</span>})[<span class="s">"Item"</span>])</pre>
+      </div>
+
+      <h3>JavaScript (AWS SDK v3)</h3>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">@aws-sdk/client-dynamodb</span></div>
+<pre><span class="k">import</span> { DynamoDBClient, PutItemCommand } <span class="k">from</span> <span class="s">"@aws-sdk/client-dynamodb"</span>;
+
+<span class="k">const</span> client = <span class="k">new</span> DynamoDBClient({
+  endpoint: <span class="s">"http://127.0.0.1:52105"</span>,
+  region: <span class="s">"us-east-1"</span>,
+  credentials: { accessKeyId: <span class="s">"local"</span>, secretAccessKey: <span class="s">"local"</span> },
+});
+
+<span class="k">await</span> client.send(<span class="k">new</span> PutItemCommand({
+  TableName: <span class="s">"orders"</span>,
+  Item: { id: { S: <span class="s">"a-3"</span> }, total: { N: <span class="s">"7"</span> } },
+}));</pre>
+      </div>
+
+      <h3>CQL</h3>
+      <p>
+        The CQL endpoint speaks native protocol v4 — <code>STARTUP</code>, <code>OPTIONS</code>,
+        <code>QUERY</code>, <code>PREPARE</code> and <code>EXECUTE</code> — over a recognizer subset of
+        the CQL grammar:
+      </p>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">statements the CQL edge accepts</span></div>
+<pre><span class="k">CREATE KEYSPACE</span> shop;
+<span class="k">CREATE TABLE</span> shop.orders (id text, line int, total int, <span class="k">PRIMARY KEY</span> (id, line));
+<span class="k">INSERT INTO</span> shop.orders (id, line, total) <span class="k">VALUES</span> (<span class="s">'b-1'</span>, 1, 12);
+<span class="k">SELECT</span> * <span class="k">FROM</span> shop.orders <span class="k">WHERE</span> id = <span class="s">'b-1'</span>;
+<span class="k">UPDATE</span> shop.orders <span class="k">SET</span> total = 15 <span class="k">WHERE</span> id = <span class="s">'b-1'</span> <span class="k">AND</span> line = 1;
+<span class="k">DELETE FROM</span> shop.orders <span class="k">WHERE</span> id = <span class="s">'b-1'</span> <span class="k">AND</span> line = 1;
+<span class="k">BEGIN BATCH</span> … <span class="k">APPLY BATCH</span>;
+<span class="k">ALTER TABLE</span> shop.orders <span class="k">ADD</span> note text;
+<span class="k">DROP TABLE IF EXISTS</span> shop.orders;</pre>
+      </div>
+      <div class="callout warn">
+        <span class="label">cqlsh does not connect yet</span>
+        <p>
+          The cluster-metadata system tables (<code>system.local</code>, <code>system.peers</code>,
+          <code>system_schema.*</code>) are not implemented. <code>cqlsh</code> and full Cassandra
+          drivers query them while connecting, so they fail during handshake. Until those land, drive
+          the CQL edge with a client that sends <code>QUERY</code> frames directly. The DynamoDB
+          endpoint is the mature one.
+        </p>
+      </div>
+
+      <h3>The animus CLI</h3>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">animus</span></div>
+<pre><span class="c"># cluster status, against a node's client port</span>
+<span class="p">$</span> <span class="k">./target/release/animus status 127.0.0.1:52104</span>
+
+<span class="c"># raw key/value access, against a table</span>
+<span class="p">$</span> <span class="k">./target/release/animus put 127.0.0.1:52104 orders k1 hello</span>
+<span class="p">$</span> <span class="k">./target/release/animus get 127.0.0.1:52104 orders k1</span>
+
+<span class="c"># operator surface, against a node's admin port</span>
+<span class="p">$</span> <span class="k">./target/release/animus admin status 127.0.0.1:52107</span></pre>
+      </div>
+    </section>
+
+    <section id="consoles">
+      <h2>Open the consoles</h2>
+      <p>Two web UIs are compiled into <code>animusd</code>; neither needs a build step or an internet connection.</p>
+      <div class="cards">
+        <div class="card">
+          <h3>Operator dashboard</h3>
+          <p>On the <strong>admin</strong> port. Cluster and node health, the tablet map, Raft internals, storage and WAL introspection, and gated operator actions like split, flush, drain and decommission.</p>
+        </div>
+        <div class="card">
+          <h3>Data console</h3>
+          <p>On the <strong>console</strong> port. A DynamoDB-shaped app for application developers: browse tables, inspect and edit items, review a table's configuration and its stream.</p>
+        </div>
+      </div>
+      <p class="muted" style="margin-top:18px">Both are printed in the startup banner. Neither has authentication — see <a href="#trouble">the security note</a>.</p>
+    </section>
+
+    <section id="multinode">
+      <h2>Run a real multi-node cluster</h2>
+      <p>
+        For separate machines, generate a config once, copy it to every node, and start one
+        process per node with a distinct <code>--node</code> index.
+      </p>
+      <ol class="steps">
+        <li>
+          <h3>Generate a cluster config</h3>
+          <div class="code">
+            <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">on any machine</span></div>
+<pre><span class="p">$</span> <span class="k">animusd gen-config --nodes 3 --host 10.0.0.1 &gt; cluster.json</span></pre>
+          </div>
+          <p>
+            The generated config lists every node's identity and its seven listener addresses.
+            Edit the hosts so each entry names the right machine, then copy the same file to
+            all of them. Ports start at <code>--base-port</code> (7100 by default).
+          </p>
+        </li>
+        <li>
+          <h3>Start each node</h3>
+          <div class="code">
+            <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">one per machine</span></div>
+<pre><span class="c"># on the first machine</span>
+<span class="p">$</span> <span class="k">animusd --config cluster.json --node 0 --dir /var/lib/animusdb</span>
+
+<span class="c"># on the second, and so on</span>
+<span class="p">$</span> <span class="k">animusd --config cluster.json --node 1 --dir /var/lib/animusdb</span>
+<span class="p">$</span> <span class="k">animusd --config cluster.json --node 2 --dir /var/lib/animusdb</span></pre>
+          </div>
+        </li>
+        <li>
+          <h3>Check it came up</h3>
+          <div class="code">
+            <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">verify</span></div>
+<pre><span class="p">$</span> <span class="k">animus admin status 10.0.0.1:7104</span>
+<span class="p">$</span> <span class="k">animus admin health 10.0.0.1:7104</span></pre>
+          </div>
+          <p>Or open the dashboard at <code>http://10.0.0.1:7104</code>.</p>
+        </li>
+      </ol>
+    </section>
+
+    <section id="grow">
+      <h2>Add and remove nodes</h2>
+      <p>
+        A new node does not need the cluster config. Give it the <strong>intra-cluster</strong>
+        address of any running node and it registers itself, learns the topology, and starts
+        receiving tablet replicas.
+      </p>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">grow</span></div>
+<pre><span class="c"># on the new machine — 7105 is node 0's intra port</span>
+<span class="p">$</span> <span class="k">animusd join --seed 10.0.0.1:7105 --base-port 7100 --dir /var/lib/animusdb</span></pre>
+      </div>
+      <p>Removing one is a drain followed by a decommission, so replicas move off before the node goes away:</p>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">shrink</span></div>
+<pre><span class="p">$</span> <span class="k">animus admin drain 10.0.0.1:7104 n3</span>
+<span class="p">$</span> <span class="k">animus admin drain-status 10.0.0.1:7104 n3</span>
+<span class="p">$</span> <span class="k">animus admin decommission 10.0.0.1:7104 n3</span></pre>
+      </div>
+    </section>
+
+    <section id="split">
+      <h2>Split control and data</h2>
+      <p>
+        Larger clusters usually want a small, stable control quorum that is not competing with
+        storage for resources. Generate a split config and run each role explicitly.
+      </p>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">split deployment</span></div>
+<pre><span class="p">$</span> <span class="k">animusd gen-config --control-nodes 3 --data-nodes 5 --host 10.0.0.1 &gt; cluster.json</span>
+
+<span class="c"># control-only: metadata quorum, no storage engine</span>
+<span class="p">$</span> <span class="k">animusd control --config cluster.json --node 0</span>
+
+<span class="c"># data-only: hosts tablets, mirrors metadata from the control plane</span>
+<span class="p">$</span> <span class="k">animusd data --config cluster.json --node 3</span>
+
+<span class="c"># or let a data node join by seed instead of by config</span>
+<span class="p">$</span> <span class="k">animusd data --seed 10.0.0.1:7105 --base-port 7200</span></pre>
+      </div>
+      <p>
+        To try the shape without eight machines, <code>animusd --cluster-control 3 --cluster-data 5</code>
+        runs the whole split deployment in one process.
+      </p>
+    </section>
+
+    <section id="ports">
+      <h2>Ports</h2>
+      <p>
+        Each node owns a block of seven consecutive ports, starting at its base port
+        (<code>7100</code> for node 0 in a generated config, then <code>7107</code>, <code>7114</code>, and so on).
+      </p>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th style="width:110px">Offset</th><th style="width:130px">Node 0</th><th style="width:130px">Listener</th><th>Purpose</th><th style="width:120px">Exposure</th></tr></thead>
+          <tbody>
+            <tr><td>+0</td><td><code>7100</code></td><td>internal</td><td>Raft traffic between nodes</td><td><span class="pill no">Cluster-internal</span></td></tr>
+            <tr><td>+1</td><td><code>7101</code></td><td>client</td><td>The native length-prefixed protocol the <code>animus</code> CLI speaks</td><td><span class="pill part">Trusted</span></td></tr>
+            <tr><td>+2</td><td><code>7102</code></td><td>dynamo</td><td>DynamoDB JSON over HTTP, plus <code>GET /metrics</code></td><td><span class="pill part">Trusted</span></td></tr>
+            <tr><td>+3</td><td><code>7103</code></td><td>cql</td><td>CQL v4</td><td><span class="pill part">Trusted</span></td></tr>
+            <tr><td>+4</td><td><code>7104</code></td><td>admin</td><td>Admin JSON API and the operator dashboard</td><td><span class="pill no">Cluster-internal</span></td></tr>
+            <tr><td>+5</td><td><code>7105</code></td><td>intra</td><td>Node-to-node request forwarding and metadata mirroring; the address to <code>--seed</code></td><td><span class="pill no">Cluster-internal</span></td></tr>
+            <tr><td>+6</td><td><code>7106</code></td><td>console</td><td>The data console (not bound on control-only nodes)</td><td><span class="pill no">Cluster-internal</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:14px">
+        Nothing authenticates callers yet, so "trusted" means a network you control. Keep the
+        internal, intra, admin and console ports off any externally reachable address.
+      </p>
+    </section>
+
+    <section id="flags">
+      <h2>Common flags</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th style="width:250px">Flag</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td><code>--config FILE --node I</code></td><td>Run node <code>I</code> of a generated cluster config. The normal production invocation.</td></tr>
+            <tr><td><code>--cluster N</code></td><td>Run an <code>N</code>-node cluster in a single process. Development convenience.</td></tr>
+            <tr><td><code>--dir DIR</code></td><td>Where this node keeps its write-ahead logs, SSTables and snapshots.</td></tr>
+            <tr><td><code>--ephemeral</code></td><td>Keep all state in memory; nothing survives a restart.</td></tr>
+            <tr><td><code>--auto-split-bytes B</code></td><td>Split a tablet once it exceeds <code>B</code> bytes.</td></tr>
+            <tr><td><code>--auto-split K</code></td><td>Split a tablet once it exceeds <code>K</code> keys.</td></tr>
+            <tr><td><code>--quiesce-after SECS</code></td><td>How long a tablet group must be idle before it stops ticking. On by default.</td></tr>
+            <tr><td><code>--stream-seal-bytes B</code><br><code>--stream-seal-age SECS</code><br><code>--stream-retention SECS</code></td><td>When change-log segments are sealed into stream shards, and how long they are kept.</td></tr>
+            <tr><td><code>--segment-store dir:PATH</code></td><td>Store sealed stream segments on a filesystem path instead of replicating them across the cluster.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:14px">Run <code>animusd</code> with no arguments for the full usage summary, and <code>animus</code> for the CLI's.</p>
+    </section>
+
+    <section id="data">
+      <h2>Data directory</h2>
+      <p>
+        Each node writes everything it owns under <code>--dir</code>: a write-ahead log and SSTables
+        per hosted tablet, control-plane state, and snapshots. Nodes never share a directory —
+        give each process its own, on storage you would be happy to lose a machine's worth of.
+      </p>
+      <div class="callout warn">
+        <span class="label">No migrations yet</span>
+        <p>
+          On-disk and wire formats change between revisions without compatibility shims. When you
+          update AnimusDB, recreate the cluster: stop the nodes, delete the data directories, and
+          start fresh.
+        </p>
+      </div>
+    </section>
+
+    <section id="trouble">
+      <h2>Troubleshooting</h2>
+      <h3>The build fails on an old toolchain</h3>
+      <p>The workspace pins Rust 1.96. Run <code>rustup update</code> and build from the repository root so the pin applies.</p>
+
+      <h3>A write returns "not leader"</h3>
+      <p>
+        Nodes forward to the tablet's leader and retry through an election, so this should be
+        transient. If it persists, check <code>animus admin health</code> — a tablet with no reachable
+        quorum cannot accept writes, by design.
+      </p>
+
+      <h3>Address already in use</h3>
+      <p>
+        Every node needs its own block of seven ports. In a generated config the blocks are
+        contiguous, so two nodes on one host must be given different base ports.
+      </p>
+
+      <h3>The AWS SDK rejects the endpoint</h3>
+      <p>
+        Set a region and placeholder credentials — the SDKs require them even though AnimusDB
+        ignores them today — and use <code>http://</code>, not <code>https://</code>. There is no TLS yet.
+      </p>
+
+      <h3>Something is wrong and it looks like a bug</h3>
+      <p>
+        Please <a href="https://github.com/animus-db/animus-db/issues">open an issue</a>. Include the
+        <code>animusd</code> invocation and, if a test failed, the seed it printed — that alone is
+        enough to replay the exact failure.
+      </p>
+    </section>
+
+  </div>
+</div>
+
+<div class="cta wrap">
+  <h2>Next: how it actually works.</h2>
+  <p>Tablets, the two planes, the consistency model, and the full API surface.</p>
+  <div class="btn-row">
+    <a class="btn primary" href="docs.html">Read the docs</a>
+    <a class="btn" href="https://github.com/animus-db/animus-db">GitHub</a>
+  </div>
+</div>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="about">
+        <a class="brand" href="index.html">
+          <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true">
+            <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+              <path d="M16 5.5a10.5 10.5 0 0 1 9.09 5.25"/><path d="M25.09 21.25A10.5 10.5 0 0 1 16 26.5"/><path d="M6.91 21.25A10.5 10.5 0 0 1 6.91 10.75"/>
+            </g><circle cx="16" cy="16" r="3.1" fill="currentColor"/>
+          </svg>
+          AnimusDB
+        </a>
+        <p class="muted">A masterless, strongly consistent NoSQL database written in Rust, verified by deterministic simulation testing.</p>
+      </div>
+      <div>
+        <h5>Product</h5>
+        <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="docs.html">Documentation</a></li>
+          <li><a href="install.html">Install</a></li>
+          <li><a href="docs.html#api">API compatibility</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Project</h5>
+        <ul>
+          <li><a href="https://github.com/animus-db/animus-db">GitHub</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/issues">Issues</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contributing</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">Design records</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Legal</h5>
+        <ul>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/LICENSE">AGPL-3.0 licence</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>© 2026 The AnimusDB authors.</span>
+      <span class="spacer"></span>
+      <span class="mono">pre-alpha · not for production data</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

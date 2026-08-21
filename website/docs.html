@@ -1,0 +1,645 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AnimusDB documentation</title>
+<meta name="description" content="How AnimusDB works: tablets and partitioning, the two planes, the consistency model, the DynamoDB and CQL API surface, operations, and deterministic simulation testing.">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="canonical" href="https://animusdb.io/docs.html">
+<meta property="og:title" content="AnimusDB documentation">
+<meta property="og:description" content="Tablets, the two planes, the consistency model, the API surface, operations, and the simulator.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<div class="banner">
+  <span class="dot"></span>
+  <b>Pre-alpha.</b> AnimusDB is under active development and is not ready for production data.
+  <a href="https://github.com/animus-db/animus-db">Follow along on GitHub&nbsp;→</a>
+</div>
+
+<header class="site">
+  <div class="wrap bar">
+    <a class="brand" href="index.html">
+      <svg width="24" height="24" viewBox="0 0 32 32" aria-hidden="true">
+        <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+          <path d="M16 5.5a10.5 10.5 0 0 1 9.09 5.25"/><path d="M25.09 21.25A10.5 10.5 0 0 1 16 26.5"/><path d="M6.91 21.25A10.5 10.5 0 0 1 6.91 10.75"/>
+        </g><circle cx="16" cy="16" r="3.1" fill="currentColor"/>
+      </svg>
+      AnimusDB
+    </a>
+    <button class="icon-btn nav-toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
+    </button>
+    <nav class="main">
+      <a href="index.html">Overview</a>
+      <a href="docs.html" aria-current="page">Docs</a>
+      <a href="install.html">Install</a>
+      <a href="https://github.com/animus-db/animus-db">GitHub</a>
+      <button class="icon-btn theme-btn" type="button" aria-label="Switch theme">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"/>
+        </svg>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="page-head">
+  <div class="wrap">
+    <span class="kicker">Documentation</span>
+    <h1>How AnimusDB works</h1>
+    <p>
+      The data model, the architecture behind it, what the API supports today, and how you
+      operate a cluster. If you just want it running, start with <a href="install.html">Install</a>.
+    </p>
+  </div>
+</div>
+
+<div class="wrap doc-layout">
+  <aside class="doc-nav">
+    <div class="cols">
+      <div>
+        <h4>Concepts</h4>
+        <a href="#model">Data model</a>
+        <a href="#tablets">Tablets and partitioning</a>
+        <a href="#replication">Replication</a>
+        <a href="#consistency">Consistency model</a>
+      </div>
+      <div>
+        <h4>Architecture</h4>
+        <a href="#planes">The two planes</a>
+        <a href="#storage">Storage engine</a>
+        <a href="#lifecycle">Splits and rebalancing</a>
+        <a href="#derived">Indexes, streams, TTL</a>
+      </div>
+      <div>
+        <h4>Interfaces</h4>
+        <a href="#api">API compatibility</a>
+        <a href="#transactions">Transactions</a>
+        <a href="#consoles">Consoles and admin</a>
+      </div>
+      <div>
+        <h4>Operating</h4>
+        <a href="#deployments">Deployment shapes</a>
+        <a href="#operations">Day-two operations</a>
+        <a href="#observability">Observability</a>
+      </div>
+      <div>
+        <h4>Engineering</h4>
+        <a href="#determinism">Deterministic testing</a>
+        <a href="#limits">Known limits</a>
+        <a href="#further">Going deeper</a>
+      </div>
+    </div>
+  </aside>
+
+  <div class="doc-body">
+
+    <section id="model">
+      <h2>Data model</h2>
+      <p>
+        AnimusDB is a wide-column key/value store in the Dynamo lineage: a partitioned, sorted
+        map of maps. A <strong>table</strong> holds <strong>items</strong>; each item is
+        addressed by a <strong>partition key</strong> and, optionally, a <strong>sort key</strong>.
+      </p>
+      <ul>
+        <li>The <strong>partition key</strong> decides where an item lives. It is hashed to a
+          token on the table's ring.</li>
+        <li>The <strong>sort key</strong> orders items within a partition, which is what makes
+          range queries inside one partition cheap.</li>
+        <li>Everything else is <strong>schemaless attributes</strong> on the DynamoDB side —
+          strings, numbers, binaries, booleans, nulls, lists, maps and sets — or typed columns
+          on the CQL side.</li>
+      </ul>
+      <p>
+        Tables are independent. Each one has its own ring, its own tablets, and its own
+        replication and placement decisions.
+      </p>
+    </section>
+
+    <section id="tablets">
+      <h2>Tablets and partitioning</h2>
+      <p>
+        A <strong>tablet</strong> is a contiguous range of a table's hash ring, and it is the unit
+        of everything: replication, placement, migration and splitting. Every key is stored
+        under a Murmur3 token of its partition key, so a tablet owns a token range rather than a
+        range of your raw keys.
+      </p>
+      <p>
+        That has a practical consequence worth knowing: <strong>scans are ordered by token, not
+        by partition-key value</strong>. Sort-key order is preserved inside a partition, which is
+        where ordering actually matters for queries.
+      </p>
+      <div class="callout">
+        <span class="label">Why hash the key</span>
+        <p>
+          Range-partitioning raw keys concentrates sequential writes — timestamps, monotonic ids —
+          onto one tablet and one leader. Hashing spreads them across the ring, so a write-heavy
+          workload uses the whole cluster instead of one machine.
+        </p>
+      </div>
+      <p>
+        A table starts as a single tablet and splits as it grows. Tablet identifiers are never
+        reused, and a tablet's lineage across splits is recorded so stream consumers can follow it.
+      </p>
+    </section>
+
+    <section id="replication">
+      <h2>Replication</h2>
+      <p>
+        Each tablet is replicated to a set of nodes — typically three — and those replicas form
+        a Raft group. One is the leader; it serializes every write for that tablet and answers
+        reads. A write is acknowledged once a majority of the group has it durably on disk.
+      </p>
+      <p>
+        Which nodes hold which replicas is a <strong>placement</strong> decision made by the
+        control plane. The placement engine honours the replication factor, spreads replicas
+        across failure domains, and respects residency labels — so you can require that a
+        group's data never leaves a given region or jurisdiction.
+      </p>
+      <p>
+        When a node fails, the control plane notices through heartbeats, re-plans the affected
+        tablets onto healthy nodes, and those nodes catch up by log replication or snapshot. No
+        operator action is needed for the repair itself.
+      </p>
+    </section>
+
+    <section id="consistency">
+      <h2>Consistency model</h2>
+      <p>
+        Single-tablet reads and writes are <strong>linearizable</strong>. There is one leader per
+        tablet, writes go through its Raft log, and reads are served with a read-index barrier
+        confirming the leader is still the leader before it answers. You do not get a stale read
+        because you happened to hit a lagging replica, and there is no quorum knob to get wrong.
+      </p>
+      <p>
+        Multi-tablet transactions are <strong>serializable</strong>: two-phase commit across the
+        participating tablets' Raft groups, with hybrid-logical-clock commit timestamps and MVCC
+        snapshot reads.
+      </p>
+      <p>
+        A few things are deliberately <em>not</em> immediately consistent, matching DynamoDB's own
+        semantics:
+      </p>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th style="width:220px">Surface</th><th>Guarantee</th></tr></thead>
+          <tbody>
+            <tr><td>Item reads and writes</td><td>Linearizable</td></tr>
+            <tr><td>Query and Scan within a tablet</td><td>Linearizable</td></tr>
+            <tr><td><code>TransactWriteItems</code> / <code>TransactGetItems</code></td><td>Serializable, atomic across partitions</td></tr>
+            <tr><td>Local secondary indexes</td><td>Updated atomically with the base item</td></tr>
+            <tr><td>Global secondary indexes</td><td>Eventually consistent — maintained asynchronously from the change log</td></tr>
+            <tr><td>Streams</td><td>Eventually consistent, ordered per item</td></tr>
+            <tr><td>TTL expiry</td><td>Best-effort timing; an expired item stays readable until the reaper deletes it, as in DynamoDB</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout">
+        <span class="label">Availability trade-off</span>
+        <p>
+          This is a CP system. A tablet whose replicas cannot form a majority stops accepting
+          reads and writes for its key range rather than serving something that might be wrong.
+          The rest of the cluster keeps working.
+        </p>
+      </div>
+    </section>
+
+    <section id="planes">
+      <h2>The two planes</h2>
+      <p>
+        AnimusDB separates cluster metadata from your data, and runs them as different systems
+        with different scaling properties.
+      </p>
+      <h3>The control plane</h3>
+      <p>
+        One small Raft group owns the things every node must agree on: which nodes are members
+        and where to reach them, the tablet map and its placement, and the table schema catalog.
+        It is deliberately small and low-traffic. Its state is applied into a per-node system
+        keyspace, so a node can restart and recover its view of the cluster from disk.
+      </p>
+      <p>
+        Nodes watch for metadata changes rather than polling. A single per-node reconciler
+        reacts to the replicated state — hosting new tablets, reconfiguring groups, releasing
+        tablets that moved away, reclaiming storage for dropped tables.
+      </p>
+      <h3>The data plane</h3>
+      <p>
+        Your data lives in one Raft group per tablet, each with its own storage engine, its own
+        leader and its own election timers. Groups commit independently, so throughput scales
+        with the number of tablets rather than funnelling through a single log.
+      </p>
+      <p>
+        An idle group <strong>quiesces</strong>: after a few seconds with no local activity it
+        stops ticking entirely — no timers, no heartbeats, no apply polling — until a write, a
+        peer message, or the reconciler wakes it. A cluster with many cold tablets costs
+        proportionally little.
+      </p>
+      <h3>Any node answers</h3>
+      <p>
+        There is no routing tier and no client-side topology to configure. Every node knows the
+        tablet map, and forwards a request it does not own to the node that does, retrying
+        through a leader election if one is in progress.
+      </p>
+    </section>
+
+    <section id="storage">
+      <h2>Storage engine</h2>
+      <p>
+        Each hosted tablet gets its own log-structured merge engine: a write-ahead log for
+        durability, memtables flushed into sorted string tables, and levelled compaction in the
+        background. Because the engine is per-tablet, a tablet's identity is its file namespace —
+        dropping it is deleting its files, and moving it does not disturb its neighbours.
+      </p>
+      <p>
+        Every byte of that engine's I/O goes through the same seam the simulator controls, which
+        is why crash recovery is tested by injecting faults rather than by hoping.
+      </p>
+    </section>
+
+    <section id="lifecycle">
+      <h2>Splits and rebalancing</h2>
+      <h3>Splitting</h3>
+      <p>
+        When a tablet passes its byte threshold, the cluster splits it in the background. Two
+        child tablets are created at placement-chosen homes and populated by copying from the
+        parent while it keeps serving; the driver then tails the parent's ongoing changes until
+        the children have caught up. A brief freeze stops writes, the children go live
+        atomically, and the parent is retired and its storage reclaimed.
+      </p>
+      <p>
+        The write pause at cutover is sub-second and masked by client retries. Tablets are
+        <strong>split-only</strong> — there is no merge operation, matching DynamoDB's own
+        behaviour — so a table that shrinks keeps its tablet count.
+      </p>
+      <h3>Rebalancing</h3>
+      <p>
+        Replica counts across nodes converge on their own: the control-plane leader moves one
+        replica at a time until the difference between the busiest and quietest node is at most
+        one tablet. Adding a node is therefore all it takes to get data onto it.
+      </p>
+    </section>
+
+    <section id="derived">
+      <h2>Indexes, streams and TTL</h2>
+      <p>
+        These three features are built on one mechanism: every tablet has a durable
+        <strong>change log</strong>, and derived state is a consumer of it that tracks its own
+        offset.
+      </p>
+      <h3>Secondary indexes</h3>
+      <p>
+        A <strong>local secondary index</strong> lives in the same tablet as its base item and is
+        written atomically with it. A <strong>global secondary index</strong> is a hidden table
+        maintained asynchronously by draining the base table's change log — which is what makes
+        it eventually consistent, exactly as in DynamoDB.
+      </p>
+      <p>
+        <code>UpdateTable</code> adds or drops a GSI on a table that already holds data. The new
+        index moves through a <code>Creating</code> → <code>Active</code> lifecycle while a backfill
+        walks the existing rows, and a dropped one goes through <code>Deleting</code> so readers
+        never see a half-built index.
+      </p>
+      <h3>Streams</h3>
+      <p>
+        Change data capture is served through the DynamoDB Streams API:
+        <code>ListStreams</code>, <code>DescribeStream</code>, <code>GetShardIterator</code> and
+        <code>GetRecords</code>. A shard is a sealed epoch of a tablet's own change log, so records
+        are ordered per item and sequence numbers stay stable. When a tablet splits, its shards'
+        lineage is recorded so a consumer can follow the children.
+      </p>
+      <h3>Time to live</h3>
+      <p>
+        A table can declare one attribute holding an absolute expiry time in epoch seconds. A
+        leader-gated reaper deletes expired items through the normal write path, so index,
+        stream and change-log maintenance all happen for free. Reads are AWS-faithful: an
+        expired item remains visible until it is actually reaped.
+      </p>
+    </section>
+
+    <section id="api">
+      <h2>API compatibility</h2>
+      <p>
+        The DynamoDB endpoint accepts DynamoDB JSON over HTTP with the usual
+        <code>X-Amz-Target</code> header, so AWS SDKs work unmodified. Requests are not
+        authenticated today; credentials are accepted and ignored.
+      </p>
+      <h3>DynamoDB operations</h3>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th style="width:280px">Operation</th><th style="width:120px">Status</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td><code>CreateTable</code></td><td><span class="pill yes">Yes</span></td><td>Partition and sort keys, GSIs and LSIs at creation</td></tr>
+            <tr><td><code>DescribeTable</code></td><td><span class="pill yes">Yes</span></td><td>Includes index status and stream configuration</td></tr>
+            <tr><td><code>UpdateTable</code></td><td><span class="pill yes">Yes</span></td><td>Add or drop a GSI on a populated table, with online backfill</td></tr>
+            <tr><td><code>PutItem</code> · <code>GetItem</code> · <code>DeleteItem</code></td><td><span class="pill yes">Yes</span></td><td>Condition expressions, projections, all attribute types</td></tr>
+            <tr><td><code>UpdateItem</code></td><td><span class="pill yes">Yes</span></td><td>Update expressions with conditions</td></tr>
+            <tr><td><code>Query</code></td><td><span class="pill yes">Yes</span></td><td>Key conditions, filters, index queries, pagination</td></tr>
+            <tr><td><code>Scan</code></td><td><span class="pill yes">Yes</span></td><td>Filters and pagination; ordered by token</td></tr>
+            <tr><td><code>BatchWriteItem</code></td><td><span class="pill yes">Yes</span></td><td>—</td></tr>
+            <tr><td><code>TransactWriteItems</code> · <code>TransactGetItems</code></td><td><span class="pill yes">Yes</span></td><td>Put, Update, Delete and ConditionCheck actions</td></tr>
+            <tr><td><code>UpdateTimeToLive</code> · <code>DescribeTimeToLive</code></td><td><span class="pill yes">Yes</span></td><td>—</td></tr>
+            <tr><td>Streams: <code>ListStreams</code>, <code>DescribeStream</code>, <code>GetShardIterator</code>, <code>GetRecords</code></td><td><span class="pill yes">Yes</span></td><td>Served on the same endpoint under the streams target prefix</td></tr>
+            <tr><td><code>BatchGetItem</code></td><td><span class="pill no">No</span></td><td>Not implemented yet</td></tr>
+            <tr><td><code>DeleteTable</code> · <code>ListTables</code></td><td><span class="pill no">No</span></td><td>Available through the admin API and the consoles instead</td></tr>
+            <tr><td>Backups, global tables, on-demand capacity accounting</td><td><span class="pill no">No</span></td><td>Out of scope for now</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>CQL</h3>
+      <p>
+        The CQL endpoint implements native protocol v4 framing and handshake —
+        <code>STARTUP</code>, <code>OPTIONS</code>, <code>QUERY</code>, <code>PREPARE</code>,
+        <code>EXECUTE</code> — over a recognizer for a subset of the grammar:
+        <code>USE</code>, <code>CREATE KEYSPACE</code>, <code>CREATE TABLE</code> with compound
+        primary keys, <code>INSERT</code>, <code>SELECT</code>, <code>UPDATE</code>,
+        <code>DELETE</code>, <code>BEGIN … APPLY BATCH</code>,
+        <code>ALTER TABLE … ADD</code> and <code>DROP TABLE</code>. Supported column types are
+        <code>text</code>, <code>int</code>, <code>bigint</code>, <code>boolean</code>,
+        <code>blob</code> and <code>uuid</code>.
+      </p>
+      <div class="callout warn">
+        <span class="label">Driver support</span>
+        <p>
+          The metadata system tables (<code>system.local</code>, <code>system.peers</code>,
+          <code>system_schema.*</code>) are not implemented, and <code>cqlsh</code> and full
+          Cassandra drivers query them during connection setup — so they cannot complete a
+          handshake yet. The CQL edge is usable by clients that issue <code>QUERY</code> frames
+          directly. The DynamoDB endpoint is the mature interface today.
+        </p>
+      </div>
+    </section>
+
+    <section id="transactions">
+      <h2>Transactions</h2>
+      <p>
+        A transaction that touches a single partition commits through that tablet's Raft group
+        directly. One that spans partitions runs two-phase commit across the participating
+        groups: the coordinator stages intents, each participant durably records its decision in
+        its own log, and a commit timestamp from a hybrid logical clock orders the result against
+        everything else.
+      </p>
+      <p>Practical consequences:</p>
+      <ul>
+        <li><strong>Reads see a snapshot.</strong> MVCC versions are keyed by commit timestamp, so
+          a transactional read observes one consistent instant.</li>
+        <li><strong>Conditions are evaluated at commit.</strong> A <code>ConditionCheck</code> or a
+          write action's own condition expression is checked against the committed state, giving
+          real cross-node optimistic concurrency control.</li>
+        <li><strong>A crashed coordinator does not strand data.</strong> A background resolver
+          finishes or aborts in-doubt transactions it finds.</li>
+        <li><strong>Clock skew is handled, not assumed away.</strong> Reads inside an uncertainty
+          interval restart rather than returning a value that might be misordered.</li>
+      </ul>
+    </section>
+
+    <section id="consoles">
+      <h2>Consoles and the admin API</h2>
+      <p>Two web interfaces are compiled into the node binary, plus a JSON API underneath them.</p>
+      <div class="cards">
+        <div class="card">
+          <h3>Operator dashboard</h3>
+          <p>On the admin port. Cluster and node health, the tablet map, Raft state, LSM and WAL introspection, transactions in flight, and gated actions: split, flush, compact, reconfigure, drain, decommission.</p>
+        </div>
+        <div class="card">
+          <h3>Data console</h3>
+          <p>On the console port. A DynamoDB-shaped app for developers: create and browse tables, inspect and edit items, review a table's configuration, and watch its stream.</p>
+        </div>
+      </div>
+      <h3>The admin API</h3>
+      <p>
+        Everything the dashboard shows is plain HTTP JSON, and the <code>animus admin</code>
+        subcommands are a thin client over it — usable directly from scripts:
+      </p>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">animus admin</span></div>
+<pre><span class="c"># observe</span>
+<span class="p">$</span> <span class="k">animus admin status|config|health|raft|raftkv|metrics &lt;admin-addr&gt;</span>
+<span class="p">$</span> <span class="k">animus admin lsm|wal &lt;admin-addr&gt; [tablet]</span>
+<span class="p">$</span> <span class="k">animus admin key &lt;admin-addr&gt; &lt;key&gt; [tablet]</span>
+
+<span class="c"># act</span>
+<span class="p">$</span> <span class="k">animus admin split &lt;admin-addr&gt; &lt;tablet&gt; &lt;split-key&gt;</span>
+<span class="p">$</span> <span class="k">animus admin flush|compact &lt;admin-addr&gt; &lt;tablet&gt;</span>
+<span class="p">$</span> <span class="k">animus admin reconfigure &lt;admin-addr&gt; &lt;tablet&gt; &lt;voter,voter,...&gt;</span>
+<span class="p">$</span> <span class="k">animus admin drain|drain-status|remove|decommission &lt;admin-addr&gt; &lt;node-id&gt;</span>
+
+<span class="c"># control-plane membership</span>
+<span class="p">$</span> <span class="k">animus admin control-add|control-remove|control-grow &lt;leader-admin-addr&gt; …</span></pre>
+      </div>
+    </section>
+
+    <section id="deployments">
+      <h2>Deployment shapes</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th style="width:190px">Shape</th><th>What it is</th><th style="width:200px">Command</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Combined</strong></td><td>Every node runs both planes. The default, and the right choice for small and medium clusters.</td><td><code>animusd --config … --node I</code></td></tr>
+            <tr><td><strong>Control-only</strong></td><td>A small metadata quorum with no storage engine and no client endpoints.</td><td><code>animusd control --config … --node I</code></td></tr>
+            <tr><td><strong>Data-only</strong></td><td>Hosts tablets and serves clients; mirrors metadata from a separate control deployment.</td><td><code>animusd data --config … --node I</code></td></tr>
+            <tr><td><strong>Single process</strong></td><td>A whole cluster in one process, for development and tests.</td><td><code>animusd --cluster N</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        A single config file can mix combined nodes with control-only and data-only ones, so a
+        cluster can migrate from one shape to another incrementally.
+      </p>
+      <h3>Kubernetes</h3>
+      <p>
+        The intended production target is an operator-managed cluster. Node-to-node traffic —
+        Raft, forwarding, metadata mirroring, seed and join — has its own listeners, separate
+        from the client-facing DynamoDB and CQL edges, so only the client edges need to be
+        exposed outside the cluster. The operator itself is not written yet.
+      </p>
+    </section>
+
+    <section id="operations">
+      <h2>Day-two operations</h2>
+      <h3>Growing</h3>
+      <p>
+        A new node needs one thing: the intra-cluster address of any running node. It mints its
+        own identity, registers with the control plane, mirrors the metadata and starts taking
+        replicas as the rebalancer moves them.
+      </p>
+      <h3>Shrinking</h3>
+      <p>
+        <code>drain</code> moves a node's replicas elsewhere; <code>drain-status</code> reports
+        progress; <code>decommission</code> removes it from membership once it is empty. A node
+        that vanishes without draining is repaired by re-planning its tablets onto survivors.
+      </p>
+      <h3>Changing the control quorum</h3>
+      <p>
+        The control group's voters can be changed at runtime — added, removed or replaced — with
+        <code>control-add</code>, <code>control-remove</code> and <code>control-grow</code>, plus
+        leadership transfer. You do not have to rebuild the cluster to move the control plane.
+      </p>
+      <h3>Dropping a table</h3>
+      <p>
+        Dropping a table marks its tablets for reclamation; each node's reclaim loop stops the
+        groups and deletes their storage. The process is convergent — it finishes correctly even
+        if nodes restart partway through.
+      </p>
+    </section>
+
+    <section id="observability">
+      <h2>Observability</h2>
+      <ul>
+        <li><strong>Metrics</strong> — a line-oriented <code>name value</code> text export at
+          <code>GET /metrics</code> on the DynamoDB port. Counters and a leadership gauge, in
+          stable order.</li>
+        <li><strong>Tracing</strong> — optional OpenTelemetry export with W3C trace context
+          propagated across forwarded hops, so a request that lands on the wrong node still shows
+          as one trace.</li>
+        <li><strong>Admin JSON</strong> — health, Raft state, storage internals, in-flight
+          transactions, and the tablet map, all queryable per node.</li>
+        <li><strong>Dashboard</strong> — the same data, rendered, with no external dependencies to
+          install.</li>
+      </ul>
+    </section>
+
+    <section id="determinism">
+      <h2>Deterministic simulation testing</h2>
+      <p>
+        This is the engineering commitment the rest of the system is built around. No component
+        outside a single seam may read a clock, spawn a task, touch the network or disk, or
+        generate randomness. Everything goes through that seam, which has two implementations:
+        the real one used in production, and a simulator.
+      </p>
+      <p>The simulator runs an entire cluster on one thread with a virtual clock, and injects:</p>
+      <ul>
+        <li>network partitions, message reordering, duplication, delay and loss;</li>
+        <li>node crashes and restarts at arbitrary points, including mid-write;</li>
+        <li>disk faults and torn writes;</li>
+        <li>clock skew between nodes.</li>
+      </ul>
+      <p>
+        Every run is a pure function of its seed. A failing test prints its seed, and that seed
+        replays exactly the same history — the same interleaving, the same crash, the same
+        partition — on any machine.
+      </p>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">replay</span></div>
+<pre><span class="p">$</span> <span class="k">ANIMUS_SEED=8402173355719163220 cargo test linearizable_under_partition</span></pre>
+      </div>
+      <p>
+        Histories are checked for genuine consistency violations with Elle-style checkers rather
+        than just checked for crashes, and corpora of seeds run in CI — a wide sweep on every
+        push, a deep one nightly.
+      </p>
+      <div class="callout">
+        <span class="label">Why it matters to you</span>
+        <p>
+          Distributed-systems bugs are rare interleavings. A system that can only observe them in
+          production fixes them by guesswork. Here the interleaving is a number you can re-run —
+          which is how splits, transactions, index backfills and stream lineage were made to hold
+          up under faults before anyone ran them on real hardware.
+        </p>
+      </div>
+    </section>
+
+    <section id="limits">
+      <h2>Known limits</h2>
+      <p>Pre-alpha means real gaps. The ones most likely to matter:</p>
+      <ul>
+        <li><strong>No authentication or TLS</strong> on any port. Every endpoint assumes a
+          trusted network.</li>
+        <li><strong>No format compatibility between revisions.</strong> Upgrading means recreating
+          the cluster.</li>
+        <li><strong>No backup or restore</strong> tooling.</li>
+        <li><strong>CQL drivers cannot connect</strong> — the metadata system tables are missing.</li>
+        <li><strong>No <code>BatchGetItem</code>, <code>DeleteTable</code> or <code>ListTables</code></strong>
+          on the DynamoDB endpoint.</li>
+        <li><strong>Tablets never merge</strong>, so a table that shrinks keeps its tablet count.</li>
+        <li><strong>No Kubernetes operator</strong> yet, though the port layout is built for one.</li>
+        <li><strong>Not benchmarked at scale.</strong> No performance claims are made here for a
+          reason.</li>
+      </ul>
+    </section>
+
+    <section id="further">
+      <h2>Going deeper</h2>
+      <p>
+        Every significant design decision in AnimusDB is written down as an architecture decision
+        record — the context, the decision, and the consequences knowingly accepted. They are the
+        real documentation for how the internals work, and they are kept current with the code.
+      </p>
+      <div class="btn-row" style="margin-top:20px">
+        <a class="btn primary" href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">Architecture decision records</a>
+        <a class="btn" href="https://github.com/animus-db/animus-db">Source on GitHub</a>
+        <a class="btn" href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contributing</a>
+      </div>
+    </section>
+
+  </div>
+</div>
+
+<div class="cta wrap">
+  <h2>Try it on your laptop.</h2>
+  <p>Three nodes, one process, and an endpoint your AWS SDK already knows how to talk to.</p>
+  <div class="btn-row">
+    <a class="btn primary" href="install.html">Install AnimusDB</a>
+    <a class="btn" href="index.html">Back to overview</a>
+  </div>
+</div>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="about">
+        <a class="brand" href="index.html">
+          <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true">
+            <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+              <path d="M16 5.5a10.5 10.5 0 0 1 9.09 5.25"/><path d="M25.09 21.25A10.5 10.5 0 0 1 16 26.5"/><path d="M6.91 21.25A10.5 10.5 0 0 1 6.91 10.75"/>
+            </g><circle cx="16" cy="16" r="3.1" fill="currentColor"/>
+          </svg>
+          AnimusDB
+        </a>
+        <p class="muted">A masterless, strongly consistent NoSQL database written in Rust, verified by deterministic simulation testing.</p>
+      </div>
+      <div>
+        <h5>Product</h5>
+        <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="docs.html">Documentation</a></li>
+          <li><a href="install.html">Install</a></li>
+          <li><a href="docs.html#api">API compatibility</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Project</h5>
+        <ul>
+          <li><a href="https://github.com/animus-db/animus-db">GitHub</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/issues">Issues</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contributing</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">Design records</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Legal</h5>
+        <ul>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/LICENSE">AGPL-3.0 licence</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>© 2026 The AnimusDB authors.</span>
+      <span class="spacer"></span>
+      <span class="mono">pre-alpha · not for production data</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

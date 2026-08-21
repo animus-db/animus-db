@@ -3,6 +3,9 @@
 [![CI](https://github.com/animusdb/animusdb/actions/workflows/ci.yml/badge.svg)](https://github.com/animusdb/animusdb/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
+**[animusdb.io](https://animusdb.io)** — overview, documentation and install
+instructions. The site's source is in [`website/`](website/).
+
 > **Status: pre-alpha, foundational.** Not usable as a database yet. The work in
 > progress is the distributed core and its deterministic test harness.
 
