@@ -687,9 +687,12 @@ pub(crate) trait ConsoleBackend: Send + Sync {
 
     /// Delete `table` outright (its schema and every tablet, incl. every
     /// GSI's hidden table — the same cascade `admin.rs::action_drop_table`
-    /// drives). **Not a DynamoDB wire operation** — DynamoDB itself has no
-    /// `DeleteTable` in this adapter's supported subset, so this is the
-    /// console's own delete primitive, same as the dashboard's.
+    /// and the DynamoDB wire's own `DeleteTable` (`dynamo.rs::delete_table`)
+    /// drive). This method predates the wire operation and stays a thin
+    /// direct `ClientCtx::drop_table` call (unlike `add_gsi`/`set_stream`/
+    /// `set_ttl`, this console screen builds no DynamoDB-shaped JSON body to
+    /// route through `execute_routed` — there is nothing here for one to
+    /// carry beyond the table name).
     async fn delete_table(&self, table: &str) -> Result<(), ConsoleError>;
 
     /// Run a `Scan` over `table` (or one of its GSIs/LSIs, via

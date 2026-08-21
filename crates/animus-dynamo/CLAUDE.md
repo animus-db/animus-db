@@ -49,12 +49,24 @@ comment for its full type/method inventory.
 - `wire` — the DynamoDB JSON translation (`decode_request` →
   `Operation`, covering CreateTable/Put/Get/Delete/Query/Scan/UpdateItem/
   BatchWriteItem/TransactWriteItems/TransactGetItems/UpdateTable/
-  DescribeTable/UpdateTimeToLive/DescribeTimeToLive, plus the response
-  encoders). One gotcha: `GetItem`/`Query`/
+  DescribeTable/DeleteTable/ListTables/UpdateTimeToLive/DescribeTimeToLive,
+  plus the response encoders). One gotcha: `GetItem`/`Query`/
   `Scan` decode `ConsistentRead` **but this crate never enforces it** —
   whether `true` is legal depends on an index's replicated *kind* (GSI vs
   LSI), which lives in the control-plane catalog this crate never sees, so
   the field rides through to `animusd::dynamo::run_index_query` to reject.
+  `DeleteTable`/`ListTables` are read-only-here operations too: `DeleteTable`
+  decodes to a bare table name (the existence check, the actual drop via
+  `ClientCtx::drop_table`, and the `ResourceNotFoundException` are all
+  `animusd`'s, since this crate never sees the replicated catalog); `wire`
+  does own the **pure** `ListTables` pagination contract though
+  (`paginate_table_names` — default/cap-100 `Limit`,
+  `ExclusiveStartTableName` positioning via a sorted-slice binary search, and
+  `LastEvaluatedTableName` reported only when truncated), so `animusd`'s
+  `list_tables` only has to build the already-filtered, already-sorted
+  candidate name list (excluding a materialized GSI's hidden
+  `<base>$<index>` table, `index::is_index_table_name`) and hand it to this
+  crate's pagination + response encoder.
 - `streams_wire` (ADR 0042 §3/§5/§6/§7) — the `DynamoDBStreams_20120810`
   service's own pure wire layer. `parse_shard_id`/`parse_stream_arn` are the
   inverses of `animus_cp_data::segment::shard_id`/`wire::stream_arn`,
