@@ -215,6 +215,19 @@ The surface now extends past the original three point ops:
   crossing the forwarding boundary instead of keeping its
   `ValidationException` code, so it surfaces as a 500 where DynamoDB returns
   400. That affects every leader-raised validation error, not just this one.
+  **Audit note (2026-08-22, ninth — `BatchGetItem`):** the operation was
+  unsupported (a wire test asserted `UnknownOperationException`). It is now
+  served as **independent point reads**, deliberately not through the
+  quiescent multi-get `TransactGetItems` uses: DynamoDB's `BatchGetItem`
+  offers no cross-item atomicity, so borrowing the transactional path would
+  have bought a guarantee the API does not promise and paid its cost on
+  every call. Projection and `ConsistentRead` are scoped per **table**, not
+  per key, matching the wire shape. A key matching nothing is reported by
+  **omission** from that table's list, unlike `TransactGetItems`'s
+  positional response, which must stay index-aligned and so carries an empty
+  object per miss. `UnprocessedKeys` is always empty: every requested key is
+  read before responding rather than shedding load. The 100-key request cap
+  is not enforced, which belongs with the permissive-divergence group.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
