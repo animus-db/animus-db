@@ -56,7 +56,7 @@ async fn assert_cache_matches_engine(
 }
 
 /// A seed-swept mixed scenario — membership, tablet create/split/merge,
-/// schema DDL, keyspace, node-id-allocation — asserting the cache/engine
+/// schema DDL, node-id-allocation — asserting the cache/engine
 /// agreement holds after every step, then a crash-and-restart of one node,
 /// asserting it holds again once the restarted node reconverges.
 #[test]
