@@ -457,6 +457,12 @@ pub enum Operation {
         /// an index cursor also carries the index's own key attributes (see
         /// `animusd::dynamo`'s `gsi_key_item_of`/`lsi_key_item_of`).
         exclusive_start_key: Option<Item>,
+        /// `ScanIndexForward` (default `true`). `false` walks the sort key
+        /// **descending** — the highest sort key in the partition/index first,
+        /// and `Limit` keeps the highest rather than the lowest. Pagination
+        /// inverts with it: `LastEvaluatedKey` becomes the *lowest* key of the
+        /// page and the next page resumes strictly below it.
+        scan_index_forward: bool,
         /// Optional post-read `FilterExpression`, applied **after** the key
         /// condition has selected what to evaluate and after `limit` has
         /// capped it — exactly `Scan`'s contract. A filtered-out item still
@@ -1627,6 +1633,13 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     // is decoded unconditionally — whether it's legal depends on `index`'s
     // *kind* (GSI vs LSI vs base), which is only known once the replicated
     // catalog is consulted at the `animusd` edge, not here.
+    // Absent means ascending, matching DynamoDB's default.
+    let scan_index_forward = match obj.get("ScanIndexForward") {
+        None | Some(Value::Null) => true,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| WireError::validation("`ScanIndexForward` must be a boolean"))?,
+    };
     Ok(Operation::Query {
         table,
         index,
@@ -1634,6 +1647,7 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         sort_condition,
         limit,
         exclusive_start_key,
+        scan_index_forward,
         filter,
         projection,
         consistent_read,
@@ -3040,11 +3054,13 @@ mod tests {
                 sort_condition,
                 limit,
                 exclusive_start_key,
+                scan_index_forward,
                 filter,
                 projection,
                 consistent_read,
             } => {
                 assert!(filter.is_none(), "no FilterExpression in the body");
+                assert!(scan_index_forward, "ScanIndexForward defaults to true");
                 assert_eq!(table, "t");
                 assert_eq!(index, None);
                 assert_eq!(partition_value, s("part"));

@@ -3410,6 +3410,34 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         end: Option<&[u8]>,
         limit: Option<usize>,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.local_scan_kind_ordered(kind, start, end, limit, false)
+            .await
+    }
+
+    /// [`local_scan_kind`](Self::local_scan_kind)'s **descending** dual — the
+    /// kind-scoped counterpart of [`local_scan_rev`](Self::local_scan_rev),
+    /// serving an LSI `Query` with `ScanIndexForward: false`.
+    pub async fn local_scan_kind_rev(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.local_scan_kind_ordered(kind, start, end, limit, true)
+            .await
+    }
+
+    /// Shared body of the two above; `reverse` picks which end of the ordered
+    /// range `limit` keeps and the order rows are returned in.
+    async fn local_scan_kind_ordered(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let Some(scope) = self.kind_scopes.get(kind as usize) else {
             return Vec::new();
         };
@@ -3449,7 +3477,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 }
             })
             .collect();
-        if let Some(n) = limit {
+        if reverse {
+            if let Some(n) = limit
+                && pairs.len() > n
+            {
+                pairs.drain(..pairs.len() - n);
+            }
+            pairs.reverse();
+        } else if let Some(n) = limit {
             pairs.truncate(n);
         }
         pairs
@@ -3570,6 +3605,31 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// `limit` is threaded straight to [`local_scan_kind`](Self::local_scan_kind)
     /// — see that method's doc for why this is a **per-tablet cap, not
     /// pushdown**.
+    /// [`linearizable_scan_kind`](Self::linearizable_scan_kind)'s **descending**
+    /// dual: same barrier, same whole-span `ts_cache` bump, highest rows first.
+    pub async fn linearizable_scan_kind_rev(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        if !self.read_barrier().await {
+            return None;
+        }
+        let ts = self.hlc.mint(self.env.now());
+        if !self.ensure_ceiling_above(ts).await {
+            return None;
+        }
+        let rows = self.local_scan_kind_rev(kind, start, end, limit).await;
+        self.ts_cache.lock().expect("ts cache poisoned").bump(
+            start.to_vec(),
+            end.map(<[u8]>::to_vec),
+            ts,
+        );
+        Some(rows)
+    }
+
     pub async fn linearizable_scan_kind(
         &self,
         kind: u8,
@@ -3877,6 +3937,38 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         Some(rows)
     }
 
+    /// [`linearizable_scan`](Self::linearizable_scan)'s **descending** dual —
+    /// the same ReadIndex barrier and the same read-timestamp-cache bump over
+    /// the whole requested span, but `limit` keeps the *highest* rows and they
+    /// come back highest-key-first. The CP read primitive behind a DynamoDB
+    /// `Query` with `ScanIndexForward: false`.
+    ///
+    /// The `ts_cache` bump is deliberately identical to the ascending form's:
+    /// it covers `[start, end)` entire, not the rows returned, so which end of
+    /// the range a `limit` happened to keep cannot change what a later write
+    /// has to be ordered above.
+    pub async fn linearizable_scan_rev(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        if !self.read_barrier().await {
+            return None;
+        }
+        let ts = self.hlc.mint(self.env.now());
+        if !self.ensure_ceiling_above(ts).await {
+            return None;
+        }
+        let rows = self.local_scan_rev(start, end, limit).await;
+        self.ts_cache.lock().expect("ts cache poisoned").bump(
+            start.to_vec(),
+            end.map(<[u8]>::to_vec),
+            ts,
+        );
+        Some(rows)
+    }
+
     /// This replica's live `(key, value)` pairs with `start <= key < end`, sorted
     /// by key, up to `limit`, from the **local engine** — *not* linearizable (no
     /// ReadIndex barrier), the scan counterpart of [`local_get`](Self::local_get).
@@ -3891,6 +3983,40 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         start: &[u8],
         end: Option<&[u8]>,
         limit: Option<usize>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.local_scan_ordered(start, end, limit, false).await
+    }
+
+    /// [`local_scan`](Self::local_scan)'s **descending** dual: the same range,
+    /// but `limit` keeps the *last* rows rather than the first, and the result
+    /// is returned highest-key-first. Serves a DynamoDB `Query` with
+    /// `ScanIndexForward: false`.
+    ///
+    /// This costs no more than the ascending form: `local_scan_ordered` pushes
+    /// the *range* into the engine and the engine returns the whole of it
+    /// key-ordered (`StorageEngine::scan` takes no limit) — `limit` has always
+    /// been a post-read take. Taking from the tail is therefore the same work
+    /// as taking from the head, and — the point of doing it here rather than in
+    /// the edge — it is what keeps a descending page's *network* payload
+    /// bounded by `limit` when the read is forwarded to another node.
+    pub async fn local_scan_rev(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.local_scan_ordered(start, end, limit, true).await
+    }
+
+    /// The shared body of [`local_scan`](Self::local_scan) and
+    /// [`local_scan_rev`](Self::local_scan_rev); `reverse` picks which end of
+    /// the ordered range `limit` keeps and which order rows come back in.
+    async fn local_scan_ordered(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+        reverse: bool,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         // Push the range down into the engine (audit P4): a bounded scan reads
         // only `[start, end)` instead of materializing the whole tablet and
@@ -3962,7 +4088,18 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // requested range never silently consumes one of the caller's
         // requested slots.
         let mut pairs = self.resolve_scan_rows(raw, None).await;
-        if let Some(n) = limit {
+        if reverse {
+            // Keep the *highest* `n` of the range, then hand them back
+            // highest-first. Draining the head (rather than truncating the
+            // tail) is what makes this the descending page rather than the
+            // ascending one.
+            if let Some(n) = limit
+                && pairs.len() > n
+            {
+                pairs.drain(..pairs.len() - n);
+            }
+            pairs.reverse();
+        } else if let Some(n) = limit {
             pairs.truncate(n);
         }
         pairs

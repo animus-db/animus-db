@@ -81,6 +81,7 @@ async fn row_count(addr: SocketAddr, table: &str) -> Option<usize> {
             start: Vec::new(),
             end: None,
             limit: None,
+            reverse: false,
             table: table.to_owned(),
         };
         animusd::write_frame(&mut s, &req).await.ok()?;

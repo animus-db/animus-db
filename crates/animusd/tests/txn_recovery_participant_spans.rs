@@ -543,6 +543,7 @@ async fn recovery_resolve_correctly_commits_both_tablets_of_a_two_tablet_transac
                     start: lower_key.clone(),
                     end: Some(scan_end.clone()),
                     limit: None,
+                    reverse: false,
                     table: "txn_group_fix".to_string(),
                 },
             )
