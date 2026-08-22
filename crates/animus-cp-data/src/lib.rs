@@ -1000,6 +1000,67 @@ struct CasResults {
     outcomes: BTreeMap<u64, bool>,
 }
 
+/// What a `KindBatch` entry actually did at apply time — the introspection
+/// channel `TxnStage` has via [`StageOutcome`] and `Cas` via
+/// [`RaftKvNode::cas_result`], which `KindBatch` lacked.
+///
+/// Without it a proposer could only confirm a write by reading the key back and
+/// comparing values, which cannot distinguish **"my entry no-op'd"** from
+/// **"my entry applied and a concurrent write then overwrote it"**. The second
+/// is a success, and reporting it as a failure is not harmless: measured, ten
+/// concurrent `PutItem`s to one key produced six spurious "superseded" errors.
+/// For an idempotent write the caller's retry hides that; for a non-idempotent
+/// one (a numeric `ADD`) retrying is precisely what corrupts the value.
+///
+/// Every replica records the identical outcome — the decision is deterministic
+/// in commit order against the same committed engine state — exactly as
+/// [`CasResults`] and [`StageOutcomes`] already are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KindBatchOutcome {
+    /// The batch's writes materialized.
+    Applied,
+    /// A key in `conditions` did not hold the expected committed value (or
+    /// expected absence) — the whole batch no-op'd. `key` is the first
+    /// condition that failed, in `conditions`' own order. The caller's cue to
+    /// re-read and re-evaluate: an ordinary OCC round, **not** an ambiguous
+    /// outcome.
+    ConditionFailed { key: Vec<u8> },
+    /// The batch carried user data into a **sealed** range (ADR 0050's split
+    /// freeze) and was vetoed whole. The caller's cue to re-route to the
+    /// child, not to retry here.
+    Sealed { key: Vec<u8> },
+}
+
+/// Per-`KindBatch` outcomes recorded at apply time, keyed by the entry's Raft
+/// log index — mirroring [`CasResults`]/[`StageOutcomes`].
+///
+/// **Bounded, unlike those two.** A `KindBatch` is proposed for *every*
+/// indexed or streamed write, not just for a CAS or a transaction, so an
+/// unpruned map would grow without limit on a busy table. Entries are only
+/// useful to a proposer polling within `CLIENT_TIMEOUT`, so old ones are
+/// dropped; a proposer that finds no record falls back to the value probe,
+/// which is exactly today's behaviour.
+#[derive(Default)]
+struct KindBatchOutcomes {
+    outcomes: BTreeMap<u64, KindBatchOutcome>,
+}
+
+impl KindBatchOutcomes {
+    /// Indices retained behind the newest. Generous next to the poll window
+    /// (`CLIENT_TIMEOUT`) while keeping the map small enough to be free.
+    const RETAIN: u64 = 8192;
+
+    fn record(&mut self, index: u64, outcome: KindBatchOutcome) {
+        self.outcomes.insert(index, outcome);
+        // Prune in batches rather than on every insert: `split_off` allocates,
+        // and doing it once per 8192 writes is not worth measuring.
+        if self.outcomes.len() > (Self::RETAIN as usize) * 2 {
+            let cutoff = index.saturating_sub(Self::RETAIN);
+            self.outcomes = self.outcomes.split_off(&cutoff);
+        }
+    }
+}
+
 /// Per-`TxnStage` outcomes recorded at apply time, keyed by the entry's
 /// **Raft log index** — the [`StageOutcome`] introspection primitive (ADR
 /// 0018 §2 apply-time write-key conditions amendment), mirroring
@@ -1246,6 +1307,8 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// Per-`TxnStage` apply-time outcomes (ADR 0018 §2 apply-time write-key
     /// conditions amendment) — see [`StageOutcomes`]'s doc.
     stage: Arc<Mutex<StageOutcomes>>,
+    /// Per-`KindBatch` apply-time outcomes — see [`KindBatchOutcomes`]'s doc.
+    kind_outcomes: Arc<Mutex<KindBatchOutcomes>>,
     /// Highest Raft log index the **apply task** has merged into the engine. The
     /// consensus loop advances the core's `last_applied` (its buffer cursor) as soon
     /// as entries are committed+durable, but the async apply task lags behind
@@ -1512,6 +1575,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let reads = Arc::new(Mutex::new(ReadState::default()));
         let cas = Arc::new(Mutex::new(CasResults::default()));
         let stage = Arc::new(Mutex::new(StageOutcomes::default()));
+        let kind_outcomes = Arc::new(Mutex::new(KindBatchOutcomes::default()));
         let halted = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let apply_stopped = Arc::new(AtomicBool::new(false));
@@ -1557,6 +1621,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             reads: Arc::clone(&reads),
             cas: Arc::clone(&cas),
             stage: Arc::clone(&stage),
+            kind_outcomes: Arc::clone(&kind_outcomes),
             engine_applied: Arc::clone(&engine_applied),
             halted: Arc::clone(&halted),
             stopped: Arc::clone(&stopped),
@@ -1590,6 +1655,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             reads,
             cas,
             stage,
+            kind_outcomes,
             engine_applied,
             wal_lock,
             halted,
@@ -2840,6 +2906,26 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.stage
             .lock()
             .expect("stage outcomes poisoned")
+            .outcomes
+            .get(&index)
+            .cloned()
+    }
+
+    /// What the `KindBatch` committed at Raft log `index` actually did —
+    /// `None` if that index has not applied on this replica **or** has aged
+    /// out of the bounded map (see [`KindBatchOutcomes`]). Mirrors
+    /// [`stage_outcome`](Self::stage_outcome)/[`cas_result`](Self::cas_result);
+    /// every replica records the identical outcome.
+    ///
+    /// This is what lets a proposer tell "my entry no-op'd" from "my entry
+    /// applied and was then overwritten" — a distinction reading the value
+    /// back cannot make, and the reason a contended key used to report
+    /// spurious write failures.
+    #[must_use]
+    pub fn kind_batch_outcome(&self, index: u64) -> Option<KindBatchOutcome> {
+        self.kind_outcomes
+            .lock()
+            .expect("kind batch outcomes poisoned")
             .outcomes
             .get(&index)
             .cloned()
@@ -5047,6 +5133,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     storage: &S,
     cas: &Arc<Mutex<CasResults>>,
     stage: &Arc<Mutex<StageOutcomes>>,
+    kind_outcomes: &Arc<Mutex<KindBatchOutcomes>>,
     engine_applied: &AtomicU64,
     wal_lock: &AsyncMutex<()>,
     halted: &AtomicBool,
@@ -5261,6 +5348,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // `TxnStage`'s own read-after-flush-pending discipline) so a
                 // condition observes every earlier committed write in this
                 // same apply pass.
+                // Which condition failed, for the recorded outcome.
+                let mut failed_condition: Option<Vec<u8>> = None;
                 let conditions_ok = if conditions.is_empty() {
                     true
                 } else {
@@ -5282,6 +5371,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         };
                         if !matches {
                             ok = false;
+                            failed_condition = Some(key.clone());
                             break;
                         }
                     }
@@ -5309,11 +5399,28 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 let carries_user_data = writes
                     .iter()
                     .any(|(kind, _, _)| *kind == KIND_BASE || *kind == KIND_LSI);
-                if conditions_ok
-                    && writes
+                let sealed_key = if carries_user_data {
+                    writes
                         .iter()
-                        .all(|(_, key, _)| !carries_user_data || !is_sealed(sealed, key))
-                {
+                        .find(|(_, key, _)| is_sealed(sealed, key))
+                        .map(|(_, key, _)| key.clone())
+                } else {
+                    None
+                };
+                // Record what this entry actually did, keyed by its Raft log
+                // index, so a proposer can tell "no-op'd" from "applied and
+                // then overwritten" instead of comparing the value back —
+                // the introspection channel `TxnStage` and `Cas` already have.
+                let outcome = match (&failed_condition, &sealed_key) {
+                    (Some(key), _) => KindBatchOutcome::ConditionFailed { key: key.clone() },
+                    (None, Some(key)) => KindBatchOutcome::Sealed { key: key.clone() },
+                    (None, None) => KindBatchOutcome::Applied,
+                };
+                kind_outcomes
+                    .lock()
+                    .expect("kind batch outcomes poisoned")
+                    .record(index, outcome);
+                if conditions_ok && sealed_key.is_none() {
                     // ADR 0046 binding decision: the ONE shared
                     // materialization helper, also used by `TxnResolve`'s
                     // commit branch below — never a second copy of this
@@ -6609,6 +6716,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     reads: Arc<Mutex<ReadState>>,
     cas: Arc<Mutex<CasResults>>,
     stage: Arc<Mutex<StageOutcomes>>,
+    kind_outcomes: Arc<Mutex<KindBatchOutcomes>>,
     engine_applied: Arc<AtomicU64>,
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
@@ -6711,6 +6819,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         reads,
         cas,
         stage,
+        kind_outcomes,
         engine_applied,
         wal_lock,
         halted,
@@ -6819,6 +6928,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         storage,
         cas,
         stage,
+        kind_outcomes,
         Arc::clone(&engine_applied),
         Arc::clone(&wal_lock),
         Arc::clone(&halted),
@@ -7199,6 +7309,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     storage: S,
     cas: Arc<Mutex<CasResults>>,
     stage: Arc<Mutex<StageOutcomes>>,
+    kind_outcomes: Arc<Mutex<KindBatchOutcomes>>,
     engine_applied: Arc<AtomicU64>,
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
@@ -7245,6 +7356,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &storage,
             &cas,
             &stage,
+            &kind_outcomes,
             &engine_applied,
             &wal_lock,
             &halted,

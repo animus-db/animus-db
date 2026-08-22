@@ -63,8 +63,8 @@ use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{
-    FastRead, IntentInfo, RaftKvNode, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome,
-    TxnRecordView,
+    FastRead, IntentInfo, KindBatchOutcome, RaftKvNode, StageOutcome, TxnDecisionStatus, TxnId,
+    TxnOutcome, TxnRecordView,
 };
 use animus_env::{Clock, Disk, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{
@@ -527,6 +527,15 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.engine_applied_index(),
             CpGroup::Mem(n) => n.engine_applied_index(),
+        }
+    }
+
+    /// What the `KindBatch` at `index` did. See
+    /// [`RaftKvNode::kind_batch_outcome`].
+    pub(crate) fn kind_batch_outcome(&self, index: u64) -> Option<KindBatchOutcome> {
+        match self {
+            CpGroup::Lsm(n) => n.kind_batch_outcome(index),
+            CpGroup::Mem(n) => n.kind_batch_outcome(index),
         }
     }
 
@@ -7394,11 +7403,38 @@ impl ClientCtx {
         deadline: tokio::time::Instant,
     ) -> ProbeWait {
         loop {
+            // Ask the entry what it did, in preference to reading the value
+            // back. Value equality cannot tell "my entry no-op'd" from "my
+            // entry applied and a concurrent write then overwrote it" — the
+            // second is a success, and reporting it as a failure made a
+            // contended key fail spuriously (measured: ten concurrent
+            // `PutItem`s to one key, six "superseded" errors). The outcome is
+            // recorded per Raft index at apply time and is identical on every
+            // replica.
+            match leader.kind_batch_outcome(accepted_index) {
+                Some(KindBatchOutcome::Applied) => return ProbeWait::Confirmed,
+                // A no-op, and now distinguishable from an ambiguous one: the
+                // caller's OCC round (re-read, re-evaluate) or a re-route.
+                Some(
+                    KindBatchOutcome::ConditionFailed { .. } | KindBatchOutcome::Sealed { .. },
+                ) => {
+                    return ProbeWait::Superseded;
+                }
+                // Not applied yet, not a `KindBatch` (the other CP write paths
+                // share this loop), or aged out of the bounded outcome map —
+                // fall through to the value probe, which is the pre-existing
+                // behaviour.
+                None => {}
+            }
             if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
                 return ProbeWait::Confirmed;
             }
             if Self::confirm_wait_is_futile(leader, accepted_index) {
-                // Close the probe-vs-apply race before giving up.
+                // Close the probe-vs-apply race before giving up: re-check the
+                // outcome first, then the value.
+                if leader.kind_batch_outcome(accepted_index) == Some(KindBatchOutcome::Applied) {
+                    return ProbeWait::Confirmed;
+                }
                 if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
                     return ProbeWait::Confirmed;
                 }
