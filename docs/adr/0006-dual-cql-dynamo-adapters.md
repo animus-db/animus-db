@@ -243,6 +243,29 @@ The surface now extends past the original three point ops:
   worker's rows. Giving `Segment` without `TotalSegments` (or the reverse) is
   rejected rather than silently scanning the whole table, which would make
   every worker in a fleet return every item.
+  **Audit note (2026-08-22, eleventh — at-most-once for non-idempotent
+  writes):** `ClientCtx::cp_kind_write_item`'s retry loop re-entered
+  `kind_write_item_at_leader`, which re-reads the old image and re-applies —
+  a fresh read-modify-write, not a replay of the original proposal. It now
+  skips that retry for a **non-idempotent** write
+  (`dynamo::kind_write_is_idempotent`: everything is idempotent except a
+  numeric `ADD`). DynamoDB's guarantee is **at-most-once per request**, not
+  exactly-once — a *client* retrying an `ADD` that applied double-counts
+  there too — so the requirement is only that the service never re-applies on
+  its own, which needs no idempotency token. Measured: ten concurrent
+  increments moved the counter by exactly ten, against 431 before.
+  **Numeric `ADD` nonetheless stays refused,** for a second and now sharper
+  reason: `cp_kind_local` confirms a write by probing that the value it
+  produced is present, and a concurrent update supersedes that value, so the
+  request reports "superseded before its effect appeared ... retry" although
+  it applied — measured at 8 of 10 requests under the same load. Retrying is
+  precisely what double-counts, so the advertised remedy corrupts the
+  counter. Unblocking it means confirming on the **proposal** (did my entry
+  commit and apply?) rather than on the value — which is
+  `docs/engineering-lessons.md`'s existing rule that a proposer must
+  distinguish never-accepted from accepted-unconfirmed, and an ADR 0046/0049
+  change rather than a wire-adapter one. The at-most-once fix stands on its
+  own regardless: it is what stops the *service* over-counting.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator

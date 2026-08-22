@@ -989,29 +989,46 @@ fn decode_update_expression(
                     let attr = resolve_attr_name(obj, name.trim())?;
                     let value = resolve_placeholder(obj, ph.trim())?;
                     if kw == "add" {
-                        // **Numeric ADD is deliberately refused.** It is the
-                        // only non-idempotent update action, and this write
-                        // path is at-least-once: `ClientCtx::cp_kind_write_item`
-                        // retries `kind_write_item_at_leader`, which re-reads
-                        // the old image and re-applies, and a write that
-                        // landed can still report a retryable error (a failed
-                        // OCC seatbelt is documented as indistinguishable from
-                        // a fence miss). Re-applying SET/REMOVE, or a set
-                        // union/difference, converges to the same state;
-                        // re-applying `+1` does not. Measured: ten concurrent
-                        // increments, two of them accepted, left the counter
-                        // at 431.
+                        // A numeric ADD is the one non-idempotent write this
+                        // adapter has. It is safe because
+                        // `ClientCtx::cp_kind_write_item` does not re-apply a
+                        // non-idempotent write on its own (see
+                        // `kind_write_is_idempotent`): DynamoDB's guarantee is
+                        // at-most-once per *request*, not exactly-once, so a
+                        // client that retries an ADD which actually applied
+                        // double-counts there too. What must never happen is
+                        // the service counting twice for one request.
+                        // **Numeric ADD stays refused, for a sharper reason
+                        // than before.** The service no longer over-counts:
+                        // `cp_kind_write_item` does not re-apply a
+                        // non-idempotent write (`kind_write_is_idempotent`),
+                        // so at-most-once per request now holds — measured,
+                        // ten concurrent increments leave the counter at
+                        // exactly ten.
                         //
-                        // Refusing is the honest behaviour until the write
-                        // path can carry a once-only guarantee — a silently
-                        // over-counted counter is far worse than a rejected
-                        // request.
+                        // What is still missing is an honest *response*.
+                        // Confirmation probes whether the value this write
+                        // produced is present; a concurrent increment
+                        // supersedes it, so the write reports "superseded
+                        // before its effect appeared ... retry" although it
+                        // applied. Measured under the same load: 8 of 10
+                        // requests were told to retry, and retrying a numeric
+                        // ADD is exactly what double-counts. A counter that
+                        // mostly reports failure, and whose advertised remedy
+                        // corrupts it, is worse than one that is refused.
+                        //
+                        // Unblocking it means confirming on the *proposal*
+                        // (did my entry commit and apply?) rather than on the
+                        // value, which is `docs/engineering-lessons.md`'s own
+                        // rule: a proposer must distinguish never-accepted
+                        // from accepted-unconfirmed. That is an ADR 0046/0049
+                        // change, not a wire-adapter one.
                         if matches!(value, AttributeValue::N(_)) {
                             return Err(WireError::validation(
-                                "numeric ADD is not supported: this write path may apply a \
-                                 request more than once, which would over-count. Read the \
-                                 value and SET it instead, or use a set-typed ADD (union \
-                                 is idempotent).",
+                                "numeric ADD is not supported: a concurrent update supersedes \
+                                 this write's confirmation, so success cannot be reported \
+                                 honestly and the advised retry would count twice. Read the \
+                                 value and SET it instead, or use a set-typed ADD.",
                             ));
                         }
                         if !matches!(
@@ -5495,12 +5512,12 @@ mod tests {
         }
     }
 
-    /// Numeric `ADD` is refused at decode, with a message that says why.
+    /// Numeric `ADD` is refused, and the message says why.
     ///
-    /// It is the only non-idempotent update action, and the kind-write path is
-    /// at-least-once — it retries and re-applies, and a landed write can still
-    /// report a retryable error. Ten concurrent increments, two accepted, were
-    /// measured leaving the counter at 431. Refusing beats over-counting.
+    /// The service no longer over-counts — at-most-once per request holds —
+    /// but confirmation still cannot tell "superseded but applied" from "no-op",
+    /// so success cannot be reported honestly and the advised retry would
+    /// double-count.
     #[test]
     fn numeric_add_is_refused_with_a_reason() {
         let body = br#"{"TableName":"t","Key":{"pk":{"S":"a"}},
@@ -5510,13 +5527,14 @@ mod tests {
             .expect_err("numeric ADD must be refused");
         assert_eq!(err.code, "ValidationException");
         assert!(
-            err.message.contains("more than once"),
-            "the message must explain why, not just refuse: {}",
+            err.message.contains("count twice"),
+            "the message must explain the consequence: {}",
             err.message
         );
     }
 
-    /// A non-set operand is refused for both clauses.
+    /// An operand that is neither a number nor a set is refused for both
+    /// clauses (`DELETE` additionally requires a set).
     #[test]
     fn add_and_delete_require_set_operands() {
         for expr in ["ADD c :s", "DELETE c :s"] {
