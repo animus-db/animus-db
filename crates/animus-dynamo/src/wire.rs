@@ -57,7 +57,9 @@ use animus_control::{IndexStatus, StreamViewType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::capacity::{ConsumedCapacity, ReturnConsumedCapacity};
+use crate::capacity::{
+    ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity, ReturnItemCollectionMetrics,
+};
 use crate::condition::{Comparator, ConditionExpression, SortKeyCondition};
 use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, SecondaryIndex};
 use crate::{AttributeValue, Item, TableSchema};
@@ -493,6 +495,10 @@ pub enum Operation {
         /// How much of the [`ConsumedCapacity`](crate::capacity::ConsumedCapacity)
         /// report the caller wants back (`NONE`/`TOTAL`/`INDEXES`).
         capacity: ReturnConsumedCapacity,
+        /// Whether to report an
+        /// [`ItemCollectionMetrics`](crate::capacity::ItemCollectionMetrics)
+        /// (`NONE`/`SIZE`). Only ever answered for a table that has an LSI.
+        metrics: ReturnItemCollectionMetrics,
     },
     /// `GetItem`: fetch the item identified by `key` from `table`.
     GetItem {
@@ -526,6 +532,10 @@ pub enum Operation {
         /// How much of the [`ConsumedCapacity`](crate::capacity::ConsumedCapacity)
         /// report the caller wants back (`NONE`/`TOTAL`/`INDEXES`).
         capacity: ReturnConsumedCapacity,
+        /// Whether to report an
+        /// [`ItemCollectionMetrics`](crate::capacity::ItemCollectionMetrics)
+        /// (`NONE`/`SIZE`). Only ever answered for a table that has an LSI.
+        metrics: ReturnItemCollectionMetrics,
     },
     /// `Query`: items in a partition (`pk = ..`) matching an optional sort-key
     /// condition — against the base table, or a secondary index when `index` is
@@ -635,6 +645,10 @@ pub enum Operation {
         /// How much of the [`ConsumedCapacity`](crate::capacity::ConsumedCapacity)
         /// report the caller wants back (`NONE`/`TOTAL`/`INDEXES`).
         capacity: ReturnConsumedCapacity,
+        /// Whether to report an
+        /// [`ItemCollectionMetrics`](crate::capacity::ItemCollectionMetrics)
+        /// (`NONE`/`SIZE`). Only ever answered for a table that has an LSI.
+        metrics: ReturnItemCollectionMetrics,
     },
     /// `BatchWriteItem`: a batch of put/delete requests grouped by table. Applied
     /// request-by-request (no cross-request atomicity, as in DynamoDB).
@@ -855,12 +869,14 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
             let condition = decode_condition(obj)?;
             let return_values = decode_return_values(obj)?;
             let capacity = decode_return_consumed_capacity(obj)?;
+            let metrics = decode_return_item_collection_metrics(obj)?;
             Ok(Operation::PutItem {
                 table,
                 item,
                 condition,
                 return_values,
                 capacity,
+                metrics,
             })
         }
         "GetItem" => {
@@ -883,12 +899,14 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
             let condition = decode_condition(obj)?;
             let return_values = decode_return_values(obj)?;
             let capacity = decode_return_consumed_capacity(obj)?;
+            let metrics = decode_return_item_collection_metrics(obj)?;
             Ok(Operation::DeleteItem {
                 table,
                 key,
                 condition,
                 return_values,
                 capacity,
+                metrics,
             })
         }
         "Query" => decode_query(obj),
@@ -924,6 +942,7 @@ fn decode_update_item(obj: &Map<String, Value>) -> Result<Operation, WireError> 
     let condition = decode_condition(obj)?;
     let return_values = decode_update_return_values(obj)?;
     let capacity = decode_return_consumed_capacity(obj)?;
+    let metrics = decode_return_item_collection_metrics(obj)?;
     Ok(Operation::UpdateItem {
         table,
         key,
@@ -931,6 +950,7 @@ fn decode_update_item(obj: &Map<String, Value>) -> Result<Operation, WireError> 
         condition,
         return_values,
         capacity,
+        metrics,
     })
 }
 
@@ -1882,6 +1902,25 @@ fn decode_return_consumed_capacity(
     }
 }
 
+/// Decode `ReturnItemCollectionMetrics` (ADR 0006). Absent ⇒ `NONE`.
+fn decode_return_item_collection_metrics(
+    obj: &Map<String, Value>,
+) -> Result<ReturnItemCollectionMetrics, WireError> {
+    match obj.get("ReturnItemCollectionMetrics") {
+        None | Some(Value::Null) => Ok(ReturnItemCollectionMetrics::None),
+        Some(v) => match v.as_str() {
+            Some("NONE") => Ok(ReturnItemCollectionMetrics::None),
+            Some("SIZE") => Ok(ReturnItemCollectionMetrics::Size),
+            Some(other) => Err(WireError::validation(format!(
+                "unsupported `ReturnItemCollectionMetrics` `{other}` (supported: NONE, SIZE)"
+            ))),
+            None => Err(WireError::validation(
+                "`ReturnItemCollectionMetrics` must be a string",
+            )),
+        },
+    }
+}
+
 /// Decode a predicate from the string field named `field` (one of
 /// `ConditionExpression` / `FilterExpression`) into a [`ConditionExpression`]:
 /// `attribute_not_exists(attr)`, `attribute_exists(attr)`, or `attr = :v`
@@ -2692,6 +2731,21 @@ fn finish(mut obj: Map<String, Value>, capacity: Option<&ConsumedCapacity>) -> S
     serde_json::to_string(&Value::Object(obj)).expect("response serializes")
 }
 
+/// [`finish`], plus an `ItemCollectionMetrics` when the write had one to
+/// report. Split from `finish` because only the three *write* operations can
+/// carry metrics — a `GetItem` never does, and giving its builder the
+/// parameter would invite exactly that mistake.
+fn finish_write(
+    mut obj: Map<String, Value>,
+    capacity: Option<&ConsumedCapacity>,
+    metrics: Option<&ItemCollectionMetrics>,
+) -> String {
+    if let Some(encoded) = metrics.and_then(|m| m.encode(encode_item)) {
+        obj.insert("ItemCollectionMetrics".into(), encoded);
+    }
+    finish(obj, capacity)
+}
+
 /// The JSON body for a successful `GetItem`: `{"Item": {..}}`, or `{}` when the
 /// item is absent (matching DynamoDB).
 #[must_use]
@@ -2763,12 +2817,13 @@ pub fn write_response(
     return_values: ReturnValues,
     old: Option<&Item>,
     capacity: Option<&ConsumedCapacity>,
+    metrics: Option<&ItemCollectionMetrics>,
 ) -> String {
     let mut obj = Map::new();
     if let (ReturnValues::AllOld, Some(item)) = (return_values, old) {
         obj.insert("Attributes".into(), encode_item(item));
     }
-    finish(obj, capacity)
+    finish_write(obj, capacity, metrics)
 }
 
 /// The JSON body for a successful `UpdateItem` echoing `ReturnValues`: `ALL_OLD`
@@ -2781,6 +2836,7 @@ pub fn update_response(
     old: Option<&Item>,
     new: Option<&Item>,
     capacity: Option<&ConsumedCapacity>,
+    metrics: Option<&ItemCollectionMetrics>,
 ) -> String {
     let attrs = match return_values {
         UpdateReturnValues::None => None,
@@ -2801,7 +2857,7 @@ pub fn update_response(
     if let Some(item) = attrs.filter(|i| !i.is_empty()) {
         obj.insert("Attributes".into(), encode_item(&item));
     }
-    finish(obj, capacity)
+    finish_write(obj, capacity, metrics)
 }
 
 /// The attributes whose value differs between `old` and `new`, taken from
@@ -3811,12 +3867,15 @@ mod tests {
     fn write_response_echoes_old_item_for_all_old() {
         let mut old = Item::new();
         old.insert("id".into(), s("k"));
-        let body = write_response(ReturnValues::AllOld, Some(&old), None);
+        let body = write_response(ReturnValues::AllOld, Some(&old), None, None);
         assert!(body.contains("\"Attributes\""));
         assert!(body.contains("\"S\":\"k\""));
         // ALL_OLD on an absent key is `{}`; NONE is always `{}`.
-        assert_eq!(write_response(ReturnValues::AllOld, None, None), "{}");
-        assert_eq!(write_response(ReturnValues::None, Some(&old), None), "{}");
+        assert_eq!(write_response(ReturnValues::AllOld, None, None, None), "{}");
+        assert_eq!(
+            write_response(ReturnValues::None, Some(&old), None, None),
+            "{}"
+        );
     }
 
     #[test]
@@ -4826,11 +4885,11 @@ mod tests {
     fn update_response_echoes_new_for_all_new() {
         let mut new = Item::new();
         new.insert("a".into(), s("x"));
-        let body = update_response(UpdateReturnValues::AllNew, None, Some(&new), None);
+        let body = update_response(UpdateReturnValues::AllNew, None, Some(&new), None, None);
         assert!(body.contains("\"Attributes\""));
         assert!(body.contains("\"S\":\"x\""));
         assert_eq!(
-            update_response(UpdateReturnValues::None, None, Some(&new), None),
+            update_response(UpdateReturnValues::None, None, Some(&new), None, None),
             "{}"
         );
     }
@@ -5758,7 +5817,13 @@ mod tests {
         new.insert("edit".into(), s("after"));
         new.insert("fresh".into(), s("created"));
 
-        let body = update_response(UpdateReturnValues::UpdatedOld, Some(&old), Some(&new), None);
+        let body = update_response(
+            UpdateReturnValues::UpdatedOld,
+            Some(&old),
+            Some(&new),
+            None,
+            None,
+        );
         assert!(body.contains(r#""edit":{"S":"before"}"#), "changed: {body}");
         assert!(
             body.contains(r#""gone":{"S":"dropped"}"#),
@@ -5771,7 +5836,13 @@ mod tests {
         assert!(!body.contains("keep"), "untouched is not reported: {body}");
         assert!(!body.contains(r#""id""#), "the key never changes: {body}");
 
-        let body = update_response(UpdateReturnValues::UpdatedNew, Some(&old), Some(&new), None);
+        let body = update_response(
+            UpdateReturnValues::UpdatedNew,
+            Some(&old),
+            Some(&new),
+            None,
+            None,
+        );
         assert!(body.contains(r#""edit":{"S":"after"}"#), "changed: {body}");
         assert!(
             body.contains(r#""fresh":{"S":"created"}"#),
@@ -5791,7 +5862,7 @@ mod tests {
             UpdateReturnValues::UpdatedNew,
         ] {
             assert_eq!(
-                update_response(rv, Some(&item), Some(&item), None),
+                update_response(rv, Some(&item), Some(&item), None, None),
                 empty_response(),
                 "an unchanged item reports no Attributes"
             );
@@ -5915,18 +5986,147 @@ mod tests {
         let cc = ConsumedCapacity::table_only("t", 1.0, ReturnConsumedCapacity::Total);
         // Present even when the body is otherwise empty: a `PutItem` with
         // `ReturnValues: NONE` still owes the caller its capacity report.
-        let with = write_response(ReturnValues::None, None, Some(&cc));
+        let with = write_response(ReturnValues::None, None, Some(&cc), None);
         let parsed: Value = serde_json::from_str(&with).expect("json");
         assert_eq!(parsed["ConsumedCapacity"]["TableName"], "t");
         assert_eq!(parsed["ConsumedCapacity"]["CapacityUnits"], 1.0);
         assert!(parsed.get("Attributes").is_none());
 
-        assert_eq!(write_response(ReturnValues::None, None, None), "{}");
+        assert_eq!(write_response(ReturnValues::None, None, None, None), "{}");
         assert_eq!(get_item_response(None, None), "{}");
         assert_eq!(
-            update_response(UpdateReturnValues::None, None, None, None),
+            update_response(UpdateReturnValues::None, None, None, None, None),
             "{}"
         );
+    }
+
+    #[test]
+    fn return_item_collection_metrics_decodes_and_defaults() {
+        let put = |extra: &str| {
+            let body = format!(r#"{{"TableName":"t","Item":{{"id":{{"S":"k"}}}}{extra}}}"#);
+            match decode_request("DynamoDB_20120810.PutItem", body.as_bytes()) {
+                Ok(Operation::PutItem { metrics, .. }) => Ok(metrics),
+                Ok(other) => panic!("expected PutItem, got {other:?}"),
+                Err(e) => Err(e),
+            }
+        };
+        assert_eq!(put("").unwrap(), ReturnItemCollectionMetrics::None);
+        assert_eq!(
+            put(r#","ReturnItemCollectionMetrics":null"#).unwrap(),
+            ReturnItemCollectionMetrics::None
+        );
+        assert_eq!(
+            put(r#","ReturnItemCollectionMetrics":"NONE""#).unwrap(),
+            ReturnItemCollectionMetrics::None
+        );
+        assert_eq!(
+            put(r#","ReturnItemCollectionMetrics":"SIZE""#).unwrap(),
+            ReturnItemCollectionMetrics::Size
+        );
+
+        // Rejected, not silently downgraded.
+        let err = put(r#","ReturnItemCollectionMetrics":"SOMETIMES""#).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("SOMETIMES"), "{}", err.message);
+        let err = put(r#","ReturnItemCollectionMetrics":7"#).unwrap_err();
+        assert!(err.message.contains("must be a string"), "{}", err.message);
+    }
+
+    #[test]
+    fn only_the_write_operations_carry_item_collection_metrics() {
+        // `GetItem` has no such field and its builder takes no such argument —
+        // a read never touches an item collection. This pins the decode side
+        // of that: the field is simply not part of a `GetItem`.
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                        "ReturnItemCollectionMetrics":"SIZE"}"#;
+        // Accepted and ignored rather than rejected, matching how DynamoDB
+        // treats a field that does not apply to the operation.
+        assert!(matches!(
+            decode_request("DynamoDB_20120810.GetItem", body),
+            Ok(Operation::GetItem { .. })
+        ));
+
+        for target in [
+            "DynamoDB_20120810.PutItem",
+            "DynamoDB_20120810.DeleteItem",
+            "DynamoDB_20120810.UpdateItem",
+        ] {
+            let body = match target {
+                "DynamoDB_20120810.PutItem" => {
+                    r#"{"TableName":"t","Item":{"id":{"S":"k"}},
+                        "ReturnItemCollectionMetrics":"SIZE"}"#
+                }
+                "DynamoDB_20120810.DeleteItem" => {
+                    r#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                        "ReturnItemCollectionMetrics":"SIZE"}"#
+                }
+                _ => {
+                    r#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                        "UpdateExpression":"SET a = :v",
+                        "ExpressionAttributeValues":{":v":{"S":"x"}},
+                        "ReturnItemCollectionMetrics":"SIZE"}"#
+                }
+            };
+            let decoded = decode_request(target, body.as_bytes()).expect("decodes");
+            let metrics = match decoded {
+                Operation::PutItem { metrics, .. }
+                | Operation::DeleteItem { metrics, .. }
+                | Operation::UpdateItem { metrics, .. } => metrics,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(metrics, ReturnItemCollectionMetrics::Size, "{target}");
+        }
+    }
+
+    #[test]
+    fn a_write_response_carries_metrics_beside_everything_else() {
+        let mut item = Item::new();
+        item.insert("pk".to_string(), s("p1"));
+        let cc = ConsumedCapacity::table_only("t", 1.0, ReturnConsumedCapacity::Total);
+        let metrics = ItemCollectionMetrics {
+            key: item.clone(),
+            bytes: Some(1_073_741_824),
+        };
+
+        // All three coexist: the echoed attributes, the capacity report, and
+        // the collection report.
+        let body: Value = serde_json::from_str(&write_response(
+            ReturnValues::AllOld,
+            Some(&item),
+            Some(&cc),
+            Some(&metrics),
+        ))
+        .expect("json");
+        assert_eq!(body["Attributes"]["pk"]["S"], "p1");
+        assert_eq!(body["ConsumedCapacity"]["CapacityUnits"], 1.0);
+        assert_eq!(
+            body["ItemCollectionMetrics"]["ItemCollectionKey"]["pk"]["S"],
+            "p1"
+        );
+        assert_eq!(body["ItemCollectionMetrics"]["SizeEstimateRangeGB"][1], 1.0);
+
+        // And metrics alone, on an otherwise-empty body.
+        let body: Value = serde_json::from_str(&write_response(
+            ReturnValues::None,
+            None,
+            None,
+            Some(&metrics),
+        ))
+        .expect("json");
+        assert!(body.get("Attributes").is_none());
+        assert!(body.get("ConsumedCapacity").is_none());
+        assert!(body.get("ItemCollectionMetrics").is_some());
+
+        // An update carries them the same way.
+        let body: Value = serde_json::from_str(&update_response(
+            UpdateReturnValues::None,
+            None,
+            None,
+            None,
+            Some(&metrics),
+        ))
+        .expect("json");
+        assert!(body.get("ItemCollectionMetrics").is_some());
     }
 
     #[test]
@@ -5946,6 +6146,7 @@ mod tests {
             ReturnValues::AllOld,
             Some(&item),
             Some(&cc),
+            None,
         ))
         .expect("json");
         assert_eq!(body["Attributes"]["id"]["S"], "k");
@@ -5959,6 +6160,7 @@ mod tests {
             Some(&item),
             Some(&new),
             Some(&cc),
+            None,
         ))
         .expect("json");
         assert_eq!(body["Attributes"]["a"]["S"], "v");

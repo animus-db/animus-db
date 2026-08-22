@@ -2073,9 +2073,20 @@ pub enum ClientResponse {
     /// `index_aware_write`'s edge-evaluated design used to hand back to its
     /// own caller directly, needed for `ReturnValues`/`UpdateReturnValues`
     /// echo. `new: None` for a `Delete` op.
+    ///
+    /// `collection_bytes` is the leader's own base + LSI byte total for the
+    /// tablet that hosts the item — the DynamoDB `ItemCollectionMetrics`
+    /// size input (see `dynamo::collection_bytes_at_leader`). It is produced
+    /// *at the leader* because that is the only node that holds the tablet's
+    /// engine; the receiving edge has no way to price a tablet it does not
+    /// host, which is precisely why this rides back on the reply rather than
+    /// being computed after the hop. `#[serde(default)]` so a peer predating
+    /// the field still decodes, reporting no estimate rather than a wrong one.
     KindWriteOk {
         old: Option<animus_dynamo::Item>,
         new: Option<animus_dynamo::Item>,
+        #[serde(default)]
+        collection_bytes: Option<u64>,
     },
     /// Reply to [`KindWriteItem`](ClientRequest::KindWriteItem): the
     /// caller's own `condition` did not match the leader's own read of the
@@ -6946,8 +6957,16 @@ impl ClientCtx {
                         condition: condition.cloned(),
                     };
                     match self.cp_forward(table, &base_key, addr, request).await {
-                        ClientResponse::KindWriteOk { old, new } => {
-                            return Ok(dynamo::KindWriteOutcome::Ok { old, new });
+                        ClientResponse::KindWriteOk {
+                            old,
+                            new,
+                            collection_bytes,
+                        } => {
+                            return Ok(dynamo::KindWriteOutcome::Ok {
+                                old,
+                                new,
+                                collection_bytes,
+                            });
                         }
                         ClientResponse::ConditionFailed => {
                             return Ok(dynamo::KindWriteOutcome::ConditionFailed);
@@ -9890,9 +9909,15 @@ impl ClientCtx {
                 )
                 .await
                 {
-                    Ok(dynamo::KindWriteOutcome::Ok { old, new }) => {
-                        ClientResponse::KindWriteOk { old, new }
-                    }
+                    Ok(dynamo::KindWriteOutcome::Ok {
+                        old,
+                        new,
+                        collection_bytes,
+                    }) => ClientResponse::KindWriteOk {
+                        old,
+                        new,
+                        collection_bytes,
+                    },
                     Ok(dynamo::KindWriteOutcome::ConditionFailed) => {
                         ClientResponse::ConditionFailed
                     }

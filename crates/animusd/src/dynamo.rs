@@ -153,7 +153,10 @@ use std::time::Duration;
 use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjection, IndexStatus};
 use animus_control::{MetaCommand, Metadata, ReplicationMode, TtlSpec};
 use animus_cp_data::{KIND_BASE, KIND_LSI};
-use animus_dynamo::capacity::{self, ConsumedCapacity, ReturnConsumedCapacity};
+use animus_dynamo::capacity::{
+    self, ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity,
+    ReturnItemCollectionMetrics,
+};
 use animus_dynamo::wire::{
     self, Operation, Projection, ReturnValues, ScanSegment, Select, TransactAction, TransactGet,
     UpdateAction, WireError, WriteRequest,
@@ -436,6 +439,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             condition,
             return_values,
             capacity: report,
+            metrics: want_metrics,
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &item)?;
             // The written image is already in hand here, so a `PutItem` can
@@ -454,7 +458,15 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             {
                 let value = wire::encode_stored_item(&item);
                 fast_marker_write(ctx, &table, &pk, sk.as_ref(), value).await?;
-                return Ok(wire::write_response(return_values, None, charged.as_ref()));
+                // No metrics: this arm is reachable only when the table has
+                // no index at all, so it has no LSI, so an item collection is
+                // not a thing this table has.
+                return Ok(wire::write_response(
+                    return_values,
+                    None,
+                    charged.as_ref(),
+                    None,
+                ));
             }
             // ADR 0046 U3: an evaluated write (a condition, an old-image
             // echo, or an images-carrying table) is evaluated **at the
@@ -478,11 +490,20 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
                 )),
-                KindWriteOutcome::Ok { old, .. } => Ok(wire::write_response(
-                    return_values,
-                    old.as_ref(),
-                    charged.as_ref(),
-                )),
+                KindWriteOutcome::Ok {
+                    old,
+                    collection_bytes,
+                    ..
+                } => {
+                    let collection =
+                        item_collection_metrics(meta, &table, &pk, collection_bytes, want_metrics);
+                    Ok(wire::write_response(
+                        return_values,
+                        old.as_ref(),
+                        charged.as_ref(),
+                        collection.as_ref(),
+                    ))
+                }
             }
         }
         Operation::DeleteItem {
@@ -491,6 +512,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             condition,
             return_values,
             capacity: report,
+            metrics: want_metrics,
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
             // ADR 0049 fast arm — see `PutItem`'s identical fork above. A
@@ -511,7 +533,9 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             {
                 let value = wire::encode_tombstone();
                 fast_marker_write(ctx, &table, &pk, sk.as_ref(), value).await?;
-                return Ok(wire::write_response(return_values, None, None));
+                // No metrics, for `PutItem`'s reason above: no index here
+                // means no LSI means no item collection.
+                return Ok(wire::write_response(return_values, None, None, None));
             }
             // See `PutItem`'s identical fork above for why an evaluated
             // write goes to the leader instead.
@@ -529,14 +553,21 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
                 )),
-                KindWriteOutcome::Ok { old, .. } => {
+                KindWriteOutcome::Ok {
+                    old,
+                    collection_bytes,
+                    ..
+                } => {
                     // A delete is charged on what it removed, including the
                     // index rows that went with it — hence the *old* image.
                     let charged = write_capacity(meta, &table, old.as_ref(), report);
+                    let collection =
+                        item_collection_metrics(meta, &table, &pk, collection_bytes, want_metrics);
                     Ok(wire::write_response(
                         return_values,
                         old.as_ref(),
                         charged.as_ref(),
+                        collection.as_ref(),
                     ))
                 }
             }
@@ -656,6 +687,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             condition,
             return_values,
             capacity: report,
+            metrics: want_metrics,
         } => {
             // ADR 0046 U3: an indexed/streamed table's `UpdateItem` also
             // evaluates at the leader now — it has the identical cross-node
@@ -681,7 +713,11 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
                 )),
-                KindWriteOutcome::Ok { old, new } => {
+                KindWriteOutcome::Ok {
+                    old,
+                    new,
+                    collection_bytes,
+                } => {
                     // DynamoDB charges an update on the **larger** of the
                     // before and after images: an update that shrinks an item
                     // still had to write the whole of the larger one, and one
@@ -697,11 +733,14 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                         (some, None) | (None, some) => some,
                     };
                     let charged = write_capacity(meta, &table, larger, report);
+                    let collection =
+                        item_collection_metrics(meta, &table, &pk, collection_bytes, want_metrics);
                     Ok(wire::update_response(
                         return_values,
                         old.as_ref(),
                         new.as_ref(),
                         charged.as_ref(),
+                        collection.as_ref(),
                     ))
                 }
             }
@@ -3557,6 +3596,19 @@ pub(crate) enum KindWriteOutcome {
     Ok {
         old: Option<Item>,
         new: Option<Item>,
+        /// The base + LSI byte total of the tablet that hosts this item,
+        /// read at the leader right after the write landed — the input the
+        /// DynamoDB `ItemCollectionMetrics` surface reports as a size
+        /// estimate. See [`collection_bytes_at_leader`] for why the *tablet*
+        /// is the right quantity and what the number does and does not mean.
+        ///
+        /// `None` only when the reply crossed a forwarding hop from a peer
+        /// predating this field (`#[serde(default)]` on
+        /// [`ClientResponse::KindWriteOk`]). A leader that computed it always
+        /// answers `Some` — both engine backends can price a tablet cheaply.
+        /// The wire edge omits the estimate entirely on `None` rather than
+        /// substituting a figure it cannot stand behind.
+        collection_bytes: Option<u64>,
     },
     /// The caller's own `condition` did not match the leader's own read of
     /// the current item — no diff was ever computed, nothing was proposed.
@@ -3713,7 +3765,55 @@ pub(crate) async fn kind_write_item_at_leader(
     ClientCtx::cp_kind_local(leader, writes, vec![change_log], seatbelt)
         .await
         .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;
-    Ok(KindWriteOutcome::Ok { old, new })
+    let collection_bytes = collection_bytes_at_leader(leader).await;
+    Ok(KindWriteOutcome::Ok {
+        old,
+        new,
+        collection_bytes,
+    })
+}
+
+/// The base + LSI byte total of the tablet `leader` leads: an **upper bound**
+/// on the size of any single item collection living in it.
+///
+/// ## Why the tablet is the right quantity
+///
+/// An item collection is every row sharing one partition-key value, across the
+/// base table and its LSIs. Both are keyed `token(pk) || …` (ADR 0022), so a
+/// collection hashes to exactly one token and therefore lives entirely inside
+/// **one** tablet — a tablet whose contents are a superset of it. That makes
+/// this a true bound, never an under-estimate, which is the safe direction for
+/// a number whose whole purpose is to warn about growth.
+///
+/// It is a *loose* bound when the tablet holds many partitions. The useful
+/// property is that **it tightens exactly as the situation it warns about gets
+/// worse**: as one collection comes to dominate its tablet, the tablet's bytes
+/// converge on that collection's. When the bound is loose, the collection is
+/// small and nobody cares.
+///
+/// ## Why this matters in AnimusDB, not only as DynamoDB parity
+///
+/// DynamoDB caps an item collection at 10 GB when a table has an LSI.
+/// AnimusDB has no such cap, but it has the same underlying shape: tablets
+/// split on bytes (ADR 0034), splitting is by **token range**, and a single
+/// partition key is one token — so a collection that grows without bound is
+/// **unsplittable**, and its tablet stays large forever. This number is the
+/// warning for that, which is the same warning DynamoDB's is, arrived at from
+/// the other direction.
+///
+/// Deliberately built from the two cheap per-kind estimators rather than by
+/// scanning the partition: an exact figure would be `O(collection)` **per
+/// write**, which is not a price a write path may pay for a diagnostic.
+/// `KIND_CHANGE` and the GSI scopes are excluded — a change record is
+/// transient (the trim janitor reclaims it) and a GSI row lives in its own
+/// hidden table, so neither is part of the collection DynamoDB names.
+/// Always `Some` — both engine backends price a tablet cheaply, so a leader
+/// that ran this has an answer. The `Option` in the reply exists for the
+/// forwarding hop alone (an older peer omits the field), not for this.
+async fn collection_bytes_at_leader(leader: &CpGroup) -> Option<u64> {
+    let base = leader.approx_bytes_kind(KIND_BASE).await;
+    let lsi = leader.approx_bytes_kind(KIND_LSI).await;
+    Some(base.saturating_add(lsi))
 }
 
 /// One entry of a multi-kind atomic batch: `(row kind, key, value-or-tombstone)`.
@@ -3943,6 +4043,49 @@ fn read_capacity(
         capacity::read_units(bytes, consistent),
         detail,
     ))
+}
+
+/// The [`ItemCollectionMetrics`] a write should report, or `None` when it
+/// should report none.
+///
+/// Answered only for a table that **has an LSI**. DynamoDB reports this field
+/// only for such tables, and the reason is not arbitrary: an item collection
+/// is a bounded, meaningful thing precisely because an LSI shares the base
+/// table's partition. Without one, "every row with this partition key" is an
+/// incidental grouping, and reporting a size for it would be answering a
+/// question the client did not ask.
+///
+/// `collection_bytes` comes back from the tablet's **leader**
+/// ([`collection_bytes_at_leader`]) because only the node hosting the tablet
+/// can price it. That is available here for free: a table with an LSI has a
+/// non-empty index list, so `table_change_records_carry_images` is true, so
+/// its writes never take the ADR 0049 fast arm and always evaluate at the
+/// leader. The two conditions coincide exactly — there is no LSI-bearing
+/// table whose write could reach the fast arm and arrive here without a
+/// price.
+fn item_collection_metrics(
+    meta: &Metadata,
+    table: &str,
+    pk: &AttributeValue,
+    collection_bytes: Option<u64>,
+    want: ReturnItemCollectionMetrics,
+) -> Option<ItemCollectionMetrics> {
+    if !want.wanted() {
+        return None;
+    }
+    let has_lsi = meta
+        .table_indexes(table)
+        .iter()
+        .any(|i| i.kind == IndexKind::Local);
+    if !has_lsi {
+        return None;
+    }
+    let mut key = Item::new();
+    key.insert(schema_for(meta, table).partition_key, pk.clone());
+    Some(ItemCollectionMetrics {
+        key,
+        bytes: collection_bytes,
+    })
 }
 
 /// The attributes an index row carries, per its declared projection.

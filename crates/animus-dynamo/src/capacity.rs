@@ -267,6 +267,74 @@ fn units(value: f64) -> Value {
     serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
 }
 
+/// The `ReturnItemCollectionMetrics` selector on a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReturnItemCollectionMetrics {
+    /// `NONE` (the default) — the response carries no `ItemCollectionMetrics`.
+    #[default]
+    None,
+    /// `SIZE` — report the collection's key and a size estimate.
+    Size,
+}
+
+impl ReturnItemCollectionMetrics {
+    /// Whether the response should carry metrics at all.
+    #[must_use]
+    pub fn wanted(self) -> bool {
+        self != ReturnItemCollectionMetrics::None
+    }
+}
+
+/// One write's item-collection report.
+///
+/// An **item collection** is every row sharing one partition-key value, across
+/// the base table and its local secondary indexes. DynamoDB reports this only
+/// for a table that *has* an LSI, because that is the only case where a
+/// collection is a bounded thing (10 GB) rather than an incidental grouping —
+/// and this adapter keeps that rule.
+///
+/// `bytes` is an **upper bound** on the collection, taken from the tablet that
+/// necessarily contains it (see `animusd::dynamo::collection_bytes_at_leader`);
+/// `None` means no bound was available and the estimate is omitted rather than
+/// guessed at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ItemCollectionMetrics {
+    /// The partition-key attribute name and value naming the collection.
+    pub key: Item,
+    /// The upper bound in bytes, if one was available.
+    pub bytes: Option<u64>,
+}
+
+/// Bytes per gigabyte, as DynamoDB's `SizeEstimateRangeGB` counts them.
+const BYTES_PER_GB: f64 = 1_073_741_824.0;
+
+impl ItemCollectionMetrics {
+    /// The `ItemCollectionMetrics` JSON object, or `None` when there is
+    /// nothing to report.
+    ///
+    /// The range is `[0, bound]`. DynamoDB's field is a *range* bracketing an
+    /// estimate rather than a single figure, which is exactly the right shape
+    /// for what we can honestly say: the lower end is zero because we do not
+    /// measure the collection itself, and the upper end is a real bound. That
+    /// is a weaker claim than DynamoDB's own estimate and a true one, where a
+    /// fabricated midpoint would be neither.
+    ///
+    /// `encode_key` is the caller's `AttributeValue` encoder, passed in so
+    /// this type stays independent of `wire`'s private encoding.
+    #[must_use]
+    pub fn encode(&self, encode_key: impl Fn(&Item) -> Value) -> Option<Value> {
+        let bytes = self.bytes?;
+        let mut obj = Map::new();
+        obj.insert("ItemCollectionKey".into(), encode_key(&self.key));
+        let upper = bytes as f64 / BYTES_PER_GB;
+        obj.insert(
+            "SizeEstimateRangeGB".into(),
+            Value::Array(vec![units(0.0), units(upper)]),
+        );
+        Some(Value::Object(obj))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +529,63 @@ mod tests {
             text.contains("\"CapacityUnits\":1.0"),
             "expected a float, got {text}"
         );
+    }
+
+    #[test]
+    fn item_collection_metrics_encode_a_bounded_range() {
+        let mut key = Item::new();
+        key.insert("pk".to_string(), AttributeValue::S("p1".into()));
+        let m = ItemCollectionMetrics {
+            key: key.clone(),
+            bytes: Some(1_073_741_824), // exactly 1 GiB
+        };
+        let encoded = m
+            .encode(|item| {
+                let mut obj = Map::new();
+                for name in item.keys() {
+                    obj.insert(name.clone(), Value::String("encoded".into()));
+                }
+                Value::Object(obj)
+            })
+            .expect("a bound was available");
+        assert_eq!(encoded["ItemCollectionKey"]["pk"], "encoded");
+        let range = encoded["SizeEstimateRangeGB"].as_array().expect("array");
+        // Lower end is zero: we report a bound, not a measurement.
+        assert_eq!(range[0], 0.0);
+        assert_eq!(range[1], 1.0);
+    }
+
+    #[test]
+    fn no_bound_means_no_report_rather_than_a_guess() {
+        // `None` bytes reaches us only across a forwarding hop from a peer
+        // predating the field. Omitting the whole object is the honest
+        // answer; emitting `[0, 0]` would assert the collection is empty.
+        let mut key = Item::new();
+        key.insert("pk".to_string(), AttributeValue::S("p1".into()));
+        let m = ItemCollectionMetrics { key, bytes: None };
+        assert!(m.encode(|_| Value::Null).is_none());
+    }
+
+    #[test]
+    fn a_sub_gigabyte_bound_is_a_fraction_not_rounded_up() {
+        let mut key = Item::new();
+        key.insert("pk".to_string(), AttributeValue::S("p1".into()));
+        let m = ItemCollectionMetrics {
+            key,
+            bytes: Some(536_870_912), // half a GiB
+        };
+        let encoded = m.encode(|_| Value::Null).expect("bound");
+        assert_eq!(encoded["SizeEstimateRangeGB"][1], 0.5);
+    }
+
+    #[test]
+    fn return_item_collection_metrics_defaults_to_none() {
+        assert_eq!(
+            ReturnItemCollectionMetrics::default(),
+            ReturnItemCollectionMetrics::None
+        );
+        assert!(!ReturnItemCollectionMetrics::None.wanted());
+        assert!(ReturnItemCollectionMetrics::Size.wanted());
     }
 
     #[test]
