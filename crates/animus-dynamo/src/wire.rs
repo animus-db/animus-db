@@ -360,6 +360,21 @@ impl TransactAction {
     }
 }
 
+/// A parallel-`Scan` worker's slice: `Segment` of `TotalSegments`.
+///
+/// DynamoDB's contract is that the segments are disjoint and jointly cover the
+/// table, so N workers each scanning their own segment see every item exactly
+/// once between them. Here that falls out of the key layout: every data-plane
+/// key leads with an 8-byte big-endian partition token (ADR 0022), so the
+/// segments are equal slices of the 64-bit token ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanSegment {
+    /// This worker's zero-based segment index; always `< total`.
+    pub segment: u32,
+    /// How many segments the scan is split into; always `>= 1`.
+    pub total: u32,
+}
+
 /// One table's slice of a `BatchGetItem` request: the keys to read from
 /// `table`, with the projection and consistency setting that apply to **all**
 /// of them (DynamoDB scopes both per table, not per key — unlike
@@ -574,6 +589,8 @@ pub enum Operation {
         /// `Select` — what the response returns. Only `COUNT` changes the
         /// response shape (no `Items`); the rest validate the request.
         select: Select,
+        /// The parallel-scan slice, when `Segment`/`TotalSegments` are given.
+        segment: Option<ScanSegment>,
         /// `ConsistentRead` (default `false`). Decoded but **accept-and-
         /// ignore** for the base table or an LSI (both linearizable here
         /// already); an error against a **GSI** — the `animusd` edge is the
@@ -2232,6 +2249,45 @@ fn decode_exclusive_start_key(obj: &Map<String, Value>) -> Result<Option<Item>, 
 /// and an optional `IndexName` (ADR 0041 §5 — scans a secondary index's own
 /// rows instead of the base table; no `KeyConditionExpression` here, unlike
 /// `Query` — DynamoDB's `Scan` never takes one, index or not).
+/// Decode `Segment`/`TotalSegments`, which DynamoDB requires together.
+///
+/// Giving one without the other is rejected rather than ignored: a client that
+/// sends `Segment` alone almost certainly believes it is scanning a slice, and
+/// silently handing it the whole table would have every worker return every
+/// item — the parallel-scan equivalent of a filter that does not filter.
+fn decode_scan_segment(obj: &Map<String, Value>) -> Result<Option<ScanSegment>, WireError> {
+    let seg = obj.get("Segment");
+    let total = obj.get("TotalSegments");
+    let (seg, total) = match (seg, total) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            return Err(WireError::validation("`Segment` requires `TotalSegments`"));
+        }
+        (None, Some(_)) => {
+            return Err(WireError::validation("`TotalSegments` requires `Segment`"));
+        }
+        (Some(s), Some(t)) => (s, t),
+    };
+    let as_u32 = |v: &Value, name: &str| -> Result<u32, WireError> {
+        v.as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                WireError::validation(format!("`{name}` must be a non-negative integer"))
+            })
+    };
+    let segment = as_u32(seg, "Segment")?;
+    let total = as_u32(total, "TotalSegments")?;
+    if total == 0 {
+        return Err(WireError::validation("`TotalSegments` must be at least 1"));
+    }
+    if segment >= total {
+        return Err(WireError::validation(format!(
+            "`Segment` {segment} is out of range for `TotalSegments` {total}"
+        )));
+    }
+    Ok(Some(ScanSegment { segment, total }))
+}
+
 fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let table = table_name(obj)?;
     let index = obj
@@ -2243,6 +2299,7 @@ fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let filter = decode_predicate(obj, "FilterExpression")?;
     let projection = decode_projection(obj)?;
     let select = decode_select(obj, index.as_deref(), projection.as_ref())?;
+    let segment = decode_scan_segment(obj)?;
     let consistent_read = decode_consistent_read(obj);
     Ok(Operation::Scan {
         table,
@@ -2252,6 +2309,7 @@ fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         filter,
         projection,
         select,
+        segment,
         consistent_read,
     })
 }
@@ -4501,12 +4559,14 @@ mod tests {
                 filter,
                 projection,
                 select,
+                segment,
                 consistent_read,
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(index, None);
                 assert_eq!(limit, Some(2));
                 assert_eq!(select, Select::AllAttributes);
+                assert_eq!(segment, None, "no Segment/TotalSegments in the body");
                 assert_eq!(exclusive_start_key.unwrap().get("id"), Some(&s("k5")));
                 assert_eq!(
                     filter,
@@ -5535,5 +5595,37 @@ mod tests {
             "a table with no hits is an empty list: {body}"
         );
         assert!(body.contains(r#""UnprocessedKeys":{}"#), "{body}");
+    }
+
+    /// `Segment`/`TotalSegments` decode together and are validated.
+    #[test]
+    fn scan_segment_decodes_and_validates() {
+        let ok = br#"{"TableName":"t","Segment":1,"TotalSegments":4}"#;
+        match decode_request("DynamoDB_20120810.Scan", ok).expect("decodes") {
+            Operation::Scan { segment, .. } => assert_eq!(
+                segment,
+                Some(ScanSegment {
+                    segment: 1,
+                    total: 4
+                })
+            ),
+            other => panic!("expected Scan, got {other:?}"),
+        }
+
+        for body in [
+            // One without the other is a client bug, not a whole-table scan.
+            &br#"{"TableName":"t","Segment":0}"#[..],
+            &br#"{"TableName":"t","TotalSegments":4}"#[..],
+            // Out of range, and a zero split.
+            &br#"{"TableName":"t","Segment":4,"TotalSegments":4}"#[..],
+            &br#"{"TableName":"t","Segment":0,"TotalSegments":0}"#[..],
+            &br#"{"TableName":"t","Segment":-1,"TotalSegments":4}"#[..],
+        ] {
+            assert!(
+                decode_request("DynamoDB_20120810.Scan", body).is_err(),
+                "must reject {}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 }

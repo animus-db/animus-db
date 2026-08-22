@@ -228,6 +228,21 @@ The surface now extends past the original three point ops:
   object per miss. `UnprocessedKeys` is always empty: every requested key is
   read before responding rather than shedding load. The 100-key request cap
   is not enforced, which belongs with the permissive-divergence group.
+  **Audit note (2026-08-22, tenth — parallel `Scan`):** `Segment`/
+  `TotalSegments` were absent entirely, so a client could not split a
+  full-table scan across workers. They now map onto the **token ring**:
+  every data-plane key leads with an 8-byte big-endian partition token (ADR
+  0022), so segment `i` of `n` owns `[i·2⁶⁴/n, (i+1)·2⁶⁴/n)` — disjoint and
+  jointly covering by construction, which is exactly DynamoDB's contract.
+  The boundary arithmetic is done in `u128` (a single segment would overflow
+  computing 2⁶⁴ in `u64`), and the last segment's upper bound is unbounded
+  rather than 2⁶⁴ so nothing falls off the end of the ring. The same slicing
+  applies to a base-table scan, a GSI scan (its hidden table shares the key
+  layout) and an LSI scan (kind-scoped but still token-led). A cursor is
+  clamped into its segment, so a cursor from one worker cannot walk another
+  worker's rows. Giving `Segment` without `TotalSegments` (or the reverse) is
+  rejected rather than silently scanning the whole table, which would make
+  every worker in a fleet return every item.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
