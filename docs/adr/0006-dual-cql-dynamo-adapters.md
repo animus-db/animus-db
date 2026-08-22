@@ -344,6 +344,53 @@ The surface now extends past the original three point ops:
   0041 §5, but a client that asked for the cheap read is told it got the
   cheap read), and an `UpdateItem` is charged on the **larger** of the
   before/after images, so shrinking an item earns no discount.
+  **Audit note (2026-08-22, fifteenth — `ReturnItemCollectionMetrics`):**
+  `PutItem`/`UpdateItem`/`DeleteItem` now answer `SIZE` with an
+  `ItemCollectionMetrics`, on tables that have an LSI. The gate is
+  DynamoDB's and is not arbitrary: an item collection — every row sharing
+  one partition-key value across the base table and its LSIs — is a bounded,
+  meaningful thing precisely *because* an LSI shares the base partition.
+  Without one it is an incidental grouping, so a table with only a GSI
+  reports nothing (tested against a GSI-only table, which takes the
+  identical leader-evaluated write path and so isolates the LSI rule rather
+  than an indexed/unindexed difference).
+
+  `ItemCollectionKey` is exact. `SizeEstimateRangeGB` is `[0, bound]`, and
+  the honest reading of that shape is the point: DynamoDB's field is a
+  *range* bracketing an estimate, so a zero lower end and a real upper bound
+  is a weaker claim than DynamoDB's and a **true** one, where a fabricated
+  midpoint would be neither.
+
+  The bound is the hosting tablet's `KIND_BASE + KIND_LSI` byte total. Both
+  scopes are keyed `token(pk) || …` (ADR 0022), so a collection hashes to one
+  token and lives entirely inside one tablet — making the tablet's size a
+  true upper bound, never an under-estimate, which is the safe direction for
+  a growth warning. It is loose when the tablet holds many partitions, and
+  the useful property is that **it tightens exactly as the situation it warns
+  about worsens**: as one collection comes to dominate its tablet the two
+  converge. An exact figure would cost `O(collection)` per write, which a
+  write path may not pay for a diagnostic.
+
+  This is not only DynamoDB parity. DynamoDB caps an item collection at
+  10 GB when a table has an LSI; AnimusDB has no cap but the same shape —
+  tablets split on **bytes** (ADR 0034), splitting is by **token range**, and
+  one partition key is one token, so a collection that grows without bound is
+  **unsplittable** and its tablet stays large forever. The number warns about
+  that, arriving at DynamoDB's warning from the other direction.
+
+  Mechanically this needed a data-plane change, since only the node hosting
+  the tablet can price it: `KindWriteOutcome::Ok` and
+  `ClientResponse::KindWriteOk` now carry `collection_bytes`, computed at the
+  leader and returned across the forwarding hop (`#[serde(default)]`, so an
+  older peer yields no estimate rather than a wrong one). That this is
+  *available* is not luck — a table with an LSI has a non-empty index list, so
+  `table_change_records_carry_images` is true, so its writes never take the
+  ADR 0049 fast arm and always evaluate at the leader. The two conditions
+  coincide exactly. A forwarding hop that dropped the field would be a
+  bimodal per-process failure of the kind the engineering lessons warn about,
+  so the regression test writes the same collection through all three nodes
+  and was **mutation-checked**: dropping `collection_bytes` on the hop turns
+  four of the five tests red.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
