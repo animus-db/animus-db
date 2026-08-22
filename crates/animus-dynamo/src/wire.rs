@@ -457,6 +457,13 @@ pub enum Operation {
         /// an index cursor also carries the index's own key attributes (see
         /// `animusd::dynamo`'s `gsi_key_item_of`/`lsi_key_item_of`).
         exclusive_start_key: Option<Item>,
+        /// Optional post-read `FilterExpression`, applied **after** the key
+        /// condition has selected what to evaluate and after `limit` has
+        /// capped it — exactly `Scan`'s contract. A filtered-out item still
+        /// counts toward `ScannedCount` and still consumes a `Limit` slot, so
+        /// a page can come back with fewer than `Limit` items and still carry
+        /// a `LastEvaluatedKey`.
+        filter: Option<ConditionExpression>,
         /// Optional projection (the attributes to return; `None` = all).
         projection: Option<Projection>,
         /// `ConsistentRead` (default `false`). DynamoDB's own contract (ADR
@@ -1608,6 +1615,9 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     };
     let limit = decode_limit(obj)?;
     let exclusive_start_key = decode_exclusive_start_key(obj)?;
+    // Same predicate decoder `Scan` uses — a `Query`'s filter is the identical
+    // post-read contract, just applied within one partition's key range.
+    let filter = decode_predicate(obj, "FilterExpression")?;
     let projection = decode_projection(obj)?;
     let consistent_read = decode_consistent_read(obj);
     // A sort condition on an index is meaningful only for a local secondary
@@ -1624,6 +1634,7 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         sort_condition,
         limit,
         exclusive_start_key,
+        filter,
         projection,
         consistent_read,
     })
@@ -3029,9 +3040,11 @@ mod tests {
                 sort_condition,
                 limit,
                 exclusive_start_key,
+                filter,
                 projection,
                 consistent_read,
             } => {
+                assert!(filter.is_none(), "no FilterExpression in the body");
                 assert_eq!(table, "t");
                 assert_eq!(index, None);
                 assert_eq!(partition_value, s("part"));
@@ -3157,6 +3170,52 @@ mod tests {
             panic!("expected GetItem");
         };
         assert!(!consistent_read);
+    }
+
+    /// A `Query`'s `FilterExpression` decodes through the same predicate
+    /// decoder `Scan` uses. Before this it was never read at all, so a filter
+    /// rode through as `None` and the edge returned unfiltered results.
+    #[test]
+    fn decodes_query_filter_expression() {
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p",
+            "FilterExpression":"kind = :k",
+            "ExpressionAttributeValues":{":p":{"S":"x"},":k":{"S":"blue"}}}"#;
+        let Operation::Query { filter, .. } =
+            decode_request("DynamoDB_20120810.Query", body).unwrap()
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(
+            filter,
+            Some(ConditionExpression::Equals("kind".into(), s("blue")))
+        );
+
+        // The function forms decode too.
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p",
+            "FilterExpression":"attribute_not_exists(gone)",
+            "ExpressionAttributeValues":{":p":{"S":"x"}}}"#;
+        let Operation::Query { filter, .. } =
+            decode_request("DynamoDB_20120810.Query", body).unwrap()
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(
+            filter,
+            Some(ConditionExpression::AttributeNotExists("gone".into()))
+        );
+
+        // Absent stays `None` rather than defaulting to something permissive.
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"x"}}}"#;
+        let Operation::Query { filter, .. } =
+            decode_request("DynamoDB_20120810.Query", body).unwrap()
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(filter, None);
     }
 
     #[test]

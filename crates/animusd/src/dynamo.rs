@@ -537,6 +537,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             sort_condition,
             limit,
             exclusive_start_key,
+            filter,
             projection,
             consistent_read,
         } => {
@@ -549,6 +550,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 sort_condition.as_ref(),
                 limit,
                 exclusive_start_key,
+                filter.as_ref(),
                 projection.as_ref(),
                 consistent_read,
             )
@@ -2011,6 +2013,7 @@ async fn run_query(
     sort_condition: Option<&SortKeyCondition>,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
+    filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
     consistent_read: bool,
 ) -> Result<String, WireError> {
@@ -2029,6 +2032,7 @@ async fn run_query(
                 sort_condition,
                 limit,
                 exclusive_start_key,
+                filter,
                 projection,
                 consistent_read,
             )
@@ -2043,6 +2047,7 @@ async fn run_query(
                 sort_condition,
                 limit,
                 exclusive_start_key,
+                filter,
                 projection,
             )
             .await
@@ -2144,6 +2149,7 @@ async fn run_base_query(
     sort_condition: Option<&SortKeyCondition>,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
+    filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
     // A base-table query must reject an unknown table the way the registry path
@@ -2209,7 +2215,13 @@ async fn run_base_query(
     };
     let mut items = Vec::with_capacity(examined.len());
     for (_key, item) in &examined {
-        items.push(wire::project(projection, item));
+        // The filter sees the whole item; projection then trims the result. It
+        // runs *after* `limit` truncation, so a filtered-out item still counted
+        // toward `ScannedCount` and still consumed its slot — DynamoDB's
+        // contract, and exactly what `run_base_scan` does.
+        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+            items.push(wire::project(projection, item));
+        }
     }
     Ok(wire::scan_response(
         &items,
@@ -2240,6 +2252,7 @@ async fn run_index_query(
     sort_condition: Option<&SortKeyCondition>,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
+    filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
     consistent_read: bool,
 ) -> Result<String, WireError> {
@@ -2294,6 +2307,7 @@ async fn run_index_query(
                 sort_condition,
                 limit,
                 exclusive_start_key,
+                filter,
                 projection,
             )
             .await
@@ -2308,6 +2322,7 @@ async fn run_index_query(
                 sort_condition,
                 limit,
                 exclusive_start_key,
+                filter,
                 projection,
             )
             .await
@@ -2349,6 +2364,7 @@ async fn run_gsi_query(
     sort_condition: Option<&SortKeyCondition>,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
+    filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
     let index_table = dynamo_index::index_table_name(table, &idx.name);
@@ -2421,7 +2437,13 @@ async fn run_gsi_query(
     };
     let mut items = Vec::with_capacity(examined.len());
     for (_key, item) in &examined {
-        items.push(wire::project(projection, item));
+        // The filter sees the whole item; projection then trims the result. It
+        // runs *after* `limit` truncation, so a filtered-out item still counted
+        // toward `ScannedCount` and still consumed its slot — DynamoDB's
+        // contract, and exactly what `run_base_scan` does.
+        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+            items.push(wire::project(projection, item));
+        }
     }
     Ok(wire::scan_response(
         &items,
@@ -2458,6 +2480,7 @@ async fn run_lsi_query(
     sort_condition: Option<&SortKeyCondition>,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
+    filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
     if !meta.has_table_tablet(table) {
@@ -2515,7 +2538,13 @@ async fn run_lsi_query(
     };
     let mut items = Vec::with_capacity(examined.len());
     for (_key, item) in &examined {
-        items.push(wire::project(projection, item));
+        // The filter sees the whole item; projection then trims the result. It
+        // runs *after* `limit` truncation, so a filtered-out item still counted
+        // toward `ScannedCount` and still consumed its slot — DynamoDB's
+        // contract, and exactly what `run_base_scan` does.
+        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+            items.push(wire::project(projection, item));
+        }
     }
     Ok(wire::scan_response(
         &items,
