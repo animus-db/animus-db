@@ -1142,6 +1142,17 @@ enum CpRoute {
     None,
 }
 
+/// The error a kind write reports when its entry committed and **provably
+/// applied nothing**.
+///
+/// A sentinel rather than prose because [`ClientCtx::cp_kind_write_item`]
+/// matches on it to decide whether a **non-idempotent** write may be retried,
+/// and that decision must not drift with a reworded message. It still ends in
+/// `; retry` so [`ClientCtx::read_should_retry`] keeps treating it as
+/// retryable for every idempotent caller that never looks closer.
+const WRITE_PROVABLY_NOT_APPLIED: &str = "CP kind write applied nothing: its optimistic-concurrency precondition lost a race \
+     (or the range is sealed), proven at apply time; retry";
+
 /// How a [`ClientCtx::poll_probe`] confirm wait ended: the probed effect
 /// appeared (`Confirmed`), the wait became provably futile before the
 /// deadline (`Superseded` — see [`ClientCtx::confirm_wait_is_futile`]), or
@@ -1149,6 +1160,16 @@ enum CpRoute {
 /// (`TimedOut`).
 enum ProbeWait {
     Confirmed,
+    /// The entry committed and **provably applied nothing** — its apply-time
+    /// outcome said so (an OCC precondition that lost a race, or a sealed
+    /// range). Distinct from [`Superseded`](Self::Superseded) because it is
+    /// *proof*, not an inference from a value that failed to appear: a write
+    /// that provably did not apply is safe to retry even when it is not
+    /// idempotent, since retrying cannot double-count something that never
+    /// counted once. That is what lets a numeric `ADD` survive contention.
+    NotApplied,
+    /// The wait became provably futile with the entry's fate **unknown** —
+    /// it may have applied. Never retried for a non-idempotent write.
     Superseded,
     TimedOut,
 }
@@ -6980,7 +7001,20 @@ impl ClientCtx {
             // re-apply on its own. A non-idempotent write therefore gets one
             // attempt, and any transient failure is surfaced for the caller to
             // decide about, exactly as DynamoDB would.
-            if !idempotent
+            //
+            // **The one exception, and why it is safe.** ADR 0046's apply-time
+            // outcome channel can prove an entry applied nothing — its OCC
+            // precondition lost a race, or its range was sealed. That is not
+            // an inference from a value that failed to appear; it is recorded
+            // at apply time, identically on every replica. Retrying a write
+            // that provably did not apply cannot double-count it, because it
+            // never counted once, so at-most-once still holds. Without this a
+            // numeric `ADD` had no chance under contention at all: ten
+            // concurrent increments on one key make an OCC miss the common
+            // case, not the rare one, and every miss surfaced to the client as
+            // a 500 it then could not safely retry either.
+            let proven_not_applied = err.message.contains(WRITE_PROVABLY_NOT_APPLIED);
+            if (!idempotent && !proven_not_applied)
                 || !Self::read_should_retry(&err.message)
                 || tokio::time::Instant::now() >= deadline
             {
@@ -7288,6 +7322,7 @@ impl ClientCtx {
             // applies as a silent no-op (see `KindBatch.conditions`' doc in
             // `animus-cp-data`), so "superseded" is the caller's cue to
             // re-read and re-evaluate — the ordinary OCC retry round.
+            ProbeWait::NotApplied => Err(WRITE_PROVABLY_NOT_APPLIED.into()),
             ProbeWait::Superseded => Err(
                 "CP kind write superseded before its effect appeared (leadership churn, an \
                  apply-time no-op, or a failed write condition); retry"
@@ -7429,10 +7464,16 @@ impl ClientCtx {
                 }
                 // A no-op, and now distinguishable from an ambiguous one: the
                 // caller's OCC round (re-read, re-evaluate) or a re-route.
+                // Proof, not inference: the entry committed and the apply
+                // gate rejected it whole, on every replica identically. A
+                // `ConditionFailed` is the ordinary OCC round (re-read,
+                // re-evaluate); a `Sealed` wants a re-route to the split
+                // child, which the caller's retry does at the top of its own
+                // loop. Neither wrote anything, so neither is ambiguous.
                 Some(
                     KindBatchOutcome::ConditionFailed { .. } | KindBatchOutcome::Sealed { .. },
                 ) => {
-                    return ProbeWait::Superseded;
+                    return ProbeWait::NotApplied;
                 }
                 // Applied but not yet readable, not applied yet, not a
                 // `KindBatch` (the other CP write paths share this loop), or
@@ -7481,7 +7522,10 @@ impl ClientCtx {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         match Self::poll_probe(leader, accepted_index, &probe_key, &probe_val, deadline).await {
             ProbeWait::Confirmed => Ok(()),
-            ProbeWait::Superseded => Err(
+            // A batch write carries only idempotent puts, so it has no use for
+            // the proven/ambiguous distinction — both mean "retry", which its
+            // caller may always safely do.
+            ProbeWait::NotApplied | ProbeWait::Superseded => Err(
                 "CP batch write superseded before its effect appeared (leadership churn or an \
                  apply-time no-op); retry"
                     .into(),

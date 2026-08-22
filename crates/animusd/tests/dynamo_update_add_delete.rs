@@ -264,13 +264,12 @@ async fn concurrent_increments_all_land_exactly_once() {
             failures.push(format!("{status}: {resp}"));
         }
     }
-    assert!(
-        failures.is_empty(),
-        "every increment applied, so every one must be acknowledged; got {} \
-         failure(s): {failures:#?}",
-        failures.len()
-    );
+    let acknowledged = 10 - failures.len();
 
+    // Read the counter **before** asserting anything, so a failure reports the
+    // number that says which way it went. Asserting on the acknowledgements
+    // first would panic while hiding exactly the diagnostic needed to tell an
+    // honest refusal from a write that landed and was reported failed.
     let (status, got) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.GetItem",
@@ -279,9 +278,47 @@ async fn concurrent_increments_all_land_exactly_once() {
     )
     .await;
     assert_eq!(status, 200, "{got}");
+    let parsed: serde_json::Value = serde_json::from_str(&got).expect("json");
+    let counter: usize = parsed["Item"]["hits"]["N"]
+        .as_str()
+        .expect("hits is a number attribute")
+        .parse()
+        .expect("hits parses");
+
+    // The two invariants that hold unconditionally, whatever the contention.
+    //
+    // Never over-counts: this is the property that read **431** before the
+    // write-path fixes.
     assert!(
-        got.contains(r#""hits":{"N":"10"}"#),
-        "ten accepted increments must leave exactly ten, never more: {got}"
+        counter <= 10,
+        "ten increments must never leave more than ten: got {counter}"
+    );
+    // Never under-counts an acknowledged write: a 200 means the increment
+    // landed, so the counter cannot be below the number of them. This is the
+    // honesty property — the one a spurious-success would break.
+    assert!(
+        counter >= acknowledged,
+        "{acknowledged} increment(s) were acknowledged but the counter is only \
+         {counter}: an acknowledged write did not land"
+    );
+
+    // And the property the proven-no-op retry rule delivers: contention alone
+    // must not refuse an increment. An OCC precondition that loses a race is
+    // *proof* the entry applied nothing, so it is safe to retry even though
+    // `ADD` is not idempotent — and retried, it converges. Before that rule,
+    // ten concurrent increments on one key made an OCC miss the common case
+    // and each miss surfaced as a 500 the client could not safely retry
+    // either; CI measured 2-of-10 refused.
+    //
+    // A refusal here is therefore a real regression, not contention noise.
+    // (The residual ambiguous case — an entry that applied while this node's
+    // outcome record lagged past the deadline — is what the two invariants
+    // above stay true for; it is not expected without an injected fault.)
+    assert!(
+        failures.is_empty(),
+        "contention alone must not refuse an increment; counter={counter}, \
+         got {} failure(s): {failures:#?}",
+        failures.len()
     );
 
     for n in nodes {
