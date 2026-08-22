@@ -7,17 +7,20 @@
 //! indexed attribute an `ADD` changed must be re-indexed, exactly as a `SET`
 //! would have caused.
 //!
-//! **Numeric `ADD` is refused**, and that is the finding this rung produced.
-//! `ClientCtx::cp_kind_write_item` retries `kind_write_item_at_leader`, which
-//! re-reads the old image and re-applies; a write that landed can still report
-//! a retryable error, since a failed OCC seatbelt is documented as
-//! indistinguishable from a fence miss. Every action before this one was
-//! idempotent, so re-application converged to the same state. `+1` does not:
-//! measured here, ten concurrent increments with **two** accepted responses
-//! left the counter at **431**.
+//! Numeric `ADD` is the adapter's only **non-idempotent** write, and that is
+//! what this file pins. `ClientCtx::cp_kind_write_item` used to retry
+//! `kind_write_item_at_leader` on any retryable error, and that re-reads the
+//! old image and re-applies — a fresh read-modify-write, not a replay. A write
+//! that landed can still report retryable, because a failed OCC seatbelt is
+//! documented as indistinguishable from a fence miss. Measured before the fix:
+//! ten concurrent increments with **two** accepted responses left the counter
+//! at **431**.
 //!
-//! Set `ADD`/`DELETE` are union and difference, which *are* idempotent, so
-//! they are safe on the same path — pinned below by a concurrent test.
+//! The guarantee to hold is DynamoDB's — **at-most-once per request**, not
+//! exactly-once. A client that retries an `ADD` which actually applied
+//! double-counts on DynamoDB too. So the service simply must not re-apply on
+//! its own, which is why the retry loop now skips non-idempotent writes rather
+//! than reaching for an idempotency token.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -186,12 +189,7 @@ async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> 
     }
 }
 
-/// Numeric `ADD` is refused over the wire, with a 400 and a message that
-/// explains why rather than a bare rejection.
-///
-/// This is the deliberate outcome of the measurement in this file's header:
-/// the kind-write path may apply a request more than once, and `+1` applied
-/// twice is silently wrong in a way a user cannot detect from the response.
+/// Numeric `ADD` is refused over the wire, with the reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn numeric_add_is_refused_over_the_wire() {
     let (_dir, nodes, addrs) = setup().await;
@@ -204,17 +202,13 @@ async fn numeric_add_is_refused_over_the_wire() {
             "ExpressionAttributeValues":{":one":{"N":"1"}}}"#,
     )
     .await;
-    assert_eq!(
-        status, 400,
-        "numeric ADD must be refused, not silently applied: {body}"
-    );
+    assert_eq!(status, 400, "numeric ADD must be refused: {body}");
     assert!(body.contains("ValidationException"), "{body}");
     assert!(
-        body.contains("more than once"),
-        "the message must explain the reason: {body}"
+        body.contains("count twice"),
+        "the reason must be stated: {body}"
     );
 
-    // And the row is untouched.
     let (_, got) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.GetItem",

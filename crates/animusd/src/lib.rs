@@ -6900,6 +6900,9 @@ impl ClientCtx {
                 .map_err(|e| dynamo::internal(&e))?;
         }
         let base_key = dynamo::item_key(pk, sk);
+        // Whether this write may be safely re-applied; see the retry decision
+        // at the bottom of the loop.
+        let idempotent = dynamo::kind_write_is_idempotent(&op);
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             let err = match self.cp_route(table, &base_key).await {
@@ -6950,7 +6953,28 @@ impl ClientCtx {
                 }
                 CpRoute::None => dynamo::internal("no CP group leader reachable"),
             };
-            if !Self::read_should_retry(&err.message) || tokio::time::Instant::now() >= deadline {
+            // **At-most-once for a non-idempotent write.** This loop re-enters
+            // `kind_write_item_at_leader`, which re-reads the old image and
+            // re-applies the actions — a fresh read-modify-write, not a replay
+            // of the original proposal. For every idempotent op (Put, Delete,
+            // SET, REMOVE, a set union or difference) that converges to the
+            // same state and the retry is free. A numeric `ADD` does not
+            // converge, and a retryable error is not proof the write missed:
+            // a failed OCC seatbelt applies as a silent no-op that the
+            // confirm-poll reports exactly like a fence miss, so a write that
+            // landed can still come back retryable. Retrying then counts twice.
+            //
+            // DynamoDB's guarantee is at-most-once **per request**, not
+            // exactly-once: a *client* that retries an `ADD` which actually
+            // applied does double-count there too. So the fix is not an
+            // idempotency token — it is simply that the service must not
+            // re-apply on its own. A non-idempotent write therefore gets one
+            // attempt, and any transient failure is surfaced for the caller to
+            // decide about, exactly as DynamoDB would.
+            if !idempotent
+                || !Self::read_should_retry(&err.message)
+                || tokio::time::Instant::now() >= deadline
+            {
                 return Err(err);
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;

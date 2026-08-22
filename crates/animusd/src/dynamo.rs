@@ -155,7 +155,7 @@ use animus_control::{MetaCommand, Metadata, ReplicationMode, TtlSpec};
 use animus_cp_data::{KIND_BASE, KIND_LSI};
 use animus_dynamo::wire::{
     self, Operation, Projection, ReturnValues, ScanSegment, Select, TransactAction, TransactGet,
-    WireError, WriteRequest,
+    UpdateAction, WireError, WriteRequest,
 };
 use animus_dynamo::{
     AttributeValue, ChangeRecord, ConditionExpression, Item, SortKeyCondition, TableSchema,
@@ -2145,6 +2145,25 @@ fn lsi_key_names(base: &TableSchema, idx: &IndexDef) -> BTreeSet<String> {
         names.insert(sort.clone());
     }
     names
+}
+
+/// Whether re-applying this write would leave the same state.
+///
+/// Everything the adapter writes is idempotent except one thing: a numeric
+/// `ADD`. `Put` and `Delete` replace or remove wholesale; `SET` and `REMOVE`
+/// assign or drop an attribute; a set `ADD`/`DELETE` is a union or difference,
+/// and applying the same union twice is that union. Adding `1` twice is `2`.
+///
+/// This is what `ClientCtx::cp_kind_write_item` consults before retrying: a
+/// retryable error is not proof a write missed, so a non-idempotent write gets
+/// exactly one attempt.
+pub(crate) fn kind_write_is_idempotent(op: &KindWriteOp) -> bool {
+    match op {
+        KindWriteOp::Put(_) | KindWriteOp::Delete => true,
+        KindWriteOp::Update { actions, .. } => !actions
+            .iter()
+            .any(|a| matches!(a, UpdateAction::Add(_, AttributeValue::N(_)))),
+    }
 }
 
 /// The half-open data-plane key range a parallel-scan segment owns.
