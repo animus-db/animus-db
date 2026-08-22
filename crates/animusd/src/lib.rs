@@ -3274,9 +3274,13 @@ impl console::ConsoleBackend for ClientCtx {
 /// Decode a `Scan`/`Query` wire response body (`{"Items": [...], "Count": n,
 /// "ScannedCount": n[, "LastEvaluatedKey": {...}]}`) into an
 /// [`console::ItemsPage`] — shared by [`ConsoleBackend::scan_items`] and
-/// [`ConsoleBackend::query_items`] above (`animus_dynamo::wire::
-/// query_response` never emits `LastEvaluatedKey` at all, so this naturally
-/// yields `None` there — see [`console::ItemsPage`]'s own doc).
+/// [`ConsoleBackend::query_items`] above. `Query` now paginates on the wire
+/// (`animus_dynamo::wire::scan_response` is the response encoder for both
+/// operations), but [`ConsoleBackend::query_items`] doesn't yet send a
+/// `Limit`/`ExclusiveStartKey` of its own, so `LastEvaluatedKey` still comes
+/// back absent in practice there — see [`console::ItemsPage`]'s own doc for
+/// why threading the console's Items tab onto real `Query` pagination is a
+/// deliberately separate, not-yet-done follow-up.
 fn console_parse_items_page(body: &str) -> Result<console::ItemsPage, console::ConsoleError> {
     let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| console::ConsoleError::new(500, format!("malformed items response: {e}")))?;
@@ -8837,13 +8841,18 @@ impl ClientCtx {
     /// `start` and `end` must resolve to that same tablet — checked here
     /// rather than assumed, mirroring [`cp_kind_write`](Self::cp_kind_write)'s
     /// cross-tablet guard: silently scanning only the first tablet's share of
-    /// a straddling range would be a silent partial read.
+    /// a straddling range would be a silent partial read. `limit` is pushed
+    /// down to [`cp_scan_kind_one`](Self::cp_scan_kind_one) — the LSI `Query`
+    /// pagination primitive (`animusd::dynamo`'s bounded, windowed
+    /// `paginated_kind_examine_one`) now pages the same way a base/GSI
+    /// `Query` does, rather than the `None`-always gap this used to have.
     pub(crate) async fn cp_scan_kind(
         &self,
         table: &str,
         kind: u8,
         start: Vec<u8>,
         end: Vec<u8>,
+        limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let start_tablet = self
             .tablet_for(table, &start)
@@ -8854,9 +8863,7 @@ impl ClientCtx {
                  an LSI query is scoped to one partition"
             ));
         }
-        // An LSI `Query` has no `Limit` (a documented DynamoDB-fidelity gap,
-        // ADR 0041) — `None` here.
-        self.cp_scan_kind_one(table, kind, start, Some(end), None)
+        self.cp_scan_kind_one(table, kind, start, Some(end), limit)
             .await
     }
 

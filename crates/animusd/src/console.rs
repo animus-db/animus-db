@@ -429,13 +429,15 @@ pub(crate) type WireItem = serde_json::Map<String, serde_json::Value>;
 /// [`ConsoleBackend::scan_items`]/[`ConsoleBackend::query_items`]'s shared
 /// return shape. `scanned_count` and `last_evaluated_key` are DynamoDB's own
 /// pagination vocabulary (`ScannedCount`/`LastEvaluatedKey`), console-cased.
-/// `last_evaluated_key` is always `None` for a `Query` result: this
-/// adapter's `Query` operation has no `Limit`/`ExclusiveStartKey` of its own
-/// (`animus-dynamo`'s `wire::decode_query` never parses either) — a
-/// documented pre-existing gap in the underlying wire layer, not something
-/// this PR's console screen introduces or attempts to paper over. A `Query`
-/// is scoped to one partition, so an unpaginated single-shot read is the
-/// same tradeoff the real wire edge already made.
+/// `last_evaluated_key` is currently always `None` for a `Query` result:
+/// the underlying wire operation now has a real `Limit`/`ExclusiveStartKey`
+/// contract (`animus-dynamo`'s `wire::decode_query` parses both, matching
+/// `Scan`), but [`QueryItemsRequest`] below doesn't yet expose either
+/// field — a documented, deliberate scope cut for the console screen alone
+/// (a `Query` is scoped to one partition, so an unpaginated single-shot read
+/// stays a reasonable console-UI tradeoff even now that the wire edge itself
+/// no longer has this gap); wiring the Items tab onto real `Query`
+/// pagination is a natural console-side follow-up, not attempted here.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ItemsPage {
     pub(crate) items: Vec<WireItem>,
@@ -491,8 +493,10 @@ pub(crate) enum SortKeyQuery {
 /// required (a `Query` always narrows to one partition); `sort_condition` is
 /// present only when the caller chose to narrow further and the target
 /// (base table, or the named GSI/LSI) actually has a sort key. No
-/// `limit`/`exclusive_start_key` — see [`ItemsPage`]'s doc on why `Query`
-/// can't paginate on this adapter.
+/// `limit`/`exclusive_start_key` yet — the wire operation itself now
+/// supports both (see [`ItemsPage`]'s doc), but this console request shape
+/// doesn't expose them; the Items tab still issues one unpaginated `Query`
+/// per partition, a deliberate scope cut, not a wire-layer limitation.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct QueryItemsRequest {
     #[serde(default)]

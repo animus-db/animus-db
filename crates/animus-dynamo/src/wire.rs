@@ -434,7 +434,13 @@ pub enum Operation {
     /// `Query`: items in a partition (`pk = ..`) matching an optional sort-key
     /// condition — against the base table, or a secondary index when `index` is
     /// set (a GSI query is a hash-key equality only; an LSI query may carry a
-    /// sort condition on the index's alternate sort key).
+    /// sort condition on the index's alternate sort key). **Paginated**, the
+    /// same `Limit`/`ExclusiveStartKey` contract as [`Scan`](Self::Scan):
+    /// `limit` caps items examined (pushed down, not applied client-side) and
+    /// `exclusive_start_key` resumes strictly after a previous page's
+    /// `LastEvaluatedKey` — see `animusd::dynamo::run_base_query`'s doc for
+    /// exactly how a `Query`'s pagination composes with the partition
+    /// sub-range and the sort-key condition.
     Query {
         /// Target table name.
         table: String,
@@ -444,6 +450,13 @@ pub enum Operation {
         partition_value: AttributeValue,
         /// Optional sort-key narrowing.
         sort_condition: Option<SortKeyCondition>,
+        /// Max items to examine this page (`None` = all remaining).
+        limit: Option<usize>,
+        /// The exclusive start key (pagination cursor) from a previous
+        /// page's `LastEvaluatedKey` — a base-table cursor is `{pk[, sk]}`;
+        /// an index cursor also carries the index's own key attributes (see
+        /// `animusd::dynamo`'s `gsi_key_item_of`/`lsi_key_item_of`).
+        exclusive_start_key: Option<Item>,
         /// Optional projection (the attributes to return; `None` = all).
         projection: Option<Projection>,
         /// `ConsistentRead` (default `false`). DynamoDB's own contract (ADR
@@ -1564,6 +1577,8 @@ fn resolve_placeholder(
 /// `<pk> = :pv [AND <sort-condition>]`, with values supplied via
 /// `ExpressionAttributeValues`. The supported sort conditions are
 /// `<sk> = :v`, `<sk> BETWEEN :lo AND :hi`, and `begins_with(<sk>, :p)`.
+/// `Limit`/`ExclusiveStartKey` decode exactly like `Scan`'s
+/// ([`decode_limit`]/[`decode_exclusive_start_key`], shared between the two).
 fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let table = table_name(obj)?;
     let expr = obj
@@ -1591,6 +1606,8 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         None => None,
         Some(clause) => Some(decode_sort_condition(obj, clause)?),
     };
+    let limit = decode_limit(obj)?;
+    let exclusive_start_key = decode_exclusive_start_key(obj)?;
     let projection = decode_projection(obj)?;
     let consistent_read = decode_consistent_read(obj);
     // A sort condition on an index is meaningful only for a local secondary
@@ -1605,6 +1622,8 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         index,
         partition_value,
         sort_condition,
+        limit,
+        exclusive_start_key,
         projection,
         consistent_read,
     })
@@ -1621,6 +1640,32 @@ fn decode_consistent_read(obj: &Map<String, Value>) -> bool {
         .unwrap_or(false)
 }
 
+/// Decode the optional `Limit` (a non-negative integer, `None` when absent or
+/// `null`). Shared by `Scan` and `Query` — both page the same way.
+fn decode_limit(obj: &Map<String, Value>) -> Result<Option<usize>, WireError> {
+    match obj.get("Limit") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => Ok(Some(
+            v.as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| WireError::validation("`Limit` must be a non-negative integer"))?,
+        )),
+    }
+}
+
+/// Decode the optional `ExclusiveStartKey` (an AttributeValue-map pagination
+/// cursor, `None` when absent or `null`). Shared by `Scan` and `Query`.
+fn decode_exclusive_start_key(obj: &Map<String, Value>) -> Result<Option<Item>, WireError> {
+    match obj.get("ExclusiveStartKey") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => Ok(Some(
+            v.as_object()
+                .ok_or_else(|| WireError::validation("`ExclusiveStartKey` must be an object"))
+                .and_then(decode_item)?,
+        )),
+    }
+}
+
 /// Decode a `Scan` body: an optional `Limit`, an optional `ExclusiveStartKey`
 /// (the AttributeValue-map cursor from a previous page's `LastEvaluatedKey`),
 /// an optional `FilterExpression` (the `ConditionExpression` predicate set),
@@ -1633,22 +1678,8 @@ fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         .get("IndexName")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let limit = match obj.get("Limit") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(
-            v.as_u64()
-                .and_then(|n| usize::try_from(n).ok())
-                .ok_or_else(|| WireError::validation("`Limit` must be a non-negative integer"))?,
-        ),
-    };
-    let exclusive_start_key = match obj.get("ExclusiveStartKey") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(
-            v.as_object()
-                .ok_or_else(|| WireError::validation("`ExclusiveStartKey` must be an object"))
-                .and_then(decode_item)?,
-        ),
-    };
+    let limit = decode_limit(obj)?;
+    let exclusive_start_key = decode_exclusive_start_key(obj)?;
     let filter = decode_predicate(obj, "FilterExpression")?;
     let projection = decode_projection(obj)?;
     let consistent_read = decode_consistent_read(obj);
@@ -2023,24 +2054,13 @@ pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Item {
     item
 }
 
-/// The JSON body for a successful `Query`: `{"Items": [..], "Count": n,
-/// "ScannedCount": n}`. Items are emitted in sort order, as the caller supplies
-/// them.
-#[must_use]
-pub fn query_response(items: &[Item]) -> String {
-    let encoded: Vec<Value> = items.iter().map(encode_item).collect();
-    let count = Value::from(items.len());
-    let mut obj = Map::new();
-    obj.insert("Items".into(), Value::Array(encoded));
-    obj.insert("Count".into(), count.clone());
-    obj.insert("ScannedCount".into(), count);
-    serde_json::to_string(&Value::Object(obj)).expect("query response serializes")
-}
-
-/// The JSON body for a successful `Scan`: `{"Items": [..], "Count": n,
-/// "ScannedCount": s}`, plus a `LastEvaluatedKey` (the AttributeValue-map
-/// pagination cursor) when the page was truncated by a `Limit`. `scanned` counts
-/// the items read before filtering; `Count` the items returned after.
+/// The JSON body for a successful `Scan` **or `Query`** (both share this exact
+/// shape now that `Query` paginates too — `animusd::dynamo`'s base/GSI/LSI
+/// query paths build their response with this same encoder): `{"Items": [..],
+/// "Count": n, "ScannedCount": s}`, plus a `LastEvaluatedKey` (the
+/// AttributeValue-map pagination cursor) when the page was truncated by a
+/// `Limit`. `scanned` counts the items read before filtering; `Count` the
+/// items returned after.
 #[must_use]
 pub fn scan_response(items: &[Item], scanned: usize, last_evaluated_key: Option<&Item>) -> String {
     let encoded: Vec<Value> = items.iter().map(encode_item).collect();
@@ -3007,6 +3027,8 @@ mod tests {
                 index,
                 partition_value,
                 sort_condition,
+                limit,
+                exclusive_start_key,
                 projection,
                 consistent_read,
             } => {
@@ -3014,11 +3036,73 @@ mod tests {
                 assert_eq!(index, None);
                 assert_eq!(partition_value, s("part"));
                 assert_eq!(sort_condition, None);
+                assert_eq!(limit, None, "no Limit in the body");
+                assert_eq!(
+                    exclusive_start_key, None,
+                    "no ExclusiveStartKey in the body"
+                );
                 assert_eq!(projection, None);
                 assert!(!consistent_read, "default is false");
             }
             other => panic!("expected Query, got {other:?}"),
         }
+    }
+
+    /// `Query` decodes `Limit`/`ExclusiveStartKey` exactly like `Scan`
+    /// (`decodes_scan_with_limit_and_filter`'s pair) — the pagination gap
+    /// this crate used to have (`decode_query` never parsed either field).
+    #[test]
+    fn decodes_query_with_limit_and_exclusive_start_key() {
+        let body = br#"{"TableName":"t","Limit":3,
+            "ExclusiveStartKey":{"pk":{"S":"part"},"sk":{"S":"k5"}},
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"part"}}}"#;
+        match decode_request("DynamoDB_20120810.Query", body).unwrap() {
+            Operation::Query {
+                limit,
+                exclusive_start_key,
+                ..
+            } => {
+                assert_eq!(limit, Some(3));
+                let esk = exclusive_start_key.expect("ExclusiveStartKey present");
+                assert_eq!(esk.get("pk"), Some(&s("part")));
+                assert_eq!(esk.get("sk"), Some(&s("k5")));
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    /// Omitting `Limit`/`ExclusiveStartKey` on a `Query` decodes both as
+    /// `None` — the same default `decodes_query_partition_only` already
+    /// covers via its explicit-destructure assertions; this test names the
+    /// property directly for the pagination fields.
+    #[test]
+    fn decodes_query_without_limit_or_exclusive_start_key() {
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"part"}}}"#;
+        match decode_request("DynamoDB_20120810.Query", body).unwrap() {
+            Operation::Query {
+                limit,
+                exclusive_start_key,
+                ..
+            } => {
+                assert_eq!(limit, None);
+                assert_eq!(exclusive_start_key, None);
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    /// A non-integer `Limit` on `Query` is rejected exactly like `Scan`'s own
+    /// `Limit` validation (`decode_limit` is now shared between the two).
+    #[test]
+    fn rejects_non_integer_query_limit() {
+        let body = br#"{"TableName":"t","Limit":"two",
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"part"}}}"#;
+        let err = decode_request("DynamoDB_20120810.Query", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
     }
 
     /// `ConsistentRead` decodes on `GetItem`/`Query`/`Scan` alike (ADR 0041
@@ -3112,16 +3196,6 @@ mod tests {
             panic!("expected Query");
         };
         assert_eq!(sort_condition, Some(SortKeyCondition::BeginsWith(s("ab"))));
-    }
-
-    #[test]
-    fn query_response_shape() {
-        let mut a = Item::new();
-        a.insert("pk".into(), s("p"));
-        let body = query_response(&[a]);
-        assert!(body.contains("\"Items\""));
-        assert!(body.contains("\"Count\":1"));
-        assert!(body.contains("\"ScannedCount\":1"));
     }
 
     #[test]
