@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use animus_storage::{StorageEngine, Version};
 use serde::{Deserialize, Serialize};
 
+pub mod capacity;
 pub mod condition;
 pub mod index;
 pub mod registry;

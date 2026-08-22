@@ -293,6 +293,57 @@ The surface now extends past the original three point ops:
   and leave the counter at exactly ten, against 431 originally. The exact
   decimal arithmetic (38 significant digits, no `f64` round-trip) that
   shipped unused with the eighth note is now on the wire.
+  **Audit note (2026-08-22, fourteenth — `ReturnConsumedCapacity`):** every
+  data-plane response can now carry a `ConsumedCapacity` report
+  (`NONE`/`TOTAL`/`INDEXES`), on `GetItem`/`PutItem`/`DeleteItem`/
+  `UpdateItem`; the collection and transactional operations follow
+  separately. The AWS SDKs read this field off every response and a great
+  deal of client telemetry is written against it, so its absence was a
+  fidelity gap even though AnimusDB has no provisioned throughput.
+
+  The decision worth recording is **what the number means here.** A capacity
+  unit is not a measurement of bytes we moved: DynamoDB defines it as a
+  documented arithmetic function of the item's *logical* size, which is why
+  the same item costs the same units whatever the storage engine did. So
+  `animus_dynamo::capacity` computes the published formula over the decoded
+  item rather than instrumenting the write path — that is both what makes
+  the numbers agree with DynamoDB's and what makes them unit-testable as
+  pure functions. What we deliberately do **not** do is invent a
+  *provisioned* figure to sit beside them: this reports what a request cost
+  and never implies a limit, because there is no limit and no throttling
+  behind it.
+
+  Number sizing normalizes the coefficient — sign, decimal point, leading
+  **and trailing** zeros are presentation and are not charged for — so
+  `100`, `100.0` and `1.0E+2` cost the same, exactly as they compare equal
+  under the sixth note's comparator. Counting characters instead would have
+  priced `100.0` below `100`: a quietly-wrong answer of the same family as
+  the fifth note's bugs, and one a client can never detect from its own
+  response.
+
+  Each index is charged on **its own row**, not on the base item, so a
+  `KEYS_ONLY` GSI beside a 1.5 KB item costs 1 unit while an `ALL` LSI costs
+  2. The per-index gates are the *same* conditions the write path uses to
+  decide whether the row exists at all (the LSI's alternate-sort presence
+  check, the drain's hash/sort presence check, and `Deleting` excluded but
+  `Creating` charged) — reporting capacity for a row that was never written
+  would be unverifiable from the client side, so the gates are shared rather
+  than restated.
+
+  One behavioural consequence: asking for capacity on a `DeleteItem` opts
+  out of the ADR 0049 fast arm, joining `ConditionExpression` and `ALL_OLD`
+  as reasons that write is evaluated at the leader. A delete is charged on
+  the item it *removed*, including the index rows that went with it, and the
+  fast arm reads none of that; reporting the one-unit floor instead would
+  understate a large indexed item's delete by an arbitrary amount.
+  `PutItem` keeps its fast arm — the written image is already in hand at the
+  edge — and the asymmetry is exactly that difference.
+
+  Two smaller alignments with DynamoDB: an eventually-consistent read is
+  billed at half a unit (our base read is linearizable either way per ADR
+  0041 §5, but a client that asked for the cheap read is told it got the
+  cheap read), and an `UpdateItem` is charged on the **larger** of the
+  before/after images, so shrinking an item earns no discount.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator

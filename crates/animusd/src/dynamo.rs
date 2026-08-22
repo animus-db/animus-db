@@ -153,6 +153,7 @@ use std::time::Duration;
 use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjection, IndexStatus};
 use animus_control::{MetaCommand, Metadata, ReplicationMode, TtlSpec};
 use animus_cp_data::{KIND_BASE, KIND_LSI};
+use animus_dynamo::capacity::{self, ConsumedCapacity, ReturnConsumedCapacity};
 use animus_dynamo::wire::{
     self, Operation, Projection, ReturnValues, ScanSegment, Select, TransactAction, TransactGet,
     UpdateAction, WireError, WriteRequest,
@@ -434,8 +435,15 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             item,
             condition,
             return_values,
+            capacity: report,
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &item)?;
+            // The written image is already in hand here, so a `PutItem` can
+            // report its capacity without giving up the fast arm below — unlike
+            // `DeleteItem`, whose charge depends on an image only the leader has
+            // read. Charged on the item as it is *after* the write, DynamoDB's
+            // own rule.
+            let charged = write_capacity(meta, &table, Some(&item), report);
             // ADR 0049 fast arm: nothing to read, nothing to evaluate —
             // the edge commits base row + marker record directly (see
             // `fast_marker_write`'s doc for why this must NOT go through
@@ -446,7 +454,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             {
                 let value = wire::encode_stored_item(&item);
                 fast_marker_write(ctx, &table, &pk, sk.as_ref(), value).await?;
-                return Ok(wire::write_response(return_values, None));
+                return Ok(wire::write_response(return_values, None, charged.as_ref()));
             }
             // ADR 0046 U3: an evaluated write (a condition, an old-image
             // echo, or an images-carrying table) is evaluated **at the
@@ -470,9 +478,11 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
                 )),
-                KindWriteOutcome::Ok { old, .. } => {
-                    Ok(wire::write_response(return_values, old.as_ref()))
-                }
+                KindWriteOutcome::Ok { old, .. } => Ok(wire::write_response(
+                    return_values,
+                    old.as_ref(),
+                    charged.as_ref(),
+                )),
             }
         }
         Operation::DeleteItem {
@@ -480,18 +490,28 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             key,
             condition,
             return_values,
+            capacity: report,
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
             // ADR 0049 fast arm — see `PutItem`'s identical fork above. A
             // delete's base write is the tombstone *sentinel value*, so the
             // routed probe still confirms on a `Some`.
+            //
+            // A capacity report joins the existing reasons to skip the fast arm.
+            // DynamoDB charges a delete on the size of the item it *removed*,
+            // and index rows are removed with it — none of which the fast arm
+            // reads. Reporting the one-unit floor instead would understate a
+            // large indexed item's delete by an arbitrary amount, so asking for
+            // capacity opts into the read that can answer honestly, exactly as
+            // asking for `ALL_OLD` already does.
             if condition.is_none()
                 && return_values == ReturnValues::None
+                && !report.wanted()
                 && !table_change_records_carry_images(meta, &table)
             {
                 let value = wire::encode_tombstone();
                 fast_marker_write(ctx, &table, &pk, sk.as_ref(), value).await?;
-                return Ok(wire::write_response(return_values, None));
+                return Ok(wire::write_response(return_values, None, None));
             }
             // See `PutItem`'s identical fork above for why an evaluated
             // write goes to the leader instead.
@@ -510,7 +530,14 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                     "the conditional request failed",
                 )),
                 KindWriteOutcome::Ok { old, .. } => {
-                    Ok(wire::write_response(return_values, old.as_ref()))
+                    // A delete is charged on what it removed, including the
+                    // index rows that went with it — hence the *old* image.
+                    let charged = write_capacity(meta, &table, old.as_ref(), report);
+                    Ok(wire::write_response(
+                        return_values,
+                        old.as_ref(),
+                        charged.as_ref(),
+                    ))
                 }
             }
         }
@@ -520,16 +547,22 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             table,
             key,
             projection,
-            // Accept-and-ignore (ADR 0041 §5): a base-table `GetItem` is
-            // already linearizable here, so `ConsistentRead: true` needs no
-            // enforcement — only a GSI `Query` ever rejects it.
-            consistent_read: _,
+            // Accept-and-ignore *for correctness* (ADR 0041 §5): a base-table
+            // `GetItem` is already linearizable here, so `ConsistentRead: true`
+            // needs no enforcement — only a GSI `Query` ever rejects it. It is
+            // still read for **capacity**, where it halves the charge.
+            consistent_read,
+            capacity: report,
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
             let data_key = item_key(&pk, sk.as_ref());
             let item = quorum_read(ctx, meta, &table, &data_key).await?;
+            // Charged on the **stored** item, before the projection: DynamoDB
+            // reads the whole item and projects on the way out, so a projection
+            // narrows the response without narrowing the cost.
+            let charged = read_capacity(&table, item.as_ref(), consistent_read, report);
             let item = item.map(|i| wire::project(projection.as_ref(), &i));
-            Ok(wire::get_item_response(item.as_ref()))
+            Ok(wire::get_item_response(item.as_ref(), charged.as_ref()))
         }
         Operation::BatchGetItem { requests } => {
             // Independent point reads, not a transaction: DynamoDB's
@@ -622,6 +655,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             actions,
             condition,
             return_values,
+            capacity: report,
         } => {
             // ADR 0046 U3: an indexed/streamed table's `UpdateItem` also
             // evaluates at the leader now — it has the identical cross-node
@@ -647,11 +681,29 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
                 )),
-                KindWriteOutcome::Ok { old, new } => Ok(wire::update_response(
-                    return_values,
-                    old.as_ref(),
-                    new.as_ref(),
-                )),
+                KindWriteOutcome::Ok { old, new } => {
+                    // DynamoDB charges an update on the **larger** of the
+                    // before and after images: an update that shrinks an item
+                    // still had to write the whole of the larger one, and one
+                    // that grows it is charged for what it grew to.
+                    let larger = match (old.as_ref(), new.as_ref()) {
+                        (Some(o), Some(n)) => {
+                            if capacity::item_size(o) > capacity::item_size(n) {
+                                old.as_ref()
+                            } else {
+                                new.as_ref()
+                            }
+                        }
+                        (some, None) | (None, some) => some,
+                    };
+                    let charged = write_capacity(meta, &table, larger, report);
+                    Ok(wire::update_response(
+                        return_values,
+                        old.as_ref(),
+                        new.as_ref(),
+                        charged.as_ref(),
+                    ))
+                }
             }
         }
         Operation::BatchWriteItem { requests } => {
@@ -3797,6 +3849,100 @@ fn token_prefixed(pk: &AttributeValue, within: &[u8]) -> Vec<u8> {
     let mut key = partition_token(&storage_key(pk, None)).to_vec();
     key.extend_from_slice(within);
     key
+}
+
+/// The [`ConsumedCapacity`] a **write** of `image` against `table` costs, or
+/// `None` when the caller asked for no capacity report.
+///
+/// `image` is the item as it exists after the write — `None` for a delete (or
+/// for a delete of a key that was never there), which charges the base table
+/// its floor of one unit and no index anything.
+///
+/// The per-index charges follow **exactly** the gates the write path itself
+/// uses to decide whether an index row exists, because reporting capacity for
+/// an index row that was never written would be a lie the client cannot check:
+///
+/// - an **LSI** is charged when the item carries the index's alternate sort
+///   attribute (`kind_writes_for_item`'s `new_alt` gate);
+/// - a **GSI** is charged when the item carries its hash attribute, and its
+///   sort attribute too when the index declares one
+///   (`index_drain::drain_tablet`'s gate);
+/// - an index being torn down (`Deleting`) is charged nothing, since the drain
+///   has already stopped maintaining it. A `Creating` index *is* charged: the
+///   drain keeps it current while backfill catches up, so the write really
+///   does reach it.
+///
+/// Each index is charged on the size of **its own row** — the projection, not
+/// the base item — so a `KEYS_ONLY` index costs far less than the table.
+fn write_capacity(
+    meta: &Metadata,
+    table: &str,
+    image: Option<&Item>,
+    detail: ReturnConsumedCapacity,
+) -> Option<ConsumedCapacity> {
+    if !detail.wanted() {
+        return None;
+    }
+    let base_bytes = image.map_or(0, capacity::item_size);
+    let mut cc = ConsumedCapacity::table_only(table, capacity::write_units(base_bytes), detail);
+    let Some(item) = image else {
+        return Some(cc);
+    };
+    let base = schema_for(meta, table);
+    for idx in meta.table_indexes(table) {
+        if idx.status == IndexStatus::Deleting {
+            continue;
+        }
+        let indexed = match idx.kind {
+            IndexKind::Local => idx
+                .sort_attribute
+                .as_ref()
+                .is_some_and(|attr| item.contains_key(attr)),
+            IndexKind::Global => {
+                item.contains_key(&idx.hash_attribute)
+                    && idx
+                        .sort_attribute
+                        .as_ref()
+                        .is_none_or(|attr| item.contains_key(attr))
+            }
+        };
+        if !indexed {
+            continue;
+        }
+        let row = projected_item(item, &base, idx);
+        let units = capacity::write_units(capacity::item_size(&row));
+        match idx.kind {
+            IndexKind::Local => cc.local_indexes.push((idx.name.clone(), units)),
+            IndexKind::Global => cc.global_indexes.push((idx.name.clone(), units)),
+        }
+    }
+    Some(cc)
+}
+
+/// The [`ConsumedCapacity`] a **read** of `item` from `table` costs, or `None`
+/// when the caller asked for no capacity report.
+///
+/// A read is charged against the base table only — reading an item does not
+/// touch its index rows. An eventually-consistent read is half price, which is
+/// why `consistent` decides the number even on the paths that otherwise
+/// accept-and-ignore `ConsistentRead` (a base-table read here is always
+/// linearizable, but DynamoDB still bills what the client *asked* for, and a
+/// client that asked for the cheap read expects to be told it got it).
+fn read_capacity(
+    table: &str,
+    item: Option<&Item>,
+    consistent: bool,
+    detail: ReturnConsumedCapacity,
+) -> Option<ConsumedCapacity> {
+    if !detail.wanted() {
+        return None;
+    }
+    let bytes = item.map_or(0, capacity::item_size);
+    Some(ConsumedCapacity::table_only(
+        table,
+        capacity::read_units(bytes, consistent),
+        detail,
+    ))
 }
 
 /// The attributes an index row carries, per its declared projection.

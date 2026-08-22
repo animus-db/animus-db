@@ -57,6 +57,7 @@ use animus_control::{IndexStatus, StreamViewType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::capacity::{ConsumedCapacity, ReturnConsumedCapacity};
 use crate::condition::{Comparator, ConditionExpression, SortKeyCondition};
 use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, SecondaryIndex};
 use crate::{AttributeValue, Item, TableSchema};
@@ -489,6 +490,9 @@ pub enum Operation {
         condition: Option<ConditionExpression>,
         /// What to echo back (`NONE` / `ALL_OLD`).
         return_values: ReturnValues,
+        /// How much of the [`ConsumedCapacity`](crate::capacity::ConsumedCapacity)
+        /// report the caller wants back (`NONE`/`TOTAL`/`INDEXES`).
+        capacity: ReturnConsumedCapacity,
     },
     /// `GetItem`: fetch the item identified by `key` from `table`.
     GetItem {
@@ -501,7 +505,13 @@ pub enum Operation {
         /// Decoded but **accept-and-ignore** (ADR 0041 §5): a base-table read
         /// is always linearizable here, so `ConsistentRead: true` is already
         /// true and needs no enforcement. Only a GSI `Query` ever rejects it.
+        ///
+        /// It is *not* ignored for capacity: an eventually-consistent read is
+        /// billed at half price, so this still decides the number reported.
         consistent_read: bool,
+        /// How much of the [`ConsumedCapacity`](crate::capacity::ConsumedCapacity)
+        /// report the caller wants back (`NONE`/`TOTAL`/`INDEXES`).
+        capacity: ReturnConsumedCapacity,
     },
     /// `DeleteItem`: remove the item identified by `key` from `table`.
     DeleteItem {
@@ -513,6 +523,9 @@ pub enum Operation {
         condition: Option<ConditionExpression>,
         /// What to echo back (`NONE` / `ALL_OLD`).
         return_values: ReturnValues,
+        /// How much of the [`ConsumedCapacity`](crate::capacity::ConsumedCapacity)
+        /// report the caller wants back (`NONE`/`TOTAL`/`INDEXES`).
+        capacity: ReturnConsumedCapacity,
     },
     /// `Query`: items in a partition (`pk = ..`) matching an optional sort-key
     /// condition — against the base table, or a secondary index when `index` is
@@ -619,6 +632,9 @@ pub enum Operation {
         condition: Option<ConditionExpression>,
         /// What to echo back (`NONE`/`ALL_OLD`/`ALL_NEW`).
         return_values: UpdateReturnValues,
+        /// How much of the [`ConsumedCapacity`](crate::capacity::ConsumedCapacity)
+        /// report the caller wants back (`NONE`/`TOTAL`/`INDEXES`).
+        capacity: ReturnConsumedCapacity,
     },
     /// `BatchWriteItem`: a batch of put/delete requests grouped by table. Applied
     /// request-by-request (no cross-request atomicity, as in DynamoDB).
@@ -838,11 +854,13 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
             let item = decode_item_field(obj, "Item")?;
             let condition = decode_condition(obj)?;
             let return_values = decode_return_values(obj)?;
+            let capacity = decode_return_consumed_capacity(obj)?;
             Ok(Operation::PutItem {
                 table,
                 item,
                 condition,
                 return_values,
+                capacity,
             })
         }
         "GetItem" => {
@@ -850,11 +868,13 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
             let key = decode_item_field(obj, "Key")?;
             let projection = decode_projection(obj)?;
             let consistent_read = decode_consistent_read(obj);
+            let capacity = decode_return_consumed_capacity(obj)?;
             Ok(Operation::GetItem {
                 table,
                 key,
                 projection,
                 consistent_read,
+                capacity,
             })
         }
         "DeleteItem" => {
@@ -862,11 +882,13 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
             let key = decode_item_field(obj, "Key")?;
             let condition = decode_condition(obj)?;
             let return_values = decode_return_values(obj)?;
+            let capacity = decode_return_consumed_capacity(obj)?;
             Ok(Operation::DeleteItem {
                 table,
                 key,
                 condition,
                 return_values,
+                capacity,
             })
         }
         "Query" => decode_query(obj),
@@ -901,12 +923,14 @@ fn decode_update_item(obj: &Map<String, Value>) -> Result<Operation, WireError> 
     }
     let condition = decode_condition(obj)?;
     let return_values = decode_update_return_values(obj)?;
+    let capacity = decode_return_consumed_capacity(obj)?;
     Ok(Operation::UpdateItem {
         table,
         key,
         actions,
         condition,
         return_values,
+        capacity,
     })
 }
 
@@ -1835,6 +1859,29 @@ fn decode_return_values(obj: &Map<String, Value>) -> Result<ReturnValues, WireEr
     }
 }
 
+/// Decode `ReturnConsumedCapacity` (ADR 0006): how much of the capacity report
+/// the caller wants back. Absent ⇒ `NONE`, matching DynamoDB's default of
+/// saying nothing.
+fn decode_return_consumed_capacity(
+    obj: &Map<String, Value>,
+) -> Result<ReturnConsumedCapacity, WireError> {
+    match obj.get("ReturnConsumedCapacity") {
+        None | Some(Value::Null) => Ok(ReturnConsumedCapacity::None),
+        Some(v) => match v.as_str() {
+            Some("NONE") => Ok(ReturnConsumedCapacity::None),
+            Some("TOTAL") => Ok(ReturnConsumedCapacity::Total),
+            Some("INDEXES") => Ok(ReturnConsumedCapacity::Indexes),
+            Some(other) => Err(WireError::validation(format!(
+                "unsupported `ReturnConsumedCapacity` `{other}` \
+                 (supported: NONE, TOTAL, INDEXES)"
+            ))),
+            None => Err(WireError::validation(
+                "`ReturnConsumedCapacity` must be a string",
+            )),
+        },
+    }
+}
+
 /// Decode a predicate from the string field named `field` (one of
 /// `ConditionExpression` / `FilterExpression`) into a [`ConditionExpression`]:
 /// `attribute_not_exists(attr)`, `attribute_exists(attr)`, or `attr = :v`
@@ -2631,15 +2678,29 @@ fn encode_attribute_value(value: &AttributeValue) -> Value {
     Value::Object(obj)
 }
 
+/// Serialize a response body, attaching `ConsumedCapacity` when the request
+/// asked for one.
+///
+/// Every response that can carry capacity goes through here, including the ones
+/// whose body is otherwise `{}` — a `PutItem` with `ReturnValues: NONE` still
+/// owes the caller its capacity report, so "empty body" and "no capacity" are
+/// deliberately not the same condition.
+fn finish(mut obj: Map<String, Value>, capacity: Option<&ConsumedCapacity>) -> String {
+    if let Some(capacity) = capacity {
+        obj.insert("ConsumedCapacity".into(), capacity.encode());
+    }
+    serde_json::to_string(&Value::Object(obj)).expect("response serializes")
+}
+
 /// The JSON body for a successful `GetItem`: `{"Item": {..}}`, or `{}` when the
 /// item is absent (matching DynamoDB).
 #[must_use]
-pub fn get_item_response(item: Option<&Item>) -> String {
+pub fn get_item_response(item: Option<&Item>, capacity: Option<&ConsumedCapacity>) -> String {
     let mut obj = Map::new();
     if let Some(item) = item {
         obj.insert("Item".into(), encode_item(item));
     }
-    serde_json::to_string(&Value::Object(obj)).expect("response serializes")
+    finish(obj, capacity)
 }
 
 /// The JSON body for a successful `PutItem` / `DeleteItem` with
@@ -2698,15 +2759,16 @@ pub fn batch_get_response(tables: &[(String, Vec<Item>)]) -> String {
 /// `ALL_OLD` a present prior item is returned under `Attributes`, an absent one
 /// yields `{}` (matching DynamoDB). For `NONE` this is always `{}`.
 #[must_use]
-pub fn write_response(return_values: ReturnValues, old: Option<&Item>) -> String {
-    match (return_values, old) {
-        (ReturnValues::AllOld, Some(item)) => {
-            let mut obj = Map::new();
-            obj.insert("Attributes".into(), encode_item(item));
-            serde_json::to_string(&Value::Object(obj)).expect("write response serializes")
-        }
-        _ => empty_response(),
+pub fn write_response(
+    return_values: ReturnValues,
+    old: Option<&Item>,
+    capacity: Option<&ConsumedCapacity>,
+) -> String {
+    let mut obj = Map::new();
+    if let (ReturnValues::AllOld, Some(item)) = (return_values, old) {
+        obj.insert("Attributes".into(), encode_item(item));
     }
+    finish(obj, capacity)
 }
 
 /// The JSON body for a successful `UpdateItem` echoing `ReturnValues`: `ALL_OLD`
@@ -2718,6 +2780,7 @@ pub fn update_response(
     return_values: UpdateReturnValues,
     old: Option<&Item>,
     new: Option<&Item>,
+    capacity: Option<&ConsumedCapacity>,
 ) -> String {
     let attrs = match return_values {
         UpdateReturnValues::None => None,
@@ -2732,16 +2795,13 @@ pub fn update_response(
         UpdateReturnValues::UpdatedOld => Some(changed_attributes(old, new, old)),
         UpdateReturnValues::UpdatedNew => Some(changed_attributes(old, new, new)),
     };
-    match attrs {
-        // DynamoDB omits `Attributes` entirely when nothing changed, rather
-        // than returning an empty map.
-        Some(item) if !item.is_empty() => {
-            let mut obj = Map::new();
-            obj.insert("Attributes".into(), encode_item(&item));
-            serde_json::to_string(&Value::Object(obj)).expect("update response serializes")
-        }
-        _ => empty_response(),
+    let mut obj = Map::new();
+    // DynamoDB omits `Attributes` entirely when nothing changed, rather than
+    // returning an empty map.
+    if let Some(item) = attrs.filter(|i| !i.is_empty()) {
+        obj.insert("Attributes".into(), encode_item(&item));
     }
+    finish(obj, capacity)
 }
 
 /// The attributes whose value differs between `old` and `new`, taken from
@@ -3751,12 +3811,12 @@ mod tests {
     fn write_response_echoes_old_item_for_all_old() {
         let mut old = Item::new();
         old.insert("id".into(), s("k"));
-        let body = write_response(ReturnValues::AllOld, Some(&old));
+        let body = write_response(ReturnValues::AllOld, Some(&old), None);
         assert!(body.contains("\"Attributes\""));
         assert!(body.contains("\"S\":\"k\""));
         // ALL_OLD on an absent key is `{}`; NONE is always `{}`.
-        assert_eq!(write_response(ReturnValues::AllOld, None), "{}");
-        assert_eq!(write_response(ReturnValues::None, Some(&old)), "{}");
+        assert_eq!(write_response(ReturnValues::AllOld, None, None), "{}");
+        assert_eq!(write_response(ReturnValues::None, Some(&old), None), "{}");
     }
 
     #[test]
@@ -3803,10 +3863,10 @@ mod tests {
 
     #[test]
     fn get_item_response_omits_missing_item() {
-        assert_eq!(get_item_response(None), "{}");
+        assert_eq!(get_item_response(None, None), "{}");
         let mut item = Item::new();
         item.insert("id".into(), s("u1"));
-        let body = get_item_response(Some(&item));
+        let body = get_item_response(Some(&item), None);
         assert!(body.contains("\"Item\""));
         assert!(body.contains("\"S\":\"u1\""));
     }
@@ -4766,11 +4826,11 @@ mod tests {
     fn update_response_echoes_new_for_all_new() {
         let mut new = Item::new();
         new.insert("a".into(), s("x"));
-        let body = update_response(UpdateReturnValues::AllNew, None, Some(&new));
+        let body = update_response(UpdateReturnValues::AllNew, None, Some(&new), None);
         assert!(body.contains("\"Attributes\""));
         assert!(body.contains("\"S\":\"x\""));
         assert_eq!(
-            update_response(UpdateReturnValues::None, None, Some(&new)),
+            update_response(UpdateReturnValues::None, None, Some(&new), None),
             "{}"
         );
     }
@@ -5698,7 +5758,7 @@ mod tests {
         new.insert("edit".into(), s("after"));
         new.insert("fresh".into(), s("created"));
 
-        let body = update_response(UpdateReturnValues::UpdatedOld, Some(&old), Some(&new));
+        let body = update_response(UpdateReturnValues::UpdatedOld, Some(&old), Some(&new), None);
         assert!(body.contains(r#""edit":{"S":"before"}"#), "changed: {body}");
         assert!(
             body.contains(r#""gone":{"S":"dropped"}"#),
@@ -5711,7 +5771,7 @@ mod tests {
         assert!(!body.contains("keep"), "untouched is not reported: {body}");
         assert!(!body.contains(r#""id""#), "the key never changes: {body}");
 
-        let body = update_response(UpdateReturnValues::UpdatedNew, Some(&old), Some(&new));
+        let body = update_response(UpdateReturnValues::UpdatedNew, Some(&old), Some(&new), None);
         assert!(body.contains(r#""edit":{"S":"after"}"#), "changed: {body}");
         assert!(
             body.contains(r#""fresh":{"S":"created"}"#),
@@ -5731,7 +5791,7 @@ mod tests {
             UpdateReturnValues::UpdatedNew,
         ] {
             assert_eq!(
-                update_response(rv, Some(&item), Some(&item)),
+                update_response(rv, Some(&item), Some(&item), None),
                 empty_response(),
                 "an unchanged item reports no Attributes"
             );
@@ -5756,5 +5816,152 @@ mod tests {
                 other => panic!("expected UpdateItem, got {other:?}"),
             }
         }
+    }
+
+    /// The `capacity` field of whichever operation `body` decodes to under
+    /// `target`, so each test reads as the one assertion it is making.
+    fn decoded_capacity(target: &str, body: &[u8]) -> ReturnConsumedCapacity {
+        match decode_request(target, body).expect("decodes") {
+            Operation::PutItem { capacity, .. }
+            | Operation::GetItem { capacity, .. }
+            | Operation::DeleteItem { capacity, .. }
+            | Operation::UpdateItem { capacity, .. } => capacity,
+            other => panic!("no capacity on {other:?}"),
+        }
+    }
+
+    #[test]
+    fn return_consumed_capacity_defaults_to_none_on_every_item_operation() {
+        // Absent is `NONE`: a request that never mentioned capacity must get a
+        // response that never mentions it either.
+        for (target, body) in [
+            (
+                "DynamoDB_20120810.PutItem",
+                &br#"{"TableName":"t","Item":{"id":{"S":"k"}}}"#[..],
+            ),
+            (
+                "DynamoDB_20120810.GetItem",
+                &br#"{"TableName":"t","Key":{"id":{"S":"k"}}}"#[..],
+            ),
+            (
+                "DynamoDB_20120810.DeleteItem",
+                &br#"{"TableName":"t","Key":{"id":{"S":"k"}}}"#[..],
+            ),
+            (
+                "DynamoDB_20120810.UpdateItem",
+                &br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                      "UpdateExpression":"SET a = :v",
+                      "ExpressionAttributeValues":{":v":{"S":"x"}}}"#[..],
+            ),
+        ] {
+            assert_eq!(
+                decoded_capacity(target, body),
+                ReturnConsumedCapacity::None,
+                "{target} should default to NONE"
+            );
+            // An explicit `null` is the same as absent.
+            let explicit_null = String::from_utf8(body.to_vec()).expect("utf8").replacen(
+                '{',
+                r#"{"ReturnConsumedCapacity":null,"#,
+                1,
+            );
+            assert_eq!(
+                decoded_capacity(target, explicit_null.as_bytes()),
+                ReturnConsumedCapacity::None,
+                "{target} should treat an explicit null as NONE"
+            );
+        }
+    }
+
+    #[test]
+    fn return_consumed_capacity_decodes_each_level() {
+        for (text, expected) in [
+            ("NONE", ReturnConsumedCapacity::None),
+            ("TOTAL", ReturnConsumedCapacity::Total),
+            ("INDEXES", ReturnConsumedCapacity::Indexes),
+        ] {
+            let body = format!(
+                r#"{{"TableName":"t","Key":{{"id":{{"S":"k"}}}},
+                     "ReturnConsumedCapacity":"{text}"}}"#
+            );
+            assert_eq!(
+                decoded_capacity("DynamoDB_20120810.GetItem", body.as_bytes()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_return_consumed_capacity_is_rejected_rather_than_ignored() {
+        // Silently downgrading an unrecognised level to `NONE` would drop the
+        // report a client asked for without telling it — the failure mode this
+        // series exists to remove.
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                        "ReturnConsumedCapacity":"SOMETIMES"}"#;
+        let err = decode_request("DynamoDB_20120810.GetItem", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("SOMETIMES"), "{}", err.message);
+        assert!(err.message.contains("INDEXES"), "{}", err.message);
+
+        let wrong_type = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                              "ReturnConsumedCapacity":true}"#;
+        let err = decode_request("DynamoDB_20120810.GetItem", wrong_type).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("must be a string"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_response_carries_consumed_capacity_only_when_one_was_built() {
+        let cc = ConsumedCapacity::table_only("t", 1.0, ReturnConsumedCapacity::Total);
+        // Present even when the body is otherwise empty: a `PutItem` with
+        // `ReturnValues: NONE` still owes the caller its capacity report.
+        let with = write_response(ReturnValues::None, None, Some(&cc));
+        let parsed: Value = serde_json::from_str(&with).expect("json");
+        assert_eq!(parsed["ConsumedCapacity"]["TableName"], "t");
+        assert_eq!(parsed["ConsumedCapacity"]["CapacityUnits"], 1.0);
+        assert!(parsed.get("Attributes").is_none());
+
+        assert_eq!(write_response(ReturnValues::None, None, None), "{}");
+        assert_eq!(get_item_response(None, None), "{}");
+        assert_eq!(
+            update_response(UpdateReturnValues::None, None, None, None),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn consumed_capacity_rides_alongside_the_bodys_own_fields() {
+        // The capacity report is additive: it must not displace `Item` or
+        // `Attributes`, which is the whole reason these share one serializer.
+        let mut item = Item::new();
+        item.insert("id".to_string(), s("k"));
+        let cc = ConsumedCapacity::table_only("t", 0.5, ReturnConsumedCapacity::Total);
+
+        let body: Value =
+            serde_json::from_str(&get_item_response(Some(&item), Some(&cc))).expect("json");
+        assert_eq!(body["Item"]["id"]["S"], "k");
+        assert_eq!(body["ConsumedCapacity"]["CapacityUnits"], 0.5);
+
+        let body: Value = serde_json::from_str(&write_response(
+            ReturnValues::AllOld,
+            Some(&item),
+            Some(&cc),
+        ))
+        .expect("json");
+        assert_eq!(body["Attributes"]["id"]["S"], "k");
+        assert_eq!(body["ConsumedCapacity"]["CapacityUnits"], 0.5);
+
+        let mut new = Item::new();
+        new.insert("id".to_string(), s("k"));
+        new.insert("a".to_string(), s("v"));
+        let body: Value = serde_json::from_str(&update_response(
+            UpdateReturnValues::AllNew,
+            Some(&item),
+            Some(&new),
+            Some(&cc),
+        ))
+        .expect("json");
+        assert_eq!(body["Attributes"]["a"]["S"], "v");
+        assert_eq!(body["ConsumedCapacity"]["CapacityUnits"], 0.5);
     }
 }
