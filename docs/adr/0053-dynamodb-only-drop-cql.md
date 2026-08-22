@@ -59,12 +59,28 @@ that goal at a pace that justified its maintenance cost.
   its own relay-allowlist coverage, not something reachable only through
   the deleted adapter — its one dead caller (`animusd`'s own wrapper
   around it) is what was actually removed.
-- Every `cql`/`CQL` reference across the workspace — doc comments, ADRs,
-  `CLAUDE.md` guides, the dashboard — is updated to describe the
-  DynamoDB-only shape, or, where the mention is historical rationale
-  (e.g. why an escape function is duplicated instead of shared, or why a
-  key-encoding module speaks of "adapters" plural), reworded to note the
-  history rather than describing live machinery.
+- Every **live-code doc comment** (`animus-control`, `animus-dynamo`,
+  `animusd`), the root and per-crate `CLAUDE.md` guides, and every ADR whose
+  own text stated a port number, an endpoint, or a catalog field as a
+  **current fact** (ADR 0020, 0021, 0035, 0047, 0052) are updated to
+  describe the DynamoDB-only shape, or carry an explicit amendment note
+  pointing at this ADR where the stale claim was structural (a port-stride
+  formula, a still-listed `Metadata` field, a documented-live endpoint) —
+  the same amendment convention ADR 0001/ADR 0019/ADR 0044 use elsewhere in
+  this directory, not an in-place rewrite. This ADR does **not** hunt down
+  and reword every incidental `cql`/`keyspace` mention in the much larger
+  body of older, dated ADRs (0004, 0006, 0011, 0013, 0016, 0018, 0019, 0022,
+  0023, 0024, 0027, 0030, 0041, 0042, 0046, 0049 among them) or in
+  `docs/engineering-lessons.md`'s append-only entries — those describe CQL
+  as it stood at each document's own date, which is exactly what an
+  immutable decision record and a dated lessons log are supposed to keep
+  saying; rewriting them to erase CQL's past existence would cost more
+  (a false, laundered history) than it buys. ADR 0006 itself is marked
+  **Superseded** above, and ADR 0013 carries its own dated amendment note,
+  which is the correct treatment for a whole-document supersession or a
+  load-bearing catalog-shape claim respectively — most other historical
+  ADRs need neither, because nothing in them asserts CQL as *currently*
+  live outside their own already-dated context.
 
 The code remains **retrievable from git history** — deleted, not archived
 dormant-but-compiling, matching the disposition ADR 0019 set for the
@@ -107,7 +123,7 @@ it is a separate, future decision.
   adoption to migrate away from; this is a clean removal, not a deprecation
   cycle.
 - **The port stride shrinks.** Any external tooling or documentation that
-  assumed the seven-port-per-node layout (ADR 0047) must be updated; the
+  assumed the seven-port-per-node layout (ADR 0052) must be updated; the
   six-port layout is a clean break, per the root `CLAUDE.md`'s no-back-compat
   policy — no live deployment exists to keep compatible with.
 - **The dual-plane-shaped "common core, two surfaces" argument ADR 0006
@@ -123,7 +139,10 @@ it is a separate, future decision.
   the resulting DynamoDB-only shape.
 
 This ADR amends ADR 0006 (whose dual-adapter decision is superseded) and
-ADR 0047 (whose seven-port stride shrinks to six). It follows ADR 0019's
-precedent for how this repo retires a subsystem: delete the code, record
-the decision and its rationale here, and leave the history in git for
-whoever revives it.
+ADR 0047 (whose seven-port stride shrinks to six) — and, transitively, the
+two ADRs that themselves amended ADR 0047's stride number since (ADR 0052's
+seven-port extension, ADR 0035's own port-count note), each carrying its
+own matching amendment note rather than this ADR trying to reach into and
+edit their bodies directly. It follows ADR 0019's precedent for how this
+repo retires a subsystem: delete the code, record the decision and its
+rationale here, and leave the history in git for whoever revives it.

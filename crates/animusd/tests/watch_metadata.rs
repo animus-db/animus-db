@@ -214,7 +214,7 @@ async fn combined_node_reconciler_and_long_poll_both_wake_on_one_commit() {
     .await;
     assert!(
         matches!(propose_reply, ClientResponse::PutOk),
-        "CreateKeyspace propose was rejected: {propose_reply:?}"
+        "CreateTableSchema propose was rejected: {propose_reply:?}"
     );
 
     let (elapsed, reply) = timeout(Duration::from_secs(10), watch_task)
