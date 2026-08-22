@@ -1656,7 +1656,127 @@ fn decode_predicate(
     let Some(expr) = obj.get(field).and_then(Value::as_str) else {
         return Ok(None);
     };
-    decode_predicate_expr(obj, field, expr.trim()).map(Some)
+    decode_predicate_or(obj, field, expr.trim()).map(Some)
+}
+
+/// Find a top-level (paren-depth-zero) occurrence of `needle`, case-insensitively,
+/// scanning **right to left** so the split is left-associative.
+///
+/// Two things make this less trivial than a `find`. Parenthesised groups must be
+/// skipped, or `(a = :x OR b = :y) AND c = :z` splits inside the group. And a
+/// `BETWEEN`'s own ` AND ` — as in `a BETWEEN :lo AND :hi` — is *not* a
+/// combinator: it belongs to the term. That one is handled by refusing to split
+/// on an ` AND ` that a `BETWEEN` at the same depth is still waiting for.
+fn find_top_level(haystack: &str, needle: &str) -> Option<usize> {
+    let lower = haystack.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut depth = 0i32;
+    // Positions of the token, recorded left to right, then chosen from the right.
+    let mut hits: Vec<usize> = Vec::new();
+    // How many ` AND `s the BETWEENs seen so far at depth 0 still owe.
+    let mut pending_between = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            if lower[i..].starts_with(" between ") {
+                pending_between += 1;
+            }
+            if lower[i..].starts_with(&needle) {
+                if needle == " and " && pending_between > 0 {
+                    // This AND closes a BETWEEN rather than joining two terms.
+                    pending_between -= 1;
+                } else {
+                    hits.push(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    hits.pop()
+}
+
+/// `OR` — the loosest binding, so it splits first.
+fn decode_predicate_or(
+    obj: &Map<String, Value>,
+    field: &str,
+    expr: &str,
+) -> Result<ConditionExpression, WireError> {
+    let expr = expr.trim();
+    if let Some(at) = find_top_level(expr, " OR ") {
+        let lhs = decode_predicate_or(obj, field, &expr[..at])?;
+        let rhs = decode_predicate_and(obj, field, &expr[at + 4..])?;
+        return Ok(ConditionExpression::Or(Box::new(lhs), Box::new(rhs)));
+    }
+    decode_predicate_and(obj, field, expr)
+}
+
+/// `AND` — binds tighter than `OR`, looser than `NOT`.
+fn decode_predicate_and(
+    obj: &Map<String, Value>,
+    field: &str,
+    expr: &str,
+) -> Result<ConditionExpression, WireError> {
+    let expr = expr.trim();
+    if let Some(at) = find_top_level(expr, " AND ") {
+        let lhs = decode_predicate_and(obj, field, &expr[..at])?;
+        let rhs = decode_predicate_not(obj, field, &expr[at + 5..])?;
+        return Ok(ConditionExpression::And(Box::new(lhs), Box::new(rhs)));
+    }
+    decode_predicate_not(obj, field, expr)
+}
+
+/// `NOT` — binds tightest, and a parenthesised group is a term.
+fn decode_predicate_not(
+    obj: &Map<String, Value>,
+    field: &str,
+    expr: &str,
+) -> Result<ConditionExpression, WireError> {
+    let expr = expr.trim();
+    if let Some(rest) = strip_keyword_prefix(expr, "NOT ") {
+        return Ok(ConditionExpression::Not(Box::new(decode_predicate_not(
+            obj, field, rest,
+        )?)));
+    }
+    // A fully-parenthesised expression is unwrapped and re-parsed from the top,
+    // but only when the opening paren matches the closing one — `(a) OR (b)`
+    // must not be mistaken for a single group.
+    if expr.starts_with('(') && expr.ends_with(')') && matching_close(expr) == Some(expr.len() - 1)
+    {
+        return decode_predicate_or(obj, field, &expr[1..expr.len() - 1]);
+    }
+    decode_predicate_expr(obj, field, expr)
+}
+
+/// Strip a leading keyword (case-insensitively) when it stands as a word.
+fn strip_keyword_prefix<'a>(expr: &'a str, keyword: &str) -> Option<&'a str> {
+    let lower = expr.to_ascii_lowercase();
+    lower
+        .starts_with(&keyword.to_ascii_lowercase())
+        .then(|| &expr[keyword.len()..])
+}
+
+/// Index of the `)` matching the `(` at position 0, if any.
+fn matching_close(expr: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, c) in expr.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parse one predicate term. Split out of [`decode_predicate`] so the boolean
@@ -4774,5 +4894,122 @@ mod tests {
         let body = br#"{"TableName":"t","FilterExpression":"a attribute_type(a, :t)",
              "ExpressionAttributeValues":{":t":{"S":"STRING"}}}"#;
         assert!(decode_request("DynamoDB_20120810.Scan", body).is_err());
+    }
+
+    /// Precedence: `NOT` binds tightest, then `AND`, then `OR` — so
+    /// `a OR b AND c` is `a OR (b AND c)`, not `(a OR b) AND c`.
+    #[test]
+    fn boolean_precedence_is_not_then_and_then_or() {
+        let f = |frag: &str| {
+            let body = format!(
+                r#"{{"TableName":"t","FilterExpression":"{frag}",
+                     "ExpressionAttributeValues":{{":a":{{"N":"1"}},":b":{{"N":"2"}},":c":{{"N":"3"}}}}}}"#
+            );
+            match decode_request("DynamoDB_20120810.Scan", body.as_bytes())
+                .unwrap_or_else(|e| panic!("`{frag}` must decode: {e:?}"))
+            {
+                Operation::Scan { filter, .. } => filter.expect("a filter"),
+                other => panic!("expected Scan, got {other:?}"),
+            }
+        };
+        let eq = |name: &str, ph: &str| {
+            ConditionExpression::Compare(name.into(), Comparator::Eq, AttributeValue::N(ph.into()))
+        };
+
+        assert_eq!(
+            f("a = :a OR b = :b AND c = :c"),
+            ConditionExpression::Or(
+                Box::new(eq("a", "1")),
+                Box::new(ConditionExpression::And(
+                    Box::new(eq("b", "2")),
+                    Box::new(eq("c", "3"))
+                ))
+            ),
+            "AND binds tighter than OR"
+        );
+        assert_eq!(
+            f("NOT a = :a AND b = :b"),
+            ConditionExpression::And(
+                Box::new(ConditionExpression::Not(Box::new(eq("a", "1")))),
+                Box::new(eq("b", "2"))
+            ),
+            "NOT binds tighter than AND"
+        );
+        assert_eq!(
+            f("(a = :a OR b = :b) AND c = :c"),
+            ConditionExpression::And(
+                Box::new(ConditionExpression::Or(
+                    Box::new(eq("a", "1")),
+                    Box::new(eq("b", "2"))
+                )),
+                Box::new(eq("c", "3"))
+            ),
+            "parentheses override precedence"
+        );
+        // Left-associative chains.
+        assert_eq!(
+            f("a = :a AND b = :b AND c = :c"),
+            ConditionExpression::And(
+                Box::new(ConditionExpression::And(
+                    Box::new(eq("a", "1")),
+                    Box::new(eq("b", "2"))
+                )),
+                Box::new(eq("c", "3"))
+            )
+        );
+    }
+
+    /// The trap: `BETWEEN :lo AND :hi` contains an `AND` that belongs to the
+    /// term, not to the combinator. Splitting on it would produce nonsense.
+    #[test]
+    fn between_s_own_and_is_not_a_combinator() {
+        let body = br#"{"TableName":"t",
+             "FilterExpression":"a BETWEEN :lo AND :hi AND b = :b",
+             "ExpressionAttributeValues":{":lo":{"N":"1"},":hi":{"N":"9"},":b":{"N":"2"}}}"#;
+        match decode_request("DynamoDB_20120810.Scan", body).expect("decodes") {
+            Operation::Scan { filter, .. } => assert_eq!(
+                filter,
+                Some(ConditionExpression::And(
+                    Box::new(ConditionExpression::Between(
+                        "a".into(),
+                        AttributeValue::N("1".into()),
+                        AttributeValue::N("9".into())
+                    )),
+                    Box::new(ConditionExpression::Compare(
+                        "b".into(),
+                        Comparator::Eq,
+                        AttributeValue::N("2".into())
+                    ))
+                )),
+                "the first AND closes the BETWEEN; only the second joins terms"
+            ),
+            other => panic!("expected Scan, got {other:?}"),
+        }
+
+        // A bare BETWEEN must still parse as one term.
+        let solo = br#"{"TableName":"t","FilterExpression":"a BETWEEN :lo AND :hi",
+             "ExpressionAttributeValues":{":lo":{"N":"1"},":hi":{"N":"9"}}}"#;
+        match decode_request("DynamoDB_20120810.Scan", solo).expect("decodes") {
+            Operation::Scan { filter, .. } => {
+                assert!(matches!(filter, Some(ConditionExpression::Between(..))));
+            }
+            other => panic!("expected Scan, got {other:?}"),
+        }
+    }
+
+    /// A combinator inside a parenthesised group must not be split at the top
+    /// level, and `(a) OR (b)` is not one group.
+    #[test]
+    fn parenthesised_groups_are_respected() {
+        let body = br#"{"TableName":"t",
+             "FilterExpression":"(a = :a) OR (b = :b)",
+             "ExpressionAttributeValues":{":a":{"N":"1"},":b":{"N":"2"}}}"#;
+        match decode_request("DynamoDB_20120810.Scan", body).expect("decodes") {
+            Operation::Scan { filter, .. } => assert!(
+                matches!(filter, Some(ConditionExpression::Or(..))),
+                "`(a) OR (b)` is a disjunction, not a single group: {filter:?}"
+            ),
+            other => panic!("expected Scan, got {other:?}"),
+        }
     }
 }

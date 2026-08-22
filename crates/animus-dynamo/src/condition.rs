@@ -250,6 +250,12 @@ pub enum ConditionExpression {
     /// `size(attr) <op> value` — bytes for `S`/`B`, element count for the
     /// document and set types.
     Size(String, Comparator, AttributeValue),
+    /// `a AND b` — both must hold.
+    And(Box<ConditionExpression>, Box<ConditionExpression>),
+    /// `a OR b` — either may hold.
+    Or(Box<ConditionExpression>, Box<ConditionExpression>),
+    /// `NOT a`.
+    Not(Box<ConditionExpression>),
 }
 
 impl ConditionExpression {
@@ -334,6 +340,13 @@ impl ConditionExpression {
                 // `size()` yields a number, so the comparison is numeric.
                 op.holds(compare_values(&AttributeValue::N(size.to_string()), value))
             }
+            // Short-circuiting matches DynamoDB's own evaluation and, more
+            // importantly, keeps every leaf's "false when absent" semantics
+            // intact under composition: `NOT attribute_exists(a)` is true for
+            // a missing `a` precisely because the leaf is false, not unknown.
+            ConditionExpression::And(a, b) => a.evaluate(current) && b.evaluate(current),
+            ConditionExpression::Or(a, b) => a.evaluate(current) || b.evaluate(current),
+            ConditionExpression::Not(inner) => !inner.evaluate(current),
         }
     }
 }
@@ -609,6 +622,118 @@ mod tests {
                 n("0")
             )),
             "a number has no size(), so the comparison is false rather than an error"
+        );
+    }
+
+    /// Composition evaluates short-circuiting, and — the subtle part — each
+    /// leaf's "false when the attribute is absent" survives under `NOT`.
+    /// `NOT a = :v` is true for a missing `a` because the leaf is false, not
+    /// unknown; DynamoDB has no three-valued logic here.
+    #[test]
+    fn boolean_composition_evaluates() {
+        let item = item_of(&[("a", n("1")), ("b", n("2"))]);
+        let eq =
+            |name: &str, v: &str| ConditionExpression::Compare(name.into(), Comparator::Eq, n(v));
+        let ev = |c: ConditionExpression| c.evaluate(Some(&item));
+
+        assert!(ev(ConditionExpression::And(
+            Box::new(eq("a", "1")),
+            Box::new(eq("b", "2"))
+        )));
+        assert!(!ev(ConditionExpression::And(
+            Box::new(eq("a", "1")),
+            Box::new(eq("b", "9"))
+        )));
+        assert!(ev(ConditionExpression::Or(
+            Box::new(eq("a", "9")),
+            Box::new(eq("b", "2"))
+        )));
+        assert!(!ev(ConditionExpression::Or(
+            Box::new(eq("a", "9")),
+            Box::new(eq("b", "9"))
+        )));
+        assert!(ev(ConditionExpression::Not(Box::new(eq("a", "9")))));
+        assert!(!ev(ConditionExpression::Not(Box::new(eq("a", "1")))));
+
+        // A missing attribute: the leaf is false, so NOT makes it true.
+        assert!(ev(ConditionExpression::Not(Box::new(eq("missing", "1")))));
+        // And `NOT attribute_exists` agrees with `attribute_not_exists`.
+        assert_eq!(
+            ev(ConditionExpression::Not(Box::new(
+                ConditionExpression::AttributeExists("missing".into())
+            ))),
+            ev(ConditionExpression::AttributeNotExists("missing".into()))
+        );
+    }
+
+    /// Nesting composes to arbitrary depth and respects the tree it was given.
+    #[test]
+    fn nested_composition_respects_its_tree() {
+        let item = item_of(&[("a", n("1")), ("b", n("2")), ("c", n("3"))]);
+        let eq =
+            |name: &str, v: &str| ConditionExpression::Compare(name.into(), Comparator::Eq, n(v));
+        // (a=1 OR b=9) AND c=3  -> true
+        assert!(
+            ConditionExpression::And(
+                Box::new(ConditionExpression::Or(
+                    Box::new(eq("a", "1")),
+                    Box::new(eq("b", "9"))
+                )),
+                Box::new(eq("c", "3"))
+            )
+            .evaluate(Some(&item))
+        );
+        // The two groupings genuinely diverge on the same item: with a=9,
+        // b=2, c=9 the OR-first tree holds (b=2 satisfies the inner OR, but
+        // c=9 fails the AND) while the AND-first tree does not.
+        let other = item_of(&[("a", n("9")), ("b", n("2")), ("c", n("9"))]);
+        assert!(
+            !ConditionExpression::And(
+                Box::new(ConditionExpression::Or(
+                    Box::new(eq("a", "1")),
+                    Box::new(eq("b", "2"))
+                )),
+                Box::new(eq("c", "3"))
+            )
+            .evaluate(Some(&other)),
+            "(a=1 OR b=2) AND c=3 fails because c=9"
+        );
+        assert!(
+            !ConditionExpression::Or(
+                Box::new(eq("a", "1")),
+                Box::new(ConditionExpression::And(
+                    Box::new(eq("b", "2")),
+                    Box::new(eq("c", "3"))
+                ))
+            )
+            .evaluate(Some(&other)),
+            "and a=1 OR (b=2 AND c=3) fails too, for a different reason"
+        );
+        // Where they diverge: a=1, b=2, c=9.
+        let diverge = item_of(&[("a", n("1")), ("b", n("2")), ("c", n("9"))]);
+        assert!(
+            !ConditionExpression::And(
+                Box::new(ConditionExpression::Or(
+                    Box::new(eq("a", "1")),
+                    Box::new(eq("b", "2"))
+                )),
+                Box::new(eq("c", "3"))
+            )
+            .evaluate(Some(&diverge)),
+            "(a=1 OR b=2) AND c=3 is false — c=9"
+        );
+        assert!(
+            ConditionExpression::Or(
+                Box::new(eq("a", "1")),
+                Box::new(ConditionExpression::And(
+                    Box::new(eq("b", "2")),
+                    Box::new(eq("c", "3"))
+                ))
+            )
+            .evaluate(Some(&diverge)),
+            "but a=1 OR (b=2 AND c=3) is true — a=1 alone satisfies it. \
+             Same leaves, different tree, different answer: this is what \
+             precedence has to get right."
         );
     }
 }
