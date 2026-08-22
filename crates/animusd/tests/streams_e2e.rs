@@ -29,6 +29,41 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+/// Ceiling for [`dynamo_retrying`]/[`dynamo_retrying_transact`]/
+/// [`get_records_allow_trim`]'s bounded retry loop against a **known,
+/// self-resolving** transient (the ADR 0050 F8 freeze→cutover blip on the
+/// write path, and the analogous "not the leader here; leader_hint=none"
+/// election-wait blip on the read path — see each helper's own doc for its
+/// exact retryable-status contract). This is NOT "how long to wait before
+/// assuming a real bug": every one of these helpers already fails
+/// immediately, zero retries, on any status/message outside its own
+/// documented allowlist — a genuine error never touches this budget at all
+/// (docs/engineering-lessons.md's Testing section: "a retryable,
+/// self-resolving condition should not exhaust the same budget as a real
+/// error").
+///
+/// Sized against what a cutover can genuinely take under load, not the
+/// steady-state "sub-second" figure ADR 0050 documents. Server-side,
+/// `ClientCtx::cp_kind_write_item`/`cp_kind_write_raw` already retry the
+/// freeze refusal internally (issue #288), but `ClientCtx::cp_txn`
+/// (`TransactWriteItems`'s coordinator) deliberately does NOT — DynamoDB's
+/// own contract maps a cancelled transaction to a client-retried
+/// `TransactionCanceledException`, not a server-absorbed blip — so for the
+/// transact path this test's own retry loop is the ONLY thing standing
+/// between a slow cutover and a spurious failure.
+/// `multi_split_soak_streamed_gsi_table_under_mixed_load` deliberately
+/// drives a CASCADE of overlapping splits (a 2KiB auto-split threshold
+/// against a continuously-written table), and was observed exhausting a
+/// prior fixed 20s ceiling on a loaded CI runner even though the cluster
+/// was making genuine, uninterrupted progress the whole time — a wider
+/// budget, not a different mechanism, since the loop already re-checks the
+/// condition every pass rather than asserting once. 90s is generous
+/// against this file's own outer per-test `tokio::time::timeout` budgets
+/// (180-300s) without being unbounded — a call still retrying past this
+/// ceiling means the condition genuinely never cleared, which is the one
+/// case these helpers must still fail loudly for.
+const RETRYABLE_BLIP_DEADLINE: Duration = Duration::from_secs(90);
+
 fn tiny_seal_knobs() -> StreamSealKnobs {
     StreamSealKnobs {
         seal_bytes: 1,
@@ -284,7 +319,7 @@ enum RecordsPoll {
 /// an unexpected 400 still indicates a real bug and must keep panicking.
 async fn get_records_allow_trim(addr: SocketAddr, iterator: &str) -> RecordsPoll {
     let body = format!(r#"{{"ShardIterator":"{iterator}"}}"#);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + RETRYABLE_BLIP_DEADLINE;
     loop {
         let (status, resp) = dynamo(addr, "DynamoDBStreams_20120810.GetRecords", &body).await;
         if status == 200 {
@@ -300,7 +335,10 @@ async fn get_records_allow_trim(addr: SocketAddr, iterator: &str) -> RecordsPoll
             sleep(Duration::from_millis(150)).await;
             continue;
         }
-        panic!("GetRecords failed (status {status}) after retrying: {resp}");
+        panic!(
+            "GetRecords failed (status {status}) after retrying for \
+             {RETRYABLE_BLIP_DEADLINE:?} with the condition never clearing: {resp}"
+        );
     }
 }
 
@@ -316,16 +354,19 @@ async fn describe_stream(addr: SocketAddr, stream_arn: &str) -> String {
 }
 
 /// A bounded retry-on-500 wrapper around [`dynamo`] for the ADR 0050 fork F8
-/// **documented** sub-second retryable write blip at freeze→cutover: a
+/// **documented** sub-second retryable write blip at freeze→cutover (a
 /// request landing inside that window surfaces as a Dynamo 500 carrying
 /// `"tablet frozen for split cutover (ADR 0050); a child will serve this
-/// range shortly; retry"` — a real DynamoDB client retries a 500, and so
-/// must this one. Modeled on `split_build.rs::put`'s retry shape (bounded
-/// deadline, fixed backoff). Any *non*-500 status, or deadline expiry with
-/// the blip still ongoing, still fails loudly — this only masks the one
-/// documented transient, never a genuine error.
+/// range shortly; retry"`) and its read-side sibling, a "not the leader
+/// here; leader_hint=none" 500 during a group's election/formation window
+/// (`get_shard_iterator`/`get_records`'s own doc) — a real DynamoDB client
+/// retries a 500, and so must this one. Modeled on `split_build.rs::put`'s
+/// retry shape (bounded deadline, fixed backoff), ceiling documented at
+/// [`RETRYABLE_BLIP_DEADLINE`]. Any *non*-500 status, or deadline expiry
+/// with the blip still ongoing, still fails loudly — this only masks the
+/// two documented transients above, never a genuine error.
 async fn dynamo_retrying(addr: SocketAddr, target: &str, body: &str, what: &str) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + RETRYABLE_BLIP_DEADLINE;
     loop {
         let (status, resp) = dynamo(addr, target, body).await;
         if status == 200 {
@@ -335,7 +376,10 @@ async fn dynamo_retrying(addr: SocketAddr, target: &str, body: &str, what: &str)
             sleep(Duration::from_millis(150)).await;
             continue;
         }
-        panic!("{what} failed (status {status}) after retrying: {resp}");
+        panic!(
+            "{what} failed (status {status}) after retrying for \
+             {RETRYABLE_BLIP_DEADLINE:?} with the condition never clearing: {resp}"
+        );
     }
 }
 
@@ -343,14 +387,25 @@ async fn dynamo_retrying(addr: SocketAddr, target: &str, body: &str, what: &str)
 /// DynamoDB's own wire convention maps a cancelled transaction to **HTTP
 /// 400** `TransactionCanceledException`, never 500 — so the identical ADR
 /// 0050 F8 freeze→cutover blip surfaces through the transact path with a
-/// different status code than a plain `PutItem`/`Query` sees
-/// (`"txn prepare: stage on table ... was rejected (a stale route, an
-/// already-sealed/out-of-fence range, or a concurrent in-doubt-recovery
-/// decision); retry"`). Retry that specific documented shape too; any other
+/// different status code than a plain `PutItem`/`Query` sees (either the raw
+/// `FROZEN_REFUSAL` text directly, `"tablet frozen for split cutover (ADR
+/// 0050); ...; retry"`, or `cp_txn`'s own staging refusal, `"txn prepare:
+/// stage on table ... was rejected (a stale route, an already-sealed/
+/// out-of-fence range, or a concurrent in-doubt-recovery decision);
+/// retry"` — both end in the house `"; retry"` retryability convention).
+/// Retry that specific documented shape too; any other
 /// `TransactionCanceledException` (a genuine condition-check failure, e.g.)
-/// still fails loudly, since only this one's own message says "retry".
+/// still fails loudly, since only these carry "retry". **Unlike
+/// `PutItem`/`DeleteItem`/`UpdateItem`, whose freeze refusal
+/// `ClientCtx::cp_kind_write_item`/`cp_kind_write_raw` already retry
+/// server-side (issue #288), `ClientCtx::cp_txn` does not retry its own
+/// staging refusal internally** — matching real DynamoDB's contract, where
+/// a cancelled transaction is the client SDK's job to retry, not the
+/// server's to absorb — so this loop, bounded by
+/// [`RETRYABLE_BLIP_DEADLINE`], is the only thing standing between a slow
+/// cutover and a spurious failure on the transact path.
 async fn dynamo_retrying_transact(addr: SocketAddr, body: &str, what: &str) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + RETRYABLE_BLIP_DEADLINE;
     loop {
         let (status, resp) = dynamo(addr, "DynamoDB_20120810.TransactWriteItems", body).await;
         if status == 200 {
@@ -364,7 +419,10 @@ async fn dynamo_retrying_transact(addr: SocketAddr, body: &str, what: &str) -> S
             sleep(Duration::from_millis(150)).await;
             continue;
         }
-        panic!("{what} failed (status {status}) after retrying: {resp}");
+        panic!(
+            "{what} failed (status {status}) after retrying for \
+             {RETRYABLE_BLIP_DEADLINE:?} with the condition never clearing: {resp}"
+        );
     }
 }
 
