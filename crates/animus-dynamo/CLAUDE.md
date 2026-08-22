@@ -50,7 +50,10 @@ comment for its full type/method inventory.
   `Operation`, covering CreateTable/Put/Get/Delete/Query/Scan/UpdateItem/
   BatchWriteItem/TransactWriteItems/TransactGetItems/UpdateTable/
   DescribeTable/DeleteTable/ListTables/UpdateTimeToLive/DescribeTimeToLive,
-  plus the response encoders). One gotcha: `GetItem`/`Query`/
+  plus the response encoders). `Query` and `Scan` share `decode_limit`/`decode_exclusive_start_key`/
+  `decode_predicate` — same `Limit`/`ExclusiveStartKey`/`FilterExpression`
+  contract, so fixing one fixes both; do not fork them.
+  One gotcha: `GetItem`/`Query`/
   `Scan` decode `ConsistentRead` **but this crate never enforces it** —
   whether `true` is legal depends on an index's replicated *kind* (GSI vs
   LSI), which lives in the control-plane catalog this crate never sees, so

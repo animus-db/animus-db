@@ -97,6 +97,18 @@ The surface now extends past the original three point ops:
   ADR 0041, which replaced it with materialized data-plane index rows — see
   that ADR and `crates/animus-dynamo/CLAUDE.md` for the current index
   design; unrelated to this pagination note.)
+  **Audit note (2026-08-22, second):** `Query` also now honours a
+  `FilterExpression`. It had been decoded for `Scan` only, so a `Query`
+  carrying one **silently returned unfiltered results** — a wrong-data
+  divergence rather than a missing-feature one. The semantics are `Scan`'s
+  verbatim: the filter runs after the key condition has selected what to
+  evaluate and after `Limit` has capped it, so a filtered-out row still
+  counts toward `ScannedCount`, still consumes a `Limit` slot, and can still
+  be the row `LastEvaluatedKey` points at — hence a page may return fewer
+  items than `Limit`, or none, and still carry a cursor. Still **not**
+  enforced (a permissive divergence, tracked with that group): DynamoDB
+  rejects a `FilterExpression` naming a key attribute of the table or index
+  being queried; we accept it.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
