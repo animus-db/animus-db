@@ -7411,8 +7411,22 @@ impl ClientCtx {
             // `PutItem`s to one key, six "superseded" errors). The outcome is
             // recorded per Raft index at apply time and is identical on every
             // replica.
+            // **Both halves are required.** The outcome says whether the entry
+            // did anything; `engine_applied_index` says whether its effects are
+            // merged and readable. The outcome is recorded as the entry is
+            // processed, *before* its writes are flushed into the engine, so
+            // acking on it alone would ack a write that is not yet visible —
+            // the durable-before-visible rule, and precisely the false-ack
+            // hazard `cp_put_local`'s doc warns about. Value equality used to
+            // imply both at once; splitting them means saying so explicitly.
+            //
+            // A no-op needs no such wait: it wrote nothing, so there is
+            // nothing to become readable and its outcome is final immediately.
+            let effects_readable = leader.engine_applied_index() >= accepted_index;
             match leader.kind_batch_outcome(accepted_index) {
-                Some(KindBatchOutcome::Applied) => return ProbeWait::Confirmed,
+                Some(KindBatchOutcome::Applied) if effects_readable => {
+                    return ProbeWait::Confirmed;
+                }
                 // A no-op, and now distinguishable from an ambiguous one: the
                 // caller's OCC round (re-read, re-evaluate) or a re-route.
                 Some(
@@ -7420,11 +7434,11 @@ impl ClientCtx {
                 ) => {
                     return ProbeWait::Superseded;
                 }
-                // Not applied yet, not a `KindBatch` (the other CP write paths
-                // share this loop), or aged out of the bounded outcome map —
-                // fall through to the value probe, which is the pre-existing
-                // behaviour.
-                None => {}
+                // Applied but not yet readable, not applied yet, not a
+                // `KindBatch` (the other CP write paths share this loop), or
+                // aged out of the bounded outcome map — fall through to the
+                // value probe, which is the pre-existing behaviour.
+                Some(KindBatchOutcome::Applied) | None => {}
             }
             if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
                 return ProbeWait::Confirmed;
@@ -7432,7 +7446,9 @@ impl ClientCtx {
             if Self::confirm_wait_is_futile(leader, accepted_index) {
                 // Close the probe-vs-apply race before giving up: re-check the
                 // outcome first, then the value.
-                if leader.kind_batch_outcome(accepted_index) == Some(KindBatchOutcome::Applied) {
+                if leader.engine_applied_index() >= accepted_index
+                    && leader.kind_batch_outcome(accepted_index) == Some(KindBatchOutcome::Applied)
+                {
                     return ProbeWait::Confirmed;
                 }
                 if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
