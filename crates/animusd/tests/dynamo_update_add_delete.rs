@@ -7,20 +7,26 @@
 //! indexed attribute an `ADD` changed must be re-indexed, exactly as a `SET`
 //! would have caused.
 //!
-//! Numeric `ADD` is the adapter's only **non-idempotent** write, and that is
-//! what this file pins. `ClientCtx::cp_kind_write_item` used to retry
-//! `kind_write_item_at_leader` on any retryable error, and that re-reads the
-//! old image and re-applies — a fresh read-modify-write, not a replay. A write
-//! that landed can still report retryable, because a failed OCC seatbelt is
-//! documented as indistinguishable from a fence miss. Measured before the fix:
-//! ten concurrent increments with **two** accepted responses left the counter
-//! at **431**.
+//! Numeric `ADD` is the adapter's only **non-idempotent** write, and it took
+//! two write-path fixes to make it safe.
 //!
-//! The guarantee to hold is DynamoDB's — **at-most-once per request**, not
-//! exactly-once. A client that retries an `ADD` which actually applied
-//! double-counts on DynamoDB too. So the service simply must not re-apply on
-//! its own, which is why the retry loop now skips non-idempotent writes rather
-//! than reaching for an idempotency token.
+//! First, `ClientCtx::cp_kind_write_item` used to retry
+//! `kind_write_item_at_leader` on any retryable error, and that re-reads the
+//! old image and re-applies — a fresh read-modify-write, not a replay.
+//! Measured then: ten concurrent increments with two accepted responses left
+//! the counter at **431**. The guarantee to hold is DynamoDB's —
+//! **at-most-once per request**, not exactly-once, since a client that retries
+//! an `ADD` which applied double-counts there too — so the service simply must
+//! not re-apply on its own.
+//!
+//! Second, confirmation compared the written value back, which cannot tell
+//! "my entry no-op'd" from "my entry applied and was immediately overwritten".
+//! That reported **8 of 10** concurrent increments as needing a retry although
+//! they had applied — and retrying is exactly what double-counts. A
+//! `KindBatch` now records what it did at apply time.
+//!
+//! With both in place: ten concurrent increments are all accepted and leave
+//! the counter at exactly ten, pinned below.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -189,34 +195,131 @@ async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> 
     }
 }
 
-/// Numeric `ADD` is refused over the wire, with the reason.
+/// The counter idiom: `ADD` seeds an absent attribute, then increments.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn numeric_add_is_refused_over_the_wire() {
+async fn add_seeds_then_increments_a_counter() {
     let (_dir, nodes, addrs) = setup().await;
 
-    let (status, body) = dynamo(
-        addrs[0],
-        "DynamoDB_20120810.UpdateItem",
-        r#"{"TableName":"events","Key":{"pk":{"S":"p1"},"sk":{"S":"a0"}},
-            "UpdateExpression":"ADD hits :one",
-            "ExpressionAttributeValues":{":one":{"N":"1"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 400, "numeric ADD must be refused: {body}");
-    assert!(body.contains("ValidationException"), "{body}");
+    let bump = |addr: SocketAddr| async move {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.UpdateItem",
+            r#"{"TableName":"events","Key":{"pk":{"S":"p1"},"sk":{"S":"a0"}},
+                "UpdateExpression":"ADD hits :one",
+                "ExpressionAttributeValues":{":one":{"N":"1"}},
+                "ReturnValues":"ALL_NEW"}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "ADD failed: {body}");
+        body
+    };
+
     assert!(
-        body.contains("count twice"),
-        "the reason must be stated: {body}"
+        bump(addrs[0]).await.contains(r#""hits":{"N":"1"}"#),
+        "seeded from absent"
+    );
+    assert!(
+        bump(addrs[1]).await.contains(r#""hits":{"N":"2"}"#),
+        "incremented"
+    );
+    assert!(
+        bump(addrs[2]).await.contains(r#""hits":{"N":"3"}"#),
+        "exact across nodes"
     );
 
-    let (_, got) = dynamo_retry(
+    for n in nodes {
+        n.shutdown_graceful().await;
+    }
+}
+
+/// **At-most-once per request, and every applied write acknowledged.** This is
+/// the test that measured 431 before the write-path fixes, and 8-of-10
+/// spurious retry responses after only the first of them.
+///
+/// Deliberately not the retrying helper: a client retry of an `ADD` that
+/// applied double-counts on DynamoDB too, so the property under test is that
+/// the *service* counts each request exactly once and reports honestly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_increments_all_land_exactly_once() {
+    let (_dir, nodes, addrs) = setup().await;
+
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let addr = addrs[i % addrs.len()];
+        handles.push(tokio::spawn(async move {
+            dynamo(
+                addr,
+                "DynamoDB_20120810.UpdateItem",
+                r#"{"TableName":"events","Key":{"pk":{"S":"p1"},"sk":{"S":"a1"}},
+                    "UpdateExpression":"ADD hits :one",
+                    "ExpressionAttributeValues":{":one":{"N":"1"}}}"#,
+            )
+            .await
+        }));
+    }
+    let mut failures = Vec::new();
+    for h in handles {
+        let (status, resp) = h.await.expect("task");
+        if status != 200 {
+            failures.push(format!("{status}: {resp}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "every increment applied, so every one must be acknowledged; got {} \
+         failure(s): {failures:#?}",
+        failures.len()
+    );
+
+    let (status, got) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"events","Key":{"pk":{"S":"p1"},"sk":{"S":"a0"}},
+        r#"{"TableName":"events","Key":{"pk":{"S":"p1"},"sk":{"S":"a1"}},
             "ConsistentRead":true}"#,
     )
     .await;
-    assert!(!got.contains("hits"), "no counter was created: {got}");
+    assert_eq!(status, 200, "{got}");
+    assert!(
+        got.contains(r#""hits":{"N":"10"}"#),
+        "ten accepted increments must leave exactly ten, never more: {got}"
+    );
+
+    for n in nodes {
+        n.shutdown_graceful().await;
+    }
+}
+
+/// Exact decimal arithmetic reaches the wire: an increment that would lose its
+/// low digits through an `f64` must not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn increments_keep_full_decimal_precision() {
+    let (_dir, nodes, addrs) = setup().await;
+
+    let (status, seeded) = dynamo_retry(
+        addrs[0],
+        "DynamoDB_20120810.UpdateItem",
+        r#"{"TableName":"events","Key":{"pk":{"S":"p1"},"sk":{"S":"a2"}},
+            "UpdateExpression":"ADD big :v",
+            "ExpressionAttributeValues":{":v":{"N":"99999999999999999999999999999999999999"}},
+            "ReturnValues":"ALL_NEW"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{seeded}");
+
+    let (status, bumped) = dynamo_retry(
+        addrs[1],
+        "DynamoDB_20120810.UpdateItem",
+        r#"{"TableName":"events","Key":{"pk":{"S":"p1"},"sk":{"S":"a2"}},
+            "UpdateExpression":"ADD big :one",
+            "ExpressionAttributeValues":{":one":{"N":"1"}},
+            "ReturnValues":"ALL_NEW"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{bumped}");
+    assert!(
+        bumped.contains("100000000000000000000000000000000000000"),
+        "38 digits carry exactly — an f64 round-trip would round this: {bumped}"
+    );
 
     for n in nodes {
         n.shutdown_graceful().await;

@@ -278,6 +278,21 @@ The surface now extends past the original three point ops:
   `Attributes` entirely rather than returning an empty map, as DynamoDB
   does. `update_response` already received both images, so this needed no
   new plumbing on the write path.
+  **Audit note (2026-08-22, thirteenth — numeric `ADD` unblocked):**
+  the refusal recorded in the eighth and eleventh notes is lifted. Two
+  write-path fixes had to land first, and neither was a wire-adapter
+  concern. `ClientCtx::cp_kind_write_item` no longer re-applies a
+  non-idempotent write on its own, so **at-most-once per request** holds —
+  DynamoDB's own guarantee, under which a *client* retry of an `ADD` that
+  applied double-counts there too. And a `KindBatch` now records what it did
+  at apply time, so a write that applied is acknowledged even when a
+  concurrent update immediately overwrites it; before that, confirmation
+  compared the written value back and told 8 of 10 concurrent increments to
+  retry although they had applied, which is precisely what double-counts.
+  Measured with both in place: ten concurrent increments are all accepted
+  and leave the counter at exactly ten, against 431 originally. The exact
+  decimal arithmetic (38 significant digits, no `f64` round-trip) that
+  shipped unused with the eighth note is now on the wire.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
