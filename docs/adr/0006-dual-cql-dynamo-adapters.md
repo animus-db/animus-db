@@ -86,6 +86,17 @@ The surface now extends past the original three point ops:
   bytes after the scan. An **index** `Query` still resolves base keys from the
   in-memory GSI/LSI index (the scan covers the base keyspace, not an index's
   alternate ordering) and quorum-reads each.
+  **Audit note (2026-08-22):** `Query` now **paginates** exactly like `Scan`
+  below — `Limit` + `ExclusiveStartKey`/`LastEvaluatedKey`, pushed down so a
+  small page reads roughly `Limit` rows of the queried partition/index
+  sub-range rather than the whole thing, never the whole table. This closes
+  what had been a real fidelity gap (a `Query` used to answer a whole
+  partition in one uncapped shot); it is a fidelity completion of the
+  pagination contract this ADR already specified for `Scan`, not a new
+  design decision. (The "in-memory GSI/LSI index" language above predates
+  ADR 0041, which replaced it with materialized data-plane index rows — see
+  that ADR and `crates/animus-dynamo/CLAUDE.md` for the current index
+  design; unrelated to this pagination note.)
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator

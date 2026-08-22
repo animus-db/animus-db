@@ -245,15 +245,26 @@ comment for its full type/method inventory.
   arithmetic, `TransactWriteItems`/`TransactGetItems` idempotency tokens
   (`ClientRequestToken`) and full per-action `CancellationReasons` fidelity
   (ADR 0018 §2/PR7 shipped atomicity itself; these wire-fidelity details
-  remain simplified). **`Query` has no pagination at all** — unlike `Scan`,
-  `decode_query` never parses `Limit`/`ExclusiveStartKey`, and `animusd::
-  dynamo::run_query` answers a whole partition in one native range scan
-  with no cap; found while building the Data Console's Items tab (ADR 0052
-  PR4), which threads `Scan`'s real `Limit`/`ExclusiveStartKey`/
-  `LastEvaluatedKey` straight through but cannot offer the same for `Query`
-  and does not attempt to fake it client-side. Real DynamoDB paginates both
-  operations identically; giving `Query` the same contract `Scan` already
-  has is the natural follow-up here, not a console-side workaround.
+  remain simplified). **`Query` now paginates exactly like `Scan`**
+  (`decode_query` parses `Limit`/`ExclusiveStartKey` the same way
+  `decode_scan` does, sharing the decode helpers; found and closed while
+  building the Data Console's Items tab, ADR 0052 PR4, which needed it and
+  had to work around its absence): `animusd::dynamo::run_base_query`/
+  `run_gsi_query`/`run_lsi_query` push `limit` down via
+  `paginated_table_examine`/`paginated_kind_examine_one` bounded to the
+  `Query`'s own partition/index sub-range (never the whole table — unlike a
+  `Scan`'s unbounded-above range), reusing the identical `LastEvaluatedKey`
+  cursor shapes `run_gsi_scan`/`run_lsi_scan` already established
+  (`gsi_key_item_of`/`lsi_key_item_of`) so a `Query` page and a `Scan` page
+  over the same index agree by construction. An `ExclusiveStartKey` is
+  validated against its target's **exact** key-attribute-name set
+  (`validate_query_cursor_shape`) before use — a GSI/LSI cursor also carries
+  the base table's own key attributes, so a laxer "needed attributes
+  present" check would silently accept a cursor from a different `Query`;
+  a mismatch is `ValidationException`, matching DynamoDB. The Data
+  Console's Items tab itself (`console.rs`'s `QueryItemsRequest`) does not
+  yet expose `limit`/`exclusive_start_key` to use this — a separate,
+  not-yet-done console-side follow-up, tracked in that module's own doc.
   `DescribeTimeToLive`'s `TimeToLiveStatus` (ADR 0051)
   only ever renders `ENABLED`/`DISABLED`, never AWS's transient
   `ENABLING`/`DISABLING` — this adapter's `UpdateTimeToLive` takes effect
