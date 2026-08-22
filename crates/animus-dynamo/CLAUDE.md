@@ -49,12 +49,27 @@ comment for its full type/method inventory.
 - `wire` — the DynamoDB JSON translation (`decode_request` →
   `Operation`, covering CreateTable/Put/Get/Delete/Query/Scan/UpdateItem/
   BatchWriteItem/TransactWriteItems/TransactGetItems/UpdateTable/
-  DescribeTable/UpdateTimeToLive/DescribeTimeToLive, plus the response
-  encoders). One gotcha: `GetItem`/`Query`/
+  DescribeTable/DeleteTable/ListTables/UpdateTimeToLive/DescribeTimeToLive,
+  plus the response encoders). `Query` and `Scan` share `decode_limit`/`decode_exclusive_start_key`/
+  `decode_predicate`/`decode_select` — same `Limit`/`ExclusiveStartKey`/`FilterExpression`/`Select`
+  contract, so fixing one fixes both; do not fork them.
+  One gotcha: `GetItem`/`Query`/
   `Scan` decode `ConsistentRead` **but this crate never enforces it** —
   whether `true` is legal depends on an index's replicated *kind* (GSI vs
   LSI), which lives in the control-plane catalog this crate never sees, so
   the field rides through to `animusd::dynamo::run_index_query` to reject.
+  `DeleteTable`/`ListTables` are read-only-here operations too: `DeleteTable`
+  decodes to a bare table name (the existence check, the actual drop via
+  `ClientCtx::drop_table`, and the `ResourceNotFoundException` are all
+  `animusd`'s, since this crate never sees the replicated catalog); `wire`
+  does own the **pure** `ListTables` pagination contract though
+  (`paginate_table_names` — default/cap-100 `Limit`,
+  `ExclusiveStartTableName` positioning via a sorted-slice binary search, and
+  `LastEvaluatedTableName` reported only when truncated), so `animusd`'s
+  `list_tables` only has to build the already-filtered, already-sorted
+  candidate name list (excluding a materialized GSI's hidden
+  `<base>$<index>` table, `index::is_index_table_name`) and hand it to this
+  crate's pagination + response encoder.
 - `streams_wire` (ADR 0042 §3/§5/§6/§7) — the `DynamoDBStreams_20120810`
   service's own pure wire layer. `parse_shard_id`/`parse_stream_arn` are the
   inverses of `animus_cp_data::segment::shard_id`/`wire::stream_arn`,
@@ -233,15 +248,26 @@ comment for its full type/method inventory.
   arithmetic, `TransactWriteItems`/`TransactGetItems` idempotency tokens
   (`ClientRequestToken`) and full per-action `CancellationReasons` fidelity
   (ADR 0018 §2/PR7 shipped atomicity itself; these wire-fidelity details
-  remain simplified). **`Query` has no pagination at all** — unlike `Scan`,
-  `decode_query` never parses `Limit`/`ExclusiveStartKey`, and `animusd::
-  dynamo::run_query` answers a whole partition in one native range scan
-  with no cap; found while building the Data Console's Items tab (ADR 0052
-  PR4), which threads `Scan`'s real `Limit`/`ExclusiveStartKey`/
-  `LastEvaluatedKey` straight through but cannot offer the same for `Query`
-  and does not attempt to fake it client-side. Real DynamoDB paginates both
-  operations identically; giving `Query` the same contract `Scan` already
-  has is the natural follow-up here, not a console-side workaround.
+  remain simplified). **`Query` now paginates exactly like `Scan`**
+  (`decode_query` parses `Limit`/`ExclusiveStartKey` the same way
+  `decode_scan` does, sharing the decode helpers; found and closed while
+  building the Data Console's Items tab, ADR 0052 PR4, which needed it and
+  had to work around its absence): `animusd::dynamo::run_base_query`/
+  `run_gsi_query`/`run_lsi_query` push `limit` down via
+  `paginated_table_examine`/`paginated_kind_examine_one` bounded to the
+  `Query`'s own partition/index sub-range (never the whole table — unlike a
+  `Scan`'s unbounded-above range), reusing the identical `LastEvaluatedKey`
+  cursor shapes `run_gsi_scan`/`run_lsi_scan` already established
+  (`gsi_key_item_of`/`lsi_key_item_of`) so a `Query` page and a `Scan` page
+  over the same index agree by construction. An `ExclusiveStartKey` is
+  validated against its target's **exact** key-attribute-name set
+  (`validate_query_cursor_shape`) before use — a GSI/LSI cursor also carries
+  the base table's own key attributes, so a laxer "needed attributes
+  present" check would silently accept a cursor from a different `Query`;
+  a mismatch is `ValidationException`, matching DynamoDB. The Data
+  Console's Items tab itself (`console.rs`'s `QueryItemsRequest`) does not
+  yet expose `limit`/`exclusive_start_key` to use this — a separate,
+  not-yet-done console-side follow-up, tracked in that module's own doc.
   `DescribeTimeToLive`'s `TimeToLiveStatus` (ADR 0051)
   only ever renders `ENABLED`/`DISABLED`, never AWS's transient
   `ENABLING`/`DISABLING` — this adapter's `UpdateTimeToLive` takes effect

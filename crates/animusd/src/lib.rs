@@ -63,8 +63,8 @@ use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{
-    FastRead, IntentInfo, RaftKvNode, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome,
-    TxnRecordView,
+    FastRead, IntentInfo, KindBatchOutcome, RaftKvNode, StageOutcome, TxnDecisionStatus, TxnId,
+    TxnOutcome, TxnRecordView,
 };
 use animus_env::{Clock, Disk, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{
@@ -370,6 +370,21 @@ impl CpGroup {
         }
     }
 
+    /// Descending kind-scoped ReadIndex scan.
+    /// See [`RaftKvNode::linearizable_scan_kind_rev`].
+    async fn linearizable_scan_kind_rev(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            CpGroup::Lsm(n) => n.linearizable_scan_kind_rev(kind, start, end, limit).await,
+            CpGroup::Mem(n) => n.linearizable_scan_kind_rev(kind, start, end, limit).await,
+        }
+    }
+
     /// As [`put`](Self::put), but for a delete (tombstone). See
     /// [`RaftKvNode::delete`].
     fn delete(&self, key: Vec<u8>) -> ProposeResult {
@@ -416,6 +431,19 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.linearizable_scan(start, end, limit).await,
             CpGroup::Mem(n) => n.linearizable_scan(start, end, limit).await,
+        }
+    }
+
+    /// Descending ReadIndex range scan. See [`RaftKvNode::linearizable_scan_rev`].
+    async fn linearizable_scan_rev(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            CpGroup::Lsm(n) => n.linearizable_scan_rev(start, end, limit).await,
+            CpGroup::Mem(n) => n.linearizable_scan_rev(start, end, limit).await,
         }
     }
 
@@ -499,6 +527,15 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.engine_applied_index(),
             CpGroup::Mem(n) => n.engine_applied_index(),
+        }
+    }
+
+    /// What the `KindBatch` at `index` did. See
+    /// [`RaftKvNode::kind_batch_outcome`].
+    pub(crate) fn kind_batch_outcome(&self, index: u64) -> Option<KindBatchOutcome> {
+        match self {
+            CpGroup::Lsm(n) => n.kind_batch_outcome(index),
+            CpGroup::Mem(n) => n.kind_batch_outcome(index),
         }
     }
 
@@ -1330,6 +1367,11 @@ pub enum ClientRequest {
         end: Option<Vec<u8>>,
         #[serde(default)]
         limit: Option<usize>,
+        /// Descending (an LSI `Query` with `ScanIndexForward: false`).
+        /// `#[serde(default)]` so a peer predating the field still decodes as
+        /// the ascending scan this has always been.
+        #[serde(default)]
+        reverse: bool,
     },
     /// **Internal seal-trigger RPC — never sent bare, only wrapped in
     /// [`Forwarded`](Self::Forwarded)** (ADR 0042/0043, round-3 sealer PR):
@@ -1526,6 +1568,13 @@ pub enum ClientRequest {
         end: Option<Vec<u8>>,
         #[serde(default)]
         limit: Option<usize>,
+        /// Descending: `limit` keeps the *highest* rows of the range and they
+        /// come back highest-key-first (a `Query` with `ScanIndexForward:
+        /// false`). `#[serde(default)]` so a peer that predates the field —
+        /// or any of the many ascending constructors — still decodes as the
+        /// ascending scan this has always been.
+        #[serde(default)]
+        reverse: bool,
         table: String,
     },
     /// A CP op **forwarded** from a node that received it but does not host the CP
@@ -2024,9 +2073,20 @@ pub enum ClientResponse {
     /// `index_aware_write`'s edge-evaluated design used to hand back to its
     /// own caller directly, needed for `ReturnValues`/`UpdateReturnValues`
     /// echo. `new: None` for a `Delete` op.
+    ///
+    /// `collection_bytes` is the leader's own base + LSI byte total for the
+    /// tablet that hosts the item — the DynamoDB `ItemCollectionMetrics`
+    /// size input (see `dynamo::collection_bytes_at_leader`). It is produced
+    /// *at the leader* because that is the only node that holds the tablet's
+    /// engine; the receiving edge has no way to price a tablet it does not
+    /// host, which is precisely why this rides back on the reply rather than
+    /// being computed after the hop. `#[serde(default)]` so a peer predating
+    /// the field still decodes, reporting no estimate rather than a wrong one.
     KindWriteOk {
         old: Option<animus_dynamo::Item>,
         new: Option<animus_dynamo::Item>,
+        #[serde(default)]
+        collection_bytes: Option<u64>,
     },
     /// Reply to [`KindWriteItem`](ClientRequest::KindWriteItem): the
     /// caller's own `condition` did not match the leader's own read of the
@@ -3274,9 +3334,13 @@ impl console::ConsoleBackend for ClientCtx {
 /// Decode a `Scan`/`Query` wire response body (`{"Items": [...], "Count": n,
 /// "ScannedCount": n[, "LastEvaluatedKey": {...}]}`) into an
 /// [`console::ItemsPage`] — shared by [`ConsoleBackend::scan_items`] and
-/// [`ConsoleBackend::query_items`] above (`animus_dynamo::wire::
-/// query_response` never emits `LastEvaluatedKey` at all, so this naturally
-/// yields `None` there — see [`console::ItemsPage`]'s own doc).
+/// [`ConsoleBackend::query_items`] above. `Query` now paginates on the wire
+/// (`animus_dynamo::wire::scan_response` is the response encoder for both
+/// operations), but [`ConsoleBackend::query_items`] doesn't yet send a
+/// `Limit`/`ExclusiveStartKey` of its own, so `LastEvaluatedKey` still comes
+/// back absent in practice there — see [`console::ItemsPage`]'s own doc for
+/// why threading the console's Items tab onto real `Query` pagination is a
+/// deliberately separate, not-yet-done follow-up.
 fn console_parse_items_page(body: &str) -> Result<console::ItemsPage, console::ConsoleError> {
     let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| console::ConsoleError::new(500, format!("malformed items response: {e}")))?;
@@ -6728,6 +6792,7 @@ impl ClientCtx {
         start: &[u8],
         end: Option<&[u8]>,
         limit: Option<usize>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
         if !leader.scope_range().contains_range(&requested) {
@@ -6735,7 +6800,14 @@ impl ClientCtx {
                 "scan window {requested:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
-        match leader.linearizable_scan(start, end, limit).await {
+        // Same range, same barrier either way — `reverse` only decides which
+        // end of it `limit` keeps and what order the rows come back in.
+        let served = if reverse {
+            leader.linearizable_scan_rev(start, end, limit).await
+        } else {
+            leader.linearizable_scan(start, end, limit).await
+        };
+        match served {
             Some(p) => Ok(p),
             None => Err("CP group leader moved; retry".into()),
         }
@@ -6848,6 +6920,9 @@ impl ClientCtx {
                 .map_err(|e| dynamo::internal(&e))?;
         }
         let base_key = dynamo::item_key(pk, sk);
+        // Whether this write may be safely re-applied; see the retry decision
+        // at the bottom of the loop.
+        let idempotent = dynamo::kind_write_is_idempotent(&op);
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             let err = match self.cp_route(table, &base_key).await {
@@ -6882,8 +6957,16 @@ impl ClientCtx {
                         condition: condition.cloned(),
                     };
                     match self.cp_forward(table, &base_key, addr, request).await {
-                        ClientResponse::KindWriteOk { old, new } => {
-                            return Ok(dynamo::KindWriteOutcome::Ok { old, new });
+                        ClientResponse::KindWriteOk {
+                            old,
+                            new,
+                            collection_bytes,
+                        } => {
+                            return Ok(dynamo::KindWriteOutcome::Ok {
+                                old,
+                                new,
+                                collection_bytes,
+                            });
                         }
                         ClientResponse::ConditionFailed => {
                             return Ok(dynamo::KindWriteOutcome::ConditionFailed);
@@ -6898,7 +6981,28 @@ impl ClientCtx {
                 }
                 CpRoute::None => dynamo::internal("no CP group leader reachable"),
             };
-            if !Self::read_should_retry(&err.message) || tokio::time::Instant::now() >= deadline {
+            // **At-most-once for a non-idempotent write.** This loop re-enters
+            // `kind_write_item_at_leader`, which re-reads the old image and
+            // re-applies the actions — a fresh read-modify-write, not a replay
+            // of the original proposal. For every idempotent op (Put, Delete,
+            // SET, REMOVE, a set union or difference) that converges to the
+            // same state and the retry is free. A numeric `ADD` does not
+            // converge, and a retryable error is not proof the write missed:
+            // a failed OCC seatbelt applies as a silent no-op that the
+            // confirm-poll reports exactly like a fence miss, so a write that
+            // landed can still come back retryable. Retrying then counts twice.
+            //
+            // DynamoDB's guarantee is at-most-once **per request**, not
+            // exactly-once: a *client* that retries an `ADD` which actually
+            // applied does double-count there too. So the fix is not an
+            // idempotency token — it is simply that the service must not
+            // re-apply on its own. A non-idempotent write therefore gets one
+            // attempt, and any transient failure is surfaced for the caller to
+            // decide about, exactly as DynamoDB would.
+            if !idempotent
+                || !Self::read_should_retry(&err.message)
+                || tokio::time::Instant::now() >= deadline
+            {
                 return Err(err);
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
@@ -7318,11 +7422,54 @@ impl ClientCtx {
         deadline: tokio::time::Instant,
     ) -> ProbeWait {
         loop {
+            // Ask the entry what it did, in preference to reading the value
+            // back. Value equality cannot tell "my entry no-op'd" from "my
+            // entry applied and a concurrent write then overwrote it" — the
+            // second is a success, and reporting it as a failure made a
+            // contended key fail spuriously (measured: ten concurrent
+            // `PutItem`s to one key, six "superseded" errors). The outcome is
+            // recorded per Raft index at apply time and is identical on every
+            // replica.
+            // **Both halves are required.** The outcome says whether the entry
+            // did anything; `engine_applied_index` says whether its effects are
+            // merged and readable. The outcome is recorded as the entry is
+            // processed, *before* its writes are flushed into the engine, so
+            // acking on it alone would ack a write that is not yet visible —
+            // the durable-before-visible rule, and precisely the false-ack
+            // hazard `cp_put_local`'s doc warns about. Value equality used to
+            // imply both at once; splitting them means saying so explicitly.
+            //
+            // A no-op needs no such wait: it wrote nothing, so there is
+            // nothing to become readable and its outcome is final immediately.
+            let effects_readable = leader.engine_applied_index() >= accepted_index;
+            match leader.kind_batch_outcome(accepted_index) {
+                Some(KindBatchOutcome::Applied) if effects_readable => {
+                    return ProbeWait::Confirmed;
+                }
+                // A no-op, and now distinguishable from an ambiguous one: the
+                // caller's OCC round (re-read, re-evaluate) or a re-route.
+                Some(
+                    KindBatchOutcome::ConditionFailed { .. } | KindBatchOutcome::Sealed { .. },
+                ) => {
+                    return ProbeWait::Superseded;
+                }
+                // Applied but not yet readable, not applied yet, not a
+                // `KindBatch` (the other CP write paths share this loop), or
+                // aged out of the bounded outcome map — fall through to the
+                // value probe, which is the pre-existing behaviour.
+                Some(KindBatchOutcome::Applied) | None => {}
+            }
             if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
                 return ProbeWait::Confirmed;
             }
             if Self::confirm_wait_is_futile(leader, accepted_index) {
-                // Close the probe-vs-apply race before giving up.
+                // Close the probe-vs-apply race before giving up: re-check the
+                // outcome first, then the value.
+                if leader.engine_applied_index() >= accepted_index
+                    && leader.kind_batch_outcome(accepted_index) == Some(KindBatchOutcome::Applied)
+                {
+                    return ProbeWait::Confirmed;
+                }
                 if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
                     return ProbeWait::Confirmed;
                 }
@@ -8725,6 +8872,7 @@ impl ClientCtx {
         start: Vec<u8>,
         end: Option<Vec<u8>>,
         limit: Option<usize>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         // The table's tablets overlapping [start, end), in token (range.start) order.
         // `end == None` is unbounded above (a whole-table scan).
@@ -8751,6 +8899,12 @@ impl ClientCtx {
             })
             .collect();
         ranges.sort();
+        // Descending: visit the overlapping tablets highest-token-first too,
+        // so `limit` fills from the top of the whole scanned span rather than
+        // from the top of merely its lowest tablet.
+        if reverse {
+            ranges.reverse();
+        }
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for r in ranges {
             if let Some(l) = limit
@@ -8773,7 +8927,7 @@ impl ClientCtx {
             }
             let remaining = limit.map(|l| l - out.len());
             out.extend(
-                self.cp_scan_one(table, sub_start, sub_end, remaining)
+                self.cp_scan_one(table, sub_start, sub_end, remaining, reverse)
                     .await?,
             );
         }
@@ -8793,12 +8947,14 @@ impl ClientCtx {
         start: Vec<u8>,
         end: Option<Vec<u8>>,
         limit: Option<usize>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             let err = match self.cp_route(table, &start).await {
                 CpRoute::Local(leader) => {
-                    match Self::cp_scan_local(&leader, &start, end.as_deref(), limit).await {
+                    match Self::cp_scan_local(&leader, &start, end.as_deref(), limit, reverse).await
+                    {
                         Ok(p) => return Ok(p),
                         Err(e) => e,
                     }
@@ -8808,6 +8964,7 @@ impl ClientCtx {
                         start: start.clone(),
                         end: end.clone(),
                         limit,
+                        reverse,
                         table: table.to_owned(),
                     };
                     match self.cp_forward(table, &start, addr, request).await {
@@ -8837,13 +8994,19 @@ impl ClientCtx {
     /// `start` and `end` must resolve to that same tablet — checked here
     /// rather than assumed, mirroring [`cp_kind_write`](Self::cp_kind_write)'s
     /// cross-tablet guard: silently scanning only the first tablet's share of
-    /// a straddling range would be a silent partial read.
+    /// a straddling range would be a silent partial read. `limit` is pushed
+    /// down to [`cp_scan_kind_one`](Self::cp_scan_kind_one) — the LSI `Query`
+    /// pagination primitive (`animusd::dynamo`'s bounded, windowed
+    /// `paginated_kind_examine_one`) now pages the same way a base/GSI
+    /// `Query` does, rather than the `None`-always gap this used to have.
     pub(crate) async fn cp_scan_kind(
         &self,
         table: &str,
         kind: u8,
         start: Vec<u8>,
         end: Vec<u8>,
+        limit: Option<usize>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let start_tablet = self
             .tablet_for(table, &start)
@@ -8854,9 +9017,7 @@ impl ClientCtx {
                  an LSI query is scoped to one partition"
             ));
         }
-        // An LSI `Query` has no `Limit` (a documented DynamoDB-fidelity gap,
-        // ADR 0041) — `None` here.
-        self.cp_scan_kind_one(table, kind, start, Some(end), None)
+        self.cp_scan_kind_one(table, kind, start, Some(end), limit, reverse)
             .await
     }
 
@@ -8927,7 +9088,7 @@ impl ClientCtx {
             // less coordinator-side memory.
             let remaining = limit.map(|l| l - out.len());
             out.extend(
-                self.cp_scan_kind_one(table, kind, sub_start, sub_end, remaining)
+                self.cp_scan_kind_one(table, kind, sub_start, sub_end, remaining, false)
                     .await?,
             );
         }
@@ -8953,13 +9114,21 @@ impl ClientCtx {
         start: Vec<u8>,
         end: Option<Vec<u8>>,
         limit: Option<usize>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             let err = match self.cp_route(table, &start).await {
                 CpRoute::Local(leader) => {
-                    match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref(), limit)
-                        .await
+                    match Self::cp_scan_kind_local(
+                        &leader,
+                        kind,
+                        &start,
+                        end.as_deref(),
+                        limit,
+                        reverse,
+                    )
+                    .await
                     {
                         Ok(p) => return Ok(p),
                         Err(e) => e,
@@ -8972,6 +9141,7 @@ impl ClientCtx {
                         start: start.clone(),
                         end: end.clone(),
                         limit,
+                        reverse,
                     };
                     match self.cp_forward(table, &start, addr, request).await {
                         ClientResponse::Pairs(p) => return Ok(p),
@@ -9006,6 +9176,7 @@ impl ClientCtx {
         start: &[u8],
         end: Option<&[u8]>,
         limit: Option<usize>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
         if !leader.scope_range().contains_range(&requested) {
@@ -9013,7 +9184,14 @@ impl ClientCtx {
                 "scan window {requested:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
-        match leader.linearizable_scan_kind(kind, start, end, limit).await {
+        let served = if reverse {
+            leader
+                .linearizable_scan_kind_rev(kind, start, end, limit)
+                .await
+        } else {
+            leader.linearizable_scan_kind(kind, start, end, limit).await
+        };
+        match served {
             Some(p) => Ok(p),
             None => Err("CP group leader moved; retry".into()),
         }
@@ -9731,9 +9909,15 @@ impl ClientCtx {
                 )
                 .await
                 {
-                    Ok(dynamo::KindWriteOutcome::Ok { old, new }) => {
-                        ClientResponse::KindWriteOk { old, new }
-                    }
+                    Ok(dynamo::KindWriteOutcome::Ok {
+                        old,
+                        new,
+                        collection_bytes,
+                    }) => ClientResponse::KindWriteOk {
+                        old,
+                        new,
+                        collection_bytes,
+                    },
                     Ok(dynamo::KindWriteOutcome::ConditionFailed) => {
                         ClientResponse::ConditionFailed
                     }
@@ -9788,6 +9972,7 @@ impl ClientCtx {
                 start,
                 end,
                 limit,
+                reverse,
                 table,
             } => {
                 let tablet = self.tablet_for(&table, &start);
@@ -9798,7 +9983,7 @@ impl ClientCtx {
                 // `cp_scan_local` decision as `cp_scan_one`'s Local arm: a
                 // scope lagging the metadata-derived scan window would
                 // silently truncate results, not error.
-                match Self::cp_scan_local(&leader, &start, end.as_deref(), limit).await {
+                match Self::cp_scan_local(&leader, &start, end.as_deref(), limit, reverse).await {
                     Ok(p) => ClientResponse::Pairs(p),
                     Err(e) => ClientResponse::Error(e),
                 }
@@ -9813,12 +9998,22 @@ impl ClientCtx {
                 start,
                 end,
                 limit,
+                reverse,
             } => {
                 let tablet = self.tablet_for(&table, &start);
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
-                match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref(), limit).await {
+                match Self::cp_scan_kind_local(
+                    &leader,
+                    kind,
+                    &start,
+                    end.as_deref(),
+                    limit,
+                    reverse,
+                )
+                .await
+                {
                     Ok(p) => ClientResponse::Pairs(p),
                     Err(e) => ClientResponse::Error(e),
                 }
@@ -12179,8 +12374,9 @@ async fn handle_request(
             start,
             end,
             limit,
+            reverse,
             table,
-        } => match ctx.cp_scan(&table, start, end, limit).await {
+        } => match ctx.cp_scan(&table, start, end, limit, reverse).await {
             Ok(pairs) => ClientResponse::Pairs(pairs),
             Err(e) => ClientResponse::Error(e),
         },

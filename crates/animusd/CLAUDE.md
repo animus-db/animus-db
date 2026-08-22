@@ -309,10 +309,16 @@ reusing the captured config is the point of the test.
   Indexes/Danger-zone jump nav (`#settings`/`#indexes`/`#danger`, now
   rendered by `renderConfigTab`, called from `renderTablePage`'s tab
   dispatch) stays a plain same-page anchor, unchanged from PR3 — and why
-  `Query` (unlike `Scan`) has no "Load more": `animus_dynamo::wire::
-  decode_query` never parses a `Limit`/`ExclusiveStartKey` at all, a
-  pre-existing gap in the underlying wire layer this PR does not attempt to
-  paper over client-side. Scanning/querying a named GSI/LSI (`index_name`,
+  `Query` (unlike `Scan`) had no "Load more" as of this PR: `animus_dynamo::
+  wire::decode_query` never parsed a `Limit`/`ExclusiveStartKey` at all, a
+  pre-existing gap in the underlying wire layer this PR did not attempt to
+  paper over client-side. **That wire-layer gap is since closed** (`Query`
+  now paginates exactly like `Scan` — see `crates/animus-dynamo/CLAUDE.md`'s
+  "Still deferred" entry for the mechanism), but `console.rs`'s
+  `QueryItemsRequest` still doesn't expose `limit`/`exclusive_start_key`, so
+  the Items tab's "Load more" gap for `Query` remains a separate,
+  not-yet-done console-side follow-up rather than a wire-layer one.
+  Scanning/querying a named GSI/LSI (`index_name`,
   a real closed set from this same table's own `TableDetail.gsis`/`lsis` —
   rendered with a `<select>`, never free text) fell out cleanly: `lib.rs`'s
   `query_items` resolves the partition/sort attribute names to query by

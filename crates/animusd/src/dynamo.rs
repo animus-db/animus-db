@@ -153,8 +153,13 @@ use std::time::Duration;
 use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjection, IndexStatus};
 use animus_control::{MetaCommand, Metadata, ReplicationMode, TtlSpec};
 use animus_cp_data::{KIND_BASE, KIND_LSI};
+use animus_dynamo::capacity::{
+    self, ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity,
+    ReturnItemCollectionMetrics,
+};
 use animus_dynamo::wire::{
-    self, Operation, Projection, ReturnValues, TransactAction, TransactGet, WireError, WriteRequest,
+    self, Operation, Projection, ReturnValues, ScanSegment, Select, TransactAction, TransactGet,
+    UpdateAction, WireError, WriteRequest,
 };
 use animus_dynamo::{
     AttributeValue, ChangeRecord, ConditionExpression, Item, SortKeyCondition, TableSchema,
@@ -423,13 +428,26 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             index_update,
         } => update_table(ctx, &table, stream, index_update).await,
         Operation::DescribeTable { table } => describe_table(ctx, meta, &table),
+        Operation::DeleteTable { table } => delete_table(ctx, &table).await,
+        Operation::ListTables {
+            exclusive_start_table_name,
+            limit,
+        } => list_tables(meta, exclusive_start_table_name.as_deref(), limit),
         Operation::PutItem {
             table,
             item,
             condition,
             return_values,
+            capacity: report,
+            metrics: want_metrics,
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &item)?;
+            // The written image is already in hand here, so a `PutItem` can
+            // report its capacity without giving up the fast arm below — unlike
+            // `DeleteItem`, whose charge depends on an image only the leader has
+            // read. Charged on the item as it is *after* the write, DynamoDB's
+            // own rule.
+            let charged = write_capacity(meta, &table, Some(&item), report);
             // ADR 0049 fast arm: nothing to read, nothing to evaluate —
             // the edge commits base row + marker record directly (see
             // `fast_marker_write`'s doc for why this must NOT go through
@@ -440,7 +458,15 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             {
                 let value = wire::encode_stored_item(&item);
                 fast_marker_write(ctx, &table, &pk, sk.as_ref(), value).await?;
-                return Ok(wire::write_response(return_values, None));
+                // No metrics: this arm is reachable only when the table has
+                // no index at all, so it has no LSI, so an item collection is
+                // not a thing this table has.
+                return Ok(wire::write_response(
+                    return_values,
+                    None,
+                    charged.as_ref(),
+                    None,
+                ));
             }
             // ADR 0046 U3: an evaluated write (a condition, an old-image
             // echo, or an images-carrying table) is evaluated **at the
@@ -464,8 +490,19 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
                 )),
-                KindWriteOutcome::Ok { old, .. } => {
-                    Ok(wire::write_response(return_values, old.as_ref()))
+                KindWriteOutcome::Ok {
+                    old,
+                    collection_bytes,
+                    ..
+                } => {
+                    let collection =
+                        item_collection_metrics(meta, &table, &pk, collection_bytes, want_metrics);
+                    Ok(wire::write_response(
+                        return_values,
+                        old.as_ref(),
+                        charged.as_ref(),
+                        collection.as_ref(),
+                    ))
                 }
             }
         }
@@ -474,18 +511,31 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             key,
             condition,
             return_values,
+            capacity: report,
+            metrics: want_metrics,
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
             // ADR 0049 fast arm — see `PutItem`'s identical fork above. A
             // delete's base write is the tombstone *sentinel value*, so the
             // routed probe still confirms on a `Some`.
+            //
+            // A capacity report joins the existing reasons to skip the fast arm.
+            // DynamoDB charges a delete on the size of the item it *removed*,
+            // and index rows are removed with it — none of which the fast arm
+            // reads. Reporting the one-unit floor instead would understate a
+            // large indexed item's delete by an arbitrary amount, so asking for
+            // capacity opts into the read that can answer honestly, exactly as
+            // asking for `ALL_OLD` already does.
             if condition.is_none()
                 && return_values == ReturnValues::None
+                && !report.wanted()
                 && !table_change_records_carry_images(meta, &table)
             {
                 let value = wire::encode_tombstone();
                 fast_marker_write(ctx, &table, &pk, sk.as_ref(), value).await?;
-                return Ok(wire::write_response(return_values, None));
+                // No metrics, for `PutItem`'s reason above: no index here
+                // means no LSI means no item collection.
+                return Ok(wire::write_response(return_values, None, None, None));
             }
             // See `PutItem`'s identical fork above for why an evaluated
             // write goes to the leader instead.
@@ -503,8 +553,22 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
                 )),
-                KindWriteOutcome::Ok { old, .. } => {
-                    Ok(wire::write_response(return_values, old.as_ref()))
+                KindWriteOutcome::Ok {
+                    old,
+                    collection_bytes,
+                    ..
+                } => {
+                    // A delete is charged on what it removed, including the
+                    // index rows that went with it — hence the *old* image.
+                    let charged = write_capacity(meta, &table, old.as_ref(), report);
+                    let collection =
+                        item_collection_metrics(meta, &table, &pk, collection_bytes, want_metrics);
+                    Ok(wire::write_response(
+                        return_values,
+                        old.as_ref(),
+                        charged.as_ref(),
+                        collection.as_ref(),
+                    ))
                 }
             }
         }
@@ -514,23 +578,61 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             table,
             key,
             projection,
-            // Accept-and-ignore (ADR 0041 §5): a base-table `GetItem` is
-            // already linearizable here, so `ConsistentRead: true` needs no
-            // enforcement — only a GSI `Query` ever rejects it.
-            consistent_read: _,
+            // Accept-and-ignore *for correctness* (ADR 0041 §5): a base-table
+            // `GetItem` is already linearizable here, so `ConsistentRead: true`
+            // needs no enforcement — only a GSI `Query` ever rejects it. It is
+            // still read for **capacity**, where it halves the charge.
+            consistent_read,
+            capacity: report,
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
             let data_key = item_key(&pk, sk.as_ref());
             let item = quorum_read(ctx, meta, &table, &data_key).await?;
+            // Charged on the **stored** item, before the projection: DynamoDB
+            // reads the whole item and projects on the way out, so a projection
+            // narrows the response without narrowing the cost.
+            let charged = read_capacity(&table, item.as_ref(), consistent_read, report);
             let item = item.map(|i| wire::project(projection.as_ref(), &i));
-            Ok(wire::get_item_response(item.as_ref()))
+            Ok(wire::get_item_response(item.as_ref(), charged.as_ref()))
+        }
+        Operation::BatchGetItem { requests } => {
+            // Independent point reads, not a transaction: DynamoDB's
+            // BatchGetItem gives no cross-item atomicity, so this reuses the
+            // ordinary GetItem path per key rather than the quiescent
+            // multi-get `TransactGetItems` needs. A key that matches nothing
+            // is omitted from its table's list.
+            let mut tables: Vec<(String, Vec<Item>)> = Vec::with_capacity(requests.len());
+            for req in requests {
+                if !table_known(ctx, meta, &req.table) {
+                    return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+                        req.table.clone(),
+                    )));
+                }
+                let mut items = Vec::with_capacity(req.keys.len());
+                for key in &req.keys {
+                    let (pk, sk) = resolve_key(ctx, meta, &req.table, key)?;
+                    let data_key = item_key(&pk, sk.as_ref());
+                    if let Some(item) = quorum_read(ctx, meta, &req.table, &data_key).await? {
+                        items.push(wire::project(req.projection.as_ref(), &item));
+                    }
+                }
+                tables.push((req.table.clone(), items));
+            }
+            Ok(wire::batch_get_response(&tables))
         }
         Operation::Query {
             table,
             index,
+            partition_attr,
             partition_value,
+            sort_attr,
             sort_condition,
+            limit,
+            exclusive_start_key,
+            scan_index_forward,
+            filter,
             projection,
+            select,
             consistent_read,
         } => {
             run_query(
@@ -538,9 +640,16 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 meta,
                 &table,
                 index.as_deref(),
+                &partition_attr,
                 &partition_value,
+                sort_attr.as_deref(),
                 sort_condition.as_ref(),
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter.as_ref(),
                 projection.as_ref(),
+                select,
                 consistent_read,
             )
             .await
@@ -552,6 +661,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             exclusive_start_key,
             filter,
             projection,
+            select,
+            segment,
             consistent_read,
         } => {
             run_scan(
@@ -563,6 +674,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 exclusive_start_key,
                 filter.as_ref(),
                 projection.as_ref(),
+                select,
+                segment,
                 consistent_read,
             )
             .await
@@ -573,6 +686,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             actions,
             condition,
             return_values,
+            capacity: report,
+            metrics: want_metrics,
         } => {
             // ADR 0046 U3: an indexed/streamed table's `UpdateItem` also
             // evaluates at the leader now — it has the identical cross-node
@@ -598,11 +713,36 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
                 )),
-                KindWriteOutcome::Ok { old, new } => Ok(wire::update_response(
-                    return_values,
-                    old.as_ref(),
-                    new.as_ref(),
-                )),
+                KindWriteOutcome::Ok {
+                    old,
+                    new,
+                    collection_bytes,
+                } => {
+                    // DynamoDB charges an update on the **larger** of the
+                    // before and after images: an update that shrinks an item
+                    // still had to write the whole of the larger one, and one
+                    // that grows it is charged for what it grew to.
+                    let larger = match (old.as_ref(), new.as_ref()) {
+                        (Some(o), Some(n)) => {
+                            if capacity::item_size(o) > capacity::item_size(n) {
+                                old.as_ref()
+                            } else {
+                                new.as_ref()
+                            }
+                        }
+                        (some, None) | (None, some) => some,
+                    };
+                    let charged = write_capacity(meta, &table, larger, report);
+                    let collection =
+                        item_collection_metrics(meta, &table, &pk, collection_bytes, want_metrics);
+                    Ok(wire::update_response(
+                        return_values,
+                        old.as_ref(),
+                        new.as_ref(),
+                        charged.as_ref(),
+                        collection.as_ref(),
+                    ))
+                }
             }
         }
         Operation::BatchWriteItem { requests } => {
@@ -1387,6 +1527,84 @@ fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<Stri
     ))
 }
 
+/// `DeleteTable`: drop `table` from the replicated catalog and reclaim its
+/// tablets — [`ClientCtx::drop_table`], the same sink CQL `DROP TABLE` and
+/// the dashboard's delete button use (ADR 0024 GC). A missing table is a
+/// `ResourceNotFoundException`, matching real DynamoDB; `drop_table` itself
+/// is **idempotent** (a second call against an absent table is a silent
+/// no-op), so this explicit existence check up front is the only thing that
+/// makes a *repeat* `DeleteTable` return the right error instead of a false
+/// success. **Fresh, not [`metadata`]'s cached request-entry snapshot** (ADR
+/// 0035 PR1) — like [`create_table`]/[`update_time_to_live`], this is a
+/// mutating, commit-wait operation, so a table created moments ago on this
+/// same connection must never be missed.
+///
+/// The `TableDescription` echoed back is read **before** the drop actually
+/// runs (the fields describe the table as it stood the instant deletion was
+/// requested — real DynamoDB's own `DeleteTable` response contract, since
+/// there the drop is asynchronous too), reusing
+/// [`wire::delete_table_response`] — the same shared table-description
+/// builder [`describe_table`] wraps under `Table`, here wrapped under
+/// `TableDescription` with `TableStatus` overridden to `DELETING`.
+async fn delete_table(ctx: &ClientCtx, table: &str) -> Result<String, WireError> {
+    let meta = metadata_fresh(ctx).await;
+    let Some(control_schema) = meta.table_schema(table) else {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    };
+    let dynamo_schema = schema_bridge::to_dynamo(control_schema);
+    let key_types = schema_bridge::key_attribute_types(control_schema);
+    let index_defs = meta.table_indexes(table);
+    let indexes = schema_bridge::indexes_to_dynamo(index_defs);
+    let index_statuses: Vec<(String, IndexStatus)> = index_defs
+        .iter()
+        .map(|d| (d.name.clone(), d.status))
+        .collect();
+    let stream_desc = meta.table_stream(table).map(stream_description);
+    let response = wire::delete_table_response(
+        table,
+        &dynamo_schema,
+        &key_types,
+        &indexes,
+        &index_statuses,
+        stream_desc.as_ref(),
+    );
+    ctx.drop_table(table.to_owned())
+        .await
+        .map_err(|e| internal(&e))?;
+    Ok(response)
+}
+
+/// `ListTables`: every user-visible table name in ascending lexicographic
+/// order, paginated by `Limit`/`ExclusiveStartTableName`
+/// ([`wire::paginate_table_names`]'s contract). A materialized GSI's hidden
+/// table (`<base>$<index>`, ADR 0041 §1) is filtered out before pagination —
+/// `animus_dynamo::index::is_index_table_name`, the same predicate
+/// `console_table_summaries` (`lib.rs`, ADR 0052) uses for the Data
+/// Console's own tables-list screen — since it is an internal
+/// implementation detail, never a real client-declared table. `meta` is the
+/// request's cached snapshot ([`metadata`]), mirroring [`describe_table`]'s
+/// identical read-only discipline: a pure read needs no fresher view than
+/// the one [`run_operation`] already took for this request.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn list_tables(
+    meta: &Metadata,
+    exclusive_start_table_name: Option<&str>,
+    limit: Option<usize>,
+) -> Result<String, WireError> {
+    // `Metadata::table_schemas()` iterates its `BTreeMap` in ascending
+    // key order already, so this is already sorted — no extra sort needed.
+    let names: Vec<String> = meta
+        .table_schemas()
+        .map(|(name, _)| name.clone())
+        .filter(|name| !dynamo_index::is_index_table_name(name))
+        .collect();
+    let (page, last_evaluated) =
+        wire::paginate_table_names(&names, exclusive_start_table_name, limit);
+    Ok(wire::list_tables_response(&page, last_evaluated.as_deref()))
+}
+
 /// Mint a fresh DynamoDB Streams label (ADR 0042 §4): an ISO8601-ish
 /// timestamp derived from this node's own `env.now()` — never the wall clock
 /// directly (ADR 0003's `Env`-seam determinism rule) — suffixed with this
@@ -1906,15 +2124,30 @@ async fn quiescent_multi_get(
 /// item. `consistent_read` (ADR 0041 §5) is only ever meaningful for an
 /// **index** query — a base query is always linearizable here regardless, so
 /// it's accepted-and-ignored on that branch.
+///
+/// **Paginated**, brought up to [`run_base_scan`]'s own standard (this used to
+/// be a documented gap: `Query` answered a whole partition in one shot,
+/// however large): `limit` and `exclusive_start_key` thread through to
+/// whichever of [`run_base_query`]/[`run_gsi_query`]/[`run_lsi_query`]
+/// actually serves the read — see each of their docs for the exact
+/// pushdown/cursor-shape/bound-checking discipline, which mirrors the
+/// base/GSI/LSI `Scan` pagination this crate already had.
 #[allow(clippy::too_many_arguments)] // one `Query`'s full decoded shape, no natural grouping
 async fn run_query(
     ctx: &ClientCtx,
     meta: &Metadata,
     table: &str,
     index: Option<&str>,
+    partition_attr: &str,
     partition_value: &AttributeValue,
+    sort_attr: Option<&str>,
     sort_condition: Option<&SortKeyCondition>,
+    limit: Option<usize>,
+    exclusive_start_key: Option<Item>,
+    scan_index_forward: bool,
+    filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
     consistent_read: bool,
 ) -> Result<String, WireError> {
     // Mirror a catalog table's schema (so its GSI index exists after a restart or
@@ -1928,35 +2161,248 @@ async fn run_query(
                 meta,
                 table,
                 index,
+                partition_attr,
                 partition_value,
+                sort_attr,
                 sort_condition,
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter,
                 projection,
+                select,
                 consistent_read,
             )
             .await
         }
         None => {
+            let base = schema_for(meta, table);
+            validate_key_condition_names(
+                &base.partition_key,
+                base.sort_key.as_deref(),
+                partition_attr,
+                sort_attr,
+            )?;
             run_base_query(
                 ctx,
                 meta,
                 table,
                 partition_value,
                 sort_condition,
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter,
                 projection,
+                select,
             )
             .await
         }
     }
 }
 
-/// A base-table `Query`: native range scan over the partition's key prefix.
+/// The exact set of attribute *names* an `ExclusiveStartKey` must carry for a
+/// base-table `Query`/pagination cursor: the partition key, plus the sort key
+/// when the table has one. Mirrors [`key_item_of`]'s own shape (the encoder
+/// this decodes the inverse of).
+fn base_key_names(base: &TableSchema) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    names.insert(base.partition_key.clone());
+    if let Some(sk) = &base.sort_key {
+        names.insert(sk.clone());
+    }
+    names
+}
+
+/// The exact attribute-name set a **GSI** `Query`/`Scan` cursor carries:
+/// the index's own hash/sort attributes *and* the base table's key
+/// attributes (mirrors [`gsi_key_item_of`]'s shape exactly, by construction —
+/// see that function's doc for why a GSI cursor needs both).
+fn gsi_key_names(base: &TableSchema, idx: &IndexDef) -> BTreeSet<String> {
+    let mut names = base_key_names(base);
+    names.insert(idx.hash_attribute.clone());
+    if let Some(sort) = &idx.sort_attribute {
+        names.insert(sort.clone());
+    }
+    names
+}
+
+/// The exact attribute-name set an **LSI** `Query`/`Scan` cursor carries:
+/// the index's own alternate-sort attribute *and* the base table's key
+/// attributes (mirrors [`lsi_key_item_of`]'s shape).
+fn lsi_key_names(base: &TableSchema, idx: &IndexDef) -> BTreeSet<String> {
+    let mut names = base_key_names(base);
+    if let Some(sort) = &idx.sort_attribute {
+        names.insert(sort.clone());
+    }
+    names
+}
+
+/// Whether re-applying this write would leave the same state.
+///
+/// Everything the adapter writes is idempotent except one thing: a numeric
+/// `ADD`. `Put` and `Delete` replace or remove wholesale; `SET` and `REMOVE`
+/// assign or drop an attribute; a set `ADD`/`DELETE` is a union or difference,
+/// and applying the same union twice is that union. Adding `1` twice is `2`.
+///
+/// This is what `ClientCtx::cp_kind_write_item` consults before retrying: a
+/// retryable error is not proof a write missed, so a non-idempotent write gets
+/// exactly one attempt.
+pub(crate) fn kind_write_is_idempotent(op: &KindWriteOp) -> bool {
+    match op {
+        KindWriteOp::Put(_) | KindWriteOp::Delete => true,
+        KindWriteOp::Update { actions, .. } => !actions
+            .iter()
+            .any(|a| matches!(a, UpdateAction::Add(_, AttributeValue::N(_)))),
+    }
+}
+
+/// The half-open data-plane key range a parallel-scan segment owns.
+///
+/// Every data-plane key leads with an 8-byte big-endian partition token (ADR
+/// 0022), so splitting the scan is splitting the 64-bit token ring into `total`
+/// equal slices: segment `i` owns `[i·2⁶⁴/total, (i+1)·2⁶⁴/total)`. The
+/// arithmetic is done in `u128` because `total = 1` would otherwise overflow
+/// computing 2⁶⁴.
+///
+/// Disjoint and jointly covering by construction, which is exactly DynamoDB's
+/// parallel-scan contract: N workers each scanning their own segment see every
+/// item exactly once between them. The last segment's upper bound is `None`
+/// (unbounded) rather than 2⁶⁴ so nothing can fall off the end of the ring.
+///
+/// An 8-byte bound compares correctly against full keys because the token is a
+/// prefix: a key with token `T` sorts inside `[start, end)` iff
+/// `start <= T < end`.
+fn segment_key_range(seg: ScanSegment) -> (Vec<u8>, Option<Vec<u8>>) {
+    let total = u128::from(seg.total);
+    let boundary = |i: u128| -> u64 {
+        u64::try_from((i << 64) / total).expect("boundary below 2^64 for i < total")
+    };
+    let start = boundary(u128::from(seg.segment)).to_be_bytes().to_vec();
+    let end = if u128::from(seg.segment) + 1 == total {
+        None
+    } else {
+        Some(boundary(u128::from(seg.segment) + 1).to_be_bytes().to_vec())
+    };
+    (start, end)
+}
+
+/// Combine a segment's range with an `ExclusiveStartKey` cursor: the scan
+/// resumes at whichever is further along, and always stops at the segment's
+/// end. A cursor from a different segment would otherwise let a worker walk
+/// into its neighbour's rows and return them twice across the fleet.
+fn scan_bounds(segment: Option<ScanSegment>, cursor: Vec<u8>) -> (Vec<u8>, Option<Vec<u8>>) {
+    match segment {
+        None => (cursor, None),
+        Some(seg) => {
+            let (start, end) = segment_key_range(seg);
+            (if cursor > start { cursor } else { start }, end)
+        }
+    }
+}
+
+/// Reject a `KeyConditionExpression` that names attributes which are not the
+/// queried table's or index's key — a `ValidationException`, as DynamoDB
+/// returns.
+///
+/// The wire decoder cannot do this: it has no catalog. Before the name was
+/// carried at all it was simply dropped, so `KeyConditionExpression:
+/// "notthekey = :v"` was served as a partition-key query against whatever
+/// value it named — returning a real partition's items for a query the
+/// caller never wrote.
+fn validate_key_condition_names(
+    expected_partition: &str,
+    expected_sort: Option<&str>,
+    partition_attr: &str,
+    sort_attr: Option<&str>,
+) -> Result<(), WireError> {
+    if partition_attr != expected_partition {
+        return Err(WireError::validation(format!(
+            "key condition names `{partition_attr}`, which is not the queried \
+             partition key `{expected_partition}`"
+        )));
+    }
+    if let Some(named) = sort_attr {
+        match expected_sort {
+            Some(expected) if named == expected => {}
+            Some(expected) => {
+                return Err(WireError::validation(format!(
+                    "key condition names `{named}`, which is not the queried \
+                     sort key `{expected}`"
+                )));
+            }
+            None => {
+                return Err(WireError::validation(format!(
+                    "key condition names a sort key `{named}`, but the queried \
+                     table or index has none"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject an `ExclusiveStartKey` whose attribute-name set doesn't exactly
+/// match `expected` — a `ValidationException`, matching DynamoDB's own
+/// behavior when a cursor from one `Query`/`Scan` is replayed against a
+/// different one. This is load-bearing, not cosmetic: a GSI or LSI cursor
+/// *also* carries the base table's own key attributes (`gsi_key_item_of`/
+/// `lsi_key_item_of`), so merely checking "are the attributes this target
+/// needs present" would silently accept an index cursor on a base `Query` (it
+/// has the base key attributes too) or a same-shaped sibling index's cursor
+/// on the wrong index. An exact set match catches every such mismatch by
+/// construction, whichever direction it runs.
+fn validate_query_cursor_shape(
+    key_item: &Item,
+    expected: &BTreeSet<String>,
+) -> Result<(), WireError> {
+    let actual: BTreeSet<String> = key_item.keys().cloned().collect();
+    if &actual != expected {
+        return Err(WireError::validation(
+            "ExclusiveStartKey does not match this table/index's key schema \
+             (it looks like a pagination cursor from a different Query or Scan)",
+        ));
+    }
+    Ok(())
+}
+
+/// A base-table `Query`: a native range scan over the partition's key prefix,
+/// bounded *above* by the partition's own end (unlike [`run_base_scan`],
+/// whose base range is unbounded above — a `Query` never leaves its one
+/// partition). Pagination mirrors `run_base_scan`'s discipline, just applied
+/// within this narrower range: `limit` caps the items **examined** (decoded,
+/// live, and — the `Query`-specific wrinkle — matching `sort_condition`) and
+/// is pushed down via [`paginated_table_examine`]'s windowed continuation; a
+/// row a `SortKeyCondition` rejects is skipped exactly like a DynamoDB
+/// tombstone (never consumes a `Limit` slot, never counts toward
+/// `ScannedCount`), so the key condition composes correctly with pagination —
+/// apply it first, then page over what's left. The page boundary always
+/// lands on a kept item; `LastEvaluatedKey` is that item's key attributes,
+/// emitted only when the page was truncated.
+///
+/// `exclusive_start_key` is validated against the base table's **exact**
+/// key-attribute set first ([`validate_query_cursor_shape`]): an index
+/// `Query`'s cursor also carries the base table's own key attributes (see
+/// [`gsi_key_item_of`]/[`lsi_key_item_of`]), so merely checking "the needed
+/// attributes are present" would silently accept a foreign cursor here — real
+/// DynamoDB rejects that with `ValidationException`, and so do we. The
+/// resolved resume key is then bound-checked against `[prefix, end)`: it must
+/// never walk past the partition's own end, and (the same check) a cursor
+/// naming a *different* partition is rejected too, since its key bytes fall
+/// outside this range as well.
+#[allow(clippy::too_many_arguments)] // mirrors `run_query`'s own full decoded shape
 async fn run_base_query(
     ctx: &ClientCtx,
     meta: &Metadata,
     table: &str,
     partition_value: &AttributeValue,
     sort_condition: Option<&SortKeyCondition>,
+    limit: Option<usize>,
+    exclusive_start_key: Option<Item>,
+    scan_index_forward: bool,
+    filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
 ) -> Result<String, WireError> {
     // A base-table query must reject an unknown table the way the registry path
     // did (ResourceNotFoundException). A table is known iff it is in the
@@ -1971,26 +2417,77 @@ async fn run_base_query(
     // so the contiguous range is `[prefix, prefix-with-last-byte-bumped)`.
     let prefix = partition_prefix(partition_value);
     let end = range_end(&prefix);
-    let pairs = native_scan(ctx, table, &prefix, Some(&end), None).await?;
-    let mut items = Vec::new();
-    for (key, value) in pairs {
-        // A DynamoDB delete stores a tombstone *value* (not a data-plane
-        // tombstone), so the scan returns it as a live pair; decode drops it.
-        let Some(item) = wire::decode_stored_item(&value)? else {
-            continue;
-        };
-        if let Some(cond) = sort_condition {
-            // The sort-key bytes are everything after the escaped table+pk
-            // prefix; test the condition on those bytes directly (storage order),
-            // exactly as the local-engine `query_with` does.
-            let sk_bytes = AttributeValue::B(key[prefix.len()..].to_vec());
-            if !cond.matches(&sk_bytes) {
-                continue;
+    let base = schema_for(meta, table);
+    let cursor = match &exclusive_start_key {
+        Some(key_item) => {
+            validate_query_cursor_shape(key_item, &base_key_names(&base))?;
+            let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
+            let at = item_key(&pk, sk.as_ref());
+            if at.as_slice() < prefix.as_slice() || at.as_slice() >= end.as_slice() {
+                return Err(WireError::validation(
+                    "ExclusiveStartKey does not belong to the queried partition",
+                ));
             }
+            Some(at)
         }
-        items.push(wire::project(projection, &item));
+        None => None,
+    };
+    let (from, upper) = query_page_bounds(cursor, &prefix, &end, scan_index_forward);
+    let want = limit.map(|n| n.saturating_add(1));
+    let (mut examined, _exhausted) = paginated_table_examine(
+        ctx,
+        table,
+        from,
+        Some(&upper),
+        want,
+        !scan_index_forward,
+        |key, value| {
+            // A DynamoDB delete stores a tombstone *value* (not a data-plane
+            // tombstone), so the scan returns it as a live pair; decode drops it.
+            let Some(item) = wire::decode_stored_item(value)? else {
+                return Ok(None);
+            };
+            if let Some(cond) = sort_condition {
+                // The sort-key bytes are everything after the escaped table+pk
+                // prefix; test the condition on those bytes directly (storage order),
+                // exactly as the local-engine `query_with` does.
+                let sk_bytes = AttributeValue::B(key[prefix.len()..].to_vec());
+                if !cond.matches(&sk_bytes) {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(item))
+        },
+    )
+    .await?;
+    let truncated = limit.is_some_and(|n| examined.len() > n);
+    if let Some(n) = limit {
+        examined.truncate(n);
     }
-    Ok(wire::query_response(&items))
+    let scanned = examined.len();
+    let last_evaluated_key = if truncated {
+        examined
+            .last()
+            .and_then(|(_, item)| key_item_of(ctx, table, item))
+    } else {
+        None
+    };
+    let mut items = Vec::with_capacity(examined.len());
+    for (_key, item) in &examined {
+        // The filter sees the whole item; projection then trims the result. It
+        // runs *after* `limit` truncation, so a filtered-out item still counted
+        // toward `ScannedCount` and still consumed its slot — DynamoDB's
+        // contract, and exactly what `run_base_scan` does.
+        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+            items.push(wire::project(projection, item));
+        }
+    }
+    Ok(wire::select_response(
+        select,
+        &items,
+        scanned,
+        last_evaluated_key.as_ref(),
+    ))
 }
 
 /// A secondary-index `Query` (ADR 0041 §5): dispatches to the GSI or LSI native
@@ -2011,9 +2508,16 @@ async fn run_index_query(
     meta: &Metadata,
     table: &str,
     index: &str,
+    partition_attr: &str,
     partition_value: &AttributeValue,
+    sort_attr: Option<&str>,
     sort_condition: Option<&SortKeyCondition>,
+    limit: Option<usize>,
+    exclusive_start_key: Option<Item>,
+    scan_index_forward: bool,
+    filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
     consistent_read: bool,
 ) -> Result<String, WireError> {
     if !table_known(ctx, meta, table) {
@@ -2031,6 +2535,19 @@ async fn run_index_query(
             index.to_owned(),
         )));
     };
+    // A GSI is queried by its own hash attribute; an LSI shares the base
+    // table's partition key and only replaces the sort key (ADR 0041).
+    let base = schema_for(meta, table);
+    let expected_partition = match idx.kind {
+        IndexKind::Global => idx.hash_attribute.as_str(),
+        IndexKind::Local => base.partition_key.as_str(),
+    };
+    validate_key_condition_names(
+        expected_partition,
+        idx.sort_attribute.as_deref(),
+        partition_attr,
+        sort_attr,
+    )?;
     if sort_condition.is_some() && idx.sort_attribute.is_none() {
         return Err(registry_error(
             animus_dynamo::RegistryError::IndexSortMismatch(index.to_owned()),
@@ -2065,7 +2582,12 @@ async fn run_index_query(
                 &idx,
                 partition_value,
                 sort_condition,
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter,
                 projection,
+                select,
             )
             .await
         }
@@ -2077,7 +2599,12 @@ async fn run_index_query(
                 &idx,
                 partition_value,
                 sort_condition,
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter,
                 projection,
+                select,
             )
             .await
         }
@@ -2098,6 +2625,17 @@ async fn run_index_query(
 /// no tablet yet (this index has never drained anything) reads as **empty**
 /// rather than waiting on routing for a tablet that may not exist yet — the
 /// same gate [`ClientCtx::cp_get`] uses for an unprovisioned table.
+///
+/// **Paginated** exactly like [`run_gsi_scan`], just bounded to this one
+/// hash value's (or, when `narrowed`, its `Equals`-narrowed) sub-range
+/// instead of the whole hidden table: `limit`/`exclusive_start_key` reuse
+/// [`paginated_table_examine`]'s pushdown, and the cursor is the **same
+/// shape** `run_gsi_scan` already uses ([`gsi_key_item_of`]/
+/// [`gsi_resume_key`]) — a `Query` page and a `Scan` page over the same
+/// index agree on `LastEvaluatedKey` by construction. A row a non-narrowed
+/// sort condition rejects is skipped without consuming a `Limit` slot, same
+/// discipline as [`run_base_query`]'s own sort-condition skip.
+#[allow(clippy::too_many_arguments)] // mirrors `run_index_query`'s own full decoded shape
 async fn run_gsi_query(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -2105,11 +2643,16 @@ async fn run_gsi_query(
     idx: &IndexDef,
     partition_value: &AttributeValue,
     sort_condition: Option<&SortKeyCondition>,
+    limit: Option<usize>,
+    exclusive_start_key: Option<Item>,
+    scan_index_forward: bool,
+    filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
 ) -> Result<String, WireError> {
     let index_table = dynamo_index::index_table_name(table, &idx.name);
     if !meta.has_table_tablet(&index_table) {
-        return Ok(wire::query_response(&[]));
+        return Ok(wire::select_response(select, &[], 0, None));
     }
     let composite = idx.sort_attribute.is_some();
     // Narrow to the `Equals` sub-prefix when possible (an engine-level
@@ -2124,30 +2667,81 @@ async fn run_gsi_query(
     let mut prefix = partition_token(&storage_key(partition_value, None)).to_vec();
     prefix.extend_from_slice(&within_prefix);
     let end = dynamo_index::range_end(&prefix);
-    let pairs = native_scan(ctx, &index_table, &prefix, Some(&end), None).await?;
-    let mut items = Vec::with_capacity(pairs.len());
-    for (key, value) in pairs {
-        // A pruned/undecodable row shouldn't normally occur (the drain deletes
-        // stale rows outright, never tombstones them), but skip rather than
-        // fail a whole query on one corrupt row.
-        let Some(item) = wire::decode_stored_item(&value)? else {
-            continue;
-        };
-        if !narrowed && let Some(cond) = sort_condition {
-            let within = key.get(TOKEN_BYTES..).unwrap_or(&[]);
-            let Some(parsed) = dynamo_index::parse_gsi_row_key(within, composite) else {
-                continue;
-            };
-            let Some(sort_bytes) = parsed.sort else {
-                continue;
-            };
-            if !cond.matches(&AttributeValue::B(sort_bytes)) {
-                continue;
+
+    let base = schema_for(meta, table);
+    let cursor = match &exclusive_start_key {
+        Some(key_item) => {
+            validate_query_cursor_shape(key_item, &gsi_key_names(&base, idx))?;
+            let resume = gsi_resume_key(key_item, &base, idx)?;
+            if resume.as_slice() < prefix.as_slice() || resume.as_slice() >= end.as_slice() {
+                return Err(WireError::validation(
+                    "ExclusiveStartKey does not belong to the queried index range",
+                ));
             }
+            Some(resume)
         }
-        items.push(wire::project(projection, &item));
+        None => None,
+    };
+    let (from, upper) = query_page_bounds(cursor, &prefix, &end, scan_index_forward);
+    let want = limit.map(|n| n.saturating_add(1));
+    let (mut examined, _exhausted) = paginated_table_examine(
+        ctx,
+        &index_table,
+        from,
+        Some(&upper),
+        want,
+        !scan_index_forward,
+        |key, value| {
+            // A pruned/undecodable row shouldn't normally occur (the drain deletes
+            // stale rows outright, never tombstones them), but skip rather than
+            // fail a whole query on one corrupt row.
+            let Some(item) = wire::decode_stored_item(value)? else {
+                return Ok(None);
+            };
+            if !narrowed && let Some(cond) = sort_condition {
+                let within = key.get(TOKEN_BYTES..).unwrap_or(&[]);
+                let Some(parsed) = dynamo_index::parse_gsi_row_key(within, composite) else {
+                    return Ok(None);
+                };
+                let Some(sort_bytes) = parsed.sort else {
+                    return Ok(None);
+                };
+                if !cond.matches(&AttributeValue::B(sort_bytes)) {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(item))
+        },
+    )
+    .await?;
+    let truncated = limit.is_some_and(|n| examined.len() > n);
+    if let Some(n) = limit {
+        examined.truncate(n);
     }
-    Ok(wire::query_response(&items))
+    let scanned = examined.len();
+    let last_evaluated_key = if truncated {
+        examined
+            .last()
+            .and_then(|(_, item)| gsi_key_item_of(item, &base, idx))
+    } else {
+        None
+    };
+    let mut items = Vec::with_capacity(examined.len());
+    for (_key, item) in &examined {
+        // The filter sees the whole item; projection then trims the result. It
+        // runs *after* `limit` truncation, so a filtered-out item still counted
+        // toward `ScannedCount` and still consumed its slot — DynamoDB's
+        // contract, and exactly what `run_base_scan` does.
+        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+            items.push(wire::project(projection, item));
+        }
+    }
+    Ok(wire::select_response(
+        select,
+        &items,
+        scanned,
+        last_evaluated_key.as_ref(),
+    ))
 }
 
 /// An **LSI** `Query` (ADR 0041 §5): a **linearizable** range scan of the
@@ -2158,6 +2752,17 @@ async fn run_gsi_query(
 /// by any sort condition on the recovered alt-sort segment
 /// (`parse_lsi_row_key`) — LSI rows also store the projected item (see
 /// `kind_writes_for_item`), so this decodes them directly.
+///
+/// **Paginated** via [`paginated_kind_examine_one`] — the single-tablet dual
+/// of [`paginated_table_examine`]/[`paginated_kind_examine`] (an LSI `Query`
+/// is scoped to one base partition, hence one tablet, unlike
+/// [`run_lsi_scan`]'s table-wide fan-out) — pushing `limit` down through
+/// [`ClientCtx::cp_scan_kind`] (which used to hardcode `None` here; this is
+/// the one place in the crate that ever asked it for a page). The cursor is
+/// the **same shape** `run_lsi_scan` already uses ([`lsi_key_item_of`]/
+/// [`lsi_resume_key`]), and a sort-condition-rejected row is skipped without
+/// consuming a `Limit` slot, mirroring `run_base_query`'s discipline.
+#[allow(clippy::too_many_arguments)] // mirrors `run_index_query`'s own full decoded shape
 async fn run_lsi_query(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -2165,37 +2770,91 @@ async fn run_lsi_query(
     idx: &IndexDef,
     partition_value: &AttributeValue,
     sort_condition: Option<&SortKeyCondition>,
+    limit: Option<usize>,
+    exclusive_start_key: Option<Item>,
+    scan_index_forward: bool,
+    filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
 ) -> Result<String, WireError> {
     if !meta.has_table_tablet(table) {
-        return Ok(wire::query_response(&[]));
+        return Ok(wire::select_response(select, &[], 0, None));
     }
     let prefix = token_prefixed(
         partition_value,
         &dynamo_index::lsi_index_prefix(partition_value, &idx.name),
     );
     let end = dynamo_index::range_end(&prefix);
-    let pairs = ctx
-        .cp_scan_kind(table, KIND_LSI, prefix, end)
-        .await
-        .map_err(|e| internal(&e))?;
-    let mut items = Vec::with_capacity(pairs.len());
-    for (key, value) in pairs {
-        let Some(item) = wire::decode_stored_item(&value)? else {
-            continue;
-        };
-        if let Some(cond) = sort_condition {
-            let within = key.get(TOKEN_BYTES..).unwrap_or(&[]);
-            let Some(parsed) = dynamo_index::parse_lsi_row_key(within) else {
-                continue;
-            };
-            if !cond.matches(&AttributeValue::B(parsed.alt_sort)) {
-                continue;
+
+    let base = schema_for(meta, table);
+    let cursor = match &exclusive_start_key {
+        Some(key_item) => {
+            validate_query_cursor_shape(key_item, &lsi_key_names(&base, idx))?;
+            let resume = lsi_resume_key(key_item, &base, idx)?;
+            if resume.as_slice() < prefix.as_slice() || resume.as_slice() >= end.as_slice() {
+                return Err(WireError::validation(
+                    "ExclusiveStartKey does not belong to the queried index range",
+                ));
             }
+            Some(resume)
         }
-        items.push(wire::project(projection, &item));
+        None => None,
+    };
+    let (from, upper) = query_page_bounds(cursor, &prefix, &end, scan_index_forward);
+    let want = limit.map(|n| n.saturating_add(1));
+    let (mut examined, _exhausted) = paginated_kind_examine_one(
+        ctx,
+        table,
+        KIND_LSI,
+        from,
+        upper,
+        want,
+        !scan_index_forward,
+        |key, value| {
+            let Some(item) = wire::decode_stored_item(value)? else {
+                return Ok(None);
+            };
+            if let Some(cond) = sort_condition {
+                let within = key.get(TOKEN_BYTES..).unwrap_or(&[]);
+                let Some(parsed) = dynamo_index::parse_lsi_row_key(within) else {
+                    return Ok(None);
+                };
+                if !cond.matches(&AttributeValue::B(parsed.alt_sort)) {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(item))
+        },
+    )
+    .await?;
+    let truncated = limit.is_some_and(|n| examined.len() > n);
+    if let Some(n) = limit {
+        examined.truncate(n);
     }
-    Ok(wire::query_response(&items))
+    let scanned = examined.len();
+    let last_evaluated_key = if truncated {
+        examined
+            .last()
+            .and_then(|(_, item)| lsi_key_item_of(item, &base, idx))
+    } else {
+        None
+    };
+    let mut items = Vec::with_capacity(examined.len());
+    for (_key, item) in &examined {
+        // The filter sees the whole item; projection then trims the result. It
+        // runs *after* `limit` truncation, so a filtered-out item still counted
+        // toward `ScannedCount` and still consumed its slot — DynamoDB's
+        // contract, and exactly what `run_base_scan` does.
+        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+            items.push(wire::project(projection, item));
+        }
+    }
+    Ok(wire::select_response(
+        select,
+        &items,
+        scanned,
+        last_evaluated_key.as_ref(),
+    ))
 }
 
 /// A `Scan`: the base table, or (ADR 0041 §5) a secondary index when `index`
@@ -2212,6 +2871,8 @@ async fn run_scan(
     exclusive_start_key: Option<Item>,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
+    segment: Option<ScanSegment>,
     consistent_read: bool,
 ) -> Result<String, WireError> {
     mirror_catalog_schema(ctx, meta, table);
@@ -2226,6 +2887,8 @@ async fn run_scan(
                 exclusive_start_key,
                 filter,
                 projection,
+                select,
+                segment,
                 consistent_read,
             )
             .await
@@ -2239,6 +2902,8 @@ async fn run_scan(
                 exclusive_start_key,
                 filter,
                 projection,
+                select,
+                segment,
             )
             .await
         }
@@ -2263,6 +2928,7 @@ async fn run_scan(
 /// attributes. The cursor thus advances over the **live data-plane keys** the
 /// scan returned — not a tracked set — so it is correct after a restart or on a
 /// follower that never saw a write.
+#[allow(clippy::too_many_arguments)] // one Scan request's full shape
 async fn run_base_scan(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -2271,6 +2937,8 @@ async fn run_base_scan(
     exclusive_start_key: Option<Item>,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
+    segment: Option<ScanSegment>,
 ) -> Result<String, WireError> {
     if !table_known(ctx, meta, table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
@@ -2289,15 +2957,23 @@ async fn run_base_scan(
         }
         None => Vec::new(),
     };
+    // A parallel-scan worker is confined to its slice of the token ring; the
+    // cursor only moves it forward within that slice.
+    let (from, end) = scan_bounds(segment, from);
     let want = limit.map(|n| n.saturating_add(1));
     // A DynamoDB `DeleteItem` stores a *tombstone value* (a live pair to the
     // data plane, decoding to `None`); `paginated_table_examine` continues past
     // it without consuming a `Limit` slot.
-    let (mut examined, _exhausted) =
-        paginated_table_examine(ctx, table, from, want, |_key, value| {
-            wire::decode_stored_item(value)
-        })
-        .await?;
+    let (mut examined, _exhausted) = paginated_table_examine(
+        ctx,
+        table,
+        from,
+        end.as_deref(),
+        want,
+        false,
+        |_key, value| wire::decode_stored_item(value),
+    )
+    .await?;
     let truncated = limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
@@ -2318,7 +2994,8 @@ async fn run_base_scan(
             items.push(wire::project(projection, item));
         }
     }
-    Ok(wire::scan_response(
+    Ok(wire::select_response(
+        select,
         &items,
         scanned,
         last_evaluated_key.as_ref(),
@@ -2342,6 +3019,8 @@ async fn run_index_scan(
     exclusive_start_key: Option<Item>,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
+    segment: Option<ScanSegment>,
     consistent_read: bool,
 ) -> Result<String, WireError> {
     if !table_known(ctx, meta, table) {
@@ -2385,6 +3064,8 @@ async fn run_index_scan(
                 exclusive_start_key,
                 filter,
                 projection,
+                select,
+                segment,
             )
             .await
         }
@@ -2398,6 +3079,8 @@ async fn run_index_scan(
                 exclusive_start_key,
                 filter,
                 projection,
+                select,
+                segment,
             )
             .await
         }
@@ -2422,26 +3105,36 @@ async fn run_gsi_scan(
     exclusive_start_key: Option<Item>,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
+    segment: Option<ScanSegment>,
 ) -> Result<String, WireError> {
     let index_table = dynamo_index::index_table_name(table, &idx.name);
     if !meta.has_table_tablet(&index_table) {
-        return Ok(wire::scan_response(&[], 0, None));
+        return Ok(wire::select_response(select, &[], 0, None));
     }
     let base = schema_for(meta, table);
     let from = match &exclusive_start_key {
-        Some(key_item) => gsi_resume_key(key_item, &base, idx)?,
+        Some(key_item) => strictly_after(gsi_resume_key(key_item, &base, idx)?),
         None => Vec::new(),
     };
+    // The index's hidden table carries the same token-led key layout, so a
+    // segment slices it identically to a base-table scan.
+    let (from, end) = scan_bounds(segment, from);
     let want = limit.map(|n| n.saturating_add(1));
     // A GSI row is never stored as a DynamoDB tombstone (ADR 0041 §4's
     // as-built note — the drain prunes with a real engine delete), so `keep`
     // only needs to guard against a corrupt row, mirroring `run_gsi_query`'s
     // own "skip rather than fail the whole query" defensiveness.
-    let (mut examined, _exhausted) =
-        paginated_table_examine(ctx, &index_table, from, want, |_key, value| {
-            wire::decode_stored_item(value)
-        })
-        .await?;
+    let (mut examined, _exhausted) = paginated_table_examine(
+        ctx,
+        &index_table,
+        from,
+        end.as_deref(),
+        want,
+        false,
+        |_key, value| wire::decode_stored_item(value),
+    )
+    .await?;
     let truncated = limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
@@ -2460,7 +3153,8 @@ async fn run_gsi_scan(
             items.push(wire::project(projection, item));
         }
     }
-    Ok(wire::scan_response(
+    Ok(wire::select_response(
+        select,
         &items,
         scanned,
         last_evaluated_key.as_ref(),
@@ -2489,19 +3183,24 @@ async fn run_lsi_scan(
     exclusive_start_key: Option<Item>,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
+    segment: Option<ScanSegment>,
 ) -> Result<String, WireError> {
     if !meta.has_table_tablet(table) {
-        return Ok(wire::scan_response(&[], 0, None));
+        return Ok(wire::select_response(select, &[], 0, None));
     }
     let base = schema_for(meta, table);
     let from = match &exclusive_start_key {
-        Some(key_item) => lsi_resume_key(key_item, &base, idx)?,
+        Some(key_item) => strictly_after(lsi_resume_key(key_item, &base, idx)?),
         None => Vec::new(),
     };
+    // An LSI row's key is kind-scoped but still token-led, so the same slice
+    // math applies within the kind.
+    let (from, end) = scan_bounds(segment, from);
     let want = limit.map(|n| n.saturating_add(1));
     let idx_name = idx.name.clone();
     let (mut examined, _exhausted) =
-        paginated_kind_examine(ctx, table, KIND_LSI, from, want, move |key, value| {
+        paginated_kind_examine(ctx, table, KIND_LSI, from, end, want, move |key, value| {
             let within = key.get(TOKEN_BYTES..).unwrap_or(&[]);
             let Some(parsed) = dynamo_index::parse_lsi_row_key(within) else {
                 return Ok(None); // a malformed key; skip defensively
@@ -2530,7 +3229,8 @@ async fn run_lsi_scan(
             items.push(wire::project(projection, item));
         }
     }
-    Ok(wire::scan_response(
+    Ok(wire::select_response(
+        select,
         &items,
         scanned,
         last_evaluated_key.as_ref(),
@@ -2538,25 +3238,85 @@ async fn run_lsi_scan(
 }
 
 /// Fetch up to `want` (`None` = unbounded) *kept* rows starting at `cursor`,
-/// from a plain table-wide native scan (`ClientCtx::cp_scan`, via
-/// [`native_scan`]) — the pagination discipline every base/GSI `Scan` shares:
-/// `limit` is pushed down as the remaining count, and a window that comes up
-/// short because `keep` skipped some of it (a DynamoDB delete tombstone) is
-/// topped up by resuming strictly past the last raw key seen, so a page's
+/// from a plain native scan (`ClientCtx::cp_scan`, via [`native_scan`]) —
+/// the pagination discipline every base/GSI `Scan` **and** base/GSI `Query`
+/// shares: `limit` is pushed down as the remaining count, and a window that
+/// comes up short because `keep` skipped some of it (a DynamoDB delete
+/// tombstone, or — a `Query`-only case — a row a `SortKeyCondition` rejects)
+/// is topped up by resuming strictly past the last raw key seen, so a page's
 /// count is never short just because a fetch window happened to land on
-/// skipped rows. Returns the examined `(raw key, decoded item)` pairs and
-/// whether the underlying range is now exhausted.
+/// skipped rows. `end` bounds the range above (`None` for a `Scan`'s
+/// unbounded table-wide sweep; `Some` for a `Query`'s own partition/index
+/// sub-range — see [`run_base_query`]/[`run_gsi_query`]'s docs for why the
+/// bound matters there: without it, a window that runs past `end` would
+/// silently start reading a neighboring partition or hash value). Returns the
+/// examined `(raw key, decoded item)` pairs and whether the underlying range
+/// is now exhausted.
 async fn paginated_table_examine(
     ctx: &ClientCtx,
     table: &str,
     mut cursor: Vec<u8>,
+    end: Option<&[u8]>,
+    want: Option<usize>,
+    reverse: bool,
+    keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
+) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
+    let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    // Ascending walks the *lower* bound up and holds `end` fixed; descending
+    // holds the lower bound fixed and walks the *upper* bound down. Only one
+    // of the two ever moves, which is why both share this loop.
+    let mut upper: Option<Vec<u8>> = end.map(<[u8]>::to_vec);
+    loop {
+        let fetch = want.map(|w| w - examined.len());
+        let pairs = native_scan(ctx, table, &cursor, upper.as_deref(), fetch, reverse).await?;
+        let exhausted = fetch.is_none_or(|f| pairs.len() < f);
+        // Rows arrive in the requested order, so the frontier to resume from
+        // is the last element either way: ascending that is the greatest key
+        // seen, descending the least.
+        let last_raw_key = pairs.last().map(|(k, _)| k.clone());
+        for (key, value) in &pairs {
+            if let Some(item) = keep(key, value)? {
+                examined.push((key.clone(), item));
+            }
+        }
+        if exhausted || want.is_some_and(|w| examined.len() >= w) {
+            return Ok((examined, exhausted));
+        }
+        let next = last_raw_key.expect("non-exhausted fetch returned pairs");
+        if reverse {
+            // The upper bound is exclusive, so handing back the frontier key
+            // itself resumes strictly *below* it — the descending dual of the
+            // ascending arm's `push(0x00)`.
+            upper = Some(next);
+        } else {
+            let mut next = next;
+            next.push(0x00);
+            cursor = next;
+        }
+    }
+}
+
+/// [`paginated_table_examine`]'s dual over a table-wide **kind-scoped** fan-out
+/// (`ClientCtx::cp_scan_kind_table`) — the LSI `Scan` read primitive. Identical
+/// windowed-continuation discipline, generalized so `run_lsi_scan`'s `keep`
+/// can skip an interleaved *other* index's row without consuming a `Limit`
+/// slot, the same way the table-wide variant skips a tombstone.
+async fn paginated_kind_examine(
+    ctx: &ClientCtx,
+    table: &str,
+    kind: u8,
+    mut cursor: Vec<u8>,
+    end: Option<Vec<u8>>,
     want: Option<usize>,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
 ) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
     loop {
         let fetch = want.map(|w| w - examined.len());
-        let pairs = native_scan(ctx, table, &cursor, None, fetch).await?;
+        let pairs = ctx
+            .cp_scan_kind_table(table, kind, cursor.clone(), end.clone(), fetch)
+            .await
+            .map_err(|e| internal(&e))?;
         let exhausted = fetch.is_none_or(|f| pairs.len() < f);
         let last_raw_key = pairs.last().map(|(k, _)| k.clone());
         for (key, value) in &pairs {
@@ -2573,24 +3333,33 @@ async fn paginated_table_examine(
     }
 }
 
-/// [`paginated_table_examine`]'s dual over a table-wide **kind-scoped** fan-out
-/// (`ClientCtx::cp_scan_kind_table`) — the LSI `Scan` read primitive. Identical
-/// windowed-continuation discipline, generalized so `run_lsi_scan`'s `keep`
-/// can skip an interleaved *other* index's row without consuming a `Limit`
-/// slot, the same way the table-wide variant skips a tombstone.
-async fn paginated_kind_examine(
+/// [`paginated_table_examine`]'s dual over a **single-tablet** kind-scoped
+/// range (`ClientCtx::cp_scan_kind`) — the LSI `Query` pagination primitive.
+/// Unlike [`paginated_kind_examine`]'s table-wide fan-out, `end` here is
+/// **required** (not optional): an LSI `Query` is scoped to one base
+/// partition's own LSI sub-range by construction, which is always a finite,
+/// bounded window — see [`run_lsi_query`]'s doc for why walking past it would
+/// be a real bug (leaking into a neighboring partition's LSI rows). Same
+/// windowed-continuation discipline otherwise.
+#[allow(clippy::too_many_arguments)] // one LSI Query page's full shape
+async fn paginated_kind_examine_one(
     ctx: &ClientCtx,
     table: &str,
     kind: u8,
     mut cursor: Vec<u8>,
+    end: Vec<u8>,
     want: Option<usize>,
+    reverse: bool,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
 ) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    // Ascending walks the lower bound up; descending walks the upper bound
+    // down — the same inversion `paginated_table_examine` documents.
+    let mut upper = end;
     loop {
         let fetch = want.map(|w| w - examined.len());
         let pairs = ctx
-            .cp_scan_kind_table(table, kind, cursor.clone(), None, fetch)
+            .cp_scan_kind(table, kind, cursor.clone(), upper.clone(), fetch, reverse)
             .await
             .map_err(|e| internal(&e))?;
         let exhausted = fetch.is_none_or(|f| pairs.len() < f);
@@ -2603,9 +3372,14 @@ async fn paginated_kind_examine(
         if exhausted || want.is_some_and(|w| examined.len() >= w) {
             return Ok((examined, exhausted));
         }
-        let mut next = last_raw_key.expect("non-exhausted fetch returned pairs");
-        next.push(0x00);
-        cursor = next;
+        let next = last_raw_key.expect("non-exhausted fetch returned pairs");
+        if reverse {
+            upper = next;
+        } else {
+            let mut next = next;
+            next.push(0x00);
+            cursor = next;
+        }
     }
 }
 
@@ -2643,6 +3417,36 @@ fn gsi_key_item_of(item: &Item, base: &TableSchema, idx: &IndexDef) -> Option<It
 /// Invert [`gsi_key_item_of`]: rebuild the raw GSI row key an
 /// `ExclusiveStartKey` names, exactly matching [`dynamo_index::gsi_row_key`]'s
 /// own layout, then advance one byte past it (keys are unique) so the resumed
+/// The first key strictly greater than `k`. Data-plane keys are unique and
+/// no key is a prefix of another, so appending a `0x00` is exactly "resume
+/// after this one" for an ascending scan. A descending scan needs no such
+/// nudge: its upper bound is exclusive already, so the boundary key itself
+/// resumes strictly below it.
+fn strictly_after(mut k: Vec<u8>) -> Vec<u8> {
+    k.push(0x00);
+    k
+}
+
+/// Turn a `Query`'s resolved cursor key into the `(lower, upper)` bounds of
+/// the next page, given the scan direction and the partition/index range
+/// `[prefix, end)` the query is confined to.
+///
+/// Ascending moves the lower bound up past the cursor and keeps `end`;
+/// descending keeps `prefix` and pulls the upper bound down to the cursor
+/// (exclusive), so the next page is the highest rows still below it.
+fn query_page_bounds(
+    cursor: Option<Vec<u8>>,
+    prefix: &[u8],
+    end: &[u8],
+    forward: bool,
+) -> (Vec<u8>, Vec<u8>) {
+    match cursor {
+        Some(at) if forward => (strictly_after(at), end.to_vec()),
+        Some(at) => (prefix.to_vec(), at),
+        None => (prefix.to_vec(), end.to_vec()),
+    }
+}
+
 /// scan starts strictly after the cursor.
 fn gsi_resume_key(
     key_item: &Item,
@@ -2662,11 +3466,10 @@ fn gsi_resume_key(
         .get(&base.partition_key)
         .ok_or_else(|| missing(&base.partition_key))?;
     let base_sk = base.sort_key.as_ref().and_then(|sk| key_item.get(sk));
-    let mut after = token_prefixed(
+    let after = token_prefixed(
         ihash,
         &dynamo_index::gsi_row_key(ihash, isort, base_pk, base_sk),
     );
-    after.push(0x00);
     Ok(after)
 }
 
@@ -2710,11 +3513,10 @@ fn lsi_resume_key(
         .get(&base.partition_key)
         .ok_or_else(|| missing(&base.partition_key))?;
     let base_sk = base.sort_key.as_ref().and_then(|sk| key_item.get(sk));
-    let mut after = token_prefixed(
+    let after = token_prefixed(
         base_pk,
         &dynamo_index::lsi_row_key(base_pk, &idx.name, alt_sort, base_sk),
     );
-    after.push(0x00);
     Ok(after)
 }
 
@@ -2794,6 +3596,19 @@ pub(crate) enum KindWriteOutcome {
     Ok {
         old: Option<Item>,
         new: Option<Item>,
+        /// The base + LSI byte total of the tablet that hosts this item,
+        /// read at the leader right after the write landed — the input the
+        /// DynamoDB `ItemCollectionMetrics` surface reports as a size
+        /// estimate. See [`collection_bytes_at_leader`] for why the *tablet*
+        /// is the right quantity and what the number does and does not mean.
+        ///
+        /// `None` only when the reply crossed a forwarding hop from a peer
+        /// predating this field (`#[serde(default)]` on
+        /// [`ClientResponse::KindWriteOk`]). A leader that computed it always
+        /// answers `Some` — both engine backends can price a tablet cheaply.
+        /// The wire edge omits the estimate entirely on `None` rather than
+        /// substituting a figure it cannot stand behind.
+        collection_bytes: Option<u64>,
     },
     /// The caller's own `condition` did not match the leader's own read of
     /// the current item — no diff was ever computed, nothing was proposed.
@@ -2922,7 +3737,10 @@ pub(crate) async fn kind_write_item_at_leader(
             KindWriteOp::Delete => None,
             KindWriteOp::Update { key_item, actions } => {
                 let base = old.clone().unwrap_or_else(|| key_item.clone());
-                Some(wire::apply_update(base, actions))
+                // A typed ADD/DELETE mismatch is a ValidationException, not a
+                // silently skipped action — it propagates from the leader that
+                // evaluated it back to the requesting edge.
+                Some(wire::apply_update(base, actions)?)
             }
         };
         let value = match &new {
@@ -2947,7 +3765,55 @@ pub(crate) async fn kind_write_item_at_leader(
     ClientCtx::cp_kind_local(leader, writes, vec![change_log], seatbelt)
         .await
         .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;
-    Ok(KindWriteOutcome::Ok { old, new })
+    let collection_bytes = collection_bytes_at_leader(leader).await;
+    Ok(KindWriteOutcome::Ok {
+        old,
+        new,
+        collection_bytes,
+    })
+}
+
+/// The base + LSI byte total of the tablet `leader` leads: an **upper bound**
+/// on the size of any single item collection living in it.
+///
+/// ## Why the tablet is the right quantity
+///
+/// An item collection is every row sharing one partition-key value, across the
+/// base table and its LSIs. Both are keyed `token(pk) || …` (ADR 0022), so a
+/// collection hashes to exactly one token and therefore lives entirely inside
+/// **one** tablet — a tablet whose contents are a superset of it. That makes
+/// this a true bound, never an under-estimate, which is the safe direction for
+/// a number whose whole purpose is to warn about growth.
+///
+/// It is a *loose* bound when the tablet holds many partitions. The useful
+/// property is that **it tightens exactly as the situation it warns about gets
+/// worse**: as one collection comes to dominate its tablet, the tablet's bytes
+/// converge on that collection's. When the bound is loose, the collection is
+/// small and nobody cares.
+///
+/// ## Why this matters in AnimusDB, not only as DynamoDB parity
+///
+/// DynamoDB caps an item collection at 10 GB when a table has an LSI.
+/// AnimusDB has no such cap, but it has the same underlying shape: tablets
+/// split on bytes (ADR 0034), splitting is by **token range**, and a single
+/// partition key is one token — so a collection that grows without bound is
+/// **unsplittable**, and its tablet stays large forever. This number is the
+/// warning for that, which is the same warning DynamoDB's is, arrived at from
+/// the other direction.
+///
+/// Deliberately built from the two cheap per-kind estimators rather than by
+/// scanning the partition: an exact figure would be `O(collection)` **per
+/// write**, which is not a price a write path may pay for a diagnostic.
+/// `KIND_CHANGE` and the GSI scopes are excluded — a change record is
+/// transient (the trim janitor reclaims it) and a GSI row lives in its own
+/// hidden table, so neither is part of the collection DynamoDB names.
+/// Always `Some` — both engine backends price a tablet cheaply, so a leader
+/// that ran this has an answer. The `Option` in the reply exists for the
+/// forwarding hop alone (an older peer omits the field), not for this.
+async fn collection_bytes_at_leader(leader: &CpGroup) -> Option<u64> {
+    let base = leader.approx_bytes_kind(KIND_BASE).await;
+    let lsi = leader.approx_bytes_kind(KIND_LSI).await;
+    Some(base.saturating_add(lsi))
 }
 
 /// One entry of a multi-kind atomic batch: `(row kind, key, value-or-tombstone)`.
@@ -3034,7 +3900,7 @@ pub(crate) async fn eval_kind_txn_write(
         KindWriteOp::Delete => None,
         KindWriteOp::Update { key_item, actions } => {
             let base = old.clone().unwrap_or_else(|| key_item.clone());
-            Some(wire::apply_update(base, actions))
+            Some(wire::apply_update(base, actions)?)
         }
     };
     let value = match &new {
@@ -3083,6 +3949,143 @@ fn token_prefixed(pk: &AttributeValue, within: &[u8]) -> Vec<u8> {
     let mut key = partition_token(&storage_key(pk, None)).to_vec();
     key.extend_from_slice(within);
     key
+}
+
+/// The [`ConsumedCapacity`] a **write** of `image` against `table` costs, or
+/// `None` when the caller asked for no capacity report.
+///
+/// `image` is the item as it exists after the write — `None` for a delete (or
+/// for a delete of a key that was never there), which charges the base table
+/// its floor of one unit and no index anything.
+///
+/// The per-index charges follow **exactly** the gates the write path itself
+/// uses to decide whether an index row exists, because reporting capacity for
+/// an index row that was never written would be a lie the client cannot check:
+///
+/// - an **LSI** is charged when the item carries the index's alternate sort
+///   attribute (`kind_writes_for_item`'s `new_alt` gate);
+/// - a **GSI** is charged when the item carries its hash attribute, and its
+///   sort attribute too when the index declares one
+///   (`index_drain::drain_tablet`'s gate);
+/// - an index being torn down (`Deleting`) is charged nothing, since the drain
+///   has already stopped maintaining it. A `Creating` index *is* charged: the
+///   drain keeps it current while backfill catches up, so the write really
+///   does reach it.
+///
+/// Each index is charged on the size of **its own row** — the projection, not
+/// the base item — so a `KEYS_ONLY` index costs far less than the table.
+fn write_capacity(
+    meta: &Metadata,
+    table: &str,
+    image: Option<&Item>,
+    detail: ReturnConsumedCapacity,
+) -> Option<ConsumedCapacity> {
+    if !detail.wanted() {
+        return None;
+    }
+    let base_bytes = image.map_or(0, capacity::item_size);
+    let mut cc = ConsumedCapacity::table_only(table, capacity::write_units(base_bytes), detail);
+    let Some(item) = image else {
+        return Some(cc);
+    };
+    let base = schema_for(meta, table);
+    for idx in meta.table_indexes(table) {
+        if idx.status == IndexStatus::Deleting {
+            continue;
+        }
+        let indexed = match idx.kind {
+            IndexKind::Local => idx
+                .sort_attribute
+                .as_ref()
+                .is_some_and(|attr| item.contains_key(attr)),
+            IndexKind::Global => {
+                item.contains_key(&idx.hash_attribute)
+                    && idx
+                        .sort_attribute
+                        .as_ref()
+                        .is_none_or(|attr| item.contains_key(attr))
+            }
+        };
+        if !indexed {
+            continue;
+        }
+        let row = projected_item(item, &base, idx);
+        let units = capacity::write_units(capacity::item_size(&row));
+        match idx.kind {
+            IndexKind::Local => cc.local_indexes.push((idx.name.clone(), units)),
+            IndexKind::Global => cc.global_indexes.push((idx.name.clone(), units)),
+        }
+    }
+    Some(cc)
+}
+
+/// The [`ConsumedCapacity`] a **read** of `item` from `table` costs, or `None`
+/// when the caller asked for no capacity report.
+///
+/// A read is charged against the base table only — reading an item does not
+/// touch its index rows. An eventually-consistent read is half price, which is
+/// why `consistent` decides the number even on the paths that otherwise
+/// accept-and-ignore `ConsistentRead` (a base-table read here is always
+/// linearizable, but DynamoDB still bills what the client *asked* for, and a
+/// client that asked for the cheap read expects to be told it got it).
+fn read_capacity(
+    table: &str,
+    item: Option<&Item>,
+    consistent: bool,
+    detail: ReturnConsumedCapacity,
+) -> Option<ConsumedCapacity> {
+    if !detail.wanted() {
+        return None;
+    }
+    let bytes = item.map_or(0, capacity::item_size);
+    Some(ConsumedCapacity::table_only(
+        table,
+        capacity::read_units(bytes, consistent),
+        detail,
+    ))
+}
+
+/// The [`ItemCollectionMetrics`] a write should report, or `None` when it
+/// should report none.
+///
+/// Answered only for a table that **has an LSI**. DynamoDB reports this field
+/// only for such tables, and the reason is not arbitrary: an item collection
+/// is a bounded, meaningful thing precisely because an LSI shares the base
+/// table's partition. Without one, "every row with this partition key" is an
+/// incidental grouping, and reporting a size for it would be answering a
+/// question the client did not ask.
+///
+/// `collection_bytes` comes back from the tablet's **leader**
+/// ([`collection_bytes_at_leader`]) because only the node hosting the tablet
+/// can price it. That is available here for free: a table with an LSI has a
+/// non-empty index list, so `table_change_records_carry_images` is true, so
+/// its writes never take the ADR 0049 fast arm and always evaluate at the
+/// leader. The two conditions coincide exactly — there is no LSI-bearing
+/// table whose write could reach the fast arm and arrive here without a
+/// price.
+fn item_collection_metrics(
+    meta: &Metadata,
+    table: &str,
+    pk: &AttributeValue,
+    collection_bytes: Option<u64>,
+    want: ReturnItemCollectionMetrics,
+) -> Option<ItemCollectionMetrics> {
+    if !want.wanted() {
+        return None;
+    }
+    let has_lsi = meta
+        .table_indexes(table)
+        .iter()
+        .any(|i| i.kind == IndexKind::Local);
+    if !has_lsi {
+        return None;
+    }
+    let mut key = Item::new();
+    key.insert(schema_for(meta, table).partition_key, pk.clone());
+    Some(ItemCollectionMetrics {
+        key,
+        bytes: collection_bytes,
+    })
 }
 
 /// The attributes an index row carries, per its declared projection.
@@ -3566,10 +4569,17 @@ async fn native_scan(
     start: &[u8],
     end: Option<&[u8]>,
     limit: Option<usize>,
+    reverse: bool,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WireError> {
-    ctx.cp_scan(table, start.to_vec(), end.map(<[u8]>::to_vec), limit)
-        .await
-        .map_err(|e| internal(&e))
+    ctx.cp_scan(
+        table,
+        start.to_vec(),
+        end.map(<[u8]>::to_vec),
+        limit,
+        reverse,
+    )
+    .await
+    .map_err(|e| internal(&e))
 }
 
 /// Whether `table` is known: present in the replicated catalog (ADR 0013) or
@@ -4366,5 +5376,81 @@ mod stream_write_path_tests {
             "every change record must survive — the streamed table's \
              expected \"copier\" tag has no cursor row yet"
         );
+    }
+}
+
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+
+    /// The segments must be **disjoint and jointly covering** — that is the
+    /// whole parallel-scan contract. Checked by walking the boundaries: each
+    /// segment starts exactly where the previous ended, the first starts at
+    /// the bottom of the ring, and the last is unbounded above.
+    #[test]
+    fn segments_tile_the_token_ring_without_gaps_or_overlap() {
+        for total in [1u32, 2, 3, 4, 7, 16, 1000] {
+            let mut previous_end: Option<Vec<u8>> = Some(vec![0u8; TOKEN_BYTES]);
+            for i in 0..total {
+                let (start, end) = segment_key_range(ScanSegment { segment: i, total });
+                assert_eq!(
+                    Some(start.clone()),
+                    previous_end,
+                    "segment {i} of {total} must start where {} ended",
+                    i.wrapping_sub(1)
+                );
+                if i + 1 == total {
+                    assert_eq!(end, None, "the last segment is unbounded above");
+                } else {
+                    let end = end.expect("a non-final segment is bounded");
+                    assert!(end > start, "segment {i} of {total} must be non-empty");
+                    previous_end = Some(end);
+                }
+            }
+        }
+    }
+
+    /// A single segment is the whole ring — the degenerate case that would
+    /// overflow if the boundary maths were done in `u64`.
+    #[test]
+    fn one_segment_covers_everything() {
+        let (start, end) = segment_key_range(ScanSegment {
+            segment: 0,
+            total: 1,
+        });
+        assert_eq!(start, vec![0u8; TOKEN_BYTES]);
+        assert_eq!(end, None);
+    }
+
+    /// A cursor moves a worker forward inside its segment, never outside it:
+    /// a cursor behind the segment start is clamped up, and the segment's end
+    /// always survives.
+    #[test]
+    fn a_cursor_cannot_walk_out_of_its_segment() {
+        let seg = ScanSegment {
+            segment: 2,
+            total: 4,
+        };
+        let (start, end) = segment_key_range(seg);
+
+        // A cursor from before this segment must not drag the scan backwards.
+        let (from, bound) = scan_bounds(Some(seg), vec![0u8; TOKEN_BYTES]);
+        assert_eq!(
+            from, start,
+            "a stale cursor is clamped to the segment start"
+        );
+        assert_eq!(bound, end);
+
+        // A cursor inside the segment moves it forward.
+        let mut inside = start.clone();
+        inside.push(0x7f);
+        let (from, bound) = scan_bounds(Some(seg), inside.clone());
+        assert_eq!(from, inside);
+        assert_eq!(bound, end, "the segment's end is kept whatever the cursor");
+
+        // With no segment, the cursor is the only bound.
+        let (from, bound) = scan_bounds(None, inside.clone());
+        assert_eq!(from, inside);
+        assert_eq!(bound, None);
     }
 }

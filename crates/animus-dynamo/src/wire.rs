@@ -13,12 +13,15 @@
 //!
 //! Operations: `CreateTable`, `UpdateTable` (a `StreamSpecification` change,
 //! or — ADR 0045 §6 — a single `GlobalSecondaryIndexUpdates` element),
-//! `DescribeTable` (ADR 0042 §2), `PutItem`, `GetItem`, `DeleteItem`, `Query`,
-//! `Scan`, `UpdateItem`, `BatchWriteItem`, `TransactWriteItems` (atomic, ADR
-//! 0018 §2/PR7), `TransactGetItems` (a consistent multi-key read, ADR 0018 §2/
-//! PR7), `UpdateTimeToLive` / `DescribeTimeToLive` (ADR 0051 — decode/encode
-//! only; the expiry predicate itself is [`crate::ttl`], and the background
-//! reaper is `animusd`'s).
+//! `DescribeTable` (ADR 0042 §2), `DeleteTable` (drops the table and its
+//! tablets through the same sink CQL `DROP TABLE`/the dashboard use),
+//! `ListTables` (ascending name order, `Limit`/`ExclusiveStartTableName`
+//! paginated, a materialized GSI's hidden table filtered out), `PutItem`,
+//! `GetItem`, `DeleteItem`, `Query`, `Scan`, `UpdateItem`, `BatchWriteItem`,
+//! `TransactWriteItems` (atomic, ADR 0018 §2/PR7), `TransactGetItems` (a
+//! consistent multi-key read, ADR 0018 §2/PR7), `UpdateTimeToLive` /
+//! `DescribeTimeToLive` (ADR 0051 — decode/encode only; the expiry predicate
+//! itself is [`crate::ttl`], and the background reaper is `animusd`'s).
 //!
 //! AttributeValue types: the scalars `S` (string), `N` (number, carried
 //! as text), `B` (binary, base64), `BOOL`, `NULL`; the document types `M` (map)
@@ -54,7 +57,10 @@ use animus_control::{IndexStatus, StreamViewType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::condition::{ConditionExpression, SortKeyCondition};
+use crate::capacity::{
+    ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity, ReturnItemCollectionMetrics,
+};
+use crate::condition::{Comparator, ConditionExpression, SortKeyCondition};
 use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, SecondaryIndex};
 use crate::{AttributeValue, Item, TableSchema};
 
@@ -130,6 +136,41 @@ pub struct TtlDescription {
 
 /// The `X-Amz-Target` service+version prefix DynamoDB clients send.
 pub const TARGET_PREFIX: &str = "DynamoDB_20120810.";
+
+/// `Select` — **what** a `Query`/`Scan` returns, as distinct from
+/// [`Projection`]'s *which attributes*.
+///
+/// Only [`Count`](Self::Count) changes the response shape: it suppresses
+/// `Items` entirely, leaving `Count`/`ScannedCount` (and a
+/// `LastEvaluatedKey` when the page was truncated). It does **not** change
+/// what is read or how paging works — a filter still runs, `Limit` still
+/// caps what is examined, and a `COUNT` page can still be truncated. That
+/// matters: `Count` is the count of *matching* items on this page, not of
+/// the whole query, so a client that wants a total must still page to
+/// exhaustion.
+///
+/// The other three describe attribute selection that this adapter already
+/// performs, and exist so the parameter validates the way DynamoDB does
+/// rather than being silently accepted:
+/// [`SpecificAttributes`](Self::SpecificAttributes) is the projection path;
+/// [`AllProjectedAttributes`](Self::AllProjectedAttributes) is an index
+/// read's declared projection (what an index query returns here anyway, per
+/// ADR 0041); [`AllAttributes`](Self::AllAttributes) is the base-table
+/// default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Select {
+    /// Every attribute of the item. The default for a base-table read.
+    #[default]
+    AllAttributes,
+    /// The queried index's declared projection. The default for an index
+    /// read, and only valid when `IndexName` is present.
+    AllProjectedAttributes,
+    /// Exactly the paths named by `ProjectionExpression`/`AttributesToGet`,
+    /// which must be present.
+    SpecificAttributes,
+    /// No `Items` — counts only.
+    Count,
+}
 
 /// A projection: the document paths a read should return (from a
 /// `ProjectionExpression` or the legacy `AttributesToGet`). `None` on an
@@ -227,6 +268,14 @@ pub enum UpdateReturnValues {
     AllOld,
     /// `ALL_NEW` — the whole item after the update.
     AllNew,
+    /// `UPDATED_OLD` — the **previous** values of only the attributes this
+    /// update changed. An attribute the update *created* has no previous
+    /// value and is therefore absent.
+    UpdatedOld,
+    /// `UPDATED_NEW` — the **new** values of only the attributes this update
+    /// changed. An attribute the update *removed* has no new value and is
+    /// therefore absent.
+    UpdatedNew,
 }
 
 /// One action of an `UpdateItem` `UpdateExpression` (the supported subset): set a
@@ -244,6 +293,14 @@ pub enum UpdateAction {
     Set(String, AttributeValue),
     /// `REMOVE attr` — drop a top-level attribute if present.
     Remove(String),
+    /// `ADD attr :v` — numeric addition when both sides are `N`, set union
+    /// when both are the same set type. On an absent attribute it seeds the
+    /// value, which is what makes `ADD` the idiomatic counter increment.
+    Add(String, AttributeValue),
+    /// `DELETE attr :v` — remove `:v`'s members from a set attribute. Only
+    /// the set types; an empty result removes the attribute entirely, as
+    /// DynamoDB does not store empty sets.
+    Delete(String, AttributeValue),
 }
 
 /// One sub-request of a `BatchWriteItem` (within a single table's request list):
@@ -314,6 +371,38 @@ impl TransactAction {
     }
 }
 
+/// A parallel-`Scan` worker's slice: `Segment` of `TotalSegments`.
+///
+/// DynamoDB's contract is that the segments are disjoint and jointly cover the
+/// table, so N workers each scanning their own segment see every item exactly
+/// once between them. Here that falls out of the key layout: every data-plane
+/// key leads with an 8-byte big-endian partition token (ADR 0022), so the
+/// segments are equal slices of the 64-bit token ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanSegment {
+    /// This worker's zero-based segment index; always `< total`.
+    pub segment: u32,
+    /// How many segments the scan is split into; always `>= 1`.
+    pub total: u32,
+}
+
+/// One table's slice of a `BatchGetItem` request: the keys to read from
+/// `table`, with the projection and consistency setting that apply to **all**
+/// of them (DynamoDB scopes both per table, not per key — unlike
+/// `TransactGetItems`, whose projection is per entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchGet {
+    /// Target table.
+    pub table: String,
+    /// The keys to read, in request order.
+    pub keys: Vec<Item>,
+    /// Optional projection applied to every item from this table.
+    pub projection: Option<Projection>,
+    /// `ConsistentRead` for this table's reads. Accept-and-ignore for the
+    /// base table, which is linearizable here already (ADR 0041 §5).
+    pub consistent_read: bool,
+}
+
 /// One item of a `TransactGetItems` request: a plain key read against `table`,
 /// with an optional per-item projection (mirrors `GetItem`'s own `key`/
 /// `projection` shape — `TransactGetItems`'s wire form is `{"Get": {TableName,
@@ -371,6 +460,28 @@ pub enum Operation {
         /// Target table name.
         table: String,
     },
+    /// `DeleteTable`: drop `table` from the replicated catalog and reclaim
+    /// its tablets (`animusd`'s `ClientCtx::drop_table`, the same sink CQL
+    /// `DROP TABLE` and the dashboard's delete button use, ADR 0024 GC). A
+    /// missing table is a `ResourceNotFoundException`, decided at the
+    /// `animusd` edge (this crate never sees the replicated catalog).
+    DeleteTable {
+        /// Target table name.
+        table: String,
+    },
+    /// `ListTables`: table names in ascending lexicographic order, paginated
+    /// by `Limit` (default/cap 100) and `ExclusiveStartTableName` ("start
+    /// strictly after this name"). A materialized GSI's hidden table
+    /// (`<base>$<index>`, `animus_dynamo::index::index_table_name`) is
+    /// internal and never listed — filtered at the `animusd` edge, which
+    /// holds the replicated catalog this crate never sees.
+    ListTables {
+        /// Pagination cursor: list only names strictly greater than this one.
+        exclusive_start_table_name: Option<String>,
+        /// Max names to return this page (`None` = the default of 100; any
+        /// value is capped at 100, matching real DynamoDB).
+        limit: Option<usize>,
+    },
     /// `PutItem`: insert or replace `item` in `table`.
     PutItem {
         /// Target table name.
@@ -381,6 +492,13 @@ pub enum Operation {
         condition: Option<ConditionExpression>,
         /// What to echo back (`NONE` / `ALL_OLD`).
         return_values: ReturnValues,
+        /// How much of the [`ConsumedCapacity`](crate::capacity::ConsumedCapacity)
+        /// report the caller wants back (`NONE`/`TOTAL`/`INDEXES`).
+        capacity: ReturnConsumedCapacity,
+        /// Whether to report an
+        /// [`ItemCollectionMetrics`](crate::capacity::ItemCollectionMetrics)
+        /// (`NONE`/`SIZE`). Only ever answered for a table that has an LSI.
+        metrics: ReturnItemCollectionMetrics,
     },
     /// `GetItem`: fetch the item identified by `key` from `table`.
     GetItem {
@@ -393,7 +511,13 @@ pub enum Operation {
         /// Decoded but **accept-and-ignore** (ADR 0041 §5): a base-table read
         /// is always linearizable here, so `ConsistentRead: true` is already
         /// true and needs no enforcement. Only a GSI `Query` ever rejects it.
+        ///
+        /// It is *not* ignored for capacity: an eventually-consistent read is
+        /// billed at half price, so this still decides the number reported.
         consistent_read: bool,
+        /// How much of the [`ConsumedCapacity`](crate::capacity::ConsumedCapacity)
+        /// report the caller wants back (`NONE`/`TOTAL`/`INDEXES`).
+        capacity: ReturnConsumedCapacity,
     },
     /// `DeleteItem`: remove the item identified by `key` from `table`.
     DeleteItem {
@@ -405,22 +529,66 @@ pub enum Operation {
         condition: Option<ConditionExpression>,
         /// What to echo back (`NONE` / `ALL_OLD`).
         return_values: ReturnValues,
+        /// How much of the [`ConsumedCapacity`](crate::capacity::ConsumedCapacity)
+        /// report the caller wants back (`NONE`/`TOTAL`/`INDEXES`).
+        capacity: ReturnConsumedCapacity,
+        /// Whether to report an
+        /// [`ItemCollectionMetrics`](crate::capacity::ItemCollectionMetrics)
+        /// (`NONE`/`SIZE`). Only ever answered for a table that has an LSI.
+        metrics: ReturnItemCollectionMetrics,
     },
     /// `Query`: items in a partition (`pk = ..`) matching an optional sort-key
     /// condition — against the base table, or a secondary index when `index` is
     /// set (a GSI query is a hash-key equality only; an LSI query may carry a
-    /// sort condition on the index's alternate sort key).
+    /// sort condition on the index's alternate sort key). **Paginated**, the
+    /// same `Limit`/`ExclusiveStartKey` contract as [`Scan`](Self::Scan):
+    /// `limit` caps items examined (pushed down, not applied client-side) and
+    /// `exclusive_start_key` resumes strictly after a previous page's
+    /// `LastEvaluatedKey` — see `animusd::dynamo::run_base_query`'s doc for
+    /// exactly how a `Query`'s pagination composes with the partition
+    /// sub-range and the sort-key condition.
     Query {
         /// Target table name.
         table: String,
         /// The secondary index to query, if any (else the base table).
         index: Option<String>,
+        /// The partition/index-key **attribute name** the request named, with
+        /// any `#alias` resolved. Carried so the edge can reject a key
+        /// condition naming something that is not the queried key; decode
+        /// itself has no catalog to check against.
+        partition_attr: String,
         /// The partition/index-key value (equality).
         partition_value: AttributeValue,
+        /// The sort-key attribute name the request named, if it had a sort
+        /// clause — carried for the same reason as `partition_attr`.
+        sort_attr: Option<String>,
         /// Optional sort-key narrowing.
         sort_condition: Option<SortKeyCondition>,
+        /// Max items to examine this page (`None` = all remaining).
+        limit: Option<usize>,
+        /// The exclusive start key (pagination cursor) from a previous
+        /// page's `LastEvaluatedKey` — a base-table cursor is `{pk[, sk]}`;
+        /// an index cursor also carries the index's own key attributes (see
+        /// `animusd::dynamo`'s `gsi_key_item_of`/`lsi_key_item_of`).
+        exclusive_start_key: Option<Item>,
+        /// `ScanIndexForward` (default `true`). `false` walks the sort key
+        /// **descending** — the highest sort key in the partition/index first,
+        /// and `Limit` keeps the highest rather than the lowest. Pagination
+        /// inverts with it: `LastEvaluatedKey` becomes the *lowest* key of the
+        /// page and the next page resumes strictly below it.
+        scan_index_forward: bool,
+        /// Optional post-read `FilterExpression`, applied **after** the key
+        /// condition has selected what to evaluate and after `limit` has
+        /// capped it — exactly `Scan`'s contract. A filtered-out item still
+        /// counts toward `ScannedCount` and still consumes a `Limit` slot, so
+        /// a page can come back with fewer than `Limit` items and still carry
+        /// a `LastEvaluatedKey`.
+        filter: Option<ConditionExpression>,
         /// Optional projection (the attributes to return; `None` = all).
         projection: Option<Projection>,
+        /// `Select` — what the response returns. Only `COUNT` changes the
+        /// response shape (no `Items`); the rest validate the request.
+        select: Select,
         /// `ConsistentRead` (default `false`). DynamoDB's own contract (ADR
         /// 0041 §5): legal and already-true against the base table or an LSI
         /// (both linearizable here); an error against a **GSI** (eventually
@@ -449,6 +617,11 @@ pub enum Operation {
         filter: Option<ConditionExpression>,
         /// Optional projection (the attributes to return; `None` = all).
         projection: Option<Projection>,
+        /// `Select` — what the response returns. Only `COUNT` changes the
+        /// response shape (no `Items`); the rest validate the request.
+        select: Select,
+        /// The parallel-scan slice, when `Segment`/`TotalSegments` are given.
+        segment: Option<ScanSegment>,
         /// `ConsistentRead` (default `false`). Decoded but **accept-and-
         /// ignore** for the base table or an LSI (both linearizable here
         /// already); an error against a **GSI** — the `animusd` edge is the
@@ -469,6 +642,13 @@ pub enum Operation {
         condition: Option<ConditionExpression>,
         /// What to echo back (`NONE`/`ALL_OLD`/`ALL_NEW`).
         return_values: UpdateReturnValues,
+        /// How much of the [`ConsumedCapacity`](crate::capacity::ConsumedCapacity)
+        /// report the caller wants back (`NONE`/`TOTAL`/`INDEXES`).
+        capacity: ReturnConsumedCapacity,
+        /// Whether to report an
+        /// [`ItemCollectionMetrics`](crate::capacity::ItemCollectionMetrics)
+        /// (`NONE`/`SIZE`). Only ever answered for a table that has an LSI.
+        metrics: ReturnItemCollectionMetrics,
     },
     /// `BatchWriteItem`: a batch of put/delete requests grouped by table. Applied
     /// request-by-request (no cross-request atomicity, as in DynamoDB).
@@ -487,6 +667,17 @@ pub enum Operation {
     /// **serializable snapshot via quiescence-confirmation**, not a wait-free
     /// one; see `animusd::dynamo::run_transact_get`'s doc for the exact
     /// mechanism and its honest semantics).
+    /// `BatchGetItem`: independent point reads across one or more tables.
+    ///
+    /// Deliberately **not** transactional — DynamoDB's `BatchGetItem` gives no
+    /// cross-item atomicity, unlike `TransactGetItems`, so this reuses the
+    /// ordinary `GetItem` read path per key rather than the quiescent
+    /// multi-get. Responses are grouped by table, and DynamoDB does not
+    /// promise any order within a table's list.
+    BatchGetItem {
+        /// One entry per requested table, in request order.
+        requests: Vec<BatchGet>,
+    },
     TransactGetItems {
         /// The keys to read, in request order (the response echoes this order).
         gets: Vec<TransactGet>,
@@ -516,15 +707,17 @@ pub enum Operation {
 }
 
 impl Operation {
-    /// The single table this operation targets, if it has one. `BatchWriteItem`,
-    /// `TransactWriteItems`, and `TransactGetItems` span multiple tables, so
-    /// they return `None`.
+    /// The single table this operation targets, if it has one.
+    /// `BatchWriteItem`, `BatchGetItem`, `TransactWriteItems`,
+    /// `TransactGetItems`, and `ListTables` span multiple (or zero) tables,
+    /// so they return `None`.
     #[must_use]
     pub fn table(&self) -> Option<&str> {
         match self {
             Operation::CreateTable { table, .. }
             | Operation::UpdateTable { table, .. }
             | Operation::DescribeTable { table, .. }
+            | Operation::DeleteTable { table, .. }
             | Operation::PutItem { table, .. }
             | Operation::GetItem { table, .. }
             | Operation::DeleteItem { table, .. }
@@ -534,8 +727,10 @@ impl Operation {
             | Operation::UpdateTimeToLive { table, .. }
             | Operation::DescribeTimeToLive { table, .. } => Some(table),
             Operation::BatchWriteItem { .. }
+            | Operation::BatchGetItem { .. }
             | Operation::TransactWriteItems { .. }
-            | Operation::TransactGetItems { .. } => None,
+            | Operation::TransactGetItems { .. }
+            | Operation::ListTables { .. } => None,
         }
     }
 }
@@ -664,16 +859,24 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "DescribeTable" => Ok(Operation::DescribeTable {
             table: table_name(obj)?,
         }),
+        "DeleteTable" => Ok(Operation::DeleteTable {
+            table: table_name(obj)?,
+        }),
+        "ListTables" => decode_list_tables(obj),
         "PutItem" => {
             let table = table_name(obj)?;
             let item = decode_item_field(obj, "Item")?;
             let condition = decode_condition(obj)?;
             let return_values = decode_return_values(obj)?;
+            let capacity = decode_return_consumed_capacity(obj)?;
+            let metrics = decode_return_item_collection_metrics(obj)?;
             Ok(Operation::PutItem {
                 table,
                 item,
                 condition,
                 return_values,
+                capacity,
+                metrics,
             })
         }
         "GetItem" => {
@@ -681,11 +884,13 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
             let key = decode_item_field(obj, "Key")?;
             let projection = decode_projection(obj)?;
             let consistent_read = decode_consistent_read(obj);
+            let capacity = decode_return_consumed_capacity(obj)?;
             Ok(Operation::GetItem {
                 table,
                 key,
                 projection,
                 consistent_read,
+                capacity,
             })
         }
         "DeleteItem" => {
@@ -693,11 +898,15 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
             let key = decode_item_field(obj, "Key")?;
             let condition = decode_condition(obj)?;
             let return_values = decode_return_values(obj)?;
+            let capacity = decode_return_consumed_capacity(obj)?;
+            let metrics = decode_return_item_collection_metrics(obj)?;
             Ok(Operation::DeleteItem {
                 table,
                 key,
                 condition,
                 return_values,
+                capacity,
+                metrics,
             })
         }
         "Query" => decode_query(obj),
@@ -705,6 +914,7 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "UpdateItem" => decode_update_item(obj),
         "BatchWriteItem" => decode_batch_write(obj),
         "TransactWriteItems" => decode_transact_write(obj),
+        "BatchGetItem" => decode_batch_get(obj),
         "TransactGetItems" => decode_transact_get(obj),
         "UpdateTimeToLive" => decode_update_time_to_live(obj),
         "DescribeTimeToLive" => Ok(Operation::DescribeTimeToLive {
@@ -731,12 +941,16 @@ fn decode_update_item(obj: &Map<String, Value>) -> Result<Operation, WireError> 
     }
     let condition = decode_condition(obj)?;
     let return_values = decode_update_return_values(obj)?;
+    let capacity = decode_return_consumed_capacity(obj)?;
+    let metrics = decode_return_item_collection_metrics(obj)?;
     Ok(Operation::UpdateItem {
         table,
         key,
         actions,
         condition,
         return_values,
+        capacity,
+        metrics,
     })
 }
 
@@ -776,7 +990,8 @@ fn decode_update_expression(
     spans.sort_by_key(|(at, _, _)| *at);
     if spans.is_empty() {
         return Err(WireError::validation(format!(
-            "unsupported `UpdateExpression` `{expr}` (supported clauses: SET, REMOVE)"
+            "unsupported `UpdateExpression` `{expr}` \
+             (supported clauses: SET, REMOVE, ADD, DELETE)"
         )));
     }
     // Reject any non-whitespace text before the first recognized clause
@@ -809,9 +1024,80 @@ fn decode_update_expression(
                     actions.push(UpdateAction::Remove(attr));
                 }
             }
+            // `ADD`/`DELETE` take `attr :value` pairs separated by spaces,
+            // not `=` — a different shape from SET's.
+            kw @ ("add" | "delete") => {
+                for clause in args.split(',') {
+                    let clause = clause.trim();
+                    if clause.is_empty() {
+                        continue;
+                    }
+                    let (name, ph) = clause.split_once(char::is_whitespace).ok_or_else(|| {
+                        WireError::validation(format!(
+                            "{} clause must be `attr :value`, got `{clause}`",
+                            kw.to_uppercase()
+                        ))
+                    })?;
+                    let attr = resolve_attr_name(obj, name.trim())?;
+                    let value = resolve_placeholder(obj, ph.trim())?;
+                    if kw == "add" {
+                        // A numeric ADD is the one non-idempotent write this
+                        // adapter has. It is safe because
+                        // `ClientCtx::cp_kind_write_item` does not re-apply a
+                        // non-idempotent write on its own (see
+                        // `kind_write_is_idempotent`): DynamoDB's guarantee is
+                        // at-most-once per *request*, not exactly-once, so a
+                        // client that retries an ADD which actually applied
+                        // double-counts there too. What must never happen is
+                        // the service counting twice for one request.
+                        // Numeric ADD is the adapter's only non-idempotent
+                        // write, and it is safe now for two reasons that had
+                        // to land first.
+                        //
+                        // `cp_kind_write_item` no longer re-applies a
+                        // non-idempotent write on its own, so at-most-once
+                        // per request holds — DynamoDB's own guarantee, under
+                        // which a *client* retry of an ADD that applied
+                        // double-counts there too.
+                        //
+                        // And a `KindBatch` now records what it did at apply
+                        // time, so a write that applied is acknowledged even
+                        // when a concurrent update immediately overwrites it.
+                        // Before that, confirmation compared the value back
+                        // and reported "superseded ... retry" on 8 of 10
+                        // concurrent increments that had in fact applied —
+                        // and retrying is precisely what double-counts.
+                        // Measured after both: ten concurrent increments are
+                        // all accepted and leave the counter at exactly ten.
+                        if !matches!(
+                            value,
+                            AttributeValue::N(_)
+                                | AttributeValue::SS(_)
+                                | AttributeValue::NS(_)
+                                | AttributeValue::BS(_)
+                        ) {
+                            return Err(WireError::validation(
+                                "ADD takes a number or a set operand (N, SS, NS or BS)",
+                            ));
+                        }
+                        actions.push(UpdateAction::Add(attr, value));
+                    } else {
+                        if !matches!(
+                            value,
+                            AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_)
+                        ) {
+                            return Err(WireError::validation(
+                                "DELETE takes a set operand (SS, NS or BS)",
+                            ));
+                        }
+                        actions.push(UpdateAction::Delete(attr, value));
+                    }
+                }
+            }
             other => {
                 return Err(WireError::validation(format!(
-                    "`UpdateExpression` clause `{other}` is not supported (SET, REMOVE only)"
+                    "`UpdateExpression` clause `{other}` is not supported \
+                     (SET, REMOVE, ADD, DELETE)"
                 )));
             }
         }
@@ -846,6 +1132,8 @@ fn decode_update_return_values(obj: &Map<String, Value>) -> Result<UpdateReturnV
             Some("NONE") => Ok(UpdateReturnValues::None),
             Some("ALL_OLD") => Ok(UpdateReturnValues::AllOld),
             Some("ALL_NEW") => Ok(UpdateReturnValues::AllNew),
+            Some("UPDATED_OLD") => Ok(UpdateReturnValues::UpdatedOld),
+            Some("UPDATED_NEW") => Ok(UpdateReturnValues::UpdatedNew),
             Some(other) => Err(WireError::validation(format!(
                 "unsupported `ReturnValues` `{other}` (supported: NONE, ALL_OLD, ALL_NEW)"
             ))),
@@ -951,6 +1239,58 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
 
 /// Decode a `TransactGetItems` body: `{"TransactItems": [{"Get": {TableName,
 /// Key, ProjectionExpression}}, ..]}`.
+/// Decode a `BatchGetItem` body: `{"RequestItems": {"<table>": {"Keys": [..],
+/// "ProjectionExpression": .., "ExpressionAttributeNames": .., "ConsistentRead":
+/// ..}}}`.
+///
+/// Unlike `TransactGetItems`, the projection and consistency setting are scoped
+/// to a **table**, not to an individual key, so they are decoded once per entry
+/// and applied to every key under it.
+///
+/// `RequestItems` is a JSON object, so the tables arrive in whatever order the
+/// map iterates; the response is keyed by table name, so that does not matter.
+/// An empty `Keys` list for a table is rejected, as DynamoDB does — it is
+/// almost always a client bug rather than an intentional no-op.
+fn decode_batch_get(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let tables = obj
+        .get("RequestItems")
+        .and_then(Value::as_object)
+        .ok_or_else(|| WireError::validation("missing object field `RequestItems`"))?;
+    if tables.is_empty() {
+        return Err(WireError::validation(
+            "`RequestItems` must name at least one table",
+        ));
+    }
+    let mut requests = Vec::with_capacity(tables.len());
+    for (table, spec) in tables {
+        let spec = spec.as_object().ok_or_else(|| {
+            WireError::validation(format!("`RequestItems.{table}` must be an object"))
+        })?;
+        let raw_keys = spec.get("Keys").and_then(Value::as_array).ok_or_else(|| {
+            WireError::validation(format!("`RequestItems.{table}` needs an array `Keys`"))
+        })?;
+        if raw_keys.is_empty() {
+            return Err(WireError::validation(format!(
+                "`RequestItems.{table}.Keys` must not be empty"
+            )));
+        }
+        let mut keys = Vec::with_capacity(raw_keys.len());
+        for k in raw_keys {
+            let map = k.as_object().ok_or_else(|| {
+                WireError::validation(format!("each key in `{table}` must be an object"))
+            })?;
+            keys.push(decode_item(map)?);
+        }
+        requests.push(BatchGet {
+            table: table.clone(),
+            keys,
+            projection: decode_projection(spec)?,
+            consistent_read: decode_consistent_read(spec),
+        });
+    }
+    Ok(Operation::BatchGetItem { requests })
+}
+
 fn decode_transact_get(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let items = obj
         .get("TransactItems")
@@ -1355,6 +1695,73 @@ fn decode_condition(obj: &Map<String, Value>) -> Result<Option<ConditionExpressi
 /// top-level attribute names, with `#name` placeholders resolved against
 /// `ExpressionAttributeNames`) or the legacy `AttributesToGet` (a JSON array of
 /// names). At most one may be present. Absent ⇒ `Ok(None)` (all attributes).
+/// Decode `Select`, validating it against the rest of the request the way
+/// DynamoDB does rather than accepting it and ignoring it.
+///
+/// Absent, it is inferred: a request carrying a projection means
+/// `SPECIFIC_ATTRIBUTES`; otherwise an index read defaults to
+/// `ALL_PROJECTED_ATTRIBUTES` and a base-table read to `ALL_ATTRIBUTES`.
+///
+/// Present, three rules are enforced, each of which AWS rejects and this
+/// adapter previously ignored:
+/// - `SPECIFIC_ATTRIBUTES` **requires** a projection (otherwise the request
+///   names no attributes at all);
+/// - every other value **forbids** one (the two would contradict);
+/// - `ALL_PROJECTED_ATTRIBUTES` requires an `IndexName` (there is no
+///   projection to speak of on a base table).
+fn decode_select(
+    obj: &Map<String, Value>,
+    index: Option<&str>,
+    projection: Option<&Projection>,
+) -> Result<Select, WireError> {
+    let Some(raw) = obj.get("Select") else {
+        return Ok(if projection.is_some() {
+            Select::SpecificAttributes
+        } else if index.is_some() {
+            Select::AllProjectedAttributes
+        } else {
+            Select::AllAttributes
+        });
+    };
+    let name = raw
+        .as_str()
+        .ok_or_else(|| WireError::validation("Select must be a string"))?;
+    let select = match name {
+        "ALL_ATTRIBUTES" => Select::AllAttributes,
+        "ALL_PROJECTED_ATTRIBUTES" => Select::AllProjectedAttributes,
+        "SPECIFIC_ATTRIBUTES" => Select::SpecificAttributes,
+        "COUNT" => Select::Count,
+        other => {
+            return Err(WireError::validation(format!(
+                "unknown Select value {other:?}; expected one of ALL_ATTRIBUTES, \
+                 ALL_PROJECTED_ATTRIBUTES, SPECIFIC_ATTRIBUTES, COUNT"
+            )));
+        }
+    };
+    match select {
+        Select::SpecificAttributes if projection.is_none() => {
+            return Err(WireError::validation(
+                "Select=SPECIFIC_ATTRIBUTES requires a ProjectionExpression \
+                 (or the legacy AttributesToGet)",
+            ));
+        }
+        Select::SpecificAttributes => {}
+        _ if projection.is_some() => {
+            return Err(WireError::validation(
+                "a ProjectionExpression (or the legacy AttributesToGet) may \
+                 only be combined with Select=SPECIFIC_ATTRIBUTES",
+            ));
+        }
+        Select::AllProjectedAttributes if index.is_none() => {
+            return Err(WireError::validation(
+                "Select=ALL_PROJECTED_ATTRIBUTES is only valid with an IndexName",
+            ));
+        }
+        _ => {}
+    }
+    Ok(select)
+}
+
 fn decode_projection(obj: &Map<String, Value>) -> Result<Option<Projection>, WireError> {
     let has_expr = obj.contains_key("ProjectionExpression");
     let has_legacy = obj.contains_key("AttributesToGet");
@@ -1472,6 +1879,48 @@ fn decode_return_values(obj: &Map<String, Value>) -> Result<ReturnValues, WireEr
     }
 }
 
+/// Decode `ReturnConsumedCapacity` (ADR 0006): how much of the capacity report
+/// the caller wants back. Absent ⇒ `NONE`, matching DynamoDB's default of
+/// saying nothing.
+fn decode_return_consumed_capacity(
+    obj: &Map<String, Value>,
+) -> Result<ReturnConsumedCapacity, WireError> {
+    match obj.get("ReturnConsumedCapacity") {
+        None | Some(Value::Null) => Ok(ReturnConsumedCapacity::None),
+        Some(v) => match v.as_str() {
+            Some("NONE") => Ok(ReturnConsumedCapacity::None),
+            Some("TOTAL") => Ok(ReturnConsumedCapacity::Total),
+            Some("INDEXES") => Ok(ReturnConsumedCapacity::Indexes),
+            Some(other) => Err(WireError::validation(format!(
+                "unsupported `ReturnConsumedCapacity` `{other}` \
+                 (supported: NONE, TOTAL, INDEXES)"
+            ))),
+            None => Err(WireError::validation(
+                "`ReturnConsumedCapacity` must be a string",
+            )),
+        },
+    }
+}
+
+/// Decode `ReturnItemCollectionMetrics` (ADR 0006). Absent ⇒ `NONE`.
+fn decode_return_item_collection_metrics(
+    obj: &Map<String, Value>,
+) -> Result<ReturnItemCollectionMetrics, WireError> {
+    match obj.get("ReturnItemCollectionMetrics") {
+        None | Some(Value::Null) => Ok(ReturnItemCollectionMetrics::None),
+        Some(v) => match v.as_str() {
+            Some("NONE") => Ok(ReturnItemCollectionMetrics::None),
+            Some("SIZE") => Ok(ReturnItemCollectionMetrics::Size),
+            Some(other) => Err(WireError::validation(format!(
+                "unsupported `ReturnItemCollectionMetrics` `{other}` (supported: NONE, SIZE)"
+            ))),
+            None => Err(WireError::validation(
+                "`ReturnItemCollectionMetrics` must be a string",
+            )),
+        },
+    }
+}
+
 /// Decode a predicate from the string field named `field` (one of
 /// `ConditionExpression` / `FilterExpression`) into a [`ConditionExpression`]:
 /// `attribute_not_exists(attr)`, `attribute_exists(attr)`, or `attr = :v`
@@ -1483,23 +1932,268 @@ fn decode_predicate(
     let Some(expr) = obj.get(field).and_then(Value::as_str) else {
         return Ok(None);
     };
+    decode_predicate_or(obj, field, expr.trim()).map(Some)
+}
+
+/// Find a top-level (paren-depth-zero) occurrence of `needle`, case-insensitively,
+/// scanning **right to left** so the split is left-associative.
+///
+/// Two things make this less trivial than a `find`. Parenthesised groups must be
+/// skipped, or `(a = :x OR b = :y) AND c = :z` splits inside the group. And a
+/// `BETWEEN`'s own ` AND ` — as in `a BETWEEN :lo AND :hi` — is *not* a
+/// combinator: it belongs to the term. That one is handled by refusing to split
+/// on an ` AND ` that a `BETWEEN` at the same depth is still waiting for.
+fn find_top_level(haystack: &str, needle: &str) -> Option<usize> {
+    let lower = haystack.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut depth = 0i32;
+    // Positions of the token, recorded left to right, then chosen from the right.
+    let mut hits: Vec<usize> = Vec::new();
+    // How many ` AND `s the BETWEENs seen so far at depth 0 still owe.
+    let mut pending_between = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            if lower[i..].starts_with(" between ") {
+                pending_between += 1;
+            }
+            if lower[i..].starts_with(&needle) {
+                if needle == " and " && pending_between > 0 {
+                    // This AND closes a BETWEEN rather than joining two terms.
+                    pending_between -= 1;
+                } else {
+                    hits.push(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    hits.pop()
+}
+
+/// `OR` — the loosest binding, so it splits first.
+fn decode_predicate_or(
+    obj: &Map<String, Value>,
+    field: &str,
+    expr: &str,
+) -> Result<ConditionExpression, WireError> {
     let expr = expr.trim();
-    let cond = if let Some(inner) = func_arg(expr, "attribute_not_exists") {
-        ConditionExpression::AttributeNotExists(inner.to_owned())
-    } else if let Some(inner) = func_arg(expr, "attribute_exists") {
-        ConditionExpression::AttributeExists(inner.to_owned())
-    } else if let Some((lhs, rhs)) = expr.split_once('=') {
-        let attr = lhs.trim();
-        let rhs = rhs.trim();
-        let value = resolve_placeholder(obj, rhs)?;
-        ConditionExpression::Equals(attr.to_owned(), value)
-    } else {
-        return Err(WireError::validation(format!(
-            "unsupported {field} `{expr}` (supported: \
-             attribute_not_exists(a), attribute_exists(a), a = :v)"
-        )));
-    };
-    Ok(Some(cond))
+    if let Some(at) = find_top_level(expr, " OR ") {
+        let lhs = decode_predicate_or(obj, field, &expr[..at])?;
+        let rhs = decode_predicate_and(obj, field, &expr[at + 4..])?;
+        return Ok(ConditionExpression::Or(Box::new(lhs), Box::new(rhs)));
+    }
+    decode_predicate_and(obj, field, expr)
+}
+
+/// `AND` — binds tighter than `OR`, looser than `NOT`.
+fn decode_predicate_and(
+    obj: &Map<String, Value>,
+    field: &str,
+    expr: &str,
+) -> Result<ConditionExpression, WireError> {
+    let expr = expr.trim();
+    if let Some(at) = find_top_level(expr, " AND ") {
+        let lhs = decode_predicate_and(obj, field, &expr[..at])?;
+        let rhs = decode_predicate_not(obj, field, &expr[at + 5..])?;
+        return Ok(ConditionExpression::And(Box::new(lhs), Box::new(rhs)));
+    }
+    decode_predicate_not(obj, field, expr)
+}
+
+/// `NOT` — binds tightest, and a parenthesised group is a term.
+fn decode_predicate_not(
+    obj: &Map<String, Value>,
+    field: &str,
+    expr: &str,
+) -> Result<ConditionExpression, WireError> {
+    let expr = expr.trim();
+    if let Some(rest) = strip_keyword_prefix(expr, "NOT ") {
+        return Ok(ConditionExpression::Not(Box::new(decode_predicate_not(
+            obj, field, rest,
+        )?)));
+    }
+    // A fully-parenthesised expression is unwrapped and re-parsed from the top,
+    // but only when the opening paren matches the closing one — `(a) OR (b)`
+    // must not be mistaken for a single group.
+    if expr.starts_with('(') && expr.ends_with(')') && matching_close(expr) == Some(expr.len() - 1)
+    {
+        return decode_predicate_or(obj, field, &expr[1..expr.len() - 1]);
+    }
+    decode_predicate_expr(obj, field, expr)
+}
+
+/// Strip a leading keyword (case-insensitively) when it stands as a word.
+fn strip_keyword_prefix<'a>(expr: &'a str, keyword: &str) -> Option<&'a str> {
+    let lower = expr.to_ascii_lowercase();
+    lower
+        .starts_with(&keyword.to_ascii_lowercase())
+        .then(|| &expr[keyword.len()..])
+}
+
+/// Index of the `)` matching the `(` at position 0, if any.
+fn matching_close(expr: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, c) in expr.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse one predicate term. Split out of [`decode_predicate`] so the boolean
+/// combinators can recurse into it.
+fn decode_predicate_expr(
+    obj: &Map<String, Value>,
+    field: &str,
+    expr: &str,
+) -> Result<ConditionExpression, WireError> {
+    let expr = expr.trim();
+    // Function forms first: their argument lists can contain commas and
+    // operators that the comparator split would otherwise cut through.
+    if let Some(inner) = func_arg(expr, "attribute_not_exists") {
+        return Ok(ConditionExpression::AttributeNotExists(resolve_attr_name(
+            obj,
+            inner.trim(),
+        )?));
+    }
+    if let Some(inner) = func_arg(expr, "attribute_exists") {
+        return Ok(ConditionExpression::AttributeExists(resolve_attr_name(
+            obj,
+            inner.trim(),
+        )?));
+    }
+    if let Some(inner) = func_arg(expr, "attribute_type") {
+        let (attr, code) = inner.split_once(',').ok_or_else(|| {
+            WireError::validation("attribute_type takes two arguments: attribute_type(a, :t)")
+        })?;
+        let attr = resolve_attr_name(obj, attr.trim())?;
+        let code = match resolve_placeholder(obj, code.trim())? {
+            AttributeValue::S(code) => code,
+            other => {
+                return Err(WireError::validation(format!(
+                    "attribute_type's second argument must be a string type code, got {other:?}"
+                )));
+            }
+        };
+        const CODES: [&str; 10] = ["S", "N", "B", "BOOL", "NULL", "M", "L", "SS", "NS", "BS"];
+        if !CODES.contains(&code.as_str()) {
+            return Err(WireError::validation(format!(
+                "unknown attribute_type code `{code}` (expected one of {})",
+                CODES.join(", ")
+            )));
+        }
+        return Ok(ConditionExpression::AttributeType(attr, code));
+    }
+    if let Some(inner) = func_arg(expr, "begins_with") {
+        let (attr, ph) = inner.split_once(',').ok_or_else(|| {
+            WireError::validation("begins_with takes two arguments: begins_with(a, :p)")
+        })?;
+        return Ok(ConditionExpression::BeginsWith(
+            resolve_attr_name(obj, attr.trim())?,
+            resolve_placeholder(obj, ph.trim())?,
+        ));
+    }
+    if let Some(inner) = func_arg(expr, "contains") {
+        let (attr, ph) = inner.split_once(',').ok_or_else(|| {
+            WireError::validation("contains takes two arguments: contains(a, :v)")
+        })?;
+        return Ok(ConditionExpression::Contains(
+            resolve_attr_name(obj, attr.trim())?,
+            resolve_placeholder(obj, ph.trim())?,
+        ));
+    }
+    // `size(a) <op> :v` — the only form where a function appears on the *left*
+    // of a comparison, so it is recognised before the generic comparator split.
+    if let Some((lhs, op, rhs)) = split_comparator(expr)
+        && let Some(inner) = func_arg(lhs.trim(), "size")
+    {
+        let attr = resolve_attr_name(obj, inner.trim())?;
+        let value = resolve_placeholder(obj, rhs.trim())?;
+        return Ok(ConditionExpression::Size(
+            attr,
+            comparator_of(op, expr)?,
+            value,
+        ));
+    }
+    // `a BETWEEN :lo AND :hi`
+    if let Some((attr, rest)) = split_once_ci(expr, " BETWEEN ") {
+        let (lo, hi) = split_once_ci(rest, " AND ")
+            .ok_or_else(|| WireError::validation("BETWEEN takes `:lo AND :hi`"))?;
+        return Ok(ConditionExpression::Between(
+            resolve_attr_name(obj, attr.trim())?,
+            resolve_placeholder(obj, lo.trim())?,
+            resolve_placeholder(obj, hi.trim())?,
+        ));
+    }
+    // `a IN (:x, :y, ..)`
+    if let Some((attr, rest)) = split_once_ci(expr, " IN ") {
+        let list = rest.trim();
+        let inner = list
+            .strip_prefix('(')
+            .and_then(|r| r.strip_suffix(')'))
+            .ok_or_else(|| WireError::validation("IN takes a parenthesised list: a IN (:x, :y)"))?;
+        let mut values = Vec::new();
+        for ph in inner.split(',') {
+            let ph = ph.trim();
+            if ph.is_empty() {
+                return Err(WireError::validation("IN list has an empty element"));
+            }
+            values.push(resolve_placeholder(obj, ph)?);
+        }
+        if values.is_empty() {
+            return Err(WireError::validation("IN list must not be empty"));
+        }
+        return Ok(ConditionExpression::In(
+            resolve_attr_name(obj, attr.trim())?,
+            values,
+        ));
+    }
+    if let Some((lhs, op, rhs)) = split_comparator(expr) {
+        let attr = resolve_attr_name(obj, lhs.trim())?;
+        let value = resolve_placeholder(obj, rhs.trim())?;
+        return Ok(ConditionExpression::Compare(
+            attr,
+            comparator_of(op, expr)?,
+            value,
+        ));
+    }
+    Err(WireError::validation(format!(
+        "unsupported {field} `{expr}` (supported: comparisons =, <>, <, <=, >, >=; \
+         BETWEEN; IN; attribute_exists; attribute_not_exists; attribute_type; \
+         begins_with; contains; size)"
+    )))
+}
+
+/// Map a comparison operator's text to its [`Comparator`].
+fn comparator_of(op: &str, expr: &str) -> Result<Comparator, WireError> {
+    Ok(match op {
+        "=" => Comparator::Eq,
+        "<>" => Comparator::Ne,
+        "<" => Comparator::Lt,
+        "<=" => Comparator::Le,
+        ">" => Comparator::Gt,
+        ">=" => Comparator::Ge,
+        other => {
+            return Err(WireError::validation(format!(
+                "unsupported operator `{other}` in `{expr}`"
+            )));
+        }
+    })
 }
 
 /// If `expr` is exactly `name(arg)`, return the trimmed `arg`.
@@ -1533,6 +2227,8 @@ fn resolve_placeholder(
 /// `<pk> = :pv [AND <sort-condition>]`, with values supplied via
 /// `ExpressionAttributeValues`. The supported sort conditions are
 /// `<sk> = :v`, `<sk> BETWEEN :lo AND :hi`, and `begins_with(<sk>, :p)`.
+/// `Limit`/`ExclusiveStartKey` decode exactly like `Scan`'s
+/// ([`decode_limit`]/[`decode_exclusive_start_key`], shared between the two).
 fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let table = table_name(obj)?;
     let expr = obj
@@ -1545,10 +2241,20 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         Some((a, b)) => (a.trim(), Some(b.trim())),
         None => (expr.trim(), None),
     };
-    // Partition: `<attr> = :placeholder`.
-    let (_pk_attr, pk_placeholder) = pk_clause
-        .split_once('=')
+    // Partition: `<attr> = :placeholder`. The attribute **name** is carried
+    // (not discarded) so the `animusd` edge can check it really is the
+    // queried table's or index's partition key — decode has no catalog. A
+    // dropped name meant `KeyConditionExpression: "notthekey = :v"` was
+    // silently served as a partition-key query against whatever value it
+    // named, which DynamoDB rejects.
+    let (pk_attr, pk_op, pk_placeholder) = split_comparator(pk_clause)
         .ok_or_else(|| WireError::validation("partition key condition must be `pk = :v`"))?;
+    if pk_op != "=" {
+        return Err(WireError::validation(format!(
+            "partition key condition must be an equality, got `{pk_op}` in `{pk_clause}`"
+        )));
+    }
+    let partition_attr = resolve_attr_name(obj, pk_attr.trim())?;
     let partition_value = resolve_placeholder(obj, pk_placeholder.trim())?;
 
     let index = obj
@@ -1556,11 +2262,20 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         .and_then(Value::as_str)
         .map(str::to_owned);
 
-    let sort_condition = match sort_clause {
-        None => None,
-        Some(clause) => Some(decode_sort_condition(obj, clause)?),
+    let (sort_attr, sort_condition) = match sort_clause {
+        None => (None, None),
+        Some(clause) => {
+            let (attr, cond) = decode_sort_condition(obj, clause)?;
+            (Some(attr), Some(cond))
+        }
     };
+    let limit = decode_limit(obj)?;
+    let exclusive_start_key = decode_exclusive_start_key(obj)?;
+    // Same predicate decoder `Scan` uses — a `Query`'s filter is the identical
+    // post-read contract, just applied within one partition's key range.
+    let filter = decode_predicate(obj, "FilterExpression")?;
     let projection = decode_projection(obj)?;
+    let select = decode_select(obj, index.as_deref(), projection.as_ref())?;
     let consistent_read = decode_consistent_read(obj);
     // A sort condition on an index is meaningful only for a local secondary
     // index (which has an alternate sort key). The caller (registry) rejects a
@@ -1569,12 +2284,26 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     // is decoded unconditionally — whether it's legal depends on `index`'s
     // *kind* (GSI vs LSI vs base), which is only known once the replicated
     // catalog is consulted at the `animusd` edge, not here.
+    // Absent means ascending, matching DynamoDB's default.
+    let scan_index_forward = match obj.get("ScanIndexForward") {
+        None | Some(Value::Null) => true,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| WireError::validation("`ScanIndexForward` must be a boolean"))?,
+    };
     Ok(Operation::Query {
         table,
         index,
+        partition_attr,
         partition_value,
+        sort_attr,
         sort_condition,
+        limit,
+        exclusive_start_key,
+        scan_index_forward,
+        filter,
         projection,
+        select,
         consistent_read,
     })
 }
@@ -1590,16 +2319,110 @@ fn decode_consistent_read(obj: &Map<String, Value>) -> bool {
         .unwrap_or(false)
 }
 
+/// Decode the optional `Limit` (a non-negative integer, `None` when absent or
+/// `null`). Shared by `Scan` and `Query` — both page the same way.
+fn decode_limit(obj: &Map<String, Value>) -> Result<Option<usize>, WireError> {
+    match obj.get("Limit") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => Ok(Some(
+            v.as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| WireError::validation("`Limit` must be a non-negative integer"))?,
+        )),
+    }
+}
+
+/// Decode the optional `ExclusiveStartKey` (an AttributeValue-map pagination
+/// cursor, `None` when absent or `null`). Shared by `Scan` and `Query`.
+fn decode_exclusive_start_key(obj: &Map<String, Value>) -> Result<Option<Item>, WireError> {
+    match obj.get("ExclusiveStartKey") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => Ok(Some(
+            v.as_object()
+                .ok_or_else(|| WireError::validation("`ExclusiveStartKey` must be an object"))
+                .and_then(decode_item)?,
+        )),
+    }
+}
+
 /// Decode a `Scan` body: an optional `Limit`, an optional `ExclusiveStartKey`
 /// (the AttributeValue-map cursor from a previous page's `LastEvaluatedKey`),
 /// an optional `FilterExpression` (the `ConditionExpression` predicate set),
 /// and an optional `IndexName` (ADR 0041 §5 — scans a secondary index's own
 /// rows instead of the base table; no `KeyConditionExpression` here, unlike
 /// `Query` — DynamoDB's `Scan` never takes one, index or not).
+/// Decode `Segment`/`TotalSegments`, which DynamoDB requires together.
+///
+/// Giving one without the other is rejected rather than ignored: a client that
+/// sends `Segment` alone almost certainly believes it is scanning a slice, and
+/// silently handing it the whole table would have every worker return every
+/// item — the parallel-scan equivalent of a filter that does not filter.
+fn decode_scan_segment(obj: &Map<String, Value>) -> Result<Option<ScanSegment>, WireError> {
+    let seg = obj.get("Segment");
+    let total = obj.get("TotalSegments");
+    let (seg, total) = match (seg, total) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            return Err(WireError::validation("`Segment` requires `TotalSegments`"));
+        }
+        (None, Some(_)) => {
+            return Err(WireError::validation("`TotalSegments` requires `Segment`"));
+        }
+        (Some(s), Some(t)) => (s, t),
+    };
+    let as_u32 = |v: &Value, name: &str| -> Result<u32, WireError> {
+        v.as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                WireError::validation(format!("`{name}` must be a non-negative integer"))
+            })
+    };
+    let segment = as_u32(seg, "Segment")?;
+    let total = as_u32(total, "TotalSegments")?;
+    if total == 0 {
+        return Err(WireError::validation("`TotalSegments` must be at least 1"));
+    }
+    if segment >= total {
+        return Err(WireError::validation(format!(
+            "`Segment` {segment} is out of range for `TotalSegments` {total}"
+        )));
+    }
+    Ok(Some(ScanSegment { segment, total }))
+}
+
 fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let table = table_name(obj)?;
     let index = obj
         .get("IndexName")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let limit = decode_limit(obj)?;
+    let exclusive_start_key = decode_exclusive_start_key(obj)?;
+    let filter = decode_predicate(obj, "FilterExpression")?;
+    let projection = decode_projection(obj)?;
+    let select = decode_select(obj, index.as_deref(), projection.as_ref())?;
+    let segment = decode_scan_segment(obj)?;
+    let consistent_read = decode_consistent_read(obj);
+    Ok(Operation::Scan {
+        table,
+        index,
+        limit,
+        exclusive_start_key,
+        filter,
+        projection,
+        select,
+        segment,
+        consistent_read,
+    })
+}
+
+/// Decode a `ListTables` body: an optional `ExclusiveStartTableName`
+/// (pagination cursor) and an optional `Limit`, decoded exactly as `Scan`'s
+/// (any non-negative integer) — the default-100/cap-100 clamp is
+/// [`paginate_table_names`]'s job, not decode's.
+fn decode_list_tables(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let exclusive_start_table_name = obj
+        .get("ExclusiveStartTableName")
         .and_then(Value::as_str)
         .map(str::to_owned);
     let limit = match obj.get("Limit") {
@@ -1610,55 +2433,87 @@ fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
                 .ok_or_else(|| WireError::validation("`Limit` must be a non-negative integer"))?,
         ),
     };
-    let exclusive_start_key = match obj.get("ExclusiveStartKey") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(
-            v.as_object()
-                .ok_or_else(|| WireError::validation("`ExclusiveStartKey` must be an object"))
-                .and_then(decode_item)?,
-        ),
-    };
-    let filter = decode_predicate(obj, "FilterExpression")?;
-    let projection = decode_projection(obj)?;
-    let consistent_read = decode_consistent_read(obj);
-    Ok(Operation::Scan {
-        table,
-        index,
+    Ok(Operation::ListTables {
+        exclusive_start_table_name,
         limit,
-        exclusive_start_key,
-        filter,
-        projection,
-        consistent_read,
     })
 }
 
 fn decode_sort_condition(
     obj: &Map<String, Value>,
     clause: &str,
-) -> Result<SortKeyCondition, WireError> {
+) -> Result<(String, SortKeyCondition), WireError> {
     let clause = clause.trim();
     if let Some(inner) = func_arg(clause, "begins_with") {
         // begins_with(<sk>, :p)
-        let (_attr, ph) = inner.split_once(',').ok_or_else(|| {
+        let (attr, ph) = inner.split_once(',').ok_or_else(|| {
             WireError::validation("begins_with takes two arguments: begins_with(sk, :p)")
         })?;
+        let attr = resolve_attr_name(obj, attr.trim())?;
         let value = resolve_placeholder(obj, ph.trim())?;
-        return Ok(SortKeyCondition::BeginsWith(value));
+        return Ok((attr, SortKeyCondition::BeginsWith(value)));
     }
-    if let Some((_attr, rest)) = split_once_ci(clause, " BETWEEN ") {
+    if let Some((attr, rest)) = split_once_ci(clause, " BETWEEN ") {
         let (lo, hi) = split_once_ci(rest, " AND ")
             .ok_or_else(|| WireError::validation("BETWEEN takes `:lo AND :hi`"))?;
+        let attr = resolve_attr_name(obj, attr.trim())?;
         let lo = resolve_placeholder(obj, lo.trim())?;
         let hi = resolve_placeholder(obj, hi.trim())?;
-        return Ok(SortKeyCondition::Between(lo, hi));
+        return Ok((attr, SortKeyCondition::Between(lo, hi)));
     }
-    if let Some((_attr, ph)) = clause.split_once('=') {
-        let value = resolve_placeholder(obj, ph.trim())?;
-        return Ok(SortKeyCondition::Equals(value));
+    if let Some((lhs, op, rhs)) = split_comparator(clause) {
+        // As in `decode_predicate`: reject a comparison we cannot represent
+        // rather than truncating it into an equality. `sk >= :v` silently
+        // becoming `sk = :v` narrows a range query to exact matches.
+        if op != "=" {
+            return Err(WireError::validation(format!(
+                "unsupported sort-key operator `{op}` in `{clause}` \
+                 (supported: =, BETWEEN, begins_with)"
+            )));
+        }
+        let attr = resolve_attr_name(obj, lhs.trim())?;
+        let value = resolve_placeholder(obj, rhs.trim())?;
+        return Ok((attr, SortKeyCondition::Equals(value)));
     }
     Err(WireError::validation(format!(
         "unsupported sort-key condition `{clause}` (supported: =, BETWEEN, begins_with)"
     )))
+}
+
+/// Split `expr` on its **comparison operator**, longest match first, returning
+/// `(lhs, op, rhs)`.
+///
+/// The longest-first order is the whole point. A naive `split_once('=')` — what
+/// three parsers here used to do — cuts `price >= :p` into `("price >", " :p")`
+/// and yields an equality against an attribute literally named `price >`, which
+/// no item has. That is silent: the caller gets zero matches (or, on a
+/// conditional write, a condition that can never hold) instead of an error. The
+/// same cut turns a sort-key range `sk <= :v` into an equality, quietly
+/// narrowing a range query to exact matches.
+///
+/// `<>` must precede `<`, and `<=`/`>=` must precede `=`, or the same
+/// truncation reappears one operator along.
+fn split_comparator(expr: &str) -> Option<(&str, &str, &str)> {
+    // Longest first: a prefix of a longer operator must never win.
+    const OPS: [&str; 6] = ["<>", "<=", ">=", "=", "<", ">"];
+    let mut best: Option<(usize, &str)> = None;
+    for op in OPS {
+        if let Some(at) = expr.find(op) {
+            // Earliest position wins; on a tie the longer operator wins, which
+            // the OPS ordering already guarantees since it is scanned first.
+            let better = match best {
+                None => true,
+                Some((at_best, op_best)) => {
+                    at < at_best || (at == at_best && op.len() > op_best.len())
+                }
+            };
+            if better {
+                best = Some((at, op));
+            }
+        }
+    }
+    let (at, op) = best?;
+    Some((&expr[..at], op, &expr[at + op.len()..]))
 }
 
 /// Case-insensitive `split_once` on a `needle` (used for ` AND `/` BETWEEN `,
@@ -1862,15 +2717,44 @@ fn encode_attribute_value(value: &AttributeValue) -> Value {
     Value::Object(obj)
 }
 
+/// Serialize a response body, attaching `ConsumedCapacity` when the request
+/// asked for one.
+///
+/// Every response that can carry capacity goes through here, including the ones
+/// whose body is otherwise `{}` — a `PutItem` with `ReturnValues: NONE` still
+/// owes the caller its capacity report, so "empty body" and "no capacity" are
+/// deliberately not the same condition.
+fn finish(mut obj: Map<String, Value>, capacity: Option<&ConsumedCapacity>) -> String {
+    if let Some(capacity) = capacity {
+        obj.insert("ConsumedCapacity".into(), capacity.encode());
+    }
+    serde_json::to_string(&Value::Object(obj)).expect("response serializes")
+}
+
+/// [`finish`], plus an `ItemCollectionMetrics` when the write had one to
+/// report. Split from `finish` because only the three *write* operations can
+/// carry metrics — a `GetItem` never does, and giving its builder the
+/// parameter would invite exactly that mistake.
+fn finish_write(
+    mut obj: Map<String, Value>,
+    capacity: Option<&ConsumedCapacity>,
+    metrics: Option<&ItemCollectionMetrics>,
+) -> String {
+    if let Some(encoded) = metrics.and_then(|m| m.encode(encode_item)) {
+        obj.insert("ItemCollectionMetrics".into(), encoded);
+    }
+    finish(obj, capacity)
+}
+
 /// The JSON body for a successful `GetItem`: `{"Item": {..}}`, or `{}` when the
 /// item is absent (matching DynamoDB).
 #[must_use]
-pub fn get_item_response(item: Option<&Item>) -> String {
+pub fn get_item_response(item: Option<&Item>, capacity: Option<&ConsumedCapacity>) -> String {
     let mut obj = Map::new();
     if let Some(item) = item {
         obj.insert("Item".into(), encode_item(item));
     }
-    serde_json::to_string(&Value::Object(obj)).expect("response serializes")
+    finish(obj, capacity)
 }
 
 /// The JSON body for a successful `PutItem` / `DeleteItem` with
@@ -1901,20 +2785,45 @@ pub fn transact_get_response(items: &[Option<Item>]) -> String {
     serde_json::to_string(&Value::Object(obj)).expect("transact-get response serializes")
 }
 
+/// The JSON body for a successful `BatchGetItem`: `{"Responses": {"<table>":
+/// [item, ..]}, "UnprocessedKeys": {}}`.
+///
+/// Keys that matched no item are simply absent from the table's list — a
+/// `BatchGetItem` reports misses by omission, unlike `TransactGetItems`, whose
+/// response is positional and carries an empty object per missing key.
+///
+/// `UnprocessedKeys` is always empty: this adapter reads every requested key
+/// before responding rather than shedding load, so there is never a remainder
+/// for the client to retry.
+#[must_use]
+pub fn batch_get_response(tables: &[(String, Vec<Item>)]) -> String {
+    let mut responses = Map::new();
+    for (table, items) in tables {
+        let encoded: Vec<Value> = items.iter().map(encode_item).collect();
+        responses.insert(table.clone(), Value::Array(encoded));
+    }
+    let mut obj = Map::new();
+    obj.insert("Responses".into(), Value::Object(responses));
+    obj.insert("UnprocessedKeys".into(), Value::Object(Map::new()));
+    serde_json::to_string(&Value::Object(obj)).expect("batch get response serializes")
+}
+
 /// The JSON body for a successful write echoing `ReturnValues`. `old` is the
 /// item as it was before the write (`None` when the key was absent); for
 /// `ALL_OLD` a present prior item is returned under `Attributes`, an absent one
 /// yields `{}` (matching DynamoDB). For `NONE` this is always `{}`.
 #[must_use]
-pub fn write_response(return_values: ReturnValues, old: Option<&Item>) -> String {
-    match (return_values, old) {
-        (ReturnValues::AllOld, Some(item)) => {
-            let mut obj = Map::new();
-            obj.insert("Attributes".into(), encode_item(item));
-            serde_json::to_string(&Value::Object(obj)).expect("write response serializes")
-        }
-        _ => empty_response(),
+pub fn write_response(
+    return_values: ReturnValues,
+    old: Option<&Item>,
+    capacity: Option<&ConsumedCapacity>,
+    metrics: Option<&ItemCollectionMetrics>,
+) -> String {
+    let mut obj = Map::new();
+    if let (ReturnValues::AllOld, Some(item)) = (return_values, old) {
+        obj.insert("Attributes".into(), encode_item(item));
     }
+    finish_write(obj, capacity, metrics)
 }
 
 /// The JSON body for a successful `UpdateItem` echoing `ReturnValues`: `ALL_OLD`
@@ -1926,20 +2835,49 @@ pub fn update_response(
     return_values: UpdateReturnValues,
     old: Option<&Item>,
     new: Option<&Item>,
+    capacity: Option<&ConsumedCapacity>,
+    metrics: Option<&ItemCollectionMetrics>,
 ) -> String {
     let attrs = match return_values {
         UpdateReturnValues::None => None,
-        UpdateReturnValues::AllOld => old,
-        UpdateReturnValues::AllNew => new,
+        UpdateReturnValues::AllOld => old.cloned(),
+        UpdateReturnValues::AllNew => new.cloned(),
+        // The `UPDATED_*` pair reports only what actually changed, taken from
+        // whichever side holds the value: the old image for `UPDATED_OLD`, the
+        // new one for `UPDATED_NEW`. An attribute present on only one side is
+        // therefore reported by exactly one of them — a created attribute has
+        // no previous value, a removed one has no new value — which is why
+        // this is a diff rather than a projection of one image.
+        UpdateReturnValues::UpdatedOld => Some(changed_attributes(old, new, old)),
+        UpdateReturnValues::UpdatedNew => Some(changed_attributes(old, new, new)),
     };
-    match attrs {
-        Some(item) => {
-            let mut obj = Map::new();
-            obj.insert("Attributes".into(), encode_item(item));
-            serde_json::to_string(&Value::Object(obj)).expect("update response serializes")
-        }
-        None => empty_response(),
+    let mut obj = Map::new();
+    // DynamoDB omits `Attributes` entirely when nothing changed, rather than
+    // returning an empty map.
+    if let Some(item) = attrs.filter(|i| !i.is_empty()) {
+        obj.insert("Attributes".into(), encode_item(&item));
     }
+    finish_write(obj, capacity, metrics)
+}
+
+/// The attributes whose value differs between `old` and `new`, taken from
+/// `from` (one of the two). An attribute missing from `from` is skipped, so
+/// `UPDATED_OLD` omits what the update created and `UPDATED_NEW` omits what it
+/// removed.
+///
+/// Key attributes fall out naturally: an update never changes them, so they
+/// never differ and never appear.
+fn changed_attributes(old: Option<&Item>, new: Option<&Item>, from: Option<&Item>) -> Item {
+    let empty = Item::new();
+    let old = old.unwrap_or(&empty);
+    let new = new.unwrap_or(&empty);
+    let Some(from) = from else {
+        return Item::new();
+    };
+    from.iter()
+        .filter(|(name, _)| old.get(*name) != new.get(*name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 /// The JSON body for a successful `BatchWriteItem`: `{"UnprocessedItems": {}}`
@@ -1952,10 +2890,21 @@ pub fn batch_write_response() -> String {
 }
 
 /// Apply a sequence of [`UpdateAction`]s to a starting item (`None` ⇒ a fresh
-/// item is built from the key by the caller before this), returning the new item.
-/// `SET` sets/overwrites a top-level attribute; `REMOVE` drops one. Pure.
-#[must_use]
-pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Item {
+/// item is built from the key by the caller before this), returning the new
+/// item. Pure.
+///
+/// `SET` sets/overwrites a top-level attribute and `REMOVE` drops one; both are
+/// infallible. `ADD` and `DELETE` are **not**: they are typed operations, and
+/// DynamoDB rejects a mismatch (`ADD`ing a number to a string set) rather than
+/// ignoring it. Hence the `Result` — silently skipping a mismatched action
+/// would leave the caller believing an update applied when it did not, which
+/// is the one outcome worse than an error.
+///
+/// This runs on the **leader** that owns the row (ADR 0046 U3), against the old
+/// image the leader itself read, so `ADD`'s read-modify-write is evaluated
+/// exactly once per applied write rather than against a possibly-stale image
+/// from the edge.
+pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Result<Item, WireError> {
     for action in actions {
         match action {
             UpdateAction::Set(attr, value) => {
@@ -1964,29 +2913,123 @@ pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Item {
             UpdateAction::Remove(attr) => {
                 item.remove(attr);
             }
+            UpdateAction::Add(attr, operand) => {
+                let updated = match (item.get(attr), operand) {
+                    // Absent: seed with the operand. This is what makes
+                    // `ADD #c :one` the idiomatic counter increment on a row
+                    // that does not exist yet.
+                    (None, v) => v.clone(),
+                    (Some(AttributeValue::N(cur)), AttributeValue::N(delta)) => AttributeValue::N(
+                        crate::condition::add_numeric(cur, delta).ok_or_else(|| {
+                            WireError::validation(format!(
+                                "ADD on `{attr}`: `{cur}` and `{delta}` are not both numbers"
+                            ))
+                        })?,
+                    ),
+                    (Some(AttributeValue::SS(cur)), AttributeValue::SS(add)) => {
+                        AttributeValue::SS(union_sorted(cur, add))
+                    }
+                    (Some(AttributeValue::NS(cur)), AttributeValue::NS(add)) => {
+                        AttributeValue::NS(union_sorted(cur, add))
+                    }
+                    (Some(AttributeValue::BS(cur)), AttributeValue::BS(add)) => {
+                        AttributeValue::BS(union_sorted(cur, add))
+                    }
+                    (Some(existing), operand) => {
+                        return Err(WireError::validation(format!(
+                            "ADD on `{attr}` needs a number or a matching set type, \
+                             got {} += {}",
+                            type_name(existing),
+                            type_name(operand)
+                        )));
+                    }
+                };
+                item.insert(attr.clone(), updated);
+            }
+            UpdateAction::Delete(attr, operand) => {
+                let Some(existing) = item.get(attr) else {
+                    // Deleting from an absent attribute is a no-op, as in
+                    // DynamoDB — not an error.
+                    continue;
+                };
+                let remaining = match (existing, operand) {
+                    (AttributeValue::SS(cur), AttributeValue::SS(rm)) => {
+                        AttributeValue::SS(difference_sorted(cur, rm))
+                    }
+                    (AttributeValue::NS(cur), AttributeValue::NS(rm)) => {
+                        AttributeValue::NS(difference_sorted(cur, rm))
+                    }
+                    (AttributeValue::BS(cur), AttributeValue::BS(rm)) => {
+                        AttributeValue::BS(difference_sorted(cur, rm))
+                    }
+                    (existing, operand) => {
+                        return Err(WireError::validation(format!(
+                            "DELETE on `{attr}` needs matching set types, got {} -= {}",
+                            type_name(existing),
+                            type_name(operand)
+                        )));
+                    }
+                };
+                // DynamoDB does not store empty sets: emptying one removes the
+                // attribute rather than leaving `SS: []` behind.
+                if set_is_empty(&remaining) {
+                    item.remove(attr);
+                } else {
+                    item.insert(attr.clone(), remaining);
+                }
+            }
         }
     }
-    item
+    Ok(item)
 }
 
-/// The JSON body for a successful `Query`: `{"Items": [..], "Count": n,
-/// "ScannedCount": n}`. Items are emitted in sort order, as the caller supplies
-/// them.
-#[must_use]
-pub fn query_response(items: &[Item]) -> String {
-    let encoded: Vec<Value> = items.iter().map(encode_item).collect();
-    let count = Value::from(items.len());
-    let mut obj = Map::new();
-    obj.insert("Items".into(), Value::Array(encoded));
-    obj.insert("Count".into(), count.clone());
-    obj.insert("ScannedCount".into(), count);
-    serde_json::to_string(&Value::Object(obj)).expect("query response serializes")
+/// Sorted, de-duplicated union — the representation this crate keeps sets in.
+fn union_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
+    let mut out: Vec<T> = a.to_vec();
+    out.extend(b.iter().cloned());
+    out.sort();
+    out.dedup();
+    out
 }
 
-/// The JSON body for a successful `Scan`: `{"Items": [..], "Count": n,
-/// "ScannedCount": s}`, plus a `LastEvaluatedKey` (the AttributeValue-map
-/// pagination cursor) when the page was truncated by a `Limit`. `scanned` counts
-/// the items read before filtering; `Count` the items returned after.
+/// Sorted difference, `a` minus `b`.
+fn difference_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
+    a.iter().filter(|x| !b.contains(x)).cloned().collect()
+}
+
+/// Whether a set-typed value has no members.
+fn set_is_empty(v: &AttributeValue) -> bool {
+    match v {
+        AttributeValue::SS(s) => s.is_empty(),
+        AttributeValue::NS(s) => s.is_empty(),
+        AttributeValue::BS(s) => s.is_empty(),
+        _ => false,
+    }
+}
+
+/// A human-readable type name for an error message.
+fn type_name(v: &AttributeValue) -> &'static str {
+    match v {
+        AttributeValue::S(_) => "S",
+        AttributeValue::N(_) => "N",
+        AttributeValue::B(_) => "B",
+        AttributeValue::Bool(_) => "BOOL",
+        AttributeValue::Null => "NULL",
+        AttributeValue::M(_) => "M",
+        AttributeValue::L(_) => "L",
+        AttributeValue::SS(_) => "SS",
+        AttributeValue::NS(_) => "NS",
+        AttributeValue::BS(_) => "BS",
+    }
+}
+
+/// The JSON body for a successful `Scan` **or `Query`** (both share this exact
+/// shape now that `Query` paginates too — `animusd::dynamo`'s base/GSI/LSI
+/// query paths build their response with this same encoder): `{"Items": [..],
+/// "Count": n, "ScannedCount": s}`, plus a `LastEvaluatedKey` (the
+/// AttributeValue-map pagination cursor) when the page was truncated by a
+/// `Limit`. `scanned` counts the items read before filtering; `Count` the
+/// items returned after.
 #[must_use]
 pub fn scan_response(items: &[Item], scanned: usize, last_evaluated_key: Option<&Item>) -> String {
     let encoded: Vec<Value> = items.iter().map(encode_item).collect();
@@ -1998,6 +3041,33 @@ pub fn scan_response(items: &[Item], scanned: usize, last_evaluated_key: Option<
         obj.insert("LastEvaluatedKey".into(), encode_item(key));
     }
     serde_json::to_string(&Value::Object(obj)).expect("scan response serializes")
+}
+
+/// [`scan_response`], honouring [`Select`]: under [`Select::Count`] the
+/// `Items` array is omitted entirely and only `Count`/`ScannedCount` (plus
+/// any `LastEvaluatedKey`) are returned. Every other `Select` returns the
+/// full page, since the attribute selection has already been applied to the
+/// items by the time they get here.
+///
+/// The counts are identical either way — a `COUNT` request reads and filters
+/// exactly what the same request without it would have.
+#[must_use]
+pub fn select_response(
+    select: Select,
+    items: &[Item],
+    scanned: usize,
+    last_evaluated_key: Option<&Item>,
+) -> String {
+    if select != Select::Count {
+        return scan_response(items, scanned, last_evaluated_key);
+    }
+    let mut obj = Map::new();
+    obj.insert("Count".into(), Value::from(items.len()));
+    obj.insert("ScannedCount".into(), Value::from(scanned));
+    if let Some(key) = last_evaluated_key {
+        obj.insert("LastEvaluatedKey".into(), encode_item(key));
+    }
+    serde_json::to_string(&Value::Object(obj)).expect("count response serializes")
 }
 
 /// The synthetic ARN this adapter surfaces for a stream (ADR 0042 §4):
@@ -2134,14 +3204,56 @@ pub fn describe_table_response(
     stream: Option<&StreamDescription>,
 ) -> String {
     let mut desc = table_description_object(table, schema, indexes, index_statuses, stream);
+    desc.insert(
+        "AttributeDefinitions".into(),
+        Value::Array(attribute_definitions(schema, key_types)),
+    );
+    let mut obj = Map::new();
+    obj.insert("Table".into(), Value::Object(desc));
+    serde_json::to_string(&Value::Object(obj)).expect("describe-table response serializes")
+}
+
+/// The JSON body for a successful `DeleteTable`: the same
+/// [`table_description_object`] every other table-description response
+/// wraps (name, key schema, `AttributeDefinitions`, secondary indexes with
+/// their real status, stream config — the exact fields
+/// [`describe_table_response`] emits, populated from the same
+/// `animusd`-supplied catalog snapshot) with `TableStatus` overridden to
+/// `DELETING` — real DynamoDB's `DeleteTable` response, since the drop
+/// itself is asynchronous there (unlike this adapter's own synchronous
+/// cascade, ADR 0024). Wrapped under `TableDescription`, matching
+/// `CreateTable`/`UpdateTable` rather than `DescribeTable`'s `Table` key.
+#[must_use]
+pub fn delete_table_response(
+    table: &str,
+    schema: &TableSchema,
+    key_types: &[(String, String)],
+    indexes: &[SecondaryIndex],
+    index_statuses: &[(String, IndexStatus)],
+    stream: Option<&StreamDescription>,
+) -> String {
+    let mut desc = table_description_object(table, schema, indexes, index_statuses, stream);
+    desc.insert("TableStatus".into(), Value::String("DELETING".into()));
+    desc.insert(
+        "AttributeDefinitions".into(),
+        Value::Array(attribute_definitions(schema, key_types)),
+    );
+    let mut obj = Map::new();
+    obj.insert("TableDescription".into(), Value::Object(desc));
+    serde_json::to_string(&Value::Object(obj)).expect("delete-table response serializes")
+}
+
+/// The `AttributeDefinitions` array (partition key, plus sort key when
+/// composite) for `schema`, resolving each key attribute's declared type
+/// from `key_types` (defaulting to `S` when absent, mirroring
+/// `CreateTable`'s own decode). Shared by [`describe_table_response`] and
+/// [`delete_table_response`] — the two response shapes that echo it.
+fn attribute_definitions(schema: &TableSchema, key_types: &[(String, String)]) -> Vec<Value> {
     let mut attrs = vec![attribute_definition(&schema.partition_key, key_types)];
     if let Some(sk) = &schema.sort_key {
         attrs.push(attribute_definition(sk, key_types));
     }
-    desc.insert("AttributeDefinitions".into(), Value::Array(attrs));
-    let mut obj = Map::new();
-    obj.insert("Table".into(), Value::Object(desc));
-    serde_json::to_string(&Value::Object(obj)).expect("describe-table response serializes")
+    attrs
 }
 
 fn attribute_definition(name: &str, key_types: &[(String, String)]) -> Value {
@@ -2153,6 +3265,58 @@ fn attribute_definition(name: &str, key_types: &[(String, String)]) -> Value {
     e.insert("AttributeName".into(), Value::String(name.to_owned()));
     e.insert("AttributeType".into(), Value::String(ty.to_owned()));
     Value::Object(e)
+}
+
+/// The default and cap for `ListTables`'s `Limit`, matching real DynamoDB.
+pub const LIST_TABLES_MAX_LIMIT: usize = 100;
+
+/// Paginate a full, already-lexicographically-sorted table-name list per
+/// `ListTables`'s contract: skip past `exclusive_start_table_name` (start
+/// strictly after it — a binary search, valid because `names` is sorted),
+/// take at most `limit` (`None` defaults to [`LIST_TABLES_MAX_LIMIT`]; any
+/// value is capped at it, matching real DynamoDB), and report the page's
+/// last name as the pagination cursor **only when the listing was
+/// truncated** (matching DynamoDB — an untruncated page carries no
+/// `LastEvaluatedTableName`). `names` must already be the caller's *final*
+/// candidate set — already filtered by whatever policy decides which names
+/// to expose (`animusd::dynamo::list_tables` excludes a materialized GSI's
+/// hidden table before calling this).
+#[must_use]
+pub fn paginate_table_names(
+    names: &[String],
+    exclusive_start_table_name: Option<&str>,
+    limit: Option<usize>,
+) -> (Vec<String>, Option<String>) {
+    let limit = limit
+        .unwrap_or(LIST_TABLES_MAX_LIMIT)
+        .min(LIST_TABLES_MAX_LIMIT);
+    let start = exclusive_start_table_name
+        .map(|s| names.partition_point(|n| n.as_str() <= s))
+        .unwrap_or(0);
+    let remaining = &names[start..];
+    let truncated = remaining.len() > limit;
+    let page = remaining[..remaining.len().min(limit)].to_vec();
+    let last_evaluated = truncated.then(|| page.last().cloned()).flatten();
+    (page, last_evaluated)
+}
+
+/// The JSON body for a successful `ListTables`: `{"TableNames": [...]}`,
+/// plus `"LastEvaluatedTableName"` only when [`paginate_table_names`]
+/// reports the listing was truncated.
+#[must_use]
+pub fn list_tables_response(names: &[String], last_evaluated_table_name: Option<&str>) -> String {
+    let mut obj = Map::new();
+    obj.insert(
+        "TableNames".into(),
+        Value::Array(names.iter().cloned().map(Value::String).collect()),
+    );
+    if let Some(last) = last_evaluated_table_name {
+        obj.insert(
+            "LastEvaluatedTableName".into(),
+            Value::String(last.to_owned()),
+        );
+    }
+    serde_json::to_string(&Value::Object(obj)).expect("list-tables response serializes")
 }
 
 /// One index entry in a `TableDescription`/`Table`: name, key schema, and its
@@ -2478,10 +3642,56 @@ mod tests {
     }
 
     #[test]
+    fn decodes_delete_table_request() {
+        let body = br#"{"TableName":"t"}"#;
+        match decode_request("DynamoDB_20120810.DeleteTable", body).unwrap() {
+            Operation::DeleteTable { table } => assert_eq!(table, "t"),
+            other => panic!("expected DeleteTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_list_tables_request_with_all_fields() {
+        let body = br#"{"ExclusiveStartTableName":"foo","Limit":25}"#;
+        match decode_request("DynamoDB_20120810.ListTables", body).unwrap() {
+            Operation::ListTables {
+                exclusive_start_table_name,
+                limit,
+            } => {
+                assert_eq!(exclusive_start_table_name.as_deref(), Some("foo"));
+                assert_eq!(limit, Some(25));
+            }
+            other => panic!("expected ListTables, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_list_tables_request_with_no_fields() {
+        match decode_request("DynamoDB_20120810.ListTables", b"{}").unwrap() {
+            Operation::ListTables {
+                exclusive_start_table_name,
+                limit,
+            } => {
+                assert_eq!(exclusive_start_table_name, None);
+                assert_eq!(limit, None);
+            }
+            other => panic!("expected ListTables, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_list_tables_rejects_a_negative_limit() {
+        let body = br#"{"Limit":-1}"#;
+        let err = decode_request("DynamoDB_20120810.ListTables", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
     fn unknown_target_is_rejected() {
-        // `BatchGetItem` is still unsupported (BatchWriteItem now is supported).
+        // `BatchGetItem` is supported now; a malformed body is a validation
+        // error rather than an unknown operation.
         let err = decode_request("DynamoDB_20120810.BatchGetItem", b"{}").unwrap_err();
-        assert_eq!(err.code, "UnknownOperationException");
+        assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
@@ -2657,12 +3867,15 @@ mod tests {
     fn write_response_echoes_old_item_for_all_old() {
         let mut old = Item::new();
         old.insert("id".into(), s("k"));
-        let body = write_response(ReturnValues::AllOld, Some(&old));
+        let body = write_response(ReturnValues::AllOld, Some(&old), None, None);
         assert!(body.contains("\"Attributes\""));
         assert!(body.contains("\"S\":\"k\""));
         // ALL_OLD on an absent key is `{}`; NONE is always `{}`.
-        assert_eq!(write_response(ReturnValues::AllOld, None), "{}");
-        assert_eq!(write_response(ReturnValues::None, Some(&old)), "{}");
+        assert_eq!(write_response(ReturnValues::AllOld, None, None, None), "{}");
+        assert_eq!(
+            write_response(ReturnValues::None, Some(&old), None, None),
+            "{}"
+        );
     }
 
     #[test]
@@ -2709,10 +3922,10 @@ mod tests {
 
     #[test]
     fn get_item_response_omits_missing_item() {
-        assert_eq!(get_item_response(None), "{}");
+        assert_eq!(get_item_response(None, None), "{}");
         let mut item = Item::new();
         item.insert("id".into(), s("u1"));
-        let body = get_item_response(Some(&item));
+        let body = get_item_response(Some(&item), None);
         assert!(body.contains("\"Item\""));
         assert!(body.contains("\"S\":\"u1\""));
     }
@@ -2796,8 +4009,9 @@ mod tests {
         };
         assert_eq!(
             condition,
-            Some(ConditionExpression::Equals(
+            Some(ConditionExpression::Compare(
                 "v".into(),
+                Comparator::Eq,
                 AttributeValue::N("7".into())
             ))
         );
@@ -2812,20 +4026,98 @@ mod tests {
             Operation::Query {
                 table,
                 index,
+                partition_attr,
                 partition_value,
+                sort_attr,
                 sort_condition,
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter,
                 projection,
+                select,
                 consistent_read,
             } => {
+                assert!(filter.is_none(), "no FilterExpression in the body");
+                assert!(scan_index_forward, "ScanIndexForward defaults to true");
+                assert_eq!(
+                    select,
+                    Select::AllAttributes,
+                    "a base-table read with no projection defaults to ALL_ATTRIBUTES"
+                );
                 assert_eq!(table, "t");
                 assert_eq!(index, None);
+                assert_eq!(partition_attr, "pk", "the key name is carried, not dropped");
                 assert_eq!(partition_value, s("part"));
+                assert_eq!(sort_attr, None);
                 assert_eq!(sort_condition, None);
+                assert_eq!(limit, None, "no Limit in the body");
+                assert_eq!(
+                    exclusive_start_key, None,
+                    "no ExclusiveStartKey in the body"
+                );
                 assert_eq!(projection, None);
                 assert!(!consistent_read, "default is false");
             }
             other => panic!("expected Query, got {other:?}"),
         }
+    }
+
+    /// `Query` decodes `Limit`/`ExclusiveStartKey` exactly like `Scan`
+    /// (`decodes_scan_with_limit_and_filter`'s pair) — the pagination gap
+    /// this crate used to have (`decode_query` never parsed either field).
+    #[test]
+    fn decodes_query_with_limit_and_exclusive_start_key() {
+        let body = br#"{"TableName":"t","Limit":3,
+            "ExclusiveStartKey":{"pk":{"S":"part"},"sk":{"S":"k5"}},
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"part"}}}"#;
+        match decode_request("DynamoDB_20120810.Query", body).unwrap() {
+            Operation::Query {
+                limit,
+                exclusive_start_key,
+                ..
+            } => {
+                assert_eq!(limit, Some(3));
+                let esk = exclusive_start_key.expect("ExclusiveStartKey present");
+                assert_eq!(esk.get("pk"), Some(&s("part")));
+                assert_eq!(esk.get("sk"), Some(&s("k5")));
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    /// Omitting `Limit`/`ExclusiveStartKey` on a `Query` decodes both as
+    /// `None` — the same default `decodes_query_partition_only` already
+    /// covers via its explicit-destructure assertions; this test names the
+    /// property directly for the pagination fields.
+    #[test]
+    fn decodes_query_without_limit_or_exclusive_start_key() {
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"part"}}}"#;
+        match decode_request("DynamoDB_20120810.Query", body).unwrap() {
+            Operation::Query {
+                limit,
+                exclusive_start_key,
+                ..
+            } => {
+                assert_eq!(limit, None);
+                assert_eq!(exclusive_start_key, None);
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    /// A non-integer `Limit` on `Query` is rejected exactly like `Scan`'s own
+    /// `Limit` validation (`decode_limit` is now shared between the two).
+    #[test]
+    fn rejects_non_integer_query_limit() {
+        let body = br#"{"TableName":"t","Limit":"two",
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"part"}}}"#;
+        let err = decode_request("DynamoDB_20120810.Query", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
     }
 
     /// `ConsistentRead` decodes on `GetItem`/`Query`/`Scan` alike (ADR 0041
@@ -2882,6 +4174,56 @@ mod tests {
         assert!(!consistent_read);
     }
 
+    /// A `Query`'s `FilterExpression` decodes through the same predicate
+    /// decoder `Scan` uses. Before this it was never read at all, so a filter
+    /// rode through as `None` and the edge returned unfiltered results.
+    #[test]
+    fn decodes_query_filter_expression() {
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p",
+            "FilterExpression":"kind = :k",
+            "ExpressionAttributeValues":{":p":{"S":"x"},":k":{"S":"blue"}}}"#;
+        let Operation::Query { filter, .. } =
+            decode_request("DynamoDB_20120810.Query", body).unwrap()
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(
+            filter,
+            Some(ConditionExpression::Compare(
+                "kind".into(),
+                Comparator::Eq,
+                s("blue")
+            ))
+        );
+
+        // The function forms decode too.
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p",
+            "FilterExpression":"attribute_not_exists(gone)",
+            "ExpressionAttributeValues":{":p":{"S":"x"}}}"#;
+        let Operation::Query { filter, .. } =
+            decode_request("DynamoDB_20120810.Query", body).unwrap()
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(
+            filter,
+            Some(ConditionExpression::AttributeNotExists("gone".into()))
+        );
+
+        // Absent stays `None` rather than defaulting to something permissive.
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"x"}}}"#;
+        let Operation::Query { filter, .. } =
+            decode_request("DynamoDB_20120810.Query", body).unwrap()
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(filter, None);
+    }
+
     #[test]
     fn decodes_query_sort_conditions() {
         // equality
@@ -2919,16 +4261,6 @@ mod tests {
             panic!("expected Query");
         };
         assert_eq!(sort_condition, Some(SortKeyCondition::BeginsWith(s("ab"))));
-    }
-
-    #[test]
-    fn query_response_shape() {
-        let mut a = Item::new();
-        a.insert("pk".into(), s("p"));
-        let body = query_response(&[a]);
-        assert!(body.contains("\"Items\""));
-        assert!(body.contains("\"Count\":1"));
-        assert!(body.contains("\"ScannedCount\":1"));
     }
 
     #[test]
@@ -3035,6 +4367,106 @@ mod tests {
         let body = create_table_response("t", &TableSchema::simple("id"), &[gsi], None);
         assert!(body.contains("\"IndexStatus\":\"ACTIVE\""));
         assert!(!body.contains("Backfilling"));
+    }
+
+    #[test]
+    fn delete_table_response_shape() {
+        let stream = StreamDescription {
+            view_type: StreamViewType::KeysOnly,
+            label: "lbl".into(),
+        };
+        let body = delete_table_response(
+            "t",
+            &TableSchema::composite("pk", "sk"),
+            &[("pk".into(), "S".into()), ("sk".into(), "N".into())],
+            &[],
+            &[],
+            Some(&stream),
+        );
+        // Wrapped under `TableDescription` (matching `CreateTable`/
+        // `UpdateTable`), not `DescribeTable`'s `Table`.
+        assert!(body.contains("\"TableDescription\""));
+        assert!(!body.starts_with("{\"Table\""));
+        assert!(body.contains("\"TableStatus\":\"DELETING\""));
+        assert!(!body.contains("\"TableStatus\":\"ACTIVE\""));
+        // Same descriptive fields `DescribeTable` emits.
+        assert!(body.contains("\"AttributeDefinitions\""));
+        assert!(body.contains("\"AttributeType\":\"N\""));
+        assert!(body.contains("\"StreamViewType\":\"KEYS_ONLY\""));
+        assert!(body.contains("\"TableName\":\"t\""));
+    }
+
+    #[test]
+    fn paginate_table_names_defaults_limit_to_100_and_caps_it() {
+        let names: Vec<String> = (0..150).map(|i| format!("t{i:03}")).collect();
+
+        // No `Limit` at all: default is 100, and since 150 > 100 the page is
+        // truncated.
+        let (page, last) = paginate_table_names(&names, None, None);
+        assert_eq!(page.len(), 100);
+        assert_eq!(page.first().unwrap(), "t000");
+        assert_eq!(page.last().unwrap(), "t099");
+        assert_eq!(last.as_deref(), Some("t099"));
+
+        // A `Limit` above 100 is capped at 100, not honored as-is.
+        let (page, last) = paginate_table_names(&names, None, Some(1000));
+        assert_eq!(page.len(), 100);
+        assert_eq!(last.as_deref(), Some("t099"));
+    }
+
+    #[test]
+    fn paginate_table_names_exclusive_start_table_name_positions_strictly_after() {
+        let names: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let (page, last) = paginate_table_names(&names, Some("b"), None);
+        // Strictly after "b": "b" itself is excluded.
+        assert_eq!(page, vec!["c".to_owned(), "d".to_owned()]);
+        assert_eq!(last, None);
+
+        // A start name equal to the last name yields an empty page.
+        let (page, last) = paginate_table_names(&names, Some("d"), None);
+        assert!(page.is_empty());
+        assert_eq!(last, None);
+
+        // A start name absent from the list still positions correctly
+        // (between "b" and "c").
+        let (page, _) = paginate_table_names(&names, Some("bb"), None);
+        assert_eq!(page, vec!["c".to_owned(), "d".to_owned()]);
+    }
+
+    #[test]
+    fn paginate_table_names_reports_last_evaluated_only_when_truncated() {
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_owned()).collect();
+
+        // The whole (small) list fits within the limit: no truncation, no
+        // `LastEvaluatedTableName`.
+        let (page, last) = paginate_table_names(&names, None, Some(10));
+        assert_eq!(page.len(), 3);
+        assert_eq!(last, None);
+
+        // A limit smaller than the candidate set truncates the page and
+        // reports the page's own last name as the cursor.
+        let (page, last) = paginate_table_names(&names, None, Some(2));
+        assert_eq!(page, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(last.as_deref(), Some("b"));
+
+        // A limit exactly matching the remaining count is NOT truncated.
+        let (page, last) = paginate_table_names(&names, None, Some(3));
+        assert_eq!(page.len(), 3);
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn list_tables_response_shape() {
+        let names = vec!["a".to_owned(), "b".to_owned()];
+        let body = list_tables_response(&names, None);
+        assert!(body.contains("\"TableNames\":[\"a\",\"b\"]"));
+        assert!(!body.contains("LastEvaluatedTableName"));
+
+        let body = list_tables_response(&names, Some("b"));
+        assert!(body.contains("\"LastEvaluatedTableName\":\"b\""));
     }
 
     #[test]
@@ -3291,11 +4723,15 @@ mod tests {
                 exclusive_start_key,
                 filter,
                 projection,
+                select,
+                segment,
                 consistent_read,
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(index, None);
                 assert_eq!(limit, Some(2));
+                assert_eq!(select, Select::AllAttributes);
+                assert_eq!(segment, None, "no Segment/TotalSegments in the body");
                 assert_eq!(exclusive_start_key.unwrap().get("id"), Some(&s("k5")));
                 assert_eq!(
                     filter,
@@ -3401,7 +4837,8 @@ mod tests {
                 UpdateAction::Set("a".into(), s("x")),
                 UpdateAction::Remove("c".into()),
             ],
-        );
+        )
+        .expect("SET/REMOVE are infallible");
         assert_eq!(new.get("a"), Some(&s("x")));
         assert!(!new.contains_key("c"));
         assert_eq!(new.get("id"), Some(&s("k")));
@@ -3448,11 +4885,11 @@ mod tests {
     fn update_response_echoes_new_for_all_new() {
         let mut new = Item::new();
         new.insert("a".into(), s("x"));
-        let body = update_response(UpdateReturnValues::AllNew, None, Some(&new));
+        let body = update_response(UpdateReturnValues::AllNew, None, Some(&new), None, None);
         assert!(body.contains("\"Attributes\""));
         assert!(body.contains("\"S\":\"x\""));
         assert_eq!(
-            update_response(UpdateReturnValues::None, None, Some(&new)),
+            update_response(UpdateReturnValues::None, None, Some(&new), None, None),
             "{}"
         );
     }
@@ -3625,5 +5062,1108 @@ mod tests {
         let body = describe_time_to_live_response(&desc);
         assert!(body.contains("\"TimeToLiveStatus\":\"DISABLED\""));
         assert!(!body.contains("AttributeName"));
+    }
+
+    /// `Select` is inferred when absent: a projection implies
+    /// `SPECIFIC_ATTRIBUTES`, an index read defaults to the index's
+    /// projection, and a plain table read to `ALL_ATTRIBUTES`.
+    #[test]
+    fn absent_select_is_inferred_from_the_rest_of_the_request() {
+        let q = |body: &str| match decode_request("DynamoDB_20120810.Query", body.as_bytes())
+            .expect("decodes")
+        {
+            Operation::Query { select, .. } => select,
+            other => panic!("expected Query, got {other:?}"),
+        };
+        assert_eq!(
+            q(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                  "ExpressionAttributeValues":{":p":{"S":"a"}}}"#),
+            Select::AllAttributes
+        );
+        assert_eq!(
+            q(
+                r#"{"TableName":"t","IndexName":"i","KeyConditionExpression":"pk = :p",
+                  "ExpressionAttributeValues":{":p":{"S":"a"}}}"#
+            ),
+            Select::AllProjectedAttributes,
+            "an index read defaults to its declared projection"
+        );
+        assert_eq!(
+            q(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                  "ExpressionAttributeValues":{":p":{"S":"a"}},
+                  "ProjectionExpression":"a,b"}"#),
+            Select::SpecificAttributes,
+            "a projection implies SPECIFIC_ATTRIBUTES"
+        );
+    }
+
+    /// Every explicit `Select` value round-trips, including `COUNT` — the one
+    /// that changes the response shape.
+    #[test]
+    fn explicit_select_values_decode() {
+        let q = |sel: &str| {
+            let body = format!(
+                r#"{{"TableName":"t","KeyConditionExpression":"pk = :p",
+                     "ExpressionAttributeValues":{{":p":{{"S":"a"}}}},"Select":"{sel}"}}"#
+            );
+            match decode_request("DynamoDB_20120810.Query", body.as_bytes()).expect("decodes") {
+                Operation::Query { select, .. } => select,
+                other => panic!("expected Query, got {other:?}"),
+            }
+        };
+        assert_eq!(q("ALL_ATTRIBUTES"), Select::AllAttributes);
+        assert_eq!(q("COUNT"), Select::Count);
+    }
+
+    /// The four validations DynamoDB performs and this adapter previously
+    /// ignored. Each was silently accepted before.
+    #[test]
+    fn select_is_validated_against_the_rest_of_the_request() {
+        let err = |body: &str| {
+            decode_request("DynamoDB_20120810.Query", body.as_bytes())
+                .expect_err("must be rejected")
+        };
+
+        // SPECIFIC_ATTRIBUTES with nothing to select.
+        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                "ExpressionAttributeValues":{":p":{"S":"a"}},
+                "Select":"SPECIFIC_ATTRIBUTES"}"#);
+
+        // A projection contradicting a non-SPECIFIC Select.
+        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                "ExpressionAttributeValues":{":p":{"S":"a"}},
+                "ProjectionExpression":"a","Select":"ALL_ATTRIBUTES"}"#);
+        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                "ExpressionAttributeValues":{":p":{"S":"a"}},
+                "ProjectionExpression":"a","Select":"COUNT"}"#);
+
+        // ALL_PROJECTED_ATTRIBUTES without an index to project.
+        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                "ExpressionAttributeValues":{":p":{"S":"a"}},
+                "Select":"ALL_PROJECTED_ATTRIBUTES"}"#);
+
+        // An unknown value is rejected rather than silently treated as default.
+        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                "ExpressionAttributeValues":{":p":{"S":"a"}},
+                "Select":"EVERYTHING"}"#);
+    }
+
+    /// `Scan` decodes `Select` through the same path as `Query`.
+    #[test]
+    fn scan_decodes_select_too() {
+        match decode_request(
+            "DynamoDB_20120810.Scan",
+            br#"{"TableName":"t","Select":"COUNT"}"#,
+        )
+        .expect("decodes")
+        {
+            Operation::Scan { select, .. } => assert_eq!(select, Select::Count),
+            other => panic!("expected Scan, got {other:?}"),
+        }
+    }
+
+    /// Under `COUNT` the response carries no `Items` at all, while the counts
+    /// and any cursor are exactly what the same page would otherwise report.
+    #[test]
+    fn count_select_omits_items_but_keeps_counts_and_cursor() {
+        let item: Item = [("id".to_string(), s("k1"))].into_iter().collect();
+        let items = vec![item.clone()];
+
+        let full = select_response(Select::AllAttributes, &items, 4, Some(&item));
+        assert!(full.contains("\"Items\""), "the normal shape keeps Items");
+
+        let counted = select_response(Select::Count, &items, 4, Some(&item));
+        assert!(
+            !counted.contains("\"Items\""),
+            "COUNT must not carry Items: {counted}"
+        );
+        assert!(counted.contains("\"Count\":1"), "{counted}");
+        assert!(counted.contains("\"ScannedCount\":4"), "{counted}");
+        assert!(
+            counted.contains("\"LastEvaluatedKey\""),
+            "a truncated COUNT page still paginates: {counted}"
+        );
+    }
+
+    /// Regression (now with the operators supported): `>=` and `<=` were once
+    /// cut by a naive `split_once('=')` into an equality against an attribute
+    /// named `price >`. They must parse as the real operator against the whole
+    /// attribute name — the property that bug violated.
+    #[test]
+    fn comparison_operators_parse_with_the_whole_attribute_name() {
+        let cases = [
+            (">=", Comparator::Ge),
+            ("<=", Comparator::Le),
+            (">", Comparator::Gt),
+            ("<", Comparator::Lt),
+            ("<>", Comparator::Ne),
+            ("=", Comparator::Eq),
+        ];
+        for (op, expected) in cases {
+            let body = format!(
+                r#"{{"TableName":"t","FilterExpression":"price {op} :p",
+                     "ExpressionAttributeValues":{{":p":{{"N":"5"}}}}}}"#
+            );
+            match decode_request("DynamoDB_20120810.Scan", body.as_bytes())
+                .unwrap_or_else(|e| panic!("`{op}` must decode: {e:?}"))
+            {
+                Operation::Scan { filter, .. } => assert_eq!(
+                    filter,
+                    Some(ConditionExpression::Compare(
+                        "price".into(),
+                        expected,
+                        AttributeValue::N("5".into())
+                    )),
+                    "`{op}` must keep the whole attribute name and its own operator"
+                ),
+                other => panic!("expected Scan, got {other:?}"),
+            }
+        }
+    }
+
+    /// Regression: `#alias` was resolved in `ProjectionExpression` but not in
+    /// `FilterExpression`/`ConditionExpression`, so `#p = :v` became an
+    /// equality against an attribute literally named `#p` — always false, and
+    /// silently so. Aliases are mandatory for DynamoDB's reserved words, so
+    /// this hit ordinary schemas.
+    #[test]
+    fn expression_attribute_names_resolve_in_predicates() {
+        let body = r##"{"TableName":"t","FilterExpression":"#p = :v",
+            "ExpressionAttributeNames":{"#p":"price"},
+            "ExpressionAttributeValues":{":v":{"N":"5"}}}"##;
+        match decode_request("DynamoDB_20120810.Scan", body.as_bytes()).expect("decodes") {
+            Operation::Scan { filter, .. } => assert_eq!(
+                filter,
+                Some(ConditionExpression::Compare(
+                    "price".into(),
+                    Comparator::Eq,
+                    AttributeValue::N("5".into())
+                )),
+                "the alias must resolve to the real attribute name"
+            ),
+            other => panic!("expected Scan, got {other:?}"),
+        }
+
+        let exists = r##"{"TableName":"t","FilterExpression":"attribute_exists(#p)",
+            "ExpressionAttributeNames":{"#p":"price"}}"##;
+        match decode_request("DynamoDB_20120810.Scan", exists.as_bytes()).expect("decodes") {
+            Operation::Scan { filter, .. } => assert_eq!(
+                filter,
+                Some(ConditionExpression::AttributeExists("price".into())),
+                "aliases resolve inside the function forms too"
+            ),
+            other => panic!("expected Scan, got {other:?}"),
+        }
+    }
+
+    /// Regression: the key condition's attribute name was discarded, so the
+    /// edge could not tell `pk = :v` from `notthekey = :v`. It is now carried
+    /// (alias-resolved) for the edge to check against the catalog.
+    #[test]
+    fn key_condition_carries_its_attribute_names() {
+        let body = r##"{"TableName":"t",
+            "KeyConditionExpression":"#k = :p AND #s = :s",
+            "ExpressionAttributeNames":{"#k":"pk","#s":"sk"},
+            "ExpressionAttributeValues":{":p":{"S":"a"},":s":{"S":"b"}}}"##;
+        match decode_request("DynamoDB_20120810.Query", body.as_bytes()).expect("decodes") {
+            Operation::Query {
+                partition_attr,
+                sort_attr,
+                ..
+            } => {
+                assert_eq!(partition_attr, "pk", "alias-resolved partition key name");
+                assert_eq!(sort_attr.as_deref(), Some("sk"), "and the sort key name");
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    /// Regression: a sort-key **range** — the main reason to have a sort key —
+    /// was truncated into an equality, silently narrowing the result set.
+    #[test]
+    fn sort_key_ranges_are_rejected_not_narrowed_to_equality() {
+        for op in [">=", "<=", ">", "<"] {
+            let body = format!(
+                r#"{{"TableName":"t","KeyConditionExpression":"pk = :p AND sk {op} :s",
+                     "ExpressionAttributeValues":{{":p":{{"S":"a"}},":s":{{"S":"b"}}}}}}"#
+            );
+            let err = decode_request("DynamoDB_20120810.Query", body.as_bytes())
+                .expect_err(&format!("sort-key `{op}` must not become an equality"));
+            assert_eq!(err.code, "ValidationException", "for `{op}`");
+        }
+        // BETWEEN and begins_with still work, and carry the sort attribute name.
+        let between = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p AND sk BETWEEN :lo AND :hi",
+            "ExpressionAttributeValues":{":p":{"S":"a"},":lo":{"S":"b"},":hi":{"S":"c"}}}"#;
+        match decode_request("DynamoDB_20120810.Query", between).expect("decodes") {
+            Operation::Query {
+                sort_attr,
+                sort_condition,
+                ..
+            } => {
+                assert_eq!(sort_attr.as_deref(), Some("sk"));
+                assert!(matches!(
+                    sort_condition,
+                    Some(SortKeyCondition::Between(..))
+                ));
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    /// A partition key condition must be an equality; `pk >= :v` is rejected
+    /// rather than silently accepted as one.
+    #[test]
+    fn partition_key_condition_must_be_an_equality() {
+        let body = br#"{"TableName":"t","KeyConditionExpression":"pk >= :p",
+             "ExpressionAttributeValues":{":p":{"S":"a"}}}"#;
+        let err = decode_request("DynamoDB_20120810.Query", body).expect_err("must be rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// Every new predicate form decodes, including the ones whose argument
+    /// lists contain commas the comparator split must not cut through.
+    #[test]
+    fn the_full_predicate_surface_decodes() {
+        let decode_filter = |frag: &str| {
+            let body = format!(
+                r##"{{"TableName":"t","FilterExpression":"{frag}",
+                     "ExpressionAttributeNames":{{"#a":"attr"}},
+                     "ExpressionAttributeValues":{{
+                        ":v":{{"N":"5"}},":lo":{{"N":"1"}},":hi":{{"N":"9"}},
+                        ":s":{{"S":"pre"}},":t":{{"S":"S"}}}}}}"##
+            );
+            match decode_request("DynamoDB_20120810.Scan", body.as_bytes())
+                .unwrap_or_else(|e| panic!("`{frag}` must decode: {e:?}"))
+            {
+                Operation::Scan { filter, .. } => filter.expect("a filter"),
+                other => panic!("expected Scan, got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            decode_filter("a BETWEEN :lo AND :hi"),
+            ConditionExpression::Between(
+                "a".into(),
+                AttributeValue::N("1".into()),
+                AttributeValue::N("9".into())
+            )
+        );
+        assert_eq!(
+            decode_filter("a IN (:lo, :hi)"),
+            ConditionExpression::In(
+                "a".into(),
+                vec![AttributeValue::N("1".into()), AttributeValue::N("9".into())]
+            )
+        );
+        assert_eq!(
+            decode_filter("begins_with(a, :s)"),
+            ConditionExpression::BeginsWith("a".into(), AttributeValue::S("pre".into()))
+        );
+        assert_eq!(
+            decode_filter("contains(a, :s)"),
+            ConditionExpression::Contains("a".into(), AttributeValue::S("pre".into()))
+        );
+        assert_eq!(
+            decode_filter("attribute_type(a, :t)"),
+            ConditionExpression::AttributeType("a".into(), "S".into())
+        );
+        assert_eq!(
+            decode_filter("size(a) > :v"),
+            ConditionExpression::Size("a".into(), Comparator::Gt, AttributeValue::N("5".into())),
+            "size() is the one form with a function on the left of a comparison"
+        );
+        // Aliases resolve in every form, not just the comparison one.
+        assert_eq!(
+            decode_filter("begins_with(#a, :s)"),
+            ConditionExpression::BeginsWith("attr".into(), AttributeValue::S("pre".into()))
+        );
+        assert_eq!(
+            decode_filter("#a BETWEEN :lo AND :hi"),
+            ConditionExpression::Between(
+                "attr".into(),
+                AttributeValue::N("1".into()),
+                AttributeValue::N("9".into())
+            )
+        );
+    }
+
+    /// Malformed forms are rejected rather than half-parsed.
+    #[test]
+    fn malformed_predicate_forms_are_rejected() {
+        for frag in [
+            "a IN :v",           // unparenthesised
+            "a IN ()",           // empty list
+            "a IN (:v,)",        // trailing empty element
+            "attribute_type(a)", // missing the type code
+            "begins_with(a)",    // missing the prefix
+            "a BETWEEN :lo",     // missing AND :hi
+        ] {
+            let body = format!(
+                r#"{{"TableName":"t","FilterExpression":"{frag}",
+                     "ExpressionAttributeValues":{{":v":{{"N":"5"}},":lo":{{"N":"1"}}}}}}"#
+            );
+            assert!(
+                decode_request("DynamoDB_20120810.Scan", body.as_bytes()).is_err(),
+                "`{frag}` must be rejected, not half-parsed"
+            );
+        }
+    }
+
+    /// An unknown `attribute_type` code is rejected rather than silently
+    /// matching nothing.
+    #[test]
+    fn unknown_attribute_type_code_is_rejected() {
+        let body = br#"{"TableName":"t","FilterExpression":"a attribute_type(a, :t)",
+             "ExpressionAttributeValues":{":t":{"S":"STRING"}}}"#;
+        assert!(decode_request("DynamoDB_20120810.Scan", body).is_err());
+    }
+
+    /// Precedence: `NOT` binds tightest, then `AND`, then `OR` — so
+    /// `a OR b AND c` is `a OR (b AND c)`, not `(a OR b) AND c`.
+    #[test]
+    fn boolean_precedence_is_not_then_and_then_or() {
+        let f = |frag: &str| {
+            let body = format!(
+                r#"{{"TableName":"t","FilterExpression":"{frag}",
+                     "ExpressionAttributeValues":{{":a":{{"N":"1"}},":b":{{"N":"2"}},":c":{{"N":"3"}}}}}}"#
+            );
+            match decode_request("DynamoDB_20120810.Scan", body.as_bytes())
+                .unwrap_or_else(|e| panic!("`{frag}` must decode: {e:?}"))
+            {
+                Operation::Scan { filter, .. } => filter.expect("a filter"),
+                other => panic!("expected Scan, got {other:?}"),
+            }
+        };
+        let eq = |name: &str, ph: &str| {
+            ConditionExpression::Compare(name.into(), Comparator::Eq, AttributeValue::N(ph.into()))
+        };
+
+        assert_eq!(
+            f("a = :a OR b = :b AND c = :c"),
+            ConditionExpression::Or(
+                Box::new(eq("a", "1")),
+                Box::new(ConditionExpression::And(
+                    Box::new(eq("b", "2")),
+                    Box::new(eq("c", "3"))
+                ))
+            ),
+            "AND binds tighter than OR"
+        );
+        assert_eq!(
+            f("NOT a = :a AND b = :b"),
+            ConditionExpression::And(
+                Box::new(ConditionExpression::Not(Box::new(eq("a", "1")))),
+                Box::new(eq("b", "2"))
+            ),
+            "NOT binds tighter than AND"
+        );
+        assert_eq!(
+            f("(a = :a OR b = :b) AND c = :c"),
+            ConditionExpression::And(
+                Box::new(ConditionExpression::Or(
+                    Box::new(eq("a", "1")),
+                    Box::new(eq("b", "2"))
+                )),
+                Box::new(eq("c", "3"))
+            ),
+            "parentheses override precedence"
+        );
+        // Left-associative chains.
+        assert_eq!(
+            f("a = :a AND b = :b AND c = :c"),
+            ConditionExpression::And(
+                Box::new(ConditionExpression::And(
+                    Box::new(eq("a", "1")),
+                    Box::new(eq("b", "2"))
+                )),
+                Box::new(eq("c", "3"))
+            )
+        );
+    }
+
+    /// The trap: `BETWEEN :lo AND :hi` contains an `AND` that belongs to the
+    /// term, not to the combinator. Splitting on it would produce nonsense.
+    #[test]
+    fn between_s_own_and_is_not_a_combinator() {
+        let body = br#"{"TableName":"t",
+             "FilterExpression":"a BETWEEN :lo AND :hi AND b = :b",
+             "ExpressionAttributeValues":{":lo":{"N":"1"},":hi":{"N":"9"},":b":{"N":"2"}}}"#;
+        match decode_request("DynamoDB_20120810.Scan", body).expect("decodes") {
+            Operation::Scan { filter, .. } => assert_eq!(
+                filter,
+                Some(ConditionExpression::And(
+                    Box::new(ConditionExpression::Between(
+                        "a".into(),
+                        AttributeValue::N("1".into()),
+                        AttributeValue::N("9".into())
+                    )),
+                    Box::new(ConditionExpression::Compare(
+                        "b".into(),
+                        Comparator::Eq,
+                        AttributeValue::N("2".into())
+                    ))
+                )),
+                "the first AND closes the BETWEEN; only the second joins terms"
+            ),
+            other => panic!("expected Scan, got {other:?}"),
+        }
+
+        // A bare BETWEEN must still parse as one term.
+        let solo = br#"{"TableName":"t","FilterExpression":"a BETWEEN :lo AND :hi",
+             "ExpressionAttributeValues":{":lo":{"N":"1"},":hi":{"N":"9"}}}"#;
+        match decode_request("DynamoDB_20120810.Scan", solo).expect("decodes") {
+            Operation::Scan { filter, .. } => {
+                assert!(matches!(filter, Some(ConditionExpression::Between(..))));
+            }
+            other => panic!("expected Scan, got {other:?}"),
+        }
+    }
+
+    /// A combinator inside a parenthesised group must not be split at the top
+    /// level, and `(a) OR (b)` is not one group.
+    #[test]
+    fn parenthesised_groups_are_respected() {
+        let body = br#"{"TableName":"t",
+             "FilterExpression":"(a = :a) OR (b = :b)",
+             "ExpressionAttributeValues":{":a":{"N":"1"},":b":{"N":"2"}}}"#;
+        match decode_request("DynamoDB_20120810.Scan", body).expect("decodes") {
+            Operation::Scan { filter, .. } => assert!(
+                matches!(filter, Some(ConditionExpression::Or(..))),
+                "`(a) OR (b)` is a disjunction, not a single group: {filter:?}"
+            ),
+            other => panic!("expected Scan, got {other:?}"),
+        }
+    }
+
+    /// `ADD` seeds an absent attribute, increments a number, and unions a set.
+    #[test]
+    fn add_seeds_increments_and_unions() {
+        let n = |v: &str| AttributeValue::N(v.into());
+        let ss = |v: &[&str]| AttributeValue::SS(v.iter().map(|s| (*s).to_string()).collect());
+
+        // Absent -> seeded. This is the counter-on-a-new-row case.
+        let out =
+            apply_update(Item::new(), &[UpdateAction::Add("c".into(), n("1"))]).expect("applies");
+        assert_eq!(out.get("c"), Some(&n("1")));
+
+        // Present -> incremented, exactly.
+        let mut item = Item::new();
+        item.insert("c".into(), n("41"));
+        let out = apply_update(item, &[UpdateAction::Add("c".into(), n("1"))]).expect("applies");
+        assert_eq!(out.get("c"), Some(&n("42")));
+
+        // Sets union and stay sorted/deduplicated.
+        let mut item = Item::new();
+        item.insert("t".into(), ss(&["a", "b"]));
+        let out =
+            apply_update(item, &[UpdateAction::Add("t".into(), ss(&["b", "c"]))]).expect("applies");
+        assert_eq!(
+            out.get("t"),
+            Some(&ss(&["a", "b", "c"])),
+            "union, deduplicated"
+        );
+    }
+
+    /// `DELETE` subtracts set members, and emptying a set removes the
+    /// attribute — DynamoDB does not store empty sets.
+    #[test]
+    fn delete_subtracts_and_drops_an_emptied_set() {
+        let ss = |v: &[&str]| AttributeValue::SS(v.iter().map(|s| (*s).to_string()).collect());
+
+        let mut item = Item::new();
+        item.insert("t".into(), ss(&["a", "b", "c"]));
+        let out =
+            apply_update(item, &[UpdateAction::Delete("t".into(), ss(&["b"]))]).expect("applies");
+        assert_eq!(out.get("t"), Some(&ss(&["a", "c"])));
+
+        let mut item = Item::new();
+        item.insert("t".into(), ss(&["a"]));
+        let out =
+            apply_update(item, &[UpdateAction::Delete("t".into(), ss(&["a"]))]).expect("applies");
+        assert!(
+            !out.contains_key("t"),
+            "an emptied set is removed, not stored as an empty set: {out:?}"
+        );
+
+        // Deleting from an absent attribute is a no-op, not an error.
+        let out = apply_update(Item::new(), &[UpdateAction::Delete("t".into(), ss(&["a"]))])
+            .expect("no-op");
+        assert!(out.is_empty());
+    }
+
+    /// A typed mismatch is an error, never a silently skipped action — the
+    /// caller must not believe an update applied when it did not.
+    #[test]
+    fn add_and_delete_reject_type_mismatches() {
+        let mut item = Item::new();
+        item.insert("s".into(), AttributeValue::S("text".into()));
+        assert!(
+            apply_update(
+                item.clone(),
+                &[UpdateAction::Add("s".into(), AttributeValue::N("1".into()))]
+            )
+            .is_err(),
+            "ADD a number to a string must be rejected"
+        );
+        assert!(
+            apply_update(
+                item,
+                &[UpdateAction::Delete(
+                    "s".into(),
+                    AttributeValue::SS(vec!["a".into()])
+                )]
+            )
+            .is_err(),
+            "DELETE a set from a string must be rejected"
+        );
+    }
+
+    /// `ADD`/`DELETE` parse with their space-separated `attr :value` shape,
+    /// alongside the `=`-shaped SET, and resolve `#alias`.
+    #[test]
+    fn add_and_delete_clauses_parse() {
+        let body = r##"{"TableName":"t","Key":{"pk":{"S":"a"}},
+            "UpdateExpression":"SET #s = :s ADD #c :new DELETE #t :rm",
+            "ExpressionAttributeNames":{"#s":"name","#c":"tags2","#t":"tags"},
+            "ExpressionAttributeValues":{":s":{"S":"x"},":new":{"SS":["a"]},
+                ":rm":{"SS":["old"]}}}"##;
+        match decode_request("DynamoDB_20120810.UpdateItem", body.as_bytes()).expect("decodes") {
+            Operation::UpdateItem { actions, .. } => {
+                assert_eq!(
+                    actions,
+                    vec![
+                        UpdateAction::Set("name".into(), AttributeValue::S("x".into())),
+                        UpdateAction::Add("tags2".into(), AttributeValue::SS(vec!["a".into()])),
+                        UpdateAction::Delete("tags".into(), AttributeValue::SS(vec!["old".into()])),
+                    ],
+                    "all three clause shapes, with aliases resolved"
+                );
+            }
+            other => panic!("expected UpdateItem, got {other:?}"),
+        }
+    }
+
+    /// A malformed ADD/DELETE clause is rejected rather than half-parsed.
+    #[test]
+    fn malformed_add_clauses_are_rejected() {
+        for expr in ["ADD c", "DELETE t"] {
+            let body = format!(
+                r#"{{"TableName":"t","Key":{{"pk":{{"S":"a"}}}},
+                     "UpdateExpression":"{expr}",
+                     "ExpressionAttributeValues":{{":one":{{"N":"1"}}}}}}"#
+            );
+            assert!(
+                decode_request("DynamoDB_20120810.UpdateItem", body.as_bytes()).is_err(),
+                "`{expr}` needs a value operand"
+            );
+        }
+    }
+
+    /// Numeric `ADD` decodes. Its safety comes from the write path — the
+    /// service does not re-apply a non-idempotent write, and a `KindBatch`
+    /// records what it did so an applied write is acknowledged even when a
+    /// concurrent update overwrites it — not from refusing it here.
+    #[test]
+    fn numeric_add_decodes() {
+        let body = br#"{"TableName":"t","Key":{"pk":{"S":"a"}},
+             "UpdateExpression":"ADD c :one",
+             "ExpressionAttributeValues":{":one":{"N":"1"}}}"#;
+        match decode_request("DynamoDB_20120810.UpdateItem", body).expect("decodes") {
+            Operation::UpdateItem { actions, .. } => assert_eq!(
+                actions,
+                vec![UpdateAction::Add("c".into(), AttributeValue::N("1".into()))]
+            ),
+            other => panic!("expected UpdateItem, got {other:?}"),
+        }
+    }
+
+    /// `ADD` still rejects an operand that is neither a number nor a set.
+    #[test]
+    fn add_rejects_a_non_numeric_non_set_operand() {
+        let body = br#"{"TableName":"t","Key":{"pk":{"S":"a"}},
+             "UpdateExpression":"ADD c :s",
+             "ExpressionAttributeValues":{":s":{"S":"x"}}}"#;
+        assert!(decode_request("DynamoDB_20120810.UpdateItem", body).is_err());
+    }
+
+    /// An operand that is neither a number nor a set is refused for both
+    /// clauses (`DELETE` additionally requires a set).
+    #[test]
+    fn add_and_delete_require_set_operands() {
+        for expr in ["ADD c :s", "DELETE c :s"] {
+            let body = format!(
+                r#"{{"TableName":"t","Key":{{"pk":{{"S":"a"}}}},
+                     "UpdateExpression":"{expr}",
+                     "ExpressionAttributeValues":{{":s":{{"S":"x"}}}}}}"#
+            );
+            assert!(
+                decode_request("DynamoDB_20120810.UpdateItem", body.as_bytes()).is_err(),
+                "`{expr}` must require a set operand"
+            );
+        }
+    }
+
+    /// `BatchGetItem` decodes per-table keys, with the projection and
+    /// consistency setting scoped to the table rather than to a key.
+    #[test]
+    fn batch_get_decodes_per_table_specs() {
+        let body = br#"{"RequestItems":{
+            "t1":{"Keys":[{"id":{"S":"a"}},{"id":{"S":"b"}}],
+                  "ProjectionExpression":"id,v","ConsistentRead":true},
+            "t2":{"Keys":[{"id":{"S":"c"}}]}}}"#;
+        match decode_request("DynamoDB_20120810.BatchGetItem", body).expect("decodes") {
+            Operation::BatchGetItem { mut requests } => {
+                requests.sort_by(|a, b| a.table.cmp(&b.table));
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0].table, "t1");
+                assert_eq!(requests[0].keys.len(), 2);
+                assert_eq!(
+                    requests[0].projection,
+                    Some(Projection(vec!["id".into(), "v".into()]))
+                );
+                assert!(requests[0].consistent_read);
+                assert_eq!(requests[1].table, "t2");
+                assert_eq!(requests[1].keys.len(), 1);
+                assert_eq!(requests[1].projection, None);
+                assert!(
+                    !requests[1].consistent_read,
+                    "ConsistentRead defaults to false"
+                );
+            }
+            other => panic!("expected BatchGetItem, got {other:?}"),
+        }
+    }
+
+    /// Malformed request shapes are rejected rather than silently read as empty.
+    #[test]
+    fn batch_get_rejects_malformed_requests() {
+        for body in [
+            &br#"{}"#[..],
+            &br#"{"RequestItems":{}}"#[..],
+            &br#"{"RequestItems":{"t":{}}}"#[..],
+            &br#"{"RequestItems":{"t":{"Keys":[]}}}"#[..],
+            &br#"{"RequestItems":{"t":{"Keys":["nope"]}}}"#[..],
+        ] {
+            assert!(
+                decode_request("DynamoDB_20120810.BatchGetItem", body).is_err(),
+                "must reject {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// The response groups items by table and always reports an empty
+    /// `UnprocessedKeys`, since every requested key is read before responding.
+    #[test]
+    fn batch_get_response_groups_by_table() {
+        let mut a = Item::new();
+        a.insert("id".into(), s("a"));
+        let body =
+            batch_get_response(&[("t1".to_string(), vec![a]), ("t2".to_string(), Vec::new())]);
+        assert!(body.contains(r#""t1":[{"id":{"S":"a"}}]"#), "{body}");
+        assert!(
+            body.contains(r#""t2":[]"#),
+            "a table with no hits is an empty list: {body}"
+        );
+        assert!(body.contains(r#""UnprocessedKeys":{}"#), "{body}");
+    }
+
+    /// `Segment`/`TotalSegments` decode together and are validated.
+    #[test]
+    fn scan_segment_decodes_and_validates() {
+        let ok = br#"{"TableName":"t","Segment":1,"TotalSegments":4}"#;
+        match decode_request("DynamoDB_20120810.Scan", ok).expect("decodes") {
+            Operation::Scan { segment, .. } => assert_eq!(
+                segment,
+                Some(ScanSegment {
+                    segment: 1,
+                    total: 4
+                })
+            ),
+            other => panic!("expected Scan, got {other:?}"),
+        }
+
+        for body in [
+            // One without the other is a client bug, not a whole-table scan.
+            &br#"{"TableName":"t","Segment":0}"#[..],
+            &br#"{"TableName":"t","TotalSegments":4}"#[..],
+            // Out of range, and a zero split.
+            &br#"{"TableName":"t","Segment":4,"TotalSegments":4}"#[..],
+            &br#"{"TableName":"t","Segment":0,"TotalSegments":0}"#[..],
+            &br#"{"TableName":"t","Segment":-1,"TotalSegments":4}"#[..],
+        ] {
+            assert!(
+                decode_request("DynamoDB_20120810.Scan", body).is_err(),
+                "must reject {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// `UPDATED_OLD`/`UPDATED_NEW` report only what changed, from the side
+    /// that holds the value.
+    #[test]
+    fn updated_return_values_report_only_the_diff() {
+        let mut old = Item::new();
+        old.insert("id".into(), s("k")); // key: never changes
+        old.insert("keep".into(), s("same")); // untouched
+        old.insert("edit".into(), s("before"));
+        old.insert("gone".into(), s("dropped"));
+
+        let mut new = Item::new();
+        new.insert("id".into(), s("k"));
+        new.insert("keep".into(), s("same"));
+        new.insert("edit".into(), s("after"));
+        new.insert("fresh".into(), s("created"));
+
+        let body = update_response(
+            UpdateReturnValues::UpdatedOld,
+            Some(&old),
+            Some(&new),
+            None,
+            None,
+        );
+        assert!(body.contains(r#""edit":{"S":"before"}"#), "changed: {body}");
+        assert!(
+            body.contains(r#""gone":{"S":"dropped"}"#),
+            "removed has an old value: {body}"
+        );
+        assert!(
+            !body.contains("fresh"),
+            "created has no previous value: {body}"
+        );
+        assert!(!body.contains("keep"), "untouched is not reported: {body}");
+        assert!(!body.contains(r#""id""#), "the key never changes: {body}");
+
+        let body = update_response(
+            UpdateReturnValues::UpdatedNew,
+            Some(&old),
+            Some(&new),
+            None,
+            None,
+        );
+        assert!(body.contains(r#""edit":{"S":"after"}"#), "changed: {body}");
+        assert!(
+            body.contains(r#""fresh":{"S":"created"}"#),
+            "created has a new value: {body}"
+        );
+        assert!(!body.contains("gone"), "removed has no new value: {body}");
+        assert!(!body.contains("keep"), "{body}");
+    }
+
+    /// When nothing changed, `Attributes` is omitted rather than sent empty.
+    #[test]
+    fn updated_return_values_omit_attributes_when_nothing_changed() {
+        let mut item = Item::new();
+        item.insert("id".into(), s("k"));
+        for rv in [
+            UpdateReturnValues::UpdatedOld,
+            UpdateReturnValues::UpdatedNew,
+        ] {
+            assert_eq!(
+                update_response(rv, Some(&item), Some(&item), None, None),
+                empty_response(),
+                "an unchanged item reports no Attributes"
+            );
+        }
+    }
+
+    /// Both new values decode.
+    #[test]
+    fn updated_return_values_decode() {
+        for (raw, want) in [
+            ("UPDATED_OLD", UpdateReturnValues::UpdatedOld),
+            ("UPDATED_NEW", UpdateReturnValues::UpdatedNew),
+        ] {
+            let body = format!(
+                r#"{{"TableName":"t","Key":{{"pk":{{"S":"a"}}}},
+                     "UpdateExpression":"SET v = :v","ReturnValues":"{raw}",
+                     "ExpressionAttributeValues":{{":v":{{"S":"x"}}}}}}"#
+            );
+            match decode_request("DynamoDB_20120810.UpdateItem", body.as_bytes()).expect("decodes")
+            {
+                Operation::UpdateItem { return_values, .. } => assert_eq!(return_values, want),
+                other => panic!("expected UpdateItem, got {other:?}"),
+            }
+        }
+    }
+
+    /// The `capacity` field of whichever operation `body` decodes to under
+    /// `target`, so each test reads as the one assertion it is making.
+    fn decoded_capacity(target: &str, body: &[u8]) -> ReturnConsumedCapacity {
+        match decode_request(target, body).expect("decodes") {
+            Operation::PutItem { capacity, .. }
+            | Operation::GetItem { capacity, .. }
+            | Operation::DeleteItem { capacity, .. }
+            | Operation::UpdateItem { capacity, .. } => capacity,
+            other => panic!("no capacity on {other:?}"),
+        }
+    }
+
+    #[test]
+    fn return_consumed_capacity_defaults_to_none_on_every_item_operation() {
+        // Absent is `NONE`: a request that never mentioned capacity must get a
+        // response that never mentions it either.
+        for (target, body) in [
+            (
+                "DynamoDB_20120810.PutItem",
+                &br#"{"TableName":"t","Item":{"id":{"S":"k"}}}"#[..],
+            ),
+            (
+                "DynamoDB_20120810.GetItem",
+                &br#"{"TableName":"t","Key":{"id":{"S":"k"}}}"#[..],
+            ),
+            (
+                "DynamoDB_20120810.DeleteItem",
+                &br#"{"TableName":"t","Key":{"id":{"S":"k"}}}"#[..],
+            ),
+            (
+                "DynamoDB_20120810.UpdateItem",
+                &br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                      "UpdateExpression":"SET a = :v",
+                      "ExpressionAttributeValues":{":v":{"S":"x"}}}"#[..],
+            ),
+        ] {
+            assert_eq!(
+                decoded_capacity(target, body),
+                ReturnConsumedCapacity::None,
+                "{target} should default to NONE"
+            );
+            // An explicit `null` is the same as absent.
+            let explicit_null = String::from_utf8(body.to_vec()).expect("utf8").replacen(
+                '{',
+                r#"{"ReturnConsumedCapacity":null,"#,
+                1,
+            );
+            assert_eq!(
+                decoded_capacity(target, explicit_null.as_bytes()),
+                ReturnConsumedCapacity::None,
+                "{target} should treat an explicit null as NONE"
+            );
+        }
+    }
+
+    #[test]
+    fn return_consumed_capacity_decodes_each_level() {
+        for (text, expected) in [
+            ("NONE", ReturnConsumedCapacity::None),
+            ("TOTAL", ReturnConsumedCapacity::Total),
+            ("INDEXES", ReturnConsumedCapacity::Indexes),
+        ] {
+            let body = format!(
+                r#"{{"TableName":"t","Key":{{"id":{{"S":"k"}}}},
+                     "ReturnConsumedCapacity":"{text}"}}"#
+            );
+            assert_eq!(
+                decoded_capacity("DynamoDB_20120810.GetItem", body.as_bytes()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_return_consumed_capacity_is_rejected_rather_than_ignored() {
+        // Silently downgrading an unrecognised level to `NONE` would drop the
+        // report a client asked for without telling it — the failure mode this
+        // series exists to remove.
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                        "ReturnConsumedCapacity":"SOMETIMES"}"#;
+        let err = decode_request("DynamoDB_20120810.GetItem", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("SOMETIMES"), "{}", err.message);
+        assert!(err.message.contains("INDEXES"), "{}", err.message);
+
+        let wrong_type = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                              "ReturnConsumedCapacity":true}"#;
+        let err = decode_request("DynamoDB_20120810.GetItem", wrong_type).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("must be a string"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_response_carries_consumed_capacity_only_when_one_was_built() {
+        let cc = ConsumedCapacity::table_only("t", 1.0, ReturnConsumedCapacity::Total);
+        // Present even when the body is otherwise empty: a `PutItem` with
+        // `ReturnValues: NONE` still owes the caller its capacity report.
+        let with = write_response(ReturnValues::None, None, Some(&cc), None);
+        let parsed: Value = serde_json::from_str(&with).expect("json");
+        assert_eq!(parsed["ConsumedCapacity"]["TableName"], "t");
+        assert_eq!(parsed["ConsumedCapacity"]["CapacityUnits"], 1.0);
+        assert!(parsed.get("Attributes").is_none());
+
+        assert_eq!(write_response(ReturnValues::None, None, None, None), "{}");
+        assert_eq!(get_item_response(None, None), "{}");
+        assert_eq!(
+            update_response(UpdateReturnValues::None, None, None, None, None),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn return_item_collection_metrics_decodes_and_defaults() {
+        let put = |extra: &str| {
+            let body = format!(r#"{{"TableName":"t","Item":{{"id":{{"S":"k"}}}}{extra}}}"#);
+            match decode_request("DynamoDB_20120810.PutItem", body.as_bytes()) {
+                Ok(Operation::PutItem { metrics, .. }) => Ok(metrics),
+                Ok(other) => panic!("expected PutItem, got {other:?}"),
+                Err(e) => Err(e),
+            }
+        };
+        assert_eq!(put("").unwrap(), ReturnItemCollectionMetrics::None);
+        assert_eq!(
+            put(r#","ReturnItemCollectionMetrics":null"#).unwrap(),
+            ReturnItemCollectionMetrics::None
+        );
+        assert_eq!(
+            put(r#","ReturnItemCollectionMetrics":"NONE""#).unwrap(),
+            ReturnItemCollectionMetrics::None
+        );
+        assert_eq!(
+            put(r#","ReturnItemCollectionMetrics":"SIZE""#).unwrap(),
+            ReturnItemCollectionMetrics::Size
+        );
+
+        // Rejected, not silently downgraded.
+        let err = put(r#","ReturnItemCollectionMetrics":"SOMETIMES""#).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("SOMETIMES"), "{}", err.message);
+        let err = put(r#","ReturnItemCollectionMetrics":7"#).unwrap_err();
+        assert!(err.message.contains("must be a string"), "{}", err.message);
+    }
+
+    #[test]
+    fn only_the_write_operations_carry_item_collection_metrics() {
+        // `GetItem` has no such field and its builder takes no such argument —
+        // a read never touches an item collection. This pins the decode side
+        // of that: the field is simply not part of a `GetItem`.
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                        "ReturnItemCollectionMetrics":"SIZE"}"#;
+        // Accepted and ignored rather than rejected, matching how DynamoDB
+        // treats a field that does not apply to the operation.
+        assert!(matches!(
+            decode_request("DynamoDB_20120810.GetItem", body),
+            Ok(Operation::GetItem { .. })
+        ));
+
+        for target in [
+            "DynamoDB_20120810.PutItem",
+            "DynamoDB_20120810.DeleteItem",
+            "DynamoDB_20120810.UpdateItem",
+        ] {
+            let body = match target {
+                "DynamoDB_20120810.PutItem" => {
+                    r#"{"TableName":"t","Item":{"id":{"S":"k"}},
+                        "ReturnItemCollectionMetrics":"SIZE"}"#
+                }
+                "DynamoDB_20120810.DeleteItem" => {
+                    r#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                        "ReturnItemCollectionMetrics":"SIZE"}"#
+                }
+                _ => {
+                    r#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                        "UpdateExpression":"SET a = :v",
+                        "ExpressionAttributeValues":{":v":{"S":"x"}},
+                        "ReturnItemCollectionMetrics":"SIZE"}"#
+                }
+            };
+            let decoded = decode_request(target, body.as_bytes()).expect("decodes");
+            let metrics = match decoded {
+                Operation::PutItem { metrics, .. }
+                | Operation::DeleteItem { metrics, .. }
+                | Operation::UpdateItem { metrics, .. } => metrics,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(metrics, ReturnItemCollectionMetrics::Size, "{target}");
+        }
+    }
+
+    #[test]
+    fn a_write_response_carries_metrics_beside_everything_else() {
+        let mut item = Item::new();
+        item.insert("pk".to_string(), s("p1"));
+        let cc = ConsumedCapacity::table_only("t", 1.0, ReturnConsumedCapacity::Total);
+        let metrics = ItemCollectionMetrics {
+            key: item.clone(),
+            bytes: Some(1_073_741_824),
+        };
+
+        // All three coexist: the echoed attributes, the capacity report, and
+        // the collection report.
+        let body: Value = serde_json::from_str(&write_response(
+            ReturnValues::AllOld,
+            Some(&item),
+            Some(&cc),
+            Some(&metrics),
+        ))
+        .expect("json");
+        assert_eq!(body["Attributes"]["pk"]["S"], "p1");
+        assert_eq!(body["ConsumedCapacity"]["CapacityUnits"], 1.0);
+        assert_eq!(
+            body["ItemCollectionMetrics"]["ItemCollectionKey"]["pk"]["S"],
+            "p1"
+        );
+        assert_eq!(body["ItemCollectionMetrics"]["SizeEstimateRangeGB"][1], 1.0);
+
+        // And metrics alone, on an otherwise-empty body.
+        let body: Value = serde_json::from_str(&write_response(
+            ReturnValues::None,
+            None,
+            None,
+            Some(&metrics),
+        ))
+        .expect("json");
+        assert!(body.get("Attributes").is_none());
+        assert!(body.get("ConsumedCapacity").is_none());
+        assert!(body.get("ItemCollectionMetrics").is_some());
+
+        // An update carries them the same way.
+        let body: Value = serde_json::from_str(&update_response(
+            UpdateReturnValues::None,
+            None,
+            None,
+            None,
+            Some(&metrics),
+        ))
+        .expect("json");
+        assert!(body.get("ItemCollectionMetrics").is_some());
+    }
+
+    #[test]
+    fn consumed_capacity_rides_alongside_the_bodys_own_fields() {
+        // The capacity report is additive: it must not displace `Item` or
+        // `Attributes`, which is the whole reason these share one serializer.
+        let mut item = Item::new();
+        item.insert("id".to_string(), s("k"));
+        let cc = ConsumedCapacity::table_only("t", 0.5, ReturnConsumedCapacity::Total);
+
+        let body: Value =
+            serde_json::from_str(&get_item_response(Some(&item), Some(&cc))).expect("json");
+        assert_eq!(body["Item"]["id"]["S"], "k");
+        assert_eq!(body["ConsumedCapacity"]["CapacityUnits"], 0.5);
+
+        let body: Value = serde_json::from_str(&write_response(
+            ReturnValues::AllOld,
+            Some(&item),
+            Some(&cc),
+            None,
+        ))
+        .expect("json");
+        assert_eq!(body["Attributes"]["id"]["S"], "k");
+        assert_eq!(body["ConsumedCapacity"]["CapacityUnits"], 0.5);
+
+        let mut new = Item::new();
+        new.insert("id".to_string(), s("k"));
+        new.insert("a".to_string(), s("v"));
+        let body: Value = serde_json::from_str(&update_response(
+            UpdateReturnValues::AllNew,
+            Some(&item),
+            Some(&new),
+            Some(&cc),
+            None,
+        ))
+        .expect("json");
+        assert_eq!(body["Attributes"]["a"]["S"], "v");
+        assert_eq!(body["ConsumedCapacity"]["CapacityUnits"], 0.5);
     }
 }

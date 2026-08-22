@@ -2815,7 +2815,61 @@ debugging anything that feels like it might have happened before.
   narrow-viewport image, and treat ~500px as the narrowest *trustworthy*
   screenshot width. (website DynamoDB-focus pass, 2026-08-21.)
 
+- **Verifying with `cargo test --workspace` does not reproduce this repo's
+  CI, and manufactures failures CI would never see** (2026-08-22, the
+  `ScanIndexForward` rung). CI deliberately splits animusd out:
+  `cargo test --workspace --exclude animusd -- --test-threads=2`, then
+  `cargo test -p animusd --lib --tests -- --test-threads=1`, because that
+  crate's ~66 real-thread multi-node integration tests starve each other at
+  default parallelism. A local `cargo test --workspace` runs exactly the
+  configuration CI was restructured to avoid — every heavyweight cluster
+  test concurrently — so a failure there is not yet evidence about the code.
+  It cost a full investigation of `schema_ddl_on_a_follower_is_relayed_to_the_leader`
+  that passed both in isolation and serially. The investigation was still
+  right to run (the diff touched forwarded request enums, and a missed
+  relay match site is exactly the bimodal per-process flake this log warns
+  about) — but the *first* step should be re-running the way `ci.yml` does,
+  before reading anything into the parallel sweep. Corollary: when a local
+  gate disagrees with CI, check how CI actually invokes it before debugging
+  the code; the invocation is part of the gate.
+
+- **Two disk exhaustions in one session: a debug `--all-targets` build of
+  this workspace is ~24GB, and `cargo clean -p <crate>` is the surgical
+  tool** (2026-08-22). `target/debug/deps` reached 23GB across 94 test
+  binaries over 100MB each (debuginfo=2 × animusd's test-binary count).
+  Symptoms mislead: the failure surfaced as a linker `signal 7 (Bus error)`
+  and `ld terminated`, not an obvious out-of-space error, and once as
+  `failed to write dep-graph.part.bin`. `cargo clean -p animusd -p
+  animus-cp-data -p animus-dynamo` freed 17GB while keeping every
+  dependency build cached (a full `cargo clean` would have forced tokio,
+  serde and the rest to rebuild); deleting `target/debug/incremental`
+  alone freed 5GB more. Prefer targeted `cargo test -p <crate> --test
+  <name>` over full sweeps when disk-constrained — it also happens to
+  match how CI runs.
+
 ### Code patterns
+- **A pagination cursor that echoes back a superset of another cursor's
+  attributes needs an *exact*-match validation, not a "the attributes I
+  need are present" check (2026-08-22, DynamoDB `Query` pagination).**
+  `animusd::dynamo`'s base/GSI/LSI `Query`/`Scan` cursors are all real
+  `Item`s built by `key_item_of`/`gsi_key_item_of`/`lsi_key_item_of` — and a
+  GSI or LSI cursor *always* carries the base table's own key attributes
+  too (real DynamoDB's `LastEvaluatedKey` needs them for uniqueness). That
+  means a base-table cursor's attribute set is a **subset** of every index
+  cursor's set on the same table. A resume-key resolver that only checks
+  "does this `Item` have the attributes I need" (the shape `resolve_key`/
+  `gsi_resume_key`/`lsi_resume_key` already had, since they only ever read
+  the keys they need and ignore the rest) will *silently accept* a GSI or
+  LSI cursor replayed against the base table — it has `pk`/`sk` and then
+  some, and "then some" is invisible to a presence check. The fix is a
+  dedicated exact-set-equality check (`validate_query_cursor_shape`, an
+  `Item`'s key names compared as a `BTreeSet` against the target's expected
+  set) run *before* the lenient resolver, on every pagination path. The
+  general form: whenever cursor/token shapes for related-but-distinct
+  operations nest inside each other (a wider shape strictly containing a
+  narrower one), presence-checking the narrower shape's fields is not
+  enough to reject the wider shape — verify the field *set*, not just that
+  the fields you need happen to be there. (`crates/animusd/src/dynamo.rs`.)
 - **A single-closure injection seam that needs to grow into several
   fallible, parameterized operations should become a small trait, not a
   pile of more closures — but the widening must be audited to stay in
@@ -8182,3 +8236,39 @@ debugging anything that feels like it might have happened before.
   already within a few hundred MB of what one large link step needs, the
   wipe bought too little margin and the very next build can ENOSPC again
   mid-link.
+- **Triaging a `ProdEnv` suite failure: compare its wall-clock against a
+  clean run first — a markedly *shorter* run points at starvation, not at a
+  logic bug.** The instinct is that a struggling run takes longer; the
+  opposite is true here, because these suites are timeout-guarded. A test
+  whose guard trips exits at the guard, while the same test passing runs
+  its full body, so the failing run finishes *sooner*.
+  `dynamo_index_writes` failed once at **57s** against a clean run's
+  **127s**, and the cause was nothing in the diff: it had been launched
+  alongside other `cargo` invocations of my own, and the CPU it lost to
+  them was enough to trip a guard. Six subsequent runs (3 on the branch, 3
+  on its base, run alone) all passed in ~127s.
+  Two rules follow. **Operationally**: run a `ProdEnv` integration sweep
+  *alone* — a concurrent `cargo test`/`clippy` on the same box is enough to
+  manufacture failures that look like real ones. **In triage**: before
+  reaching for the branch-vs-base comparison (which costs ~12 minutes
+  here), check whether the change is even *reachable* from the failing
+  suite — `grep`ping the suite for the new request field took seconds and
+  proved the new code paths were unreachable and the emitted bytes
+  identical, which is a stronger argument than any number of green reruns.
+  Run the comparison to confirm, not to decide.
+- **The `debug = 0` cargo-config fix for this workspace's disk pressure is
+  worth applying *before* the first ENOSPC, not after the fourth.** The
+  entry above describes it as the remedy once you are already wedged; in
+  practice a session that builds `animusd --all-targets` more than a couple
+  of times will get there, because each rebuild of the ~90 integration test
+  binaries re-links the same large dependency set with full debuginfo.
+  Measured in one session: writing `[profile.dev]`/`[profile.test]`
+  `debug = 0`, `incremental = false` to `/root/.cargo/config.toml` and
+  re-running took free space from **3.6 GB to 18 GB** and left the full
+  build passing in 1m21s. Confirm it took by the build summary line —
+  `unoptimized` with no `+ debuginfo`. Nothing is lost that matters here:
+  these are integration tests asserting on HTTP responses, not something
+  anyone attaches a debugger to. The cost of *not* doing it is worse than
+  lost disk — an ENOSPC surfaces as a linker `cc` failure or a garbled
+  compile error, so it reads as a code problem and costs a diagnosis
+  before it costs a cleanup.

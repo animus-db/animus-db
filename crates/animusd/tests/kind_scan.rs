@@ -156,6 +156,7 @@ async fn bare_kind_scan_is_refused() {
         start: Vec::new(),
         end: Some(vec![0xFF]),
         limit: None,
+        reverse: false,
     };
     animusd::write_frame(&mut stream, &request)
         .await

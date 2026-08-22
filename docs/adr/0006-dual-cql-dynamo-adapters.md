@@ -86,6 +86,311 @@ The surface now extends past the original three point ops:
   bytes after the scan. An **index** `Query` still resolves base keys from the
   in-memory GSI/LSI index (the scan covers the base keyspace, not an index's
   alternate ordering) and quorum-reads each.
+  **Audit note (2026-08-22):** `Query` now **paginates** exactly like `Scan`
+  below — `Limit` + `ExclusiveStartKey`/`LastEvaluatedKey`, pushed down so a
+  small page reads roughly `Limit` rows of the queried partition/index
+  sub-range rather than the whole thing, never the whole table. This closes
+  what had been a real fidelity gap (a `Query` used to answer a whole
+  partition in one uncapped shot); it is a fidelity completion of the
+  pagination contract this ADR already specified for `Scan`, not a new
+  design decision. (The "in-memory GSI/LSI index" language above predates
+  ADR 0041, which replaced it with materialized data-plane index rows — see
+  that ADR and `crates/animus-dynamo/CLAUDE.md` for the current index
+  design; unrelated to this pagination note.)
+  **Audit note (2026-08-22, second):** `Query` also now honours a
+  `FilterExpression`. It had been decoded for `Scan` only, so a `Query`
+  carrying one **silently returned unfiltered results** — a wrong-data
+  divergence rather than a missing-feature one. The semantics are `Scan`'s
+  verbatim: the filter runs after the key condition has selected what to
+  evaluate and after `Limit` has capped it, so a filtered-out row still
+  counts toward `ScannedCount`, still consumes a `Limit` slot, and can still
+  be the row `LastEvaluatedKey` points at — hence a page may return fewer
+  items than `Limit`, or none, and still carry a cursor. Still **not**
+  enforced (a permissive divergence, tracked with that group): DynamoDB
+  rejects a `FilterExpression` naming a key attribute of the table or index
+  being queried; we accept it.
+  **Audit note (2026-08-22, fourth):** `Query`/`Scan` now honour `Select`.
+  It had not been decoded at all, so `Select: COUNT` — the "how many match,
+  don't send them" form — **silently returned every item**: both the wrong
+  response shape and an unbounded payload for the one request whose purpose
+  is to avoid one. `COUNT` now suppresses `Items` while changing nothing
+  about what is read: the filter still runs, `Limit` still caps what is
+  examined, and a truncated `COUNT` page still carries a `LastEvaluatedKey`.
+  `Count` is therefore the matches on *this page*, not of the whole query.
+  The other three values describe attribute selection this adapter already
+  performed, and are now **validated** the way DynamoDB validates them
+  rather than silently accepted: `SPECIFIC_ATTRIBUTES` requires a
+  projection, every other value forbids one, `ALL_PROJECTED_ATTRIBUTES`
+  requires an `IndexName`, and an unknown value is rejected.
+  Still **not** enforced (a divergence tracked with the permissive group):
+  DynamoDB rejects `ALL_ATTRIBUTES` against a GSI that does not project
+  every attribute, and serves it on an **LSI** by fetching the missing
+  attributes from the base row; this adapter returns the index's declared
+  projection in both cases (ADR 0041), so such a request quietly yields
+  fewer attributes than AWS would. Closing it means a base-row fetch for
+  the LSI case, which is its own change.
+  **Audit note (2026-08-22, fifth — three silent-wrongness bugs):** the
+  expression parsers shared a naive `split_once('=')` and discarded the
+  attribute name a key condition named. Three consequences, all of which
+  returned plausible wrong answers rather than errors:
+  (1) `price >= :p` was cut into an equality against an attribute literally
+  named `price >`, so a `FilterExpression` matched nothing and a
+  `ConditionExpression` could never hold — and the same cut narrowed a
+  sort-key range `sk <= :v` to an exact-match query, which is the main
+  reason to have a sort key at all;
+  (2) `#alias` was resolved for `ProjectionExpression` but **not** for
+  `FilterExpression`/`ConditionExpression`, so `#p = :v` compared against an
+  attribute named `#p` — always false, and inconsistent within a single
+  request; aliases are mandatory for DynamoDB's reserved words, so this hit
+  ordinary schemas;
+  (3) the key condition's attribute name was dropped, so
+  `KeyConditionExpression: "notthekey = :v"` was served as a partition-key
+  query against whatever value it named.
+  Fixed at the root with one comparator-aware splitter (longest operator
+  first) used by all three parsers, alias resolution in every predicate
+  form, and the key attribute names carried on `Operation::Query` for the
+  `animusd` edge to check against the catalog (decode has none). Operators
+  that cannot yet be represented are now **rejected by name** rather than
+  truncated; the operators themselves arrive with the expression-surface
+  work.
+  **Audit note (2026-08-22, sixth — the expression surface):**
+  `FilterExpression`/`ConditionExpression` supported exactly three forms
+  (`attribute_exists`, `attribute_not_exists`, `a = :v`), so every
+  comparison, range, membership test and function was a
+  `ValidationException`. The surface now covers the comparison operators
+  (`=`, `<>`, `<`, `<=`, `>`, `>=`), `BETWEEN`, `IN`, `begins_with`,
+  `contains`, `attribute_type` and `size`, across `Query`/`Scan` filters and
+  conditional writes alike (one decoder serves both). Boolean composition
+  (`AND`/`OR`/`NOT` with parentheses) is the remaining piece and lands
+  separately.
+  **One decision worth recording:** filter comparisons order numbers
+  **numerically**, deliberately unlike `AttributeValue::key_bytes`, whose
+  lexicographic number order is a documented simplification of *key*
+  ordering. A key's order must agree with how rows are stored; a filter is
+  evaluated in memory over an item and carries no such constraint, so
+  inheriting the simplification would make `price > :p` quietly wrong
+  (9 would outrank 10). The comparison is done on the decimal text rather
+  than through an `f64`, because DynamoDB permits 38 significant digits and
+  a float round-trip would silently collapse exactly the large numeric
+  identifiers people use as keys. Equality is numeric-aware for the same
+  reason: `1.10`, `1.1` and `-0`/`0` are the same number written
+  differently. A missing attribute, and any ordering across incomparable
+  types, is false for every operator — `<>` included, since DynamoDB has no
+  three-valued logic here.
+  **Audit note (2026-08-22, seventh — boolean composition):** the predicate
+  grammar now composes with `AND`/`OR`/`NOT` and parentheses, completing the
+  `FilterExpression`/`ConditionExpression` surface. Precedence is DynamoDB's:
+  `NOT` binds tightest, then `AND`, then `OR`, with parentheses overriding
+  and chains left-associative. Two parser edges are worth knowing because
+  either would return plausible wrong rows rather than erroring: a
+  `BETWEEN`'s own ` AND ` belongs to the term, not the combinator, so the
+  splitter tracks how many `AND`s the `BETWEEN`s at the current depth still
+  owe; and the top-level split skips parenthesised groups, so
+  `(a OR b) AND c` is not cut inside the group while `(a) OR (b)` is still
+  recognised as a disjunction rather than one group. Composition is
+  short-circuiting, which also preserves each leaf's "false when the
+  attribute is absent" under `NOT` — `NOT attribute_exists(a)` agrees with
+  `attribute_not_exists(a)` precisely because the leaf is false rather than
+  unknown.
+  **Audit note (2026-08-22, eighth — `ADD`/`DELETE`, and a write-path
+  constraint):** `UpdateExpression` gains `ADD` and `DELETE` for the **set**
+  types (union and difference). **Numeric `ADD` is deliberately refused**, and
+  the reason is a property of the write path rather than of the arithmetic.
+  `ClientCtx::cp_kind_write_item` retries `kind_write_item_at_leader`, which
+  re-reads the old image and re-applies the actions; and a write that landed
+  can still report a retryable error, since a failed OCC seatbelt is
+  documented as indistinguishable from a fence miss. Every update action
+  before this one was **idempotent**, so re-application converged to the same
+  state and the retry was free. `+1` is not idempotent: measured, ten
+  concurrent increments with two accepted responses left the counter at 431.
+  Set union and difference *are* idempotent, so they are safe on the same
+  path and are pinned by a concurrent test. Supporting numeric `ADD`
+  correctly needs a once-only guarantee on the kind-write path — an
+  idempotency token or an equivalent — which is an ADR 0046/0049 change, not
+  a wire-adapter one. Refusing with an explanatory error is the honest
+  interim: a silently over-counted counter cannot be detected by the client
+  from the response, which makes it worse than a rejection.
+  Noted in passing, and **not** fixed here: a validation error raised at the
+  leader (an `ADD` type mismatch, say) is re-wrapped as `InternalServerError`
+  crossing the forwarding boundary instead of keeping its
+  `ValidationException` code, so it surfaces as a 500 where DynamoDB returns
+  400. That affects every leader-raised validation error, not just this one.
+  **Audit note (2026-08-22, ninth — `BatchGetItem`):** the operation was
+  unsupported (a wire test asserted `UnknownOperationException`). It is now
+  served as **independent point reads**, deliberately not through the
+  quiescent multi-get `TransactGetItems` uses: DynamoDB's `BatchGetItem`
+  offers no cross-item atomicity, so borrowing the transactional path would
+  have bought a guarantee the API does not promise and paid its cost on
+  every call. Projection and `ConsistentRead` are scoped per **table**, not
+  per key, matching the wire shape. A key matching nothing is reported by
+  **omission** from that table's list, unlike `TransactGetItems`'s
+  positional response, which must stay index-aligned and so carries an empty
+  object per miss. `UnprocessedKeys` is always empty: every requested key is
+  read before responding rather than shedding load. The 100-key request cap
+  is not enforced, which belongs with the permissive-divergence group.
+  **Audit note (2026-08-22, tenth — parallel `Scan`):** `Segment`/
+  `TotalSegments` were absent entirely, so a client could not split a
+  full-table scan across workers. They now map onto the **token ring**:
+  every data-plane key leads with an 8-byte big-endian partition token (ADR
+  0022), so segment `i` of `n` owns `[i·2⁶⁴/n, (i+1)·2⁶⁴/n)` — disjoint and
+  jointly covering by construction, which is exactly DynamoDB's contract.
+  The boundary arithmetic is done in `u128` (a single segment would overflow
+  computing 2⁶⁴ in `u64`), and the last segment's upper bound is unbounded
+  rather than 2⁶⁴ so nothing falls off the end of the ring. The same slicing
+  applies to a base-table scan, a GSI scan (its hidden table shares the key
+  layout) and an LSI scan (kind-scoped but still token-led). A cursor is
+  clamped into its segment, so a cursor from one worker cannot walk another
+  worker's rows. Giving `Segment` without `TotalSegments` (or the reverse) is
+  rejected rather than silently scanning the whole table, which would make
+  every worker in a fleet return every item.
+  **Audit note (2026-08-22, eleventh — at-most-once for non-idempotent
+  writes):** `ClientCtx::cp_kind_write_item`'s retry loop re-entered
+  `kind_write_item_at_leader`, which re-reads the old image and re-applies —
+  a fresh read-modify-write, not a replay of the original proposal. It now
+  skips that retry for a **non-idempotent** write
+  (`dynamo::kind_write_is_idempotent`: everything is idempotent except a
+  numeric `ADD`). DynamoDB's guarantee is **at-most-once per request**, not
+  exactly-once — a *client* retrying an `ADD` that applied double-counts
+  there too — so the requirement is only that the service never re-applies on
+  its own, which needs no idempotency token. Measured: ten concurrent
+  increments moved the counter by exactly ten, against 431 before.
+  **Numeric `ADD` nonetheless stays refused,** for a second and now sharper
+  reason: `cp_kind_local` confirms a write by probing that the value it
+  produced is present, and a concurrent update supersedes that value, so the
+  request reports "superseded before its effect appeared ... retry" although
+  it applied — measured at 8 of 10 requests under the same load. Retrying is
+  precisely what double-counts, so the advertised remedy corrupts the
+  counter. Unblocking it means confirming on the **proposal** (did my entry
+  commit and apply?) rather than on the value — which is
+  `docs/engineering-lessons.md`'s existing rule that a proposer must
+  distinguish never-accepted from accepted-unconfirmed, and an ADR 0046/0049
+  change rather than a wire-adapter one. The at-most-once fix stands on its
+  own regardless: it is what stops the *service* over-counting.
+  **Audit note (2026-08-22, twelfth — `UPDATED_OLD`/`UPDATED_NEW`):**
+  `UpdateItem`'s `ReturnValues` had `NONE`/`ALL_OLD`/`ALL_NEW` but not the
+  `UPDATED_*` pair, which reports only the attributes an update actually
+  changed. They are a **diff of the two images**, not a projection of one,
+  and the asymmetry is the point: an attribute the update *created* has no
+  previous value so `UPDATED_OLD` omits it, and one it *removed* has no new
+  value so `UPDATED_NEW` omits it, so each is reported by exactly one of the
+  two. Key attributes fall out naturally, since an update never changes them
+  and so they never differ. An update that changes nothing omits
+  `Attributes` entirely rather than returning an empty map, as DynamoDB
+  does. `update_response` already received both images, so this needed no
+  new plumbing on the write path.
+  **Audit note (2026-08-22, thirteenth — numeric `ADD` unblocked):**
+  the refusal recorded in the eighth and eleventh notes is lifted. Two
+  write-path fixes had to land first, and neither was a wire-adapter
+  concern. `ClientCtx::cp_kind_write_item` no longer re-applies a
+  non-idempotent write on its own, so **at-most-once per request** holds —
+  DynamoDB's own guarantee, under which a *client* retry of an `ADD` that
+  applied double-counts there too. And a `KindBatch` now records what it did
+  at apply time, so a write that applied is acknowledged even when a
+  concurrent update immediately overwrites it; before that, confirmation
+  compared the written value back and told 8 of 10 concurrent increments to
+  retry although they had applied, which is precisely what double-counts.
+  Measured with both in place: ten concurrent increments are all accepted
+  and leave the counter at exactly ten, against 431 originally. The exact
+  decimal arithmetic (38 significant digits, no `f64` round-trip) that
+  shipped unused with the eighth note is now on the wire.
+  **Audit note (2026-08-22, fourteenth — `ReturnConsumedCapacity`):** every
+  data-plane response can now carry a `ConsumedCapacity` report
+  (`NONE`/`TOTAL`/`INDEXES`), on `GetItem`/`PutItem`/`DeleteItem`/
+  `UpdateItem`; the collection and transactional operations follow
+  separately. The AWS SDKs read this field off every response and a great
+  deal of client telemetry is written against it, so its absence was a
+  fidelity gap even though AnimusDB has no provisioned throughput.
+
+  The decision worth recording is **what the number means here.** A capacity
+  unit is not a measurement of bytes we moved: DynamoDB defines it as a
+  documented arithmetic function of the item's *logical* size, which is why
+  the same item costs the same units whatever the storage engine did. So
+  `animus_dynamo::capacity` computes the published formula over the decoded
+  item rather than instrumenting the write path — that is both what makes
+  the numbers agree with DynamoDB's and what makes them unit-testable as
+  pure functions. What we deliberately do **not** do is invent a
+  *provisioned* figure to sit beside them: this reports what a request cost
+  and never implies a limit, because there is no limit and no throttling
+  behind it.
+
+  Number sizing normalizes the coefficient — sign, decimal point, leading
+  **and trailing** zeros are presentation and are not charged for — so
+  `100`, `100.0` and `1.0E+2` cost the same, exactly as they compare equal
+  under the sixth note's comparator. Counting characters instead would have
+  priced `100.0` below `100`: a quietly-wrong answer of the same family as
+  the fifth note's bugs, and one a client can never detect from its own
+  response.
+
+  Each index is charged on **its own row**, not on the base item, so a
+  `KEYS_ONLY` GSI beside a 1.5 KB item costs 1 unit while an `ALL` LSI costs
+  2. The per-index gates are the *same* conditions the write path uses to
+  decide whether the row exists at all (the LSI's alternate-sort presence
+  check, the drain's hash/sort presence check, and `Deleting` excluded but
+  `Creating` charged) — reporting capacity for a row that was never written
+  would be unverifiable from the client side, so the gates are shared rather
+  than restated.
+
+  One behavioural consequence: asking for capacity on a `DeleteItem` opts
+  out of the ADR 0049 fast arm, joining `ConditionExpression` and `ALL_OLD`
+  as reasons that write is evaluated at the leader. A delete is charged on
+  the item it *removed*, including the index rows that went with it, and the
+  fast arm reads none of that; reporting the one-unit floor instead would
+  understate a large indexed item's delete by an arbitrary amount.
+  `PutItem` keeps its fast arm — the written image is already in hand at the
+  edge — and the asymmetry is exactly that difference.
+
+  Two smaller alignments with DynamoDB: an eventually-consistent read is
+  billed at half a unit (our base read is linearizable either way per ADR
+  0041 §5, but a client that asked for the cheap read is told it got the
+  cheap read), and an `UpdateItem` is charged on the **larger** of the
+  before/after images, so shrinking an item earns no discount.
+  **Audit note (2026-08-22, fifteenth — `ReturnItemCollectionMetrics`):**
+  `PutItem`/`UpdateItem`/`DeleteItem` now answer `SIZE` with an
+  `ItemCollectionMetrics`, on tables that have an LSI. The gate is
+  DynamoDB's and is not arbitrary: an item collection — every row sharing
+  one partition-key value across the base table and its LSIs — is a bounded,
+  meaningful thing precisely *because* an LSI shares the base partition.
+  Without one it is an incidental grouping, so a table with only a GSI
+  reports nothing (tested against a GSI-only table, which takes the
+  identical leader-evaluated write path and so isolates the LSI rule rather
+  than an indexed/unindexed difference).
+
+  `ItemCollectionKey` is exact. `SizeEstimateRangeGB` is `[0, bound]`, and
+  the honest reading of that shape is the point: DynamoDB's field is a
+  *range* bracketing an estimate, so a zero lower end and a real upper bound
+  is a weaker claim than DynamoDB's and a **true** one, where a fabricated
+  midpoint would be neither.
+
+  The bound is the hosting tablet's `KIND_BASE + KIND_LSI` byte total. Both
+  scopes are keyed `token(pk) || …` (ADR 0022), so a collection hashes to one
+  token and lives entirely inside one tablet — making the tablet's size a
+  true upper bound, never an under-estimate, which is the safe direction for
+  a growth warning. It is loose when the tablet holds many partitions, and
+  the useful property is that **it tightens exactly as the situation it warns
+  about worsens**: as one collection comes to dominate its tablet the two
+  converge. An exact figure would cost `O(collection)` per write, which a
+  write path may not pay for a diagnostic.
+
+  This is not only DynamoDB parity. DynamoDB caps an item collection at
+  10 GB when a table has an LSI; AnimusDB has no cap but the same shape —
+  tablets split on **bytes** (ADR 0034), splitting is by **token range**, and
+  one partition key is one token, so a collection that grows without bound is
+  **unsplittable** and its tablet stays large forever. The number warns about
+  that, arriving at DynamoDB's warning from the other direction.
+
+  Mechanically this needed a data-plane change, since only the node hosting
+  the tablet can price it: `KindWriteOutcome::Ok` and
+  `ClientResponse::KindWriteOk` now carry `collection_bytes`, computed at the
+  leader and returned across the forwarding hop (`#[serde(default)]`, so an
+  older peer yields no estimate rather than a wrong one). That this is
+  *available* is not luck — a table with an LSI has a non-empty index list, so
+  `table_change_records_carry_images` is true, so its writes never take the
+  ADR 0049 fast arm and always evaluate at the leader. The two conditions
+  coincide exactly. A forwarding hop that dropped the field would be a
+  bimodal per-process failure of the kind the engineering lessons warn about,
+  so the regression test writes the same collection through all three nodes
+  and was **mutation-checked**: dropping `collection_bytes` on the hop turns
+  four of the five tests red.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator

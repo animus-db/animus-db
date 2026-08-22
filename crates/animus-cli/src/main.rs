@@ -654,8 +654,17 @@ fn print_response(response: &ClientResponse) {
         // `BatchWriteItem` handlers) and by tests driving the client
         // protocol directly — not requested by any CLI subcommand of its
         // own, mirroring `JoinInfo`/`MetadataDelta` above.
-        ClientResponse::KindWriteOk { old, new } => {
+        ClientResponse::KindWriteOk {
+            old,
+            new,
+            collection_bytes,
+        } => {
             println!("kind write ok: old={old:?} new={new:?}");
+            // The item-collection size bound the leader priced (ADR 0006's
+            // `ItemCollectionMetrics`), when the reply carried one.
+            if let Some(bytes) = collection_bytes {
+                println!("collection bytes (upper bound): {bytes}");
+            }
         }
         ClientResponse::ConditionFailed => println!("condition failed"),
         // Join discovery (ADR 0032 PR2): consumed programmatically by
