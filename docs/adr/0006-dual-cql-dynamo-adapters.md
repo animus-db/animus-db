@@ -192,6 +192,29 @@ The surface now extends past the original three point ops:
   attribute is absent" under `NOT` — `NOT attribute_exists(a)` agrees with
   `attribute_not_exists(a)` precisely because the leaf is false rather than
   unknown.
+  **Audit note (2026-08-22, eighth — `ADD`/`DELETE`, and a write-path
+  constraint):** `UpdateExpression` gains `ADD` and `DELETE` for the **set**
+  types (union and difference). **Numeric `ADD` is deliberately refused**, and
+  the reason is a property of the write path rather than of the arithmetic.
+  `ClientCtx::cp_kind_write_item` retries `kind_write_item_at_leader`, which
+  re-reads the old image and re-applies the actions; and a write that landed
+  can still report a retryable error, since a failed OCC seatbelt is
+  documented as indistinguishable from a fence miss. Every update action
+  before this one was **idempotent**, so re-application converged to the same
+  state and the retry was free. `+1` is not idempotent: measured, ten
+  concurrent increments with two accepted responses left the counter at 431.
+  Set union and difference *are* idempotent, so they are safe on the same
+  path and are pinned by a concurrent test. Supporting numeric `ADD`
+  correctly needs a once-only guarantee on the kind-write path — an
+  idempotency token or an equivalent — which is an ADR 0046/0049 change, not
+  a wire-adapter one. Refusing with an explanatory error is the honest
+  interim: a silently over-counted counter cannot be detected by the client
+  from the response, which makes it worse than a rejection.
+  Noted in passing, and **not** fixed here: a validation error raised at the
+  leader (an `ADD` type mismatch, say) is re-wrapped as `InternalServerError`
+  crossing the forwarding boundary instead of keeping its
+  `ValidationException` code, so it surfaces as a 500 where DynamoDB returns
+  400. That affects every leader-raised validation error, not just this one.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator

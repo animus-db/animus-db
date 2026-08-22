@@ -191,6 +191,131 @@ fn values_equal(a: &AttributeValue, b: &AttributeValue) -> bool {
     }
 }
 
+/// Add two DynamoDB numbers given as text, exactly.
+///
+/// `ADD` is how DynamoDB increments a counter, so this has to be exact for the
+/// same reason [`compare_numeric`] does: 38 significant digits do not survive
+/// an `f64`, and a counter that silently loses its low digits at scale is
+/// worse than one that refuses to move. The arithmetic is done on the decimal
+/// digits — align the fractions, then add or subtract magnitudes according to
+/// the signs.
+///
+/// `None` if either side is not a number.
+#[must_use]
+pub(crate) fn add_numeric(x: &str, y: &str) -> Option<String> {
+    let (xn, xi, xf) = decimal_parts(x)?;
+    let (yn, yi, yf) = decimal_parts(y)?;
+
+    // Align the fractional digits so both sides are plain integers scaled by
+    // the same power of ten.
+    let scale = xf.len().max(yf.len());
+    let widen = |i: &str, f: &str| format!("{i}{f:0<scale$}");
+    let xd = widen(&xi, &xf);
+    let yd = widen(&yi, &yf);
+
+    let (neg, mut digits) = if xn == yn {
+        (xn, add_digits(&xd, &yd))
+    } else {
+        match cmp_digits(&xd, &yd) {
+            std::cmp::Ordering::Equal => (false, "0".to_string()),
+            std::cmp::Ordering::Greater => (xn, sub_digits(&xd, &yd)),
+            std::cmp::Ordering::Less => (yn, sub_digits(&yd, &xd)),
+        }
+    };
+
+    // Re-insert the decimal point `scale` digits from the right.
+    if digits.len() <= scale {
+        digits = format!("{:0>width$}", digits, width = scale + 1);
+    }
+    let split = digits.len() - scale;
+    let (int, frac) = digits.split_at(split);
+    let int = int.trim_start_matches('0');
+    let frac = frac.trim_end_matches('0');
+    let int = if int.is_empty() { "0" } else { int };
+    let sign = if neg && !(int == "0" && frac.is_empty()) {
+        "-"
+    } else {
+        ""
+    };
+    Some(if frac.is_empty() {
+        format!("{sign}{int}")
+    } else {
+        format!("{sign}{int}.{frac}")
+    })
+}
+
+/// `(negative, integer digits, fractional digits)` for a decimal string.
+#[must_use]
+fn decimal_parts(v: &str) -> Option<(bool, String, String)> {
+    let v = v.trim();
+    let (neg, rest) = match v.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, v.strip_prefix('+').unwrap_or(v)),
+    };
+    let (int, frac) = rest.split_once('.').unwrap_or((rest, ""));
+    if int.is_empty() && frac.is_empty() {
+        return None;
+    }
+    if !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((neg, int.to_owned(), frac.to_owned()))
+}
+
+/// Compare two equal-scale digit strings by magnitude.
+#[must_use]
+fn cmp_digits(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a, b) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// Schoolbook addition over digit strings.
+#[must_use]
+fn add_digits(a: &str, b: &str) -> String {
+    let (mut a, mut b) = (a.bytes().rev(), b.bytes().rev());
+    let mut out = Vec::new();
+    let mut carry = 0u8;
+    loop {
+        let (x, y) = (a.next(), b.next());
+        if x.is_none() && y.is_none() && carry == 0 {
+            break;
+        }
+        let sum = (x.map_or(0, |d| d - b'0')) + (y.map_or(0, |d| d - b'0')) + carry;
+        out.push(b'0' + sum % 10);
+        carry = sum / 10;
+    }
+    out.reverse();
+    String::from_utf8(out).expect("digits are ASCII")
+}
+
+/// Schoolbook subtraction, `a - b`, where `a >= b` by magnitude.
+#[must_use]
+fn sub_digits(a: &str, b: &str) -> String {
+    let (mut a, mut b) = (a.bytes().rev(), b.bytes().rev());
+    let mut out = Vec::new();
+    let mut borrow = 0i8;
+    loop {
+        let (x, y) = (a.next(), b.next());
+        if x.is_none() && y.is_none() {
+            break;
+        }
+        let mut d = i8::try_from(x.map_or(0, |d| d - b'0')).expect("digit")
+            - i8::try_from(y.map_or(0, |d| d - b'0')).expect("digit")
+            - borrow;
+        if d < 0 {
+            d += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out.push(b'0' + u8::try_from(d).expect("digit"));
+    }
+    out.reverse();
+    let s = String::from_utf8(out).expect("digits are ASCII");
+    let t = s.trim_start_matches('0');
+    if t.is_empty() { "0".into() } else { t.into() }
+}
+
 /// The `attribute_type` type codes, as DynamoDB spells them on the wire.
 #[must_use]
 fn type_code(v: &AttributeValue) -> &'static str {
@@ -735,5 +860,31 @@ mod tests {
              Same leaves, different tree, different answer: this is what \
              precedence has to get right."
         );
+    }
+
+    /// `ADD` increments counters, so the arithmetic must be exact — an `f64`
+    /// round-trip loses the low digits of exactly the large identifiers
+    /// people count with.
+    #[test]
+    fn decimal_addition_is_exact() {
+        let add = |a: &str, b: &str| add_numeric(a, b).expect("numbers");
+        assert_eq!(add("1", "1"), "2");
+        assert_eq!(add("0", "0"), "0");
+        assert_eq!(add("9", "1"), "10", "carry");
+        assert_eq!(add("99", "1"), "100", "carry chain");
+        assert_eq!(add("1.5", "2.25"), "3.75", "fraction alignment");
+        assert_eq!(add("0.1", "0.2"), "0.3", "no binary-float artefact");
+        assert_eq!(add("5", "-3"), "2", "mixed signs");
+        assert_eq!(add("3", "-5"), "-2");
+        assert_eq!(add("-3", "-5"), "-8");
+        assert_eq!(add("5", "-5"), "0", "and never -0");
+        assert_eq!(add("1.10", "0.90"), "2", "trailing zeros normalise away");
+        assert_eq!(
+            add("99999999999999999999999999999999999999", "1"),
+            "100000000000000000000000000000000000000",
+            "38 digits carry exactly — f64 would round this"
+        );
+        assert_eq!(add("-0", "0"), "0");
+        assert!(add_numeric("abc", "1").is_none());
     }
 }
