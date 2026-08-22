@@ -481,8 +481,16 @@ pub enum Operation {
         table: String,
         /// The secondary index to query, if any (else the base table).
         index: Option<String>,
+        /// The partition/index-key **attribute name** the request named, with
+        /// any `#alias` resolved. Carried so the edge can reject a key
+        /// condition naming something that is not the queried key; decode
+        /// itself has no catalog to check against.
+        partition_attr: String,
         /// The partition/index-key value (equality).
         partition_value: AttributeValue,
+        /// The sort-key attribute name the request named, if it had a sort
+        /// clause — carried for the same reason as `partition_attr`.
+        sort_attr: Option<String>,
         /// Optional sort-key narrowing.
         sort_condition: Option<SortKeyCondition>,
         /// Max items to examine this page (`None` = all remaining).
@@ -1650,14 +1658,22 @@ fn decode_predicate(
     };
     let expr = expr.trim();
     let cond = if let Some(inner) = func_arg(expr, "attribute_not_exists") {
-        ConditionExpression::AttributeNotExists(inner.to_owned())
+        ConditionExpression::AttributeNotExists(resolve_attr_name(obj, inner.trim())?)
     } else if let Some(inner) = func_arg(expr, "attribute_exists") {
-        ConditionExpression::AttributeExists(inner.to_owned())
-    } else if let Some((lhs, rhs)) = expr.split_once('=') {
-        let attr = lhs.trim();
-        let rhs = rhs.trim();
-        let value = resolve_placeholder(obj, rhs)?;
-        ConditionExpression::Equals(attr.to_owned(), value)
+        ConditionExpression::AttributeExists(resolve_attr_name(obj, inner.trim())?)
+    } else if let Some((lhs, op, rhs)) = split_comparator(expr) {
+        // Only equality is representable today; every other comparison is
+        // rejected by name rather than mis-parsed into an equality that can
+        // never hold (see `split_comparator`).
+        if op != "=" {
+            return Err(WireError::validation(format!(
+                "unsupported operator `{op}` in {field} `{expr}` \
+                 (supported: a = :v, attribute_exists(a), attribute_not_exists(a))"
+            )));
+        }
+        let attr = resolve_attr_name(obj, lhs.trim())?;
+        let value = resolve_placeholder(obj, rhs.trim())?;
+        ConditionExpression::Equals(attr, value)
     } else {
         return Err(WireError::validation(format!(
             "unsupported {field} `{expr}` (supported: \
@@ -1712,10 +1728,20 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         Some((a, b)) => (a.trim(), Some(b.trim())),
         None => (expr.trim(), None),
     };
-    // Partition: `<attr> = :placeholder`.
-    let (_pk_attr, pk_placeholder) = pk_clause
-        .split_once('=')
+    // Partition: `<attr> = :placeholder`. The attribute **name** is carried
+    // (not discarded) so the `animusd` edge can check it really is the
+    // queried table's or index's partition key — decode has no catalog. A
+    // dropped name meant `KeyConditionExpression: "notthekey = :v"` was
+    // silently served as a partition-key query against whatever value it
+    // named, which DynamoDB rejects.
+    let (pk_attr, pk_op, pk_placeholder) = split_comparator(pk_clause)
         .ok_or_else(|| WireError::validation("partition key condition must be `pk = :v`"))?;
+    if pk_op != "=" {
+        return Err(WireError::validation(format!(
+            "partition key condition must be an equality, got `{pk_op}` in `{pk_clause}`"
+        )));
+    }
+    let partition_attr = resolve_attr_name(obj, pk_attr.trim())?;
     let partition_value = resolve_placeholder(obj, pk_placeholder.trim())?;
 
     let index = obj
@@ -1723,9 +1749,12 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         .and_then(Value::as_str)
         .map(str::to_owned);
 
-    let sort_condition = match sort_clause {
-        None => None,
-        Some(clause) => Some(decode_sort_condition(obj, clause)?),
+    let (sort_attr, sort_condition) = match sort_clause {
+        None => (None, None),
+        Some(clause) => {
+            let (attr, cond) = decode_sort_condition(obj, clause)?;
+            (Some(attr), Some(cond))
+        }
     };
     let limit = decode_limit(obj)?;
     let exclusive_start_key = decode_exclusive_start_key(obj)?;
@@ -1752,7 +1781,9 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     Ok(Operation::Query {
         table,
         index,
+        partition_attr,
         partition_value,
+        sort_attr,
         sort_condition,
         limit,
         exclusive_start_key,
@@ -1857,30 +1888,78 @@ fn decode_list_tables(obj: &Map<String, Value>) -> Result<Operation, WireError> 
 fn decode_sort_condition(
     obj: &Map<String, Value>,
     clause: &str,
-) -> Result<SortKeyCondition, WireError> {
+) -> Result<(String, SortKeyCondition), WireError> {
     let clause = clause.trim();
     if let Some(inner) = func_arg(clause, "begins_with") {
         // begins_with(<sk>, :p)
-        let (_attr, ph) = inner.split_once(',').ok_or_else(|| {
+        let (attr, ph) = inner.split_once(',').ok_or_else(|| {
             WireError::validation("begins_with takes two arguments: begins_with(sk, :p)")
         })?;
+        let attr = resolve_attr_name(obj, attr.trim())?;
         let value = resolve_placeholder(obj, ph.trim())?;
-        return Ok(SortKeyCondition::BeginsWith(value));
+        return Ok((attr, SortKeyCondition::BeginsWith(value)));
     }
-    if let Some((_attr, rest)) = split_once_ci(clause, " BETWEEN ") {
+    if let Some((attr, rest)) = split_once_ci(clause, " BETWEEN ") {
         let (lo, hi) = split_once_ci(rest, " AND ")
             .ok_or_else(|| WireError::validation("BETWEEN takes `:lo AND :hi`"))?;
+        let attr = resolve_attr_name(obj, attr.trim())?;
         let lo = resolve_placeholder(obj, lo.trim())?;
         let hi = resolve_placeholder(obj, hi.trim())?;
-        return Ok(SortKeyCondition::Between(lo, hi));
+        return Ok((attr, SortKeyCondition::Between(lo, hi)));
     }
-    if let Some((_attr, ph)) = clause.split_once('=') {
-        let value = resolve_placeholder(obj, ph.trim())?;
-        return Ok(SortKeyCondition::Equals(value));
+    if let Some((lhs, op, rhs)) = split_comparator(clause) {
+        // As in `decode_predicate`: reject a comparison we cannot represent
+        // rather than truncating it into an equality. `sk >= :v` silently
+        // becoming `sk = :v` narrows a range query to exact matches.
+        if op != "=" {
+            return Err(WireError::validation(format!(
+                "unsupported sort-key operator `{op}` in `{clause}` \
+                 (supported: =, BETWEEN, begins_with)"
+            )));
+        }
+        let attr = resolve_attr_name(obj, lhs.trim())?;
+        let value = resolve_placeholder(obj, rhs.trim())?;
+        return Ok((attr, SortKeyCondition::Equals(value)));
     }
     Err(WireError::validation(format!(
         "unsupported sort-key condition `{clause}` (supported: =, BETWEEN, begins_with)"
     )))
+}
+
+/// Split `expr` on its **comparison operator**, longest match first, returning
+/// `(lhs, op, rhs)`.
+///
+/// The longest-first order is the whole point. A naive `split_once('=')` — what
+/// three parsers here used to do — cuts `price >= :p` into `("price >", " :p")`
+/// and yields an equality against an attribute literally named `price >`, which
+/// no item has. That is silent: the caller gets zero matches (or, on a
+/// conditional write, a condition that can never hold) instead of an error. The
+/// same cut turns a sort-key range `sk <= :v` into an equality, quietly
+/// narrowing a range query to exact matches.
+///
+/// `<>` must precede `<`, and `<=`/`>=` must precede `=`, or the same
+/// truncation reappears one operator along.
+fn split_comparator(expr: &str) -> Option<(&str, &str, &str)> {
+    // Longest first: a prefix of a longer operator must never win.
+    const OPS: [&str; 6] = ["<>", "<=", ">=", "=", "<", ">"];
+    let mut best: Option<(usize, &str)> = None;
+    for op in OPS {
+        if let Some(at) = expr.find(op) {
+            // Earliest position wins; on a tie the longer operator wins, which
+            // the OPS ordering already guarantees since it is scanned first.
+            let better = match best {
+                None => true,
+                Some((at_best, op_best)) => {
+                    at < at_best || (at == at_best && op.len() > op_best.len())
+                }
+            };
+            if better {
+                best = Some((at, op));
+            }
+        }
+    }
+    let (at, op) = best?;
+    Some((&expr[..at], op, &expr[at + op.len()..]))
 }
 
 /// Case-insensitive `split_once` on a `needle` (used for ` AND `/` BETWEEN `,
@@ -3189,7 +3268,9 @@ mod tests {
             Operation::Query {
                 table,
                 index,
+                partition_attr,
                 partition_value,
+                sort_attr,
                 sort_condition,
                 limit,
                 exclusive_start_key,
@@ -3208,7 +3289,9 @@ mod tests {
                 );
                 assert_eq!(table, "t");
                 assert_eq!(index, None);
+                assert_eq!(partition_attr, "pk", "the key name is carried, not dropped");
                 assert_eq!(partition_value, s("part"));
+                assert_eq!(sort_attr, None);
                 assert_eq!(sort_condition, None);
                 assert_eq!(limit, None, "no Limit in the body");
                 assert_eq!(
@@ -4335,5 +4418,139 @@ mod tests {
             counted.contains("\"LastEvaluatedKey\""),
             "a truncated COUNT page still paginates: {counted}"
         );
+    }
+
+    /// Regression: `>=` and `<=` were cut by a naive `split_once('=')` into an
+    /// equality against an attribute named `price >`, which no item has — so a
+    /// filter silently matched nothing and a conditional write could never
+    /// hold. They must be rejected by name until the operators are supported.
+    #[test]
+    fn comparison_operators_are_rejected_not_truncated() {
+        for op in [">=", "<=", ">", "<", "<>"] {
+            let body = format!(
+                r#"{{"TableName":"t","FilterExpression":"price {op} :p",
+                     "ExpressionAttributeValues":{{":p":{{"N":"5"}}}}}}"#
+            );
+            let err = decode_request("DynamoDB_20120810.Scan", body.as_bytes())
+                .expect_err(&format!("`{op}` must be rejected, never truncated"));
+            assert_eq!(err.code, "ValidationException", "for `{op}`");
+        }
+        // The supported operator still works, and keeps its whole attribute name.
+        match decode_request(
+            "DynamoDB_20120810.Scan",
+            br#"{"TableName":"t","FilterExpression":"price = :p",
+                 "ExpressionAttributeValues":{":p":{"N":"5"}}}"#,
+        )
+        .expect("equality decodes")
+        {
+            Operation::Scan { filter, .. } => assert_eq!(
+                filter,
+                Some(ConditionExpression::Equals(
+                    "price".into(),
+                    AttributeValue::N("5".into())
+                )),
+                "the attribute name must not be truncated"
+            ),
+            other => panic!("expected Scan, got {other:?}"),
+        }
+    }
+
+    /// Regression: `#alias` was resolved in `ProjectionExpression` but not in
+    /// `FilterExpression`/`ConditionExpression`, so `#p = :v` became an
+    /// equality against an attribute literally named `#p` — always false, and
+    /// silently so. Aliases are mandatory for DynamoDB's reserved words, so
+    /// this hit ordinary schemas.
+    #[test]
+    fn expression_attribute_names_resolve_in_predicates() {
+        let body = r##"{"TableName":"t","FilterExpression":"#p = :v",
+            "ExpressionAttributeNames":{"#p":"price"},
+            "ExpressionAttributeValues":{":v":{"N":"5"}}}"##;
+        match decode_request("DynamoDB_20120810.Scan", body.as_bytes()).expect("decodes") {
+            Operation::Scan { filter, .. } => assert_eq!(
+                filter,
+                Some(ConditionExpression::Equals(
+                    "price".into(),
+                    AttributeValue::N("5".into())
+                )),
+                "the alias must resolve to the real attribute name"
+            ),
+            other => panic!("expected Scan, got {other:?}"),
+        }
+
+        let exists = r##"{"TableName":"t","FilterExpression":"attribute_exists(#p)",
+            "ExpressionAttributeNames":{"#p":"price"}}"##;
+        match decode_request("DynamoDB_20120810.Scan", exists.as_bytes()).expect("decodes") {
+            Operation::Scan { filter, .. } => assert_eq!(
+                filter,
+                Some(ConditionExpression::AttributeExists("price".into())),
+                "aliases resolve inside the function forms too"
+            ),
+            other => panic!("expected Scan, got {other:?}"),
+        }
+    }
+
+    /// Regression: the key condition's attribute name was discarded, so the
+    /// edge could not tell `pk = :v` from `notthekey = :v`. It is now carried
+    /// (alias-resolved) for the edge to check against the catalog.
+    #[test]
+    fn key_condition_carries_its_attribute_names() {
+        let body = r##"{"TableName":"t",
+            "KeyConditionExpression":"#k = :p AND #s = :s",
+            "ExpressionAttributeNames":{"#k":"pk","#s":"sk"},
+            "ExpressionAttributeValues":{":p":{"S":"a"},":s":{"S":"b"}}}"##;
+        match decode_request("DynamoDB_20120810.Query", body.as_bytes()).expect("decodes") {
+            Operation::Query {
+                partition_attr,
+                sort_attr,
+                ..
+            } => {
+                assert_eq!(partition_attr, "pk", "alias-resolved partition key name");
+                assert_eq!(sort_attr.as_deref(), Some("sk"), "and the sort key name");
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    /// Regression: a sort-key **range** — the main reason to have a sort key —
+    /// was truncated into an equality, silently narrowing the result set.
+    #[test]
+    fn sort_key_ranges_are_rejected_not_narrowed_to_equality() {
+        for op in [">=", "<=", ">", "<"] {
+            let body = format!(
+                r#"{{"TableName":"t","KeyConditionExpression":"pk = :p AND sk {op} :s",
+                     "ExpressionAttributeValues":{{":p":{{"S":"a"}},":s":{{"S":"b"}}}}}}"#
+            );
+            let err = decode_request("DynamoDB_20120810.Query", body.as_bytes())
+                .expect_err(&format!("sort-key `{op}` must not become an equality"));
+            assert_eq!(err.code, "ValidationException", "for `{op}`");
+        }
+        // BETWEEN and begins_with still work, and carry the sort attribute name.
+        let between = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p AND sk BETWEEN :lo AND :hi",
+            "ExpressionAttributeValues":{":p":{"S":"a"},":lo":{"S":"b"},":hi":{"S":"c"}}}"#;
+        match decode_request("DynamoDB_20120810.Query", between).expect("decodes") {
+            Operation::Query {
+                sort_attr,
+                sort_condition,
+                ..
+            } => {
+                assert_eq!(sort_attr.as_deref(), Some("sk"));
+                assert!(matches!(
+                    sort_condition,
+                    Some(SortKeyCondition::Between(..))
+                ));
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    /// A partition key condition must be an equality; `pk >= :v` is rejected
+    /// rather than silently accepted as one.
+    #[test]
+    fn partition_key_condition_must_be_an_equality() {
+        let body = br#"{"TableName":"t","KeyConditionExpression":"pk >= :p",
+             "ExpressionAttributeValues":{":p":{"S":"a"}}}"#;
+        let err = decode_request("DynamoDB_20120810.Query", body).expect_err("must be rejected");
+        assert_eq!(err.code, "ValidationException");
     }
 }

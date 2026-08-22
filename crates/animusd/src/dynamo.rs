@@ -534,7 +534,9 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
         Operation::Query {
             table,
             index,
+            partition_attr,
             partition_value,
+            sort_attr,
             sort_condition,
             limit,
             exclusive_start_key,
@@ -549,7 +551,9 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 meta,
                 &table,
                 index.as_deref(),
+                &partition_attr,
                 &partition_value,
+                sort_attr.as_deref(),
                 sort_condition.as_ref(),
                 limit,
                 exclusive_start_key,
@@ -2016,7 +2020,9 @@ async fn run_query(
     meta: &Metadata,
     table: &str,
     index: Option<&str>,
+    partition_attr: &str,
     partition_value: &AttributeValue,
+    sort_attr: Option<&str>,
     sort_condition: Option<&SortKeyCondition>,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
@@ -2037,7 +2043,9 @@ async fn run_query(
                 meta,
                 table,
                 index,
+                partition_attr,
                 partition_value,
+                sort_attr,
                 sort_condition,
                 limit,
                 exclusive_start_key,
@@ -2050,6 +2058,13 @@ async fn run_query(
             .await
         }
         None => {
+            let base = schema_for(meta, table);
+            validate_key_condition_names(
+                &base.partition_key,
+                base.sort_key.as_deref(),
+                partition_attr,
+                sort_attr,
+            )?;
             run_base_query(
                 ctx,
                 meta,
@@ -2103,6 +2118,47 @@ fn lsi_key_names(base: &TableSchema, idx: &IndexDef) -> BTreeSet<String> {
         names.insert(sort.clone());
     }
     names
+}
+
+/// Reject a `KeyConditionExpression` that names attributes which are not the
+/// queried table's or index's key — a `ValidationException`, as DynamoDB
+/// returns.
+///
+/// The wire decoder cannot do this: it has no catalog. Before the name was
+/// carried at all it was simply dropped, so `KeyConditionExpression:
+/// "notthekey = :v"` was served as a partition-key query against whatever
+/// value it named — returning a real partition's items for a query the
+/// caller never wrote.
+fn validate_key_condition_names(
+    expected_partition: &str,
+    expected_sort: Option<&str>,
+    partition_attr: &str,
+    sort_attr: Option<&str>,
+) -> Result<(), WireError> {
+    if partition_attr != expected_partition {
+        return Err(WireError::validation(format!(
+            "key condition names `{partition_attr}`, which is not the queried \
+             partition key `{expected_partition}`"
+        )));
+    }
+    if let Some(named) = sort_attr {
+        match expected_sort {
+            Some(expected) if named == expected => {}
+            Some(expected) => {
+                return Err(WireError::validation(format!(
+                    "key condition names `{named}`, which is not the queried \
+                     sort key `{expected}`"
+                )));
+            }
+            None => {
+                return Err(WireError::validation(format!(
+                    "key condition names a sort key `{named}`, but the queried \
+                     table or index has none"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reject an `ExclusiveStartKey` whose attribute-name set doesn't exactly
@@ -2271,7 +2327,9 @@ async fn run_index_query(
     meta: &Metadata,
     table: &str,
     index: &str,
+    partition_attr: &str,
     partition_value: &AttributeValue,
+    sort_attr: Option<&str>,
     sort_condition: Option<&SortKeyCondition>,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
@@ -2296,6 +2354,19 @@ async fn run_index_query(
             index.to_owned(),
         )));
     };
+    // A GSI is queried by its own hash attribute; an LSI shares the base
+    // table's partition key and only replaces the sort key (ADR 0041).
+    let base = schema_for(meta, table);
+    let expected_partition = match idx.kind {
+        IndexKind::Global => idx.hash_attribute.as_str(),
+        IndexKind::Local => base.partition_key.as_str(),
+    };
+    validate_key_condition_names(
+        expected_partition,
+        idx.sort_attribute.as_deref(),
+        partition_attr,
+        sort_attr,
+    )?;
     if sort_condition.is_some() && idx.sort_attribute.is_none() {
         return Err(registry_error(
             animus_dynamo::RegistryError::IndexSortMismatch(index.to_owned()),

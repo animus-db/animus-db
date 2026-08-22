@@ -129,6 +129,30 @@ The surface now extends past the original three point ops:
   projection in both cases (ADR 0041), so such a request quietly yields
   fewer attributes than AWS would. Closing it means a base-row fetch for
   the LSI case, which is its own change.
+  **Audit note (2026-08-22, fifth — three silent-wrongness bugs):** the
+  expression parsers shared a naive `split_once('=')` and discarded the
+  attribute name a key condition named. Three consequences, all of which
+  returned plausible wrong answers rather than errors:
+  (1) `price >= :p` was cut into an equality against an attribute literally
+  named `price >`, so a `FilterExpression` matched nothing and a
+  `ConditionExpression` could never hold — and the same cut narrowed a
+  sort-key range `sk <= :v` to an exact-match query, which is the main
+  reason to have a sort key at all;
+  (2) `#alias` was resolved for `ProjectionExpression` but **not** for
+  `FilterExpression`/`ConditionExpression`, so `#p = :v` compared against an
+  attribute named `#p` — always false, and inconsistent within a single
+  request; aliases are mandatory for DynamoDB's reserved words, so this hit
+  ordinary schemas;
+  (3) the key condition's attribute name was dropped, so
+  `KeyConditionExpression: "notthekey = :v"` was served as a partition-key
+  query against whatever value it named.
+  Fixed at the root with one comparator-aware splitter (longest operator
+  first) used by all three parsers, alias resolution in every predicate
+  form, and the key attribute names carried on `Operation::Query` for the
+  `animusd` edge to check against the catalog (decode has none). Operators
+  that cannot yet be represented are now **rejected by name** rather than
+  truncated; the operators themselves arrive with the expression-surface
+  work.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
