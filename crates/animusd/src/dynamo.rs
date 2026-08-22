@@ -154,7 +154,8 @@ use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjecti
 use animus_control::{MetaCommand, Metadata, ReplicationMode, TtlSpec};
 use animus_cp_data::{KIND_BASE, KIND_LSI};
 use animus_dynamo::wire::{
-    self, Operation, Projection, ReturnValues, TransactAction, TransactGet, WireError, WriteRequest,
+    self, Operation, Projection, ReturnValues, Select, TransactAction, TransactGet, WireError,
+    WriteRequest,
 };
 use animus_dynamo::{
     AttributeValue, ChangeRecord, ConditionExpression, Item, SortKeyCondition, TableSchema,
@@ -540,6 +541,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             scan_index_forward,
             filter,
             projection,
+            select,
             consistent_read,
         } => {
             run_query(
@@ -554,6 +556,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 scan_index_forward,
                 filter.as_ref(),
                 projection.as_ref(),
+                select,
                 consistent_read,
             )
             .await
@@ -565,6 +568,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             exclusive_start_key,
             filter,
             projection,
+            select,
             consistent_read,
         } => {
             run_scan(
@@ -576,6 +580,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 exclusive_start_key,
                 filter.as_ref(),
                 projection.as_ref(),
+                select,
                 consistent_read,
             )
             .await
@@ -2018,6 +2023,7 @@ async fn run_query(
     scan_index_forward: bool,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
     consistent_read: bool,
 ) -> Result<String, WireError> {
     // Mirror a catalog table's schema (so its GSI index exists after a restart or
@@ -2038,6 +2044,7 @@ async fn run_query(
                 scan_index_forward,
                 filter,
                 projection,
+                select,
                 consistent_read,
             )
             .await
@@ -2054,6 +2061,7 @@ async fn run_query(
                 scan_index_forward,
                 filter,
                 projection,
+                select,
             )
             .await
         }
@@ -2157,6 +2165,7 @@ async fn run_base_query(
     scan_index_forward: bool,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
 ) -> Result<String, WireError> {
     // A base-table query must reject an unknown table the way the registry path
     // did (ResourceNotFoundException). A table is known iff it is in the
@@ -2236,7 +2245,8 @@ async fn run_base_query(
             items.push(wire::project(projection, item));
         }
     }
-    Ok(wire::scan_response(
+    Ok(wire::select_response(
+        select,
         &items,
         scanned,
         last_evaluated_key.as_ref(),
@@ -2268,6 +2278,7 @@ async fn run_index_query(
     scan_index_forward: bool,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
     consistent_read: bool,
 ) -> Result<String, WireError> {
     if !table_known(ctx, meta, table) {
@@ -2324,6 +2335,7 @@ async fn run_index_query(
                 scan_index_forward,
                 filter,
                 projection,
+                select,
             )
             .await
         }
@@ -2340,6 +2352,7 @@ async fn run_index_query(
                 scan_index_forward,
                 filter,
                 projection,
+                select,
             )
             .await
         }
@@ -2383,10 +2396,11 @@ async fn run_gsi_query(
     scan_index_forward: bool,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
 ) -> Result<String, WireError> {
     let index_table = dynamo_index::index_table_name(table, &idx.name);
     if !meta.has_table_tablet(&index_table) {
-        return Ok(wire::scan_response(&[], 0, None));
+        return Ok(wire::select_response(select, &[], 0, None));
     }
     let composite = idx.sort_attribute.is_some();
     // Narrow to the `Equals` sub-prefix when possible (an engine-level
@@ -2470,7 +2484,8 @@ async fn run_gsi_query(
             items.push(wire::project(projection, item));
         }
     }
-    Ok(wire::scan_response(
+    Ok(wire::select_response(
+        select,
         &items,
         scanned,
         last_evaluated_key.as_ref(),
@@ -2508,9 +2523,10 @@ async fn run_lsi_query(
     scan_index_forward: bool,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
 ) -> Result<String, WireError> {
     if !meta.has_table_tablet(table) {
-        return Ok(wire::scan_response(&[], 0, None));
+        return Ok(wire::select_response(select, &[], 0, None));
     }
     let prefix = token_prefixed(
         partition_value,
@@ -2581,7 +2597,8 @@ async fn run_lsi_query(
             items.push(wire::project(projection, item));
         }
     }
-    Ok(wire::scan_response(
+    Ok(wire::select_response(
+        select,
         &items,
         scanned,
         last_evaluated_key.as_ref(),
@@ -2602,6 +2619,7 @@ async fn run_scan(
     exclusive_start_key: Option<Item>,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
     consistent_read: bool,
 ) -> Result<String, WireError> {
     mirror_catalog_schema(ctx, meta, table);
@@ -2616,6 +2634,7 @@ async fn run_scan(
                 exclusive_start_key,
                 filter,
                 projection,
+                select,
                 consistent_read,
             )
             .await
@@ -2629,6 +2648,7 @@ async fn run_scan(
                 exclusive_start_key,
                 filter,
                 projection,
+                select,
             )
             .await
         }
@@ -2653,6 +2673,7 @@ async fn run_scan(
 /// attributes. The cursor thus advances over the **live data-plane keys** the
 /// scan returned — not a tracked set — so it is correct after a restart or on a
 /// follower that never saw a write.
+#[allow(clippy::too_many_arguments)] // one Scan request's full shape
 async fn run_base_scan(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -2661,6 +2682,7 @@ async fn run_base_scan(
     exclusive_start_key: Option<Item>,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
 ) -> Result<String, WireError> {
     if !table_known(ctx, meta, table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
@@ -2708,7 +2730,8 @@ async fn run_base_scan(
             items.push(wire::project(projection, item));
         }
     }
-    Ok(wire::scan_response(
+    Ok(wire::select_response(
+        select,
         &items,
         scanned,
         last_evaluated_key.as_ref(),
@@ -2732,6 +2755,7 @@ async fn run_index_scan(
     exclusive_start_key: Option<Item>,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
     consistent_read: bool,
 ) -> Result<String, WireError> {
     if !table_known(ctx, meta, table) {
@@ -2775,6 +2799,7 @@ async fn run_index_scan(
                 exclusive_start_key,
                 filter,
                 projection,
+                select,
             )
             .await
         }
@@ -2788,6 +2813,7 @@ async fn run_index_scan(
                 exclusive_start_key,
                 filter,
                 projection,
+                select,
             )
             .await
         }
@@ -2812,10 +2838,11 @@ async fn run_gsi_scan(
     exclusive_start_key: Option<Item>,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
 ) -> Result<String, WireError> {
     let index_table = dynamo_index::index_table_name(table, &idx.name);
     if !meta.has_table_tablet(&index_table) {
-        return Ok(wire::scan_response(&[], 0, None));
+        return Ok(wire::select_response(select, &[], 0, None));
     }
     let base = schema_for(meta, table);
     let from = match &exclusive_start_key {
@@ -2850,7 +2877,8 @@ async fn run_gsi_scan(
             items.push(wire::project(projection, item));
         }
     }
-    Ok(wire::scan_response(
+    Ok(wire::select_response(
+        select,
         &items,
         scanned,
         last_evaluated_key.as_ref(),
@@ -2879,9 +2907,10 @@ async fn run_lsi_scan(
     exclusive_start_key: Option<Item>,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
+    select: Select,
 ) -> Result<String, WireError> {
     if !meta.has_table_tablet(table) {
-        return Ok(wire::scan_response(&[], 0, None));
+        return Ok(wire::select_response(select, &[], 0, None));
     }
     let base = schema_for(meta, table);
     let from = match &exclusive_start_key {
@@ -2920,7 +2949,8 @@ async fn run_lsi_scan(
             items.push(wire::project(projection, item));
         }
     }
-    Ok(wire::scan_response(
+    Ok(wire::select_response(
+        select,
         &items,
         scanned,
         last_evaluated_key.as_ref(),

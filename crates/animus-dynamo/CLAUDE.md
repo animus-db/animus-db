@@ -51,7 +51,7 @@ comment for its full type/method inventory.
   BatchWriteItem/TransactWriteItems/TransactGetItems/UpdateTable/
   DescribeTable/DeleteTable/ListTables/UpdateTimeToLive/DescribeTimeToLive,
   plus the response encoders). `Query` and `Scan` share `decode_limit`/`decode_exclusive_start_key`/
-  `decode_predicate` — same `Limit`/`ExclusiveStartKey`/`FilterExpression`
+  `decode_predicate`/`decode_select` — same `Limit`/`ExclusiveStartKey`/`FilterExpression`/`Select`
   contract, so fixing one fixes both; do not fork them.
   One gotcha: `GetItem`/`Query`/
   `Scan` decode `ConsistentRead` **but this crate never enforces it** —
