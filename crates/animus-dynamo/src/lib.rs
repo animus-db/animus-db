@@ -30,7 +30,7 @@ pub mod streams_wire;
 pub mod ttl;
 pub mod wire;
 
-pub use condition::{ConditionExpression, SortKeyCondition};
+pub use condition::{Comparator, ConditionExpression, SortKeyCondition};
 pub use index::{
     ChangeRecord, FootprintEntry, GsiRowRef, IndexFootprint, ItemFootprint, LsiRowRef,
     index_table_name, is_index_table_name, split_index_table_name,

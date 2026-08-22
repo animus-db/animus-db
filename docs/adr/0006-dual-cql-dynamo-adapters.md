@@ -153,6 +153,30 @@ The surface now extends past the original three point ops:
   that cannot yet be represented are now **rejected by name** rather than
   truncated; the operators themselves arrive with the expression-surface
   work.
+  **Audit note (2026-08-22, sixth — the expression surface):**
+  `FilterExpression`/`ConditionExpression` supported exactly three forms
+  (`attribute_exists`, `attribute_not_exists`, `a = :v`), so every
+  comparison, range, membership test and function was a
+  `ValidationException`. The surface now covers the comparison operators
+  (`=`, `<>`, `<`, `<=`, `>`, `>=`), `BETWEEN`, `IN`, `begins_with`,
+  `contains`, `attribute_type` and `size`, across `Query`/`Scan` filters and
+  conditional writes alike (one decoder serves both). Boolean composition
+  (`AND`/`OR`/`NOT` with parentheses) is the remaining piece and lands
+  separately.
+  **One decision worth recording:** filter comparisons order numbers
+  **numerically**, deliberately unlike `AttributeValue::key_bytes`, whose
+  lexicographic number order is a documented simplification of *key*
+  ordering. A key's order must agree with how rows are stored; a filter is
+  evaluated in memory over an item and carries no such constraint, so
+  inheriting the simplification would make `price > :p` quietly wrong
+  (9 would outrank 10). The comparison is done on the decimal text rather
+  than through an `f64`, because DynamoDB permits 38 significant digits and
+  a float round-trip would silently collapse exactly the large numeric
+  identifiers people use as keys. Equality is numeric-aware for the same
+  reason: `1.10`, `1.1` and `-0`/`0` are the same number written
+  differently. A missing attribute, and any ordering across incomparable
+  types, is false for every operator — `<>` included, since DynamoDB has no
+  three-valued logic here.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
