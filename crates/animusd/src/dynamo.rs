@@ -154,8 +154,8 @@ use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjecti
 use animus_control::{MetaCommand, Metadata, ReplicationMode, TtlSpec};
 use animus_cp_data::{KIND_BASE, KIND_LSI};
 use animus_dynamo::wire::{
-    self, Operation, Projection, ReturnValues, Select, TransactAction, TransactGet, WireError,
-    WriteRequest,
+    self, Operation, Projection, ReturnValues, ScanSegment, Select, TransactAction, TransactGet,
+    WireError, WriteRequest,
 };
 use animus_dynamo::{
     AttributeValue, ChangeRecord, ConditionExpression, Item, SortKeyCondition, TableSchema,
@@ -598,6 +598,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             filter,
             projection,
             select,
+            segment,
             consistent_read,
         } => {
             run_scan(
@@ -610,6 +611,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 filter.as_ref(),
                 projection.as_ref(),
                 select,
+                segment,
                 consistent_read,
             )
             .await
@@ -2145,6 +2147,50 @@ fn lsi_key_names(base: &TableSchema, idx: &IndexDef) -> BTreeSet<String> {
     names
 }
 
+/// The half-open data-plane key range a parallel-scan segment owns.
+///
+/// Every data-plane key leads with an 8-byte big-endian partition token (ADR
+/// 0022), so splitting the scan is splitting the 64-bit token ring into `total`
+/// equal slices: segment `i` owns `[i·2⁶⁴/total, (i+1)·2⁶⁴/total)`. The
+/// arithmetic is done in `u128` because `total = 1` would otherwise overflow
+/// computing 2⁶⁴.
+///
+/// Disjoint and jointly covering by construction, which is exactly DynamoDB's
+/// parallel-scan contract: N workers each scanning their own segment see every
+/// item exactly once between them. The last segment's upper bound is `None`
+/// (unbounded) rather than 2⁶⁴ so nothing can fall off the end of the ring.
+///
+/// An 8-byte bound compares correctly against full keys because the token is a
+/// prefix: a key with token `T` sorts inside `[start, end)` iff
+/// `start <= T < end`.
+fn segment_key_range(seg: ScanSegment) -> (Vec<u8>, Option<Vec<u8>>) {
+    let total = u128::from(seg.total);
+    let boundary = |i: u128| -> u64 {
+        u64::try_from((i << 64) / total).expect("boundary below 2^64 for i < total")
+    };
+    let start = boundary(u128::from(seg.segment)).to_be_bytes().to_vec();
+    let end = if u128::from(seg.segment) + 1 == total {
+        None
+    } else {
+        Some(boundary(u128::from(seg.segment) + 1).to_be_bytes().to_vec())
+    };
+    (start, end)
+}
+
+/// Combine a segment's range with an `ExclusiveStartKey` cursor: the scan
+/// resumes at whichever is further along, and always stops at the segment's
+/// end. A cursor from a different segment would otherwise let a worker walk
+/// into its neighbour's rows and return them twice across the fleet.
+fn scan_bounds(segment: Option<ScanSegment>, cursor: Vec<u8>) -> (Vec<u8>, Option<Vec<u8>>) {
+    match segment {
+        None => (cursor, None),
+        Some(seg) => {
+            let (start, end) = segment_key_range(seg);
+            (if cursor > start { cursor } else { start }, end)
+        }
+    }
+}
+
 /// Reject a `KeyConditionExpression` that names attributes which are not the
 /// queried table's or index's key — a `ValidationException`, as DynamoDB
 /// returns.
@@ -2716,6 +2762,7 @@ async fn run_scan(
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
     select: Select,
+    segment: Option<ScanSegment>,
     consistent_read: bool,
 ) -> Result<String, WireError> {
     mirror_catalog_schema(ctx, meta, table);
@@ -2731,6 +2778,7 @@ async fn run_scan(
                 filter,
                 projection,
                 select,
+                segment,
                 consistent_read,
             )
             .await
@@ -2745,6 +2793,7 @@ async fn run_scan(
                 filter,
                 projection,
                 select,
+                segment,
             )
             .await
         }
@@ -2779,6 +2828,7 @@ async fn run_base_scan(
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
     select: Select,
+    segment: Option<ScanSegment>,
 ) -> Result<String, WireError> {
     if !table_known(ctx, meta, table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
@@ -2797,15 +2847,23 @@ async fn run_base_scan(
         }
         None => Vec::new(),
     };
+    // A parallel-scan worker is confined to its slice of the token ring; the
+    // cursor only moves it forward within that slice.
+    let (from, end) = scan_bounds(segment, from);
     let want = limit.map(|n| n.saturating_add(1));
     // A DynamoDB `DeleteItem` stores a *tombstone value* (a live pair to the
     // data plane, decoding to `None`); `paginated_table_examine` continues past
     // it without consuming a `Limit` slot.
-    let (mut examined, _exhausted) =
-        paginated_table_examine(ctx, table, from, None, want, false, |_key, value| {
-            wire::decode_stored_item(value)
-        })
-        .await?;
+    let (mut examined, _exhausted) = paginated_table_examine(
+        ctx,
+        table,
+        from,
+        end.as_deref(),
+        want,
+        false,
+        |_key, value| wire::decode_stored_item(value),
+    )
+    .await?;
     let truncated = limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
@@ -2852,6 +2910,7 @@ async fn run_index_scan(
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
     select: Select,
+    segment: Option<ScanSegment>,
     consistent_read: bool,
 ) -> Result<String, WireError> {
     if !table_known(ctx, meta, table) {
@@ -2896,6 +2955,7 @@ async fn run_index_scan(
                 filter,
                 projection,
                 select,
+                segment,
             )
             .await
         }
@@ -2910,6 +2970,7 @@ async fn run_index_scan(
                 filter,
                 projection,
                 select,
+                segment,
             )
             .await
         }
@@ -2935,6 +2996,7 @@ async fn run_gsi_scan(
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
     select: Select,
+    segment: Option<ScanSegment>,
 ) -> Result<String, WireError> {
     let index_table = dynamo_index::index_table_name(table, &idx.name);
     if !meta.has_table_tablet(&index_table) {
@@ -2945,16 +3007,24 @@ async fn run_gsi_scan(
         Some(key_item) => strictly_after(gsi_resume_key(key_item, &base, idx)?),
         None => Vec::new(),
     };
+    // The index's hidden table carries the same token-led key layout, so a
+    // segment slices it identically to a base-table scan.
+    let (from, end) = scan_bounds(segment, from);
     let want = limit.map(|n| n.saturating_add(1));
     // A GSI row is never stored as a DynamoDB tombstone (ADR 0041 §4's
     // as-built note — the drain prunes with a real engine delete), so `keep`
     // only needs to guard against a corrupt row, mirroring `run_gsi_query`'s
     // own "skip rather than fail the whole query" defensiveness.
-    let (mut examined, _exhausted) =
-        paginated_table_examine(ctx, &index_table, from, None, want, false, |_key, value| {
-            wire::decode_stored_item(value)
-        })
-        .await?;
+    let (mut examined, _exhausted) = paginated_table_examine(
+        ctx,
+        &index_table,
+        from,
+        end.as_deref(),
+        want,
+        false,
+        |_key, value| wire::decode_stored_item(value),
+    )
+    .await?;
     let truncated = limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
@@ -3004,6 +3074,7 @@ async fn run_lsi_scan(
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
     select: Select,
+    segment: Option<ScanSegment>,
 ) -> Result<String, WireError> {
     if !meta.has_table_tablet(table) {
         return Ok(wire::select_response(select, &[], 0, None));
@@ -3013,10 +3084,13 @@ async fn run_lsi_scan(
         Some(key_item) => strictly_after(lsi_resume_key(key_item, &base, idx)?),
         None => Vec::new(),
     };
+    // An LSI row's key is kind-scoped but still token-led, so the same slice
+    // math applies within the kind.
+    let (from, end) = scan_bounds(segment, from);
     let want = limit.map(|n| n.saturating_add(1));
     let idx_name = idx.name.clone();
     let (mut examined, _exhausted) =
-        paginated_kind_examine(ctx, table, KIND_LSI, from, want, move |key, value| {
+        paginated_kind_examine(ctx, table, KIND_LSI, from, end, want, move |key, value| {
             let within = key.get(TOKEN_BYTES..).unwrap_or(&[]);
             let Some(parsed) = dynamo_index::parse_lsi_row_key(within) else {
                 return Ok(None); // a malformed key; skip defensively
@@ -3122,6 +3196,7 @@ async fn paginated_kind_examine(
     table: &str,
     kind: u8,
     mut cursor: Vec<u8>,
+    end: Option<Vec<u8>>,
     want: Option<usize>,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
 ) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
@@ -3129,7 +3204,7 @@ async fn paginated_kind_examine(
     loop {
         let fetch = want.map(|w| w - examined.len());
         let pairs = ctx
-            .cp_scan_kind_table(table, kind, cursor.clone(), None, fetch)
+            .cp_scan_kind_table(table, kind, cursor.clone(), end.clone(), fetch)
             .await
             .map_err(|e| internal(&e))?;
         let exhausted = fetch.is_none_or(|f| pairs.len() < f);
@@ -4993,5 +5068,81 @@ mod stream_write_path_tests {
             "every change record must survive — the streamed table's \
              expected \"copier\" tag has no cursor row yet"
         );
+    }
+}
+
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+
+    /// The segments must be **disjoint and jointly covering** — that is the
+    /// whole parallel-scan contract. Checked by walking the boundaries: each
+    /// segment starts exactly where the previous ended, the first starts at
+    /// the bottom of the ring, and the last is unbounded above.
+    #[test]
+    fn segments_tile_the_token_ring_without_gaps_or_overlap() {
+        for total in [1u32, 2, 3, 4, 7, 16, 1000] {
+            let mut previous_end: Option<Vec<u8>> = Some(vec![0u8; TOKEN_BYTES]);
+            for i in 0..total {
+                let (start, end) = segment_key_range(ScanSegment { segment: i, total });
+                assert_eq!(
+                    Some(start.clone()),
+                    previous_end,
+                    "segment {i} of {total} must start where {} ended",
+                    i.wrapping_sub(1)
+                );
+                if i + 1 == total {
+                    assert_eq!(end, None, "the last segment is unbounded above");
+                } else {
+                    let end = end.expect("a non-final segment is bounded");
+                    assert!(end > start, "segment {i} of {total} must be non-empty");
+                    previous_end = Some(end);
+                }
+            }
+        }
+    }
+
+    /// A single segment is the whole ring — the degenerate case that would
+    /// overflow if the boundary maths were done in `u64`.
+    #[test]
+    fn one_segment_covers_everything() {
+        let (start, end) = segment_key_range(ScanSegment {
+            segment: 0,
+            total: 1,
+        });
+        assert_eq!(start, vec![0u8; TOKEN_BYTES]);
+        assert_eq!(end, None);
+    }
+
+    /// A cursor moves a worker forward inside its segment, never outside it:
+    /// a cursor behind the segment start is clamped up, and the segment's end
+    /// always survives.
+    #[test]
+    fn a_cursor_cannot_walk_out_of_its_segment() {
+        let seg = ScanSegment {
+            segment: 2,
+            total: 4,
+        };
+        let (start, end) = segment_key_range(seg);
+
+        // A cursor from before this segment must not drag the scan backwards.
+        let (from, bound) = scan_bounds(Some(seg), vec![0u8; TOKEN_BYTES]);
+        assert_eq!(
+            from, start,
+            "a stale cursor is clamped to the segment start"
+        );
+        assert_eq!(bound, end);
+
+        // A cursor inside the segment moves it forward.
+        let mut inside = start.clone();
+        inside.push(0x7f);
+        let (from, bound) = scan_bounds(Some(seg), inside.clone());
+        assert_eq!(from, inside);
+        assert_eq!(bound, end, "the segment's end is kept whatever the cursor");
+
+        // With no segment, the cursor is the only bound.
+        let (from, bound) = scan_bounds(None, inside.clone());
+        assert_eq!(from, inside);
+        assert_eq!(bound, None);
     }
 }
