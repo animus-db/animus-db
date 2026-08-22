@@ -537,6 +537,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             sort_condition,
             limit,
             exclusive_start_key,
+            scan_index_forward,
             filter,
             projection,
             consistent_read,
@@ -550,6 +551,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 sort_condition.as_ref(),
                 limit,
                 exclusive_start_key,
+                scan_index_forward,
                 filter.as_ref(),
                 projection.as_ref(),
                 consistent_read,
@@ -2013,6 +2015,7 @@ async fn run_query(
     sort_condition: Option<&SortKeyCondition>,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
+    scan_index_forward: bool,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
     consistent_read: bool,
@@ -2032,6 +2035,7 @@ async fn run_query(
                 sort_condition,
                 limit,
                 exclusive_start_key,
+                scan_index_forward,
                 filter,
                 projection,
                 consistent_read,
@@ -2047,6 +2051,7 @@ async fn run_query(
                 sort_condition,
                 limit,
                 exclusive_start_key,
+                scan_index_forward,
                 filter,
                 projection,
             )
@@ -2149,6 +2154,7 @@ async fn run_base_query(
     sort_condition: Option<&SortKeyCondition>,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
+    scan_index_forward: bool,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
@@ -2166,24 +2172,30 @@ async fn run_base_query(
     let prefix = partition_prefix(partition_value);
     let end = range_end(&prefix);
     let base = schema_for(meta, table);
-    let from = match &exclusive_start_key {
+    let cursor = match &exclusive_start_key {
         Some(key_item) => {
             validate_query_cursor_shape(key_item, &base_key_names(&base))?;
             let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
-            let mut after = item_key(&pk, sk.as_ref());
-            after.push(0x00); // first key strictly past the cursor (keys are unique)
-            if after.as_slice() < prefix.as_slice() || after.as_slice() >= end.as_slice() {
+            let at = item_key(&pk, sk.as_ref());
+            if at.as_slice() < prefix.as_slice() || at.as_slice() >= end.as_slice() {
                 return Err(WireError::validation(
                     "ExclusiveStartKey does not belong to the queried partition",
                 ));
             }
-            after
+            Some(at)
         }
-        None => prefix.clone(),
+        None => None,
     };
+    let (from, upper) = query_page_bounds(cursor, &prefix, &end, scan_index_forward);
     let want = limit.map(|n| n.saturating_add(1));
-    let (mut examined, _exhausted) =
-        paginated_table_examine(ctx, table, from, Some(&end), want, |key, value| {
+    let (mut examined, _exhausted) = paginated_table_examine(
+        ctx,
+        table,
+        from,
+        Some(&upper),
+        want,
+        !scan_index_forward,
+        |key, value| {
             // A DynamoDB delete stores a tombstone *value* (not a data-plane
             // tombstone), so the scan returns it as a live pair; decode drops it.
             let Some(item) = wire::decode_stored_item(value)? else {
@@ -2199,8 +2211,9 @@ async fn run_base_query(
                 }
             }
             Ok(Some(item))
-        })
-        .await?;
+        },
+    )
+    .await?;
     let truncated = limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
@@ -2252,6 +2265,7 @@ async fn run_index_query(
     sort_condition: Option<&SortKeyCondition>,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
+    scan_index_forward: bool,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
     consistent_read: bool,
@@ -2307,6 +2321,7 @@ async fn run_index_query(
                 sort_condition,
                 limit,
                 exclusive_start_key,
+                scan_index_forward,
                 filter,
                 projection,
             )
@@ -2322,6 +2337,7 @@ async fn run_index_query(
                 sort_condition,
                 limit,
                 exclusive_start_key,
+                scan_index_forward,
                 filter,
                 projection,
             )
@@ -2364,6 +2380,7 @@ async fn run_gsi_query(
     sort_condition: Option<&SortKeyCondition>,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
+    scan_index_forward: bool,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
@@ -2386,7 +2403,7 @@ async fn run_gsi_query(
     let end = dynamo_index::range_end(&prefix);
 
     let base = schema_for(meta, table);
-    let from = match &exclusive_start_key {
+    let cursor = match &exclusive_start_key {
         Some(key_item) => {
             validate_query_cursor_shape(key_item, &gsi_key_names(&base, idx))?;
             let resume = gsi_resume_key(key_item, &base, idx)?;
@@ -2395,13 +2412,20 @@ async fn run_gsi_query(
                     "ExclusiveStartKey does not belong to the queried index range",
                 ));
             }
-            resume
+            Some(resume)
         }
-        None => prefix.clone(),
+        None => None,
     };
+    let (from, upper) = query_page_bounds(cursor, &prefix, &end, scan_index_forward);
     let want = limit.map(|n| n.saturating_add(1));
-    let (mut examined, _exhausted) =
-        paginated_table_examine(ctx, &index_table, from, Some(&end), want, |key, value| {
+    let (mut examined, _exhausted) = paginated_table_examine(
+        ctx,
+        &index_table,
+        from,
+        Some(&upper),
+        want,
+        !scan_index_forward,
+        |key, value| {
             // A pruned/undecodable row shouldn't normally occur (the drain deletes
             // stale rows outright, never tombstones them), but skip rather than
             // fail a whole query on one corrupt row.
@@ -2421,8 +2445,9 @@ async fn run_gsi_query(
                 }
             }
             Ok(Some(item))
-        })
-        .await?;
+        },
+    )
+    .await?;
     let truncated = limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
@@ -2480,6 +2505,7 @@ async fn run_lsi_query(
     sort_condition: Option<&SortKeyCondition>,
     limit: Option<usize>,
     exclusive_start_key: Option<Item>,
+    scan_index_forward: bool,
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
 ) -> Result<String, WireError> {
@@ -2493,7 +2519,7 @@ async fn run_lsi_query(
     let end = dynamo_index::range_end(&prefix);
 
     let base = schema_for(meta, table);
-    let from = match &exclusive_start_key {
+    let cursor = match &exclusive_start_key {
         Some(key_item) => {
             validate_query_cursor_shape(key_item, &lsi_key_names(&base, idx))?;
             let resume = lsi_resume_key(key_item, &base, idx)?;
@@ -2502,13 +2528,21 @@ async fn run_lsi_query(
                     "ExclusiveStartKey does not belong to the queried index range",
                 ));
             }
-            resume
+            Some(resume)
         }
-        None => prefix.clone(),
+        None => None,
     };
+    let (from, upper) = query_page_bounds(cursor, &prefix, &end, scan_index_forward);
     let want = limit.map(|n| n.saturating_add(1));
-    let (mut examined, _exhausted) =
-        paginated_kind_examine_one(ctx, table, KIND_LSI, from, end, want, |key, value| {
+    let (mut examined, _exhausted) = paginated_kind_examine_one(
+        ctx,
+        table,
+        KIND_LSI,
+        from,
+        upper,
+        want,
+        !scan_index_forward,
+        |key, value| {
             let Some(item) = wire::decode_stored_item(value)? else {
                 return Ok(None);
             };
@@ -2522,8 +2556,9 @@ async fn run_lsi_query(
                 }
             }
             Ok(Some(item))
-        })
-        .await?;
+        },
+    )
+    .await?;
     let truncated = limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
@@ -2649,7 +2684,7 @@ async fn run_base_scan(
     // data plane, decoding to `None`); `paginated_table_examine` continues past
     // it without consuming a `Limit` slot.
     let (mut examined, _exhausted) =
-        paginated_table_examine(ctx, table, from, None, want, |_key, value| {
+        paginated_table_examine(ctx, table, from, None, want, false, |_key, value| {
             wire::decode_stored_item(value)
         })
         .await?;
@@ -2784,7 +2819,7 @@ async fn run_gsi_scan(
     }
     let base = schema_for(meta, table);
     let from = match &exclusive_start_key {
-        Some(key_item) => gsi_resume_key(key_item, &base, idx)?,
+        Some(key_item) => strictly_after(gsi_resume_key(key_item, &base, idx)?),
         None => Vec::new(),
     };
     let want = limit.map(|n| n.saturating_add(1));
@@ -2793,7 +2828,7 @@ async fn run_gsi_scan(
     // only needs to guard against a corrupt row, mirroring `run_gsi_query`'s
     // own "skip rather than fail the whole query" defensiveness.
     let (mut examined, _exhausted) =
-        paginated_table_examine(ctx, &index_table, from, None, want, |_key, value| {
+        paginated_table_examine(ctx, &index_table, from, None, want, false, |_key, value| {
             wire::decode_stored_item(value)
         })
         .await?;
@@ -2850,7 +2885,7 @@ async fn run_lsi_scan(
     }
     let base = schema_for(meta, table);
     let from = match &exclusive_start_key {
-        Some(key_item) => lsi_resume_key(key_item, &base, idx)?,
+        Some(key_item) => strictly_after(lsi_resume_key(key_item, &base, idx)?),
         None => Vec::new(),
     };
     let want = limit.map(|n| n.saturating_add(1));
@@ -2913,13 +2948,21 @@ async fn paginated_table_examine(
     mut cursor: Vec<u8>,
     end: Option<&[u8]>,
     want: Option<usize>,
+    reverse: bool,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
 ) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    // Ascending walks the *lower* bound up and holds `end` fixed; descending
+    // holds the lower bound fixed and walks the *upper* bound down. Only one
+    // of the two ever moves, which is why both share this loop.
+    let mut upper: Option<Vec<u8>> = end.map(<[u8]>::to_vec);
     loop {
         let fetch = want.map(|w| w - examined.len());
-        let pairs = native_scan(ctx, table, &cursor, end, fetch).await?;
+        let pairs = native_scan(ctx, table, &cursor, upper.as_deref(), fetch, reverse).await?;
         let exhausted = fetch.is_none_or(|f| pairs.len() < f);
+        // Rows arrive in the requested order, so the frontier to resume from
+        // is the last element either way: ascending that is the greatest key
+        // seen, descending the least.
         let last_raw_key = pairs.last().map(|(k, _)| k.clone());
         for (key, value) in &pairs {
             if let Some(item) = keep(key, value)? {
@@ -2929,9 +2972,17 @@ async fn paginated_table_examine(
         if exhausted || want.is_some_and(|w| examined.len() >= w) {
             return Ok((examined, exhausted));
         }
-        let mut next = last_raw_key.expect("non-exhausted fetch returned pairs");
-        next.push(0x00);
-        cursor = next;
+        let next = last_raw_key.expect("non-exhausted fetch returned pairs");
+        if reverse {
+            // The upper bound is exclusive, so handing back the frontier key
+            // itself resumes strictly *below* it — the descending dual of the
+            // ascending arm's `push(0x00)`.
+            upper = Some(next);
+        } else {
+            let mut next = next;
+            next.push(0x00);
+            cursor = next;
+        }
     }
 }
 
@@ -2979,6 +3030,7 @@ async fn paginated_kind_examine(
 /// bounded window — see [`run_lsi_query`]'s doc for why walking past it would
 /// be a real bug (leaking into a neighboring partition's LSI rows). Same
 /// windowed-continuation discipline otherwise.
+#[allow(clippy::too_many_arguments)] // one LSI Query page's full shape
 async fn paginated_kind_examine_one(
     ctx: &ClientCtx,
     table: &str,
@@ -2986,13 +3038,17 @@ async fn paginated_kind_examine_one(
     mut cursor: Vec<u8>,
     end: Vec<u8>,
     want: Option<usize>,
+    reverse: bool,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
 ) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    // Ascending walks the lower bound up; descending walks the upper bound
+    // down — the same inversion `paginated_table_examine` documents.
+    let mut upper = end;
     loop {
         let fetch = want.map(|w| w - examined.len());
         let pairs = ctx
-            .cp_scan_kind(table, kind, cursor.clone(), end.clone(), fetch)
+            .cp_scan_kind(table, kind, cursor.clone(), upper.clone(), fetch, reverse)
             .await
             .map_err(|e| internal(&e))?;
         let exhausted = fetch.is_none_or(|f| pairs.len() < f);
@@ -3005,9 +3061,14 @@ async fn paginated_kind_examine_one(
         if exhausted || want.is_some_and(|w| examined.len() >= w) {
             return Ok((examined, exhausted));
         }
-        let mut next = last_raw_key.expect("non-exhausted fetch returned pairs");
-        next.push(0x00);
-        cursor = next;
+        let next = last_raw_key.expect("non-exhausted fetch returned pairs");
+        if reverse {
+            upper = next;
+        } else {
+            let mut next = next;
+            next.push(0x00);
+            cursor = next;
+        }
     }
 }
 
@@ -3045,6 +3106,36 @@ fn gsi_key_item_of(item: &Item, base: &TableSchema, idx: &IndexDef) -> Option<It
 /// Invert [`gsi_key_item_of`]: rebuild the raw GSI row key an
 /// `ExclusiveStartKey` names, exactly matching [`dynamo_index::gsi_row_key`]'s
 /// own layout, then advance one byte past it (keys are unique) so the resumed
+/// The first key strictly greater than `k`. Data-plane keys are unique and
+/// no key is a prefix of another, so appending a `0x00` is exactly "resume
+/// after this one" for an ascending scan. A descending scan needs no such
+/// nudge: its upper bound is exclusive already, so the boundary key itself
+/// resumes strictly below it.
+fn strictly_after(mut k: Vec<u8>) -> Vec<u8> {
+    k.push(0x00);
+    k
+}
+
+/// Turn a `Query`'s resolved cursor key into the `(lower, upper)` bounds of
+/// the next page, given the scan direction and the partition/index range
+/// `[prefix, end)` the query is confined to.
+///
+/// Ascending moves the lower bound up past the cursor and keeps `end`;
+/// descending keeps `prefix` and pulls the upper bound down to the cursor
+/// (exclusive), so the next page is the highest rows still below it.
+fn query_page_bounds(
+    cursor: Option<Vec<u8>>,
+    prefix: &[u8],
+    end: &[u8],
+    forward: bool,
+) -> (Vec<u8>, Vec<u8>) {
+    match cursor {
+        Some(at) if forward => (strictly_after(at), end.to_vec()),
+        Some(at) => (prefix.to_vec(), at),
+        None => (prefix.to_vec(), end.to_vec()),
+    }
+}
+
 /// scan starts strictly after the cursor.
 fn gsi_resume_key(
     key_item: &Item,
@@ -3064,11 +3155,10 @@ fn gsi_resume_key(
         .get(&base.partition_key)
         .ok_or_else(|| missing(&base.partition_key))?;
     let base_sk = base.sort_key.as_ref().and_then(|sk| key_item.get(sk));
-    let mut after = token_prefixed(
+    let after = token_prefixed(
         ihash,
         &dynamo_index::gsi_row_key(ihash, isort, base_pk, base_sk),
     );
-    after.push(0x00);
     Ok(after)
 }
 
@@ -3112,11 +3202,10 @@ fn lsi_resume_key(
         .get(&base.partition_key)
         .ok_or_else(|| missing(&base.partition_key))?;
     let base_sk = base.sort_key.as_ref().and_then(|sk| key_item.get(sk));
-    let mut after = token_prefixed(
+    let after = token_prefixed(
         base_pk,
         &dynamo_index::lsi_row_key(base_pk, &idx.name, alt_sort, base_sk),
     );
-    after.push(0x00);
     Ok(after)
 }
 
@@ -3968,10 +4057,17 @@ async fn native_scan(
     start: &[u8],
     end: Option<&[u8]>,
     limit: Option<usize>,
+    reverse: bool,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WireError> {
-    ctx.cp_scan(table, start.to_vec(), end.map(<[u8]>::to_vec), limit)
-        .await
-        .map_err(|e| internal(&e))
+    ctx.cp_scan(
+        table,
+        start.to_vec(),
+        end.map(<[u8]>::to_vec),
+        limit,
+        reverse,
+    )
+    .await
+    .map_err(|e| internal(&e))
 }
 
 /// Whether `table` is known: present in the replicated catalog (ADR 0013) or

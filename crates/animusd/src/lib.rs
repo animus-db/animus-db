@@ -370,6 +370,21 @@ impl CpGroup {
         }
     }
 
+    /// Descending kind-scoped ReadIndex scan.
+    /// See [`RaftKvNode::linearizable_scan_kind_rev`].
+    async fn linearizable_scan_kind_rev(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            CpGroup::Lsm(n) => n.linearizable_scan_kind_rev(kind, start, end, limit).await,
+            CpGroup::Mem(n) => n.linearizable_scan_kind_rev(kind, start, end, limit).await,
+        }
+    }
+
     /// As [`put`](Self::put), but for a delete (tombstone). See
     /// [`RaftKvNode::delete`].
     fn delete(&self, key: Vec<u8>) -> ProposeResult {
@@ -416,6 +431,19 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.linearizable_scan(start, end, limit).await,
             CpGroup::Mem(n) => n.linearizable_scan(start, end, limit).await,
+        }
+    }
+
+    /// Descending ReadIndex range scan. See [`RaftKvNode::linearizable_scan_rev`].
+    async fn linearizable_scan_rev(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            CpGroup::Lsm(n) => n.linearizable_scan_rev(start, end, limit).await,
+            CpGroup::Mem(n) => n.linearizable_scan_rev(start, end, limit).await,
         }
     }
 
@@ -1330,6 +1358,11 @@ pub enum ClientRequest {
         end: Option<Vec<u8>>,
         #[serde(default)]
         limit: Option<usize>,
+        /// Descending (an LSI `Query` with `ScanIndexForward: false`).
+        /// `#[serde(default)]` so a peer predating the field still decodes as
+        /// the ascending scan this has always been.
+        #[serde(default)]
+        reverse: bool,
     },
     /// **Internal seal-trigger RPC — never sent bare, only wrapped in
     /// [`Forwarded`](Self::Forwarded)** (ADR 0042/0043, round-3 sealer PR):
@@ -1526,6 +1559,13 @@ pub enum ClientRequest {
         end: Option<Vec<u8>>,
         #[serde(default)]
         limit: Option<usize>,
+        /// Descending: `limit` keeps the *highest* rows of the range and they
+        /// come back highest-key-first (a `Query` with `ScanIndexForward:
+        /// false`). `#[serde(default)]` so a peer that predates the field —
+        /// or any of the many ascending constructors — still decodes as the
+        /// ascending scan this has always been.
+        #[serde(default)]
+        reverse: bool,
         table: String,
     },
     /// A CP op **forwarded** from a node that received it but does not host the CP
@@ -6732,6 +6772,7 @@ impl ClientCtx {
         start: &[u8],
         end: Option<&[u8]>,
         limit: Option<usize>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
         if !leader.scope_range().contains_range(&requested) {
@@ -6739,7 +6780,14 @@ impl ClientCtx {
                 "scan window {requested:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
-        match leader.linearizable_scan(start, end, limit).await {
+        // Same range, same barrier either way — `reverse` only decides which
+        // end of it `limit` keeps and what order the rows come back in.
+        let served = if reverse {
+            leader.linearizable_scan_rev(start, end, limit).await
+        } else {
+            leader.linearizable_scan(start, end, limit).await
+        };
+        match served {
             Some(p) => Ok(p),
             None => Err("CP group leader moved; retry".into()),
         }
@@ -8729,6 +8777,7 @@ impl ClientCtx {
         start: Vec<u8>,
         end: Option<Vec<u8>>,
         limit: Option<usize>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         // The table's tablets overlapping [start, end), in token (range.start) order.
         // `end == None` is unbounded above (a whole-table scan).
@@ -8755,6 +8804,12 @@ impl ClientCtx {
             })
             .collect();
         ranges.sort();
+        // Descending: visit the overlapping tablets highest-token-first too,
+        // so `limit` fills from the top of the whole scanned span rather than
+        // from the top of merely its lowest tablet.
+        if reverse {
+            ranges.reverse();
+        }
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for r in ranges {
             if let Some(l) = limit
@@ -8777,7 +8832,7 @@ impl ClientCtx {
             }
             let remaining = limit.map(|l| l - out.len());
             out.extend(
-                self.cp_scan_one(table, sub_start, sub_end, remaining)
+                self.cp_scan_one(table, sub_start, sub_end, remaining, reverse)
                     .await?,
             );
         }
@@ -8797,12 +8852,14 @@ impl ClientCtx {
         start: Vec<u8>,
         end: Option<Vec<u8>>,
         limit: Option<usize>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             let err = match self.cp_route(table, &start).await {
                 CpRoute::Local(leader) => {
-                    match Self::cp_scan_local(&leader, &start, end.as_deref(), limit).await {
+                    match Self::cp_scan_local(&leader, &start, end.as_deref(), limit, reverse).await
+                    {
                         Ok(p) => return Ok(p),
                         Err(e) => e,
                     }
@@ -8812,6 +8869,7 @@ impl ClientCtx {
                         start: start.clone(),
                         end: end.clone(),
                         limit,
+                        reverse,
                         table: table.to_owned(),
                     };
                     match self.cp_forward(table, &start, addr, request).await {
@@ -8853,6 +8911,7 @@ impl ClientCtx {
         start: Vec<u8>,
         end: Vec<u8>,
         limit: Option<usize>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let start_tablet = self
             .tablet_for(table, &start)
@@ -8863,7 +8922,7 @@ impl ClientCtx {
                  an LSI query is scoped to one partition"
             ));
         }
-        self.cp_scan_kind_one(table, kind, start, Some(end), limit)
+        self.cp_scan_kind_one(table, kind, start, Some(end), limit, reverse)
             .await
     }
 
@@ -8934,7 +8993,7 @@ impl ClientCtx {
             // less coordinator-side memory.
             let remaining = limit.map(|l| l - out.len());
             out.extend(
-                self.cp_scan_kind_one(table, kind, sub_start, sub_end, remaining)
+                self.cp_scan_kind_one(table, kind, sub_start, sub_end, remaining, false)
                     .await?,
             );
         }
@@ -8960,13 +9019,21 @@ impl ClientCtx {
         start: Vec<u8>,
         end: Option<Vec<u8>>,
         limit: Option<usize>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             let err = match self.cp_route(table, &start).await {
                 CpRoute::Local(leader) => {
-                    match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref(), limit)
-                        .await
+                    match Self::cp_scan_kind_local(
+                        &leader,
+                        kind,
+                        &start,
+                        end.as_deref(),
+                        limit,
+                        reverse,
+                    )
+                    .await
                     {
                         Ok(p) => return Ok(p),
                         Err(e) => e,
@@ -8979,6 +9046,7 @@ impl ClientCtx {
                         start: start.clone(),
                         end: end.clone(),
                         limit,
+                        reverse,
                     };
                     match self.cp_forward(table, &start, addr, request).await {
                         ClientResponse::Pairs(p) => return Ok(p),
@@ -9013,6 +9081,7 @@ impl ClientCtx {
         start: &[u8],
         end: Option<&[u8]>,
         limit: Option<usize>,
+        reverse: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
         if !leader.scope_range().contains_range(&requested) {
@@ -9020,7 +9089,14 @@ impl ClientCtx {
                 "scan window {requested:?} outside tablet's current range (stale routing, likely a split crossover); retry"
             ));
         }
-        match leader.linearizable_scan_kind(kind, start, end, limit).await {
+        let served = if reverse {
+            leader
+                .linearizable_scan_kind_rev(kind, start, end, limit)
+                .await
+        } else {
+            leader.linearizable_scan_kind(kind, start, end, limit).await
+        };
+        match served {
             Some(p) => Ok(p),
             None => Err("CP group leader moved; retry".into()),
         }
@@ -9795,6 +9871,7 @@ impl ClientCtx {
                 start,
                 end,
                 limit,
+                reverse,
                 table,
             } => {
                 let tablet = self.tablet_for(&table, &start);
@@ -9805,7 +9882,7 @@ impl ClientCtx {
                 // `cp_scan_local` decision as `cp_scan_one`'s Local arm: a
                 // scope lagging the metadata-derived scan window would
                 // silently truncate results, not error.
-                match Self::cp_scan_local(&leader, &start, end.as_deref(), limit).await {
+                match Self::cp_scan_local(&leader, &start, end.as_deref(), limit, reverse).await {
                     Ok(p) => ClientResponse::Pairs(p),
                     Err(e) => ClientResponse::Error(e),
                 }
@@ -9820,12 +9897,22 @@ impl ClientCtx {
                 start,
                 end,
                 limit,
+                reverse,
             } => {
                 let tablet = self.tablet_for(&table, &start);
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
-                match Self::cp_scan_kind_local(&leader, kind, &start, end.as_deref(), limit).await {
+                match Self::cp_scan_kind_local(
+                    &leader,
+                    kind,
+                    &start,
+                    end.as_deref(),
+                    limit,
+                    reverse,
+                )
+                .await
+                {
                     Ok(p) => ClientResponse::Pairs(p),
                     Err(e) => ClientResponse::Error(e),
                 }
@@ -12186,8 +12273,9 @@ async fn handle_request(
             start,
             end,
             limit,
+            reverse,
             table,
-        } => match ctx.cp_scan(&table, start, end, limit).await {
+        } => match ctx.cp_scan(&table, start, end, limit, reverse).await {
             Ok(pairs) => ClientResponse::Pairs(pairs),
             Err(e) => ClientResponse::Error(e),
         },
