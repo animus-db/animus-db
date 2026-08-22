@@ -266,6 +266,18 @@ The surface now extends past the original three point ops:
   distinguish never-accepted from accepted-unconfirmed, and an ADR 0046/0049
   change rather than a wire-adapter one. The at-most-once fix stands on its
   own regardless: it is what stops the *service* over-counting.
+  **Audit note (2026-08-22, twelfth — `UPDATED_OLD`/`UPDATED_NEW`):**
+  `UpdateItem`'s `ReturnValues` had `NONE`/`ALL_OLD`/`ALL_NEW` but not the
+  `UPDATED_*` pair, which reports only the attributes an update actually
+  changed. They are a **diff of the two images**, not a projection of one,
+  and the asymmetry is the point: an attribute the update *created* has no
+  previous value so `UPDATED_OLD` omits it, and one it *removed* has no new
+  value so `UPDATED_NEW` omits it, so each is reported by exactly one of the
+  two. Key attributes fall out naturally, since an update never changes them
+  and so they never differ. An update that changes nothing omits
+  `Attributes` entirely rather than returning an empty map, as DynamoDB
+  does. `update_response` already received both images, so this needed no
+  new plumbing on the write path.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
