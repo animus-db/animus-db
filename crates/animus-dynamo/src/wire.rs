@@ -134,6 +134,41 @@ pub struct TtlDescription {
 /// The `X-Amz-Target` service+version prefix DynamoDB clients send.
 pub const TARGET_PREFIX: &str = "DynamoDB_20120810.";
 
+/// `Select` — **what** a `Query`/`Scan` returns, as distinct from
+/// [`Projection`]'s *which attributes*.
+///
+/// Only [`Count`](Self::Count) changes the response shape: it suppresses
+/// `Items` entirely, leaving `Count`/`ScannedCount` (and a
+/// `LastEvaluatedKey` when the page was truncated). It does **not** change
+/// what is read or how paging works — a filter still runs, `Limit` still
+/// caps what is examined, and a `COUNT` page can still be truncated. That
+/// matters: `Count` is the count of *matching* items on this page, not of
+/// the whole query, so a client that wants a total must still page to
+/// exhaustion.
+///
+/// The other three describe attribute selection that this adapter already
+/// performs, and exist so the parameter validates the way DynamoDB does
+/// rather than being silently accepted:
+/// [`SpecificAttributes`](Self::SpecificAttributes) is the projection path;
+/// [`AllProjectedAttributes`](Self::AllProjectedAttributes) is an index
+/// read's declared projection (what an index query returns here anyway, per
+/// ADR 0041); [`AllAttributes`](Self::AllAttributes) is the base-table
+/// default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Select {
+    /// Every attribute of the item. The default for a base-table read.
+    #[default]
+    AllAttributes,
+    /// The queried index's declared projection. The default for an index
+    /// read, and only valid when `IndexName` is present.
+    AllProjectedAttributes,
+    /// Exactly the paths named by `ProjectionExpression`/`AttributesToGet`,
+    /// which must be present.
+    SpecificAttributes,
+    /// No `Items` — counts only.
+    Count,
+}
+
 /// A projection: the document paths a read should return (from a
 /// `ProjectionExpression` or the legacy `AttributesToGet`). `None` on an
 /// operation means "all attributes"; `Some(paths)` keeps only the requested
@@ -472,6 +507,9 @@ pub enum Operation {
         filter: Option<ConditionExpression>,
         /// Optional projection (the attributes to return; `None` = all).
         projection: Option<Projection>,
+        /// `Select` — what the response returns. Only `COUNT` changes the
+        /// response shape (no `Items`); the rest validate the request.
+        select: Select,
         /// `ConsistentRead` (default `false`). DynamoDB's own contract (ADR
         /// 0041 §5): legal and already-true against the base table or an LSI
         /// (both linearizable here); an error against a **GSI** (eventually
@@ -500,6 +538,9 @@ pub enum Operation {
         filter: Option<ConditionExpression>,
         /// Optional projection (the attributes to return; `None` = all).
         projection: Option<Projection>,
+        /// `Select` — what the response returns. Only `COUNT` changes the
+        /// response shape (no `Items`); the rest validate the request.
+        select: Select,
         /// `ConsistentRead` (default `false`). Decoded but **accept-and-
         /// ignore** for the base table or an LSI (both linearizable here
         /// already); an error against a **GSI** — the `animusd` edge is the
@@ -1412,6 +1453,73 @@ fn decode_condition(obj: &Map<String, Value>) -> Result<Option<ConditionExpressi
 /// top-level attribute names, with `#name` placeholders resolved against
 /// `ExpressionAttributeNames`) or the legacy `AttributesToGet` (a JSON array of
 /// names). At most one may be present. Absent ⇒ `Ok(None)` (all attributes).
+/// Decode `Select`, validating it against the rest of the request the way
+/// DynamoDB does rather than accepting it and ignoring it.
+///
+/// Absent, it is inferred: a request carrying a projection means
+/// `SPECIFIC_ATTRIBUTES`; otherwise an index read defaults to
+/// `ALL_PROJECTED_ATTRIBUTES` and a base-table read to `ALL_ATTRIBUTES`.
+///
+/// Present, three rules are enforced, each of which AWS rejects and this
+/// adapter previously ignored:
+/// - `SPECIFIC_ATTRIBUTES` **requires** a projection (otherwise the request
+///   names no attributes at all);
+/// - every other value **forbids** one (the two would contradict);
+/// - `ALL_PROJECTED_ATTRIBUTES` requires an `IndexName` (there is no
+///   projection to speak of on a base table).
+fn decode_select(
+    obj: &Map<String, Value>,
+    index: Option<&str>,
+    projection: Option<&Projection>,
+) -> Result<Select, WireError> {
+    let Some(raw) = obj.get("Select") else {
+        return Ok(if projection.is_some() {
+            Select::SpecificAttributes
+        } else if index.is_some() {
+            Select::AllProjectedAttributes
+        } else {
+            Select::AllAttributes
+        });
+    };
+    let name = raw
+        .as_str()
+        .ok_or_else(|| WireError::validation("Select must be a string"))?;
+    let select = match name {
+        "ALL_ATTRIBUTES" => Select::AllAttributes,
+        "ALL_PROJECTED_ATTRIBUTES" => Select::AllProjectedAttributes,
+        "SPECIFIC_ATTRIBUTES" => Select::SpecificAttributes,
+        "COUNT" => Select::Count,
+        other => {
+            return Err(WireError::validation(format!(
+                "unknown Select value {other:?}; expected one of ALL_ATTRIBUTES, \
+                 ALL_PROJECTED_ATTRIBUTES, SPECIFIC_ATTRIBUTES, COUNT"
+            )));
+        }
+    };
+    match select {
+        Select::SpecificAttributes if projection.is_none() => {
+            return Err(WireError::validation(
+                "Select=SPECIFIC_ATTRIBUTES requires a ProjectionExpression \
+                 (or the legacy AttributesToGet)",
+            ));
+        }
+        Select::SpecificAttributes => {}
+        _ if projection.is_some() => {
+            return Err(WireError::validation(
+                "a ProjectionExpression (or the legacy AttributesToGet) may \
+                 only be combined with Select=SPECIFIC_ATTRIBUTES",
+            ));
+        }
+        Select::AllProjectedAttributes if index.is_none() => {
+            return Err(WireError::validation(
+                "Select=ALL_PROJECTED_ATTRIBUTES is only valid with an IndexName",
+            ));
+        }
+        _ => {}
+    }
+    Ok(select)
+}
+
 fn decode_projection(obj: &Map<String, Value>) -> Result<Option<Projection>, WireError> {
     let has_expr = obj.contains_key("ProjectionExpression");
     let has_legacy = obj.contains_key("AttributesToGet");
@@ -1625,6 +1733,7 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     // post-read contract, just applied within one partition's key range.
     let filter = decode_predicate(obj, "FilterExpression")?;
     let projection = decode_projection(obj)?;
+    let select = decode_select(obj, index.as_deref(), projection.as_ref())?;
     let consistent_read = decode_consistent_read(obj);
     // A sort condition on an index is meaningful only for a local secondary
     // index (which has an alternate sort key). The caller (registry) rejects a
@@ -1650,6 +1759,7 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         scan_index_forward,
         filter,
         projection,
+        select,
         consistent_read,
     })
 }
@@ -1707,6 +1817,7 @@ fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let exclusive_start_key = decode_exclusive_start_key(obj)?;
     let filter = decode_predicate(obj, "FilterExpression")?;
     let projection = decode_projection(obj)?;
+    let select = decode_select(obj, index.as_deref(), projection.as_ref())?;
     let consistent_read = decode_consistent_read(obj);
     Ok(Operation::Scan {
         table,
@@ -1715,6 +1826,7 @@ fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         exclusive_start_key,
         filter,
         projection,
+        select,
         consistent_read,
     })
 }
@@ -2097,6 +2209,33 @@ pub fn scan_response(items: &[Item], scanned: usize, last_evaluated_key: Option<
         obj.insert("LastEvaluatedKey".into(), encode_item(key));
     }
     serde_json::to_string(&Value::Object(obj)).expect("scan response serializes")
+}
+
+/// [`scan_response`], honouring [`Select`]: under [`Select::Count`] the
+/// `Items` array is omitted entirely and only `Count`/`ScannedCount` (plus
+/// any `LastEvaluatedKey`) are returned. Every other `Select` returns the
+/// full page, since the attribute selection has already been applied to the
+/// items by the time they get here.
+///
+/// The counts are identical either way — a `COUNT` request reads and filters
+/// exactly what the same request without it would have.
+#[must_use]
+pub fn select_response(
+    select: Select,
+    items: &[Item],
+    scanned: usize,
+    last_evaluated_key: Option<&Item>,
+) -> String {
+    if select != Select::Count {
+        return scan_response(items, scanned, last_evaluated_key);
+    }
+    let mut obj = Map::new();
+    obj.insert("Count".into(), Value::from(items.len()));
+    obj.insert("ScannedCount".into(), Value::from(scanned));
+    if let Some(key) = last_evaluated_key {
+        obj.insert("LastEvaluatedKey".into(), encode_item(key));
+    }
+    serde_json::to_string(&Value::Object(obj)).expect("count response serializes")
 }
 
 /// The synthetic ARN this adapter surfaces for a stream (ADR 0042 §4):
@@ -3057,10 +3196,16 @@ mod tests {
                 scan_index_forward,
                 filter,
                 projection,
+                select,
                 consistent_read,
             } => {
                 assert!(filter.is_none(), "no FilterExpression in the body");
                 assert!(scan_index_forward, "ScanIndexForward defaults to true");
+                assert_eq!(
+                    select,
+                    Select::AllAttributes,
+                    "a base-table read with no projection defaults to ALL_ATTRIBUTES"
+                );
                 assert_eq!(table, "t");
                 assert_eq!(index, None);
                 assert_eq!(partition_value, s("part"));
@@ -3733,11 +3878,13 @@ mod tests {
                 exclusive_start_key,
                 filter,
                 projection,
+                select,
                 consistent_read,
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(index, None);
                 assert_eq!(limit, Some(2));
+                assert_eq!(select, Select::AllAttributes);
                 assert_eq!(exclusive_start_key.unwrap().get("id"), Some(&s("k5")));
                 assert_eq!(
                     filter,
@@ -4067,5 +4214,126 @@ mod tests {
         let body = describe_time_to_live_response(&desc);
         assert!(body.contains("\"TimeToLiveStatus\":\"DISABLED\""));
         assert!(!body.contains("AttributeName"));
+    }
+
+    /// `Select` is inferred when absent: a projection implies
+    /// `SPECIFIC_ATTRIBUTES`, an index read defaults to the index's
+    /// projection, and a plain table read to `ALL_ATTRIBUTES`.
+    #[test]
+    fn absent_select_is_inferred_from_the_rest_of_the_request() {
+        let q = |body: &str| match decode_request("DynamoDB_20120810.Query", body.as_bytes())
+            .expect("decodes")
+        {
+            Operation::Query { select, .. } => select,
+            other => panic!("expected Query, got {other:?}"),
+        };
+        assert_eq!(
+            q(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                  "ExpressionAttributeValues":{":p":{"S":"a"}}}"#),
+            Select::AllAttributes
+        );
+        assert_eq!(
+            q(
+                r#"{"TableName":"t","IndexName":"i","KeyConditionExpression":"pk = :p",
+                  "ExpressionAttributeValues":{":p":{"S":"a"}}}"#
+            ),
+            Select::AllProjectedAttributes,
+            "an index read defaults to its declared projection"
+        );
+        assert_eq!(
+            q(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                  "ExpressionAttributeValues":{":p":{"S":"a"}},
+                  "ProjectionExpression":"a,b"}"#),
+            Select::SpecificAttributes,
+            "a projection implies SPECIFIC_ATTRIBUTES"
+        );
+    }
+
+    /// Every explicit `Select` value round-trips, including `COUNT` — the one
+    /// that changes the response shape.
+    #[test]
+    fn explicit_select_values_decode() {
+        let q = |sel: &str| {
+            let body = format!(
+                r#"{{"TableName":"t","KeyConditionExpression":"pk = :p",
+                     "ExpressionAttributeValues":{{":p":{{"S":"a"}}}},"Select":"{sel}"}}"#
+            );
+            match decode_request("DynamoDB_20120810.Query", body.as_bytes()).expect("decodes") {
+                Operation::Query { select, .. } => select,
+                other => panic!("expected Query, got {other:?}"),
+            }
+        };
+        assert_eq!(q("ALL_ATTRIBUTES"), Select::AllAttributes);
+        assert_eq!(q("COUNT"), Select::Count);
+    }
+
+    /// The four validations DynamoDB performs and this adapter previously
+    /// ignored. Each was silently accepted before.
+    #[test]
+    fn select_is_validated_against_the_rest_of_the_request() {
+        let err = |body: &str| {
+            decode_request("DynamoDB_20120810.Query", body.as_bytes())
+                .expect_err("must be rejected")
+        };
+
+        // SPECIFIC_ATTRIBUTES with nothing to select.
+        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                "ExpressionAttributeValues":{":p":{"S":"a"}},
+                "Select":"SPECIFIC_ATTRIBUTES"}"#);
+
+        // A projection contradicting a non-SPECIFIC Select.
+        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                "ExpressionAttributeValues":{":p":{"S":"a"}},
+                "ProjectionExpression":"a","Select":"ALL_ATTRIBUTES"}"#);
+        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                "ExpressionAttributeValues":{":p":{"S":"a"}},
+                "ProjectionExpression":"a","Select":"COUNT"}"#);
+
+        // ALL_PROJECTED_ATTRIBUTES without an index to project.
+        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                "ExpressionAttributeValues":{":p":{"S":"a"}},
+                "Select":"ALL_PROJECTED_ATTRIBUTES"}"#);
+
+        // An unknown value is rejected rather than silently treated as default.
+        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+                "ExpressionAttributeValues":{":p":{"S":"a"}},
+                "Select":"EVERYTHING"}"#);
+    }
+
+    /// `Scan` decodes `Select` through the same path as `Query`.
+    #[test]
+    fn scan_decodes_select_too() {
+        match decode_request(
+            "DynamoDB_20120810.Scan",
+            br#"{"TableName":"t","Select":"COUNT"}"#,
+        )
+        .expect("decodes")
+        {
+            Operation::Scan { select, .. } => assert_eq!(select, Select::Count),
+            other => panic!("expected Scan, got {other:?}"),
+        }
+    }
+
+    /// Under `COUNT` the response carries no `Items` at all, while the counts
+    /// and any cursor are exactly what the same page would otherwise report.
+    #[test]
+    fn count_select_omits_items_but_keeps_counts_and_cursor() {
+        let item: Item = [("id".to_string(), s("k1"))].into_iter().collect();
+        let items = vec![item.clone()];
+
+        let full = select_response(Select::AllAttributes, &items, 4, Some(&item));
+        assert!(full.contains("\"Items\""), "the normal shape keeps Items");
+
+        let counted = select_response(Select::Count, &items, 4, Some(&item));
+        assert!(
+            !counted.contains("\"Items\""),
+            "COUNT must not carry Items: {counted}"
+        );
+        assert!(counted.contains("\"Count\":1"), "{counted}");
+        assert!(counted.contains("\"ScannedCount\":4"), "{counted}");
+        assert!(
+            counted.contains("\"LastEvaluatedKey\""),
+            "a truncated COUNT page still paginates: {counted}"
+        );
     }
 }

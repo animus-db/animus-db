@@ -109,6 +109,26 @@ The surface now extends past the original three point ops:
   enforced (a permissive divergence, tracked with that group): DynamoDB
   rejects a `FilterExpression` naming a key attribute of the table or index
   being queried; we accept it.
+  **Audit note (2026-08-22, fourth):** `Query`/`Scan` now honour `Select`.
+  It had not been decoded at all, so `Select: COUNT` — the "how many match,
+  don't send them" form — **silently returned every item**: both the wrong
+  response shape and an unbounded payload for the one request whose purpose
+  is to avoid one. `COUNT` now suppresses `Items` while changing nothing
+  about what is read: the filter still runs, `Limit` still caps what is
+  examined, and a truncated `COUNT` page still carries a `LastEvaluatedKey`.
+  `Count` is therefore the matches on *this page*, not of the whole query.
+  The other three values describe attribute selection this adapter already
+  performed, and are now **validated** the way DynamoDB validates them
+  rather than silently accepted: `SPECIFIC_ATTRIBUTES` requires a
+  projection, every other value forbids one, `ALL_PROJECTED_ATTRIBUTES`
+  requires an `IndexName`, and an unknown value is rejected.
+  Still **not** enforced (a divergence tracked with the permissive group):
+  DynamoDB rejects `ALL_ATTRIBUTES` against a GSI that does not project
+  every attribute, and serves it on an **LSI** by fetching the missing
+  attributes from the base row; this adapter returns the index's declared
+  projection in both cases (ADR 0041), so such a request quietly yields
+  fewer attributes than AWS would. Closing it means a base-row fetch for
+  the LSI case, which is its own change.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
