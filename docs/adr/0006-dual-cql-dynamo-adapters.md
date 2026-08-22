@@ -177,6 +177,21 @@ The surface now extends past the original three point ops:
   differently. A missing attribute, and any ordering across incomparable
   types, is false for every operator — `<>` included, since DynamoDB has no
   three-valued logic here.
+  **Audit note (2026-08-22, seventh — boolean composition):** the predicate
+  grammar now composes with `AND`/`OR`/`NOT` and parentheses, completing the
+  `FilterExpression`/`ConditionExpression` surface. Precedence is DynamoDB's:
+  `NOT` binds tightest, then `AND`, then `OR`, with parentheses overriding
+  and chains left-associative. Two parser edges are worth knowing because
+  either would return plausible wrong rows rather than erroring: a
+  `BETWEEN`'s own ` AND ` belongs to the term, not the combinator, so the
+  splitter tracks how many `AND`s the `BETWEEN`s at the current depth still
+  owe; and the top-level split skips parenthesised groups, so
+  `(a OR b) AND c` is not cut inside the group while `(a) OR (b)` is still
+  recognised as a disjunction rather than one group. Composition is
+  short-circuiting, which also preserves each leaf's "false when the
+  attribute is absent" under `NOT` — `NOT attribute_exists(a)` agrees with
+  `attribute_not_exists(a)` precisely because the leaf is false rather than
+  unknown.
 - **Conditional writes.** A `ConditionExpression` subset
   (`attribute_not_exists(a)`, `attribute_exists(a)`, `a = :v`) gates `PutItem` /
   `DeleteItem`: the edge quorum-reads the current item under the coordinator
