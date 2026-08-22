@@ -1006,45 +1006,34 @@ fn decode_update_expression(
                         // client that retries an ADD which actually applied
                         // double-counts there too. What must never happen is
                         // the service counting twice for one request.
-                        // **Numeric ADD stays refused, for a sharper reason
-                        // than before.** The service no longer over-counts:
-                        // `cp_kind_write_item` does not re-apply a
-                        // non-idempotent write (`kind_write_is_idempotent`),
-                        // so at-most-once per request now holds — measured,
-                        // ten concurrent increments leave the counter at
-                        // exactly ten.
+                        // Numeric ADD is the adapter's only non-idempotent
+                        // write, and it is safe now for two reasons that had
+                        // to land first.
                         //
-                        // What is still missing is an honest *response*.
-                        // Confirmation probes whether the value this write
-                        // produced is present; a concurrent increment
-                        // supersedes it, so the write reports "superseded
-                        // before its effect appeared ... retry" although it
-                        // applied. Measured under the same load: 8 of 10
-                        // requests were told to retry, and retrying a numeric
-                        // ADD is exactly what double-counts. A counter that
-                        // mostly reports failure, and whose advertised remedy
-                        // corrupts it, is worse than one that is refused.
+                        // `cp_kind_write_item` no longer re-applies a
+                        // non-idempotent write on its own, so at-most-once
+                        // per request holds — DynamoDB's own guarantee, under
+                        // which a *client* retry of an ADD that applied
+                        // double-counts there too.
                         //
-                        // Unblocking it means confirming on the *proposal*
-                        // (did my entry commit and apply?) rather than on the
-                        // value, which is `docs/engineering-lessons.md`'s own
-                        // rule: a proposer must distinguish never-accepted
-                        // from accepted-unconfirmed. That is an ADR 0046/0049
-                        // change, not a wire-adapter one.
-                        if matches!(value, AttributeValue::N(_)) {
-                            return Err(WireError::validation(
-                                "numeric ADD is not supported: a concurrent update supersedes \
-                                 this write's confirmation, so success cannot be reported \
-                                 honestly and the advised retry would count twice. Read the \
-                                 value and SET it instead, or use a set-typed ADD.",
-                            ));
-                        }
+                        // And a `KindBatch` now records what it did at apply
+                        // time, so a write that applied is acknowledged even
+                        // when a concurrent update immediately overwrites it.
+                        // Before that, confirmation compared the value back
+                        // and reported "superseded ... retry" on 8 of 10
+                        // concurrent increments that had in fact applied —
+                        // and retrying is precisely what double-counts.
+                        // Measured after both: ten concurrent increments are
+                        // all accepted and leave the counter at exactly ten.
                         if !matches!(
                             value,
-                            AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_)
+                            AttributeValue::N(_)
+                                | AttributeValue::SS(_)
+                                | AttributeValue::NS(_)
+                                | AttributeValue::BS(_)
                         ) {
                             return Err(WireError::validation(
-                                "ADD takes a set operand (SS, NS or BS)",
+                                "ADD takes a number or a set operand (N, SS, NS or BS)",
                             ));
                         }
                         actions.push(UpdateAction::Add(attr, value));
@@ -5552,25 +5541,31 @@ mod tests {
         }
     }
 
-    /// Numeric `ADD` is refused, and the message says why.
-    ///
-    /// The service no longer over-counts — at-most-once per request holds —
-    /// but confirmation still cannot tell "superseded but applied" from "no-op",
-    /// so success cannot be reported honestly and the advised retry would
-    /// double-count.
+    /// Numeric `ADD` decodes. Its safety comes from the write path — the
+    /// service does not re-apply a non-idempotent write, and a `KindBatch`
+    /// records what it did so an applied write is acknowledged even when a
+    /// concurrent update overwrites it — not from refusing it here.
     #[test]
-    fn numeric_add_is_refused_with_a_reason() {
+    fn numeric_add_decodes() {
         let body = br#"{"TableName":"t","Key":{"pk":{"S":"a"}},
              "UpdateExpression":"ADD c :one",
              "ExpressionAttributeValues":{":one":{"N":"1"}}}"#;
-        let err = decode_request("DynamoDB_20120810.UpdateItem", body)
-            .expect_err("numeric ADD must be refused");
-        assert_eq!(err.code, "ValidationException");
-        assert!(
-            err.message.contains("count twice"),
-            "the message must explain the consequence: {}",
-            err.message
-        );
+        match decode_request("DynamoDB_20120810.UpdateItem", body).expect("decodes") {
+            Operation::UpdateItem { actions, .. } => assert_eq!(
+                actions,
+                vec![UpdateAction::Add("c".into(), AttributeValue::N("1".into()))]
+            ),
+            other => panic!("expected UpdateItem, got {other:?}"),
+        }
+    }
+
+    /// `ADD` still rejects an operand that is neither a number nor a set.
+    #[test]
+    fn add_rejects_a_non_numeric_non_set_operand() {
+        let body = br#"{"TableName":"t","Key":{"pk":{"S":"a"}},
+             "UpdateExpression":"ADD c :s",
+             "ExpressionAttributeValues":{":s":{"S":"x"}}}"#;
+        assert!(decode_request("DynamoDB_20120810.UpdateItem", body).is_err());
     }
 
     /// An operand that is neither a number nor a set is refused for both
