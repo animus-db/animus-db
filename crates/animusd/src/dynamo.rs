@@ -3685,7 +3685,12 @@ pub(crate) enum KindWriteOutcome {
 /// racing evaluators of the same item safe, and it already has to work
 /// lock-free (`txn_resolver_loop` never takes this lock either). Narrowing
 /// the scope trades a few more retried OCC misses under genuine same-key
-/// contention for not stalling unrelated items' writes.
+/// contention for not stalling unrelated items' writes. Regression-tested
+/// by `animusd`'s `confirm_futility_tests::
+/// an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_confirm_wait`
+/// — see [`rmw285_confirm_gate`] for how that test holds this function's
+/// own propose/confirm phase open deterministically rather than racing a
+/// real apply backlog to build in time.
 /// `ttl_expired` (ADR 0051 §7): `true` only for the TTL reaper's own delete
 /// — stamps the resulting change record's `userIdentity` as the service
 /// principal (see [`kind_writes_for_item`]'s doc) instead of leaving it a
@@ -3762,6 +3767,8 @@ pub(crate) async fn kind_write_item_at_leader(
         (old, new, writes, change_log, seatbelt)
         // `_rmw` drops here — released before the propose/confirm below.
     };
+    #[cfg(test)]
+    rmw285_confirm_gate::wait_if_armed(table).await;
     ClientCtx::cp_kind_local(leader, writes, vec![change_log], seatbelt)
         .await
         .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;
@@ -3771,6 +3778,70 @@ pub(crate) async fn kind_write_item_at_leader(
         new,
         collection_bytes,
     })
+}
+
+/// Test-only synchronization hook for the issue #285 regression
+/// (`kind_write_item_at_leader`'s own doc, above), used by `animusd`'s
+/// `confirm_futility_tests::
+/// an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_confirm_wait`.
+///
+/// That test needs one write's propose+confirm phase to reliably still be
+/// running when a second, unrelated write returns. The original version
+/// tried to manufacture that by racing a concurrent filler flood against
+/// real apply-backlog timing — which a CPU-starved runner starves right
+/// along with everything else it is supposed to slow down, so the flood
+/// sometimes never builds enough backlog and the "slow" write finishes
+/// first (observed in CI on commit `97289e2`: one parallel run green, one
+/// red, from the identical code). Racing real backlog is not load-bearing
+/// for what the test actually checks — only the *lock's scope* is — so
+/// this hook lets the test hold a specific table's write open under its
+/// own control instead: deterministic, and immune to scheduler load.
+///
+/// Armed for exactly one table name at a time via [`arm`]; consumed
+/// (disarmed) the first time [`wait_if_armed`] matches, so a single arm
+/// call can never bleed into a later, unrelated call through this same
+/// function — including this same test's *own* second write, which must
+/// run at full speed for the regression to mean anything.
+#[cfg(test)]
+pub(crate) mod rmw285_confirm_gate {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    static ARMED: OnceLock<Mutex<Option<(String, Duration)>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<(String, Duration)>> {
+        ARMED.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Arm the gate: the next [`kind_write_item_at_leader`](super::
+    /// kind_write_item_at_leader) call for `table` sleeps `delay` right
+    /// after releasing `rmw_lock`, immediately before its propose+confirm
+    /// — modeling a slow confirm-poll without needing one to actually
+    /// occur. One-shot: fires for the *next* matching call only.
+    pub(crate) fn arm(table: &str, delay: Duration) {
+        *slot().lock().expect("rmw285_confirm_gate poisoned") = Some((table.to_string(), delay));
+    }
+
+    /// Called by `kind_write_item_at_leader` once `rmw_lock` is already
+    /// released. A no-op unless `table` matches an [`arm`] call still
+    /// pending, in which case it sleeps the armed delay and disarms.
+    pub(crate) async fn wait_if_armed(table: &str) {
+        let delay = {
+            let mut guard = slot().lock().expect("rmw285_confirm_gate poisoned");
+            match guard.as_ref() {
+                Some((armed_table, delay)) if armed_table == table => {
+                    let delay = *delay;
+                    *guard = None;
+                    Some(delay)
+                }
+                _ => None,
+            }
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
 }
 
 /// The base + LSI byte total of the tablet `leader` leads: an **upper bound**
