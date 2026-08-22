@@ -224,8 +224,7 @@ async fn drop_table_cascades_to_its_gsis_hidden_table() {
         let index_tablets = tablet_ids_for(&node, index_table);
         assert!(!base_tablets.is_empty() && !index_tablets.is_empty());
 
-        // DROP the base table via the admin sink (same path as CQL
-        // `DROP TABLE`) — the DynamoDB wire itself has no `DeleteTable`.
+        // DROP the base table via the admin sink.
         let (status, body) = admin(
             admin_addr,
             "POST",

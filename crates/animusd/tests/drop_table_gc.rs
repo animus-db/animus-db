@@ -36,18 +36,17 @@ async fn bring_up(
     dir: &Path,
 ) -> (Vec<Node>, animusd::ClusterConfig, Vec<std::path::PathBuf>) {
     for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 7);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[7 * i],
-                client: addrs[7 * i + 1],
-                dynamo: addrs[7 * i + 2],
-                cql: addrs[7 * i + 3],
-                admin: addrs[7 * i + 4],
-                intra: addrs[7 * i + 5],
-                console: addrs[7 * i + 6],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -256,7 +255,7 @@ async fn dropped_table_data_is_reclaimed_including_split_child() {
         })
         .await;
 
-        // DROP the table via the admin sink (same path as CQL `DROP TABLE`).
+        // DROP the table via the admin sink.
         let (s, body) = admin(
             admin_addr,
             "POST",

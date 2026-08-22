@@ -8,8 +8,7 @@
 //! drain's own reconcile cursor) and `"copier"` (the stream copier's cursor,
 //! landing with the shard subsystem) — the type here is deliberately generic
 //! over the tag string rather than a closed enum, since ADR 0042's own
-//! roadmap expects more consumer kinds later (per-CQL-CDC-consumer cursors
-//! named as a follow-up).
+//! roadmap expects more consumer kinds to be named as a follow-up.
 //!
 //! ## Why a scalar per-tag watermark is sound
 //!
@@ -89,9 +88,8 @@
 //!
 //! [`ConsumerOffset`] is an additive, unifying wrapper over the two
 //! conventions above — for a future consumer that wants to hold either
-//! shape without hard-coding which one its own tag uses (a per-CQL-CDC-
-//! consumer cursor is the concrete future case ADR 0042's own roadmap
-//! names, see this doc's own intro). It delegates to the existing
+//! shape without hard-coding which one its own tag uses (see this doc's
+//! own intro for the future-consumer-kinds roadmap). It delegates to the existing
 //! `encode_watermark`/`decode_watermark`/`encode_backfill_cursor`/
 //! `decode_backfill_cursor` free functions rather than re-implementing
 //! either encoding — those functions, and every existing caller of them,
@@ -248,8 +246,7 @@ pub fn decode_backfill_cursor(bytes: &[u8]) -> Vec<u8> {
 /// and every existing caller of them are untouched. This exists for a
 /// **future** generic consumer that wants to hold either offset shape
 /// without hard-coding which convention its own tag uses (the module doc's
-/// own "per-CQL-CDC-consumer cursors named as a follow-up" case) — no
-/// current caller constructs one.
+/// own future-consumer-kinds roadmap) — no current caller constructs one.
 ///
 /// There is deliberately no single `decode(bytes) -> ConsumerOffset`: the
 /// module doc's own disjointness note applies here too — "a reader always

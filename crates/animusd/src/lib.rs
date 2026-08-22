@@ -45,8 +45,6 @@ pub use animus_control::{
 mod admin;
 mod console;
 mod control_handle;
-mod cql;
-mod cql_client;
 mod dashboard;
 mod dynamo;
 mod dynamo_streams;
@@ -1553,12 +1551,12 @@ pub enum ClientRequest {
     /// through the `Forwarded` arm; not a `MetaCommand`, so
     /// `is_relayable_command` does not apply.
     GetSnapshot { key: Vec<u8>, table: String },
-    /// Delete `key` of `table` from the **CP** plane (a Raft-committed tombstone) —
-    /// the CQL edge's whole-partition delete. `table` is **required** (ADR 0023).
+    /// Delete `key` of `table` from the **CP** plane (a Raft-committed tombstone).
+    /// `table` is **required** (ADR 0023).
     Delete { key: Vec<u8>, table: String },
     /// A **linearizable range scan** of `table` over `[start, end)`, up to `limit`
     /// keys, served from the group leader (ReadIndex). The CP read primitive behind
-    /// the DynamoDB `Query`/`Scan` and CQL `SELECT` edges; also the cross-process
+    /// the DynamoDB `Query`/`Scan` edges; also the cross-process
     /// forwarding payload for a scan (ADR 0017 #3b). `table` is **required** (ADR
     /// 0023) — scans are per-table fan-outs.
     Scan {
@@ -1777,7 +1775,7 @@ pub enum ClientRequest {
 /// would make the refusal rule look symmetric when it is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListenerKind {
-    /// The external, DynamoDB/CQL-adjacent client port.
+    /// The external, DynamoDB-adjacent client port.
     Client,
     /// The cluster-internal RPC port (ADR 0047) — the more-trusted network
     /// segment; the operator's Kubernetes topology keeps it off any
@@ -1952,8 +1950,6 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // see this function's own doc for why `ExpireStreamShards` is
             // deliberately NOT included here.
             | MetaCommand::SealStreamShard { .. }
-            | MetaCommand::CreateKeyspace { .. }
-            | MetaCommand::DropKeyspace { .. }
             | MetaCommand::RegisterCpAddr { .. }
             // Node address book (ADR 0032 PR1): every node self-registers its
             // full address set at startup, from whichever node it happens to
@@ -2217,7 +2213,7 @@ pub enum ClientResponse {
 /// Listen addresses for a node's endpoints (use port 0 for ephemeral): one
 /// **internal** `ProdEnv` (ADR 0040 PR1 — one identity per node: the control
 /// Raft rides stream 0, every per-tablet Raft group its own stream ≥ 1) + the
-/// client API + the DynamoDB HTTP and CQL endpoints. v1 (ADR 0019) is
+/// client API + the DynamoDB HTTP endpoint. v1 (ADR 0019) is
 /// CP-only — the AP `data`/`coord` roles are gone.
 ///
 /// **ADR 0035** adds [`role`](Self::role): a node declares whether it runs the
@@ -2225,8 +2221,8 @@ pub enum ClientResponse {
 /// this ADR, the *only* shape). `internal` is required for every role (a
 /// control-only node needs it for the control Raft; a data-only node needs it
 /// for its per-tablet Raft groups **and** for heartbeating the control group,
-/// ADR 0012) — only `dynamo`/`cql` stay meaningfully role-gated in practice
-/// (unused by a control-only node), and they stay plain `SocketAddr` as
+/// ADR 0012) — only `dynamo` stays meaningfully role-gated in practice
+/// (unused by a control-only node), and it stays a plain `SocketAddr` as
 /// before. See `crate::config::NodeRole` for the role-derived `ClusterConfig`
 /// helpers (`control_ids`/`data_ids`/`peer_book`) that key off this field.
 ///
@@ -2275,13 +2271,9 @@ pub struct RoleAddrs {
     /// configs) to an ephemeral loopback port.
     #[serde(default = "default_ephemeral_addr")]
     pub dynamo: SocketAddr,
-    /// The CQL (Cassandra) binary-protocol endpoint. Defaults (when absent in
-    /// older configs) to an ephemeral loopback port.
-    #[serde(default = "default_ephemeral_addr")]
-    pub cql: SocketAddr,
     /// The **admin / debug** HTTP-JSON endpoint (ADR 0020) — a read-only
     /// introspection + operator-action surface on its own port, isolated from the
-    /// client/dynamo/cql data edges. Defaults (when absent in older configs) to an
+    /// client/dynamo data edges. Defaults (when absent in older configs) to an
     /// ephemeral loopback port.
     #[serde(default = "default_ephemeral_addr")]
     pub admin: SocketAddr,
@@ -2325,8 +2317,6 @@ pub struct BoundNode {
     client_addr: SocketAddr,
     dynamo_listener: TcpListener,
     dynamo_addr: SocketAddr,
-    cql_listener: TcpListener,
-    cql_addr: SocketAddr,
     admin_listener: TcpListener,
     admin_addr: SocketAddr,
     /// The intra-cluster RPC listener (ADR 0047) — bound but not yet served
@@ -2364,9 +2354,6 @@ pub(crate) struct AdminInfo {
     /// `None` on a control-only node (the DynamoDB listener is never bound
     /// there, ADR 0035 PR3).
     pub(crate) dynamo_addr: Option<SocketAddr>,
-    /// `None` on a control-only node (the CQL listener is never bound there,
-    /// ADR 0035 PR3).
-    pub(crate) cql_addr: Option<SocketAddr>,
     pub(crate) admin_addr: SocketAddr,
     /// This node's own intra-cluster RPC address (ADR 0047) — used to
     /// self-skip in `propose_schema`'s broadcast fallback (the intra-flavored
@@ -3391,7 +3378,7 @@ fn stream_view_type_label(view_type: animus_control::StreamViewType) -> &'static
 /// Returns the built `ClientCtx` — so the caller can
 /// spawn whatever role-specific tasks it still needs (`bootstrap`/
 /// `peer_sync_loop`/the growth-node mirror/`heartbeat_loop`/the tablet-host
-/// reconciler/`auto_split_loop`/the dynamo+cql listeners for a data-capable
+/// reconciler/`auto_split_loop`/the dynamo listener for a data-capable
 /// node; nothing more for a control-only one) — plus the join handles
 /// spawned here, which the caller folds into its own task list so
 /// [`Node::shutdown`] aborts all of it.
@@ -3541,11 +3528,6 @@ impl BoundNode {
     /// The address the DynamoDB JSON/HTTP endpoint listens on.
     pub fn dynamo_addr(&self) -> SocketAddr {
         self.dynamo_addr
-    }
-
-    /// The address the CQL binary-protocol endpoint listens on.
-    pub fn cql_addr(&self) -> SocketAddr {
-        self.cql_addr
     }
 
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
@@ -3786,7 +3768,6 @@ impl BoundNode {
             internal_addr: Some(self.internal_addr),
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
-            cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
             role: "combined",
@@ -4029,7 +4010,7 @@ impl BoundNode {
         // `metrics_sample_loop`/this node's own `register_node_addrs`
         // self-registration/`serve_requests` (both listeners)/`admin::serve`) — everything below is
         // combined-mode/data-role-only, tracked in the same task list so
-        // `shutdown` aborts all of it and releases the client/dynamo/cql
+        // `shutdown` aborts all of it and releases the client/dynamo
         // listener ports (these run on plain `tokio::spawn`, off the `Env`
         // network).
         // `data_ids` is caller-supplied (see `start_with`'s doc) — a caller
@@ -4193,14 +4174,13 @@ impl BoundNode {
                 },
             )));
         }
-        // The DynamoDB JSON/HTTP and CQL endpoints — data-role-only, unlike the
+        // The DynamoDB JSON/HTTP endpoint — data-role-only, unlike the
         // plain client server + admin endpoint (already spawned by
         // `spawn_common_tail`, which every node shape runs).
         tasks.push(tokio::spawn(dynamo::serve(
             self.dynamo_listener,
             ctx.clone(),
         )));
-        tasks.push(tokio::spawn(cql::serve(self.cql_listener, ctx.clone())));
 
         Ok(Node {
             raft: ControlHandle::Local(raft),
@@ -4209,7 +4189,6 @@ impl BoundNode {
             edge: ctx.edge.clone(),
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
-            cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
             console_addr: Some(self.console_addr),
@@ -4223,10 +4202,10 @@ impl BoundNode {
 ///
 /// **ADR 0035 PR3**: this one type now backs both a combined-mode/data-role
 /// node (two internal `ProdEnv` roles, both listeners bound) and a
-/// control-only node (one internal role, no `raftkv`/dynamo/cql listeners at
+/// control-only node (one internal role, no `raftkv`/dynamo listeners at
 /// all) — see [`BoundControlNode::start_control_with`]. `envs` is therefore a
-/// `Vec` (1 or 2 entries) rather than a fixed-size array, and `dynamo_addr`/
-/// `cql_addr` are `Option` internally; the public accessors below still
+/// `Vec` (1 or 2 entries) rather than a fixed-size array, and `dynamo_addr`
+/// is `Option` internally; the public accessor below still
 /// return a bare `SocketAddr` (panicking if absent) so every existing
 /// combined-mode caller — which only ever holds a `Some` — is unaffected.
 pub struct Node {
@@ -4243,7 +4222,7 @@ pub struct Node {
     /// [`shutdown`](Node::shutdown) can abort every task they own and free
     /// their listener ports.
     envs: Vec<ProdEnv>,
-    /// The client-facing listener tasks (client TCP / dynamo HTTP / cql), which
+    /// The client-facing listener tasks (client TCP / dynamo HTTP), which
     /// run on plain `tokio::spawn` off the `Env` network; aborted on shutdown.
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// This node's own edge state (ADR 0031 PR2 — cheap to clone, `Arc`-wrapped
@@ -4256,9 +4235,6 @@ pub struct Node {
     /// `None` on a control-only node (ADR 0035 PR3) — the DynamoDB listener is
     /// never bound there. See [`dynamo_addr`](Self::dynamo_addr)'s doc.
     dynamo_addr: Option<SocketAddr>,
-    /// `None` on a control-only node (ADR 0035 PR3) — the CQL listener is
-    /// never bound there. See [`cql_addr`](Self::cql_addr)'s doc.
-    cql_addr: Option<SocketAddr>,
     admin_addr: SocketAddr,
     /// This node's intra-cluster RPC listen address (ADR 0047). Always
     /// populated — every deployment shape binds and (from `intra/2-cutover`
@@ -4284,7 +4260,7 @@ pub struct Node {
 
 impl Node {
     /// Bind this node's listeners (the one internal env + the client TCP
-    /// server + the DynamoDB HTTP and CQL endpoints) and create its data
+    /// server + the DynamoDB HTTP endpoint) and create its data
     /// directory (ADR 0040 PR1: one identity, one internal `ProdEnv`, per
     /// node — the control Raft and every per-tablet Raft group this node
     /// hosts share it, disambiguated by stream, ADR 0026).
@@ -4303,8 +4279,6 @@ impl Node {
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
         let dynamo_addr = dynamo_listener.local_addr()?;
-        let cql_listener = TcpListener::bind(addrs.cql).await?;
-        let cql_addr = cql_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
         let intra_listener = TcpListener::bind(addrs.intra).await?;
@@ -4320,8 +4294,6 @@ impl Node {
             client_addr,
             dynamo_listener,
             dynamo_addr,
-            cql_listener,
-            cql_addr,
             admin_listener,
             admin_addr,
             intra_listener,
@@ -4334,7 +4306,7 @@ impl Node {
     /// Bind a **control-only** node's listeners (ADR 0035 PR3): the internal
     /// `ProdEnv` (control Raft only — it hosts no tablet, so no stream ever
     /// rides above 0) plus the client + admin TCP listeners only — no
-    /// dynamo/cql listeners, and (ADR 0052) no console listener either: a
+    /// dynamo listener, and (ADR 0052) no console listener either: a
     /// control-only node hosts no CP-data tablet, so it has nothing the
     /// console could show — see [`console`](crate::console)'s module doc.
     ///
@@ -4371,7 +4343,7 @@ impl Node {
     /// `ProdEnv` (every per-tablet Raft group this node hosts, plus its own
     /// failure-detection heartbeats to the control group — no local control
     /// `RaftCore` at all, `Node::bind_control`'s exact dual) plus the
-    /// client/dynamo/cql/admin/console TCP listeners — a data-only node hosts
+    /// client/dynamo/admin/console TCP listeners — a data-only node hosts
     /// real CP-data tablets, so it binds the console listener (ADR 0052) just
     /// like a combined node.
     ///
@@ -4389,8 +4361,6 @@ impl Node {
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
         let dynamo_addr = dynamo_listener.local_addr()?;
-        let cql_listener = TcpListener::bind(addrs.cql).await?;
-        let cql_addr = cql_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
         let intra_listener = TcpListener::bind(addrs.intra).await?;
@@ -4406,8 +4376,6 @@ impl Node {
             client_addr,
             dynamo_listener,
             dynamo_addr,
-            cql_listener,
-            cql_addr,
             admin_listener,
             admin_addr,
             intra_listener,
@@ -4431,15 +4399,6 @@ impl Node {
     pub fn dynamo_addr(&self) -> SocketAddr {
         self.dynamo_addr
             .expect("dynamo_addr: this node has no data role (ADR 0035 PR3 control-only)")
-    }
-
-    /// The address the CQL binary-protocol endpoint listens on.
-    ///
-    /// # Panics
-    /// If this node has no data role — see [`dynamo_addr`](Self::dynamo_addr)'s doc.
-    pub fn cql_addr(&self) -> SocketAddr {
-        self.cql_addr
-            .expect("cql_addr: this node has no data role (ADR 0035 PR3 control-only)")
     }
 
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
@@ -4507,7 +4466,7 @@ impl Node {
     }
 
     /// Gracefully stop the node: abort its client-facing listeners (client, plus
-    /// dynamo / cql on a data-role node) and every task its internal `ProdEnv`
+    /// dynamo on a data-role node) and every task its internal `ProdEnv`
     /// role(s) own (the control Raft driver, plus the CP Raft driver on a
     /// data-role node, and the internal accept loops). This releases every
     /// listener port so a replacement node can rebind the same addresses on
@@ -4692,7 +4651,7 @@ const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// A **control-only** node (ADR 0035 PR3) whose listeners are bound but not
 /// yet started — the control-only counterpart of [`BoundNode`]. Binds the
 /// one internal `ProdEnv` (ADR 0040 PR1) plus the client + admin TCP
-/// listeners; no dynamo/cql listeners, no CP storage engine (a control node
+/// listeners; no dynamo listener, no CP storage engine (a control node
 /// never hosts a tablet or speaks a data-plane wire protocol). See
 /// [`Node::bind_control`] to construct one and
 /// [`start_control_with`](Self::start_control_with) to start it.
@@ -4749,7 +4708,7 @@ impl BoundControlNode {
     /// members — combined-mode-only, ADR 0035 PR2), `peer_sync_loop` /
     /// `heartbeat_loop` (raftkv-env-specific — this node has no raftkv env to
     /// sync or heartbeat from), the tablet-host reconciler / `auto_split_loop`
-    /// (nothing to host, no engine to sample), or the dynamo/cql listeners
+    /// (nothing to host, no engine to sample), or the dynamo listener
     /// (never bound here). Every client-request dispatch path this node *can*
     /// reach (`Status`/`ProposeSchema`/`JoinInfo`/`SplitTablet`,
     /// and the data ops `Put`/`Get`/`Scan`/`Delete`/`PutBatch`) already works
@@ -4796,7 +4755,6 @@ impl BoundControlNode {
             internal_addr: Some(self.internal_addr),
             client_addr: self.client_addr,
             dynamo_addr: None,
-            cql_addr: None,
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
             role: "control",
@@ -4929,7 +4887,6 @@ impl BoundControlNode {
             edge: ctx.edge.clone(),
             client_addr: self.client_addr,
             dynamo_addr: None,
-            cql_addr: None,
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
             console_addr: None, // ADR 0052: a control-only node hosts no CP-data tablet.
@@ -4942,7 +4899,7 @@ impl BoundControlNode {
 /// A **data-only** node (ADR 0035 PR4) whose listeners are bound but not yet
 /// started — the data-only counterpart of [`BoundNode`] (which is
 /// [`BoundControlNode`]'s own dual). Binds the one internal `ProdEnv` (ADR
-/// 0040 PR1) plus the client/dynamo/cql/admin TCP listeners; no local
+/// 0040 PR1) plus the client/dynamo/admin TCP listeners; no local
 /// control `RaftCore`, no bootstrap. See [`Node::bind_data`] to
 /// construct one and [`start_data_with`](Self::start_data_with) to start it.
 pub struct BoundDataNode {
@@ -4956,8 +4913,6 @@ pub struct BoundDataNode {
     client_addr: SocketAddr,
     dynamo_listener: TcpListener,
     dynamo_addr: SocketAddr,
-    cql_listener: TcpListener,
-    cql_addr: SocketAddr,
     admin_listener: TcpListener,
     admin_addr: SocketAddr,
     intra_listener: TcpListener,
@@ -4978,11 +4933,6 @@ impl BoundDataNode {
     /// The address the DynamoDB JSON/HTTP endpoint listens on.
     pub fn dynamo_addr(&self) -> SocketAddr {
         self.dynamo_addr
-    }
-
-    /// The address the CQL binary-protocol endpoint listens on.
-    pub fn cql_addr(&self) -> SocketAddr {
-        self.cql_addr
     }
 
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
@@ -5029,7 +4979,7 @@ impl BoundDataNode {
     ///
     /// Otherwise mirrors [`BoundNode::start_with`]'s data-role assembly
     /// exactly (the shared storage engine, the tablet-host reconciler, the
-    /// dynamo/cql listeners) minus everything control-plane-specific
+    /// dynamo listener) minus everything control-plane-specific
     /// (`bootstrap`, `edge.register_control`) — see that method's doc for
     /// what each shared piece does. `spawn_common_tail` still runs
     /// unconditionally (`route_sync_loop`/`metrics_sample_loop`/this node's
@@ -5151,7 +5101,6 @@ impl BoundDataNode {
             internal_addr: Some(self.internal_addr),
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
-            cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
             role: "data",
@@ -5347,7 +5296,6 @@ impl BoundDataNode {
             self.dynamo_listener,
             ctx.clone(),
         )));
-        tasks.push(tokio::spawn(cql::serve(self.cql_listener, ctx.clone())));
 
         Ok(Node {
             raft: ctx.control.clone(),
@@ -5356,7 +5304,6 @@ impl BoundDataNode {
             edge: ctx.edge.clone(),
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
-            cql_addr: Some(self.cql_addr),
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
             console_addr: Some(self.console_addr),
@@ -5411,11 +5358,6 @@ pub struct ClusterEdgeState {
     /// The DynamoDB edge's in-memory GSI declarations + observation-built
     /// written-key index (ADR 0006). Not durable / not replicated; per-node.
     dynamo_registry: Arc<Mutex<animus_dynamo::SchemaRegistry>>,
-    /// The CQL edge's keyspaces + prepared-statement store (ADR 0013). Not
-    /// durable / not replicated; per-node — a statement `PREPARE`d on one node
-    /// is only `EXECUTE`-able on connections to *that* node (matching a real
-    /// one-process-per-node deployment's per-process catalog).
-    cql_state: Arc<tokio::sync::Mutex<cql::CqlState>>,
     /// This **node's own** hosted **leaderful CP** per-tablet Raft group
     /// handles (ADR 0017 #3a), **keyed by tablet** so a wire edge routes a key
     /// to its owning tablet's group **leader** when this node hosts it, or
@@ -5437,7 +5379,6 @@ impl ClusterEdgeState {
         Self {
             control: Arc::new(Mutex::new(Vec::new())),
             dynamo_registry: Arc::new(Mutex::new(animus_dynamo::SchemaRegistry::new())),
-            cql_state: Arc::new(tokio::sync::Mutex::new(cql::CqlState::default())),
             raftkv: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -5601,11 +5542,6 @@ impl ClusterEdgeState {
     /// The DynamoDB edge's per-node registry.
     pub(crate) fn dynamo_registry(&self) -> &Arc<Mutex<animus_dynamo::SchemaRegistry>> {
         &self.dynamo_registry
-    }
-
-    /// The CQL edge's per-node state.
-    pub(crate) fn cql_state(&self) -> &Arc<tokio::sync::Mutex<cql::CqlState>> {
-        &self.cql_state
     }
 }
 
@@ -6016,16 +5952,16 @@ impl ChangeRateTracker {
 /// This node's data-plane fields (ADR 0035 PR3) — present in [`ClientCtx`]
 /// iff this node runs the data role (`NodeRole::Data`/`Both`); `None` on a
 /// control-only node, which never hosts a tablet and never runs the CP/
-/// DynamoDB/CQL machinery these back. Grouping them under one `Option`
+/// DynamoDB machinery these back. Grouping them under one `Option`
 /// (rather than three loose `Option` fields on `ClientCtx`) means "does this
 /// node have a data role" is answered once, at the type level, instead of
 /// re-derived from whether several unrelated fields all happen to be `Some`.
 #[derive(Clone)]
 struct DataRole {
-    /// Serializes a node's read-modify-writes so a CQL/DynamoDB RMW (linearizable
+    /// Serializes a node's read-modify-writes so a DynamoDB RMW (linearizable
     /// CP read → CP write) is atomic *per node*. Cross-node atomicity (a CAS on the
-    /// CP group) is later v1 work. Accessed only from the dynamo/cql wire edges,
-    /// whose listeners are never bound on a control-only node.
+    /// CP group) is later v1 work. Accessed only from the dynamo wire edge,
+    /// whose listener is never bound on a control-only node.
     pub(crate) rmw_lock: Arc<tokio::sync::Mutex<()>>,
     /// The raftkv-role env's recording metrics sink (the CP group records here).
     /// Aggregated into the `/metrics` export (ADR 0015) alongside the control
@@ -6059,7 +5995,7 @@ struct DataRole {
     pub(crate) split_builds: Arc<Mutex<BTreeMap<u64, SplitBuildView>>>,
 }
 
-/// Shared context for the client request server and the DynamoDB/CQL endpoints:
+/// Shared context for the client request server and the DynamoDB endpoint:
 /// the control-plane handle (for cached metadata + schema proposals — a
 /// [`ControlHandle`], ADR 0035 PR1), this node's own wire-edge state (incl. the
 /// CP group handles it hosts), the cross-node CP routing table, and — iff this
@@ -6148,7 +6084,7 @@ impl ClientCtx {
     /// # Panics
     /// If this node has no data role (ADR 0035 PR3 control-only). Every call
     /// site must be reachable only from a path that structurally cannot run
-    /// on a control-only node: the dynamo/cql wire edges (their listeners are
+    /// on a control-only node: the dynamo wire edge (its listener is
     /// never bound there) or an internal loop `start_with` only spawns for a
     /// data-capable node (`auto_split_loop`). **Never** call this from a
     /// client-request dispatch path a control-only node can reach — CP
@@ -6189,9 +6125,8 @@ impl ClientCtx {
     /// this node's own address-registration commit check, the raftkv peer-sync
     /// loop, the split trigger's precondition reads, and (ADR 0035 PR1)
     /// the general-purpose schema-catalog reads (`table_schema`/
-    /// `has_table_schema`, and — since the PR5 staleness audit closed the gap
-    /// PR1 flagged — `has_keyspace` too) the CQL/DynamoDB wire edges use for
-    /// everything except their own commit-wait polls (see
+    /// `has_table_schema`) the DynamoDB wire edge uses for
+    /// everything except its own commit-wait polls (see
     /// [`metadata_fresh`](Self::metadata_fresh) for those).
     fn effective_metadata(&self) -> Metadata {
         if let Some(meta) = self
@@ -6213,8 +6148,7 @@ impl ClientCtx {
     /// where it stays exactly as fresh (or as stuck) as it always was before
     /// this seam existed.
     ///
-    /// Used by the schema commit-wait polls (`create_table_schema`/
-    /// `replace_table_schema`/`drop_table_schema`/`trigger_split`
+    /// Used by the schema commit-wait polls (`drop_table_schema`/`trigger_split`
     /// below) and the DynamoDB conditional-write existence
     /// gate (`dynamo.rs::quorum_read`'s live re-check on a snapshot miss) —
     /// each must observe its own just-proposed command (or a concurrent
@@ -7030,7 +6964,7 @@ impl ClientCtx {
     ///
     /// **Retries the retryable freeze refusal (issue #288)** — the fast/
     /// marker-write arm's own share of the gap: this primitive backs plain
-    /// (unindexed, unstreamed) Dynamo writes, CQL's partition writes, and the
+    /// (unindexed, unstreamed) Dynamo writes and the
     /// raw client protocol, none of which used to retry `FROZEN_REFUSAL`
     /// either. Same shape as [`cp_kind_write_item`](Self::cp_kind_write_item)'s
     /// identical fix: a deadline-bounded loop mirroring
@@ -7102,10 +7036,9 @@ impl ClientCtx {
     /// kind batch, shared by `cp_kind_write_raw`'s `Local` arm and
     /// `cp_serve_forwarded`'s `KindWrite` arm — they diverged once
     /// (the serve arm used [`cp_kind_local`](Self::cp_kind_local), whose
-    /// confirm *requires* a `Some`-valued base write), so a whole-partition
-    /// CQL DELETE — the first raw batch whose base write is a tombstone —
-    /// erred iff the connected node did not lead the tablet
-    /// (leader-placement-bimodal; caught by `cql_clustering`).
+    /// confirm *requires* a `Some`-valued base write), so a raw batch whose
+    /// base write is a tombstone erred iff the connected node did not lead
+    /// the tablet (leader-placement-bimodal).
     /// Propose one split-build seed chunk on a **known-leader** local handle
     /// of the child group and confirm it applied (ADR 0050 Train B rung 4).
     ///
@@ -7224,7 +7157,7 @@ impl ClientCtx {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         // The same exponential confirm back-off `cp_put_local` uses — NOT the
         // drain's old flat 10ms sleep. This is a client hot path since ADR
-        // 0049 routed every plain Dynamo/CQL/raw-protocol write through it,
+        // 0049 routed every plain Dynamo/raw-protocol write through it,
         // and a flat 10ms floor put one whole tick under nearly every
         // sequential write (measured on the ADR 0049 §5 bench: ~13.6 ms/op
         // vs the pre-train ~4.7 — the poll cadence, not the marker bytes).
@@ -8397,11 +8330,10 @@ impl ClientCtx {
                 // during an ADR 0050 split build would otherwise be invisible
                 // to the build's change-log tail until resolve — which can
                 // land after the parent is gone. Prefix = the write's own
-                // full key bytes (a raw write has no pk/sk decomposition;
-                // the CQL edge's own convention — the finest per-key dirty
-                // hint, leading with the key's own token so the apply-time
-                // token validation holds), `base_sk` empty, exactly like
-                // `cql::kind_partition_write`'s markers.
+                // full key bytes (a raw write has no pk/sk decomposition —
+                // the finest per-key dirty hint, leading with the key's own
+                // token so the apply-time token validation holds), `base_sk`
+                // empty.
                 (Some(value), None) => {
                     let marker = crate::dynamo::stage_marker_change_log(&w.key, Vec::new());
                     let mut write = TxnWrite::plain(w.key, Some(value));
@@ -8441,7 +8373,7 @@ impl ClientCtx {
         // check**: `RaftKvNode::txn_stage` (the anchor's own stage) hard-
         // `assert!`s its anchor key is at least `TOKEN_BYTES` long (ADR
         // 0022) — a sound invariant when only trusted internal callers
-        // (a test, or a Dynamo/CQL edge that always builds ADR-0022-shaped
+        // (a test, or the Dynamo edge, which always builds ADR-0022-shaped
         // keys) ever reached it. This is the **first** wire-facing caller
         // that can hand it an arbitrary client-supplied key — a short key
         // would panic this whole node process (a real DoS vector), not
@@ -9776,7 +9708,7 @@ impl ClientCtx {
     /// the **metadata** commit; the tablet's Raft group then forms and elects
     /// asynchronously (each replica's tablet-host reconciler, ADR 0031). A
     /// caller that *acks table creation to a client* (the DynamoDB
-    /// `CreateTable` / CQL `CREATE TABLE` edges) must call this before
+    /// `CreateTable` edge) must call this before
     /// replying, or the ack races the formation window: the client's
     /// immediately-following first write only lands via the election-wait
     /// machinery (`cp_forward`'s backoff pass / the local
@@ -9866,7 +9798,7 @@ impl ClientCtx {
                 // The identical confirm `cp_kind_write_raw`'s own Local arm
                 // runs — never a second implementation (`cp_kind_local`'s
                 // Some-base-write requirement wrongly refused a forwarded
-                // whole-partition CQL DELETE, whose base write is a
+                // whole-partition raw DELETE, whose base write is a
                 // tombstone; see `cp_kind_raw_local`'s doc).
                 match Self::cp_kind_raw_local(&leader, writes, change_log).await {
                     Ok(()) => ClientResponse::PutOk,
@@ -12536,7 +12468,7 @@ async fn handle_request(
     }
 }
 
-/// How long the CQL/DynamoDB edges wait for a proposed schema `MetaCommand`
+/// How long the DynamoDB edge waits for a proposed schema `MetaCommand`
 /// (`CreateTableSchema`/`DropTableSchema`) to commit through the control plane
 /// before giving up. Generous: a fresh cluster may still be electing a leader.
 const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -12564,30 +12496,6 @@ const CP_CONFIRM_POLL_INIT: Duration = Duration::from_micros(200);
 const CP_CONFIRM_POLL_MAX: Duration = Duration::from_millis(5);
 
 impl ClientCtx {
-    /// The replicated schema for `table` (the control plane's `ks.table`-keyed
-    /// catalog, ADR 0013), read from this node's **cache-tolerant**
-    /// `effective_metadata()` (ADR 0035 PR1 — previously a bare
-    /// `self.control.metadata_cached()`, which on a control-plane-follower-less
-    /// growth node never reflects anything since that node's own local control
-    /// raft never replicates; this closes that latent staleness bug for the
-    /// CQL/DynamoDB wire edges' general schema lookups). Every node applies
-    /// committed metadata, so a follower sees a table the leader created once
-    /// the entry replicates. Returns `None` for an unknown table.
-    ///
-    /// **Not** for a schema commit-wait poll's own confirmation — those must
-    /// observe read-your-writes and go through
-    /// [`metadata_fresh`](Self::metadata_fresh) directly instead (see
-    /// `create_table_schema`/`replace_table_schema`/`drop_table_schema` below).
-    pub(crate) fn table_schema(&self, table: &str) -> Option<TableSchema> {
-        self.effective_metadata().table_schema(table).cloned()
-    }
-
-    /// Whether `table` has a replicated schema — see [`table_schema`](Self::table_schema)'s
-    /// doc for the same cache-tolerant-but-not-commit-wait-safe contract.
-    pub(crate) fn has_table_schema(&self, table: &str) -> bool {
-        self.effective_metadata().has_table_schema(table)
-    }
-
     /// Kick off a **copy-based split** of `tablet` at `split_key` (ADR 0050):
     /// propose `MetaCommand::BeginSplit` — parent to `Splitting` (still fully
     /// serving), two `Building` children minted at **placement-chosen final
@@ -12832,149 +12740,15 @@ impl ClientCtx {
         }
     }
 
-    /// Propose `CreateKeyspace` to the control-plane leader and wait for it to
-    /// commit + replicate here (v1 A3): a CQL `CREATE KEYSPACE` is durable +
-    /// cluster-agreed, surviving restart, instead of living in per-process edge
-    /// state. Idempotent (an existing keyspace returns immediately). Routes via the
-    /// A2 leader relay; times out after [`SCHEMA_COMMIT_TIMEOUT`].
-    pub(crate) async fn create_keyspace(&self, keyspace: String) -> Result<(), String> {
-        // Fresh, not `self.has_keyspace` (ADR 0035 PR5 staleness-audit fix —
-        // see `create_table_schema`'s identical note): this whole function is
-        // the CreateKeyspace commit-wait poll, which must observe its own
-        // just-proposed command landing in the authoritative state, never a
-        // cache-tolerant mirror that could still be a poll interval behind —
-        // the pre-fix version, keyed on `has_keyspace`'s (then)
-        // `metadata_cached()`-based check, never resolved at all on a
-        // control-plane-follower-less growth node (permanently empty local
-        // view), so `CREATE KEYSPACE` always timed out there even after
-        // genuinely committing to the real cluster.
-        if self.metadata_fresh().await.has_keyspace(&keyspace) {
-            return Ok(());
-        }
-        let ks = keyspace.clone();
-        self.propose_and_await(
-            MetaCommand::CreateKeyspace {
-                keyspace: keyspace.clone(),
-            },
-            SCHEMA_COMMIT_TIMEOUT,
-            || async { self.metadata_fresh().await.has_keyspace(&ks).then_some(()) },
-        )
-        .await
-        .map_err(|()| {
-            format!(
-                "CREATE KEYSPACE `{keyspace}` did not commit within {}s (no control-plane leader reachable?)",
-                SCHEMA_COMMIT_TIMEOUT.as_secs()
-            )
-        })
-    }
-
-    /// Propose `MetaCommand::CreateTableSchema` to the control-plane **leader**
-    /// and wait for it to commit, so a `CREATE TABLE` is **durable +
-    /// cluster-agreed** (ADR 0013) before the client is told it succeeded.
-    ///
-    /// A proposal must land on the Raft leader. The client may have connected to
-    /// a follower, so the proposal is routed to whichever registered control
-    /// handle ([`control_handles`]) currently believes it is leader, rather than
-    /// blindly to the local node. It re-proposes each poll tick (leadership may
-    /// still be settling, or a leader change drops the in-flight entry) until the
-    /// table appears in this node's replicated catalog — `CreateTableSchema`
-    /// rejects a duplicate, so a racing double-create settles to one schema.
-    /// Times out after [`SCHEMA_COMMIT_TIMEOUT`].
-    ///
-    /// Returns `Ok(())` once the schema is committed and visible here. Returns
-    /// `Err` if it did not commit in time (e.g. no leader reachable) or if a
-    /// *different* schema is already registered for `table` (a conflicting
-    /// `CREATE TABLE`).
-    pub(crate) async fn create_table_schema(
-        &self,
-        table: String,
-        schema: TableSchema,
-    ) -> Result<(), String> {
-        // Already present? Treat an identical schema as success (idempotent
-        // re-create); a different one is a conflict the caller should surface.
-        // Fresh, not `self.table_schema` (ADR 0035 PR1): this whole function is
-        // the CreateTable commit-wait poll, which must observe its own
-        // just-proposed command landing in the authoritative state, never a
-        // growth-node mirror that could still be a poll interval behind.
-        if let Some(existing) = self.metadata_fresh().await.table_schema(&table).cloned() {
-            return if existing == schema {
-                Ok(())
-            } else {
-                Err(format!(
-                    "table `{table}` already exists with a different schema"
-                ))
-            };
-        }
-        let command = MetaCommand::CreateTableSchema {
-            table: table.clone(),
-            schema: schema.clone(),
-        };
-        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || async {
-            self.metadata_fresh().await.table_schema(&table).cloned()
-        })
-        .await
-            .map_err(|()| {
-                format!(
-                    "CREATE TABLE `{table}` did not commit within {}s (no control-plane leader reachable?)",
-                    SCHEMA_COMMIT_TIMEOUT.as_secs()
-                )
-            })
-            .and_then(|committed| {
-                if committed == schema {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "table `{table}` already exists with a different schema"
-                    ))
-                }
-            })
-    }
-
-    /// **Atomically replace** `table`'s schema in the replicated catalog
-    /// (`MetaCommand::ReplaceTableSchema`) and wait until the replacement is
-    /// visible here — the CQL `ALTER TABLE … ADD` sink. One command, one apply:
-    /// unlike the former drop-then-recreate, there is no window in which the
-    /// table is schema-less (a crash between the two commands stranded it).
-    /// Routes to the leader exactly as
-    /// [`create_table_schema`](Self::create_table_schema); idempotent (replacing
-    /// with an identical schema is a state-machine no-op that still satisfies the
-    /// visibility check). Errors if the table has no schema (the state machine
-    /// rejects — an ALTER cannot create a table) or on commit timeout.
-    pub(crate) async fn replace_table_schema(
-        &self,
-        table: String,
-        schema: TableSchema,
-    ) -> Result<(), String> {
-        let command = MetaCommand::ReplaceTableSchema {
-            table: table.clone(),
-            schema: schema.clone(),
-        };
-        // Fresh, not `self.table_schema` (ADR 0035 PR1) — see
-        // `create_table_schema`'s identical note: this is a commit-wait poll.
-        self.propose_and_await(command, SCHEMA_COMMIT_TIMEOUT, || async {
-            (self.metadata_fresh().await.table_schema(&table) == Some(&schema)).then_some(())
-        })
-        .await
-        .map_err(|()| {
-            format!(
-                "ALTER TABLE `{table}` did not commit within {}s \
-                 (no control-plane leader reachable, or the table has no schema?)",
-                SCHEMA_COMMIT_TIMEOUT.as_secs()
-            )
-        })
-    }
-
     /// Drop `table` **and garbage-collect its data** (ADR 0024), cascading to
     /// every GSI's hidden index table (ADR 0041 §5): remove the schema from the
     /// replicated catalog, then remove every affected table's tablets from the
     /// replicated tablet map — the trigger each hosting node's per-node
     /// tablet-host reconciler (ADR 0031 PR4) converges on by stopping its
     /// local group and deleting its engine + WAL files. This is the real
-    /// `DROP TABLE` sink (CQL + the admin
+    /// `DeleteTable` sink (the DynamoDB edge + the admin
     /// dashboard); [`drop_table_schema`](Self::drop_table_schema) alone remains
-    /// the schema-only primitive (the admin panel's schema-only drop) — an
-    /// `ALTER TABLE` now mutates the schema in place via
-    /// [`replace_table_schema`](Self::replace_table_schema) and never GCs data.
+    /// the schema-only primitive (the admin panel's schema-only drop).
     /// Returns once the schema and every tablet (base **and** hidden index)
     /// have left this node's replicated metadata; the per-node file
     /// reclamation continues asynchronously on every replica.
@@ -13099,15 +12873,13 @@ impl ClientCtx {
 
     /// Propose `MetaCommand::DropTableSchema` and wait for the table to disappear
     /// from the replicated catalog (ADR 0013). Idempotent: dropping an absent
-    /// table returns `Ok(())` immediately. Routes to the leader exactly as
-    /// [`create_table_schema`](Self::create_table_schema). Schema-only: does
+    /// table returns `Ok(())` immediately. Schema-only: does
     /// **not** touch the table's tablets/data (the admin panel's schema-only
-    /// drop uses this); a real drop goes through [`drop_table`](Self::drop_table)
-    /// and an `ALTER TABLE` replaces in place via
-    /// [`replace_table_schema`](Self::replace_table_schema).
+    /// drop uses this); a real drop goes through [`drop_table`](Self::drop_table).
     pub(crate) async fn drop_table_schema(&self, table: String) -> Result<(), String> {
-        // Fresh, not `self.has_table_schema` (ADR 0035 PR1) — see
-        // `create_table_schema`'s identical note: this is a commit-wait poll.
+        // Fresh, not a cache-tolerant read (ADR 0035 PR1): this is a
+        // commit-wait poll, which must observe its own just-proposed
+        // command landing in the authoritative state.
         if !self.metadata_fresh().await.has_table_schema(&table) {
             return Ok(());
         }
@@ -13515,7 +13287,6 @@ pub async fn bind_cluster(
             internal: addr(),
             client: addr(),
             dynamo: addr(),
-            cql: addr(),
             admin: addr(),
             intra: addr(),
             console: addr(),
@@ -14014,7 +13785,6 @@ pub async fn start_split_cluster_with_growth(
             internal: ephemeral(),
             client: ephemeral(),
             dynamo: ephemeral(),
-            cql: ephemeral(),
             admin: ephemeral(),
             intra: ephemeral(),
             console: ephemeral(),
@@ -14031,7 +13801,6 @@ pub async fn start_split_cluster_with_growth(
             internal: ephemeral(),
             client: ephemeral(),
             dynamo: ephemeral(),
-            cql: ephemeral(),
             admin: ephemeral(),
             intra: ephemeral(),
             console: ephemeral(),
@@ -14369,7 +14138,7 @@ pub async fn run_node_with_ttl_sweep_interval(
 /// shares (`route_sync_loop`/`metrics_sample_loop`/self-registration/
 /// `serve_requests` (both listeners)/admin `serve`, via
 /// [`BoundControlNode::start_control_with`]) — no CP data storage engine, no
-/// `raftkv` env, no DynamoDB/CQL listeners. `backend` (ADR 0038) selects the
+/// `raftkv` env, no DynamoDB listener. `backend` (ADR 0038) selects the
 /// **dedicated** system-keyspace engine this control-only node provisions
 /// (`StorageBackend::Lsm` durable by default, `::Memory` under `--ephemeral`)
 /// — now the durable home of the apply task's published `Metadata` cache
@@ -14462,7 +14231,7 @@ pub async fn run_node_control_with_orphan_sweep_after(
 
 /// Start node `index` from `config` as a **data-only** node (ADR 0035 PR4,
 /// `animusd data`): binds only the `raftkv` internal `ProdEnv` role plus the
-/// client/dynamo/cql/admin listeners, and runs no local control `RaftCore` at
+/// client/dynamo/admin listeners, and runs no local control `RaftCore` at
 /// all — `Metadata` comes from a polled mirror of the control deployment
 /// (`ControlHandle::Remote`, [`BoundDataNode::start_data_with`]) rather than
 /// this process's own Raft replication.
@@ -15313,7 +15082,7 @@ mod confirm_futility_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(7);
+        let addrs = free_addrs(6);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -15321,10 +15090,9 @@ mod confirm_futility_tests {
                 internal: addrs[0],
                 client: addrs[1],
                 dynamo: addrs[2],
-                cql: addrs[3],
-                admin: addrs[4],
-                intra: addrs[5],
-                console: addrs[6],
+                admin: addrs[3],
+                intra: addrs[4],
+                console: addrs[5],
             }],
         }
     }
@@ -15708,7 +15476,7 @@ mod halted_shutdown_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(7);
+        let addrs = free_addrs(6);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -15716,10 +15484,9 @@ mod halted_shutdown_tests {
                 internal: addrs[0],
                 client: addrs[1],
                 dynamo: addrs[2],
-                cql: addrs[3],
-                admin: addrs[4],
-                intra: addrs[5],
-                console: addrs[6],
+                admin: addrs[3],
+                intra: addrs[4],
+                console: addrs[5],
             }],
         }
     }

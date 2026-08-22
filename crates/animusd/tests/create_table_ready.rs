@@ -8,9 +8,7 @@
 //!
 //! The mechanism under test is `ClientCtx::await_table_serveable` (a
 //! linearizable probe read, converged-or-timeout), called by the DynamoDB
-//! `CreateTable` edge before it acks; the CQL `CREATE TABLE` edge shares the
-//! identical helper, so the DynamoDB coverage here proves both call sites'
-//! shared machinery.
+//! `CreateTable` edge before it acks.
 //!
 //! The load-bearing assertion is deliberately **one-shot, not a poll**: the
 //! moment the 200 arrives, some node must *already* report itself leader of

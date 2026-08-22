@@ -107,24 +107,9 @@
     <section id="browser" class="view-max">
       <div class="view-head">
         <h1>Data Browser</h1>
-        <div class="seg-group">
-          <button id="br-proto-cql" class="active">CQL</button>
-          <button id="br-proto-dynamo">DynamoDB</button>
-        </div>
       </div>
 
-      <div id="br-cql-panel">
-        <div class="row" style="margin-bottom:10px">
-          <label>keyspace (optional USE)</label><input type="text" id="br-cql-ks" placeholder="(none)">
-        </div>
-        <textarea id="br-cql-query" rows="4" spellcheck="false" placeholder="SELECT * FROM t LIMIT 20;"></textarea>
-        <div class="row" style="justify-content:flex-end;margin:10px 0">
-          <button class="primary" id="br-cql-run">Run query</button>
-        </div>
-        <div id="br-cql-result"></div>
-      </div>
-
-      <div id="br-dynamo-panel" style="display:none">
+      <div id="br-dynamo-panel">
         <div class="row" style="margin-bottom:14px">
           <label>table</label><select id="br-dy-table"></select>
           <span class="muted" id="br-dy-no-tables" style="display:none">create a table first</span>
@@ -404,9 +389,6 @@ $("tb-table-filter").addEventListener("change", () => { tbTableFilter = $("tb-ta
 $("tb-status-filter").addEventListener("change", () => { tbStatusFilter = $("tb-status-filter").value; renderTablets(); });
 
 // Data Browser
-$("br-proto-cql").addEventListener("click", () => setProtocol("cql"));
-$("br-proto-dynamo").addEventListener("click", () => setProtocol("dynamo"));
-$("br-cql-run").addEventListener("click", runCql);
 $("br-dy-table").addEventListener("change", onDyTableChange);
 $("br-dy-new-table").addEventListener("click", openTableForm);
 $("br-dy-drop-table").addEventListener("click", dropCurrentTable);

@@ -87,16 +87,13 @@ fn run_scenario(seed: u64) {
         sim.run_for(Duration::from_secs(2));
         let leader = unique_leader(&nodes, seed);
 
-        // Membership + a table's tablet lifecycle + schema + keyspace + a
+        // Membership + a table's tablet lifecycle + schema + a
         // cluster-allocated node id, one after another.
         nodes[leader].propose(upsert(10));
         nodes[leader].propose(upsert(11));
         nodes[leader].propose(MetaCommand::CreateTableSchema {
             table: "orders".to_string(),
             schema: animus_control::TableSchema::simple("id", animus_control::ColumnType::String),
-        });
-        nodes[leader].propose(MetaCommand::CreateKeyspace {
-            keyspace: "ks1".to_string(),
         });
         nodes[leader].propose(MetaCommand::CreateTablet {
             tablet: TabletId(1),

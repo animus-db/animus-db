@@ -7,7 +7,7 @@
 //! translation) and route the resulting key/value bytes (v1, ADR 0019) through the
 //! **leaderful CP data plane** — `ClientCtx::cp_read`/`cp_write`/`cp_scan` to the
 //! per-tablet Raft group leader (linearizable, forwarded cross-process), the same
-//! CP primitives the plain-TCP client API and the CQL endpoint use. The HTTP edge
+//! CP primitives the plain-TCP client API uses. The HTTP edge
 //! itself is production-only I/O, like `ProdEnv`.
 //!
 //! ## Why hand-rolled HTTP
@@ -1528,8 +1528,8 @@ fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<Stri
 }
 
 /// `DeleteTable`: drop `table` from the replicated catalog and reclaim its
-/// tablets — [`ClientCtx::drop_table`], the same sink CQL `DROP TABLE` and
-/// the dashboard's delete button use (ADR 0024 GC). A missing table is a
+/// tablets — [`ClientCtx::drop_table`], the same sink
+/// the dashboard's delete button uses (ADR 0024 GC). A missing table is a
 /// `ResourceNotFoundException`, matching real DynamoDB; `drop_table` itself
 /// is **idempotent** (a second call against an absent table is a silent
 /// no-op), so this explicit existence check up front is the only thing that
@@ -4198,7 +4198,7 @@ pub(crate) type MarkerRow = (Vec<u8>, Option<Vec<u8>>, (Vec<u8>, Vec<u8>));
 /// implementation, shared with the plain client-protocol arms
 /// (`ClientRequest::Put`/`PutBatch`/`Delete`, ADR 0049 Train A rung 5),
 /// whose keys are arbitrary caller bytes with no `pk`/`sk` decomposition
-/// (their markers use the full-key-as-prefix convention, like CQL's and the
+/// (their markers use the full-key-as-prefix convention, like the
 /// GSI drain's — see [`marker_change_log`]'s doc). A `None` value is a
 /// genuine engine delete (`KindBatch`'s real tombstone), matching the old
 /// `cp_delete` semantics. `provision_if_absent` mirrors the primitives each
@@ -4270,20 +4270,15 @@ fn item_stage_marker_change_log(
 }
 
 /// The one construction site for an ADR 0049 §1 image-less **marker**
-/// record's `(change_key_prefix, encoded_record)` pair, shared by every edge
-/// that commits one (this file's fast arm above; the CQL edge's partition
-/// writes, `cql::kind_partition_write`; the GSI drain's hidden-index-table
-/// row writes, `index_drain::reconcile_partition` — full row key as prefix,
-/// empty `base_sk`, the CQL convention). `partition_prefix` is the change
+/// record's `(change_key_prefix, encoded_record)` pair, shared by every
+/// caller that commits one (this file's fast arm above; the GSI drain's
+/// hidden-index-table row writes, `index_drain::reconcile_partition` — full
+/// row key as prefix, empty `base_sk`). `partition_prefix` is the change
 /// key's apply-completed prefix — the base row's own partition-scoped key
 /// bytes, token first, so the record lands in the same tablet as the base
-/// row and sorts per-partition (Dynamo: `token(escape(pk)) || escape(pk)`;
-/// CQL: `token(pk_bytes) || pk_bytes`, its `data_key` shape — the two edges'
-/// escaping conventions differ, which is exactly why the prefix is an
-/// argument rather than derived here); apply appends `hlc::pack(ts)` (ADR
-/// 0041 §4a). `base_sk` is the Dynamo sort-key suffix a consumer rebuilds an
-/// item key from — empty for CQL, whose partition is one value with no sort
-/// dimension.
+/// row and sorts per-partition (`token(escape(pk)) || escape(pk)`); apply
+/// appends `hlc::pack(ts)` (ADR 0041 §4a). `base_sk` is the sort-key suffix
+/// a consumer rebuilds an item key from.
 pub(crate) fn marker_change_log(partition_prefix: &[u8], base_sk: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
     marker_record(partition_prefix, base_sk, false)
 }
@@ -4683,7 +4678,7 @@ mod stream_write_path_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(7);
+        let addrs = free_addrs(6);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -4691,10 +4686,9 @@ mod stream_write_path_tests {
                 internal: addrs[0],
                 client: addrs[1],
                 dynamo: addrs[2],
-                cql: addrs[3],
-                admin: addrs[4],
-                intra: addrs[5],
-                console: addrs[6],
+                admin: addrs[3],
+                intra: addrs[4],
+                console: addrs[5],
             }],
         }
     }

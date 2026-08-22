@@ -1052,7 +1052,7 @@ async fn ship_all(
 ///
 /// Dirty granularity is two-tier, keyed off the change key's own prefix
 /// (the logical key minus its trailing 8-byte packed HLC):
-/// - a prefix carrying a full 8-byte token (every dynamo/CQL key, and any
+/// - a prefix carrying a full 8-byte token (every dynamo key, and any
 ///   raw key >= 8 bytes) dirties its whole **token** — the unit that also
 ///   owns the item's LSI rows (which reorder the sk and share only the
 ///   token+pk lead) and its txn-record row (which shares the anchor's
@@ -1433,7 +1433,7 @@ async fn reconcile_partition(
     // its own tablets need a change-log delta feed too (ADR 0050's
     // split-build tail will consume it when a hidden table's tablet splits).
     // The marker's prefix is the row's own full key with an empty `base_sk`
-    // — the CQL convention (`marker_change_log`'s doc) — and the markers are
+    // (`marker_change_log`'s doc) — and the markers are
     // transient exactly like a plain table's: a hidden table has no stream
     // and no GSI of its own, so the zero-expected-terms trim rule deletes
     // them. One `KindBatch` entry per row, same entry count as the plain
@@ -2377,7 +2377,7 @@ mod gsi_drain_cursor_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(7);
+        let addrs = free_addrs(6);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -2385,10 +2385,9 @@ mod gsi_drain_cursor_tests {
                 internal: addrs[0],
                 client: addrs[1],
                 dynamo: addrs[2],
-                cql: addrs[3],
-                admin: addrs[4],
-                intra: addrs[5],
-                console: addrs[6],
+                admin: addrs[3],
+                intra: addrs[4],
+                console: addrs[5],
             }],
         }
     }
@@ -2979,7 +2978,7 @@ mod stream_sealer_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(7);
+        let addrs = free_addrs(6);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -2987,10 +2986,9 @@ mod stream_sealer_tests {
                 internal: addrs[0],
                 client: addrs[1],
                 dynamo: addrs[2],
-                cql: addrs[3],
-                admin: addrs[4],
-                intra: addrs[5],
-                console: addrs[6],
+                admin: addrs[3],
+                intra: addrs[4],
+                console: addrs[5],
             }],
         }
     }

@@ -275,18 +275,11 @@ pub fn apply_and_derive_mirror(
             }
         }
         MetaCommand::MarkIndexBackfilled { tablet, index, .. } => {
-            // The value is always empty (presence alone is the fact) —
-            // mirrors `CreateKeyspace`'s identical empty-`Put` convention.
+            // The value is always empty (presence alone is the fact).
             writes.push(KeyWrite::Put(
                 syskv::index_backfill_key(*tablet, index),
                 Vec::new(),
             ));
-        }
-        MetaCommand::CreateKeyspace { keyspace } => {
-            writes.push(KeyWrite::Put(syskv::keyspace_key(keyspace), Vec::new()));
-        }
-        MetaCommand::DropKeyspace { keyspace } => {
-            writes.push(KeyWrite::Delete(syskv::keyspace_key(keyspace)));
         }
         MetaCommand::RegisterCpAddr { id, addr, tablet } => {
             let entry = CpMemberAddrEntry {
@@ -485,10 +478,6 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
                 serde_json::from_slice(value).expect("mirrored node-addrs value decodes");
             meta.node_addrs.insert(decode_node_id(id), addrs);
         }
-        EntityKind::Keyspace => {
-            let name = String::from_utf8(id).expect("keyspace id is UTF-8");
-            meta.keyspaces.insert(name);
-        }
         EntityKind::Counter => {
             let value = decode_u64(value);
             if id == NEXT_TABLET_ID_COUNTER.as_bytes() {
@@ -549,10 +538,6 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
         }
         EntityKind::NodeAddrs => {
             meta.node_addrs.remove(&decode_node_id(id));
-        }
-        EntityKind::Keyspace => {
-            let name = String::from_utf8(id).expect("keyspace id is UTF-8");
-            meta.keyspaces.remove(&name);
         }
         EntityKind::Counter => {
             // Never deleted in practice (a monotonic counter is only ever
@@ -931,9 +916,8 @@ mod tests {
     }
 
     /// `MarkIndexBackfilled` (ADR 0045 §4) mirrors as a single empty `Put`
-    /// at the row's `index_backfill_key` — mirroring `CreateKeyspace`'s own
-    /// empty-value convention — and a repeat proposal is a `NoOp` that
-    /// derives no further writes.
+    /// at the row's `index_backfill_key`, and a repeat proposal is a `NoOp`
+    /// that derives no further writes.
     #[test]
     fn mark_index_backfilled_writes_the_row_and_is_idempotent() {
         let mut meta = Metadata::default();
@@ -1104,27 +1088,6 @@ mod tests {
                 meta.schemas.get("orders").unwrap()
             )]
         );
-    }
-
-    #[test]
-    fn create_and_drop_keyspace() {
-        let mut meta = Metadata::default();
-        let create = MetaCommand::CreateKeyspace {
-            keyspace: "ks".to_string(),
-        };
-        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &create);
-        assert_eq!(outcome, ApplyOutcome::Applied);
-        assert_eq!(
-            writes,
-            vec![KeyWrite::Put(syskv::keyspace_key("ks"), Vec::new())]
-        );
-
-        let drop = MetaCommand::DropKeyspace {
-            keyspace: "ks".to_string(),
-        };
-        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &drop);
-        assert_eq!(outcome, ApplyOutcome::Applied);
-        assert_eq!(writes, vec![KeyWrite::Delete(syskv::keyspace_key("ks"))]);
     }
 
     #[test]
@@ -1385,9 +1348,6 @@ mod tests {
             MetaCommand::CreateTableSchema {
                 table: "orders".to_string(),
                 schema: schema("id"),
-            },
-            MetaCommand::CreateKeyspace {
-                keyspace: "ks".to_string(),
             },
             MetaCommand::RegisterNode {
                 node: nid(2),
