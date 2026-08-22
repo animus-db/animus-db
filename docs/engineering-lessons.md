@@ -2815,6 +2815,38 @@ debugging anything that feels like it might have happened before.
   narrow-viewport image, and treat ~500px as the narrowest *trustworthy*
   screenshot width. (website DynamoDB-focus pass, 2026-08-21.)
 
+- **Verifying with `cargo test --workspace` does not reproduce this repo's
+  CI, and manufactures failures CI would never see** (2026-08-22, the
+  `ScanIndexForward` rung). CI deliberately splits animusd out:
+  `cargo test --workspace --exclude animusd -- --test-threads=2`, then
+  `cargo test -p animusd --lib --tests -- --test-threads=1`, because that
+  crate's ~66 real-thread multi-node integration tests starve each other at
+  default parallelism. A local `cargo test --workspace` runs exactly the
+  configuration CI was restructured to avoid — every heavyweight cluster
+  test concurrently — so a failure there is not yet evidence about the code.
+  It cost a full investigation of `schema_ddl_on_a_follower_is_relayed_to_the_leader`
+  that passed both in isolation and serially. The investigation was still
+  right to run (the diff touched forwarded request enums, and a missed
+  relay match site is exactly the bimodal per-process flake this log warns
+  about) — but the *first* step should be re-running the way `ci.yml` does,
+  before reading anything into the parallel sweep. Corollary: when a local
+  gate disagrees with CI, check how CI actually invokes it before debugging
+  the code; the invocation is part of the gate.
+
+- **Two disk exhaustions in one session: a debug `--all-targets` build of
+  this workspace is ~24GB, and `cargo clean -p <crate>` is the surgical
+  tool** (2026-08-22). `target/debug/deps` reached 23GB across 94 test
+  binaries over 100MB each (debuginfo=2 × animusd's test-binary count).
+  Symptoms mislead: the failure surfaced as a linker `signal 7 (Bus error)`
+  and `ld terminated`, not an obvious out-of-space error, and once as
+  `failed to write dep-graph.part.bin`. `cargo clean -p animusd -p
+  animus-cp-data -p animus-dynamo` freed 17GB while keeping every
+  dependency build cached (a full `cargo clean` would have forced tokio,
+  serde and the rest to rebuild); deleting `target/debug/incremental`
+  alone freed 5GB more. Prefer targeted `cargo test -p <crate> --test
+  <name>` over full sweeps when disk-constrained — it also happens to
+  match how CI runs.
+
 ### Code patterns
 - **A pagination cursor that echoes back a superset of another cursor's
   attributes needs an *exact*-match validation, not a "the attributes I
