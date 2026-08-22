@@ -282,6 +282,14 @@ pub enum UpdateAction {
     Set(String, AttributeValue),
     /// `REMOVE attr` — drop a top-level attribute if present.
     Remove(String),
+    /// `ADD attr :v` — numeric addition when both sides are `N`, set union
+    /// when both are the same set type. On an absent attribute it seeds the
+    /// value, which is what makes `ADD` the idiomatic counter increment.
+    Add(String, AttributeValue),
+    /// `DELETE attr :v` — remove `:v`'s members from a set attribute. Only
+    /// the set types; an empty result removes the attribute entirely, as
+    /// DynamoDB does not store empty sets.
+    Delete(String, AttributeValue),
 }
 
 /// One sub-request of a `BatchWriteItem` (within a single table's request list):
@@ -882,7 +890,8 @@ fn decode_update_expression(
     spans.sort_by_key(|(at, _, _)| *at);
     if spans.is_empty() {
         return Err(WireError::validation(format!(
-            "unsupported `UpdateExpression` `{expr}` (supported clauses: SET, REMOVE)"
+            "unsupported `UpdateExpression` `{expr}` \
+             (supported clauses: SET, REMOVE, ADD, DELETE)"
         )));
     }
     // Reject any non-whitespace text before the first recognized clause
@@ -915,9 +924,74 @@ fn decode_update_expression(
                     actions.push(UpdateAction::Remove(attr));
                 }
             }
+            // `ADD`/`DELETE` take `attr :value` pairs separated by spaces,
+            // not `=` — a different shape from SET's.
+            kw @ ("add" | "delete") => {
+                for clause in args.split(',') {
+                    let clause = clause.trim();
+                    if clause.is_empty() {
+                        continue;
+                    }
+                    let (name, ph) = clause.split_once(char::is_whitespace).ok_or_else(|| {
+                        WireError::validation(format!(
+                            "{} clause must be `attr :value`, got `{clause}`",
+                            kw.to_uppercase()
+                        ))
+                    })?;
+                    let attr = resolve_attr_name(obj, name.trim())?;
+                    let value = resolve_placeholder(obj, ph.trim())?;
+                    if kw == "add" {
+                        // **Numeric ADD is deliberately refused.** It is the
+                        // only non-idempotent update action, and this write
+                        // path is at-least-once: `ClientCtx::cp_kind_write_item`
+                        // retries `kind_write_item_at_leader`, which re-reads
+                        // the old image and re-applies, and a write that
+                        // landed can still report a retryable error (a failed
+                        // OCC seatbelt is documented as indistinguishable from
+                        // a fence miss). Re-applying SET/REMOVE, or a set
+                        // union/difference, converges to the same state;
+                        // re-applying `+1` does not. Measured: ten concurrent
+                        // increments, two of them accepted, left the counter
+                        // at 431.
+                        //
+                        // Refusing is the honest behaviour until the write
+                        // path can carry a once-only guarantee — a silently
+                        // over-counted counter is far worse than a rejected
+                        // request.
+                        if matches!(value, AttributeValue::N(_)) {
+                            return Err(WireError::validation(
+                                "numeric ADD is not supported: this write path may apply a \
+                                 request more than once, which would over-count. Read the \
+                                 value and SET it instead, or use a set-typed ADD (union \
+                                 is idempotent).",
+                            ));
+                        }
+                        if !matches!(
+                            value,
+                            AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_)
+                        ) {
+                            return Err(WireError::validation(
+                                "ADD takes a set operand (SS, NS or BS)",
+                            ));
+                        }
+                        actions.push(UpdateAction::Add(attr, value));
+                    } else {
+                        if !matches!(
+                            value,
+                            AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_)
+                        ) {
+                            return Err(WireError::validation(
+                                "DELETE takes a set operand (SS, NS or BS)",
+                            ));
+                        }
+                        actions.push(UpdateAction::Delete(attr, value));
+                    }
+                }
+            }
             other => {
                 return Err(WireError::validation(format!(
-                    "`UpdateExpression` clause `{other}` is not supported (SET, REMOVE only)"
+                    "`UpdateExpression` clause `{other}` is not supported \
+                     (SET, REMOVE, ADD, DELETE)"
                 )));
             }
         }
@@ -2490,10 +2564,21 @@ pub fn batch_write_response() -> String {
 }
 
 /// Apply a sequence of [`UpdateAction`]s to a starting item (`None` ⇒ a fresh
-/// item is built from the key by the caller before this), returning the new item.
-/// `SET` sets/overwrites a top-level attribute; `REMOVE` drops one. Pure.
-#[must_use]
-pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Item {
+/// item is built from the key by the caller before this), returning the new
+/// item. Pure.
+///
+/// `SET` sets/overwrites a top-level attribute and `REMOVE` drops one; both are
+/// infallible. `ADD` and `DELETE` are **not**: they are typed operations, and
+/// DynamoDB rejects a mismatch (`ADD`ing a number to a string set) rather than
+/// ignoring it. Hence the `Result` — silently skipping a mismatched action
+/// would leave the caller believing an update applied when it did not, which
+/// is the one outcome worse than an error.
+///
+/// This runs on the **leader** that owns the row (ADR 0046 U3), against the old
+/// image the leader itself read, so `ADD`'s read-modify-write is evaluated
+/// exactly once per applied write rather than against a possibly-stale image
+/// from the edge.
+pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Result<Item, WireError> {
     for action in actions {
         match action {
             UpdateAction::Set(attr, value) => {
@@ -2502,9 +2587,114 @@ pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Item {
             UpdateAction::Remove(attr) => {
                 item.remove(attr);
             }
+            UpdateAction::Add(attr, operand) => {
+                let updated = match (item.get(attr), operand) {
+                    // Absent: seed with the operand. This is what makes
+                    // `ADD #c :one` the idiomatic counter increment on a row
+                    // that does not exist yet.
+                    (None, v) => v.clone(),
+                    (Some(AttributeValue::N(cur)), AttributeValue::N(delta)) => AttributeValue::N(
+                        crate::condition::add_numeric(cur, delta).ok_or_else(|| {
+                            WireError::validation(format!(
+                                "ADD on `{attr}`: `{cur}` and `{delta}` are not both numbers"
+                            ))
+                        })?,
+                    ),
+                    (Some(AttributeValue::SS(cur)), AttributeValue::SS(add)) => {
+                        AttributeValue::SS(union_sorted(cur, add))
+                    }
+                    (Some(AttributeValue::NS(cur)), AttributeValue::NS(add)) => {
+                        AttributeValue::NS(union_sorted(cur, add))
+                    }
+                    (Some(AttributeValue::BS(cur)), AttributeValue::BS(add)) => {
+                        AttributeValue::BS(union_sorted(cur, add))
+                    }
+                    (Some(existing), operand) => {
+                        return Err(WireError::validation(format!(
+                            "ADD on `{attr}` needs a number or a matching set type, \
+                             got {} += {}",
+                            type_name(existing),
+                            type_name(operand)
+                        )));
+                    }
+                };
+                item.insert(attr.clone(), updated);
+            }
+            UpdateAction::Delete(attr, operand) => {
+                let Some(existing) = item.get(attr) else {
+                    // Deleting from an absent attribute is a no-op, as in
+                    // DynamoDB — not an error.
+                    continue;
+                };
+                let remaining = match (existing, operand) {
+                    (AttributeValue::SS(cur), AttributeValue::SS(rm)) => {
+                        AttributeValue::SS(difference_sorted(cur, rm))
+                    }
+                    (AttributeValue::NS(cur), AttributeValue::NS(rm)) => {
+                        AttributeValue::NS(difference_sorted(cur, rm))
+                    }
+                    (AttributeValue::BS(cur), AttributeValue::BS(rm)) => {
+                        AttributeValue::BS(difference_sorted(cur, rm))
+                    }
+                    (existing, operand) => {
+                        return Err(WireError::validation(format!(
+                            "DELETE on `{attr}` needs matching set types, got {} -= {}",
+                            type_name(existing),
+                            type_name(operand)
+                        )));
+                    }
+                };
+                // DynamoDB does not store empty sets: emptying one removes the
+                // attribute rather than leaving `SS: []` behind.
+                if set_is_empty(&remaining) {
+                    item.remove(attr);
+                } else {
+                    item.insert(attr.clone(), remaining);
+                }
+            }
         }
     }
-    item
+    Ok(item)
+}
+
+/// Sorted, de-duplicated union — the representation this crate keeps sets in.
+fn union_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
+    let mut out: Vec<T> = a.to_vec();
+    out.extend(b.iter().cloned());
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Sorted difference, `a` minus `b`.
+fn difference_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
+    a.iter().filter(|x| !b.contains(x)).cloned().collect()
+}
+
+/// Whether a set-typed value has no members.
+fn set_is_empty(v: &AttributeValue) -> bool {
+    match v {
+        AttributeValue::SS(s) => s.is_empty(),
+        AttributeValue::NS(s) => s.is_empty(),
+        AttributeValue::BS(s) => s.is_empty(),
+        _ => false,
+    }
+}
+
+/// A human-readable type name for an error message.
+fn type_name(v: &AttributeValue) -> &'static str {
+    match v {
+        AttributeValue::S(_) => "S",
+        AttributeValue::N(_) => "N",
+        AttributeValue::B(_) => "B",
+        AttributeValue::Bool(_) => "BOOL",
+        AttributeValue::Null => "NULL",
+        AttributeValue::M(_) => "M",
+        AttributeValue::L(_) => "L",
+        AttributeValue::SS(_) => "SS",
+        AttributeValue::NS(_) => "NS",
+        AttributeValue::BS(_) => "BS",
+    }
 }
 
 /// The JSON body for a successful `Scan` **or `Query`** (both share this exact
@@ -4315,7 +4505,8 @@ mod tests {
                 UpdateAction::Set("a".into(), s("x")),
                 UpdateAction::Remove("c".into()),
             ],
-        );
+        )
+        .expect("SET/REMOVE are infallible");
         assert_eq!(new.get("a"), Some(&s("x")));
         assert!(!new.contains_key("c"));
         assert_eq!(new.get("id"), Some(&s("k")));
@@ -5010,6 +5201,167 @@ mod tests {
                 "`(a) OR (b)` is a disjunction, not a single group: {filter:?}"
             ),
             other => panic!("expected Scan, got {other:?}"),
+        }
+    }
+
+    /// `ADD` seeds an absent attribute, increments a number, and unions a set.
+    #[test]
+    fn add_seeds_increments_and_unions() {
+        let n = |v: &str| AttributeValue::N(v.into());
+        let ss = |v: &[&str]| AttributeValue::SS(v.iter().map(|s| (*s).to_string()).collect());
+
+        // Absent -> seeded. This is the counter-on-a-new-row case.
+        let out =
+            apply_update(Item::new(), &[UpdateAction::Add("c".into(), n("1"))]).expect("applies");
+        assert_eq!(out.get("c"), Some(&n("1")));
+
+        // Present -> incremented, exactly.
+        let mut item = Item::new();
+        item.insert("c".into(), n("41"));
+        let out = apply_update(item, &[UpdateAction::Add("c".into(), n("1"))]).expect("applies");
+        assert_eq!(out.get("c"), Some(&n("42")));
+
+        // Sets union and stay sorted/deduplicated.
+        let mut item = Item::new();
+        item.insert("t".into(), ss(&["a", "b"]));
+        let out =
+            apply_update(item, &[UpdateAction::Add("t".into(), ss(&["b", "c"]))]).expect("applies");
+        assert_eq!(
+            out.get("t"),
+            Some(&ss(&["a", "b", "c"])),
+            "union, deduplicated"
+        );
+    }
+
+    /// `DELETE` subtracts set members, and emptying a set removes the
+    /// attribute — DynamoDB does not store empty sets.
+    #[test]
+    fn delete_subtracts_and_drops_an_emptied_set() {
+        let ss = |v: &[&str]| AttributeValue::SS(v.iter().map(|s| (*s).to_string()).collect());
+
+        let mut item = Item::new();
+        item.insert("t".into(), ss(&["a", "b", "c"]));
+        let out =
+            apply_update(item, &[UpdateAction::Delete("t".into(), ss(&["b"]))]).expect("applies");
+        assert_eq!(out.get("t"), Some(&ss(&["a", "c"])));
+
+        let mut item = Item::new();
+        item.insert("t".into(), ss(&["a"]));
+        let out =
+            apply_update(item, &[UpdateAction::Delete("t".into(), ss(&["a"]))]).expect("applies");
+        assert!(
+            !out.contains_key("t"),
+            "an emptied set is removed, not stored as an empty set: {out:?}"
+        );
+
+        // Deleting from an absent attribute is a no-op, not an error.
+        let out = apply_update(Item::new(), &[UpdateAction::Delete("t".into(), ss(&["a"]))])
+            .expect("no-op");
+        assert!(out.is_empty());
+    }
+
+    /// A typed mismatch is an error, never a silently skipped action — the
+    /// caller must not believe an update applied when it did not.
+    #[test]
+    fn add_and_delete_reject_type_mismatches() {
+        let mut item = Item::new();
+        item.insert("s".into(), AttributeValue::S("text".into()));
+        assert!(
+            apply_update(
+                item.clone(),
+                &[UpdateAction::Add("s".into(), AttributeValue::N("1".into()))]
+            )
+            .is_err(),
+            "ADD a number to a string must be rejected"
+        );
+        assert!(
+            apply_update(
+                item,
+                &[UpdateAction::Delete(
+                    "s".into(),
+                    AttributeValue::SS(vec!["a".into()])
+                )]
+            )
+            .is_err(),
+            "DELETE a set from a string must be rejected"
+        );
+    }
+
+    /// `ADD`/`DELETE` parse with their space-separated `attr :value` shape,
+    /// alongside the `=`-shaped SET, and resolve `#alias`.
+    #[test]
+    fn add_and_delete_clauses_parse() {
+        let body = r##"{"TableName":"t","Key":{"pk":{"S":"a"}},
+            "UpdateExpression":"SET #s = :s ADD #c :new DELETE #t :rm",
+            "ExpressionAttributeNames":{"#s":"name","#c":"tags2","#t":"tags"},
+            "ExpressionAttributeValues":{":s":{"S":"x"},":new":{"SS":["a"]},
+                ":rm":{"SS":["old"]}}}"##;
+        match decode_request("DynamoDB_20120810.UpdateItem", body.as_bytes()).expect("decodes") {
+            Operation::UpdateItem { actions, .. } => {
+                assert_eq!(
+                    actions,
+                    vec![
+                        UpdateAction::Set("name".into(), AttributeValue::S("x".into())),
+                        UpdateAction::Add("tags2".into(), AttributeValue::SS(vec!["a".into()])),
+                        UpdateAction::Delete("tags".into(), AttributeValue::SS(vec!["old".into()])),
+                    ],
+                    "all three clause shapes, with aliases resolved"
+                );
+            }
+            other => panic!("expected UpdateItem, got {other:?}"),
+        }
+    }
+
+    /// A malformed ADD/DELETE clause is rejected rather than half-parsed.
+    #[test]
+    fn malformed_add_clauses_are_rejected() {
+        for expr in ["ADD c", "DELETE t"] {
+            let body = format!(
+                r#"{{"TableName":"t","Key":{{"pk":{{"S":"a"}}}},
+                     "UpdateExpression":"{expr}",
+                     "ExpressionAttributeValues":{{":one":{{"N":"1"}}}}}}"#
+            );
+            assert!(
+                decode_request("DynamoDB_20120810.UpdateItem", body.as_bytes()).is_err(),
+                "`{expr}` needs a value operand"
+            );
+        }
+    }
+
+    /// Numeric `ADD` is refused at decode, with a message that says why.
+    ///
+    /// It is the only non-idempotent update action, and the kind-write path is
+    /// at-least-once — it retries and re-applies, and a landed write can still
+    /// report a retryable error. Ten concurrent increments, two accepted, were
+    /// measured leaving the counter at 431. Refusing beats over-counting.
+    #[test]
+    fn numeric_add_is_refused_with_a_reason() {
+        let body = br#"{"TableName":"t","Key":{"pk":{"S":"a"}},
+             "UpdateExpression":"ADD c :one",
+             "ExpressionAttributeValues":{":one":{"N":"1"}}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateItem", body)
+            .expect_err("numeric ADD must be refused");
+        assert_eq!(err.code, "ValidationException");
+        assert!(
+            err.message.contains("more than once"),
+            "the message must explain why, not just refuse: {}",
+            err.message
+        );
+    }
+
+    /// A non-set operand is refused for both clauses.
+    #[test]
+    fn add_and_delete_require_set_operands() {
+        for expr in ["ADD c :s", "DELETE c :s"] {
+            let body = format!(
+                r#"{{"TableName":"t","Key":{{"pk":{{"S":"a"}}}},
+                     "UpdateExpression":"{expr}",
+                     "ExpressionAttributeValues":{{":s":{{"S":"x"}}}}}}"#
+            );
+            assert!(
+                decode_request("DynamoDB_20120810.UpdateItem", body.as_bytes()).is_err(),
+                "`{expr}` must require a set operand"
+            );
         }
     }
 }

@@ -3514,7 +3514,10 @@ pub(crate) async fn kind_write_item_at_leader(
             KindWriteOp::Delete => None,
             KindWriteOp::Update { key_item, actions } => {
                 let base = old.clone().unwrap_or_else(|| key_item.clone());
-                Some(wire::apply_update(base, actions))
+                // A typed ADD/DELETE mismatch is a ValidationException, not a
+                // silently skipped action — it propagates from the leader that
+                // evaluated it back to the requesting edge.
+                Some(wire::apply_update(base, actions)?)
             }
         };
         let value = match &new {
@@ -3626,7 +3629,7 @@ pub(crate) async fn eval_kind_txn_write(
         KindWriteOp::Delete => None,
         KindWriteOp::Update { key_item, actions } => {
             let base = old.clone().unwrap_or_else(|| key_item.clone());
-            Some(wire::apply_update(base, actions))
+            Some(wire::apply_update(base, actions)?)
         }
     };
     let value = match &new {
