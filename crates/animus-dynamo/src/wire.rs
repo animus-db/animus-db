@@ -265,6 +265,14 @@ pub enum UpdateReturnValues {
     AllOld,
     /// `ALL_NEW` — the whole item after the update.
     AllNew,
+    /// `UPDATED_OLD` — the **previous** values of only the attributes this
+    /// update changed. An attribute the update *created* has no previous
+    /// value and is therefore absent.
+    UpdatedOld,
+    /// `UPDATED_NEW` — the **new** values of only the attributes this update
+    /// changed. An attribute the update *removed* has no new value and is
+    /// therefore absent.
+    UpdatedNew,
 }
 
 /// One action of an `UpdateItem` `UpdateExpression` (the supported subset): set a
@@ -1091,6 +1099,8 @@ fn decode_update_return_values(obj: &Map<String, Value>) -> Result<UpdateReturnV
             Some("NONE") => Ok(UpdateReturnValues::None),
             Some("ALL_OLD") => Ok(UpdateReturnValues::AllOld),
             Some("ALL_NEW") => Ok(UpdateReturnValues::AllNew),
+            Some("UPDATED_OLD") => Ok(UpdateReturnValues::UpdatedOld),
+            Some("UPDATED_NEW") => Ok(UpdateReturnValues::UpdatedNew),
             Some(other) => Err(WireError::validation(format!(
                 "unsupported `ReturnValues` `{other}` (supported: NONE, ALL_OLD, ALL_NEW)"
             ))),
@@ -2722,17 +2732,47 @@ pub fn update_response(
 ) -> String {
     let attrs = match return_values {
         UpdateReturnValues::None => None,
-        UpdateReturnValues::AllOld => old,
-        UpdateReturnValues::AllNew => new,
+        UpdateReturnValues::AllOld => old.cloned(),
+        UpdateReturnValues::AllNew => new.cloned(),
+        // The `UPDATED_*` pair reports only what actually changed, taken from
+        // whichever side holds the value: the old image for `UPDATED_OLD`, the
+        // new one for `UPDATED_NEW`. An attribute present on only one side is
+        // therefore reported by exactly one of them — a created attribute has
+        // no previous value, a removed one has no new value — which is why
+        // this is a diff rather than a projection of one image.
+        UpdateReturnValues::UpdatedOld => Some(changed_attributes(old, new, old)),
+        UpdateReturnValues::UpdatedNew => Some(changed_attributes(old, new, new)),
     };
     match attrs {
-        Some(item) => {
+        // DynamoDB omits `Attributes` entirely when nothing changed, rather
+        // than returning an empty map.
+        Some(item) if !item.is_empty() => {
             let mut obj = Map::new();
-            obj.insert("Attributes".into(), encode_item(item));
+            obj.insert("Attributes".into(), encode_item(&item));
             serde_json::to_string(&Value::Object(obj)).expect("update response serializes")
         }
-        None => empty_response(),
+        _ => empty_response(),
     }
+}
+
+/// The attributes whose value differs between `old` and `new`, taken from
+/// `from` (one of the two). An attribute missing from `from` is skipped, so
+/// `UPDATED_OLD` omits what the update created and `UPDATED_NEW` omits what it
+/// removed.
+///
+/// Key attributes fall out naturally: an update never changes them, so they
+/// never differ and never appear.
+fn changed_attributes(old: Option<&Item>, new: Option<&Item>, from: Option<&Item>) -> Item {
+    let empty = Item::new();
+    let old = old.unwrap_or(&empty);
+    let new = new.unwrap_or(&empty);
+    let Some(from) = from else {
+        return Item::new();
+    };
+    from.iter()
+        .filter(|(name, _)| old.get(*name) != new.get(*name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 /// The JSON body for a successful `BatchWriteItem`: `{"UnprocessedItems": {}}`
@@ -5644,6 +5684,82 @@ mod tests {
                 "must reject {}",
                 String::from_utf8_lossy(body)
             );
+        }
+    }
+
+    /// `UPDATED_OLD`/`UPDATED_NEW` report only what changed, from the side
+    /// that holds the value.
+    #[test]
+    fn updated_return_values_report_only_the_diff() {
+        let mut old = Item::new();
+        old.insert("id".into(), s("k")); // key: never changes
+        old.insert("keep".into(), s("same")); // untouched
+        old.insert("edit".into(), s("before"));
+        old.insert("gone".into(), s("dropped"));
+
+        let mut new = Item::new();
+        new.insert("id".into(), s("k"));
+        new.insert("keep".into(), s("same"));
+        new.insert("edit".into(), s("after"));
+        new.insert("fresh".into(), s("created"));
+
+        let body = update_response(UpdateReturnValues::UpdatedOld, Some(&old), Some(&new));
+        assert!(body.contains(r#""edit":{"S":"before"}"#), "changed: {body}");
+        assert!(
+            body.contains(r#""gone":{"S":"dropped"}"#),
+            "removed has an old value: {body}"
+        );
+        assert!(
+            !body.contains("fresh"),
+            "created has no previous value: {body}"
+        );
+        assert!(!body.contains("keep"), "untouched is not reported: {body}");
+        assert!(!body.contains(r#""id""#), "the key never changes: {body}");
+
+        let body = update_response(UpdateReturnValues::UpdatedNew, Some(&old), Some(&new));
+        assert!(body.contains(r#""edit":{"S":"after"}"#), "changed: {body}");
+        assert!(
+            body.contains(r#""fresh":{"S":"created"}"#),
+            "created has a new value: {body}"
+        );
+        assert!(!body.contains("gone"), "removed has no new value: {body}");
+        assert!(!body.contains("keep"), "{body}");
+    }
+
+    /// When nothing changed, `Attributes` is omitted rather than sent empty.
+    #[test]
+    fn updated_return_values_omit_attributes_when_nothing_changed() {
+        let mut item = Item::new();
+        item.insert("id".into(), s("k"));
+        for rv in [
+            UpdateReturnValues::UpdatedOld,
+            UpdateReturnValues::UpdatedNew,
+        ] {
+            assert_eq!(
+                update_response(rv, Some(&item), Some(&item)),
+                empty_response(),
+                "an unchanged item reports no Attributes"
+            );
+        }
+    }
+
+    /// Both new values decode.
+    #[test]
+    fn updated_return_values_decode() {
+        for (raw, want) in [
+            ("UPDATED_OLD", UpdateReturnValues::UpdatedOld),
+            ("UPDATED_NEW", UpdateReturnValues::UpdatedNew),
+        ] {
+            let body = format!(
+                r#"{{"TableName":"t","Key":{{"pk":{{"S":"a"}}}},
+                     "UpdateExpression":"SET v = :v","ReturnValues":"{raw}",
+                     "ExpressionAttributeValues":{{":v":{{"S":"x"}}}}}}"#
+            );
+            match decode_request("DynamoDB_20120810.UpdateItem", body.as_bytes()).expect("decodes")
+            {
+                Operation::UpdateItem { return_values, .. } => assert_eq!(return_values, want),
+                other => panic!("expected UpdateItem, got {other:?}"),
+            }
         }
     }
 }
