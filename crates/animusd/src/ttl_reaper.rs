@@ -68,7 +68,7 @@
 //!
 //! Every delete is conditional on the **exact** `AttributeValue` this
 //! sweep observed for the TTL attribute
-//! (`ConditionExpression::Equals(attribute, observed_value)`), evaluated at
+//! (`ConditionExpression::Compare(attribute, Comparator::Eq, observed_value)`), evaluated at
 //! the leader under the same `rmw_lock` (and apply-time OCC seatbelt)
 //! ordinary conditional writes get. If a client refreshes or removes the
 //! item's TTL between this scan and the delete actually landing, the
@@ -82,7 +82,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use animus_cp_data::KIND_BASE;
-use animus_dynamo::{ConditionExpression, is_expired, wire};
+use animus_dynamo::{Comparator, ConditionExpression, is_expired, wire};
 use animus_env::Clock;
 use animus_tablet::{TabletId, TabletState};
 
@@ -220,7 +220,11 @@ pub(crate) async fn ttl_reaper_loop(ctx: ClientCtx, interval: Duration) {
                 // ADR 0051 §6: wake — and only now — because there is
                 // genuinely a delete to propose.
                 group.wake();
-                let condition = ConditionExpression::Equals(ttl.attribute_name.clone(), ttl_value);
+                let condition = ConditionExpression::Compare(
+                    ttl.attribute_name.clone(),
+                    Comparator::Eq,
+                    ttl_value,
+                );
                 match dynamo::kind_write_item_at_leader(
                     &ctx,
                     &group,

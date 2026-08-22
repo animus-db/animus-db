@@ -183,24 +183,27 @@ async fn an_aliased_filter_actually_filters() {
     }
 }
 
-/// An unsupported comparison is now a 400, not a silent empty page.
+/// The comparison operators are now served (the expression-surface rung).
+/// What must never come back is the old behaviour: a 200 with an empty page
+/// because `sk >= :v` had been truncated into an equality on `sk >`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unsupported_comparison_is_rejected_loudly() {
+async fn comparisons_filter_rather_than_matching_nothing() {
     let (_dir, nodes, addrs) = setup().await;
 
-    for op in [">=", "<=", ">", "<"] {
-        let req = format!(
-            r#"{{"TableName":"events","KeyConditionExpression":"pk = :p",
-                 "FilterExpression":"sk {op} :v",
-                 "ExpressionAttributeValues":{{":p":{{"S":"p1"}},":v":{{"S":"a3"}}}}}}"#
-        );
-        let (status, resp) = dynamo(addrs[0], "DynamoDB_20120810.Query", &req).await;
-        assert_eq!(status, 400, "`{op}` must be rejected, got: {resp}");
-        assert!(
-            resp.contains("ValidationException"),
-            "`{op}` must be a ValidationException: {resp}"
-        );
-    }
+    let (status, body) = dynamo_retry(
+        addrs[0],
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+            "FilterExpression":"sk >= :v",
+            "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"S":"a3"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "`>=` is served now: {body}");
+    assert!(
+        body.contains("\"a3\"") && body.contains("\"a5\""),
+        "it must actually match — the truncated form matched nothing: {body}"
+    );
+    assert!(!body.contains("\"a2\""), "and still be bounded: {body}");
     for n in nodes {
         n.shutdown_graceful().await;
     }

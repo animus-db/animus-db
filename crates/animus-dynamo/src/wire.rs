@@ -57,7 +57,7 @@ use animus_control::{IndexStatus, StreamViewType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::condition::{ConditionExpression, SortKeyCondition};
+use crate::condition::{Comparator, ConditionExpression, SortKeyCondition};
 use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, SecondaryIndex};
 use crate::{AttributeValue, Item, TableSchema};
 
@@ -1656,31 +1656,148 @@ fn decode_predicate(
     let Some(expr) = obj.get(field).and_then(Value::as_str) else {
         return Ok(None);
     };
+    decode_predicate_expr(obj, field, expr.trim()).map(Some)
+}
+
+/// Parse one predicate term. Split out of [`decode_predicate`] so the boolean
+/// combinators can recurse into it.
+fn decode_predicate_expr(
+    obj: &Map<String, Value>,
+    field: &str,
+    expr: &str,
+) -> Result<ConditionExpression, WireError> {
     let expr = expr.trim();
-    let cond = if let Some(inner) = func_arg(expr, "attribute_not_exists") {
-        ConditionExpression::AttributeNotExists(resolve_attr_name(obj, inner.trim())?)
-    } else if let Some(inner) = func_arg(expr, "attribute_exists") {
-        ConditionExpression::AttributeExists(resolve_attr_name(obj, inner.trim())?)
-    } else if let Some((lhs, op, rhs)) = split_comparator(expr) {
-        // Only equality is representable today; every other comparison is
-        // rejected by name rather than mis-parsed into an equality that can
-        // never hold (see `split_comparator`).
-        if op != "=" {
+    // Function forms first: their argument lists can contain commas and
+    // operators that the comparator split would otherwise cut through.
+    if let Some(inner) = func_arg(expr, "attribute_not_exists") {
+        return Ok(ConditionExpression::AttributeNotExists(resolve_attr_name(
+            obj,
+            inner.trim(),
+        )?));
+    }
+    if let Some(inner) = func_arg(expr, "attribute_exists") {
+        return Ok(ConditionExpression::AttributeExists(resolve_attr_name(
+            obj,
+            inner.trim(),
+        )?));
+    }
+    if let Some(inner) = func_arg(expr, "attribute_type") {
+        let (attr, code) = inner.split_once(',').ok_or_else(|| {
+            WireError::validation("attribute_type takes two arguments: attribute_type(a, :t)")
+        })?;
+        let attr = resolve_attr_name(obj, attr.trim())?;
+        let code = match resolve_placeholder(obj, code.trim())? {
+            AttributeValue::S(code) => code,
+            other => {
+                return Err(WireError::validation(format!(
+                    "attribute_type's second argument must be a string type code, got {other:?}"
+                )));
+            }
+        };
+        const CODES: [&str; 10] = ["S", "N", "B", "BOOL", "NULL", "M", "L", "SS", "NS", "BS"];
+        if !CODES.contains(&code.as_str()) {
             return Err(WireError::validation(format!(
-                "unsupported operator `{op}` in {field} `{expr}` \
-                 (supported: a = :v, attribute_exists(a), attribute_not_exists(a))"
+                "unknown attribute_type code `{code}` (expected one of {})",
+                CODES.join(", ")
             )));
         }
+        return Ok(ConditionExpression::AttributeType(attr, code));
+    }
+    if let Some(inner) = func_arg(expr, "begins_with") {
+        let (attr, ph) = inner.split_once(',').ok_or_else(|| {
+            WireError::validation("begins_with takes two arguments: begins_with(a, :p)")
+        })?;
+        return Ok(ConditionExpression::BeginsWith(
+            resolve_attr_name(obj, attr.trim())?,
+            resolve_placeholder(obj, ph.trim())?,
+        ));
+    }
+    if let Some(inner) = func_arg(expr, "contains") {
+        let (attr, ph) = inner.split_once(',').ok_or_else(|| {
+            WireError::validation("contains takes two arguments: contains(a, :v)")
+        })?;
+        return Ok(ConditionExpression::Contains(
+            resolve_attr_name(obj, attr.trim())?,
+            resolve_placeholder(obj, ph.trim())?,
+        ));
+    }
+    // `size(a) <op> :v` — the only form where a function appears on the *left*
+    // of a comparison, so it is recognised before the generic comparator split.
+    if let Some((lhs, op, rhs)) = split_comparator(expr)
+        && let Some(inner) = func_arg(lhs.trim(), "size")
+    {
+        let attr = resolve_attr_name(obj, inner.trim())?;
+        let value = resolve_placeholder(obj, rhs.trim())?;
+        return Ok(ConditionExpression::Size(
+            attr,
+            comparator_of(op, expr)?,
+            value,
+        ));
+    }
+    // `a BETWEEN :lo AND :hi`
+    if let Some((attr, rest)) = split_once_ci(expr, " BETWEEN ") {
+        let (lo, hi) = split_once_ci(rest, " AND ")
+            .ok_or_else(|| WireError::validation("BETWEEN takes `:lo AND :hi`"))?;
+        return Ok(ConditionExpression::Between(
+            resolve_attr_name(obj, attr.trim())?,
+            resolve_placeholder(obj, lo.trim())?,
+            resolve_placeholder(obj, hi.trim())?,
+        ));
+    }
+    // `a IN (:x, :y, ..)`
+    if let Some((attr, rest)) = split_once_ci(expr, " IN ") {
+        let list = rest.trim();
+        let inner = list
+            .strip_prefix('(')
+            .and_then(|r| r.strip_suffix(')'))
+            .ok_or_else(|| WireError::validation("IN takes a parenthesised list: a IN (:x, :y)"))?;
+        let mut values = Vec::new();
+        for ph in inner.split(',') {
+            let ph = ph.trim();
+            if ph.is_empty() {
+                return Err(WireError::validation("IN list has an empty element"));
+            }
+            values.push(resolve_placeholder(obj, ph)?);
+        }
+        if values.is_empty() {
+            return Err(WireError::validation("IN list must not be empty"));
+        }
+        return Ok(ConditionExpression::In(
+            resolve_attr_name(obj, attr.trim())?,
+            values,
+        ));
+    }
+    if let Some((lhs, op, rhs)) = split_comparator(expr) {
         let attr = resolve_attr_name(obj, lhs.trim())?;
         let value = resolve_placeholder(obj, rhs.trim())?;
-        ConditionExpression::Equals(attr, value)
-    } else {
-        return Err(WireError::validation(format!(
-            "unsupported {field} `{expr}` (supported: \
-             attribute_not_exists(a), attribute_exists(a), a = :v)"
-        )));
-    };
-    Ok(Some(cond))
+        return Ok(ConditionExpression::Compare(
+            attr,
+            comparator_of(op, expr)?,
+            value,
+        ));
+    }
+    Err(WireError::validation(format!(
+        "unsupported {field} `{expr}` (supported: comparisons =, <>, <, <=, >, >=; \
+         BETWEEN; IN; attribute_exists; attribute_not_exists; attribute_type; \
+         begins_with; contains; size)"
+    )))
+}
+
+/// Map a comparison operator's text to its [`Comparator`].
+fn comparator_of(op: &str, expr: &str) -> Result<Comparator, WireError> {
+    Ok(match op {
+        "=" => Comparator::Eq,
+        "<>" => Comparator::Ne,
+        "<" => Comparator::Lt,
+        "<=" => Comparator::Le,
+        ">" => Comparator::Gt,
+        ">=" => Comparator::Ge,
+        other => {
+            return Err(WireError::validation(format!(
+                "unsupported operator `{other}` in `{expr}`"
+            )));
+        }
+    })
 }
 
 /// If `expr` is exactly `name(arg)`, return the trimmed `arg`.
@@ -3252,8 +3369,9 @@ mod tests {
         };
         assert_eq!(
             condition,
-            Some(ConditionExpression::Equals(
+            Some(ConditionExpression::Compare(
                 "v".into(),
+                Comparator::Eq,
                 AttributeValue::N("7".into())
             ))
         );
@@ -3432,7 +3550,11 @@ mod tests {
         };
         assert_eq!(
             filter,
-            Some(ConditionExpression::Equals("kind".into(), s("blue")))
+            Some(ConditionExpression::Compare(
+                "kind".into(),
+                Comparator::Eq,
+                s("blue")
+            ))
         );
 
         // The function forms decode too.
@@ -4420,38 +4542,39 @@ mod tests {
         );
     }
 
-    /// Regression: `>=` and `<=` were cut by a naive `split_once('=')` into an
-    /// equality against an attribute named `price >`, which no item has — so a
-    /// filter silently matched nothing and a conditional write could never
-    /// hold. They must be rejected by name until the operators are supported.
+    /// Regression (now with the operators supported): `>=` and `<=` were once
+    /// cut by a naive `split_once('=')` into an equality against an attribute
+    /// named `price >`. They must parse as the real operator against the whole
+    /// attribute name — the property that bug violated.
     #[test]
-    fn comparison_operators_are_rejected_not_truncated() {
-        for op in [">=", "<=", ">", "<", "<>"] {
+    fn comparison_operators_parse_with_the_whole_attribute_name() {
+        let cases = [
+            (">=", Comparator::Ge),
+            ("<=", Comparator::Le),
+            (">", Comparator::Gt),
+            ("<", Comparator::Lt),
+            ("<>", Comparator::Ne),
+            ("=", Comparator::Eq),
+        ];
+        for (op, expected) in cases {
             let body = format!(
                 r#"{{"TableName":"t","FilterExpression":"price {op} :p",
                      "ExpressionAttributeValues":{{":p":{{"N":"5"}}}}}}"#
             );
-            let err = decode_request("DynamoDB_20120810.Scan", body.as_bytes())
-                .expect_err(&format!("`{op}` must be rejected, never truncated"));
-            assert_eq!(err.code, "ValidationException", "for `{op}`");
-        }
-        // The supported operator still works, and keeps its whole attribute name.
-        match decode_request(
-            "DynamoDB_20120810.Scan",
-            br#"{"TableName":"t","FilterExpression":"price = :p",
-                 "ExpressionAttributeValues":{":p":{"N":"5"}}}"#,
-        )
-        .expect("equality decodes")
-        {
-            Operation::Scan { filter, .. } => assert_eq!(
-                filter,
-                Some(ConditionExpression::Equals(
-                    "price".into(),
-                    AttributeValue::N("5".into())
-                )),
-                "the attribute name must not be truncated"
-            ),
-            other => panic!("expected Scan, got {other:?}"),
+            match decode_request("DynamoDB_20120810.Scan", body.as_bytes())
+                .unwrap_or_else(|e| panic!("`{op}` must decode: {e:?}"))
+            {
+                Operation::Scan { filter, .. } => assert_eq!(
+                    filter,
+                    Some(ConditionExpression::Compare(
+                        "price".into(),
+                        expected,
+                        AttributeValue::N("5".into())
+                    )),
+                    "`{op}` must keep the whole attribute name and its own operator"
+                ),
+                other => panic!("expected Scan, got {other:?}"),
+            }
         }
     }
 
@@ -4468,8 +4591,9 @@ mod tests {
         match decode_request("DynamoDB_20120810.Scan", body.as_bytes()).expect("decodes") {
             Operation::Scan { filter, .. } => assert_eq!(
                 filter,
-                Some(ConditionExpression::Equals(
+                Some(ConditionExpression::Compare(
                     "price".into(),
+                    Comparator::Eq,
                     AttributeValue::N("5".into())
                 )),
                 "the alias must resolve to the real attribute name"
@@ -4552,5 +4676,103 @@ mod tests {
              "ExpressionAttributeValues":{":p":{"S":"a"}}}"#;
         let err = decode_request("DynamoDB_20120810.Query", body).expect_err("must be rejected");
         assert_eq!(err.code, "ValidationException");
+    }
+
+    /// Every new predicate form decodes, including the ones whose argument
+    /// lists contain commas the comparator split must not cut through.
+    #[test]
+    fn the_full_predicate_surface_decodes() {
+        let decode_filter = |frag: &str| {
+            let body = format!(
+                r##"{{"TableName":"t","FilterExpression":"{frag}",
+                     "ExpressionAttributeNames":{{"#a":"attr"}},
+                     "ExpressionAttributeValues":{{
+                        ":v":{{"N":"5"}},":lo":{{"N":"1"}},":hi":{{"N":"9"}},
+                        ":s":{{"S":"pre"}},":t":{{"S":"S"}}}}}}"##
+            );
+            match decode_request("DynamoDB_20120810.Scan", body.as_bytes())
+                .unwrap_or_else(|e| panic!("`{frag}` must decode: {e:?}"))
+            {
+                Operation::Scan { filter, .. } => filter.expect("a filter"),
+                other => panic!("expected Scan, got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            decode_filter("a BETWEEN :lo AND :hi"),
+            ConditionExpression::Between(
+                "a".into(),
+                AttributeValue::N("1".into()),
+                AttributeValue::N("9".into())
+            )
+        );
+        assert_eq!(
+            decode_filter("a IN (:lo, :hi)"),
+            ConditionExpression::In(
+                "a".into(),
+                vec![AttributeValue::N("1".into()), AttributeValue::N("9".into())]
+            )
+        );
+        assert_eq!(
+            decode_filter("begins_with(a, :s)"),
+            ConditionExpression::BeginsWith("a".into(), AttributeValue::S("pre".into()))
+        );
+        assert_eq!(
+            decode_filter("contains(a, :s)"),
+            ConditionExpression::Contains("a".into(), AttributeValue::S("pre".into()))
+        );
+        assert_eq!(
+            decode_filter("attribute_type(a, :t)"),
+            ConditionExpression::AttributeType("a".into(), "S".into())
+        );
+        assert_eq!(
+            decode_filter("size(a) > :v"),
+            ConditionExpression::Size("a".into(), Comparator::Gt, AttributeValue::N("5".into())),
+            "size() is the one form with a function on the left of a comparison"
+        );
+        // Aliases resolve in every form, not just the comparison one.
+        assert_eq!(
+            decode_filter("begins_with(#a, :s)"),
+            ConditionExpression::BeginsWith("attr".into(), AttributeValue::S("pre".into()))
+        );
+        assert_eq!(
+            decode_filter("#a BETWEEN :lo AND :hi"),
+            ConditionExpression::Between(
+                "attr".into(),
+                AttributeValue::N("1".into()),
+                AttributeValue::N("9".into())
+            )
+        );
+    }
+
+    /// Malformed forms are rejected rather than half-parsed.
+    #[test]
+    fn malformed_predicate_forms_are_rejected() {
+        for frag in [
+            "a IN :v",           // unparenthesised
+            "a IN ()",           // empty list
+            "a IN (:v,)",        // trailing empty element
+            "attribute_type(a)", // missing the type code
+            "begins_with(a)",    // missing the prefix
+            "a BETWEEN :lo",     // missing AND :hi
+        ] {
+            let body = format!(
+                r#"{{"TableName":"t","FilterExpression":"{frag}",
+                     "ExpressionAttributeValues":{{":v":{{"N":"5"}},":lo":{{"N":"1"}}}}}}"#
+            );
+            assert!(
+                decode_request("DynamoDB_20120810.Scan", body.as_bytes()).is_err(),
+                "`{frag}` must be rejected, not half-parsed"
+            );
+        }
+    }
+
+    /// An unknown `attribute_type` code is rejected rather than silently
+    /// matching nothing.
+    #[test]
+    fn unknown_attribute_type_code_is_rejected() {
+        let body = br#"{"TableName":"t","FilterExpression":"a attribute_type(a, :t)",
+             "ExpressionAttributeValues":{":t":{"S":"STRING"}}}"#;
+        assert!(decode_request("DynamoDB_20120810.Scan", body).is_err());
     }
 }
