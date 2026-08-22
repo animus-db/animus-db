@@ -531,6 +531,31 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             let item = item.map(|i| wire::project(projection.as_ref(), &i));
             Ok(wire::get_item_response(item.as_ref()))
         }
+        Operation::BatchGetItem { requests } => {
+            // Independent point reads, not a transaction: DynamoDB's
+            // BatchGetItem gives no cross-item atomicity, so this reuses the
+            // ordinary GetItem path per key rather than the quiescent
+            // multi-get `TransactGetItems` needs. A key that matches nothing
+            // is omitted from its table's list.
+            let mut tables: Vec<(String, Vec<Item>)> = Vec::with_capacity(requests.len());
+            for req in requests {
+                if !table_known(ctx, meta, &req.table) {
+                    return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+                        req.table.clone(),
+                    )));
+                }
+                let mut items = Vec::with_capacity(req.keys.len());
+                for key in &req.keys {
+                    let (pk, sk) = resolve_key(ctx, meta, &req.table, key)?;
+                    let data_key = item_key(&pk, sk.as_ref());
+                    if let Some(item) = quorum_read(ctx, meta, &req.table, &data_key).await? {
+                        items.push(wire::project(req.projection.as_ref(), &item));
+                    }
+                }
+                tables.push((req.table.clone(), items));
+            }
+            Ok(wire::batch_get_response(&tables))
+        }
         Operation::Query {
             table,
             index,

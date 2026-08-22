@@ -360,6 +360,23 @@ impl TransactAction {
     }
 }
 
+/// One table's slice of a `BatchGetItem` request: the keys to read from
+/// `table`, with the projection and consistency setting that apply to **all**
+/// of them (DynamoDB scopes both per table, not per key — unlike
+/// `TransactGetItems`, whose projection is per entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchGet {
+    /// Target table.
+    pub table: String,
+    /// The keys to read, in request order.
+    pub keys: Vec<Item>,
+    /// Optional projection applied to every item from this table.
+    pub projection: Option<Projection>,
+    /// `ConsistentRead` for this table's reads. Accept-and-ignore for the
+    /// base table, which is linearizable here already (ADR 0041 §5).
+    pub consistent_read: bool,
+}
+
 /// One item of a `TransactGetItems` request: a plain key read against `table`,
 /// with an optional per-item projection (mirrors `GetItem`'s own `key`/
 /// `projection` shape — `TransactGetItems`'s wire form is `{"Get": {TableName,
@@ -595,6 +612,17 @@ pub enum Operation {
     /// **serializable snapshot via quiescence-confirmation**, not a wait-free
     /// one; see `animusd::dynamo::run_transact_get`'s doc for the exact
     /// mechanism and its honest semantics).
+    /// `BatchGetItem`: independent point reads across one or more tables.
+    ///
+    /// Deliberately **not** transactional — DynamoDB's `BatchGetItem` gives no
+    /// cross-item atomicity, unlike `TransactGetItems`, so this reuses the
+    /// ordinary `GetItem` read path per key rather than the quiescent
+    /// multi-get. Responses are grouped by table, and DynamoDB does not
+    /// promise any order within a table's list.
+    BatchGetItem {
+        /// One entry per requested table, in request order.
+        requests: Vec<BatchGet>,
+    },
     TransactGetItems {
         /// The keys to read, in request order (the response echoes this order).
         gets: Vec<TransactGet>,
@@ -624,9 +652,10 @@ pub enum Operation {
 }
 
 impl Operation {
-    /// The single table this operation targets, if it has one. `BatchWriteItem`,
-    /// `TransactWriteItems`, `TransactGetItems`, and `ListTables` span
-    /// multiple (or zero) tables, so they return `None`.
+    /// The single table this operation targets, if it has one.
+    /// `BatchWriteItem`, `BatchGetItem`, `TransactWriteItems`,
+    /// `TransactGetItems`, and `ListTables` span multiple (or zero) tables,
+    /// so they return `None`.
     #[must_use]
     pub fn table(&self) -> Option<&str> {
         match self {
@@ -643,6 +672,7 @@ impl Operation {
             | Operation::UpdateTimeToLive { table, .. }
             | Operation::DescribeTimeToLive { table, .. } => Some(table),
             Operation::BatchWriteItem { .. }
+            | Operation::BatchGetItem { .. }
             | Operation::TransactWriteItems { .. }
             | Operation::TransactGetItems { .. }
             | Operation::ListTables { .. } => None,
@@ -819,6 +849,7 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "UpdateItem" => decode_update_item(obj),
         "BatchWriteItem" => decode_batch_write(obj),
         "TransactWriteItems" => decode_transact_write(obj),
+        "BatchGetItem" => decode_batch_get(obj),
         "TransactGetItems" => decode_transact_get(obj),
         "UpdateTimeToLive" => decode_update_time_to_live(obj),
         "DescribeTimeToLive" => Ok(Operation::DescribeTimeToLive {
@@ -1131,6 +1162,58 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
 
 /// Decode a `TransactGetItems` body: `{"TransactItems": [{"Get": {TableName,
 /// Key, ProjectionExpression}}, ..]}`.
+/// Decode a `BatchGetItem` body: `{"RequestItems": {"<table>": {"Keys": [..],
+/// "ProjectionExpression": .., "ExpressionAttributeNames": .., "ConsistentRead":
+/// ..}}}`.
+///
+/// Unlike `TransactGetItems`, the projection and consistency setting are scoped
+/// to a **table**, not to an individual key, so they are decoded once per entry
+/// and applied to every key under it.
+///
+/// `RequestItems` is a JSON object, so the tables arrive in whatever order the
+/// map iterates; the response is keyed by table name, so that does not matter.
+/// An empty `Keys` list for a table is rejected, as DynamoDB does — it is
+/// almost always a client bug rather than an intentional no-op.
+fn decode_batch_get(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let tables = obj
+        .get("RequestItems")
+        .and_then(Value::as_object)
+        .ok_or_else(|| WireError::validation("missing object field `RequestItems`"))?;
+    if tables.is_empty() {
+        return Err(WireError::validation(
+            "`RequestItems` must name at least one table",
+        ));
+    }
+    let mut requests = Vec::with_capacity(tables.len());
+    for (table, spec) in tables {
+        let spec = spec.as_object().ok_or_else(|| {
+            WireError::validation(format!("`RequestItems.{table}` must be an object"))
+        })?;
+        let raw_keys = spec.get("Keys").and_then(Value::as_array).ok_or_else(|| {
+            WireError::validation(format!("`RequestItems.{table}` needs an array `Keys`"))
+        })?;
+        if raw_keys.is_empty() {
+            return Err(WireError::validation(format!(
+                "`RequestItems.{table}.Keys` must not be empty"
+            )));
+        }
+        let mut keys = Vec::with_capacity(raw_keys.len());
+        for k in raw_keys {
+            let map = k.as_object().ok_or_else(|| {
+                WireError::validation(format!("each key in `{table}` must be an object"))
+            })?;
+            keys.push(decode_item(map)?);
+        }
+        requests.push(BatchGet {
+            table: table.clone(),
+            keys,
+            projection: decode_projection(spec)?,
+            consistent_read: decode_consistent_read(spec),
+        });
+    }
+    Ok(Operation::BatchGetItem { requests })
+}
+
 fn decode_transact_get(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let items = obj
         .get("TransactItems")
@@ -2513,6 +2596,29 @@ pub fn transact_get_response(items: &[Option<Item>]) -> String {
     serde_json::to_string(&Value::Object(obj)).expect("transact-get response serializes")
 }
 
+/// The JSON body for a successful `BatchGetItem`: `{"Responses": {"<table>":
+/// [item, ..]}, "UnprocessedKeys": {}}`.
+///
+/// Keys that matched no item are simply absent from the table's list — a
+/// `BatchGetItem` reports misses by omission, unlike `TransactGetItems`, whose
+/// response is positional and carries an empty object per missing key.
+///
+/// `UnprocessedKeys` is always empty: this adapter reads every requested key
+/// before responding rather than shedding load, so there is never a remainder
+/// for the client to retry.
+#[must_use]
+pub fn batch_get_response(tables: &[(String, Vec<Item>)]) -> String {
+    let mut responses = Map::new();
+    for (table, items) in tables {
+        let encoded: Vec<Value> = items.iter().map(encode_item).collect();
+        responses.insert(table.clone(), Value::Array(encoded));
+    }
+    let mut obj = Map::new();
+    obj.insert("Responses".into(), Value::Object(responses));
+    obj.insert("UnprocessedKeys".into(), Value::Object(Map::new()));
+    serde_json::to_string(&Value::Object(obj)).expect("batch get response serializes")
+}
+
 /// The JSON body for a successful write echoing `ReturnValues`. `old` is the
 /// item as it was before the write (`None` when the key was absent); for
 /// `ALL_OLD` a present prior item is returned under `Attributes`, an absent one
@@ -3362,9 +3468,10 @@ mod tests {
 
     #[test]
     fn unknown_target_is_rejected() {
-        // `BatchGetItem` is still unsupported (BatchWriteItem now is supported).
+        // `BatchGetItem` is supported now; a malformed body is a validation
+        // error rather than an unknown operation.
         let err = decode_request("DynamoDB_20120810.BatchGetItem", b"{}").unwrap_err();
-        assert_eq!(err.code, "UnknownOperationException");
+        assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
@@ -5363,5 +5470,70 @@ mod tests {
                 "`{expr}` must require a set operand"
             );
         }
+    }
+
+    /// `BatchGetItem` decodes per-table keys, with the projection and
+    /// consistency setting scoped to the table rather than to a key.
+    #[test]
+    fn batch_get_decodes_per_table_specs() {
+        let body = br#"{"RequestItems":{
+            "t1":{"Keys":[{"id":{"S":"a"}},{"id":{"S":"b"}}],
+                  "ProjectionExpression":"id,v","ConsistentRead":true},
+            "t2":{"Keys":[{"id":{"S":"c"}}]}}}"#;
+        match decode_request("DynamoDB_20120810.BatchGetItem", body).expect("decodes") {
+            Operation::BatchGetItem { mut requests } => {
+                requests.sort_by(|a, b| a.table.cmp(&b.table));
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0].table, "t1");
+                assert_eq!(requests[0].keys.len(), 2);
+                assert_eq!(
+                    requests[0].projection,
+                    Some(Projection(vec!["id".into(), "v".into()]))
+                );
+                assert!(requests[0].consistent_read);
+                assert_eq!(requests[1].table, "t2");
+                assert_eq!(requests[1].keys.len(), 1);
+                assert_eq!(requests[1].projection, None);
+                assert!(
+                    !requests[1].consistent_read,
+                    "ConsistentRead defaults to false"
+                );
+            }
+            other => panic!("expected BatchGetItem, got {other:?}"),
+        }
+    }
+
+    /// Malformed request shapes are rejected rather than silently read as empty.
+    #[test]
+    fn batch_get_rejects_malformed_requests() {
+        for body in [
+            &br#"{}"#[..],
+            &br#"{"RequestItems":{}}"#[..],
+            &br#"{"RequestItems":{"t":{}}}"#[..],
+            &br#"{"RequestItems":{"t":{"Keys":[]}}}"#[..],
+            &br#"{"RequestItems":{"t":{"Keys":["nope"]}}}"#[..],
+        ] {
+            assert!(
+                decode_request("DynamoDB_20120810.BatchGetItem", body).is_err(),
+                "must reject {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// The response groups items by table and always reports an empty
+    /// `UnprocessedKeys`, since every requested key is read before responding.
+    #[test]
+    fn batch_get_response_groups_by_table() {
+        let mut a = Item::new();
+        a.insert("id".into(), s("a"));
+        let body =
+            batch_get_response(&[("t1".to_string(), vec![a]), ("t2".to_string(), Vec::new())]);
+        assert!(body.contains(r#""t1":[{"id":{"S":"a"}}]"#), "{body}");
+        assert!(
+            body.contains(r#""t2":[]"#),
+            "a table with no hits is an empty list: {body}"
+        );
+        assert!(body.contains(r#""UnprocessedKeys":{}"#), "{body}");
     }
 }
