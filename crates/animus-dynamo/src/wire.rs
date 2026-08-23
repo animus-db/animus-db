@@ -1162,8 +1162,23 @@ fn decode_update_return_values(obj: &Map<String, Value>) -> Result<UpdateReturnV
     }
 }
 
+/// AWS's `BatchWriteItem` cap: at most 25 request items, summed across every
+/// table named in `RequestItems`, in one call.
+pub const BATCH_WRITE_MAX_ITEMS: usize = 25;
+
+/// AWS's `BatchGetItem` cap: at most 100 keys, summed across every table
+/// named in `RequestItems`, in one call.
+pub const BATCH_GET_MAX_KEYS: usize = 100;
+
+/// AWS's `TransactWriteItems` cap: at most 100 actions in one call.
+pub const TRANSACT_WRITE_MAX_ACTIONS: usize = 100;
+
+/// AWS's `TransactGetItems` cap: at most 100 items in one call.
+pub const TRANSACT_GET_MAX_ITEMS: usize = 100;
+
 /// Decode a `BatchWriteItem` body: `{"RequestItems": {table: [{PutRequest|
-/// DeleteRequest}, ..], ..}}`.
+/// DeleteRequest}, ..], ..}}`. Rejects more than [`BATCH_WRITE_MAX_ITEMS`]
+/// request items total across every table, matching real DynamoDB.
 fn decode_batch_write(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let items = obj
         .get("RequestItems")
@@ -1191,11 +1206,19 @@ fn decode_batch_write(obj: &Map<String, Value>) -> Result<Operation, WireError> 
         }
         requests.insert(table.clone(), reqs);
     }
+    let total: usize = requests.values().map(Vec::len).sum();
+    if total > BATCH_WRITE_MAX_ITEMS {
+        return Err(WireError::validation(format!(
+            "too many items in BatchWriteItem: {total} requested, at most \
+             {BATCH_WRITE_MAX_ITEMS} allowed per call across all tables"
+        )));
+    }
     Ok(Operation::BatchWriteItem { requests })
 }
 
 /// Decode a `TransactWriteItems` body: `{"TransactItems": [{Put|Delete|Update|
-/// ConditionCheck}, ..]}`.
+/// ConditionCheck}, ..]}`. Rejects more than [`TRANSACT_WRITE_MAX_ACTIONS`]
+/// actions, matching real DynamoDB.
 fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let items = obj
         .get("TransactItems")
@@ -1254,11 +1277,16 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
         };
         actions.push(action);
     }
+    if actions.len() > TRANSACT_WRITE_MAX_ACTIONS {
+        return Err(WireError::validation(format!(
+            "too many actions in TransactWriteItems: {} requested, at most \
+             {TRANSACT_WRITE_MAX_ACTIONS} allowed per call",
+            actions.len()
+        )));
+    }
     Ok(Operation::TransactWriteItems { actions })
 }
 
-/// Decode a `TransactGetItems` body: `{"TransactItems": [{"Get": {TableName,
-/// Key, ProjectionExpression}}, ..]}`.
 /// Decode a `BatchGetItem` body: `{"RequestItems": {"<table>": {"Keys": [..],
 /// "ProjectionExpression": .., "ExpressionAttributeNames": .., "ConsistentRead":
 /// ..}}}`.
@@ -1270,7 +1298,9 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
 /// `RequestItems` is a JSON object, so the tables arrive in whatever order the
 /// map iterates; the response is keyed by table name, so that does not matter.
 /// An empty `Keys` list for a table is rejected, as DynamoDB does — it is
-/// almost always a client bug rather than an intentional no-op.
+/// almost always a client bug rather than an intentional no-op. Rejects more
+/// than [`BATCH_GET_MAX_KEYS`] keys total across every table, matching real
+/// DynamoDB.
 fn decode_batch_get(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let tables = obj
         .get("RequestItems")
@@ -1308,9 +1338,19 @@ fn decode_batch_get(obj: &Map<String, Value>) -> Result<Operation, WireError> {
             consistent_read: decode_consistent_read(spec),
         });
     }
+    let total: usize = requests.iter().map(|r| r.keys.len()).sum();
+    if total > BATCH_GET_MAX_KEYS {
+        return Err(WireError::validation(format!(
+            "too many keys in BatchGetItem: {total} requested, at most \
+             {BATCH_GET_MAX_KEYS} allowed per call across all tables"
+        )));
+    }
     Ok(Operation::BatchGetItem { requests })
 }
 
+/// Decode a `TransactGetItems` body: `{"TransactItems": [{"Get": {TableName,
+/// Key, ProjectionExpression}}, ..]}`. Rejects more than
+/// [`TRANSACT_GET_MAX_ITEMS`] items, matching real DynamoDB.
 fn decode_transact_get(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let items = obj
         .get("TransactItems")
@@ -1333,6 +1373,13 @@ fn decode_transact_get(obj: &Map<String, Value>) -> Result<Operation, WireError>
             key,
             projection,
         });
+    }
+    if gets.len() > TRANSACT_GET_MAX_ITEMS {
+        return Err(WireError::validation(format!(
+            "too many items in TransactGetItems: {} requested, at most \
+             {TRANSACT_GET_MAX_ITEMS} allowed per call",
+            gets.len()
+        )));
     }
     Ok(Operation::TransactGetItems { gets })
 }
@@ -4899,6 +4946,98 @@ mod tests {
         assert!(matches!(actions[0], TransactAction::Put { .. }));
         assert!(matches!(actions[1], TransactAction::Update { .. }));
         assert!(matches!(actions[2], TransactAction::ConditionCheck { .. }));
+    }
+
+    // --- AWS batch/transaction count caps ----------------------------------
+
+    /// A `BatchWriteItem` body with `n` `PutRequest`s against one table.
+    fn batch_write_body(n: usize) -> String {
+        let items: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"PutRequest":{{"Item":{{"id":{{"S":"i{i}"}}}}}}}}"#))
+            .collect();
+        format!(r#"{{"RequestItems":{{"t":[{}]}}}}"#, items.join(","))
+    }
+
+    #[test]
+    fn batch_write_accepts_the_cap_and_rejects_one_over_it() {
+        let at_cap = batch_write_body(BATCH_WRITE_MAX_ITEMS);
+        decode_request("DynamoDB_20120810.BatchWriteItem", at_cap.as_bytes())
+            .expect("exactly the cap is accepted");
+
+        let over_cap = batch_write_body(BATCH_WRITE_MAX_ITEMS + 1);
+        let err = decode_request("DynamoDB_20120810.BatchWriteItem", over_cap.as_bytes())
+            .expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A `BatchGetItem` body with `n` keys against one table.
+    fn batch_get_body(n: usize) -> String {
+        let keys: Vec<String> = (0..n).map(|i| format!(r#"{{"id":{{"S":"i{i}"}}}}"#)).collect();
+        format!(r#"{{"RequestItems":{{"t":{{"Keys":[{}]}}}}}}"#, keys.join(","))
+    }
+
+    #[test]
+    fn batch_get_accepts_the_cap_and_rejects_one_over_it() {
+        let at_cap = batch_get_body(BATCH_GET_MAX_KEYS);
+        decode_request("DynamoDB_20120810.BatchGetItem", at_cap.as_bytes())
+            .expect("exactly the cap is accepted");
+
+        let over_cap = batch_get_body(BATCH_GET_MAX_KEYS + 1);
+        let err = decode_request("DynamoDB_20120810.BatchGetItem", over_cap.as_bytes())
+            .expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A `TransactWriteItems` body with `n` `Put` actions, each its own key.
+    fn transact_write_body(n: usize) -> String {
+        let actions: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"Put":{{"TableName":"t","Item":{{"id":{{"S":"i{i}"}}}}}}}}"#))
+            .collect();
+        format!(r#"{{"TransactItems":[{}]}}"#, actions.join(","))
+    }
+
+    #[test]
+    fn transact_write_accepts_the_cap_and_rejects_one_over_it() {
+        let at_cap = transact_write_body(TRANSACT_WRITE_MAX_ACTIONS);
+        decode_request("DynamoDB_20120810.TransactWriteItems", at_cap.as_bytes())
+            .expect("exactly the cap is accepted");
+
+        let over_cap = transact_write_body(TRANSACT_WRITE_MAX_ACTIONS + 1);
+        let err = decode_request("DynamoDB_20120810.TransactWriteItems", over_cap.as_bytes())
+            .expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A `TransactGetItems` body with `n` `Get` items, each its own key.
+    fn transact_get_body(n: usize) -> String {
+        let gets: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"Get":{{"TableName":"t","Key":{{"id":{{"S":"i{i}"}}}}}}}}"#))
+            .collect();
+        format!(r#"{{"TransactItems":[{}]}}"#, gets.join(","))
+    }
+
+    #[test]
+    fn decodes_transact_get() {
+        let body = transact_get_body(2);
+        let Operation::TransactGetItems { gets } =
+            decode_request("DynamoDB_20120810.TransactGetItems", body.as_bytes()).unwrap()
+        else {
+            panic!("expected TransactGetItems");
+        };
+        assert_eq!(gets.len(), 2);
+        assert_eq!(gets[0].table, "t");
+    }
+
+    #[test]
+    fn transact_get_accepts_the_cap_and_rejects_one_over_it() {
+        let at_cap = transact_get_body(TRANSACT_GET_MAX_ITEMS);
+        decode_request("DynamoDB_20120810.TransactGetItems", at_cap.as_bytes())
+            .expect("exactly the cap is accepted");
+
+        let over_cap = transact_get_body(TRANSACT_GET_MAX_ITEMS + 1);
+        let err = decode_request("DynamoDB_20120810.TransactGetItems", over_cap.as_bytes())
+            .expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
