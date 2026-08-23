@@ -676,7 +676,7 @@ demand the identical action, so no disambiguation is needed.
   ~11ms).
 - **Unbounded scans must not fall through to `entries()`.** `local_scan`'s
   `end: None` branch (used by `/admin/raftkv`'s `raft_view`, by teardown, and
-  transparently by `linearizable_scan` — the real DynamoDB `Scan`/CQL
+  transparently by `linearizable_scan` — the real DynamoDB `Scan`
   full-table path) derives a bounded upper bound from `physical_bounds`
   instead — post-F2b always finite for a kind scope (`[kind] .. [kind+1]`).
   The engine is the tablet's own now (ADR 0050), so the historical

@@ -54,20 +54,19 @@ async fn bring_up_control(n: usize, dir: &std::path::Path) -> (Vec<Node>, animus
     for attempt in 0..16 {
         // Six addresses per index even though a control-only entry only ever
         // binds four of them (internal, client, admin, intra) — `RoleAddrs::
-        // dynamo`/`cql` aren't `Option`, and matching the six-port stride (ADR
+        // dynamo` isn't `Option`, and matching the six-port stride (ADR
         // 0047) keeps this config trivially comparable to a combined-mode one.
-        let addrs = free_addrs(n * 7);
+        let addrs = free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Control,
-                internal: addrs[7 * i],
-                client: addrs[7 * i + 1],
-                dynamo: addrs[7 * i + 2],
-                cql: addrs[7 * i + 3],
-                admin: addrs[7 * i + 4],
-                intra: addrs[7 * i + 5],
-                console: addrs[7 * i + 6],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -177,10 +176,6 @@ async fn control_only_cluster_elects_leader_and_serves_status() {
             assert!(
                 config_view["addrs"]["dynamo"].is_null(),
                 "a control-only node's dynamo listener is never bound: {config_view}"
-            );
-            assert!(
-                config_view["addrs"]["cql"].is_null(),
-                "a control-only node's cql listener is never bound: {config_view}"
             );
 
             // ADR 0038 PR4: a control-only node unconditionally provisions
@@ -386,30 +381,28 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
         // trio's voter set, and it mirrors the trio's `Metadata` via
         // `remote_metadata_sync_loop`.
         let (control_nodes, config, data_node) = 'bring_up: loop {
-            let addrs = free_addrs(4 * 7);
+            let addrs = free_addrs(4 * 6);
             let mut nodes_cfg: Vec<animusd::RoleAddrs> = (0..3)
                 .map(|i| animusd::RoleAddrs {
                     id: animusd::config::node_id(i),
                     role: animusd::config::NodeRole::Control,
-                    internal: addrs[7 * i],
-                    client: addrs[7 * i + 1],
-                    dynamo: addrs[7 * i + 2],
-                    cql: addrs[7 * i + 3],
-                    admin: addrs[7 * i + 4],
-                    intra: addrs[7 * i + 5],
-                    console: addrs[7 * i + 6],
+                    internal: addrs[6 * i],
+                    client: addrs[6 * i + 1],
+                    dynamo: addrs[6 * i + 2],
+                    admin: addrs[6 * i + 3],
+                    intra: addrs[6 * i + 4],
+                    console: addrs[6 * i + 5],
                 })
                 .collect();
             nodes_cfg.push(animusd::RoleAddrs {
                 id: animusd::config::node_id(3),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[21],
-                client: addrs[22],
-                dynamo: addrs[23],
-                cql: addrs[24],
-                admin: addrs[25],
-                intra: addrs[26],
-                console: addrs[27],
+                internal: addrs[18],
+                client: addrs[19],
+                dynamo: addrs[20],
+                admin: addrs[21],
+                intra: addrs[22],
+                console: addrs[23],
             });
             let config = animusd::ClusterConfig { nodes: nodes_cfg };
 

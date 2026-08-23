@@ -65,19 +65,18 @@ const KV_TABLET: TabletId = TabletId(1);
 /// data dirs so a test can assert on-disk WAL state and restart nodes in place.
 async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig, Vec<PathBuf>) {
     for attempt in 0..16 {
-        let a = support::free_addrs(n * 7);
+        let a = support::free_addrs(n * 6);
         let config = ClusterConfig {
             nodes: (0..n)
                 .map(|i| RoleAddrs {
                     id: animusd::config::node_id(i),
                     role: animusd::config::NodeRole::Both,
-                    internal: a[7 * i],
-                    client: a[7 * i + 1],
-                    dynamo: a[7 * i + 2],
-                    cql: a[7 * i + 3],
-                    admin: a[7 * i + 4],
-                    intra: a[7 * i + 5],
-                    console: a[7 * i + 6],
+                    internal: a[6 * i],
+                    client: a[6 * i + 1],
+                    dynamo: a[6 * i + 2],
+                    admin: a[6 * i + 3],
+                    intra: a[6 * i + 4],
+                    console: a[6 * i + 5],
                 })
                 .collect(),
         };

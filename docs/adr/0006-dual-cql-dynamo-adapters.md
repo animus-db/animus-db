@@ -1,6 +1,10 @@
 # ADR 0006 — Dual CQL + DynamoDB adapters over a common core
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR 0053](0053-dynamodb-only-drop-cql.md)
+  (2026-08-22) — v1 serves DynamoDB only; `animus-cql` is deleted (retrievable
+  from git history). The dual-adapter decision and everything CQL-specific
+  below is kept as a historical record of what was built and why; do not
+  treat it as describing the current adapter surface.
 - **Amended for v1 (ADR 0019):** the adapters route through the **CP data
   plane** — `DataClient` and the quorum coordinator are deleted with the AP
   plane; the "native quorum range scan" below is now the CP `cp_scan`

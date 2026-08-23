@@ -228,7 +228,6 @@ async fn ephemeral_control_only_restart_does_not_carry_over_metadata() {
         internal: free_addr(),
         client: free_addr(),
         dynamo: free_addr(),
-        cql: free_addr(),
         admin: free_addr(),
         intra: free_addr(),
         console: free_addr(),

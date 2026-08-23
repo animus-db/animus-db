@@ -26,9 +26,8 @@
 //!
 //! Going the other way, [`to_dynamo`] reads the partition key and the first
 //! clustering key (DynamoDB has at most one sort key) back out, ignoring any
-//! extra clustering columns a non-DynamoDB writer (CQL) might have declared — so
-//! the two adapters can coexist in one catalog without the DynamoDB edge choking
-//! on a CQL table it does not own.
+//! extra clustering columns the shared catalog's general shape allows but
+//! DynamoDB's own key model has no use for.
 
 use animus_control::{
     ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection as ControlProjection, IndexStatus,
@@ -84,8 +83,8 @@ pub fn to_control(schema: &TableSchema, key_types: &[(String, String)]) -> Contr
 /// The reverse of [`column_type_for`]: a control-plane [`ColumnType`] back to
 /// its DynamoDB `AttributeType` (`S`/`N`/`B`) — used to build `DescribeTable`'s
 /// `AttributeDefinitions` from the replicated catalog's typed key columns.
-/// Every non-key `ColumnType` (`Int`/`BigInt`/`Bool`/`Uuid`) only ever
-/// appears here from a CQL-declared table sharing the catalog; DynamoDB
+/// The non-key `ColumnType` variants (`Int`/`BigInt`/`Bool`/`Uuid`) are
+/// part of the shared catalog's broader type vocabulary (ADR 0013); DynamoDB
 /// itself only ever stores `String`/`Number`/`Binary` for a key, so those
 /// fall back to `"S"` (the most permissive), mirroring `column_type_for`'s
 /// own default direction.
@@ -118,10 +117,9 @@ pub fn key_attribute_types(control: &ControlSchema) -> Vec<(String, String)> {
 
 /// Recover the DynamoDB key shape from a control-plane [`ControlSchema`]: the
 /// partition key, plus the first clustering key as the DynamoDB sort key (DynamoDB
-/// has at most one). Extra clustering columns — which a CQL `CREATE TABLE` may
-/// have declared in the same shared catalog — are ignored, so the DynamoDB edge
-/// resolves keys for its own tables and reports a CQL-only table's extra
-/// clustering columns as simply absent from the DynamoDB view.
+/// has at most one). Extra clustering columns — which the shared catalog's
+/// general shape (ADR 0013) allows for — are ignored, so the DynamoDB edge
+/// simply sees them as absent from the DynamoDB view.
 #[must_use]
 pub fn to_dynamo(schema: &ControlSchema) -> TableSchema {
     TableSchema {
@@ -289,8 +287,8 @@ mod tests {
 
     #[test]
     fn extra_clustering_columns_are_dropped_for_dynamo() {
-        // A CQL table with two clustering columns is seen by the DynamoDB edge as
-        // a composite table on the first clustering column.
+        // A catalog entry with two clustering columns is seen by the DynamoDB
+        // edge as a composite table on the first clustering column.
         let control = ControlSchema::with_columns(
             "pk",
             vec!["c1".into(), "c2".into()],

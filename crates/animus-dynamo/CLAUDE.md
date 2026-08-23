@@ -274,7 +274,7 @@ comment for its full type/method inventory.
   synchronously, so there is no in-flight state to report. The
   `Scan`/`Query` `FilterExpression` reuses the `ConditionExpression` predicate
   subset (`attribute_exists`/`attribute_not_exists`/`a = :v`), not the fuller
-  filter grammar. `animus-cql` would map onto the same core the same way.
+  filter grammar.
   **Every write op maintains a table's secondary indexes** — and since ADR
   0049 (the universal kind-write path) **every Dynamo write op on every
   table commits through `KindBatch`**: `PutItem`/`DeleteItem`/`UpdateItem`/

@@ -8,7 +8,11 @@
   (see the fourth 2026-08-20 amendment below) ships that page's third and
   final tab, Stream data; PR6 (see the fifth 2026-08-20 amendment below)
   ships the create-table form, completing the console's screens — this
-  stack has no further follow-up PR planned.
+  stack has no further follow-up PR planned. **Amended by [ADR 0053](
+  0053-dynamodb-only-drop-cql.md) (2026-08-22):** the CQL wire adapter and
+  its port slot are dropped, so the "seven-port stride" this ADR
+  established is now six again, differently composed; see the amendment
+  note at the end of this document.
 - **Date:** 2026-08-19
 - **Amends:** [ADR 0035](0035-control-plane-separate-deployment.md) (owns the
   deployment shapes and their port contracts — gains a seventh port and a
@@ -757,3 +761,18 @@ not reintroduced: the create-table form's stream-enabled and TTL-enabled
 controls are both `toggleSwitch`, and the segmented control is reserved
 for the form's two genuinely closed sets (stream view type, GSI projection
 type).
+
+## Amendment (2026-08-22, ADR 0053)
+
+[ADR 0053](0053-dynamodb-only-drop-cql.md) drops the CQL wire adapter and
+its port slot entirely. This ADR's "seven-port stride" (`base_port + 7*i +
+{internal:0, client:1, dynamo:2, cql:3, admin:4, intra:5, console:6}`,
+§"What this PR ships" above) and its Consequences section's "combined and
+data-only bind **seven** listeners now" are both historical as of ADR
+0053: with `cql` removed, the stride is **six** again, renumbered as
+`base_port + 6*i + {internal:0, client:1, dynamo:2, admin:3, intra:4,
+console:5}`. The console-binding rule this ADR set (combined and
+data-only bind it; control-only does not) is unchanged — only the slot
+numbering shifts, and only for the roles at or after `admin`. The body
+above is kept as originally written; see ADR 0047's own matching
+amendment note for the full before/after port table.

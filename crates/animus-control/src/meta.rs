@@ -182,15 +182,6 @@ pub struct Metadata {
     /// consume it (a deliberate follow-up) so a `CreateTable`/`CREATE TABLE`
     /// survives restart and is agreed cluster-wide.
     pub schemas: SchemaCatalog,
-    /// Replicated **keyspace** names (ADR 0013 / v1 A3): the CQL keyspace namespace,
-    /// mutated only through [`MetaCommand::CreateKeyspace`] /
-    /// [`MetaCommand::DropKeyspace`] so it is Raft-replicated and recovered from the
-    /// WAL/snapshot — a `CREATE KEYSPACE` survives restart and is agreed
-    /// cluster-wide, instead of living in per-process edge state. Names are stored
-    /// as given (the CQL edge lowercases before proposing). `#[serde(default)]`
-    /// keeps snapshots written before this field existed loading (empty set).
-    #[serde(default)]
-    pub keyspaces: BTreeSet<String>,
     /// Replicated **CP group member addresses** (Phase 2): each CP per-tablet Raft
     /// member id → the listen address of its hosting node's `raftkv` role, as an
     /// opaque string (the control plane never dials it). Mutated only through
@@ -594,8 +585,9 @@ pub enum MetaCommand {
     /// if no schema is registered for `table`.
     DropTableSchema { table: TableName },
     /// **Atomically replace** an existing table's schema (ADR 0013) — the in-place
-    /// schema mutation behind CQL `ALTER TABLE … ADD` (which appends columns to
-    /// the current schema and replaces it wholesale). One command, one apply: no
+    /// schema mutation originally behind CQL's `ALTER TABLE … ADD` (ADR 0006,
+    /// since dropped by ADR 0053; appends columns to the current schema and
+    /// replaces it wholesale). One command, one apply: no
     /// drop-then-recreate window in which a crash — or any reader of a replica
     /// that applied the drop but not yet the recreate — sees the table
     /// schema-less. Rejected if `table` has no schema (an ALTER cannot create a
@@ -790,13 +782,6 @@ pub enum MetaCommand {
         rows: Vec<(TabletId, u64)>,
         remove: bool,
     },
-    /// Register a **keyspace** name (ADR 0013 / v1 A3). Idempotent: a no-op if the
-    /// keyspace already exists. Replicated so a CQL `CREATE KEYSPACE` is durable +
-    /// cluster-agreed.
-    CreateKeyspace { keyspace: String },
-    /// Remove a keyspace name. Idempotent: a no-op if absent. (Tables in the
-    /// keyspace are dropped separately; this removes only the namespace entry.)
-    DropKeyspace { keyspace: String },
     /// Register (or update) a **CP group member's address** (Phase 2): the
     /// `raftkv`-role listen address of member `id`, stored opaquely in
     /// [`Metadata::cp_member_addrs`] and replicated so every node's peer-sync loop
@@ -1665,25 +1650,6 @@ impl Metadata {
                     ApplyOutcome::NoOp
                 }
             }
-            MetaCommand::CreateKeyspace { keyspace } => {
-                if crate::syskv::is_reserved_name(keyspace) {
-                    return ApplyOutcome::Rejected(
-                        "keyspace name collides with the reserved system namespace",
-                    );
-                }
-                if self.keyspaces.insert(keyspace.clone()) {
-                    ApplyOutcome::Applied
-                } else {
-                    ApplyOutcome::NoOp
-                }
-            }
-            MetaCommand::DropKeyspace { keyspace } => {
-                if self.keyspaces.remove(keyspace) {
-                    ApplyOutcome::Applied
-                } else {
-                    ApplyOutcome::NoOp
-                }
-            }
             MetaCommand::RegisterCpAddr { id, addr, tablet } => {
                 // A tablet-scoped registration for a tablet not (yet or anymore)
                 // in the map is rejected: accepting it would either leak (the GC
@@ -1901,13 +1867,6 @@ impl Metadata {
     #[must_use]
     pub fn has_table_schema(&self, table: &str) -> bool {
         self.schemas.contains(table)
-    }
-
-    /// Whether `keyspace` is registered (ADR 0013 / v1 A3). Read by the CQL edge
-    /// for `USE` / qualifier validation, in place of per-process edge state.
-    #[must_use]
-    pub fn has_keyspace(&self, keyspace: &str) -> bool {
-        self.keyspaces.contains(keyspace)
     }
 
     /// The table's replication mode (ADR 0016 / ADR 0017). Defaults to `Cp` —
@@ -2677,29 +2636,6 @@ mod tests {
             }),
             ApplyOutcome::Rejected("table name may not contain the reserved `$` separator")
         );
-    }
-
-    /// `CreateKeyspace` rejects the same reserved-namespace collision as
-    /// `CreateTableSchema` (ADR 0038).
-    #[test]
-    fn create_keyspace_rejects_reserved_namespace() {
-        let mut m = Metadata::default();
-        assert_eq!(
-            m.apply(&MetaCommand::CreateKeyspace {
-                keyspace: crate::syskv::RESERVED_NAMESPACE.to_owned(),
-            }),
-            ApplyOutcome::Rejected("keyspace name collides with the reserved system namespace")
-        );
-        assert!(!m.has_keyspace(crate::syskv::RESERVED_NAMESPACE));
-
-        // An ordinary keyspace name is unaffected.
-        assert_eq!(
-            m.apply(&MetaCommand::CreateKeyspace {
-                keyspace: "orders_ks".to_owned(),
-            }),
-            ApplyOutcome::Applied
-        );
-        assert!(m.has_keyspace("orders_ks"));
     }
 
     /// `RegisterCpAddr` records a CP member's address, updates on change, and is a

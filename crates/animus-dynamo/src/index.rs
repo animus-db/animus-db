@@ -2,7 +2,7 @@
 //!
 //! Pure, deterministic, no I/O — `BTreeMap` only (ADR 0003). This module owns
 //! every byte layout ADR 0041 introduces, so the layout is testable in isolation
-//! and the `animusd` edge, the CQL edge, and the drain all agree by construction.
+//! and the `animusd` edge and the drain agree by construction.
 //!
 //! ## Within-table keys
 //!
@@ -61,8 +61,8 @@ use crate::{AttributeValue, Item, escape};
 /// The separator between a base table's name and its index's name in a hidden
 /// index table's name (ADR 0041 §1).
 ///
-/// `$` is legal in neither a DynamoDB table/index name (`[A-Za-z0-9_.-]`) nor a
-/// CQL identifier, so an index table's name cannot collide with a user table's.
+/// `$` is not legal in a DynamoDB table/index name (`[A-Za-z0-9_.-]`), so an
+/// index table's name cannot collide with a user table's.
 /// That is **enforced, not assumed** — `Metadata::apply`'s `CreateTableSchema`
 /// arm rejects a user table name containing it, alongside the existing
 /// `syskv::is_reserved_name` gate.
@@ -608,8 +608,7 @@ mod tests {
     #[test]
     fn the_base_layout_is_adr_0022_unchanged() {
         // ADR 0041 moved the row kind into the scope prefix precisely so this
-        // stays true: nothing existing moves on disk, and the CQL edge — which
-        // has no LSI — needs no change at all.
+        // stays true: nothing existing moves on disk.
         for (pk, sk) in [(s("alice"), None), (s("alice"), Some(s("42")))] {
             assert_eq!(
                 base_row_key(&pk, sk.as_ref()),

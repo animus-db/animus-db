@@ -22,7 +22,7 @@ per-tablet CP data plane (`animus-cp-data`).
 
   and `Metadata::rebalance` are the *pure* placement decisions (see
   Invariants). Holds members, the tablet map, placement policies, the
-  table-schema catalog, keyspaces, node addressing (`node_addrs`), the
+  table-schema catalog, node addressing (`node_addrs`), the
   DynamoDB Streams segment catalog (`stream_shards`), and the secondary-index
   backfill-completion catalog (`index_backfill`, ADR 0045 §4 — per-`(tablet,
   index)` "this tablet finished seeding change-log coverage for this index",
@@ -208,10 +208,11 @@ per-tablet CP data plane (`animus-cp-data`).
   node's mirror writes directly through this same already-globally-
   namespaced engine with no further `StorageScope` wrapper, and a prefix
   match is the collision that scheme cannot tell apart from a real system
-  key. Called from both `Metadata::apply`'s create-schema/keyspace arms
-  (state-machine-level gate) and both wire edges' client-side validation
-  (surfaces as an immediate error instead of an opaque commit-wait
-  timeout) — same two-layer idiom the duplicate-table check uses.
+  key. Called from both `Metadata::apply`'s `CreateTableSchema` arm
+  (state-machine-level gate) and the DynamoDB wire edge's client-side
+  validation (surfaces as an immediate error instead of an opaque
+  commit-wait timeout) — same two-layer idiom the duplicate-table check
+  uses.
 
   `reserved_scan_bounds() -> (Vec<u8>, Vec<u8>)` is **the load-bearing
   bound the admin endpoint scans with instead of

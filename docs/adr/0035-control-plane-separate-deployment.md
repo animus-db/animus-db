@@ -3,6 +3,10 @@
 - **Status:** Implemented — PR0 through PR7 are all shipped (§Delivery plan).
   Amends ADR 0030 (data-plane-only growth) and ADR 0032 (seed/join, address
   book) — see the note at the end of ADR 0030 and the top of ADR 0032.
+  **Amended by [ADR 0053](0053-dynamodb-only-drop-cql.md) (2026-08-22):**
+  the CQL wire adapter is dropped, so the "seven ports" this ADR's own
+  ADR 0052 amendment (below) describes is stale; see the further amendment
+  note after it.
 - **2026-08-10 note:** a **control-only** node (§ this ADR's PR3) now
   **unconditionally** provisions a dedicated system-keyspace storage engine
   (ADR 0038) — it is no longer a storage-engine-free deployment shape.
@@ -481,3 +485,15 @@ see ADR 0052's own "Which deployment shapes serve it" for the full
 reasoning). No other target-topology bullet in this ADR changes — this is
 an additive port, not a new shape or a change to the two existing roles'
 own responsibilities.
+
+## Amendment (2026-08-22, ADR 0053)
+
+[ADR 0053](0053-dynamodb-only-drop-cql.md) drops the CQL wire adapter and
+its port slot entirely, so the "seven" the amendment immediately above
+records is stale: with `cql` removed the stride is **six** again, but
+composed differently from either this ADR's original five-port layout or
+ADR 0047's six-port one — `{internal:0, client:1, dynamo:2, admin:3,
+intra:4, console:5}`. The console-binding rule (combined and data-only
+bind it, control-only does not) is unaffected; only the numbering from
+`admin` onward shifts down by one slot. See ADR 0047's and ADR 0052's own
+matching amendment notes for the full before/after port table.
