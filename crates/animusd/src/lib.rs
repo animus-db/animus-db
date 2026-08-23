@@ -15238,22 +15238,32 @@ mod confirm_futility_tests {
     /// (`ConditionFailed`) before `cp_kind_local` is ever called, so the
     /// lock is released at the same point regardless of the fix — the bug
     /// is specifically about the propose+confirm phase, which a failed
-    /// eval-time condition never reaches. To exercise it for real we need a
-    /// write whose **read** is fast but whose **propose+confirm** is slow: a
-    /// continuous filler flood against the write's own tablet, running for
-    /// the whole test, gives exactly that — the flood's own commits keep
-    /// growing the tablet's apply backlog throughout the window, but the
-    /// target write's read starts essentially at once (the group is
-    /// otherwise idle), typically resolving before much backlog has built
-    /// up, while its subsequent confirm-poll (for the entry the flood keeps
-    /// pushing behind) has to wait out however much is still queued.
+    /// eval-time condition never reaches.
+    ///
+    /// **Why this doesn't race a real apply backlog.** An earlier version of
+    /// this test built the "slow propose+confirm" scenario for real, with a
+    /// concurrent filler flood against the write's own tablet running for a
+    /// fixed wall-clock window, hoping the flood's own commits would grow
+    /// the tablet's apply backlog faster than the target write's confirm
+    /// could drain it. That is a real race, not a guarantee: on a CPU-
+    /// starved runner the flood is starved right along with everything
+    /// else, so it can fail to build any backlog at all — observed in CI on
+    /// commit `97289e2`, where two parallel runs of the identical code came
+    /// back one green and one red, the red one logging `DIAG: unrelated
+    /// write (group B) took 103.937566ms` with the "slow" write having
+    /// *already finished*. This test now uses
+    /// `dynamo::rmw285_confirm_gate` (see its own doc) to hold write A's
+    /// propose+confirm phase open for a fixed, generous delay under this
+    /// test's own control instead of hoping a flood wins a scheduling race
+    /// — the in-flight window this regresses against no longer depends on
+    /// how contended the machine happens to be.
     ///
     /// A second, wholly unrelated tablet (its own independent Raft group and
-    /// apply pipeline — no flood) then proves the point: pre-fix, a write to
-    /// it queues behind the node-wide lock held for the first write's entire
-    /// read+propose+confirm; post-fix the lock is released the moment the
-    /// first write's read+evaluate finishes, so the second write is
-    /// unaffected by the first write's still-ongoing confirm-poll.
+    /// apply pipeline) then proves the point: pre-fix, a write to it queues
+    /// behind the node-wide lock held for write A's entire gated
+    /// read+propose+confirm; post-fix the lock is released the moment
+    /// write A's read+evaluate finishes, so the second write is unaffected
+    /// by write A's still-ongoing (artificially held-open) confirm phase.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_confirm_wait() {
         let dir = tempfile::tempdir().unwrap();
@@ -15298,47 +15308,16 @@ mod confirm_futility_tests {
             .expect("tablet group did not elect a local leader in time");
         }
 
-        // A continuous filler flood against table A's own tablet ONLY, for a
-        // fixed wall-clock window long enough to outlast both writes below.
-        // `put_kind_batch_conditioned` is a synchronous, non-blocking
-        // propose (append-only, no confirm wait), so this keeps landing
-        // fresh committed-but-unapplied entries in group A's own log for the
-        // whole window regardless of how fast its apply task drains them.
-        let flood_deadline = Instant::now() + Duration::from_millis(1800);
-        let mut flood_tasks = Vec::new();
-        for lane in 0..3u32 {
-            let group_a = group_a.clone();
-            flood_tasks.push(tokio::spawn(async move {
-                let filler = vec![7u8; 2048];
-                let mut i: u64 = 0;
-                while Instant::now() < flood_deadline {
-                    let key = format!("rmw-285-filler-{lane}-{i:08}").into_bytes();
-                    let _ = group_a.put_kind_batch_conditioned(
-                        vec![(animus_cp_data::KIND_BASE, key, Some(filler.clone()))],
-                        Vec::new(),
-                        Vec::new(),
-                    );
-                    i += 1;
-                    // A real (short) sleep, not just `yield_now`: this flood
-                    // only needs to keep group A's own apply queue
-                    // non-empty, not to saturate a worker thread — the
-                    // node's own background tasks (its apply loop included,
-                    // for BOTH groups) share this same runtime and must get
-                    // real wall-clock scheduling slots too, or the whole
-                    // process slows down and the test stops isolating the
-                    // lock from ordinary scheduler contention (measured:
-                    // a bare `yield_now` flood starved group B's own apply
-                    // task for seconds, nothing to do with the lock at all).
-                    // Deliberately modest total volume (a few thousand small
-                    // entries, not tens of thousands): heavy enough to make
-                    // a held-lock write to group B queue for a clearly
-                    // observable stretch, light enough that the backlogged
-                    // write's own confirm reliably lands within
-                    // `CLIENT_TIMEOUT` (10s) even under CI contention.
-                    sleep(Duration::from_micros(500)).await;
-                }
-            }));
-        }
+        // Arm write A's propose+confirm phase to hold open for a fixed
+        // delay once it releases `rmw_lock` (see `dynamo::
+        // rmw285_confirm_gate`'s doc for why this replaced a real,
+        // load-sensitive filler flood). `GATE_DELAY` only needs to
+        // comfortably outlast an ordinary unrelated write's own
+        // read+evaluate+propose+confirm — including under real contention:
+        // CI observed 104ms for that under load (commit `97289e2`), so this
+        // leaves roughly a 20x margin, not a hand-tuned near-miss.
+        const GATE_DELAY: Duration = Duration::from_secs(2);
+        crate::dynamo::rmw285_confirm_gate::arm("rmw_285_a", GATE_DELAY);
 
         let mut item_a = animus_dynamo::Item::new();
         item_a.insert(
@@ -15366,12 +15345,10 @@ mod confirm_futility_tests {
             }
         });
 
-        // Give the slow write's own read a head start before the flood has
-        // built up much backlog, so its read tends to resolve fast and the
-        // slowness lands on its propose+confirm instead — not load-bearing
-        // for correctness (the assertion below is about the *second*
-        // write), just makes the scenario reliably reproduce the bug this
-        // regresses.
+        // Cosmetic pacing only (not load-bearing): give write A's task a
+        // moment to actually start running before write B is spawned, so
+        // the two don't merely race to get scheduled at all. The gate above
+        // is what actually makes write A's in-flight window deterministic.
         sleep(Duration::from_millis(10)).await;
 
         let mut item_b = animus_dynamo::Item::new();
@@ -15405,43 +15382,55 @@ mod confirm_futility_tests {
             "the unrelated write must actually land, not just return some outcome"
         );
 
-        // The structural, load-independent half of this regression: group A's
-        // slow task must still be RUNNING at the instant the unrelated write
-        // (group B) returns. This is a hard ordering guarantee, not a timing
-        // race — pre-fix, `rmw_lock` is one node-wide lock, so the unrelated
-        // write cannot even *start* its own read until the slow task's whole
-        // call (read+evaluate+propose+confirm) returns and drops the guard;
-        // by construction it can therefore never observe the slow task as
-        // still in flight. Post-fix, the slow task keeps grinding through its
-        // own backlogged confirm-poll (below) well after releasing the lock,
-        // so the unrelated write — unblocked once the slow task's own
-        // read+evaluate finishes — routinely finishes first.
+        // What this actually proves, and what it does not. Pre-fix,
+        // `rmw_lock` is one node-wide lock held across write A's whole
+        // call, so write B cannot even *start* its own read until write A's
+        // ENTIRE call (read+evaluate+propose+confirm) returns and drops the
+        // guard — under that code, write B could never observe write A as
+        // still in flight. Post-fix, write A drops the lock the moment its
+        // own read+evaluate finishes, then (via the gate armed above) sits
+        // in its propose+confirm phase for a fixed `GATE_DELAY` before ever
+        // proposing — so write B, unblocked as soon as the lock frees,
+        // reliably finishes and returns while write A is still gated.
+        //
+        // This is *not* a hard ordering guarantee in the way the assertion
+        // below reads on its own: it holds because `GATE_DELAY` was chosen
+        // to comfortably outlast write B's own real duration (see that
+        // constant's doc), not because the two are ordered by construction.
+        // A version of write B slow enough to exceed `GATE_DELAY` — which
+        // the `elapsed` check right below also guards against — could in
+        // principle still invert it. What *is* load-independent is the
+        // mechanism: write A's in-flight window no longer depends on a
+        // flood winning a real-time race to build apply backlog, only on
+        // write B finishing inside a fixed, generous budget.
         assert!(
             !slow.is_finished(),
-            "the backlogged write (group A) must still be in flight when the unrelated write \
+            "the gated write (group A) must still be in flight when the unrelated write \
              (group B) returns — pre-fix, the unrelated write cannot even start until the \
-             backlogged write's ENTIRE call (including its confirm-poll) has already \
-             returned and released the node-wide rmw_lock, so it could never observe this"
+             gated write's ENTIRE call (including its confirm-poll) has already returned and \
+             released the node-wide rmw_lock, so it could never observe this"
         );
-        // A loose sanity ceiling — not the load-bearing assertion above, just
-        // a guard against a genuine hang (this write should never need
-        // anywhere near CLIENT_TIMEOUT once its own read+evaluate resolves).
+        // The load-bearing margin for the assertion above: write B must
+        // finish well inside `GATE_DELAY`, not just inside some loose
+        // hang-guard ceiling — a regression that re-widens `rmw_lock`'s
+        // scope would force write B to wait out (most of) `GATE_DELAY`
+        // itself, which this catches even if `slow.is_finished()` above
+        // somehow didn't.
         assert!(
-            elapsed < Duration::from_secs(8),
-            "the unrelated write took implausibly long even accounting for CI noise: {elapsed:?}"
+            elapsed < GATE_DELAY / 2,
+            "the unrelated write took implausibly long relative to GATE_DELAY={GATE_DELAY:?} — \
+             either implausible CI noise, or rmw_lock's scope regressed to cover write A's \
+             gated propose/confirm phase again: {elapsed:?}"
         );
 
         let slow_started = Instant::now();
         slow.await
             .expect("slow task panicked")
-            .expect("the backlogged write must itself eventually succeed too");
+            .expect("the gated write must itself eventually succeed too");
         eprintln!(
             "DIAG: slow task (group A) finished {:?} after the unrelated write returned",
             slow_started.elapsed()
         );
-        for t in flood_tasks {
-            let _ = t.await;
-        }
         node.shutdown();
     }
 }

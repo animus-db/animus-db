@@ -1126,7 +1126,16 @@ route below the edge through the same `ClientCtx` CP primitives.
   node behind it, not just racing writers of the same item — the seatbelt
   above is what actually keeps concurrent writers of one item safe, and it
   already has to work lock-free for the `txn_resolver_loop` case, so the
-  lock never needed the wider span for correctness.
+  lock never needed the wider span for correctness. The regression test for
+  this (`confirm_futility_tests::an_unrelated_evaluated_write_is_not_
+  stalled_behind_another_writes_confirm_wait`) needs write A's propose+
+  confirm phase to reliably still be running when an unrelated write
+  returns — racing a real apply backlog against real time to manufacture
+  that was itself load-sensitive (a starved flood can fail to build any
+  backlog, so the "slow" write finishes first; see
+  `docs/engineering-lessons.md`'s Testing section, 2026-08-22 entry), so it
+  now uses `dynamo::rmw285_confirm_gate`, a `#[cfg(test)]`-only hook that
+  holds that phase open for a fixed delay under the test's own control.
   **The plain-table half of the old named gap is closed (ADR 0049)**: a
   plain table's conditioned `PutItem`/`DeleteItem` and `UpdateItem` now
   route through this same leader funnel (constant-true gate, below), so
