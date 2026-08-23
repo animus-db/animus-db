@@ -1,8 +1,26 @@
 name: CI
 
+# A branch under review already gets a `pull_request` run, so `push` is scoped
+# to `main`. Left unscoped, every push to a PR branch in this repo fired both
+# events on the same commit and ran `gates` + `prod-liveness` twice for
+# identical results — a straight doubling of shared-runner time. Post-merge
+# `main` pushes keep their run: that is what the README's CI badge reports,
+# and it is the only signal for a commit that reaches `main` without a PR.
+# A branch pushed with no PR open now gets no CI until the PR exists.
 on:
   push:
+    branches: [main]
   pull_request:
+
+# At most one in-flight CI run per branch. A `pull_request` event's
+# `github.ref` is that PR's own `refs/pull/N/merge`, so this keys per-PR
+# without needing the PR number.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded PR runs are cancelled — only the newest head is worth a
+  # verdict. `main` pushes are never cancelled: each merged commit gets its
+  # own run, and the group merely serialises them instead of overlapping.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always

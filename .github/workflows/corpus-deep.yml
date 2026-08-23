@@ -37,6 +37,15 @@ on:
         required: false
         default: "40"
 
+# One deep run at a time. The corpora are long-running and share the same
+# runner class as CI, so an on-demand `workflow_dispatch` queues behind a
+# nightly still in flight rather than running alongside it; nothing is
+# cancelled, because a scheduled run that never reports is a silent gap in
+# the nightly record.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
