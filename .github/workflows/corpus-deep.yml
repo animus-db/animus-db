@@ -39,6 +39,10 @@ on:
         description: "Seeds per property (ANIMUS_QUIESCE_SEEDS, ADR 0048 quiescence corpus)"
         required: false
         default: "40"
+      raftkv_seeds:
+        description: "Seeds per cell (ANIMUS_RAFTKV_SEEDS, ADR 0017 raftkv linearizability corpus over LsmEngine)"
+        required: false
+        default: "10"
 
 env:
   CARGO_TERM_COLOR: always
@@ -56,6 +60,20 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+
+      # The raftkv linearizability corpus over the **real on-disk engine**
+      # (`ANIMUS_RAFTKV_LSM=1`), which no workflow set until now — the always-on
+      # `gates` tier runs the whole corpus on `MemoryEngine` plus only a
+      # representative LSM subset. Asserts strict serializability (real-time
+      # edges — ADR 0017 §3's linearizability claim), not just data-dependency
+      # serializability. Deliberately the FIRST corpus step: the steps below are
+      # sequential `run:`s with no `continue-on-error`, so anything placed after
+      # a failing step never executes at all.
+      - name: deep raftkv linearizability corpus over LsmEngine (ADR 0017)
+        env:
+          ANIMUS_RAFTKV_LSM: "1"
+          ANIMUS_RAFTKV_SEEDS: ${{ github.event.inputs.raftkv_seeds || '10' }}
+        run: cargo test -p animus-test --test raftkv_linearizable -- --nocapture
 
       # Depth (ANIMUS_CORPUS_SEEDS) × breadth (ANIMUS_CORPUS_FULL). Each scenario
       # is a pure function of its seed, so a failure names one scenario + seed and

@@ -3048,6 +3048,51 @@ debugging anything that feels like it might have happened before.
   against — diagnosing and fixing it belongs in its own change with its
   own investigation, not folded into this one.
 
+- **A checker that passes proves only what its edges encode — name the
+  property the edges actually define, not the property the file is named
+  for.** `raftkv_linearizable.rs` had asserted `check_cycles` since it was
+  written, and its module doc argued that a deposed leader's stale read
+  "manifests as a contradictory recovered order, i.e. a cycle the checker
+  flags." That argument is true of a *fork* (an observed list that is not a
+  prefix of the recovered order — `recover` rejects those) and false of
+  *staleness*. `check_cycles` builds only data-dependency edges
+  (`ww`/`wr`/`rw`), and this corpus puts exactly one mop in every
+  transaction, which makes the gap structural rather than incidental: a
+  read-only transaction's only outgoing edges are `rw` to appenders it
+  missed, its only incoming edges are `wr` from appenders it saw, `ww` runs
+  strictly forward through the recovered order, and a surviving read saw a
+  prefix — so everything it missed sorts after everything it saw and no path
+  leads back. **A read-only transaction can never lie on a cycle**, so a
+  stale read produced a history that was perfectly serializable (order the
+  stale read earlier) while being flatly non-linearizable. The corpus was
+  creating the exact condition it could not observe: `leader_minority`
+  isolates the leader with a minority so the deposed one still believes it
+  leads, and `run_read`'s `leader_slot(nodes)` will happily pick it.
+
+  The fix was not more fault injection but a second oracle:
+  `check_strict_cycles` adds **real-time precedence** edges (`A → B` when
+  `A` completed before `B` was invoked), i.e. strict serializability, which
+  for single-object operations is linearizability. Everything it needed was
+  already recorded and thrown away — `Recorder::invoke` stamps the time and
+  `ok_entries()` filters `Invoke` out. The frozen corpus went green on it
+  immediately (29 cells, and at `ANIMUS_RAFTKV_SEEDS=10`, and over
+  `LsmEngine`), so this closed a hole in the *proof*, not in the system.
+
+  Two generalizable rules came out of it. **First: when a checker is shared
+  across corpora, the property is a property of the call site, not of the
+  checker** — the same `check_cycles` is the correct oracle for the Accord
+  and multi-tablet-transaction corpora, which claim serializability, and the
+  wrong one here. **Second: a strengthened check needs a vacuity guard in
+  the same commit.** Real-time edges only constrain operations that do not
+  overlap, so a corpus of entirely concurrent operations would pass the
+  strict check for free. Each scenario now asserts `realtime_edges > 0`
+  alongside the verdict (they run 40–411, ~6.3k across the frozen corpus),
+  and `strict_negative_control.rs` pins both sides: the stale-read history
+  the plain checker accepts and the strict one rejects, *and* the
+  concurrent-window read that must stay accepted, so the new check cannot
+  quietly decay into "any stale read is a bug."
+
+
 ### Code patterns
 - **A pagination cursor that echoes back a superset of another cursor's
   attributes needs an *exact*-match validation, not a "the attributes I

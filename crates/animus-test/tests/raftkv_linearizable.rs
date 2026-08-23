@@ -9,16 +9,37 @@
 //! `check_durability`/`check_convergence`) and the `Recorder`/`History` model,
 //! driving a **single-key list-append** workload over one Raft group.
 //!
-//! **Why serializability (`check_cycles`) is sound here — and scaled to depth.** A
-//! single Raft group orders every operation through one committed log: a write is
-//! a list-append to one key, a read is a `linearizable_get` (ReadIndex — a quorum
-//! read-barrier, no wall clock). Linearizability is a **safety** property, so a
-//! forked/stale read — exactly the failure a deposed leader serving a stale value
-//! would cause — manifests as a contradictory recovered order, i.e. a cycle the
-//! checker flags. Unlike the AP `Frontier` topology there is no eventually-
+//! **What is asserted here, and why it takes two checkers.** A single Raft group
+//! orders every operation through one committed log: a write is a list-append to
+//! one key, a read is a `linearizable_get` (ReadIndex — a quorum read-barrier, no
+//! wall clock). Unlike the AP `Frontier` topology there is no eventually-
 //! consistent read path to produce torn-read false positives: the plane *is* the
-//! serialization authority. So all three checks (cycles + durability +
-//! convergence) are asserted on this one layer. Convergence + durability remain
+//! serialization authority, so all four checks (cycles + strict cycles +
+//! durability + convergence) are asserted on this one layer.
+//!
+//! `check_cycles` alone is **not** a sufficient oracle for this corpus, despite
+//! its name. This module's doc used to claim that a forked/stale read "manifests
+//! as a contradictory recovered order, i.e. a cycle the checker flags." That is
+//! true of a *fork* (a read whose observed list is not a prefix of the recovered
+//! order — `recover` rejects it) but **false of staleness**: this workload puts
+//! exactly one mop in every transaction, so a read-only transaction's only
+//! outgoing edges are `rw` to appenders it missed and its only incoming edges are
+//! `wr` from appenders it saw. Append→append edges (`ww`) run strictly forward
+//! through the recovered order, and a surviving read saw a prefix — so everything
+//! it missed sorts after everything it saw and no path leads back. A read-only
+//! transaction can therefore never lie on a data-dependency cycle, and a read
+//! served from stale state produces a history that is perfectly serializable
+//! (order the stale read earlier) while being flatly non-linearizable — exactly
+//! the deposed-leader window `leader_minority`/`split_brain` exist to create.
+//!
+//! `check_strict_cycles` closes that: the same graph plus **real-time**
+//! precedence edges (`A → B` when `A` completed before `B` was invoked), which is
+//! strict serializability — linearizability, for single-object operations. Each
+//! scenario also asserts `realtime_edges > 0`, because the strict check is only
+//! stronger than the plain one where operations genuinely do not overlap; see
+//! `strict_negative_control.rs` for the teeth-proof on both sides (the stale-read
+//! history the plain checker accepts and the strict one rejects, and the
+//! concurrent-window read that must stay accepted). Convergence + durability remain
 //! **eventual** (a lagging follower catches up via anti-entropy / snapshot), so
 //! they get the same **converged-or-timeout** poll the Accord runner uses.
 //!
@@ -72,7 +93,10 @@ use animus_env::{Clock, EnvExt, Rng, nid};
 use animus_sim::{NetConfig, SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, MemoryEngine, StorageEngine};
 use animus_test::history::{Key, Mop, Process};
-use animus_test::{History, Recorder, check_convergence, check_cycles, check_durability};
+use animus_test::{
+    History, Recorder, check_convergence, check_cycles, check_durability, check_strict_cycles,
+    realtime_edge_count,
+};
 use futures::executor::block_on;
 
 /// A group node over a chosen engine tier.
@@ -797,6 +821,14 @@ async fn run_read<S: StorageEngine + 'static>(
 
 struct ScenarioResult {
     cycles: animus_test::CheckReport,
+    /// The **linearizability** verdict (ADR 0017 §3): `cycles`' dependency graph
+    /// plus real-time precedence edges. `cycles` alone cannot see a stale read —
+    /// see `check_strict_cycles`' doc — so this is the check that actually
+    /// corresponds to what this corpus's name claims.
+    strict: animus_test::CheckReport,
+    /// How many real-time edges `strict` had to work with. Zero means the strict
+    /// verdict is no stronger than `cycles`, however green it is.
+    realtime_edges: usize,
     durability: animus_test::CheckReport,
     convergence: animus_test::CheckReport,
     history: History,
@@ -870,6 +902,8 @@ fn run_scenario_on<S: StorageEngine + 'static>(
     let keys = scenario.keyspace;
     let history = group.shared.rec.lock().unwrap().history().clone();
     let cycles = check_cycles(&history);
+    let strict = check_strict_cycles(&history);
+    let realtime_edges = realtime_edge_count(&history);
 
     // Converged-or-timeout poll for the eventual properties (mirrors the Accord
     // runner): a lagging follower may still be catching up at the fixed drain, so
@@ -913,6 +947,8 @@ fn run_scenario_on<S: StorageEngine + 'static>(
 
     ScenarioResult {
         cycles,
+        strict,
+        realtime_edges,
         durability,
         convergence,
         history,
@@ -926,15 +962,35 @@ fn run_scenario(scenario: &Scenario) -> ScenarioResult {
     run_scenario_on(scenario, mem_engine)
 }
 
-/// Assert the three checks on one scenario result, labelling the engine tier in
-/// the failure message. Serializability is a **safety** property (hard assert at
-/// any depth); durability + convergence already sat behind the converged-or-
-/// timeout poll, so a failure here means the budget was genuinely exhausted.
+/// Assert the four checks on one scenario result, labelling the engine tier in
+/// the failure message. Serializability and linearizability are **safety**
+/// properties (hard assert at any depth); durability + convergence already sat
+/// behind the converged-or-timeout poll, so a failure there means the budget was
+/// genuinely exhausted.
 fn assert_scenario_ok(tier: &str, s: &Scenario, r: &ScenarioResult) {
     assert!(
         r.cycles.ok,
         "[{tier}] scenario {} not serializable: {:?} (seed={})",
         s.name, r.cycles.violations, s.seed
+    );
+    // The check this corpus is named for (ADR 0017 §3). Asserted *after*
+    // `cycles` purely for diagnosis: a failure here with `cycles` green is
+    // specifically a real-time violation — a read served from stale state — not
+    // a data-dependency anomaly.
+    assert!(
+        r.strict.ok,
+        "[{tier}] scenario {} not linearizable: {:?} (seed={})",
+        s.name, r.strict.violations, s.seed
+    );
+    // Teeth for the assert above: the strict check is only stronger than the
+    // plain one where operations do not overlap in real time. A scenario whose
+    // ops all overlap would pass `strict` for free, proving nothing.
+    assert!(
+        r.realtime_edges > 0,
+        "[{tier}] scenario {} admits no real-time edges — its linearizability \
+         verdict is vacuous (seed={})",
+        s.name,
+        s.seed
     );
     assert!(
         r.durability.ok,
@@ -960,6 +1016,15 @@ fn raftkv_baseline_is_linearizable() {
         r.cycles.ok,
         "baseline must be serializable: {:?} (seed={})",
         r.cycles.violations, scenario.seed
+    );
+    assert!(
+        r.strict.ok,
+        "baseline must be linearizable: {:?} (seed={})",
+        r.strict.violations, scenario.seed
+    );
+    assert!(
+        r.realtime_edges > 0,
+        "baseline admits no real-time edges — linearizability verdict is vacuous"
     );
     assert!(
         r.durability.ok,

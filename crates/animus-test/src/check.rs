@@ -113,8 +113,101 @@ fn recover(history: &History) -> Recovered {
     }
 }
 
-/// Check the transactional path for serializability cycles.
+/// Per-`Ok`-transaction real-time span `[invoke, complete]`, indexed exactly as
+/// [`check_cycles`] indexes transactions (position within
+/// [`History::ok_entries`]).
+///
+/// A process issues operations serially, so pairing is a single forward walk:
+/// an `Invoke` stamps that process's pending start, and the terminal entry
+/// consumes it. A terminal `Fail`/`Info` clears the pending start without
+/// producing a span (those transactions are not graph vertices).
+///
+/// If a well-formed pair is ever missing an `Invoke`, the span starts at `0` —
+/// deliberately the **conservative** fallback: an op that appears to have begun
+/// at the start of the run has nothing preceding it, so the unpaired entry can
+/// only ever *lose* real-time edges, never gain a spurious one.
+fn realtime_spans(history: &History) -> Vec<(u64, u64)> {
+    use crate::history::{Outcome, Process};
+
+    let mut pending: BTreeMap<Process, u64> = BTreeMap::new();
+    let mut spans = Vec::new();
+    for entry in &history.entries {
+        match entry.outcome {
+            Outcome::Invoke => {
+                pending.insert(entry.process, entry.time);
+            }
+            Outcome::Ok => {
+                let start = pending.remove(&entry.process).unwrap_or(0);
+                spans.push((start, entry.time));
+            }
+            Outcome::Fail | Outcome::Info => {
+                pending.remove(&entry.process);
+            }
+        }
+    }
+    spans
+}
+
+/// How many **real-time** precedence edges [`check_strict_cycles`] contributes
+/// over [`check_cycles`] for this history.
+///
+/// A corpus uses this as a **non-vacuity guard**: the strict check only has
+/// teeth where operations genuinely do not overlap in real time, so a scenario
+/// reporting zero here proves nothing stronger than plain serializability, no
+/// matter how green it is.
+#[must_use]
+pub fn realtime_edge_count(history: &History) -> usize {
+    let spans = realtime_spans(history);
+    let mut n = 0;
+    for (a, &(_, a_done)) in spans.iter().enumerate() {
+        for (b, &(b_start, _)) in spans.iter().enumerate() {
+            if a != b && a_done < b_start {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Check the transactional path for **serializability** cycles.
+///
+/// Data dependencies only (`ww`/`wr`/`rw`): this proves the history is
+/// *equivalent to some serial order*, and deliberately says nothing about
+/// whether that order respects real time. For a plane that claims
+/// **linearizable** reads, use [`check_strict_cycles`] instead — see its doc
+/// for exactly what this one cannot see.
 pub fn check_cycles(history: &History) -> CheckReport {
+    cycles_inner(history, false)
+}
+
+/// Check the transactional path for **strict**-serializability cycles: the
+/// [`check_cycles`] dependency graph *plus* real-time precedence edges.
+///
+/// For single-object operations strict serializability is linearizability, so
+/// this is the checker a linearizable plane (ADR 0016/0017) must be held to.
+///
+/// **Why the plain check is not enough.** With a one-mop-per-transaction
+/// workload (the shape `raftkv_linearizable` drives), a read-only transaction
+/// can never lie on a data-dependency cycle: its only outgoing edges are `rw`
+/// to appenders it *missed*, its only incoming edges are `wr` from appenders it
+/// *saw*, the sole append→append edges (`ww`) run strictly forward through the
+/// recovered order, and every read surviving [`recover`]'s prefix check saw a
+/// prefix — so everything it missed sorts after everything it saw and no path
+/// leads back. A read served from stale state therefore produces a history that
+/// is perfectly serializable (order the stale read earlier) while being flatly
+/// non-linearizable. That is precisely the deposed-leader stale read ADR 0017
+/// §3's ReadIndex barrier exists to prevent, and the reason this variant exists.
+///
+/// An edge runs `A → B` when `A` **completed** before `B` was **invoked**;
+/// operations that overlap in real time are unordered by it, exactly as
+/// linearizability allows. [`realtime_edge_count`] reports how many such edges a
+/// history actually admits, so a caller can assert the check is not vacuous.
+pub fn check_strict_cycles(history: &History) -> CheckReport {
+    cycles_inner(history, true)
+}
+
+/// The shared body of [`check_cycles`] and [`check_strict_cycles`].
+fn cycles_inner(history: &History, strict: bool) -> CheckReport {
     let rec = recover(history);
 
     let ok: Vec<&crate::history::Entry> = history.ok_entries().collect();
@@ -158,6 +251,24 @@ pub fn check_cycles(history: &History) -> CheckReport {
                     if !seen.contains(&value) {
                         edge(txn, w, &mut edges);
                     }
+                }
+            }
+        }
+    }
+
+    // Real-time precedence (strict serializability only): `A → B` whenever `A`
+    // completed before `B` was invoked. Overlapping operations stay unordered.
+    if strict {
+        let spans = realtime_spans(history);
+        debug_assert_eq!(
+            spans.len(),
+            ok.len(),
+            "real-time spans must index identically to `ok_entries`"
+        );
+        for (a, &(_, a_done)) in spans.iter().enumerate() {
+            for (b, &(b_start, _)) in spans.iter().enumerate() {
+                if a_done < b_start {
+                    edge(a, b, &mut edges);
                 }
             }
         }
