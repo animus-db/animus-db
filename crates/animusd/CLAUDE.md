@@ -612,6 +612,18 @@ never fail where the strong one would have succeeded:
   (`STALE_READ_REFUSAL`) means "not cheaply, then", and waiting out an
   election to serve a stale read is incoherent.
 
+**Testing gotcha this created (ADR 0055).** Two shapes in this crate's
+`tests/` tree stopped being implicitly safe. (1) **A read that verifies a
+write** must ask for `ConsistentRead: true` — the wire default no longer
+guarantees read-your-writes, and the failure is a *race*, so one green run of
+a binary proves nothing. (2) **A read loop that rotates across nodes** — the
+deliberate round-robin several pagination suites do to exercise the forwarded
+path — is only stable if every node it touches agrees: consecutive pages now
+sample different, independently-lagging replicas. Fix by asking for the strong
+read, or (a GSI rejects it) converging on *every* address first
+(`dynamo_query_pagination.rs::await_gsi_query_everywhere`). Both are in
+`docs/engineering-lessons.md`'s Testing section.
+
 **Observability**: `Metric::CpEventualReadsLocal`/`CpEventualReadsForwarded`/
 `CpEventualReadsFellBack` (`/metrics`'s `cp_eventual_reads_*`), recorded by
 `ClientCtx::record_eventual_read` — a no-op on a control-only node, which has

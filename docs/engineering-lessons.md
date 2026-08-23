@@ -3083,6 +3083,29 @@ debugging anything that feels like it might have happened before.
   never mention the thing you changed, expect it to be flaky rather than
   deterministic, and treat each break as a test that was under-specified
   rather than as evidence against the change.
+- **A multi-endpoint read loop is only as consistent as its weakest
+  endpoint — and that was free until it wasn't (2026-08-23, ADR 0055).**
+  Several suites deliberately round-robin a paginated `Query`/`Scan` walk
+  across all three nodes, with an explicit comment saying why: it exercises
+  the *forwarded* read path, not just the node that happens to lead the
+  tablet. That rotation was implicitly safe because every node forwarded to
+  the same leader, so all three answered from one state and a convergence
+  poll on **one** node covered all of them. Making the default read
+  replica-local broke that silently: consecutive pages now sample different,
+  independently-lagging replicas, so a walk can terminate a page early and
+  drop an item into the gap — which is exactly what CI caught
+  (`gsi_query_paginates_with_the_scan_cursor_shape`: node 1 had all 6 GSI
+  rows, another node still had 5, and `sk=a5` was never returned). Two things
+  generalize. **The rotation is worth keeping** — it is testing something
+  real — so the fix is to make the data stable across endpoints, not to stop
+  rotating: ask for the strong read where the API allows it, and where it
+  does not (a GSI rejects `ConsistentRead: true`), converge on *every*
+  endpoint before the walk, not just one. And more broadly: **when a change
+  makes per-endpoint views diverge, audit every loop that talks to more than
+  one endpoint and combines the results** — paginated walks, parallel-scan
+  segment fleets, any "collect from each node then compare" assertion. None
+  of them mention consistency, the compiler cannot see them, and most will
+  pass most of the time.
 - **A test can prove "this path never blocks" by how it drives the path.**
   `animus-cp-data`'s `tests/stale_read.rs` deliberately drives the ADR 0055
   eventual reads with `block_on` instead of this crate's usual spawn-and-
@@ -7567,6 +7590,20 @@ debugging anything that feels like it might have happened before.
   gate," take the compiler — and note that this is the same instinct behind
   the `RoleAddrs` port-addition advice above, applied to an enum instead of a
   struct.
+- **A comment added "next to" a value inside a raw string becomes part of the
+  value (2026-08-23).** While adding `"ConsistentRead":true,` to JSON request
+  bodies held in `r#"…"#` literals, one site got an explanatory `// ADR 0055 …`
+  appended on the same line — inside the raw string, so the request body
+  shipped a `//` comment as JSON and the edge answered `400` on every page.
+  It failed deterministically, which is the good case; the trap is that the
+  edit *looks* right in a diff, because a trailing `//` comment is exactly
+  what you would write one line earlier or later in real code. Rule: when
+  annotating a change inside a string literal, the comment goes **outside the
+  literal** (above the `format!`/`let`, or at the call site) — and grep the
+  touched files for a comment marker inside quotes (`'"[^"]*//'`) as a
+  mechanical post-check, the same way the `NAME:`-vs-`NAME::` entry below
+  recommends for path-shaped mangling.
+
 - **A regex mass-edit over Rust must be brace-balanced, not
   next-delimiter-based (2026-08-23).** Adding `stale: false,` to every
   `ClientRequest::Get { … }` literal across the test tree with

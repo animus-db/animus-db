@@ -337,10 +337,15 @@ async fn descending_pagination_visits_every_item_exactly_once() {
         let body = format!(
             r#"{{"TableName":"events","KeyConditionExpression":"pk = :p",
                 "ExpressionAttributeValues":{{":p":{{"S":"p1"}}}},
+                "ConsistentRead":true,
                 "ScanIndexForward":false,"Limit":2{esk}}}"#
         );
         // Round-robin the nodes so the forwarded descending read is exercised
-        // too, not just the one that happens to lead the tablet.
+        // too, not just the one that happens to lead the tablet. That rotation
+        // is why the body above asks for `ConsistentRead: true` (ADR 0055):
+        // the wire default is now served from whichever replica the receiving
+        // node holds, so consecutive pages would otherwise sample different,
+        // independently-lagging views.
         let (status, resp) =
             dynamo_retry(addrs[pages % addrs.len()], "DynamoDB_20120810.Query", &body).await;
         assert_eq!(status, 200, "descending page failed: {resp}");

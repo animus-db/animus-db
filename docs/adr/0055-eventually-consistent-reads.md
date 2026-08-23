@@ -319,6 +319,19 @@ this time" — see `docs/engineering-lessons.md`'s entry on this. Some latent
 flakes may remain in reads that happened to win the race; each is fixed the
 same way when it surfaces.
 
+**A second, less obvious class: multi-endpoint read loops.** Several suites
+round-robin a paginated `Query`/`Scan` walk across all three nodes on purpose,
+to exercise the forwarded read path. That rotation was implicitly safe while
+every node forwarded to the same leader — one state, one convergence check.
+Replica-local reads make consecutive pages sample different, independently
+lagging replicas, so a walk can terminate a page early and drop an item into
+the gap. The rotation is worth keeping (it tests something real), so the fix is
+to stabilize the data across endpoints instead: ask for the strong read where
+the API allows it, and where it does not — a GSI `Query` rejects
+`ConsistentRead: true` — converge on *every* endpoint before walking, not just
+one. Anything that collects from several nodes and compares (parallel-scan
+segment fleets included) needs the same audit.
+
 **Followers now serve client traffic.** Read volume on a tablet is no longer
 bounded by its leader's capacity. That is the payoff; it also means follower
 latency and follower engine health are now on a client-visible path, where before
