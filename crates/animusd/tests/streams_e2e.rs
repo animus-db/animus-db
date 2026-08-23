@@ -29,6 +29,54 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+/// Ceiling for [`multi_split_soak_streamed_gsi_table_under_mixed_load`]'s GSI
+/// convergence poll — how long the four `by-tag` `Query`s' summed `Count` is
+/// given to reach `expected` after the soak's write loop finishes.
+///
+/// This is a **converged-or-timeout poll on a genuinely eventual property**
+/// (ADR 0041 §4: a GSI is asynchronously drained from the change log, never
+/// synchronously written), not a fixed-deadline one-shot assert — the loop
+/// re-samples the real `Count` every 50ms and only fails once `expected` is
+/// still unmet at the deadline. The mechanism this polls
+/// (`animusd::index_drain::change_consumer_loop`'s GSI-drain arm) is **not**
+/// leader-of-control-plane-gated or edge-triggered the way the segment
+/// janitor / backfill-completion aggregator are: it is a continuous per-node
+/// sweep over every tablet that node currently **leads**, on a flat 200ms
+/// tick, re-scanning `hosted_groups()` from scratch every pass — so there is
+/// no "descheduled and never re-triggered" failure mode to guard against
+/// here; a live write or a split cutover's own routing update is picked up
+/// on this loop's very next tick by construction (see that module's own doc
+/// for the full design). What genuinely varies is *how long one pass takes*
+/// under contention, which is what this ceiling has to absorb.
+///
+/// Sized against measurement, not guessed. Instrumenting this exact poll
+/// (a `GSI_POLL n=.. total=.. elapsed_ms=..` line per iteration, local to
+/// the investigation, not shipped) under real thread-oversubscription CPU
+/// contention (`nproc`-many busy loops racing the test's own worker
+/// threads — the closest local approximation available; see
+/// `docs/engineering-lessons.md`'s "green locally under `yes`-loop
+/// contention does not refute a hosted-runner flake" entry for why this
+/// likely *undersells* the true GitHub Actions 2-vCPU cgroup-quota-throttled
+/// shape) reproduced the exact failure signature (`await_true(60, "GSI
+/// never converged to one row per item", ..)` timing out) directly: one run
+/// panicked at the old 60s ceiling sitting at 120/144 (83%), and two
+/// otherwise-identical runs went on to converge fully at 65.5s and 66s
+/// respectively — every single sample across every reproduction was
+/// **monotonically non-decreasing**, never flat at a wrong number once
+/// established, right up to the moment of either success or the old
+/// timeout. That is the signature of a slow eventual convergence under
+/// contention, not a stall: nothing here ever got stuck.
+/// 150s is chosen for real margin over the worst *observed* convergence
+/// (65.5s) — about 2.3x, generous without being unbounded (see
+/// `docs/engineering-lessons.md`'s Testing section on sizing a genuinely
+/// scoped retry/wait ceiling against measurement rather than guessing) —
+/// while leaving headroom under this test's own outer `Duration::from_secs(300)`
+/// timeout alongside its other bounded waits (a correlated worse-than-usual
+/// contention spike would slow every phase together, so the outer timeout,
+/// not this constant, is the honest final backstop for a truly pathological
+/// run). If this ceiling is ever hit, the poll still fails loudly with the
+/// same message — this raises the bound, it does not remove the check.
+const GSI_CONVERGENCE_DEADLINE_SECS: u64 = 150;
 /// Ceiling for [`dynamo_retrying`]/[`dynamo_retrying_transact`]/
 /// [`get_records_allow_trim`]'s bounded retry loop against a **known,
 /// self-resolving** transient (the ADR 0050 F8 freeze→cutover blip on the
@@ -2675,7 +2723,10 @@ async fn multi_split_soak_streamed_gsi_table_under_mixed_load() {
 
         // 3. GSI convergence: the four tags' Counts sum to exactly one row
         //    per item (children's drains restarted clean at activation).
-        await_true(60, "GSI never converged to one row per item", || {
+        await_true(
+            GSI_CONVERGENCE_DEADLINE_SECS,
+            "GSI never converged to one row per item",
+            || {
             // `await_true` takes a sync closure — sample via a blocking
             // one-shot runtime handle instead: issue the four queries on
             // the current runtime through block_in_place.
