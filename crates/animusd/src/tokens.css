@@ -1,0 +1,200 @@
+/* AnimusDB design tokens — the "Readout" design system (ADR 0056).
+ *
+ * THIS FILE IS THE SHARED BASE. It is byte-identical to
+ * `website/assets/tokens.css`; `dashboard::tokens_css_matches_website_copy`
+ * fails the build's test gate if the two drift. Edit one, copy to the other.
+ *
+ * What lives here is what is genuinely the same on every surface: the colour
+ * palette, the two type families, status colours, glow, and motion. What does
+ * NOT live here is geometry — radius, spacing rhythm, control height, type
+ * sizes — because those are the *skin*, and the marketing site (roomy, read at
+ * leisure) and the in-product consoles (dense, scanned all day) deliberately
+ * differ. Each consumer sets its own skin on top of this base.
+ *
+ * Dark is the default state. Light is a full theme, not a filter:
+ * `[data-theme=light]` and `prefers-color-scheme` both override.
+ *
+ * The one rule that defines this system: GLOW MEANS LIVE. Static content never
+ * glows, which is what makes a glow readable as information rather than
+ * decoration. A glow on paper reads as a printing fault, so the light theme
+ * substitutes a keyline (`--live-underline`) in the same position.
+ */
+
+:root {
+  /* --- ground --- */
+  --bg: #07080a;
+  --bg-soft: #08090c;
+  --surface: #12161c;
+  --surface2: #1a1f26;
+  --panel: linear-gradient(#12161c, #0c0f13);
+  --recessed: #0b0e12;
+  --code-bg: #060709;
+
+  /* --- edges --- */
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --lit: rgba(255, 255, 255, 0.06);
+  --grid: rgba(255, 255, 255, 0.035);
+
+  /* --- ink --- */
+  --text: #eceef0;
+  --text2: rgba(236, 238, 240, 0.78);
+  --text3: rgba(236, 238, 240, 0.6);
+
+  /* --- accent --- */
+  --accent: oklch(72% 0.15 250);
+  --accent-hi: oklch(84% 0.11 250);
+  --accent-soft: oklch(30% 0.06 250);
+  --accent-ink: #07080a;
+  --accent-glow: rgba(106, 168, 255, 0.4);
+
+  /* --- status --- */
+  --ok: oklch(74% 0.15 155);
+  --warn: oklch(80% 0.15 85);
+  --danger: oklch(70% 0.19 25);
+  --ok-bg: rgba(80, 220, 160, 0.12);
+  --warn-bg: rgba(230, 190, 90, 0.12);
+  --danger-bg: rgba(240, 90, 90, 0.12);
+
+  /* --- illumination: glow in dark, keyline in light --- */
+  --glow-s: 0 0 7px currentColor;
+  --glow-m: 0 0 16px var(--accent-glow);
+  --glow-l: 0 0 28px var(--accent-glow);
+  --glow-text: 0 0 18px var(--accent-glow);
+  --live-underline: 0;
+
+  /* Readout has no drop shadows: depth is the panel gradient + lit top edge. */
+  --shadow: inset 0 1px 0 var(--lit);
+  --shadow-recessed: inset 0 1px 3px rgba(0, 0, 0, 0.6);
+
+  /* --- type --- */
+  --font-ui: "Space Grotesk", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Roboto, sans-serif;
+  --font-mono: "Martian Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* --- motion --- */
+  --t-control: 120ms;
+  --t-panel: 220ms;
+  --t-glow: 400ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+
+  color-scheme: dark;
+}
+
+/* Light theme values. Token NAMES are identical — only values change. Status
+ * hues drop lightness and gain chroma so they stay legible on paper. */
+:root[data-theme="light"] {
+  --bg: #fbfaf7;
+  --bg-soft: #f6f4ef;
+  --surface: #ffffff;
+  --surface2: #f2f0ea;
+  --panel: linear-gradient(#ffffff, #f7f5f1);
+  --recessed: #f2f0ea;
+  --code-bg: #15181d;
+
+  --border: rgba(20, 20, 15, 0.11);
+  --border-strong: rgba(20, 20, 15, 0.22);
+  --lit: rgba(255, 255, 255, 0.9);
+  --grid: rgba(20, 20, 15, 0.045);
+
+  --text: #1a1a17;
+  --text2: rgba(26, 26, 23, 0.76);
+  --text3: rgba(26, 26, 23, 0.58);
+
+  --accent: oklch(52% 0.17 250);
+  --accent-hi: oklch(44% 0.18 250);
+  --accent-soft: oklch(93% 0.03 250);
+  --accent-ink: #ffffff;
+  --accent-glow: transparent;
+
+  --ok: oklch(48% 0.13 155);
+  --warn: oklch(52% 0.14 80);
+  --danger: oklch(52% 0.19 25);
+  --ok-bg: rgba(30, 150, 100, 0.1);
+  --warn-bg: rgba(180, 140, 30, 0.12);
+  --danger-bg: rgba(200, 50, 40, 0.08);
+
+  --glow-s: none;
+  --glow-m: none;
+  --glow-l: none;
+  --glow-text: none;
+  --live-underline: 2px;
+
+  --shadow: inset 0 1px 0 var(--lit);
+  --shadow-recessed: inset 0 1px 2px rgba(20, 20, 15, 0.08);
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #fbfaf7;
+    --bg-soft: #f6f4ef;
+    --surface: #ffffff;
+    --surface2: #f2f0ea;
+    --panel: linear-gradient(#ffffff, #f7f5f1);
+    --recessed: #f2f0ea;
+    --code-bg: #15181d;
+
+    --border: rgba(20, 20, 15, 0.11);
+    --border-strong: rgba(20, 20, 15, 0.22);
+    --lit: rgba(255, 255, 255, 0.9);
+    --grid: rgba(20, 20, 15, 0.045);
+
+    --text: #1a1a17;
+    --text2: rgba(26, 26, 23, 0.76);
+    --text3: rgba(26, 26, 23, 0.58);
+
+    --accent: oklch(52% 0.17 250);
+    --accent-hi: oklch(44% 0.18 250);
+    --accent-soft: oklch(93% 0.03 250);
+    --accent-ink: #ffffff;
+    --accent-glow: transparent;
+
+    --ok: oklch(48% 0.13 155);
+    --warn: oklch(52% 0.14 80);
+    --danger: oklch(52% 0.19 25);
+    --ok-bg: rgba(30, 150, 100, 0.1);
+    --warn-bg: rgba(180, 140, 30, 0.12);
+    --danger-bg: rgba(200, 50, 40, 0.08);
+
+    --glow-s: none;
+    --glow-m: none;
+    --glow-l: none;
+    --glow-text: none;
+    --live-underline: 2px;
+
+    --shadow: inset 0 1px 0 var(--lit);
+    --shadow-recessed: inset 0 1px 2px rgba(20, 20, 15, 0.08);
+
+    color-scheme: light;
+  }
+}
+
+/* Shared primitives. A `.panel` is the one surface recipe in the system; a
+ * `.live` value is the one thing allowed to glow. */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+
+.live {
+  color: var(--accent-hi);
+  text-shadow: var(--glow-text);
+  border-bottom: var(--live-underline) solid var(--accent);
+}
+
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.05em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

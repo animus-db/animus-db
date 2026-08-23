@@ -16,9 +16,10 @@ and DynamoDB: a wide-column / key-value model over a partitioned, sorted
 
 It pairs:
 
-- a **leaderless AP data plane** with tunable consistency (quorum reads/writes),
-- a small **strongly-consistent, Raft-backed transactional control plane** that
-  owns cluster metadata,
+- a **leaderful, strongly-consistent per-tablet Raft data plane**
+  (Cockroach/TiKV-shaped) serving **linearizable** single-tablet
+  reads/writes, and
+- a small **Raft-backed control plane** that owns cluster metadata,
 
 shards data into **tablets** (splittable, movable key ranges), and is
 **topology-aware** so data can be pinned to regions/jurisdictions for per-group
@@ -31,10 +32,14 @@ is byte-for-byte reproducible from a single seed.
 ## Why two planes?
 
 The **control plane** is consistent (Raft) and owns cluster metadata
-(membership, the tablet map). The **data plane** is leaderless/AP and serves
-reads and writes. A control-plane outage must **not** take down the data plane:
-data nodes keep serving on cached metadata; only topology changes block. See
-[ADR 0001](docs/adr/0001-two-plane-architecture.md).
+(membership, the tablet map). The **data plane** is a separate, leaderful Raft
+group per tablet, serving linearizable reads/writes. A control-plane outage
+must **not** take down the data plane: data nodes keep serving on cached
+metadata; only topology changes block. See
+[ADR 0001](docs/adr/0001-two-plane-architecture.md) for the two-plane split
+and [ADR 0019](docs/adr/0019-cp-only-v1-defer-ap.md) for why v1's data plane
+is CP (leaderful per-tablet Raft) rather than the originally-designed
+leaderless AP plane, which is deferred and its code deleted.
 
 ## Design principles
 
@@ -55,14 +60,14 @@ data nodes keep serving on cached metadata; only topology changes block. See
 |-------|---------|
 | `animus-env` | `Env` traits + `ProdEnv` (real clock/net/disk/spawn) |
 | `animus-sim` | Deterministic simulator: virtual clock, in-memory net, fake disk, scheduler, fault injection |
-| `animus-storage` | `StorageEngine` trait + in-memory `BTreeMap` impl + custom on-disk `LsmEngine` (WAL/SSTable/compaction over the `Env` seam) |
-| `animus-control` | Control-plane RSM: Raft, metadata model, epochs |
-| `animus-data` | Leaderless data plane: quorum read/write, routing, epoch fencing |
-| `animus-tablet` | Tablet model (key ranges, replica sets, epochs) |
-| `animus-placement` | Placement groups + topology labels + residency *(later)* |
-| `animus-dynamo` | DynamoDB-style item API over the common core (wire protocol later) |
-| `animus-test` | Elle-style history recorder + checker |
-| `animusd` | Node server: assembles control + data + a client API over `ProdEnv` (runnable `--cluster` mode) |
+| `animus-storage` | `StorageEngine` trait + in-memory `MemoryEngine` + custom on-disk `LsmEngine` (WAL/SSTable/compaction over the `Env` seam) |
+| `animus-control` | Control-plane Raft: replicated cluster metadata (membership, tablet map, schema catalog) with epoch-CAS transactions |
+| `animus-cp-data` | The CP data plane: a leaderful Raft group per tablet serving linearizable single-tablet reads/writes/scans (ADR 0016/0017) |
+| `animus-tablet` | Tablet model + per-table hash-ring key layout (Murmur3 partitioning, order-preserving key escapes) |
+| `animus-placement` | Topology-aware placement + data residency: replication factor, residency labels, failure-domain spread |
+| `animus-dynamo` | DynamoDB-style item API + DynamoDB JSON wire encoding over the common storage core |
+| `animus-test` | Elle-style consistency checker + fault-injecting corpora for the CP data plane (raftkv, cross-tablet txn, streams, backfill) |
+| `animusd` | Node server: assembles the control plane + CP data plane + wire edges (DynamoDB, admin, console) over `ProdEnv` (runnable `--cluster` mode) |
 | `animus-cli` | Operator/client CLI (`status` / `put` / `get`) |
 
 ## Running a cluster

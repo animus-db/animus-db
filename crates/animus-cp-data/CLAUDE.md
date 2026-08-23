@@ -195,7 +195,10 @@ Three things about them that a doc comment cannot enforce:
   the cheap read silently cost what a strong one costs, and **no test would
   fail** — which is why `tests/stale_read.rs` deliberately drives these with
   `block_on` rather than the `drive` helper: a stale read that grew an
-  internal `env.sleep` hangs that file instead.
+  internal `env.sleep` hangs that file instead. The quiescence half of that
+  claim (no wake, checked against a real quiesced 3-node group's own
+  timeline/metrics rather than just structurally) is `tests/
+  quiesced_eventual_read.rs`'s regression.
 - **An unresolved intent reads back one MVCC version**
   (`stale_value` → `prior_committed`), never as absent. `local_get`'s raw
   peek reports it as absent — correct for its admin/debug callers, a

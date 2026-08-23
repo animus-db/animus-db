@@ -429,15 +429,21 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             // arms. It serves nothing yet (unroutable), so every consumer
             // restarts from scratch at activation (the classified
             // RestartFromScratch policy, ADR 0046) — and running them early
-            // is actively harmful, not just wasted: the child's own
-            // token-truncated "gsi" cursor key sorts below its range.start,
-            // so its cursor write ROUTES to the still-routable parent and
-            // lands in the parent's own KIND_CURSOR scope, where the
+            // is actively harmful, not just wasted: `topology::
+            // tablet_for_key` structurally excludes a `Building` tablet
+            // from routing at all (its range overlaps the still-serving
+            // parent's), so ANY cursor write keyed inside the child's own
+            // range routes to the still-routable PARENT instead — landing
+            // in the parent's own KIND_CURSOR scope, where the
             // min-over-rows watermark rule drags the PARENT's cursor down
-            // forever — deadlocking the rung-5 GSI cutover veto (the
-            // split-child-cursor-unreadable shape, poisoning the parent
-            // this time; caught red by `backfill_seeder`'s revived
-            // split-during-backfill e2e).
+            // forever, deadlocking the rung-5 GSI cutover veto. This holds
+            // regardless of the cursor key's own encoding (issue #355's
+            // fix, `cursor::cursor_key` embedding `range.start` verbatim,
+            // closes a *different* misrouting — a fresh right child's own
+            // writes landing on its LEFT SIBLING post-cutover — but does
+            // nothing here: an unroutable tablet has no routing candidacy
+            // to fix into). Caught red by `backfill_seeder`'s revived
+            // split-during-backfill e2e.
             if meta
                 .tablets
                 .get(&tablet)
@@ -1284,7 +1290,6 @@ async fn drain_tablet(
         }
     }
 
-    let marker_only_pass = by_partition.is_empty();
     for fp_key in by_partition {
         reconcile_partition(ctx, meta, table, group, gsis, &fp_key).await?;
     }
@@ -1296,26 +1301,14 @@ async fn drain_tablet(
     // property: the cursor can only ever name a `max_hlc` whose covering
     // reconciliations have already landed, never one still in flight.
     if let Some(max_hlc) = max_hlc {
+        // Issue #355 fix: `cursor::cursor_key` now embeds this tablet's own
+        // `range.start` verbatim (never truncated to a bare token), so this
+        // write's own key always sorts at or above `range.start` — the
+        // `cp_kind_write_raw` route below (which resolves the target tablet
+        // by comparing the write's own key bytes against each tablet's
+        // declared range) lands it on THIS tablet, never a sibling's,
+        // regardless of whether `range.start` happens to be token-aligned.
         let cursor_key = cursor::cursor_key(&group.scope_range().start, GSI_TAG);
-        // ADR 0049 fixup: a split's right child's own cursor key is
-        // **token-truncated below its own `range.start`** (the exact shape
-        // `advance_backfill_cursor`'s doc dissects), so the row this write
-        // would create routes to — and lands physically inside — the LEFT
-        // sibling's scope, where this tablet's own `cursor_min_watermark`
-        // can never read it back. On a **marker-only** pass (nothing
-        // reconciled — markers are covered-by-construction) that write is
-        // pure per-tick churn: it can never advance this tablet's own
-        // watermark, so the identical pass would repeat, and repeat its
-        // futile routed round trip, every tick forever. Skip it; the
-        // markers stay pending (bounded: only pre-split history can be in
-        // this state) and cost a scan, which the real fix — a
-        // child-scope-readable cursor key — would remove for the
-        // reconciling case too (a named, pre-existing follow-up: the same
-        // unreadable-row shape exists on main for a child's post-split
-        // reconciliations, where the write is still performed for parity).
-        if marker_only_pass && !group.scope_range().contains(&cursor_key) {
-            return Ok(());
-        }
         ctx.cp_kind_write_raw(
             table,
             vec![(
@@ -1587,37 +1580,43 @@ async fn backfill_seed_tick(
 /// **Why the cursor write must NOT be range-fenced** (a real bug this
 /// tablet-split/fault-injection corpus found, seed-reproducible at *every*
 /// seed, not just under fault injection — see `docs/engineering-
-/// lessons.md`): [`cursor::cursor_key`] truncates its `range_start`
-/// argument to a bare [`TOKEN_BYTES`]-wide token ([`cursor::token_of`]) —
-/// but a split's own `split_key` is essentially never token-aligned (it is
-/// chosen from real row content via the byte-weighted-median split point,
-/// never the hash ring), so a split child's own `range.start` is almost
-/// always *longer* than `TOKEN_BYTES`. Comparing the two lexicographically,
-/// the cursor key (`token || 0x00 || tag_byte || tag`) sorts *below* that
-/// child's own `range.start` the instant `range.start`'s own byte
-/// immediately past the token is non-zero — true of `escape(pk)`'s leading
-/// byte for essentially any real partition key — so `ctx.
-/// cp_kind_write_raw`'s ordinary fence-check (`fence.contains(cursor_key)`)
-/// rejected the cursor's own advance write as "outside this group's live
-/// range," silently, every single tick, forever (the error is logged and
-/// swallowed by `change_consumer_loop`'s own top-level `Err` handling).
-/// Data coverage itself was never at risk — the change-log seed writes
-/// above are keyed by a *real* base key that genuinely does fall inside
-/// the live range — only the cursor's own persistence was, so a split
-/// child's sweep silently restarted from scratch every tick instead of
-/// resuming from where it left off. The `"gsi"` cursor tag's own callers
-/// already tolerate this same underlying gap as a pure efficiency loss
-/// (`drain_tablet`'s watermark just stays `None`, meaning "reconcile
-/// everything," always correct, just not optimally incremental) — but for
-/// backfill specifically this was a **liveness** bug, not merely an
-/// efficiency one: a child with more than [`BACKFILL_SEED_BATCH`]
-/// partitions on its own side could never advance past that one batch's
-/// worth, restarting from position zero every tick forever, so it never
-/// reached its own end and the index never flipped `Active`. A cursor
-/// row's identity is already fully captured by its own *token* — disjoint
-/// from base data by row-kind (ADR 0041 §3) and immutable across a
-/// narrowing, since the token a tablet anchors never changes once minted —
-/// it needs no range-fencing at all, the same reasoning `seal.rs`/
+/// lessons.md`): [`cursor::cursor_key`] used to truncate its `range_start`
+/// argument to a bare `TOKEN_BYTES`-wide token — but a split's own
+/// `split_key` is essentially never token-aligned (it is chosen from real
+/// row content via the byte-weighted-median split point, never the hash
+/// ring), so a split child's own `range.start` was almost always *longer*
+/// than `TOKEN_BYTES`. Comparing the two lexicographically, the truncated
+/// cursor key sorted *below* that child's own `range.start` the instant
+/// `range.start`'s own byte immediately past the truncation point was
+/// non-zero — true of `escape(pk)`'s leading byte for essentially any real
+/// partition key — so `ctx.cp_kind_write_raw`'s ordinary fence-check
+/// (`fence.contains(cursor_key)`) rejected the cursor's own advance write
+/// as "outside this group's live range," silently, every single tick,
+/// forever (the error is logged and swallowed by `change_consumer_loop`'s
+/// own top-level `Err` handling). Data coverage itself was never at risk —
+/// the change-log seed writes above are keyed by a *real* base key that
+/// genuinely does fall inside the live range — only the cursor's own
+/// persistence was, so a split child's sweep silently restarted from
+/// scratch every tick instead of resuming from where it left off. The
+/// `"gsi"` cursor tag's own callers tolerated this same underlying
+/// truncation as a pure efficiency loss (`drain_tablet`'s watermark just
+/// stayed `None`, meaning "reconcile everything," always correct, just
+/// not optimally incremental) — but for backfill specifically this was a
+/// **liveness** bug, not merely an efficiency one: a child with more than
+/// [`BACKFILL_SEED_BATCH`] partitions on its own side could never advance
+/// past that one batch's worth, restarting from position zero every tick
+/// forever, so it never reached its own end and the index never flipped
+/// `Active`. **`cursor::cursor_key` no longer truncates at all** (issue
+/// #355: it now embeds `range_start` verbatim, so a routed write's key
+/// always sorts at or above the writing tablet's own `range.start` — see
+/// that function's own doc), which closes the misrouting half of this
+/// same root cause for [`drain_tablet`]'s `"gsi"` cursor write below. This
+/// function keeps writing directly to `group`, unfenced, regardless: a
+/// cursor row's identity is already fully captured by its own *tag plus
+/// range-start* — disjoint from base data by row-kind (ADR 0041 §3) and
+/// immutable across a narrowing, since the range a tablet anchors never
+/// changes once minted — it needs no range-fencing (nor, for that matter,
+/// `ClientCtx`'s key-based routing at all) the same reasoning `seal.rs`/
 /// `ceiling.rs`'s engine-global markers already rely on for a *different*
 /// flavor of range-independent bookkeeping key.
 async fn advance_backfill_cursor(
@@ -2894,48 +2893,44 @@ mod gsi_drain_cursor_tests {
         .expect("split cold-start scenario did not converge in time");
     }
 
-    /// **Issue #355 reproduction harness.** The test just above splits at
+    /// **Issue #355 regression (fixed).** The test just above splits at
     /// `BOUNDARY`, a bare `TOKEN_BYTES`-long numeric value — which is
-    /// itself already token-aligned, so it never exercises the shape
+    /// itself already token-aligned, so it never exercised the shape
     /// [`advance_backfill_cursor`]'s own doc comment (and the `"gsi"`
     /// cursor write's comment in [`drain_tablet`]) describes: a real
     /// split's `split_key` is chosen from actual row content
     /// (`byte_weighted_median`), essentially never token-aligned, so a
     /// child's own `range.start` is almost always *longer* than
     /// `TOKEN_BYTES` — exactly the condition under which
-    /// [`cursor::cursor_key`]'s truncation to a bare token can sort the
-    /// resulting key *below* the child's own `range.start` and route it to
-    /// a sibling instead.
+    /// [`cursor::cursor_key`]'s pre-fix truncation to a bare token could
+    /// sort the resulting key *below* the child's own `range.start` and
+    /// route it to a sibling instead.
     ///
     /// This test splits at a **real row's own physical key** (mirroring
-    /// production's `byte_weighted_median`, never a bare token) and then
-    /// polls the right child's own GSI cursor watermark and change-log
-    /// length over many drain ticks, logging both every tick to stderr, and
-    /// finally reads the raw `KIND_CURSOR` row for the right child's own
-    /// token directly off *both* siblings' engines via
-    /// `CpGroup::local_get_kind` — a bound-free physical read, never
-    /// inferred from the key-construction code. Legible either way: if the
-    /// watermark advances and the row is found on the right child's own
-    /// engine, the claim is disproven; if the watermark never advances and
-    /// the row is instead found on the LEFT sibling's engine, it is
-    /// confirmed.
+    /// production's `byte_weighted_median`, never a bare token), polls the
+    /// right child's own GSI cursor watermark and change-log length over
+    /// many drain ticks, logging both every tick to stderr, and finally
+    /// reads the raw `KIND_CURSOR` row for the right child's own range
+    /// directly off *both* siblings' engines via `CpGroup::local_get_kind`
+    /// — a bound-free physical read, never inferred from the
+    /// key-construction code.
     ///
-    /// **CONFIRMED (2026-08-22/23)** — run twice, identical both times: the
+    /// **Pre-fix (2026-08-22/23), run twice, identical both times**: the
     /// right child's own watermark stayed `None` and `pending_changes`
     /// stayed pinned at 8 across 20 drain ticks (~8s, forty times the
     /// 200ms drain interval); the cursor row for the right child's own
-    /// token was absent on the right engine and present on the LEFT
+    /// range was absent on the right engine and present on the LEFT
     /// sibling's engine. GSI *correctness* was unaffected (every item still
-    /// indexed) — only the cursor/trim bookkeeping is broken, matching
+    /// indexed) — only the cursor/trim bookkeeping was broken, matching
     /// `drain_tablet`'s own comment that a watermark stuck at `None` means
-    /// "reconcile everything, always correct, just not incremental." `
-    /// #[ignore]`d so CI stays green until the real fix (a child-scope-
-    /// readable cursor key, per `drain_tablet`'s own comment) lands — run
-    /// explicitly with `cargo test -p animusd --lib
-    /// split_right_childs_gsi_cursor_after_a_non_token_aligned_split_issue_355
-    /// -- --ignored --exact --nocapture` to see the per-tick trend again.
-    #[ignore = "issue #355: right child's GSI cursor never advances after a non-token-aligned \
-                split — expected to fail until the cursor key is made child-scope-readable"]
+    /// "reconcile everything, always correct, just not incremental."
+    ///
+    /// **Post-fix**: `cursor::cursor_key` embeds `range.start` verbatim, so
+    /// the write always routes to the right child itself — the assertions
+    /// below pin the fixed end-state precisely (watermark advances, the
+    /// change log trims to zero, and the physical cursor row lives on the
+    /// right child's own engine and nowhere else), not just "eventually
+    /// stops being `None`."
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn split_right_childs_gsi_cursor_after_a_non_token_aligned_split_issue_355() {
         timeout(Duration::from_secs(90), async {
@@ -3067,6 +3062,20 @@ mod gsi_drain_cursor_tests {
                  engine={}",
                 row_on_right.is_some(),
                 row_on_left.is_some(),
+            );
+            // The fixed end-state, pinned precisely rather than just
+            // "eventually not None": the physical cursor row lives on the
+            // right child's own engine, and nowhere else — the exact
+            // opposite of the pre-fix cross-tablet leak.
+            assert!(
+                row_on_right.is_some(),
+                "issue #355: the right child's own gsi cursor row must be physically present \
+                 on its own engine after the fix"
+            );
+            assert!(
+                row_on_left.is_none(),
+                "issue #355: the right child's own gsi cursor row must NOT leak onto the left \
+                 sibling's engine after the fix"
             );
             await_pending_changes(&node, right, 0, "right child's own change log drains").await;
         })

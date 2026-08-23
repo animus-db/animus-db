@@ -277,9 +277,27 @@ comment for its full type/method inventory.
   only ever renders `ENABLED`/`DISABLED`, never AWS's transient
   `ENABLING`/`DISABLING` — this adapter's `UpdateTimeToLive` takes effect
   synchronously, so there is no in-flight state to report. The
-  `Scan`/`Query` `FilterExpression` reuses the `ConditionExpression` predicate
-  subset (`attribute_exists`/`attribute_not_exists`/`a = :v`), not the fuller
-  filter grammar.
+  `Scan`/`Query` `FilterExpression` shares `ConditionExpression` wholesale —
+  same decoder, same `evaluate` — not a narrower predicate subset; the two
+  surfaces are indistinguishable by construction, which is what let the
+  `size()` fix below land once for both. `ConditionExpression::evaluate`
+  returns `Result<bool, ConditionError>`, not a bare `bool`: a missing
+  attribute is still `Ok(false)` on every leaf (DynamoDB has no
+  three-valued logic), but `size()`/`begins_with()`/`contains()` are
+  *functions* with a fixed operand-type domain, and applying one to an
+  **existing** attribute outside that domain (`size()` on an `N`/`BOOL`/
+  `NULL`; `begins_with()` on anything but `S`/`B`; `contains()` on anything
+  but `S`/`SS`/`NS`/`BS`/`L`) is `Err(ConditionError)` — a real DynamoDB
+  `ValidationException` at evaluation time, matching AWS's own wording
+  (`"Incorrect operand type for operator or function; operator or
+  function: <fn>, operand type: <TYPE>"`). An ordinary comparator
+  (`Compare`/`Between`/`In`) type mismatch between two *supplied* operands
+  is unaffected and stays `Ok(false)`, DynamoDB's own documented comparator
+  behavior. `animusd`'s `WireError: From<ConditionError>` maps it to the
+  wire `ValidationException` at every evaluation call site (conditional
+  writes, `Scan`/`Query` filters, `TransactWriteItems`'
+  `ConditionCheck`) — grep `condition.rs`'s own module doc before touching
+  this again; the false-vs-error distinction is easy to blur back together.
   **Every write op maintains a table's secondary indexes** — and since ADR
   0049 (the universal kind-write path) **every Dynamo write op on every
   table commits through `KindBatch`**: `PutItem`/`DeleteItem`/`UpdateItem`/

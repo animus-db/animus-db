@@ -7477,7 +7477,11 @@ impl ClientCtx {
                         ClientResponse::ConditionFailed => {
                             return Ok(dynamo::KindWriteOutcome::ConditionFailed);
                         }
-                        ClientResponse::Error(e) => dynamo::internal(&e),
+                        // The far side may carry a typed error's own code
+                        // in the string (`dynamo::encode_relayed_error`);
+                        // an unmarked string decodes to `internal`, the
+                        // pre-marker behavior.
+                        ClientResponse::Error(e) => dynamo::decode_relayed_error(&e),
                         other => {
                             return Err(dynamo::internal(&format!(
                                 "unexpected reply to forwarded kind write item: {other:?}"
@@ -10520,7 +10524,12 @@ impl ClientCtx {
                     Ok(dynamo::KindWriteOutcome::ConditionFailed) => {
                         ClientResponse::ConditionFailed
                     }
-                    Err(e) => ClientResponse::Error(e.message),
+                    // Preserve the error's own code across the hop (a typed
+                    // evaluation error — e.g. size() on an N attribute, a
+                    // real ValidationException — must not degrade to a 500
+                    // just because the leader was remote); see
+                    // `dynamo::encode_relayed_error`.
+                    Err(e) => ClientResponse::Error(dynamo::encode_relayed_error(&e)),
                 }
             }
             // ADR 0055: an eventual read is answered by whichever replica

@@ -347,13 +347,15 @@ fn backfill_seed_tick(
         let cursor_val = cursor::encode_backfill_cursor(&prefix);
         // `KeyRange::whole()`, NEVER `range` — mirrors the real fix to the
         // exact bug this corpus found (see `advance_backfill_cursor`'s doc
-        // in `animusd::index_drain`): `cursor::cursor_key` truncates
-        // `range.start` to a bare token, which sorts *below* a non-token-
+        // in `animusd::index_drain`): `cursor::cursor_key` used to truncate
+        // `range.start` to a bare token, which sorted *below* a non-token-
         // aligned split child's own `range.start` — fencing this write to
-        // `range` itself rejects it as "outside this group's live range"
-        // on every real split, forever. A cursor row's identity is already
-        // fully captured by its own token (disjoint from base data by row
-        // kind) and needs no range-fencing at all.
+        // `range` itself rejected it as "outside this group's live range"
+        // on every real split, forever (`cursor_key` no longer truncates at
+        // all, issue #355, but this write stays unfenced regardless — a
+        // cursor row's identity is already fully captured by its own tag
+        // plus range-start, disjoint from base data by row kind, and needs
+        // no range-fencing at all).
         let result = node.put_kind_batch_conditioned(
             vec![(KIND_CURSOR, cursor_key_bytes, Some(cursor_val))],
             Vec::new(),

@@ -18,6 +18,19 @@
 //! (or its absence) before a write commits — the DynamoDB conditional-write
 //! contract. The fuller expression grammar (AND/OR/NOT, comparators, functions)
 //! is deferred.
+//!
+//! **A missing attribute vs. a wrong-typed one are not the same outcome.**
+//! Every leaf here is false when the target attribute is absent (DynamoDB has
+//! no three-valued logic). But `size()`/`begins_with()`/`contains()` are
+//! *functions* with a fixed operand-type domain, and applying one to an
+//! attribute that **exists** with a type outside that domain is a real
+//! DynamoDB `ValidationException` at evaluation time, not a false
+//! comparison — [`ConditionExpression::evaluate`] surfaces that as
+//! `Err(ConditionError)` instead of `Ok(false)`. Plain comparators
+//! (`Compare`/`Between`/`In`) stay `Ok(false)` on a type mismatch between two
+//! *supplied* operands (`attr > :v` where `attr` and `:v` disagree) — that is
+//! DynamoDB's own documented comparator behavior, distinct from a function's
+//! operand-domain violation, and is unaffected by this distinction.
 
 use serde::{Deserialize, Serialize};
 
@@ -333,10 +346,48 @@ fn type_code(v: &AttributeValue) -> &'static str {
     }
 }
 
+/// Why a `ConditionExpression`/filter evaluation could not produce a
+/// true/false answer. This is DynamoDB's real `ValidationException` for a
+/// function (`size`/`begins_with`/`contains`) applied to an *existing*
+/// attribute whose type is outside that function's operand domain — e.g.
+/// `size()` on an `N`. It is deliberately distinct from an ordinary `false`
+/// result (a missing attribute, or two comparable-but-unequal/mismatched
+/// operands): AWS itself only raises this for the function's own operand,
+/// never for a plain comparator's type mismatch. The message text mirrors
+/// AWS's own wording so it reads believably once it reaches a wire client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConditionError {
+    pub message: String,
+}
+
+impl ConditionError {
+    #[must_use]
+    fn invalid_operand_type(function: &str, actual: &AttributeValue) -> Self {
+        Self {
+            message: format!(
+                "Incorrect operand type for operator or function; operator or function: {function}, operand type: {}",
+                type_code(actual)
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ConditionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ConditionError {}
+
 /// DynamoDB's `size()` of an attribute: bytes for `S`/`B`, element count for
-/// the document and set types, and **no size at all** for `N`/`BOOL`/`NULL`
-/// (a `size()` comparison against those is false rather than an error, as on
-/// a missing attribute).
+/// the document and set types. `None` for `N`/`BOOL`/`NULL`, which have no
+/// notion of size — the caller (only ever reached once the attribute is
+/// known to *exist*) turns that into a [`ConditionError`], matching real
+/// DynamoDB: `size()` on an existing attribute of one of those three types is
+/// a runtime `ValidationException`, not a false comparison. A *missing*
+/// attribute never reaches `size_of` at all — the caller's own `None` arm
+/// keeps that case a plain `false`, exactly as before.
 #[must_use]
 fn size_of(v: &AttributeValue) -> Option<usize> {
     match v {
@@ -364,16 +415,32 @@ pub enum ConditionExpression {
     Between(String, AttributeValue, AttributeValue),
     /// `attr IN (:a, :b, ..)` — equality against any listed value.
     In(String, Vec<AttributeValue>),
-    /// `begins_with(attr, prefix)` — `S` and `B` only.
+    /// `begins_with(attr, prefix)` — `S` and `B` only. An existing attribute
+    /// of any other type is a `ValidationException`
+    /// ([`ConditionError`]), matching real DynamoDB; a missing attribute is
+    /// still `false`, and an `S`/`B` attribute compared against a
+    /// mismatched-type `prefix` literal is still `false` too (that mismatch
+    /// is between two supplied operands, not a domain violation of the
+    /// attribute itself).
     BeginsWith(String, AttributeValue),
     /// `contains(attr, operand)` — substring for `S`, membership for the set
-    /// and list types.
+    /// and list types. An existing attribute of any other type (`N`, `B`,
+    /// `BOOL`, `NULL`, `M`) is a `ValidationException` ([`ConditionError`]),
+    /// matching real DynamoDB; a missing attribute is still `false`, and an
+    /// operand of the wrong element type against an otherwise-valid
+    /// container is still `false` too, the same supplied-operands-mismatch
+    /// distinction `BeginsWith` draws.
     Contains(String, AttributeValue),
     /// `attribute_type(attr, :code)` — `"S"`, `"N"`, `"B"`, `"BOOL"`,
     /// `"NULL"`, `"M"`, `"L"`, `"SS"`, `"NS"`, `"BS"`.
     AttributeType(String, String),
     /// `size(attr) <op> value` — bytes for `S`/`B`, element count for the
-    /// document and set types.
+    /// document and set types. An **existing** attribute of type `N`,
+    /// `BOOL`, or `NULL` has no `size()` at all — real DynamoDB rejects the
+    /// call with a `ValidationException`, surfaced here as
+    /// `Err(`[`ConditionError`]`)` rather than a false comparison. A
+    /// *missing* attribute is unaffected: it still evaluates to `false`,
+    /// the same as every other leaf.
     Size(String, Comparator, AttributeValue),
     /// `a AND b` — both must hold.
     And(Box<ConditionExpression>, Box<ConditionExpression>),
@@ -385,93 +452,124 @@ pub enum ConditionExpression {
 
 impl ConditionExpression {
     /// Evaluate the condition against the current item at the key (`None` when
-    /// no live item exists). A write proceeds only when this returns `true`.
-    #[must_use]
-    pub fn evaluate(&self, current: Option<&Item>) -> bool {
+    /// no live item exists). A write proceeds only when this returns
+    /// `Ok(true)`.
+    ///
+    /// # Errors
+    /// `Err(ConditionError)` when a `size()`/`begins_with()`/`contains()` leaf
+    /// is applied to an **existing** attribute whose type is outside that
+    /// function's operand domain — the runtime `ValidationException` real
+    /// DynamoDB raises there (see each variant's own doc). A missing
+    /// attribute, or a plain comparator's type mismatch between two supplied
+    /// operands, is unaffected and stays `Ok(false)`.
+    pub fn evaluate(&self, current: Option<&Item>) -> Result<bool, ConditionError> {
         match self {
             ConditionExpression::AttributeNotExists(attr) => {
-                current.is_none_or(|item| !item.contains_key(attr))
+                Ok(current.is_none_or(|item| !item.contains_key(attr)))
             }
             ConditionExpression::AttributeExists(attr) => {
-                current.is_some_and(|item| item.contains_key(attr))
+                Ok(current.is_some_and(|item| item.contains_key(attr)))
             }
             ConditionExpression::Compare(attr, op, value) => {
                 let Some(actual) = current.and_then(|item| item.get(attr)) else {
                     // A missing attribute satisfies no comparison — `<>`
                     // included. DynamoDB has no three-valued logic here.
-                    return false;
+                    return Ok(false);
                 };
                 // Equality and inequality work for *every* type (two maps can
                 // be equal); ordering only for the comparable scalars.
-                match op {
+                Ok(match op {
                     // Equality works for every type (two maps can be equal) and
                     // must be numeric-aware; ordering only for the comparable
                     // scalars.
                     Comparator::Eq => values_equal(actual, value),
                     Comparator::Ne => !values_equal(actual, value),
                     _ => op.holds(compare_values(actual, value)),
-                }
+                })
             }
             ConditionExpression::Between(attr, lo, hi) => {
                 let Some(actual) = current.and_then(|item| item.get(attr)) else {
-                    return false;
+                    return Ok(false);
                 };
-                Comparator::Ge.holds(compare_values(actual, lo))
-                    && Comparator::Le.holds(compare_values(actual, hi))
+                Ok(Comparator::Ge.holds(compare_values(actual, lo))
+                    && Comparator::Le.holds(compare_values(actual, hi)))
             }
-            ConditionExpression::In(attr, values) => current
+            ConditionExpression::In(attr, values) => Ok(current
                 .and_then(|item| item.get(attr))
-                .is_some_and(|actual| values.iter().any(|v| values_equal(actual, v))),
+                .is_some_and(|actual| values.iter().any(|v| values_equal(actual, v)))),
             ConditionExpression::BeginsWith(attr, prefix) => {
-                match (current.and_then(|item| item.get(attr)), prefix) {
-                    (Some(AttributeValue::S(v)), AttributeValue::S(p)) => v.starts_with(p),
-                    (Some(AttributeValue::B(v)), AttributeValue::B(p)) => v.starts_with(p),
-                    _ => false,
+                match current.and_then(|item| item.get(attr)) {
+                    None => Ok(false),
+                    Some(AttributeValue::S(v)) => Ok(match prefix {
+                        AttributeValue::S(p) => v.starts_with(p),
+                        // The literal argument's type doesn't match — a
+                        // supplied-operands mismatch, not a domain violation
+                        // of `attr` itself, so this stays `false`.
+                        _ => false,
+                    }),
+                    Some(AttributeValue::B(v)) => Ok(match prefix {
+                        AttributeValue::B(p) => v.starts_with(p),
+                        _ => false,
+                    }),
+                    // `attr` itself is outside begins_with's S/B domain.
+                    Some(actual) => {
+                        Err(ConditionError::invalid_operand_type("begins_with", actual))
+                    }
                 }
             }
             ConditionExpression::Contains(attr, operand) => {
                 match current.and_then(|item| item.get(attr)) {
-                    Some(AttributeValue::S(v)) => match operand {
+                    None => Ok(false),
+                    Some(AttributeValue::S(v)) => Ok(match operand {
                         AttributeValue::S(needle) => v.contains(needle.as_str()),
                         _ => false,
-                    },
-                    Some(AttributeValue::SS(vs)) => match operand {
+                    }),
+                    Some(AttributeValue::SS(vs)) => Ok(match operand {
                         AttributeValue::S(needle) => vs.contains(needle),
                         _ => false,
-                    },
-                    Some(AttributeValue::NS(vs)) => match operand {
+                    }),
+                    Some(AttributeValue::NS(vs)) => Ok(match operand {
                         AttributeValue::N(needle) => vs
                             .iter()
                             .any(|v| compare_numeric(v, needle) == Some(std::cmp::Ordering::Equal)),
                         _ => false,
-                    },
-                    Some(AttributeValue::BS(vs)) => match operand {
+                    }),
+                    Some(AttributeValue::BS(vs)) => Ok(match operand {
                         AttributeValue::B(needle) => vs.contains(needle),
                         _ => false,
-                    },
+                    }),
                     Some(AttributeValue::L(items)) => {
-                        items.iter().any(|i| values_equal(i, operand))
+                        Ok(items.iter().any(|i| values_equal(i, operand)))
                     }
-                    _ => false,
+                    // `attr` itself (N/B/BOOL/NULL/M) is outside contains's
+                    // string/set/list domain.
+                    Some(actual) => Err(ConditionError::invalid_operand_type("contains", actual)),
                 }
             }
-            ConditionExpression::AttributeType(attr, code) => current
+            ConditionExpression::AttributeType(attr, code) => Ok(current
                 .and_then(|item| item.get(attr))
-                .is_some_and(|actual| type_code(actual) == code),
+                .is_some_and(|actual| type_code(actual) == code)),
             ConditionExpression::Size(attr, op, value) => {
-                let Some(size) = current.and_then(|item| item.get(attr)).and_then(size_of) else {
-                    return false;
+                let Some(actual) = current.and_then(|item| item.get(attr)) else {
+                    return Ok(false);
+                };
+                let Some(size) = size_of(actual) else {
+                    return Err(ConditionError::invalid_operand_type("size", actual));
                 };
                 // `size()` yields a number, so the comparison is numeric.
-                op.holds(compare_values(&AttributeValue::N(size.to_string()), value))
+                Ok(op.holds(compare_values(&AttributeValue::N(size.to_string()), value)))
             }
             // Short-circuiting matches DynamoDB's own evaluation and, more
             // importantly, keeps every leaf's "false when absent" semantics
             // intact under composition: `NOT attribute_exists(a)` is true for
             // a missing `a` precisely because the leaf is false, not unknown.
-            ConditionExpression::And(a, b) => a.evaluate(current) && b.evaluate(current),
-            ConditionExpression::Or(a, b) => a.evaluate(current) || b.evaluate(current),
-            ConditionExpression::Not(inner) => !inner.evaluate(current),
+            // `?` on each side means an operand-type error anywhere in the
+            // tree still short-circuits `&&`/`||` exactly like a plain
+            // boolean would — the right side simply never runs once the left
+            // side has already settled (or failed) the outcome.
+            ConditionExpression::And(a, b) => Ok(a.evaluate(current)? && b.evaluate(current)?),
+            ConditionExpression::Or(a, b) => Ok(a.evaluate(current)? || b.evaluate(current)?),
+            ConditionExpression::Not(inner) => Ok(!inner.evaluate(current)?),
         }
     }
 }
@@ -515,12 +613,12 @@ mod tests {
     #[test]
     fn attribute_not_exists() {
         let cond = ConditionExpression::AttributeNotExists("pk".into());
-        assert!(cond.evaluate(None));
+        assert!(cond.evaluate(None).unwrap());
         let mut item = Item::new();
         item.insert("other".into(), s("x"));
-        assert!(cond.evaluate(Some(&item)));
+        assert!(cond.evaluate(Some(&item)).unwrap());
         item.insert("pk".into(), s("k"));
-        assert!(!cond.evaluate(Some(&item)));
+        assert!(!cond.evaluate(Some(&item)).unwrap());
     }
 
     #[test]
@@ -528,11 +626,20 @@ mod tests {
         let mut item = Item::new();
         item.insert("pk".into(), s("k"));
         item.insert("v".into(), AttributeValue::N("1".into()));
-        assert!(ConditionExpression::AttributeExists("pk".into()).evaluate(Some(&item)));
-        assert!(!ConditionExpression::AttributeExists("pk".into()).evaluate(None));
+        assert!(
+            ConditionExpression::AttributeExists("pk".into())
+                .evaluate(Some(&item))
+                .unwrap()
+        );
+        assert!(
+            !ConditionExpression::AttributeExists("pk".into())
+                .evaluate(None)
+                .unwrap()
+        );
         assert!(
             ConditionExpression::Compare("v".into(), Comparator::Eq, AttributeValue::N("1".into()))
                 .evaluate(Some(&item))
+                .unwrap()
         );
         assert!(
             !ConditionExpression::Compare(
@@ -541,6 +648,7 @@ mod tests {
                 AttributeValue::N("2".into())
             )
             .evaluate(Some(&item))
+            .unwrap()
         );
         assert!(
             !ConditionExpression::Compare(
@@ -549,6 +657,7 @@ mod tests {
                 AttributeValue::N("1".into())
             )
             .evaluate(None)
+            .unwrap()
         );
     }
 
@@ -572,6 +681,7 @@ mod tests {
         let gt = |target: &str| {
             ConditionExpression::Compare("v".into(), Comparator::Gt, n(target))
                 .evaluate(Some(&item))
+                .unwrap()
         };
         assert!(
             gt("9"),
@@ -583,6 +693,7 @@ mod tests {
         let cmp = |a: &str, op: Comparator, b: &str| {
             ConditionExpression::Compare("v".into(), op, n(b))
                 .evaluate(Some(&item_of(&[("v", n(a))])))
+                .unwrap()
         };
         assert!(cmp("-5", Comparator::Lt, "3"));
         assert!(cmp("-5", Comparator::Lt, "-3"));
@@ -619,7 +730,9 @@ mod tests {
             Comparator::Ge,
         ] {
             assert!(
-                !ConditionExpression::Compare("v".into(), op, n("1")).evaluate(Some(&item)),
+                !ConditionExpression::Compare("v".into(), op, n("1"))
+                    .evaluate(Some(&item))
+                    .unwrap(),
                 "missing attribute must not satisfy {op:?}"
             );
         }
@@ -631,10 +744,14 @@ mod tests {
     fn cross_type_ordering_is_false_but_inequality_holds() {
         let item = item_of(&[("v", s("abc"))]);
         assert!(
-            !ConditionExpression::Compare("v".into(), Comparator::Gt, n("1")).evaluate(Some(&item))
+            !ConditionExpression::Compare("v".into(), Comparator::Gt, n("1"))
+                .evaluate(Some(&item))
+                .unwrap()
         );
         assert!(
-            ConditionExpression::Compare("v".into(), Comparator::Ne, n("1")).evaluate(Some(&item)),
+            ConditionExpression::Compare("v".into(), Comparator::Ne, n("1"))
+                .evaluate(Some(&item))
+                .unwrap(),
             "a string is not that number"
         );
     }
@@ -647,7 +764,7 @@ mod tests {
             ("tags", AttributeValue::SS(vec!["a".into(), "b".into()])),
             ("list", AttributeValue::L(vec![n("1"), s("x")])),
         ]);
-        let ev = |c: ConditionExpression| c.evaluate(Some(&item));
+        let ev = |c: ConditionExpression| c.evaluate(Some(&item)).unwrap();
 
         assert!(ev(ConditionExpression::Between(
             "num".into(),
@@ -704,7 +821,7 @@ mod tests {
             ("num", n("42")),
             ("list", AttributeValue::L(vec![n("1"), n("2"), n("3")])),
         ]);
-        let ev = |c: ConditionExpression| c.evaluate(Some(&item));
+        let ev = |c: ConditionExpression| c.evaluate(Some(&item)).unwrap();
 
         assert!(ev(ConditionExpression::AttributeType(
             "s".into(),
@@ -740,13 +857,101 @@ mod tests {
             Comparator::Gt,
             n("3")
         )));
+    }
+
+    /// `size()` on an **existing** `N`/`BOOL`/`NULL` attribute is a real
+    /// DynamoDB `ValidationException`, not a false comparison — the fidelity
+    /// gap this module used to have (flagged in review of the commit that
+    /// introduced `size()`, fe0ce0c). A *missing* attribute is unaffected: it
+    /// still evaluates to `false`, exactly like every other leaf.
+    #[test]
+    fn size_of_an_existing_n_bool_or_null_attribute_is_a_validation_error() {
+        let item = item_of(&[
+            ("num", n("42")),
+            ("flag", AttributeValue::Bool(true)),
+            ("nothing", AttributeValue::Null),
+        ]);
+        for (attr, type_code) in [("num", "N"), ("flag", "BOOL"), ("nothing", "NULL")] {
+            let err = ConditionExpression::Size(attr.into(), Comparator::Gt, n("0"))
+                .evaluate(Some(&item))
+                .expect_err("size() on an existing N/BOOL/NULL attribute must error");
+            assert_eq!(
+                err.message,
+                format!(
+                    "Incorrect operand type for operator or function; operator or function: size, operand type: {type_code}"
+                ),
+                "message should match AWS's own ValidationException wording for {attr}"
+            );
+        }
+
+        // A *missing* attribute is a different case entirely — still false,
+        // never an error, same as before this fix.
         assert!(
-            !ev(ConditionExpression::Size(
-                "num".into(),
-                Comparator::Gt,
-                n("0")
-            )),
-            "a number has no size(), so the comparison is false rather than an error"
+            !ConditionExpression::Size("missing".into(), Comparator::Gt, n("0"))
+                .evaluate(Some(&item))
+                .unwrap(),
+            "a missing attribute has no ValidationException — it's just false"
+        );
+        assert!(
+            !ConditionExpression::Size("num".into(), Comparator::Gt, n("0"))
+                .evaluate(None)
+                .unwrap(),
+            "no item at all is also just false, not an error"
+        );
+    }
+
+    /// `begins_with()`/`contains()` on an **existing** attribute of a type
+    /// outside their own operand domain are the same class of
+    /// `ValidationException` as `size()` — found while auditing for the same
+    /// bug shape. A missing attribute, and a same-domain attribute compared
+    /// against a mismatched-type *literal*, both stay `false` (a supplied-
+    /// operands mismatch, not a domain violation of the attribute itself).
+    #[test]
+    fn begins_with_and_contains_on_a_wrong_typed_existing_attribute_error_too() {
+        let item = item_of(&[
+            ("num", n("42")),
+            ("flag", AttributeValue::Bool(true)),
+            ("map", AttributeValue::M(item_of(&[("k", s("v"))]))),
+            ("name", s("hello")),
+        ]);
+
+        let err = ConditionExpression::BeginsWith("num".into(), s("4"))
+            .evaluate(Some(&item))
+            .expect_err("begins_with on an existing N attribute must error");
+        assert_eq!(
+            err.message,
+            "Incorrect operand type for operator or function; operator or function: begins_with, operand type: N"
+        );
+        assert!(
+            !ConditionExpression::BeginsWith("missing".into(), s("4"))
+                .evaluate(Some(&item))
+                .unwrap(),
+            "a missing attribute is still false"
+        );
+        assert!(
+            !ConditionExpression::BeginsWith("name".into(), AttributeValue::N("1".into()))
+                .evaluate(Some(&item))
+                .unwrap(),
+            "an S attribute against a mismatched-type literal is a supplied-operands \
+             mismatch, still false, not a domain violation"
+        );
+
+        for (attr, type_code) in [("flag", "BOOL"), ("map", "M")] {
+            let err = ConditionExpression::Contains(attr.into(), s("x"))
+                .evaluate(Some(&item))
+                .expect_err("contains on an existing BOOL/M attribute must error");
+            assert_eq!(
+                err.message,
+                format!(
+                    "Incorrect operand type for operator or function; operator or function: contains, operand type: {type_code}"
+                )
+            );
+        }
+        assert!(
+            !ConditionExpression::Contains("missing".into(), s("x"))
+                .evaluate(Some(&item))
+                .unwrap(),
+            "a missing attribute is still false"
         );
     }
 
@@ -759,7 +964,7 @@ mod tests {
         let item = item_of(&[("a", n("1")), ("b", n("2"))]);
         let eq =
             |name: &str, v: &str| ConditionExpression::Compare(name.into(), Comparator::Eq, n(v));
-        let ev = |c: ConditionExpression| c.evaluate(Some(&item));
+        let ev = |c: ConditionExpression| c.evaluate(Some(&item)).unwrap();
 
         assert!(ev(ConditionExpression::And(
             Box::new(eq("a", "1")),
@@ -807,6 +1012,7 @@ mod tests {
                 Box::new(eq("c", "3"))
             )
             .evaluate(Some(&item))
+            .unwrap()
         );
         // The two groupings genuinely diverge on the same item: with a=9,
         // b=2, c=9 the OR-first tree holds (b=2 satisfies the inner OR, but
@@ -820,7 +1026,8 @@ mod tests {
                 )),
                 Box::new(eq("c", "3"))
             )
-            .evaluate(Some(&other)),
+            .evaluate(Some(&other))
+            .unwrap(),
             "(a=1 OR b=2) AND c=3 fails because c=9"
         );
         assert!(
@@ -831,7 +1038,8 @@ mod tests {
                     Box::new(eq("c", "3"))
                 ))
             )
-            .evaluate(Some(&other)),
+            .evaluate(Some(&other))
+            .unwrap(),
             "and a=1 OR (b=2 AND c=3) fails too, for a different reason"
         );
         // Where they diverge: a=1, b=2, c=9.
@@ -844,7 +1052,8 @@ mod tests {
                 )),
                 Box::new(eq("c", "3"))
             )
-            .evaluate(Some(&diverge)),
+            .evaluate(Some(&diverge))
+            .unwrap(),
             "(a=1 OR b=2) AND c=3 is false — c=9"
         );
         assert!(
@@ -855,7 +1064,8 @@ mod tests {
                     Box::new(eq("c", "3"))
                 ))
             )
-            .evaluate(Some(&diverge)),
+            .evaluate(Some(&diverge))
+            .unwrap(),
             "but a=1 OR (b=2 AND c=3) is true — a=1 alone satisfies it. \
              Same leaves, different tree, different answer: this is what \
              precedence has to get right."
