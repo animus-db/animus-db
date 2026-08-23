@@ -37,8 +37,36 @@
 
 /// The console's page shell, embedded at compile time.
 pub(crate) const HTML: &str = include_str!("dashboard.html");
-/// The console's stylesheet (dark + light themes).
-pub(crate) const CSS: &str = include_str!("dashboard.css");
+/// The console's stylesheet (dark + light themes): the embedded webfaces, then
+/// the shared design tokens (ADR 0055), then this surface's own skin. Served as
+/// one stylesheet — `concat!` of `include_str!` literals, so it stays a single
+/// compile-time constant with no bundler and no extra route.
+pub(crate) const CSS: &str = concat!(
+    include_str!("fonts.css"),
+    include_str!("tokens.css"),
+    include_str!("dashboard.css"),
+);
+
+/// The website's copy of the shared token file, pulled in purely so
+/// [`tokens_css_matches_website_copy`] can prove the two have not drifted.
+#[cfg(test)]
+const WEBSITE_TOKENS_CSS: &str = include_str!("../../../website/assets/tokens.css");
+
+/// The design tokens are duplicated on purpose: the site ships static files and
+/// the consoles embed their assets in the binary, so there is no runtime they
+/// can share (and ADR 0021 rules out a build step that would generate one).
+/// Duplication without a check is exactly the drift ADR 0055 exists to stop, so
+/// the check is this test.
+#[test]
+fn tokens_css_matches_website_copy() {
+    assert_eq!(
+        include_str!("tokens.css"),
+        WEBSITE_TOKENS_CSS,
+        "crates/animusd/src/tokens.css and website/assets/tokens.css have \
+         drifted. They are the shared base of the design system (ADR 0055) and \
+         must stay byte-identical: edit one, copy it over the other."
+    );
+}
 /// Shared state, fetch helpers, formatting/data-derivation utilities, theme,
 /// and tab routing.
 pub(crate) const CORE_JS: &str = include_str!("dashboard_core.js");

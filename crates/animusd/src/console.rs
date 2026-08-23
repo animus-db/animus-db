@@ -100,8 +100,14 @@ use crate::http;
 
 /// The console's page shell, embedded at compile time.
 const HTML: &str = include_str!("console.html");
-/// The console's stylesheet.
-const CSS: &str = include_str!("console.css");
+/// The console's stylesheet: the embedded webfaces, then the shared design
+/// tokens (ADR 0055), then this surface's own skin — same `concat!` shape as
+/// `dashboard::CSS`, so both consoles serve one stylesheet from one constant.
+const CSS: &str = concat!(
+    include_str!("fonts.css"),
+    include_str!("tokens.css"),
+    include_str!("console.css"),
+);
 /// The console's client-side app (routing + every screen), vanilla JS, no
 /// bundler — mirrors `dashboard.rs`'s `include_str!`'d asset shape.
 const JS: &str = include_str!("console.js");
