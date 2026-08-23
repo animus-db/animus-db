@@ -163,6 +163,28 @@ reusing the captured config is the point of the test.
   index's own stale scan position (see the function's own doc and
   `docs/engineering-lessons.md`'s "convergent per-name cursor... can
   silently poison a same-named recreation" entry).
+  **Confirmed open bug (issue #355, 2026-08-23), NOT fixed here**: the
+  `"gsi"` cursor write in `drain_tablet` (`cursor::cursor_key(&group.
+  scope_range().start, GSI_TAG)`) is token-truncated below a split right
+  child's own `range.start` whenever the split key is non-token-aligned
+  (the normal case — `byte_weighted_median` picks a real row's key, almost
+  never `TOKEN_BYTES` long); the write goes through `ClientCtx::
+  cp_kind_write_raw`, which **routes by the write's own key**, so it lands
+  — successfully, not rejected — on the LEFT sibling's tablet instead of
+  the right child's own. Reproduced directly:
+  `gsi_drain_cursor_tests::split_right_childs_gsi_cursor_after_a_non_token_
+  aligned_split_issue_355` (`#[ignore]`d so CI stays green) splits at a
+  real row key and shows the right child's watermark pinned at `None` and
+  its change log pinned at 8 records across 20 drain ticks, with the
+  cursor row for its own token physically present on the left sibling's
+  engine and absent on its own — GSI correctness itself is unaffected
+  (every item still indexes), only the cursor/trim bookkeeping. The
+  existing `split_right_childs_cold_start_re_reconciles_from_zero_without_
+  corrupting_the_gsi` regression stays green because its own split
+  boundary (`BOUNDARY`, a bare `TOKEN_BYTES`-long constant) is *itself*
+  already token-aligned — see `docs/engineering-lessons.md`'s Testing
+  entry on this exact fixture-vs-production-shape gap. Fix (not made
+  here): a child-scope-readable cursor key.
 - **`ttl_reaper.rs`** (ADR 0051) — the DynamoDB-style **TTL reaper**: a
   per-node background loop, spawned everywhere `index_drain::
   change_consumer_loop` is (combined + data-only; see the module map
