@@ -322,12 +322,21 @@ async fn gsi_scan_rejects_consistent_read() {
 
 /// (c) + (e): an LSI `Scan` returns exactly the requested index's rows — not
 /// its sibling LSI's interleaved rows, and not duplicated across the two
-/// partitions — with **immediate** consistency (no polling: an LSI row
-/// commits atomically with its base row). Issued through **every** node of
+/// partitions — with **immediate** consistency: the scan asks for
+/// `ConsistentRead: true` (an LSI accepts it, unlike a GSI), which an LSI
+/// row commits atomically with its base row, so no polling is needed. The
+/// strong read is load-bearing since ADR 0055 — the wire default now
+/// samples each node's own possibly-lagging replica, so an unqualified
+/// scan rotated across nodes can legitimately miss the last-written rows
+/// (the "read loop that rotates across nodes" testing gotcha; this file
+/// was missed by the efd5224 sweep and flaked in CI exactly that way).
+/// Issued through **every** node of
 /// the 3-node cluster in turn (the `kind_scan.rs` forwarding-regression
 /// pattern): one un-split table has exactly one tablet and hence one leader,
 /// so at least two of the three nodes below are not it, exercising
-/// `cp_scan_kind_table`'s forwarded `KindScan` path per tablet.
+/// `cp_scan_kind_table`'s forwarded `KindScan` path per tablet — a
+/// `ConsistentRead` scan still forwards (a non-leader forwards to the
+/// leader); only the per-node divergence is removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lsi_scan_returns_only_the_requested_index_through_every_node() {
     let (_dir, nodes, _addr) = setup().await;
@@ -336,7 +345,7 @@ async fn lsi_scan_returns_only_the_requested_index_through_every_node() {
         let (status, body) = dynamo_retry(
             node.dynamo_addr(),
             "DynamoDB_20120810.Scan",
-            r#"{"TableName":"events","IndexName":"by-score"}"#,
+            r#"{"TableName":"events","IndexName":"by-score","ConsistentRead":true}"#,
         )
         .await;
         assert_eq!(status, 200, "LSI scan via node {i} failed: {body}");
@@ -370,7 +379,7 @@ async fn lsi_scan_supports_filter_expression() {
     let (status, body) = dynamo_retry(
         addr,
         "DynamoDB_20120810.Scan",
-        r#"{"TableName":"events","IndexName":"by-score",
+        r#"{"TableName":"events","IndexName":"by-score","ConsistentRead":true,
             "FilterExpression":"cat = :c",
             "ExpressionAttributeValues":{":c":{"S":"A"}}}"#,
     )
@@ -396,7 +405,7 @@ async fn lsi_scan_supports_filter_expression() {
     // filtered index still recovers every matching item exactly once.
     let combined = drain_scan_pages(
         addr,
-        r#"{"TableName":"events","IndexName":"by-score",
+        r#"{"TableName":"events","IndexName":"by-score","ConsistentRead":true,
             "FilterExpression":"cat = :c",
             "ExpressionAttributeValues":{":c":{"S":"A"}}"#,
         1,
@@ -488,8 +497,12 @@ async fn lsi_scan_with_limit_paginates_identically_across_a_split_table() {
     })
     .await;
 
-    let combined =
-        drain_scan_pages(addr, r#"{"TableName":"events","IndexName":"by-score""#, 1).await;
+    let combined = drain_scan_pages(
+        addr,
+        r#"{"TableName":"events","IndexName":"by-score","ConsistentRead":true"#,
+        1,
+    )
+    .await;
     for sk in ["a0", "a1", "a2", "b0", "b1"] {
         let marker = format!(r#""sk":{{"S":"{sk}"}}"#);
         assert_eq!(
