@@ -49,8 +49,8 @@ pub trait StateMachine<C>: Default + Clone + Serialize + DeserializeOwned {
     /// [`apply`](StateMachine::apply). When `true`, the core does **not** apply
     /// in-core; it buffers committed-durable commands as effects for an **async
     /// driver** to apply to a real `StorageEngine` (drained via
-    /// [`RaftCore::drain_apply`]) — the sync-core / async-driver split the
-    /// `animus-consensus` `AccordCore` uses, required because a `StorageEngine`
+    /// [`RaftCore::drain_apply`]) — a sync-core / async-driver split, required
+    /// because a `StorageEngine`
     /// apply is async I/O and the core is synchronous (ADR 0017). With this set,
     /// the in-core `apply` is never called (a unit placeholder `S` suffices).
     const DRIVER_APPLIED: bool = false;
@@ -854,7 +854,7 @@ where
     /// not yet handed to its async driver, as `(index, command)` in commit order.
     /// **The driver applies each to the real engine (in order) and is the only
     /// consumer.** Always empty for the in-core control plane (which applies in
-    /// `apply` instead). Mirrors `AccordCore::drain_apply` (ADR 0017).
+    /// `apply` instead). ADR 0017.
     pub fn drain_apply(&mut self) -> Vec<(u64, C)> {
         std::mem::take(&mut self.pending_apply)
     }
