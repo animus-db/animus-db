@@ -260,8 +260,18 @@ pub enum Role {
 /// Outcome of proposing a command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProposeResult {
-    /// Appended to the leader's log at `index` (will replicate + commit).
-    Accepted { index: u64 },
+    /// Appended to the leader's log at `index`, under the leader's own
+    /// current `term` (will replicate + commit).
+    ///
+    /// **`term` is what lets a proposer later prove a committed-and-applied
+    /// entry at `index` is genuinely the one it appended**, not a different
+    /// command that came to occupy the same log position after this one was
+    /// truncated by a leadership change (log-matching: identical `index` +
+    /// `term` implies identical entry, cluster-wide, for the life of the
+    /// log). `index` alone cannot make that distinction — see
+    /// `animus-cp-data`'s `KindBatchOutcome` doc for the incident this
+    /// closed.
+    Accepted { index: u64, term: u64 },
     /// This node is not the leader; `leader` is the best-known leader hint.
     NotLeader { leader: Option<NodeId> },
 }
@@ -415,9 +425,10 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     metadata: S,
     applied: Vec<C>,
     // Committed-and-durable commands a `DRIVER_APPLIED` state machine has not yet
-    // handed to its async driver, as `(index, command)` in commit order. Always
-    // empty for the in-core control plane. Drained by [`RaftCore::drain_apply`].
-    pending_apply: Vec<(u64, C)>,
+    // handed to its async driver, as `(index, term, command)` in commit order.
+    // Always empty for the in-core control plane. Drained by
+    // [`RaftCore::drain_apply`].
+    pending_apply: Vec<(u64, u64, C)>,
 
     // Durable-state changes awaiting write to the WAL, plus the hard state last
     // marked for persistence (to detect term/vote changes).
@@ -851,11 +862,15 @@ where
     }
 
     /// Take the committed-and-durable commands a `DRIVER_APPLIED` state machine has
-    /// not yet handed to its async driver, as `(index, command)` in commit order.
-    /// **The driver applies each to the real engine (in order) and is the only
-    /// consumer.** Always empty for the in-core control plane (which applies in
-    /// `apply` instead). ADR 0017.
-    pub fn drain_apply(&mut self) -> Vec<(u64, C)> {
+    /// not yet handed to its async driver, as `(index, term, command)` in commit
+    /// order — `term` is the entry's own leader term (`LogEntry::term`), the same
+    /// value a proposer's own `ProposeResult::Accepted` carried, so a driver-side
+    /// outcome channel keyed by `index` can also record `term` and let a proposer
+    /// tell "this is genuinely my entry" from "a different entry now occupies my
+    /// old index" (see `ProposeResult::Accepted`'s doc). **The driver applies each
+    /// to the real engine (in order) and is the only consumer.** Always empty for
+    /// the in-core control plane (which applies in `apply` instead). ADR 0017.
+    pub fn drain_apply(&mut self) -> Vec<(u64, u64, C)> {
         std::mem::take(&mut self.pending_apply)
     }
 
@@ -1055,7 +1070,10 @@ where
         });
         self.maybe_advance_commit();
         self.apply();
-        ProposeResult::Accepted { index }
+        ProposeResult::Accepted {
+            index,
+            term: self.current_term,
+        }
     }
 
     /// The leader's last-known replicated log index for `node` (0 if unknown —
@@ -1458,7 +1476,10 @@ where
         // because commit still requires a majority of matchIndex.
         self.maybe_advance_commit();
         self.apply();
-        ProposeResult::Accepted { index }
+        ProposeResult::Accepted {
+            index,
+            term: self.current_term,
+        }
     }
 
     // ---- message handlers ------------------------------------------------
@@ -2456,12 +2477,16 @@ where
         while self.last_applied < frontier {
             self.last_applied += 1;
             let offset = (self.last_applied - self.snapshot_index - 1) as usize;
-            let command = self.log[offset].command.clone();
+            let entry = &self.log[offset];
+            let term = entry.term;
+            let command = entry.command.clone();
             if S::DRIVER_APPLIED {
                 // The async driver applies this to the real engine (drained via
                 // `drain_apply`); the core only decides the order. Don't grow the
-                // unbounded `applied` log for the data plane.
-                self.pending_apply.push((self.last_applied, command));
+                // unbounded `applied` log for the data plane. `term` rides along so
+                // a driver-side outcome channel can prove entry identity across a
+                // truncation (see `drain_apply`'s doc).
+                self.pending_apply.push((self.last_applied, term, command));
             } else {
                 self.metadata.apply(&command);
                 self.applied.push(command);

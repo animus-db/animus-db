@@ -125,7 +125,7 @@ fn fresh_leader_case(seed: u64) {
 
     // The write under test: acked by the old leader once the heir's ack lands.
     let v2_index = match nodes[old].put(b"x".to_vec(), b"new".to_vec()) {
-        ProposeResult::Accepted { index } => index,
+        ProposeResult::Accepted { index, .. } => index,
         other => panic!("put not accepted: {other:?} (seed={seed})"),
     };
     // Step at 1ms granularity to the exact commit edge: the old leader has

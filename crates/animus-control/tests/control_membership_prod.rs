@@ -70,7 +70,7 @@ async fn change_membership_retry(
     loop {
         let leader_idx = wait_for_leader(nodes).await;
         match nodes[leader_idx].change_membership(voters.clone()) {
-            ProposeResult::Accepted { index } => return (leader_idx, index),
+            ProposeResult::Accepted { index, .. } => return (leader_idx, index),
             ProposeResult::NotLeader { .. } if Instant::now() < deadline => {
                 sleep(Duration::from_millis(50)).await;
             }

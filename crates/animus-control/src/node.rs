@@ -1170,7 +1170,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     // `cache` publish, which also only happens after the engine write.
     let mut ring_batch: Vec<(u64, Vec<KeyWrite>)> = Vec::new();
     let mut max_index = *watermark;
-    for (index, command) in effects {
+    for (index, _term, command) in effects {
         if index <= *watermark {
             continue;
         }

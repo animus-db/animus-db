@@ -154,7 +154,7 @@ fn engine_applied_index_confirms_a_specific_proposal() {
     let base = nodes[l].engine_applied_index();
 
     let index = match nodes[l].put(b"confirm".to_vec(), b"v1".to_vec()) {
-        animus_control::ProposeResult::Accepted { index } => index,
+        animus_control::ProposeResult::Accepted { index, .. } => index,
         other => panic!("put not accepted: {other:?} (seed={seed})"),
     };
     assert!(

@@ -187,7 +187,7 @@ fn confirm(sim: &mut Simulator, node: &KvNode, index: u64, seed: u64) {
 /// one choke point every write in this file goes through.
 fn propose_confirmed(sim: &mut Simulator, node: &KvNode, seed: u64, result: ProposeResult) -> u64 {
     match result {
-        ProposeResult::Accepted { index } => {
+        ProposeResult::Accepted { index, .. } => {
             confirm(sim, node, index, seed);
             index
         }

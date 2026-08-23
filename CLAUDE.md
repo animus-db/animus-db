@@ -360,7 +360,11 @@ most often, distilled:
 - **Durable-before-visible**: never expose state a crash could lose; an ack
   means fsynced. `ProposeResult::Accepted` means "appended locally", never
   "committed" — every proposer confirms, and retries must distinguish
-  never-accepted from accepted-unconfirmed.
+  never-accepted from accepted-unconfirmed. A confirm signal must identify
+  the proposer's **own** entry — by term or content, never index alone — since
+  an uncommitted entry's log index can be reoccupied by a different command
+  after a leadership change (`KindBatchOutcome`'s false-ack, closed by pairing
+  the outcome with the entry's own Raft term).
 - **When adding a variant to a replicated/forwarded command enum**, grep every
   gating match site (`is_relayable_command`, `cp_serve_forwarded`, admin
   filters) — a missed allowlist is a bimodal per-process flake the compiler

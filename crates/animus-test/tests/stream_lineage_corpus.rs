@@ -177,7 +177,7 @@ fn propose_write(group: &Group, leader: usize, item_key: &[u8], record: &[u8]) -
         vec![(item_key.to_vec(), record.to_vec())],
         Vec::new(),
     ) {
-        animus_control::ProposeResult::Accepted { index } => index,
+        animus_control::ProposeResult::Accepted { index, .. } => index,
         other => panic!("leader rejected a write: {other:?}"),
     }
 }

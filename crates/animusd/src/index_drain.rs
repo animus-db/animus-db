@@ -1633,7 +1633,7 @@ async fn advance_backfill_cursor(
         Vec::new(),
         Vec::new(),
     ) {
-        ProposeResult::Accepted { index } => index,
+        ProposeResult::Accepted { index, .. } => index,
         other => return Err(format!("backfill cursor advance not accepted: {other:?}")),
     };
     let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;
@@ -1676,7 +1676,7 @@ pub(crate) async fn clear_backfill_cursor(group: &CpGroup, index: &str) -> Resul
         Vec::new(),
         Vec::new(),
     ) {
-        ProposeResult::Accepted { index } => index,
+        ProposeResult::Accepted { index, .. } => index,
         other => return Err(format!("backfill cursor clear not accepted: {other:?}")),
     };
     let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;
@@ -1746,7 +1746,7 @@ async fn seed_change_log_record(
         vec![(change_log_prefix, record)],
         Vec::new(),
     ) {
-        ProposeResult::Accepted { index } => index,
+        ProposeResult::Accepted { index, .. } => index,
         other => return Err(format!("backfill seed not accepted: {other:?}")),
     };
     let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;

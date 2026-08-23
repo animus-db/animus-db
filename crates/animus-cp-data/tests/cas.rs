@@ -78,11 +78,11 @@ fn concurrent_cas_has_exactly_one_winner() {
     // ordered by Raft; the first to apply moves the committed value, so the
     // second's compare against the (now-changed) value fails.
     let a = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"A".to_vec()) {
-        ProposeResult::Accepted { index } => index,
+        ProposeResult::Accepted { index, .. } => index,
         other => panic!("CAS A rejected: {other:?} (seed={seed})"),
     };
     let b = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"B".to_vec()) {
-        ProposeResult::Accepted { index } => index,
+        ProposeResult::Accepted { index, .. } => index,
         other => panic!("CAS B rejected: {other:?} (seed={seed})"),
     };
     sim.run_for(Duration::from_secs(3)); // commit + apply both
@@ -191,7 +191,7 @@ fn cas_if_absent() {
 
     // Empty key: CAS-if-absent succeeds.
     let first = match nodes[l].cas(b"k".to_vec(), None, b"v1".to_vec()) {
-        ProposeResult::Accepted { index } => index,
+        ProposeResult::Accepted { index, .. } => index,
         other => panic!("CAS-if-absent rejected: {other:?} (seed={seed})"),
     };
     sim.run_for(Duration::from_secs(2));
@@ -204,7 +204,7 @@ fn cas_if_absent() {
 
     // Now a value exists: a second CAS-if-absent fails (no overwrite).
     let second = match nodes[l].cas(b"k".to_vec(), None, b"v2".to_vec()) {
-        ProposeResult::Accepted { index } => index,
+        ProposeResult::Accepted { index, .. } => index,
         other => panic!("CAS-if-absent rejected: {other:?} (seed={seed})"),
     };
     sim.run_for(Duration::from_secs(2));
@@ -245,7 +245,7 @@ fn successful_cas_survives_restart() {
 
     let l = leader(&nodes, &[0, 1, 2], seed);
     let idx = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"swapped".to_vec()) {
-        ProposeResult::Accepted { index } => index,
+        ProposeResult::Accepted { index, .. } => index,
         other => panic!("CAS rejected: {other:?} (seed={seed})"),
     };
     sim.run_for(Duration::from_secs(2));
@@ -293,11 +293,11 @@ fn cas_winner_consistent_across_seeds() {
 
         let l = leader(&nodes, &[0, 1, 2], seed);
         let a = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"A".to_vec()) {
-            ProposeResult::Accepted { index } => index,
+            ProposeResult::Accepted { index, .. } => index,
             other => panic!("CAS A rejected: {other:?} (seed={seed})"),
         };
         let b = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"B".to_vec()) {
-            ProposeResult::Accepted { index } => index,
+            ProposeResult::Accepted { index, .. } => index,
             other => panic!("CAS B rejected: {other:?} (seed={seed})"),
         };
         sim.run_for(Duration::from_secs(3));
