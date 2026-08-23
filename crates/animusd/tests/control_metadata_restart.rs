@@ -74,7 +74,10 @@ async fn await_leader_only(node: &Node) {
 /// Start a single-node **control-only** cluster at fixed `addrs` (so a later
 /// restart can rebind the exact same addresses).
 async fn start_control(addrs: animusd::RoleAddrs, dir: &std::path::Path) -> Node {
-    let config = animusd::ClusterConfig { nodes: vec![addrs] };
+    let config = animusd::ClusterConfig {
+        nodes: vec![addrs],
+        dynamo_auth: None,
+    };
     animusd::run_node_control(&config, 0, dir, StorageBackend::Memory)
         .await
         .expect("control-only node starts")

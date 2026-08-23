@@ -245,7 +245,10 @@ async fn bring_up_combined(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
                 console: addrs[6 * i + 5],
             })
             .collect();
-        let config = ClusterConfig { nodes: nodes_cfg };
+        let config = ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+        };
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..n {

@@ -102,11 +102,52 @@ impl NodeRole {
     }
 }
 
+/// The client DynamoDB port's SigV4 credential store (ADR 0057): a static
+/// `access_key_id → secret_access_key` map, loaded either from a
+/// [`ClusterConfig`]'s own `dynamo_auth` section or from the file named by a
+/// config-less startup mode's `--dynamo-auth PATH` flag (same JSON shape
+/// either way — `{"credentials": {"AKID": "secret", ...}}`). Deliberately
+/// minimal (ADR 0057's non-goals): no rotation, no dynamic credential API, no
+/// secret-at-rest protection — the secret sits in plaintext in a config file
+/// that is already trusted operator input.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DynamoAuthConfig {
+    /// `access_key_id → secret_access_key`. A `BTreeMap` (ADR 0003
+    /// determinism rules — no `HashMap` in logic, even config-shaped logic).
+    pub credentials: BTreeMap<String, String>,
+}
+
+impl DynamoAuthConfig {
+    /// A present `dynamo_auth` section with an empty credential map is a
+    /// misconfiguration (every request would be rejected as an unknown
+    /// access key, indistinguishable from auth simply being broken) — reject
+    /// it at load time rather than at the first client request.
+    ///
+    /// # Errors
+    /// Returns a message if `credentials` is empty.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.credentials.is_empty() {
+            return Err(
+                "dynamo_auth is present but its credentials map is empty — omit the section \
+                 entirely to disable auth, or list at least one access_key_id/secret_access_key \
+                 pair"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// A whole-cluster configuration shared (identically) by every node's process.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterConfig {
     /// Per-node listen addresses, indexed by node index.
     pub nodes: Vec<RoleAddrs>,
+    /// The client DynamoDB port's SigV4 credential store (ADR 0057) —
+    /// `None` (every existing config) disables auth entirely, byte-identical
+    /// to pre-ADR-0057 behavior. See [`DynamoAuthConfig`]'s own doc.
+    #[serde(default)]
+    pub dynamo_auth: Option<DynamoAuthConfig>,
 }
 
 impl ClusterConfig {
@@ -136,7 +177,10 @@ impl ClusterConfig {
                 }
             })
             .collect();
-        Self { nodes }
+        Self {
+            nodes,
+            dynamo_auth: None,
+        }
     }
 
     /// Generate a **split-deployment** config (ADR 0035 target topology):
@@ -167,7 +211,10 @@ impl ClusterConfig {
                 }
             })
             .collect();
-        Self { nodes }
+        Self {
+            nodes,
+            dynamo_auth: None,
+        }
     }
 
     /// Number of nodes.
@@ -256,10 +303,12 @@ impl ClusterConfig {
     /// Parse from JSON.
     ///
     /// # Errors
-    /// Returns a `serde_json` error if the text is not a valid config, or if
+    /// Returns a `serde_json` error if the text is not a valid config, if
     /// two entries claim the same [`RoleAddrs::id`] (ADR 0040 PR3: ids are
     /// now explicit and must be unique — a duplicate is a hard load-time
-    /// error, not a silently-shadowed entry).
+    /// error, not a silently-shadowed entry), or if a present `dynamo_auth`
+    /// section has an empty credentials map (ADR 0057 — see
+    /// [`DynamoAuthConfig::validate`]).
     pub fn from_json(text: &str) -> serde_json::Result<Self> {
         let cfg: Self = serde_json::from_str(text)?;
         let mut seen = std::collections::BTreeSet::new();
@@ -270,6 +319,9 @@ impl ClusterConfig {
                     n.id
                 )));
             }
+        }
+        if let Some(auth) = &cfg.dynamo_auth {
+            auth.validate().map_err(serde_json::Error::custom)?;
         }
         Ok(cfg)
     }
@@ -401,5 +453,45 @@ mod tests {
         let err = ClusterConfig::from_json(&cfg.to_json())
             .expect_err("a config with two entries claiming the same id must be rejected");
         assert!(err.to_string().contains("duplicate node id"));
+    }
+
+    #[test]
+    fn dynamo_auth_defaults_to_none_and_round_trips_absent() {
+        // ADR 0057: a generated config carries no `dynamo_auth` section, and
+        // it survives a JSON round trip as `None` — byte-identical to
+        // pre-ADR-0057 behavior.
+        let cfg = ClusterConfig::generate(2, "127.0.0.1".parse().unwrap(), 7000);
+        assert!(cfg.dynamo_auth.is_none());
+        let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
+        assert!(parsed.dynamo_auth.is_none());
+
+        // An old-shaped config JSON with no `dynamo_auth` key at all must
+        // still parse (the field is additive via `#[serde(default)]`, never
+        // a breaking requirement on an existing config file).
+        let bare = serde_json::json!({ "nodes": cfg.nodes }).to_string();
+        let parsed = ClusterConfig::from_json(&bare).unwrap();
+        assert!(parsed.dynamo_auth.is_none());
+    }
+
+    #[test]
+    fn dynamo_auth_with_credentials_round_trips() {
+        let mut cfg = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        let mut credentials = BTreeMap::new();
+        credentials.insert("AKIDEXAMPLE".to_string(), "secret".to_string());
+        cfg.dynamo_auth = Some(DynamoAuthConfig { credentials });
+        let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
+        let auth = parsed.dynamo_auth.expect("dynamo_auth survives round trip");
+        assert_eq!(auth.credentials.get("AKIDEXAMPLE").unwrap(), "secret");
+    }
+
+    #[test]
+    fn empty_dynamo_auth_credentials_rejected_at_load() {
+        let mut cfg = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        cfg.dynamo_auth = Some(DynamoAuthConfig {
+            credentials: BTreeMap::new(),
+        });
+        let err = ClusterConfig::from_json(&cfg.to_json())
+            .expect_err("an empty dynamo_auth credentials map must be rejected at load");
+        assert!(err.to_string().contains("credentials map is empty"));
     }
 }

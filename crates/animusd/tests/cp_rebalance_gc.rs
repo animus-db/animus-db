@@ -79,6 +79,7 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig, Vec<PathBu
                     console: a[6 * i + 5],
                 })
                 .collect(),
+            dynamo_auth: None,
         };
         let dirs: Vec<PathBuf> = (0..n)
             .map(|i| dir.join(format!("node-{attempt}-{i}")))

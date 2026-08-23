@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod config;
 mod index_drain;
 pub mod otel;
-pub use config::ClusterConfig;
+pub use config::{ClusterConfig, DynamoAuthConfig};
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
 // cluster metadata — membership status and the tablet map — without depending on
 // `animus-control` directly.
@@ -3558,6 +3558,7 @@ fn spawn_common_tail(
     console_listener: Option<TcpListener>,
     control_storage: Option<SharedEngine>,
     env: ProdEnv,
+    dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -3578,6 +3579,7 @@ fn spawn_common_tail(
         metrics_history: Arc::new(Mutex::new(VecDeque::with_capacity(METRICS_HISTORY_CAP))),
         remote_metadata: Arc::new(Mutex::new(None)),
         control_storage,
+        dynamo_auth,
     };
 
     let mut tasks = Vec::with_capacity(5);
@@ -3842,6 +3844,7 @@ impl BoundNode {
             None,
             Duration::ZERO,
             ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+            None,
         )
         .await
     }
@@ -3865,6 +3868,14 @@ impl BoundNode {
     /// calls this method (or `run_node_with_ttl_sweep_interval`) directly,
     /// the same "widen the innermost layer, mint a thin test-facing
     /// wrapper" convention `quiesce_after` established.
+    ///
+    /// `dynamo_auth` (ADR 0057) is the client DynamoDB port's SigV4
+    /// credential store — `None` (every caller above this layer) disables
+    /// auth entirely, byte-identical to pre-ADR-0057 behavior. A caller that
+    /// wants it set (`run_node_with_streams_quiesce_and_ttl_sweep_interval`,
+    /// reading `ClusterConfig::dynamo_auth`, or `start_cluster_inner` for
+    /// `--cluster N`) calls this method directly, the same layered-wrapper
+    /// convention as every other knob here.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_growth(
         self,
@@ -3885,6 +3896,7 @@ impl BoundNode {
         auto_split_change_rate: Option<u64>,
         quiesce_after: Duration,
         ttl_sweep_interval: Duration,
+        dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         // The initial (static) peer book + an env clone, kept for the
@@ -4095,6 +4107,7 @@ impl BoundNode {
             Some(self.console_listener),
             Some(storage.clone()),
             self.env.clone(),
+            dynamo_auth,
         );
 
         // The per-node **tablet-host reconciler** (ADR 0031 PR4): the single
@@ -5001,6 +5014,9 @@ impl BoundControlNode {
             None, // ADR 0052: a control-only node hosts no CP-data tablet, so it binds no console listener.
             Some(control_storage),
             sync_env.clone(),
+            // A control-only node never binds the dynamo listener (ADR
+            // 0057) — nothing here would ever read `ClientCtx::dynamo_auth`.
+            None,
         );
 
         // Peer-sync loop (ADR 0040 PR1) — a control-only node needs it
@@ -5213,6 +5229,7 @@ impl BoundDataNode {
             stream_seal_knobs,
             segment_store_config,
             None,
+            None,
         )
         .await
     }
@@ -5221,6 +5238,11 @@ impl BoundDataNode {
     /// the opt-in **change-rate** auto-split trigger — see
     /// [`BoundNode::start_with_growth`]'s doc for the full design (identical
     /// here; a data-only node runs the same `auto_split_loop`).
+    ///
+    /// `dynamo_auth` (ADR 0057) — see [`BoundNode::start_with_growth`]'s doc:
+    /// same knob, same default-`None`-disables contract. A data-only node
+    /// binds the dynamo listener (ADR 0035 PR4) just like a combined node,
+    /// so this is threaded here too, not skipped.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_growth(
         self,
@@ -5237,6 +5259,7 @@ impl BoundDataNode {
         stream_seal_knobs: StreamSealKnobs,
         segment_store_config: SegmentStoreConfig,
         auto_split_change_rate: Option<u64>,
+        dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         let static_peers = peers;
@@ -5332,6 +5355,7 @@ impl BoundDataNode {
             // no system-keyspace engine to surface (ADR 0038 PR4).
             None,
             self.env.clone(),
+            dynamo_auth,
         );
 
         // The per-node tablet-host reconciler (ADR 0031 PR4) — identical
@@ -6231,6 +6255,17 @@ pub(crate) struct ClientCtx {
     /// handle (moved into `RaftNode::start_with_metrics`) remains the sole
     /// writer.
     pub(crate) control_storage: Option<SharedEngine>,
+    /// The client DynamoDB port's SigV4 credential store (ADR 0057):
+    /// `access_key_id → secret_access_key`, from the cluster config's
+    /// `dynamo_auth` section (or `--dynamo-auth PATH` on a config-less
+    /// startup mode). `None` — every existing config/test/deployment —
+    /// means auth is **disabled**: `dynamo::handle_conn` skips verification
+    /// entirely, zero-cost and behavior-identical to before this ADR.
+    /// `Arc`-wrapped (not `Arc<Mutex<_>>`) because this is a **static**
+    /// load-time credential set with no runtime mutation path (ADR 0057's
+    /// "explicitly out of scope: rotation, dynamic credential API") — cheap
+    /// to clone onto each connection's `ClientCtx`, never locked.
+    pub(crate) dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
 }
 
 impl ClientCtx {
@@ -13889,6 +13924,7 @@ pub async fn start_cluster_with(
         DEFAULT_STREAM_RETENTION,
         None,
         Duration::ZERO,
+        None,
     )
     .await
 }
@@ -13915,6 +13951,7 @@ pub async fn start_cluster_auto_split(
         DEFAULT_STREAM_RETENTION,
         None,
         Duration::ZERO,
+        None,
     )
     .await
 }
@@ -13941,6 +13978,7 @@ pub async fn start_cluster_with_auto_split(
         DEFAULT_STREAM_RETENTION,
         None,
         Duration::ZERO,
+        None,
     )
     .await
 }
@@ -13970,6 +14008,7 @@ pub async fn start_cluster_with_auto_split_bytes(
         DEFAULT_STREAM_RETENTION,
         None,
         Duration::ZERO,
+        None,
     )
     .await
 }
@@ -14000,6 +14039,7 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         DEFAULT_STREAM_RETENTION,
         None,
         Duration::ZERO,
+        None,
     )
     .await
 }
@@ -14037,6 +14077,7 @@ pub async fn start_cluster_with_streams(
         stream_retention,
         None,
         Duration::ZERO,
+        None,
     )
     .await
 }
@@ -14071,6 +14112,7 @@ pub async fn start_cluster_with_growth(
         stream_retention,
         auto_split_change_rate,
         Duration::ZERO,
+        None,
     )
     .await
 }
@@ -14105,6 +14147,7 @@ pub async fn start_cluster_with_quiesce_after(
         DEFAULT_STREAM_RETENTION,
         None,
         quiesce_after,
+        None,
     )
     .await
 }
@@ -14116,6 +14159,13 @@ pub async fn start_cluster_with_quiesce_after(
 /// (the full-combination sibling of [`start_cluster_with_quiesce_after`],
 /// which predates the streams/change-rate knobs being combinable with
 /// quiescence).
+///
+/// `dynamo_auth` (ADR 0057) is the client DynamoDB port's SigV4 credential
+/// store for the whole in-process cluster — `--cluster N`'s `--dynamo-auth
+/// PATH` CLI flag threads through here (a config-less dev shape, so there is
+/// no `ClusterConfig::dynamo_auth` section to read instead). `None` (every
+/// other wrapper above) disables auth entirely, byte-identical to
+/// pre-ADR-0057 behavior.
 ///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
@@ -14131,6 +14181,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     stream_retention: Duration,
     auto_split_change_rate: Option<u64>,
     quiesce_after: Duration,
+    dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
@@ -14143,6 +14194,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
         stream_retention,
         auto_split_change_rate,
         quiesce_after,
+        dynamo_auth,
     )
     .await
 }
@@ -14159,6 +14211,7 @@ async fn start_cluster_inner(
     stream_retention: Duration,
     auto_split_change_rate: Option<u64>,
     quiesce_after: Duration,
+    dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -14227,6 +14280,7 @@ async fn start_cluster_inner(
                 // default; a test that needs a fast sweep uses the
                 // per-process `run_node_with_ttl_sweep_interval` instead.
                 ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+                dynamo_auth.clone(),
             )
             .await?;
         nodes.push(node);
@@ -14313,6 +14367,7 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
         auto_split_bytes_threshold,
         orphan_sweep_after,
         None,
+        None,
     )
     .await
 }
@@ -14336,6 +14391,7 @@ pub async fn start_split_cluster_with_growth(
     auto_split_bytes_threshold: Option<u64>,
     orphan_sweep_after: Duration,
     auto_split_change_rate: Option<u64>,
+    dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
 ) -> std::io::Result<Vec<Node>> {
     let dir = dir.into();
     let total = control_n + data_n;
@@ -14457,6 +14513,7 @@ pub async fn start_split_cluster_with_growth(
                 StreamSealKnobs::default(),
                 SegmentStoreConfig::default(),
                 auto_split_change_rate,
+                dynamo_auth.clone(),
             )
             .await?,
         );
@@ -14640,6 +14697,13 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     // Every node's admin address from the shared config, so this node's dashboard
     // (ADR 0021) can fan out to the whole cluster.
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
+    // ADR 0057: the cluster config's `dynamo_auth` section (already validated
+    // non-empty at `ClusterConfig::from_json` load time), or `None` — disables
+    // auth entirely, byte-identical to pre-ADR-0057 behavior.
+    let dynamo_auth = config
+        .dynamo_auth
+        .as_ref()
+        .map(|cfg| Arc::new(cfg.credentials.clone()));
     bound
         .start_with_growth(
             config.peer_book(),
@@ -14659,6 +14723,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             None,
             quiesce_after,
             ttl_sweep_interval,
+            dynamo_auth,
         )
         .await
 }
@@ -14866,9 +14931,22 @@ pub async fn run_node_data(
     // Every node's admin address from the shared config, so this node's
     // dashboard fan-out (ADR 0021) covers the whole split deployment.
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
+    // ADR 0057: same `dynamo_auth` section, same non-empty validation, as
+    // the combined-mode path above (`run_node_with_streams_quiesce_and_ttl_
+    // sweep_interval`) — a data-only node binds the dynamo listener too
+    // (ADR 0035 PR4), so it needs the credential store just the same.
+    let dynamo_auth = config
+        .dynamo_auth
+        .as_ref()
+        .map(|cfg| Arc::new(cfg.credentials.clone()));
 
+    // Calls `start_data_with_growth` directly (skipping the `start_data_with`/
+    // `start_data_with_streams` wrapper layers) so `dynamo_auth` can be
+    // threaded in — the same "call the innermost layer directly for a
+    // knob its wrappers don't expose" convention the combined-mode path
+    // above uses.
     bound
-        .start_data_with(
+        .start_data_with_growth(
             // This node's internal env peer book: every node in the
             // deployment (`ClusterConfig::peer_book`) — `heartbeat_loop`
             // below sends to `control_ids` over this very env.
@@ -14882,6 +14960,10 @@ pub async fn run_node_data(
             None,
             None,
             admin_addrs,
+            StreamSealKnobs::default(),
+            SegmentStoreConfig::default(),
+            None,
+            dynamo_auth,
         )
         .await
 }
@@ -15332,6 +15414,7 @@ pub async fn run_node_data_join(
     dir: &Path,
     backend: StorageBackend,
     labels: BTreeMap<String, String>,
+    dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
 ) -> std::io::Result<Node> {
     if seeds.is_empty() {
         return Err(std::io::Error::new(
@@ -15368,6 +15451,7 @@ pub async fn run_node_data_join(
         intra_route,
         admin_addrs,
         backend,
+        dynamo_auth,
     )
     .await
 }
@@ -15388,6 +15472,7 @@ async fn finish_data_join(
     mut intra_route: BTreeMap<NodeId, SocketAddr>,
     mut admin_addrs: Vec<SocketAddr>,
     backend: StorageBackend,
+    dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
 ) -> std::io::Result<Node> {
     // The data-only dual of `finish_combined_join`'s merge (a single raftkv
     // peer entry, no control id of its own to add).
@@ -15410,8 +15495,10 @@ async fn finish_data_join(
         .filter_map(|id| intra_route.get(id).copied())
         .collect();
 
+    // Calls `start_data_with_growth` directly (skipping the layered wrapper
+    // shape) — see `run_node_data`'s identical note.
     bound
-        .start_data_with(
+        .start_data_with_growth(
             peers,
             original_control_ids,
             control_seeds,
@@ -15422,6 +15509,10 @@ async fn finish_data_join(
             None,
             None,
             admin_addrs,
+            StreamSealKnobs::default(),
+            SegmentStoreConfig::default(),
+            None,
+            dynamo_auth,
         )
         .await
 }
@@ -15658,6 +15749,7 @@ mod confirm_futility_tests {
                 intra: addrs[4],
                 console: addrs[5],
             }],
+            dynamo_auth: None,
         }
     }
 
@@ -16041,6 +16133,7 @@ mod halted_shutdown_tests {
                 intra: addrs[4],
                 console: addrs[5],
             }],
+            dynamo_auth: None,
         }
     }
 

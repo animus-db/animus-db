@@ -4,8 +4,15 @@
 //! `SimEnv`, so it does its own I/O directly rather than through the `Env` seam.
 //!
 //! The parser handles the small slice of HTTP/1.1 these edges need: a request
-//! line, `Content-Length`/`Connection`/`X-Amz-Target` headers, keep-alive, and
-//! pipelined requests. Responses are a single content-type-tagged body.
+//! line, keep-alive, and pipelined requests. `Content-Length`/`Connection`/
+//! `X-Amz-Target` get their own derived fields as before; since ADR 0057
+//! every header is **also** retained (lowercased name → value, repeats
+//! comma-joined) in [`HttpRequest::headers`] — needed because a SigV4
+//! `SignedHeaders` list can name any header, and verification must
+//! reconstruct each one's canonical form. Responses are a single
+//! content-type-tagged body.
+
+use std::collections::BTreeMap;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -23,8 +30,19 @@ pub(crate) struct HttpRequest {
     /// [`query_param`].
     pub(crate) query: String,
     /// The `X-Amz-Target` header value (used only by the DynamoDB edge; empty
-    /// otherwise).
+    /// otherwise). A derived convenience over [`Self::headers`] — kept as its
+    /// own field since every caller reads it, unlike an arbitrary
+    /// `SignedHeaders` member.
     pub(crate) target: String,
+    /// Every header on the request (ADR 0057): **lowercased** names →
+    /// values, trimmed the same way [`Self::target`]/[`Self::keep_alive`]
+    /// already were. A repeated header's values are comma-joined in the
+    /// order received — the SigV4 canonical-header form
+    /// (`animus_dynamo::sigv4::SigV4Request::headers`'s own contract) — so
+    /// this map can be handed straight to `sigv4::verify` with no further
+    /// massaging. `BTreeMap`, never `HashMap` (ADR 0003 determinism rule,
+    /// lint-enforced).
+    pub(crate) headers: BTreeMap<String, String>,
     /// The request body bytes.
     pub(crate) body: Vec<u8>,
     /// Whether the client wants the connection kept alive.
@@ -113,6 +131,7 @@ pub(crate) async fn read_http_request(
     let mut keep_alive = request_line.contains("HTTP/1.1");
     let mut target = String::new();
     let mut content_length = 0usize;
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
@@ -132,6 +151,16 @@ pub(crate) async fn read_http_request(
                 }
                 _ => {}
             }
+            // Every header, not just the three special-cased above (ADR
+            // 0057) — a repeated header's values comma-join in the order
+            // received, the SigV4 canonical form.
+            headers
+                .entry(name)
+                .and_modify(|existing| {
+                    existing.push_str(", ");
+                    existing.push_str(value);
+                })
+                .or_insert_with(|| value.to_owned());
         }
     }
     if content_length > MAX_BODY {
@@ -157,6 +186,7 @@ pub(crate) async fn read_http_request(
         path,
         query,
         target,
+        headers,
         body: body_buf,
         keep_alive,
     }))
