@@ -398,8 +398,10 @@ pub struct BatchGet {
     pub keys: Vec<Item>,
     /// Optional projection applied to every item from this table.
     pub projection: Option<Projection>,
-    /// `ConsistentRead` for this table's reads. Accept-and-ignore for the
-    /// base table, which is linearizable here already (ADR 0041 §5).
+    /// `ConsistentRead` for this table's reads (per table request, not per
+    /// batch — DynamoDB's own shape). Since ADR 0055 the `animusd` edge
+    /// serves `false` from any replica's applied state rather than the
+    /// linearizable path, so this genuinely selects a read.
     pub consistent_read: bool,
 }
 
@@ -508,12 +510,16 @@ pub enum Operation {
         key: Item,
         /// Optional projection (the attributes to return; `None` = all).
         projection: Option<Projection>,
-        /// Decoded but **accept-and-ignore** (ADR 0041 §5): a base-table read
-        /// is always linearizable here, so `ConsistentRead: true` is already
-        /// true and needs no enforcement. Only a GSI `Query` ever rejects it.
+        /// `ConsistentRead` (default `false`). **Since ADR 0055 this selects
+        /// a real read path** at the `animusd` edge — `true` is the
+        /// linearizable ReadIndex read, `false` is served from any replica's
+        /// own applied state — where it used to be accept-and-ignore for
+        /// correctness (ADR 0041 §5, when every read was linearizable
+        /// regardless). This crate still only decodes it; the edge enforces
+        /// it, and is also the one place that *rejects* it against a GSI.
         ///
-        /// It is *not* ignored for capacity: an eventually-consistent read is
-        /// billed at half price, so this still decides the number reported.
+        /// It has always decided capacity too: an eventually-consistent read
+        /// is billed at half price.
         consistent_read: bool,
         /// How much of the [`ConsumedCapacity`](crate::capacity::ConsumedCapacity)
         /// report the caller wants back (`NONE`/`TOTAL`/`INDEXES`).
@@ -590,10 +596,12 @@ pub enum Operation {
         /// response shape (no `Items`); the rest validate the request.
         select: Select,
         /// `ConsistentRead` (default `false`). DynamoDB's own contract (ADR
-        /// 0041 §5): legal and already-true against the base table or an LSI
-        /// (both linearizable here); an error against a **GSI** (eventually
-        /// consistent by construction) — the `animusd` edge is the one place
-        /// that rejects it, once `index` names a global index.
+        /// 0041 §5): legal against the base table or an LSI, an error against
+        /// a **GSI** (eventually consistent by construction) — the `animusd`
+        /// edge is the one place that rejects it, once `index` names a global
+        /// index. **Since ADR 0055 it also selects the read path** on the
+        /// non-GSI cases, rather than describing one that was linearizable
+        /// either way.
         consistent_read: bool,
     },
     /// `Scan`: a full-table read with pagination and an optional filter — or,
@@ -622,11 +630,11 @@ pub enum Operation {
         select: Select,
         /// The parallel-scan slice, when `Segment`/`TotalSegments` are given.
         segment: Option<ScanSegment>,
-        /// `ConsistentRead` (default `false`). Decoded but **accept-and-
-        /// ignore** for the base table or an LSI (both linearizable here
-        /// already); an error against a **GSI** — the `animusd` edge is the
-        /// one place that rejects it, mirroring `Query`'s identical
-        /// enforcement point (ADR 0041 §5).
+        /// `ConsistentRead` (default `false`), exactly as [`Query`](Self::Query)
+        /// defines it: legal against the base table or an LSI and selecting
+        /// the read path there since ADR 0055, an error against a **GSI** —
+        /// the `animusd` edge is the one place that rejects it, mirroring
+        /// `Query`'s identical enforcement point (ADR 0041 §5).
         consistent_read: bool,
     },
     /// `UpdateItem`: read-modify-write the item at `key`, applying `actions`
@@ -2309,10 +2317,10 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
 }
 
 /// Decode the optional `ConsistentRead` boolean (default `false`, matching
-/// DynamoDB). Shared by `GetItem`/`Query`/`Scan` — see [`Operation::Query`]'s
-/// doc for the one place this is ever enforced (a GSI `Query`, at the
-/// `animusd` edge); everywhere else it is accept-and-ignore, since a base or
-/// LSI read is already linearizable regardless of what the client asked for.
+/// DynamoDB). Shared by `GetItem`/`Query`/`Scan`. This crate only decodes it:
+/// the `animusd` edge both *rejects* it (a GSI `Query`/`Scan`, ADR 0041 §5 —
+/// the only rejection) and, since ADR 0055, *acts* on it everywhere else,
+/// choosing between the linearizable ReadIndex read and a replica-local one.
 fn decode_consistent_read(obj: &Map<String, Value>) -> bool {
     obj.get("ConsistentRead")
         .and_then(Value::as_bool)
@@ -4121,10 +4129,10 @@ mod tests {
     }
 
     /// `ConsistentRead` decodes on `GetItem`/`Query`/`Scan` alike (ADR 0041
-    /// §5) — accept-and-ignore everywhere except a GSI `Query`, whose
-    /// rejection is enforced at the `animusd` edge (e2e-tested there, since
-    /// this crate never sees the replicated catalog needed to know an
-    /// index's kind).
+    /// §5). What the flag then *means* is entirely the `animusd` edge's
+    /// business — the GSI rejection, and since ADR 0055 the read-path choice
+    /// — and is e2e-tested there, since this crate never sees the replicated
+    /// catalog needed to know an index's kind.
     #[test]
     fn decodes_consistent_read_true_on_get_item_query_and_scan() {
         let get = br#"{"TableName":"t","Key":{"pk":{"S":"a"}},"ConsistentRead":true}"#;

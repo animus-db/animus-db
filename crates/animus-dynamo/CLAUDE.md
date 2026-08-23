@@ -58,6 +58,11 @@ comment for its full type/method inventory.
   whether `true` is legal depends on an index's replicated *kind* (GSI vs
   LSI), which lives in the control-plane catalog this crate never sees, so
   the field rides through to `animusd::dynamo::run_index_query` to reject.
+  The same field also **selects a read path** at that edge since ADR 0055
+  (`true` = the linearizable ReadIndex read, `false` = served from any
+  replica's applied state) — likewise not this crate's business, but worth
+  knowing before describing the flag as decorative anywhere: it stopped
+  being accept-and-ignore.
   `DeleteTable`/`ListTables` are read-only-here operations too: `DeleteTable`
   decodes to a bare table name (the existence check, the actual drop via
   `ClientCtx::drop_table`, and the `ResourceNotFoundException` are all

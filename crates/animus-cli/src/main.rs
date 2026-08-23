@@ -4,7 +4,13 @@
 //!   animus status <node-addr>
 //!   animus put    <node-addr> <table> <key> <value>
 //!   animus get    <node-addr> <table> <key>
+//!   animus get-eventual <node-addr> <table> <key>
 //!   animus admin  <subcommand> <admin-addr> [args...]
+//!
+//! `get` is linearizable (ReadIndex on the tablet's leader); `get-eventual` is
+//! the ADR 0055 eventually-consistent read — DynamoDB's `ConsistentRead:
+//! false` — served from any replica's applied state, which is what makes it
+//! the hand-driven way to observe replica lag on a live cluster.
 //!
 //! `status`/`put`/`get` are a thin plain-TCP client over a node's request/reply
 //! API. `admin` talks the HTTP/JSON admin interface (ADR 0020) on a node's
@@ -27,7 +33,7 @@ async fn main() -> ExitCode {
         Err(msg) => {
             eprintln!("animus: {msg}");
             eprintln!(
-                "\nusage:\n  animus status <node-addr>\n  animus put <node-addr> <table> <key> <value>\n  animus get <node-addr> <table> <key>\n{ADMIN_USAGE}"
+                "\nusage:\n  animus status <node-addr>\n  animus put <node-addr> <table> <key> <value>\n  animus get <node-addr> <table> <key>\n  animus get-eventual <node-addr> <table> <key>\n{ADMIN_USAGE}"
             );
             ExitCode::FAILURE
         }
@@ -72,13 +78,17 @@ async fn run(args: &[String]) -> Result<(), String> {
                 table: table.clone(),
             }
         }
-        "get" => {
-            // `get <addr> <table> <key>`.
+        // `get <addr> <table> <key>` is linearizable; `get-eventual` is the
+        // ADR 0055 cheap read (`ConsistentRead: false`) — any replica's own
+        // applied state, no ReadIndex barrier, no leader hop. Same shape
+        // otherwise, so they share one arm.
+        cmd @ ("get" | "get-eventual") => {
             let table = args.get(2).ok_or("get needs <table>")?;
             let key = args.get(3).ok_or("get needs <key>")?;
             ClientRequest::Get {
                 key: key.clone().into_bytes(),
                 table: table.clone(),
+                stale: cmd == "get-eventual",
             }
         }
         other => return Err(format!("unknown command `{other}`")),

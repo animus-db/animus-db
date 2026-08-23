@@ -363,7 +363,9 @@ async fn transact_write_items_commits_atomically_across_a_split_table() {
         let (status, body) = dynamo(
             reader,
             "DynamoDB_20120810.GetItem",
-            &format!(r#"{{"TableName":"txitems_a","Key":{{"id":{{"S":"{id}"}}}}}}"#),
+            &format!(
+                r#"{{"ConsistentRead":true,"TableName":"txitems_a","Key":{{"id":{{"S":"{id}"}}}}}}"#
+            ),
         )
         .await;
         assert_eq!(status, 200, "GetItem({id}) failed: {body}");
@@ -426,7 +428,9 @@ async fn failing_condition_check_cancels_the_whole_transaction() {
         let (status, body) = dynamo(
             addr0,
             "DynamoDB_20120810.GetItem",
-            &format!(r#"{{"TableName":"txitems_b","Key":{{"id":{{"S":"{id}"}}}}}}"#),
+            &format!(
+                r#"{{"ConsistentRead":true,"TableName":"txitems_b","Key":{{"id":{{"S":"{id}"}}}}}}"#
+            ),
         )
         .await;
         assert_eq!(status, 200);
@@ -640,7 +644,7 @@ async fn concurrent_transact_write_items_on_a_shared_key_resolve_one_winner() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.GetItem",
-        &format!(r#"{{"TableName":"txitems_d","Key":{{"id":{{"S":"{winner_own}"}}}}}}"#),
+        &format!(r#"{{"ConsistentRead":true,"TableName":"txitems_d","Key":{{"id":{{"S":"{winner_own}"}}}}}}"#),
     )
     .await;
     assert_eq!(status, 200);
@@ -651,7 +655,7 @@ async fn concurrent_transact_write_items_on_a_shared_key_resolve_one_winner() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.GetItem",
-        &format!(r#"{{"TableName":"txitems_d","Key":{{"id":{{"S":"{loser_own}"}}}}}}"#),
+        &format!(r#"{{"ConsistentRead":true,"TableName":"txitems_d","Key":{{"id":{{"S":"{loser_own}"}}}}}}"#),
     )
     .await;
     assert_eq!(status, 200);
@@ -786,6 +790,7 @@ async fn admin_txns_shows_a_pending_record_then_clears_after_recovery() {
                 ClientRequest::Get {
                     key: b"admin-txn-key".to_vec(),
                     table: "admintxn".to_string(),
+                    stale: false,
                 },
             )
             .await
@@ -880,7 +885,9 @@ async fn cross_node_racing_own_key_conditional_writes_resolve_exactly_one_winner
     let (status, body) = dynamo(
         config.nodes[2 % n].dynamo,
         "DynamoDB_20120810.GetItem",
-        &format!(r#"{{"TableName":"{table}","Key":{{"id":{{"S":"{shared}"}}}}}}"#),
+        &format!(
+            r#"{{"ConsistentRead":true,"TableName":"{table}","Key":{{"id":{{"S":"{shared}"}}}}}}"#
+        ),
     )
     .await;
     assert_eq!(status, 200);
@@ -948,7 +955,7 @@ async fn own_key_condition_failure_cancels_a_multi_tablet_transaction_wholly() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.GetItem",
-        &format!(r#"{{"TableName":"txitems_e","Key":{{"id":{{"S":"{lower_id}"}}}}}}"#),
+        &format!(r#"{{"ConsistentRead":true,"TableName":"txitems_e","Key":{{"id":{{"S":"{lower_id}"}}}}}}"#),
     )
     .await;
     assert_eq!(status, 200);
@@ -962,7 +969,7 @@ async fn own_key_condition_failure_cancels_a_multi_tablet_transaction_wholly() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.GetItem",
-        &format!(r#"{{"TableName":"txitems_e","Key":{{"id":{{"S":"{upper_id}"}}}}}}"#),
+        &format!(r#"{{"ConsistentRead":true,"TableName":"txitems_e","Key":{{"id":{{"S":"{upper_id}"}}}}}}"#),
     )
     .await;
     assert_eq!(status, 200);

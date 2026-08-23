@@ -3064,6 +3064,35 @@ debugging anything that feels like it might have happened before.
   convergence, not the transact retry budget) and was never reported
   against — diagnosing and fixing it belongs in its own change with its
   own investigation, not folded into this one.
+- **Weakening a default is a test-suite-wide event, and the compiler cannot
+  see any of it (2026-08-23, ADR 0055).** Making `ConsistentRead: false` —
+  DynamoDB's *default* — a genuinely eventually-consistent read broke a
+  scatter of tests across unrelated files, all with the same shape: write
+  something, then immediately read it back to check the write landed. Every
+  one of them had been silently relying on the read path being *stronger than
+  the API promised*. Two things worth carrying forward. **First, the failures
+  are non-deterministic by construction** — a follower that happens to have
+  applied in time passes — so "the suite went green once" proves nothing
+  here; the real signal is auditing which reads exist to verify a write, not
+  re-running until it passes. **Second, the fix is never to re-strengthen the
+  default**: each such test asks for `ConsistentRead: true`, which is exactly
+  what a real DynamoDB client must do, and the resulting test says out loud
+  which consistency it depends on instead of inheriting one by accident.
+  Generalized: when a change makes a default *weaker* (a read, a lock, a
+  timeout, a durability level), expect the breakage to land in tests that
+  never mention the thing you changed, expect it to be flaky rather than
+  deterministic, and treat each break as a test that was under-specified
+  rather than as evidence against the change.
+- **A test can prove "this path never blocks" by how it drives the path.**
+  `animus-cp-data`'s `tests/stale_read.rs` deliberately drives the ADR 0055
+  eventual reads with `block_on` instead of this crate's usual spawn-and-
+  `run_for` `drive` helper. Under `SimEnv` nothing advances the clock unless
+  the simulator is driven, so a read that ever grew an internal `env.sleep`
+  — a barrier, a ceiling wait, an intent chase — **hangs that test** instead
+  of quietly costing what the expensive path costs. The cheap path's defining
+  property is a budget, and a budget that nothing enforces is a comment; this
+  turns it into a test failure. Applicable anywhere a "must not block / must
+  not round-trip" invariant matters and would otherwise only be documented.
 
 ### Code patterns
 - **Deleting a seam: grep the *verb* as well as the *noun*, then grep the
@@ -7522,6 +7551,37 @@ debugging anything that feels like it might have happened before.
   touch) immediately after any regex-driven multi-file edit, since the
   script's blast radius is whatever text matches its pattern, not whatever
   you intended it to match.**
+- **Adding a field beats adding a variant when a codebase gates on variants
+  (2026-08-23, ADR 0055).** Threading "is this read allowed to be stale"
+  through `ClientRequest` could have been three new variants
+  (`GetStale`/`ScanStale`/`KindScanStale`) or one `#[serde(default)] stale:
+  bool` on the three existing ones. The field won for a reason specific to
+  this repo: a new `ClientRequest` variant must be classified in ADR 0047's
+  exhaustive `surface_of` table and checked against every gating match site
+  (`is_relayable_command`, `cp_serve_forwarded`, admin filters) — and the
+  standing lesson about those is that a *missed* allowlist is a bimodal
+  per-process flake the compiler can't catch. A new **field**, by contrast,
+  makes `error[E0063]: missing field` enumerate every construction site for
+  you, and a `#[serde(default)]` keeps old peers decoding. General rule: when
+  the alternative is "the compiler finds every site" vs. "I grep for every
+  gate," take the compiler — and note that this is the same instinct behind
+  the `RoleAddrs` port-addition advice above, applied to an enum instead of a
+  struct.
+- **A regex mass-edit over Rust must be brace-balanced, not
+  next-delimiter-based (2026-08-23).** Adding `stale: false,` to every
+  `ClientRequest::Get { … }` literal across the test tree with
+  `re.sub(r"ClientRequest::Get \{\n(?:.*\n)*?( *)\},", …)` silently
+  corrupted two distinct shapes: a struct literal that ends in `};` (a `let`
+  binding) let the match run past it into an *unrelated* later literal —
+  `SplitTablet` acquired a `stale` field it has no business having — and a
+  literal whose last field had no trailing comma produced
+  `table: "kv".to_string()\n    stale: false,`. Both were caught only by the
+  build. The reliable shape is to find the opening `{` and walk forward
+  counting braces to its real partner, then insert relative to *that*; and to
+  check the preceding token for a comma before appending a field. This is the
+  same family as the 2026-08-22 `NAME:` vs `NAME::` entry below/above — a
+  scripted edit's blast radius is whatever its pattern matches, so prefer
+  patterns that can't run past the construct they name.
 
 ### Parallel-agent orchestration
 - **A single long-lived session can exhaust the disk on `target/` alone, with

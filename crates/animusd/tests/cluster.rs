@@ -117,6 +117,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         ClientRequest::Get {
             key: b"hello".to_vec(),
             table: "kv".to_string(),
+            stale: false,
         },
     )
     .await;
@@ -128,6 +129,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         ClientRequest::Get {
             key: b"nope".to_vec(),
             table: "kv".to_string(),
+            stale: false,
         },
     )
     .await;
@@ -147,6 +149,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         ClientRequest::Get {
             key: b"hello".to_vec(),
             table: "kv".to_string(),
+            stale: false,
         },
     )
     .await;

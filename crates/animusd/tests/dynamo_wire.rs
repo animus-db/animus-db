@@ -90,11 +90,13 @@ async fn dynamo_wire_put_get_delete_round_trip() {
     assert_eq!(status, 200, "PutItem failed: {body}");
     assert_eq!(body, "{}");
 
-    // GetItem on node 1 (quorum read across the cluster).
+    // GetItem on node 1, `ConsistentRead: true` (ADR 0055): this reads back
+    // the write just made on node 0, so it needs the linearizable path — the
+    // wire default is now a genuinely eventually-consistent read.
     let (status, body) = dynamo(
         addr1,
         "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"users","Key":{"pk":{"S":"u1"}}}"#,
+        r#"{"ConsistentRead":true,"TableName":"users","Key":{"pk":{"S":"u1"}}}"#,
     )
     .await;
     assert_eq!(status, 200, "GetItem failed: {body}");
@@ -125,7 +127,7 @@ async fn dynamo_wire_put_get_delete_round_trip() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"users","Key":{"pk":{"S":"u1"}}}"#,
+        r#"{"ConsistentRead":true,"TableName":"users","Key":{"pk":{"S":"u1"}}}"#,
     )
     .await;
     assert_eq!(status, 200);

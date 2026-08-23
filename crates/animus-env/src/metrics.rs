@@ -162,6 +162,21 @@ pub enum Metric {
     /// A ReadIndex read barrier did not confirm before its deadline (a step-down,
     /// term change, or the wait timed out) and returned no value.
     CpReadBarriersTimedOut,
+    /// An **eventually-consistent** read (ADR 0055, `ConsistentRead: false`)
+    /// was served from this node's **own** replica — no network hop, no
+    /// consensus work. The cheapest outcome, and the one the feature exists
+    /// to produce.
+    CpEventualReadsLocal,
+    /// An eventually-consistent read was served by **one forwarded hop** to
+    /// another replica, because this node holds none it may serve from.
+    CpEventualReadsForwarded,
+    /// An eventually-consistent read could **not** be served cheaply at all
+    /// and fell back to the linearizable ReadIndex path (no serveable
+    /// replica here, no reachable one elsewhere, a scope/routing race, or the
+    /// freshness gate refusing a catching-up replica). Always correct, never
+    /// cheap — a rate that stays high means the cheap path is not actually
+    /// being taken, which no client-visible symptom would reveal.
+    CpEventualReadsFellBack,
     /// The threshold-triggered compaction step advanced the snapshot base and
     /// truncated the Raft log prefix. Decoupled from
     /// [`CpSnapshotImageBuilds`] (PR #29's lazy-image design): a trigger does not
@@ -497,7 +512,7 @@ pub enum Metric {
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 70] = [
+    pub const ALL: [Metric; 73] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -533,6 +548,9 @@ impl Metric {
         Metric::CpApplyBatchSizeSum,
         Metric::CpReadBarriersServed,
         Metric::CpReadBarriersTimedOut,
+        Metric::CpEventualReadsLocal,
+        Metric::CpEventualReadsForwarded,
+        Metric::CpEventualReadsFellBack,
         Metric::CpSnapshotTriggers,
         Metric::CpSnapshotImageBuilds,
         Metric::CpSnapshotShips,
@@ -610,6 +628,9 @@ impl Metric {
             Metric::CpApplyBatchSizeSum => "cp_apply_batch_size_sum",
             Metric::CpReadBarriersServed => "cp_read_barriers_served",
             Metric::CpReadBarriersTimedOut => "cp_read_barriers_timed_out",
+            Metric::CpEventualReadsLocal => "cp_eventual_reads_local",
+            Metric::CpEventualReadsForwarded => "cp_eventual_reads_forwarded",
+            Metric::CpEventualReadsFellBack => "cp_eventual_reads_fell_back",
             Metric::CpSnapshotTriggers => "cp_snapshot_triggers",
             Metric::CpSnapshotImageBuilds => "cp_snapshot_image_builds",
             Metric::CpSnapshotShips => "cp_snapshot_ships",

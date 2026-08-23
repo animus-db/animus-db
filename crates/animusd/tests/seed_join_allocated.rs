@@ -219,6 +219,7 @@ async fn await_value(clients: &[SocketAddr], table: &str, key: &[u8], want: &[u8
                     ClientRequest::Get {
                         key: key.to_vec(),
                         table: table.to_string(),
+                        stale: false,
                     },
                 )
                 .await

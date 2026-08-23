@@ -460,7 +460,10 @@ async fn transact_write_items_maintains_lsi_and_gsi_across_a_split_table() {
         let (status, body) = dynamo(
             addr,
             "DynamoDB_20120810.GetItem",
-            &format!(r#"{{"TableName":"indexed","Key":{{"id":{{"S":"{id}"}},"sk":{{"S":"a"}}}}}}"#),
+            &format!(
+                r#"{{"ConsistentRead":true,"TableName":"indexed",
+                    "Key":{{"id":{{"S":"{id}"}},"sk":{{"S":"a"}}}}}}"#
+            ),
         )
         .await;
         assert_eq!(status, 200);
@@ -478,7 +481,7 @@ async fn transact_write_items_maintains_lsi_and_gsi_across_a_split_table() {
             addr,
             "DynamoDB_20120810.Query",
             &format!(
-                r#"{{"TableName":"indexed","IndexName":"by-alt",
+                r#"{{"ConsistentRead":true,"TableName":"indexed","IndexName":"by-alt",
                     "KeyConditionExpression":"id = :i AND alt = :a",
                     "ExpressionAttributeValues":{{":i":{{"S":"{id}"}},":a":{{"S":"{alt}"}}}}}}"#
             ),

@@ -232,6 +232,7 @@ async fn begin_split_lifecycle_over_three_nodes_via_a_follower() {
                     &ClientRequest::Get {
                         key: key.clone(),
                         table: "t".to_string(),
+                        stale: false,
                     },
                 )
                 .await;

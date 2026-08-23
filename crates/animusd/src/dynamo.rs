@@ -170,7 +170,7 @@ use animus_tablet::{TOKEN_BYTES, TabletId, partition_token};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::http;
-use crate::{ClientCtx, CpGroup, KindWriteOp, SnapshotRead};
+use crate::{ClientCtx, CpGroup, KindWriteOp, ReadConsistency, SnapshotRead};
 
 /// How long `CreateTable` waits for its `CreateTableSchema` proposal to commit in
 /// the replicated catalog before giving up.
@@ -578,16 +578,25 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             table,
             key,
             projection,
-            // Accept-and-ignore *for correctness* (ADR 0041 §5): a base-table
-            // `GetItem` is already linearizable here, so `ConsistentRead: true`
-            // needs no enforcement — only a GSI `Query` ever rejects it. It is
-            // still read for **capacity**, where it halves the charge.
+            // ADR 0055: this now selects a real read path — `true` is the
+            // linearizable ReadIndex read, `false` (the wire default) is
+            // served from any replica's applied state. It is still read for
+            // **capacity** too, where it halves the charge; that halving used
+            // to price work the database did anyway, and now prices what
+            // actually happened.
             consistent_read,
             capacity: report,
         } => {
             let (pk, sk) = resolve_key(ctx, meta, &table, &key)?;
             let data_key = item_key(&pk, sk.as_ref());
-            let item = quorum_read(ctx, meta, &table, &data_key).await?;
+            let item = quorum_read(
+                ctx,
+                meta,
+                &table,
+                &data_key,
+                ReadConsistency::from_consistent_read(consistent_read),
+            )
+            .await?;
             // Charged on the **stored** item, before the projection: DynamoDB
             // reads the whole item and projects on the way out, so a projection
             // narrows the response without narrowing the cost.
@@ -612,7 +621,15 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 for key in &req.keys {
                     let (pk, sk) = resolve_key(ctx, meta, &req.table, key)?;
                     let data_key = item_key(&pk, sk.as_ref());
-                    if let Some(item) = quorum_read(ctx, meta, &req.table, &data_key).await? {
+                    if let Some(item) = quorum_read(
+                        ctx,
+                        meta,
+                        &req.table,
+                        &data_key,
+                        ReadConsistency::from_consistent_read(req.consistent_read),
+                    )
+                    .await?
+                    {
                         items.push(wire::project(req.projection.as_ref(), &item));
                     }
                 }
@@ -1863,7 +1880,11 @@ async fn run_transact(
         // `ConditionCheck`'s condition evaluates against a read here, and
         // its observed value becomes an ordinary cross-key `cp_txn`
         // precondition.
-        let raw = raw_quorum_read(ctx, meta, &table, &data_key).await?;
+        // A `ConditionCheck`'s observed value becomes a transaction
+        // precondition: always linearizable (ADR 0055), never the cheap path
+        // — `TransactWriteItems` carries no `ConsistentRead` and its
+        // conditions decide whether the whole transaction commits.
+        let raw = raw_quorum_read(ctx, meta, &table, &data_key, ReadConsistency::Strong).await?;
         let decoded = match &raw {
             Some(bytes) => wire::decode_stored_item(bytes)?,
             _ => None,
@@ -1887,7 +1908,7 @@ async fn run_transact(
         // why this is a documented, narrow fallback rather than a call to
         // `cp_txn` (which requires at least one write to anchor on).
         for (table, key, expected) in &preconditions {
-            let actual = raw_quorum_read(ctx, meta, table, key).await?;
+            let actual = raw_quorum_read(ctx, meta, table, key, ReadConsistency::Strong).await?;
             if &actual != expected {
                 ctx.data()
                     .raftkv_metrics
@@ -2193,6 +2214,7 @@ async fn run_query(
                 filter,
                 projection,
                 select,
+                ReadConsistency::from_consistent_read(consistent_read),
             )
             .await
         }
@@ -2401,6 +2423,7 @@ async fn run_base_query(
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
     select: Select,
+    consistency: ReadConsistency,
 ) -> Result<String, WireError> {
     // A base-table query must reject an unknown table the way the registry path
     // did (ResourceNotFoundException). A table is known iff it is in the
@@ -2439,6 +2462,7 @@ async fn run_base_query(
         Some(&upper),
         want,
         !scan_index_forward,
+        consistency,
         |key, value| {
             // A DynamoDB delete stores a tombstone *value* (not a data-plane
             // tombstone), so the scan returns it as a live pair; decode drops it.
@@ -2586,6 +2610,12 @@ async fn run_index_query(
                 filter,
                 projection,
                 select,
+                // A GSI read is eventually consistent by DynamoDB's own
+                // contract and `ConsistentRead: true` was rejected above, so
+                // this is always `Eventual` (ADR 0055) — derived from the
+                // flag rather than hard-coded so the two facts stay tied
+                // together at one place if that rejection ever moves.
+                ReadConsistency::from_consistent_read(consistent_read),
             )
             .await
         }
@@ -2603,6 +2633,7 @@ async fn run_index_query(
                 filter,
                 projection,
                 select,
+                ReadConsistency::from_consistent_read(consistent_read),
             )
             .await
         }
@@ -2647,6 +2678,7 @@ async fn run_gsi_query(
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
     select: Select,
+    consistency: ReadConsistency,
 ) -> Result<String, WireError> {
     let index_table = dynamo_index::index_table_name(table, &idx.name);
     if !meta.has_table_tablet(&index_table) {
@@ -2689,6 +2721,7 @@ async fn run_gsi_query(
         Some(&upper),
         want,
         !scan_index_forward,
+        consistency,
         |key, value| {
             // A pruned/undecodable row shouldn't normally occur (the drain deletes
             // stale rows outright, never tombstones them), but skip rather than
@@ -2774,6 +2807,7 @@ async fn run_lsi_query(
     filter: Option<&ConditionExpression>,
     projection: Option<&Projection>,
     select: Select,
+    consistency: ReadConsistency,
 ) -> Result<String, WireError> {
     if !meta.has_table_tablet(table) {
         return Ok(wire::select_response(select, &[], 0, None));
@@ -2808,6 +2842,7 @@ async fn run_lsi_query(
         upper,
         want,
         !scan_index_forward,
+        consistency,
         |key, value| {
             let Some(item) = wire::decode_stored_item(value)? else {
                 return Ok(None);
@@ -2902,6 +2937,7 @@ async fn run_scan(
                 projection,
                 select,
                 segment,
+                ReadConsistency::from_consistent_read(consistent_read),
             )
             .await
         }
@@ -2937,6 +2973,7 @@ async fn run_base_scan(
     projection: Option<&Projection>,
     select: Select,
     segment: Option<ScanSegment>,
+    consistency: ReadConsistency,
 ) -> Result<String, WireError> {
     if !table_known(ctx, meta, table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
@@ -2969,6 +3006,7 @@ async fn run_base_scan(
         end.as_deref(),
         want,
         false,
+        consistency,
         |_key, value| wire::decode_stored_item(value),
     )
     .await?;
@@ -3064,6 +3102,8 @@ async fn run_index_scan(
                 projection,
                 select,
                 segment,
+                // Always `Eventual` — see `run_gsi_query`'s own call site.
+                ReadConsistency::from_consistent_read(consistent_read),
             )
             .await
         }
@@ -3079,6 +3119,7 @@ async fn run_index_scan(
                 projection,
                 select,
                 segment,
+                ReadConsistency::from_consistent_read(consistent_read),
             )
             .await
         }
@@ -3105,6 +3146,7 @@ async fn run_gsi_scan(
     projection: Option<&Projection>,
     select: Select,
     segment: Option<ScanSegment>,
+    consistency: ReadConsistency,
 ) -> Result<String, WireError> {
     let index_table = dynamo_index::index_table_name(table, &idx.name);
     if !meta.has_table_tablet(&index_table) {
@@ -3130,6 +3172,7 @@ async fn run_gsi_scan(
         end.as_deref(),
         want,
         false,
+        consistency,
         |_key, value| wire::decode_stored_item(value),
     )
     .await?;
@@ -3183,6 +3226,7 @@ async fn run_lsi_scan(
     projection: Option<&Projection>,
     select: Select,
     segment: Option<ScanSegment>,
+    consistency: ReadConsistency,
 ) -> Result<String, WireError> {
     if !meta.has_table_tablet(table) {
         return Ok(wire::select_response(select, &[], 0, None));
@@ -3197,8 +3241,15 @@ async fn run_lsi_scan(
     let (from, end) = scan_bounds(segment, from);
     let want = limit.map(|n| n.saturating_add(1));
     let idx_name = idx.name.clone();
-    let (mut examined, _exhausted) =
-        paginated_kind_examine(ctx, table, KIND_LSI, from, end, want, move |key, value| {
+    let (mut examined, _exhausted) = paginated_kind_examine(
+        ctx,
+        table,
+        KIND_LSI,
+        from,
+        end,
+        want,
+        consistency,
+        move |key, value| {
             let within = key.get(TOKEN_BYTES..).unwrap_or(&[]);
             let Some(parsed) = dynamo_index::parse_lsi_row_key(within) else {
                 return Ok(None); // a malformed key; skip defensively
@@ -3207,8 +3258,9 @@ async fn run_lsi_scan(
                 return Ok(None); // this partition's *other* LSI's row
             }
             wire::decode_stored_item(value)
-        })
-        .await?;
+        },
+    )
+    .await?;
     let truncated = limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
@@ -3250,6 +3302,7 @@ async fn run_lsi_scan(
 /// silently start reading a neighboring partition or hash value). Returns the
 /// examined `(raw key, decoded item)` pairs and whether the underlying range
 /// is now exhausted.
+#[allow(clippy::too_many_arguments)] // one base/GSI page's full shape
 async fn paginated_table_examine(
     ctx: &ClientCtx,
     table: &str,
@@ -3257,6 +3310,7 @@ async fn paginated_table_examine(
     end: Option<&[u8]>,
     want: Option<usize>,
     reverse: bool,
+    consistency: ReadConsistency,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
 ) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
@@ -3266,7 +3320,16 @@ async fn paginated_table_examine(
     let mut upper: Option<Vec<u8>> = end.map(<[u8]>::to_vec);
     loop {
         let fetch = want.map(|w| w - examined.len());
-        let pairs = native_scan(ctx, table, &cursor, upper.as_deref(), fetch, reverse).await?;
+        let pairs = native_scan(
+            ctx,
+            table,
+            &cursor,
+            upper.as_deref(),
+            fetch,
+            reverse,
+            consistency,
+        )
+        .await?;
         let exhausted = fetch.is_none_or(|f| pairs.len() < f);
         // Rows arrive in the requested order, so the frontier to resume from
         // is the last element either way: ascending that is the greatest key
@@ -3299,6 +3362,7 @@ async fn paginated_table_examine(
 /// windowed-continuation discipline, generalized so `run_lsi_scan`'s `keep`
 /// can skip an interleaved *other* index's row without consuming a `Limit`
 /// slot, the same way the table-wide variant skips a tombstone.
+#[allow(clippy::too_many_arguments)] // one LSI Scan page's full shape
 async fn paginated_kind_examine(
     ctx: &ClientCtx,
     table: &str,
@@ -3306,13 +3370,14 @@ async fn paginated_kind_examine(
     mut cursor: Vec<u8>,
     end: Option<Vec<u8>>,
     want: Option<usize>,
+    consistency: ReadConsistency,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
 ) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
     loop {
         let fetch = want.map(|w| w - examined.len());
         let pairs = ctx
-            .cp_scan_kind_table(table, kind, cursor.clone(), end.clone(), fetch)
+            .cp_scan_kind_table(table, kind, cursor.clone(), end.clone(), fetch, consistency)
             .await
             .map_err(|e| internal(&e))?;
         let exhausted = fetch.is_none_or(|f| pairs.len() < f);
@@ -3348,6 +3413,7 @@ async fn paginated_kind_examine_one(
     end: Vec<u8>,
     want: Option<usize>,
     reverse: bool,
+    consistency: ReadConsistency,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
 ) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
@@ -3357,7 +3423,15 @@ async fn paginated_kind_examine_one(
     loop {
         let fetch = want.map(|w| w - examined.len());
         let pairs = ctx
-            .cp_scan_kind(table, kind, cursor.clone(), upper.clone(), fetch, reverse)
+            .cp_scan_kind(
+                table,
+                kind,
+                cursor.clone(),
+                upper.clone(),
+                fetch,
+                reverse,
+                consistency,
+            )
             .await
             .map_err(|e| internal(&e))?;
         let exhausted = fetch.is_none_or(|f| pairs.len() < f);
@@ -4092,11 +4166,10 @@ fn write_capacity(
 /// when the caller asked for no capacity report.
 ///
 /// A read is charged against the base table only — reading an item does not
-/// touch its index rows. An eventually-consistent read is half price, which is
-/// why `consistent` decides the number even on the paths that otherwise
-/// accept-and-ignore `ConsistentRead` (a base-table read here is always
-/// linearizable, but DynamoDB still bills what the client *asked* for, and a
-/// client that asked for the cheap read expects to be told it got it).
+/// touch its index rows. An eventually-consistent read is half price. This
+/// halving predates ADR 0055, when it billed what the client *asked* for
+/// against a read that was linearizable either way; since ADR 0055 it bills
+/// what the client actually got.
 fn read_capacity(
     table: &str,
     item: Option<&Item>,
@@ -4622,11 +4695,13 @@ fn range_end(prefix: &[u8]) -> Vec<u8> {
     end
 }
 
-/// Linearizable CP range scan over the half-open range `[start, end)`, returning
-/// the live `(key, value)` pairs in key order (tombstones already excluded by the
-/// engine), optionally capped at `limit` keys. Routes to the CP group leader via
-/// [`ClientCtx::cp_scan`] (ReadIndex; forwarded cross-process). A scan the leader
-/// cannot serve is an internal error (the scan analog of a failed read).
+/// CP range scan over the half-open range `[start, end)`, returning the live
+/// `(key, value)` pairs in key order (tombstones already excluded by the
+/// engine), optionally capped at `limit` keys, at the requested `consistency`
+/// (ADR 0055): `Strong` routes to the CP group leader (ReadIndex; forwarded
+/// cross-process), `Eventual` prefers any replica's applied state and falls
+/// back to that same leader path. A scan that cannot be served either way is
+/// an internal error (the scan analog of a failed read).
 async fn native_scan(
     ctx: &ClientCtx,
     table: &str,
@@ -4634,6 +4709,7 @@ async fn native_scan(
     end: Option<&[u8]>,
     limit: Option<usize>,
     reverse: bool,
+    consistency: ReadConsistency,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WireError> {
     ctx.cp_scan(
         table,
@@ -4641,6 +4717,7 @@ async fn native_scan(
         end.map(<[u8]>::to_vec),
         limit,
         reverse,
+        consistency,
     )
     .await
     .map_err(|e| internal(&e))
@@ -4661,16 +4738,19 @@ fn table_known(ctx: &ClientCtx, meta: &Metadata, table: &str) -> bool {
         .has_table(table)
 }
 
-/// Linearizable CP read of `key`, returning the **raw stored bytes** (the
-/// tagged envelope `quorum_read` decodes, or a `DeleteItem` tombstone
-/// sentinel verbatim) — the building block for anything that needs to hand
-/// the exact observed bytes onward (a `cp_txn` OCC precondition,
-/// `TransactGetItems`'s quiescent read), not just the decoded [`Item`].
+/// CP read of `key` at the requested `consistency` (ADR 0055), returning the
+/// **raw stored bytes** (the tagged envelope `quorum_read` decodes, or a
+/// `DeleteItem` tombstone sentinel verbatim) — the building block for anything
+/// that needs to hand the exact observed bytes onward (a `cp_txn` OCC
+/// precondition, `TransactGetItems`'s quiescent read), not just the decoded
+/// [`Item`]. Those two callers pass [`ReadConsistency::Strong`] and must keep
+/// doing so: a transaction's commit decision is not a client's to weaken.
 async fn raw_quorum_read(
     ctx: &ClientCtx,
     meta: &Metadata,
     table: &str,
     key: &[u8],
+    consistency: ReadConsistency,
 ) -> Result<Option<Vec<u8>>, WireError> {
     // A table with no tablet has no data (ADR 0023) — read as absent without waiting
     // on routing for a tablet that does not exist. The gate short-circuits a
@@ -4684,23 +4764,36 @@ async fn raw_quorum_read(
     // existence gate, which must not conclude "absent" from a growth-node
     // mirror that could still be a poll interval behind a concurrent writer's
     // just-committed provisioning.
+    //
+    // An ADR 0055 eventual read runs the same live re-check on the miss path.
+    // It does not strictly need to — an eventual read is allowed to report a
+    // just-provisioned table as empty — but the check only fires when the
+    // snapshot already says "no tablet", which for a table anyone is reading
+    // is the rare bootstrap case, and having one gate rather than two
+    // consistency-dependent ones is worth more than the saved round trip.
     if !meta.has_table_tablet(table) && !metadata_fresh(ctx).await.has_table_tablet(table) {
         return Ok(None);
     }
-    ctx.cp_read(table, key.to_vec())
+    ctx.cp_read(table, key.to_vec(), consistency)
         .await
         .map_err(|e| internal(&e))
 }
 
-/// Linearizable CP read of `key`, decoding the stored DynamoDB item (an absent
-/// key — including one tombstoned by a `DeleteItem` sentinel — reads as `None`).
+/// CP read of `key` at the requested `consistency` (ADR 0055), decoding the
+/// stored DynamoDB item (an absent key — including one tombstoned by a
+/// `DeleteItem` sentinel — reads as `None`).
+///
+/// The name predates ADR 0055 and is now only half accurate: a `Strong` read
+/// is the quorum-confirmed ReadIndex read it has always been, an `Eventual`
+/// one reaches no quorum at all.
 async fn quorum_read(
     ctx: &ClientCtx,
     meta: &Metadata,
     table: &str,
     key: &[u8],
+    consistency: ReadConsistency,
 ) -> Result<Option<Item>, WireError> {
-    match raw_quorum_read(ctx, meta, table, key).await? {
+    match raw_quorum_read(ctx, meta, table, key, consistency).await? {
         Some(bytes) => wire::decode_stored_item(&bytes),
         None => Ok(None),
     }
@@ -5179,6 +5272,7 @@ mod stream_write_path_tests {
             &ClientRequest::Get {
                 table: "rawt".into(),
                 key: b"k2".to_vec(),
+                stale: false,
             },
         )
         .await;
@@ -5191,6 +5285,7 @@ mod stream_write_path_tests {
             &ClientRequest::Get {
                 table: "rawt".into(),
                 key: b"k1".to_vec(),
+                stale: false,
             },
         )
         .await;

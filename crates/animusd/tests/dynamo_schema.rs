@@ -233,7 +233,7 @@ async fn create_table_survives_node_restart() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"events","Key":{"pk":{"S":"u1"},"sk":{"S":"a"}}}"#,
+        r#"{"ConsistentRead":true,"TableName":"events","Key":{"pk":{"S":"u1"},"sk":{"S":"a"}}}"#,
     )
     .await;
     assert_eq!(status, 200, "GetItem failed: {body}");
@@ -361,7 +361,7 @@ async fn scan_and_query_read_live_storage_after_restart() {
     let (status, all) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.Scan",
-        r#"{"TableName":"events"}"#,
+        r#"{"ConsistentRead":true,"TableName":"events"}"#,
     )
     .await;
     assert_eq!(status, 200, "Scan failed: {all}");
@@ -375,7 +375,7 @@ async fn scan_and_query_read_live_storage_after_restart() {
     let (status, q) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        r#"{"ConsistentRead":true,"TableName":"events","KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"u1"}}}"#,
     )
     .await;
@@ -389,7 +389,7 @@ async fn scan_and_query_read_live_storage_after_restart() {
     let (status, narrowed) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events",
+        r#"{"ConsistentRead":true,"TableName":"events",
             "KeyConditionExpression":"pk = :p AND sk = :s",
             "ExpressionAttributeValues":{":p":{"S":"u1"},":s":{"S":"b"}}}"#,
     )
@@ -662,7 +662,7 @@ async fn extended_surface() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"users","Key":{"id":{"S":"u1"}},
+        r#"{"ConsistentRead":true,"TableName":"users","Key":{"id":{"S":"u1"}},
             "ProjectionExpression":"profile.city"}"#,
     )
     .await;
@@ -714,7 +714,7 @@ async fn extended_surface() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"users","Key":{"id":{"S":"u1"}}}"#,
+        r#"{"ConsistentRead":true,"TableName":"users","Key":{"id":{"S":"u1"}}}"#,
     )
     .await;
     assert_eq!(status, 200);
@@ -759,7 +759,7 @@ async fn extended_surface() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"notes","Key":{"id":{"S":"n4"}}}"#,
+        r#"{"ConsistentRead":true,"TableName":"notes","Key":{"id":{"S":"n4"}}}"#,
     )
     .await;
     assert_eq!(status, 200);

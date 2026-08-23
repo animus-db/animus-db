@@ -181,6 +181,32 @@ existing sealed-set discipline whose durable seal marker re-latches
 keep serving; `propose_freeze` is idempotent and `tests/freeze.rs` is its
 suite; **transactions** (ADR 0018 §2) are covered in Key invariants
 below. See the crate's rustdoc for the full method/accessor inventory.
+**Eventually-consistent reads (ADR 0055)** are the second read path this
+crate serves, and the one whose budget is easiest to destroy by accident:
+`stale_read_ready()` (the gate), `stale_get_served()` (outer `None` =
+"not served", never absence — the `linearizable_get_served` discipline),
+`stale_scan`/`stale_scan_rev`, and — for a non-base kind scope, which only
+ever holds committed values — plain `local_scan_kind`/`local_scan_kind_rev`.
+Three things about them that a doc comment cannot enforce:
+
+- **Nothing on this path may block, propose, round-trip, or `wake()`.** No
+  read barrier, no `ensure_ceiling_above`, no `ts_cache` bump, no anchor
+  query for an intent, no quiescence wake. Adding any of those would make
+  the cheap read silently cost what a strong one costs, and **no test would
+  fail** — which is why `tests/stale_read.rs` deliberately drives these with
+  `block_on` rather than the `drive` helper: a stale read that grew an
+  internal `env.sleep` hangs that file instead.
+- **An unresolved intent reads back one MVCC version**
+  (`stale_value` → `prior_committed`), never as absent. `local_get`'s raw
+  peek reports it as absent — correct for its admin/debug callers, a
+  fabricated deletion for a client-visible read. `stale_scan_rows` applies
+  the same rule row-by-row, where `resolve_scan_rows` drops the row.
+- **The gate is not a staleness bound.** It only excludes a replica whose
+  engine is not yet *any* state of this tablet (no leader known yet, or a
+  committed tail / snapshot image not merged). A partitioned replica passes
+  it and answers arbitrarily stale data — which is the DynamoDB contract,
+  not an oversight. See ADR 0055 §2.
+
 Four rules that aren't derivable from a doc comment:
 
 - **A group owns a scope *set*, not one scope.** `with_kind(kind)` derives a

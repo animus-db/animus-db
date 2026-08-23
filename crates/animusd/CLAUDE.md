@@ -589,6 +589,50 @@ None` (unbounded above) is legal on `KindScan` too, resolved inside
 range is open-ended, never computed by the caller (no finite byte string
 could do that job — see the DynamoDB wire-edge entry above).
 
+**Eventually-consistent reads take a second route entirely (ADR 0055).**
+`cp_read`/`cp_scan`/`cp_scan_kind`/`cp_scan_kind_table` each take a
+`ReadConsistency` (`Strong`/`Eventual`, built from DynamoDB's `ConsistentRead`
+via `ReadConsistency::from_consistent_read`). `Eventual` tries a cheap attempt
+FIRST and falls through to the untouched linearizable loop on `None`, so the
+strong path's behavior is bit-for-bit what it always was and the weak one can
+never fail where the strong one would have succeeded:
+
+- `cp_stale_local(tablet)` — serve from a **local replica**, leader or not, if
+  this node is a voter in the group's own durable Raft config (the same check
+  `resolve_cp_route` makes), the key/range is inside the handle's live
+  `scope_range()`, and `CpGroup::stale_read_ready()` passes. **Deliberately no
+  `wake()`** — unlike `resolve_cp_route`'s wake-on-demand edge; an eventual
+  read needs no Raft activity and a quiesced group is fully applied by
+  construction (ADR 0048 fork F's "reading never wakes anything," now extended
+  from diagnostics to a real client read path).
+- otherwise `cp_stale_forward_target(tablet)` — **any** replica's intra
+  address, and `relay_stale_read` sends ONE `Forwarded` frame with a short
+  `STALE_READ_FORWARD_TIMEOUT` (2s). Deliberately **not**
+  `forward_to_tablet_leader`: there is no leader to chase, a refusal
+  (`STALE_READ_REFUSAL`) means "not cheaply, then", and waiting out an
+  election to serve a stale read is incoherent.
+
+**Observability**: `Metric::CpEventualReadsLocal`/`CpEventualReadsForwarded`/
+`CpEventualReadsFellBack` (`/metrics`'s `cp_eventual_reads_*`), recorded by
+`ClientCtx::record_eventual_read` — a no-op on a control-only node, which has
+no data-role sink. The fallback counter is the one that matters: a high rate
+means the cheap path is silently not being taken, and **nothing a client sees
+would reveal it** (the reads are still correct, just expensive). None of the
+three measures *staleness* — see ADR 0055's Consequences for that named gap.
+
+The wire carries it as `#[serde(default)] stale: bool` on `ClientRequest::
+Get`/`Scan`/`KindScan` rather than three new variants — a field is caught at
+every construction site by `error[E0063]`, where a new variant would need ADR
+0047's exhaustive `surface_of` table and every gating allowlist updated by
+hand. `cp_serve_forwarded` splits each of those three arms on `stale`
+(`true` → `cp_stale_local`-or-refuse, never a re-forward or a wait; `false` →
+the unchanged leader arm). `animus get-eventual` is the plain-protocol client
+form. **What stays `Strong` regardless of what a client asked** is ADR 0055
+§6's list — transaction preconditions/`ConditionCheck` reads,
+`TransactGetItems` (`cp_read_snapshot`, which has no eventual path at all),
+and `await_table_serveable`'s readiness probe; add to that list in the ADR
+when adding to it here.
+
 **`cp_kind_write_raw` does NOT auto-provision a table's first tablet** —
 unlike `cp_kind_write`/`cp_kind_write_item`/`cp_txn`/`marker_batch_write_raw`
 (with its provision flag set), which all do. (`cp_batch_write_patient` was
@@ -1296,7 +1340,17 @@ route below the edge through the same `ClientCtx` CP primitives.
   asynchronously); an **LSI** one stays strongly consistent.
   `ConsistentRead: true` is accepted everywhere except a GSI `Query`/`Scan`,
   which rejects it (`ValidationException` — only `animusd`, with `Metadata`
-  in hand, knows an index's kind).
+  in hand, knows an index's kind). **Since ADR 0055 the flag selects a real
+  read path** rather than only halving the reported capacity: `true` is the
+  linearizable ReadIndex read; `false` — the wire default — is served from any
+  replica's applied state (see "Request routing (CP)" above). Two consequences
+  worth knowing when writing tests here: **a write followed by an unqualified
+  read may not see it** (add `"ConsistentRead":true` to any read that is
+  asserting a write landed — that is what a DynamoDB client must do, and it
+  makes the test say what it depends on), and a **GSI** read is now always
+  eventual, which falls out of the rejection above rather than being a special
+  case (`consistent_read` is always `false` there, so the ordinary derivation
+  produces `Eventual`).
 
   Regression: `animus-dynamo`'s `wire` unit tests plus `tests/
   dynamo_index_scan.rs`/`kind_scan.rs` end to end.

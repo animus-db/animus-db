@@ -139,7 +139,8 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
             client1,
             ClientRequest::Get {
                 key: b"k".to_vec(),
-                table: "kv".to_string()
+                table: "kv".to_string(),
+                stale: false,
             }
         )
         .await,
@@ -155,7 +156,8 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
             client0,
             ClientRequest::Get {
                 key: b"k".to_vec(),
-                table: "kv".to_string()
+                table: "kv".to_string(),
+                stale: false,
             }
         )
         .await,
