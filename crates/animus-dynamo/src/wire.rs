@@ -59,6 +59,7 @@ use serde_json::{Map, Value};
 
 use crate::capacity::{
     ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity, ReturnItemCollectionMetrics,
+    item_size,
 };
 use crate::condition::{Comparator, ConditionError, ConditionExpression, SortKeyCondition};
 use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, SecondaryIndex};
@@ -886,6 +887,7 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "PutItem" => {
             let table = table_name(obj)?;
             let item = decode_item_field(obj, "Item")?;
+            check_item_size(&item)?;
             let condition = decode_condition(obj)?;
             let return_values = decode_return_values(obj)?;
             let capacity = decode_return_consumed_capacity(obj)?;
@@ -1162,6 +1164,29 @@ fn decode_update_return_values(obj: &Map<String, Value>) -> Result<UpdateReturnV
     }
 }
 
+/// AWS's per-item size cap: 400 KB (`409600` bytes), computed by
+/// [`item_size`] — the sum, over every attribute, of the UTF-8 length of its
+/// name plus the size of its value. Enforced on every decoded **write**
+/// item: `PutItem`, `BatchWriteItem`'s `PutRequest`s, and
+/// `TransactWriteItems`'s `Put` actions ([`check_item_size`]). **Not**
+/// enforced on `UpdateItem`'s post-update result — that needs a
+/// read-modify-write path this decode-time check has no access to (a known
+/// remaining gap; the item as it exists before the update may already be
+/// under the cap, so the check would have to run at the `animusd` edge
+/// after applying the update, not here).
+pub const MAX_ITEM_SIZE_BYTES: usize = 409_600;
+
+/// Reject `item` if it exceeds [`MAX_ITEM_SIZE_BYTES`], matching real
+/// DynamoDB's own `ValidationException` wording.
+fn check_item_size(item: &Item) -> Result<(), WireError> {
+    if item_size(item) > MAX_ITEM_SIZE_BYTES {
+        return Err(WireError::validation(
+            "Item size has exceeded the maximum allowed size",
+        ));
+    }
+    Ok(())
+}
+
 /// AWS's `BatchWriteItem` cap: at most 25 request items, summed across every
 /// table named in `RequestItems`, in one call.
 pub const BATCH_WRITE_MAX_ITEMS: usize = 25;
@@ -1195,7 +1220,9 @@ fn decode_batch_write(obj: &Map<String, Value>) -> Result<Operation, WireError> 
                 .as_object()
                 .ok_or_else(|| WireError::validation("each batch request must be an object"))?;
             if let Some(put) = e.get("PutRequest").and_then(Value::as_object) {
-                reqs.push(WriteRequest::Put(decode_sub_item(put, "Item")?));
+                let item = decode_sub_item(put, "Item")?;
+                check_item_size(&item)?;
+                reqs.push(WriteRequest::Put(item));
             } else if let Some(del) = e.get("DeleteRequest").and_then(Value::as_object) {
                 reqs.push(WriteRequest::Delete(decode_sub_item(del, "Key")?));
             } else {
@@ -1237,11 +1264,15 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
             .ok_or_else(|| WireError::validation(format!("`{kind}` must be an object")))?;
         let table = table_name(inner)?;
         let action = match kind.as_str() {
-            "Put" => TransactAction::Put {
-                table,
-                item: decode_sub_item(inner, "Item")?,
-                condition: decode_condition(inner)?,
-            },
+            "Put" => {
+                let item = decode_sub_item(inner, "Item")?;
+                check_item_size(&item)?;
+                TransactAction::Put {
+                    table,
+                    item,
+                    condition: decode_condition(inner)?,
+                }
+            }
             "Delete" => TransactAction::Delete {
                 table,
                 key: decode_sub_item(inner, "Key")?,
@@ -4972,8 +5003,13 @@ mod tests {
 
     /// A `BatchGetItem` body with `n` keys against one table.
     fn batch_get_body(n: usize) -> String {
-        let keys: Vec<String> = (0..n).map(|i| format!(r#"{{"id":{{"S":"i{i}"}}}}"#)).collect();
-        format!(r#"{{"RequestItems":{{"t":{{"Keys":[{}]}}}}}}"#, keys.join(","))
+        let keys: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"id":{{"S":"i{i}"}}}}"#))
+            .collect();
+        format!(
+            r#"{{"RequestItems":{{"t":{{"Keys":[{}]}}}}}}"#,
+            keys.join(",")
+        )
     }
 
     #[test]
@@ -5037,6 +5073,64 @@ mod tests {
         let over_cap = transact_get_body(TRANSACT_GET_MAX_ITEMS + 1);
         let err = decode_request("DynamoDB_20120810.TransactGetItems", over_cap.as_bytes())
             .expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    // --- AWS 400 KB item-size cap -------------------------------------------
+
+    /// A single-attribute item (`"a": {"S": ..}`) whose `item_size` is exactly
+    /// `1 + value_len` (the attribute name `"a"` is one byte, an `S` value's
+    /// size is its length).
+    fn item_of_size(value_len: usize) -> String {
+        format!(r#"{{"a":{{"S":"{}"}}}}"#, "x".repeat(value_len))
+    }
+
+    #[test]
+    fn put_item_accepts_exactly_the_size_cap_and_rejects_one_byte_over() {
+        let item = item_of_size(MAX_ITEM_SIZE_BYTES - 1);
+        let at_cap = format!(r#"{{"TableName":"t","Item":{item}}}"#);
+        decode_request("DynamoDB_20120810.PutItem", at_cap.as_bytes())
+            .expect("exactly 409600 bytes is accepted");
+
+        let item = item_of_size(MAX_ITEM_SIZE_BYTES);
+        let over_cap = format!(r#"{{"TableName":"t","Item":{item}}}"#);
+        let err = decode_request("DynamoDB_20120810.PutItem", over_cap.as_bytes())
+            .expect_err("409601 bytes is rejected");
+        assert_eq!(err.code, "ValidationException");
+        assert!(
+            err.message
+                .contains("Item size has exceeded the maximum allowed size")
+        );
+    }
+
+    #[test]
+    fn batch_write_put_request_enforces_the_item_size_cap() {
+        let item = item_of_size(MAX_ITEM_SIZE_BYTES - 1);
+        let at_cap = format!(r#"{{"RequestItems":{{"t":[{{"PutRequest":{{"Item":{item}}}}}]}}}}"#);
+        decode_request("DynamoDB_20120810.BatchWriteItem", at_cap.as_bytes())
+            .expect("exactly 409600 bytes is accepted");
+
+        let item = item_of_size(MAX_ITEM_SIZE_BYTES);
+        let over_cap =
+            format!(r#"{{"RequestItems":{{"t":[{{"PutRequest":{{"Item":{item}}}}}]}}}}"#);
+        let err = decode_request("DynamoDB_20120810.BatchWriteItem", over_cap.as_bytes())
+            .expect_err("409601 bytes is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn transact_write_put_action_enforces_the_item_size_cap() {
+        let item = item_of_size(MAX_ITEM_SIZE_BYTES - 1);
+        let at_cap =
+            format!(r#"{{"TransactItems":[{{"Put":{{"TableName":"t","Item":{item}}}}}]}}"#);
+        decode_request("DynamoDB_20120810.TransactWriteItems", at_cap.as_bytes())
+            .expect("exactly 409600 bytes is accepted");
+
+        let item = item_of_size(MAX_ITEM_SIZE_BYTES);
+        let over_cap =
+            format!(r#"{{"TransactItems":[{{"Put":{{"TableName":"t","Item":{item}}}}}]}}"#);
+        let err = decode_request("DynamoDB_20120810.TransactWriteItems", over_cap.as_bytes())
+            .expect_err("409601 bytes is rejected");
         assert_eq!(err.code, "ValidationException");
     }
 
