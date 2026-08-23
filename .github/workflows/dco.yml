@@ -4,6 +4,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# One check per PR; a rapid re-push supersedes the run still in flight, which
+# is only re-reading the same commit list.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   # get-pr-commits lists the PR's commits via the REST API; without this the
