@@ -161,7 +161,8 @@ async fn numeric_comparators_filter_numerically() {
     // seeded above with two-digit values to make that visible.
     async fn q(addr: SocketAddr, op: &str, v: &str) -> (u16, String) {
         let body = format!(
-            r#"{{"TableName":"events","KeyConditionExpression":"pk = :p",
+            r#"{{"TableName":"events","ConsistentRead":true,
+                 "KeyConditionExpression":"pk = :p",
                  "FilterExpression":"seq {op} :v",
                  "ExpressionAttributeValues":{{":p":{{"S":"p1"}},":v":{{"N":"{v}"}}}}}}"#
         );
@@ -194,7 +195,8 @@ async fn the_function_and_range_forms_serve() {
 
     async fn run(addr: SocketAddr, frag: &str) -> (u16, String) {
         let body = format!(
-            r#"{{"TableName":"events","KeyConditionExpression":"pk = :p",
+            r#"{{"TableName":"events","ConsistentRead":true,
+                 "KeyConditionExpression":"pk = :p",
                  "FilterExpression":"{frag}",
                  "ExpressionAttributeValues":{{":p":{{"S":"p1"}},
                     ":lo":{{"N":"1"}},":hi":{{"N":"3"}},
