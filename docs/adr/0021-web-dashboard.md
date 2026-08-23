@@ -1,6 +1,12 @@
 # ADR 0021 — Web dashboard over the admin JSON surface (observe + operator actions)
 
-- **Status:** Accepted (implemented — follow-ups 1–4, 7–9 shipped; 5 awaits ADR 0018, 6 on demand)
+- **Status:** Accepted (implemented — follow-ups 1–4, 7–9 shipped; 5 awaits ADR 0018, 6 on demand).
+  **Amended by [ADR 0053](0053-dynamodb-only-drop-cql.md) (2026-08-22):** the
+  CQL wire adapter is dropped, and with it follow-up 4's CQL query panel
+  (the `POST /admin/data/cql` proxy, `cql_client.rs`) and every other CQL
+  reference below — the Write tab's DDL+DML editor is now Dynamo-only. Kept
+  below as originally written, describing the dashboard as it was designed
+  and shipped at the time.
 - **Date:** 2026-08-04 (status updated 2026-08-14 — follow-up 9, the Streams tab)
 
 ## Context
@@ -286,6 +292,8 @@ client-side SPA).
   strongest reason yet to land the deferred admin-auth follow-up. The proxies reuse
   the existing edges (Dynamo in-process; CQL via a loopback client to the node's own
   CQL port), so they introduce no new data path, only a new *entrance* to it.
+  **Removed by ADR 0053** (2026-08-22): `POST /admin/data/cql` and the CQL
+  loopback client are gone; the write surface is DynamoDB-only.
 
 **Follow-up (each a green-keeping increment):**
 
@@ -307,7 +315,8 @@ client-side SPA).
    loopback client (the browser can't speak the CQL binary protocol). This
    **extends the admin port into a data-write + DDL surface** — see the added
    consequence below. Operator actions (split/flush/compact/reconfigure/drain) wired
-   to the UI with confirmation is still to do.
+   to the UI with confirmation is still to do. **The CQL editor and its proxy
+   are removed by ADR 0053** (2026-08-22) — the Write tab is Dynamo-only now.
 5. Transaction view over ADR 0018's state (intents, txn-status record, MVCC
    versions) — co-developed with, or immediately after, ADR 0018's admin-JSON
    extensions.

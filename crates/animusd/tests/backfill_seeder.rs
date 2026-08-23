@@ -44,18 +44,17 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
 async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, animusd::ClusterConfig) {
     let mut brought_up = None;
     'attempts: for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 7);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[7 * i],
-                client: addrs[7 * i + 1],
-                dynamo: addrs[7 * i + 2],
-                cql: addrs[7 * i + 3],
-                admin: addrs[7 * i + 4],
-                intra: addrs[7 * i + 5],
-                console: addrs[7 * i + 6],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -551,17 +550,16 @@ async fn a_crash_and_restart_mid_backfill_still_converges() {
     let node_dir = dir.path().join("node-0");
     let config = animusd::ClusterConfig {
         nodes: vec![{
-            let addrs = support::free_addrs(7);
+            let addrs = support::free_addrs(6);
             animusd::RoleAddrs {
                 id: animusd::config::node_id(0),
                 role: animusd::config::NodeRole::Both,
                 internal: addrs[0],
                 client: addrs[1],
                 dynamo: addrs[2],
-                cql: addrs[3],
-                admin: addrs[4],
-                intra: addrs[5],
-                console: addrs[6],
+                admin: addrs[3],
+                intra: addrs[4],
+                console: addrs[5],
             }
         }],
     };

@@ -1,7 +1,7 @@
 //! The admin / debug interface (ADR 0020): a read-only introspection surface
 //! plus a small set of gated operator actions, served as HTTP/JSON on the node's
-//! **dedicated admin port** (`RoleAddrs.admin`) — isolated from the client/dynamo/
-//! cql data edges so a deployment can firewall it off or bind it to a management
+//! **dedicated admin port** (`RoleAddrs.admin`) — isolated from the client/dynamo
+//! data edges so a deployment can firewall it off or bind it to a management
 //! interface.
 //!
 //! Like the DynamoDB edge it is a *production-only I/O edge* (real tokio sockets +
@@ -49,7 +49,6 @@
 //! - `POST /admin/control/member/add`    — `{node?, addr}` — grow the control group (ADR 0037 PR3; `node` optional since the ADR 0037 hardening trio's PR3, allocator-minted)
 //! - `POST /admin/control/member/remove` — `{node}` — shrink the control group (ADR 0037 PR3)
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021), item API or Streams read API alike (ADR 0042)
-//! - `POST /admin/data/cql`            — run CQL `{query, keyspace?}` (ADR 0021)
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
 //! - `POST /admin/data/seed`           — bulk-write synthetic DynamoDB items `{count, …}` (ADR 0021)
 
@@ -379,7 +378,6 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
             action_remove_control_member(ctx, &request.body).await
         }
         ("POST", "/admin/data/dynamo") => action_data_dynamo(ctx, &request.body).await,
-        ("POST", "/admin/data/cql") => action_data_cql(ctx, &request.body).await,
         ("POST", "/admin/data/drop-table") => action_drop_table(ctx, &request.body).await,
         ("POST", "/admin/data/seed") => action_data_seed(ctx, &request.body).await,
         // A known admin path with the wrong verb vs an unknown path.
@@ -440,7 +438,6 @@ fn config_view(ctx: &ClientCtx) -> Value {
             // `null` on a control-only node — these listeners are never bound
             // there.
             "dynamo": a.dynamo_addr.map(|x| x.to_string()),
-            "cql": a.cql_addr.map(|x| x.to_string()),
             "admin": a.admin_addr.to_string(),
         },
         "peers": peers,
@@ -892,7 +889,7 @@ async fn storage_scan(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 /// addendum) — a read-only browse of this node's own control-plane **system
 /// keyspace** (`animus_control::syskv::RESERVED_NAMESPACE`): every mirrored
 /// `Metadata` entity (tablets, members, schemas, policies, the node address
-/// book, keyspaces, split provenance) **plus** the internal/legacy bookkeeping
+/// book, split provenance) **plus** the internal/legacy bookkeeping
 /// kinds (the monotonic tablet-id-allocator counter, the legacy CP-member
 /// address book) — full transparency by default, no kind hidden here; only
 /// the dashboard labels the internal/legacy ones for an operator's benefit.
@@ -1063,7 +1060,7 @@ fn system_table_id_is_numeric(kind: syskv::EntityKind) -> bool {
 /// ([`system_table_id_is_numeric`]) is 8 big-endian bytes, rendered as a
 /// decimal **string** (not a JSON number — a `u64` can exceed `f64`'s exact
 /// integer range, and JSON has no native 64-bit integer type); every other
-/// kind's id is a UTF-8 name (a `NodeId` string, a schema/keyspace name, or a
+/// kind's id is a UTF-8 name (a `NodeId` string, a schema name, or a
 /// join nonce), rendered verbatim (lossy on malformed UTF-8, defensive only
 /// — this module never writes anything else there).
 fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
@@ -1103,8 +1100,8 @@ fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
 /// `Schema`/`Policy`/`NodeAddrs`/`CpMemberAddr` are `serde_json` passthrough
 /// (`null` on a malformed value — defensive only, every real writer produces
 /// valid JSON here); `Counter` is a raw big-endian `u64` (`null` if not
-/// exactly 8 bytes); `Keyspace`/`IndexBackfill` (ADR 0045 §4) are
-/// presence-only (their value is always empty) — always `null`, regardless
+/// exactly 8 bytes); `IndexBackfill` (ADR 0045 §4) is
+/// presence-only (its value is always empty) — always `null`, regardless
 /// of the actual bytes.
 /// `SplitParent` (ADR 0018 §2 amendment) stores the other
 /// tablet's id as a raw big-endian `u64`, same shape as `Counter` but
@@ -1131,9 +1128,9 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
             Ok(bytes) => json!(u64::from_be_bytes(bytes)),
             Err(_) => Value::Null,
         },
-        // Presence-only, like `Keyspace` (ADR 0045 §4: the value is always
-        // empty — the row's existence is the fact).
-        syskv::EntityKind::Keyspace | syskv::EntityKind::IndexBackfill => Value::Null,
+        // Presence-only (ADR 0045 §4: the value is always empty — the
+        // row's existence is the fact).
+        syskv::EntityKind::IndexBackfill => Value::Null,
     }
 }
 
@@ -1580,15 +1577,6 @@ struct DynamoDataReq {
     payload: Value,
 }
 
-#[derive(Deserialize)]
-struct CqlDataReq {
-    /// One or more `;`-separated CQL statements.
-    query: String,
-    /// Optional keyspace to `USE` before running the statements.
-    #[serde(default)]
-    keyspace: Option<String>,
-}
-
 /// The `DynamoDB Streams` op names (ADR 0042 §3) — used to resolve a bare
 /// `op` (no target-prefix dot) to the Streams read API rather than the item
 /// API. Unambiguous: the item API has no op sharing any of these names, so a
@@ -1629,28 +1617,6 @@ async fn action_data_dynamo(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     (status, value)
 }
 
-/// `POST /admin/data/cql` — run CQL statements from the dashboard's editor by
-/// driving this node's own CQL port as a loopback client (ADR 0021,
-/// [`crate::cql_client`]); returns one JSON result per statement. A connection or
-/// handshake failure is a `502` (the node's CQL edge is unreachable).
-async fn action_data_cql(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
-    let req: CqlDataReq = match parse_body(body) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-    // A control-only node (ADR 0035 PR3) has no CQL listener to proxy to.
-    let Some(cql_addr) = ctx.admin.cql_addr else {
-        return (
-            404,
-            json!({"error": "this node has no data role (control-only) — no CQL listener"}),
-        );
-    };
-    match crate::cql_client::run(cql_addr, req.keyspace.as_deref(), &req.query).await {
-        Ok(results) => (200, json!({ "results": results })),
-        Err(e) => (502, json!({ "error": e })),
-    }
-}
-
 #[derive(Deserialize)]
 struct DropTableReq {
     table: String,
@@ -1659,7 +1625,7 @@ struct DropTableReq {
 /// `POST /admin/data/drop-table {table}` — drop a table: remove its schema from
 /// the replicated catalog (ADR 0021 table management) **and** its tablets from
 /// the replicated map, which triggers every replica's GC loop to reclaim the
-/// table's data on disk (ADR 0024). Same sink as CQL `DROP TABLE` and the
+/// table's data on disk (ADR 0024). Same sink as the
 /// DynamoDB wire's own `DeleteTable` (`dynamo.rs::delete_table`); idempotent.
 /// This is the dashboard's delete primitive.
 async fn action_drop_table(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
@@ -2016,7 +1982,7 @@ fn parse_token_base64(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Render a data-plane **key** for the dashboard's key views. A key written
-/// through a wire edge (DynamoDB/CQL) or the bulk seeder is
+/// through the DynamoDB wire edge or the bulk seeder is
 /// `token || escape(pk) || rk` (ADR 0022/0023): the leading [`TOKEN_BYTES`] bytes
 /// are the big-endian Murmur3 **partition token** — binary, not text — so lossy
 /// UTF-8 would mangle them into replacement characters. Show that token as
@@ -2227,7 +2193,7 @@ mod system_table_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(7);
+        let addrs = free_addrs(6);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -2235,10 +2201,9 @@ mod system_table_tests {
                 internal: addrs[0],
                 client: addrs[1],
                 dynamo: addrs[2],
-                cql: addrs[3],
-                admin: addrs[4],
-                intra: addrs[5],
-                console: addrs[6],
+                admin: addrs[3],
+                intra: addrs[4],
+                console: addrs[5],
             }],
         }
     }

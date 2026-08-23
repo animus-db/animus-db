@@ -1,5 +1,13 @@
 # AnimusDB — Bootstrap Brief for Claude Code
 
+**Historical document.** This is the founding brief written before the first
+commit; it records the original scope and vision. Two load-bearing scope
+changes since: v1 is **CP-only** (ADR 0019 deferred the leaderless AP data
+plane described below, and its `animus-data` crate is deleted), and v1 is
+**DynamoDB-only** (ADR 0053 dropped the CQL wire adapter described below,
+`animus-cql`). Read `CLAUDE.md` and `docs/adr/README.md` for the current
+architecture; treat this file as a record of intent, not current state.
+
 You are bootstrapping a new open-source project, **AnimusDB**, and delivering its
 first milestones. Read this whole brief before writing code. Work in small,
 reviewable, vertical slices and keep everything testable under simulation from

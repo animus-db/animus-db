@@ -25,9 +25,9 @@ successor invariant).
   into stored keys.
 - `escape(&[u8]) -> Vec<u8>` — the order-preserving, **prefix-free** escape
   (no key's encoding prefixes another's). It is **deliberately duplicated**
-  from the wire adapters (`animus-dynamo`/`animus-cql` carry their own copies)
-  and must match them **byte-for-byte** — the duplication keeps this crate
-  dependency-light while the adapters stay pure.
+  from the wire adapter (`animus-dynamo` carries its own copy)
+  and must match it **byte-for-byte** — the duplication keeps this crate
+  dependency-light while the adapter stays pure.
 
 ## Tablets & ranges
 
@@ -66,7 +66,7 @@ successor invariant).
   this crate has nothing to say about it.
 - Serializable (`serde`) because tablets travel inside control-plane Raft log
   entries and data-plane routing views.
-- Dependency direction: `animus-control`, `animus-cql`, `animus-cp-data`, and
+- Dependency direction: `animus-control`, `animus-cp-data`, and
   `animusd` all depend on this crate — never the reverse. That reverse-dep ban
   is exactly why `escape`/`TableName` are duplicated here rather than imported.
 

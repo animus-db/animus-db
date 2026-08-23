@@ -67,17 +67,16 @@ fn free_addr() -> SocketAddr {
 
 /// The five addresses a node's roles bind, allocated as one distinct set.
 fn role_addrs(id: NodeId) -> animusd::RoleAddrs {
-    let a = free_addrs(7);
+    let a = free_addrs(6);
     animusd::RoleAddrs {
         id,
         role: animusd::config::NodeRole::Control,
         internal: a[0],
         client: a[1],
         dynamo: a[2],
-        cql: a[3],
-        admin: a[4],
-        intra: a[5],
-        console: a[6],
+        admin: a[3],
+        intra: a[4],
+        console: a[5],
     }
 }
 

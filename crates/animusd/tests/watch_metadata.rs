@@ -95,14 +95,15 @@ async fn control_node_wakes_the_watch_on_a_real_commit_not_the_server_timeout() 
     sleep(Duration::from_millis(150)).await;
     let propose_reply = call(
         control_client,
-        ClientRequest::ProposeSchema(MetaCommand::CreateKeyspace {
-            keyspace: "watch_metadata_wake_test".into(),
+        ClientRequest::ProposeSchema(MetaCommand::CreateTableSchema {
+            table: "watch_metadata_wake_test".into(),
+            schema: animus_control::TableSchema::simple("id", animus_control::ColumnType::String),
         }),
     )
     .await;
     assert!(
         matches!(propose_reply, ClientResponse::PutOk),
-        "CreateKeyspace propose was rejected: {propose_reply:?}"
+        "CreateTableSchema propose was rejected: {propose_reply:?}"
     );
 
     let (elapsed, reply) = timeout(Duration::from_secs(10), watch_task)
@@ -205,14 +206,15 @@ async fn combined_node_reconciler_and_long_poll_both_wake_on_one_commit() {
 
     let propose_reply = call(
         addr,
-        ClientRequest::ProposeSchema(MetaCommand::CreateKeyspace {
-            keyspace: "combined_multi_waiter_wake_test".into(),
+        ClientRequest::ProposeSchema(MetaCommand::CreateTableSchema {
+            table: "combined_multi_waiter_wake_test".into(),
+            schema: animus_control::TableSchema::simple("id", animus_control::ColumnType::String),
         }),
     )
     .await;
     assert!(
         matches!(propose_reply, ClientResponse::PutOk),
-        "CreateKeyspace propose was rejected: {propose_reply:?}"
+        "CreateTableSchema propose was rejected: {propose_reply:?}"
     );
 
     let (elapsed, reply) = timeout(Duration::from_secs(10), watch_task)
@@ -296,7 +298,6 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
             internal: free(),
             client: free(),
             dynamo: free(),
-            cql: free(),
             admin: free(),
             intra: free(),
             console: free(),
@@ -335,11 +336,15 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
     // replicated `Metadata` — see `ClientRequest::ProposeSchema`'s handler
     // doc), so poll this node's own `metadata()` directly for each one.
     for i in 0..3u64 {
-        let keyspace = format!("watch_deltas_restart_ks_{i}");
+        let table = format!("watch_deltas_restart_table_{i}");
         let resp = call(
             client_addr,
-            ClientRequest::ProposeSchema(MetaCommand::CreateKeyspace {
-                keyspace: keyspace.clone(),
+            ClientRequest::ProposeSchema(MetaCommand::CreateTableSchema {
+                table: table.clone(),
+                schema: animus_control::TableSchema::simple(
+                    "id",
+                    animus_control::ColumnType::String,
+                ),
             }),
         )
         .await;
@@ -349,14 +354,14 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
         );
         timeout(Duration::from_secs(10), async {
             loop {
-                if node.metadata().keyspaces.contains(&keyspace) {
+                if node.metadata().has_table_schema(&table) {
                     return;
                 }
                 sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("proposed keyspace did not land in 10s");
+        .expect("proposed table schema did not land in 10s");
     }
     let pre_restart_watermark = watermark_of(&call(client_addr, ClientRequest::Status).await);
     assert!(pre_restart_watermark > early_watermark);

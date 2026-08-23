@@ -132,7 +132,7 @@ async fn hosted_voters(admin_addr: SocketAddr) -> BTreeMap<u64, Vec<NodeId>> {
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig) {
     for attempt in 0..16 {
         let a: Vec<SocketAddr> = {
-            let ls: Vec<std::net::TcpListener> = (0..n * 7)
+            let ls: Vec<std::net::TcpListener> = (0..n * 6)
                 .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
                 .collect();
             ls.iter().map(|l| l.local_addr().unwrap()).collect()
@@ -142,13 +142,12 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
                 .map(|i| RoleAddrs {
                     id: animusd::config::node_id(i),
                     role: animusd::config::NodeRole::Both,
-                    internal: a[7 * i],
-                    client: a[7 * i + 1],
-                    dynamo: a[7 * i + 2],
-                    cql: a[7 * i + 3],
-                    admin: a[7 * i + 4],
-                    intra: a[7 * i + 5],
-                    console: a[7 * i + 6],
+                    internal: a[6 * i],
+                    client: a[6 * i + 1],
+                    dynamo: a[6 * i + 2],
+                    admin: a[6 * i + 3],
+                    intra: a[6 * i + 4],
+                    console: a[6 * i + 5],
                 })
                 .collect(),
         };

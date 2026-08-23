@@ -50,7 +50,6 @@ the relevant one before working in a crate:
 | `animus-dynamo` | [crates/animus-dynamo/CLAUDE.md](crates/animus-dynamo/CLAUDE.md) |
 | `animus-placement` | [crates/animus-placement/CLAUDE.md](crates/animus-placement/CLAUDE.md) |
 | `animus-consensus` | [crates/animus-consensus/CLAUDE.md](crates/animus-consensus/CLAUDE.md) |
-| `animus-cql` | [crates/animus-cql/CLAUDE.md](crates/animus-cql/CLAUDE.md) |
 | `animusd` | [crates/animusd/CLAUDE.md](crates/animusd/CLAUDE.md) |
 | `animus-cli` | [crates/animus-cli/CLAUDE.md](crates/animus-cli/CLAUDE.md) |
 
@@ -212,10 +211,11 @@ truth; this map is just for navigation.
   trait; `MemoryEngine` (deterministic, for sim) and a custom on-disk
   `LsmEngine<E>` (WAL/SSTable/leveled compaction, all I/O via the `Env` disk seam
   so its crash recovery is sim-tested).
-- **Wire adapters** — `animus-dynamo`, `animus-cql` (ADR 0006). DynamoDB JSON/HTTP
-  and CQL v4, served by `animusd`, routed through the **CP data plane** (v1,
-  ADR 0019); both consume the replicated schema catalog (ADR 0013) and build
-  ADR 0022 token-prefixed keys. `UpdateTable` can add/drop a GSI on an
+- **Wire adapter** — `animus-dynamo` (ADR 0006; a CQL adapter, `animus-cql`,
+  also shipped for a time but was dropped, ADR 0053 — v1 is DynamoDB-only).
+  DynamoDB JSON/HTTP, served by `animusd`, routed through the **CP data
+  plane** (v1, ADR 0019); consumes the replicated schema catalog (ADR 0013)
+  and builds ADR 0022 token-prefixed keys. `UpdateTable` can add/drop a GSI on an
   already-populated table (ADR 0045): the new index goes through a
   `Creating`/`Active`/`Deleting` lifecycle, backfilled by reusing the ADR
   0041 drain over the table's pre-existing rows.
@@ -249,7 +249,7 @@ truth; this map is just for navigation.
 - **Deployment target (Kubernetes operator)** — the intended production shape:
   a K8s operator runs the cluster with seed/intra node-to-node traffic kept
   cluster-internal (never on an externally-reachable Service); only the
-  client-facing wire edges (DynamoDB/CQL) are exposed outside the cluster.
+  client-facing wire edge (DynamoDB) is exposed outside the cluster.
   This is what motivated the ADR 0047 client/intra port split — review any
   design touching listeners, ports, or address resolution against this shape.
 

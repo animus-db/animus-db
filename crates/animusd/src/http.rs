@@ -175,7 +175,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// CORS header lines for the admin edge (ADR 0021). The web dashboard is served
 /// from one node's admin port but fans out to *every* node's `/admin/*` JSON, so
 /// those cross-origin reads need a permissive `Access-Control-Allow-Origin`.
-/// Scoped to the admin listener only — the data edges (dynamo/cql) never send it;
+/// Scoped to the admin listener only — the dynamo data edge never sends it;
 /// the admin port is assumed bound to a trusted interface (ADR 0020, no auth yet).
 /// Each line ends with CRLF so it can be spliced straight into the header block.
 pub(crate) const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\n\

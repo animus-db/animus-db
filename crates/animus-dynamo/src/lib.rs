@@ -7,8 +7,7 @@
 //! **Scope.** This implements `PutItem` / `GetItem` / `DeleteItem` / `Query`
 //! against a [`StorageEngine`]. The DynamoDB HTTP/JSON *wire protocol*,
 //! conditional writes, secondary indexes, and the distributed request path are
-//! explicitly future work — as is the parallel CQL adapter (`animus-cql`), which
-//! would map the CQL model onto the same core in the same way.
+//! explicitly future work.
 //!
 //! ## Key encoding
 //!

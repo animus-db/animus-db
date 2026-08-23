@@ -9,7 +9,7 @@
 //! The incarnations run in the **same tokio runtime**: between them,
 //! [`Node::shutdown_graceful`] cooperatively drains the node's spawned protocols
 //! (Raft driver, replica serve loop, the internal accept loops) and its
-//! client/dynamo/cql listeners, freeing all six listener ports so the
+//! client/dynamo listeners, freeing all five listener ports so the
 //! replacement can rebind the same addresses — a clean teardown → rebind →
 //! recover cycle. (Before `shutdown` existed, dropping a `Node` left those
 //! detached tasks running, so the test had to spin up a fresh runtime per

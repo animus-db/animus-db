@@ -2,34 +2,34 @@
 //! Raft-replicated record of which tables exist and what their keys and columns
 //! are.
 //!
-//! Both wire adapters (`animus-dynamo`, `animus-cql`) previously kept table
-//! schemas in per-process, in-memory catalogs, so a `CreateTable` / `CREATE
-//! TABLE` neither survived a restart nor replicated to other nodes. This module
-//! is the control-plane substrate that fixes that: a [`TableSchema`] lives in
-//! [`Metadata`](crate::Metadata) and is mutated by replicated
-//! [`MetaCommand`](crate::MetaCommand)s, so it is agreed cluster-wide, durable
-//! (recovered from the WAL/snapshot like all metadata), and consistent on every
-//! replica. Wiring the adapters to *consume* this catalog is a deliberate
-//! follow-up; this slice is the substrate plus the read accessors.
+//! `animus-dynamo` previously kept table schemas in a per-process, in-memory
+//! catalog, so a `CreateTable` neither survived a restart nor replicated to
+//! other nodes. This module is the control-plane substrate that fixes that: a
+//! [`TableSchema`] lives in [`Metadata`](crate::Metadata) and is mutated by
+//! replicated [`MetaCommand`](crate::MetaCommand)s, so it is agreed
+//! cluster-wide, durable (recovered from the WAL/snapshot like all metadata),
+//! and consistent on every replica.
 //!
-//! ## A shape that fits both adapters
+//! ## A shape wider than DynamoDB alone needs
 //!
 //! DynamoDB declares a **partition key** and an optional **sort key** (its key
-//! attributes are typed; non-key attributes are schemaless). CQL declares an
-//! ordered list of typed **columns**, one of which is the partition key, plus —
-//! eventually — clustering columns. The union modelled here is:
+//! attributes are typed; non-key attributes are schemaless). This module's
+//! shape (ADR 0006) was originally designed to also fit a CQL wire adapter
+//! (`animus-cql`, since dropped — v1 is DynamoDB-only, ADR 0053) — a table
+//! declared as an ordered list of typed
+//! **columns**, one of which is the partition key, plus any number of
+//! clustering columns. The union kept here, unused past its DynamoDB subset
+//! today, is:
 //!
 //! - a [`partition_key`](TableSchema::partition_key): the single required key
 //!   column, by name;
 //! - any number of ordered [`clustering_keys`](TableSchema::clustering_keys):
-//!   DynamoDB's optional sort key is the one-element case, CQL's clustering
-//!   columns the general case;
+//!   DynamoDB's optional sort key is the one-element case;
 //! - a set of typed [`columns`](TableSchema::columns) (keyed and non-keyed
 //!   alike), each carrying a [`ColumnType`].
 //!
-//! [`ColumnType`] is the union of the CQL scalar types and the DynamoDB
-//! key-attribute families, so an adapter can map its own type onto it losslessly
-//! enough to round-trip key handling. Everything here is **pure and
+//! [`ColumnType`] carries a few scalar variants beyond DynamoDB's own key
+//! types, kept for the same reason. Everything here is **pure and
 //! deterministic** (ADR 0003): plain data, `BTreeMap`/`Vec`, no I/O, no clock,
 //! no RNG.
 
@@ -37,37 +37,33 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-/// A table name (the catalog key). For CQL this is the keyspace-qualified table
-/// name the adapter chooses to use (e.g. `ks.table`); for DynamoDB it is the
-/// bare table name. The control plane treats it as an opaque, case-sensitive
-/// identifier — namespacing is the adapter's responsibility.
+/// A table name (the catalog key). For DynamoDB it is the bare table name.
+/// The control plane treats it as an opaque, case-sensitive identifier —
+/// namespacing is the adapter's responsibility.
 pub type TableName = String;
 
-/// The column type vocabulary shared by both wire adapters.
-///
-/// It is the union of the CQL scalar type system (`text`/`int`/`bigint`/
-/// `boolean`/`blob`/`uuid`) and the DynamoDB key-attribute families
-/// (`String`/`Number`/`Binary`/`Bool`). The two overlap (`String`≈CQL `text`,
-/// `Binary`≈CQL `blob`, `Bool`≈CQL `boolean`); both names are kept so each
-/// adapter can record its declared type faithfully and recover it on read. The
-/// control plane never interprets a value — it only stores the declared type —
-/// so the breadth here is about *fidelity for the adapters*, not validation.
+/// The column type vocabulary, wider than DynamoDB's own key-attribute
+/// families alone (`String`/`Number`/`Binary`/`Bool`) — the extra variants
+/// were originally the CQL scalar type system's own vocabulary (`text`/`int`/
+/// `bigint`/`boolean`/`blob`/`uuid`, ADR 0006), kept even after CQL's removal
+/// since the catalog stores only a declared type and never interprets a
+/// value, so the breadth costs nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ColumnType {
-    /// UTF-8 string (CQL `text`/`varchar`, DynamoDB `S`).
+    /// UTF-8 string (DynamoDB `S`).
     String,
-    /// A number (DynamoDB `N`; CQL callers should prefer [`Int`](ColumnType::Int)
+    /// A number (DynamoDB `N`; prefer [`Int`](ColumnType::Int)
     /// / [`BigInt`](ColumnType::BigInt) where the width is known).
     Number,
-    /// 32-bit signed integer (CQL `int`).
+    /// 32-bit signed integer.
     Int,
-    /// 64-bit signed integer (CQL `bigint`).
+    /// 64-bit signed integer.
     BigInt,
-    /// Boolean (CQL `boolean`, DynamoDB `BOOL`).
+    /// Boolean (DynamoDB `BOOL`).
     Bool,
-    /// Arbitrary bytes (CQL `blob`, DynamoDB `B`).
+    /// Arbitrary bytes (DynamoDB `B`).
     Binary,
-    /// A 16-byte UUID (CQL `uuid`).
+    /// A 16-byte UUID.
     Uuid,
 }
 
@@ -293,7 +289,8 @@ pub struct TableSchema {
     pub partition_key: String,
     /// The clustering / sort-key columns, in order. Empty for a hash-only table
     /// (DynamoDB simple table); one element for a DynamoDB composite table's
-    /// sort key; many for CQL clustering columns.
+    /// sort key. More than one is a shape only a CQL-style multi-column
+    /// clustering key ever used (ADR 0006, since dropped by ADR 0053).
     pub clustering_keys: Vec<String>,
     /// Every column (keys included), in declaration order.
     pub columns: Vec<ColumnDef>,

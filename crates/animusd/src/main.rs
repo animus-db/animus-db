@@ -43,7 +43,7 @@
 //! restart-stable identity; see `crates/animusd/CLAUDE.md` and ADR 0040.
 //!
 //! `animusd control` runs one of a config's control-role node(s) only — no
-//! storage engine, no `raftkv` env, no DynamoDB/CQL listeners; `animusd data`
+//! storage engine, no `raftkv` env, no DynamoDB listener; `animusd data`
 //! runs one of a config's data-role node(s) only — no control env, no local
 //! control `RaftCore` at all, reaching a **separately-deployed** control
 //! plane over the network instead (ADR 0035: control plane as a separate
@@ -497,11 +497,10 @@ async fn run_single(
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;
     println!(
-        "animusd: node {index}/{} up (CP) — client {} — dynamo http {} — cql {} — admin http://{} — console http://{}",
+        "animusd: node {index}/{} up (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
         config.len(),
         node.client_addr(),
         node.dynamo_addr(),
-        node.cql_addr(),
         node.admin_addr(),
         node.console_addr(),
     );
@@ -512,8 +511,8 @@ async fn run_single(
 }
 
 /// `control`: run node `index` of `config` as a **control-only** node (ADR
-/// 0035 PR3) — no CP data storage engine, no `raftkv` env, no DynamoDB/CQL
-/// listeners. `--ephemeral` (ADR 0038 PR2) selects a volatile in-memory
+/// 0035 PR3) — no CP data storage engine, no `raftkv` env, no DynamoDB
+/// listener. `--ephemeral` (ADR 0038 PR2) selects a volatile in-memory
 /// system-keyspace mirror engine instead of the durable on-disk default.
 async fn run_control(args: &[String]) -> Result<(), String> {
     let mut config_path: Option<String> = None;
@@ -644,11 +643,10 @@ async fn run_data_config(
         .await
         .map_err(|e| format!("failed to start data node {index}: {e}"))?;
     println!(
-        "animusd: data node {index}/{} up (CP) — client {} — dynamo http {} — cql {} — admin http://{} — console http://{}",
+        "animusd: data node {index}/{} up (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
         config.len(),
         node.client_addr(),
         node.dynamo_addr(),
-        node.cql_addr(),
         node.admin_addr(),
         node.console_addr(),
     );
@@ -696,10 +694,9 @@ async fn run_data_join(
         internal: p(0),
         client: p(1),
         dynamo: p(2),
-        cql: p(3),
-        admin: p(4),
-        intra: p(5),
-        console: p(6),
+        admin: p(3),
+        intra: p(4),
+        console: p(5),
     };
     let dir_name = id
         .as_ref()
@@ -712,10 +709,9 @@ async fn run_data_join(
         .await
         .map_err(|e| format!("failed to join as a data node: {e}"))?;
     println!(
-        "animusd: data node joined (CP) — client {} — dynamo http {} — cql {} — admin http://{} — console http://{}",
+        "animusd: data node joined (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
         node.client_addr(),
         node.dynamo_addr(),
-        node.cql_addr(),
         node.admin_addr(),
         node.console_addr(),
     );
@@ -792,10 +788,9 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         internal: p(0),
         client: p(1),
         dynamo: p(2),
-        cql: p(3),
-        admin: p(4),
-        intra: p(5),
-        console: p(6),
+        admin: p(3),
+        intra: p(4),
+        console: p(5),
     };
     let dir_name = id
         .as_ref()
@@ -807,10 +802,9 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         .await
         .map_err(|e| format!("failed to join: {e}"))?;
     println!(
-        "animusd: node joined (CP) — client {} — dynamo http {} — cql {} — admin http://{} — console http://{}",
+        "animusd: node joined (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
         node.client_addr(),
         node.dynamo_addr(),
-        node.cql_addr(),
         node.admin_addr(),
         node.console_addr(),
     );
@@ -877,10 +871,9 @@ async fn run_in_process_cluster(
     }
     for (i, node) in nodes.iter().enumerate() {
         println!(
-            "  node {i}: client {} — dynamo http {} — cql {} — admin http://{} — console http://{}",
+            "  node {i}: client {} — dynamo http {} — admin http://{} — console http://{}",
             node.client_addr(),
             node.dynamo_addr(),
-            node.cql_addr(),
             node.admin_addr(),
             node.console_addr(),
         );
@@ -956,10 +949,9 @@ async fn run_in_process_split_cluster(
     }
     for (i, node) in nodes.iter().skip(control_n).enumerate() {
         println!(
-            "  data node {i}: client {} — dynamo http {} — cql {} — admin http://{} — console http://{}",
+            "  data node {i}: client {} — dynamo http {} — admin http://{} — console http://{}",
             node.client_addr(),
             node.dynamo_addr(),
-            node.cql_addr(),
             node.admin_addr(),
             node.console_addr(),
         );
