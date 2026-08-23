@@ -163,28 +163,28 @@ reusing the captured config is the point of the test.
   index's own stale scan position (see the function's own doc and
   `docs/engineering-lessons.md`'s "convergent per-name cursor... can
   silently poison a same-named recreation" entry).
-  **Confirmed open bug (issue #355, 2026-08-23), NOT fixed here**: the
-  `"gsi"` cursor write in `drain_tablet` (`cursor::cursor_key(&group.
-  scope_range().start, GSI_TAG)`) is token-truncated below a split right
-  child's own `range.start` whenever the split key is non-token-aligned
-  (the normal case — `byte_weighted_median` picks a real row's key, almost
-  never `TOKEN_BYTES` long); the write goes through `ClientCtx::
-  cp_kind_write_raw`, which **routes by the write's own key**, so it lands
-  — successfully, not rejected — on the LEFT sibling's tablet instead of
-  the right child's own. Reproduced directly:
-  `gsi_drain_cursor_tests::split_right_childs_gsi_cursor_after_a_non_token_
-  aligned_split_issue_355` (`#[ignore]`d so CI stays green) splits at a
-  real row key and shows the right child's watermark pinned at `None` and
-  its change log pinned at 8 records across 20 drain ticks, with the
-  cursor row for its own token physically present on the left sibling's
-  engine and absent on its own — GSI correctness itself is unaffected
-  (every item still indexes), only the cursor/trim bookkeeping. The
-  existing `split_right_childs_cold_start_re_reconciles_from_zero_without_
-  corrupting_the_gsi` regression stays green because its own split
-  boundary (`BOUNDARY`, a bare `TOKEN_BYTES`-long constant) is *itself*
-  already token-aligned — see `docs/engineering-lessons.md`'s Testing
-  entry on this exact fixture-vs-production-shape gap. Fix (not made
-  here): a child-scope-readable cursor key.
+  **Issue #355 (2026-08-23), fixed**: the `"gsi"` cursor write in
+  `drain_tablet` (`cursor::cursor_key(&group.scope_range().start,
+  GSI_TAG)`) used to be token-truncated below a split right child's own
+  `range.start` whenever the split key was non-token-aligned (the normal
+  case — `byte_weighted_median` picks a real row's key, almost never
+  `TOKEN_BYTES` long); since the write goes through `ClientCtx::
+  cp_kind_write_raw`, which **routes by the write's own key**, it landed —
+  successfully, not rejected — on the LEFT sibling's tablet instead of the
+  right child's own. Fixed in `animus_cp_data::cursor::cursor_key`: the key
+  now embeds the tablet's own `range.start` **verbatim** (never truncated),
+  with a trailing 2-byte length so [`parse_cursor_key`] can still recover
+  the tag unambiguously — see that module's own doc for the full scheme.
+  Regression: `gsi_drain_cursor_tests::split_right_childs_gsi_cursor_
+  after_a_non_token_aligned_split_issue_355` splits at a real row key and
+  asserts the fixed end-state precisely: the watermark advances, the
+  change log trims to zero, and the physical cursor row lives on the right
+  child's own engine and nowhere else. The existing `split_right_childs_
+  cold_start_re_reconciles_from_zero_without_corrupting_the_gsi` regression
+  stays green throughout (its own split boundary, `BOUNDARY`, is already
+  token-aligned, so it never exercised the bug either way — see
+  `docs/engineering-lessons.md`'s Testing entry on this exact
+  fixture-vs-production-shape gap).
 - **`ttl_reaper.rs`** (ADR 0051) — the DynamoDB-style **TTL reaper**: a
   per-node background loop, spawned everywhere `index_drain::
   change_consumer_loop` is (combined + data-only; see the module map
@@ -508,10 +508,17 @@ protocol write funnels through one of these two since ADR 0049's write-path
 unification, so a write racing the freeze window got a terminal 500
 instead of the write landing on the child a moment later), mirroring
 `cp_read`'s deadline-bounded loop and re-resolving `cp_route` each attempt.
-A `Building` child runs **no consumer arms at all** (its token-truncated
-cursor key would land in the parent's scope and poison the parent's
-min-over-rows watermark). E2e: `tests/split_build.rs` (full workflow +
-racing txns + post-freeze leader kill).
+A `Building` child runs **no consumer arms at all**: it is structurally
+unroutable (`topology::tablet_for_key` excludes it — its range overlaps
+the still-serving parent's), so any cursor write keyed inside its own
+range would land in the parent's scope and poison the parent's
+min-over-rows watermark regardless of the cursor key's own encoding —
+issue #355's fix (`cursor::cursor_key` embedding `range.start` verbatim)
+closes a *different* misrouting (a fresh right child's own writes landing
+on its left sibling post-cutover) and doesn't touch this one, since an
+unroutable tablet has no routing candidacy to fix into. E2e:
+`tests/split_build.rs` (full workflow + racing txns + post-freeze leader
+kill).
 
 `--auto-split K` (key count), `--auto-split-bytes B` (byte size), and
 `--auto-split-change-rate RATE` (streamed tables only, ADR 0042 §14 Fork F —
