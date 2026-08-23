@@ -23,6 +23,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use animus_control::IndexStatus;
+use animus_dynamo::wire::MAX_GSI_PER_TABLE;
 use animusd::Node;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -417,6 +418,61 @@ async fn update_table_create_validation_rejects_bad_index_declarations() {
         assert!(
             body.contains("ResourceNotFoundException"),
             "expected ResourceNotFoundException, got: {body}"
+        );
+
+        node.shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `create_index` (the `UpdateTable`-`Create` path) enforces AWS's
+/// [`MAX_GSI_PER_TABLE`] (20) cap against the table's *current* replicated
+/// GSI count — the wire decoder enforces the same cap declaratively at
+/// `CreateTable` time (`animus_dynamo::wire`'s own decode-level tests), but
+/// only this edge function has the replicated catalog in hand to check a
+/// table that accumulated its GSIs one `UpdateTable` call at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn update_table_create_rejects_past_the_gsi_cap() {
+    timeout(Duration::from_secs(60), async {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _config) =
+            support::start_single_node(tmp.path(), animusd::StorageBackend::default()).await;
+        let addr = node.dynamo_addr();
+
+        // A table declared with exactly the cap's worth of GSIs at
+        // `CreateTable` time — accepted, since it is exactly at the limit.
+        let table = "at_gsi_cap";
+        let gsis: Vec<String> = (0..MAX_GSI_PER_TABLE)
+            .map(|i| {
+                format!(
+                    r#"{{"IndexName":"gsi{i}","KeySchema":[{{"AttributeName":"a{i}","KeyType":"HASH"}}],
+                        "Projection":{{"ProjectionType":"ALL"}}}}"#
+                )
+            })
+            .collect();
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.CreateTable",
+            &format!(
+                r#"{{"TableName":"{table}",
+                    "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                    "GlobalSecondaryIndexes":[{}]}}"#,
+                gsis.join(",")
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "CreateTable with exactly {MAX_GSI_PER_TABLE} GSIs failed: {body}"
+        );
+
+        // A 21st GSI via `UpdateTable`, past the cap, is rejected.
+        let (status, body) = create_index_via_wire(addr, table, "one_too_many", "over").await;
+        assert_ne!(status, 200, "a 21st GSI should be rejected: {body}");
+        assert!(
+            body.contains("ValidationException"),
+            "expected ValidationException, got: {body}"
         );
 
         node.shutdown_graceful().await;

@@ -1480,17 +1480,36 @@ fn decode_attribute_types(obj: &Map<String, Value>) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// AWS's cap on a table's `GlobalSecondaryIndexes`, declared at `CreateTable`
+/// or accumulated one at a time via `UpdateTable` (`animusd::dynamo::
+/// create_index`, which has the replicated catalog this pure decoder
+/// doesn't, checks the running total against this same constant).
+pub const MAX_GSI_PER_TABLE: usize = 20;
+
+/// AWS's cap on a table's `LocalSecondaryIndexes` — create-time-only in real
+/// DynamoDB, so this is the only place it is ever checked.
+pub const MAX_LSI_PER_TABLE: usize = 5;
+
 /// Decode the optional `GlobalSecondaryIndexes` + `LocalSecondaryIndexes` of a
 /// `CreateTable` into a list of [`SecondaryIndex`]. A GSI's `KeySchema` is a
 /// `HASH` attribute plus an optional `RANGE` (a composite GSI); an LSI's
 /// `KeySchema` shares the base partition `HASH` and adds a `RANGE` (the index's
-/// alternate sort key). Absent ⇒ an empty list.
+/// alternate sort key). Absent ⇒ an empty list. Rejects more than
+/// [`MAX_GSI_PER_TABLE`] GSIs or [`MAX_LSI_PER_TABLE`] LSIs, matching real
+/// DynamoDB.
 fn decode_indexes(obj: &Map<String, Value>) -> Result<Vec<SecondaryIndex>, WireError> {
     let mut out = Vec::new();
     if let Some(gsis) = obj.get("GlobalSecondaryIndexes") {
         let gsis = gsis
             .as_array()
             .ok_or_else(|| WireError::validation("`GlobalSecondaryIndexes` must be an array"))?;
+        if gsis.len() > MAX_GSI_PER_TABLE {
+            return Err(WireError::validation(format!(
+                "too many GlobalSecondaryIndexes: {} declared, at most {MAX_GSI_PER_TABLE} \
+                 allowed per table",
+                gsis.len()
+            )));
+        }
         for gsi in gsis {
             let (name, schema, projection) = decode_index_entry(gsi, "GSI")?;
             out.push(SecondaryIndex::Global(GlobalSecondaryIndex {
@@ -1505,6 +1524,13 @@ fn decode_indexes(obj: &Map<String, Value>) -> Result<Vec<SecondaryIndex>, WireE
         let lsis = lsis
             .as_array()
             .ok_or_else(|| WireError::validation("`LocalSecondaryIndexes` must be an array"))?;
+        if lsis.len() > MAX_LSI_PER_TABLE {
+            return Err(WireError::validation(format!(
+                "too many LocalSecondaryIndexes: {} declared, at most {MAX_LSI_PER_TABLE} \
+                 allowed per table",
+                lsis.len()
+            )));
+        }
         let base = decode_key_schema(obj)?;
         for lsi in lsis {
             let (name, schema, projection) = decode_index_entry(lsi, "LSI")?;
@@ -5172,6 +5198,66 @@ mod tests {
             i.projection,
             IndexProjection::Include(vec!["x".into(), "y".into()])
         );
+    }
+
+    // --- AWS index-count caps (CreateTable) --------------------------------
+
+    /// A `CreateTable` body declaring `n` GSIs, each with a unique name.
+    fn create_table_with_gsis(n: usize) -> String {
+        let gsis: Vec<String> = (0..n)
+            .map(|i| {
+                format!(r#"{{"IndexName":"gsi{i}","KeySchema":[{{"AttributeName":"e","KeyType":"HASH"}}]}}"#)
+            })
+            .collect();
+        format!(
+            r#"{{"TableName":"t","KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                "GlobalSecondaryIndexes":[{}]}}"#,
+            gsis.join(",")
+        )
+    }
+
+    #[test]
+    fn create_table_accepts_the_gsi_cap_and_rejects_one_over_it() {
+        let at_cap = create_table_with_gsis(MAX_GSI_PER_TABLE);
+        decode_request("DynamoDB_20120810.CreateTable", at_cap.as_bytes())
+            .expect("exactly 20 GSIs is accepted");
+
+        let over_cap = create_table_with_gsis(MAX_GSI_PER_TABLE + 1);
+        let err = decode_request("DynamoDB_20120810.CreateTable", over_cap.as_bytes())
+            .expect_err("21 GSIs is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A `CreateTable` body declaring `n` LSIs, each with its own sort
+    /// attribute (LSIs must all share the base HASH key, so only the RANGE
+    /// attribute varies).
+    fn create_table_with_lsis(n: usize) -> String {
+        let lsis: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{"IndexName":"lsi{i}","KeySchema":[
+                        {{"AttributeName":"id","KeyType":"HASH"}},
+                        {{"AttributeName":"r{i}","KeyType":"RANGE"}}]}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"TableName":"t","KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                "LocalSecondaryIndexes":[{}]}}"#,
+            lsis.join(",")
+        )
+    }
+
+    #[test]
+    fn create_table_accepts_the_lsi_cap_and_rejects_one_over_it() {
+        let at_cap = create_table_with_lsis(MAX_LSI_PER_TABLE);
+        decode_request("DynamoDB_20120810.CreateTable", at_cap.as_bytes())
+            .expect("exactly 5 LSIs is accepted");
+
+        let over_cap = create_table_with_lsis(MAX_LSI_PER_TABLE + 1);
+        let err = decode_request("DynamoDB_20120810.CreateTable", over_cap.as_bytes())
+            .expect_err("6 LSIs is rejected");
+        assert_eq!(err.code, "ValidationException");
     }
 
     // --- UpdateTimeToLive / DescribeTimeToLive (ADR 0051) -----------------

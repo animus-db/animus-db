@@ -158,8 +158,8 @@ use animus_dynamo::capacity::{
     ReturnItemCollectionMetrics,
 };
 use animus_dynamo::wire::{
-    self, Operation, Projection, ReturnValues, ScanSegment, Select, TransactAction, TransactGet,
-    UpdateAction, WireError, WriteRequest,
+    self, MAX_GSI_PER_TABLE, Operation, Projection, ReturnValues, ScanSegment, Select,
+    TransactAction, TransactGet, UpdateAction, WireError, WriteRequest,
 };
 use animus_dynamo::{
     AttributeValue, ChangeRecord, ConditionExpression, Item, SortKeyCondition, TableSchema,
@@ -1266,6 +1266,13 @@ async fn update_table(
 ///   *replace* an existing definition (a different kind/attrs) rather than
 ///   erroring, so the duplicate check must happen here, client-side, before
 ///   ever proposing.
+/// - **[`MAX_GSI_PER_TABLE`] (20, matching real DynamoDB) enforced against
+///   the table's *current* replicated GSI count** — the wire decoder
+///   (`wire::decode_indexes`) enforces the same cap at `CreateTable` time,
+///   but has no way to know how many GSIs a table already has when they
+///   accumulate one at a time via `UpdateTable`, so this is the one site
+///   that actually has the replicated catalog in hand to check the running
+///   total.
 ///
 /// Bridges the validated declaration to the control-plane `IndexDef` via
 /// [`schema_bridge::index_to_control`], **overriding its status to
@@ -1316,6 +1323,17 @@ async fn create_index(
     if meta.table_indexes(table).iter().any(|d| d.name == name) {
         return Err(WireError::validation(format!(
             "index `{name}` already exists on table `{table}`"
+        )));
+    }
+    let existing_gsi_count = meta
+        .table_indexes(table)
+        .iter()
+        .filter(|d| d.kind == IndexKind::Global)
+        .count();
+    if existing_gsi_count >= MAX_GSI_PER_TABLE {
+        return Err(WireError::validation(format!(
+            "table `{table}` already has {existing_gsi_count} GlobalSecondaryIndexes, at most \
+             {MAX_GSI_PER_TABLE} allowed per table"
         )));
     }
     let mut def = schema_bridge::index_to_control(index, &control_schema.partition_key);
