@@ -1,11 +1,14 @@
 # AnimusDB — Bootstrap Brief for Claude Code
 
 **Historical document.** This is the founding brief written before the first
-commit; it records the original scope and vision. Two load-bearing scope
+commit; it records the original scope and vision. Three load-bearing scope
 changes since: v1 is **CP-only** (ADR 0019 deferred the leaderless AP data
-plane described below, and its `animus-data` crate is deleted), and v1 is
+plane described below, and its `animus-data` crate is deleted); v1 is
 **DynamoDB-only** (ADR 0053 dropped the CQL wire adapter described below,
-`animus-cql`). Read `CLAUDE.md` and `docs/adr/README.md` for the current
+`animus-cql`); and AP's deferral became **permanent** (ADR 0019's 2026-08-23
+amendment — with CQL gone no shipping wire can express a per-table replication
+mode, so the `animus-consensus` Accord crate described below, its Elle corpus,
+and the `ReplicationMode` seam are deleted too). Read `CLAUDE.md` and `docs/adr/README.md` for the current
 architecture; treat this file as a record of intent, not current state.
 
 You are bootstrapping a new open-source project, **AnimusDB**, and delivering its

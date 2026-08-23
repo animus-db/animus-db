@@ -44,7 +44,7 @@
 //! **Keyspace.** Nine keys (3 groups × 3 clients: a key's global id is its
 //! owning group times 3 plus its owning client) — **single-writer-per-key
 //! throughout**, including the read-modify-write shape, exactly like the
-//! raftkv/Accord corpora (see `run_rmw_txn`'s doc for why this is load-
+//! raftkv corpus (see `run_rmw_txn`'s doc for why this is load-
 //! bearing here too: the storage layer's plain `TxnStage` merge does not
 //! arbitrate two transactions racing to stage the *same* key — an earlier
 //! draft of this corpus used separate multi-writer "shared" keys for the
@@ -57,7 +57,7 @@
 //! 1. **Write-only, multi-key.** A client appends to 2–3 of its own owned
 //!    keys (spanning that many distinct groups) through the full 2PC
 //!    protocol — never a begin-time read (the house lesson from the
-//!    Accord/raftkv corpora): each client keeps its own authoritative
+//!    raftkv corpus): each client keeps its own authoritative
 //!    in-memory list per owned key and only commits a candidate list into
 //!    that cache once the transaction's outcome is `Committed`/
 //!    `Indeterminate` — **never on a confirmed `Aborted`**, so a
@@ -182,7 +182,7 @@ fn group_index_of_table(table: &str) -> usize {
 /// (see `run_rmw_txn`'s doc for why: the storage layer's plain `TxnStage`
 /// merge does not arbitrate two transactions racing to stage the same key,
 /// so genuine multi-writer contention on one key is out of scope here,
-/// exactly like the raftkv/Accord corpora's own single-writer-per-key
+/// exactly like the raftkv corpus's own single-writer-per-key
 /// doctrine).
 fn group_of_key(key: Key) -> usize {
     (key / NUM_CLIENTS as u64) as usize
@@ -1389,7 +1389,7 @@ async fn resolver_loop(env: SimEnv, topo: Arc<Topology>) {
 /// from it, and only ever written back into `my_lists` once the outcome is
 /// `Committed` or `Indeterminate` — **never** on a confirmed `Aborted`, so a
 /// provably-rolled-back value can never "leak" into a later write's encoded
-/// prefix (which, unlike the raftkv/Accord corpora's plain-KV workload,
+/// prefix (which, unlike the raftkv corpus's plain-KV workload,
 /// *would* otherwise silently re-introduce a value the checker was told
 /// definitely did not happen).
 #[allow(clippy::too_many_arguments)]

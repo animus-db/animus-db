@@ -17,18 +17,12 @@ properties; it also hosts cross-crate fault sweeps.
 - `src/check.rs` — `check_cycles` (serializability), `check_durability`,
   `check_convergence`; each returns a `CheckReport` carrying the run seed.
 - `src/export.rs` — `to_json`, `to_edn` (Jepsen/Elle).
-- `tests/support/mod.rs` — the shared Accord harness: the declarative
-  `Scenario`/`NemesisAction` model, `run_scenario`, the frozen `corpus()`
-  generator, and the depth/breadth expansions (`seed_expand`,
-  `corpus_extended`). See the corpus sections below.
 
 Env knobs at a glance (details in the sections below):
 
 | Knob | Default | Effect |
 |------|---------|--------|
 | `ANIMUS_SEED` | unset | replay one failed sim run from its printed seed (repo-wide convention) |
-| `ANIMUS_CORPUS_SEEDS=K` | 1 | K seed variants per Accord-corpus cell (depth) |
-| `ANIMUS_CORPUS_FULL=1` | off | extended Accord-corpus dimensions (breadth) |
 | `ANIMUS_RAFTKV_SEEDS=K` | 1 | K seed variants per raftkv-corpus cell |
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
 | `ANIMUS_TXN_SEEDS=K` | 1 | K seed variants per multi-tablet transaction-corpus cell (ADR 0018) |
@@ -39,77 +33,95 @@ Env knobs at a glance (details in the sections below):
 
 - **Indeterminate outcomes (e.g. a timeout) MUST be recorded `info`, never
   `fail`.** `fail` asserts the op definitely did not happen; misclassifying
-  makes a checker draw false conclusions. The harnesses follow this: a transaction
-  whose commit could not be confirmed (a crash/partition) is `info`.
+  makes a checker draw false conclusions. Every corpus in this crate follows
+  this: an op whose outcome could not be confirmed (a crash/partition/timeout)
+  is `info` — even though, if it actually executed, its effect is still
+  present in the observed universe (a later read can see it; it can still
+  appear in a final converged state). That's sound: an `info` op simply forms
+  no dependency edge of its own, so a checker never draws a false conclusion
+  from it either way. Never record an indeterminate op `ok`.
 - `check_cycles` is the core Elle idea: recover each key's append order from
   observed reads, build wr/ww/**rw** edges, run Tarjan SCC. The `rw`
   anti-dependency rule (a read precedes the appenders of values it did *not*
   observe) is what catches write skew — keep it if you refactor.
-- AP checks assume `R + W > N`: durability = every `ok` append is in a final
-  quorum read; convergence = two final quorum reads agree (not raw per-replica
-  state — there's no read-repair yet).
+- **Every appended element must be globally unique, not just per-key-per-round
+  (Elle workload-modeling rule).** Reusing a value across rounds/phases/keys
+  makes Elle's `recover` collapse distinct transactions onto one `(key,
+  value)` appender, manufacturing **spurious cycles** the checker correctly
+  flags even though nothing was actually wrong. Every list-append workload in
+  this crate draws its values from one monotonic fresh-value source for
+  exactly this reason. If `check_cycles` trips, suspect value reuse in the
+  workload before suspecting the system under test.
+- **Durability/convergence checks need a converged read, not a raw
+  single-shot one.** `check_durability` = every `ok` op is present in the
+  converged final state; `check_convergence` = two independent post-
+  convergence reads agree — neither is sound against raw per-replica state
+  with no read-repair expectation. How convergence is *reached* is each
+  corpus's own concern (a quorum read, a caught-up Raft follower, a
+  cross-tablet snapshot round) and belongs in the runner as a
+  **converged-or-timeout poll, never a fixed-deadline one-shot read** — see
+  each corpus section below for its own mechanism, including the multi-tablet
+  corpus's three-redesign account of just how easy this is to get wrong.
+- **Single-writer-per-key is a workload-design tool, not just an
+  optimization**, when a corpus wants clean wr/rw/ww edges without the
+  key's own data-model semantics (LWW) manufacturing false-positive
+  divergence. Two writers racing one key under plain LWW lose updates *by
+  design*, which reads as a checker failure for the wrong reason. Where a
+  corpus needs a write to depend on another client's key anyway (to get real
+  G2/write-skew teeth), route it through a **read** of that key, never a
+  second writer on it — see the multi-tablet corpus's read-modify-write shape
+  below for a worked example.
+- **A corpus is a committed generator, not a live-random test.** Every
+  scenario/cell's seed is a stable hash of its own name, so a suite run is
+  the same set every time and a failure names one scenario + seed,
+  replayable via `ANIMUS_SEED`. Regenerating/growing a corpus is an explicit
+  edit to its own generator function; a bug-catching scenario stays forever
+  once added.
 - `CheckReport.seed` exists so a flagged anomaly is replayable; surface it in
   assertion messages.
 
 ## Tests
 
 `cargo test -p animus-test` — `cycle_checker.rs` (hand-built histories) + the
-Accord serializability corpus + the CP-plane corpus below. (v1 is CP-only,
-ADR 0019: the AP data-plane test files — `ap_data_plane.rs`, `fault_sweep.rs`, the
-assembled-stack `end_to_end.rs` — were removed with `animus-data`, as was the
-`Frontier` topology.)
+CP-plane corpora below. (v1 is CP-only, ADR 0019: the AP data-plane test
+files — `ap_data_plane.rs`, `fault_sweep.rs`, the assembled-stack
+`end_to_end.rs` — were removed with `animus-data`, as was the `Frontier`
+topology; the Accord transaction-consensus testbed (`animus-consensus`) and
+its Elle corpus (`elle_accord.rs`, `corpus.rs`, `tests/support/`) were removed
+once ADR 0019's AP deferral became permanent — AP's only remaining stated role
+was Accord's transaction story, and with the CQL wire adapter also dropped
+(ADR 0053) no shipping wire can even select `ReplicationMode::Ap`. If
+transaction consensus over an AP data plane is ever revived, both are
+retrievable from git history.)
 
-### Elle-against-Accord + the frozen scenario corpus (ADR 0014)
-
-The Accord-targeted suite exercises `check_cycles` under contention:
-
-- `negative_control.rs` — the **teeth proof**: hand-built non-serializable
-  histories (write skew G2, circular read dep G1c, a 3-txn cycle) the checker
-  *must* reject, plus serializable ones it must accept. Run/read this before
-  trusting any green corpus run.
-- `support/mod.rs` — the shared harness: assembles a **pure-Accord** replica set
-  (`AccordNode::start` — local execution + versioned-snapshot reads, the
-  serialization authority), drives **concurrent conflicting** multi-key read/write
-  transactions over a small shared key space as **genuine black-box list-append**
-  (real list values stored and observed — see below), records an Elle list-append
-  `History`, and runs all three checkers. Also defines the declarative `Scenario` /
-  `NemesisAction` model, the `run_scenario` runner, and the frozen `corpus()`
-  generator. (The former `Frontier` topology + the data-plane scaffolding were
-  removed in v1.)
-- `elle_accord.rs` — Accord under contention: a no-fault contended run + seed
-  sweep + a determinism check, with teeth-guards asserting the run genuinely
-  contended.
-- `corpus.rs` — the parametric runner over the **frozen, named, seeded** corpus
-  (119 base scenarios: fault type × timing × workload shape × cluster shape, plus
-  baselines and compound lossy/overlapping scenarios), a coverage guard, a
-  non-vacuity guard, a determinism check, and the seed-expansion / extended-tier
-  structural guards. The headline `corpus_is_consistent` asserts **serializability**
-  (`check_cycles`) over the env-scaled `corpus()`; the structural guards run the
-  env-independent `corpus_base()`. Coverage scales by two env knobs (depth/breadth —
-  see below).
+- `negative_control.rs` — the **teeth proof**, shared by every corpus below
+  that runs `check_cycles`: hand-built non-serializable histories (write skew
+  G2, circular read dep G1c, a 3-txn cycle) the checker *must* reject, plus
+  serializable ones it must accept. Run/read this before trusting any green
+  corpus run.
 
 ### Elle-against-Raft: the leaderful (CP) plane corpus (ADR 0017)
 
-- `raftkv_linearizable.rs` — the **CP counterpart** of the Accord corpus, for the
-  `animus-cp-data` leaderful data plane. Crucially it is **not** built on
-  `support/mod.rs`: that harness drives **multi-key transactions** via
-  `AccordNode`, but the Raft KV plane is **single-tablet, non-transactional KV**
-  (`put`/`delete`/`linearizable_get`, one key per op), so the transactional
-  workload can't run over it. The file is self-contained — it reuses only the
+- `raftkv_linearizable.rs` — proves `animus-cp-data`'s leaderful data plane
+  serializable under contention. **Self-contained** — it reuses only the
   *checkers* (`check_cycles`/`check_durability`/`check_convergence`) and the
-  `Recorder`/`History` model — and drives a **single-key list-append** workload
-  over one Raft group (clients route each op to the current leader, tolerating
-  crashes/partitions → `info`).
+  `Recorder`/`History` model from this crate's `src/`, no shared scenario/
+  nemesis harness — and drives a **single-key list-append** workload
+  (`put`/`delete`/`linearizable_get`, one key per op — the Raft KV plane is
+  single-tablet and non-transactional, so a multi-key transactional workload
+  doesn't apply here) over one Raft group (clients route each op to the
+  current leader, tolerating crashes/partitions → `info`).
 - **Serializability is sound *and* asserted here**: a
   single Raft group *is* the serialization authority, so a forked/stale read (the
   failure a deposed leader would cause) shows up as a `check_cycles` cycle. There
   is no eventually-consistent read path to manufacture torn-read false positives,
   so all three checks run on this one layer. Convergence + durability are still
   *eventual* (a lagging follower catches up via log/snapshot), so they use the same
-  **converged-or-timeout** poll as the Accord runner.
+  **converged-or-timeout** poll every corpus in this crate does (see "What's
+  non-obvious" above).
 - Frozen, name-seeded scenario set (29 cells): baselines + leader-kill /
   follower-kill / partition-leader / lossy × early/mid/late × 3- and 5-replica,
-  **plus the deepened tier** mirroring the Accord fault matrix — `stop_restart`
+  **plus a deepened tier** — `stop_restart`
   (a true process restart: `sim.stop` + a fresh `RaftKvNode::start` on the same
   id, recovering from the durable WAL — the CP recovery path), `split_brain`
   (full-mesh partition, no majority anywhere), `leader_minority` (5-replica:
@@ -173,7 +185,7 @@ The Accord-targeted suite exercises `check_cycles` under contention:
   (the commit depends on a read of something a concurrently-running
   transaction writes).
 - **Three shapes**: write-only multi-key (never a begin-time read — same
-  discipline as the raftkv/Accord corpora, with one addition: a
+  discipline as the raftkv corpus, with one addition: a
   provably-rolled-back append must never leak into a later write's encoded
   prefix, so the client's list cache is only advanced on `Committed`/
   `Indeterminate`, never a confirmed `Aborted`); read-only multi-key via
@@ -362,79 +374,3 @@ The Accord-targeted suite exercises `check_cycles` under contention:
   engine-global markers already rely on. See
   `docs/engineering-lessons.md` for the general lesson and
   `advance_backfill_cursor`'s own doc for the full account.
-
-### Scaling coverage: the two env knobs + the topology split (ADR 0014)
-
-- **Depth — `ANIMUS_CORPUS_SEEDS=K` (default 1).** `support::seed_expand` emits
-  `K` seed variants of every structural cell. Variant 0 keeps the cell's
-  **canonical (frozen) name+seed**; variants `1..K` get a `_sNN` suffix + a fresh
-  name-derived seed. `K=1` is the identity, so the always-on default is
-  byte-identical to the committed corpus — a frozen regression seed never moves.
-  This is the dominant bug-finding lever: one structural cell × many interleavings.
-- **Breadth — `ANIMUS_CORPUS_FULL=1` (default off).** `support::corpus_extended`
-  adds new dimension *values* (`SlowLinks` fault; 7-node + asymmetric 3+5/5+3
-  shapes; very-early/wind-down timings; write-only/big-txn/low-contention
-  workloads; triple-fault + partition→heal→repartition schedules). All
-  `ext_`-prefixed, so they never collide with or perturb a base name/seed.
-- **Tiering.** Default `cargo test` → `K=1`, no FULL → the frozen 119. Deep tier
-  (`ANIMUS_CORPUS_SEEDS=40 ANIMUS_CORPUS_FULL=1`) runs **nightly** in CI
-  (`.github/workflows/corpus-deep.yml`), not per-push.
-- **Serializability is the corpus's safety property, scaled to depth.**
-  `check_cycles` is sound on **pure Accord** (`AccordNode::start`: local execution +
-  versioned-snapshot reads `get_at(execute_at)`, fault-robust), which is the only
-  layer the corpus now runs (v1 is CP-only). Serializability is a *safety* property,
-  so `corpus_is_consistent` asserts it over the full env-scaled `corpus()` and it
-  scales to the deep tier (it held 7,560/7,560 historically). (Pre-v1 the corpus also
-  ran a `Frontier` topology — Accord wired to the AP data plane — checked only for
-  **convergence + durability** because its quorum read is eventually consistent and
-  would give `check_cycles` torn-read false positives; that topology + check went
-  with `animus-data`, ADR 0019.)
-
-- **Genuine black-box list-append over Accord (ADR 0014, closed limitation).**
-  With **arbitrary write values** (ADR 0011) each key stores a *real list value*:
-  a write is a list-append (append this txn's globally-unique element to the key's
-  list, write the whole new list back as the stored value via
-  `AccordNode::submit_writes`), and a read observes the **actual stored list**
-  (decoded from `AccordNode::read_value_result`). The recovered order comes from
-  observed *values* (Elle's `recover`), **not** from `applied_order` — so
-  `check_cycles` is a real black-box serializability check (a single
-  globally-agreed-but-non-serializable order now shows as a cycle, not just
-  cross-replica divergence). The earlier "recover the list from `applied_order`"
-  modelling is **obsolete** — do not reintroduce it.
-- **`list_state` reads stored values, not the order.** Final state is read
-  straight from each key's actually-stored value on two *distinct* replicas
-  (`store_value` → `decode_list`), keeping convergence a real cross-replica
-  agreement check and durability ("every ok append is in the final list")
-  meaningful. **Do not** run `check_durability` against a single raw per-replica
-  read with no read-repair expectation; read the converged stored list per
-  replica.
-- **Single-writer-per-key is load-bearing here (not just an optimisation).** Each
-  key is written by exactly one client (`owner(key) = key % clients`); a write
-  only appends to keys it owns. Two clients appending to one key lose updates by
-  the *data model* (per-key LWW), which would show as a false-positive durability
-  failure / divergent read — not a consistency bug. Cross-transaction conflict
-  (the wr/rw/ww edges) still comes from multi-key transactions and from reads
-  observing keys *other* clients write. **A client builds each append on its own
-  authoritative in-memory list**, *not* a begin-time read: the apply marks a txn
-  `Applied` before the driver's spawned task has merged the write into the engine,
-  so a begin-time read can see a stale base and lose the client's own earlier
-  appends (this bit during development — the seed sweep caught it as a divergent
-  read).
-- **The corpus is a committed generator, not a live-random test.** Each
-  scenario's seed is a stable hash of its name, so the suite runs the same set
-  every time and a failure names one scenario + seed. Regenerating/growing it is
-  an explicit edit to `support::corpus`; a bug-catching scenario stays forever.
-- **Indeterminate (`info`) vs the observed universe.** A write whose client timed
-  out is recorded `info`, but if it actually executed its element is in the key's
-  stored list (hence observed by later reads and present in the final list).
-  That's sound: reads and the final state both read stored values, so they stay
-  prefix-consistent under single-writer-per-key; `info` values simply have no `ok`
-  appender, so they form no dependency edges. Never record an indeterminate op
-  `ok`.
-- **Workload modeling gotcha (Elle).** Every appended element must be **globally
-  unique**, not just per-key-per-round. Reusing a value across rounds/phases makes
-  `recover` collapse distinct transactions onto one `(key, value)` appender,
-  manufacturing **spurious cycles** the checker correctly flags. The harness draws
-  values from one monotonic `fresh_value()` source for exactly this reason. If
-  `check_cycles` trips on a single-writer-per-key workload, suspect value reuse
-  before suspecting the system.

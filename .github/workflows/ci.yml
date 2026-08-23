@@ -75,9 +75,9 @@ jobs:
       #
       # `--exclude animusd` drops that crate's 66 real-thread integration
       # binaries plus its real-thread `--lib` tests (`prod-liveness` below
-      # covers all of it instead). The other 6 scattered real-thread
-      # binaries (`animus-control`/`animus-cp-data`/`animus-storage`/
-      # `animus-consensus`) are excluded structurally, not by name here: each
+      # covers all of it instead). The other 5 scattered real-thread
+      # binaries (`animus-control`/`animus-cp-data`/`animus-storage`) are
+      # excluded structurally, not by name here: each
       # is declared as an explicit `[[test]] required-features =
       # ["prod-heavy"]` target in its crate's Cargo.toml, and this plain
       # `cargo test` (no `--features`) never turns that feature on, so Cargo
@@ -146,7 +146,7 @@ jobs:
           done
           exit 1
 
-      # The 6 scattered real-thread binaries outside animusd, each gated
+      # The 5 scattered real-thread binaries outside animusd, each gated
       # behind its crate's opt-in `prod-heavy` feature (see `gates`'s test
       # step comment).
       - name: test scattered prod-heavy binaries (2 attempts)
@@ -161,9 +161,6 @@ jobs:
                  -- --test-threads=1 \
                && cargo test -p animus-storage --features prod-heavy \
                  --test lsm_concurrent --test idle_engine_cost \
-                 -- --test-threads=1 \
-               && cargo test -p animus-consensus --features prod-heavy \
-                 --test accord_concurrent \
                  -- --test-threads=1; then
               exit 0
             fi

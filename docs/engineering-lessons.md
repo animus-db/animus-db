@@ -14,6 +14,23 @@ one-line pointer when the underlying lesson still generalizes.
 Read the section relevant to your task before starting work; grep it when
 debugging anything that feels like it might have happened before.
 
+> **Note on deleted subsystems (2026-08-23).** Entries throughout this log cite
+> **Accord** (`animus-consensus`, `AccordNode`/`AccordCore`, the
+> `animus-test` Accord corpus in `tests/support/` + `corpus.rs` +
+> `elle_accord.rs`) and the per-table **`ReplicationMode`** seam. All of that
+> was **deleted** by [ADR 0019](adr/0019-cp-only-v1-defer-ap.md)'s 2026-08-23
+> amendment — with CQL dropped (ADR 0053), DynamoDB's wire cannot express a
+> replication mode, so AP became unselectable and Accord's remaining role
+> vacuous. Those citations are kept deliberately and read as **historical**:
+> the lessons they carry are general (checker teeth and workload design,
+> collapsing a total order into one `u64`, composing rather than reshaping a
+> proven core, one `Env`/inbox/WAL per hosted protocol instance) and apply
+> directly to the surviving corpora — the CP raftkv corpus (ADR 0017) and the
+> multi-tablet transaction corpus (ADR 0018). They are **not** moved to the
+> archive, because unlike a superseded *lesson* the lesson here still stands;
+> only its illustration is gone. The code is retrievable from git history if a
+> citation needs chasing.
+
 ### Testing
 - **A regression's own split key can quietly exempt it from the bug it
   claims to cover — check whether the fixture's boundary is realistic, not
@@ -3049,6 +3066,34 @@ debugging anything that feels like it might have happened before.
   own investigation, not folded into this one.
 
 ### Code patterns
+- **Deleting a seam: grep the *verb* as well as the *noun*, then grep the
+  prose.** Removing the `ReplicationMode` seam (ADR 0019's 2026-08-23
+  amendment) had an obvious target list — the enum, the `TableSchema::mode`
+  field, the `with_mode` builder, the `Metadata::table_mode` accessor — and
+  that list was **incomplete**. A replicated-catalog field's *write* path in
+  this codebase is a separate `MetaCommand` variant, not the struct field:
+  `MetaCommand::SetTableMode` only surfaced from grepping the accessor and
+  builder names, never from grepping the type. The general rule: for anything
+  that lives in replicated `Metadata`, the removal set is
+  `{type, field, builder, accessor, the MetaCommand variant that mutates it,
+  every gating match site that variant appears in}` — and this repo's own
+  standing lesson about `is_relayable_command`/`cp_serve_forwarded` allowlists
+  is the reason the last item matters.
+
+  The second half is compiler-invisible and therefore easier to miss: deleting
+  a subsystem strands **documentation** pointing at it, and nothing fails the
+  build. After this removal, `raftkv_linearizable.rs`'s module doc still opened
+  with "This is the CP counterpart of the Accord corpus in `corpus.rs`" — a
+  file deleted in the same change — and `hlc.rs` still told readers to "see
+  `crates/animus-consensus/src/node.rs`'s `mvcc_version` doc," a path that no
+  longer exists. Both passed fmt, clippy `-D warnings`, build and the full test
+  suite. So after the code gate is green, grep the deleted names across `*.rs`
+  doc comments, `CLAUDE.md` files and ADRs as a separate pass, and decide per
+  hit: **re-anchor** it (a comparison that stood on its own — "the same poll
+  every corpus uses"), or **mark it historical** where the lineage is the point
+  ("unlike the `(logical, node)` encoding the deleted `animus-consensus`
+  used"). What you must not leave is a live-voice pointer to a path or file
+  that is gone.
 - **A pagination cursor that echoes back a superset of another cursor's
   attributes needs an *exact*-match validation, not a "the attributes I
   need are present" check (2026-08-22, DynamoDB `Query` pagination).**

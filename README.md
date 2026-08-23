@@ -60,7 +60,6 @@ data nodes keep serving on cached metadata; only topology changes block. See
 | `animus-data` | Leaderless data plane: quorum read/write, routing, epoch fencing |
 | `animus-tablet` | Tablet model (key ranges, replica sets, epochs) |
 | `animus-placement` | Placement groups + topology labels + residency *(later)* |
-| `animus-consensus` | Accord-style transactional escalation *(later)* |
 | `animus-dynamo` | DynamoDB-style item API over the common core (wire protocol later) |
 | `animus-test` | Elle-style history recorder + checker |
 | `animusd` | Node server: assembles control + data + a client API over `ProdEnv` (runnable `--cluster` mode) |
