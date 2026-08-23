@@ -7226,6 +7226,35 @@ debugging anything that feels like it might have happened before.
   read, which the compiler-driven approach surfaced as compile errors as
   reliably as everything else, rather than as something a grep could have
   silently missed entirely.
+- **Removing a stride field is the mirror of adding one (above) and needs the
+  identical compiler-driven discipline — but a regex-based mass fixup script
+  for the ~50 call sites carries a distinct, silent-corruption risk the
+  compiler does NOT catch for free: a field-name-keyed regex
+  (`^(admin|intra|console):`) matches the first colon of an unrelated
+  `admin::SomeType { .. }` module path exactly as readily as a
+  `RoleAddrs { admin: p(3), .. }` struct-literal field** (2026-08-22, ADR
+  0053's CQL-port removal, `RoleAddrs::cql` deleted, the 7→6-port stride).
+  The script's per-line regex couldn't distinguish "a field named `admin`
+  inside a `RoleAddrs` literal" from "the start of the path `admin::CpTxnView`
+  used as an ordinary expression" — both are `admin:` followed by more text
+  at the start of a line — so it rewrote several `console::TableSummary { .. }`/
+  `admin::CpRaftView { .. }`/`dynamo::txn_resolve_awaited(..)` call sites into
+  `console: :TableSummary { .. }` (space-then-colon), a token sequence that
+  parses as "the struct field `console`, with its value starting with an
+  unexpected bare `:`". This *did* immediately fail `cargo build`, with a
+  parse error at the corrupted line — so the mistake was never silent in the
+  sense of shipping unnoticed — but the error site is generic enough
+  (`expected one of \`!\`, \`.\`, \`::\`, ...\`, found \`:\``) that it does not
+  self-explain "your last mass-edit script mangled unrelated `Type::path`
+  expressions"; diagnosing it means recognizing the shape, not just reading
+  the compiler's own words. **General rule: a scripted mass edit keyed on
+  `NAME:` (a struct-field shape) must exclude or specifically detect
+  `NAME::` (a path shape) — grep the touched files for `\bNAME: :` (or any
+  of your field names) as a mechanical post-check before trusting a clean
+  build, and always run the full build (not just the files you *meant* to
+  touch) immediately after any regex-driven multi-file edit, since the
+  script's blast radius is whatever text matches its pattern, not whatever
+  you intended it to match.**
 
 ### Parallel-agent orchestration
 - **A single long-lived session can exhaust the disk on `target/` alone, with
@@ -7332,7 +7361,7 @@ debugging anything that feels like it might have happened before.
 - **Partition work by disjoint crate ownership — exactly one owner per shared
   crate/file.** The assembly points (`animusd`, `animus-control`) are
   chokepoints; if several agents must touch `animusd`, split by *file*
-  (`dynamo.rs` / `cql.rs` / `lib.rs`) and expect a small `lib.rs` merge.
+  (`dynamo.rs` / `admin.rs` / `lib.rs`) and expect a small `lib.rs` merge.
 - **Verify agent output yourself** (build + gates), don't trust the report —
   especially for safety-critical changes (a `SimEnv`/determinism edit) and after
   any agent died mid-run.
@@ -8272,3 +8301,34 @@ debugging anything that feels like it might have happened before.
   lost disk — an ENOSPC surfaces as a linker `cc` failure or a garbled
   compile error, so it reads as a code problem and costs a diagnosis
   before it costs a cleanup.
+
+- **A removal ADR's own "every reference is updated" claim needs the same
+  skepticism as any other ADR-vs-code drift — verify it, don't cite it.**
+  ADR 0053 (2026-08-22, drop the CQL wire adapter) asserted a complete sweep:
+  "every `cql`/`CQL` reference across the workspace... is updated... or
+  reworded to note the history." An independent read found it false in the
+  load-bearing places that matter most — the two ADRs it explicitly claimed
+  to amend (ADR 0047's port-stride formula was never touched) plus two more
+  it didn't even claim (ADR 0052, ADR 0035, both still asserting a
+  "seven-port" stride as current fact with `cql` in the list), a live admin
+  endpoint documented as still-present after its own deletion (ADR 0020's
+  `POST /admin/data/cql`), a whole design-doc section for a UI panel deleted
+  from the actual dashboard (ADR 0021's CQL query panel), a crate `CLAUDE.md`
+  still listing a deleted `Metadata` field and a deleted `apply` arm, and a
+  pre-existing test assert string naming a `MetaCommand` variant
+  (`CreateKeyspace`) that no longer compiles anywhere else in the tree. **A
+  stale ADR that claims it swept is worse than one that says nothing**,
+  because a future reader trusts the claim instead of grepping to check it
+  themselves — the fix (this entry's own change) treats "amends ADR N" as a
+  testable assertion: either ADR N's own text now reflects the change, with
+  a dated amendment note in the ADR 0001/0019/0044 style, or the claim gets
+  softened to name what was actually swept (the structural, current-fact
+  references) versus what was deliberately left alone (the much larger body
+  of older ADRs' and the dated lessons log's own historical narrative
+  prose, which is *supposed* to keep describing a deleted feature as it
+  stood at each document's own date — rewriting those would launder history,
+  not fix it). **When asked to "sweep every reference to X," grep the whole
+  tree at the end and read every hit** — not just the files the task
+  description named — because a sweep claim is exactly the kind of thing
+  that silently narrows from "everything" to "everything I happened to
+  touch" without anyone noticing until an independent verifier greps it.

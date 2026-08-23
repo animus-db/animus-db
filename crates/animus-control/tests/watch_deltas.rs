@@ -109,9 +109,6 @@ fn run_scenario(seed: u64) {
             table: "orders".to_string(),
             schema: animus_control::TableSchema::simple("id", animus_control::ColumnType::String),
         });
-        nodes[leader].propose(MetaCommand::CreateKeyspace {
-            keyspace: "ks1".to_string(),
-        });
         nodes[leader].propose(MetaCommand::CreateTablet {
             tablet: TabletId(1),
             table: Some("orders".to_string()),

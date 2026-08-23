@@ -1,9 +1,9 @@
 "use strict";
-// The Data Browser view: a CQL query box + results, and a DynamoDB panel
-// (table select, Scan/Query, an item list with per-row Edit/Delete, a detail
-// panel, Create table / Create item forms, and the bulk-seed tool — which
-// writes real DynamoDB items, hence lives here rather than in Storage) — all
-// against the real /admin/data/{cql,dynamo,drop-table,seed} endpoints, not
+// The Data Browser view: a DynamoDB panel (table select, Scan/Query, an item
+// list with per-row Edit/Delete, a detail panel, Create table / Create item
+// forms, and the bulk-seed tool — which writes real DynamoDB items, hence
+// lives here rather than in Storage) — all against the real
+// /admin/data/{dynamo,drop-table,seed} endpoints, not
 // the design mockup's fake in-memory item store. Depends on
 // `dashboard_core.js` (STATE, $, esc, pill, getJSON, postJSON, loadAll,
 // splitHiddenTable) and `dashboard_streams.js` (viewTypeLabel — the Stream
@@ -12,8 +12,6 @@
 // `tabletsForTable`, reused below for the Indexes card's backfill-progress
 // count — a stream shard count and an index backfill count both need "every
 // tablet currently mapped to this table", the same live-topology lookup).
-
-let brProtocol = "cql";
 
 // ---- DynamoDB: schema helpers (shared by Scan/Query/item forms) ----
 // Excludes a GSI's own hidden `<base>$<index>` materialization table
@@ -658,50 +656,14 @@ async function dropCurrentTable() {
   await loadAll();
 }
 
-// ---- CQL ----
-function setProtocol(p) {
-  brProtocol = p;
-  $("br-proto-cql").classList.toggle("active", p === "cql");
-  $("br-proto-dynamo").classList.toggle("active", p === "dynamo");
-  $("br-cql-panel").style.display = p === "cql" ? "" : "none";
-  $("br-dynamo-panel").style.display = p === "dynamo" ? "" : "none";
-}
-async function runCql() {
-  const query = $("br-cql-query").value;
-  const ks = $("br-cql-ks").value.trim();
-  if (!query.trim()) { $("br-cql-result").innerHTML = `<div class="empty">enter a statement</div>`; return; }
-  try {
-    const { status, body } = await postJSON(SEED, "/admin/data/cql", { query, keyspace: ks || null });
-    if (status !== 200 || !body.results) {
-      $("br-cql-result").innerHTML = `<div class="err-line">${esc((body && body.error) || ("HTTP " + status))}</div>`;
-      return;
-    }
-    $("br-cql-result").innerHTML = body.results.map(renderCqlResult).join("");
-  } catch (e) { $("br-cql-result").innerHTML = `<div class="err-line">${esc(e)}</div>`; }
-}
-function renderCqlResult(r) {
-  const head = `<div class="muted" style="margin-top:8px"><code>${esc(r.statement)}</code></div>`;
-  if (r.kind === "error") return head + `<div class="err-line">${esc(r.error)}</div>`;
-  if (r.kind === "rows") {
-    const cols = (r.columns || []).map((c) => `<th>${esc(c)}</th>`).join("");
-    const rows = (r.rows || []).map((row) =>
-      `<tr>${row.map((c) => `<td class="mono">${c === null ? "<span class='muted'>null</span>" : esc(c)}</td>`).join("")}</tr>`).join("");
-    return head + `<table><thead><tr>${cols}</tr></thead><tbody>${rows}</tbody></table>`
-      + `<div class="muted">${esc(r.row_count)} row(s)</div>`;
-  }
-  if (r.kind === "set_keyspace") return head + `<div class="muted">${pill("ok", "USE " + esc(r.keyspace))}</div>`;
-  if (r.kind === "schema_change") return head + `<div class="muted">${pill("ok", esc(r.change) + " " + esc(r.target))}</div>`;
-  return head + `<div class="muted">${pill("ok", "ok")}</div>`;
-}
-
 // ---- Bulk seed (sharding test) ----
 let seeding = false;
 let seedTable = "";
 
 // The seeder writes real DynamoDB items (keyed by the table's catalog schema),
-// so the target list is the DynamoDB tables (`dynamoTables()` — the catalog
-// minus CQL `ks.table` entries) that *have a tablet*, the set
-// `/admin/data/seed` accepts (it validates against the replicated tablet map).
+// so the target list is the DynamoDB tables (`dynamoTables()`) that *have a
+// tablet*, the set `/admin/data/seed` accepts (it validates against the
+// replicated tablet map).
 // Refreshed by render() (which also runs mid-seed via loadAll), so keep the
 // Seed button's disabled state in sync with both table validity and `seeding`.
 // Auto-picks the first seedable table when none is selected yet or the

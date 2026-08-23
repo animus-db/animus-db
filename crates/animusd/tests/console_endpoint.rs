@@ -181,7 +181,7 @@ async fn console_serves_shell_on_data_only_node() {
 /// The deliberate non-goal (ADR 0052 "Which deployment shapes serve it"): a
 /// **control-only** node hosts no CP-data tablet, so it binds no console
 /// listener at all — `Node::console_addr()` panics there, the identical
-/// contract `dynamo_addr()`/`cql_addr()` already carry for the same shape.
+/// contract `dynamo_addr()` already carries for the same shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[should_panic(expected = "this node has no data role")]
 async fn console_addr_panics_on_control_only_node() {

@@ -43,17 +43,16 @@ use tokio::time::{sleep, timeout};
 /// fresh `tempfile::tempdir()` + freshly-bound `:0` ports per call is enough
 /// isolation for one node).
 async fn bring_up_one(dir: &std::path::Path) -> Node {
-    let addrs = free_addrs(7);
+    let addrs = free_addrs(6);
     let node_cfg = animusd::RoleAddrs {
         id: animusd::config::node_id(0),
         role: animusd::config::NodeRole::Both,
         internal: addrs[0],
         client: addrs[1],
         dynamo: addrs[2],
-        cql: addrs[3],
-        admin: addrs[4],
-        intra: addrs[5],
-        console: addrs[6],
+        admin: addrs[3],
+        intra: addrs[4],
+        console: addrs[5],
     };
     let config = animusd::ClusterConfig {
         nodes: vec![node_cfg],
@@ -230,26 +229,6 @@ async fn system_table_lists_every_seeded_entity_kind() {
         )
         .await;
 
-        // ---- Keyspace ---------------------------------------------------------
-        let resp = call(
-            client,
-            ClientRequest::ProposeSchema(MetaCommand::CreateKeyspace {
-                keyspace: "ks1".to_string(),
-            }),
-        )
-        .await;
-        assert!(matches!(resp, ClientResponse::PutOk), "{resp:?}");
-        await_status(
-            admin,
-            |s| {
-                s["keyspaces"]
-                    .as_array()
-                    .is_some_and(|a| a.iter().any(|v| v == "ks1"))
-            },
-            "keyspace committed",
-        )
-        .await;
-
         // ---- CpMemberAddr (legacy) --------------------------------------------
         let resp = call(
             client,
@@ -313,13 +292,12 @@ async fn system_table_lists_every_seeded_entity_kind() {
             .expect("a sibling tablet exists after split");
 
         // ---- every seeded kind eventually shows up in the browse surface ----
-        const EXPECT_KINDS: [&str; 9] = [
+        const EXPECT_KINDS: [&str; 8] = [
             "tablet",
             "member",
             "schema",
             "policy",
             "node_addrs",
-            "keyspace",
             "counter",
             "cp_member_addr",
             // ADR 0050 fork F9: the cutover above froze this lineage row.
@@ -397,13 +375,6 @@ async fn system_table_lists_every_seeded_entity_kind() {
 
         let node_addrs_item = find_one("node_addrs");
         assert!(node_addrs_item["value"].is_object());
-
-        let keyspace_item = find("keyspace", "ks1");
-        assert_eq!(
-            keyspace_item["value"],
-            Value::Null,
-            "keyspace is presence-only: {keyspace_item}"
-        );
 
         // ADR 0050 fork F9: the cutover above froze `split_lineage[sibling_id]`
         // naming parent tablet 1 — a JSON entity (unlike the retired

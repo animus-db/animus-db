@@ -8,11 +8,13 @@ The runnable AnimusDB node server — a **lib + bin**. `lib.rs` assembles a node
 over `ProdEnv` (the first real use of the production seam): a control-plane Raft
 (`animus-control`) for cluster metadata plus the CP data plane (`animus-cp-data`,
 one leaderful Raft group per tablet) for linearizable reads/writes, fronted by
-four wire edges (DynamoDB JSON/HTTP, CQL v4, a plain length-prefixed TCP client
+three wire edges (DynamoDB JSON/HTTP, a plain length-prefixed TCP client
 protocol, and an admin/debug HTTP-JSON port with a web console). `main.rs` is a
 thin CLI wrapper. `animus-cli` depends on this crate for the client protocol
 types. v1 (ADR 0019) is **CP-only**; the leaderless AP `data`/`coord` roles are
-gone. Streams implementation notes: [`docs/streams-notes.md`](../../docs/streams-notes.md).
+gone. v1 is also **DynamoDB-only** (ADR 0053) — a CQL wire edge shipped for a
+time and was dropped; retrievable from git history if ever revived.
+Streams implementation notes: [`docs/streams-notes.md`](../../docs/streams-notes.md).
 
 **`lib.rs` is ~6800 lines** — grep for the symbol, don't scroll. It also holds
 in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
@@ -48,9 +50,9 @@ reusing the captured config is the point of the test.
 - **`config.rs`** — `ClusterConfig`/`RoleAddrs` (per-process deployment
   config; every entry names its own **`id: NodeId`** rather than deriving
   it from position — `from_json` hard-errors on a duplicate) and the
-  **seven-port stride** (ADR 0047 + ADR 0052: `base_port + 7*i +
-  {internal,client,dynamo,cql,admin,intra,console}` — `intra` at offset 5
-  (the client/intra-cluster RPC port split), `console` at offset 6 (the
+  **six-port stride** (ADR 0047 + ADR 0052 + ADR 0053: `base_port + 6*i +
+  {internal,client,dynamo,admin,intra,console}` — `intra` at offset 4
+  (the client/intra-cluster RPC port split), `console` at offset 5 (the
   AnimusDB Data Console, ADR 0052 — a DynamoDB-shaped data app on its own
   port, deliberately separate from the operator dashboard the admin port
   serves; bound on combined/data-only nodes, never control-only, which
@@ -63,7 +65,13 @@ reusing the captured config is the point of the test.
   `error[E0063]: missing field` output enumerate every one of the ~60
   literal construction sites across `src/`+`tests/` — don't trust a grep
   pass to have found them all (see `docs/engineering-lessons.md`'s
-  2026-08-19 "Code patterns" entry on this exact port addition).
+  2026-08-19 "Code patterns" entry on this exact port addition). **Removing
+  a field is the mirror**, and a regex-driven fixup script across the
+  construction sites carries its own silent-corruption risk — see the
+  2026-08-22 "Code patterns" entry (ADR 0053's `cql` port removal) on a
+  field-name-keyed regex mangling unrelated `admin::Type`/`console::Type`
+  module-path expressions into invalid syntax; always full-build immediately
+  after, not just visually diff.
 - **`control_handle.rs`** — the `ControlHandle` seam (ADR 0035 PR1):
   `Local(RaftNode<ProdEnv>)` for a node with real control Raft, vs.
   `Remote(RemoteControlClient)` for a data-only node reaching a separate control
@@ -206,9 +214,6 @@ reusing the captured config is the point of the test.
   for `UpdateTimeToLive` (`MetaCommand::SetTableTtl` on the
   `is_relayable_command` allowlist) lives in `tests/schema_ddl_relay.rs`,
   alongside its sibling DDL-relay tests.
-- **`cql.rs`** (~42 KB) — the CQL (Cassandra) v4 binary-protocol edge.
-- **`cql_client.rs`** — a minimal loopback CQL client the admin dashboard's CQL
-  editor uses (`POST /admin/data/cql`) to drive this node's own CQL port.
 - **`admin.rs`** (~58 KB) — the admin/debug HTTP-JSON endpoint (ADR 0020):
   read-only `GET` views + gated `POST` actions + the dashboard's data-write
   surface; also serves the SPA static assets.
@@ -476,7 +481,7 @@ to a frozen parent gets the retryable `FROZEN_REFUSAL` from every local
 write/txn helper (`frozen_refusal`; bookkeeping-only kind batches exempt).
 **Both `ClientCtx::cp_kind_write_item` (the evaluated arm) and
 `cp_kind_write_raw` (the fast/marker arm) retry this internally** (issue
-#288: pre-fix, neither had a retry loop at all — every Dynamo/CQL/raw-
+#288: pre-fix, neither had a retry loop at all — every Dynamo/raw-
 protocol write funnels through one of these two since ADR 0049's write-path
 unification, so a write racing the freeze window got a terminal 500
 instead of the write landing on the child a moment later), mirroring
@@ -522,12 +527,12 @@ and this engine is the durable home of the control plane's async apply
 task's published cache (see `animus-control/CLAUDE.md`'s `node.rs`/
 `mirror.rs` entries).
 
-**Console binding (ADR 0052) follows the same split as `dynamo`/`cql`**:
+**Console binding (ADR 0052) follows the same split as `dynamo`**:
 combined and data-only bind `RoleAddrs.console` (real CP-data tablets to
 show); control-only does not (`Node::bind_control` never reads
 `addrs.console` at all, and `BoundControlNode::start_control_with` passes
 `None` for `spawn_common_tail`'s `console_listener` — `Node::console_addr()`
-panics there, mirroring `dynamo_addr()`/`cql_addr()`'s existing
+panics there, mirroring `dynamo_addr()`'s existing
 control-only-panics contract).
 
 ## Request routing (CP)
@@ -1085,8 +1090,7 @@ route below the edge through the same `ClientCtx` CP primitives.
   0013) and waits for commit — and, before acking, for the provisioned
   tablet's group to actually **serve** (`ClientCtx::await_table_serveable`,
   a linearizable probe read; ADR 0023's 2026-08-17 amendment — the 200 must
-  not hand the client the group's formation/election window; the CQL
-  `CREATE TABLE` edge shares the same helper; regression:
+  not hand the client the group's formation/election window; regression:
   `tests/create_table_ready.rs`, whose readiness assertion is one-shot at
   ack time on purpose); a node reconciles its local registry from
   `Metadata::table_indexes` — the registry holds only *definition*
@@ -1126,12 +1130,7 @@ route below the edge through the same `ClientCtx` CP primitives.
   **The plain-table half of the old named gap is closed (ADR 0049)**: a
   plain table's conditioned `PutItem`/`DeleteItem` and `UpdateItem` now
   route through this same leader funnel (constant-true gate, below), so
-  their conditions/RMW evaluate at the leader too; only CQL's own RMW
-  (`cql.rs`) keeps the node-local-`rmw_lock`-only scope — deliberately,
-  including after Train A's CQL rung, which moved CQL's *commit* onto the
-  kind path but not its RMW's evaluation point (a CQL partition write has
-  no derived state, so there is no U3 funnel to route it through; the
-  cross-node RMW race stays a documented pre-existing gap of its own).
+  their conditions/RMW evaluate at the leader too.
   An **unevaluated** plain-table write (no condition, no
   old-image echo) takes the ADR 0049 **fast arm** instead
   (`dynamo::fast_marker_write`): the edge builds base row + marker record
@@ -1207,9 +1206,8 @@ route below the edge through the same `ClientCtx` CP primitives.
   rung 5. Two consequences worth knowing:
   ADR 0046 §2's "a plain table's condition only has node-local `rmw_lock`
   protection" gap is **closed for the Dynamo edge** (every write now
-  evaluates at the tablet leader; CQL's own RMW keeps the gap — see the
-  routing section's note on why the CQL rung deliberately did not move it),
-  and a plain or CQL table's markers are **transient** (Train A rung 4):
+  evaluates at the tablet leader), and a plain table's markers are
+  **transient** (Train A rung 4):
   `change_consumer_loop` now visits every led tablet — a marker table gets
   a mandatory cheap idle gate (`approx_bytes_kind(KIND_CHANGE) == 0` ⇒
   nothing at all this tick), holds the quiesce veto while markers are
@@ -1313,25 +1311,6 @@ route below the edge through the same `ClientCtx` CP primitives.
   `ttl_expired: bool`). `MetaCommand::SetTableTtl` is on the
   `is_relayable_command` allowlist beside `SetTableStream` — regression:
   `tests/schema_ddl_relay.rs`.
-- **CQL v4** (`cql.rs`, `RoleAddrs.cql`) — `STARTUP`/`OPTIONS` handshake +
-  `QUERY`/`PREPARE`/`EXECUTE` via the pure `animus_cql` crate. `CREATE TABLE`
-  proposes a typed schema into the replicated catalog (incl. clustering/
-  compound keys). A partition is one CP value, so `INSERT`/`UPDATE`/`DELETE`
-  are RMW under `rmw_lock`; **the commit itself rides the universal
-  kind-write path (ADR 0049 Train A rung 2)** — `cql::kind_partition_write`
-  commits one `KindBatch` entry per mutation (the partition's base row or
-  whole-partition tombstone + an image-less marker record built by the
-  shared `dynamo::marker_change_log`, change-key prefix = the partition's
-  own `data_key` bytes, `base_sk` empty), so every CQL mutation is
-  observable on the tablet's change log; in-crate regression
-  `cql::cql_kind_write_tests` (real-socket, needs `pending_changes`). The
-  requested consistency level is accepted but moot (CP). Keyspaces are **replicated** (`CREATE KEYSPACE` proposes
-  `MetaCommand::CreateKeyspace`; `USE`/qualifier validation reads the
-  replicated set via `keyspace_exists`, with a `ks.table`-prefix fallback).
-  Only the **prepared-statement store** (`CqlState`) is per-node edge state
-  (shared across connections *to the same node*, isolated between nodes,
-  lost on restart); prepared ids are
-  content-addressed (FNV-1a of the text).
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only
   `GET` views + gated `POST` actions + data writes; grep `admin.rs`'s route
   table for the full endpoint inventory. Below the edge it only reads node
@@ -1422,7 +1401,7 @@ route below the edge through the same `ClientCtx` CP primitives.
   protocol instances). The client API is a plain TCP server, *not* on the
   `Network` — a non-leader forwards over a fresh client connection.
 - **Two client-protocol listeners, one dispatch (ADR 0047)**: `RoleAddrs.client`
-  (external, DynamoDB/CQL-adjacent callers) and `RoleAddrs.intra` (every
+  (external, DynamoDB-adjacent callers) and `RoleAddrs.intra` (every
   node-to-node `ClientRequest` — `Forwarded`, `ProposeSchema`,
   `WatchMetadata`, `JoinInfo`, and every internal-only forwarding payload)
   are the **same** length-prefixed JSON `ClientRequest`/`ClientResponse`
@@ -1451,12 +1430,12 @@ route below the edge through the same `ClientCtx` CP primitives.
 - **`ClusterEdgeState` is scoped to one NODE** (ADR 0031 PR2), created fresh per
   node — even in `--cluster N`, which previously shared one instance across the
   cluster and masked cross-process bugs. Holds this node's own control handle, its
-  hosted CP group handles (keyed by tablet), the DynamoDB `SchemaRegistry`, and
-  the CQL `CqlState`. No process-global (`OnceLock`) mutable state.
+  hosted CP group handles (keyed by tablet), and the DynamoDB `SchemaRegistry`.
+  No process-global (`OnceLock`) mutable state.
 - **`ClientCtx.data: Option<DataRole>`** groups the data-role-only fields
   (`rmw_lock`, `raftkv_metrics`, `base_id`). `ClientCtx::data()` **panics** if
   absent — safe only from paths that structurally can't run on a control-only node
-  (dynamo/cql edges, `auto_split_loop`). `resolve_cp_route` must never panic — it
+  (the dynamo edge, `auto_split_loop`). `resolve_cp_route` must never panic — it
   matches `self.data.as_ref()` directly (control-only node ⇒ zero local replicas).
 - **`--cluster N` without `--dir` reuses ONE fixed path** (`$TMPDIR/animusd`), and
   `--ephemeral` does NOT make the control/raftkv WALs ephemeral (it only selects
@@ -1562,12 +1541,12 @@ route below the edge through the same `ClientCtx` CP primitives.
   0050 gating measurement). Node-start entry points are async+fallible
   (`io::Result`).
 - **`Node::shutdown()` is a graceful teardown** — aborts the listener tasks and
-  `ProdEnv::shutdown()`s the node's one internal env, freeing all seven ports
+  `ProdEnv::shutdown()`s the node's one internal env, freeing all six ports
   on a combined/data-only node (ADR 0040 PR1's `internal`/`client`/`dynamo`/
-  `cql`/`admin` stride, plus ADR 0047's `intra` and ADR 0052's `console` — the
+  `admin` stride, plus ADR 0047's `intra` and ADR 0052's `console` — the
   pre-ADR-0040 stride was six too, but split across two role envs instead of
-  one node/one port-block; a control-only node frees five, since it never
-  binds `dynamo`/`cql`/`console`) so a replacement can rebind
+  one node/one port-block; a control-only node frees four, since it never
+  binds `dynamo`/`console`) so a replacement can rebind
   the same addresses/dir. Dropping a `Node` without it leaves tasks running.
   **It's fire-and-forget (`abort()` then return), not a guarantee those ports are
   free the instant it returns** — see `animus-env/CLAUDE.md`'s `ProdEnv::shutdown()`
@@ -1698,7 +1677,7 @@ group's `halted` flag.
 One binary per behavior; the file names describe them (`ls
 crates/animusd/tests/`) — covering combined/control-only/data-only/split
 deployment shapes and growth/decommission, control-plane and CP-data-plane
-membership change, the DynamoDB/CQL/admin/dashboard wire edges (including
+membership change, the DynamoDB/admin/dashboard wire edges (including
 the ADR 0041 secondary-index and ADR 0018 transaction suites), the ADR
 0042/0043 streams surface end to end (`docs/streams-notes.md` has the
 streams-specific test notes), the ADR 0051 TTL surface end to end
