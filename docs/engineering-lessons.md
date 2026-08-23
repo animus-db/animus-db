@@ -32,6 +32,31 @@ debugging anything that feels like it might have happened before.
 > citation needs chasing.
 
 ### Testing
+- **Adding a new AWS-documented request-shape limit needs a workspace-wide
+  sweep for pre-existing test helpers that already build a request past it,
+  not just a decode-level unit test (2026-08-23, DynamoDB batch/transaction
+  caps).** Enforcing `BatchWriteItem`'s real 25-item-per-call cap
+  immediately broke three already-green `animusd` integration tests that
+  predate the cap and built genuinely oversized single-call batches to
+  drive load gently: `batch_write.rs`'s throughput comparison (200 items in
+  one call), `backfill_seeder.rs`'s 300-row populate (chunked at 100), and
+  `update_table_drop_index.rs`'s `batch_put_items` helper (also chunked at
+  100). None of them were wrong when written — nothing enforced the cap
+  yet, so "one big batch" was a legitimate way to minimize consensus
+  rounds. `grep -rn 'chunks(100)\|chunks(200)\|...'`-style searches across
+  every crate's `tests/` tree (not just the crate whose decoder changed) is
+  what found them, plus a targeted run of every test file the grep for the
+  changed operation names turned up; the crate's own decode-level unit
+  tests, however thorough (at-cap accepted, one-over rejected), only prove
+  the new check rejects a synthetic oversized request — they can't prove
+  the rest of the workspace doesn't already build one for an unrelated
+  reason. **General form**: any new hard cap on a previously-uncapped wire
+  shape (item size, batch/transaction item count, index count, key count,
+  …) needs the same workspace-wide sweep before the change is considered
+  validated, since a test helper written before the cap existed has no
+  reason to already respect it. Fix the test helpers to chunk (the same
+  technique a real client SDK uses), not the new cap. (`crates/animusd/
+  tests/batch_write.rs`, `backfill_seeder.rs`, `update_table_drop_index.rs`.)
 - **A regression's own split key can quietly exempt it from the bug it
   claims to cover — check whether the fixture's boundary is realistic, not
   just whether the test passes.** Issue #355 suspected (from code reading)
