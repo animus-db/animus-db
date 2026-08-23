@@ -3802,19 +3802,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .collect()
     }
 
-    /// As [`cursor_rows`](Self::cursor_rows), but keeping the **token** each
-    /// row's own key names alongside its tag. `cursor_rows` drops it (none of
-    /// its own callers need it). Its original caller — the ADR 0042 §7 trim
-    /// janitor's merge-residue cleanup (`animusd::index_drain`), which told
-    /// "this tablet's own row" (`token ==
-    /// cursor::token_of(self.scope_range().start)`) from "a
-    /// still-physically-present absorbed sibling's row" — no longer exists:
-    /// tablet merge was removed entirely (ADR 0044). This method (and
-    /// [`cursor::token_of`]) currently has **no production caller**; kept for
-    /// the same reason `token_of`'s own doc gives.
-    pub async fn cursor_rows_with_token(
-        &self,
-    ) -> Vec<([u8; animus_tablet::TOKEN_BYTES], String, HlcTimestamp)> {
+    /// As [`cursor_rows`](Self::cursor_rows), but keeping the **range-start**
+    /// each row's own key names alongside its tag (issue #355: a cursor
+    /// key's leading bytes are now the writing tablet's own live
+    /// `range.start`, embedded verbatim rather than truncated to a fixed
+    /// token — see [`cursor::cursor_key`]'s own doc). `cursor_rows` drops it
+    /// (none of its own callers need it). Its original caller — the ADR
+    /// 0042 §7 trim janitor's merge-residue cleanup (`animusd::index_drain`),
+    /// which told "this tablet's own row" from "a still-physically-present
+    /// absorbed sibling's row" — no longer exists: tablet merge was removed
+    /// entirely (ADR 0044). This method currently has **no production
+    /// caller**; kept in case a future consumer needs the same
+    /// row-provenance disambiguation.
+    pub async fn cursor_rows_with_token(&self) -> Vec<(Vec<u8>, String, HlcTimestamp)> {
         let scope = &self.kind_scopes[KIND_CURSOR as usize];
         let (start, end) = scope.physical_bounds();
         let Some(end) = end else {
@@ -3828,14 +3828,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .flatten()
             .filter_map(|(k, vv)| {
                 let logical = scope.strip_in_range(&k)?;
-                let (token, tag) = cursor::parse_cursor_key(logical)?;
+                let (range_start, tag) = cursor::parse_cursor_key(logical)?;
                 let ts = match txn::decode_envelope(&vv.value) {
                     txn::Envelope::Committed(v) => cursor::decode_watermark(&v)?,
                     txn::Envelope::Intent { .. } => return None,
                 };
-                let mut tok = [0u8; animus_tablet::TOKEN_BYTES];
-                tok.copy_from_slice(token);
-                Some((tok, tag.to_string(), ts))
+                Some((range_start.to_vec(), tag.to_string(), ts))
             })
             .collect()
     }

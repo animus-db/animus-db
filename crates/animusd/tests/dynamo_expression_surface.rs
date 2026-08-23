@@ -161,7 +161,8 @@ async fn numeric_comparators_filter_numerically() {
     // seeded above with two-digit values to make that visible.
     async fn q(addr: SocketAddr, op: &str, v: &str) -> (u16, String) {
         let body = format!(
-            r#"{{"TableName":"events","KeyConditionExpression":"pk = :p",
+            r#"{{"TableName":"events","ConsistentRead":true,
+                 "KeyConditionExpression":"pk = :p",
                  "FilterExpression":"seq {op} :v",
                  "ExpressionAttributeValues":{{":p":{{"S":"p1"}},":v":{{"N":"{v}"}}}}}}"#
         );
@@ -194,7 +195,8 @@ async fn the_function_and_range_forms_serve() {
 
     async fn run(addr: SocketAddr, frag: &str) -> (u16, String) {
         let body = format!(
-            r#"{{"TableName":"events","KeyConditionExpression":"pk = :p",
+            r#"{{"TableName":"events","ConsistentRead":true,
+                 "KeyConditionExpression":"pk = :p",
                  "FilterExpression":"{frag}",
                  "ExpressionAttributeValues":{{":p":{{"S":"p1"}},
                     ":lo":{{"N":"1"}},":hi":{{"N":"3"}},
@@ -236,6 +238,76 @@ async fn the_function_and_range_forms_serve() {
 
     let (_, size) = run(at, "size(sk) = :two").await;
     assert!(size.contains("\"a0\""), "`a0` is two bytes: {size}");
+
+    for n in nodes {
+        n.shutdown_graceful().await;
+    }
+}
+
+/// `size()` on an attribute that **exists** with a type it has no size for
+/// (`N`/`BOOL`/`NULL`) is a real DynamoDB `ValidationException`, not a false
+/// filter match — the fidelity gap flagged in review of the commit that
+/// introduced `size()` (fe0ce0c). Covers both evaluation paths the wire
+/// shares: a `Scan`/`Query` `FilterExpression` and a `PutItem`
+/// `ConditionExpression`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn size_of_an_existing_number_attribute_is_a_validation_exception() {
+    let (_dir, nodes, addrs) = setup().await;
+
+    // `seq` is an `N` on every seeded item — `size()` has no meaning for it.
+    // `ConsistentRead: true` is load-bearing for the ASSERTION, not the
+    // semantics: the error only raises when an item is actually examined, so
+    // an eventual read served by a still-empty lagging replica (ADR 0055's
+    // wire default) would legitimately return 200/Count:0 instead.
+    let (status, body) = dynamo_retry(
+        addrs[0],
+        "DynamoDB_20120810.Scan",
+        r#"{"TableName":"events","ConsistentRead":true,
+            "FilterExpression":"size(seq) > :zero",
+            "ExpressionAttributeValues":{":zero":{"N":"0"}}}"#,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "size() on an existing N attribute must be rejected, not just false: {body}"
+    );
+    assert!(body.contains("ValidationException"), "{body}");
+    assert!(
+        body.contains("operator or function: size, operand type: N"),
+        "message should match AWS's own wording: {body}"
+    );
+
+    // The same evaluator backs a conditional write — issued through EVERY
+    // node, not one fixed address: a conditional write evaluates at the
+    // tablet's leader (ADR 0046 U3), so on a 3-node cluster at least two of
+    // these sends cross the forwarded `KindWriteItem` hop, where the typed
+    // error's own code must survive the string-typed reply channel
+    // (`dynamo::encode_relayed_error`). Pre-fix this was a
+    // placement-dependent failure: the leader-local send returned the
+    // correct 400 while a forwarded one degraded to a 500 — exactly what CI
+    // caught. `dynamo_retry` retries only genuine transient 500s
+    // (leadership churn), so it converges on the stable answer either way.
+    for (i, addr) in addrs.iter().enumerate() {
+        let (status, body) = dynamo_retry(
+            *addr,
+            "DynamoDB_20120810.PutItem",
+            r#"{"TableName":"events","Item":{"pk":{"S":"p1"},"sk":{"S":"a0"},"seq":{"N":"0"}},
+                "ConditionExpression":"size(seq) > :zero",
+                "ExpressionAttributeValues":{":zero":{"N":"0"}}}"#,
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "node {i}: the same size()-on-N error must reach a conditional \
+             write too (a forwarded hop must not degrade it to a 500): {body}"
+        );
+        assert!(body.contains("ValidationException"), "node {i}: {body}");
+        assert!(
+            !body.contains("ConditionalCheckFailed"),
+            "node {i}: an operand-type violation is a ValidationException, \
+             not a failed condition check: {body}"
+        );
+    }
 
     for n in nodes {
         n.shutdown_graceful().await;

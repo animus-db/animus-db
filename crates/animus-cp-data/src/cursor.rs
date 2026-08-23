@@ -24,38 +24,76 @@
 //!
 //! ## Key scheme + disjointness proof
 //!
-//! [`cursor_key`] returns `token(8 bytes) || [0x00, CURSOR_TAG] ||
-//! consumer.as_bytes()`, where `token` is this tablet's own live
-//! `KeyRange::start`, truncated (zero-padded if shorter) to
-//! [`TOKEN_BYTES`] — mirroring `txn.rs`'s `record_key` scheme exactly (`token
-//! || [0x00, TAG] || id`), with `CURSOR_TAG` (`0x03`) taking the next unused
-//! value after `seal.rs`'s marker doesn't share this scope at all and
-//! `txn.rs`'s own `RECORD_TAG` (`0x02`).
+//! [`cursor_key`] returns `range_start (verbatim, untruncated) || [0x00,
+//! CURSOR_TAG] || consumer.as_bytes() || len(range_start) as a 2-byte
+//! big-endian trailer`, where `range_start` is this tablet's own live
+//! `KeyRange::start` — the **whole** value, never truncated. `CURSOR_TAG`
+//! (`0x03`) is the next unused value after `seal.rs`'s marker (which
+//! doesn't share this scope at all) and `txn.rs`'s own `RECORD_TAG`
+//! (`0x02`); the leading-bytes-then-tag shape otherwise mirrors `txn.rs`'s
+//! `record_key` scheme (`token || [0x00, TAG] || id`), except a cursor key
+//! carries its own length trailer instead of relying on `TAG` living at a
+//! fixed byte offset (see "Why untruncated, and why a trailer" below for
+//! why a cursor row needs that where a txn record doesn't).
 //!
 //! Unlike a txn record, a cursor row lives in its **own** row-kind scope
 //! (`KIND_CURSOR`), physically disjoint from `KIND_BASE` by construction
 //! (every kind is a distinct `StorageScope` prefix — see `StorageScope::
 //! with_kind`'s own doc) — so cursor rows can never collide with a real
-//! client key at all, regardless of byte content. The disjointness argument
-//! below is still worth stating structurally, for the same reason `txn.rs`
-//! states its own even though `RaftKvNode::txn_stage` never scans the base
-//! scope for record keys either: it is what lets [`parse_cursor_key`]
-//! recover a tag from a raw scanned key (the min-over-rows rule, ADR 0042
-//! §7, needs to enumerate every row in a tablet's `KIND_CURSOR` scope and
-//! group by tag) with a fixed, unambiguous byte offset, rather than a scan
-//! for the marker pair that a pathological token's own bytes could in
-//! principle spoof.
+//! client key at all, regardless of byte content, and [`parse_cursor_key`]
+//! only ever has to disambiguate rows this crate itself wrote.
 //!
-//! `animus_tablet::escape`'s structural guarantee (restated from `txn.rs`):
-//! `escape(pk)` never emits a lone `0x00` byte — every literal `0x00` in `pk`
-//! is doubled to `0x00 0x01`, and the whole encoding is terminated by `0x00
-//! 0x00`. So the only two bytes that can ever follow a `0x00` inside a real
-//! `escape(pk) ++ rk` suffix are `0x00` (the empty-pk / end-of-encoding
-//! terminator) or `0x01` (an escaped literal zero, encoding continues).
-//! `CURSOR_TAG` (`0x03`) is neither, so `[0x00, CURSOR_TAG, ..]` can never
-//! be mistaken for the start of a real key's post-token suffix at the
-//! byte offset [`TOKEN_BYTES`] — the same argument `txn.rs`'s
-//! `RECORD_TAG` (`0x02`) relies on, transplanted to this scope.
+//! **Why untruncated, and why a trailer, not a fixed offset (ADR fix for
+//! issue #355).** A prior revision of this scheme truncated `range_start`
+//! to a fixed [`TOKEN_BYTES`]-wide prefix, which let [`parse_cursor_key`]
+//! recover `(token, tag)` at a fixed byte offset — but a tablet's
+//! `range.start` is a split's own `split_key`, and a real split point is
+//! chosen from live row content (`byte_weighted_median`), essentially
+//! never `TOKEN_BYTES` long. Every writer of a cursor row that ever reaches
+//! `animusd::ClientCtx`'s key-routed write path (`cp_kind_write_raw`,
+//! which resolves the target tablet by comparing the write's own key
+//! bytes against each tablet's declared `range` — see
+//! `animusd::topology::tablet_for_key`) needs its own cursor key to
+//! lexicographically fall inside `[range.start, range.end)`, and a
+//! truncated key can sort *below* `range.start` the instant the byte just
+//! past the truncation point is non-zero — true of almost any real split
+//! child, which silently misrouted (not rejected) the write onto a
+//! sibling tablet instead. Emitting `range_start` **verbatim** as the
+//! key's own leading bytes fixes that structurally: the key is `range_start`
+//! extended with more bytes, so it always compares strictly greater
+//! (`key > range_start`, satisfying the inclusive lower bound) — the
+//! `>= range.start` half of every consumer's containment check is now true
+//! by construction, not by luck.
+//!
+//! That leaves recovering `tag` from a key whose leading `range_start`
+//! component is now variable-length and untrusted-content (it's real row
+//! bytes, not a value this module controls) — a fixed byte offset no
+//! longer works, and scanning forward for the `[0x00, CURSOR_TAG]` marker
+//! would need the same escape-discipline argument the old scheme used to
+//! avoid (fragile, and this module shouldn't have to reason about
+//! `animus_dynamo::escape`'s encoding to stay correct). [`cursor_key`]
+//! instead appends `range_start`'s own byte length as a fixed 2-byte
+//! big-endian **trailer** — the last thing in the key — so
+//! [`parse_cursor_key`] reads the trailer first (an O(1), always-present
+//! fixed-width suffix) and then slices `range_start`/`tag` from a length it
+//! now knows exactly, no content scanning or escape argument required.
+//! `u16` is generous headroom over any real DynamoDB key (partition +
+//! sort key stay in the low kilobytes); [`cursor_key`] hard-`expect`s
+//! rather than silently truncating if this is ever violated, mirroring
+//! `hlc::pack`'s own doctrine that a silent encoding overflow must never
+//! quietly collapse distinct values.
+//!
+//! **A residual, documented gap, narrower than before**: it is still not
+//! proven that `range_start || [0x00, CURSOR_TAG] || consumer || len` is
+//! always strictly less than this tablet's own `range.end` — only a
+//! pathological `range.end` that happens to extend `range_start` with
+//! *exactly* the same marker/tag/trailer bytes a real consumer would write
+//! could violate it, vanishingly unlikely for any real split boundary
+//! (itself real row content, `byte_weighted_median`-chosen) to reproduce
+//! byte-for-byte. Left for a future PR's corpus to stress, exactly as the
+//! prior revision of this doc deferred the analogous (and much easier to
+//! trigger) truncation gap, and as `txn.rs` defers its own split-alignment
+//! gap.
 //!
 //! ## Two value conventions, side by side
 //!
@@ -112,28 +150,6 @@
 //! (checked by this module's own `every_known_cursor_tag_prefix_is_
 //! classified` test) — a new consumer tag must earn a deliberate entry
 //! here before it ships, not fall through silently.
-//!
-//! **A residual, documented gap** (mirroring `txn.rs`'s own "not closed
-//! here" note about `split_key` not being token-aligned): `cursor_key`
-//! truncates the tablet's live `range.start` to its leading [`TOKEN_BYTES`]
-//! bytes, which is exactly this tablet's own genuine ADR 0022 partition
-//! token *when* `range.start` is empty (the ring's own start, zero-padded)
-//! or a prior split's boundary key (whose own leading `TOKEN_BYTES` are a
-//! real Murmur3 token by construction). It is **not** proven here that the
-//! resulting key is always strictly less than this tablet's own
-//! `range.end` in every pathological case (e.g. a table using a `Binary`
-//! partition key whose first byte is `0x00`, split at a boundary
-//! immediately following `range.start`'s own token) — in the ordinary case
-//! the marker sits at the very start of the tablet's own key space, far
-//! below any split point chosen deeper into its rows, and `assert_ts_
-//! monotonic`/`with_kind`'s shared-range narrowing never depends on this for
-//! *correctness of tag disjointness*, only for the cursor row surviving a
-//! future `narrow_scope`/`erase_scope`/`engine_image` bound unclipped. Left
-//! for a future PR's corpus to stress (a table with `Binary` keys starting
-//! `0x00`, split near its own first tablet's boundary) exactly as `txn.rs`
-//! defers its own split-alignment gap to PR4+.
-
-use animus_tablet::TOKEN_BYTES;
 
 use crate::hlc::{self, HlcTimestamp};
 
@@ -143,60 +159,48 @@ use crate::hlc::{self, HlcTimestamp};
 /// `StorageScope` entirely, so they never share this numbering.
 const CURSOR_TAG: u8 = 0x03;
 
-/// The tablet-token component of [`cursor_key`]: `range_start` truncated
-/// (zero-padded if shorter) to [`TOKEN_BYTES`]. Split out of `cursor_key`
-/// so a caller that already has a *parsed* row's own token (from
-/// [`parse_cursor_key`]) can compute *this* tablet's own token to compare
-/// against, without rebuilding a whole key. Its original caller — the ADR
-/// 0042 §7 trim janitor's merge-residue cleanup (`animusd::index_drain`),
-/// which told "this row is this tablet's own" from "a
-/// still-physically-present absorbed sibling's" after a merge widened a
-/// survivor's scope over it — no longer exists: tablet merge was removed
-/// entirely (ADR 0044, tablets are split-only). This function (and its
-/// `lib.rs` consumer, [`RaftKvNode::cursor_rows_with_token`]) currently has
-/// **no production caller**; kept because a future consumer needing the
-/// same token-vs-physical-presence disambiguation would otherwise have to
-/// reinvent it.
-#[must_use]
-pub fn token_of(range_start: &[u8]) -> [u8; TOKEN_BYTES] {
-    let mut token = [0u8; TOKEN_BYTES];
-    let n = range_start.len().min(TOKEN_BYTES);
-    token[..n].copy_from_slice(&range_start[..n]);
-    token
-}
-
 /// This tablet's own cursor-row key for `consumer` (see the module doc for
 /// the full scheme + disjointness proof). `range_start` is the tablet's
 /// live `KeyRange::start` at the moment of the call (`RaftKvNode::
-/// scope_range().start`) — truncated (zero-padded if shorter) to
-/// [`TOKEN_BYTES`] by [`token_of`].
+/// scope_range().start`) — embedded **verbatim, untruncated** (issue #355:
+/// a truncated token could sort below a non-token-aligned `range_start`,
+/// silently misrouting a routed write onto a sibling tablet).
 #[must_use]
 pub fn cursor_key(range_start: &[u8], consumer: &str) -> Vec<u8> {
-    let token = token_of(range_start);
-    let mut out = Vec::with_capacity(TOKEN_BYTES + 2 + consumer.len());
-    out.extend_from_slice(&token);
+    let len = u16::try_from(range_start.len())
+        .expect("a tablet's own range_start must fit a u16-length cursor-key trailer");
+    let mut out = Vec::with_capacity(range_start.len() + 2 + consumer.len() + 2);
+    out.extend_from_slice(range_start);
     out.push(0x00);
     out.push(CURSOR_TAG);
     out.extend_from_slice(consumer.as_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
     out
 }
 
-/// Recover `(token, consumer)` from a raw `KIND_CURSOR`-scoped key, or
-/// `None` if it isn't shaped like one (wrong length, wrong lead pair, or a
-/// non-UTF8 tag — this crate only ever writes tags it itself minted as
+/// Recover `(range_start, consumer)` from a raw `KIND_CURSOR`-scoped key, or
+/// `None` if it isn't shaped like one (a too-short trailer, wrong lead pair,
+/// or a non-UTF8 tag — this crate only ever writes tags it itself minted as
 /// valid UTF-8 strings, so a decode failure here is a defensive read, not an
-/// expected case). See the module doc for why the fixed offset (rather than
-/// a scan for the lead pair) is what makes this unambiguous.
+/// expected case). See the module doc for why the trailing length (rather
+/// than a fixed byte offset) is what makes this unambiguous now that
+/// `range_start` is embedded at its own real, variable length.
 #[must_use]
 pub fn parse_cursor_key(key: &[u8]) -> Option<(&[u8], &str)> {
-    if key.len() < TOKEN_BYTES + 2 {
+    if key.len() < 2 {
         return None;
     }
-    if key[TOKEN_BYTES] != 0x00 || key[TOKEN_BYTES + 1] != CURSOR_TAG {
+    let (body, len_bytes) = key.split_at(key.len() - 2);
+    let range_start_len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    if body.len() < range_start_len + 2 {
         return None;
     }
-    let tag = std::str::from_utf8(&key[TOKEN_BYTES + 2..]).ok()?;
-    Some((&key[..TOKEN_BYTES], tag))
+    let (range_start, rest) = body.split_at(range_start_len);
+    if rest[0] != 0x00 || rest[1] != CURSOR_TAG {
+        return None;
+    }
+    let tag = std::str::from_utf8(&rest[2..]).ok()?;
+    Some((range_start, tag))
 }
 
 /// A cursor row's stored value: `hlc::pack(ts)` as 8 big-endian bytes — the
@@ -347,32 +351,73 @@ mod tests {
         decode_watermark, encode_backfill_cursor, encode_watermark, parse_cursor_key,
     };
     use crate::hlc::HlcTimestamp;
-    use animus_tablet::TOKEN_BYTES;
 
     #[test]
     fn round_trips_through_build_and_parse() {
         let range_start = b"abcdefgh-and-then-more-row-key-bytes";
         let key = cursor_key(range_start, "gsi");
-        let (token, tag) = parse_cursor_key(&key).expect("a well-formed key must parse");
-        assert_eq!(token, &range_start[..TOKEN_BYTES]);
+        let (start, tag) = parse_cursor_key(&key).expect("a well-formed key must parse");
+        assert_eq!(start, &range_start[..]);
         assert_eq!(tag, "gsi");
     }
 
     #[test]
-    fn zero_pads_a_short_range_start() {
+    fn embeds_a_short_range_start_verbatim() {
         // The ring's own first tablet has an empty (unbounded) start.
         let key = cursor_key(b"", "copier");
-        let (token, tag) = parse_cursor_key(&key).expect("must parse");
-        assert_eq!(token, [0u8; TOKEN_BYTES]);
+        let (start, tag) = parse_cursor_key(&key).expect("must parse");
+        assert_eq!(start, b"");
         assert_eq!(tag, "copier");
 
         let key2 = cursor_key(b"ab", "copier");
-        let (token2, _) = parse_cursor_key(&key2).expect("must parse");
-        assert_eq!(token2, [b'a', b'b', 0, 0, 0, 0, 0, 0]);
+        let (start2, _) = parse_cursor_key(&key2).expect("must parse");
+        assert_eq!(start2, b"ab");
+    }
+
+    /// Issue #355's own precondition: a real split's `range.start` is chosen
+    /// from live row content (`byte_weighted_median`), essentially never
+    /// `TOKEN_BYTES` long — this must round-trip exactly like any other
+    /// length, with nothing special happening at that one width.
+    #[test]
+    fn embeds_a_non_token_aligned_range_start_verbatim() {
+        let range_start = b"token(8b)+a-real-row-key-tail-thats-longer-than-a-bare-token";
+        assert_ne!(
+            range_start.len(),
+            8,
+            "must exercise a non-token-aligned width"
+        );
+        let key = cursor_key(range_start, "gsi");
+        let (start, tag) = parse_cursor_key(&key).expect("must parse");
+        assert_eq!(start, &range_start[..]);
+        assert_eq!(tag, "gsi");
+    }
+
+    /// The routing-correctness property issue #355 needed: a cursor key must
+    /// lexicographically sort **at or above** its own tablet's `range.start`
+    /// (`KeyRange::contains`'s inclusive lower bound), for every length —
+    /// never just at `TOKEN_BYTES`. True by construction now: the key is
+    /// `range_start` extended with more bytes, never truncated.
+    #[test]
+    fn cursor_key_never_sorts_below_its_own_range_start() {
+        for range_start in [
+            &b""[..],
+            &b"ab"[..],
+            &b"exactly8"[..],
+            &b"a real non-token-aligned split boundary key, quite long"[..],
+        ] {
+            for tag in ["gsi", "backfill:by-status", "copier"] {
+                let key = cursor_key(range_start, tag);
+                assert!(
+                    key.as_slice() >= range_start,
+                    "cursor_key({range_start:?}, {tag:?}) = {key:?} sorted below its own \
+                     range_start"
+                );
+            }
+        }
     }
 
     #[test]
-    fn distinct_tags_never_collide_for_the_same_token() {
+    fn distinct_tags_never_collide_for_the_same_range_start() {
         let range_start = b"same-tablet-boundary";
         let gsi = cursor_key(range_start, "gsi");
         let copier = cursor_key(range_start, "copier");
@@ -381,30 +426,43 @@ mod tests {
 
     #[test]
     fn rejects_too_short_input() {
-        assert_eq!(parse_cursor_key(&[0u8; TOKEN_BYTES + 1]), None);
+        assert_eq!(parse_cursor_key(&[0u8; 1]), None);
         assert_eq!(parse_cursor_key(&[]), None);
     }
 
     #[test]
+    fn rejects_a_key_whose_trailer_overstates_its_own_length() {
+        // A 2-byte trailer claiming a range_start longer than the rest of
+        // the key actually has room for.
+        let bytes = 0xFFFFu16.to_be_bytes().to_vec();
+        assert_eq!(parse_cursor_key(&bytes), None);
+    }
+
+    #[test]
     fn rejects_a_key_missing_the_lead_pair() {
-        let mut bytes = vec![0u8; TOKEN_BYTES];
+        let range_start = b"abc";
+        let mut bytes = range_start.to_vec();
         bytes.extend_from_slice(b"gsi"); // no [0x00, CURSOR_TAG] at all
+        bytes.extend_from_slice(&(range_start.len() as u16).to_be_bytes());
         assert_eq!(parse_cursor_key(&bytes), None);
 
         // Right first byte, wrong second byte (not CURSOR_TAG).
-        let mut bytes = vec![0u8; TOKEN_BYTES];
+        let mut bytes = range_start.to_vec();
         bytes.push(0x00);
         bytes.push(CURSOR_TAG.wrapping_add(1));
         bytes.extend_from_slice(b"gsi");
+        bytes.extend_from_slice(&(range_start.len() as u16).to_be_bytes());
         assert_eq!(parse_cursor_key(&bytes), None);
     }
 
     #[test]
     fn rejects_a_non_utf8_tag() {
-        let mut bytes = vec![0u8; TOKEN_BYTES];
+        let range_start = b"abc";
+        let mut bytes = range_start.to_vec();
         bytes.push(0x00);
         bytes.push(CURSOR_TAG);
         bytes.push(0xFF); // invalid UTF-8 on its own
+        bytes.extend_from_slice(&(range_start.len() as u16).to_be_bytes());
         assert_eq!(parse_cursor_key(&bytes), None);
     }
 
@@ -440,8 +498,8 @@ mod tests {
         let watermark_row = cursor_key(range_start, "gsi");
         let backfill_row = cursor_key(range_start, "backfill:by-status");
         assert_ne!(watermark_row, backfill_row);
-        let (token, tag) = parse_cursor_key(&backfill_row).expect("must parse");
-        assert_eq!(token, &range_start[..TOKEN_BYTES]);
+        let (start, tag) = parse_cursor_key(&backfill_row).expect("must parse");
+        assert_eq!(start, &range_start[..]);
         assert_eq!(tag, "backfill:by-status");
     }
 

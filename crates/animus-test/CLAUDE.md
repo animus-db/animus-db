@@ -353,10 +353,13 @@ retrievable from git history.)
   cursor-persist attempt for a split child whose `range.start` is not
   itself a bare `TOKEN_BYTES`-wide token — true of essentially every real
   split, since a split key is chosen from real row content, never the
-  hash ring. `cursor::cursor_key` truncates `range.start` to its own
-  8-byte token, which then sorts *below* the child's own (longer)
-  `range.start` the instant the byte right after the token is non-zero
-  (true for any real `escape(pk)`). Data coverage itself was never at
+  hash ring. `cursor::cursor_key` used to truncate `range.start` to its own
+  8-byte token, which then sorted *below* the child's own (longer)
+  `range.start` the instant the byte right after the token was non-zero
+  (true for any real `escape(pk)`) — this same truncation was later closed
+  outright (issue #355; `cursor_key` now embeds `range.start` verbatim), but
+  at the time of this corpus the fix below (an unfenced write) was the only
+  one available. Data coverage itself was never at
   risk (the change-log seed writes are keyed by real base keys, which
   correctly satisfy the fence) — only the cursor's own persistence was,
   so a split child's sweep silently restarted from scratch every tick

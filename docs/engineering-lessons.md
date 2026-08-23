@@ -80,6 +80,33 @@ debugging anything that feels like it might have happened before.
   (`CpGroup::local_get_kind` — bound-free, reads any key physically present
   regardless of the tablet's declared range) rather than inferring the
   landing site from the key-construction code alone.
+
+  **Fixed (2026-08-23).** `animus_cp_data::cursor::cursor_key` now embeds
+  the tablet's own `range.start` **verbatim** (never truncated), with a
+  trailing 2-byte big-endian length so `parse_cursor_key` can still recover
+  the tag unambiguously without relying on a fixed byte offset (the old
+  scheme's whole reason to truncate in the first place). The key is now
+  `range_start` extended with more bytes, so it always compares
+  lexicographically `>=` its own tablet's `range.start` by construction —
+  the routing half of `KeyRange::contains` is satisfied unconditionally,
+  not by luck of the split boundary's own byte content. The repro test
+  (`gsi_drain_cursor_tests::split_right_childs_gsi_cursor_after_a_non_
+  token_aligned_split_issue_355`) now asserts the fixed end-state
+  precisely — watermark advances, change log trims to zero, and the
+  physical cursor row lives on the right child's own engine and is absent
+  from the left sibling's — rather than only "eventually not `None`."
+  **Pre-fix stray rows**: a cluster that hit this bug before the fix could
+  have a truncated cursor row physically sitting on a sibling tablet's
+  engine forever, silently depressing that sibling's own `"gsi"`
+  min-over-rows watermark (redundant re-reconciliation there, never a
+  correctness or non-convergence issue — the same "reconcile everything,
+  always correct, just not incremental" property the bug's `None` case
+  already had). No migration/cleanup was written for it — the root
+  `CLAUDE.md`'s no-back-compat policy means clusters are recreated from
+  scratch, and a convergent sweep to find and delete such rows would need
+  to distinguish a truncated stray from a genuine (if unlikely) same-prefix
+  collision, which isn't a cheap, obviously-safe addition, so it was left
+  alone per the same policy rather than over-engineered.
 - **A hand-rolled HTTP test helper that reads the response with
   `read_to_end` MUST send `Connection: close` — an HTTP/1.1 request without
   it deadlocks against a keep-alive server, and the hang lands on the
@@ -3118,6 +3145,28 @@ debugging anything that feels like it might have happened before.
   not round-trip" invariant matters and would otherwise only be documented.
 
 ### Code patterns
+- **A convergent bookkeeping write must be routable to its own owner: derive
+  its key from the owner's actual scope, not a normalized/truncated form of
+  it.** Issue #355's root cause (see the Testing entry above for the full
+  incident): `cursor::cursor_key` derived a cursor row's key by truncating
+  the writing tablet's own `range.start` to a fixed-width token, on the
+  assumption that "this tablet's own token" was a safe stand-in for "a key
+  inside this tablet's own declared range." That assumption held only by
+  coincidence — a hash-ring token happens to be a real byte prefix of a
+  tablet's range only when the range boundary is itself token-aligned, which
+  a real split boundary (chosen from row content) essentially never is. Any
+  write that reaches a codebase's own key-based routing layer (here,
+  `ClientCtx::cp_kind_write_raw`'s `cp_route`, which resolves a target purely
+  from the write's own key bytes against each candidate's declared range)
+  needs a key that is *actually, structurally* inside its intended owner's
+  range — not merely "derived from" that owner in some way that seems close
+  enough. The fix embeds the owner's real range boundary verbatim (with a
+  trailing length so a fixed-width parse can still recover what follows it)
+  instead of a lossy summary of it. The general check: before writing a
+  bookkeeping/cursor/marker key that will be routed by content rather than
+  written directly to an already-resolved handle, ask whether the key is
+  provably inside the target's own bounds by construction, or only usually
+  inside them for shapes a test happened to try.
 - **Deleting a seam: grep the *verb* as well as the *noun*, then grep the
   prose.** Removing the `ReplicationMode` seam (ADR 0019's 2026-08-23
   amendment) had an obvious target list — the enum, the `TableSchema::mode`
@@ -8711,3 +8760,58 @@ debugging anything that feels like it might have happened before.
   description named — because a sweep claim is exactly the kind of thing
   that silently narrows from "everything" to "everything I happened to
   touch" without anyone noticing until an independent verifier greps it.
+- **A standing instruction buried as a Conventions bullet doesn't set session
+  posture — put binding defaults at the top of CLAUDE.md *and* inject them at
+  boot (2026-08-23).** The subagent-delegation / background-execution /
+  stack-by-default rules had lived for weeks as one bullet deep in CLAUDE.md's
+  Conventions, and the maintainer still had to re-issue all three as live
+  instructions in session after session: agents either did token-heavy work
+  inline in the main thread or ran subagents in the foreground and went
+  silent, and shipped flat PRs where a stack was wanted. The lesson is about
+  *placement and delivery*, not wording — an entry-point doc is skimmed once
+  at boot with attention concentrated at the top, and a rule that must shape
+  a session's default behavior (rather than answer a lookup) competes badly
+  from position 8 of a bullet list 300 lines in. **Fix pattern**: promote
+  behavioral defaults to a short, numbered "Session operating mode" section
+  at the very top of CLAUDE.md, and have the SessionStart hook `cat` a
+  faithful summary to stdout — a SessionStart hook's stdout is added to the
+  agent's context, which turns the posture into a boot-time instruction that
+  arrives the way a maintainer's own message would. Keep the two in sync by
+  making CLAUDE.md the named source of truth and the hook text explicitly a
+  summary of it; and make the rules *thresholded* so they need no judgment
+  call (delegate anything multi-file/exploratory/build-heavy, inline only
+  trivial one-file work; stack whenever there is more than one reviewable
+  logical step, flat PRs state why).
+
+## Duplicated config needs a test, not a comment (ADR 0056)
+
+The design tokens have to exist twice — the site ships static files, the
+consoles `include_str!` theirs into the binary, and ADR 0021 bans the build step
+that would generate one from the other. The previous revision handled this with
+a comment in each file saying "same values as the other one". They drifted
+anyway; that is what commissioning a design system turned up.
+
+The fix that generalises: **when two files must stay identical and no mechanism
+can make them one file, the mechanism is a test.**
+`dashboard::tokens_css_matches_website_copy` is a three-line `assert_eq!` over
+two `include_str!`s, and it makes the drift impossible rather than discouraged.
+A comment asking humans to remember is not a mechanism.
+
+The corollary is knowing what must NOT be in the check. The `@font-face` blocks
+carry the same faces by different delivery (URL vs base64 `data:` URI) because
+the deployments differ, so they are deliberately outside it. A check that
+over-reaches gets disabled the first time it is legitimately wrong.
+
+## Read the constraint before designing around it (ADR 0056)
+
+ADR 0021 says the dashboard ships "no external fonts, no CDN". That was read as
+"no webfonts", and the surfaces ran system stacks for it. The rule actually bans
+*fetching from a third party* — self-hosting an OFL face, or embedding it in the
+binary, always satisfied it. A whole design constraint was self-imposed by a
+misreading of one clause.
+
+Related, and worth checking before rejecting a face on weight: both faces here
+turned out to be **variable** fonts, so one 22–23 KB Latin file covers the entire
+weight range. The cost was first estimated per weight, which was wrong by about
+4x and nearly drove a font substitution that was not needed. Fetch the file and
+look before costing it.

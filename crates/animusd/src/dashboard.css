@@ -1,36 +1,18 @@
-/* Design tokens — from the "AnimusDB Console" design (Claude Design project
-   f2b4c368-4267-4fd7-b4c6-e2775eb4ad0e). Dark is the default; `[data-theme=
-   light]` overrides. Colors are the mockup's oklch() values verbatim (broad
-   enough browser support for an ops tool). Fonts are system stacks that
-   approximate the mockup's Inter/IBM Plex Mono choice — ADR 0021 is firm that
-   the dashboard ships with no external fonts/CDN, so nothing is fetched. */
+/* AnimusDB operator dashboard (ADR 0021) — app skin.
+ *
+ * Design tokens come from the shared base — `tokens.css`, concatenated ahead of
+ * this file by `dashboard::CSS` (ADR 0056). Only the *skin* lives here: the geometry
+ * that makes this surface dense (the marketing site sets a roomier one from the
+ * same base). No shared stylesheet at runtime, no bundler, no external
+ * fonts/CDN — ADR 0021's rule, unchanged; the faces are embedded as base64 in
+ * `fonts.css`.
+ */
 :root {
-  --bg: #0a0c0f; --surface: #12151a; --surface2: #1a1e24;
-  --border: rgba(255,255,255,0.09); --border-strong: rgba(255,255,255,0.18);
-  --text: #eceef0; --text2: rgba(236,238,240,0.75); --text3: rgba(236,238,240,0.46);
-  --accent: oklch(72% 0.15 250); --accent-soft: oklch(30% 0.06 250); --accent-ink: #0a0c0f;
-  --ok: oklch(74% 0.15 155); --warn: oklch(80% 0.15 85); --danger: oklch(70% 0.19 25);
-  --ok-bg: rgba(80,220,160,0.12); --warn-bg: rgba(230,190,90,0.12); --danger-bg: rgba(240,90,90,0.12);
-  --font-ui: -apple-system, "Segoe UI", system-ui, Roboto, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-:root[data-theme="light"] {
-  --bg: #fbfaf7; --surface: #ffffff; --surface2: #f2f0ea;
-  --border: rgba(20,20,15,0.1); --border-strong: rgba(20,20,15,0.2);
-  --text: #1a1a17; --text2: rgba(26,26,23,0.75); --text3: rgba(26,26,23,0.48);
-  --accent: oklch(52% 0.17 250); --accent-soft: oklch(92% 0.03 250); --accent-ink: #ffffff;
-  --ok: oklch(52% 0.13 155); --warn: oklch(58% 0.14 80); --danger: oklch(54% 0.19 25);
-  --ok-bg: rgba(30,150,100,0.09); --warn-bg: rgba(180,140,30,0.09); --danger-bg: rgba(200,50,40,0.08);
-}
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
-    --bg: #fbfaf7; --surface: #ffffff; --surface2: #f2f0ea;
-    --border: rgba(20,20,15,0.1); --border-strong: rgba(20,20,15,0.2);
-    --text: #1a1a17; --text2: rgba(26,26,23,0.75); --text3: rgba(26,26,23,0.48);
-    --accent: oklch(52% 0.17 250); --accent-soft: oklch(92% 0.03 250); --accent-ink: #ffffff;
-    --ok: oklch(52% 0.13 155); --warn: oklch(58% 0.14 80); --danger: oklch(54% 0.19 25);
-    --ok-bg: rgba(30,150,100,0.09); --warn-bg: rgba(180,140,30,0.09); --danger-bg: rgba(200,50,40,0.08);
-  }
+  /* app skin — dense: scanned all day, on a desk */
+  --radius: 6px;
+  --radius-panel: 10px;
+  --ctl-h: 28px;
+  --row-h: 34px;
 }
 
 * { box-sizing: border-box; }
@@ -121,7 +103,7 @@ main section.active { display: flex; }
 .view-max { max-width: 1180px; width: 100%; }
 
 /* ---- cards / rows / tables (reused across views) ---- */
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+.card { background: var(--panel); box-shadow: var(--shadow); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
 .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text3); margin: 0 0 10px; font-weight: 600; }
 .scroll { overflow-x: auto; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }

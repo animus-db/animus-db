@@ -10,7 +10,35 @@ design *rationale* (that lives in the ADRs, `docs/adr/`), per-crate *mechanism*
 Those are the source of truth — keep *them* current on decisions and details,
 not this file.
 
-## What this is
+## Session operating mode (binding defaults)
+
+Every agent session on this repo boots into this posture — it is a maintainer
+standing instruction, not a preference to rediscover mid-task. The session-start
+hook re-injects a summary at boot; treat a violation like a failed gate.
+
+1. **The main thread orchestrates; Sonnet subagents do the heavy lifting.**
+   Delegate to a Sonnet subagent any work that would pull substantial file
+   content, build output, or test output into the main context: code
+   exploration, multi-file implementation, gate runs. One investigation agent
+   per issue, one implementation agent per change. Brief each subagent with
+   the relevant crate guides, the applicable lessons-log sections, and an
+   explicit validation gate; verify its committed state on completion rather
+   than trusting its report alone. Inline main-thread work is for **trivial
+   tasks only**: a one-liner, a doc tweak, a targeted read or grep.
+
+2. **Subagents run in the background; the main thread stays responsive.**
+   Never park the conversation behind a foreground subagent. While agents
+   work, the main thread remains available to the maintainer — brief progress
+   notes as agents report back, planning, review, GitHub interactions. A
+   silent session is a bug in the workflow.
+
+3. **A stacked PR series is the default shape for delivered work.** Any
+   change with more than one reviewable logical step (groundwork + mechanism,
+   refactor + feature, schema + consumer) ships as a `gh-stack` series —
+   tooling in Conventions below. A single flat PR is the *exception*, and its
+   description says why it wasn't stacked.
+
+
 
 AnimusDB is a masterless, linearly-scalable NoSQL database in Rust. **For v1
 (ADR 0019) it is strongly-consistent (CP):** a **leaderful per-tablet Raft data
@@ -263,7 +291,9 @@ truth; this map is just for navigation.
 
 ## Conventions
 
-- One milestone / logical change per PR; keep diffs reviewable.
+- One milestone / logical change per PR; keep diffs reviewable. Work with
+  more than one reviewable logical step stacks by default — see **Session
+  operating mode** at the top of this file.
 - An incidental pre-existing bug discovered during a task gets its own
   separate PR (with its own test), never a drive-by fix folded into an
   unrelated diff.
@@ -291,16 +321,10 @@ truth; this map is just for navigation.
   is reproducible from a seed.
 - Higher layers define their own message enums and (de)serialize with
   `serde_json` over the `Vec<u8>` payloads the `Network` moves.
-- **Agent sessions delegate heavy work to Sonnet subagents** (maintainer
-  standing instruction): unless the task says otherwise, an orchestrating
-  Claude session on this repo hands code exploration, implementation/
-  delivery, and any other token-intensive work to Sonnet subagents (one
-  investigation agent per issue, one implementation agent per change),
-  keeping the main session for planning, cross-agent synthesis, review,
-  verification, and GitHub interactions. Brief each subagent with the
-  relevant crate guides, the lessons-log sections, and an explicit
-  validation gate; verify its committed state on completion rather than
-  trusting its report alone.
+- Subagent delegation, background execution, and stack-by-default are
+  defined once in **Session operating mode** at the top of this file — that
+  section is the source of truth; don't restate (or renegotiate) it per
+  task.
 
 ## Engineering practices
 
