@@ -2494,16 +2494,7 @@ async fn run_base_query(
     } else {
         None
     };
-    let mut items = Vec::with_capacity(examined.len());
-    for (_key, item) in &examined {
-        // The filter sees the whole item; projection then trims the result. It
-        // runs *after* `limit` truncation, so a filtered-out item still counted
-        // toward `ScannedCount` and still consumed its slot — DynamoDB's
-        // contract, and exactly what `run_base_scan` does.
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
-            items.push(wire::project(projection, item));
-        }
-    }
+    let items = apply_filter_and_project(&examined, filter, projection);
     Ok(wire::select_response(
         select,
         &items,
@@ -2757,16 +2748,7 @@ async fn run_gsi_query(
     } else {
         None
     };
-    let mut items = Vec::with_capacity(examined.len());
-    for (_key, item) in &examined {
-        // The filter sees the whole item; projection then trims the result. It
-        // runs *after* `limit` truncation, so a filtered-out item still counted
-        // toward `ScannedCount` and still consumed its slot — DynamoDB's
-        // contract, and exactly what `run_base_scan` does.
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
-            items.push(wire::project(projection, item));
-        }
-    }
+    let items = apply_filter_and_project(&examined, filter, projection);
     Ok(wire::select_response(
         select,
         &items,
@@ -2872,16 +2854,7 @@ async fn run_lsi_query(
     } else {
         None
     };
-    let mut items = Vec::with_capacity(examined.len());
-    for (_key, item) in &examined {
-        // The filter sees the whole item; projection then trims the result. It
-        // runs *after* `limit` truncation, so a filtered-out item still counted
-        // toward `ScannedCount` and still consumed its slot — DynamoDB's
-        // contract, and exactly what `run_base_scan` does.
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
-            items.push(wire::project(projection, item));
-        }
-    }
+    let items = apply_filter_and_project(&examined, filter, projection);
     Ok(wire::select_response(
         select,
         &items,
@@ -3023,13 +2996,7 @@ async fn run_base_scan(
     } else {
         None
     };
-    let mut items = Vec::new();
-    for (_key, item) in &examined {
-        // The filter sees the whole item; projection then trims the result.
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
-            items.push(wire::project(projection, item));
-        }
-    }
+    let items = apply_filter_and_project(&examined, filter, projection);
     Ok(wire::select_response(
         select,
         &items,
@@ -3188,12 +3155,7 @@ async fn run_gsi_scan(
     } else {
         None
     };
-    let mut items = Vec::new();
-    for (_key, item) in &examined {
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
-            items.push(wire::project(projection, item));
-        }
-    }
+    let items = apply_filter_and_project(&examined, filter, projection);
     Ok(wire::select_response(
         select,
         &items,
@@ -3273,18 +3235,34 @@ async fn run_lsi_scan(
     } else {
         None
     };
-    let mut items = Vec::new();
-    for (_key, item) in &examined {
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
-            items.push(wire::project(projection, item));
-        }
-    }
+    let items = apply_filter_and_project(&examined, filter, projection);
     Ok(wire::select_response(
         select,
         &items,
         scanned,
         last_evaluated_key.as_ref(),
     ))
+}
+
+/// Applies an optional `FilterExpression`, then an optional projection, to a
+/// page of already-paginated `Query`/`Scan` results — the tail shared by every
+/// base/GSI/LSI leaf above. The filter sees the whole item; projection then
+/// trims what survives. It runs **after** `limit` truncation (the caller has
+/// already truncated `examined` to the page size), so a filtered-out item
+/// still counted toward `ScannedCount` and still consumed its `Limit` slot —
+/// DynamoDB's own contract, not an implementation shortcut.
+fn apply_filter_and_project(
+    examined: &[(Vec<u8>, Item)],
+    filter: Option<&ConditionExpression>,
+    projection: Option<&Projection>,
+) -> Vec<Item> {
+    let mut items = Vec::with_capacity(examined.len());
+    for (_key, item) in examined {
+        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+            items.push(wire::project(projection, item));
+        }
+    }
+    items
 }
 
 /// Fetch up to `want` (`None` = unbounded) *kept* rows starting at `cursor`,
