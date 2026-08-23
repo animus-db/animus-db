@@ -48,7 +48,7 @@ comment for its full type/method inventory.
     `escape(isort)` would, so the layout is otherwise ambiguous.
 - `wire` — the DynamoDB JSON translation (`decode_request` →
   `Operation`, covering CreateTable/Put/Get/Delete/Query/Scan/UpdateItem/
-  BatchWriteItem/TransactWriteItems/TransactGetItems/UpdateTable/
+  BatchWriteItem/BatchGetItem/TransactWriteItems/TransactGetItems/UpdateTable/
   DescribeTable/DeleteTable/ListTables/UpdateTimeToLive/DescribeTimeToLive,
   plus the response encoders). `Query` and `Scan` share `decode_limit`/`decode_exclusive_start_key`/
   `decode_predicate`/`decode_select` — same `Limit`/`ExclusiveStartKey`/`FilterExpression`/`Select`
@@ -198,8 +198,9 @@ comment for its full type/method inventory.
 - **`ReturnValues`** supports `NONE` (default) and `ALL_OLD` on Put/Delete; the
   edge reads the prior item once (reusing it for any `ConditionExpression` check,
   so there is no double read) and `write_response` echoes it under `Attributes`.
-  `UpdateItem` additionally supports `ALL_NEW` (`update_response`); `UPDATED_OLD`/
-  `UPDATED_NEW` remain deferred.
+  `UpdateItem` additionally supports `ALL_NEW` and `UPDATED_OLD`/`UPDATED_NEW`
+  (`update_response`, `changed_attributes` diffing the old/new images against
+  whichever side changed) — see `animusd`'s `tests/dynamo_updated_return_values.rs`.
 - **`UpdateItem`/`BatchWriteItem`/`TransactWriteItems`/`TransactGetItems`** are
   decoded here and run at the `animusd` edge. `UpdateItem` is read-modify-write
   of one item applying `SET`/`REMOVE` (upsert when absent); `BatchWriteItem`
@@ -248,12 +249,14 @@ comment for its full type/method inventory.
   deviation) and exactly one `GlobalSecondaryIndexUpdates` element is
   accepted per call; adding an LSI this way stays rejected (LSIs are
   create-time-only in real DynamoDB too).
-- **Still deferred** (don't represent as a full adapter): `BatchGetItem`,
-  list-index document paths (`a[0]`), `ADD`/`DELETE` `UpdateExpression`
-  arithmetic, `TransactWriteItems`/`TransactGetItems` idempotency tokens
+- **Still deferred** (don't represent as a full adapter): list-index document
+  paths (`a[0]`), `TransactWriteItems`/`TransactGetItems` idempotency tokens
   (`ClientRequestToken`) and full per-action `CancellationReasons` fidelity
   (ADR 0018 §2/PR7 shipped atomicity itself; these wire-fidelity details
-  remain simplified). **`Query` now paginates exactly like `Scan`**
+  remain simplified). `BatchGetItem` and `ADD`/`DELETE` `UpdateExpression`
+  arithmetic are both implemented (`decode_batch_get`/`decode_update_expression`
+  in `wire.rs`) — see the `wire` entry point above and this crate's own unit
+  tests. **`Query` now paginates exactly like `Scan`**
   (`decode_query` parses `Limit`/`ExclusiveStartKey` the same way
   `decode_scan` does, sharing the decode helpers; found and closed while
   building the Data Console's Items tab, ADR 0052 PR4, which needed it and
