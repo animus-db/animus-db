@@ -19,8 +19,9 @@ It instantiates `animus-control`'s generic, sync, I/O-free `RaftCore<C, S>`
 does **not** apply them in-core (a `StorageEngine` apply is async I/O the sync
 core can't do). The core buffers committed-and-durable commands as effects;
 this crate's **async driver** drains them (`RaftCore::drain_apply`) and applies
-to the engine — the same sync-core/async-driver split as `animus-consensus`'s
-`AccordCore`.
+to the engine. (Historical note: this sync-core/async-driver split was shared
+with the Accord slice in `animus-consensus`, deleted by ADR 0019's 2026-08-23
+amendment — the shape predates and outlives it.)
 
 ## Entry points
 

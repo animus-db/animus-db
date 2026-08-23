@@ -1,20 +1,17 @@
 name: corpus-deep
 
-# The deep tier of the Elle-against-Accord scenario corpus (ADR 0014): every
-# structural cell explored over many seeds, plus the extended dimension set. This
-# is far too large for the per-push `cargo test` gate, so it runs on a nightly
-# schedule (and on demand) instead. The default `cargo test` still runs the frozen
-# base set on every push via the `gates` job in ci.yml.
+# The deep tier of the fault-injection scenario corpora (deterministic
+# SimEnv): every structural cell explored over many seeds, plus the extended
+# dimension set where applicable. This is far too large for the per-push
+# `cargo test` gate, so it runs on a nightly schedule (and on demand)
+# instead. The default `cargo test` still runs each corpus's frozen base set
+# on every push via the `gates` job in ci.yml.
 on:
   schedule:
     # 03:17 UTC nightly (off the hour to avoid the scheduler stampede).
     - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
-      seeds:
-        description: "Seeds per structural cell (ANIMUS_CORPUS_SEEDS)"
-        required: false
-        default: "40"
       txn_seeds:
         description: "Seeds per structural cell (ANIMUS_TXN_SEEDS, ADR 0018 multi-tablet txn corpus)"
         required: false
@@ -74,16 +71,6 @@ jobs:
           ANIMUS_RAFTKV_LSM: "1"
           ANIMUS_RAFTKV_SEEDS: ${{ github.event.inputs.raftkv_seeds || '10' }}
         run: cargo test -p animus-test --test raftkv_linearizable -- --nocapture
-
-      # Depth (ANIMUS_CORPUS_SEEDS) × breadth (ANIMUS_CORPUS_FULL). Each scenario
-      # is a pure function of its seed, so a failure names one scenario + seed and
-      # is replayable. The runner is the serialization-authoritative topology, so a
-      # cycle here is a genuine Accord serializability violation.
-      - name: deep corpus (serializability + frontier convergence/durability)
-        env:
-          ANIMUS_CORPUS_SEEDS: ${{ github.event.inputs.seeds || '40' }}
-          ANIMUS_CORPUS_FULL: "1"
-        run: cargo test -p animus-test --test corpus -- --nocapture
 
       # ADR 0018's multi-tablet cross-transaction corpus: the 2PC protocol
       # (stage/commit/resolve + the recovery push) under fault injection,

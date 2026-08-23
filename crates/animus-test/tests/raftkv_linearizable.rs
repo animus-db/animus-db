@@ -1,10 +1,9 @@
 //! ADR 0017 / ADR 0016 step 4 / ADR 0014: an **Elle linearizability corpus for the
 //! per-tablet Raft KV data plane** (`animus-cp-data`).
 //!
-//! This is the CP counterpart of the Accord corpus in `corpus.rs`. The leaderful
-//! data plane offers **single-tablet linearizable KV** (`put`/`delete`/
-//! `linearizable_get`) — *not* multi-key transactions — so it cannot reuse the
-//! Accord harness's multi-key list-append workload. Instead this is a
+//! The leaderful data plane offers **single-tablet linearizable KV**
+//! (`put`/`delete`/`linearizable_get`) — *not* multi-key transactions — so a
+//! multi-key transactional workload does not apply to it. This is therefore a
 //! self-contained harness that reuses the proven **checkers** (`check_cycles`/
 //! `check_durability`/`check_convergence`) and the `Recorder`/`History` model,
 //! driving a **single-key list-append** workload over one Raft group.
@@ -41,10 +40,11 @@
 //! history the plain checker accepts and the strict one rejects, and the
 //! concurrent-window read that must stay accepted). Convergence + durability remain
 //! **eventual** (a lagging follower catches up via anti-entropy / snapshot), so
-//! they get the same **converged-or-timeout** poll the Accord runner uses.
+//! they get a **converged-or-timeout** poll, the pattern every corpus in this
+//! crate uses (see `animus-test`'s crate guide).
 //!
-//! Single-writer-per-key (`owner(key) = key % clients`) is load-bearing for the
-//! same reason as the Accord corpus: per-key LWW (the Raft log index is the MVCC
+//! Single-writer-per-key (`owner(key) = key % clients`) is load-bearing here:
+//! per-key LWW (the Raft log index is the MVCC
 //! version) would otherwise *lose* a concurrent writer's append, a data-model
 //! artefact rather than a consistency bug. A client builds each append on its own
 //! authoritative in-memory list (it is the sole writer and runs serially) and
@@ -53,7 +53,7 @@
 //!
 //! **The deepened fault matrix (frozen alongside the original cells).** Beyond the
 //! original single-fault vocabulary (leader/follower kill, leader partition,
-//! lossy), the corpus covers the fault classes the Accord corpus proved out:
+//! lossy), the corpus covers a deepened set of fault classes:
 //!
 //! - `StopRestart` — a true **process restart**: `sim.stop` drops the victim's
 //!   tasks + volatile state (its in-memory `RaftCore` is *gone*), then a fresh
@@ -68,8 +68,8 @@
 //!   leader + 1 vs 3): the majority elects a fresh leader while the deposed one
 //!   still believes it leads — the classic stale-read window a linearizable read
 //!   must not serve from.
-//! - Compound `Lossy` + `StopRestart` — the class that surfaced real findings in
-//!   the Accord deep tier: a WAL recovery racing a degraded network.
+//! - Compound `Lossy` + `StopRestart` — a WAL recovery racing a degraded
+//!   network; historically the class that surfaced real findings at depth.
 //!
 //! The new cells also carry a non-zero **fault window** (`Scenario::window`): the
 //! runner holds the last fault open for that long before healing, so the group
@@ -130,13 +130,13 @@ const SETTLE: Duration = Duration::from_millis(800);
 /// poll. After this the history is stable, so the `cycles` verdict is snapshotted
 /// here.
 const DRAIN: Duration = Duration::from_secs(40);
-/// Converged-or-timeout poll step + budget (mirrors the Accord runner): eventual
+/// Converged-or-timeout poll step + budget: eventual
 /// properties get a generous bounded poll rather than a fixed-drain snapshot.
 const CONVERGENCE_POLL_STEP: Duration = Duration::from_secs(2);
 const CONVERGENCE_BUDGET: Duration = Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
-// Declarative scenario model (a focused mirror of the Accord corpus's, with the
+// Declarative scenario model (focused on this plane's fault vocabulary, with the
 // fault vocabulary the *leaderful* plane actually exercises).
 // ---------------------------------------------------------------------------
 
@@ -318,7 +318,7 @@ fn corpus_cells() -> Vec<Scenario> {
         vec![(Duration::from_millis(2200), Nemesis::LeaderMinority)],
     ));
     // Compound faults: a WAL-recovering restart under a degraded network — the
-    // class that surfaced real findings in the Accord deep tier.
+    // class that has historically surfaced real findings at depth.
     out.push(windowed_workload(
         "lossy_stop_restart_3",
         3,
@@ -339,7 +339,7 @@ fn corpus_cells() -> Vec<Scenario> {
 }
 
 /// Seeds per structural cell (`ANIMUS_RAFTKV_SEEDS`, default 1) — the *depth* knob
-/// (mirrors the Accord corpus's `ANIMUS_CORPUS_SEEDS`). One structural cell × many
+/// One structural cell × many
 /// interleavings is the dominant bug-finding lever; `K=1` is byte-identical to the
 /// committed frozen set.
 fn seeds_per_cell() -> usize {
@@ -438,7 +438,7 @@ fn lsm_engine(sim: &Simulator, id: u64) -> LsmEngine<SimEnv> {
 }
 
 // ---------------------------------------------------------------------------
-// List value encoding (matches the Accord harness: u64 elements, 8 big-endian
+// List value encoding (u64 elements, 8 big-endian
 // bytes each). An empty list encodes to empty bytes.
 // ---------------------------------------------------------------------------
 
@@ -905,8 +905,8 @@ fn run_scenario_on<S: StorageEngine + 'static>(
     let strict = check_strict_cycles(&history);
     let realtime_edges = realtime_edge_count(&history);
 
-    // Converged-or-timeout poll for the eventual properties (mirrors the Accord
-    // runner): a lagging follower may still be catching up at the fixed drain, so
+    // Converged-or-timeout poll for the eventual properties: a lagging follower
+    // may still be catching up at the fixed drain, so
     // re-read in bounded increments and stop early once both hold.
     let last = group.replicas - 1;
     let mut a = final_state(&group.nodes, 0, keys);
@@ -1078,7 +1078,7 @@ fn raftkv_corpus_is_linearizable() {
     );
 }
 
-/// Coverage guard (mirrors the Accord corpus's `corpus_covers_the_fault_matrix`):
+/// Coverage guard:
 /// the generator must keep exercising every fault class, both group shapes,
 /// compound schedules, and real outage windows — otherwise a dimension silently
 /// stopped being tested. Structural only (no scenario runs). Also pins the
@@ -1177,7 +1177,7 @@ fn raftkv_corpus_covers_the_fault_matrix() {
 /// Seed-depth lever (`ANIMUS_RAFTKV_SEEDS`): expanding the cells by `k` yields
 /// exactly `k×` scenarios, names/seeds stay unique, and **variant 0 preserves the
 /// canonical (frozen) name+seed** — growing depth never moves a regression seed.
-/// Structural only (mirrors the Accord corpus's guard).
+/// Structural only.
 #[test]
 fn raftkv_seed_expansion_is_additive_and_unique() {
     let base = corpus_cells();

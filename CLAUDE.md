@@ -17,10 +17,13 @@ AnimusDB is a masterless, linearly-scalable NoSQL database in Rust. **For v1
 plane** (linearizable single-tablet reads/writes, ADR 0016/0017) under a small
 **Raft control plane** that owns cluster metadata — Cockroach/TiKV-shaped.
 Correctness is established by **deterministic simulation testing**. The original
-Dynamo-lineage **leaderless AP data plane** (ADR 0001) is **deferred** — a
-long-shot future improvement (ADR 0019); its crate (`animus-data`) and the Accord
-data-plane "frontier" that depended on it were **deleted**, retrievable from git
-history if both-planes is revived.
+Dynamo-lineage **leaderless AP data plane** (ADR 0001) is **gone**: deferred by
+ADR 0019 and, as of that ADR's 2026-08-23 amendment, its **long shot is closed**
+— with CQL dropped (ADR 0053) DynamoDB's wire cannot express a per-table
+replication mode, so AP became unselectable. `animus-data`, the Accord crate
+(`animus-consensus`) and its Elle corpus, and the `ReplicationMode` seam are all
+**deleted**, retrievable from git history if AP is ever revived (which would
+first need a wire that can express it).
 
 Status: pre-alpha. For *what's implemented* and *why*, read the ADR index
 ([`docs/adr/README.md`](docs/adr/README.md)) and the per-crate guides below —
@@ -49,7 +52,6 @@ the relevant one before working in a crate:
 | `animus-test` | [crates/animus-test/CLAUDE.md](crates/animus-test/CLAUDE.md) |
 | `animus-dynamo` | [crates/animus-dynamo/CLAUDE.md](crates/animus-dynamo/CLAUDE.md) |
 | `animus-placement` | [crates/animus-placement/CLAUDE.md](crates/animus-placement/CLAUDE.md) |
-| `animus-consensus` | [crates/animus-consensus/CLAUDE.md](crates/animus-consensus/CLAUDE.md) |
 | `animusd` | [crates/animusd/CLAUDE.md](crates/animusd/CLAUDE.md) |
 | `animus-cli` | [crates/animus-cli/CLAUDE.md](crates/animus-cli/CLAUDE.md) |
 
@@ -82,8 +84,6 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | Env var | Default | Effect |
 |---------|---------|--------|
 | `ANIMUS_SEED` | unset | replay one sim run from its printed seed |
-| `ANIMUS_CORPUS_SEEDS=K` | 1 | Accord Elle-corpus depth: K seed variants per cell (`animus-test`) |
-| `ANIMUS_CORPUS_FULL=1` | off | Accord Elle-corpus breadth: extended dimensions (`animus-test`) |
 | `ANIMUS_RAFTKV_SEEDS=K` | 1 | raftkv-corpus depth (`animus-test`) |
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
 | `ANIMUS_RECONCILER_SEEDS=K` | 1 | reconciler-corpus depth (`animus-cp-data`) |
@@ -94,8 +94,8 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_SPLIT_SEEDS=K` | 1 | split-build `SeedBatch` corpus depth (`animus-cp-data`, ADR 0050 Train B) |
 | `ANIMUS_BENCH_{KEYS,GETS,SCAN,VALUE_BYTES,APPLY_BATCH}` | — | `engine_bench` workload tuning |
 
-The deep corpus tier (`ANIMUS_CORPUS_SEEDS=40 ANIMUS_CORPUS_FULL=1`) runs
-nightly in CI (`.github/workflows/corpus-deep.yml`), not per-push.
+The deep corpus tiers run nightly in CI
+(`.github/workflows/corpus-deep.yml`), not per-push.
 
 ### Dashboard
 
@@ -202,11 +202,11 @@ truth; this map is just for navigation.
   placement event-driven (ADR 0031). Clusters grow online: new nodes
   self-register and mirror `Metadata` (ADR 0030), join via seed addresses, and
   are decommissioned via drain → remove (ADR 0032).
-- **Transaction consensus** — `animus-consensus` (ADR 0011). An Accord slice in
-  the same shape as the Raft core (sync `AccordCore` + `AccordNode<E>`).
-  **Testbed-only** (ADR 0018/0019): no production consumer — it exists as the
-  known-serializable system the Elle checkers are proven against; ADR 0018
-  chose 2PC-over-Raft (unbuilt) for future CP transactions.
+- **Transaction consensus** — 2PC/HLC over the per-tablet Raft groups (ADR
+  0018), the only transaction story. The Accord slice that used to sit here
+  (`animus-consensus`, ADR 0011) is **deleted** — rejected for CP by ADR 0018 in
+  favour of 2PC-over-Raft, and deferred with AP by ADR 0019, whose 2026-08-23
+  amendment removed it outright along with its Elle corpus (ADR 0014).
 - **Storage** — `animus-storage` (ADR 0004, 0008). The **async** `StorageEngine`
   trait; `MemoryEngine` (deterministic, for sim) and a custom on-disk
   `LsmEngine<E>` (WAL/SSTable/leveled compaction, all I/O via the `Env` disk seam

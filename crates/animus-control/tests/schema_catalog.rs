@@ -19,7 +19,7 @@
 use std::time::Duration;
 
 use animus_control::raft::ProposeResult;
-use animus_control::{ColumnDef, ColumnType, MetaCommand, RaftNode, ReplicationMode, TableSchema};
+use animus_control::{ColumnDef, ColumnType, MetaCommand, RaftNode, TableSchema};
 use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
@@ -196,67 +196,6 @@ fn run(seed: u64) {
         assert!(
             m.has_table_schema("events"),
             "node {i}: drop removed the wrong schema (seed={seed})"
-        );
-    }
-}
-
-#[test]
-fn set_table_mode_replicates_and_survives_leader_kill() {
-    // A table's replication mode (ADR 0016/0017) is part of the replicated catalog:
-    // it defaults to CP (the only v1 plane, ADR 0019), a `SetTableMode` flips it
-    // (here to the forward-compat AP hook), the change replicates to every node,
-    // is rejected for an unknown table, and survives a leader kill.
-    let seed = 0x00C0_DE3A;
-    let (mut sim, nodes) = cluster(seed);
-    sim.run_for(Duration::from_secs(2));
-    let leader = unique_leader(&nodes, &[0, 1, 2], seed);
-
-    nodes[leader].propose(MetaCommand::CreateTableSchema {
-        table: "users".into(),
-        schema: users_schema(),
-    });
-    sim.run_for(Duration::from_secs(1));
-    // Default mode is CP everywhere (ADR 0019: CP is the v1 plane).
-    for node in &nodes {
-        assert_eq!(node.metadata().table_mode("users"), ReplicationMode::Cp);
-    }
-
-    // Flip "users" to AP (the forward-compat hook — proving `SetTableMode`
-    // replicates a non-default mode); a SetTableMode on an unknown table is
-    // rejected.
-    assert!(matches!(
-        nodes[leader].propose(MetaCommand::SetTableMode {
-            table: "users".into(),
-            mode: ReplicationMode::Ap,
-        }),
-        ProposeResult::Accepted { .. }
-    ));
-    nodes[leader].propose(MetaCommand::SetTableMode {
-        table: "ghost".into(),
-        mode: ReplicationMode::Ap,
-    });
-    sim.run_for(Duration::from_secs(1));
-    for node in &nodes {
-        let m = node.metadata();
-        assert_eq!(
-            m.table_mode("users"),
-            ReplicationMode::Ap,
-            "the set mode must replicate to every node (seed={seed})"
-        );
-        // The rejected command left no schema/mode for the unknown table — it
-        // reads as the CP default.
-        assert!(!m.has_table_schema("ghost"));
-        assert_eq!(m.table_mode("ghost"), ReplicationMode::Cp);
-    }
-
-    // Kill the leader; the set mode survives on the durable survivors.
-    sim.crash(nid(leader as u64));
-    sim.run_for(Duration::from_secs(3));
-    for i in (0..3).filter(|&i| i != leader) {
-        assert_eq!(
-            nodes[i].metadata().table_mode("users"),
-            ReplicationMode::Ap,
-            "the set mode must survive a leader kill (seed={seed})"
         );
     }
 }

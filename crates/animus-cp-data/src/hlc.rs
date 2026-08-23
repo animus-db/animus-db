@@ -55,8 +55,9 @@ impl HlcTimestamp {
 
 /// Pack an [`HlcTimestamp`] into the storage-engine `u64` MVCC version: ADR
 /// 0018 §2 settled the engine version to be the HLC directly, no node-id bits
-/// folded in (unlike `animus-consensus::node::mvcc_version`'s `(logical,
-/// node)` encoding — string [`NodeId`]s can't be bit-packed post-ADR-0040, and
+/// folded in (unlike the `(logical, node)` encoding the deleted
+/// `animus-consensus` used — string [`NodeId`]s can't be bit-packed
+/// post-ADR-0040, and
 /// per-key monotonicity across concurrent writers is the transaction layer's
 /// job, not this encoding's — see the timestamp-cache / write-conflict-push
 /// design in later PRs of ADR 0018).
@@ -68,8 +69,7 @@ impl HlcTimestamp {
 /// would silently collapse to the same version and per-key LWW would keep an
 /// arbitrary winner — a silent-corruption failure, not a recoverable error —
 /// so the guards are hard `assert!`s (they do **not** vanish in release
-/// builds, unlike `debug_assert!`). Mirrors the doctrine in
-/// `animus-consensus::node::mvcc_version`.
+/// builds, unlike `debug_assert!`).
 ///
 /// # Panics
 ///
@@ -149,9 +149,8 @@ struct HlcState {
 /// a shared `&self` can advance the clock, matching the `Rng` seam's
 /// interior-mutability convention (`animus_env::Rng`). The node id is carried
 /// for debugging/future stamping only — it does **not** enter timestamps or
-/// [`pack`]/[`unpack`] (string `NodeId`s can't bit-pack; see
-/// `crates/animus-consensus/src/node.rs`'s `mvcc_version` doc for why the old
-/// numeric-folding trick died with ADR 0040).
+/// [`pack`]/[`unpack`] — string `NodeId`s can't bit-pack, which is why the old
+/// numeric-folding trick died with ADR 0040.
 ///
 /// **Pure-function discipline**: `Hlc` never touches an `Env` or the wall
 /// clock. [`mint`](Hlc::mint) and [`witness`](Hlc::witness) both take the

@@ -1,10 +1,11 @@
 //! Phase 1 / A2 (v1 plan, ADR 0013): **cross-process schema-DDL relay**. In a
 //! one-process-per-node deployment, a schema command (`CreateTableSchema` /
-//! `SetTableMode` / …) issued to a node that is **not** the control-plane leader
-//! is relayed (via `ClientRequest::ProposeSchema`) to the leader's node so it
-//! commits + replicates — instead of timing out (the prior behavior, where a
-//! follower had no leader handle to propose on). The relay is **gated** to
-//! schema-catalog commands: a membership/placement command is rejected.
+//! `CreateTableIndex` / …) issued to a node that is **not** the control-plane
+//! leader is relayed (via `ClientRequest::ProposeSchema`) to the leader's node
+//! so it commits + replicates — instead of timing out (the prior behavior,
+//! where a follower had no leader handle to propose on). The relay is
+//! **gated** to schema-catalog commands: a membership/placement command is
+//! rejected.
 //!
 //! Real TCP/time → polls with timeouts.
 
@@ -13,8 +14,7 @@ use std::time::Duration;
 
 use animus_env::nid;
 use animusd::{
-    ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, ReplicationMode, TableSchema,
-    read_frame,
+    ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, TableSchema, read_frame,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -130,31 +130,6 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
         );
     }
 
-    // Also flip its mode to CP via the follower (another schema command) and see it
-    // replicate — exercises the relay for `SetTableMode` too.
-    let set_cp = MetaCommand::SetTableMode {
-        table: "ddl_t".into(),
-        mode: ReplicationMode::Cp,
-    };
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let _ = call(
-                follower_client,
-                ClientRequest::ProposeSchema(set_cp.clone()),
-            )
-            .await;
-            if nodes
-                .iter()
-                .all(|n| n.metadata().table_mode("ddl_t") == ReplicationMode::Cp)
-            {
-                return;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("follower-issued SetTableMode did not replicate in 20s");
-
     // The atomic `ALTER TABLE` primitive (`ReplaceTableSchema`) relays too — the
     // gating allowlist (`is_relayable_command`) must include it, or a
     // follower-connected ALTER silently times out (works only when the connected
@@ -163,7 +138,6 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
     extended
         .columns
         .push(animusd::ColumnDef::new("age", ColumnType::Number));
-    extended.mode = ReplicationMode::Cp; // preserve the mode set above
     let replace = MetaCommand::ReplaceTableSchema {
         table: "ddl_t".into(),
         schema: extended.clone(),
