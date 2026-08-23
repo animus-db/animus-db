@@ -83,6 +83,7 @@ async fn row_count(addr: SocketAddr, table: &str) -> Option<usize> {
             limit: None,
             reverse: false,
             table: table.to_owned(),
+            stale: false,
         };
         animusd::write_frame(&mut s, &req).await.ok()?;
         match read_frame(&mut s).await.ok()?? {

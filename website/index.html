@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AnimusDB — a masterless, horizontally scalable NoSQL database</title>
-<meta name="description" content="AnimusDB is an open-source, masterless NoSQL database in Rust: horizontally scalable, linearizable by default, sharded into tablets with per-tablet Raft, and verified by deterministic simulation testing. Includes a DynamoDB-compatible API, so existing AWS SDKs work unmodified.">
+<meta name="description" content="AnimusDB is an open-source, masterless NoSQL database in Rust: horizontally scalable, linearizable writes and linearizable reads on request, sharded into tablets with per-tablet Raft, and verified by deterministic simulation testing. Includes a DynamoDB-compatible API, so existing AWS SDKs work unmodified.">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="canonical" href="https://animusdb.io/">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://animusdb.io/">
 <meta property="og:title" content="AnimusDB — a masterless, horizontally scalable NoSQL database">
-<meta property="og:description" content="Open-source, masterless, horizontally scalable, linearizable by default. Written in Rust, verified by deterministic simulation testing. Speaks a DynamoDB-compatible API, so existing AWS SDKs work unmodified.">
+<meta property="og:description" content="Open-source, masterless, horizontally scalable, with linearizable writes and linearizable reads on request. Written in Rust, verified by deterministic simulation testing. Speaks a DynamoDB-compatible API, so existing AWS SDKs work unmodified.">
 <meta name="twitter:card" content="summary">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -79,8 +79,8 @@
       <h1>A masterless NoSQL database, built for strong consistency at scale.</h1>
       <p class="lede">
         AnimusDB is a horizontally scalable database you run yourself. Data is sharded into
-        <strong>tablets</strong>, each its own topology-aware Raft group, so every read and
-        write is <strong>linearizable</strong> instead of eventually consistent, and the
+        <strong>tablets</strong>, each its own topology-aware Raft group, so every write —
+        and every read that asks for it — is <strong>linearizable</strong>, and the
         distributed core is verified by deterministic simulation testing. It speaks a
         DynamoDB-compatible API, so your existing AWS SDKs work unmodified.
       </p>
@@ -136,7 +136,7 @@
       </div>
       <div class="card">
         <h3><span class="ico"><svg width="17" height="17" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1.5 2 4v4c0 3.2 2.4 5.4 6 6.5 3.6-1.1 6-3.3 6-6.5V4L8 1.5Z"/></svg></span>Strong consistency</h3>
-        <p>Every partition is its own Raft group with a single leader. Reads and writes are linearizable by default — no quorum tuning, no read repair, no "eventually".</p>
+        <p>Every partition is its own Raft group with a single leader, so writes are linearizable — no quorum tuning, no read repair. Reads follow DynamoDB: <code>ConsistentRead: true</code> is linearizable; the default is an eventually-consistent read served from any replica, at half the cost.</p>
       </div>
       <div class="card">
         <h3><span class="ico"><svg width="17" height="17" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 8h10M9 4l4 4-4 4"/><path d="M3 3v10"/></svg></span>Transactions</h3>

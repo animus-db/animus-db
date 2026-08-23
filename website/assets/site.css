@@ -1,7 +1,7 @@
 /* AnimusDB marketing site — animusdb.io — site skin.
  *
  * Design tokens come from the shared base, `assets/tokens.css`, which is
- * byte-identical to the copy the in-product consoles embed (ADR 0055); a test
+ * byte-identical to the copy the in-product consoles embed (ADR 0056); a test
  * in `animusd` fails if the two drift. Only the *skin* lives here: the geometry
  * that makes this surface roomy — the consoles set a dense one from the same
  * base. Faces are self-hosted in `assets/fonts.css`; no CDN, no build step.

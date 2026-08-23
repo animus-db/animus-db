@@ -167,7 +167,12 @@ truth; this map is just for navigation.
   Raft group with a single leader serving **linearizable** single-tablet
   reads/writes/scans, durable on a real `StorageEngine`; reuses the control
   plane's sync `RaftCore` with a KV state machine; ReadIndex reads, compaction +
-  streaming `InstallSnapshot`, single-server membership change. Each hosted
+  streaming `InstallSnapshot`, single-server membership change. **Reads have a
+  second, weaker path since ADR 0055**: a `ConsistentRead: false` read (the
+  DynamoDB wire default) is served from *any* replica's own applied engine
+  state — no read barrier, no leadership, no wake of a quiesced group — behind
+  a purely local freshness gate, falling back to the ReadIndex path whenever no
+  replica can serve it cheaply. Each hosted
   tablet has its **own private engine** (ADR 0050; keys `kind || logical`,
   identity in the engine's file namespace — the shared-engine
   `StorageScope`/fence machinery of ADR 0028 is gone). The per-node
@@ -215,7 +220,10 @@ truth; this map is just for navigation.
   also shipped for a time but was dropped, ADR 0053 — v1 is DynamoDB-only).
   DynamoDB JSON/HTTP, served by `animusd`, routed through the **CP data
   plane** (v1, ADR 0019); consumes the replicated schema catalog (ADR 0013)
-  and builds ADR 0022 token-prefixed keys. `UpdateTable` can add/drop a GSI on an
+  and builds ADR 0022 token-prefixed keys. **`ConsistentRead` selects a real
+  read path** (ADR 0055): `true` is the linearizable ReadIndex read, `false`
+  — the wire default — is the cheap replica-local one, so **read-your-writes
+  does not hold for an unqualified read**, exactly as DynamoDB defines it. `UpdateTable` can add/drop a GSI on an
   already-populated table (ADR 0045): the new index goes through a
   `Creating`/`Active`/`Deleting` lifecycle, backfilled by reusing the ADR
   0041 drain over the table's pre-existing rows.

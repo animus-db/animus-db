@@ -402,6 +402,7 @@ async fn anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_
                 ClientRequest::Get {
                     key: lower_key.clone(),
                     table: "txn_spans_a".to_string(),
+                    stale: false,
                 },
             )
             .await
@@ -544,6 +545,7 @@ async fn recovery_resolve_correctly_commits_both_tablets_of_a_two_tablet_transac
                     limit: None,
                     reverse: false,
                     table: "txn_group_fix".to_string(),
+                    stale: false,
                 },
             )
             .await

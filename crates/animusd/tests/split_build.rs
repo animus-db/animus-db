@@ -149,6 +149,7 @@ async fn get(stream: &mut TcpStream, key: Vec<u8>) -> Option<Vec<u8>> {
             &ClientRequest::Get {
                 key: key.clone(),
                 table: "t".to_string(),
+                stale: false,
             },
         )
         .await
@@ -603,6 +604,7 @@ async fn get_in(stream: &mut TcpStream, table: &str, key: Vec<u8>) -> Option<Vec
             &ClientRequest::Get {
                 key: key.clone(),
                 table: table.to_string(),
+                stale: false,
             },
         )
         .await

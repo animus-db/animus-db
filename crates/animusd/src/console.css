@@ -1,7 +1,7 @@
 /* AnimusDB Data Console (ADR 0052) — app skin.
  *
  * Design tokens come from the shared base — `tokens.css`, concatenated ahead of
- * this file by `console::CSS` (ADR 0055). Only the *skin* lives here: the geometry
+ * this file by `console::CSS` (ADR 0056). Only the *skin* lives here: the geometry
  * that makes this surface dense (the marketing site sets a roomier one from the
  * same base). No shared stylesheet at runtime, no bundler, no external
  * fonts/CDN — ADR 0021's rule, unchanged; the faces are embedded as base64 in

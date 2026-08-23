@@ -218,8 +218,15 @@ async fn a_segmented_fleet_sees_every_item_exactly_once() {
     for total in [2u32, 3, 4] {
         let mut seen: Vec<String> = Vec::new();
         for segment in 0..total {
-            let body =
-                format!(r#"{{"TableName":"events","Segment":{segment},"TotalSegments":{total}}}"#);
+            // `ConsistentRead: true` (ADR 0055): the segments are issued to
+            // different nodes and their results combined into one
+            // exactly-once check, so every segment must see the same table
+            // state — the wire default now answers from each node's own
+            // replica, which need not agree.
+            let body = format!(
+                r#"{{"TableName":"events","ConsistentRead":true,
+                        "Segment":{segment},"TotalSegments":{total}}}"#
+            );
             let (status, resp) = dynamo_retry(
                 addrs[segment as usize % addrs.len()],
                 "DynamoDB_20120810.Scan",

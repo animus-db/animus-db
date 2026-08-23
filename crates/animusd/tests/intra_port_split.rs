@@ -146,6 +146,7 @@ async fn find_leader_index(
                     ClientRequest::Get {
                         key: key.to_vec(),
                         table: table.to_string(),
+                        stale: false,
                     },
                 )
                 .await
@@ -196,6 +197,7 @@ async fn client_port_refuses_intra_traffic_intra_port_serves_it() {
         ClientRequest::Get {
             key: key.to_vec(),
             table: table.to_string(),
+            stale: false,
         },
     )
     .await;
@@ -252,6 +254,7 @@ async fn client_port_refuses_intra_traffic_intra_port_serves_it() {
         ClientRequest::Get {
             key: key.to_vec(),
             table: table.to_string(),
+            stale: false,
         },
     )
     .await;

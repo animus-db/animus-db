@@ -311,7 +311,12 @@ async fn a_filtered_page_returns_fewer_than_limit_and_still_carries_a_cursor() {
             addrs[pages % addrs.len()],
             "DynamoDB_20120810.Query",
             &format!(
-                r#"{{"TableName":"events",
+                // `ConsistentRead: true` (ADR 0055): this walk rotates across
+                // nodes, and the wire default is now served from whichever replica
+                // the receiving node holds — consecutive pages would otherwise
+                // sample different, independently-lagging views. The strong read
+                // still exercises the forwarded path the rotation exists to cover.
+                r#"{{"TableName":"events","ConsistentRead":true,
                     "KeyConditionExpression":"pk = :p",
                     "FilterExpression":"parity = :v",
                     "ExpressionAttributeValues":{{":p":{{"S":"p1"}},":v":{{"S":"odd"}}}},

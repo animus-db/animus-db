@@ -356,6 +356,7 @@ async fn manual_split_with_unaligned_key_on_streamed_table_rounds_to_token_bound
                 ClientRequest::Get {
                     key: key_a.clone(),
                     table: "orders".into(),
+                    stale: false,
                 }
             )
             .await,
@@ -367,6 +368,7 @@ async fn manual_split_with_unaligned_key_on_streamed_table_rounds_to_token_bound
                 ClientRequest::Get {
                     key: key_b.clone(),
                     table: "orders".into(),
+                    stale: false,
                 }
             )
             .await,

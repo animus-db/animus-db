@@ -351,6 +351,7 @@ async fn await_value(clients: &[SocketAddr], key: &[u8], want: &[u8], secs: u64)
                     ClientRequest::Get {
                         key: key.to_vec(),
                         table: "kv".to_string(),
+                        stale: false,
                     },
                 )
                 .await

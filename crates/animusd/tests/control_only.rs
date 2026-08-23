@@ -490,6 +490,7 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
             ClientRequest::Get {
                 key: b"mixed-key".to_vec(),
                 table: "mixed_t".to_string(),
+                stale: false,
             },
         )
         .await;
@@ -503,6 +504,7 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
             ClientRequest::Get {
                 key: b"mixed-key".to_vec(),
                 table: "mixed_t".to_string(),
+                stale: false,
             },
         )
         .await;

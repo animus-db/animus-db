@@ -188,10 +188,15 @@
     <section id="consistency">
       <h2>Consistency model</h2>
       <p>
-        Single-tablet reads and writes are <strong>linearizable</strong>. There is one leader per
-        tablet, writes go through its Raft log, and reads are served with a read-index barrier
-        confirming the leader is still the leader before it answers. You do not get a stale read
-        because you happened to hit a lagging replica, and there is no quorum knob to get wrong.
+        Single-tablet writes are <strong>linearizable</strong>: there is one leader per tablet and
+        every write goes through its Raft log. Reads follow DynamoDB's own contract, and the choice
+        is per request. <code>ConsistentRead: true</code> is linearizable — served by the leader
+        behind a read-index barrier that confirms it is still the leader before it answers, so you
+        never get a stale answer because you happened to hit a lagging replica. The default,
+        <code>ConsistentRead: false</code>, is an <strong>eventually-consistent</strong> read: any
+        replica answers it from its own applied state, with no barrier and no hop to the leader.
+        It is cheaper and it scales across replicas, and it may return a slightly older — but
+        always genuinely committed — version of the item. There is no quorum knob either way.
       </p>
       <p>
         Multi-tablet transactions are <strong>serializable</strong>: two-phase commit across the

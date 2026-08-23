@@ -296,6 +296,69 @@ impl CpGroup {
         }
     }
 
+    // ---- eventually-consistent reads (ADR 0055) --------------------------
+
+    /// Whether this replica may serve an eventually-consistent read — the
+    /// purely local freshness gate. See [`RaftKvNode::stale_read_ready`].
+    pub(crate) fn stale_read_ready(&self) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.stale_read_ready(),
+            CpGroup::Mem(n) => n.stale_read_ready(),
+        }
+    }
+
+    /// An eventually-consistent point read from this replica's own engine.
+    /// See [`RaftKvNode::stale_get_served`] — outer `None` is "not served",
+    /// never absence.
+    pub(crate) async fn stale_get_served(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        match self {
+            CpGroup::Lsm(n) => n.stale_get_served(key).await,
+            CpGroup::Mem(n) => n.stale_get_served(key).await,
+        }
+    }
+
+    /// An eventually-consistent base-scope range scan of this replica's own
+    /// engine. See [`RaftKvNode::stale_scan`]/[`RaftKvNode::stale_scan_rev`].
+    pub(crate) async fn stale_scan(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match (self, reverse) {
+            (CpGroup::Lsm(n), false) => n.stale_scan(start, end, limit).await,
+            (CpGroup::Lsm(n), true) => n.stale_scan_rev(start, end, limit).await,
+            (CpGroup::Mem(n), false) => n.stale_scan(start, end, limit).await,
+            (CpGroup::Mem(n), true) => n.stale_scan_rev(start, end, limit).await,
+        }
+    }
+
+    /// An eventually-consistent **kind-scoped** range scan of this replica's
+    /// own engine (ADR 0041 §3 scopes; the LSI/GSI-hidden-table read path).
+    ///
+    /// This is plain [`RaftKvNode::local_scan_kind`] and needs no
+    /// stale-specific envelope resolution: a non-base scope only ever holds
+    /// **committed** values (only `KvCommand::KindBatch` writes them, and it
+    /// always commits outright), so there is no intent for an eventual read
+    /// to fall back past — the difference from the linearizable form is
+    /// purely the missing ReadIndex barrier.
+    pub(crate) async fn stale_scan_kind(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match (self, reverse) {
+            (CpGroup::Lsm(n), false) => n.local_scan_kind(kind, start, end, limit).await,
+            (CpGroup::Lsm(n), true) => n.local_scan_kind_rev(kind, start, end, limit).await,
+            (CpGroup::Mem(n), false) => n.local_scan_kind(kind, start, end, limit).await,
+            (CpGroup::Mem(n), true) => n.local_scan_kind_rev(kind, start, end, limit).await,
+        }
+    }
+
     /// A non-linearizable, bounded scan of one non-base row-kind scope (ADR
     /// 0041 §3) — the raw kind-scan primitive tests use to prove exactly
     /// which kinds an entry wrote (e.g. a streamed-unindexed table's write
@@ -1139,6 +1202,46 @@ enum CpRoute {
     None,
 }
 
+/// Which consistency a CP read is asking for (ADR 0055) — this crate's
+/// spelling of DynamoDB's own per-request `ConsistentRead` flag, threaded
+/// from the wire edge down through [`ClientCtx::cp_read`]/
+/// [`ClientCtx::cp_scan`]/[`ClientCtx::cp_scan_kind`] to the read primitive
+/// that serves it.
+///
+/// The two are genuinely different reads, not two cost tiers of one read:
+/// `Strong` is the ReadIndex path every read took before ADR 0055
+/// (leader-only, quorum-confirmed, linearizable); `Eventual` is served from
+/// **any** replica's own applied state with no barrier and no leader hop,
+/// and may return an older — but genuinely committed — state of the tablet.
+///
+/// `Eventual` is only ever a *preference*: every read falls back to the
+/// `Strong` path when no replica can serve it cheaply, so the weaker request
+/// can never fail where the stronger one would have succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadConsistency {
+    /// Linearizable: ReadIndex on the tablet's group leader (ADR 0017).
+    Strong,
+    /// Eventually consistent: any replica's applied state (ADR 0055).
+    Eventual,
+}
+
+impl ReadConsistency {
+    /// The DynamoDB `ConsistentRead` flag as this crate spells it. `false`
+    /// — the wire default, and by far the common case — is `Eventual`.
+    pub(crate) fn from_consistent_read(consistent: bool) -> Self {
+        if consistent {
+            Self::Strong
+        } else {
+            Self::Eventual
+        }
+    }
+
+    /// Whether the cheap path should be tried first.
+    fn is_eventual(self) -> bool {
+        matches!(self, Self::Eventual)
+    }
+}
+
 /// How a [`ClientCtx::poll_probe`] confirm wait ended: the probed effect
 /// appeared (`Confirmed`), the wait became provably futile before the
 /// deadline (`Superseded` — see [`ClientCtx::confirm_wait_is_futile`]), or
@@ -1178,6 +1281,28 @@ pub(crate) enum SnapshotRead {
 /// longer than a steady-state op. No happy-path cost: `cp_route` returns as soon as
 /// a leader is reachable; the cap only bounds the wait when the group is forming.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// ADR 0055: the refusal a node returns for a **forwarded** eventual read it
+/// cannot serve — it holds no serveable replica of the tablet, or the one it
+/// holds does not cover the requested range.
+///
+/// Deliberately **not** a `"; retry"` error and deliberately not a
+/// not-the-leader refusal: neither retrying here nor chasing a leader is the
+/// right response. The forwarder's answer to this is to stop being cheap and
+/// take the linearizable path, which always works — so this string is only
+/// ever a fallback signal, never something a client sees.
+const STALE_READ_REFUSAL: &str =
+    "no replica here can serve an eventually-consistent read (ADR 0055)";
+
+/// How long a **forwarded** eventually-consistent read (ADR 0055) waits on
+/// its one-shot relay before giving up and falling back to the linearizable
+/// path.
+///
+/// Deliberately far below [`CLIENT_TIMEOUT`], and deliberately not shared
+/// with it: a cheap read that sits ten seconds on an unresponsive replica
+/// has already lost every property it was chosen for. Failing fast into the
+/// strong path costs one leader hop and always answers; waiting does not.
+const STALE_READ_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// ADR 0050 rung 5: the retryable refusal every mutating propose helper
 /// returns for a frozen split parent (post-`Freeze`, pre-cutover). Ends in
@@ -1369,6 +1494,16 @@ pub enum ClientRequest {
         /// the ascending scan this has always been.
         #[serde(default)]
         reverse: bool,
+        /// ADR 0055: serve this read from **any** replica's applied state
+        /// (`ConsistentRead: false`) instead of the linearizable ReadIndex
+        /// path. The receiver serves it only if it holds a replica that
+        /// passes `RaftKvNode::stale_read_ready`, and refuses otherwise —
+        /// the sender then falls back to the strong path, so a refusal is
+        /// never a client-visible failure. `#[serde(default)]`: a peer
+        /// predating the field decodes as the linearizable read this has
+        /// always been.
+        #[serde(default)]
+        stale: bool,
     },
     /// **Internal seal-trigger RPC — never sent bare, only wrapped in
     /// [`Forwarded`](Self::Forwarded)** (ADR 0042/0043, round-3 sealer PR):
@@ -1528,7 +1663,20 @@ pub enum ClientRequest {
     },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
-    Get { key: Vec<u8>, table: String },
+    Get {
+        key: Vec<u8>,
+        table: String,
+        /// ADR 0055: serve this read from **any** replica's applied state
+        /// (`ConsistentRead: false`) instead of the linearizable ReadIndex
+        /// path. The receiver serves it only if it holds a replica that
+        /// passes `RaftKvNode::stale_read_ready`, and refuses otherwise —
+        /// the sender then falls back to the strong path, so a refusal is
+        /// never a client-visible failure. `#[serde(default)]`: a peer
+        /// predating the field decodes as the linearizable read this has
+        /// always been.
+        #[serde(default)]
+        stale: bool,
+    },
     /// **Internal non-blocking single-shot read RPC — never sent bare, only
     /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0018 §2, the
     /// torn-pair-fix stack's PR2 amendment): the point-in-time analog of
@@ -1573,6 +1721,16 @@ pub enum ClientRequest {
         #[serde(default)]
         reverse: bool,
         table: String,
+        /// ADR 0055: serve this read from **any** replica's applied state
+        /// (`ConsistentRead: false`) instead of the linearizable ReadIndex
+        /// path. The receiver serves it only if it holds a replica that
+        /// passes `RaftKvNode::stale_read_ready`, and refuses otherwise —
+        /// the sender then falls back to the strong path, so a refusal is
+        /// never a client-visible failure. `#[serde(default)]`: a peer
+        /// predating the field decodes as the linearizable read this has
+        /// always been.
+        #[serde(default)]
+        stale: bool,
     },
     /// A CP op **forwarded** from a node that received it but does not host the CP
     /// group leader, to the leader's node (ADR 0017 #3b cross-process routing). The
@@ -6476,6 +6634,253 @@ impl ClientCtx {
         None
     }
 
+    // ---- eventually-consistent read routing (ADR 0055) -------------------
+    //
+    // `ConsistentRead: false` reads take a route the linearizable path does
+    // not have: they are served by ANY replica of the key's tablet, so a
+    // node that hosts one answers with zero network hops and zero consensus
+    // work, and reads scale across a tablet's replicas instead of all
+    // landing on its leader.
+    //
+    // Every function here is **best-effort by construction**: each returns
+    // `None` for "could not serve this cheaply", and every caller falls
+    // straight through to the ordinary linearizable path on `None`. That is
+    // what keeps the whole feature a strict optimization — there is no
+    // eventual-read-specific failure a client can ever observe, only an
+    // eventual read that quietly cost what a strong one costs.
+
+    /// The local replica this node may serve an **eventually-consistent**
+    /// read of `tablet` from (ADR 0055), or `None` if it may not.
+    ///
+    /// Three conditions, all local and all cheap:
+    ///
+    /// - this node has a data role at all (a control-only node hosts no
+    ///   tablet, ADR 0035);
+    /// - the local handle is a voter in the group's **own durable Raft
+    ///   config** — the identical check
+    ///   [`resolve_cp_route`](Self::resolve_cp_route) makes, and for the
+    ///   identical reason: a node moved off a tablet by a rebalance keeps
+    ///   its handle registered until the release-GC erases it (ADR 0029),
+    ///   and that departing handle's engine is not this tablet's state to
+    ///   serve;
+    /// - the replica passes [`RaftKvNode::stale_read_ready`] — it knows a
+    ///   leader and its engine holds everything it knows to be committed.
+    ///
+    /// **Deliberately does not `wake()` the group**, unlike
+    /// `resolve_cp_route`'s wake-on-demand edge (ADR 0048 PR4). An eventual
+    /// read needs no Raft activity whatsoever, and a quiesced group is idle
+    /// by construction — hence fully applied, hence exactly as current as it
+    /// will ever be. Waking a fleet's worth of cold groups to serve reads
+    /// that do not need them waking is precisely the cost ADR 0044's
+    /// cheap-groups roadmap exists to avoid.
+    /// Count one eventually-consistent read's outcome (ADR 0055, ADR 0015).
+    ///
+    /// Silently a no-op on a control-only node, which has no data-role
+    /// metrics sink — and no replicas either, so it can only ever record
+    /// fallbacks. `self.data()` would panic there; `resolve_cp_route`'s own
+    /// rule (this path must never panic) applies just as much to counting as
+    /// to routing.
+    fn record_eventual_read(&self, metric: Metric) {
+        if let Some(data) = self.data.as_ref() {
+            data.raftkv_metrics.incr(metric);
+        }
+    }
+
+    fn cp_stale_local(&self, tablet: TabletId) -> Option<CpGroup> {
+        let data = self.data.as_ref()?;
+        let group = self.edge.local_cp(tablet)?;
+        (group.config().contains(&data.base_id) && group.stale_read_ready()).then_some(group)
+    }
+
+    /// Where to send an eventually-consistent read this node cannot serve
+    /// itself (ADR 0055): **any** replica of `tablet`, deliberately not its
+    /// leader.
+    ///
+    /// This is the one place the eventual path's routing genuinely differs
+    /// in kind rather than in cost from [`cp_forward_target`](Self::cp_forward_target):
+    /// there is no leader to resolve, nothing to hint at, and nothing to
+    /// chase — every voter holds an answer this read is allowed to return.
+    /// Intra-flavored (ADR 0047), like every forwarding target: the
+    /// receiving node's `cp_serve_forwarded` is only reachable there.
+    ///
+    /// Picks the first **other** replica with a known intra address, in
+    /// `NodeId` order, which is deterministic on every node. This node is
+    /// excluded deliberately: this is only reached after
+    /// [`cp_stale_local`](Self::cp_stale_local) already declined, so relaying
+    /// to ourselves would spend a round trip re-deriving the identical
+    /// refusal.
+    ///
+    /// It deliberately does **not** spread a table's forwarded eventual reads
+    /// across its replicas — read-spreading here comes from clients reaching
+    /// different nodes, each answering locally, not from a coordinator fanning
+    /// out. A replica-picking policy (latency, load) is a later question and a
+    /// bigger one; this returns a correct, stable answer until it is asked.
+    fn cp_stale_forward_target(&self, tablet: TabletId) -> Option<SocketAddr> {
+        let meta = self.effective_metadata();
+        let replicas = &meta.tablets.get(&tablet)?.replicas;
+        let me = self.data.as_ref().map(|d| &d.base_id);
+        let route = self.intra_route_snapshot();
+        replicas
+            .iter()
+            .filter(|id| Some(*id) != me)
+            .find_map(|id| route.get(id).copied())
+    }
+
+    /// One-shot `Forwarded` relay for an eventually-consistent read (ADR
+    /// 0055).
+    ///
+    /// Deliberately **not** [`forward_to_tablet_leader`](Self::forward_to_tablet_leader):
+    /// that function's whole job is chasing a group's leader through
+    /// not-the-leader refusals and election backoff, and an eventual read
+    /// has no leader to chase — a refusal from the replica it asked means
+    /// "not cheaply, then", which is a fallback signal, not something to
+    /// retry. One connection, one reply, [`STALE_READ_FORWARD_TIMEOUT`],
+    /// no retries, no waiting out an election.
+    async fn relay_stale_read(&self, addr: SocketAddr, request: ClientRequest) -> ClientResponse {
+        relay_request_with_timeout(
+            addr,
+            &ClientRequest::Forwarded {
+                request: Box::new(request),
+                traceparent: crate::otel::current_traceparent(),
+            },
+            STALE_READ_FORWARD_TIMEOUT,
+        )
+        .await
+    }
+
+    /// One attempt at serving an **eventually-consistent** point read of
+    /// `key` cheaply (ADR 0055) — locally if this node holds a serveable
+    /// replica, else one forwarded hop to a replica that might.
+    ///
+    /// `None` means "not served cheaply"; the caller
+    /// ([`cp_read`](Self::cp_read)) falls through to the linearizable path,
+    /// which is always correct. `Some(v)` is a served answer, with the
+    /// inner `Option` carrying genuine presence/absence exactly as
+    /// [`RaftKvNode::stale_get_served`] defines it.
+    async fn cp_read_eventual(&self, table: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let served = self.cp_read_eventual_inner(table, key).await;
+        if served.is_none() {
+            self.record_eventual_read(Metric::CpEventualReadsFellBack);
+        }
+        served
+    }
+
+    /// [`cp_read_eventual`](Self::cp_read_eventual)'s body, split out only so
+    /// the fallback counter has exactly one place to live rather than one per
+    /// `return None`.
+    async fn cp_read_eventual_inner(&self, table: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let tablet = self.tablet_for(table, key)?;
+        if let Some(group) = self.cp_stale_local(tablet) {
+            // The same read-side scope pre-check the linearizable local arm
+            // makes (ADR 0033): routing that has raced a split crossover
+            // must fall back, never answer from a scope that does not own
+            // the key.
+            if !group.scope_range().contains(key) {
+                return None;
+            }
+            let served = group.stale_get_served(key).await?;
+            self.record_eventual_read(Metric::CpEventualReadsLocal);
+            return Some(served);
+        }
+        let addr = self.cp_stale_forward_target(tablet)?;
+        let request = ClientRequest::Get {
+            key: key.to_vec(),
+            table: table.to_owned(),
+            stale: true,
+        };
+        match self.relay_stale_read(addr, request).await {
+            ClientResponse::Value(v) => {
+                self.record_eventual_read(Metric::CpEventualReadsForwarded);
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    /// [`cp_read_eventual`](Self::cp_read_eventual)'s scan twin — one
+    /// attempt at serving one tablet's share of an eventually-consistent
+    /// base-scope range scan (ADR 0055). `None` falls back to
+    /// [`cp_scan_one`](Self::cp_scan_one)'s linearizable loop.
+    async fn cp_scan_one_eventual(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        let tablet = self.tablet_for(table, start)?;
+        if let Some(group) = self.cp_stale_local(tablet) {
+            // The scan-side scope pre-check (ADR 0033, `cp_scan_local`'s own
+            // rationale): a scope narrower than the requested window would
+            // silently truncate the page rather than error, so fall back
+            // instead of serving a short answer.
+            let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
+            if !group.scope_range().contains_range(&requested) {
+                return None;
+            }
+            return Some(group.stale_scan(start, end, limit, reverse).await);
+        }
+        let addr = self.cp_stale_forward_target(tablet)?;
+        let request = ClientRequest::Scan {
+            start: start.to_vec(),
+            end: end.map(<[u8]>::to_vec),
+            limit,
+            reverse,
+            table: table.to_owned(),
+            stale: true,
+        };
+        match self.relay_stale_read(addr, request).await {
+            ClientResponse::Pairs(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// [`cp_scan_one_eventual`](Self::cp_scan_one_eventual)'s **kind-scoped**
+    /// sibling (ADR 0041 §3 scopes) — one tablet's share of an
+    /// eventually-consistent LSI `Query`/`Scan`. `None` falls back to
+    /// [`cp_scan_kind_one`](Self::cp_scan_kind_one)'s linearizable loop.
+    async fn cp_scan_kind_one_eventual(
+        &self,
+        table: &str,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        let tablet = self.tablet_for(table, start)?;
+        if let Some(group) = self.cp_stale_local(tablet) {
+            let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
+            if !group.scope_range().contains_range(&requested) {
+                return None;
+            }
+            self.record_eventual_read(Metric::CpEventualReadsLocal);
+            return Some(
+                group
+                    .stale_scan_kind(kind, start, end, limit, reverse)
+                    .await,
+            );
+        }
+        let addr = self.cp_stale_forward_target(tablet)?;
+        let request = ClientRequest::KindScan {
+            table: table.to_owned(),
+            kind,
+            start: start.to_vec(),
+            end: end.map(<[u8]>::to_vec),
+            limit,
+            reverse,
+            stale: true,
+        };
+        match self.relay_stale_read(addr, request).await {
+            ClientResponse::Pairs(p) => {
+                self.record_eventual_read(Metric::CpEventualReadsForwarded);
+                Some(p)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether a CP read error is a **transient routing/leadership/scope race**
     /// the reader should retry with re-resolved routing (the `"; retry"` shape
     /// every such error in this file carries), as opposed to a genuine failure
@@ -6759,7 +7164,17 @@ impl ClientCtx {
         &self,
         table: &str,
         key: Vec<u8>,
+        consistency: ReadConsistency,
     ) -> Result<Option<Vec<u8>>, String> {
+        // ADR 0055: try the cheap path first for a `ConsistentRead: false`
+        // read, and fall straight through to the linearizable loop below
+        // when no replica can serve it. The strong path is untouched — a
+        // `Strong` read compiles down to exactly what it always did.
+        if consistency.is_eventual()
+            && let Some(v) = self.cp_read_eventual(table, &key).await
+        {
+            return Ok(v);
+        }
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             let err = match self.cp_route(table, &key).await {
@@ -6776,6 +7191,7 @@ impl ClientCtx {
                             ClientRequest::Get {
                                 key: key.clone(),
                                 table: table.to_owned(),
+                                stale: false,
                             },
                         )
                         .await
@@ -8776,7 +9192,12 @@ impl ClientCtx {
     ) -> Result<Vec<TxnPrecondition>, String> {
         let mut observed = Vec::with_capacity(preconditions.len());
         for (table, key, expected) in preconditions {
-            let actual = self.cp_read(table, key.clone()).await?;
+            // A transaction precondition is an OCC check the commit
+            // decision rests on: always linearizable (ADR 0055), never the
+            // cheap path, whatever the client's own reads asked for.
+            let actual = self
+                .cp_read(table, key.clone(), ReadConsistency::Strong)
+                .await?;
             if &actual != expected {
                 return Err(format!(
                     "transaction precondition failed for {table}/{key:?}: expected {expected:?}, \
@@ -8802,6 +9223,7 @@ impl ClientCtx {
         end: Option<Vec<u8>>,
         limit: Option<usize>,
         reverse: bool,
+        consistency: ReadConsistency,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         // The table's tablets overlapping [start, end), in token (range.start) order.
         // `end == None` is unbounded above (a whole-table scan).
@@ -8856,7 +9278,7 @@ impl ClientCtx {
             }
             let remaining = limit.map(|l| l - out.len());
             out.extend(
-                self.cp_scan_one(table, sub_start, sub_end, remaining, reverse)
+                self.cp_scan_one(table, sub_start, sub_end, remaining, reverse, consistency)
                     .await?,
             );
         }
@@ -8877,7 +9299,17 @@ impl ClientCtx {
         end: Option<Vec<u8>>,
         limit: Option<usize>,
         reverse: bool,
+        consistency: ReadConsistency,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        // ADR 0055: the cheap path, per tablet — a fan-out falls back only
+        // for the sub-ranges no replica could serve, never wholesale.
+        if consistency.is_eventual()
+            && let Some(p) = self
+                .cp_scan_one_eventual(table, &start, end.as_deref(), limit, reverse)
+                .await
+        {
+            return Ok(p);
+        }
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             let err = match self.cp_route(table, &start).await {
@@ -8895,6 +9327,7 @@ impl ClientCtx {
                         limit,
                         reverse,
                         table: table.to_owned(),
+                        stale: false,
                     };
                     match self.cp_forward(table, &start, addr, request).await {
                         ClientResponse::Pairs(p) => return Ok(p),
@@ -8928,6 +9361,7 @@ impl ClientCtx {
     /// pagination primitive (`animusd::dynamo`'s bounded, windowed
     /// `paginated_kind_examine_one`) now pages the same way a base/GSI
     /// `Query` does, rather than the `None`-always gap this used to have.
+    #[allow(clippy::too_many_arguments)] // one kind-scoped Query's full shape
     pub(crate) async fn cp_scan_kind(
         &self,
         table: &str,
@@ -8936,6 +9370,7 @@ impl ClientCtx {
         end: Vec<u8>,
         limit: Option<usize>,
         reverse: bool,
+        consistency: ReadConsistency,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let start_tablet = self
             .tablet_for(table, &start)
@@ -8946,7 +9381,7 @@ impl ClientCtx {
                  an LSI query is scoped to one partition"
             ));
         }
-        self.cp_scan_kind_one(table, kind, start, Some(end), limit, reverse)
+        self.cp_scan_kind_one(table, kind, start, Some(end), limit, reverse, consistency)
             .await
     }
 
@@ -8970,6 +9405,7 @@ impl ClientCtx {
         start: Vec<u8>,
         end: Option<Vec<u8>>,
         limit: Option<usize>,
+        consistency: ReadConsistency,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         // The table's tablets overlapping [start, end), in token order — the
         // identical range math `cp_scan` uses (see that method's doc for the
@@ -9017,8 +9453,16 @@ impl ClientCtx {
             // less coordinator-side memory.
             let remaining = limit.map(|l| l - out.len());
             out.extend(
-                self.cp_scan_kind_one(table, kind, sub_start, sub_end, remaining, false)
-                    .await?,
+                self.cp_scan_kind_one(
+                    table,
+                    kind,
+                    sub_start,
+                    sub_end,
+                    remaining,
+                    false,
+                    consistency,
+                )
+                .await?,
             );
         }
         if let Some(l) = limit {
@@ -9036,6 +9480,7 @@ impl ClientCtx {
     /// doc) — [`cp_scan_kind`](Self::cp_scan_kind) always passes `None` (an
     /// LSI `Query` has no `Limit`, ADR 0041); only
     /// [`cp_scan_kind_table`](Self::cp_scan_kind_table) passes a real value.
+    #[allow(clippy::too_many_arguments)] // one tablet's kind-scoped page, plus consistency
     async fn cp_scan_kind_one(
         &self,
         table: &str,
@@ -9044,7 +9489,16 @@ impl ClientCtx {
         end: Option<Vec<u8>>,
         limit: Option<usize>,
         reverse: bool,
+        consistency: ReadConsistency,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        // ADR 0055, per tablet — see `cp_scan_one`'s identical arm.
+        if consistency.is_eventual()
+            && let Some(p) = self
+                .cp_scan_kind_one_eventual(table, kind, &start, end.as_deref(), limit, reverse)
+                .await
+        {
+            return Ok(p);
+        }
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             let err = match self.cp_route(table, &start).await {
@@ -9071,6 +9525,7 @@ impl ClientCtx {
                         end: end.clone(),
                         limit,
                         reverse,
+                        stale: false,
                     };
                     match self.cp_forward(table, &start, addr, request).await {
                         ClientResponse::Pairs(p) => return Ok(p),
@@ -9267,7 +9722,7 @@ impl ClientCtx {
 
     /// Route a CP-mode **read** for the plain client API (returns a wire
     /// [`ClientResponse`]). Thin adapter over [`cp_read`](Self::cp_read).
-    async fn cp_get(&self, table: &str, key: Vec<u8>) -> ClientResponse {
+    async fn cp_get(&self, table: &str, key: Vec<u8>, stale: bool) -> ClientResponse {
         // A table with no tablet has no data (ADR 0023) — absent, no routing wait.
         // `effective_metadata` (not `metadata_cached()` directly): on a growth
         // node (ADR 0030) the local raft never reflects a table created
@@ -9275,7 +9730,10 @@ impl ClientCtx {
         if !self.effective_metadata().has_table_tablet(table) {
             return ClientResponse::Value(None);
         }
-        match self.cp_read(table, key).await {
+        match self
+            .cp_read(table, key, ReadConsistency::from_consistent_read(!stale))
+            .await
+        {
             Ok(v) => ClientResponse::Value(v),
             Err(e) => ClientResponse::Error(e),
         }
@@ -9734,7 +10192,16 @@ impl ClientCtx {
         // house converged-or-timeout retry loop with its own overall deadline.
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
-            let err = match self.cp_read(table, Vec::new()).await {
+            // Deliberately `Strong` (ADR 0055): this probe exists to prove
+            // the group has actually elected and can serve a linearizable
+            // read before `CreateTable` acks — an eventual read would pass
+            // against a replica that has merely applied something, which is
+            // precisely the formation window the probe must not hand the
+            // client (ADR 0023's 2026-08-17 amendment).
+            let err = match self
+                .cp_read(table, Vec::new(), ReadConsistency::Strong)
+                .await
+            {
                 Ok(_) => return Ok(()),
                 Err(e) => e,
             };
@@ -9853,7 +10320,35 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e.message),
                 }
             }
-            ClientRequest::Get { key, table } => {
+            // ADR 0055: an eventual read is answered by whichever replica
+            // of the tablet this node happens to hold — the forwarder chose
+            // this node for hosting one, not for leading it. Serve-or-refuse
+            // only, exactly like the strong arm below: the refusal is the
+            // forwarder's signal to fall back to the linearizable path, so
+            // it never re-forwards and never waits out an election.
+            ClientRequest::Get {
+                key,
+                table,
+                stale: true,
+            } => {
+                let Some(tablet) = self.tablet_for(&table, &key) else {
+                    return ClientResponse::Error(STALE_READ_REFUSAL.into());
+                };
+                match self.cp_stale_local(tablet) {
+                    Some(group) if group.scope_range().contains(&key) => {
+                        match group.stale_get_served(&key).await {
+                            Some(v) => ClientResponse::Value(v),
+                            None => ClientResponse::Error(STALE_READ_REFUSAL.into()),
+                        }
+                    }
+                    _ => ClientResponse::Error(STALE_READ_REFUSAL.into()),
+                }
+            }
+            ClientRequest::Get {
+                key,
+                table,
+                stale: false,
+            } => {
                 let tablet = self.tablet_for(&table, &key);
                 match tablet.and_then(|t| self.edge.cp_leader(t)) {
                     // Read-side scope pre-check + served/absent disambiguation
@@ -9897,12 +10392,38 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
+            // ADR 0055's scan arm — same serve-or-refuse discipline as the
+            // eventual `Get` above.
             ClientRequest::Scan {
                 start,
                 end,
                 limit,
                 reverse,
                 table,
+                stale: true,
+            } => {
+                let Some(tablet) = self.tablet_for(&table, &start) else {
+                    return ClientResponse::Error(STALE_READ_REFUSAL.into());
+                };
+                let requested = KeyRange::new(start.clone(), end.clone());
+                match self.cp_stale_local(tablet) {
+                    Some(group) if group.scope_range().contains_range(&requested) => {
+                        ClientResponse::Pairs(
+                            group
+                                .stale_scan(&start, end.as_deref(), limit, reverse)
+                                .await,
+                        )
+                    }
+                    _ => ClientResponse::Error(STALE_READ_REFUSAL.into()),
+                }
+            }
+            ClientRequest::Scan {
+                start,
+                end,
+                limit,
+                reverse,
+                table,
+                stale: false,
             } => {
                 let tablet = self.tablet_for(&table, &start);
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
@@ -9921,6 +10442,7 @@ impl ClientCtx {
             // resolve to one tablet by construction (the forwarder already
             // checked this in `cp_scan_kind`), so resolve the leader by
             // `start` alone.
+            // ADR 0055's kind-scoped scan arm (an eventual LSI/GSI page).
             ClientRequest::KindScan {
                 table,
                 kind,
@@ -9928,6 +10450,31 @@ impl ClientCtx {
                 end,
                 limit,
                 reverse,
+                stale: true,
+            } => {
+                let Some(tablet) = self.tablet_for(&table, &start) else {
+                    return ClientResponse::Error(STALE_READ_REFUSAL.into());
+                };
+                let requested = KeyRange::new(start.clone(), end.clone());
+                match self.cp_stale_local(tablet) {
+                    Some(group) if group.scope_range().contains_range(&requested) => {
+                        ClientResponse::Pairs(
+                            group
+                                .stale_scan_kind(kind, &start, end.as_deref(), limit, reverse)
+                                .await,
+                        )
+                    }
+                    _ => ClientResponse::Error(STALE_READ_REFUSAL.into()),
+                }
+            }
+            ClientRequest::KindScan {
+                table,
+                kind,
+                start,
+                end,
+                limit,
+                reverse,
+                stale: false,
             } => {
                 let tablet = self.tablet_for(&table, &start);
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
@@ -12298,14 +12845,25 @@ async fn handle_request(
                 Err(e) => ClientResponse::Error(e),
             }
         }
-        ClientRequest::Get { key, table } => ctx.cp_get(&table, key).await,
+        ClientRequest::Get { key, table, stale } => ctx.cp_get(&table, key, stale).await,
         ClientRequest::Scan {
             start,
             end,
             limit,
             reverse,
             table,
-        } => match ctx.cp_scan(&table, start, end, limit, reverse).await {
+            stale,
+        } => match ctx
+            .cp_scan(
+                &table,
+                start,
+                end,
+                limit,
+                reverse,
+                ReadConsistency::from_consistent_read(!stale),
+            )
+            .await
+        {
             Ok(pairs) => ClientResponse::Pairs(pairs),
             Err(e) => ClientResponse::Error(e),
         },

@@ -1,4 +1,4 @@
-# ADR 0055 — One design system for the website and the in-product consoles ("Readout")
+# ADR 0056 — One design system for the website and the in-product consoles ("Readout")
 
 - **Status:** Accepted — implemented (token layer, typography and the panel
   recipe; per-component polish is a follow-up, see *Follow-ups* below).

@@ -293,7 +293,13 @@ async fn count_select_paginates_and_sums_to_the_whole_partition() {
             None => String::new(),
         };
         let req = format!(
-            r#"{{"TableName":"events","KeyConditionExpression":"pk = :p",
+            // `ConsistentRead: true` (ADR 0055): this walk rotates across
+            // nodes, and the wire default is now served from whichever replica
+            // the receiving node holds — consecutive pages would otherwise
+            // sample different, independently-lagging views. The strong read
+            // still exercises the forwarded path the rotation exists to cover.
+            r#"{{"TableName":"events","ConsistentRead":true,
+                 "KeyConditionExpression":"pk = :p",
                  "ExpressionAttributeValues":{{":p":{{"S":"p1"}}}},
                  "Select":"COUNT","Limit":2{esk}}}"#
         );

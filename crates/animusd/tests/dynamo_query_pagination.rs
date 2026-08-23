@@ -114,6 +114,30 @@ async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> 
     }
 }
 
+/// [`await_gsi_query`]'s multi-node form: poll `body` on **every** address
+/// until each one satisfies `accept`.
+///
+/// Load-bearing since ADR 0055, and only since then. A rotating paginated
+/// walk (see [`drain_query_pages`]) is stable only if every node it will
+/// touch already agrees on the data — and a `ConsistentRead: false` read (the
+/// wire default) is now served from whichever replica the *receiving* node
+/// holds, so converging on one node says nothing about the node the next page
+/// lands on. Before ADR 0055 every node forwarded to the tablet leader, so a
+/// single convergence check covered all of them for free.
+///
+/// A GSI walk has no alternative to this: `ConsistentRead: true` against a
+/// global index is a `ValidationException` (ADR 0041 §5), so it cannot simply
+/// ask for the strong read the base/LSI walks in this file do.
+async fn await_gsi_query_everywhere(
+    addrs: &[SocketAddr],
+    body: &str,
+    accept: impl Fn(&str) -> bool + Copy,
+) {
+    for &addr in addrs {
+        await_gsi_query(addr, body, accept).await;
+    }
+}
+
 /// Extract the raw `LastEvaluatedKey` JSON object verbatim from a `Query`
 /// response body — brace-matched, since it can be an arbitrary
 /// AttributeValue map shape (a base cursor is `{pk,sk}`; a GSI cursor also
@@ -174,7 +198,14 @@ async fn drain_query_pages(addrs: &[SocketAddr], request_prefix: &str, limit: us
             Some(c) => format!(",\"ExclusiveStartKey\":{c}"),
             None => String::new(),
         };
-        let body = format!("{request_prefix},\"Limit\":{limit}{esk}}}");
+        // `ConsistentRead: true` (ADR 0055): this walk deliberately rotates
+        // nodes, and the wire default is now served from whichever replica
+        // the receiving node holds — so consecutive pages could sample
+        // different, independently-lagging views and drop an item into the
+        // gap between them. The strong read still exercises the forwarded
+        // path this rotation exists to cover (a non-leader node forwards to
+        // the leader); it only removes the per-node divergence.
+        let body = format!("{request_prefix},\"ConsistentRead\":true,\"Limit\":{limit}{esk}}}");
         let (status, resp) = dynamo_retry(addr, "DynamoDB_20120810.Query", &body).await;
         assert_eq!(status, 200, "query page failed: {resp}");
         let items_part = resp
@@ -379,8 +410,14 @@ async fn pagination_composes_with_a_sort_key_condition() {
 async fn gsi_query_paginates_with_the_scan_cursor_shape() {
     let (_dir, _nodes, addrs) = setup().await;
 
-    await_gsi_query(
-        addrs[1],
+    // Every node, not just one (ADR 0055): the walk below rotates across all
+    // three, and each now answers from its own replica — so one node having
+    // converged says nothing about the next page's node. This is what the CI
+    // failure on PR #360 actually was: node 1 had all 6 GSI rows, another
+    // node still had 5, and the walk terminated a page early with `sk=a5`
+    // never returned.
+    await_gsi_query_everywhere(
+        &addrs,
         r#"{"TableName":"events","IndexName":"by-cat",
             "KeyConditionExpression":"cat = :c",
             "ExpressionAttributeValues":{":c":{"S":"X"}}}"#,
@@ -405,6 +442,9 @@ async fn gsi_query_paginates_with_the_scan_cursor_shape() {
             None => String::new(),
         };
         let body = format!(
+            // Deliberately no `ConsistentRead` here, unlike the base/LSI
+            // walks: a GSI rejects it (ADR 0041 §5). The convergence sweep
+            // above is what makes this rotating walk stable instead.
             r#"{{"TableName":"events","IndexName":"by-cat",
                 "KeyConditionExpression":"cat = :c",
                 "ExpressionAttributeValues":{{":c":{{"S":"X"}}}},
@@ -463,7 +503,10 @@ async fn lsi_query_paginates_with_the_scan_cursor_shape() {
             None => String::new(),
         };
         let body = format!(
+            // `ConsistentRead: true` (ADR 0055) — legal on an LSI, and needed
+            // for the same rotating-walk reason `drain_query_pages` documents.
             r#"{{"TableName":"events","IndexName":"by-score",
+                "ConsistentRead":true,
                 "KeyConditionExpression":"pk = :p",
                 "ExpressionAttributeValues":{{":p":{{"S":"p1"}}}},
                 "Limit":2{esk}}}"#

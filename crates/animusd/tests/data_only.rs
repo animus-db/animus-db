@@ -114,6 +114,7 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
             ClientRequest::Get {
                 key: b"split-key".to_vec(),
                 table: "split_t".to_string(),
+                stale: false,
             },
         )
         .await;
@@ -171,6 +172,7 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
                     ClientRequest::Get {
                         key: b"via-control-key".to_vec(),
                         table: "split_t".to_string(),
+                        stale: false,
                     },
                 )
                 .await
@@ -417,6 +419,7 @@ async fn data_node_falls_over_to_a_remaining_control_seed() {
             ClientRequest::Get {
                 key: b"post-failure-key".to_vec(),
                 table: "split_t2".to_string(),
+                stale: false,
             },
         )
         .await;
@@ -505,6 +508,7 @@ async fn data_node_restart_rejoins_and_serves_reads_again() {
                     ClientRequest::Get {
                         key: b"restart-key".to_vec(),
                         table: "split_t3".to_string(),
+                        stale: false,
                     },
                 )
                 .await;
