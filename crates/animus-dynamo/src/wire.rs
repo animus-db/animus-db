@@ -14,7 +14,7 @@
 //! Operations: `CreateTable`, `UpdateTable` (a `StreamSpecification` change,
 //! or — ADR 0045 §6 — a single `GlobalSecondaryIndexUpdates` element),
 //! `DescribeTable` (ADR 0042 §2), `DeleteTable` (drops the table and its
-//! tablets through the same sink CQL `DROP TABLE`/the dashboard use),
+//! tablets through the same sink the dashboard uses),
 //! `ListTables` (ascending name order, `Limit`/`ExclusiveStartTableName`
 //! paginated, a materialized GSI's hidden table filtered out), `PutItem`,
 //! `GetItem`, `DeleteItem`, `Query`, `Scan`, `UpdateItem`, `BatchWriteItem`,
@@ -461,8 +461,8 @@ pub enum Operation {
         table: String,
     },
     /// `DeleteTable`: drop `table` from the replicated catalog and reclaim
-    /// its tablets (`animusd`'s `ClientCtx::drop_table`, the same sink CQL
-    /// `DROP TABLE` and the dashboard's delete button use, ADR 0024 GC). A
+    /// its tablets (`animusd`'s `ClientCtx::drop_table`, the same sink
+    /// the dashboard's delete button uses, ADR 0024 GC). A
     /// missing table is a `ResourceNotFoundException`, decided at the
     /// `animusd` edge (this crate never sees the replicated catalog).
     DeleteTable {

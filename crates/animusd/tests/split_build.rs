@@ -30,18 +30,17 @@ mod support;
 /// port-TOCTOU-retrying shape as `split_lifecycle.rs`'s copy.
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
     for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 7);
+        let addrs = support::free_addrs(n * 6);
         let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
             .map(|i| animusd::RoleAddrs {
                 id: animusd::config::node_id(i),
                 role: animusd::config::NodeRole::Both,
-                internal: addrs[7 * i],
-                client: addrs[7 * i + 1],
-                dynamo: addrs[7 * i + 2],
-                cql: addrs[7 * i + 3],
-                admin: addrs[7 * i + 4],
-                intra: addrs[7 * i + 5],
-                console: addrs[7 * i + 6],
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
             })
             .collect();
         let config = animusd::ClusterConfig { nodes: nodes_cfg };
@@ -1373,8 +1372,8 @@ async fn indexed_put_item_racing_the_freeze_window_retries_to_success() {
 
 /// Issue #288's symmetric fast-arm coverage: a plain (unindexed,
 /// unstreamed) table's `PutItem` — `dynamo::fast_marker_write` →
-/// `ClientCtx::cp_kind_write_raw`, the "fast/marker" arm also used by CQL
-/// and the raw client protocol — racing the identical freeze window. This
+/// `ClientCtx::cp_kind_write_raw`, the "fast/marker" arm also used by
+/// the raw client protocol — racing the identical freeze window. This
 /// path had no coverage either way before (the issue's premise that plain
 /// writes already retried across a split was itself mistaken — ADR 0049's
 /// funnel unification dropped the old higher-layer retry along with the

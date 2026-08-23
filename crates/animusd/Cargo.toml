@@ -27,7 +27,6 @@ animus-cp-data.workspace = true
 animus-storage.workspace = true
 animus-tablet.workspace = true
 animus-dynamo.workspace = true
-animus-cql.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

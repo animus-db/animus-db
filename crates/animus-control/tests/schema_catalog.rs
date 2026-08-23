@@ -60,7 +60,8 @@ fn users_schema() -> TableSchema {
     TableSchema::simple("id", ColumnType::Uuid)
 }
 
-/// A CQL-style table: a partition key, one clustering key, and extra columns.
+/// A table with a partition key, one clustering key, and extra columns —
+/// the general (wider-than-DynamoDB) shape the catalog still supports.
 fn events_schema() -> TableSchema {
     TableSchema::with_columns(
         "device",
@@ -256,45 +257,6 @@ fn set_table_mode_replicates_and_survives_leader_kill() {
             nodes[i].metadata().table_mode("users"),
             ReplicationMode::Ap,
             "the set mode must survive a leader kill (seed={seed})"
-        );
-    }
-}
-
-#[test]
-fn create_keyspace_replicates_and_survives_leader_kill() {
-    // Keyspaces are replicated control-plane state (v1 A3): CreateKeyspace commits
-    // through Raft, replicates to every node, is idempotent, and survives a leader
-    // kill — so a CQL `CREATE KEYSPACE` is durable + cluster-agreed.
-    let seed = 0x00CE_A5ED;
-    let (mut sim, nodes) = cluster(seed);
-    sim.run_for(Duration::from_secs(2));
-    let leader = unique_leader(&nodes, &[0, 1, 2], seed);
-
-    assert!(matches!(
-        nodes[leader].propose(MetaCommand::CreateKeyspace {
-            keyspace: "ks1".into(),
-        }),
-        ProposeResult::Accepted { .. }
-    ));
-    // Idempotent re-create (still committed; no duplicate).
-    nodes[leader].propose(MetaCommand::CreateKeyspace {
-        keyspace: "ks1".into(),
-    });
-    sim.run_for(Duration::from_secs(1));
-    for node in &nodes {
-        assert!(
-            node.metadata().has_keyspace("ks1"),
-            "keyspace must replicate to every node (seed={seed})"
-        );
-        assert!(!node.metadata().has_keyspace("absent"));
-    }
-
-    sim.crash(nid(leader as u64));
-    sim.run_for(Duration::from_secs(3));
-    for i in (0..3).filter(|&i| i != leader) {
-        assert!(
-            nodes[i].metadata().has_keyspace("ks1"),
-            "keyspace must survive a leader kill (seed={seed})"
         );
     }
 }

@@ -7,7 +7,7 @@
 //! translation) and route the resulting key/value bytes (v1, ADR 0019) through the
 //! **leaderful CP data plane** — `ClientCtx::cp_read`/`cp_write`/`cp_scan` to the
 //! per-tablet Raft group leader (linearizable, forwarded cross-process), the same
-//! CP primitives the plain-TCP client API and the CQL endpoint use. The HTTP edge
+//! CP primitives the plain-TCP client API uses. The HTTP edge
 //! itself is production-only I/O, like `ProdEnv`.
 //!
 //! ## Why hand-rolled HTTP
@@ -1528,8 +1528,8 @@ fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<Stri
 }
 
 /// `DeleteTable`: drop `table` from the replicated catalog and reclaim its
-/// tablets — [`ClientCtx::drop_table`], the same sink CQL `DROP TABLE` and
-/// the dashboard's delete button use (ADR 0024 GC). A missing table is a
+/// tablets — [`ClientCtx::drop_table`], the same sink
+/// the dashboard's delete button uses (ADR 0024 GC). A missing table is a
 /// `ResourceNotFoundException`, matching real DynamoDB; `drop_table` itself
 /// is **idempotent** (a second call against an absent table is a silent
 /// no-op), so this explicit existence check up front is the only thing that
@@ -3685,7 +3685,12 @@ pub(crate) enum KindWriteOutcome {
 /// racing evaluators of the same item safe, and it already has to work
 /// lock-free (`txn_resolver_loop` never takes this lock either). Narrowing
 /// the scope trades a few more retried OCC misses under genuine same-key
-/// contention for not stalling unrelated items' writes.
+/// contention for not stalling unrelated items' writes. Regression-tested
+/// by `animusd`'s `confirm_futility_tests::
+/// an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_confirm_wait`
+/// — see [`rmw285_confirm_gate`] for how that test holds this function's
+/// own propose/confirm phase open deterministically rather than racing a
+/// real apply backlog to build in time.
 /// `ttl_expired` (ADR 0051 §7): `true` only for the TTL reaper's own delete
 /// — stamps the resulting change record's `userIdentity` as the service
 /// principal (see [`kind_writes_for_item`]'s doc) instead of leaving it a
@@ -3762,6 +3767,8 @@ pub(crate) async fn kind_write_item_at_leader(
         (old, new, writes, change_log, seatbelt)
         // `_rmw` drops here — released before the propose/confirm below.
     };
+    #[cfg(test)]
+    rmw285_confirm_gate::wait_if_armed(table).await;
     ClientCtx::cp_kind_local(leader, writes, vec![change_log], seatbelt)
         .await
         .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;
@@ -3771,6 +3778,70 @@ pub(crate) async fn kind_write_item_at_leader(
         new,
         collection_bytes,
     })
+}
+
+/// Test-only synchronization hook for the issue #285 regression
+/// (`kind_write_item_at_leader`'s own doc, above), used by `animusd`'s
+/// `confirm_futility_tests::
+/// an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_confirm_wait`.
+///
+/// That test needs one write's propose+confirm phase to reliably still be
+/// running when a second, unrelated write returns. The original version
+/// tried to manufacture that by racing a concurrent filler flood against
+/// real apply-backlog timing — which a CPU-starved runner starves right
+/// along with everything else it is supposed to slow down, so the flood
+/// sometimes never builds enough backlog and the "slow" write finishes
+/// first (observed in CI on commit `97289e2`: one parallel run green, one
+/// red, from the identical code). Racing real backlog is not load-bearing
+/// for what the test actually checks — only the *lock's scope* is — so
+/// this hook lets the test hold a specific table's write open under its
+/// own control instead: deterministic, and immune to scheduler load.
+///
+/// Armed for exactly one table name at a time via [`arm`]; consumed
+/// (disarmed) the first time [`wait_if_armed`] matches, so a single arm
+/// call can never bleed into a later, unrelated call through this same
+/// function — including this same test's *own* second write, which must
+/// run at full speed for the regression to mean anything.
+#[cfg(test)]
+pub(crate) mod rmw285_confirm_gate {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    static ARMED: OnceLock<Mutex<Option<(String, Duration)>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<(String, Duration)>> {
+        ARMED.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Arm the gate: the next [`kind_write_item_at_leader`](super::
+    /// kind_write_item_at_leader) call for `table` sleeps `delay` right
+    /// after releasing `rmw_lock`, immediately before its propose+confirm
+    /// — modeling a slow confirm-poll without needing one to actually
+    /// occur. One-shot: fires for the *next* matching call only.
+    pub(crate) fn arm(table: &str, delay: Duration) {
+        *slot().lock().expect("rmw285_confirm_gate poisoned") = Some((table.to_string(), delay));
+    }
+
+    /// Called by `kind_write_item_at_leader` once `rmw_lock` is already
+    /// released. A no-op unless `table` matches an [`arm`] call still
+    /// pending, in which case it sleeps the armed delay and disarms.
+    pub(crate) async fn wait_if_armed(table: &str) {
+        let delay = {
+            let mut guard = slot().lock().expect("rmw285_confirm_gate poisoned");
+            match guard.as_ref() {
+                Some((armed_table, delay)) if armed_table == table => {
+                    let delay = *delay;
+                    *guard = None;
+                    Some(delay)
+                }
+                _ => None,
+            }
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
 }
 
 /// The base + LSI byte total of the tablet `leader` leads: an **upper bound**
@@ -4198,7 +4269,7 @@ pub(crate) type MarkerRow = (Vec<u8>, Option<Vec<u8>>, (Vec<u8>, Vec<u8>));
 /// implementation, shared with the plain client-protocol arms
 /// (`ClientRequest::Put`/`PutBatch`/`Delete`, ADR 0049 Train A rung 5),
 /// whose keys are arbitrary caller bytes with no `pk`/`sk` decomposition
-/// (their markers use the full-key-as-prefix convention, like CQL's and the
+/// (their markers use the full-key-as-prefix convention, like the
 /// GSI drain's — see [`marker_change_log`]'s doc). A `None` value is a
 /// genuine engine delete (`KindBatch`'s real tombstone), matching the old
 /// `cp_delete` semantics. `provision_if_absent` mirrors the primitives each
@@ -4270,20 +4341,15 @@ fn item_stage_marker_change_log(
 }
 
 /// The one construction site for an ADR 0049 §1 image-less **marker**
-/// record's `(change_key_prefix, encoded_record)` pair, shared by every edge
-/// that commits one (this file's fast arm above; the CQL edge's partition
-/// writes, `cql::kind_partition_write`; the GSI drain's hidden-index-table
-/// row writes, `index_drain::reconcile_partition` — full row key as prefix,
-/// empty `base_sk`, the CQL convention). `partition_prefix` is the change
+/// record's `(change_key_prefix, encoded_record)` pair, shared by every
+/// caller that commits one (this file's fast arm above; the GSI drain's
+/// hidden-index-table row writes, `index_drain::reconcile_partition` — full
+/// row key as prefix, empty `base_sk`). `partition_prefix` is the change
 /// key's apply-completed prefix — the base row's own partition-scoped key
 /// bytes, token first, so the record lands in the same tablet as the base
-/// row and sorts per-partition (Dynamo: `token(escape(pk)) || escape(pk)`;
-/// CQL: `token(pk_bytes) || pk_bytes`, its `data_key` shape — the two edges'
-/// escaping conventions differ, which is exactly why the prefix is an
-/// argument rather than derived here); apply appends `hlc::pack(ts)` (ADR
-/// 0041 §4a). `base_sk` is the Dynamo sort-key suffix a consumer rebuilds an
-/// item key from — empty for CQL, whose partition is one value with no sort
-/// dimension.
+/// row and sorts per-partition (`token(escape(pk)) || escape(pk)`); apply
+/// appends `hlc::pack(ts)` (ADR 0041 §4a). `base_sk` is the sort-key suffix
+/// a consumer rebuilds an item key from.
 pub(crate) fn marker_change_log(partition_prefix: &[u8], base_sk: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
     marker_record(partition_prefix, base_sk, false)
 }
@@ -4683,7 +4749,7 @@ mod stream_write_path_tests {
     }
 
     fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(7);
+        let addrs = free_addrs(6);
         ClusterConfig {
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
@@ -4691,10 +4757,9 @@ mod stream_write_path_tests {
                 internal: addrs[0],
                 client: addrs[1],
                 dynamo: addrs[2],
-                cql: addrs[3],
-                admin: addrs[4],
-                intra: addrs[5],
-                console: addrs[6],
+                admin: addrs[3],
+                intra: addrs[4],
+                console: addrs[5],
             }],
         }
     }

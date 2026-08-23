@@ -1,7 +1,10 @@
 # ADR 0047 — The intra-cluster port: splitting node-to-node traffic off the client port
 
 - **Status:** Accepted — implemented (this stack: `intra/1-plumbing` →
-  `intra/2-cutover` → `intra/3-join-docs`).
+  `intra/2-cutover` → `intra/3-join-docs`). **Amended by [ADR 0053](
+  0053-dynamodb-only-drop-cql.md) (2026-08-22):** the CQL wire adapter this
+  ADR's port-stride formula includes is dropped; see the amendment note at
+  the end of this document.
 - **Date:** 2026-08-16
 
 ## Context
@@ -236,3 +239,19 @@ surface check, independent of leadership; the tablet **leader**'s own
 **intra** port serves the identical `Forwarded{Get}` request end-to-end,
 one hop, returning the real committed value — proving the intra port is
 genuinely wired to `cp_serve_forwarded`, not just unblocked.
+
+## Amendment (2026-08-22, ADR 0053)
+
+[ADR 0053](0053-dynamodb-only-drop-cql.md) drops the CQL wire adapter and
+its port entirely. This ADR's own port-stride formula above (`base_port +
+6*i + {internal:0, client:1, dynamo:2, cql:3, admin:4, intra:5}`) and
+[ADR 0052](0052-data-console-port.md)'s later seven-slot extension (`+
+console:6`) are both historical at this point — as of ADR 0053 the stride
+is six again, but composed differently than it was here: `base_port + 6*i
++ {internal:0, client:1, dynamo:2, admin:3, intra:4, console:5}`. Every
+slot from `admin` onward renumbers down by one; this is an in-process
+constant only (root `CLAUDE.md`'s no-back-compat policy), not a wire
+format any client depends on across the change. The body above is kept
+as originally written — it was correct when this ADR shipped — and
+should be read alongside ADR 0052's and ADR 0053's own amendment notes
+for the current layout.

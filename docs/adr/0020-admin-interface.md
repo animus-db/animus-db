@@ -1,6 +1,10 @@
 # ADR 0020 — Admin / debug interface on a dedicated port
 
-- **Status:** Accepted
+- **Status:** Accepted. **Amended by [ADR 0053](
+  0053-dynamodb-only-drop-cql.md) (2026-08-22):** the CQL listener this ADR
+  references below (and the `POST /admin/data/cql` proxy a later follow-up,
+  ADR 0021, added on top of this admin surface) are both removed — v1
+  serves DynamoDB only.
 - **Date:** 2026-08-04
 
 ## Context
@@ -39,7 +43,9 @@ would want is locked inside the process:
 Three standing constraints shape any answer:
 
 1. **Determinism (ADR 0003).** The admin surface is a *production-only I/O edge*,
-   exactly like `/metrics` and the Dynamo/CQL listeners — it lives in `animusd`
+   exactly like `/metrics` and the Dynamo/CQL listeners (CQL removed by
+   [ADR 0053](0053-dynamodb-only-drop-cql.md); Dynamo is the only wire
+   listener as of that ADR) — it lives in `animusd`
    over `ProdEnv` and never runs under `SimEnv`. But the *accessors* it calls in
    the `<E: Env>` crates (`animus-control`, `animus-cp-data`, `animus-storage`)
    must stay determinism-clean: pure reads, no wall clock, no `HashMap`, snapshot
@@ -98,6 +104,11 @@ A hand-rolled HTTP/1.1 server (reuse `dynamo.rs`'s request parser and
 |-------|---------|--------------|
 | `GET /admin/config` | This node's `ClusterConfig` view: node index, control id, raftkv id, the five (now six) `RoleAddrs`, the static peer list, and `cp_member_addrs` from `Metadata` | `ClientCtx` holds config/ids; `Metadata::cp_member_addrs` |
 | `GET /admin/status` | The full replicated `Metadata` as JSON: members + `NodeStatus`, tablet map (range, epoch, replicas), schema catalog, table indexes, keyspaces | `ctx.raft.metadata()` |
+
+> **Amended (2026-08-22, ADR 0053):** `/admin/status` no longer emits
+> `keyspaces` — the field was CQL's and left `Metadata` with the adapter.
+> The row above is the original design record; the live payload omits it.
+
 | `GET /admin/raft` | Control-plane Raft: `role`, `term`, `leader`, `commit_index`, `last_applied`, `durable_index`, `snapshot_index`, `log_len`, `config` (voter set), and `believes_alive` per member | `RaftNode` accessors (exist) + new `log_len`/`config`/`last_log` pass-throughs |
 | `GET /admin/raftkv` | Per hosted CP group: tablet id, `is_leader`, `term`, `leader`, indices, `config` (voters), applies-in-flight | iterate `ClusterEdgeState.raftkv`; new `RaftKvNode` accessors |
 | `GET /admin/storage/lsm?tablet=N` | LSM debug for a tablet's engine: per-level table counts, every `SsTableMeta` (seq, level, key range, version range, file size, entry count, bloom), memtable byte size, flush/compaction/block-read counters, `levels_non_overlapping` | promote `LsmEngine` `#[doc(hidden)]` accessors to a real `Introspect` API |
@@ -156,7 +167,8 @@ Extend the `animus` CLI with an `admin` subcommand group that GETs/POSTs these
 routes and pretty-prints them (`admin status|config|raft|raftkv|lsm|wal|metrics|
 health`, and `admin split|flush|compact|reconfigure|drain`). The CLI stays a
 thin client; the node is the source of truth. `<addr>` is the node's admin
-address (printed at startup alongside client/dynamo/cql).
+address (printed at startup alongside client/dynamo/cql — the `cql` listener
+was removed by [ADR 0053](0053-dynamodb-only-drop-cql.md)).
 
 ### Accessors to add (grounded; all pure reads)
 

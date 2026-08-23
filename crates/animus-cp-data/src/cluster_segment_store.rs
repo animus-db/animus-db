@@ -32,7 +32,7 @@
 //! cluster-wide (not per-tablet) responsibility. [`SegmentWire`] is this
 //! module's own enum, `serde_json`'d over the `Network`'s `Vec<u8>`
 //! payloads — the same "define and (de)serialize your own message type"
-//! convention the wire edges (`animus-dynamo`/`animus-cql`) already use, not
+//! convention the DynamoDB wire edge (`animus-dynamo`) already uses, not
 //! this crate's own compact binary `codec` (that optimization exists for the
 //! *hot* per-write Raft path; segment operations are one per seal-epoch —
 //! by default every 4 MiB or 4 hours — so `serde_json`'s cost is immaterial

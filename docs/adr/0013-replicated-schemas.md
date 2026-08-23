@@ -8,6 +8,14 @@
   not embedded in a whole-`Metadata` WAL snapshot blob. The replicated-catalog
   *design* this ADR describes (one `Metadata.schemas` map, mutated only by the
   `*TableSchema` commands) is unchanged.
+- **2026-08-22 note (ADR 0053):** `animus-cql` is deleted — v1 serves
+  DynamoDB only. Every mention of the CQL edge below is a historical record
+  of why the catalog's shape is wider than DynamoDB alone needs
+  (`clustering_keys` as a general list, the non-DynamoDB `ColumnType`
+  variants); the shape itself is kept (it costs nothing idle), but nothing
+  proposes a CQL keyspace or a multi-column clustering key anymore, and the
+  `Metadata::keyspaces`/`CreateKeyspace`/`DropKeyspace` machinery this ADR
+  describes below is removed.
 
 ## Context
 

@@ -55,7 +55,7 @@ pub(crate) const TABLETS_JS: &str = include_str!("dashboard_tablets.js");
 /// with the shard chain (segment catalog merged with a live `DescribeStream`)
 /// and a live-tail poller (`GetShardIterator`/`GetRecords`).
 pub(crate) const STREAMS_JS: &str = include_str!("dashboard_streams.js");
-/// The Data Browser view: CQL + real DynamoDB Scan/Query/item CRUD/table DDL,
+/// The Data Browser view: real DynamoDB Scan/Query/item CRUD/table DDL,
 /// a per-table Stream enable/disable row, plus the bulk-seed tool (it writes
 /// real DynamoDB items, so it lives in the DynamoDB panel).
 pub(crate) const BROWSER_JS: &str = include_str!("dashboard_browser.js");

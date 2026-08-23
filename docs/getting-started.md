@@ -43,7 +43,7 @@ cargo run -p animusd -- --config cluster.toml --node 2
 
 Each node assembles three internal roles over `ProdEnv` (the only place real
 time/IO/RNG live): a control-plane Raft node, a data-plane replica, and a
-client-facing coordinator that serves the DynamoDB-JSON and CQL wire adapters.
+client-facing coordinator that serves the DynamoDB-JSON wire adapter.
 
 ## Where metrics surface
 

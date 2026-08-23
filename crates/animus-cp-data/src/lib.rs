@@ -3994,8 +3994,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// full-table scan has no finite upper bound). Same barrier as
     /// [`linearizable_get`](Self::linearizable_get) — only the confirmed leader
     /// serves it, so a deposed leader returns `None` rather than a stale/partial
-    /// range. This is the CP read primitive the DynamoDB `Query`/`Scan` and CQL
-    /// `SELECT` edges use in place of the AP quorum scan.
+    /// range. This is the CP read primitive the DynamoDB `Query`/`Scan`
+    /// edge uses in place of the AP quorum scan.
     pub async fn linearizable_scan(
         &self,
         start: &[u8],

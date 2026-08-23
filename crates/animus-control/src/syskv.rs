@@ -6,8 +6,8 @@
 //! **PR1** left this module inert — nothing called [`entity_key`] yet (no
 //! engine wired to a `RaftNode`, no `StateMachine::DRIVER_APPLIED` change, no
 //! `node.rs` change); only [`is_reserved_name`] was wired, at
-//! `Metadata::apply`'s `CreateTableSchema`/`CreateKeyspace` arms and both wire
-//! edges' `CreateTable`/`CREATE KEYSPACE` paths. **PR2** (`mirror.rs`) is the
+//! `Metadata::apply`'s `CreateTableSchema` arm and the DynamoDB edge's
+//! `CreateTable` path. **PR2** (`mirror.rs`) is the
 //! first real writer: it derives per-command system-keyspace writes from
 //! these keys and shadow-mirrors them into a `StorageEngine` **after** the
 //! unchanged in-core `Metadata::apply` still runs (`DRIVER_APPLIED` stays
@@ -20,7 +20,7 @@
 //!
 //! Reuses [`animus_tablet::escape`] byte-for-byte (ADR 0022/0023) — the same
 //! order-preserving, prefix-free primitive that already backs the data-plane
-//! hash ring and `animus-dynamo`/`animus-cql`'s own key encodings — so this
+//! hash ring and `animus-dynamo`'s own key encoding — so this
 //! crate doesn't invent a second escaping scheme:
 //!
 //! ```text
@@ -28,7 +28,7 @@
 //! ```
 //!
 //! e.g. `.../tablet/<tablet_id>`, `.../member/<node_id>`, `.../schema/<table>`,
-//! `.../policy/<tablet_id>`, `.../node_addrs/<node_id>`, `.../keyspace/<name>`.
+//! `.../policy/<tablet_id>`, `.../node_addrs/<node_id>`.
 //! A dedicated watermark key,
 //! `escape(RESERVED_NAMESPACE) || escape("_applied_index")`
 //! ([`applied_index_key`]), sits alongside the entity-kind segment (not under
@@ -45,10 +45,10 @@
 //!
 //! `animus-control` already depends on `animus-tablet` (for `Epoch`/`KeyRange`/
 //! `Tablet`/`TabletId` in `meta.rs`), so importing `escape` from there adds no
-//! new dependency edge — unlike the wire adapters (`animus-dynamo`/
-//! `animus-cql`), which deliberately duplicate `escape` to stay
-//! dependency-light of `animus-tablet`, this crate has no such constraint and
-//! should reuse the primitive directly rather than triplicate it.
+//! new dependency edge — unlike the DynamoDB wire adapter (`animus-dynamo`),
+//! which deliberately duplicates `escape` to stay dependency-light of
+//! `animus-tablet`, this crate has no such constraint and should reuse the
+//! primitive directly rather than duplicate it.
 
 use animus_env::NodeId;
 #[cfg(test)]
@@ -73,9 +73,8 @@ const APPLIED_INDEX_SEGMENT: &[u8] = b"_applied_index";
 /// collision that scoping scheme cannot tell apart from a real system key.
 ///
 /// Case-sensitive, matching `TableName`'s documented case-sensitivity
-/// (`schema.rs`) — a CQL identifier is already lowercased by that edge before
-/// it reaches this check, and DynamoDB table names are case-sensitive
-/// verbatim, so no case-folding belongs here.
+/// (`schema.rs`) — DynamoDB table names are case-sensitive verbatim, so no
+/// case-folding belongs here.
 #[must_use]
 pub fn is_reserved_name(name: &str) -> bool {
     name.starts_with(RESERVED_NAMESPACE)
@@ -111,8 +110,6 @@ pub enum EntityKind {
     /// A member's full address book (`Metadata::node_addrs`), keyed by
     /// [`NodeId`].
     NodeAddrs,
-    /// A registered keyspace (`Metadata::keyspaces`), keyed by its name.
-    Keyspace,
     /// A monotonic id-allocator counter (`Metadata::next_tablet_id`), keyed
     /// by a fixed ASCII counter name (PR2: `mirror::NEXT_TABLET_ID_COUNTER`;
     /// the ADR 0036 allocator's sibling counter, `next_alloc_id` /
@@ -145,8 +142,7 @@ pub enum EntityKind {
     /// `entity_key` has already escaped the whole id blob as one opaque
     /// segment, so there is nothing for a variable-length suffix to
     /// ambiguously merge into. The value is always empty (presence alone is
-    /// the fact — mirrors [`Keyspace`](Self::Keyspace)'s empty-value
-    /// convention).
+    /// the fact).
     IndexBackfill,
     /// A copy-based split child's lineage row (`Metadata::split_lineage`,
     /// ADR 0050 fork F9), keyed by the child's [`TabletId`] — recorded by
@@ -169,7 +165,6 @@ impl EntityKind {
             EntityKind::Schema => "schema",
             EntityKind::Policy => "policy",
             EntityKind::NodeAddrs => "node_addrs",
-            EntityKind::Keyspace => "keyspace",
             EntityKind::Counter => "counter",
             EntityKind::CpMemberAddr => "cp_member_addr",
             EntityKind::StreamShard => "stream_shard",
@@ -192,7 +187,6 @@ impl EntityKind {
             b"schema" => EntityKind::Schema,
             b"policy" => EntityKind::Policy,
             b"node_addrs" => EntityKind::NodeAddrs,
-            b"keyspace" => EntityKind::Keyspace,
             b"counter" => EntityKind::Counter,
             b"cp_member_addr" => EntityKind::CpMemberAddr,
             b"stream_shard" => EntityKind::StreamShard,
@@ -307,12 +301,6 @@ pub fn policy_key(id: TabletId) -> Vec<u8> {
 #[must_use]
 pub fn node_addrs_key(id: &NodeId) -> Vec<u8> {
     entity_key(EntityKind::NodeAddrs, id.as_str().as_bytes())
-}
-
-/// A keyspace name's key under [`EntityKind::Keyspace`].
-#[must_use]
-pub fn keyspace_key(name: &str) -> Vec<u8> {
-    entity_key(EntityKind::Keyspace, name.as_bytes())
 }
 
 /// A named counter's key under [`EntityKind::Counter`] (PR2). `name` is a
@@ -462,13 +450,12 @@ pub fn decode_key(key: &[u8]) -> Option<DecodedKey> {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [EntityKind; 10] = [
+    const ALL_KINDS: [EntityKind; 9] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
         EntityKind::Policy,
         EntityKind::NodeAddrs,
-        EntityKind::Keyspace,
         EntityKind::Counter,
         EntityKind::CpMemberAddr,
         EntityKind::StreamShard,
@@ -499,8 +486,7 @@ mod tests {
 
     #[test]
     fn reserved_name_check_is_case_sensitive() {
-        // Matches `TableName`'s documented case-sensitivity; CQL lowercases
-        // before this check ever sees an identifier.
+        // Matches `TableName`'s documented case-sensitivity.
         assert!(!is_reserved_name("__ANIMUS_SYSTEM"));
     }
 
@@ -563,18 +549,6 @@ mod tests {
             Some(DecodedKey::Entity {
                 kind: EntityKind::NodeAddrs,
                 id: b"n300".to_vec(),
-            })
-        );
-    }
-
-    #[test]
-    fn keyspace_key_round_trips() {
-        let key = keyspace_key("my_ks");
-        assert_eq!(
-            decode_key(&key),
-            Some(DecodedKey::Entity {
-                kind: EntityKind::Keyspace,
-                id: b"my_ks".to_vec(),
             })
         );
     }
