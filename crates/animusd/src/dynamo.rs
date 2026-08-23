@@ -151,7 +151,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjection, IndexStatus};
-use animus_control::{MetaCommand, Metadata, ReplicationMode, TtlSpec};
+use animus_control::{MetaCommand, Metadata, TtlSpec};
 use animus_cp_data::{KIND_BASE, KIND_LSI};
 use animus_dynamo::capacity::{
     self, ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity,
@@ -978,11 +978,9 @@ async fn create_table(
         )));
     }
     // v1: every wire-created table is served by the leaderful CP plane (ADR 0019),
-    // so it is created in `ReplicationMode::Cp`. The edge routes its reads/writes
-    // through the CP primitives regardless, but recording the mode keeps the
-    // replicated catalog truthful (and the plain-client `is_cp` gate consistent).
-    let control_schema =
-        schema_bridge::to_control(schema, key_types).with_mode(ReplicationMode::Cp);
+    // the only data plane there is — the edge routes its reads/writes through
+    // the CP primitives unconditionally.
+    let control_schema = schema_bridge::to_control(schema, key_types);
     let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
     loop {
         // Propose against this cluster's current leader (idempotent: the create is

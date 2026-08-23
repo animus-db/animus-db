@@ -617,7 +617,7 @@ pub enum MetaCommand {
     /// Idempotent: a no-op if the table or the named index does not exist.
     DropTableIndex { table: TableName, index: String },
     /// Set a secondary index's lifecycle **status** (ADR 0045):
-    /// `Creating`/`Active`/`Deleting`. Mirrors `SetTableMode`'s minimal shape.
+    /// `Creating`/`Active`/`Deleting`.
     /// Rejected if the table or the named index does not exist; a no-op if the
     /// index is already at `status`. In-place mutation via
     /// `TableSchema::set_index_status` — deliberately **not**
@@ -647,15 +647,6 @@ pub enum MetaCommand {
         table: TableName,
         index: String,
         tablet: TabletId,
-    },
-    /// Set a table's **replication mode** (ADR 0016 / ADR 0017): `Ap` (leaderless
-    /// data plane) or `Cp` (leaderful per-tablet Raft). Rejected if the table has
-    /// no schema; a no-op if the mode is already set. Replicated like the rest of
-    /// the catalog, so the choice is durable + cluster-agreed and the wire edges
-    /// route reads/writes accordingly.
-    SetTableMode {
-        table: TableName,
-        mode: crate::ReplicationMode,
     },
     /// Enable or disable a table's **DynamoDB Streams** configuration (ADR
     /// 0042 §2/§4/§9). Rejected if the table has no schema. Enabling
@@ -1479,16 +1470,6 @@ impl Metadata {
                 self.index_backfill.insert((*tablet, index.clone()), ());
                 ApplyOutcome::Applied
             }
-            MetaCommand::SetTableMode { table, mode } => {
-                let Some(schema) = self.schemas.get_mut(table) else {
-                    return ApplyOutcome::Rejected("no such table schema");
-                };
-                if schema.mode == *mode {
-                    return ApplyOutcome::NoOp;
-                }
-                schema.mode = *mode;
-                ApplyOutcome::Applied
-            }
             MetaCommand::SetTableStream { table, spec } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
                     return ApplyOutcome::Rejected("no such table schema");
@@ -1867,17 +1848,6 @@ impl Metadata {
     #[must_use]
     pub fn has_table_schema(&self, table: &str) -> bool {
         self.schemas.contains(table)
-    }
-
-    /// The table's replication mode (ADR 0016 / ADR 0017). Defaults to `Cp` —
-    /// including for an unknown table — since the leaderful per-tablet Raft plane
-    /// is the only v1 data plane (ADR 0019; the AP plane is deferred and its
-    /// crate deleted). Read by the wire edges to route a table's reads/writes.
-    #[must_use]
-    pub fn table_mode(&self, table: &str) -> crate::ReplicationMode {
-        self.schemas
-            .get(table)
-            .map_or(crate::ReplicationMode::default(), |s| s.mode)
     }
 
     /// All `(name, schema)` pairs in the catalog, in ascending name order.

@@ -262,10 +262,9 @@ pub fn apply_and_derive_mirror(
         }
         MetaCommand::CreateTableIndex { table, .. }
         | MetaCommand::SetIndexStatus { table, .. }
-        | MetaCommand::SetTableMode { table, .. }
         // ADR 0042: a stream (de)configuration is part of the table's schema
-        // entry, so it mirrors identically to an index/mode change — the
-        // whole (already-mutated) schema, re-serialized.
+        // entry, so it mirrors identically to an index change — the whole
+        // (already-mutated) schema, re-serialized.
         | MetaCommand::SetTableStream { table, .. }
         // ADR 0051: TTL is likewise part of the table's schema entry, so it
         // mirrors exactly the same way.
@@ -1035,33 +1034,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn set_table_mode_writes_the_updated_schema() {
-        let mut meta = Metadata::default();
-        let _ = apply_and_derive_mirror(
-            &mut meta,
-            &MetaCommand::CreateTableSchema {
-                table: "orders".to_string(),
-                schema: schema("id"),
-            },
-        );
-        let command = MetaCommand::SetTableMode {
-            table: "orders".to_string(),
-            mode: crate::ReplicationMode::Ap,
-        };
-        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
-        assert_eq!(outcome, ApplyOutcome::Applied);
-        assert_eq!(
-            writes,
-            vec![put_json(
-                syskv::schema_key("orders"),
-                meta.schemas.get("orders").unwrap()
-            )]
-        );
-    }
-
     /// ADR 0051: TTL is part of the table's schema entry, so it mirrors
-    /// identically to a mode change — the whole (already-mutated) schema,
+    /// identically to an index change — the whole (already-mutated) schema,
     /// re-serialized under the same `schema_key`.
     #[test]
     fn set_table_ttl_writes_the_updated_schema() {

@@ -15,8 +15,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animusd::{
-    ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, ReplicationMode, TableSchema,
-    read_frame,
+    ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, TableSchema, read_frame,
 };
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -112,7 +111,8 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
 
-    // Mark a table CP and wait for it to replicate to every node.
+    // Create the table (served by the CP plane unconditionally, ADR 0019) and
+    // wait for its schema to replicate to every node.
     propose_on_leader(
         &nodes,
         MetaCommand::CreateTableSchema {
@@ -121,19 +121,11 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
         },
     )
     .await;
-    propose_on_leader(
-        &nodes,
-        MetaCommand::SetTableMode {
-            table: CP_TABLE.into(),
-            mode: ReplicationMode::Cp,
-        },
-    )
-    .await;
     timeout(Duration::from_secs(20), async {
         loop {
             if nodes
                 .iter()
-                .all(|n| n.metadata().table_mode(CP_TABLE) == ReplicationMode::Cp)
+                .all(|n| n.metadata().has_table_schema(CP_TABLE))
             {
                 return;
             }
@@ -141,7 +133,7 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
         }
     })
     .await
-    .expect("CP mode did not replicate in 20s");
+    .expect("table schema did not replicate in 20s");
 
     let client = |i: usize| config.nodes[i].client;
 

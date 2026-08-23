@@ -22,7 +22,6 @@ animus-storage = { path = "crates/animus-storage" }
 animus-control = { path = "crates/animus-control" }
 animus-tablet = { path = "crates/animus-tablet" }
 animus-placement = { path = "crates/animus-placement" }
-animus-consensus = { path = "crates/animus-consensus" }
 animus-cp-data = { path = "crates/animus-cp-data" }
 animus-dynamo = { path = "crates/animus-dynamo" }
 animus-test = { path = "crates/animus-test" }

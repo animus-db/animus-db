@@ -38,8 +38,7 @@ pub use config::ClusterConfig;
 // cluster metadata — membership status and the tablet map — without depending on
 // `animus-control` directly.
 pub use animus_control::{
-    ColumnDef, ColumnType, IndexStatus, MetaCommand, Metadata, NodeAddrs, NodeStatus,
-    ReplicationMode, TableSchema,
+    ColumnDef, ColumnType, IndexStatus, MetaCommand, Metadata, NodeAddrs, NodeStatus, TableSchema,
 };
 
 mod admin;
@@ -1591,7 +1590,7 @@ pub enum ClientRequest {
     },
     /// Relay a **schema-catalog** `MetaCommand` to be proposed on the control-plane
     /// leader (v1 Phase 1 / A2, ADR 0013): a node that received a `CreateTable` /
-    /// `CREATE TABLE` / `SetTableMode` but isn't the control leader sends this to
+    /// `CREATE TABLE` / `CreateTableIndex` but isn't the control leader sends this to
     /// the leader's node, so DDL on a follower-connected client still commits. Any
     /// node accepts it, **gates** it to schema-catalog commands (membership /
     /// placement commands are rejected — not a general "propose anything" surface),
@@ -1921,7 +1920,7 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             | MetaCommand::CreateTableIndex { .. }
             | MetaCommand::DropTableIndex { .. }
             // Index status transition (ADR 0045): same schema-catalog class as
-            // `CreateTableIndex`/`DropTableIndex`/`SetTableMode` — the backfill
+            // `CreateTableIndex`/`DropTableIndex` — the backfill
             // seeder/aggregator (this crate) may propose it from wherever the
             // relevant tablet/control leader actually runs.
             | MetaCommand::SetIndexStatus { .. }
@@ -1934,14 +1933,13 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // `SetIndexStatus` directly, exactly like `SealStreamShard`'s own
             // aggregator does, so it needs no relay path of its own.
             | MetaCommand::MarkIndexBackfilled { .. }
-            | MetaCommand::SetTableMode { .. }
             // DynamoDB Streams enable/disable (ADR 0042): schema-catalog
-            // class, same relay reason as `CreateTableIndex`/`SetTableMode` —
-            // a follower-connected `CreateTable`/`UpdateTable` must reach the
+            // class, same relay reason as `CreateTableIndex` — a
+            // follower-connected `CreateTable`/`UpdateTable` must reach the
             // control leader.
             | MetaCommand::SetTableStream { .. }
             // DynamoDB-style TTL configuration (ADR 0051): schema-catalog
-            // class, same relay reason as `SetTableStream`/`SetTableMode` — a
+            // class, same relay reason as `SetTableStream` — a
             // follower-connected `UpdateTimeToLive` must reach the control
             // leader.
             | MetaCommand::SetTableTtl { .. }
@@ -4447,8 +4445,7 @@ impl Node {
     /// Propose a control-plane [`MetaCommand`] on this node's control replica,
     /// returning whether it was accepted (i.e. this node is the leader). The
     /// interim admin hook for cluster metadata operations the wire edges do not
-    /// yet expose — notably marking a table **CP** (ADR 0017 #3a) via
-    /// `MetaCommand::SetTableMode`. A non-leader proposal is dropped (`false`); the
+    /// yet expose. A non-leader proposal is dropped (`false`); the
     /// caller retries on the current leader. Replication + durability are the
     /// control plane's (the command commits through Raft).
     ///

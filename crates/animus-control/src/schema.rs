@@ -253,25 +253,6 @@ impl ColumnDef {
     }
 }
 
-/// How a table's data is replicated (ADR 0016 / ADR 0017). The default is **CP**
-/// — the leaderful per-tablet Raft plane (`animus-cp-data`) with linearizable
-/// single-tablet reads/writes, the only data plane in v1 (ADR 0019). **AP** is
-/// retained as a forward-compat hook for the deferred leaderless plane (its crate
-/// was deleted; ADR 0019); nothing routes to it in v1. Replicated in the schema
-/// catalog so the choice is durable, cluster-agreed, and recovered from Raft like
-/// the rest of the schema; the wire edges read it to route a table's
-/// reads/writes to the right plane.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ReplicationMode {
-    /// Leaderless AP data plane (tunable quorum). Deferred in v1 (ADR 0019) —
-    /// kept only as a forward-compat hook; no v1 table uses it.
-    Ap,
-    /// Leaderful per-tablet Raft (linearizable single-tablet KV). The default,
-    /// and the only v1 plane (ADR 0019).
-    #[default]
-    Cp,
-}
-
 /// A table's replicated schema: its key structure plus its typed columns.
 ///
 /// Invariants enforced by [`TableSchema::validate`] (and thus by
@@ -302,24 +283,17 @@ pub struct TableSchema {
     /// deterministic order. Validated by [`TableSchema::validate`].
     #[serde(default)]
     pub indexes: Vec<IndexDef>,
-    /// The table's replication mode (ADR 0016 / ADR 0017). `#[serde(default)]` →
-    /// [`ReplicationMode::Cp`] (the only v1 plane, ADR 0019), so a schema
-    /// persisted before this field existed deserializes as CP — the correct v1
-    /// semantic, since the AP plane it predated no longer exists. Additive like
-    /// `indexes`.
-    #[serde(default)]
-    pub mode: ReplicationMode,
     /// This table's DynamoDB Streams configuration (ADR 0042), if enabled.
     /// `None` for a table with no stream (the common case, and every schema
     /// persisted before this field existed — `#[serde(default)]`, additive
-    /// like `indexes`/`mode`). Mutated only through
+    /// like `indexes`). Mutated only through
     /// `MetaCommand::SetTableStream` (so it replicates).
     #[serde(default)]
     pub stream: Option<StreamSpec>,
     /// This table's DynamoDB-style TTL configuration (ADR 0051), if enabled.
     /// `None` for a table with no TTL (the common case, and every schema
     /// persisted before this field existed — `#[serde(default)]`, additive
-    /// like `indexes`/`mode`/`stream`). Mutated only through
+    /// like `indexes`/`stream`). Mutated only through
     /// `MetaCommand::SetTableTtl` (so it replicates); see [`TtlSpec`] for
     /// what the control plane does and does not do with it.
     #[serde(default)]
@@ -358,7 +332,6 @@ impl TableSchema {
             partition_key: pk,
             clustering_keys: Vec::new(),
             indexes: Vec::new(),
-            mode: ReplicationMode::default(),
             stream: None,
             ttl: None,
         }
@@ -383,7 +356,6 @@ impl TableSchema {
             partition_key: pk,
             clustering_keys: vec![sk],
             indexes: Vec::new(),
-            mode: ReplicationMode::default(),
             stream: None,
             ttl: None,
         }
@@ -404,17 +376,9 @@ impl TableSchema {
             clustering_keys,
             columns,
             indexes: Vec::new(),
-            mode: ReplicationMode::default(),
             stream: None,
             ttl: None,
         }
-    }
-
-    /// Set the replication mode (builder; default [`ReplicationMode::Cp`]).
-    #[must_use]
-    pub fn with_mode(mut self, mode: ReplicationMode) -> Self {
-        self.mode = mode;
-        self
     }
 
     /// Look up a column by name (exact match).
