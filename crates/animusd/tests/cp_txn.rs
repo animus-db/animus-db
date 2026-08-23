@@ -206,6 +206,7 @@ async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
                     ClientRequest::Get {
                         key: key.clone(),
                         table: "txn_t5".to_string(),
+                        stale: false,
                     },
                 )
                 .await
@@ -317,6 +318,7 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
                     ClientRequest::Get {
                         key: key.clone(),
                         table: "txn_t6".to_string(),
+                        stale: false,
                     },
                 )
                 .await
@@ -558,6 +560,7 @@ async fn multi_tablet_txn_commits_atomically_across_a_split_table() {
                 ClientRequest::Get {
                     key: key.clone(),
                     table: "txn_t".to_string(),
+                    stale: false,
                 },
             ),
         )
@@ -634,6 +637,7 @@ async fn txn_through_every_node_including_followers_succeeds() {
                 ClientRequest::Get {
                     key: key.clone(),
                     table: "txn_t2".to_string(),
+                    stale: false,
                 },
             )
             .await;
@@ -713,6 +717,7 @@ async fn concurrent_transactions_are_individually_atomic() {
             ClientRequest::Get {
                 key: lower_key,
                 table: "txn_t3".to_string(),
+                stale: false,
             },
         )
         .await;
@@ -721,6 +726,7 @@ async fn concurrent_transactions_are_individually_atomic() {
             ClientRequest::Get {
                 key: upper_key,
                 table: "txn_t3".to_string(),
+                stale: false,
             },
         )
         .await;
@@ -802,6 +808,7 @@ async fn violated_precondition_aborts_the_whole_transaction() {
         ClientRequest::Get {
             key: lower_key,
             table: "txn_t4".to_string(),
+            stale: false,
         },
     )
     .await;
@@ -811,6 +818,7 @@ async fn violated_precondition_aborts_the_whole_transaction() {
         ClientRequest::Get {
             key: upper_key,
             table: "txn_t4".to_string(),
+            stale: false,
         },
     )
     .await;

@@ -110,6 +110,7 @@ async fn data_survives_node_restart_on_disk() {
             ClientRequest::Get {
                 key: b"durable".to_vec(),
                 table: "kv".to_string(),
+                stale: false,
             }
         )
         .await,
@@ -131,6 +132,7 @@ async fn data_survives_node_restart_on_disk() {
         ClientRequest::Get {
             key: b"durable".to_vec(),
             table: "kv".to_string(),
+            stale: false,
         },
     )
     .await;
@@ -147,6 +149,7 @@ async fn data_survives_node_restart_on_disk() {
         ClientRequest::Get {
             key: b"never".to_vec(),
             table: "kv".to_string(),
+            stale: false,
         },
     )
     .await;
@@ -201,6 +204,7 @@ async fn acked_write_survives_memory_backend_restart_via_raft_wal() {
                 ClientRequest::Get {
                     key: b"acked".to_vec(),
                     table: "kv".to_string(),
+                    stale: false,
                 },
             )
             .await;

@@ -160,7 +160,7 @@ async fn scan_paginates_a_whole_table() {
     let (status, page1) = dynamo(
         addr1,
         "DynamoDB_20120810.Scan",
-        r#"{"TableName":"docs","Limit":2}"#,
+        r#"{"ConsistentRead":true,"TableName":"docs","Limit":2}"#,
     )
     .await;
     assert_eq!(status, 200, "Scan page1 failed: {page1}");
@@ -174,7 +174,7 @@ async fn scan_paginates_a_whole_table() {
     let (status, page2) = dynamo(
         addr1,
         "DynamoDB_20120810.Scan",
-        &format!(r#"{{"TableName":"docs","ExclusiveStartKey":{{"id":{{"S":"{cursor_id}"}}}}}}"#),
+        &format!(r#"{{"ConsistentRead":true,"TableName":"docs","ExclusiveStartKey":{{"id":{{"S":"{cursor_id}"}}}}}}"#),
     )
     .await;
     assert_eq!(status, 200, "Scan page2 failed: {page2}");
@@ -182,7 +182,12 @@ async fn scan_paginates_a_whole_table() {
     assert!(!page2.contains("LastEvaluatedKey"), "page2: {page2}");
 
     // A full scan returns all five.
-    let (status, all) = dynamo(addr0, "DynamoDB_20120810.Scan", r#"{"TableName":"docs"}"#).await;
+    let (status, all) = dynamo(
+        addr0,
+        "DynamoDB_20120810.Scan",
+        r#"{"ConsistentRead":true,"TableName":"docs"}"#,
+    )
+    .await;
     assert_eq!(status, 200);
     assert!(all.contains("\"Count\":5"), "all: {all}");
 
@@ -190,7 +195,7 @@ async fn scan_paginates_a_whole_table() {
     let (status, even) = dynamo(
         addr1,
         "DynamoDB_20120810.Scan",
-        r#"{"TableName":"docs","FilterExpression":"kind = :k",
+        r#"{"ConsistentRead":true,"TableName":"docs","FilterExpression":"kind = :k",
             "ExpressionAttributeValues":{":k":{"S":"even"}}}"#,
     )
     .await;
@@ -271,7 +276,7 @@ async fn gsi_write_then_query() {
     let (status, _) = dynamo(
         addr0,
         "DynamoDB_20120810.DeleteItem",
-        r#"{"TableName":"users","Key":{"id":{"S":"u3"}}}"#,
+        r#"{"ConsistentRead":true,"TableName":"users","Key":{"id":{"S":"u3"}}}"#,
     )
     .await;
     assert_eq!(status, 200);
@@ -342,7 +347,12 @@ async fn scan_skips_deleted_items_and_paginates() {
     assert_eq!(status, 200);
 
     // A full scan omits the deleted item: 4 live items, no "1".
-    let (status, all) = dynamo(addr, "DynamoDB_20120810.Scan", r#"{"TableName":"docs"}"#).await;
+    let (status, all) = dynamo(
+        addr,
+        "DynamoDB_20120810.Scan",
+        r#"{"ConsistentRead":true,"TableName":"docs"}"#,
+    )
+    .await;
     assert_eq!(status, 200, "scan: {all}");
     assert!(
         all.contains("\"Count\":4"),
@@ -358,7 +368,7 @@ async fn scan_skips_deleted_items_and_paginates() {
     let (status, page1) = dynamo(
         addr,
         "DynamoDB_20120810.Scan",
-        r#"{"TableName":"docs","Limit":2}"#,
+        r#"{"ConsistentRead":true,"TableName":"docs","Limit":2}"#,
     )
     .await;
     assert_eq!(status, 200, "page1: {page1}");
@@ -373,7 +383,7 @@ async fn scan_skips_deleted_items_and_paginates() {
     let (status, page2) = dynamo(
         addr,
         "DynamoDB_20120810.Scan",
-        &format!(r#"{{"TableName":"docs","ExclusiveStartKey":{{"id":{{"S":"{cursor_id}"}}}}}}"#),
+        &format!(r#"{{"ConsistentRead":true,"TableName":"docs","ExclusiveStartKey":{{"id":{{"S":"{cursor_id}"}}}}}}"#),
     )
     .await;
     assert_eq!(status, 200, "page2: {page2}");

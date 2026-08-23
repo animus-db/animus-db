@@ -289,7 +289,7 @@ async fn gsi_scan_paginates_and_drains_all_rows() {
 /// (b) `ConsistentRead: true` against a GSI `Scan` is rejected exactly like a
 /// GSI `Query` (ADR 0041 §5's asymmetric contract) — and, for contrast, the
 /// same flag against the base table's own `Scan` and an LSI `Scan` is
-/// accepted (both already linearizable here).
+/// accepted (ADR 0055: on those it selects the linearizable read).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gsi_scan_rejects_consistent_read() {
     let (_dir, _nodes, addr) = setup().await;

@@ -392,7 +392,13 @@ async fn admin_data_write_dynamo() {
             a,
             "POST",
             "/admin/data/dynamo",
-            Some(r#"{"op":"GetItem","payload":{"TableName":"t","Key":{"pk":{"S":"alice"}}}}"#),
+            // `ConsistentRead: true` (ADR 0055): this reads back a write it
+            // just made, and the wire default is now a genuinely
+            // eventually-consistent read that may not reflect it yet.
+            Some(
+                r#"{"op":"GetItem","payload":{"TableName":"t",
+                    "Key":{"pk":{"S":"alice"}},"ConsistentRead":true}}"#,
+            ),
         )
         .await;
         assert_eq!(s, 200, "GetItem via admin proxy: {got}");
@@ -658,8 +664,10 @@ async fn admin_seed_writes_synthetic_keys() {
             "POST",
             "/admin/data/dynamo",
             Some(
+                // `ConsistentRead: true` (ADR 0055), like the composite-table
+                // read below: this reads back the seeder's own writes.
                 r#"{"op":"GetItem","payload":{"TableName":"seedt",
-                    "Key":{"id":{"S":"seed:000000000007"}}}}"#,
+                    "Key":{"id":{"S":"seed:000000000007"}},"ConsistentRead":true}}"#,
             ),
         )
         .await;
@@ -703,8 +711,11 @@ async fn admin_seed_writes_synthetic_keys() {
             "POST",
             "/admin/data/dynamo",
             Some(
+                // `ConsistentRead: true` (ADR 0055): reads back the seeder's
+                // own writes.
                 r#"{"op":"GetItem","payload":{"TableName":"seedc",
-                    "Key":{"id":{"S":"seed:000000000003"},"rk":{"S":"000000000003"}}}}"#,
+                    "Key":{"id":{"S":"seed:000000000003"},"rk":{"S":"000000000003"}},
+                    "ConsistentRead":true}}"#,
             ),
         )
         .await;
@@ -1091,6 +1102,7 @@ async fn admin_split_kicks_off_the_copy_based_workflow() {
             &ClientRequest::Get {
                 key: b"k".to_vec(),
                 table: "t".to_string(),
+                stale: false,
             },
         )
         .await

@@ -99,6 +99,7 @@ async fn assembled_node_handles_concurrent_client_load_without_deadlock() {
                     ClientRequest::Get {
                         key,
                         table: "kv".to_string(),
+                        stale: false,
                     },
                 )
                 .await;

@@ -133,7 +133,7 @@ async fn document_set_types_projection_and_return_values() {
     let (status, body) = dynamo(
         addr1,
         "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"profiles","Key":{"id":{"S":"u1"}}}"#,
+        r#"{"ConsistentRead":true,"TableName":"profiles","Key":{"id":{"S":"u1"}}}"#,
     )
     .await;
     assert_eq!(status, 200, "GetItem failed: {body}");
@@ -154,7 +154,7 @@ async fn document_set_types_projection_and_return_values() {
     let (status, body) = dynamo(
         addr1,
         "DynamoDB_20120810.GetItem",
-        r##"{"TableName":"profiles","Key":{"id":{"S":"u1"}},
+        r##"{"ConsistentRead":true,"TableName":"profiles","Key":{"id":{"S":"u1"}},
             "ProjectionExpression":"id, #n",
             "ExpressionAttributeNames":{"#n":"name"}}"##,
     )
@@ -286,7 +286,7 @@ async fn multiple_gsis_composite_gsi_and_lsi() {
     let (status, body) = dynamo(
         addr1,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","IndexName":"by-ts",
+        r#"{"ConsistentRead":true,"TableName":"events","IndexName":"by-ts",
             "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
     )

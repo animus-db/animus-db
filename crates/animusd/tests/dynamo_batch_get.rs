@@ -176,10 +176,15 @@ async fn batch_get_reads_across_tables() {
     let (status, body) = dynamo_retry(
         addrs[1],
         "DynamoDB_20120810.BatchGetItem",
+        // `ConsistentRead: true` per table request (ADR 0055): this reads
+        // back items the test itself just wrote, and the wire default is now
+        // a genuinely eventually-consistent read that may not reflect them
+        // yet. `BatchGetItem` carries the flag per table, not per batch.
         r#"{"RequestItems":{
-            "events":{"Keys":[{"pk":{"S":"p1"},"sk":{"S":"a0"}},
+            "events":{"ConsistentRead":true,
+                      "Keys":[{"pk":{"S":"p1"},"sk":{"S":"a0"}},
                               {"pk":{"S":"p1"},"sk":{"S":"a2"}}]},
-            "other":{"Keys":[{"id":{"S":"o1"}}]}}}"#,
+            "other":{"ConsistentRead":true,"Keys":[{"id":{"S":"o1"}}]}}}"#,
     )
     .await;
     assert_eq!(status, 200, "BatchGetItem failed: {body}");

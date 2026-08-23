@@ -3234,38 +3234,40 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 ResolveStep::Value(staged_value)
             }
             txn::TxnDecisionStatus::Committed { .. } | txn::TxnDecisionStatus::Aborted => {
-                let prior = self
-                    .storage
-                    .get_at(physical_key, vv_version.saturating_sub(1))
-                    .await
-                    .ok()
-                    .flatten();
-                ResolveStep::Value(
-                    prior.and_then(|pvv| match txn::decode_envelope(&pvv.value) {
-                        txn::Envelope::Committed(v) => Some(v),
-                        // A prior intent: **should be unreachable since ADR
-                        // 0018 §2/PR6 (task #16)** — `KvCommand::TxnStage`'s
-                        // apply-time writer-push-intents guard now rejects a
-                        // stage over any key still holding another
-                        // transaction's unresolved intent, so one hop back
-                        // from *this* intent's own version can only ever be
-                        // a genuinely committed value or true absence (see
-                        // `KvCommand::TxnStage`'s doc for the durability
-                        // argument this closes — a corpus depth run found a
-                        // corrupted MVCC version chain that made an
-                        // already-committed value permanently unreadable).
-                        // Kept as a defensive fallback rather than an
-                        // assert: this function has no way to distinguish
-                        // "the invariant broke" from "an older, pre-fix WAL
-                        // entry replayed on recovery" — conservatively
-                        // treating it as absent (never leaking raw envelope
-                        // bytes to a caller) is still correct either way.
-                        txn::Envelope::Intent { .. } => None,
-                    }),
-                )
+                ResolveStep::Value(self.prior_committed(physical_key, vv_version).await)
             }
             txn::TxnDecisionStatus::Pending => ResolveStep::Pending(pending),
         }
+    }
+
+    /// The key's **last committed value**, read one MVCC version below
+    /// `version` — the "one hop back from this intent" lookup shared by
+    /// [`resolve_decided`](Self::resolve_decided)'s aborted/too-late branch
+    /// and the ADR 0055 eventually-consistent read path.
+    ///
+    /// A *prior intent* one hop back **should be unreachable since ADR 0018
+    /// §2/PR6 (task #16)** — `KvCommand::TxnStage`'s apply-time
+    /// writer-push-intents guard rejects a stage over any key still holding
+    /// another transaction's unresolved intent, so one hop back from an
+    /// intent's own version can only ever be a genuinely committed value or
+    /// true absence (see `KvCommand::TxnStage`'s doc for the durability
+    /// argument this closes — a corpus depth run found a corrupted MVCC
+    /// version chain that made an already-committed value permanently
+    /// unreadable). Kept as a defensive fallback rather than an assert: this
+    /// function has no way to distinguish "the invariant broke" from "an
+    /// older, pre-fix WAL entry replayed on recovery" — conservatively
+    /// treating it as absent (never leaking raw envelope bytes to a caller)
+    /// is still correct either way.
+    async fn prior_committed(&self, physical_key: &[u8], version: u64) -> Option<Vec<u8>> {
+        self.storage
+            .get_at(physical_key, version.saturating_sub(1))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|pvv| match txn::decode_envelope(&pvv.value) {
+                txn::Envelope::Committed(v) => Some(v),
+                txn::Envelope::Intent { .. } => None,
+            })
     }
 
     /// The outcome of resolving one raw, envelope-tagged stored value
@@ -3433,6 +3435,190 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         match self.resolve_once_step(&physical, vv, None).await {
             ResolveStep::Value(v) => v,
             ResolveStep::Pending(_) | ResolveStep::Foreign(_) => None,
+        }
+    }
+
+    // ---- eventually-consistent reads (ADR 0055) --------------------------
+    //
+    // The `ConsistentRead: false` half of the DynamoDB read contract, served
+    // from *this* replica's own applied engine state: no ReadIndex barrier,
+    // no ceiling proposal, no read-timestamp-cache bump, no leadership
+    // requirement, and — deliberately — no network hop and no wait of any
+    // kind. That budget is the whole point of the path: anything added here
+    // that can block or round-trip silently turns the cheap read back into
+    // an expensive one, and no test would notice. Keep it local.
+
+    /// Whether this replica may serve an **eventually-consistent** read (ADR
+    /// 0055) — the cheap, purely local freshness gate every stale read is
+    /// taken behind.
+    ///
+    /// True when both hold:
+    ///
+    /// - the replica knows a **current leader** (its Raft `leader_id` is
+    ///   set). A replica that has never heard an `AppendEntries` — a freshly
+    ///   added voter (ADR 0029 rebalance), a node between start and its
+    ///   first heartbeat — holds an engine that is not yet *any* state this
+    ///   tablet ever had, so serving it would report **false absence**.
+    ///   That is categorically worse than staleness: an eventual read may
+    ///   return an older committed state, never a state that never existed
+    ///   (the ADR 0033 read-path lesson, in its read-your-replica form).
+    /// - its **engine** holds every entry it knows to be committed
+    ///   (`engine_applied_index() >= commit_index()`). This excludes one
+    ///   carrying a committed-but-not-yet-merged log tail, and — the case
+    ///   that actually matters — one **mid-`InstallSnapshot`**: `RaftCore`
+    ///   sets `commit_index = snapshot.last_index` the moment the last chunk
+    ///   arrives, while `engine_applied` only advances after the apply task
+    ///   has merged the whole image (`install_engine_image` →
+    ///   `fetch_max(last_index)`). The gate is therefore closed for exactly
+    ///   the window in which this engine holds a half-written image — the
+    ///   one state a replica can be in that is not a prefix of the log at
+    ///   all, and so the one an eventual read must never touch.
+    ///
+    /// Deliberately **not** a staleness *bound*. A replica partitioned away
+    /// from its leader passes this gate and answers from an arbitrarily old
+    /// state — one that is still genuinely committed and still a genuine
+    /// prefix of this tablet's log, which is exactly what DynamoDB's
+    /// eventually-consistent read promises and all it promises. A caller
+    /// that needs a bound asks for `ConsistentRead: true`.
+    ///
+    /// Never wakes a quiesced group (ADR 0048): an eventual read needs no
+    /// Raft activity at all, and a quiesced group is idle by construction —
+    /// hence fully applied, hence current.
+    #[must_use]
+    pub fn stale_read_ready(&self) -> bool {
+        // One lock acquisition for both core facts. `engine_applied` is read
+        // *after* releasing it and only ever grows, so a concurrent apply can
+        // make this false-negative (a read that falls back to the strong
+        // path, which is always correct) but never false-positive.
+        let (has_leader, commit) = {
+            let core = self.lock();
+            (core.leader().is_some(), core.commit_index())
+        };
+        has_leader && self.engine_applied_index() >= commit
+    }
+
+    /// An **eventually-consistent** read of `key` from this replica's own
+    /// engine (ADR 0055): no ReadIndex barrier, no leadership requirement,
+    /// no wait. The caller gates it on
+    /// [`stale_read_ready`](Self::stale_read_ready) first.
+    ///
+    /// The two `None`s are disambiguated exactly as
+    /// [`linearizable_get_served`](Self::linearizable_get_served) does, and
+    /// for the identical reason (the ADR 0033 read-path fix): the **outer**
+    /// `Option` is "was this read served at all" — `None` means the engine
+    /// refused the read, which a caller must never report to a client as
+    /// absence — and the **inner** one is the served answer (`Some(None)` =
+    /// the key is genuinely absent).
+    ///
+    /// A key covered by an **unresolved intent** (ADR 0018 §2) reads as its
+    /// **last committed value** (the MVCC version one below the intent's own),
+    /// rather than as absent the way [`local_get`](Self::local_get)'s raw
+    /// peek reports it, and without the anchor-tablet round trip a
+    /// linearizable read pays to decide the intent. That value is a state
+    /// this tablet genuinely had, and the covering transaction has not
+    /// committed as far as this replica knows — so returning it is staleness
+    /// and nothing more. Reporting the key as absent would instead fabricate
+    /// a deletion that never happened, which the eventual contract does not
+    /// license.
+    pub async fn stale_get_served(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let physical = self.scope.physical(key);
+        let Ok(found) = self.storage.get(&physical).await else {
+            return None;
+        };
+        match found {
+            Some(vv) => Some(self.stale_value(&physical, vv).await),
+            None => Some(None),
+        }
+    }
+
+    /// An **eventually-consistent** range scan of the base scope over
+    /// `[start, end)` (ADR 0055) — [`local_scan`](Self::local_scan)'s range,
+    /// bounds and ordering contract exactly (`end == None` is unbounded
+    /// above but still bounded to *this* scope), resolving each row the way
+    /// [`stale_get_served`](Self::stale_get_served) resolves a point read.
+    ///
+    /// The one difference from `local_scan` that matters: a row under an
+    /// unresolved intent contributes its **last committed value** instead of
+    /// being dropped. Dropping it is right for `local_scan`'s admin/debug
+    /// callers and wrong here — a client-visible scan that silently omits an
+    /// item which exists is a fabricated deletion, not staleness.
+    pub async fn stale_scan(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.stale_scan_ordered(start, end, limit, false).await
+    }
+
+    /// [`stale_scan`](Self::stale_scan)'s **descending** dual — the eventual
+    /// counterpart of [`local_scan_rev`](Self::local_scan_rev), serving a
+    /// `ConsistentRead: false` `Query` with `ScanIndexForward: false`.
+    pub async fn stale_scan_rev(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.stale_scan_ordered(start, end, limit, true).await
+    }
+
+    /// Shared body of the two above — the eventual twin of
+    /// [`local_scan_ordered`](Self::local_scan_ordered): same rows
+    /// ([`raw_base_rows`](Self::raw_base_rows)), same `reverse`/`limit` tail
+    /// ([`order_and_limit`](Self::order_and_limit)), different envelope
+    /// resolution.
+    async fn stale_scan_ordered(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let raw = self.raw_base_rows(start, end).await;
+        let pairs = self.stale_scan_rows(raw).await;
+        Self::order_and_limit(pairs, limit, reverse)
+    }
+
+    /// [`resolve_scan_rows`](Self::resolve_scan_rows)'s eventual counterpart
+    /// (ADR 0055): drop this crate's internal txn-record marker keys exactly
+    /// as that one does, then resolve each remaining row with
+    /// [`stale_value`](Self::stale_value) — so an intent-covered row keeps
+    /// its last committed value instead of vanishing from the page.
+    /// Resolution runs **before** the caller's `limit`, mirroring
+    /// `local_scan_ordered`'s own ordering, so an internal marker key never
+    /// consumes one of the caller's requested slots.
+    async fn stale_scan_rows(
+        &self,
+        rows: Vec<(Vec<u8>, animus_storage::VersionedValue)>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::with_capacity(rows.len());
+        for (key, vv) in rows {
+            if txn::is_record_key(&key) {
+                continue;
+            }
+            let physical = self.scope.physical(&key);
+            if let Some(v) = self.stale_value(&physical, vv).await {
+                out.push((key, v));
+            }
+        }
+        out
+    }
+
+    /// Resolve one stored envelope for an eventually-consistent read (ADR
+    /// 0055) — the shared body of [`stale_get_served`](Self::stale_get_served)
+    /// and [`stale_scan_rows`](Self::stale_scan_rows). Pure local engine
+    /// work: a committed envelope *is* the value; an unresolved intent falls
+    /// back one MVCC version to the key's last committed value (see
+    /// [`prior_committed`](Self::prior_committed)).
+    async fn stale_value(
+        &self,
+        physical_key: &[u8],
+        vv: animus_storage::VersionedValue,
+    ) -> Option<Vec<u8>> {
+        match txn::decode_envelope(&vv.value) {
+            txn::Envelope::Committed(v) => Some(v),
+            txn::Envelope::Intent { .. } => self.prior_committed(physical_key, vv.version).await,
         }
     }
 
@@ -4104,6 +4290,29 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         limit: Option<usize>,
         reverse: bool,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let raw = self.raw_base_rows(start, end).await;
+        // ADR 0018 §2/PR3: filter out this crate's internal txn-record
+        // marker keys and resolve every remaining row's value envelope
+        // (`resolve_scan_rows`'s doc) — applied *before* `limit` so an
+        // internal marker key or a still-`Pending` row interleaved in the
+        // requested range never silently consumes one of the caller's
+        // requested slots.
+        let pairs = self.resolve_scan_rows(raw, None).await;
+        Self::order_and_limit(pairs, limit, reverse)
+    }
+
+    /// The raw, still-enveloped `(logical key, versioned value)` rows of this
+    /// group's **base** scope over `[start, end)`, in key order — the shared
+    /// engine half of [`local_scan_ordered`](Self::local_scan_ordered) and
+    /// its ADR 0055 eventually-consistent twin
+    /// [`stale_scan_ordered`](Self::stale_scan_ordered). The two differ only
+    /// in how they resolve a row's envelope, never in which rows they read,
+    /// so the range/bounds reasoning below lives here once.
+    async fn raw_base_rows(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, animus_storage::VersionedValue)> {
         // Push the range down into the engine (audit P4): a bounded scan reads
         // only `[start, end)` instead of materializing the whole tablet and
         // filtering; both `scan` and `entries` return key-ordered results by the
@@ -4127,7 +4336,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // engine is this tablet's own (ADR 0050), so the filter's remaining
         // job is separating this kind's rows from sibling kinds' and from
         // the engine-global reserved-namespace markers.
-        let raw: Vec<(Vec<u8>, animus_storage::VersionedValue)> = match end {
+        match end {
             Some(e) => self
                 .storage
                 .scan(&self.scope.physical(start), &self.scope.physical(e))
@@ -4166,14 +4375,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     })
                     .collect(),
             },
-        };
-        // ADR 0018 §2/PR3: filter out this crate's internal txn-record
-        // marker keys and resolve every remaining row's value envelope
-        // (`resolve_scan_rows`'s doc) — applied *before* `limit` so an
-        // internal marker key or a still-`Pending` row interleaved in the
-        // requested range never silently consumes one of the caller's
-        // requested slots.
-        let mut pairs = self.resolve_scan_rows(raw, None).await;
+        }
+    }
+
+    /// Apply a scan's `reverse`/`limit` tail to already-key-ordered,
+    /// already-resolved rows — the shared post-step of every base-scope scan
+    /// flavor (linearizable, local, and the ADR 0055 eventual one).
+    fn order_and_limit(
+        mut pairs: Vec<(Vec<u8>, Vec<u8>)>,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
         if reverse {
             // Keep the *highest* `n` of the range, then hand them back
             // highest-first. Draining the head (rather than truncating the

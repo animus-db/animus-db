@@ -442,11 +442,14 @@ here.
 >   never sees. `animusd::dynamo::run_index_query` is the one place that
 >   ever rejects it, exactly matching the accept/reject matrix this section's
 >   body already stated: `ValidationException` when the queried index is
->   `IndexKind::Global`; accepted-and-ignored against an LSI `Query`, a base
->   `Query`/`Scan`, and a base `GetItem` alike, since every one of those
->   reads is already linearizable here regardless of what the client asked
->   for. Regression (decode): `animus-dynamo`'s `wire` unit tests. Regression
->   (rejection/acceptance): `animusd/tests/dynamo_consistent_read.rs`.
+>   `IndexKind::Global`; accepted against an LSI `Query`, a base
+>   `Query`/`Scan`, and a base `GetItem` alike. (When this was written those
+>   acceptances were accept-and-*ignore*, since every one of those reads was
+>   linearizable regardless of what the client asked for. [ADR
+>   0055](0055-eventually-consistent-reads.md) changed that half: the flag now
+>   selects the read path there. The accept/reject matrix itself is
+>   unchanged.) Regression (decode): `animus-dynamo`'s `wire` unit tests.
+>   Regression (rejection/acceptance): `animusd/tests/dynamo_consistent_read.rs`.
 >
 > Neither gap was reachable from `CreateTable`-declared indexes without a
 > multi-step scenario (a populated GSI, then a drop; an explicit
@@ -593,6 +596,12 @@ mechanism.
   is weaker than everything else this codebase serves, and it is the first
   non-linearizable read path in v1 (ADR 0019). Tests asserting index contents
   must use a converged-or-timeout poll, never a fixed-deadline one-shot assert.
+  (**No longer the only one, as of [ADR 0055](0055-eventually-consistent-reads.md)**:
+  every `ConsistentRead: false` read — the wire default — is now served from a
+  replica's applied state, so §5's `ConsistentRead` handling below is no longer
+  "accept-and-ignore for correctness" on the base/LSI path either. The GSI-side
+  rejection of `ConsistentRead: true` is unchanged, and is what makes a GSI read
+  *always* take the eventual path.)
 - **A new background loop** joins the reconciler, GC, auto-split, and txn-resolver
   loops. It is modelled on the last of these, but it is another thing that must
   make progress under fault injection.

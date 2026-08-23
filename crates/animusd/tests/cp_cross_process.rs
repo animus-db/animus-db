@@ -169,6 +169,7 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
             ClientRequest::Get {
                 key: b"k".to_vec(),
                 table: CP_TABLE.into(),
+                stale: false,
             },
         )
         .await;
@@ -240,6 +241,7 @@ async fn batch_write_on_a_non_leader_node_is_forwarded() {
                 ClientRequest::Get {
                     key: format!("bw{k}-{i}").into_bytes(),
                     table: CP_TABLE.into(),
+                    stale: false,
                 },
             )
             .await;
@@ -309,6 +311,7 @@ async fn second_table_forwards_across_processes() {
             ClientRequest::Get {
                 key: b"b".to_vec(),
                 table: "cp_second".into(),
+                stale: false,
             },
         )
         .await;

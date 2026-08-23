@@ -140,7 +140,9 @@ Note the asymmetry this closes. The single consistency choice DynamoDB *does* le
 a client make is `ConsistentRead` on an individual read — a strong read versus a
 cheap eventually-consistent one. That is a read-path option over a
 strongly-consistent store, not a replication mode, and it is served by the CP
-plane (see ADR 0055). It is not a residual use for AP, and it was never one:
+plane ([ADR 0055](0055-eventually-consistent-reads.md), which makes that
+forward reference concrete: `false` reads answer from any replica's applied
+state, `true` reads keep the ReadIndex path). It is not a residual use for AP, and it was never one:
 an AP plane answers a *write*-availability question that DynamoDB's protocol
 gives a client no way to ask.
 

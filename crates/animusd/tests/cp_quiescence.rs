@@ -233,6 +233,7 @@ async fn write_after_leader_kill_of_a_quiesced_group_converges() {
         ClientRequest::Get {
             key: b"k1".to_vec(),
             table: TABLE.to_string(),
+            stale: false,
         },
     )
     .await;
@@ -282,6 +283,7 @@ async fn quiescence_enabled_does_not_disrupt_ordinary_traffic() {
             ClientRequest::Get {
                 key: key.clone(),
                 table: TABLE.to_string(),
+                stale: false,
             },
         )
         .await;

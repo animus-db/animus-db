@@ -156,6 +156,7 @@ async fn client_get(addr: SocketAddr, table: &str, key: &[u8]) -> Option<Vec<u8>
         &ClientRequest::Get {
             key: key.to_vec(),
             table: table.to_string(),
+            stale: false,
         },
     )
     .await

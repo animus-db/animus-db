@@ -2,7 +2,12 @@
 //! `Query` with `ConsistentRead: true` against a **GSI** is rejected
 //! (`ValidationException`, matching DynamoDB's own contract — a GSI is
 //! maintained asynchronously); against an **LSI** — or the base table — it is
-//! legal and already true, since every non-GSI read here is linearizable.
+//! legal.
+//!
+//! This file is about **acceptance and rejection of the flag**, not about what
+//! it now selects. Since ADR 0055 `true` and `false` are genuinely different
+//! reads (linearizable ReadIndex vs. any replica's applied state) — that
+//! contract lives in `dynamo_eventual_read.rs`.
 //!
 //! Mirrors `dynamo_documents.rs`/`dynamo_gsi_drain.rs`'s bring-up and
 //! converged-or-timeout idiom (a GSI is eventually consistent by DynamoDB's
@@ -149,8 +154,8 @@ async fn consistent_read_rejects_gsi_query_but_accepts_lsi_and_base() {
         "expected ValidationException: {body}"
     );
 
-    // `ConsistentRead: true` against the LSI is legal and already true (the
-    // LSI row commits atomically with the base row) — no drain to wait on.
+    // `ConsistentRead: true` against the LSI is legal (the LSI row commits
+    // atomically with the base row) — no drain to wait on.
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.Query",
@@ -163,7 +168,7 @@ async fn consistent_read_rejects_gsi_query_but_accepts_lsi_and_base() {
     assert!(body.contains("\"Count\":1"), "LSI query result: {body}");
 
     // `ConsistentRead: true` against the base table (no `IndexName`) is
-    // likewise legal and already true.
+    // likewise legal.
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.Query",
@@ -178,8 +183,9 @@ async fn consistent_read_rejects_gsi_query_but_accepts_lsi_and_base() {
     );
     assert!(body.contains("\"Count\":1"), "base query result: {body}");
 
-    // `ConsistentRead: true` against a plain `GetItem` is likewise
-    // accept-and-ignore.
+    // `ConsistentRead: true` against a plain `GetItem` is likewise accepted —
+    // and, since ADR 0055, is what makes this read see the `PutItem` above
+    // without a convergence poll.
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.GetItem",

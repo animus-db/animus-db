@@ -104,6 +104,7 @@ async fn reads_and_writes_route_through_the_raft_group() {
         ClientRequest::Get {
             key: b"k".to_vec(),
             table: CP_TABLE.into(),
+            stale: false,
         },
     )
     .await;
@@ -119,6 +120,7 @@ async fn reads_and_writes_route_through_the_raft_group() {
         ClientRequest::Get {
             key: b"absent".to_vec(),
             table: CP_TABLE.into(),
+            stale: false,
         },
     )
     .await;
@@ -154,6 +156,7 @@ async fn reads_and_writes_route_through_the_raft_group() {
         ClientRequest::Get {
             key: b"u".to_vec(),
             table: "kv".to_string(),
+            stale: false,
         },
     )
     .await;
@@ -302,6 +305,7 @@ async fn cp_tablet_splits_and_both_halves_serve() {
                 ClientRequest::Get {
                     key: b"k9".to_vec(),
                     table: "kv".to_string(),
+                    stale: false,
                 },
             )
             .await;
@@ -321,6 +325,7 @@ async fn cp_tablet_splits_and_both_halves_serve() {
         ClientRequest::Get {
             key: b"k1".to_vec(),
             table: "kv".to_string(),
+            stale: false,
         },
     )
     .await;
@@ -333,6 +338,7 @@ async fn cp_tablet_splits_and_both_halves_serve() {
         ClientRequest::Get {
             key: b"k7".to_vec(),
             table: "kv".to_string(),
+            stale: false,
         },
     )
     .await;
@@ -514,6 +520,7 @@ async fn tablet_auto_splits_when_it_grows() {
                     ClientRequest::Get {
                         key: k.clone(),
                         table: "kv".to_string(),
+                        stale: false,
                     },
                 )
                 .await;
@@ -632,6 +639,7 @@ async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
                     ClientRequest::Get {
                         key: k.clone(),
                         table: "kv".to_string(),
+                        stale: false,
                     },
                 )
                 .await;
@@ -812,6 +820,7 @@ async fn already_split_tablet_splits_again_once_it_regrows() {
                     ClientRequest::Get {
                         key: k.clone(),
                         table: "kv".to_string(),
+                        stale: false,
                     },
                 )
                 .await;
