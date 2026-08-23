@@ -26,6 +26,7 @@ pub mod condition;
 pub mod index;
 pub mod registry;
 pub mod schema;
+pub mod sigv4;
 pub mod streams_wire;
 pub mod ttl;
 pub mod wire;
