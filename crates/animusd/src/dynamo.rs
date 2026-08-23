@@ -1890,7 +1890,7 @@ async fn run_transact(
             _ => None,
         };
         if let Some(cond) = condition
-            && !cond.evaluate(decoded.as_ref())
+            && !cond.evaluate(decoded.as_ref())?
         {
             return Err(WireError::transaction_canceled(
                 "a transaction condition check failed",
@@ -2500,7 +2500,7 @@ async fn run_base_query(
         // runs *after* `limit` truncation, so a filtered-out item still counted
         // toward `ScannedCount` and still consumed its slot — DynamoDB's
         // contract, and exactly what `run_base_scan` does.
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+        if filter.map_or(Ok(true), |f| f.evaluate(Some(item)))? {
             items.push(wire::project(projection, item));
         }
     }
@@ -2763,7 +2763,7 @@ async fn run_gsi_query(
         // runs *after* `limit` truncation, so a filtered-out item still counted
         // toward `ScannedCount` and still consumed its slot — DynamoDB's
         // contract, and exactly what `run_base_scan` does.
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+        if filter.map_or(Ok(true), |f| f.evaluate(Some(item)))? {
             items.push(wire::project(projection, item));
         }
     }
@@ -2878,7 +2878,7 @@ async fn run_lsi_query(
         // runs *after* `limit` truncation, so a filtered-out item still counted
         // toward `ScannedCount` and still consumed its slot — DynamoDB's
         // contract, and exactly what `run_base_scan` does.
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+        if filter.map_or(Ok(true), |f| f.evaluate(Some(item)))? {
             items.push(wire::project(projection, item));
         }
     }
@@ -3026,7 +3026,7 @@ async fn run_base_scan(
     let mut items = Vec::new();
     for (_key, item) in &examined {
         // The filter sees the whole item; projection then trims the result.
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+        if filter.map_or(Ok(true), |f| f.evaluate(Some(item)))? {
             items.push(wire::project(projection, item));
         }
     }
@@ -3190,7 +3190,7 @@ async fn run_gsi_scan(
     };
     let mut items = Vec::new();
     for (_key, item) in &examined {
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+        if filter.map_or(Ok(true), |f| f.evaluate(Some(item)))? {
             items.push(wire::project(projection, item));
         }
     }
@@ -3275,7 +3275,7 @@ async fn run_lsi_scan(
     };
     let mut items = Vec::new();
     for (_key, item) in &examined {
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+        if filter.map_or(Ok(true), |f| f.evaluate(Some(item)))? {
             items.push(wire::project(projection, item));
         }
     }
@@ -3805,7 +3805,7 @@ pub(crate) async fn kind_write_item_at_leader(
             None => None,
         };
         if let Some(cond) = condition
-            && !cond.evaluate(old.as_ref())
+            && !cond.evaluate(old.as_ref())?
         {
             return Ok(KindWriteOutcome::ConditionFailed);
         }
@@ -4034,7 +4034,7 @@ pub(crate) async fn eval_kind_txn_write(
         None => None,
     };
     if let Some(cond) = condition
-        && !cond.evaluate(old.as_ref())
+        && !cond.evaluate(old.as_ref())?
     {
         return Ok(None);
     }

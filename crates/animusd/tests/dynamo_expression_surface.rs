@@ -242,6 +242,59 @@ async fn the_function_and_range_forms_serve() {
     }
 }
 
+/// `size()` on an attribute that **exists** with a type it has no size for
+/// (`N`/`BOOL`/`NULL`) is a real DynamoDB `ValidationException`, not a false
+/// filter match — the fidelity gap flagged in review of the commit that
+/// introduced `size()` (fe0ce0c). Covers both evaluation paths the wire
+/// shares: a `Scan`/`Query` `FilterExpression` and a `PutItem`
+/// `ConditionExpression`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn size_of_an_existing_number_attribute_is_a_validation_exception() {
+    let (_dir, nodes, addrs) = setup().await;
+
+    // `seq` is an `N` on every seeded item — `size()` has no meaning for it.
+    let (status, body) = dynamo_retry(
+        addrs[0],
+        "DynamoDB_20120810.Scan",
+        r#"{"TableName":"events","FilterExpression":"size(seq) > :zero",
+            "ExpressionAttributeValues":{":zero":{"N":"0"}}}"#,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "size() on an existing N attribute must be rejected, not just false: {body}"
+    );
+    assert!(body.contains("ValidationException"), "{body}");
+    assert!(
+        body.contains("operator or function: size, operand type: N"),
+        "message should match AWS's own wording: {body}"
+    );
+
+    // The same evaluator backs a conditional write.
+    let (status, body) = dynamo(
+        addrs[1],
+        "DynamoDB_20120810.PutItem",
+        r#"{"TableName":"events","Item":{"pk":{"S":"p1"},"sk":{"S":"a0"},"seq":{"N":"0"}},
+            "ConditionExpression":"size(seq) > :zero",
+            "ExpressionAttributeValues":{":zero":{"N":"0"}}}"#,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "the same size()-on-N error must reach a conditional write too: {body}"
+    );
+    assert!(body.contains("ValidationException"), "{body}");
+    assert!(
+        !body.contains("ConditionalCheckFailed"),
+        "an operand-type violation is a ValidationException, not a failed \
+         condition check: {body}"
+    );
+
+    for n in nodes {
+        n.shutdown_graceful().await;
+    }
+}
+
 /// The same surface reaches a **conditional write**, which shares the decoder.
 /// A comparison that could never hold before must now gate correctly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
