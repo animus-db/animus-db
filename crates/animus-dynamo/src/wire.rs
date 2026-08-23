@@ -60,7 +60,7 @@ use serde_json::{Map, Value};
 use crate::capacity::{
     ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity, ReturnItemCollectionMetrics,
 };
-use crate::condition::{Comparator, ConditionExpression, SortKeyCondition};
+use crate::condition::{Comparator, ConditionError, ConditionExpression, SortKeyCondition};
 use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, SecondaryIndex};
 use crate::{AttributeValue, Item, TableSchema};
 
@@ -827,6 +827,18 @@ impl std::fmt::Display for WireError {
 }
 
 impl std::error::Error for WireError {}
+
+impl From<ConditionError> for WireError {
+    /// A `size()`/`begins_with()`/`contains()` applied to an existing
+    /// attribute of a type outside that function's operand domain — the
+    /// same `ValidationException` shape real DynamoDB returns, so a `?` on
+    /// `ConditionExpression::evaluate` anywhere along a condition or filter
+    /// path (conditional writes, `Query`/`Scan` filters, `TransactWriteItems`
+    /// `ConditionCheck`) turns it into the right wire error automatically.
+    fn from(err: ConditionError) -> Self {
+        WireError::validation(err.message)
+    }
+}
 
 #[derive(Serialize)]
 struct ErrorBody {

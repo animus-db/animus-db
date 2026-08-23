@@ -1890,7 +1890,7 @@ async fn run_transact(
             _ => None,
         };
         if let Some(cond) = condition
-            && !cond.evaluate(decoded.as_ref())
+            && !cond.evaluate(decoded.as_ref())?
         {
             return Err(WireError::transaction_canceled(
                 "a transaction condition check failed",
@@ -2500,7 +2500,7 @@ async fn run_base_query(
         // runs *after* `limit` truncation, so a filtered-out item still counted
         // toward `ScannedCount` and still consumed its slot — DynamoDB's
         // contract, and exactly what `run_base_scan` does.
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+        if filter.map_or(Ok(true), |f| f.evaluate(Some(item)))? {
             items.push(wire::project(projection, item));
         }
     }
@@ -2763,7 +2763,7 @@ async fn run_gsi_query(
         // runs *after* `limit` truncation, so a filtered-out item still counted
         // toward `ScannedCount` and still consumed its slot — DynamoDB's
         // contract, and exactly what `run_base_scan` does.
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+        if filter.map_or(Ok(true), |f| f.evaluate(Some(item)))? {
             items.push(wire::project(projection, item));
         }
     }
@@ -2878,7 +2878,7 @@ async fn run_lsi_query(
         // runs *after* `limit` truncation, so a filtered-out item still counted
         // toward `ScannedCount` and still consumed its slot — DynamoDB's
         // contract, and exactly what `run_base_scan` does.
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+        if filter.map_or(Ok(true), |f| f.evaluate(Some(item)))? {
             items.push(wire::project(projection, item));
         }
     }
@@ -3026,7 +3026,7 @@ async fn run_base_scan(
     let mut items = Vec::new();
     for (_key, item) in &examined {
         // The filter sees the whole item; projection then trims the result.
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+        if filter.map_or(Ok(true), |f| f.evaluate(Some(item)))? {
             items.push(wire::project(projection, item));
         }
     }
@@ -3190,7 +3190,7 @@ async fn run_gsi_scan(
     };
     let mut items = Vec::new();
     for (_key, item) in &examined {
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+        if filter.map_or(Ok(true), |f| f.evaluate(Some(item)))? {
             items.push(wire::project(projection, item));
         }
     }
@@ -3275,7 +3275,7 @@ async fn run_lsi_scan(
     };
     let mut items = Vec::new();
     for (_key, item) in &examined {
-        if filter.is_none_or(|f| f.evaluate(Some(item))) {
+        if filter.map_or(Ok(true), |f| f.evaluate(Some(item)))? {
             items.push(wire::project(projection, item));
         }
     }
@@ -3805,7 +3805,7 @@ pub(crate) async fn kind_write_item_at_leader(
             None => None,
         };
         if let Some(cond) = condition
-            && !cond.evaluate(old.as_ref())
+            && !cond.evaluate(old.as_ref())?
         {
             return Ok(KindWriteOutcome::ConditionFailed);
         }
@@ -4034,7 +4034,7 @@ pub(crate) async fn eval_kind_txn_write(
         None => None,
     };
     if let Some(cond) = condition
-        && !cond.evaluate(old.as_ref())
+        && !cond.evaluate(old.as_ref())?
     {
         return Ok(None);
     }
@@ -4803,6 +4803,112 @@ pub(crate) fn internal(message: &str) -> WireError {
     WireError {
         code: "InternalServerError",
         message: message.to_owned(),
+    }
+}
+
+/// Marker carrying a [`WireError`]'s own `code` across the forwarded
+/// `KindWriteItem` hop, where the reply's error channel is a plain string
+/// (`ClientResponse::Error`) — the same plain-string-marker convention
+/// `topology::format_not_leader_refusal` uses, chosen for the same reason:
+/// no new wire variant, and old/new binaries interoperate (an unmarked
+/// string decodes exactly as before). Without this, a typed evaluation
+/// error minted at the tablet leader (e.g. `size()` on an `N` attribute —
+/// a real `ValidationException`) flattened into the generic 500
+/// `InternalServerError` whenever the leader happened to be remote, while
+/// the identical request against the leader's own node returned the
+/// correct 400 — a placement-dependent status code.
+const RELAYED_WIRE_ERROR_MARK: &str = "wire-error:";
+
+/// Encode `err` for `ClientResponse::Error` so
+/// [`decode_relayed_error`] can recover the code on the far side. A plain
+/// `InternalServerError` stays an unmarked bare message — that is exactly
+/// what the pre-marker wire shape was, so every other consumer of the
+/// error string (the not-leader-refusal chase, `read_should_retry`'s
+/// suffix matching) sees what it always saw.
+pub(crate) fn encode_relayed_error(err: &WireError) -> String {
+    if err.code == "InternalServerError" {
+        err.message.clone()
+    } else {
+        format!("{RELAYED_WIRE_ERROR_MARK}{}:{}", err.code, err.message)
+    }
+}
+
+/// Recover a [`WireError`] from a `ClientResponse::Error` string —
+/// [`encode_relayed_error`]'s inverse. An unmarked string (every error
+/// producer other than the forwarded `KindWriteItem` serve arm, and every
+/// marked error whose code isn't one this build knows) falls back to
+/// [`internal`], the pre-marker behavior. `code` is `&'static str`, so
+/// decoding maps through the closed set of codes this crate can actually
+/// mint rather than round-tripping arbitrary text.
+pub(crate) fn decode_relayed_error(raw: &str) -> WireError {
+    if let Some(rest) = raw.strip_prefix(RELAYED_WIRE_ERROR_MARK)
+        && let Some((code, message)) = rest.split_once(':')
+    {
+        let known: Option<&'static str> = match code {
+            "ValidationException" => Some("ValidationException"),
+            "ConditionalCheckFailedException" => Some("ConditionalCheckFailedException"),
+            "ResourceNotFoundException" => Some("ResourceNotFoundException"),
+            "ResourceInUseException" => Some("ResourceInUseException"),
+            "TransactionCanceledException" => Some("TransactionCanceledException"),
+            "SerializationException" => Some("SerializationException"),
+            "UnknownOperationException" => Some("UnknownOperationException"),
+            _ => None,
+        };
+        if let Some(code) = known {
+            return WireError {
+                code,
+                message: message.to_owned(),
+            };
+        }
+    }
+    internal(raw)
+}
+
+#[cfg(test)]
+mod relayed_error_tests {
+    use super::{decode_relayed_error, encode_relayed_error, internal};
+    use animus_dynamo::wire::WireError;
+
+    /// The round trip this marker exists for: a typed error minted at a
+    /// remote leader must come back out with its own code, not as a 500.
+    #[test]
+    fn a_typed_error_round_trips_with_its_code() {
+        let err = WireError {
+            code: "ValidationException",
+            message: "Incorrect operand type for operator or function; \
+                      operator or function: size, operand type: N"
+                .into(),
+        };
+        let decoded = decode_relayed_error(&encode_relayed_error(&err));
+        assert_eq!(decoded.code, err.code);
+        assert_eq!(decoded.message, err.message);
+    }
+
+    /// An `InternalServerError` stays an unmarked bare message — the
+    /// pre-marker wire shape, so suffix-matching consumers of the string
+    /// (`read_should_retry`, the not-leader chase) are untouched.
+    #[test]
+    fn an_internal_error_stays_a_bare_message() {
+        let err = internal("kind write outside this group's live range; retry");
+        let encoded = encode_relayed_error(&err);
+        assert_eq!(encoded, err.message);
+        let decoded = decode_relayed_error(&encoded);
+        assert_eq!(decoded.code, "InternalServerError");
+        assert_eq!(decoded.message, err.message);
+    }
+
+    /// A message from an ordinary (unmarked) producer, or a marked code
+    /// this build doesn't know, degrades to `internal` — never a panic,
+    /// never a wrong code.
+    #[test]
+    fn unmarked_or_unknown_input_degrades_to_internal() {
+        let plain = decode_relayed_error("no CP group leader reachable");
+        assert_eq!(plain.code, "InternalServerError");
+        assert_eq!(plain.message, "no CP group leader reachable");
+
+        let unknown = decode_relayed_error("wire-error:MadeUpException:boom");
+        assert_eq!(unknown.code, "InternalServerError");
+        assert_eq!(unknown.message, "wire-error:MadeUpException:boom");
     }
 }
 
