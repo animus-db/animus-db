@@ -255,3 +255,13 @@ format any client depends on across the change. The body above is kept
 as originally written — it was correct when this ADR shipped — and
 should be read alongside ADR 0052's and ADR 0053's own amendment notes
 for the current layout.
+
+## Amendment (2026-08-23, ADR 0057)
+
+The Consequences bullet above — "No authentication on either port yet …
+a later milestone" — is now half-closed: [ADR 0057](0057-sigv4-client-auth.md)
+adds SigV4 verification against static credentials on the **client
+DynamoDB port** (default-off). The **intra port deliberately stays
+unauthenticated**, exactly per this ADR's stance: it is the more-trusted,
+cluster-internal segment, kept off any externally-reachable Service by
+the operator topology.
