@@ -3080,9 +3080,9 @@ debugging anything that feels like it might have happened before.
 
   Two generalizable rules came out of it. **First: when a checker is shared
   across corpora, the property is a property of the call site, not of the
-  checker** — the same `check_cycles` is the correct oracle for the Accord
-  and multi-tablet-transaction corpora, which claim serializability, and the
-  wrong one here. **Second: a strengthened check needs a vacuity guard in
+  checker** — the same `check_cycles` is the correct oracle for a corpus
+  that claims serializability (the multi-tablet transaction corpus, ADR
+  0018) and the wrong one here. **Second: a strengthened check needs a vacuity guard in
   the same commit.** Real-time edges only constrain operations that do not
   overlap, so a corpus of entirely concurrent operations would pass the
   strict check for free. Each scenario now asserts `realtime_edges > 0`
