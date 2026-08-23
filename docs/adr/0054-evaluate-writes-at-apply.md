@@ -7,18 +7,19 @@ for its layering.
 ## Context
 
 A DynamoDB write today is evaluated at the tablet's Raft leader **before** the
-log. `kind_write_item_at_leader` (`crates/animusd/src/dynamo.rs:3694`) takes the
+log. `kind_write_item_at_leader` (`crates/animusd/src/dynamo.rs`) takes the
 node's `rmw_lock`, reads the item's committed bytes, evaluates any client
 `ConditionExpression`, computes the new item, derives the LSI row diff and the
-stream `ChangeRecord` (`kind_writes_for_item`, `dynamo.rs:4465`), releases the
+stream `ChangeRecord` (`kind_writes_for_item`, same file), releases the
 lock, and proposes a `KindBatch` carrying the **finished bytes**.
 
 Because the read happened outside the log, the entry cannot simply be applied —
 the state it was computed against may have changed by the time it applies. So
 every such entry also carries an apply-time OCC precondition, the *seatbelt*:
-`vec![(base_key, raw_old)]` (`dynamo.rs:3761`), checked byte-for-byte on every
-replica (`animus-cp-data/src/lib.rs:5363`). If the key no longer holds the bytes
-the leader read, the batch no-ops whole and records
+`vec![(base_key, raw_old)]` (built in `kind_write_item_at_leader`, `dynamo.rs`),
+checked byte-for-byte on every replica (`apply_and_compact`'s `KvCommand::
+KindBatch` arm, `crates/animus-cp-data/src/lib.rs`). If the key no longer holds
+the bytes the leader read, the batch no-ops whole and records
 `KindBatchOutcome::ConditionFailed`.
 
 ### What that costs
@@ -86,7 +87,7 @@ Three mechanisms make that possible.
 
 Apply has **no access to control-plane `Metadata`** — this is not an omitted
 parameter but a deliberately closed boundary: `apply_and_compact`'s signature
-(`animus-cp-data/src/lib.rs:5129`) has no catalog handle, and the only
+(`crates/animus-cp-data/src/lib.rs`) has no catalog handle, and the only
 `Metadata` mentions in the crate are doc prose. Wiring a live catalog read into
 apply would be actively wrong: `Metadata` is replicated by a *separate* Raft
 group, so two replicas applying the same entry against different catalog
@@ -97,8 +98,8 @@ impossible by construction, because only the leader reads the catalog and the
 So the entry carries the schema slice it was accepted under — the table's key
 schema, its index definitions, and whether change records carry images. Those
 are exactly the three lookups `kind_writes_for_item` performs
-(`meta.table_indexes`, `schema_for`, `table_change_records_carry_images`;
-`dynamo.rs:4476`, `:4477`, `:4518`). Apply becomes a pure function of
+(`Metadata::table_indexes`, `schema_for`, `table_change_records_carry_images`,
+all in `crates/animusd/src/dynamo.rs`). Apply becomes a pure function of
 `(entry, engine state)`, deterministic by construction rather than by a
 coincidence of catalog timing.
 
@@ -128,11 +129,13 @@ Every consumer that today reads the leader's return value needs a new path:
 `ReturnValues`, the stream images, `collection_bytes` (ADR 0006's
 `ItemCollectionMetrics`), and `ConditionalCheckFailedException`.
 `ConsumedCapacity` needs nothing new — it is already derived at the edge from
-the returned images (`dynamo.rs:3977`), so it follows for free.
+the returned images (`write_capacity`, `crates/animusd/src/dynamo.rs`), so it
+follows for free.
 
 `KindBatchOutcome` carries no payload today, and its own doc already worries
-about unbounded growth (`animus-cp-data/src/lib.rs:1037`). Attaching full images
-to all 8,192 retained entries on every replica would be wasteful, so:
+about unbounded growth (the `KindBatchOutcomes` doc, `crates/animus-cp-data/src/lib.rs`).
+Attaching full images to all 8,192 retained entries on every replica would be
+wasteful, so:
 
 - the **decision** (`Applied` / `ConditionFailed` / `Sealed`) stays replicated
   and recorded identically on every replica, exactly as now;
@@ -166,9 +169,9 @@ That is the inverse of #285's trade: same-key writes stop serialising, but *all*
 evaluation for a tablet starts to. Engine reads should dominate, and apply
 already reads for the conditions check — but this must be benchmarked, not
 assumed. The existing harness is `bench_plain_table_put_wall_clock`
-(`dynamo.rs:4970`), whose ADR 0049 §5 baseline is 4.69 ms/op; that is the
-before/after gate. Nothing today isolates the apply loop alone, so a narrower
-harness is likely needed.
+(`crates/animusd/src/dynamo.rs`), whose ADR 0049 §5 baseline is 4.69 ms/op;
+that is the before/after gate. Nothing today isolates the apply loop alone, so
+a narrower harness is likely needed.
 
 **Producers.** The ordinary write path, `BatchWriteItem`'s images arm, the TTL
 reaper, the admin seeder, and `txn_stage_local` all evaluate and move together.
