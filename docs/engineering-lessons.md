@@ -14,6 +14,23 @@ one-line pointer when the underlying lesson still generalizes.
 Read the section relevant to your task before starting work; grep it when
 debugging anything that feels like it might have happened before.
 
+> **Note on deleted subsystems (2026-08-23).** Entries throughout this log cite
+> **Accord** (`animus-consensus`, `AccordNode`/`AccordCore`, the
+> `animus-test` Accord corpus in `tests/support/` + `corpus.rs` +
+> `elle_accord.rs`) and the per-table **`ReplicationMode`** seam. All of that
+> was **deleted** by [ADR 0019](adr/0019-cp-only-v1-defer-ap.md)'s 2026-08-23
+> amendment — with CQL dropped (ADR 0053), DynamoDB's wire cannot express a
+> replication mode, so AP became unselectable and Accord's remaining role
+> vacuous. Those citations are kept deliberately and read as **historical**:
+> the lessons they carry are general (checker teeth and workload design,
+> collapsing a total order into one `u64`, composing rather than reshaping a
+> proven core, one `Env`/inbox/WAL per hosted protocol instance) and apply
+> directly to the surviving corpora — the CP raftkv corpus (ADR 0017) and the
+> multi-tablet transaction corpus (ADR 0018). They are **not** moved to the
+> archive, because unlike a superseded *lesson* the lesson here still stands;
+> only its illustration is gone. The code is retrievable from git history if a
+> citation needs chasing.
+
 ### Testing
 - **A regression's own split key can quietly exempt it from the bug it
   claims to cover — check whether the fixture's boundary is realistic, not

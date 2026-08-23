@@ -1,6 +1,17 @@
 # ADR 0014 — Elle consistency testing against Accord + a frozen scenario corpus
 
-- **Status:** Accepted (the register-recovery limitation **closed** 2026-08-02:
+- **Status:** **Superseded by [ADR 0019](0019-cp-only-v1-defer-ap.md)'s
+  2026-08-23 amendment** — Accord and this corpus are **deleted**
+  (`crates/animus-consensus`, `animus-test/tests/{support,corpus.rs,elle_accord.rs}`,
+  and the `ANIMUS_CORPUS_SEEDS`/`ANIMUS_CORPUS_FULL` knobs). The Elle *checkers*
+  this ADR built (`check_cycles`/`check_durability`/`check_convergence`) live on
+  and are still asserted — by the CP raftkv corpus (ADR 0017) and the
+  multi-tablet transaction corpus (ADR 0018) — but the Accord reference system
+  they were originally validated against is gone, and the hand-built
+  `negative_control.rs` teeth-proof (always Accord-independent) now carries that
+  role alone. Retained for the design record; retrievable from git history.
+  Historical status below.
+- **Was:** Accepted (the register-recovery limitation **closed** 2026-08-02:
   reads are now genuinely observed from stored state, see the increment below).
   **Amended for v1 (ADR 0019, noted 2026-08-06):** the **`Frontier` topology and
   `frontier_corpus_converges_and_is_durable` were deleted** with the AP data

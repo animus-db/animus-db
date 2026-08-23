@@ -109,3 +109,67 @@ This ADR builds on ADR 0017/0018 (the CP stack it makes v1's whole data plane),
 ADR 0016 (pluggable replication — the frame that made one-plane-at-a-time viable),
 and amends ADR 0001 (whose AP data-plane decision becomes the deferred long shot;
 its control-plane decision stands).
+
+## Amendment (2026-08-23) — the long shot is closed; Accord and the `ReplicationMode` seam are deleted
+
+This ADR deferred the AP plane and kept a deliberate escape hatch: the
+"long shot" above, backed by two artefacts held in the tree for it — the
+per-table `ReplicationMode` seam ("**retained but forced to `Cp`**  … kept as the
+forward-compatibility hook for AP's eventual return, not removed") and the Accord
+crate (`animus-consensus`), whose surviving purpose this ADR named as AP's
+transaction story.
+
+**Both are now removed, and the long shot is closed.** The reason is not a
+change of appetite for availability — it is that the escape hatch became
+unreachable.
+
+**The argument.** AP is selectable only through `ReplicationMode`, a *per-table*
+schema property. A per-table property has to be expressible by some wire the
+cluster actually serves. When this ADR was written there were two adapters
+(ADR 0006), and CQL was the one that could express it: `WITH` clauses on
+`CREATE TABLE`, and per-query `ONE`/`QUORUM`/`ALL` consistency levels — a natural
+surface for tunable-quorum AP. **ADR 0053 then dropped CQL**, leaving DynamoDB
+as the only wire. DynamoDB's `CreateTable` has no replication-mode field, and
+inventing one would break exactly the wire fidelity ADR 0006 and ADR 0053
+committed to. So `ReplicationMode::Ap` became a forward-compatibility hook
+forward-compatible with nothing: no client of any shipping wire can select it,
+and the code path behind it (`animus-data`) was already deleted by this ADR's own
+updated disposition.
+
+Note the asymmetry this closes. The single consistency choice DynamoDB *does* let
+a client make is `ConsistentRead` on an individual read — a strong read versus a
+cheap eventually-consistent one. That is a read-path option over a
+strongly-consistent store, not a replication mode, and it is served by the CP
+plane (see ADR 0055). It is not a residual use for AP, and it was never one:
+an AP plane answers a *write*-availability question that DynamoDB's protocol
+gives a client no way to ask.
+
+**Deleted, therefore:**
+
+- `crates/animus-consensus` — the whole Accord implementation, its test suite,
+  and its crate guide. ADR 0018 had already rejected Accord as the CP transaction
+  mechanism (2PC-over-Raft was chosen instead), and this ADR deferred
+  Accord-over-AP with AP, so its only remaining role was as the
+  known-serializable reference system the Elle checkers were proven against
+  (ADR 0014).
+- The Accord Elle corpus in `animus-test` — `tests/support/` (the shared Accord
+  harness), `tests/corpus.rs`, `tests/elle_accord.rs` — and with it the
+  `ANIMUS_CORPUS_SEEDS` / `ANIMUS_CORPUS_FULL` knobs and their nightly CI tier.
+- `ReplicationMode` itself, `TableSchema::mode`, and every call site.
+
+**What this costs, stated plainly.** ADR 0014 built the Elle checkers *against*
+Accord as a known-serializable system; deleting it means `check_cycles` keeps
+working but loses the reference implementation it was originally validated
+against. The surviving corpora that assert it — the multi-tablet transaction
+corpus (ADR 0018) above all — carry that weight now, backed by the hand-built
+negative controls in `animus-test/tests/negative_control.rs`, which are
+independent of Accord and always were. That is a real reduction in the evidence
+base, accepted in exchange for a materially smaller tree.
+
+**Revival, if AP ever returns.** Unchanged in kind but now larger in degree: the
+plane (`animus-data`), Accord, and the `ReplicationMode` seam all come back from
+git history, and ADRs 0001, 0011, 0014 and 0016 remain on record as the design.
+The new precondition is the one that closed the hatch — **a wire adapter that can
+express a replication mode.** Reviving AP under a DynamoDB-only surface would
+mean either a second adapter or a deliberate, documented departure from
+DynamoDB's `CreateTable` contract; neither is a decision to make in advance.

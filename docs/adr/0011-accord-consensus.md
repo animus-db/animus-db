@@ -1,6 +1,14 @@
 # ADR 0011 — Accord-style leaderless transaction consensus
 
-- **Status:** Accepted (first minimal slice; extended with execution + durability;
+- **Status:** **Superseded by [ADR 0019](0019-cp-only-v1-defer-ap.md)'s
+  2026-08-23 amendment** — `crates/animus-consensus` is **deleted**. ADR 0018
+  had already rejected Accord as the CP transaction mechanism (2PC-over-Raft was
+  chosen instead) and ADR 0019 deferred Accord-over-AP with the AP plane, so its
+  only remaining role was as a testbed; with the `ReplicationMode` seam removed
+  and DynamoDB the only wire, AP is unselectable and that role is vacuous.
+  Retained for the design record; retrievable from git history. Historical
+  status below.
+- **Was:** Accepted (first minimal slice; extended with execution + durability;
   then storage-backed execution + coordinator failover; then read transactions +
   multi-thread liveness regression; then message retry + the data-plane frontier;
   then data-plane reads + an interactive transaction API; then sharded
