@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use animus_control::{IndexDef, IndexKind, IndexProjection, IndexStatus};
 use animus_dynamo::AttributeValue;
+use animus_dynamo::wire::BATCH_WRITE_MAX_ITEMS;
 use animusd::{ClientRequest, ClientResponse, MetaCommand, Node, read_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -727,15 +728,16 @@ async fn split_during_backfill_converges_with_correct_final_gsi() {
     let split_key = candidates[mid].1.clone();
     let ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
 
-    // Populated via `BatchWriteItem` in chunks (one Raft entry per chunk),
-    // not 300 individual `PutItem` round trips: this table is still
+    // Populated via `BatchWriteItem` in BATCH_WRITE_MAX_ITEMS-sized chunks
+    // (one Raft entry per chunk, capped at AWS's own 25-item-per-call
+    // limit), not 300 individual `PutItem` round trips: this table is still
     // unindexed at population time, so it rides the fast `cp_batch_write`
     // path (`animusd`'s own CLAUDE.md) — far gentler on WAL fsync
     // throughput than 300 independent commits, which was found to starve
     // this environment's disk I/O under concurrent load (three replicas'
     // WAL group-commits) and produce spurious `Backend(..)` panics
     // unrelated to backfill/split logic.
-    for chunk in ids.chunks(100) {
+    for chunk in ids.chunks(BATCH_WRITE_MAX_ITEMS) {
         let puts: Vec<String> = chunk
             .iter()
             .map(|id| {
