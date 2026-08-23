@@ -664,8 +664,10 @@ async fn admin_seed_writes_synthetic_keys() {
             "POST",
             "/admin/data/dynamo",
             Some(
+                // `ConsistentRead: true` (ADR 0055), like the composite-table
+                // read below: this reads back the seeder's own writes.
                 r#"{"op":"GetItem","payload":{"TableName":"seedt",
-                    "Key":{"id":{"S":"seed:000000000007"}}}}"#,
+                    "Key":{"id":{"S":"seed:000000000007"}},"ConsistentRead":true}}"#,
             ),
         )
         .await;
