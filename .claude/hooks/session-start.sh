@@ -1,15 +1,43 @@
 #!/bin/bash
-# SessionStart hook: make `gh stack` available to Claude Code on the web.
+# SessionStart hook, two jobs:
 #
-# This repo ships larger work as a stacked PR series (see CLAUDE.md's
-# Conventions). The tooling for that is github/gh-stack, a `gh` CLI extension,
-# plus its agent skill — neither of which is present in a fresh web container.
-# Without them an agent hand-rolls the stack, which strands the top PR when the
-# base merges first (issue #279; see docs/engineering-lessons.md).
+#   1. Inject the repo's session operating mode (CLAUDE.md "Session operating
+#      mode") into the agent's context. stdout of a SessionStart hook is added
+#      to the conversation, which makes the posture a live boot-time
+#      instruction instead of a mid-file bullet sessions read past — the
+#      maintainer was having to re-issue it by hand every session (see
+#      docs/engineering-lessons.md, Parallel-agent orchestration).
+#   2. Make `gh stack` available to Claude Code on the web. This repo ships
+#      larger work as a stacked PR series (see CLAUDE.md's Conventions). The
+#      tooling for that is github/gh-stack, a `gh` CLI extension, plus its
+#      agent skill — neither of which is present in a fresh web container.
+#      Without them an agent hand-rolls the stack, which strands the top PR
+#      when the base merges first (issue #279; see
+#      docs/engineering-lessons.md).
 #
 # Idempotent and non-interactive: safe to re-run, installs only what is missing.
 set -euo pipefail
 
+# --- 1. Operating-mode injection (every session, local and web) -------------
+# Keep this a faithful summary of CLAUDE.md "Session operating mode"; that
+# section is the source of truth.
+cat <<'EOF'
+ANIMUS-DB SESSION OPERATING MODE (maintainer standing instruction — binding;
+full text in CLAUDE.md "Session operating mode"):
+1. Main thread orchestrates only. Delegate anything token-heavy — code
+   exploration, multi-file implementation, gate runs — to Sonnet subagents
+   (one investigation agent per issue, one implementation agent per change).
+   Inline main-thread work is for trivial tasks only: a one-liner, a doc
+   tweak, a targeted read/grep.
+2. Run subagents in the BACKGROUND. The main thread stays responsive to the
+   maintainer throughout — brief progress notes while agents work, never a
+   silent session blocked on a foreground agent.
+3. Deliver work as a gh-stack PR series whenever it has more than one
+   reviewable logical step; a single flat PR is the exception and its
+   description says why.
+EOF
+
+# --- 2. Tooling install (web containers only) -------------------------------
 # Local checkouts already have whatever the developer installed; only the
 # ephemeral web container needs this.
 if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
