@@ -2895,6 +2895,188 @@ mod gsi_drain_cursor_tests {
         .expect("split cold-start scenario did not converge in time");
     }
 
+    /// **Issue #355 reproduction harness.** The test just above splits at
+    /// `BOUNDARY`, a bare `TOKEN_BYTES`-long numeric value — which is
+    /// itself already token-aligned, so it never exercises the shape
+    /// [`advance_backfill_cursor`]'s own doc comment (and the `"gsi"`
+    /// cursor write's comment in [`drain_tablet`]) describes: a real
+    /// split's `split_key` is chosen from actual row content
+    /// (`byte_weighted_median`), essentially never token-aligned, so a
+    /// child's own `range.start` is almost always *longer* than
+    /// `TOKEN_BYTES` — exactly the condition under which
+    /// [`cursor::cursor_key`]'s truncation to a bare token can sort the
+    /// resulting key *below* the child's own `range.start` and route it to
+    /// a sibling instead.
+    ///
+    /// This test splits at a **real row's own physical key** (mirroring
+    /// production's `byte_weighted_median`, never a bare token) and then
+    /// polls the right child's own GSI cursor watermark and change-log
+    /// length over many drain ticks, logging both every tick to stderr, and
+    /// finally reads the raw `KIND_CURSOR` row for the right child's own
+    /// token directly off *both* siblings' engines via
+    /// `CpGroup::local_get_kind` — a bound-free physical read, never
+    /// inferred from the key-construction code. Legible either way: if the
+    /// watermark advances and the row is found on the right child's own
+    /// engine, the claim is disproven; if the watermark never advances and
+    /// the row is instead found on the LEFT sibling's engine, it is
+    /// confirmed.
+    ///
+    /// **CONFIRMED (2026-08-22/23)** — run twice, identical both times: the
+    /// right child's own watermark stayed `None` and `pending_changes`
+    /// stayed pinned at 8 across 20 drain ticks (~8s, forty times the
+    /// 200ms drain interval); the cursor row for the right child's own
+    /// token was absent on the right engine and present on the LEFT
+    /// sibling's engine. GSI *correctness* was unaffected (every item still
+    /// indexed) — only the cursor/trim bookkeeping is broken, matching
+    /// `drain_tablet`'s own comment that a watermark stuck at `None` means
+    /// "reconcile everything, always correct, just not incremental." `
+    /// #[ignore]`d so CI stays green until the real fix (a child-scope-
+    /// readable cursor key, per `drain_tablet`'s own comment) lands — run
+    /// explicitly with `cargo test -p animusd --lib
+    /// split_right_childs_gsi_cursor_after_a_non_token_aligned_split_issue_355
+    /// -- --ignored --exact --nocapture` to see the per-tick trend again.
+    #[ignore = "issue #355: right child's GSI cursor never advances after a non-token-aligned \
+                split — expected to fail until the cursor key is made child-scope-readable"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn split_right_childs_gsi_cursor_after_a_non_token_aligned_split_issue_355() {
+        timeout(Duration::from_secs(90), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node(dir.path()).await;
+            let dynamo_addr = node.dynamo_addr();
+            let client_addr = node.client_addr();
+            let table = "orders";
+            create_table_with_gsi(dynamo_addr, table).await;
+
+            let left_id = find_id_on_side(&BOUNDARY, true, "l");
+            put_item(dynamo_addr, table, &left_id).await;
+            await_indexed(dynamo_addr, table, &left_id).await;
+
+            // A real split key: an actual row's own physical key, not a
+            // bare token — the shape `byte_weighted_median` produces in
+            // production, and the exact shape the bug's own doc comment
+            // describes. Pick the smallest (by raw key bytes) among several
+            // right-side candidates, so every other candidate's key sorts
+            // at or above it by construction and therefore still lands in
+            // the right child after the split.
+            let right_ids: Vec<String> = (0..8)
+                .map(|i| find_id_on_side(&BOUNDARY, false, &format!("r{i}")))
+                .collect();
+            let mut right_keys: Vec<(String, Vec<u8>)> = right_ids
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        crate::dynamo::item_key(&AttributeValue::S(id.clone()), None),
+                    )
+                })
+                .collect();
+            right_keys.sort_by(|a, b| a.1.cmp(&b.1));
+            let split_key = right_keys[0].1.clone();
+            assert!(
+                split_key.len() > TOKEN_BYTES,
+                "a real row key must be longer than a bare token to reproduce the bug's own \
+                 preconditions — got {} bytes",
+                split_key.len()
+            );
+
+            let parent = only_tablet(&node, table);
+            split(client_addr, parent, split_key.clone()).await;
+            await_true(20, "split produced two tablets", || {
+                tablets_of(&node, table).len() == 2
+            })
+            .await;
+
+            let (left, right) = {
+                let m = node.metadata();
+                let ts = tablets_of(&node, table);
+                let right = ts
+                    .iter()
+                    .copied()
+                    .find(|t| m.tablets[t].range.start == split_key)
+                    .expect("one child's range must start exactly at the split key");
+                let left = ts
+                    .iter()
+                    .copied()
+                    .find(|t| *t != right)
+                    .expect("the sibling tablet");
+                (left, right)
+            };
+
+            for (id, _) in &right_keys {
+                put_item(dynamo_addr, table, id).await;
+            }
+            for (id, _) in &right_keys {
+                await_indexed(dynamo_addr, table, id).await;
+            }
+            // Correctness on the left side must be unaffected either way —
+            // the claim under test is about the right child's own cursor
+            // bookkeeping, not about missing/corrupted GSI rows (which the
+            // module's own doc says stays correct, just non-incremental,
+            // even under the bug).
+            await_indexed(dynamo_addr, table, &left_id).await;
+
+            let right_group = await_hosted(&node, right, "right child hosted").await;
+            let left_group = await_hosted(&node, left, "left sibling hosted").await;
+
+            // The right child's own cursor-row key for the "gsi" tag,
+            // computed exactly the way `drain_tablet` computes it.
+            let cursor_key_bytes = cursor::cursor_key(&right_group.scope_range().start, GSI_TAG);
+
+            // Poll many drain ticks (each `INDEX_DRAIN_INTERVAL` = 200ms),
+            // logging the right child's own watermark and change-log length
+            // every tick so the trend is visible regardless of outcome.
+            let mut watermark_ever_advanced = false;
+            let mut pending_history = Vec::new();
+            for tick in 0..20 {
+                tokio::time::sleep(INDEX_DRAIN_INTERVAL * 2).await;
+                let watermark = right_group.cursor_min_watermark(GSI_TAG).await;
+                let pending = right_group.pending_changes().await.len();
+                if watermark.is_some() {
+                    watermark_ever_advanced = true;
+                }
+                pending_history.push(pending);
+                eprintln!(
+                    "[issue-355 tick {tick:02}] right child watermark={watermark:?} \
+                     pending_changes={pending}"
+                );
+            }
+
+            // Read the physical KIND_CURSOR row for the right child's own
+            // token directly off each sibling's own engine — never inferred
+            // from the key-construction code, per the task's own ask.
+            let row_on_right = right_group
+                .local_get_kind(KIND_CURSOR, &cursor_key_bytes)
+                .await;
+            let row_on_left = left_group
+                .local_get_kind(KIND_CURSOR, &cursor_key_bytes)
+                .await;
+            eprintln!(
+                "[issue-355] right child's own gsi cursor row present on RIGHT engine: {}",
+                row_on_right.is_some()
+            );
+            eprintln!(
+                "[issue-355] right child's own gsi cursor row present on LEFT engine: {}",
+                row_on_left.is_some()
+            );
+            eprintln!("[issue-355] pending_changes trend: {pending_history:?}");
+
+            assert!(
+                watermark_ever_advanced,
+                "issue #355: right child's own GSI cursor watermark never advanced across \
+                 20 drain ticks (~8s) after a non-token-aligned split; pending_changes \
+                 trend={pending_history:?}; cursor row present on RIGHT engine={}, on LEFT \
+                 engine={}",
+                row_on_right.is_some(),
+                row_on_left.is_some(),
+            );
+            await_pending_changes(&node, right, 0, "right child's own change log drains").await;
+        })
+        .await
+        .expect(
+            "issue #355 reproduction did not converge in time (see stderr for the per-tick trend)",
+        );
+    }
+
     /// An expected consumer ("gsi", since this table has a GSI) with no
     /// cursor row at all must block trim **entirely** — the ADR 0042 §7 safe
     /// default. `index_drain_loop`'s own first statement is an
