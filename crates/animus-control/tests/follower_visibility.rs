@@ -47,7 +47,7 @@ fn upsert(node: u64) -> MetaCommand {
 /// check is a real `Metadata::apply`, not just an index comparison.
 fn drained_contains_member(core: &mut RaftCore, node: u64) -> bool {
     let mut oracle = Metadata::default();
-    for (_, command) in core.drain_apply() {
+    for (_, _, command) in core.drain_apply() {
         let _ = mirror::apply_and_derive_mirror(&mut oracle, &command);
     }
     oracle.members.contains_key(&nid(node))

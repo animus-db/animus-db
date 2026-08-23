@@ -33,7 +33,7 @@ fn persist(core: &mut RaftCore, wal: &mut Vec<WalRecord>) {
 /// same derivation `mirror.rs` gives the production apply task) onto `oracle` —
 /// the hand-driven stand-in for `node.rs`'s `meta_apply_and_compact`.
 fn drain_and_apply(core: &mut RaftCore, oracle: &mut Metadata) {
-    for (_, command) in core.drain_apply() {
+    for (_, _, command) in core.drain_apply() {
         let _ = mirror::apply_and_derive_mirror(oracle, &command);
     }
 }

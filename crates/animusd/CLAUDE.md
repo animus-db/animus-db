@@ -22,9 +22,15 @@ can't reach — e.g. `auto_split_median_tests` and `confirm_futility_tests`
 (issue #268 — the confirm-loop fast-fail regression, needing a raw
 `CpGroup` + the `pub(crate)` `ClientCtx::cp_kind_local`; `split_fence_tests`
 and `hot_read_latch_tests` were deleted with their fence/latch subjects in
-the ADR 0050 Train B rung-7 sweep). `index_drain.rs` has another,
-`gsi_drain_cursor_tests`, and `dynamo.rs` another, `stream_write_path_tests`
-(ADR 0042), for the same reason (see each file's own entry below).
+the ADR 0050 Train B rung-7 sweep). `kind_batch_signal_tests` is the newest
+of these, but for a different reason than the others — it needs no bring-up
+at all, only the private `classify_kind_batch_outcome`/`KindBatchSignal`
+symbols (the pure predicate `poll_probe` calls; see that method's doc and
+`docs/engineering-lessons.md`'s PR #334 entry for why an index-keyed
+apply-time outcome needed a term check added). `index_drain.rs` has
+another, `gsi_drain_cursor_tests`, and `dynamo.rs` another,
+`stream_write_path_tests` (ADR 0042), for the same reason (see each file's
+own entry below).
 
 **Every in-crate bring-up retries the port-TOCTOU race (issue #278 item
 3).** Since these mods can't reach `tests/support`, each hand-rolls its own
@@ -574,6 +580,30 @@ plain client protocol's `Put`/`PutBatch`/`Delete` arms commit through
 `dynamo::marker_batch_write_raw` (one `KindBatch` per tablet, one image-less
 marker per mutation, full-raw-key-as-prefix; `Put`/`PutBatch` auto-provision
 like the old `cp_put` did, `Delete` deliberately never does).
+
+**`poll_probe` is the shared durable-before-ack confirm wait behind
+`cp_kind_local`/`cp_batch_local`** — it prefers `animus-cp-data`'s
+per-`KindBatch` apply-time outcome (`RaftKvNode::kind_batch_outcome`) over a
+raw value re-read, since value equality alone can't distinguish "my entry
+no-op'd" from "my entry applied and a concurrent write then overwrote it"
+(the second is a success). **A recorded `Applied` outcome is trusted as a
+confirm only when its own term matches the term `ProposeResult::Accepted`
+handed the proposer** (`classify_kind_batch_outcome`, a small pure predicate
+factored
+out specifically so this identity check is unit-testable in isolation —
+`kind_batch_signal_tests`, above) — `ProposeResult::Accepted{index}` means
+"appended to my own log," never "committed," so an *accepted but not yet
+committed* entry's index can be reoccupied by a completely different
+command if this node loses leadership first (Raft log-matching), and that
+reoccupying entry's own `Applied` outcome would otherwise be read as a
+confirm of the *original* proposer's write — the false-ack found in review
+of PR #334, closed by pairing the outcome with the entry's own Raft term
+(index **and** term together identify one entry, cluster-wide).
+`ConditionFailed`/`Sealed` need no such check (a no-op is a no-op
+regardless of whose entry occupies the index). See
+`docs/engineering-lessons.md` for the full incident and
+`animus-cp-data/tests/kind_batch_outcome_identity.rs` for the seed-
+reproducible truncation regression that proves it end to end.
 
 **`cp_scan_kind` (ADR 0041)** is `cp_scan`'s single-tablet, kind-scoped
 sibling — the LSI `Query` read primitive: unlike `cp_scan`'s per-table

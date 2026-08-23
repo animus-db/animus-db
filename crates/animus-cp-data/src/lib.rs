@@ -1015,6 +1015,20 @@ struct CasResults {
 /// Every replica records the identical outcome — the decision is deterministic
 /// in commit order against the same committed engine state — exactly as
 /// [`CasResults`] and [`StageOutcomes`] already are.
+///
+/// **`Applied` says "this Raft index applied," never "my content landed"
+/// (ADR 0018 §2's `TxnStage`/`StageOutcome` doctrine, and the incident that
+/// made `KindBatchOutcome` follow it too).** An entry this proposer appended
+/// but never committed (a leadership change truncated it) can have its log
+/// position reoccupied by a *different* command, which then applies and
+/// records `Applied` at the identical index — index alone cannot tell that
+/// apart from the proposer's own entry having applied. [`KindBatchOutcomes`]
+/// additionally keys every record on the entry's own Raft **term**
+/// (mirroring [`ProposeResult::Accepted`]'s `term`), so a caller can check
+/// index **and** term together — Raft's log-matching property makes that
+/// pair a sound proof of entry identity — before ever trusting `Applied` as a
+/// confirm. See [`RaftKvNode::kind_batch_outcome`]'s doc for the accessor
+/// that exposes the recorded term.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KindBatchOutcome {
     /// The batch's writes materialized.
@@ -1023,26 +1037,31 @@ pub enum KindBatchOutcome {
     /// expected absence) — the whole batch no-op'd. `key` is the first
     /// condition that failed, in `conditions`' own order. The caller's cue to
     /// re-read and re-evaluate: an ordinary OCC round, **not** an ambiguous
-    /// outcome.
+    /// outcome. (No term check is needed to trust this variant: a no-op
+    /// writes nothing regardless of whose entry occupies the index, so it is
+    /// always a sound "nothing landed here" signal.)
     ConditionFailed { key: Vec<u8> },
     /// The batch carried user data into a **sealed** range (ADR 0050's split
     /// freeze) and was vetoed whole. The caller's cue to re-route to the
-    /// child, not to retry here.
+    /// child, not to retry here. Same term-independent soundness as
+    /// `ConditionFailed`.
     Sealed { key: Vec<u8> },
 }
 
 /// Per-`KindBatch` outcomes recorded at apply time, keyed by the entry's Raft
-/// log index — mirroring [`CasResults`]/[`StageOutcomes`].
+/// log index, each paired with the entry's own **term** — mirroring
+/// [`CasResults`]/[`StageOutcomes`] plus the term identity check
+/// [`KindBatchOutcome`]'s doc explains.
 ///
 /// **Bounded, unlike those two.** A `KindBatch` is proposed for *every*
 /// indexed or streamed write, not just for a CAS or a transaction, so an
 /// unpruned map would grow without limit on a busy table. Entries are only
 /// useful to a proposer polling within `CLIENT_TIMEOUT`, so old ones are
-/// dropped; a proposer that finds no record falls back to the value probe,
-/// which is exactly today's behaviour.
+/// dropped; a proposer that finds no record (or a term mismatch) falls back
+/// to the value probe, which is exactly today's behaviour.
 #[derive(Default)]
 struct KindBatchOutcomes {
-    outcomes: BTreeMap<u64, KindBatchOutcome>,
+    outcomes: BTreeMap<u64, (u64, KindBatchOutcome)>,
 }
 
 impl KindBatchOutcomes {
@@ -1050,8 +1069,8 @@ impl KindBatchOutcomes {
     /// (`CLIENT_TIMEOUT`) while keeping the map small enough to be free.
     const RETAIN: u64 = 8192;
 
-    fn record(&mut self, index: u64, outcome: KindBatchOutcome) {
-        self.outcomes.insert(index, outcome);
+    fn record(&mut self, index: u64, term: u64, outcome: KindBatchOutcome) {
+        self.outcomes.insert(index, (term, outcome));
         // Prune in batches rather than on every insert: `split_off` allocates,
         // and doing it once per 8192 writes is not worth measuring.
         if self.outcomes.len() > (Self::RETAIN as usize) * 2 {
@@ -2363,7 +2382,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             (cmd, (txn_id, record_key))
         });
         let index = match result {
-            ProposeResult::Accepted { index } => index,
+            ProposeResult::Accepted { index, .. } => index,
             ProposeResult::NotLeader { .. } => return None,
         };
         let outcome = self.wait_stage_outcome(index).await?;
@@ -2414,7 +2433,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             (cmd, ts)
         });
         let index = match result {
-            ProposeResult::Accepted { index } => index,
+            ProposeResult::Accepted { index, .. } => index,
             ProposeResult::NotLeader { .. } => return None,
         };
         let outcome = self.wait_stage_outcome(index).await?;
@@ -2500,7 +2519,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             (cmd, ts)
         });
         let index = match result {
-            ProposeResult::Accepted { index } => index,
+            ProposeResult::Accepted { index, .. } => index,
             ProposeResult::NotLeader { .. } => return None,
         };
         self.wait_applied(index).await.then_some(ts)
@@ -2534,7 +2553,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             (cmd, ts)
         });
         let index = match result {
-            ProposeResult::Accepted { index } => index,
+            ProposeResult::Accepted { index, .. } => index,
             ProposeResult::NotLeader { .. } => return None,
         };
         self.wait_applied(index).await.then_some(ts)
@@ -2580,7 +2599,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             (cmd, ts)
         });
         let index = match result {
-            ProposeResult::Accepted { index } => index,
+            ProposeResult::Accepted { index, .. } => index,
             ProposeResult::NotLeader { .. } => return None,
         };
         self.wait_applied(index).await.then_some(ts)
@@ -2625,7 +2644,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             (cmd, ts)
         });
         let index = match result {
-            ProposeResult::Accepted { index } => index,
+            ProposeResult::Accepted { index, .. } => index,
             ProposeResult::NotLeader { .. } => return None,
         };
         self.wait_applied(index).await.then_some(ts)
@@ -2676,7 +2695,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             (cmd, ts)
         });
         let decide_index = match decide_result {
-            ProposeResult::Accepted { index } => index,
+            ProposeResult::Accepted { index, .. } => index,
             ProposeResult::NotLeader { .. } => return None,
         };
         if !self.wait_applied(decide_index).await {
@@ -2911,18 +2930,26 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .cloned()
     }
 
-    /// What the `KindBatch` committed at Raft log `index` actually did —
-    /// `None` if that index has not applied on this replica **or** has aged
-    /// out of the bounded map (see [`KindBatchOutcomes`]). Mirrors
+    /// What the `KindBatch` committed at Raft log `index` actually did, paired
+    /// with the entry's own **term** — `None` if that index has not applied
+    /// on this replica **or** has aged out of the bounded map (see
+    /// [`KindBatchOutcomes`]). Mirrors
     /// [`stage_outcome`](Self::stage_outcome)/[`cas_result`](Self::cas_result);
     /// every replica records the identical outcome.
     ///
     /// This is what lets a proposer tell "my entry no-op'd" from "my entry
     /// applied and was then overwritten" — a distinction reading the value
     /// back cannot make, and the reason a contended key used to report
-    /// spurious write failures.
+    /// spurious write failures. **The returned `term` is load-bearing, not
+    /// incidental**: `Applied` recorded here only proves *some* entry applied
+    /// at `index`, and after a leadership change that can be a *different*
+    /// entry than the one this proposer's own `ProposeResult::Accepted`
+    /// named — see [`KindBatchOutcome`]'s doc. A caller must compare this
+    /// `term` against its own accepted `term` before treating `Applied` as a
+    /// confirm; `ConditionFailed`/`Sealed` need no such check (see their own
+    /// variant docs).
     #[must_use]
-    pub fn kind_batch_outcome(&self, index: u64) -> Option<KindBatchOutcome> {
+    pub fn kind_batch_outcome(&self, index: u64) -> Option<(u64, KindBatchOutcome)> {
         self.kind_outcomes
             .lock()
             .expect("kind batch outcomes poisoned")
@@ -2954,7 +2981,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         value: Vec<u8>,
     ) -> Option<bool> {
         let index = match self.cas(key, expected, value) {
-            ProposeResult::Accepted { index } => index,
+            ProposeResult::Accepted { index, .. } => index,
             ProposeResult::NotLeader { .. } => return None,
         };
         let deadline = self.env.now().0 + CAS_TIMEOUT.as_nanos() as u64;
@@ -5446,7 +5473,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // `pending`, so advancing mid-loop would claim the engine holds an index it has
     // not merged yet, letting a read gate open and observe past the engine.
     let mut max_index = 0u64;
-    for (index, command) in effects {
+    for (index, term, command) in effects {
         match command {
             KvCommand::Put { key, value, ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
@@ -5620,9 +5647,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     None
                 };
                 // Record what this entry actually did, keyed by its Raft log
-                // index, so a proposer can tell "no-op'd" from "applied and
-                // then overwritten" instead of comparing the value back —
-                // the introspection channel `TxnStage` and `Cas` already have.
+                // index (and own term — see `KindBatchOutcomes`' doc), so a
+                // proposer can tell "no-op'd" from "applied and then
+                // overwritten" instead of comparing the value back — the
+                // introspection channel `TxnStage` and `Cas` already have.
                 let outcome = match (&failed_condition, &sealed_key) {
                     (Some(key), _) => KindBatchOutcome::ConditionFailed { key: key.clone() },
                     (None, Some(key)) => KindBatchOutcome::Sealed { key: key.clone() },
@@ -5631,7 +5659,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 kind_outcomes
                     .lock()
                     .expect("kind batch outcomes poisoned")
-                    .record(index, outcome);
+                    .record(index, term, outcome);
                 if conditions_ok && sealed_key.is_none() {
                     // ADR 0046 binding decision: the ONE shared
                     // materialization helper, also used by `TxnResolve`'s
@@ -7911,7 +7939,7 @@ mod pr5_orphan_and_resurrection_tests {
             (cmd, ts)
         });
         let late_index = match result {
-            ProposeResult::Accepted { index } => index,
+            ProposeResult::Accepted { index, .. } => index,
             other => panic!("late anchor stage proposal rejected: {other:?} (seed={seed})"),
         };
         let applied = drive(&mut sim, node_a.env(), Duration::from_millis(300), {

@@ -62,14 +62,16 @@ fn driver_applied_core_buffers_effects_instead_of_applying_in_core() {
     core.mark_durable_through(through);
 
     // The effects are exactly the committed-durable commands, in commit order:
-    // the election no-op, then the two puts.
+    // the election no-op, then the two puts. All three ride the sole election's
+    // term (1) — `drain_apply` hands out `(index, term, command)` so a driver-side
+    // outcome channel can prove entry identity across a truncation.
     let effects = core.drain_apply();
     assert_eq!(
         effects,
         vec![
-            (1, KvCommand::NoOp),
-            (2, KvCommand::Put { key: 1, value: 10 }),
-            (3, KvCommand::Put { key: 2, value: 20 }),
+            (1, 1, KvCommand::NoOp),
+            (2, 1, KvCommand::Put { key: 1, value: 10 }),
+            (3, 1, KvCommand::Put { key: 2, value: 20 }),
         ],
         "effects are the committed-durable commands in commit order"
     );
@@ -176,7 +178,8 @@ fn caught_up_node_reships_non_empty_snapshot() {
     // --- Source leader (node 0): commit some commands, set an engine image, snapshot.
     let mut src = elect_sole_leader(&group);
     for i in 0..5u64 {
-        if let ProposeResult::Accepted { index } = src.propose(KvCommand::Put { key: i, value: i })
+        if let ProposeResult::Accepted { index, .. } =
+            src.propose(KvCommand::Put { key: i, value: i })
         {
             // One follower ack (node 1) is a majority of 3 -> commit advances.
             let _ = src.handle(

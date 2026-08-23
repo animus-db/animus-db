@@ -8711,3 +8711,100 @@ debugging anything that feels like it might have happened before.
   description named — because a sweep claim is exactly the kind of thing
   that silently narrows from "everything" to "everything I happened to
   touch" without anyone noticing until an independent verifier greps it.
+- **An apply-time outcome channel keyed by Raft log index alone can tell
+  no-op from failure, but it is NOT a confirm-of-success by itself — the
+  proposer must also prove the applied entry is genuinely its OWN entry**
+  (found in review of PR #334, 2026-08-23). `KindBatch`'s outcome channel
+  (`KindBatchOutcomes`, `animus-cp-data`) was modeled directly on `Cas`'s
+  `CasResults` — record what an entry did, keyed by the Raft log index
+  `ProposeResult::Accepted` handed the proposer — and that shape is sound
+  for CAS (a *committed* entry's index is unambiguous once you have it,
+  because `compare_and_swap` only ever reads `cas_result` after confirming
+  the entry applied via a value/ceiling read that already implies commit).
+  It stopped being sound the moment `animusd::poll_probe` used the outcome
+  alone, ahead of any value check, to end the wait: `ProposeResult::
+  Accepted{index}` means "appended to **my own log**," never "committed" —
+  and an appended-but-not-yet-committed entry's index can be **reoccupied**
+  by a completely different command if this node loses leadership first
+  (Raft log-matching truncates the original and a new leader's own entry
+  lands at the identical position). Every replica — including the original
+  proposer, once it reconnects as a follower — then records `Applied` at
+  that index for the *reoccupying* entry's content, not the original
+  proposer's. A `poll_probe` that trusted `Some(KindBatchOutcome::Applied)`
+  alone read exactly that false signal and returned `Confirmed` to the
+  client — a silently dropped write reported as a success, the precise
+  failure class the at-most-once confirm-loop work (issue #268, this same
+  log) exists to prevent, and worse for a non-idempotent numeric `ADD` than
+  for an idempotent `Put` (a lost increment can't be told from a landed
+  one by re-reading). **The sibling channel already had the fix**:
+  `TxnStage`'s own `StageOutcome` carries the identical "index alone means
+  no-op-vs-failure, never success" caveat in its doc, and every real
+  coordinator (`ClientCtx::txn_prepare_pushing`) pairs a `Some(ts)` stage
+  result with `txn_verify_staged` — an explicit read proving the staged
+  content is genuinely present — before ever trusting it; `KindBatchOutcome`
+  reused `StageOutcome`'s shape (index-keyed, apply-time-recorded) without
+  reusing that verification discipline, because unlike a transaction stage a
+  `KindBatch`'s own apply is fire-and-forget from the state machine's side —
+  there was no second "verify" call anywhere in the design to carry the
+  fix. The closed fix pairs the outcome with the entry's own Raft **term**
+  (`ProposeResult::Accepted` now carries `term` alongside `index`;
+  `KindBatchOutcomes` records `(term, outcome)`) and requires `term ==
+  accepted_term` before ever treating `Applied` as a confirm — sound by
+  Raft's log-matching property (identical index **and** term implies
+  identical entry, cluster-wide, for the life of the log), the same
+  identity guarantee a content check would need to approximate with a
+  fingerprint (rejected here: a fixed-size hash risks a — admittedly
+  astronomically unlikely — collision reintroducing the exact false-ack
+  class the fix exists to close, where a cheap integer-term comparison
+  carries zero such risk and needs no extra bytes in the bounded outcome
+  map). **The general rule**: before reusing an existing outcome-channel
+  *shape* for a new apply-time signal, ask what verification discipline the
+  original shape's callers relied on to stay safe (a value check that
+  implicitly proved commit, an explicit `verify_staged`-style read, a
+  requirement that the caller only ever consult the channel after already
+  knowing the entry committed) — copying the struct without copying (or
+  deliberately, consciously replacing) that discipline is how a channel
+  that was safe in its original home becomes a false-ack in its new one.
+  Regression: `animus-cp-data/tests/kind_batch_outcome_identity.rs`
+  (isolates a leader, lets it accept two entries that never commit, lets
+  the survivors elect a new leader whose own election no-op and first real
+  `KindBatch` occupy the identical two log positions, heals the partition,
+  and asserts the truncated write never appears on any replica — proven red
+  pre-fix by reverting `KindBatchOutcomes::record`'s term to a constant);
+  `animusd`'s `kind_batch_signal_tests` module (a focused, table-driven unit
+  suite for the extracted `classify_kind_batch_outcome` predicate
+  `poll_probe` now calls, including the term-mismatch case — proven red
+  pre-fix by dropping the predicate's term-equality guard).
+- **A `CARGO_TARGET_DIR` shared across concurrently-running agent
+  worktrees can silently link one session's build against ANOTHER
+  session's stale source** (2026-08-23, discovered mid-fix on the
+  `KindBatchOutcome` false-ack above). Two sibling sessions building
+  crates at the same package/version/profile into the same shared target
+  dir produce output artifacts whose filename hash is derived from the
+  dependency/profile graph, not from the source files' own content or
+  absolute path — so a session on a branch that has NOT yet landed a
+  struct change (e.g. an unmodified worktree still on `main`) and a
+  session that HAS landed it can both write to the identical `.rlib`/
+  `.rmeta` path. Observed directly: `cargo test -p animus-cp-data --test
+  <new file>` failed to compile with `variant Accepted does not have a
+  field named term` and `expected Option<KindBatchOutcome>, found
+  Option<(_, KindBatchOutcome)>` — both flatly contradicted by `grep`ping
+  the very source files cargo had just reported compiling — while `ps
+  aux` showed a sibling session's `cargo build`/`cargo test` running
+  concurrently against the same `CARGO_TARGET_DIR` from a different
+  worktree path. The error vanished on the next attempt with no source
+  change, confirming a race rather than a real compile error. **Diagnosis
+  rule**: a compile error that contradicts what's actually on disk (the
+  compiler complaining about a shape the source doesn't have) is a
+  first-class signal to check for a concurrent `cargo`/`rustc` process
+  (`ps aux | grep cargo`) before debugging the "wrong" source — don't
+  trust a single failing compile as proof the edit is broken. **Mitigation
+  used here**: point `CARGO_TARGET_DIR` at a private, session-scoped
+  directory (e.g. under the scratchpad) for the remainder of validation,
+  accepting the slower from-scratch build, then re-verify once against the
+  shared dir for the final gate run. This is a real gap in the "shared
+  build cache" convention the root `CLAUDE.md`/session setup currently
+  documents as safe by default — it is only safe when every concurrently-
+  building session's *relevant* crates are source-identical, which is not
+  guaranteed for parallel agents mid-way through independent, uncoordinated
+  changes to the same crate.

@@ -295,23 +295,48 @@ State once here; cross-referenced from the sections below.
 - **`KindBatch` gained the identical own-key `conditions` field (ADR 0046
   "evaluate at leader" seatbelt, codec version 15)** — modeled directly on
   `TxnStage.conditions`, `(key, expected)` byte-level OCC pairs checked
-  against the KIND_BASE scope. Two deliberate differences from `TxnStage`'s
-  own handling: (1) **no `StageOutcome` analogue** — a condition-failed
-  `KindBatch` no-ops silently, indistinguishable from a seal miss (the
-  existing generic-error/probe-poll-timeout contract every
-  `put_kind_batch_conditioned` caller already handles), so there is nothing
-  to disambiguate; and (2) **checked BEFORE the seal gate**, not behind it —
-  `TxnStage`'s `condition_failure` only evaluates once already known
+  against the KIND_BASE scope, **checked BEFORE the seal gate**, not behind
+  it — `TxnStage`'s `condition_failure` only evaluates once already known
   unsealed so `StageOutcome` can report the seal reason ahead of a
-  condition one, but with no outcome channel to prioritize for `KindBatch`
-  there is no reason to gate the read behind the seal check. The two gates
-  still simply AND together either way. Production caller:
+  condition one; `KindBatch` had no outcome channel of its own at
+  introduction to prioritize this way, so this ordering difference predates
+  (and survives) the outcome channel described next. The two gates still
+  simply AND together either way. Production caller:
   `dynamo::kind_write_item_at_leader`'s leader-side evaluate-then-propose
   write path (ADR 0046 U3) passes `seatbelt: vec![(base_key, raw_old)]` —
   the guard against a concurrent `TxnStage`/`TxnResolve` commit landing
   between that evaluator's own-key read and its own propose call. Tests:
   `tests/kind_batch_conditions.rs`, mirroring `tests/txn_conditions.rs`
   scenario-for-scenario.
+- **`KindBatch` later gained its own `StageOutcome` analogue —
+  `KindBatchOutcome`/`KindBatchOutcomes`, recorded per apply and keyed by
+  Raft log index (plus, since a PR #334 review fix, the entry's own
+  **term** — see below).** A proposer can now tell "my entry no-op'd"
+  (`ConditionFailed`/`Sealed`) from "applied" without falling back to a bare
+  value-equality read, mirroring `Cas`'s `CasResults`/`TxnStage`'s
+  `StageOutcomes`. **Bounded, unlike those two** (a `KindBatch` proposes for
+  *every* indexed or streamed write, not just a CAS or a transaction, so an
+  unpruned map would grow without limit) — an aged-out entry falls back to
+  the value probe, the pre-existing behavior before this channel existed.
+  **`Applied` alone is not a confirm of success — the identical
+  "index means no-op-vs-failure, never success" discipline `StageOutcome`'s
+  own doc states, and the coordinator-side `txn_verify_staged` enforces for
+  `TxnStage`.** `KindBatchOutcome` reused `StageOutcome`'s index-keyed shape
+  without initially reusing that verification discipline: `animusd::
+  poll_probe` used to treat `Some(KindBatchOutcome::Applied)` alone as a
+  confirm, which is unsound the instant the proposer's own entry was
+  *accepted* (appended locally — `ProposeResult::Accepted`) but never
+  *committed* — a leadership change can truncate it and let a different
+  command's apply record `Applied` at the identical index. The closed fix
+  pairs the outcome with the entry's own Raft term (`ProposeResult::
+  Accepted{index, term}`, `KindBatchOutcomes` storing `(term, outcome)`) and
+  requires `term == accepted_term` before ever trusting `Applied` — sound by
+  Raft's log-matching property (index **and** term together imply an
+  identical entry, cluster-wide). `animusd::classify_kind_batch_outcome` is
+  the confirm-side predicate that enforces this; see `docs/engineering-
+  lessons.md` for the full incident and
+  `tests/kind_batch_outcome_identity.rs` for the seed-reproducible
+  truncation regression.
 - **`KindBatch.change_log` is a `Vec<(prefix, record)>` (codec v17, ADR
   0049 Train A rung-1 fixup)** — one entry can carry a whole marker-table
   batch's records (one per item, all completed at the entry's own apply

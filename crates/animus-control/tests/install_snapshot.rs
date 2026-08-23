@@ -169,7 +169,7 @@ fn follower_catches_up_via_multi_chunk_snapshot() {
     // With node 1 acking, commit advances; then snapshot to compact the prefix.
     let n_members = 300u64;
     for i in 0..n_members {
-        if let animus_control::ProposeResult::Accepted { index } = leader.propose(upsert(i)) {
+        if let animus_control::ProposeResult::Accepted { index, .. } = leader.propose(upsert(i)) {
             let _ = leader.handle(
                 nid(1),
                 RaftMsg::AppendEntriesResp {
@@ -284,7 +284,7 @@ fn large_snapshot_ships_in_o_chunk_time_not_o_state() {
     assert!(leader.is_leader(), "node 0 should have won the election");
 
     for i in 0..130u64 {
-        if let animus_control::ProposeResult::Accepted { index } = leader.propose(upsert(i)) {
+        if let animus_control::ProposeResult::Accepted { index, .. } = leader.propose(upsert(i)) {
             let _ = leader.handle(
                 nid(1),
                 RaftMsg::AppendEntriesResp {
@@ -430,7 +430,7 @@ fn caught_up_control_node_reships_non_empty() {
     );
     assert!(src.is_leader(), "node 0 should have won");
     for i in 0..200u64 {
-        if let animus_control::ProposeResult::Accepted { index } = src.propose(upsert(i)) {
+        if let animus_control::ProposeResult::Accepted { index, .. } = src.propose(upsert(i)) {
             let _ = src.handle(
                 nid(1),
                 RaftMsg::AppendEntriesResp {

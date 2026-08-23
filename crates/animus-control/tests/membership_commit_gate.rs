@@ -98,7 +98,7 @@ fn change_membership_rejects_until_the_no_op_commits_then_accepts() {
     // Gate open: the same change is now accepted and adopted immediately.
     assert!(matches!(
         core.change_membership(set(&[nid(0), nid(1)])),
-        ProposeResult::Accepted { index: 2 }
+        ProposeResult::Accepted { index: 2, .. }
     ));
     assert_eq!(core.config(), set(&[nid(0), nid(1)]));
 }

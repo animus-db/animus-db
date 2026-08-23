@@ -84,7 +84,7 @@ fn batch_commits_and_applies_on_every_replica() {
     let l = leader(&nodes, &[0, 1, 2], seed);
     let puts = batch(50);
     let index = match nodes[l].put_batch(puts.clone()) {
-        ProposeResult::Accepted { index } => index,
+        ProposeResult::Accepted { index, .. } => index,
         other => panic!("leader rejected the batch: {other:?} (seed={seed})"),
     };
     sim.run_for(Duration::from_secs(2)); // replicate + apply

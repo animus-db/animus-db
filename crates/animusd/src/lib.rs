@@ -590,9 +590,9 @@ impl CpGroup {
         }
     }
 
-    /// What the `KindBatch` at `index` did. See
-    /// [`RaftKvNode::kind_batch_outcome`].
-    pub(crate) fn kind_batch_outcome(&self, index: u64) -> Option<KindBatchOutcome> {
+    /// What the `KindBatch` at `index` did, paired with the entry's own
+    /// term. See [`RaftKvNode::kind_batch_outcome`].
+    pub(crate) fn kind_batch_outcome(&self, index: u64) -> Option<(u64, KindBatchOutcome)> {
         match self {
             CpGroup::Lsm(n) => n.kind_batch_outcome(index),
             CpGroup::Mem(n) => n.kind_batch_outcome(index),
@@ -1251,6 +1251,165 @@ enum ProbeWait {
     Confirmed,
     Superseded,
     TimedOut,
+}
+
+/// What a `KindBatch` apply-time outcome, read alone (no value probe), proves
+/// about the entry [`ProposeResult::Accepted`] named — the pure decision
+/// [`ClientCtx::poll_probe`] makes at each poll. Factored out so the
+/// index+term identity check (below) is directly unit-testable rather than
+/// only reachable through a full multi-node truncation scenario.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KindBatchSignal {
+    /// Provably **this proposer's own entry** applied and its effects are
+    /// merged into the engine — safe to ack.
+    Confirm,
+    /// Provably **nothing** landed at this index (a no-op is a no-op
+    /// regardless of whose entry it was — see [`KindBatchOutcome`]'s doc) —
+    /// safe to give up and tell the caller to retry.
+    NoOp,
+    /// No conclusion from the outcome channel alone: not yet applied, aged
+    /// out of the bounded map, applied but not yet readable, or — the
+    /// identity check this exists for — `Applied` recorded under a
+    /// **different** term than this proposer's own `accepted_term`. A term
+    /// mismatch is not proof of failure either (the value probe still
+    /// confirms if the reoccupying entry's content happens to be identical);
+    /// it is simply not proof of *this* proposer's success. The caller falls
+    /// through to the value probe either way.
+    Inconclusive,
+}
+
+/// The identity check at the heart of the KindBatch outcome false-ack fix: a
+/// recorded `Applied` outcome only proves *this* `accepted_index`/
+/// `accepted_term` entry applied when its own recorded term matches —
+/// otherwise a *different* command (one that reoccupied the index after a
+/// leadership change truncated the original entry) is the one that actually
+/// applied, and index alone cannot tell the two apart (see
+/// [`ProposeResult::Accepted`]'s doc for the log-matching argument).
+/// `ConditionFailed`/`Sealed` need no term check — see their own variant
+/// docs on why a no-op is sound regardless of whose entry it was.
+fn classify_kind_batch_outcome(
+    outcome: Option<(u64, KindBatchOutcome)>,
+    accepted_term: u64,
+    effects_readable: bool,
+) -> KindBatchSignal {
+    match outcome {
+        Some((term, KindBatchOutcome::Applied)) if term == accepted_term && effects_readable => {
+            KindBatchSignal::Confirm
+        }
+        Some((_, KindBatchOutcome::ConditionFailed { .. } | KindBatchOutcome::Sealed { .. })) => {
+            KindBatchSignal::NoOp
+        }
+        _ => KindBatchSignal::Inconclusive,
+    }
+}
+
+#[cfg(test)]
+mod kind_batch_signal_tests {
+    use super::{KindBatchOutcome, KindBatchSignal, classify_kind_batch_outcome};
+
+    const ACCEPTED_TERM: u64 = 7;
+
+    /// The confirm this whole channel exists to grant: my own entry, same
+    /// term, effects merged and readable.
+    #[test]
+    fn same_term_applied_and_readable_confirms() {
+        assert_eq!(
+            classify_kind_batch_outcome(
+                Some((ACCEPTED_TERM, KindBatchOutcome::Applied)),
+                ACCEPTED_TERM,
+                true,
+            ),
+            KindBatchSignal::Confirm
+        );
+    }
+
+    /// Recorded, but the apply task hasn't merged it into the readable
+    /// engine state yet — must not confirm (the durable-before-visible
+    /// rule), but it's still provably mine, so it isn't a `NoOp` either.
+    #[test]
+    fn same_term_applied_but_not_yet_readable_is_inconclusive() {
+        assert_eq!(
+            classify_kind_batch_outcome(
+                Some((ACCEPTED_TERM, KindBatchOutcome::Applied)),
+                ACCEPTED_TERM,
+                false,
+            ),
+            KindBatchSignal::Inconclusive
+        );
+    }
+
+    /// **The regression this suite exists for.** A truncated entry's index
+    /// reoccupied by a different command, at a different term, that
+    /// genuinely applied: index-alone would have called this `Confirm`
+    /// (the bug found in review of PR #334) — the fix must call it
+    /// `Inconclusive` (falls through to a value probe) instead, no matter
+    /// how "ready" the engine looks.
+    #[test]
+    fn a_different_terms_applied_outcome_never_confirms() {
+        let other_term = ACCEPTED_TERM + 1;
+        assert_eq!(
+            classify_kind_batch_outcome(
+                Some((other_term, KindBatchOutcome::Applied)),
+                ACCEPTED_TERM,
+                true,
+            ),
+            KindBatchSignal::Inconclusive,
+            "a term mismatch must never be treated as a confirm of the \
+             original entry — this is the false-ack the fix closes"
+        );
+        // Also true for a lower term (a stale replay), not just a higher one.
+        assert_eq!(
+            classify_kind_batch_outcome(
+                Some((ACCEPTED_TERM.saturating_sub(1), KindBatchOutcome::Applied)),
+                ACCEPTED_TERM,
+                true,
+            ),
+            KindBatchSignal::Inconclusive
+        );
+    }
+
+    /// A no-op is a no-op regardless of whose entry occupies the index or
+    /// what term it carries — no term check gates this branch.
+    #[test]
+    fn condition_failed_and_sealed_are_no_ops_at_any_term() {
+        for term in [
+            ACCEPTED_TERM,
+            ACCEPTED_TERM + 1,
+            ACCEPTED_TERM.saturating_sub(1),
+        ] {
+            assert_eq!(
+                classify_kind_batch_outcome(
+                    Some((
+                        term,
+                        KindBatchOutcome::ConditionFailed { key: b"k".to_vec() }
+                    )),
+                    ACCEPTED_TERM,
+                    true,
+                ),
+                KindBatchSignal::NoOp,
+                "ConditionFailed at term {term}"
+            );
+            assert_eq!(
+                classify_kind_batch_outcome(
+                    Some((term, KindBatchOutcome::Sealed { key: b"k".to_vec() })),
+                    ACCEPTED_TERM,
+                    true,
+                ),
+                KindBatchSignal::NoOp,
+                "Sealed at term {term}"
+            );
+        }
+    }
+
+    /// No record at all (not yet applied, or aged out of the bounded map) —
+    /// nothing to conclude either way.
+    #[test]
+    fn no_record_is_inconclusive() {
+        assert_eq!(
+            classify_kind_batch_outcome(None, ACCEPTED_TERM, true),
+            KindBatchSignal::Inconclusive
+        );
+    }
 }
 
 /// The point-in-time outcome of
@@ -7564,7 +7723,7 @@ impl ClientCtx {
         };
         let accepted_index = match leader.put_kind_batch_conditioned(writes, change_log, Vec::new())
         {
-            ProposeResult::Accepted { index } => index,
+            ProposeResult::Accepted { index, .. } => index,
             other => return Err(format!("kind write not accepted: {other:?}")),
         };
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
@@ -7641,13 +7800,22 @@ impl ClientCtx {
                 return Err("kind write outside this group's live range; retry".into());
             }
         }
-        let accepted_index = match leader.put_kind_batch_conditioned(writes, change_log, conditions)
-        {
-            ProposeResult::Accepted { index } => index,
-            other => return Err(format!("kind write not accepted: {other:?}")),
-        };
+        let (accepted_index, accepted_term) =
+            match leader.put_kind_batch_conditioned(writes, change_log, conditions) {
+                ProposeResult::Accepted { index, term } => (index, term),
+                other => return Err(format!("kind write not accepted: {other:?}")),
+            };
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-        match Self::poll_probe(leader, accepted_index, &probe_key, &probe_val, deadline).await {
+        match Self::poll_probe(
+            leader,
+            accepted_index,
+            accepted_term,
+            &probe_key,
+            &probe_val,
+            deadline,
+        )
+        .await
+        {
             ProbeWait::Confirmed => Ok(()),
             // A failed own-key `conditions` entry lands here too: the entry
             // applies as a silent no-op (see `KindBatch.conditions`' doc in
@@ -7702,7 +7870,7 @@ impl ClientCtx {
     fn cp_batch_propose(
         leader: &CpGroup,
         group: Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<Option<(u64, KvPair)>, String> {
+    ) -> Result<Option<(u64, u64, KvPair)>, String> {
         Self::frozen_refusal(leader)?;
         let probe = group.last().cloned();
         let fence = leader.scope_range();
@@ -7712,7 +7880,7 @@ impl ClientCtx {
             ));
         }
         match leader.put_batch(group) {
-            ProposeResult::Accepted { index } => Ok(probe.map(|p| (index, p))),
+            ProposeResult::Accepted { index, term } => Ok(probe.map(|p| (index, term, p))),
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
         }
     }
@@ -7760,9 +7928,13 @@ impl ClientCtx {
     /// [`ProbeWait::Superseded`], once [`confirm_wait_is_futile`](Self::
     /// confirm_wait_is_futile) says the accepted entry's effect can no longer
     /// appear.
+    ///
+    /// `accepted_term` is the term [`ProposeResult::Accepted`] carried
+    /// alongside `accepted_index` — see the identity-check note below.
     async fn poll_probe(
         leader: &CpGroup,
         accepted_index: u64,
+        accepted_term: u64,
         probe_key: &[u8],
         probe_val: &[u8],
         deadline: tokio::time::Instant,
@@ -7787,32 +7959,53 @@ impl ClientCtx {
             //
             // A no-op needs no such wait: it wrote nothing, so there is
             // nothing to become readable and its outcome is final immediately.
+            //
+            // **`classify_kind_batch_outcome` additionally requires `term ==
+            // accepted_term` before treating `Applied` as a confirm (a
+            // false-ack found in review of PR #334's KindBatch apply-time
+            // outcome channel).** The outcome map is keyed by Raft log index
+            // alone, and an *accepted* (appended-locally) entry is not yet a
+            // *committed* one — if this node loses leadership before commit,
+            // log-matching truncates the accepted entry and a completely
+            // different command can commit and apply at the identical index,
+            // recording `Applied` there for *its* content, not ours. Index
+            // alone cannot tell "my entry applied" from "a different entry
+            // now occupies my old index" — only the pair (index, term) can,
+            // by Raft's log-matching property (see `ProposeResult::
+            // Accepted`'s doc). A term mismatch is classified `Inconclusive`
+            // exactly like `None`: not proof of failure either (the value
+            // probe below still confirms if the reoccupying entry's content
+            // happens to be identical), just not proof of success. See
+            // `kind_batch_signal_tests` for the identity check exercised in
+            // isolation.
             let effects_readable = leader.engine_applied_index() >= accepted_index;
-            match leader.kind_batch_outcome(accepted_index) {
-                Some(KindBatchOutcome::Applied) if effects_readable => {
-                    return ProbeWait::Confirmed;
-                }
-                // A no-op, and now distinguishable from an ambiguous one: the
-                // caller's OCC round (re-read, re-evaluate) or a re-route.
-                Some(
-                    KindBatchOutcome::ConditionFailed { .. } | KindBatchOutcome::Sealed { .. },
-                ) => {
-                    return ProbeWait::Superseded;
-                }
-                // Applied but not yet readable, not applied yet, not a
-                // `KindBatch` (the other CP write paths share this loop), or
-                // aged out of the bounded outcome map — fall through to the
-                // value probe, which is the pre-existing behaviour.
-                Some(KindBatchOutcome::Applied) | None => {}
+            match classify_kind_batch_outcome(
+                leader.kind_batch_outcome(accepted_index),
+                accepted_term,
+                effects_readable,
+            ) {
+                KindBatchSignal::Confirm => return ProbeWait::Confirmed,
+                // The caller's OCC round (re-read, re-evaluate) or a re-route.
+                KindBatchSignal::NoOp => return ProbeWait::Superseded,
+                // Fall through to the value probe, which is the pre-existing
+                // behaviour.
+                KindBatchSignal::Inconclusive => {}
             }
             if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
                 return ProbeWait::Confirmed;
             }
             if Self::confirm_wait_is_futile(leader, accepted_index) {
                 // Close the probe-vs-apply race before giving up: re-check the
-                // outcome first, then the value.
-                if leader.engine_applied_index() >= accepted_index
-                    && leader.kind_batch_outcome(accepted_index) == Some(KindBatchOutcome::Applied)
+                // outcome first, then the value. `confirm_wait_is_futile` can
+                // have returned `true` via its `!is_leader()` clause alone,
+                // with `engine_applied_index()` still behind `accepted_index`
+                // — so `effects_readable` must be recomputed here, not
+                // assumed `true` from the fact that we're in this branch.
+                if classify_kind_batch_outcome(
+                    leader.kind_batch_outcome(accepted_index),
+                    accepted_term,
+                    leader.engine_applied_index() >= accepted_index,
+                ) == KindBatchSignal::Confirm
                 {
                     return ProbeWait::Confirmed;
                 }
@@ -7839,12 +8032,22 @@ impl ClientCtx {
         leader: &CpGroup,
         group: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
-        let Some((accepted_index, (probe_key, probe_val))) = Self::cp_batch_propose(leader, group)?
+        let Some((accepted_index, accepted_term, (probe_key, probe_val))) =
+            Self::cp_batch_propose(leader, group)?
         else {
             return Ok(());
         };
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-        match Self::poll_probe(leader, accepted_index, &probe_key, &probe_val, deadline).await {
+        match Self::poll_probe(
+            leader,
+            accepted_index,
+            accepted_term,
+            &probe_key,
+            &probe_val,
+            deadline,
+        )
+        .await
+        {
             ProbeWait::Confirmed => Ok(()),
             ProbeWait::Superseded => Err(
                 "CP batch write superseded before its effect appeared (leadership churn or an \
@@ -9632,7 +9835,7 @@ impl ClientCtx {
             );
         }
         match leader.put(key.clone(), value.clone()) {
-            ProposeResult::Accepted { index } => {
+            ProposeResult::Accepted { index, .. } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
                 let mut poll = CP_CONFIRM_POLL_INIT;
                 loop {
@@ -9682,7 +9885,7 @@ impl ClientCtx {
             );
         }
         match leader.delete(key.clone()) {
-            ProposeResult::Accepted { index } => {
+            ProposeResult::Accepted { index, .. } => {
                 let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
                 let mut poll = CP_CONFIRM_POLL_INIT;
                 loop {
