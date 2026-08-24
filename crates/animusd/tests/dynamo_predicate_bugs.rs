@@ -209,25 +209,41 @@ async fn comparisons_filter_rather_than_matching_nothing() {
     }
 }
 
-/// A sort-key range is rejected rather than silently narrowed to an equality.
+/// A sort-key range comparator is genuinely served (issue #373 — `<`/`<=`/`>`/
+/// `>=` used to be rejected here the same way `<>` still is), not silently
+/// narrowed to an equality the way the pre-fix `>=` truncation used to behave.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_sort_key_range_is_rejected_rather_than_narrowed() {
+async fn a_sort_key_range_is_served_rather_than_narrowed() {
     let (_dir, nodes, addrs) = setup().await;
 
+    // `<>` is still rejected: it is not in AWS's own KeyConditionExpression
+    // grammar (there is no not-equal *range*), unlike the other five.
     let (status, resp) = dynamo(
         addrs[1],
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"events","KeyConditionExpression":"pk = :p AND sk <> :s",
+            "ExpressionAttributeValues":{":p":{"S":"p1"},":s":{"S":"a3"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "`<>` must stay rejected: {resp}");
+    assert!(resp.contains("ValidationException"), "{resp}");
+
+    // `>=`, which now genuinely narrows the range rather than being rejected.
+    let (status, ge) = dynamo_retry(
+        addrs[0],
         "DynamoDB_20120810.Query",
         r#"{"TableName":"events","KeyConditionExpression":"pk = :p AND sk >= :s",
             "ExpressionAttributeValues":{":p":{"S":"p1"},":s":{"S":"a3"}}}"#,
     )
     .await;
-    assert_eq!(
-        status, 400,
-        "a sort-key range must not be silently narrowed: {resp}"
+    assert_eq!(status, 200, "`>=` is served now: {ge}");
+    assert!(
+        ge.contains("\"a3\"") && ge.contains("\"a5\""),
+        "it must actually match — the pre-fix truncated form matched nothing: {ge}"
     );
-    assert!(resp.contains("ValidationException"), "{resp}");
+    assert!(!ge.contains("\"a2\""), "and still be bounded: {ge}");
 
-    // BETWEEN, which *is* supported, still works over the same data.
+    // BETWEEN, which was already supported, still works over the same data.
     let (status, ok) = dynamo_retry(
         addrs[1],
         "DynamoDB_20120810.Query",

@@ -143,11 +143,37 @@ comment for its full type/method inventory.
   that range returns, compares `N` **numerically**, not by those same bytes
   (issue #373: a byte compare put `sk = 9` outside `sk BETWEEN 5 AND 15`,
   since `"15" < "9"` lexicographically) — `S`/`B` still compare by key bytes,
-  which already matches DynamoDB for those types. **The stored data-plane key adds
-  a prefix at the `animusd` edge** (`dynamo.rs::item_key`, ADR 0022/0023):
-  `partition_token(escape(pk)) || escape(pk) || sk` — a Murmur3 token spreads
-  partitions across the table's hash ring, and there is **no table prefix**
-  (tables are separated by per-table tablets, the table is a routing argument).
+  which already matches DynamoDB for those types. `SortKeyCondition` carries
+  one `Compare(Comparator, AttributeValue)` variant (reusing the same
+  `Comparator` `ConditionExpression` does) for all five `KeyConditionExpression`
+  comparators DynamoDB supports (`=`, `<`, `<=`, `>`, `>=` — `<>` stays
+  rejected at decode: it is not in AWS's own `KeyConditionExpression`
+  grammar), plus `Between` and `BeginsWith` — every comparator is a **filter**
+  over the whole scanned partition/index sub-range, never a narrower key-range
+  bound (`run_gsi_query`'s `Equals`-only prefix narrowing is the one
+  exception, an engine-level optimization that still falls back to filtering
+  everything else). A caller holding only a sort key's **raw on-disk bytes**
+  (off an engine/tablet scan, with no type tag) must call
+  `SortKeyCondition::matches_raw`, not `matches` directly with the bytes
+  wrapped in `AttributeValue::B` — every production call site used to do
+  exactly that, which silently defeated the numeric compare above for `N`
+  (the raw bytes are decimal text, and `B`-vs-`N` falls back to a byte
+  compare) even after `matches` itself went numeric; `matches_raw`
+  reinterprets the raw bytes as the condition's own declared type first.
+  **Range/`BETWEEN` filtering is now correct for `N`** end to end (base
+  table, GSI, LSI), including mixed digit counts and negatives — but **result
+  *ordering*** (`ScanIndexForward`) **is not**: it is still the raw
+  byte-ordered scan order, lexicographic-by-text for `N`, so a page ordered
+  by `ScanIndexForward` is unfaithful whenever an `N` partition mixes
+  magnitudes or signs (e.g. `9` sorts after `15` in the returned order even
+  though the *filter* now correctly includes both). An order-preserving
+  numeric key encoding would fix ordering too, but is a real wire-format
+  change and out of scope here — it needs its own ADR. **The stored data-plane
+  key adds a prefix at the `animusd` edge** (`dynamo.rs::item_key`, ADR
+  0022/0023): `partition_token(escape(pk)) || escape(pk) || sk` — a Murmur3
+  token spreads partitions across the table's hash ring, and there is **no
+  table prefix** (tables are separated by per-table tablets, the table is a
+  routing argument).
 - `Query` / `Scan` over the **distributed** plane use the CP data plane's
   **linearizable range scan** (`animusd`'s `native_scan` → `ClientCtx::cp_scan`,
   ReadIndex on each tablet leader, forwarded cross-process), not a tracked key

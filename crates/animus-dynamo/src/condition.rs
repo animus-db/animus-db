@@ -5,10 +5,14 @@
 //! ## Sort-key conditions
 //!
 //! A `Query` always pins the partition key to a single value (`pk = ..`) and may
-//! additionally narrow the sort key with one of: equality (`sk = v`), a range
-//! (`sk BETWEEN lo AND hi`), or a prefix (`begins_with(sk, p)`). Each maps to a
-//! byte range over a partition's contiguous keyspace plus an exact predicate, so
-//! a caller can scan the partition and keep the matching rows.
+//! additionally narrow the sort key with one of: a comparison (`sk = v`,
+//! `sk < v`, `sk <= v`, `sk > v`, `sk >= v` — every `KeyConditionExpression`
+//! comparator AWS supports except `<>`, which is not part of that grammar), a
+//! range (`sk BETWEEN lo AND hi`), or a prefix (`begins_with(sk, p)`). None of
+//! these narrow the *scan range* itself — the partition's whole contiguous
+//! keyspace is still scanned; each is a **filter** applied to the rows that
+//! scan returns (`SortKeyCondition::matches`/`matches_raw`), the identical
+//! mechanism `BETWEEN` always used.
 //!
 //! ## Condition expressions
 //!
@@ -40,8 +44,16 @@ use crate::{AttributeValue, Item};
 /// equality (handled by the caller); this narrows within that partition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SortKeyCondition {
-    /// `sk = value`.
-    Equals(AttributeValue),
+    /// `sk <op> value` for any of DynamoDB's `KeyConditionExpression`
+    /// comparators (`=`, `<`, `<=`, `>`, `>=`) — reusing [`Comparator`]
+    /// wholesale rather than a narrower enum of its own. `Ne` (`<>`) is a
+    /// legal [`Comparator`] value but never reaches here: AWS's own
+    /// `KeyConditionExpression` grammar has no not-equal operator, so the
+    /// wire decoder (`animus_dynamo::wire::decode_sort_condition`) rejects it
+    /// before a `SortKeyCondition` is ever built. `matches` still handles it
+    /// correctly if constructed directly (e.g. in a test), since it costs
+    /// nothing extra to support.
+    Compare(Comparator, AttributeValue),
     /// `sk BETWEEN lo AND hi` (inclusive on both ends).
     Between(AttributeValue, AttributeValue),
     /// `begins_with(sk, prefix)` — only meaningful for string/binary sort keys.
@@ -51,24 +63,29 @@ pub enum SortKeyCondition {
 impl SortKeyCondition {
     /// Whether an item's sort-key value satisfies this condition.
     ///
-    /// `N` values compare **numerically** (via [`compare_numeric`]), not by
-    /// their raw text bytes: a number sort key is stored as decimal text
-    /// (`storage_key`'s documented simplification), so a byte compare would
-    /// put `"9"` after `"15"` and make `sk BETWEEN 5 AND 15` wrongly exclude
-    /// `sk = 9`. This is exactly the key-ordering-vs-filter split
-    /// [`compare_values`]'s doc comment already draws: the scan *range* still
-    /// walks the engine's byte-ordered keyspace (unaffected — it can only
-    /// widen, never narrow, since it stays keyed on `key_bytes`), but this
-    /// in-memory filter over the rows that range returns must agree with
-    /// DynamoDB's actual numeric semantics. `S`/`B` are unaffected: their
-    /// `key_bytes` already sorts the way DynamoDB compares them, and this
-    /// keeps using it (also making `Equals` consistent with `Between` rather
-    /// than diverging on `N` alone).
+    /// `N` values compare **numerically** (via [`compare_numeric`], through
+    /// [`sort_key_cmp`]), not by their raw text bytes: a number sort key is
+    /// stored as decimal text (`storage_key`'s documented simplification), so
+    /// a byte compare would put `"9"` after `"15"` and make
+    /// `sk BETWEEN 5 AND 15` wrongly exclude `sk = 9`. This is exactly the
+    /// key-ordering-vs-filter split [`compare_values`]'s doc comment already
+    /// draws: the scan *range* still walks the engine's byte-ordered keyspace
+    /// (unaffected — it can only widen, never narrow, since it stays keyed on
+    /// `key_bytes`), but this in-memory filter over the rows that range
+    /// returns must agree with DynamoDB's actual numeric semantics. `S`/`B`
+    /// are unaffected: their `key_bytes` already sorts the way DynamoDB
+    /// compares them, and this keeps using it (also making every comparator
+    /// consistent with `Between` rather than diverging on `N` alone).
+    ///
+    /// A caller holding only a sort key's **raw stored bytes** (off an engine
+    /// scan, with no type tag) must use [`Self::matches_raw`] instead — see
+    /// its own doc for why passing raw bytes here directly would silently
+    /// defeat the numeric compare for `N`.
     #[must_use]
     pub fn matches(&self, sort_value: &AttributeValue) -> bool {
         match self {
-            SortKeyCondition::Equals(target) => {
-                sort_key_cmp(sort_value, target) == std::cmp::Ordering::Equal
+            SortKeyCondition::Compare(op, target) => {
+                op.holds(Some(sort_key_cmp(sort_value, target)))
             }
             SortKeyCondition::Between(lo, hi) => {
                 sort_key_cmp(sort_value, lo) != std::cmp::Ordering::Less
@@ -77,6 +94,66 @@ impl SortKeyCondition {
             SortKeyCondition::BeginsWith(prefix) => {
                 sort_value.key_bytes().starts_with(&prefix.key_bytes())
             }
+        }
+    }
+
+    /// Whether a sort key's **raw, on-disk key bytes** (as recovered from a
+    /// scanned storage key — everything after the escaped partition-key
+    /// prefix) satisfy this condition.
+    ///
+    /// A raw sort-key byte string is exactly [`AttributeValue::key_bytes`]'s
+    /// encoding (`storage_key`'s doc) — for `N` that is decimal *text*, not a
+    /// numeric-order-preserving layout. A caller with only those bytes has no
+    /// type tag to hand [`Self::matches`] directly; wrapping them as an
+    /// opaque [`AttributeValue::B`] would compare by raw bytes even against
+    /// an `N` operand (`sort_key_cmp`'s numeric arm only fires when **both**
+    /// sides are literally the `N` variant), silently reproducing the exact
+    /// byte-vs-numeric bug `matches` exists to fix (issue #373) — every
+    /// production call site used to do exactly that. This reinterprets the
+    /// raw bytes as the type this condition's own operand(s) declare (a real
+    /// sort key's condition operands are always one consistent declared
+    /// type) before delegating to [`Self::matches`], so a caller never has to
+    /// reason about the distinction itself.
+    #[must_use]
+    pub fn matches_raw(&self, raw_sort_bytes: &[u8]) -> bool {
+        let value = if self.is_numeric() {
+            match std::str::from_utf8(raw_sort_bytes) {
+                Ok(text) => AttributeValue::N(text.to_owned()),
+                // Not valid UTF-8 text, so it cannot be the decimal text an
+                // `N` is stored as — fall back to a raw compare rather than
+                // panicking on data that disagrees with the condition's type.
+                Err(_) => AttributeValue::B(raw_sort_bytes.to_vec()),
+            }
+        } else {
+            AttributeValue::B(raw_sort_bytes.to_vec())
+        };
+        self.matches(&value)
+    }
+
+    /// Whether this condition's own operand(s) are `N` — see
+    /// [`Self::matches_raw`]. `begins_with` is only ever meaningful for
+    /// `S`/`B` sort keys in DynamoDB, so it is never numeric.
+    #[must_use]
+    fn is_numeric(&self) -> bool {
+        let is_n = |v: &AttributeValue| matches!(v, AttributeValue::N(_));
+        match self {
+            SortKeyCondition::Compare(_, v) => is_n(v),
+            SortKeyCondition::Between(lo, hi) => is_n(lo) || is_n(hi),
+            SortKeyCondition::BeginsWith(_) => false,
+        }
+    }
+
+    /// The DynamoDB `AttributeType` code(s) (`S`/`N`/`B`) of this condition's
+    /// own operand(s) — for a caller with schema access (`animusd`) to
+    /// validate against a declared sort-key type before the condition is
+    /// ever evaluated, mirroring how a plain comparator's operand type would
+    /// be checked against `AttributeDefinitions` in real DynamoDB.
+    #[must_use]
+    pub fn operand_type_codes(&self) -> Vec<&'static str> {
+        match self {
+            SortKeyCondition::Compare(_, v) => vec![type_code(v)],
+            SortKeyCondition::Between(lo, hi) => vec![type_code(lo), type_code(hi)],
+            SortKeyCondition::BeginsWith(v) => vec![type_code(v)],
         }
     }
 }
@@ -613,7 +690,7 @@ mod tests {
 
     #[test]
     fn equals_matches_only_exact() {
-        let cond = SortKeyCondition::Equals(s("b"));
+        let cond = SortKeyCondition::Compare(Comparator::Eq, s("b"));
         assert!(cond.matches(&s("b")));
         assert!(!cond.matches(&s("a")));
         assert!(!cond.matches(&s("bb")));
@@ -677,14 +754,14 @@ mod tests {
     /// diverging on `Equals` alone (mirrors `values_equal`'s own contract).
     #[test]
     fn n_equals_is_numeric_not_textual() {
-        let cond = SortKeyCondition::Equals(n("1.10"));
+        let cond = SortKeyCondition::Compare(Comparator::Eq, n("1.10"));
         assert!(
             cond.matches(&n("1.1")),
             "trailing zero doesn't change value"
         );
         assert!(!cond.matches(&n("1.11")));
 
-        let cond = SortKeyCondition::Equals(n("0"));
+        let cond = SortKeyCondition::Compare(Comparator::Eq, n("0"));
         assert!(cond.matches(&n("-0")), "-0 and 0 are the same number");
     }
 
@@ -700,7 +777,7 @@ mod tests {
             assert!(!cond.matches(&s(miss)), "{miss}");
         }
         assert!(
-            !SortKeyCondition::Equals(s("b")).matches(&s("B")),
+            !SortKeyCondition::Compare(Comparator::Eq, s("b")).matches(&s("B")),
             "byte-exact, case-sensitive"
         );
 
@@ -708,8 +785,124 @@ mod tests {
         let cond = SortKeyCondition::Between(b(&[1, 0]), b(&[3, 0]));
         assert!(cond.matches(&b(&[2, 0])));
         assert!(!cond.matches(&b(&[4, 0])));
-        assert!(SortKeyCondition::Equals(b(&[1, 2])).matches(&b(&[1, 2])));
-        assert!(!SortKeyCondition::Equals(b(&[1, 2])).matches(&b(&[1, 2, 0])));
+        assert!(SortKeyCondition::Compare(Comparator::Eq, b(&[1, 2])).matches(&b(&[1, 2])));
+        assert!(!SortKeyCondition::Compare(Comparator::Eq, b(&[1, 2])).matches(&b(&[1, 2, 0])));
+    }
+
+    /// Issue #373's follow-on: `<`/`<=`/`>`/`>=` go through the exact same
+    /// [`SortKeyCondition::Compare`]/[`sort_key_cmp`] machinery `Equals`
+    /// already did, so an operator × type matrix over `S`, `N` (mixed digit
+    /// counts, negatives), and `B` is the right level to prove them at — a
+    /// byte-lexicographic regression on any one operator would fail exactly
+    /// one row of this table.
+    #[test]
+    fn range_operators_over_s_type_sort_keys() {
+        let lt = |v: &str| SortKeyCondition::Compare(Comparator::Lt, s(v));
+        let le = |v: &str| SortKeyCondition::Compare(Comparator::Le, s(v));
+        let gt = |v: &str| SortKeyCondition::Compare(Comparator::Gt, s(v));
+        let ge = |v: &str| SortKeyCondition::Compare(Comparator::Ge, s(v));
+
+        assert!(lt("m").matches(&s("b")));
+        assert!(!lt("m").matches(&s("m")));
+        assert!(!lt("m").matches(&s("z")));
+
+        assert!(le("m").matches(&s("b")));
+        assert!(le("m").matches(&s("m")));
+        assert!(!le("m").matches(&s("z")));
+
+        assert!(!gt("m").matches(&s("b")));
+        assert!(!gt("m").matches(&s("m")));
+        assert!(gt("m").matches(&s("z")));
+
+        assert!(!ge("m").matches(&s("b")));
+        assert!(ge("m").matches(&s("m")));
+        assert!(ge("m").matches(&s("z")));
+    }
+
+    #[test]
+    fn range_operators_over_n_type_sort_keys_mixed_digit_counts_and_negatives() {
+        let lt = |v: &str| SortKeyCondition::Compare(Comparator::Lt, n(v));
+        let le = |v: &str| SortKeyCondition::Compare(Comparator::Le, n(v));
+        let gt = |v: &str| SortKeyCondition::Compare(Comparator::Gt, n(v));
+        let ge = |v: &str| SortKeyCondition::Compare(Comparator::Ge, n(v));
+
+        // A byte-lexicographic compare would put "9" after "15" — the exact
+        // shape issue #373 reported for BETWEEN, now checked for every
+        // ordering operator too.
+        assert!(gt("9").matches(&n("15")), "15 > 9 numerically");
+        assert!(!lt("9").matches(&n("15")), "15 is not < 9");
+        assert!(lt("15").matches(&n("9")), "9 < 15 numerically");
+        assert!(!gt("15").matches(&n("9")), "9 is not > 15");
+
+        assert!(le("10").matches(&n("10")), "<= is inclusive at equality");
+        assert!(!lt("10").matches(&n("10")), "< is exclusive at equality");
+        assert!(ge("10").matches(&n("10")), ">= is inclusive at equality");
+        assert!(!gt("10").matches(&n("10")), "> is exclusive at equality");
+
+        // Negatives and decimals.
+        assert!(lt("-2").matches(&n("-10")), "-10 < -2");
+        assert!(!lt("-10").matches(&n("-2")), "-2 is not < -10");
+        assert!(gt("0.45").matches(&n("0.5")));
+        assert!(!gt("0.5").matches(&n("0.45")));
+    }
+
+    #[test]
+    fn range_operators_over_b_type_sort_keys() {
+        let b = |v: &[u8]| AttributeValue::B(v.to_vec());
+        let lt = |v: &[u8]| SortKeyCondition::Compare(Comparator::Lt, b(v));
+        let gt = |v: &[u8]| SortKeyCondition::Compare(Comparator::Gt, b(v));
+
+        assert!(lt(&[2, 0]).matches(&b(&[1, 0])));
+        assert!(!lt(&[2, 0]).matches(&b(&[2, 0])));
+        assert!(!lt(&[2, 0]).matches(&b(&[3, 0])));
+
+        assert!(!gt(&[2, 0]).matches(&b(&[1, 0])));
+        assert!(!gt(&[2, 0]).matches(&b(&[2, 0])));
+        assert!(gt(&[2, 0]).matches(&b(&[3, 0])));
+    }
+
+    /// [`SortKeyCondition::matches_raw`] is the one production callers
+    /// actually use (a scanned key's sort segment has no type tag) — this is
+    /// the regression that would have caught the pre-existing gap where every
+    /// call site wrapped raw bytes as `B` and silently lost the numeric
+    /// compare for `N` sort keys, even after `matches` itself was fixed.
+    #[test]
+    fn matches_raw_reinterprets_bytes_by_the_conditions_own_declared_type() {
+        let between = SortKeyCondition::Between(n("5"), n("15"));
+        // "9" is only 1 byte vs "15"'s 2 — a raw `B` compare would place it
+        // outside the range exactly like the original issue #373 bug.
+        assert!(between.matches_raw(b"9"));
+        assert!(between.matches_raw(b"5"));
+        assert!(between.matches_raw(b"15"));
+        assert!(!between.matches_raw(b"16"));
+        assert!(!between.matches_raw(b"4"));
+
+        let gt = SortKeyCondition::Compare(Comparator::Gt, n("9"));
+        assert!(gt.matches_raw(b"15"), "15 > 9 numerically, not by bytes");
+        assert!(!gt.matches_raw(b"2"));
+
+        // S/B sort keys are unaffected — raw bytes already sort the way
+        // DynamoDB compares them, so matches_raw and matches agree exactly.
+        let s_between = SortKeyCondition::Between(s("b"), s("d"));
+        assert!(s_between.matches_raw(b"c"));
+        assert!(!s_between.matches_raw(b"e"));
+    }
+
+    #[test]
+    fn operand_type_codes_reports_the_conditions_own_declared_type() {
+        assert_eq!(
+            SortKeyCondition::Compare(Comparator::Gt, n("1")).operand_type_codes(),
+            vec!["N"]
+        );
+        assert_eq!(
+            SortKeyCondition::Between(s("a"), n("1")).operand_type_codes(),
+            vec!["S", "N"],
+            "mixed-type operands are reported verbatim, not unified"
+        );
+        assert_eq!(
+            SortKeyCondition::BeginsWith(AttributeValue::B(vec![1])).operand_type_codes(),
+            vec!["B"]
+        );
     }
 
     #[test]
