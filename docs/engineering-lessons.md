@@ -3183,6 +3183,24 @@ debugging anything that feels like it might have happened before.
   property is a budget, and a budget that nothing enforces is a comment; this
   turns it into a test failure. Applicable anywhere a "must not block / must
   not round-trip" invariant matters and would otherwise only be documented.
+- **A per-item `WireError` raised inside a `TransactWriteItems` write action's
+  evaluation does not keep its own error `code` by the time it reaches the
+  wire (2026-08-24, issue #372 part 2).** `wire::apply_update`'s
+  `ValidationException` (the 400 KB post-update-result cap, closed this
+  change) propagates out of `eval_kind_txn_write` fine as a `WireError`, but
+  `ClientCtx::txn_stage_local` immediately `map_err`s it to a plain `String`
+  (`format!("txn prepare: leader-side evaluation failed: {e}")`) to satisfy
+  `cp_txn`'s `Result<_, String>` signature, and `run_transact`'s `Err(e)` arm
+  then wraps *that* string as `WireError::transaction_canceled(..)` —
+  `TransactionCanceledException`, unconditionally, regardless of what the
+  original code was. So the same validation failure surfaces as
+  `ValidationException` through `UpdateItem` (which calls `apply_update`
+  directly) but as `TransactionCanceledException` (with the original message
+  merely nested in the text) through `TransactWriteItems`'s `Update` action.
+  A test asserting the specific DynamoDB error code on a transactional write
+  path must know which of these two shapes applies rather than assuming the
+  bare `WireError` constructor's code survives — match on the nested message
+  substring there instead. (`animusd/tests/dynamo_item_size_cap.rs`.)
 
 ### Code patterns
 - **A convergent bookkeeping write must be routable to its own owner: derive
@@ -7764,6 +7782,39 @@ debugging anything that feels like it might have happened before.
   same family as the 2026-08-22 `NAME:` vs `NAME::` entry below/above — a
   scripted edit's blast radius is whatever its pattern matches, so prefer
   patterns that can't run past the construct they name.
+
+- **A hand-rolled recursive-descent parser must not give a separator token
+  (`,`) lookahead-based "maybe this ends the list" behavior — that
+  reintroduces exactly the spelling-based ambiguity a real tokenizer was
+  built to remove (2026-08-24, issue #372).** Replacing
+  `animus-dynamo::wire::decode_update_expression`'s substring keyword scan
+  with a real clause tokenizer required, per the DynamoDB grammar, that
+  `SET`/`REMOVE`/`ADD`/`DELETE` only start a new clause at a genuine
+  clause-start *position* (expression start, or right after a completed
+  action with no separator) — never merely because a token is spelled that
+  way, so `SET set = :v` (an unaliased attribute literally named `set`)
+  parses correctly. The first implementation still broke on `SET add = :v,
+  remove = :w`: after finishing the `add` action it saw the following `,`
+  and *peeked past it* — if the next token happened to spell a clause
+  keyword, it guessed "trailing comma before a new clause" and stopped the
+  `SET` clause early, misreading `remove` as a `REMOVE` clause instead of the
+  second `SET` action's attribute name it actually was. The grammar itself
+  already disambiguates this without any lookahead: a `,` immediately after
+  a completed action is *always* an action separator within the current
+  clause (the grammar has no other legal use for it there), full stop — only
+  the unconditional absence of a following token (a bare trailing comma at
+  the very end of the expression) is safe to special-case, because there is
+  nothing left to misinterpret. **General rule: when a parser's separator
+  token has to decide "continue this production or end it," that decision
+  must come from the separator's own unambiguous grammar role, never from
+  inspecting or guessing at what a subsequent token might mean** — peeking
+  past a separator to pattern-match on the next token's spelling is the same
+  category of bug as the substring scan the rewrite was fixing in the first
+  place, just moved one token later. Caught by a test the rewrite's own task
+  required (`reserved_words_as_attribute_names_in_a_set_action_list`), not
+  by any pre-existing test — a reminder that a new parser needs the
+  ambiguous-looking cases in its own test corpus, not just the cases the old
+  implementation happened to get right.
 
 ### Parallel-agent orchestration
 - **A single long-lived session can exhaust the disk on `target/` alone, with
