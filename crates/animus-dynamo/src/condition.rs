@@ -49,21 +49,50 @@ pub enum SortKeyCondition {
 }
 
 impl SortKeyCondition {
-    /// Whether an item's sort-key value satisfies this condition. Comparison is
-    /// over the same key-bytes used for storage ordering (so it agrees with the
-    /// scan range below).
+    /// Whether an item's sort-key value satisfies this condition.
+    ///
+    /// `N` values compare **numerically** (via [`compare_numeric`]), not by
+    /// their raw text bytes: a number sort key is stored as decimal text
+    /// (`storage_key`'s documented simplification), so a byte compare would
+    /// put `"9"` after `"15"` and make `sk BETWEEN 5 AND 15` wrongly exclude
+    /// `sk = 9`. This is exactly the key-ordering-vs-filter split
+    /// [`compare_values`]'s doc comment already draws: the scan *range* still
+    /// walks the engine's byte-ordered keyspace (unaffected — it can only
+    /// widen, never narrow, since it stays keyed on `key_bytes`), but this
+    /// in-memory filter over the rows that range returns must agree with
+    /// DynamoDB's actual numeric semantics. `S`/`B` are unaffected: their
+    /// `key_bytes` already sorts the way DynamoDB compares them, and this
+    /// keeps using it (also making `Equals` consistent with `Between` rather
+    /// than diverging on `N` alone).
     #[must_use]
     pub fn matches(&self, sort_value: &AttributeValue) -> bool {
-        let v = sort_value.key_bytes();
         match self {
-            SortKeyCondition::Equals(target) => v == target.key_bytes(),
-            SortKeyCondition::Between(lo, hi) => {
-                let (lo, hi) = (lo.key_bytes(), hi.key_bytes());
-                v >= lo && v <= hi
+            SortKeyCondition::Equals(target) => {
+                sort_key_cmp(sort_value, target) == std::cmp::Ordering::Equal
             }
-            SortKeyCondition::BeginsWith(prefix) => v.starts_with(&prefix.key_bytes()),
+            SortKeyCondition::Between(lo, hi) => {
+                sort_key_cmp(sort_value, lo) != std::cmp::Ordering::Less
+                    && sort_key_cmp(sort_value, hi) != std::cmp::Ordering::Greater
+            }
+            SortKeyCondition::BeginsWith(prefix) => {
+                sort_value.key_bytes().starts_with(&prefix.key_bytes())
+            }
         }
     }
+}
+
+/// Order two sort-key values the way [`SortKeyCondition::matches`] needs:
+/// numerically for a pair of `N`s, by raw key bytes otherwise (`S`/`B`, and
+/// any pair `compare_numeric` can't parse as numbers — sort keys are always
+/// same-typed in practice, so this fallback is defensive, not a real path).
+#[must_use]
+fn sort_key_cmp(a: &AttributeValue, b: &AttributeValue) -> std::cmp::Ordering {
+    if let (AttributeValue::N(x), AttributeValue::N(y)) = (a, b)
+        && let Some(ord) = compare_numeric(x, y)
+    {
+        return ord;
+    }
+    a.key_bytes().cmp(&b.key_bytes())
 }
 
 /// A minimal DynamoDB `ConditionExpression` subset, evaluated against the
@@ -608,6 +637,79 @@ mod tests {
         assert!(cond.matches(&s("abc")));
         assert!(!cond.matches(&s("ac")));
         assert!(!cond.matches(&s("a")));
+    }
+
+    /// Issue #373: `SortKeyCondition::matches` used to compare `N` sort keys
+    /// by raw `key_bytes`, which orders decimal text lexicographically —
+    /// `"9" > "15"` as text — so `sk BETWEEN 5 AND 15` wrongly excluded
+    /// `sk = 9`. Numeric compare fixes exactly this.
+    #[test]
+    fn n_between_compares_numerically_not_lexicographically() {
+        let cond = SortKeyCondition::Between(n("5"), n("15"));
+        for hit in ["5", "9", "10", "15"] {
+            assert!(cond.matches(&n(hit)), "{hit}");
+        }
+        for miss in ["4", "16", "2"] {
+            assert!(!cond.matches(&n(miss)), "{miss}");
+        }
+    }
+
+    #[test]
+    fn n_between_with_negatives_and_decimals() {
+        let cond = SortKeyCondition::Between(n("-10"), n("-2"));
+        for hit in ["-10", "-9", "-2"] {
+            assert!(cond.matches(&n(hit)), "{hit}");
+        }
+        for miss in ["-11", "-1", "0"] {
+            assert!(!cond.matches(&n(miss)), "{miss}");
+        }
+
+        // A decimal midpoint that a byte compare would also place wrong: "9.5"
+        // as text falls between "10" and "2" lexicographically at all.
+        let cond = SortKeyCondition::Between(n("9"), n("10.5"));
+        assert!(cond.matches(&n("9.5")));
+        assert!(cond.matches(&n("10.5")), "inclusive upper bound");
+        assert!(!cond.matches(&n("10.6")));
+    }
+
+    /// `N` equality is numeric too, so differently-written text for the same
+    /// number still matches — consistent with `Between` rather than
+    /// diverging on `Equals` alone (mirrors `values_equal`'s own contract).
+    #[test]
+    fn n_equals_is_numeric_not_textual() {
+        let cond = SortKeyCondition::Equals(n("1.10"));
+        assert!(
+            cond.matches(&n("1.1")),
+            "trailing zero doesn't change value"
+        );
+        assert!(!cond.matches(&n("1.11")));
+
+        let cond = SortKeyCondition::Equals(n("0"));
+        assert!(cond.matches(&n("-0")), "-0 and 0 are the same number");
+    }
+
+    /// `S`/`B` sort keys are unaffected by the `N` fix — they keep comparing
+    /// by raw key bytes, which already matches DynamoDB for those types.
+    #[test]
+    fn s_and_b_sort_keys_still_compare_by_bytes() {
+        let cond = SortKeyCondition::Between(s("b"), s("d"));
+        for hit in ["b", "c", "d"] {
+            assert!(cond.matches(&s(hit)), "{hit}");
+        }
+        for miss in ["a", "e"] {
+            assert!(!cond.matches(&s(miss)), "{miss}");
+        }
+        assert!(
+            !SortKeyCondition::Equals(s("b")).matches(&s("B")),
+            "byte-exact, case-sensitive"
+        );
+
+        let b = |v: &[u8]| AttributeValue::B(v.to_vec());
+        let cond = SortKeyCondition::Between(b(&[1, 0]), b(&[3, 0]));
+        assert!(cond.matches(&b(&[2, 0])));
+        assert!(!cond.matches(&b(&[4, 0])));
+        assert!(SortKeyCondition::Equals(b(&[1, 2])).matches(&b(&[1, 2])));
+        assert!(!SortKeyCondition::Equals(b(&[1, 2])).matches(&b(&[1, 2, 0])));
     }
 
     #[test]

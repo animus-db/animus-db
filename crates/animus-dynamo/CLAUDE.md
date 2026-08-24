@@ -136,9 +136,14 @@ comment for its full type/method inventory.
 - This crate's `storage_key` = `escape(partition_key) || sort_key`, using an
   order-preserving, prefix-free escape (no key's encoding prefixes another's).
   So a partition's items are contiguous and sort-ordered, and `query` is one
-  range scan. Numbers (`N`) are carried as text and sort lexicographically (a
-  documented simplification). `SortKeyCondition::matches` compares the same
-  key-bytes, so it agrees with the scan range. **The stored data-plane key adds
+  range scan. Numbers (`N`) are carried as text and sort lexicographically in
+  the **byte-ordered scan range** (a documented simplification — it can only
+  widen the range scanned, never narrow it, so it stays correct). But
+  `SortKeyCondition::matches`, the **in-memory filter** applied to the rows
+  that range returns, compares `N` **numerically**, not by those same bytes
+  (issue #373: a byte compare put `sk = 9` outside `sk BETWEEN 5 AND 15`,
+  since `"15" < "9"` lexicographically) — `S`/`B` still compare by key bytes,
+  which already matches DynamoDB for those types. **The stored data-plane key adds
   a prefix at the `animusd` edge** (`dynamo.rs::item_key`, ADR 0022/0023):
   `partition_token(escape(pk)) || escape(pk) || sk` — a Murmur3 token spreads
   partitions across the table's hash ring, and there is **no table prefix**
