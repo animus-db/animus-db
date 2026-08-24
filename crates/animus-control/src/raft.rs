@@ -87,6 +87,15 @@ pub struct LogEntry<C = MetaCommand> {
     /// unchanged on the wire.
     #[serde(default)]
     pub config: Option<BTreeSet<NodeId>>,
+    /// For a **membership-change** entry, the new **learner** set this entry
+    /// installs (ADR 0058 Train 1: a non-voting membership class) — `None` for
+    /// an ordinary command entry, and always `Some` (though possibly empty)
+    /// exactly when `config` is `Some`: every membership-change entry restates
+    /// both sets together, so "does this entry carry a config" stays the single
+    /// `config.is_some()` test every existing call site already uses.
+    /// `#[serde(default)]` so pre-existing entries decode with no learners.
+    #[serde(default)]
+    pub learners: Option<BTreeSet<NodeId>>,
 }
 
 /// Wire messages exchanged between Raft peers, generic over the command type `C`
@@ -164,6 +173,11 @@ pub enum RaftMsg<C = MetaCommand> {
         /// follower adopts it on install. `None` (default) ⇒ the initial config.
         #[serde(default)]
         config: Option<BTreeSet<NodeId>>,
+        /// The **learner** configuration at the snapshot (ADR 0058 Train 1),
+        /// mirroring `config` above — the image bytes carry no Raft membership
+        /// of either class. `None` (default) ⇒ no learners.
+        #[serde(default)]
+        learners: Option<BTreeSet<NodeId>>,
     },
     /// Response to [`RaftMsg::InstallSnapshot`]. `next_offset` is the number of
     /// contiguous snapshot bytes the follower now holds — the offset the leader
@@ -257,6 +271,20 @@ pub enum Role {
     Leader,
 }
 
+/// A member's role in the active configuration (ADR 0058 Train 1): a
+/// **voter** counts toward every quorum computation (commit-index
+/// advancement, election majorities) and may campaign; a **learner** is a
+/// non-voting member that receives `AppendEntries`/`InstallSnapshot` exactly
+/// like a voter (its `match_index` is tracked the same way) but is excluded
+/// from quorum math entirely and never campaigns or pre-votes. See
+/// [`RaftCore::member_role`]/[`RaftCore::add_learner`]/
+/// [`RaftCore::promote_learner`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberRole {
+    Voter,
+    Learner,
+}
+
 /// Outcome of proposing a command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProposeResult {
@@ -318,6 +346,27 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // The voter config recorded by the latest local snapshot (so compaction does
     // not lose membership); restored on recovery.
     snapshot_config: Option<BTreeSet<NodeId>>,
+
+    // The active **learner** set (ADR 0058 Train 1), mirroring `config` above
+    // but never contributing to `peers`/`cluster_size`/quorum math — a learner
+    // is deliberately kept out of the set those are derived from, so the
+    // majority-computation call sites (`maybe_advance_commit`, `majority()`
+    // via `cluster_size`) need no learner-awareness at all. A learner *is*
+    // still replicated to (see `broadcast_append`/`become_leader`, which union
+    // this in) and its `match_index` is tracked in the same `next_index`/
+    // `match_index` maps as any voter's. Kept in sync with `config` by
+    // `apply_config`, from the same config-in-log discipline (ADR 0017 C):
+    // every membership-change `LogEntry` carries both sets together (see
+    // `LogEntry::learners`'s doc).
+    learners: BTreeSet<NodeId>,
+    // The learner set the node booted with — always empty, since `RaftCore::
+    // new` never bootstraps learners (a learner is only ever introduced via
+    // `add_learner` after the group is running). Kept for symmetry with
+    // `initial_config`'s fallback role in `learners_at`.
+    initial_learners: BTreeSet<NodeId>,
+    // The learner set recorded by the latest local snapshot, mirroring
+    // `snapshot_config`.
+    snapshot_learners: Option<BTreeSet<NodeId>>,
 
     role: Role,
     current_term: u64,
@@ -536,6 +585,9 @@ where
             config: initial_config.clone(),
             initial_config,
             snapshot_config: None,
+            learners: BTreeSet::new(),
+            initial_learners: BTreeSet::new(),
+            snapshot_learners: None,
             role: Role::Follower,
             current_term: 0,
             voted_for: None,
@@ -622,6 +674,7 @@ where
         // is the base, and the recovered log tail's latest config entry (if any)
         // overrides it — `recompute_config` applies that precedence (ADR 0017 C).
         core.snapshot_config = persisted.snapshot_config;
+        core.snapshot_learners = persisted.snapshot_learners;
         core.recompute_config();
         // Everything restored from the WAL/snapshot is by definition durable, so
         // the durable watermark covers the whole recovered log. The tail re-applies
@@ -678,6 +731,7 @@ where
                 last_index: self.snapshot_index,
                 last_term: self.snapshot_term,
                 config: self.snapshot_config.clone(),
+                learners: self.snapshot_learners.clone(),
             });
         }
         image.push(WalRecord::Hard {
@@ -714,6 +768,7 @@ where
         // Capture the config effective at the snapshot base *before* truncating
         // (the config entry may be in the prefix we are about to drop).
         self.snapshot_config = Some(self.config_at(new_index));
+        self.snapshot_learners = Some(self.learners_at(new_index));
         self.log.retain(|e| e.index > new_index);
         // Drop the retained applied-command history the snapshot now covers,
         // mirroring the log truncation (and the clear `InstallSnapshot` already
@@ -975,18 +1030,74 @@ where
         self.config.contains(&self.id)
     }
 
+    /// Whether this node is a **learner** in the active configuration (ADR
+    /// 0058 Train 1) — mutually exclusive with [`is_voter`](Self::is_voter):
+    /// membership-change proposals (`change_membership`/`add_learner`/
+    /// `promote_learner`) keep `config`/`learners` disjoint by construction.
+    #[must_use]
+    pub fn is_learner(&self) -> bool {
+        self.learners.contains(&self.id)
+    }
+
     /// The active voter configuration.
     #[must_use]
     pub fn config(&self) -> BTreeSet<NodeId> {
         self.config.clone()
     }
 
-    /// Adopt `voters` as the active config and keep `peers`/`cluster_size` in sync,
-    /// so every quorum/replication/election decision reflects it immediately.
-    fn apply_config(&mut self, voters: BTreeSet<NodeId>) {
+    /// The active **learner** configuration (ADR 0058 Train 1) — non-voting
+    /// members that receive replication but never count toward quorum. Always
+    /// disjoint from [`config`](Self::config).
+    #[must_use]
+    pub fn learners(&self) -> BTreeSet<NodeId> {
+        self.learners.clone()
+    }
+
+    /// `id`'s role in the active configuration, or `None` if it is not
+    /// currently a member at all (ADR 0058 Train 1).
+    #[must_use]
+    pub fn member_role(&self, id: &NodeId) -> Option<MemberRole> {
+        if self.config.contains(id) {
+            Some(MemberRole::Voter)
+        } else if self.learners.contains(id) {
+            Some(MemberRole::Learner)
+        } else {
+            None
+        }
+    }
+
+    /// Whether learner `id` is caught up closely enough to this leader's own
+    /// log to be a promotion candidate (ADR 0058 Train 1's promotion
+    /// criterion): its tracked `match_index` is within `threshold` of
+    /// [`last_log_index`](Self::last_log_index). A pure predicate over
+    /// already-tracked state (the same bookkeeping `AppendEntries`/
+    /// `InstallSnapshot` acks already maintain) — it does **not** gate
+    /// [`promote_learner`](Self::promote_learner) itself; a later layer (the
+    /// host reconciler) decides *when* to act on it. `false` for any `id`
+    /// that is not currently a learner.
+    #[must_use]
+    pub fn learner_caught_up(&self, id: &NodeId, threshold: u64) -> bool {
+        self.learners.contains(id)
+            && self.last_log_index().saturating_sub(self.peer_match(id)) <= threshold
+    }
+
+    /// Adopt `voters`/`learners` as the active config and keep
+    /// `peers`/`cluster_size` in sync, so every quorum/replication/election
+    /// decision reflects it immediately. **`peers`/`cluster_size` are derived
+    /// from `voters` alone** (ADR 0058 Train 1) — a learner is never counted
+    /// toward `cluster_size` (hence never toward `majority()`), and is never
+    /// added to `peers` (the set `start_election`/`start_pre_vote` solicit and
+    /// `maybe_advance_commit` tallies) — it is replicated to via the separate
+    /// `learners` union in `broadcast_append`/`become_leader`/
+    /// `broadcast_quiesce`/`quiesce_entry_ok` instead. This is what keeps
+    /// every existing quorum-computation call site correct with **zero**
+    /// changes: they were already voter-only before learners existed, and
+    /// stay voter-only now.
+    fn apply_config(&mut self, voters: BTreeSet<NodeId>, learners: BTreeSet<NodeId>) {
         self.peers = voters.iter().filter(|n| **n != self.id).cloned().collect();
         self.cluster_size = voters.len();
         self.config = voters;
+        self.learners = learners;
     }
 
     /// The voter config effective at log `index`: the latest config-bearing entry
@@ -1001,11 +1112,26 @@ where
             .unwrap_or_else(|| self.initial_config.clone())
     }
 
+    /// The learner config effective at log `index` (ADR 0058 Train 1),
+    /// mirroring [`config_at`](Self::config_at) exactly — gated on the same
+    /// `e.config.is_some()` test, since every membership-change entry carries
+    /// both sets together (see `LogEntry::learners`'s doc).
+    fn learners_at(&self, index: u64) -> BTreeSet<NodeId> {
+        self.log
+            .iter()
+            .rev()
+            .find(|e| e.index <= index && e.config.is_some())
+            .and_then(|e| e.learners.clone())
+            .or_else(|| self.snapshot_learners.clone())
+            .unwrap_or_else(|| self.initial_learners.clone())
+    }
+
     /// Recompute the active config from the current log tail (used after a
     /// truncation, which may have removed a config entry, or on recovery).
     fn recompute_config(&mut self) {
         let voters = self.config_at(self.last_log_index());
-        self.apply_config(voters);
+        let learners = self.learners_at(self.last_log_index());
+        self.apply_config(voters, learners);
     }
 
     /// Whether a membership change is in flight: an uncommitted config entry.
@@ -1053,10 +1179,21 @@ where
             };
         }
         let delta = self.config.symmetric_difference(&voters).count();
-        if delta != 1 || self.config_change_in_flight() || !voters.contains(&self.id) {
-            // No-op rejection (a self-removal / multi-server / in-flight change):
-            // report not-accepted by returning the leader hint. (`delta == 0` is
-            // also rejected — nothing to change.)
+        if delta != 1
+            || self.config_change_in_flight()
+            || !voters.contains(&self.id)
+            // ADR 0058 Train 1: this method only ever moves a member into or
+            // out of the *voter* set; a node currently tracked as a learner
+            // must go through `promote_learner` instead (which explicitly
+            // moves it out of `learners`, keeping the two sets disjoint by
+            // construction). Without this guard, adding a current learner's
+            // id here would silently make it a voter while leaving it in
+            // `learners` too — an ambiguous, ill-defined membership state.
+            || !voters.is_disjoint(&self.learners)
+        {
+            // No-op rejection (a self-removal / multi-server / in-flight change
+            // / learner-ambiguous delta): report not-accepted by returning the
+            // leader hint. (`delta == 0` is also rejected — nothing to change.)
             return ProposeResult::NotLeader {
                 leader: Some(self.id.clone()),
             };
@@ -1067,6 +1204,7 @@ where
             index,
             command: S::noop(),
             config: Some(voters),
+            learners: Some(self.learners.clone()),
         });
         self.maybe_advance_commit();
         self.apply();
@@ -1074,6 +1212,134 @@ where
             index,
             term: self.current_term,
         }
+    }
+
+    /// Leader-only pre-flight guard shared by
+    /// [`add_learner`](Self::add_learner)/[`promote_learner`](Self::promote_learner)/
+    /// [`remove_learner`](Self::remove_learner): not leader, a transfer armed,
+    /// the current-term-commit erratum gate, or a change already in flight —
+    /// the identical discipline [`change_membership`](Self::change_membership)
+    /// enforces (see its doc for the rationale of each clause).
+    fn learner_change_precheck(&self) -> Option<ProposeResult> {
+        if self.role != Role::Leader {
+            return Some(ProposeResult::NotLeader {
+                leader: self.leader_id.clone(),
+            });
+        }
+        if let Some(target) = self.transfer_target.clone() {
+            return Some(ProposeResult::NotLeader {
+                leader: Some(target),
+            });
+        }
+        if self.commit_index < self.first_term_index {
+            return Some(ProposeResult::NotLeader {
+                leader: Some(self.id.clone()),
+            });
+        }
+        if self.config_change_in_flight() {
+            return Some(ProposeResult::NotLeader {
+                leader: Some(self.id.clone()),
+            });
+        }
+        None
+    }
+
+    /// Append a single-server membership-change entry carrying `voters`/
+    /// `learners` together (the shared tail of every ADR 0058 Train 1
+    /// transition method, once its own precondition already holds).
+    fn append_membership_entry(
+        &mut self,
+        voters: BTreeSet<NodeId>,
+        learners: BTreeSet<NodeId>,
+    ) -> ProposeResult {
+        let index = self.last_log_index() + 1;
+        self.log_append(LogEntry {
+            term: self.current_term,
+            index,
+            command: S::noop(),
+            config: Some(voters),
+            learners: Some(learners),
+        });
+        self.maybe_advance_commit();
+        self.apply();
+        ProposeResult::Accepted {
+            index,
+            term: self.current_term,
+        }
+    }
+
+    /// Add `id` as a **learner** (ADR 0058 Train 1): a new, non-voting member
+    /// that receives `AppendEntries`/`InstallSnapshot` exactly like a voter
+    /// (its `match_index` is tracked the same way, for
+    /// [`learner_caught_up`](Self::learner_caught_up)) but is excluded from
+    /// every quorum computation and never campaigns
+    /// (`start_election`/`start_pre_vote` gate on `is_voter`). Leader-only;
+    /// rejected under the same single-in-flight-change discipline
+    /// [`change_membership`](Self::change_membership) uses, or if `id` is
+    /// already a member (voter or learner) of this group, or is this leader's
+    /// own id (a leader is always a voter — see `become_leader`/
+    /// `start_election`'s `is_voter` gate — so it can never sensibly add
+    /// itself as a learner).
+    pub fn add_learner(&mut self, id: NodeId) -> ProposeResult {
+        if let Some(rejected) = self.learner_change_precheck() {
+            return rejected;
+        }
+        if id == self.id || self.config.contains(&id) || self.learners.contains(&id) {
+            return ProposeResult::NotLeader {
+                leader: Some(self.id.clone()),
+            };
+        }
+        let mut new_learners = self.learners.clone();
+        new_learners.insert(id);
+        self.append_membership_entry(self.config.clone(), new_learners)
+    }
+
+    /// Promote learner `id` to **voter** (ADR 0058 Train 1) — the reachable
+    /// transition a caller takes once [`learner_caught_up`](Self::learner_caught_up)
+    /// (or an equivalent external judgment) says `id` is ready: it moves from
+    /// `learners` into `config` in a single committed configuration entry,
+    /// identical in shape to any other single-server change
+    /// ([`change_membership`](Self::change_membership)'s doc, ADR 0017 Stage
+    /// C) — this PR ships the primitive only; the *decision* of when to call
+    /// it (the host reconciler's replica-move sequencing) is a later layer.
+    /// Leader-only; rejected under the same discipline as
+    /// [`add_learner`](Self::add_learner), or if `id` is not currently a
+    /// learner.
+    pub fn promote_learner(&mut self, id: NodeId) -> ProposeResult {
+        if let Some(rejected) = self.learner_change_precheck() {
+            return rejected;
+        }
+        if !self.learners.contains(&id) {
+            return ProposeResult::NotLeader {
+                leader: Some(self.id.clone()),
+            };
+        }
+        let mut new_voters = self.config.clone();
+        new_voters.insert(id.clone());
+        let mut new_learners = self.learners.clone();
+        new_learners.remove(&id);
+        self.append_membership_entry(new_voters, new_learners)
+    }
+
+    /// Remove learner `id` without promoting it (ADR 0058 Train 1) — the
+    /// "demote/remove" case: a learner that fails to catch up, or is no
+    /// longer wanted, is dropped directly rather than ever becoming a voter.
+    /// Leader-only; rejected under the same discipline as
+    /// [`add_learner`](Self::add_learner), or if `id` is not currently a
+    /// learner. (Removing a **voter** stays `change_membership`'s job — this
+    /// method only ever touches `learners`, never `config`.)
+    pub fn remove_learner(&mut self, id: NodeId) -> ProposeResult {
+        if let Some(rejected) = self.learner_change_precheck() {
+            return rejected;
+        }
+        if !self.learners.contains(&id) {
+            return ProposeResult::NotLeader {
+                leader: Some(self.id.clone()),
+            };
+        }
+        let mut new_learners = self.learners.clone();
+        new_learners.remove(&id);
+        self.append_membership_entry(self.config.clone(), new_learners)
     }
 
     /// The leader's last-known replicated log index for `node` (0 if unknown —
@@ -1199,7 +1465,16 @@ where
     fn log_append(&mut self, entry: LogEntry<C>) {
         if let Some(voters) = &entry.config {
             let old_peers = self.peers.clone();
-            self.apply_config(voters.clone());
+            // Every membership-change entry carries both sets together (see
+            // `LogEntry::learners`'s doc); fall back to the current learners
+            // only as defensive robustness against a decoded entry that
+            // predates this field (`#[serde(default)]` ⇒ `None`), which must
+            // never wipe out an already-known learner set.
+            let learners = entry
+                .learners
+                .clone()
+                .unwrap_or_else(|| self.learners.clone());
+            self.apply_config(voters.clone(), learners);
             // Leader-only bookkeeping: a peer this entry just dropped from `peers`
             // must still be told, so track it as departing until it acks past this
             // entry's index (see the `departing` field doc). A peer this entry
@@ -1408,9 +1683,10 @@ where
                 total,
                 done,
                 config,
+                learners,
             } => self.handle_install_snapshot(
-                term, leader, last_index, last_term, offset, data, total, done, config, now,
-                entropy,
+                term, leader, last_index, last_term, offset, data, total, done, config, learners,
+                now, entropy,
             ),
             RaftMsg::InstallSnapshotResp {
                 term,
@@ -1471,6 +1747,7 @@ where
             index,
             command,
             config: None,
+            learners: None,
         });
         // Lets a single-node group make progress; safe for larger groups
         // because commit still requires a majority of matchIndex.
@@ -1506,7 +1783,13 @@ where
             || (self.leader_id.is_some() && now.0 < self.election_deadline.0);
         let log_ok = last_log_term > self.last_log_term()
             || (last_log_term == self.last_log_term() && last_log_index >= self.last_log_index());
-        let granted = !has_live_leader && term >= self.current_term && log_ok;
+        // ADR 0058 Train 1: a learner never pre-votes — it is never solicited
+        // in the first place (`start_pre_vote` broadcasts to `peers`, which
+        // stays voter-only), but this is a cheap, structurally-load-bearing
+        // second line of defense: even a stray/injected `PreVote` addressed to
+        // a learner can never be granted, so a learner's presence or absence
+        // can never influence a pre-vote majority.
+        let granted = self.is_voter() && !has_live_leader && term >= self.current_term && log_ok;
         vec![(
             candidate,
             RaftMsg::PreVoteResp {
@@ -1537,7 +1820,15 @@ where
             return Vec::new();
         }
         if granted {
-            if term == self.current_term + 1 {
+            // ADR 0058 Train 1: only ever count a grant from a current voter
+            // toward the pre-vote majority — `majority()` is computed over
+            // `cluster_size` (voters only), so tallying a learner's grant
+            // here would let a candidate reach "majority" without actually
+            // having a majority of real quorum members on board. In normal
+            // operation this can't happen (only voter peers are solicited —
+            // see `handle_pre_vote`'s own gate), but this is the safety net
+            // if that ever changes.
+            if term == self.current_term + 1 && self.config.contains(&from) {
                 self.pre_votes.insert(from);
                 if self.pre_votes.len() >= self.majority() {
                     return self.start_election(now, entropy);
@@ -1573,7 +1864,9 @@ where
                 || (last_log_term == self.last_log_term()
                     && last_log_index >= self.last_log_index());
             let can_vote = self.voted_for.is_none() || self.voted_for == Some(candidate.clone());
-            if can_vote && log_ok {
+            // ADR 0058 Train 1: a learner never grants a real vote either
+            // (mirrors `handle_pre_vote`'s identical gate/rationale).
+            if self.is_voter() && can_vote && log_ok {
                 self.voted_for = Some(candidate.clone());
                 self.reset_election_timer(now, entropy);
                 true
@@ -1600,7 +1893,9 @@ where
         if self.role != Role::Candidate || term != self.current_term {
             return Vec::new();
         }
-        if granted {
+        // ADR 0058 Train 1: same safety net as `handle_pre_vote_resp` — only a
+        // current voter's grant counts toward the real election majority.
+        if granted && self.config.contains(&from) {
             self.votes.insert(from);
             if self.votes.len() >= self.majority() {
                 return self.become_leader(now);
@@ -1757,6 +2052,7 @@ where
         total: u64,
         done: bool,
         config: Option<BTreeSet<NodeId>>,
+        learners: Option<BTreeSet<NodeId>>,
         now: Nanos,
         entropy: u64,
     ) -> Vec<Out<C>> {
@@ -1838,10 +2134,12 @@ where
                 core.log.clear();
                 core.applied.clear();
                 core.snapshot_dirty = true;
-                // Adopt the snapshot's voter configuration (ADR 0017 C): the image
-                // bytes carry no Raft membership. With the log now empty,
-                // `recompute_config` resolves to this snapshot config (or initial).
+                // Adopt the snapshot's voter/learner configuration (ADR 0017 C,
+                // ADR 0058 Train 1): the image bytes carry no Raft membership of
+                // either class. With the log now empty, `recompute_config`
+                // resolves to this snapshot config (or initial).
                 core.snapshot_config = config.clone();
+                core.snapshot_learners = learners.clone();
                 core.recompute_config();
             };
             if S::DRIVER_APPLIED {
@@ -2056,7 +2354,11 @@ where
         self.quiesced = false;
         self.last_activity = now;
         let last = self.last_log_index();
-        for p in self.peers.clone() {
+        // ADR 0058 Train 1: seed a learner's `next_index`/`match_index`/
+        // `last_contact` the identical way a voter's is seeded — a learner is
+        // replicated to and tracked exactly like a follower, just never
+        // counted toward quorum (see `apply_config`'s doc).
+        for p in self.peers.clone().into_iter().chain(self.learners.clone()) {
             self.next_index.insert(p.clone(), last + 1);
             self.match_index.insert(p.clone(), 0);
             // Start every peer's liveness clock fresh on this leader's own
@@ -2084,6 +2386,7 @@ where
             index: last + 1,
             command: S::noop(),
             config: None,
+            learners: None,
         });
         // Let a single-node group commit its no-op immediately (majority == 1);
         // in a larger group commit still waits on follower `matchIndex`. Without
@@ -2098,7 +2401,11 @@ where
     fn broadcast_append(&mut self) -> Vec<Out<C>> {
         // Include departing peers (see the `departing` field doc): a peer just
         // removed from `peers` still needs the removing entry replicated to it.
+        // Include learners too (ADR 0058 Train 1): they receive
+        // `AppendEntries`/`InstallSnapshot` exactly like a voter (see
+        // `apply_config`'s doc) even though they never join `peers` itself.
         let mut targets = self.peers.clone();
+        targets.extend(self.learners.iter().cloned());
         targets.extend(self.departing.keys().cloned());
         let mut outs: Vec<Out<C>> = targets
             .iter()
@@ -2162,9 +2469,13 @@ where
         let last = self.last_log_index();
         self.commit_index == last
             && self.commit_index >= self.first_term_index
+            // ADR 0058 Train 1: a learner still mid-catch-up is exactly
+            // "something left to replicate" — a leader must not quiesce out
+            // from under an active learner catch-up.
             && self
                 .peers
                 .iter()
+                .chain(self.learners.iter())
                 .all(|p| self.match_index.get(p).copied().unwrap_or(0) == last)
             && self.transfer_target.is_none()
             && self.departing.is_empty()
@@ -2177,16 +2488,20 @@ where
             && self.quiesce_veto_fresh_through >= self.commit_index
     }
 
-    /// Broadcast [`RaftMsg::Quiesce`] once to every voter — the leader-side
-    /// half of entering quiescence. Deliberately mirrors `broadcast_append`'s
-    /// peer selection (`peers`, not `departing`: a departing peer that hasn't
-    /// yet caught up to its own removal entry would fail `quiesce_entry_ok`'s
+    /// Broadcast [`RaftMsg::Quiesce`] once to every voter **and learner**
+    /// (ADR 0058 Train 1) — the leader-side half of entering quiescence.
+    /// Deliberately mirrors `broadcast_append`'s peer selection (`peers` ∪
+    /// `learners`, not `departing`: a departing peer that hasn't yet caught
+    /// up to its own removal entry would fail `quiesce_entry_ok`'s
     /// `match_index == last_log_index` clause already, so this path can only
     /// be reached with no departing peer outstanding).
     fn broadcast_quiesce(&mut self) -> Vec<Out<C>> {
+        // ADR 0058 Train 1: a learner also stops ticking once the group is
+        // fully idle, mirroring every voter (`broadcast_append`'s doc).
         self.peers
             .clone()
             .into_iter()
+            .chain(self.learners.clone())
             .map(|p| {
                 (
                     p,
@@ -2412,6 +2727,7 @@ where
                 total,
                 done,
                 config: self.snapshot_config.clone(),
+                learners: self.snapshot_learners.clone(),
             },
         ))
     }

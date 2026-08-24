@@ -55,6 +55,10 @@ pub enum WalRecord<C = MetaCommand, S = Metadata> {
         /// the never-reconfigured control plane) means "the node's initial set".
         #[serde(default)]
         config: Option<BTreeSet<NodeId>>,
+        /// The **learner** configuration effective at `last_index` (ADR 0058
+        /// Train 1), mirroring `config` above. `None` means "no learners".
+        #[serde(default)]
+        learners: Option<BTreeSet<NodeId>>,
     },
 }
 
@@ -73,6 +77,10 @@ pub struct PersistedState<C = MetaCommand, S = Metadata> {
     /// The voter configuration recorded by the latest snapshot, if any (ADR 0017
     /// C). `None` means the snapshot predates membership changes / there is none.
     pub snapshot_config: Option<BTreeSet<NodeId>>,
+    /// The learner configuration recorded by the latest snapshot, if any (ADR
+    /// 0058 Train 1). `None` means no learners (or the snapshot predates this
+    /// field).
+    pub snapshot_learners: Option<BTreeSet<NodeId>>,
 }
 
 // Manual `Default` (not derived): the derive would demand `C: Default` + `S:
@@ -86,6 +94,7 @@ impl<C, S> Default for PersistedState<C, S> {
             log: Vec::new(),
             snapshot: None,
             snapshot_config: None,
+            snapshot_learners: None,
         }
     }
 }
@@ -117,9 +126,11 @@ where
                     last_index,
                     last_term,
                     config,
+                    learners,
                 } => {
                     state.snapshot = Some((metadata, last_index, last_term));
                     state.snapshot_config = config;
+                    state.snapshot_learners = learners;
                 }
             }
         }
@@ -242,6 +253,7 @@ mod tests {
             term,
             command,
             config: None,
+            learners: None,
         }
     }
 

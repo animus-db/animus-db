@@ -225,6 +225,7 @@ mod tests {
                 status: NodeStatus::Active,
             },
             config: None,
+            learners: None,
         }
     }
 
