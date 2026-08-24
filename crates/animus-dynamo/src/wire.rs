@@ -315,6 +315,23 @@ pub enum WriteRequest {
     Delete(Item),
 }
 
+/// The `ReturnValuesOnConditionCheckFailure` selector on one
+/// `TransactWriteItems` action (`Put`/`Delete`/`Update`/`ConditionCheck` —
+/// every variant that carries a condition, ADR 0018's 2026-08-24
+/// `CancellationReasons` amendment, issue #374 C2). Unlike the top-level
+/// `ReturnValues`, this only ever matters when the *cancellation* is this
+/// exact action's own condition failing: it selects whether that action's
+/// `CancellationReasons` entry echoes the item's old image under `Item`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ReturnValuesOnConditionCheckFailure {
+    /// `NONE` (default) — no `Item` on this action's cancellation reason.
+    #[default]
+    None,
+    /// `ALL_OLD` — echo the item's old image under `Item` when this exact
+    /// action is the one whose condition caused the cancellation.
+    AllOld,
+}
+
 /// One action of a `TransactWriteItems` request. Each is condition-gated like a
 /// conditional write; see [`Operation::TransactWriteItems`] for the (documented)
 /// non-atomicity caveat.
@@ -335,6 +352,10 @@ pub enum TransactAction {
         item: Item,
         /// Optional gate.
         condition: Option<ConditionExpression>,
+        /// `ReturnValuesOnConditionCheckFailure` (ADR 0018's 2026-08-24
+        /// `CancellationReasons` amendment).
+        #[serde(default)]
+        rvocf: ReturnValuesOnConditionCheckFailure,
     },
     /// `Delete`: delete `key` from `table`, gated on `condition`.
     Delete {
@@ -344,6 +365,10 @@ pub enum TransactAction {
         key: Item,
         /// Optional gate.
         condition: Option<ConditionExpression>,
+        /// `ReturnValuesOnConditionCheckFailure` (ADR 0018's 2026-08-24
+        /// `CancellationReasons` amendment).
+        #[serde(default)]
+        rvocf: ReturnValuesOnConditionCheckFailure,
     },
     /// `Update`: apply `actions` to `key` in `table`, gated on `condition`.
     Update {
@@ -355,6 +380,10 @@ pub enum TransactAction {
         actions: Vec<UpdateAction>,
         /// Optional gate.
         condition: Option<ConditionExpression>,
+        /// `ReturnValuesOnConditionCheckFailure` (ADR 0018's 2026-08-24
+        /// `CancellationReasons` amendment).
+        #[serde(default)]
+        rvocf: ReturnValuesOnConditionCheckFailure,
     },
     /// `ConditionCheck`: assert `condition` on `key` in `table` without writing.
     ConditionCheck {
@@ -364,6 +393,10 @@ pub enum TransactAction {
         key: Item,
         /// The asserted condition.
         condition: ConditionExpression,
+        /// `ReturnValuesOnConditionCheckFailure` (ADR 0018's 2026-08-24
+        /// `CancellationReasons` amendment).
+        #[serde(default)]
+        rvocf: ReturnValuesOnConditionCheckFailure,
     },
 }
 
@@ -376,6 +409,19 @@ impl TransactAction {
             | TransactAction::Delete { table, .. }
             | TransactAction::Update { table, .. }
             | TransactAction::ConditionCheck { table, .. } => table,
+        }
+    }
+
+    /// This action's own `ReturnValuesOnConditionCheckFailure` — every
+    /// variant carries one (ADR 0018's 2026-08-24 `CancellationReasons`
+    /// amendment).
+    #[must_use]
+    pub fn rvocf(&self) -> ReturnValuesOnConditionCheckFailure {
+        match self {
+            TransactAction::Put { rvocf, .. }
+            | TransactAction::Delete { rvocf, .. }
+            | TransactAction::Update { rvocf, .. }
+            | TransactAction::ConditionCheck { rvocf, .. } => *rvocf,
         }
     }
 }
@@ -788,15 +834,105 @@ impl Operation {
     }
 }
 
+/// One entry of AWS's `CancellationReasons` array on a
+/// `TransactionCanceledException` (ADR 0018's 2026-08-24 `CancellationReasons`
+/// amendment, issue #374 C2) — one per `TransactItems` action, in the
+/// request's own order. `Code: "None"` (with a `null` `Message`, never
+/// omitted — matching AWS's own wire shape) marks an action that was **not**
+/// itself the cause of the cancellation. `Item` is present only on a
+/// `ConditionalCheckFailed` entry, and only when that action requested
+/// `ReturnValuesOnConditionCheckFailure: "ALL_OLD"` — every other entry omits
+/// the field entirely (never `null`), matching AWS's own asymmetry between
+/// `Message` (always rendered) and `Item` (rendered only when present).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CancellationReason {
+    /// `"None"`, `"ConditionalCheckFailed"`, or `"TransactionConflict"` — the
+    /// closed set this adapter emits.
+    #[serde(rename = "Code")]
+    pub code: &'static str,
+    /// `None` renders as JSON `null` (not omitted) — AWS always includes this
+    /// key, `null` for a `None`-coded entry.
+    #[serde(rename = "Message")]
+    pub message: Option<String>,
+    /// The item's old image, DynamoDB-wire-encoded exactly like a `GetItem`
+    /// result — present only for a `ConditionalCheckFailed` entry whose own
+    /// action asked for `ReturnValuesOnConditionCheckFailure: "ALL_OLD"` and
+    /// whose old image was in hand at the point of failure.
+    #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    pub item: Option<Value>,
+}
+
+impl CancellationReason {
+    /// An action that was not the cause of the cancellation.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            code: "None",
+            message: None,
+            item: None,
+        }
+    }
+
+    /// A `ConditionExpression`/`ConditionCheck` that evaluated to false.
+    /// `item` is the old image to echo under `Item` when the action's own
+    /// `ReturnValuesOnConditionCheckFailure` was `ALL_OLD`; pass `None` when
+    /// it was `NONE` (the default) or the old image was not in hand.
+    #[must_use]
+    pub fn conditional_check_failed(item: Option<&Item>) -> Self {
+        Self {
+            code: "ConditionalCheckFailed",
+            message: Some("The conditional request failed".into()),
+            item: item.map(encode_item),
+        }
+    }
+
+    /// A key already held a different, still-unresolved transaction's
+    /// intent — a lost race, not a permanent condition failure (ADR 0018 §2
+    /// `StageOutcome::IntentBlocked`). Never carries `Item`: AWS does not
+    /// document one for this code, and this adapter has no old image in hand
+    /// at the point this is minted.
+    #[must_use]
+    pub fn transaction_conflict() -> Self {
+        Self {
+            code: "TransactionConflict",
+            message: Some("Transaction is ongoing for the item".into()),
+            item: None,
+        }
+    }
+}
+
+/// The bracketed aggregate `message` AWS derives from a `CancellationReasons`
+/// array, e.g. `"Transaction cancelled, please refer cancellation reasons for
+/// specific reasons [None, ConditionalCheckFailed]"`.
+#[must_use]
+fn cancellation_aggregate_message(reasons: &[CancellationReason]) -> String {
+    let codes = reasons
+        .iter()
+        .map(|r| r.code)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Transaction cancelled, please refer cancellation reasons for specific reasons [{codes}]"
+    )
+}
+
 /// A wire-level decode/encode failure, carrying the DynamoDB-style error code
 /// (the `__type` field) and a human message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WireError {
     /// The DynamoDB error code, e.g. `ValidationException` or
     /// `UnknownOperationException`. Sent to clients as the `__type` field.
     pub code: &'static str,
     /// A human-readable message.
     pub message: String,
+    /// The per-action `CancellationReasons` array (ADR 0018's 2026-08-24
+    /// `CancellationReasons` amendment) — `Some` only on a
+    /// `TransactionCanceledException` minted with per-action detail in hand
+    /// ([`Self::transaction_canceled_with_reasons`]); `None` for every other
+    /// error, and for the aggregate-only [`Self::transaction_canceled`] used
+    /// where no per-action detail is available (e.g. a cached `CANCELLED`
+    /// idempotency replay, which never persisted its original reasons).
+    pub reasons: Option<Vec<CancellationReason>>,
 }
 
 impl WireError {
@@ -807,6 +943,7 @@ impl WireError {
         Self {
             code: "ValidationException",
             message: message.into(),
+            reasons: None,
         }
     }
 
@@ -816,6 +953,7 @@ impl WireError {
         Self {
             code: "UnknownOperationException",
             message: format!("unsupported operation `{target}`"),
+            reasons: None,
         }
     }
 
@@ -825,6 +963,7 @@ impl WireError {
         Self {
             code: "SerializationException",
             message: message.into(),
+            reasons: None,
         }
     }
 
@@ -834,6 +973,7 @@ impl WireError {
         Self {
             code: "ConditionalCheckFailedException",
             message: message.into(),
+            reasons: None,
         }
     }
 
@@ -842,20 +982,38 @@ impl WireError {
     /// internal 2PC abort (ADR 0018 §2/PR7). This is the DynamoDB exception
     /// type real `TransactWriteItems`/`TransactGetItems` failures use (as
     /// opposed to the bare `ConditionalCheckFailedException` a single-item
-    /// conditional `PutItem`/`DeleteItem`/`UpdateItem` returns) — **simple
-    /// form**: a single human message, not AWS's per-action
-    /// `CancellationReasons` array (explicitly deferred, ADR 0018 PR1
-    /// amendment decision 4 / the PR7 amendment — still deferred as of the
-    /// 2026-08-24 `ClientRequestToken` amendment, which shipped
-    /// [`idempotent_parameter_mismatch`](Self::idempotent_parameter_mismatch)/
-    /// [`transaction_in_progress`](Self::transaction_in_progress) alongside
-    /// this constructor, closing the *other* half of that same deferred
-    /// pair, but left per-action fidelity untouched).
+    /// conditional `PutItem`/`DeleteItem`/`UpdateItem` returns) — **aggregate
+    /// form**: a single human message and no `CancellationReasons` array.
+    /// Used where no per-action detail is available at the point of failure
+    /// (a cached `CANCELLED` idempotency replay, which never persisted its
+    /// original reasons; a structural/routing abort with no single
+    /// responsible action). Prefer
+    /// [`Self::transaction_canceled_with_reasons`] whenever the failing
+    /// action is known (ADR 0018's 2026-08-24 `CancellationReasons`
+    /// amendment, issue #374 C2).
     #[must_use]
     pub fn transaction_canceled(message: impl Into<String>) -> Self {
         Self {
             code: "TransactionCanceledException",
             message: message.into(),
+            reasons: None,
+        }
+    }
+
+    /// A `TransactWriteItems` request was cancelled, with AWS's full
+    /// per-action `CancellationReasons` array in hand (ADR 0018's 2026-08-24
+    /// `CancellationReasons` amendment, issue #374 C2) — `reasons` has one
+    /// entry per `TransactItems` action, in the request's own order
+    /// ([`CancellationReason::none`] for every action that was not the
+    /// cause). The aggregate `message` is derived from `reasons` itself
+    /// (AWS's own bracketed-code-list wording), never supplied separately —
+    /// see [`cancellation_aggregate_message`].
+    #[must_use]
+    pub fn transaction_canceled_with_reasons(reasons: Vec<CancellationReason>) -> Self {
+        Self {
+            code: "TransactionCanceledException",
+            message: cancellation_aggregate_message(&reasons),
+            reasons: Some(reasons),
         }
     }
 
@@ -869,6 +1027,7 @@ impl WireError {
         Self {
             code: "IdempotentParameterMismatchException",
             message: message.into(),
+            reasons: None,
         }
     }
 
@@ -888,15 +1047,19 @@ impl WireError {
         Self {
             code: "TransactionInProgressException",
             message: message.into(),
+            reasons: None,
         }
     }
 
-    /// Render as the DynamoDB error JSON body (`{"__type":..,"message":..}`).
+    /// Render as the DynamoDB error JSON body (`{"__type":..,"message":..}`,
+    /// plus a `"CancellationReasons"` sibling array when [`Self::reasons`]
+    /// is `Some`, ADR 0018's 2026-08-24 `CancellationReasons` amendment).
     #[must_use]
     pub fn to_json(&self) -> String {
         let body = ErrorBody {
             type_: format!("com.amazonaws.dynamodb.v20120810#{}", self.code),
             message: self.message.clone(),
+            cancellation_reasons: self.reasons.clone(),
         };
         serde_json::to_string(&body).expect("error body serializes")
     }
@@ -927,6 +1090,15 @@ struct ErrorBody {
     #[serde(rename = "__type")]
     type_: String,
     message: String,
+    /// `Some` renders a `"CancellationReasons"` sibling array (ADR 0018's
+    /// 2026-08-24 `CancellationReasons` amendment); `None` omits the key
+    /// entirely, matching every non-`TransactWriteItems` error's wire shape
+    /// exactly as before this amendment.
+    #[serde(
+        rename = "CancellationReasons",
+        skip_serializing_if = "Option::is_none"
+    )]
+    cancellation_reasons: Option<Vec<CancellationReason>>,
 }
 
 /// Decode a request body for the operation named by `target` (the full
@@ -1226,6 +1398,28 @@ fn resolve_attr_name(obj: &Map<String, Value>, raw: &str) -> Result<String, Wire
     Ok(reject_path(name)?.to_owned())
 }
 
+/// Decode one `TransactWriteItems` action's `ReturnValuesOnConditionCheckFailure`
+/// (`NONE`/`ALL_OLD`, ADR 0018's 2026-08-24 `CancellationReasons` amendment).
+/// Absent ⇒ `NONE`, matching AWS's own default.
+fn decode_rvocf(
+    obj: &Map<String, Value>,
+) -> Result<ReturnValuesOnConditionCheckFailure, WireError> {
+    match obj.get("ReturnValuesOnConditionCheckFailure") {
+        None | Some(Value::Null) => Ok(ReturnValuesOnConditionCheckFailure::None),
+        Some(v) => match v.as_str() {
+            Some("NONE") => Ok(ReturnValuesOnConditionCheckFailure::None),
+            Some("ALL_OLD") => Ok(ReturnValuesOnConditionCheckFailure::AllOld),
+            Some(other) => Err(WireError::validation(format!(
+                "unsupported `ReturnValuesOnConditionCheckFailure` `{other}` \
+                 (supported: NONE, ALL_OLD)"
+            ))),
+            None => Err(WireError::validation(
+                "`ReturnValuesOnConditionCheckFailure` must be a string",
+            )),
+        },
+    }
+}
+
 /// Decode an `UpdateItem` `ReturnValues` (`NONE`/`ALL_OLD`/`ALL_NEW`). Absent ⇒
 /// `NONE`. `UPDATED_OLD`/`UPDATED_NEW` are deferred (rejected).
 fn decode_update_return_values(obj: &Map<String, Value>) -> Result<UpdateReturnValues, WireError> {
@@ -1344,6 +1538,7 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
             .as_object()
             .ok_or_else(|| WireError::validation(format!("`{kind}` must be an object")))?;
         let table = table_name(inner)?;
+        let rvocf = decode_rvocf(inner)?;
         let action = match kind.as_str() {
             "Put" => {
                 let item = decode_sub_item(inner, "Item")?;
@@ -1352,12 +1547,14 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
                     table,
                     item,
                     condition: decode_condition(inner)?,
+                    rvocf,
                 }
             }
             "Delete" => TransactAction::Delete {
                 table,
                 key: decode_sub_item(inner, "Key")?,
                 condition: decode_condition(inner)?,
+                rvocf,
             },
             "Update" => {
                 let key = decode_sub_item(inner, "Key")?;
@@ -1372,6 +1569,7 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
                     key,
                     actions: decode_update_expression(inner, expr)?,
                     condition: decode_condition(inner)?,
+                    rvocf,
                 }
             }
             "ConditionCheck" => TransactAction::ConditionCheck {
@@ -1380,6 +1578,7 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
                 condition: decode_condition(inner)?.ok_or_else(|| {
                     WireError::validation("ConditionCheck requires a `ConditionExpression`")
                 })?,
+                rvocf,
             },
             other => {
                 return Err(WireError::validation(format!(
@@ -5234,6 +5433,125 @@ mod tests {
             "TransactItems":[{"Put":{"TableName":"t","Item":{"id":{"S":"a"}}}}]}"#;
         let err = decode_request("DynamoDB_20120810.TransactWriteItems", body.as_bytes())
             .expect_err("empty token is below the AWS minimum");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    // --- Per-action `CancellationReasons` (ADR 0018's 2026-08-24
+    // `CancellationReasons` amendment, issue #374 C2a) ----------------------
+
+    #[test]
+    fn cancellation_reason_json_shape_matches_aws_exactly() {
+        // The exact shape ADR 0018's amendment specifies: `Message` always
+        // present (`null` for `None`), `Item` present only on a
+        // `ConditionalCheckFailed` entry that actually has one.
+        let mut item = Item::new();
+        item.insert("id".into(), s("k"));
+        let err = WireError::transaction_canceled_with_reasons(vec![
+            CancellationReason::none(),
+            CancellationReason::conditional_check_failed(Some(&item)),
+        ]);
+        assert_eq!(err.code, "TransactionCanceledException");
+        let json: Value = serde_json::from_str(&err.to_json()).unwrap();
+        let reasons = json
+            .get("CancellationReasons")
+            .and_then(Value::as_array)
+            .expect("CancellationReasons array present");
+        assert_eq!(reasons.len(), 2);
+        assert_eq!(reasons[0]["Code"], "None");
+        assert_eq!(reasons[0]["Message"], Value::Null);
+        assert!(
+            reasons[0].get("Item").is_none(),
+            "a `None` entry must omit `Item` entirely, not null it"
+        );
+        assert_eq!(reasons[1]["Code"], "ConditionalCheckFailed");
+        assert_eq!(reasons[1]["Message"], "The conditional request failed");
+        assert_eq!(reasons[1]["Item"]["id"]["S"], "k");
+    }
+
+    #[test]
+    fn cancellation_reason_without_all_old_omits_item() {
+        let err = WireError::transaction_canceled_with_reasons(vec![
+            CancellationReason::conditional_check_failed(None),
+        ]);
+        let json: Value = serde_json::from_str(&err.to_json()).unwrap();
+        let reason = &json["CancellationReasons"][0];
+        assert_eq!(reason["Code"], "ConditionalCheckFailed");
+        assert!(
+            reason.get("Item").is_none(),
+            "no old image in hand ⇒ no `Item`, even for a `ConditionalCheckFailed` entry"
+        );
+    }
+
+    #[test]
+    fn cancellation_reason_transaction_conflict_shape() {
+        let err = WireError::transaction_canceled_with_reasons(vec![
+            CancellationReason::none(),
+            CancellationReason::none(),
+            CancellationReason::transaction_conflict(),
+        ]);
+        let json: Value = serde_json::from_str(&err.to_json()).unwrap();
+        let reasons = json["CancellationReasons"].as_array().unwrap();
+        assert_eq!(reasons.len(), 3);
+        assert_eq!(reasons[2]["Code"], "TransactionConflict");
+        assert!(reasons[2]["Message"].is_string());
+        assert!(reasons[2].get("Item").is_none());
+    }
+
+    #[test]
+    fn cancellation_aggregate_message_brackets_the_codes_in_order() {
+        let err = WireError::transaction_canceled_with_reasons(vec![
+            CancellationReason::none(),
+            CancellationReason::conditional_check_failed(None),
+        ]);
+        assert_eq!(
+            err.message,
+            "Transaction cancelled, please refer cancellation reasons for specific reasons \
+             [None, ConditionalCheckFailed]"
+        );
+    }
+
+    #[test]
+    fn a_plain_transaction_canceled_carries_no_reasons() {
+        // `transaction_canceled` (the aggregate-only constructor, still used
+        // where no per-action detail is available) must not accidentally
+        // gain a `CancellationReasons` key.
+        let err = WireError::transaction_canceled("aggregate only");
+        assert_eq!(err.reasons, None);
+        let json: Value = serde_json::from_str(&err.to_json()).unwrap();
+        assert!(json.get("CancellationReasons").is_none());
+    }
+
+    #[test]
+    fn decodes_return_values_on_condition_check_failure_per_action() {
+        let body = br#"{"TransactItems":[
+            {"Put":{"TableName":"t","Item":{"id":{"S":"a"}},
+                    "ConditionExpression":"attribute_not_exists(id)",
+                    "ReturnValuesOnConditionCheckFailure":"ALL_OLD"}},
+            {"ConditionCheck":{"TableName":"t","Key":{"id":{"S":"b"}},
+                               "ConditionExpression":"attribute_exists(id)"}}]}"#;
+        let Operation::TransactWriteItems { actions, .. } =
+            decode_request("DynamoDB_20120810.TransactWriteItems", body).unwrap()
+        else {
+            panic!("expected TransactWriteItems");
+        };
+        assert_eq!(
+            actions[0].rvocf(),
+            ReturnValuesOnConditionCheckFailure::AllOld
+        );
+        // Absent ⇒ NONE, matching AWS's own default.
+        assert_eq!(
+            actions[1].rvocf(),
+            ReturnValuesOnConditionCheckFailure::None
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_return_values_on_condition_check_failure() {
+        let body = br#"{"TransactItems":[
+            {"Put":{"TableName":"t","Item":{"id":{"S":"a"}},
+                    "ReturnValuesOnConditionCheckFailure":"ALL_NEW"}}]}"#;
+        let err = decode_request("DynamoDB_20120810.TransactWriteItems", body)
+            .expect_err("ALL_NEW is not a legal ReturnValuesOnConditionCheckFailure value");
         assert_eq!(err.code, "ValidationException");
     }
 

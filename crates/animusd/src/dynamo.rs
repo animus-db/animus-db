@@ -523,11 +523,13 @@ fn reject_internal_table(table: &str, ddl: bool) -> Result<(), WireError> {
         Err(WireError {
             code: "ValidationException",
             message: format!("`{table}` is a reserved internal table name"),
+            reasons: None,
         })
     } else {
         Err(WireError {
             code: "ResourceNotFoundException",
             message: format!("table `{table}` does not exist"),
+            reasons: None,
         })
     }
 }
@@ -1121,6 +1123,7 @@ async fn create_table(
         return Err(WireError {
             code: "ValidationException",
             message: format!("table name `{table}` collides with the reserved system namespace"),
+            reasons: None,
         });
     }
     // Reject a duplicate up front, matching DynamoDB's `ResourceInUseException`,
@@ -2053,7 +2056,7 @@ async fn run_transact(
     // `drop(_rmw)` below, alongside every other cancellation exit.
     let mut condition_check_failure: Option<WireError> = None;
 
-    'actions: for action in actions {
+    'actions: for (action_index, action) in actions.iter().enumerate() {
         let table = action.table().to_owned();
         let (key_item, condition): (&Item, Option<&ConditionExpression>) = match action {
             TransactAction::Put {
@@ -2129,9 +2132,25 @@ async fn run_transact(
         if let Some(cond) = condition
             && !cond.evaluate(decoded.as_ref())?
         {
-            condition_check_failure = Some(WireError::transaction_canceled(
-                "a transaction condition check failed",
-            ));
+            // ADR 0018's 2026-08-24 `CancellationReasons` amendment (issue
+            // #374 C2a): this action's own index is known here, so the
+            // reply carries the full per-action array rather than an
+            // aggregate-only message. `decoded` is this `ConditionCheck`'s
+            // own observed item — the exact "old image" AWS's `Item` field
+            // means for a check that never writes — echoed only when this
+            // action asked for `ReturnValuesOnConditionCheckFailure: ALL_OLD`.
+            let item = matches!(
+                action.rvocf(),
+                wire::ReturnValuesOnConditionCheckFailure::AllOld
+            )
+            .then_some(decoded.as_ref())
+            .flatten();
+            let reasons = cancellation_reasons_for(
+                actions,
+                action_index,
+                wire::CancellationReason::conditional_check_failed(item),
+            );
+            condition_check_failure = Some(WireError::transaction_canceled_with_reasons(reasons));
             break 'actions;
         }
         preconditions.push((table, data_key, raw));
@@ -2153,7 +2172,14 @@ async fn run_transact(
         // Every action was a `ConditionCheck` — see this function's doc for
         // why this is a documented, narrow fallback rather than a call to
         // `cp_txn` (which requires at least one write to anchor on).
-        for (table, key, expected) in &preconditions {
+        // `preconditions[i]` corresponds to `actions[i]`: this branch only
+        // runs when every action reached the `ConditionCheck` arm below
+        // (`writes.is_empty()`), and that arm pushes exactly one
+        // precondition per action, in the same iteration order — so a
+        // mismatch's index into `preconditions` is that action's own index
+        // into `actions` (ADR 0018's 2026-08-24 `CancellationReasons`
+        // amendment, issue #374 C2a).
+        for (action_index, (table, key, expected)) in preconditions.iter().enumerate() {
             let actual = raw_quorum_read(ctx, meta, table, key, ReadConsistency::Strong).await?;
             if &actual != expected {
                 ctx.data()
@@ -2171,9 +2197,22 @@ async fn run_transact(
                     )
                     .await;
                 }
-                return Err(WireError::transaction_canceled(
-                    "a transaction condition check failed",
-                ));
+                let decoded_item = match &actual {
+                    Some(bytes) => wire::decode_stored_item(bytes)?,
+                    None => None,
+                };
+                let item = matches!(
+                    actions[action_index].rvocf(),
+                    wire::ReturnValuesOnConditionCheckFailure::AllOld
+                )
+                .then_some(decoded_item.as_ref())
+                .flatten();
+                let reasons = cancellation_reasons_for(
+                    actions,
+                    action_index,
+                    wire::CancellationReason::conditional_check_failed(item),
+                );
+                return Err(WireError::transaction_canceled_with_reasons(reasons));
             }
         }
         ctx.data()
@@ -2217,11 +2256,38 @@ async fn run_transact(
                 )
                 .await;
             }
+            // `cp_txn`'s own abort still crosses as an untyped `String`
+            // (site 3 of ADR 0018's 2026-08-24 `CancellationReasons`
+            // amendment, issue #374 C2) — aggregate-only for now. C2b
+            // threads a typed `TxnAbortReason` through this boundary so a
+            // write action's own condition/conflict can flag the right
+            // index here too, matching sites 1/2 above.
             Err(WireError::transaction_canceled(format!(
                 "transaction cancelled: {e}"
             )))
         }
     }
+}
+
+/// Build a full per-action `CancellationReasons` array (ADR 0018's
+/// 2026-08-24 `CancellationReasons` amendment, issue #374 C2): one entry per
+/// `actions`, [`wire::CancellationReason::none`] everywhere except
+/// `failing_index`, which gets `reason`. `run_transact`'s three cancellation
+/// sites each call this once they know which action caused the cancellation.
+fn cancellation_reasons_for(
+    actions: &[TransactAction],
+    failing_index: usize,
+    reason: wire::CancellationReason,
+) -> Vec<wire::CancellationReason> {
+    (0..actions.len())
+        .map(|i| {
+            if i == failing_index {
+                reason.clone()
+            } else {
+                wire::CancellationReason::none()
+            }
+        })
+        .collect()
 }
 
 /// The key-identifying `Item` of one `TransactAction` — `item` for a `Put`,
@@ -4181,26 +4247,32 @@ fn registry_error(err: animus_dynamo::RegistryError) -> WireError {
         R::NoSuchTable(t) => WireError {
             code: "ResourceNotFoundException",
             message: format!("table `{t}` does not exist"),
+            reasons: None,
         },
         R::TableExists(t) => WireError {
             code: "ResourceInUseException",
             message: format!("table `{t}` already exists"),
+            reasons: None,
         },
         R::MissingKey(k) => WireError {
             code: "ValidationException",
             message: format!("missing key attribute `{k}`"),
+            reasons: None,
         },
         R::SortKeyMismatch(t) => WireError {
             code: "ValidationException",
             message: format!("table `{t}` has no sort key for this condition"),
+            reasons: None,
         },
         R::NoSuchIndex(i) => WireError {
             code: "ValidationException",
             message: format!("index `{i}` does not exist on this table"),
+            reasons: None,
         },
         R::IndexSortMismatch(i) => WireError {
             code: "ValidationException",
             message: format!("index `{i}` is hash-only and takes no sort-key condition"),
+            reasons: None,
         },
     }
 }
@@ -5362,6 +5434,7 @@ pub(crate) fn internal(message: &str) -> WireError {
     WireError {
         code: "InternalServerError",
         message: message.to_owned(),
+        reasons: None,
     }
 }
 
@@ -5417,6 +5490,7 @@ pub(crate) fn decode_relayed_error(raw: &str) -> WireError {
             return WireError {
                 code,
                 message: message.to_owned(),
+                reasons: None,
             };
         }
     }
@@ -5437,6 +5511,7 @@ mod relayed_error_tests {
             message: "Incorrect operand type for operator or function; \
                       operator or function: size, operand type: N"
                 .into(),
+            reasons: None,
         };
         let decoded = decode_relayed_error(&encode_relayed_error(&err));
         assert_eq!(decoded.code, err.code);
