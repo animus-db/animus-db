@@ -2205,6 +2205,7 @@ mod system_table_tests {
                 intra: addrs[4],
                 console: addrs[5],
             }],
+            dynamo_auth: None,
         }
     }
 

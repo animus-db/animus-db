@@ -303,7 +303,10 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
             console: free(),
         }
     };
-    let config = animusd::ClusterConfig { nodes: vec![addrs] };
+    let config = animusd::ClusterConfig {
+        nodes: vec![addrs],
+        dynamo_auth: None,
+    };
 
     let node = animusd::run_node_control(&config, 0, dir.path(), animusd::StorageBackend::Lsm)
         .await

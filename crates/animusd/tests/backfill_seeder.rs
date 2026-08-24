@@ -58,7 +58,10 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, animusd::ClusterConfig) {
                 console: addrs[6 * i + 5],
             })
             .collect();
-        let config = animusd::ClusterConfig { nodes: nodes_cfg };
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+        };
         let mut nodes = Vec::new();
         for i in 0..n {
             match animusd::run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
@@ -564,6 +567,7 @@ async fn a_crash_and_restart_mid_backfill_still_converges() {
                 console: addrs[5],
             }
         }],
+        dynamo_auth: None,
     };
     let node = animusd::run_node(&config, 0, &node_dir)
         .await

@@ -2388,6 +2388,7 @@ mod gsi_drain_cursor_tests {
                 intra: addrs[4],
                 console: addrs[5],
             }],
+            dynamo_auth: None,
         }
     }
 
@@ -3181,6 +3182,7 @@ mod stream_sealer_tests {
                 intra: addrs[4],
                 console: addrs[5],
             }],
+            dynamo_auth: None,
         }
     }
 
@@ -3303,6 +3305,7 @@ mod stream_sealer_tests {
                 None,
                 quiesce_after,
                 crate::ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+                None,
             )
             .await
             .expect("bring up single node with streams + quiescence");

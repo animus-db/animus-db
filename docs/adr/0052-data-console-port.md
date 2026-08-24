@@ -776,3 +776,12 @@ data-only bind it; control-only does not) is unchanged — only the slot
 numbering shifts, and only for the roles at or after `admin`. The body
 above is kept as originally written; see ADR 0047's own matching
 amendment note for the full before/after port table.
+
+## Amendment (2026-08-23, ADR 0057)
+
+The "Auth" non-goal above is narrowed by [ADR 0057](0057-sigv4-client-auth.md):
+the client **DynamoDB port** now supports SigV4 verification against
+static credentials (default-off). The **console and admin ports are
+unchanged** — their trusted-operator-network posture stands, and auth
+there remains the flagged prerequisite this ADR states before the console
+is exposed more widely.

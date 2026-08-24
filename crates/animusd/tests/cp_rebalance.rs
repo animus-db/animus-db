@@ -150,6 +150,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
                     console: a[6 * i + 5],
                 })
                 .collect(),
+            dynamo_auth: None,
         };
         let mut nodes = Vec::new();
         let mut ok = true;

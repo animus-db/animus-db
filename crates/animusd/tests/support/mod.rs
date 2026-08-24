@@ -56,6 +56,7 @@ fn single_node_config() -> ClusterConfig {
             intra: a[4],
             console: a[5],
         }],
+        dynamo_auth: None,
     }
 }
 
@@ -136,7 +137,10 @@ pub async fn bring_up_deadline(
                 console: addrs[6 * i + 5],
             })
             .collect();
-        let config = ClusterConfig { nodes: nodes_cfg };
+        let config = ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+        };
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..n {
@@ -193,7 +197,10 @@ pub async fn grow_deadline(
                 console: addrs[6 * i + 5],
             });
         }
-        let expanded = ClusterConfig { nodes: nodes_cfg };
+        let expanded = ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+        };
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..extra {
@@ -323,6 +330,7 @@ pub async fn join_data_fresh_deadline(
             &node_dir,
             backend,
             BTreeMap::new(),
+            None,
         )
         .await
         {
@@ -425,6 +433,7 @@ pub async fn join_data_allocated_fresh_deadline(
             &node_dir,
             backend,
             BTreeMap::new(),
+            None,
         )
         .await
         {
@@ -477,7 +486,10 @@ pub async fn bring_up_split(
                 }
             })
             .collect();
-        let config = ClusterConfig { nodes: nodes_cfg };
+        let config = ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+        };
 
         let mut control_nodes = Vec::new();
         let mut data_nodes = Vec::new();

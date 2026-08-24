@@ -71,7 +71,10 @@ async fn bring_up(n: usize, dir: &Path) -> Vec<Node> {
                 console: addrs[6 * i + 5],
             })
             .collect();
-        let config = animusd::ClusterConfig { nodes: nodes_cfg };
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+        };
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..n {

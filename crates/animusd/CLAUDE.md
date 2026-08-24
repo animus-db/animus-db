@@ -77,7 +77,34 @@ reusing the captured config is the point of the test.
   2026-08-22 "Code patterns" entry (ADR 0053's `cql` port removal) on a
   field-name-keyed regex mangling unrelated `admin::Type`/`console::Type`
   module-path expressions into invalid syntax; always full-build immediately
-  after, not just visually diff.
+  after, not just visually diff. **`dynamo_auth: Option<DynamoAuthConfig>`
+  (ADR 0057)** is the client DynamoDB port's SigV4 credential store —
+  `#[serde(default)]` so an absent section (every existing config)
+  deserializes as `None`, but `ClusterConfig` itself derives no `Default`,
+  so adding this field hit the exact same `error[E0063]` fan-out the port
+  additions above describe: every `ClusterConfig { .. }` **literal**
+  (`generate`/`generate_split`, and every `src/`+`tests/` fixture that
+  builds one by hand rather than through those two constructors) needed
+  `dynamo_auth: None,` added by hand, compiler-enumerated. `DynamoAuthConfig
+  { credentials: BTreeMap<String, String> }` (`access_key_id →
+  secret_access_key`) — `ClusterConfig::from_json` calls
+  `DynamoAuthConfig::validate()` on a present section (empty credentials is
+  a load-time error, the same `serde_json::Error::custom` idiom the
+  duplicate-node-id check uses). Threaded from there down to `ClientCtx::
+  dynamo_auth` (an `Option<Arc<BTreeMap<String, String>>>`, cheap to clone
+  onto each connection) via `spawn_common_tail`'s own new trailing
+  parameter — every `start_with_growth`/`start_data_with_growth` /
+  `start_cluster_inner` layer that assembles `ClientCtx` gained the same
+  trailing `dynamo_auth` knob, mirroring the `quiesce_after`/
+  `ttl_sweep_interval` layered-wrapper convention: outer wrapper methods
+  default it to `None`, and a caller that needs it set
+  (`run_node_with_streams_quiesce_and_ttl_sweep_interval` reading
+  `ClusterConfig::dynamo_auth`, `run_node_data`/`run_node_data_join`'s data-
+  only duals, `main.rs`'s `--dynamo-auth`-fed config-less paths) calls the
+  innermost layer directly rather than growing every wrapper's arity.
+  `BoundControlNode::start_control_with` hardcodes `None` at its own
+  `spawn_common_tail` call — a control-only node never binds the dynamo
+  listener, so nothing there would ever read the field.
 - **`control_handle.rs`** — the `ControlHandle` seam (ADR 0035 PR1):
   `Local(RaftNode<ProdEnv>)` for a node with real control Raft, vs.
   `Remote(RemoteControlClient)` for a data-only node reaching a separate control
@@ -89,7 +116,30 @@ reusing the captured config is the point of the test.
 - **`dynamo.rs`** (~59 KB) — the DynamoDB JSON-over-HTTP edge; the `GET /metrics`
   route (ADR 0015) shares this listener. `dispatch` also forwards a
   `DynamoDBStreams_20120810.*` target to `dynamo_streams::execute`
-  (below) — the two services share one listener/port.
+  (below) — the two services share one listener/port. **SigV4 enforcement
+  (ADR 0057) lives in `handle_conn`, ahead of `dispatch`** — after the `GET
+  /metrics` special case, before every other request reaches `dispatch`/
+  `execute_routed`: when `ctx.dynamo_auth` is `Some` (a `dynamo_auth`
+  cluster-config section, or `--dynamo-auth PATH` on a config-less startup
+  mode), the request's method/path/query/headers/body build an
+  `animus_dynamo::sigv4::SigV4Request`, `ctx.env.wall_now()` supplies "now"
+  (never `SystemTime::now()`, ADR 0051 discipline), and a verification
+  failure short-circuits straight to a `400` with the AWS-faithful
+  `com.amazon.coral.service#...` body (`sigv4_error_body`, rendered via
+  `serde_json` rather than `WireError::to_json`'s DynamoDB-namespace
+  prefix — a different `__type` namespace entirely). This gates the item
+  API **and** Streams (both flow through `execute_routed`), and is
+  deliberately **not** inside `execute_routed` itself: that function is
+  also the admin dashboard's `POST /admin/data/dynamo` proxy's single
+  dispatch point (ADR 0021), which must stay unauthenticated (ADR 0020's
+  trusted-operator-network posture) — gating inside it would silently
+  re-gate that surface too. `ctx.dynamo_auth: Option<Arc<BTreeMap<String,
+  String>>>` — `None` (every existing config/test/deployment) skips the
+  whole block, zero-cost and behavior-identical to pre-ADR-0057. `http.rs`'s
+  `HttpRequest::headers` (every header, lowercased, repeats comma-joined —
+  added by this same ADR) is what makes the `SigV4Request` buildable at
+  all; a `SignedHeaders` list can name any header, not just the three this
+  crate used to retain.
 - **`dynamo_streams.rs`** (ADR 0042 §3/§5/§6/§7/§9/§10/§11) — the
   DynamoDB Streams read API: `ListStreams`/`DescribeStream`/
   `GetShardIterator`/`GetRecords`. Full design (label resolution, the
@@ -246,7 +296,13 @@ reusing the captured config is the point of the test.
   read-only `GET` views + gated `POST` actions + the dashboard's data-write
   surface; also serves the SPA static assets.
 - **`http.rs`** — shared hand-rolled HTTP/1.1 helpers (request parser + response
-  writers) used by `dynamo.rs`, `admin.rs`, and `console.rs`.
+  writers) used by `dynamo.rs`, `admin.rs`, and `console.rs`. **`HttpRequest::
+  headers` (ADR 0057)** retains every header (lowercased name → value, a
+  repeated header's values comma-joined in receipt order — the SigV4
+  canonical form) instead of the three fields (`target`/`content-length`
+  handling/`connection`) the parser used to keep and discard the rest of;
+  those three keep their own derived fields (every existing caller
+  untouched), `headers` is purely additive.
 - **`otel.rs`** — OTLP/HTTP distributed-tracing seam (ADR 0027); opt-in, no-op
   unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Scoped to this crate only.
 - **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** — the
@@ -444,6 +500,21 @@ reusing the captured config is the point of the test.
 help) prints the full invocation reference (durable LSM backend by
 default; `--ephemeral` selects the volatile memory engine). Notes not
 obvious from `--help` alone:
+
+**`--dynamo-auth PATH` (ADR 0057)** — a JSON file of the same shape as a
+`ClusterConfig`'s own `dynamo_auth` section (`{"credentials": {"AKID...":
+"secret...", ...}}`), naming the client DynamoDB port's SigV4 credential
+store. Accepted by `run`'s shared flag parser (so it applies to `--config
+FILE --node I` and `--cluster N`) and by `data`'s own parser (`data --config
+FILE --node I` and `data --seed ...`) — the config-less shapes (`--cluster
+N`, `--cluster-control`/`--cluster-data`, `data --seed`) have no other way
+to supply credentials; `--config`/`data --config` can instead put the
+`dynamo_auth` section directly in the config file. Supplying credentials
+**both** ways (a config file whose own section is present, **and** the
+flag) is a hard startup error (`apply_dynamo_auth_flag`) — never a silent
+precedence rule. Not accepted by `join`/`control` (a control-only node never
+binds the dynamo listener). Omitted (the default), auth stays disabled —
+byte-identical to pre-ADR-0057 behavior.
 
 **The split-build driver** (ADR 0050 Train B rung 4) is a
 `change_consumer_loop` arm: for a `Splitting` parent this node leads, it

@@ -5,13 +5,13 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS] # run an N-node cluster in one process
-//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] # run a whole split deployment in one process (ADR 0035)
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS] [--dynamo-auth PATH] # run node I of a cluster (one process)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS] [--dynamo-auth PATH] # run an N-node cluster in one process
+//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] # run node I as a control-only node (ADR 0035 PR3)
-//! animusd data --config FILE --node I [--dir DIR] [--ephemeral] # run node I as a data-only node (ADR 0035 PR4)
-//! animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # data-only seed/join (ADR 0035 PR5; ADR 0040 PR4 self-minting if --id is omitted)
+//! animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH] # run node I as a data-only node (ADR 0035 PR4)
+//! animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] [--dynamo-auth PATH] # data-only seed/join (ADR 0035 PR5; ADR 0040 PR4 self-minting if --id is omitted)
 //! ```
 //!
 //! The data replica is durable by default (an on-disk LSM under the node's data
@@ -92,6 +92,25 @@
 //! change-consumer sweep interval — issue #302 fix) is rejected at parse
 //! time**, since it can reopen the stale-veto quiescence race the fix
 //! closes; see that constant's own doc.
+//!
+//! `--dynamo-auth PATH` (ADR 0057) points at a JSON file holding the client
+//! DynamoDB port's SigV4 credential store — the same shape as a
+//! `ClusterConfig`'s own `dynamo_auth` section: `{"credentials":
+//! {"AKID...": "secret...", ...}}`. Absent (the default), auth is
+//! **disabled** on the dynamo port — byte-identical to pre-ADR-0057
+//! behavior, and every existing deployment/test/quick-start keeps working
+//! unmodified. It is the only way to configure credentials on a mode with no
+//! config file (`--cluster N`, `--cluster-control`/`--cluster-data`, `data
+//! --seed`); `--config FILE`/`data --config FILE` can instead (or also, as
+//! long as only one source supplies it) carry a `dynamo_auth` section
+//! directly in the config file. Supplying credentials **both** ways — a
+//! config file whose own `dynamo_auth` section is present, and this flag —
+//! is a hard startup error, never a silent precedence rule. Not accepted by
+//! `join`/`control` (a control-only node never binds the dynamo listener) or
+//! `data --config` without also specifying `--config` (see the mode's own
+//! flag list above). When set, every request on the dynamo port — item API
+//! and Streams alike — must carry a valid `Authorization: AWS4-HMAC-SHA256
+//! ...` header (`GET /metrics` stays unauthenticated, matching ADR 0057).
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -156,13 +175,13 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS]\n  \
-    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS] [--dynamo-auth PATH]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS] [--dynamo-auth PATH]\n  \
+    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS]\n  \
-    animusd data --config FILE --node I [--dir DIR] [--ephemeral]\n  \
-    animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]";
+    animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH]\n  \
+    animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--dynamo-auth PATH]";
 
 /// `gen-config`: print a generated cluster config as JSON — either combined-mode
 /// (`--nodes N`) or the ADR 0035 split-deployment shape (`--control-nodes N
@@ -269,6 +288,17 @@ async fn run(args: &[String]) -> Result<(), String> {
     // own doc for why (a maintainer-reviewable call, flagged there and in
     // the delivery PR body, not a settled operational fact).
     let mut quiesce_after: Option<u64> = None;
+    // `--dynamo-auth PATH` (ADR 0057): a JSON file of the same shape as a
+    // `ClusterConfig`'s `dynamo_auth` section (`{"credentials": {"AKID":
+    // "secret", ...}}`) — the client DynamoDB port's SigV4 credential store.
+    // Absent (the default) leaves auth disabled. Needed here because
+    // `--cluster`/`--cluster-control`/`--cluster-data` generate their config
+    // in-process (no config **file** to carry a `dynamo_auth` section of its
+    // own); `--config FILE` can also combine this flag with a config that
+    // has no `dynamo_auth` section of its own, but specifying credentials
+    // both ways (flag **and** the loaded file's own section) is a hard
+    // startup error — see `run_single`.
+    let mut dynamo_auth_path: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -308,6 +338,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--quiesce-after" => {
                 quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
             }
+            "--dynamo-auth" => {
+                dynamo_auth_path = Some(parse_next(&mut it, "--dynamo-auth")?);
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -329,6 +362,10 @@ async fn run(args: &[String]) -> Result<(), String> {
             quiesce_after.as_millis()
         ));
     }
+    let dynamo_auth_flag = dynamo_auth_path
+        .as_deref()
+        .map(load_dynamo_auth_file)
+        .transpose()?;
 
     if cluster_control.is_some() || cluster_data.is_some() {
         if config_path.is_some() || cluster.is_some() {
@@ -353,6 +390,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             auto_split_bytes,
             auto_split_change_rate,
             orphan_sweep_after,
+            dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
         )
         .await;
     }
@@ -371,6 +409,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 segment_store_config,
                 stream_retention,
                 quiesce_after,
+                dynamo_auth_flag,
             )
             .await
         }
@@ -388,6 +427,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 segment_store_config,
                 stream_retention,
                 quiesce_after,
+                dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
             )
             .await
         }
@@ -466,7 +506,48 @@ fn parse_segment_store(value: Option<&str>) -> Result<animusd::SegmentStoreConfi
     }
 }
 
+/// Load a `--dynamo-auth PATH` file (ADR 0057): the same JSON shape as a
+/// [`ClusterConfig`]'s own `dynamo_auth` section
+/// (`{"credentials": {"AKID": "secret", ...}}`), validated the same way
+/// (a present-but-empty credentials map is a load-time error).
+fn load_dynamo_auth_file(path: &str) -> Result<animusd::DynamoAuthConfig, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
+    let cfg: animusd::DynamoAuthConfig =
+        serde_json::from_str(&text).map_err(|e| format!("parsing --dynamo-auth {path}: {e}"))?;
+    cfg.validate()
+        .map_err(|e| format!("--dynamo-auth {path}: {e}"))?;
+    Ok(cfg)
+}
+
+/// Merge a `--dynamo-auth PATH` flag into a loaded [`ClusterConfig`] (ADR
+/// 0057): if the config file's own `dynamo_auth` section is also present,
+/// that is a hard startup error — no silent precedence between the two
+/// sources. Otherwise the flag's credentials become the config's, exactly as
+/// if the config file had carried that section itself.
+fn apply_dynamo_auth_flag(
+    config: &mut ClusterConfig,
+    flag: Option<animusd::DynamoAuthConfig>,
+) -> Result<(), String> {
+    match (&config.dynamo_auth, flag) {
+        (Some(_), Some(_)) => Err(
+            "dynamo_auth is set both in the config file and via --dynamo-auth — specify it \
+             one way, not both"
+                .to_string(),
+        ),
+        (None, Some(flag)) => {
+            config.dynamo_auth = Some(flag);
+            Ok(())
+        }
+        (_, None) => Ok(()),
+    }
+}
+
 /// Per-process: run node `index` from the config file.
+///
+/// `dynamo_auth_flag` (ADR 0057) is `--dynamo-auth PATH`, already loaded —
+/// specifying credentials **both** ways (the flag **and** the config file's
+/// own `dynamo_auth` section) is a hard startup error, not a silent
+/// precedence rule.
 #[allow(clippy::too_many_arguments)]
 async fn run_single(
     path: &str,
@@ -478,9 +559,11 @@ async fn run_single(
     segment_store_config: animusd::SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
+    dynamo_auth_flag: Option<animusd::DynamoAuthConfig>,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
-    let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    apply_dynamo_auth_flag(&mut config, dynamo_auth_flag)?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-node-{index}")));
 
     let node = animusd::run_node_with_streams_and_quiesce_after(
@@ -591,6 +674,10 @@ async fn run_data(args: &[String]) -> Result<(), String> {
     let mut id: Option<String> = None;
     let mut ip: IpAddr = "127.0.0.1".parse().unwrap();
     let mut base_port: Option<u16> = None;
+    // `--dynamo-auth PATH` (ADR 0057) — see `run`'s own doc for the shared
+    // shape/semantics; accepted here too since a data-only node binds the
+    // dynamo listener (ADR 0035 PR4).
+    let mut dynamo_auth_path: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -603,15 +690,22 @@ async fn run_data(args: &[String]) -> Result<(), String> {
             "--id" => id = Some(parse_next::<String>(&mut it, "--id")?),
             "--ip" => ip = parse_next(&mut it, "--ip")?,
             "--base-port" => base_port = Some(parse_next(&mut it, "--base-port")?),
+            "--dynamo-auth" => {
+                dynamo_auth_path = Some(parse_next(&mut it, "--dynamo-auth")?);
+            }
             other => return Err(format!("unknown data argument `{other}`")),
         }
     }
+    let dynamo_auth_flag = dynamo_auth_path
+        .as_deref()
+        .map(load_dynamo_auth_file)
+        .transpose()?;
 
     match (config_path, seed_arg) {
         (Some(_), Some(_)) => Err("use either --config or --seed, not both".into()),
         (Some(path), None) => {
             let index = node.ok_or("data requires --node I")?;
-            run_data_config(&path, index, dir, backend).await
+            run_data_config(&path, index, dir, backend, dynamo_auth_flag).await
         }
         (None, Some(seed_arg)) => {
             let id = id
@@ -622,21 +716,36 @@ async fn run_data(args: &[String]) -> Result<(), String> {
                 "data --seed requires an explicit --base-port (ADR 0040: there is no \
                  --node index left to derive a default port range from)",
             )?;
-            run_data_join(&seed_arg, id, ip, base_port, dir, backend).await
+            run_data_join(
+                &seed_arg,
+                id,
+                ip,
+                base_port,
+                dir,
+                backend,
+                dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
+            )
+            .await
         }
         (None, None) => Err("data requires --config FILE or --seed ADDR[,ADDR...]".into()),
     }
 }
 
 /// `animusd data --config FILE --node I` (ADR 0035 PR4): the operator-assembled-config half of [`run_data`].
+///
+/// `dynamo_auth_flag` — see [`run_single`]'s identical doc: specifying
+/// credentials both in the config file's own `dynamo_auth` section and via
+/// the flag is a hard startup error.
 async fn run_data_config(
     path: &str,
     index: usize,
     dir: Option<std::path::PathBuf>,
     backend: animusd::StorageBackend,
+    dynamo_auth_flag: Option<animusd::DynamoAuthConfig>,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
-    let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    apply_dynamo_auth_flag(&mut config, dynamo_auth_flag)?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-data-{index}")));
 
     let node = animusd::run_node_data(&config, index, &dir, backend)
@@ -671,6 +780,7 @@ async fn run_data_join(
     base_port: u16,
     dir: Option<std::path::PathBuf>,
     backend: animusd::StorageBackend,
+    dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
 ) -> Result<(), String> {
     let seeds: Vec<SocketAddr> = seed_arg
         .split(',')
@@ -705,9 +815,17 @@ async fn run_data_join(
     let dir =
         dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-data-join-{dir_name}")));
 
-    let node = animusd::run_node_data_join(seeds, id, addrs, &dir, backend, BTreeMap::new())
-        .await
-        .map_err(|e| format!("failed to join as a data node: {e}"))?;
+    let node = animusd::run_node_data_join(
+        seeds,
+        id,
+        addrs,
+        &dir,
+        backend,
+        BTreeMap::new(),
+        dynamo_auth,
+    )
+    .await
+    .map_err(|e| format!("failed to join as a data node: {e}"))?;
     println!(
         "animusd: data node joined (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
         node.client_addr(),
@@ -829,6 +947,7 @@ async fn run_in_process_cluster(
     segment_store_config: animusd::SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
+    dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
@@ -848,6 +967,7 @@ async fn run_in_process_cluster(
         stream_retention,
         auto_split_change_rate,
         quiesce_after,
+        dynamo_auth,
     )
     .await
     .map_err(|e| format!("failed to start cluster: {e}"))?;
@@ -902,6 +1022,7 @@ async fn run_in_process_split_cluster(
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
     orphan_sweep_after: Duration,
+    dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
 ) -> Result<(), String> {
     if control_n == 0 || data_n == 0 {
         return Err("--cluster-control and --cluster-data must each be at least 1".into());
@@ -917,6 +1038,7 @@ async fn run_in_process_split_cluster(
         auto_split_bytes,
         orphan_sweep_after,
         auto_split_change_rate,
+        dynamo_auth,
     )
     .await
     .map_err(|e| format!("failed to start split cluster: {e}"))?;

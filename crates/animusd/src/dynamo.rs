@@ -344,6 +344,37 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
             }
             continue;
         }
+        // SigV4 enforcement (ADR 0057): gates the item API AND Streams —
+        // everything else on this listener that reaches `dispatch`/
+        // `execute_routed` — but deliberately sits *here*, ahead of
+        // `dispatch`, rather than inside `execute_routed` itself: that
+        // function is also the admin dashboard's `POST /admin/data/dynamo`
+        // proxy's single dispatch point (ADR 0021), which the ADR requires
+        // to stay unauthenticated (a different, already-trusted-network
+        // posture, ADR 0020). Gating inside `execute_routed` would silently
+        // re-gate that admin surface too; gating in this listener's own
+        // connection handler keeps the fork itself untouched and makes the
+        // gate a property of *this* port, not of the shared dispatch
+        // function. `None` (auth disabled, the default) skips this
+        // entirely — zero cost, byte-identical to pre-ADR-0057 behavior.
+        if let Some(credentials) = &ctx.dynamo_auth {
+            let sigv4_req = animus_dynamo::sigv4::SigV4Request {
+                method: &request.method,
+                path: &request.path,
+                query: &request.query,
+                headers: &request.headers,
+                body: &request.body,
+            };
+            let now_epoch_ms = ctx.env.wall_now().0;
+            if let Err(err) = animus_dynamo::sigv4::verify(&sigv4_req, credentials, now_epoch_ms) {
+                let body = sigv4_error_body(&err);
+                http::write_amz_json_response(&mut stream, 400, &body, keep_alive).await?;
+                if !keep_alive {
+                    return Ok(());
+                }
+                continue;
+            }
+        }
         let (status, body) = dispatch(&ctx, &request).await;
         http::write_amz_json_response(&mut stream, status, &body, keep_alive).await?;
         if !keep_alive {
@@ -353,6 +384,30 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
             return Ok(());
         }
     }
+}
+
+/// Render a [`animus_dynamo::sigv4::SigV4Error`] as the AWS-faithful auth-layer
+/// error body (ADR 0057's error-mapping table): `{"__type":
+/// "com.amazon.coral.service#...", "message": "..."}`. Rendered at this edge
+/// rather than through [`animus_dynamo::wire::WireError::to_json`] — that
+/// type's `__type` is always prefixed with the **DynamoDB service**
+/// namespace (`com.amazonaws.dynamodb.v20120810#...`), distinct from the
+/// **auth layer** namespace (`com.amazon.coral.service#...`) a SigV4 failure
+/// uses. `serde_json`, not hand-rolled string formatting, so a message
+/// containing a quote/backslash (none of ADR 0057's fixed messages do today,
+/// but a future one might) still produces valid JSON.
+fn sigv4_error_body(err: &animus_dynamo::sigv4::SigV4Error) -> String {
+    #[derive(serde::Serialize)]
+    struct AuthErrorBody {
+        #[serde(rename = "__type")]
+        type_: String,
+        message: String,
+    }
+    let body = AuthErrorBody {
+        type_: err.type_name(),
+        message: err.message(),
+    };
+    serde_json::to_string(&body).expect("auth error body serializes")
 }
 
 /// Dispatch a decoded request, returning the HTTP status code and JSON body.
@@ -4958,6 +5013,7 @@ mod stream_write_path_tests {
                 intra: addrs[4],
                 console: addrs[5],
             }],
+            dynamo_auth: None,
         }
     }
 

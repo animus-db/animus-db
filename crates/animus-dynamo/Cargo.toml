@@ -17,6 +17,10 @@ animus-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# SigV4 client-edge auth (ADR 0057) — `sigv4` is pure (no I/O/clock), the
+# crate's first crypto widening.
+sha2.workspace = true
+hmac.workspace = true
 
 [dev-dependencies]
 futures.workspace = true

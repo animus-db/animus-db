@@ -69,7 +69,10 @@ async fn bring_up_control(n: usize, dir: &std::path::Path) -> (Vec<Node>, animus
                 console: addrs[6 * i + 5],
             })
             .collect();
-        let config = animusd::ClusterConfig { nodes: nodes_cfg };
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+        };
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..n {
@@ -404,7 +407,10 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
                 intra: addrs[22],
                 console: addrs[23],
             });
-            let config = animusd::ClusterConfig { nodes: nodes_cfg };
+            let config = animusd::ClusterConfig {
+                nodes: nodes_cfg,
+                dynamo_auth: None,
+            };
 
             let mut control_nodes: Vec<Node> = Vec::new();
             let mut ok = true;

@@ -97,7 +97,10 @@ async fn await_leader(node: &Node) {
 /// restart can rebind the exact same addresses), with the ADR 0038 PR2
 /// mirror engine attached over the durable `LsmEngine` backend.
 async fn start(addrs: animusd::RoleAddrs, dir: &std::path::Path) -> Node {
-    let config = animusd::ClusterConfig { nodes: vec![addrs] };
+    let config = animusd::ClusterConfig {
+        nodes: vec![addrs],
+        dynamo_auth: None,
+    };
     // Bounded rebind retry against the documented port-TOCTOU: another test
     // binary's `free_addrs` probe can hold a just-freed port for microseconds,
     // and this test cannot re-allocate around a thief — both call sites are

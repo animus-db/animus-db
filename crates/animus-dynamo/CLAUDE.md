@@ -82,6 +82,26 @@ comment for its full type/method inventory.
   stays dependency-light by re-deriving small byte-shape functions instead
   of pulling in a whole sibling crate, the same precedent its other
   cross-crate duplications follow.
+- `sigv4` (ADR 0057) — client-edge SigV4 verification and signing: canonical
+  request / string-to-sign / HMAC-SHA256 signing-key chain, plus
+  constant-shape signature comparison. This is a **deliberate, narrow
+  widening of the crate's charter** flagged by that ADR (until now:
+  decode/encode only) — it stays inside the same purity rules as every other
+  module here (no `Env`, no I/O, `BTreeMap` only), and in particular **no
+  clock call of its own**: `verify(req, credentials, now_epoch_ms)` takes
+  "now" as a parameter, mirroring exactly how `ttl.rs` takes
+  `now_epoch_secs` rather than reading a clock — the caller (`animusd`)
+  reads `env.wall_now()` (ADR 0051 discipline) and passes the result in.
+  `SigV4Error`'s `error_code()`/`type_name()`/`message()` render the
+  AWS-faithful `com.amazon.coral.service#…` wire shape (ADR 0057's
+  error-mapping table); the module doc comment documents and justifies the
+  check order (structural → unknown key → skew → scope/signature compare)
+  the ADR leaves to the implementation. `canonical_request`/
+  `string_to_sign`/`sign` are exported (beyond what `verify` alone would
+  need) specifically so the vendored test-vector suite below can assert
+  each intermediate stage, and so a hand-rolled test signer (`animusd`,
+  ADR 0057's e2e tests) can produce a real `Authorization` header without
+  duplicating the HMAC chain.
 - `ttl` (ADR 0051) — the pure DynamoDB-TTL expiry predicate: `expires_at`
   (an item's declared expiry epoch second under a table's TTL attribute, or
   `None` when the attribute is absent or not a usable `N`) and `is_expired`
@@ -324,7 +344,21 @@ tests for `wire`/`streams_wire`/`condition`/`registry`/`schema`/`index`/`ttl`
 round-trip, response-shape encoders, and `ttl`'s expiry-boundary table —
 absent/wrong-type attributes, future/past/equal-to-now, fractional
 truncation, the negative-value fold, and both sides of the
-`MAX_PAST_EXPIRY_SECS` window). The rejection of `ConsistentRead` on
+`MAX_PAST_EXPIRY_SECS` window), and `sigv4`'s own unit tests (a correctly
+signed request accepted; tampered body / wrong secret / unknown key /
+absent or malformed `Authorization` / a `SignedHeaders` missing `host` /
+scope-date mismatch / non-`aws4_request` terminal / malformed `X-Amz-Date` /
+both skew directions including the exact ±5 minute boundary, all rejected
+with the expected `SigV4Error` variant; `error_code()`/`type_name()`/
+`message()` asserted against ADR 0057's table verbatim).
+`tests/sigv4_vectors_test.rs` runs `sigv4` against AWS's own vendored
+`aws-sig-v4-test-suite` (`tests/sigv4_vectors/`, see that directory's
+`README.md` for provenance) — the independent, AWS-authored compatibility
+oracle ADR 0057 substitutes for a real-SDK smoke test (which cargo-deny's
+license allow-list rules out, see the ADR): each case parses a `.req`
+fixture, asserts the canonical request/string-to-sign/`Authorization`
+against the suite's own precomputed `.creq`/`.sts`/`.authz`, then re-verifies
+the signed request through `sigv4::verify`. The rejection of `ConsistentRead` on
 a GSI `Query`/`Scan` is `animusd`-only (this crate never sees the
 replicated catalog needed to know an index's kind) and is end-to-end
 tested in `animusd`'s `tests/dynamo_consistent_read.rs`/

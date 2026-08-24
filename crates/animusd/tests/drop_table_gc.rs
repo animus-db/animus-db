@@ -49,7 +49,10 @@ async fn bring_up(
                 console: addrs[6 * i + 5],
             })
             .collect();
-        let config = animusd::ClusterConfig { nodes: nodes_cfg };
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+        };
         let dirs: Vec<std::path::PathBuf> = (0..n)
             .map(|i| dir.join(format!("node-{attempt}-{i}")))
             .collect();
