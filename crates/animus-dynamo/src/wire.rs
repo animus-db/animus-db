@@ -51,6 +51,7 @@
 //! modes, and adding an LSI to an existing table (LSIs are create-time-only
 //! in real DynamoDB).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use animus_control::{IndexStatus, StreamViewType};
@@ -976,152 +977,326 @@ fn decode_update_item(obj: &Map<String, Value>) -> Result<Operation, WireError> 
     })
 }
 
+/// A lexical token of an `UpdateExpression`, paired (by [`tokenize_update_expression`])
+/// with the paren-nesting depth it sits at. `Word` keeps the exact source
+/// slice — an attribute name/path (`a`, `a.b`), a `#alias`, a `:placeholder`,
+/// or a clause-keyword spelling (`SET`/`set`/...); which of those it *means*
+/// depends on where it sits in the token stream, never on its spelling alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateToken<'a> {
+    Word(&'a str),
+    Comma,
+    Equals,
+    LParen,
+    RParen,
+}
+
+impl UpdateToken<'_> {
+    /// Render a token back to text for an error message.
+    fn text(&self) -> Cow<'_, str> {
+        match self {
+            UpdateToken::Word(w) => Cow::Borrowed(w),
+            UpdateToken::Comma => Cow::Borrowed(","),
+            UpdateToken::Equals => Cow::Borrowed("="),
+            UpdateToken::LParen => Cow::Borrowed("("),
+            UpdateToken::RParen => Cow::Borrowed(")"),
+        }
+    }
+}
+
+/// Tokenize an `UpdateExpression` into words and punctuation, each paired with
+/// the paren-nesting depth (0 = top level) it appears at. A "word" is a
+/// maximal run of characters that is none of whitespace, `,`, `=`, `(`, `)` —
+/// so an attribute path (`a.b`), a `#alias`, and a `:placeholder` each come
+/// out as one token, exactly like the substring scan this replaces treated
+/// them, but a clause keyword is now just another word: whether it *starts a
+/// clause* is a property of its position in the grammar, decided by the
+/// caller, never of its spelling. Depth-tracking exists so a keyword spelled
+/// inside function-call parens is never mistaken for a clause start — this
+/// grammar has no function calls yet ([`resolve_placeholder`] only accepts a
+/// bare `:placeholder`), so depth never actually exceeds 0 in an expression
+/// that goes on to parse successfully, but the tracking is the foundation a
+/// future document-path/function-call grammar needs.
+fn tokenize_update_expression(expr: &str) -> Vec<(UpdateToken<'_>, u32)> {
+    let mut tokens = Vec::new();
+    let mut depth: u32 = 0;
+    let mut chars = expr.char_indices().peekable();
+    while let Some(&(start, c)) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        match c {
+            ',' => {
+                tokens.push((UpdateToken::Comma, depth));
+                chars.next();
+            }
+            '=' => {
+                tokens.push((UpdateToken::Equals, depth));
+                chars.next();
+            }
+            '(' => {
+                tokens.push((UpdateToken::LParen, depth));
+                depth += 1;
+                chars.next();
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                tokens.push((UpdateToken::RParen, depth));
+                chars.next();
+            }
+            _ => {
+                let mut end = start;
+                while let Some(&(idx, ch)) = chars.peek() {
+                    if ch.is_whitespace() || matches!(ch, ',' | '=' | '(' | ')') {
+                        break;
+                    }
+                    end = idx + ch.len_utf8();
+                    chars.next();
+                }
+                tokens.push((UpdateToken::Word(&expr[start..end]), depth));
+            }
+        }
+    }
+    tokens
+}
+
+/// The four `UpdateExpression` clause keywords, matched case-insensitively.
+/// Returns the canonical lowercase spelling, used only to dispatch — never to
+/// decide *whether* a word is a keyword-in-clause-start-position, which is
+/// the caller's job.
+fn update_clause_keyword(word: &str) -> Option<&'static str> {
+    match word {
+        w if w.eq_ignore_ascii_case("set") => Some("set"),
+        w if w.eq_ignore_ascii_case("remove") => Some("remove"),
+        w if w.eq_ignore_ascii_case("add") => Some("add"),
+        w if w.eq_ignore_ascii_case("delete") => Some("delete"),
+        _ => None,
+    }
+}
+
+/// Consume one `Word` token, or fail with a message naming what was expected.
+fn expect_update_word<'a>(
+    tokens: &[(UpdateToken<'a>, u32)],
+    i: &mut usize,
+    expr: &str,
+    what: &str,
+) -> Result<&'a str, WireError> {
+    match tokens.get(*i) {
+        Some((UpdateToken::Word(w), _)) => {
+            let w = *w;
+            *i += 1;
+            Ok(w)
+        }
+        Some((tok, _)) => Err(WireError::validation(format!(
+            "`UpdateExpression` `{expr}` expected {what}, found `{}`",
+            tok.text()
+        ))),
+        None => Err(WireError::validation(format!(
+            "`UpdateExpression` `{expr}` expected {what}, found end of expression"
+        ))),
+    }
+}
+
+/// After one completed action, decide what comes next: `,` continues the
+/// current clause's action list with another action (return `true`) — this
+/// is unconditional, per the grammar, **even when the token right after the
+/// comma is spelled like a clause keyword**: `SET add = :v, remove = :w` is
+/// two `SET` actions on attributes literally named `add`/`remove`, not a
+/// `SET` clause followed by a `REMOVE` clause, because a clause boundary is
+/// never introduced by a comma. A clause keyword appearing directly (no
+/// comma) or end-of-expression ends this clause (return `false`, leaving
+/// `*i` positioned at the keyword or past the end); anything else is a
+/// validation error — e.g. `SET a = :v b = :w` is missing its comma.
+/// Tolerates one trailing `,` at the very end of the expression (matching
+/// the substring scanner this replaces, which stripped a trailing comma off
+/// each clause's raw text before splitting it into actions) — that specific
+/// case is unambiguous since there is nothing after it to misparse.
+fn continues_update_clause(
+    tokens: &[(UpdateToken<'_>, u32)],
+    i: &mut usize,
+    expr: &str,
+) -> Result<bool, WireError> {
+    match tokens.get(*i) {
+        Some((UpdateToken::Comma, _)) => {
+            *i += 1;
+            // A trailing comma with nothing after it: tolerate, don't try to
+            // parse a nonexistent next action.
+            Ok(tokens.get(*i).is_some())
+        }
+        Some((UpdateToken::Word(w), 0)) if update_clause_keyword(w).is_some() => Ok(false),
+        None => Ok(false),
+        Some((tok, _)) => Err(WireError::validation(format!(
+            "`UpdateExpression` `{expr}` expected `,` or a clause keyword \
+             (SET, REMOVE, ADD, DELETE), found `{}`",
+            tok.text()
+        ))),
+    }
+}
+
 /// Decode a DynamoDB `UpdateExpression` (the supported subset). Recognized
-/// clauses are `SET a = :v, b = :w` and `REMOVE c, d`, in either order; the
-/// attribute names may use `#alias` placeholders and the values `:placeholder`s.
-/// `ADD`/`DELETE` clauses are rejected (deferred). Non-whitespace text before
+/// clauses are `SET a = :v, b = :w`, `REMOVE c, d`, `ADD e :v`, and
+/// `DELETE f :v`, in any order; the attribute names may use `#alias`
+/// placeholders and the values `:placeholder`s. Non-whitespace text before
 /// the first recognized clause keyword is rejected too — e.g. `"foo SET x =
 /// :v"` — rather than silently dropped, which would otherwise apply only the
-/// `SET` and never surface the leading garbage. **Known remaining gap**: an
-/// *unaliased* top-level attribute literally named `set`/`remove`/`add`/
-/// `delete` (e.g. `SET set = :v`) still misparses, since this is a substring
-/// keyword scan, not a real tokenizer — a compliant SDK always aliases a
-/// reserved word via `#name`, so this is accepted as a documented, low-risk
-/// limitation rather than reworked into a fuller parser here.
+/// `SET` and never surface the leading garbage.
+///
+/// This is a real clause tokenizer ([`tokenize_update_expression`]), not a
+/// substring keyword scan: `SET`/`REMOVE`/`ADD`/`DELETE` are recognized as
+/// clause-starting keywords **only** at a clause-start grammar position — the
+/// very start of the expression, or immediately after a completed action (not
+/// after a `,`, which continues that action's own clause, and not anywhere an
+/// operand is expected) — so an *unaliased* top-level attribute literally
+/// named `set`/`remove`/`add`/`delete` (e.g. `SET set = :v`, or the
+/// multi-clause `SET set = :v REMOVE remove ADD add :n DELETE delete :ss`)
+/// parses correctly instead of misparsing, closing what used to be a
+/// documented gap here.
 fn decode_update_expression(
     obj: &Map<String, Value>,
     expr: &str,
 ) -> Result<Vec<UpdateAction>, WireError> {
-    // Split into clauses on the SET/REMOVE/ADD/DELETE keywords (case-insensitive).
-    // We do a simple scan: find each keyword and the text up to the next keyword.
-    let lower = expr.to_ascii_lowercase();
-    let keywords = ["set ", "remove ", "add ", "delete "];
-    // Collect (keyword, start-of-args) positions in order.
-    let mut spans: Vec<(usize, usize, &str)> = Vec::new();
-    for kw in keywords {
-        let mut from = 0;
-        while let Some(rel) = lower[from..].find(kw) {
-            let at = from + rel;
-            // Only at a clause boundary (start, or preceded by whitespace).
-            if at == 0 || lower.as_bytes()[at - 1].is_ascii_whitespace() {
-                spans.push((at, at + kw.len(), kw.trim()));
-            }
-            from = at + kw.len();
-        }
-    }
-    spans.sort_by_key(|(at, _, _)| *at);
-    if spans.is_empty() {
-        return Err(WireError::validation(format!(
+    let tokens = tokenize_update_expression(expr);
+    // Find the first word, anywhere, that is a clause keyword at top level —
+    // regardless of whether *this* parse would actually treat it as a clause
+    // start (that grammar-position judgment happens below); this is purely to
+    // classify "no clause keyword anywhere" (unsupported expression) from
+    // "a clause keyword exists, but there's text before it" (leading garbage).
+    let first_keyword_at = tokens.iter().position(|(tok, depth)| match tok {
+        UpdateToken::Word(w) => *depth == 0 && update_clause_keyword(w).is_some(),
+        _ => false,
+    });
+    match first_keyword_at {
+        None => Err(WireError::validation(format!(
             "unsupported `UpdateExpression` `{expr}` \
              (supported clauses: SET, REMOVE, ADD, DELETE)"
-        )));
-    }
-    // Reject any non-whitespace text before the first recognized clause
-    // keyword — e.g. `UpdateExpression: "foo SET x = :v"` — instead of
-    // silently dropping it and applying only the recognized part.
-    let (first_at, _, _) = spans[0];
-    if !expr[..first_at].trim().is_empty() {
-        return Err(WireError::validation(format!(
+        ))),
+        Some(idx) if idx != 0 => Err(WireError::validation(format!(
             "`UpdateExpression` `{expr}` has unrecognized text before its first clause"
-        )));
+        ))),
+        Some(_) => parse_update_clauses(obj, expr, &tokens),
     }
+}
+
+/// Parse the clause sequence of an already-tokenized `UpdateExpression`,
+/// given `tokens[0]` is confirmed to be a clause keyword (checked by
+/// [`decode_update_expression`] before calling this).
+fn parse_update_clauses(
+    obj: &Map<String, Value>,
+    expr: &str,
+    tokens: &[(UpdateToken<'_>, u32)],
+) -> Result<Vec<UpdateAction>, WireError> {
     let mut actions = Vec::new();
-    for (i, (_, args_start, kw)) in spans.iter().enumerate() {
-        let args_end = spans.get(i + 1).map_or(expr.len(), |(at, _, _)| *at);
-        let args = expr[*args_start..args_end].trim().trim_end_matches(',');
-        match *kw {
-            "set" => {
-                for clause in args.split(',') {
-                    let (lhs, rhs) = clause.split_once('=').ok_or_else(|| {
-                        WireError::validation("SET clause must be `attr = :value`")
-                    })?;
-                    let attr = resolve_attr_name(obj, lhs.trim())?;
-                    let value = resolve_placeholder(obj, rhs.trim())?;
-                    actions.push(UpdateAction::Set(attr, value));
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let kw = match tokens[i] {
+            (UpdateToken::Word(w), 0) => update_clause_keyword(w),
+            _ => None,
+        };
+        let kw = kw.ok_or_else(|| {
+            WireError::validation(format!(
+                "`UpdateExpression` `{expr}` expected `,` or a clause keyword \
+                 (SET, REMOVE, ADD, DELETE), found `{}`",
+                tokens[i].0.text()
+            ))
+        })?;
+        i += 1;
+        match kw {
+            "set" => loop {
+                let path = expect_update_word(tokens, &mut i, expr, "an attribute name")?;
+                match tokens.get(i) {
+                    Some((UpdateToken::Equals, _)) => i += 1,
+                    _ => {
+                        return Err(WireError::validation("SET clause must be `attr = :value`"));
+                    }
                 }
-            }
-            "remove" => {
-                for name in args.split(',') {
-                    let attr = resolve_attr_name(obj, name.trim())?;
-                    actions.push(UpdateAction::Remove(attr));
+                let value_tok = expect_update_word(tokens, &mut i, expr, "a `:value` placeholder")
+                    .map_err(|_| WireError::validation("SET clause must be `attr = :value`"))?;
+                let attr = resolve_attr_name(obj, path)?;
+                let value = resolve_placeholder(obj, value_tok)?;
+                actions.push(UpdateAction::Set(attr, value));
+                if !continues_update_clause(tokens, &mut i, expr)? {
+                    break;
                 }
-            }
+            },
+            "remove" => loop {
+                let path = expect_update_word(tokens, &mut i, expr, "an attribute name")?;
+                let attr = resolve_attr_name(obj, path)?;
+                actions.push(UpdateAction::Remove(attr));
+                if !continues_update_clause(tokens, &mut i, expr)? {
+                    break;
+                }
+            },
             // `ADD`/`DELETE` take `attr :value` pairs separated by spaces,
             // not `=` — a different shape from SET's.
-            kw @ ("add" | "delete") => {
-                for clause in args.split(',') {
-                    let clause = clause.trim();
-                    if clause.is_empty() {
-                        continue;
-                    }
-                    let (name, ph) = clause.split_once(char::is_whitespace).ok_or_else(|| {
+            kw @ ("add" | "delete") => loop {
+                let name = expect_update_word(tokens, &mut i, expr, "an attribute name")?;
+                let value_tok = expect_update_word(tokens, &mut i, expr, "a `:value` placeholder")
+                    .map_err(|_| {
                         WireError::validation(format!(
-                            "{} clause must be `attr :value`, got `{clause}`",
+                            "{} clause must be `attr :value`, got `{name}`",
                             kw.to_uppercase()
                         ))
                     })?;
-                    let attr = resolve_attr_name(obj, name.trim())?;
-                    let value = resolve_placeholder(obj, ph.trim())?;
-                    if kw == "add" {
-                        // A numeric ADD is the one non-idempotent write this
-                        // adapter has. It is safe because
-                        // `ClientCtx::cp_kind_write_item` does not re-apply a
-                        // non-idempotent write on its own (see
-                        // `kind_write_is_idempotent`): DynamoDB's guarantee is
-                        // at-most-once per *request*, not exactly-once, so a
-                        // client that retries an ADD which actually applied
-                        // double-counts there too. What must never happen is
-                        // the service counting twice for one request.
-                        // Numeric ADD is the adapter's only non-idempotent
-                        // write, and it is safe now for two reasons that had
-                        // to land first.
-                        //
-                        // `cp_kind_write_item` no longer re-applies a
-                        // non-idempotent write on its own, so at-most-once
-                        // per request holds — DynamoDB's own guarantee, under
-                        // which a *client* retry of an ADD that applied
-                        // double-counts there too.
-                        //
-                        // And a `KindBatch` now records what it did at apply
-                        // time, so a write that applied is acknowledged even
-                        // when a concurrent update immediately overwrites it.
-                        // Before that, confirmation compared the value back
-                        // and reported "superseded ... retry" on 8 of 10
-                        // concurrent increments that had in fact applied —
-                        // and retrying is precisely what double-counts.
-                        // Measured after both: ten concurrent increments are
-                        // all accepted and leave the counter at exactly ten.
-                        if !matches!(
-                            value,
-                            AttributeValue::N(_)
-                                | AttributeValue::SS(_)
-                                | AttributeValue::NS(_)
-                                | AttributeValue::BS(_)
-                        ) {
-                            return Err(WireError::validation(
-                                "ADD takes a number or a set operand (N, SS, NS or BS)",
-                            ));
-                        }
-                        actions.push(UpdateAction::Add(attr, value));
-                    } else {
-                        if !matches!(
-                            value,
-                            AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_)
-                        ) {
-                            return Err(WireError::validation(
-                                "DELETE takes a set operand (SS, NS or BS)",
-                            ));
-                        }
-                        actions.push(UpdateAction::Delete(attr, value));
+                let attr = resolve_attr_name(obj, name)?;
+                let value = resolve_placeholder(obj, value_tok)?;
+                if kw == "add" {
+                    // A numeric ADD is the one non-idempotent write this
+                    // adapter has. It is safe because
+                    // `ClientCtx::cp_kind_write_item` does not re-apply a
+                    // non-idempotent write on its own (see
+                    // `kind_write_is_idempotent`): DynamoDB's guarantee is
+                    // at-most-once per *request*, not exactly-once, so a
+                    // client that retries an ADD which actually applied
+                    // double-counts there too. What must never happen is
+                    // the service counting twice for one request.
+                    // Numeric ADD is the adapter's only non-idempotent
+                    // write, and it is safe now for two reasons that had
+                    // to land first.
+                    //
+                    // `cp_kind_write_item` no longer re-applies a
+                    // non-idempotent write on its own, so at-most-once
+                    // per request holds — DynamoDB's own guarantee, under
+                    // which a *client* retry of an ADD that applied
+                    // double-counts there too.
+                    //
+                    // And a `KindBatch` now records what it did at apply
+                    // time, so a write that applied is acknowledged even
+                    // when a concurrent update immediately overwrites it.
+                    // Before that, confirmation compared the value back
+                    // and reported "superseded ... retry" on 8 of 10
+                    // concurrent increments that had in fact applied —
+                    // and retrying is precisely what double-counts.
+                    // Measured after both: ten concurrent increments are
+                    // all accepted and leave the counter at exactly ten.
+                    if !matches!(
+                        value,
+                        AttributeValue::N(_)
+                            | AttributeValue::SS(_)
+                            | AttributeValue::NS(_)
+                            | AttributeValue::BS(_)
+                    ) {
+                        return Err(WireError::validation(
+                            "ADD takes a number or a set operand (N, SS, NS or BS)",
+                        ));
                     }
+                    actions.push(UpdateAction::Add(attr, value));
+                } else {
+                    if !matches!(
+                        value,
+                        AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_)
+                    ) {
+                        return Err(WireError::validation(
+                            "DELETE takes a set operand (SS, NS or BS)",
+                        ));
+                    }
+                    actions.push(UpdateAction::Delete(attr, value));
                 }
-            }
-            other => {
-                return Err(WireError::validation(format!(
-                    "`UpdateExpression` clause `{other}` is not supported \
-                     (SET, REMOVE, ADD, DELETE)"
-                )));
-            }
+                if !continues_update_clause(tokens, &mut i, expr)? {
+                    break;
+                }
+            },
+            _ => unreachable!("update_clause_keyword only returns the four matched arms"),
         }
     }
     Ok(actions)
@@ -4946,6 +5121,205 @@ mod tests {
         let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
             "UpdateExpression":"foo SET x = :v",
             "ExpressionAttributeValues":{":v":{"S":"y"}}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// The tokenizer rewrite's whole point: an *unaliased* top-level
+    /// attribute literally spelled like a clause keyword now parses as an
+    /// attribute name wherever the grammar expects one, not as a clause
+    /// keyword — issue #372.
+    #[test]
+    fn unaliased_reserved_word_as_top_level_attribute_parses() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET set = :v",
+            "ExpressionAttributeValues":{":v":{"S":"x"}}}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(actions, vec![UpdateAction::Set("set".into(), s("x"))]);
+    }
+
+    /// A reserved word used as the attribute name on *both* sides of a SET
+    /// clause's comma-separated action list.
+    #[test]
+    fn reserved_words_as_attribute_names_in_a_set_action_list() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET add = :v, remove = :w",
+            "ExpressionAttributeValues":{":v":{"S":"x"},":w":{"S":"y"}}}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(
+            actions,
+            vec![
+                UpdateAction::Set("add".into(), s("x")),
+                UpdateAction::Set("remove".into(), s("y")),
+            ]
+        );
+    }
+
+    /// A reserved word as the sole `REMOVE` target.
+    #[test]
+    fn reserved_word_as_remove_target() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"REMOVE set"}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(actions, vec![UpdateAction::Remove("set".into())]);
+    }
+
+    /// Two reserved words in one `REMOVE` action list.
+    #[test]
+    fn reserved_words_in_a_remove_action_list() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"REMOVE remove, delete"}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(
+            actions,
+            vec![
+                UpdateAction::Remove("remove".into()),
+                UpdateAction::Remove("delete".into()),
+            ]
+        );
+    }
+
+    /// A reserved word as an `ADD` target.
+    #[test]
+    fn reserved_word_as_add_target() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"ADD add :n",
+            "ExpressionAttributeValues":{":n":{"N":"1"}}}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(
+            actions,
+            vec![UpdateAction::Add(
+                "add".into(),
+                AttributeValue::N("1".into())
+            )]
+        );
+    }
+
+    /// A reserved word as a `DELETE` target.
+    #[test]
+    fn reserved_word_as_delete_target() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"DELETE delete :ss",
+            "ExpressionAttributeValues":{":ss":{"SS":["a"]}}}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(
+            actions,
+            vec![UpdateAction::Delete(
+                "delete".into(),
+                AttributeValue::SS(vec!["a".into()])
+            )]
+        );
+    }
+
+    /// The interleaved case that most exercises the clause-boundary logic:
+    /// every clause keyword also appears, immediately after, as the reserved
+    /// word spelling of the *next* clause's target attribute — the tokenizer
+    /// must recognize each leading keyword as a clause start while treating
+    /// every other occurrence as a plain attribute name.
+    #[test]
+    fn mixed_multi_clause_reserved_word_attributes_parse() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET set = :v REMOVE remove ADD add :n DELETE delete :ss",
+            "ExpressionAttributeValues":{":v":{"S":"x"},":n":{"N":"1"},":ss":{"SS":["a"]}}}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(
+            actions,
+            vec![
+                UpdateAction::Set("set".into(), s("x")),
+                UpdateAction::Remove("remove".into()),
+                UpdateAction::Add("add".into(), AttributeValue::N("1".into())),
+                UpdateAction::Delete("delete".into(), AttributeValue::SS(vec!["a".into()])),
+            ]
+        );
+    }
+
+    /// `size` is a reserved word too (a `ConditionExpression` function name),
+    /// but is not one of the four `UpdateExpression` clause keywords, so it
+    /// was never actually at risk — kept as a belt-and-suspenders check.
+    #[test]
+    fn reserved_condition_function_name_as_top_level_attribute() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET size = :v",
+            "ExpressionAttributeValues":{":v":{"S":"x"}}}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(actions, vec![UpdateAction::Set("size".into(), s("x"))]);
+    }
+
+    /// A reserved word aliased via `#alias` (the AWS-recommended way to name
+    /// a reserved word) keeps working exactly as before.
+    #[test]
+    fn aliased_reserved_word_still_resolves_through_expression_attribute_names() {
+        let body = br##"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET #s = :v",
+            "ExpressionAttributeNames":{"#s":"set"},
+            "ExpressionAttributeValues":{":v":{"S":"x"}}}"##;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(actions, vec![UpdateAction::Set("set".into(), s("x"))]);
+    }
+
+    /// Clause keywords stay case-insensitive at a genuine clause-start
+    /// position — the substring scanner this replaces already lowercased
+    /// before matching, so a lowercase `set` at the very start of the
+    /// expression was, and remains, a real `SET` clause (unlike the
+    /// reserved-word-as-attribute cases above, where the keyword spelling
+    /// only appears in an *operand* position).
+    #[test]
+    fn clause_keywords_stay_case_insensitive_at_a_clause_start() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"set a = :v",
+            "ExpressionAttributeValues":{":v":{"S":"x"}}}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(actions, vec![UpdateAction::Set("a".into(), s("x"))]);
+    }
+
+    /// A malformed sequence — a second `path = value` action missing its
+    /// separating comma — is still rejected, not silently misparsed, even
+    /// though the tokenizer no longer keys off keyword substrings.
+    #[test]
+    fn rejects_a_set_action_list_missing_its_comma() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET a = :v b = :w",
+            "ExpressionAttributeValues":{":v":{"S":"x"},":w":{"S":"y"}}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
