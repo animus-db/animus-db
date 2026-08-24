@@ -1343,12 +1343,13 @@ fn decode_update_return_values(obj: &Map<String, Value>) -> Result<UpdateReturnV
 /// [`item_size`] — the sum, over every attribute, of the UTF-8 length of its
 /// name plus the size of its value. Enforced on every decoded **write**
 /// item: `PutItem`, `BatchWriteItem`'s `PutRequest`s, and
-/// `TransactWriteItems`'s `Put` actions ([`check_item_size`]). **Not**
-/// enforced on `UpdateItem`'s post-update result — that needs a
-/// read-modify-write path this decode-time check has no access to (a known
-/// remaining gap; the item as it exists before the update may already be
-/// under the cap, so the check would have to run at the `animusd` edge
-/// after applying the update, not here).
+/// `TransactWriteItems`'s `Put` actions ([`check_item_size`]). Also enforced
+/// on `UpdateItem`'s post-update result, inside [`apply_update`] itself:
+/// that decode-time check alone can't cover a read-modify-write, since the
+/// item as it exists before the update may already be under the cap but the
+/// applied actions can push it over, so `apply_update` re-checks after
+/// folding every action — the single choke point both `UpdateItem` and
+/// `TransactWriteItems`'s `Update` action route through at the leader.
 pub const MAX_ITEM_SIZE_BYTES: usize = 409_600;
 
 /// Reject `item` if it exceeds [`MAX_ITEM_SIZE_BYTES`], matching real
@@ -3203,6 +3204,14 @@ pub fn batch_write_response() -> String {
 /// image the leader itself read, so `ADD`'s read-modify-write is evaluated
 /// exactly once per applied write rather than against a possibly-stale image
 /// from the edge.
+///
+/// After the full action list folds — not mid-fold — the result is checked
+/// against [`MAX_ITEM_SIZE_BYTES`] ([`check_item_size`]): an item that is
+/// temporarily over the cap partway through (e.g. a `SET` that pushes it over,
+/// followed later in the same expression by a `REMOVE` that nets it back
+/// under) still succeeds, matching AWS's own post-update-result contract.
+/// This is the single choke point that covers both `UpdateItem` and
+/// `TransactWriteItems`'s `Update` action, since both call this function.
 pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Result<Item, WireError> {
     for action in actions {
         match action {
@@ -3279,6 +3288,7 @@ pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Result<Item, Wi
             }
         }
     }
+    check_item_size(&item)?;
     Ok(item)
 }
 
@@ -5531,6 +5541,79 @@ mod tests {
             format!(r#"{{"TransactItems":[{{"Put":{{"TableName":"t","Item":{item}}}}}]}}"#);
         let err = decode_request("DynamoDB_20120810.TransactWriteItems", over_cap.as_bytes())
             .expect_err("409601 bytes is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// `apply_update`'s post-fold result is checked against the same cap:
+    /// exactly `MAX_ITEM_SIZE_BYTES` is accepted, one byte over is rejected.
+    /// This is the choke point both `UpdateItem` and `TransactWriteItems`'s
+    /// `Update` action route through, so covering it here covers both.
+    #[test]
+    fn apply_update_result_accepts_exactly_the_size_cap_and_rejects_one_byte_over() {
+        // "a" is a 1-byte attribute name, so a value of `MAX_ITEM_SIZE_BYTES -
+        // 1` bytes makes the post-update item land exactly on the cap.
+        let at_cap_value = AttributeValue::S("x".repeat(MAX_ITEM_SIZE_BYTES - 1));
+        let out = apply_update(Item::new(), &[UpdateAction::Set("a".into(), at_cap_value)])
+            .expect("exactly the cap is accepted");
+        assert_eq!(item_size(&out), MAX_ITEM_SIZE_BYTES);
+
+        let over_cap_value = AttributeValue::S("x".repeat(MAX_ITEM_SIZE_BYTES));
+        let err = apply_update(
+            Item::new(),
+            &[UpdateAction::Set("a".into(), over_cap_value)],
+        )
+        .expect_err("one byte over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+        assert!(
+            err.message
+                .contains("Item size has exceeded the maximum allowed size")
+        );
+    }
+
+    /// An item temporarily over the cap **mid-fold** must still succeed if
+    /// the fold's own later action nets the *final* result back under it —
+    /// the check runs once, after the whole action list folds, never
+    /// mid-fold. Ordered `SET` (pushes it over) then `REMOVE` (nets it back
+    /// under) so the over-size state genuinely occurs before the netting.
+    #[test]
+    fn apply_update_nets_under_the_cap_after_an_over_size_mid_fold_state() {
+        let mut item = Item::new();
+        item.insert("keep".into(), s("k"));
+
+        let huge = AttributeValue::S("x".repeat(MAX_ITEM_SIZE_BYTES));
+        let out = apply_update(
+            item,
+            &[
+                UpdateAction::Set("temp".into(), huge),
+                UpdateAction::Remove("temp".into()),
+            ],
+        )
+        .expect("nets back under the cap after the REMOVE, so it must succeed");
+        assert!(!out.contains_key("temp"));
+        assert_eq!(out.get("keep"), Some(&s("k")));
+    }
+
+    /// An update to an already-near-cap base item whose result tips over the
+    /// cap is rejected — the pre-update image being under the cap does not
+    /// exempt the post-update one.
+    #[test]
+    fn apply_update_rejects_when_it_tips_a_near_cap_base_item_over() {
+        let mut item = Item::new();
+        item.insert(
+            "a".into(),
+            AttributeValue::S("x".repeat(MAX_ITEM_SIZE_BYTES - 10)),
+        );
+        // base item size = 1 ("a") + (MAX_ITEM_SIZE_BYTES - 10) = MAX_ITEM_SIZE_BYTES - 9.
+
+        let err = apply_update(
+            item,
+            &[UpdateAction::Set(
+                "b".into(),
+                AttributeValue::S("y".repeat(20)),
+            )],
+        )
+        // adds 1 ("b") + 20 = 21 bytes -> MAX_ITEM_SIZE_BYTES + 12, over the cap.
+        .expect_err("tips the near-cap base item over the cap");
         assert_eq!(err.code, "ValidationException");
     }
 
