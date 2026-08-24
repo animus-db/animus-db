@@ -3235,6 +3235,62 @@ debugging anything that feels like it might have happened before.
   ("unlike the `(logical, node)` encoding the deleted `animus-consensus`
   used"). What you must not leave is a live-voice pointer to a path or file
   that is gone.
+- **A numeric-vs-byte comparison fix applied to one predicate over a type
+  doesn't automatically reach a sibling predicate over the same type
+  (2026-08-24, issue #373, `animus-dynamo::condition`).** This crate already
+  had the *correct* pattern for DynamoDB `N`: `compare_values`/`compare_numeric`
+  compare number text by decimal magnitude, with a doc comment explicitly
+  contrasting that against `AttributeValue::key_bytes`'s lexicographic
+  ordering (a documented simplification of on-disk key order, not something a
+  filter should inherit). But `SortKeyCondition::matches` — a second, older
+  predicate over the exact same `N` values, for `Query`'s `sk BETWEEN`/`sk =`
+  — had never been switched over, and kept comparing raw `key_bytes`
+  directly: `sk BETWEEN 5 AND 15` excluded `sk = 9` because `"15" < "9"` as
+  text. The general check: when a type has more than one comparison/equality
+  call site in a crate (here, `ConditionExpression`'s comparators and
+  `SortKeyCondition`'s own), a numeric-ordering fix to one is a signal to grep
+  every other site over the same type for the identical byte-vs-numeric
+  divergence, not just extend the one you're already touching — the existing
+  doc comment even named the divergence (`AttributeValue::key_bytes`'s
+  lexicographic number order) but that cross-reference apparently never got
+  checked against every reader of `key_bytes`, only the one being written at
+  the time.
+- **A unit-level fix to a pure predicate proves nothing about its production
+  call sites if a caller reconstructs the predicate's input in a way the
+  predicate's own type dispatch can't see through — always trace the actual
+  value a real caller hands the fixed function, not just the type it accepts
+  in principle (2026-08-24, issue #373 follow-up, `animus-dynamo::condition`
+  / `animusd::dynamo`).** The entry above fixed `SortKeyCondition::matches`
+  to compare `N` numerically once *both* sides are literally the `N`
+  variant — and its own unit tests, which construct both sides as
+  `AttributeValue::N`, genuinely proved that. But every production caller
+  (`run_base_query`/`run_gsi_query`/`run_lsi_query` in `animusd`, and this
+  crate's own `Table::query_with`) held only a scanned key's **raw bytes**,
+  with no type tag, and wrapped them as `AttributeValue::B` before calling
+  `matches` — so the numeric arm's `(N, N)` pattern match never fired at any
+  real call site, even after the "fix" landed: `sort_key_cmp` fell through to
+  `a.key_bytes().cmp(&b.key_bytes())`, which for a `B`-wrapped raw-bytes
+  value is byte-identical to the *unfixed* behavior, since a `N`'s raw
+  stored bytes are literally its own decimal text. Confirmed empirically
+  (not just by code reading) with a throwaway `#[test]` calling `matches`
+  once with the value typed `N` and once with the identical bytes wrapped
+  `B`: the two calls returned different answers for the exact same logical
+  comparison. The general check: after fixing a comparison predicate that
+  dispatches on an enum variant (here, `AttributeValue`'s `N` vs `B`), grep
+  every production call site and ask "does this caller actually have a
+  value of the variant my fix's fast path checks for, or does it have raw
+  bytes / a different representation that only happens to satisfy the type
+  the function *accepts*?" — a function accepting `&AttributeValue` gives no
+  static guarantee the caller passes the semantically-correct variant, and a
+  fix's own unit tests, if they construct inputs "the right way" rather than
+  the way production actually does, can pass while production stays broken.
+  Fixed by adding `SortKeyCondition::matches_raw(&self, raw_bytes: &[u8])`,
+  which reinterprets raw bytes as the condition's own declared operand type
+  before delegating to `matches`, and switching every raw-bytes call site to
+  it — so the type-correct reconstruction happens once, in the one place
+  that knows the rule, instead of being (mis)implemented ad hoc at each
+  call site. (`crates/animus-dynamo/src/condition.rs`,
+  `crates/animus-dynamo/src/lib.rs`, `crates/animusd/src/dynamo.rs`.)
 - **A pagination cursor that echoes back a superset of another cursor's
   attributes needs an *exact*-match validation, not a "the attributes I
   need are present" check (2026-08-22, DynamoDB `Query` pagination).**

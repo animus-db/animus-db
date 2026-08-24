@@ -2586,21 +2586,29 @@ fn decode_sort_condition(
         return Ok((attr, SortKeyCondition::Between(lo, hi)));
     }
     if let Some((lhs, op, rhs)) = split_comparator(clause) {
-        // As in `decode_predicate`: reject a comparison we cannot represent
-        // rather than truncating it into an equality. `sk >= :v` silently
-        // becoming `sk = :v` narrows a range query to exact matches.
-        if op != "=" {
+        // `<>` is a legal `Comparator` (reused wholesale below) but is not in
+        // AWS's own `KeyConditionExpression` grammar — a key condition can
+        // only narrow a contiguous range, and "not equal to" isn't one, so
+        // real DynamoDB rejects it here too. Every other comparator maps
+        // straight onto a `Compare` condition, sharing `comparator_of` with
+        // `decode_predicate` rather than re-deriving the same mapping.
+        if op == "<>" {
             return Err(WireError::validation(format!(
-                "unsupported sort-key operator `{op}` in `{clause}` \
-                 (supported: =, BETWEEN, begins_with)"
+                "`<>` is not a valid KeyConditionExpression operator in `{clause}` \
+                 (AWS's KeyConditionExpression grammar has no not-equal comparator; \
+                 supported: =, <, <=, >, >=, BETWEEN, begins_with)"
             )));
         }
         let attr = resolve_attr_name(obj, lhs.trim())?;
         let value = resolve_placeholder(obj, rhs.trim())?;
-        return Ok((attr, SortKeyCondition::Equals(value)));
+        return Ok((
+            attr,
+            SortKeyCondition::Compare(comparator_of(op, clause)?, value),
+        ));
     }
     Err(WireError::validation(format!(
-        "unsupported sort-key condition `{clause}` (supported: =, BETWEEN, begins_with)"
+        "unsupported sort-key condition `{clause}` \
+         (supported: =, <, <=, >, >=, BETWEEN, begins_with)"
     )))
 }
 
@@ -3734,6 +3742,10 @@ mod tests {
         AttributeValue::S(v.into())
     }
 
+    fn n(v: &str) -> AttributeValue {
+        AttributeValue::N(v.into())
+    }
+
     #[test]
     fn decodes_a_put_item_request() {
         let body = br#"{"TableName":"users","Item":{"id":{"S":"u1"},"n":{"N":"42"},
@@ -4359,7 +4371,10 @@ mod tests {
         else {
             panic!("expected Query");
         };
-        assert_eq!(sort_condition, Some(SortKeyCondition::Equals(s("y"))));
+        assert_eq!(
+            sort_condition,
+            Some(SortKeyCondition::Compare(Comparator::Eq, s("y")))
+        );
 
         // between (mixed case AND/BETWEEN)
         let body = br#"{"TableName":"t",
@@ -4385,6 +4400,61 @@ mod tests {
             panic!("expected Query");
         };
         assert_eq!(sort_condition, Some(SortKeyCondition::BeginsWith(s("ab"))));
+    }
+
+    /// Issue #373: `KeyConditionExpression` used to reject `<`/`<=`/`>`/`>=`
+    /// sort-key operators outright. Each now decodes onto the same
+    /// [`SortKeyCondition::Compare`] shape `=` already used, sharing
+    /// [`comparator_of`] with `FilterExpression`/`ConditionExpression`
+    /// decoding rather than a parallel mapping.
+    #[test]
+    fn decodes_query_sort_range_operators() {
+        let decode = |op: &str| {
+            let body = format!(
+                r#"{{"TableName":"t",
+                    "KeyConditionExpression":"pk = :p AND sk {op} :s",
+                    "ExpressionAttributeValues":{{":p":{{"S":"x"}},":s":{{"N":"5"}}}}}}"#
+            );
+            let Operation::Query { sort_condition, .. } =
+                decode_request("DynamoDB_20120810.Query", body.as_bytes()).unwrap()
+            else {
+                panic!("expected Query");
+            };
+            sort_condition
+        };
+        assert_eq!(
+            decode("<"),
+            Some(SortKeyCondition::Compare(Comparator::Lt, n("5")))
+        );
+        assert_eq!(
+            decode("<="),
+            Some(SortKeyCondition::Compare(Comparator::Le, n("5")))
+        );
+        assert_eq!(
+            decode(">"),
+            Some(SortKeyCondition::Compare(Comparator::Gt, n("5")))
+        );
+        assert_eq!(
+            decode(">="),
+            Some(SortKeyCondition::Compare(Comparator::Ge, n("5")))
+        );
+    }
+
+    /// `<>` is a real [`Comparator`] variant but not part of AWS's
+    /// `KeyConditionExpression` grammar (there is no not-equal *range*), so it
+    /// stays explicitly rejected rather than silently accepted once the other
+    /// four comparators opened up.
+    #[test]
+    fn key_condition_rejects_not_equal() {
+        let body = br#"{"TableName":"t",
+            "KeyConditionExpression":"pk = :p AND sk <> :s",
+            "ExpressionAttributeValues":{":p":{"S":"x"},":s":{"N":"5"}}}"#;
+        let err = decode_request("DynamoDB_20120810.Query", body).unwrap_err();
+        assert!(
+            err.message.contains("<>"),
+            "error should name the rejected operator: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -5618,17 +5688,39 @@ mod tests {
     }
 
     /// Regression: a sort-key **range** — the main reason to have a sort key —
-    /// was truncated into an equality, silently narrowing the result set.
+    /// used to be truncated into an equality, silently narrowing the result
+    /// set (and, before issue #373 closed the gap, rejected outright rather
+    /// than truncated). Each of the four range comparators now decodes to its
+    /// own real [`SortKeyCondition::Compare`], never collapsing onto `Eq`.
     #[test]
-    fn sort_key_ranges_are_rejected_not_narrowed_to_equality() {
-        for op in [">=", "<=", ">", "<"] {
+    fn sort_key_ranges_decode_to_their_own_comparator_not_an_equality() {
+        for (op, expected) in [
+            (">=", Comparator::Ge),
+            ("<=", Comparator::Le),
+            (">", Comparator::Gt),
+            ("<", Comparator::Lt),
+        ] {
             let body = format!(
                 r#"{{"TableName":"t","KeyConditionExpression":"pk = :p AND sk {op} :s",
                      "ExpressionAttributeValues":{{":p":{{"S":"a"}},":s":{{"S":"b"}}}}}}"#
             );
-            let err = decode_request("DynamoDB_20120810.Query", body.as_bytes())
-                .expect_err(&format!("sort-key `{op}` must not become an equality"));
-            assert_eq!(err.code, "ValidationException", "for `{op}`");
+            match decode_request("DynamoDB_20120810.Query", body.as_bytes())
+                .unwrap_or_else(|e| panic!("sort-key `{op}` must decode: {e:?}"))
+            {
+                Operation::Query {
+                    sort_attr,
+                    sort_condition,
+                    ..
+                } => {
+                    assert_eq!(sort_attr.as_deref(), Some("sk"), "for `{op}`");
+                    assert_eq!(
+                        sort_condition,
+                        Some(SortKeyCondition::Compare(expected, s("b"))),
+                        "for `{op}` — must not silently collapse onto `=`"
+                    );
+                }
+                other => panic!("expected Query, got {other:?}"),
+            }
         }
         // BETWEEN and begins_with still work, and carry the sort attribute name.
         let between = br#"{"TableName":"t",
