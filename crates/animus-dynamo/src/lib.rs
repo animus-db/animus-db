@@ -271,10 +271,12 @@ impl<S: StorageEngine> Table<S> {
         let mut items = Vec::new();
         for (key, vv) in self.engine.scan(&prefix, &end).await? {
             if let Some(cond) = condition {
-                // The sort-key bytes are everything after the escaped pk; test
-                // the condition against them directly (storage-order bytes).
-                let sk_bytes = AttributeValue::B(key[prefix.len()..].to_vec());
-                if !cond.matches(&sk_bytes) {
+                // The sort-key bytes are everything after the escaped pk;
+                // `matches_raw` reinterprets them per the condition's own
+                // declared type (numeric for `N`, raw bytes otherwise) rather
+                // than comparing them as opaque bytes — see its own doc for
+                // why that distinction matters for `N` sort keys.
+                if !cond.matches_raw(&key[prefix.len()..]) {
                     continue;
                 }
             }

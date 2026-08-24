@@ -2884,6 +2884,13 @@ async fn run_query(
                 partition_attr,
                 sort_attr,
             )?;
+            if let Some(cond) = sort_condition {
+                let declared = base
+                    .sort_key
+                    .as_deref()
+                    .and_then(|sk| declared_sort_key_type(meta, table, sk));
+                validate_sort_condition_type(declared.as_deref(), cond)?;
+            }
             run_base_query(
                 ctx,
                 meta,
@@ -3044,6 +3051,52 @@ fn validate_key_condition_names(
     Ok(())
 }
 
+/// A queried sort key's declared DynamoDB `AttributeType` (`S`/`N`/`B`),
+/// read from the replicated catalog — `None` when it isn't known there.
+///
+/// The **base table's own** sort key always has a declared type (recorded at
+/// `CreateTable`, [`schema_bridge::key_attribute_types`]). A **secondary
+/// index's** own key attribute currently has no declared type recorded in
+/// the catalog at all — a pre-existing gap (issue #319, this crate's
+/// `CLAUDE.md`'s "Code patterns" entry on `UpdateTable`'s GSI decode path):
+/// `IndexDef` stores only the attribute *name*. So this looks the name up
+/// among the base table's own typed key columns only; a genuine index sort
+/// attribute (a different attribute from the base table's own sort key, the
+/// whole point of declaring one) simply won't be found there, and callers
+/// treat `None` as "type unknown, don't reject."
+fn declared_sort_key_type(meta: &Metadata, table: &str, sort_attr: &str) -> Option<String> {
+    let control_schema = meta.table_schema(table)?;
+    schema_bridge::key_attribute_types(control_schema)
+        .into_iter()
+        .find(|(name, _)| name == sort_attr)
+        .map(|(_, ty)| ty)
+}
+
+/// Reject a sort-key condition whose operand(s) are a different DynamoDB
+/// `AttributeType` than the queried sort key's own declared type — a
+/// `ValidationException`, mirroring [`validate_key_condition_names`]'s own
+/// name-validation shape (and real DynamoDB, which rejects a
+/// `KeyConditionExpression` operand that disagrees with `AttributeDefinitions`).
+/// A no-op when `declared` is `None` — see [`declared_sort_key_type`] for
+/// when that is (an index's own sort attribute, today).
+fn validate_sort_condition_type(
+    declared: Option<&str>,
+    condition: &SortKeyCondition,
+) -> Result<(), WireError> {
+    let Some(declared) = declared else {
+        return Ok(());
+    };
+    for actual in condition.operand_type_codes() {
+        if actual != declared {
+            return Err(WireError::validation(format!(
+                "sort-key condition operand type `{actual}` does not match the sort \
+                 key's declared type `{declared}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Reject an `ExclusiveStartKey` whose attribute-name set doesn't exactly
 /// match `expected` — a `ValidationException`, matching DynamoDB's own
 /// behavior when a cursor from one `Query`/`Scan` is replayed against a
@@ -3153,10 +3206,11 @@ async fn run_base_query(
             };
             if let Some(cond) = sort_condition {
                 // The sort-key bytes are everything after the escaped table+pk
-                // prefix; test the condition on those bytes directly (storage order),
+                // prefix; `matches_raw` reinterprets them per the condition's
+                // own declared type (numeric for `N`, raw bytes otherwise —
+                // see its own doc) rather than comparing opaque bytes,
                 // exactly as the local-engine `query_with` does.
-                let sk_bytes = AttributeValue::B(key[prefix.len()..].to_vec());
-                if !cond.matches(&sk_bytes) {
+                if !cond.matches_raw(&key[prefix.len()..]) {
                     return Ok(None);
                 }
             }
@@ -3243,6 +3297,13 @@ async fn run_index_query(
         partition_attr,
         sort_attr,
     )?;
+    if let Some(cond) = sort_condition {
+        let declared = idx
+            .sort_attribute
+            .as_deref()
+            .and_then(|sa| declared_sort_key_type(meta, table, sa));
+        validate_sort_condition_type(declared.as_deref(), cond)?;
+    }
     if sort_condition.is_some() && idx.sort_attribute.is_none() {
         return Err(registry_error(
             animus_dynamo::RegistryError::IndexSortMismatch(index.to_owned()),
@@ -3359,10 +3420,13 @@ async fn run_gsi_query(
     }
     let composite = idx.sort_attribute.is_some();
     // Narrow to the `Equals` sub-prefix when possible (an engine-level
-    // optimization); every other shape (no condition, `Between`,
-    // `BeginsWith`) scans the whole hash value's rows and filters below.
+    // optimization); every other shape — no condition, a range comparator
+    // (`<`/`<=`/`>`/`>=`, issue #373), `Between`, `BeginsWith` — scans the
+    // whole hash value's rows and filters below instead. A range comparator
+    // needs no new key-range math of its own: it rides the exact same
+    // filter-only path `Between` already used.
     let (within_prefix, narrowed) = match sort_condition {
-        Some(SortKeyCondition::Equals(v)) if composite => {
+        Some(SortKeyCondition::Compare(Comparator::Eq, v)) if composite => {
             (dynamo_index::gsi_hash_sort_prefix(partition_value, v), true)
         }
         _ => (dynamo_index::gsi_hash_prefix(partition_value), false),
@@ -3410,7 +3474,7 @@ async fn run_gsi_query(
                 let Some(sort_bytes) = parsed.sort else {
                     return Ok(None);
                 };
-                if !cond.matches(&AttributeValue::B(sort_bytes)) {
+                if !cond.matches_raw(&sort_bytes) {
                     return Ok(None);
                 }
             }
@@ -3516,7 +3580,7 @@ async fn run_lsi_query(
                 let Some(parsed) = dynamo_index::parse_lsi_row_key(within) else {
                     return Ok(None);
                 };
-                if !cond.matches(&AttributeValue::B(parsed.alt_sort)) {
+                if !cond.matches_raw(&parsed.alt_sort) {
                     return Ok(None);
                 }
             }

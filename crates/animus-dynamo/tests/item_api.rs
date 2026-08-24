@@ -1,7 +1,7 @@
 //! The DynamoDB-style item API maps onto the storage core: put/get/delete and
 //! ordered Query within a partition, over the in-memory engine.
 
-use animus_dynamo::{AttributeValue as Av, Item, SortKeyCondition, Table, TableSchema};
+use animus_dynamo::{AttributeValue as Av, Comparator, Item, SortKeyCondition, Table, TableSchema};
 use animus_storage::MemoryEngine;
 use futures::executor::block_on;
 
@@ -115,7 +115,10 @@ fn query_with_sort_conditions_narrows_a_partition() {
         let eq = table
             .query_with(
                 &Av::S("p".into()),
-                Some(&SortKeyCondition::Equals(Av::S("b".into()))),
+                Some(&SortKeyCondition::Compare(
+                    Comparator::Eq,
+                    Av::S("b".into()),
+                )),
             )
             .await
             .unwrap();
