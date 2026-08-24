@@ -54,16 +54,18 @@ off shared storage:
    converges by construction. See the engineering-lessons entry "A catch-up
    convergence predicate needs a liveness bound, and the load that breaks it
    is *sustained*, not bursty."
-2. **The cutover has a second veto with no such bound.** The GSI-drain veto
+2. **The cutover has a second, far slower gate.** The GSI-drain veto
    (the parent's `"gsi"` cursor must reach the freeze) is not covered by
    `SPLIT_MAX_TAIL_PASSES` at all — it is a *cutover* gate, not a *tail*
-   gate. Issue #288 found that an unpaced continuous write flood against an
-   indexed table can make the drain livelock against the split it is
-   supposed to unblock: the flood generates change-log backlog faster than
-   the drain clears it, so cutover never fires within any bound the test
-   author chose. The fix that shipped was pacing the *test's* write flood,
-   which proves the mechanism can converge under polite load — it does not
-   bound the veto itself the way `SPLIT_MAX_TAIL_PASSES` bounds the tail.
+   gate, and unlike the tail it guards a correctness property, so it cannot
+   simply be bounded (see Alternative 1). Issue #288 found that an unpaced
+   continuous write flood against an indexed table can make the drain
+   livelock against the split it is supposed to unblock: the flood
+   generates change-log backlog faster than the drain clears it, so cutover
+   never fires within any budget the test author chose. The fix that
+   shipped was pacing the *test's* write flood, which proves the mechanism
+   can converge under polite load — it does nothing to make the veto's own
+   convergence fast under impolite load.
 3. **The freeze window is a measured, size-scaling write outage.** Rung 8
    measured **458ms** of retry-masked write blip at 2,000 rows on a 3-node
    cluster — inside fork F8's sub-second contract, but not zero, and the
@@ -396,11 +398,20 @@ same house rule (mechanism-gone lessons move to the archive):
 
 ## Alternatives considered and rejected
 
-**1. Status quo, plus a bounded GSI-drain veto.** The narrowest possible
-fix for weakness 2 above (add a `SPLIT_MAX_TAIL_PASSES`-shaped bound to the
-cutover veto, mirroring the tail-pass fix). This is the interim fix and
-should ship **separately, and first, regardless of this ADR's fate** — it
-closes a real livelock class (issue #288) with a small, well-understood
+**1. Status quo, plus an accelerated GSI-drain endgame.** The narrowest
+possible fix for weakness 2 above. Note the shape carefully: a
+`SPLIT_MAX_TAIL_PASSES`-style *bound* on the cutover veto — the first
+instinct, by analogy with the tail-pass fix — would be **unsafe**: the veto
+is a correctness gate, not a liveness heuristic, because cutover retires
+the parent and `Release`/`Reclaim` teardown deletes its engine files with
+no drain-before-halt, so force-firing cutover past an un-drained `"gsi"`
+cursor silently loses index updates. What *is* safe is acceleration: once
+the parent is frozen it is static (its backlog only shrinks), so the
+frozen endgame can drive the drain to exhaustion in a bounded loop within
+the tick instead of one batch per 200ms tick, with the veto's own
+pass/fail condition untouched. This is the interim fix and should ship
+**separately, and first, regardless of this ADR's fate** — it closes a
+real slow-convergence class (issue #288) with a small, well-understood
 change, and this ADR's timeline should not gate it. It leaves the rest of
 the copy-based workflow's structure untouched: the bespoke `SeedBatch`
 protocol, the three-full-scan endgame, and the write-outage-shaped freeze
@@ -506,10 +517,12 @@ Train 2's single-entry mint.
    cutover vetoes**, in the same bottom-up, red→green-per-cell discipline
    ADR 0050's own Train B used.
 
-**Independent of this sequencing**, the interim GSI-veto bound
-(Alternative 1) should ship **before rung 1**, as its own small, separate
-change — it fixes a livelock class on the record today (issue #288) and
-should not wait on any part of this proposal.
+**Independent of this sequencing**, the interim GSI-drain endgame
+acceleration (Alternative 1 — an acceleration, deliberately *not* a bound;
+see that alternative for why a bound would be unsafe) should ship
+**before rung 1**, as its own small, separate change — it fixes a
+slow-convergence class on the record today (issue #288) and should not
+wait on any part of this proposal.
 
 ## Open forks (deliberately not decided by this ADR)
 
