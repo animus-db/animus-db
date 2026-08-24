@@ -285,10 +285,25 @@ comment for its full type/method inventory.
   nothing to deduplicate. See the ADR amendment and `animusd::dynamo::
   run_transact`'s own doc for the full protocol (including the deliberate
   `PENDING`→`TransactionInProgressException` conservative narrowing).
+- **`TransactionCanceledException` carries AWS's real per-action
+  `CancellationReasons` array** (ADR 0018's 2026-08-24 `CancellationReasons`
+  amendment, issue #374 C2, shipped as C2a then C2b): `WireError.reasons`
+  (`Option<Vec<CancellationReason>>`) and
+  `WireError::transaction_canceled_with_reasons` — one entry per
+  `TransactItems` action (`None`/`ConditionalCheckFailed`/
+  `TransactionConflict`, `Item` echoed only for a `ConditionalCheckFailed`
+  entry whose own action asked `ReturnValuesOnConditionCheckFailure:
+  "ALL_OLD"`); the plain aggregate-only `WireError::transaction_canceled`
+  stays for the cases with no single responsible action to name (a cached
+  `CANCELLED` idempotency replay, a structural/routing abort). See the ADR
+  amendment for the full design, including why `TransactionConflict`'s
+  practical reachability through this wire is narrower than it looks (every
+  DynamoDB write action reads its item's current value before ever staging,
+  so the apply-time `IntentBlocked` guard `TransactionConflict` maps from is
+  reached by the raw client protocol's plain writes, not ordinary
+  `TransactWriteItems` contention).
 - **Still deferred** (don't represent as a full adapter): list-index document
-  paths (`a[0]`) and full per-action `CancellationReasons` fidelity (ADR
-  0018 §2/PR7 shipped atomicity itself; that wire-fidelity detail remains
-  simplified). `BatchGetItem` and `ADD`/`DELETE` `UpdateExpression`
+  paths (`a[0]`). `BatchGetItem` and `ADD`/`DELETE` `UpdateExpression`
   arithmetic are both implemented (`decode_batch_get`/`decode_update_expression`
   in `wire.rs`) — see the `wire` entry point above and this crate's own unit
   tests. **`Query` now paginates exactly like `Scan`**

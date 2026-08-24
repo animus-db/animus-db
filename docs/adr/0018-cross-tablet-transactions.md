@@ -2756,3 +2756,251 @@ serve a same-fingerprint retry racing its own still-in-flight original"
 contract (§4's documented conservative narrowing) — a future refinement if
 real operational need for it ever materializes, not a correctness gap in
 what shipped.
+
+## Amendment (2026-08-24, per-action `CancellationReasons`)
+
+This amendment closes the one item every prior amendment's own deferred list
+kept naming and deferring further: AWS's per-action `CancellationReasons`
+array on a `TransactionCanceledException`. Landed as two commits, C2a then
+C2b (issue #374's own split), each independently gated and green.
+
+### 1. The wire shape
+
+`WireError` gains `reasons: Option<Vec<CancellationReason>>`
+(`animus-dynamo::wire`) — `Some` only on a `TransactionCanceledException`
+minted with per-action detail in hand
+(`WireError::transaction_canceled_with_reasons`); `None` for every other
+error, including the pre-existing aggregate-only
+`WireError::transaction_canceled` (kept, for the cases below that still have
+no single responsible action to name). `to_json` renders a
+`"CancellationReasons"` sibling of `__type`/`message` only when `reasons` is
+`Some`. One `CancellationReason` per `TransactItems` action, in the
+request's own order:
+
+- `Code: "None"`, `Message: null` (present, never omitted) for every action
+  that was not itself the cause.
+- `Code: "ConditionalCheckFailed"`, `Message: "The conditional request
+  failed"`, and — only when that exact action requested
+  `ReturnValuesOnConditionCheckFailure: "ALL_OLD"` **and** the old image was
+  cheaply in hand at the point of failure — an `Item` field, DynamoDB-wire-
+  encoded exactly like a `GetItem` result.
+- `Code: "TransactionConflict"` for a lost race against another
+  transaction's own still-unresolved intent — never carries `Item` (no old
+  image is ever in hand at the point this is minted).
+
+The aggregate `message` on a `_with_reasons` error is derived from the array
+itself (`Transaction cancelled, please refer cancellation reasons for
+specific reasons [<codes>]`, AWS's own bracketed wording) — never supplied
+separately, so the two can't drift.
+
+`ReturnValuesOnConditionCheckFailure` (`NONE`/`ALL_OLD`, decoded per action —
+`wire::decode_rvocf`) is new: every `TransactAction` variant that carries a
+condition (`Put`/`Delete`/`Update`/`ConditionCheck`) gained an `rvocf`
+field, `#[serde(default)]` so `ClientRequestToken` fingerprinting (ADR
+0018's 2026-08-24 amendment, above) stays stable for a request that omits
+it.
+
+### 2. Three sites, one shared builder
+
+`dynamo.rs::run_transact` has exactly three places a `TransactionCanceled`
+can originate, and this amendment reaches all three — the third only after
+C2b's own boundary work (§4 below):
+
+1. **The in-loop `ConditionCheck` evaluation** (a transaction with at least
+   one write action, so `cp_txn` is eventually called): the failing action's
+   own index is known the instant its `cond.evaluate` returns false.
+2. **The all-`ConditionCheck` `writes.is_empty()` fallback** (`cp_txn` is
+   never called — see the PR7 amendment §"all-ConditionCheck corner case"):
+   `preconditions[i]` corresponds to `actions[i]` by construction (only a
+   `ConditionCheck` ever pushes a precondition in this branch, in the same
+   iteration order), so a mismatch's index falls out of the loop counter
+   directly.
+3. **`cp_txn`'s own `Err` return** (C2b): correlated back to an action index
+   via `action_keys`, a `(table, key)` list `run_transact` builds in its main
+   loop (the same one that resolves every action's key regardless) —
+   `TxnAbortReason::ConditionFailed`/`TransactionConflict` name a `(table,
+   key)`, matched by position against `action_keys`.
+
+All three build their `Vec<CancellationReason>` through one shared helper,
+`dynamo::cancellation_reasons_for(actions, failing_index, reason)` —
+`CancellationReason::none()` at every other index, so the three sites can
+never disagree about the array's shape.
+
+### 3. `TxnAbortReason`: a typed reason across the `cp_txn` boundary
+
+C2b's core addition is `animusd::TxnAbortReason` (`pub(crate)`, `lib.rs`,
+near the other `cp_txn`-adjacent types): `ConditionFailed { table, key }`,
+`TransactionConflict { table, key }`, `Other(String)`. `cp_txn`'s own return
+type becomes `Result<HlcTimestamp, TxnAbortReason>` — previously `Result<_,
+String>`, aggregate by construction. Threading this required widening
+`txn_stage_local`/`txn_prepare`/`txn_prepare_pushing`'s own error types to
+match (the minimal set that must carry a typed reason, per the "adding a
+field beats adding a variant" instinct applied to a `Result`'s error type
+instead of an enum — `docs/engineering-lessons.md`); every deeper
+`Result<_, String>` helper (`split_group`, `check_preconditions`,
+`provision_tablet`, `txn_decide_anchor`, …) kept its shape, wrapped with
+`.map_err(TxnAbortReason::Other)` at the boundary that needs to cross it.
+
+The mapping, precisely:
+
+| Source | `TxnAbortReason` | `CancellationReason.Code` |
+|---|---|---|
+| `txn_stage_local`'s own write-condition eval (`eval_kind_txn_write` returns `Ok(None)`) | `ConditionFailed { table, key }` (`key` = `dynamo::item_key(&p.pk, p.sk.as_ref())`) | `ConditionalCheckFailed` |
+| `StageOutcome::ConditionFailed { key }` (apply-time byte-level OCC, ADR 0018 §2's own amendment) | `ConditionFailed { table, key }` | `ConditionalCheckFailed` |
+| `StageOutcome::IntentBlocked` surviving every `txn_prepare_pushing` retry | `TransactionConflict { table, key }` (`key` = the last-seen blocked key) | `TransactionConflict` |
+| `StageOutcome::Fenced`, a routing failure, a precondition re-check mismatch, any other internal error | `Other(String)` | *(none — aggregate fallback)* |
+
+**Never conflate the two typed variants**: `ConditionFailed` is permanent (a
+condition evaluated against a fixed observed value — retrying the identical
+request changes nothing); `TransactionConflict` is a transient lost race (a
+client's own retry can succeed). This is the same distinction the ADR 0018
+§2/PR6 `StageOutcome` doc already draws between its own `ConditionFailed`
+and `IntentBlocked` variants — `TxnAbortReason` inherits it rather than
+re-deriving it.
+
+### 4. The forwarded hop: a marker-prefixed string, no new wire variant
+
+`ClientRequest::TxnPrepare`'s reply channel is `ClientResponse::TxnPrepared`
+or `ClientResponse::Error(String)` — a plain string, the same shape
+`dynamo::encode_relayed_error`/`decode_relayed_error` already solve for the
+forwarded `KindWriteItem` hop. `TxnAbortReason::encode`/`decode` follow the
+identical convention: `encode` renders `serde_json::to_string(self)` behind
+a `"txn-abort-reason:"` marker prefix; `decode` strips the marker and
+`serde_json::from_str`s the rest, falling back to `Other(raw)` for anything
+unmarked or undecodable (an older peer's plain string, a genuinely internal
+error, or a corrupted payload) — never a panic, never a silently wrong
+variant. `cp_serve_forwarded`'s `TxnPrepare` arm encodes on its `Err` path;
+`txn_prepare`'s own `Forward` branch decodes on receipt. No new
+`ClientResponse` variant, no `ClientRequest::surface_of` table entry, no
+`is_relayable_command` gate to remember — the same reasoning that made a
+field win over a variant for ADR 0055's `stale` flag applies here too.
+
+`write_action_condition_failure_survives_the_forwarding_hop`
+(`animusd/tests/dynamo_txn_cancellation.rs`) proves the round trip for
+real: a pre-split table, a failing write-action condition on the participant
+tablet, issued through **every** node's own Dynamo listener in turn (some
+route locally, some forward one or two hops) — the right index is flagged
+regardless of which node received the request.
+
+### 5. `TransactionConflict`'s reachability is narrower than it looks
+
+`StageOutcome::IntentBlocked` — the source of `TransactionConflict` — is
+only ever produced by `TxnStage`'s own apply-time writer-push-intents guard,
+reached when a **plain, already-known-value** write proposes directly with
+no preceding read (`TxnTableWrite::plain`, the raw client protocol's own
+shape). A DynamoDB write action is never that: since ADR 0049's universal
+kind-write-path gate, every one evaluates through
+`ClientCtx::txn_stage_local` → `dynamo::eval_kind_txn_write`, which reads
+the item's **current value first** (`cp_get_local_resolving`) before ever
+proposing. When another transaction already holds an unresolved intent on
+that exact key, this read is what blocks or errors — confirmed empirically
+while building the e2e suite below: routing a real `TransactWriteItems`
+write at an intent-held key through the DynamoDB edge consistently produced
+`TxnAbortReason::Other("...old-image read failed: CP group leader moved;
+retry")` after blocking for `INTENT_WAIT_TIMEOUT` (5s), never
+`IntentBlocked` — the coordinator's own read resolves (or fails) the
+question long before any stage proposal reaches the apply-time guard that
+would answer it differently.
+
+The mapping itself is real machinery, not dead code: it is reached by the
+**raw client protocol**'s plain writes (`ClientRequest::Txn` with
+`TxnTableWrite::plain`, e.g. `animus-cli`, or any caller of `ClientCtx::
+cp_txn` that supplies an already-known value instead of a pending kind
+write) — proven end to end by
+`write_action_intent_conflict_flags_transaction_conflict`, which stages a
+raw, never-decided `TxnPrepare` against a key and then races a second raw
+`ClientRequest::Txn` write against it, asserting the second loses with
+exactly `TransactionConflict`'s own wording. This is a genuine, narrower-
+than-hoped reachability finding about the *DynamoDB* surface specifically,
+not a gap in the typed-reason machinery itself; a future change that moves
+`eval_kind_txn_write`'s own read to tolerate (rather than block on) a
+foreign pending intent would widen it, but is out of scope here.
+
+### 6. Inherited granularity limits — not new ones
+
+- **First-failure-wins, not every-failure-reported**: the in-loop
+  `ConditionCheck` scan (§2 site 1) `break`s at the first failing action,
+  exactly like the pre-existing whole-or-nothing behavior it always had — a
+  request with two failing `ConditionCheck`s only ever reports the first one
+  in list order, the rest silently `None`. AWS's own real behavior is the
+  same for this shape (a `ConditionCheck` failure aborts the scan
+  immediately), so this is not a new simplification.
+- **First-participant-wins in `cp_txn`'s own fan-out**: `first_err` (the
+  pre-existing field this amendment retypes from `Option<String>` to
+  `Option<TxnAbortReason>`) keeps only the first participant failure
+  observed, by iteration order over `join_all`'s results — a transaction
+  whose anchor AND a participant both fail independently only ever reports
+  the participant order happened to surface first. Also pre-existing
+  behavior, not a new gap.
+- **`Other`/unmatched-key always falls back to the aggregate shape,
+  deliberately, never a guessed index**: `dynamo.rs`'s own site-3 matching
+  (§2) only builds a `CancellationReason` array when `action_keys` contains
+  an exact `(table, key)` match for the typed reason; anything else —
+  `Other`, or a `(table, key)` this coordinator never itself resolved
+  (should not happen, but is not asserted against) — degrades to
+  `WireError::transaction_canceled`'s existing aggregate-only shape. Never
+  index-zero, never a best guess.
+
+### 7. Interaction with `ClientRequestToken` idempotency (this file's prior
+amendment)
+
+A cached `CANCELLED` outcome replay (a retried token whose original attempt
+already failed) stays **aggregate-only** — `transact_write_idempotency_
+preflight` returns `WireError::transaction_canceled("cached cancelled
+outcome for this ClientRequestToken")` unchanged. The idempotency record
+(`__animus_txn_idempotency`) never persisted the original attempt's
+`CancellationReasons`, only a bare outcome tag (`PENDING`/`COMMITTED`/
+`CANCELLED`) — adding a reasons column there is a distinct, not-yet-needed
+widening (the retry is already told the transaction was cancelled; only the
+per-action detail is lost on replay, not the fact itself), left for a future
+change if real operational need for it materializes.
+
+### 8. Tests
+
+`animus-dynamo::wire`'s own unit tests (`cargo test -p animus-dynamo`): the
+exact JSON shape (`Message: null` always present, `Item` present only when
+earned, the bracketed aggregate message), `ReturnValuesOnConditionCheckFailure`
+decode (present/absent/invalid), and that a plain `transaction_canceled`
+never gains a stray `CancellationReasons` key. `animusd::lib.rs`'s in-crate
+`txn_abort_reason_tests` (`cargo test -p animusd --lib`): `TxnAbortReason::
+encode`/`decode`'s marker-prefixed round trip, including both fallback
+shapes (an unmarked string, a marked-but-undecodable payload) degrading to
+`Other` rather than panicking — the reachability case §5 already covers end
+to end for the *transaction-conflict* variant specifically, so this unit
+suite is scoped to the encode/decode mechanism itself.
+
+`animusd/tests/dynamo_txn_cancellation.rs` (real `ProdEnv`, `cargo test -p
+animusd --test dynamo_txn_cancellation`) — seven scenarios: a `ConditionCheck`
+failure inside a mixed write+check transaction, and the all-`ConditionCheck`
+fallback, each flagging the right index (C2a); the `ALL_OLD`/`Item` echo
+rule; a successful transaction carrying no `CancellationReasons` at all; a
+write action's own condition failing single-node and across the forwarding
+hop (C2b, §4); and `TransactionConflict` reachability via the raw protocol
+(§5). The pre-existing `dynamo_txn.rs`/`cp_txn.rs`/`dynamo_txn_idempotency.rs`
+suites — atomicity, cross-tablet 2PC, and idempotency, all unrelated to
+per-action reason fidelity — stay green unchanged, confirming this amendment
+only enriched the failure-reporting path rather than perturbing the
+commit/abort machinery underneath it.
+
+### 9. What ships with this amendment, what's still deferred
+
+Landing: `WireError.reasons` + `CancellationReason` + `transaction_canceled_
+with_reasons` (`animus-dynamo::wire`); per-action `ReturnValuesOnCondition
+CheckFailure` decode; the three `dynamo.rs::run_transact` sites building a
+full per-action array; `animusd::TxnAbortReason` and its threading through
+`cp_txn`/`txn_stage_local`/`txn_prepare`/`txn_prepare_pushing`; the
+marker-prefixed encode/decode across the forwarded `TxnPrepare` hop. **Full
+per-action `CancellationReasons` fidelity is therefore removed from this
+ADR's own deferred list** (the PR7 amendment §5, the follow-up amendment's
+own deferred summary, and this file's `ClientRequestToken` amendment §8,
+all stale as of this landing).
+
+Still deferred: CQL LWT/atomic `BATCH` (moot — CQL itself was dropped, ADR
+0053); `/admin/txns` manual resolution actions; a persisted-reasons column
+on the idempotency record for a cached-`CANCELLED` replay (§7). Record/intent
+GC remains out of scope (ADR 0018 §2/PR5's own note). Newly named by this
+amendment: `TransactionConflict`'s narrow practical reachability through the
+DynamoDB wire specifically (§5) — not a correctness gap (the typed mapping
+is real and end-to-end tested via the raw protocol), but a fidelity ceiling
+worth knowing about before reaching for this array to debug a real
+DynamoDB-edge lost-race scenario.

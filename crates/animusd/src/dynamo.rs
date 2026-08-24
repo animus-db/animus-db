@@ -34,8 +34,11 @@
 //! `Put`/`Delete`/`Update`/`ConditionCheck` action commits whole-or-nothing
 //! across however many tablets/tables it spans, via
 //! [`ClientCtx::cp_txn`](crate::ClientCtx::cp_txn) — see [`run_transact`]'s doc
-//! for the exact condition-evaluation/precondition layering and the still-
-//! deferred per-action `CancellationReasons` fidelity. **`ClientRequestToken`
+//! for the exact condition-evaluation/precondition layering. **A cancellation
+//! carries AWS's real per-action `CancellationReasons` array** (ADR 0018's
+//! 2026-08-24 `CancellationReasons` amendment, issue #374 C2) — see that
+//! amendment for the full design, including `TxnAbortReason`'s threading
+//! through `cp_txn`'s own 2PC boundary. **`ClientRequestToken`
 //! idempotency (ADR 0018's 2026-08-24 amendment) is implemented** — see
 //! [`run_transact`]'s own doc for the dedup protocol; `TransactGetItems`
 //! carries no such token (AWS gives reads nothing to deduplicate). `TransactGetItems` is a
@@ -1897,12 +1900,14 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// reported as `TransactionCanceledException` — the real DynamoDB
 /// exception type for a transaction (as opposed to
 /// `ConditionalCheckFailedException`, which only a single-item conditional
-/// write returns) — in **simple form**: one message, not AWS's per-action
-/// `CancellationReasons` array (explicitly deferred, ADR 0018 PR1 amendment
-/// decision 4 / the PR7 amendment — still deferred as of the 2026-08-24
-/// `ClientRequestToken` amendment, which closed the *other* half of that
-/// same deferred pair; see this function's own `ClientRequestToken`
-/// paragraph below).
+/// write returns). **Carries AWS's real per-action `CancellationReasons`
+/// array** whenever the failing action's own index is known (ADR 0018's
+/// 2026-08-24 `CancellationReasons` amendment, issue #374 C2 — see that
+/// amendment for the three sites this function builds one at, and
+/// `cancellation_reasons_for`'s own doc for the shared builder); a
+/// structural/routing abort with no single responsible action, or a cached
+/// `CANCELLED` idempotency replay (whose original reasons were never
+/// persisted), still falls back to the pre-existing aggregate-only shape.
 ///
 /// **The all-`ConditionCheck` corner case**: `cp_txn` requires at least one
 /// write to anchor its 2PC record on. A request with no `Put`/`Delete`/
@@ -2055,6 +2060,14 @@ async fn run_transact(
     // while `_rmw` is still held — captured here and handled once, after
     // `drop(_rmw)` below, alongside every other cancellation exit.
     let mut condition_check_failure: Option<WireError> = None;
+    // Every action's own (table, data key), by index — populated below in
+    // the same order `actions` is iterated, so `action_keys[i]` always
+    // corresponds to `actions[i]`. `cp_txn`'s own typed `TxnAbortReason`
+    // (ADR 0018's 2026-08-24 `CancellationReasons` amendment, issue #374
+    // C2b) names a `(table, key)`, not an action index — this is what lets
+    // this function's own `cp_txn` call site (below) correlate the two
+    // without re-deriving each key a second time.
+    let mut action_keys: Vec<(String, Vec<u8>)> = Vec::with_capacity(actions.len());
 
     'actions: for (action_index, action) in actions.iter().enumerate() {
         let table = action.table().to_owned();
@@ -2074,6 +2087,8 @@ async fn run_transact(
                 "Transaction request cannot include multiple operations on one item",
             ));
         }
+        debug_assert_eq!(action_keys.len(), action_index);
+        action_keys.push((table.clone(), data_key.clone()));
 
         // ADR 0046 U3 (universal since ADR 0049): EVERY write action — never
         // a bare `ConditionCheck`, which writes nothing and stays the
@@ -2256,15 +2271,38 @@ async fn run_transact(
                 )
                 .await;
             }
-            // `cp_txn`'s own abort still crosses as an untyped `String`
-            // (site 3 of ADR 0018's 2026-08-24 `CancellationReasons`
-            // amendment, issue #374 C2) — aggregate-only for now. C2b
-            // threads a typed `TxnAbortReason` through this boundary so a
-            // write action's own condition/conflict can flag the right
-            // index here too, matching sites 1/2 above.
-            Err(WireError::transaction_canceled(format!(
-                "transaction cancelled: {e}"
-            )))
+            // Site 3 of ADR 0018's 2026-08-24 `CancellationReasons`
+            // amendment (issue #374 C2b): `cp_txn` now returns a typed
+            // `TxnAbortReason` naming a `(table, key)` — correlate it back
+            // to its own action index via `action_keys` (built above, same
+            // order as `actions`) so a write action's own condition/
+            // conflict flags the right entry, matching sites 1/2. `Other`,
+            // or a `(table, key)` this coordinator never resolved (should
+            // not happen, but never guess an index), falls back to the
+            // aggregate-only shape.
+            let matched = match &e {
+                crate::TxnAbortReason::ConditionFailed { table, key } => action_keys
+                    .iter()
+                    .position(|(t, k)| t == table && k == key)
+                    // `Item` is deliberately omitted: the old image isn't in
+                    // hand at this site and this path must not add a read
+                    // just to populate it (see this function's own doc).
+                    .map(|i| (i, wire::CancellationReason::conditional_check_failed(None))),
+                crate::TxnAbortReason::TransactionConflict { table, key } => action_keys
+                    .iter()
+                    .position(|(t, k)| t == table && k == key)
+                    .map(|i| (i, wire::CancellationReason::transaction_conflict())),
+                crate::TxnAbortReason::Other(_) => None,
+            };
+            match matched {
+                Some((index, reason)) => {
+                    let reasons = cancellation_reasons_for(actions, index, reason);
+                    Err(WireError::transaction_canceled_with_reasons(reasons))
+                }
+                None => Err(WireError::transaction_canceled(format!(
+                    "transaction cancelled: {e}"
+                ))),
+            }
         }
     }
 }

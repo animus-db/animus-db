@@ -171,6 +171,136 @@ type TxnWriteCondition = (String, Vec<u8>, Option<Vec<u8>>);
 /// `type_complexity` bar.
 type StageConditions = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
+/// Why a [`ClientCtx::cp_txn`] 2PC attempt aborted (ADR 0018's 2026-08-24
+/// `CancellationReasons` amendment, issue #374 C2b) — carried across the 2PC
+/// boundary, including the forwarded `TxnPrepare` hop (via [`Self::encode`]/
+/// [`Self::decode`], mirroring `dynamo::encode_relayed_error`/
+/// `decode_relayed_error`'s marker-prefixed-string convention), so
+/// `dynamo::run_transact` can flag the exact action index responsible
+/// instead of falling back to an aggregate-only message.
+///
+/// **Never conflate [`Self::ConditionFailed`] with
+/// [`Self::TransactionConflict`]**: the former is a **permanent**
+/// `ConditionalCheckFailedException` — the condition was evaluated against a
+/// fixed observed value, so retrying the identical request changes nothing.
+/// The latter is a **lost race** against another transaction's own
+/// still-unresolved intent (`animus_cp_data::txn::StageOutcome::
+/// IntentBlocked`, ADR 0018 §2/PR6) surviving `txn_prepare_pushing`'s own
+/// bounded retry budget — transient, and a client's own retry can succeed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum TxnAbortReason {
+    /// A write action's own `ConditionExpression` (evaluated at its
+    /// participant leader, `ClientCtx::txn_stage_local`) — or the identical
+    /// condition re-checked at apply time
+    /// (`animus_cp_data::txn::StageOutcome::ConditionFailed`) — evaluated to
+    /// false against `key`'s current value.
+    ConditionFailed { table: String, key: Vec<u8> },
+    /// `key` already held a different, still-unresolved transaction's own
+    /// intent (`StageOutcome::IntentBlocked`) even after
+    /// `txn_prepare_pushing`'s bounded retry budget.
+    TransactionConflict { table: String, key: Vec<u8> },
+    /// Every other abort reason: a routing failure, a structural `Fenced`
+    /// rejection, a precondition re-check mismatch, or any other internal
+    /// error — carries only a human message, the same fidelity
+    /// `WireError::transaction_canceled` (the aggregate-only constructor)
+    /// always had.
+    Other(String),
+}
+
+impl TxnAbortReason {
+    /// Marker prefix distinguishing an encoded [`TxnAbortReason`] from a
+    /// plain, pre-existing error string on the forwarded `TxnPrepare` hop —
+    /// same convention as `dynamo::RELAYED_WIRE_ERROR_MARK`.
+    const MARK: &'static str = "txn-abort-reason:";
+
+    /// Encode for `ClientResponse::Error` (the forwarded `TxnPrepare` hop's
+    /// only error channel) so [`Self::decode`] can recover the typed reason
+    /// on the far side.
+    fn encode(&self) -> String {
+        match serde_json::to_string(self) {
+            Ok(json) => format!("{}{json}", Self::MARK),
+            // Unreachable in practice (every field here is a plain String/
+            // Vec<u8>, both infallibly serializable) — degrade to the
+            // aggregate-only shape rather than panic on a forwarded reply.
+            Err(_) => Self::Other(self.to_string()).to_string(),
+        }
+    }
+
+    /// [`Self::encode`]'s inverse. An unmarked string (a plain internal
+    /// error from any pre-this-amendment call site, or a peer running an
+    /// older build) degrades to `Other(raw)` — never a panic, never a
+    /// silently-wrong variant.
+    fn decode(raw: &str) -> Self {
+        raw.strip_prefix(Self::MARK)
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_else(|| TxnAbortReason::Other(raw.to_owned()))
+    }
+}
+
+impl std::fmt::Display for TxnAbortReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TxnAbortReason::ConditionFailed { table, key } => {
+                write!(f, "a condition on table `{table}` key {key:?} was not met")
+            }
+            TxnAbortReason::TransactionConflict { table, key } => write!(
+                f,
+                "table `{table}` key {key:?} lost a race against another in-flight transaction"
+            ),
+            TxnAbortReason::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// `TxnAbortReason::encode`/`decode` are `pub(crate)` (no external `tests/`
+/// binary can reach them), so this lives as an in-crate `#[cfg(test)]`
+/// module (same idiom as `kind_batch_signal_tests` above) — no cluster
+/// bring-up needed, just the pure marker-prefixed-string round trip (ADR
+/// 0018's 2026-08-24 `CancellationReasons` amendment, issue #374 C2b).
+#[cfg(test)]
+mod txn_abort_reason_tests {
+    use super::TxnAbortReason;
+
+    #[test]
+    fn condition_failed_round_trips_through_encode_decode() {
+        let reason = TxnAbortReason::ConditionFailed {
+            table: "t".into(),
+            key: vec![1, 2, 3],
+        };
+        assert_eq!(TxnAbortReason::decode(&reason.encode()), reason);
+    }
+
+    #[test]
+    fn transaction_conflict_round_trips_through_encode_decode() {
+        let reason = TxnAbortReason::TransactionConflict {
+            table: "t".into(),
+            key: vec![9],
+        };
+        assert_eq!(TxnAbortReason::decode(&reason.encode()), reason);
+    }
+
+    /// The reachability case the e2e suite calls out as impractical to
+    /// exercise end to end: a peer's plain, unmarked error string (a
+    /// pre-this-amendment build, or any genuinely internal failure that
+    /// never went through `encode`) must degrade to `Other`, never panic
+    /// or silently misparse as a different variant.
+    #[test]
+    fn an_unmarked_string_degrades_to_other() {
+        assert_eq!(
+            TxnAbortReason::decode("no CP group leader reachable for txn prepare"),
+            TxnAbortReason::Other("no CP group leader reachable for txn prepare".into())
+        );
+    }
+
+    /// A marked-but-corrupted payload (mismatched build, truncated in
+    /// transit) degrades the same way — never a panic.
+    #[test]
+    fn a_marked_but_undecodable_payload_degrades_to_other() {
+        let raw = format!("{}not valid json", TxnAbortReason::MARK);
+        assert_eq!(TxnAbortReason::decode(&raw), TxnAbortReason::Other(raw));
+    }
+}
+
 /// A decided [`TxnOutcome`]'s public-status mirror (ADR 0018 §2/PR5) — the
 /// two types mean the same thing (`Committed`/`Aborted`) but come from
 /// different call sites (`TxnOutcome` is what a coordinator/recovery pusher
@@ -8136,8 +8266,8 @@ impl ClientCtx {
         mut conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         participant_spans: Vec<(String, KeyRange)>,
         pending_kind_writes: Vec<PendingKindWrite>,
-    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), String> {
-        Self::frozen_refusal(leader)?;
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), TxnAbortReason> {
+        Self::frozen_refusal(leader).map_err(TxnAbortReason::Other)?;
         if !pending_kind_writes.is_empty() {
             let meta = self.effective_metadata();
             let _rmw = self.data().rmw_lock.lock().await;
@@ -8153,11 +8283,22 @@ impl ClientCtx {
                     p.condition.as_ref(),
                 )
                 .await
-                .map_err(|e| format!("txn prepare: leader-side evaluation failed: {e}"))?;
+                .map_err(|e| {
+                    TxnAbortReason::Other(format!(
+                        "txn prepare: leader-side evaluation failed: {e}"
+                    ))
+                })?;
+                // ADR 0018's 2026-08-24 `CancellationReasons` amendment
+                // (issue #374 C2b): a write action's own condition failing
+                // here is a **permanent** `ConditionalCheckFailedException`,
+                // never a `TransactionConflict` — `key` is this exact item's
+                // own data-plane key, recovered from `p.pk`/`p.sk` the same
+                // way `dynamo::item_key` derives it everywhere else.
                 let Some(eval) = evaluated else {
-                    return Err(format!(
-                        "txn prepare: a condition on table `{table}` was not met"
-                    ));
+                    return Err(TxnAbortReason::ConditionFailed {
+                        table: table.to_owned(),
+                        key: dynamo::item_key(&p.pk, p.sk.as_ref()),
+                    });
                 };
                 conditions.push((eval.key.clone(), eval.raw_old.clone()));
                 writes.push(animus_cp_data::TxnWrite {
@@ -8174,7 +8315,11 @@ impl ClientCtx {
                 let (txn_id, record_key, outcome) = leader
                     .txn_stage(table, writes, participant_spans, conditions)
                     .await
-                    .ok_or("CP group leader moved during anchor stage; retry")?;
+                    .ok_or_else(|| {
+                        TxnAbortReason::Other(
+                            "CP group leader moved during anchor stage; retry".into(),
+                        )
+                    })?;
                 let ts = txn_id.ts;
                 Ok((txn_id, record_key, table.to_owned(), ts, outcome))
             }
@@ -8188,7 +8333,11 @@ impl ClientCtx {
                         conditions,
                     )
                     .await
-                    .ok_or("CP group leader moved during participant stage; retry")?;
+                    .ok_or_else(|| {
+                        TxnAbortReason::Other(
+                            "CP group leader moved during participant stage; retry".into(),
+                        )
+                    })?;
                 Ok((txn_id, record_key, record_table, ts, outcome))
             }
         }
@@ -8225,13 +8374,15 @@ impl ClientCtx {
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         participant_spans: Vec<(String, KeyRange)>,
         pending_kind_writes: Vec<PendingKindWrite>,
-    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), String> {
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), TxnAbortReason> {
         let Some(first) = writes.first().map(|w| w.key.clone()).or_else(|| {
             pending_kind_writes
                 .first()
                 .map(|p| dynamo::item_key(&p.pk, p.sk.as_ref()))
         }) else {
-            return Err("txn prepare: writes must be non-empty".into());
+            return Err(TxnAbortReason::Other(
+                "txn prepare: writes must be non-empty".into(),
+            ));
         };
         match self.cp_route(table, &first).await {
             CpRoute::Local(leader) => {
@@ -8263,13 +8414,21 @@ impl ClientCtx {
                         ts,
                         outcome,
                     } => Ok((txn_id, record_key, record_table, ts, outcome)),
-                    ClientResponse::Error(e) => Err(e),
-                    other => Err(format!(
+                    // ADR 0018's 2026-08-24 `CancellationReasons` amendment
+                    // (issue #374 C2b): recover the typed reason a remote
+                    // `txn_stage_local` minted, `TxnAbortReason::encode`d
+                    // into this same `ClientResponse::Error` string —
+                    // `decode` degrades a peer's plain (pre-amendment, or
+                    // genuinely unmarked) error to `Other` automatically.
+                    ClientResponse::Error(e) => Err(TxnAbortReason::decode(&e)),
+                    other => Err(TxnAbortReason::Other(format!(
                         "unexpected reply to forwarded TxnPrepare: {other:?}"
-                    )),
+                    ))),
                 }
             }
-            CpRoute::None => Err("no CP group leader reachable for txn prepare".into()),
+            CpRoute::None => Err(TxnAbortReason::Other(
+                "no CP group leader reachable for txn prepare".into(),
+            )),
         }
     }
 
@@ -8308,7 +8467,13 @@ impl ClientCtx {
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         participant_spans: Vec<(String, KeyRange)>,
         pending_kind_writes: Vec<PendingKindWrite>,
-    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp), String> {
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp), TxnAbortReason> {
+        // ADR 0018's 2026-08-24 `CancellationReasons` amendment (issue #374
+        // C2b): the last-seen `IntentBlocked` key, so exhausting every retry
+        // attempt can still name the specific key that never cleared —
+        // `TransactionConflict`, never `ConditionFailed` (a lost race, not a
+        // permanent condition failure).
+        let mut last_blocked: Option<Vec<u8>> = None;
         for attempt in 0..TXN_STAGE_PUSH_ATTEMPTS {
             let (txn_id, record_key, record_table, ts, outcome) = self
                 .txn_prepare(
@@ -8334,28 +8499,42 @@ impl ClientCtx {
                         "txn prepare: stage blocked by another transaction's unresolved intent; \
                          retrying"
                     );
+                    last_blocked = Some(key);
                 }
                 StageOutcome::ConditionFailed { key } => {
-                    return Err(format!(
-                        "txn prepare: a condition on table `{table}` key {key:?} was not met"
-                    ));
+                    return Err(TxnAbortReason::ConditionFailed {
+                        table: table.to_owned(),
+                        key,
+                    });
                 }
                 StageOutcome::Fenced => {
-                    return Err(format!(
+                    return Err(TxnAbortReason::Other(format!(
                         "txn prepare: stage on table `{table}` was rejected (a stale route, an \
                          already-sealed/out-of-fence range, or a concurrent in-doubt-recovery \
                          decision); retry"
-                    ));
+                    )));
                 }
             }
             if attempt + 1 < TXN_STAGE_PUSH_ATTEMPTS {
                 tokio::time::sleep(TXN_STAGE_PUSH_BACKOFF).await;
             }
         }
-        Err(format!(
-            "txn prepare: stage on table `{table}` was blocked by another transaction's \
-             unresolved intent on a target key, even after {TXN_STAGE_PUSH_ATTEMPTS} attempts"
-        ))
+        match last_blocked {
+            Some(key) => Err(TxnAbortReason::TransactionConflict {
+                table: table.to_owned(),
+                key,
+            }),
+            // Every `TXN_STAGE_PUSH_ATTEMPTS` attempt returning `Ok` with an
+            // outcome other than `Staged`/`IntentBlocked`/`ConditionFailed`/
+            // `Fenced` is unreachable (`StageOutcome` is exhaustively
+            // matched above) — kept as a typed fallback rather than an
+            // `unreachable!()` so a future `StageOutcome` variant fails soft
+            // here instead of panicking a live node.
+            None => Err(TxnAbortReason::Other(format!(
+                "txn prepare: stage on table `{table}` did not converge after \
+                 {TXN_STAGE_PUSH_ATTEMPTS} attempts"
+            ))),
+        }
     }
 
     /// **Commit or abort** `txn_id`'s record at `record_key` on `table`'s
@@ -9030,9 +9209,11 @@ impl ClientCtx {
         writes: Vec<TxnTableWrite>,
         preconditions: Vec<TxnPrecondition>,
         write_conditions: Vec<TxnWriteCondition>,
-    ) -> Result<HlcTimestamp, String> {
+    ) -> Result<HlcTimestamp, TxnAbortReason> {
         if writes.is_empty() {
-            return Err("cp_txn: writes must be non-empty".into());
+            return Err(TxnAbortReason::Other(
+                "cp_txn: writes must be non-empty".into(),
+            ));
         }
         // **Load-bearing validation, not a redundant belt-and-suspenders
         // check**: `RaftKvNode::txn_stage` (the anchor's own stage) hard-
@@ -9047,11 +9228,11 @@ impl ClientCtx {
         // resurface this) and return a client-facing error instead of ever
         // reaching that assert.
         if let Some(w) = writes.iter().find(|w| w.key.len() < TOKEN_BYTES) {
-            return Err(format!(
+            return Err(TxnAbortReason::Other(format!(
                 "txn key {:?} of table `{}` must be at least {TOKEN_BYTES} bytes long \
                  (ADR 0022) for a multi-participant transaction",
                 w.key, w.table
-            ));
+            )));
         }
 
         // Auto-provision every distinct table's first tablet on demand, like
@@ -9061,12 +9242,25 @@ impl ClientCtx {
             if seen_tables.insert(w.table.clone())
                 && !self.effective_metadata().has_table_tablet(&w.table)
             {
-                self.provision_tablet(&w.table).await?;
+                self.provision_tablet(&w.table)
+                    .await
+                    .map_err(TxnAbortReason::Other)?;
             }
         }
 
-        // Precondition check #1 (pre-stage).
-        let observed = self.check_preconditions(&preconditions).await?;
+        // Precondition check #1 (pre-stage). A mismatch here is a
+        // `ConditionCheck` action's own cross-key OCC (`preconditions`, never
+        // a write's own key — see `TxnWriteCondition`'s doc) — not one of
+        // this amendment's two typed reasons (ADR 0018's 2026-08-24
+        // `CancellationReasons` amendment, issue #374 C2b left this path
+        // aggregate-only; `dynamo.rs::run_transact`'s own coordinator-side
+        // preflight already flags a `ConditionCheck` failure by index before
+        // `cp_txn` is ever called, so this re-check only fires on a genuine
+        // race the preflight couldn't have seen).
+        let observed = self
+            .check_preconditions(&preconditions)
+            .await
+            .map_err(TxnAbortReason::Other)?;
 
         // Own-key condition lookup, consumed (via `remove`) as `writes` is
         // grouped below — whatever's left over named a key that isn't one
@@ -9102,9 +9296,9 @@ impl ClientCtx {
         let mut groups: BTreeMap<(String, TabletId), Vec<TxnTableWrite>> = BTreeMap::new();
         let mut condition_groups: BTreeMap<(String, TabletId), StageConditions> = BTreeMap::new();
         for w in writes {
-            let tablet = self
-                .tablet_for(&w.table, &w.key)
-                .ok_or_else(|| format!("no tablet owns a txn key of table `{}`", w.table))?;
+            let tablet = self.tablet_for(&w.table, &w.key).ok_or_else(|| {
+                TxnAbortReason::Other(format!("no tablet owns a txn key of table `{}`", w.table))
+            })?;
             if let Some(expected) = condition_map.remove(&(w.table.clone(), w.key.clone())) {
                 condition_groups
                     .entry((w.table.clone(), tablet))
@@ -9119,11 +9313,11 @@ impl ClientCtx {
             groups.get_mut(&gk).expect("just inserted").push(w);
         }
         if let Some(((table, key), _)) = condition_map.into_iter().next() {
-            return Err(format!(
+            return Err(TxnAbortReason::Other(format!(
                 "cp_txn: a write-key condition named {table}/{key:?}, which is not one of this \
                  transaction's own write keys — use `preconditions` for a condition on a key \
                  this transaction does not write"
-            ));
+            )));
         }
 
         let anchor_gk = order[0].clone();
@@ -9131,7 +9325,8 @@ impl ClientCtx {
         let anchor_conditions = condition_groups.remove(&anchor_gk).unwrap_or_default();
         let (anchor_table, _anchor_tablet) = anchor_gk;
         let anchor_keys: Vec<Vec<u8>> = anchor_group.iter().map(|w| w.key.clone()).collect();
-        let (anchor_writes, anchor_pending) = Self::split_group(anchor_group)?;
+        let (anchor_writes, anchor_pending) =
+            Self::split_group(anchor_group).map_err(TxnAbortReason::Other)?;
 
         // ADR 0018 §2/PR5 (task #18 fix): the anchor's record must name
         // every OTHER participant's `(table, span)` pairs up front, not
@@ -9179,7 +9374,7 @@ impl ClientCtx {
             async move {
                 let (writes, pending) = match Self::split_group(group) {
                     Ok(split) => split,
-                    Err(e) => return (table, keys, Err(e)),
+                    Err(e) => return (table, keys, Err(TxnAbortReason::Other(e))),
                 };
                 let result = self
                     .txn_prepare_pushing(
@@ -9204,7 +9399,7 @@ impl ClientCtx {
         // identically too).
         let mut candidate = anchor_ts;
         let mut staged: Vec<(String, Vec<Vec<u8>>)> = vec![(anchor_table.clone(), anchor_keys)];
-        let mut first_err: Option<String> = None;
+        let mut first_err: Option<TxnAbortReason> = None;
         for (table, keys, result) in participant_results {
             match result {
                 Ok((_, _, _, ts)) => {
@@ -9325,18 +9520,28 @@ impl ClientCtx {
             {
                 Ok(TxnOutcome::Aborted) => {
                     resolve_all(TxnOutcome::Aborted, staged).await;
-                    Err(format!("transaction aborted: {reason}"))
+                    // Propagate the participant's own typed reason verbatim
+                    // (ADR 0018's 2026-08-24 `CancellationReasons`
+                    // amendment) — it already names the responsible action;
+                    // wrapping it in another `Other` string here would erase
+                    // the `ConditionFailed`/`TransactionConflict` distinction
+                    // `dynamo.rs::run_transact` needs to flag the right index.
+                    Err(reason)
                 }
                 Ok(TxnOutcome::Committed { commit_ts }) => {
                     resolve_all(TxnOutcome::Committed { commit_ts }, staged).await;
                     Ok(commit_ts)
                 }
-                Err(e) => Err(format!(
+                Err(e) => Err(TxnAbortReason::Other(format!(
                     "transaction aborted: {reason} (and abort itself failed: {e})"
-                )),
+                ))),
             }
         } else if !preconditions.is_empty()
-            && self.check_preconditions(&preconditions).await? != observed
+            && self
+                .check_preconditions(&preconditions)
+                .await
+                .map_err(TxnAbortReason::Other)?
+                != observed
         {
             // Precondition check #2 (pre-commit refresh — see this method's own
             // doc for why this is a value re-check, not the ADR's ts-based one).
@@ -9353,20 +9558,18 @@ impl ClientCtx {
             {
                 Ok(TxnOutcome::Aborted) => {
                     resolve_all(TxnOutcome::Aborted, staged).await;
-                    Err(
-                        "transaction aborted: a precondition changed between prepare and commit; \
-                         retry"
-                            .into(),
-                    )
+                    Err(TxnAbortReason::Other(
+                        "a precondition changed between prepare and commit; retry".into(),
+                    ))
                 }
                 Ok(TxnOutcome::Committed { commit_ts }) => {
                     resolve_all(TxnOutcome::Committed { commit_ts }, staged).await;
                     Ok(commit_ts)
                 }
-                Err(e) => Err(format!(
+                Err(e) => Err(TxnAbortReason::Other(format!(
                     "transaction aborted: a precondition changed between prepare and commit \
                      (and abort itself failed: {e})"
-                )),
+                ))),
             }
         } else {
             match self
@@ -9378,7 +9581,8 @@ impl ClientCtx {
                     candidate,
                     None,
                 )
-                .await?
+                .await
+                .map_err(TxnAbortReason::Other)?
             {
                 TxnOutcome::Committed { commit_ts } => {
                     // ADR 0018 §2/PR5: the deviation PR4 flagged, lifted —
@@ -9422,10 +9626,10 @@ impl ClientCtx {
                 // abort honestly rather than a false success.
                 TxnOutcome::Aborted => {
                     resolve_all(TxnOutcome::Aborted, staged).await;
-                    Err(
+                    Err(TxnAbortReason::Other(
                         "transaction aborted: lost to a concurrent in-doubt-recovery decision"
                             .into(),
-                    )
+                    ))
                 }
             }
         }
@@ -10862,7 +11066,10 @@ impl ClientCtx {
                         .first()
                         .map(|p| dynamo::item_key(&p.pk, p.sk.as_ref()))
                 }) else {
-                    return ClientResponse::Error("txn prepare: writes must be non-empty".into());
+                    return ClientResponse::Error(
+                        TxnAbortReason::Other("txn prepare: writes must be non-empty".into())
+                            .encode(),
+                    );
                 };
                 let tablet = self.tablet_for(&table, &first);
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
@@ -10892,7 +11099,11 @@ impl ClientCtx {
                             outcome,
                         }
                     }
-                    Err(e) => ClientResponse::Error(e),
+                    // ADR 0018's 2026-08-24 `CancellationReasons` amendment
+                    // (issue #374 C2b): encode the typed reason into this
+                    // hop's only error channel — `txn_prepare`'s `Forward`
+                    // branch decodes it back out via `TxnAbortReason::decode`.
+                    Err(e) => ClientResponse::Error(e.encode()),
                 }
             }
             ClientRequest::TxnDecide {
@@ -13183,7 +13394,13 @@ async fn handle_request(
             write_conditions,
         } => match ctx.cp_txn(writes, preconditions, write_conditions).await {
             Ok(commit_ts) => ClientResponse::TxnCommitted { commit_ts },
-            Err(e) => ClientResponse::Error(e),
+            // The raw client protocol's `Txn` reply carries a plain string
+            // (unchanged wire shape) — `TxnAbortReason`'s `Display` is the
+            // same human message `dynamo.rs::run_transact`'s own aggregate
+            // fallback would have shown; only that Dynamo edge needs the
+            // typed reason (ADR 0018's 2026-08-24 `CancellationReasons`
+            // amendment, issue #374 C2b) to flag a specific action's index.
+            Err(e) => ClientResponse::Error(e.to_string()),
         },
         // The six internal 2PC/recovery coordinator RPCs below are **never
         // sent as a bare top-level request** — a coordinator only ever
