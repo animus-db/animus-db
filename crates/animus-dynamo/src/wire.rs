@@ -59,6 +59,7 @@ use serde_json::{Map, Value};
 
 use crate::capacity::{
     ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity, ReturnItemCollectionMetrics,
+    item_size,
 };
 use crate::condition::{Comparator, ConditionError, ConditionExpression, SortKeyCondition};
 use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, SecondaryIndex};
@@ -886,6 +887,7 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "PutItem" => {
             let table = table_name(obj)?;
             let item = decode_item_field(obj, "Item")?;
+            check_item_size(&item)?;
             let condition = decode_condition(obj)?;
             let return_values = decode_return_values(obj)?;
             let capacity = decode_return_consumed_capacity(obj)?;
@@ -1162,8 +1164,46 @@ fn decode_update_return_values(obj: &Map<String, Value>) -> Result<UpdateReturnV
     }
 }
 
+/// AWS's per-item size cap: 400 KB (`409600` bytes), computed by
+/// [`item_size`] — the sum, over every attribute, of the UTF-8 length of its
+/// name plus the size of its value. Enforced on every decoded **write**
+/// item: `PutItem`, `BatchWriteItem`'s `PutRequest`s, and
+/// `TransactWriteItems`'s `Put` actions ([`check_item_size`]). **Not**
+/// enforced on `UpdateItem`'s post-update result — that needs a
+/// read-modify-write path this decode-time check has no access to (a known
+/// remaining gap; the item as it exists before the update may already be
+/// under the cap, so the check would have to run at the `animusd` edge
+/// after applying the update, not here).
+pub const MAX_ITEM_SIZE_BYTES: usize = 409_600;
+
+/// Reject `item` if it exceeds [`MAX_ITEM_SIZE_BYTES`], matching real
+/// DynamoDB's own `ValidationException` wording.
+fn check_item_size(item: &Item) -> Result<(), WireError> {
+    if item_size(item) > MAX_ITEM_SIZE_BYTES {
+        return Err(WireError::validation(
+            "Item size has exceeded the maximum allowed size",
+        ));
+    }
+    Ok(())
+}
+
+/// AWS's `BatchWriteItem` cap: at most 25 request items, summed across every
+/// table named in `RequestItems`, in one call.
+pub const BATCH_WRITE_MAX_ITEMS: usize = 25;
+
+/// AWS's `BatchGetItem` cap: at most 100 keys, summed across every table
+/// named in `RequestItems`, in one call.
+pub const BATCH_GET_MAX_KEYS: usize = 100;
+
+/// AWS's `TransactWriteItems` cap: at most 100 actions in one call.
+pub const TRANSACT_WRITE_MAX_ACTIONS: usize = 100;
+
+/// AWS's `TransactGetItems` cap: at most 100 items in one call.
+pub const TRANSACT_GET_MAX_ITEMS: usize = 100;
+
 /// Decode a `BatchWriteItem` body: `{"RequestItems": {table: [{PutRequest|
-/// DeleteRequest}, ..], ..}}`.
+/// DeleteRequest}, ..], ..}}`. Rejects more than [`BATCH_WRITE_MAX_ITEMS`]
+/// request items total across every table, matching real DynamoDB.
 fn decode_batch_write(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let items = obj
         .get("RequestItems")
@@ -1180,7 +1220,9 @@ fn decode_batch_write(obj: &Map<String, Value>) -> Result<Operation, WireError> 
                 .as_object()
                 .ok_or_else(|| WireError::validation("each batch request must be an object"))?;
             if let Some(put) = e.get("PutRequest").and_then(Value::as_object) {
-                reqs.push(WriteRequest::Put(decode_sub_item(put, "Item")?));
+                let item = decode_sub_item(put, "Item")?;
+                check_item_size(&item)?;
+                reqs.push(WriteRequest::Put(item));
             } else if let Some(del) = e.get("DeleteRequest").and_then(Value::as_object) {
                 reqs.push(WriteRequest::Delete(decode_sub_item(del, "Key")?));
             } else {
@@ -1191,11 +1233,19 @@ fn decode_batch_write(obj: &Map<String, Value>) -> Result<Operation, WireError> 
         }
         requests.insert(table.clone(), reqs);
     }
+    let total: usize = requests.values().map(Vec::len).sum();
+    if total > BATCH_WRITE_MAX_ITEMS {
+        return Err(WireError::validation(format!(
+            "too many items in BatchWriteItem: {total} requested, at most \
+             {BATCH_WRITE_MAX_ITEMS} allowed per call across all tables"
+        )));
+    }
     Ok(Operation::BatchWriteItem { requests })
 }
 
 /// Decode a `TransactWriteItems` body: `{"TransactItems": [{Put|Delete|Update|
-/// ConditionCheck}, ..]}`.
+/// ConditionCheck}, ..]}`. Rejects more than [`TRANSACT_WRITE_MAX_ACTIONS`]
+/// actions, matching real DynamoDB.
 fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let items = obj
         .get("TransactItems")
@@ -1214,11 +1264,15 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
             .ok_or_else(|| WireError::validation(format!("`{kind}` must be an object")))?;
         let table = table_name(inner)?;
         let action = match kind.as_str() {
-            "Put" => TransactAction::Put {
-                table,
-                item: decode_sub_item(inner, "Item")?,
-                condition: decode_condition(inner)?,
-            },
+            "Put" => {
+                let item = decode_sub_item(inner, "Item")?;
+                check_item_size(&item)?;
+                TransactAction::Put {
+                    table,
+                    item,
+                    condition: decode_condition(inner)?,
+                }
+            }
             "Delete" => TransactAction::Delete {
                 table,
                 key: decode_sub_item(inner, "Key")?,
@@ -1254,11 +1308,16 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
         };
         actions.push(action);
     }
+    if actions.len() > TRANSACT_WRITE_MAX_ACTIONS {
+        return Err(WireError::validation(format!(
+            "too many actions in TransactWriteItems: {} requested, at most \
+             {TRANSACT_WRITE_MAX_ACTIONS} allowed per call",
+            actions.len()
+        )));
+    }
     Ok(Operation::TransactWriteItems { actions })
 }
 
-/// Decode a `TransactGetItems` body: `{"TransactItems": [{"Get": {TableName,
-/// Key, ProjectionExpression}}, ..]}`.
 /// Decode a `BatchGetItem` body: `{"RequestItems": {"<table>": {"Keys": [..],
 /// "ProjectionExpression": .., "ExpressionAttributeNames": .., "ConsistentRead":
 /// ..}}}`.
@@ -1270,7 +1329,9 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
 /// `RequestItems` is a JSON object, so the tables arrive in whatever order the
 /// map iterates; the response is keyed by table name, so that does not matter.
 /// An empty `Keys` list for a table is rejected, as DynamoDB does — it is
-/// almost always a client bug rather than an intentional no-op.
+/// almost always a client bug rather than an intentional no-op. Rejects more
+/// than [`BATCH_GET_MAX_KEYS`] keys total across every table, matching real
+/// DynamoDB.
 fn decode_batch_get(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let tables = obj
         .get("RequestItems")
@@ -1308,9 +1369,19 @@ fn decode_batch_get(obj: &Map<String, Value>) -> Result<Operation, WireError> {
             consistent_read: decode_consistent_read(spec),
         });
     }
+    let total: usize = requests.iter().map(|r| r.keys.len()).sum();
+    if total > BATCH_GET_MAX_KEYS {
+        return Err(WireError::validation(format!(
+            "too many keys in BatchGetItem: {total} requested, at most \
+             {BATCH_GET_MAX_KEYS} allowed per call across all tables"
+        )));
+    }
     Ok(Operation::BatchGetItem { requests })
 }
 
+/// Decode a `TransactGetItems` body: `{"TransactItems": [{"Get": {TableName,
+/// Key, ProjectionExpression}}, ..]}`. Rejects more than
+/// [`TRANSACT_GET_MAX_ITEMS`] items, matching real DynamoDB.
 fn decode_transact_get(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let items = obj
         .get("TransactItems")
@@ -1333,6 +1404,13 @@ fn decode_transact_get(obj: &Map<String, Value>) -> Result<Operation, WireError>
             key,
             projection,
         });
+    }
+    if gets.len() > TRANSACT_GET_MAX_ITEMS {
+        return Err(WireError::validation(format!(
+            "too many items in TransactGetItems: {} requested, at most \
+             {TRANSACT_GET_MAX_ITEMS} allowed per call",
+            gets.len()
+        )));
     }
     Ok(Operation::TransactGetItems { gets })
 }
@@ -1402,17 +1480,36 @@ fn decode_attribute_types(obj: &Map<String, Value>) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// AWS's cap on a table's `GlobalSecondaryIndexes`, declared at `CreateTable`
+/// or accumulated one at a time via `UpdateTable` (`animusd::dynamo::
+/// create_index`, which has the replicated catalog this pure decoder
+/// doesn't, checks the running total against this same constant).
+pub const MAX_GSI_PER_TABLE: usize = 20;
+
+/// AWS's cap on a table's `LocalSecondaryIndexes` — create-time-only in real
+/// DynamoDB, so this is the only place it is ever checked.
+pub const MAX_LSI_PER_TABLE: usize = 5;
+
 /// Decode the optional `GlobalSecondaryIndexes` + `LocalSecondaryIndexes` of a
 /// `CreateTable` into a list of [`SecondaryIndex`]. A GSI's `KeySchema` is a
 /// `HASH` attribute plus an optional `RANGE` (a composite GSI); an LSI's
 /// `KeySchema` shares the base partition `HASH` and adds a `RANGE` (the index's
-/// alternate sort key). Absent ⇒ an empty list.
+/// alternate sort key). Absent ⇒ an empty list. Rejects more than
+/// [`MAX_GSI_PER_TABLE`] GSIs or [`MAX_LSI_PER_TABLE`] LSIs, matching real
+/// DynamoDB.
 fn decode_indexes(obj: &Map<String, Value>) -> Result<Vec<SecondaryIndex>, WireError> {
     let mut out = Vec::new();
     if let Some(gsis) = obj.get("GlobalSecondaryIndexes") {
         let gsis = gsis
             .as_array()
             .ok_or_else(|| WireError::validation("`GlobalSecondaryIndexes` must be an array"))?;
+        if gsis.len() > MAX_GSI_PER_TABLE {
+            return Err(WireError::validation(format!(
+                "too many GlobalSecondaryIndexes: {} declared, at most {MAX_GSI_PER_TABLE} \
+                 allowed per table",
+                gsis.len()
+            )));
+        }
         for gsi in gsis {
             let (name, schema, projection) = decode_index_entry(gsi, "GSI")?;
             out.push(SecondaryIndex::Global(GlobalSecondaryIndex {
@@ -1427,6 +1524,13 @@ fn decode_indexes(obj: &Map<String, Value>) -> Result<Vec<SecondaryIndex>, WireE
         let lsis = lsis
             .as_array()
             .ok_or_else(|| WireError::validation("`LocalSecondaryIndexes` must be an array"))?;
+        if lsis.len() > MAX_LSI_PER_TABLE {
+            return Err(WireError::validation(format!(
+                "too many LocalSecondaryIndexes: {} declared, at most {MAX_LSI_PER_TABLE} \
+                 allowed per table",
+                lsis.len()
+            )));
+        }
         let base = decode_key_schema(obj)?;
         for lsi in lsis {
             let (name, schema, projection) = decode_index_entry(lsi, "LSI")?;
@@ -4901,6 +5005,161 @@ mod tests {
         assert!(matches!(actions[2], TransactAction::ConditionCheck { .. }));
     }
 
+    // --- AWS batch/transaction count caps ----------------------------------
+
+    /// A `BatchWriteItem` body with `n` `PutRequest`s against one table.
+    fn batch_write_body(n: usize) -> String {
+        let items: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"PutRequest":{{"Item":{{"id":{{"S":"i{i}"}}}}}}}}"#))
+            .collect();
+        format!(r#"{{"RequestItems":{{"t":[{}]}}}}"#, items.join(","))
+    }
+
+    #[test]
+    fn batch_write_accepts_the_cap_and_rejects_one_over_it() {
+        let at_cap = batch_write_body(BATCH_WRITE_MAX_ITEMS);
+        decode_request("DynamoDB_20120810.BatchWriteItem", at_cap.as_bytes())
+            .expect("exactly the cap is accepted");
+
+        let over_cap = batch_write_body(BATCH_WRITE_MAX_ITEMS + 1);
+        let err = decode_request("DynamoDB_20120810.BatchWriteItem", over_cap.as_bytes())
+            .expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A `BatchGetItem` body with `n` keys against one table.
+    fn batch_get_body(n: usize) -> String {
+        let keys: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"id":{{"S":"i{i}"}}}}"#))
+            .collect();
+        format!(
+            r#"{{"RequestItems":{{"t":{{"Keys":[{}]}}}}}}"#,
+            keys.join(",")
+        )
+    }
+
+    #[test]
+    fn batch_get_accepts_the_cap_and_rejects_one_over_it() {
+        let at_cap = batch_get_body(BATCH_GET_MAX_KEYS);
+        decode_request("DynamoDB_20120810.BatchGetItem", at_cap.as_bytes())
+            .expect("exactly the cap is accepted");
+
+        let over_cap = batch_get_body(BATCH_GET_MAX_KEYS + 1);
+        let err = decode_request("DynamoDB_20120810.BatchGetItem", over_cap.as_bytes())
+            .expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A `TransactWriteItems` body with `n` `Put` actions, each its own key.
+    fn transact_write_body(n: usize) -> String {
+        let actions: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"Put":{{"TableName":"t","Item":{{"id":{{"S":"i{i}"}}}}}}}}"#))
+            .collect();
+        format!(r#"{{"TransactItems":[{}]}}"#, actions.join(","))
+    }
+
+    #[test]
+    fn transact_write_accepts_the_cap_and_rejects_one_over_it() {
+        let at_cap = transact_write_body(TRANSACT_WRITE_MAX_ACTIONS);
+        decode_request("DynamoDB_20120810.TransactWriteItems", at_cap.as_bytes())
+            .expect("exactly the cap is accepted");
+
+        let over_cap = transact_write_body(TRANSACT_WRITE_MAX_ACTIONS + 1);
+        let err = decode_request("DynamoDB_20120810.TransactWriteItems", over_cap.as_bytes())
+            .expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A `TransactGetItems` body with `n` `Get` items, each its own key.
+    fn transact_get_body(n: usize) -> String {
+        let gets: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"Get":{{"TableName":"t","Key":{{"id":{{"S":"i{i}"}}}}}}}}"#))
+            .collect();
+        format!(r#"{{"TransactItems":[{}]}}"#, gets.join(","))
+    }
+
+    #[test]
+    fn decodes_transact_get() {
+        let body = transact_get_body(2);
+        let Operation::TransactGetItems { gets } =
+            decode_request("DynamoDB_20120810.TransactGetItems", body.as_bytes()).unwrap()
+        else {
+            panic!("expected TransactGetItems");
+        };
+        assert_eq!(gets.len(), 2);
+        assert_eq!(gets[0].table, "t");
+    }
+
+    #[test]
+    fn transact_get_accepts_the_cap_and_rejects_one_over_it() {
+        let at_cap = transact_get_body(TRANSACT_GET_MAX_ITEMS);
+        decode_request("DynamoDB_20120810.TransactGetItems", at_cap.as_bytes())
+            .expect("exactly the cap is accepted");
+
+        let over_cap = transact_get_body(TRANSACT_GET_MAX_ITEMS + 1);
+        let err = decode_request("DynamoDB_20120810.TransactGetItems", over_cap.as_bytes())
+            .expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    // --- AWS 400 KB item-size cap -------------------------------------------
+
+    /// A single-attribute item (`"a": {"S": ..}`) whose `item_size` is exactly
+    /// `1 + value_len` (the attribute name `"a"` is one byte, an `S` value's
+    /// size is its length).
+    fn item_of_size(value_len: usize) -> String {
+        format!(r#"{{"a":{{"S":"{}"}}}}"#, "x".repeat(value_len))
+    }
+
+    #[test]
+    fn put_item_accepts_exactly_the_size_cap_and_rejects_one_byte_over() {
+        let item = item_of_size(MAX_ITEM_SIZE_BYTES - 1);
+        let at_cap = format!(r#"{{"TableName":"t","Item":{item}}}"#);
+        decode_request("DynamoDB_20120810.PutItem", at_cap.as_bytes())
+            .expect("exactly 409600 bytes is accepted");
+
+        let item = item_of_size(MAX_ITEM_SIZE_BYTES);
+        let over_cap = format!(r#"{{"TableName":"t","Item":{item}}}"#);
+        let err = decode_request("DynamoDB_20120810.PutItem", over_cap.as_bytes())
+            .expect_err("409601 bytes is rejected");
+        assert_eq!(err.code, "ValidationException");
+        assert!(
+            err.message
+                .contains("Item size has exceeded the maximum allowed size")
+        );
+    }
+
+    #[test]
+    fn batch_write_put_request_enforces_the_item_size_cap() {
+        let item = item_of_size(MAX_ITEM_SIZE_BYTES - 1);
+        let at_cap = format!(r#"{{"RequestItems":{{"t":[{{"PutRequest":{{"Item":{item}}}}}]}}}}"#);
+        decode_request("DynamoDB_20120810.BatchWriteItem", at_cap.as_bytes())
+            .expect("exactly 409600 bytes is accepted");
+
+        let item = item_of_size(MAX_ITEM_SIZE_BYTES);
+        let over_cap =
+            format!(r#"{{"RequestItems":{{"t":[{{"PutRequest":{{"Item":{item}}}}}]}}}}"#);
+        let err = decode_request("DynamoDB_20120810.BatchWriteItem", over_cap.as_bytes())
+            .expect_err("409601 bytes is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn transact_write_put_action_enforces_the_item_size_cap() {
+        let item = item_of_size(MAX_ITEM_SIZE_BYTES - 1);
+        let at_cap =
+            format!(r#"{{"TransactItems":[{{"Put":{{"TableName":"t","Item":{item}}}}}]}}"#);
+        decode_request("DynamoDB_20120810.TransactWriteItems", at_cap.as_bytes())
+            .expect("exactly 409600 bytes is accepted");
+
+        let item = item_of_size(MAX_ITEM_SIZE_BYTES);
+        let over_cap =
+            format!(r#"{{"TransactItems":[{{"Put":{{"TableName":"t","Item":{item}}}}}]}}"#);
+        let err = decode_request("DynamoDB_20120810.TransactWriteItems", over_cap.as_bytes())
+            .expect_err("409601 bytes is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
     #[test]
     fn update_response_echoes_new_for_all_new() {
         let mut new = Item::new();
@@ -4939,6 +5198,66 @@ mod tests {
             i.projection,
             IndexProjection::Include(vec!["x".into(), "y".into()])
         );
+    }
+
+    // --- AWS index-count caps (CreateTable) --------------------------------
+
+    /// A `CreateTable` body declaring `n` GSIs, each with a unique name.
+    fn create_table_with_gsis(n: usize) -> String {
+        let gsis: Vec<String> = (0..n)
+            .map(|i| {
+                format!(r#"{{"IndexName":"gsi{i}","KeySchema":[{{"AttributeName":"e","KeyType":"HASH"}}]}}"#)
+            })
+            .collect();
+        format!(
+            r#"{{"TableName":"t","KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                "GlobalSecondaryIndexes":[{}]}}"#,
+            gsis.join(",")
+        )
+    }
+
+    #[test]
+    fn create_table_accepts_the_gsi_cap_and_rejects_one_over_it() {
+        let at_cap = create_table_with_gsis(MAX_GSI_PER_TABLE);
+        decode_request("DynamoDB_20120810.CreateTable", at_cap.as_bytes())
+            .expect("exactly 20 GSIs is accepted");
+
+        let over_cap = create_table_with_gsis(MAX_GSI_PER_TABLE + 1);
+        let err = decode_request("DynamoDB_20120810.CreateTable", over_cap.as_bytes())
+            .expect_err("21 GSIs is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A `CreateTable` body declaring `n` LSIs, each with its own sort
+    /// attribute (LSIs must all share the base HASH key, so only the RANGE
+    /// attribute varies).
+    fn create_table_with_lsis(n: usize) -> String {
+        let lsis: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{"IndexName":"lsi{i}","KeySchema":[
+                        {{"AttributeName":"id","KeyType":"HASH"}},
+                        {{"AttributeName":"r{i}","KeyType":"RANGE"}}]}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"TableName":"t","KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                "LocalSecondaryIndexes":[{}]}}"#,
+            lsis.join(",")
+        )
+    }
+
+    #[test]
+    fn create_table_accepts_the_lsi_cap_and_rejects_one_over_it() {
+        let at_cap = create_table_with_lsis(MAX_LSI_PER_TABLE);
+        decode_request("DynamoDB_20120810.CreateTable", at_cap.as_bytes())
+            .expect("exactly 5 LSIs is accepted");
+
+        let over_cap = create_table_with_lsis(MAX_LSI_PER_TABLE + 1);
+        let err = decode_request("DynamoDB_20120810.CreateTable", over_cap.as_bytes())
+            .expect_err("6 LSIs is rejected");
+        assert_eq!(err.code, "ValidationException");
     }
 
     // --- UpdateTimeToLive / DescribeTimeToLive (ADR 0051) -----------------

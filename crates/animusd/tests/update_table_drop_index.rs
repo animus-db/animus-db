@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use animus_control::{IndexDef, IndexKind, IndexProjection, IndexStatus};
+use animus_dynamo::wire::BATCH_WRITE_MAX_ITEMS;
 use animusd::{ClientRequest, ClientResponse, MetaCommand, Node, read_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -160,12 +161,13 @@ async fn put_item(addr: SocketAddr, table: &str, id: &str, attr: &str, value: &s
 }
 
 /// Populate `table` with `attr = "{id}@x"` for every id in `ids`, via
-/// `BatchWriteItem` in chunks (one Raft entry per chunk) — duplicated from
+/// `BatchWriteItem` in [`BATCH_WRITE_MAX_ITEMS`]-sized chunks (one Raft entry
+/// per chunk, capped at AWS's own 25-item-per-call limit) — duplicated from
 /// `tests/backfill_seeder.rs::split_during_backfill_converges_with_correct_
 /// final_gsi`'s own technique, gentler on WAL fsync throughput than one
 /// `PutItem` round trip per item under concurrent multi-replica load.
 async fn batch_put_items(addr: SocketAddr, table: &str, attr: &str, ids: &[String]) {
-    for chunk in ids.chunks(100) {
+    for chunk in ids.chunks(BATCH_WRITE_MAX_ITEMS) {
         let puts: Vec<String> = chunk
             .iter()
             .map(|id| {

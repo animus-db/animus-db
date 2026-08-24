@@ -158,8 +158,8 @@ use animus_dynamo::capacity::{
     ReturnItemCollectionMetrics,
 };
 use animus_dynamo::wire::{
-    self, Operation, Projection, ReturnValues, ScanSegment, Select, TransactAction, TransactGet,
-    UpdateAction, WireError, WriteRequest,
+    self, MAX_GSI_PER_TABLE, Operation, Projection, ReturnValues, ScanSegment, Select,
+    TransactAction, TransactGet, UpdateAction, WireError, WriteRequest,
 };
 use animus_dynamo::{
     AttributeValue, ChangeRecord, ConditionExpression, Item, SortKeyCondition, TableSchema,
@@ -1266,6 +1266,13 @@ async fn update_table(
 ///   *replace* an existing definition (a different kind/attrs) rather than
 ///   erroring, so the duplicate check must happen here, client-side, before
 ///   ever proposing.
+/// - **[`MAX_GSI_PER_TABLE`] (20, matching real DynamoDB) enforced against
+///   the table's *current* replicated GSI count** — the wire decoder
+///   (`wire::decode_indexes`) enforces the same cap at `CreateTable` time,
+///   but has no way to know how many GSIs a table already has when they
+///   accumulate one at a time via `UpdateTable`, so this is the one site
+///   that actually has the replicated catalog in hand to check the running
+///   total.
 ///
 /// Bridges the validated declaration to the control-plane `IndexDef` via
 /// [`schema_bridge::index_to_control`], **overriding its status to
@@ -1316,6 +1323,17 @@ async fn create_index(
     if meta.table_indexes(table).iter().any(|d| d.name == name) {
         return Err(WireError::validation(format!(
             "index `{name}` already exists on table `{table}`"
+        )));
+    }
+    let existing_gsi_count = meta
+        .table_indexes(table)
+        .iter()
+        .filter(|d| d.kind == IndexKind::Global)
+        .count();
+    if existing_gsi_count >= MAX_GSI_PER_TABLE {
+        return Err(WireError::validation(format!(
+            "table `{table}` already has {existing_gsi_count} GlobalSecondaryIndexes, at most \
+             {MAX_GSI_PER_TABLE} allowed per table"
         )));
     }
     let mut def = schema_bridge::index_to_control(index, &control_schema.partition_key);
@@ -4909,6 +4927,7 @@ mod stream_write_path_tests {
 
     use animus_cp_data::{KIND_FOOTPRINT, KIND_LSI};
     use animus_dynamo::ChangeRecord;
+    use animus_dynamo::wire::BATCH_WRITE_MAX_ITEMS;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio::time::{sleep, timeout};
@@ -5144,7 +5163,9 @@ mod stream_write_path_tests {
     /// markers of one batch must share exactly ONE distinct HLC suffix —
     /// the per-item shape this replaces produced N distinct ones (one
     /// entry each), which is how the `backfill_seeder` populate-then-
-    /// backfill regression got in.
+    /// backfill regression got in. Sends exactly `BATCH_WRITE_MAX_ITEMS`
+    /// items — AWS's own 25-item-per-call cap — the most one `BatchWriteItem`
+    /// call can carry, so this stays a single-call, single-entry test.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn batch_write_on_a_marker_table_commits_one_entry_per_tablet() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -5159,7 +5180,7 @@ mod stream_write_path_tests {
         assert_eq!(status, 200, "CreateTable failed: {body}");
         let group = await_group(&node, "mb").await;
 
-        let puts: Vec<String> = (0..40)
+        let puts: Vec<String> = (0..BATCH_WRITE_MAX_ITEMS)
             .map(|i| format!(r#"{{"PutRequest":{{"Item":{{"id":{{"S":"k{i:03}"}}}}}}}}"#))
             .collect();
         let body_json = format!(r#"{{"RequestItems":{{"mb":[{}]}}}}"#, puts.join(","));
@@ -5177,14 +5198,14 @@ mod stream_write_path_tests {
         // over whatever is still live — every live marker of this batch must
         // share ONE apply HLC (the per-item regression shape shows up as
         // several distinct HLCs the instant any two markers survive a tick,
-        // which under a 40-item batch they essentially always do; a
-        // fully-trimmed-before-observation batch skips only this half, never
-        // the count).
+        // which under a BATCH_WRITE_MAX_ITEMS-item batch they essentially
+        // always do; a fully-trimmed-before-observation batch skips only
+        // this half, never the count).
         let records = group.pending_changes().await;
         let trimmed = metrics_value(node.dynamo_addr(), "change_log_trimmed_total").await;
         assert_eq!(
             records.len() as u64 + trimmed,
-            40,
+            BATCH_WRITE_MAX_ITEMS as u64,
             "exactly one marker per batched item (live {} + trimmed {trimmed})",
             records.len()
         );

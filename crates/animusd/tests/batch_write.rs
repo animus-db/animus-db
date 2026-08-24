@@ -6,7 +6,8 @@
 //! `GetItem` each back — that **survives a process restart** (the batch was
 //! Raft-committed + WAL-fsynced before the ack, so the on-disk LSM recovers it);
 //! and (2) a throughput contrast showing a batched write of N items beats N
-//! individual `PutItem`s (one consensus round for the whole batch vs one per key).
+//! individual `PutItem`s (one consensus round per `BATCH_WRITE_MAX_ITEMS`-sized
+//! chunk of the batch — AWS's own 25-item-per-call cap — vs one round per key).
 //!
 //! Like the other `animusd` tests this uses real TCP/time and polls with generous
 //! timeouts (the `ProdEnv` edge is non-deterministic by design).
@@ -14,6 +15,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use animus_dynamo::wire::BATCH_WRITE_MAX_ITEMS;
 use animusd::{Node, StorageBackend};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -79,7 +81,14 @@ async fn stop(node: Node) {
 
 /// A `BatchWriteItem` body writing `n` items to `table` with pk `pk` = `bN`.
 fn batch_put_body(table: &str, n: usize) -> String {
-    let puts: Vec<String> = (0..n)
+    batch_put_body_range(table, 0, n)
+}
+
+/// A `BatchWriteItem` body writing items `[start, end)` to `table`, each with
+/// pk `pk` = `b{i}` — the chunking primitive [`batched_write_beats_per_key`]
+/// uses to stay under [`BATCH_WRITE_MAX_ITEMS`] per call.
+fn batch_put_body_range(table: &str, start: usize, end: usize) -> String {
+    let puts: Vec<String> = (start..end)
         .map(|i| {
             format!(r#"{{"PutRequest":{{"Item":{{"pk":{{"S":"b{i}"}},"v":{{"N":"{i}"}}}}}}}}"#)
         })
@@ -147,10 +156,13 @@ async fn batch_write_round_trip_survives_restart() {
     stop(node).await;
 }
 
-/// A batched write of N items (one `BatchWriteItem` → one Raft entry) is faster
-/// than N individual `PutItem`s (one consensus round each). This is the whole
-/// point of the batch primitive; the margin is large (round count differs by N),
-/// so the assertion is robust despite real-time noise.
+/// A batched write of N items (one `BatchWriteItem` per [`BATCH_WRITE_MAX_ITEMS`]
+/// chunk → one Raft entry each) is faster than N individual `PutItem`s (one
+/// consensus round each). This is the whole point of the batch primitive; the
+/// margin is large (round count differs by roughly `BATCH_WRITE_MAX_ITEMS`x),
+/// so the assertion is robust despite real-time noise. `N` is chunked into
+/// `BATCH_WRITE_MAX_ITEMS`-sized `BatchWriteItem` calls — real DynamoDB's own
+/// 25-item-per-call cap, which a real client SDK chunks around the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batched_write_beats_per_key() {
     timeout(Duration::from_secs(60), async {
@@ -177,15 +189,23 @@ async fn batched_write_beats_per_key() {
         }
         let per_key = per_key_start.elapsed();
 
-        // Batched: the same N items in one BatchWriteItem (one Raft entry).
+        // Batched: the same N items, chunked to BATCH_WRITE_MAX_ITEMS per
+        // BatchWriteItem call (one Raft entry per chunk) — still far fewer
+        // rounds than N individual PutItems.
         let batched_start = Instant::now();
-        let (s, b) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.BatchWriteItem",
-            &batch_put_body("bk", N),
-        )
-        .await;
-        assert_eq!(s, 200, "batched BatchWriteItem: {b}");
+        for chunk_start in (0..N).step_by(BATCH_WRITE_MAX_ITEMS) {
+            let chunk_end = (chunk_start + BATCH_WRITE_MAX_ITEMS).min(N);
+            let (s, b) = dynamo(
+                dynamo_addr,
+                "DynamoDB_20120810.BatchWriteItem",
+                &batch_put_body_range("bk", chunk_start, chunk_end),
+            )
+            .await;
+            assert_eq!(
+                s, 200,
+                "batched BatchWriteItem[{chunk_start}..{chunk_end}]: {b}"
+            );
+        }
         let batched = batched_start.elapsed();
 
         eprintln!(
