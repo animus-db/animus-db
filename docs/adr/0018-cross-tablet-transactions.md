@@ -1,9 +1,10 @@
 # ADR 0018 — Cross-tablet transactions on the CP plane (2PC over per-tablet Raft + HLC + MVCC)
 
 - **Status:** Accepted — implemented (PR1-PR7 + corpus-found fixes + the
-  apply-time write-key conditions follow-up; CQL transactional surface,
-  idempotency tokens, CancellationReasons fidelity, and manual
-  txn-resolution admin actions deferred). PR1: HLC + sim clock skew; PR2:
+  apply-time write-key conditions follow-up + the 2026-08-24
+  `ClientRequestToken` idempotency amendment; CQL transactional surface,
+  CancellationReasons fidelity, and manual txn-resolution admin actions
+  deferred). PR1: HLC + sim clock skew; PR2:
   HLC commit timestamps as the CP-plane MVCC version + the range-seal
   design; PR2b: MVCC snapshot reads at a timestamp + the read-timestamp
   cache/logged read ceiling; PR3: single-participant transactions — the
@@ -1725,11 +1726,12 @@ other key never landing; `/admin/txns` showing a pending record during a
 simulated coordinator stall and clearing once recovery decides it).
 
 Deferred (per PR1's amendment decision 4, unchanged): CQL LWT/atomic
-`BATCH`; Dynamo `ClientRequestToken` idempotency; full per-action
-`CancellationReasons` fidelity. Newly identified and deferred by this PR:
-cross-node OCC for a write action's own `ConditionExpression` (§1's
-documented asymmetry above); `/admin/txns` manual resolution actions (§3).
-Record/intent GC remains out of scope (ADR 0018 §2/PR5's own note).
+`BATCH`; Dynamo `ClientRequestToken` idempotency (**closed by the
+2026-08-24 amendment below**); full per-action `CancellationReasons`
+fidelity. Newly identified and deferred by this PR: cross-node OCC for a
+write action's own `ConditionExpression` (§1's documented asymmetry
+above); `/admin/txns` manual resolution actions (§3). Record/intent GC
+remains out of scope (ADR 0018 §2/PR5's own note).
 
 No new `ClientRequest`/wire variant was needed — `cp_txn`/`cp_read`
 already existed and already route/forward correctly (proven generically
@@ -1902,10 +1904,11 @@ fix stays dead by construction (the new mechanism has no re-read to stall
 on at all, not just a faster one).
 
 Unchanged, still deferred: CQL LWT/atomic `BATCH`; Dynamo
-`ClientRequestToken` idempotency; full per-action `CancellationReasons`
-fidelity (a condition failure is still reported as one message, not AWS's
-per-action array); `/admin/txns` manual resolution actions. Record/intent
-GC remains out of scope (ADR 0018 §2/PR5's own note).
+`ClientRequestToken` idempotency (**closed by the 2026-08-24 amendment
+below**); full per-action `CancellationReasons` fidelity (a condition
+failure is still reported as one message, not AWS's per-action array);
+`/admin/txns` manual resolution actions. Record/intent GC remains out of
+scope (ADR 0018 §2/PR5's own note).
 
 Codec: `animus-cp-data`'s wire/image `VERSION` bumped 10 → 11
 (`TxnStage.conditions`) — internal format only, no cross-version
@@ -2506,3 +2509,250 @@ RMW-shaped write sharing a write-only cell's own keyspace needs the
 identical kind payload, or the corpus's own workload mix — not the
 mechanism — produces exactly the "silently stale derived row" symptom the
 check exists to catch).
+
+## Amendment (2026-08-24, `ClientRequestToken` idempotency)
+
+This amendment closes the one item of PR1's amendment decision 4 that
+survived every later PR7/follow-up sweep untouched: Dynamo
+`TransactWriteItems`'s `ClientRequestToken` idempotency. `TransactGetItems`
+needs no equivalent — a read has nothing to deduplicate — and full
+per-action `CancellationReasons` fidelity remains deferred; that is a
+separate follow-up (issue #374's C2), not part of this change.
+
+### 1. Composed primitives, not a new mechanism
+
+The entire feature is a **preflight** wrapped around `run_transact`'s
+existing atomic-commit machinery, built from primitives that already
+existed for other reasons — no new Raft command, no new `ClientRequest`
+variant, no change to `cp_txn`/`KvCommand::TxnStage` at all:
+
+- **Storage**: an ordinary catalog table (ADR 0013), written and read
+  through the same `ClientCtx::cp_kind_write_item`/`raw_quorum_read`
+  primitives every other Dynamo write/read uses.
+- **Conditional claim**: `ConditionExpression::AttributeNotExists`, the
+  identical mechanism a client's own `attribute_not_exists(pk)` conditional
+  `PutItem` uses — "first committer wins" for a token is exactly "first
+  committer wins" for an item.
+- **Expiry**: the table's TTL attribute (ADR 0051) and its existing reaper
+  — zero reaper code touched.
+- **Fingerprint**: `serde_json::to_vec` of the decoded `Vec<TransactAction>`
+  (`BTreeMap`-backed throughout, ADR 0003, hence deterministic regardless of
+  the client's own JSON key order) hashed with `sha2`, the identical crypto
+  dependency ADR 0057's SigV4 already added to `animus-dynamo`.
+
+Composing existing primitives instead of inventing a bespoke idempotency
+mechanism is a deliberate choice, not an accident of convenience: every
+property the feature needs (durability, replication, conditional
+first-writer-wins, expiry, leader-routing/forwarding, crash recovery) is a
+property those primitives were already independently proven to have, by
+their own existing test suites. A hand-rolled mechanism would have had to
+re-earn every one of those properties from scratch.
+
+### 2. A schema-registered internal table, not the `$`-prefixed hidden-table convention
+
+The idempotency records live in `__animus_txn_idempotency`
+(`animus_dynamo::internal_tables::TXN_IDEMPOTENCY_TABLE`): an **ordinary**,
+schema-registered catalog table — real `CreateTableSchema`/`SetTableTtl`
+entries, a real tablet, real replication — made invisible to clients only
+by a name check at every entry point (`ListTables`, the Data Console's
+table-summary/detail projections, and every client-facing data/DDL wire
+operation), not by any structural exemption from the schema catalog.
+
+**This is deliberately not** the `$`-prefixed hidden-table convention a
+materialized GSI/LSI already uses (`animus_dynamo::index::
+index_table_name`, `<base>$<index>`), even though that convention looks
+like the obvious fit for "an internal table a client should never see."
+Tracing why that convention cannot serve this feature is itself
+instructive, and is why this section exists:
+
+- `Metadata::apply`'s `CreateTableSchema` arm **rejects** any table name
+  containing `$` outright (the guard that stops a hidden index table from
+  ever colliding with a user table's own name) — a `$`-named table
+  therefore never gets a `Metadata.schemas` entry of its own at all.
+- The ADR 0051 TTL reaper's own per-tick sweep requires **both** a
+  `table_ttl` entry **and** a `table_schema` entry for a table before it
+  will ever scan it (`ttl_reaper.rs`'s leader-gated per-table loop) — and
+  `SetTableTtl`'s own apply arm has the identical rejection `CreateTableSchema`
+  does for a `$`-named table, so a hidden-table-shaped idempotency table
+  could never be TTL-enabled in the first place, let alone reaped.
+
+So the `$`-name-plus-TTL-reaper combination the naive design would reach
+for is not merely awkward — it is structurally impossible given the two
+existing guards, neither of which this amendment touches or should touch
+(the `$` guard is exactly what keeps a hidden index table's identity
+collision-free; loosening it to admit this one table would be a far more
+invasive change than picking a different name). `__animus_txn_idempotency`
+was chosen specifically because it clears both guards unmodified: it
+contains no `$`, and `animus_control::syskv::is_reserved_name` only tests
+a different, longer prefix (`__animus_system`), so the two names cannot
+collide either. The consequence worth stating plainly: this table needed
+its own **client-visibility** guard (§3 below) precisely because it is
+*not* exempted from the schema catalog the way a hidden index table is —
+being an ordinary table is what buys the free TTL reaping, and the price of
+that is that every client-facing surface must be taught to hide it, rather
+than the schema catalog hiding it structurally.
+
+### 3. Visibility guards
+
+A reserved-name predicate (`animus_dynamo::internal_tables::
+is_internal_table_name`, the one place any current or future internal
+table name is ever tested — kept as a single predicate so a second internal
+table joins the same check instead of every call site growing its own)
+gates every place a `TableName` reaches this table:
+
+- `ListTables` filters it out of the catalog projection.
+- The Data Console's `console_table_summaries`/`console_table_detail`
+  exclude it, mirroring the existing belt-and-suspenders exclusion those
+  two functions already apply to a hidden GSI/LSI table.
+- `animusd::dynamo::run_operation` rejects it for every single-table
+  operation up front (`Operation::table()`, covering `GetItem`/`PutItem`/
+  `DeleteItem`/`Query`/`Scan`/`UpdateItem`/`CreateTable`/`UpdateTable`/
+  `DeleteTable`/`DescribeTable`/`UpdateTimeToLive`/`DescribeTimeToLive`),
+  and `BatchWriteItem`/`BatchGetItem`/`TransactWriteItems`/
+  `TransactGetItems` — which span multiple tables, so `Operation::table()`
+  cannot cover them — are each guarded at their own per-table entry point.
+
+A data or read operation naming the table gets `ResourceNotFoundException`
+— indistinguishable, from any client's point of view, from a table that
+was never created. A `CreateTable`/`UpdateTable`/`DeleteTable`/
+`UpdateTimeToLive` naming it gets `ValidationException` instead: the name
+genuinely *is* reserved, a stronger and more honest signal than "does not
+exist" for an operation that is trying to establish or change that exact
+identity.
+
+### 4. The `PENDING` outcome: a deliberate conservative narrowing
+
+A retried token whose stored record is still `PENDING` gets a retryable
+`TransactionInProgressException`, not a wait, and not a re-run.
+
+Real DynamoDB's own documented contract is looser: a same-fingerprint
+retry racing its own still-in-flight original request is tolerated, and
+eventually serves whatever outcome the original settles on. This adapter
+does not implement that looser contract, on purpose. Closing the gap fully
+would mean either blocking the retry until the original's `cp_txn` call
+resolves (turning an idempotency preflight into a second consensus wait
+with no natural timeout of its own) or building a way to observe a
+*specific* transaction's own in-flight resolution from outside it — a
+primitive that does not exist today and would duplicate machinery
+`txn_resolver_loop`/`ClientCtx::txn_recover` (ADR 0018 §2/PR5) already
+owns for a different purpose. Neither is worth building for a narrow,
+retryable window: `TransactionInProgressException` is itself a
+documented, expected AWS exception a client's own SDK retry policy already
+handles, so the observable behavior is "retry once more," not a hard
+failure — the same shape a client already needs to tolerate for the
+ordinary transient conditions DynamoDB itself can return.
+
+### 5. The best-effort outcome update, and why a lost one self-heals
+
+After `run_transact` reaches a terminal outcome — commit or cancel,
+including both `ConditionCheck`-triggered cancellation sites — a
+best-effort `Put` updates the token's record from `PENDING` to
+`COMMITTED`/`CANCELLED`, conditioned on the stored `fingerprint` still
+matching (so a race against the TTL reaper reclaiming this exact record,
+followed by an unrelated request reusing the identical token value, can
+never overwrite a foreign record with our own outcome). Every failure of
+this update — a lost race, a routing hiccup, a crash — is silently
+ignored: no retry, no error surfaced to the client whose transaction just
+committed or was cancelled.
+
+This is sound specifically **because** the conditional claim `Put` at the
+start of the preflight, not the outcome update at the end, is what
+guarantees the transaction itself executes at most once per token. The
+outcome update is pure cache-freshness bookkeeping layered on top of an
+already-safe protocol, not part of the safety argument:
+
+- A committed/cancelled transaction whose outcome update is lost simply
+  leaves its record `PENDING` until the TTL reaper reclaims it
+  (`TXN_IDEMPOTENCY_TTL_SECS`, ten minutes).
+- A retry that lands **before** the TTL reclaims it observes stale
+  `PENDING` and gets an over-conservative `TransactionInProgressException`
+  (§4) — annoying, retryable, but never wrong.
+- A retry that lands **after** reclaim finds no record at all, retries the
+  claim once (the record-missing branch already needed for the ordinary
+  claim-then-reap race), and — since the original transaction is genuinely
+  done — either claims a fresh record and re-runs the *already-decided*
+  actions (safe only because every write action in the original committed
+  set is DynamoDB-conditioned the same way it always was: a
+  `PutItem`/`Update` with no condition is idempotent by construction, and a
+  conditioned one simply re-evaluates against current state) or observes
+  `TransactionInProgressException` again.
+
+The property that must hold, and does: a lost outcome update can only ever
+make a *future* retry more conservative (an unnecessary
+`TransactionInProgressException`, or — in the reclaimed-and-reused-token
+tail case — a fresh re-run of actions that were already safely
+DynamoDB-conditioned to begin with), never less — it can never turn into a
+silent double-commit of a transaction that already durably committed once,
+because that guarantee never depended on the outcome update landing.
+
+### 6. The `rmw_lock` placement constraint
+
+`run_transact` already documents (§1 of the PR7 amendment, and this
+function's own doc) that `ctx.data().rmw_lock` — the node-local,
+non-reentrant lock serializing this node's conditional writes — must never
+be held across a `cp_kind_write_item` call, because that call can re-enter
+the same lock on a combined-role node hosting the target tablet's own
+leader. Every idempotency-table read/write this amendment adds is subject
+to the identical constraint, and is placed accordingly:
+
+- The whole preflight (claim `Put`, any cached-record read) runs entirely
+  **before** `rmw_lock` is acquired.
+- Every outcome update runs entirely **after** it is dropped — including
+  the one in-loop `ConditionCheck` failure site, which used to `return`
+  directly from inside the lock's scope. That early return is now deferred
+  (captured in a local `condition_check_failure` variable, the loop broken
+  out of, the lock dropped, *then* the outcome update runs and the error is
+  returned) specifically so this amendment's own outcome-update call can
+  never execute while the lock is held.
+
+This is the identical hazard `docs/engineering-lessons.md` already records
+against this exact function, from the earlier, unrelated fix that first
+established the "scope `rmw_lock` to end before `cp_txn`" rule ("Holding a
+node-local lock across a call that can recurse back into the same lock, on
+the same node, is a self-deadlock waiting for the one deployment shape that
+makes the recursion local") — restated here because a less careful
+implementation of this exact feature would have reintroduced precisely that
+class of bug, in a new call site the original fix never had to consider.
+
+### 7. Tests
+
+`animusd/tests/dynamo_txn_idempotency.rs` (real `ProdEnv`, converged-or-
+timeout polling throughout): a same-token/same-fingerprint retry after
+commit returns cached success with the effect applied exactly once; a
+same-token/different-actions retry is `IdempotentParameterMismatchException`;
+token dedup survives a leader failover of the internal table's own
+tablet (a 3-node cluster, the node currently leading that tablet killed
+mid-scenario, the retry issued through a surviving node); and the
+visibility guards (`ListTables` omission, `ResourceNotFoundException` on a
+direct `PutItem`/`GetItem`, `ValidationException` on `CreateTable`) all in
+one suite. `animus-dynamo`'s own `wire.rs` unit tests cover
+`ClientRequestToken` decode (present/absent/both length boundaries/over
+the cap/empty) and fingerprint stability (two JSON-key-reordered but
+logically identical requests fingerprint identically; a genuinely
+different action fingerprints differently). The existing `dynamo_txn.rs`
+and `cp_txn.rs` suites — proving atomicity and cross-tablet 2PC unrelated
+to idempotency — stay green unchanged, confirming this amendment added a
+preflight in front of the existing machinery rather than perturbing it.
+
+### 8. What ships with this amendment, what's still deferred
+
+Landing: `ClientRequestToken` decode + validation (`animus-dynamo::wire`);
+a deterministic per-request fingerprint; the reserved internal
+`__animus_txn_idempotency` table and its lazy bootstrap; the conditional-
+claim/cached-outcome preflight and the best-effort outcome update
+(`animusd::dynamo::run_transact`); the `ListTables`/Data Console/every
+client-facing wire-operation visibility guards; two new `WireError`
+constructors (`idempotent_parameter_mismatch`/`transaction_in_progress`).
+`ClientRequestToken` idempotency is therefore **removed from this ADR's own
+deferred list** (§5 of the PR7 amendment, and the follow-up amendment's own
+deferred summary, both updated in place to point here).
+
+Still deferred, unchanged: CQL LWT/atomic `BATCH`; full per-action
+`CancellationReasons` fidelity (issue #374's C2 — a separate follow-up, not
+part of this change); `/admin/txns` manual resolution actions. Record/intent
+GC remains out of scope (ADR 0018 §2/PR5's own note). Newly named by this
+amendment, not pursued here: real DynamoDB's looser "tolerate and eventually
+serve a same-fingerprint retry racing its own still-in-flight original"
+contract (§4's documented conservative narrowing) — a future refinement if
+real operational need for it ever materializes, not a correctness gap in
+what shipped.

@@ -269,11 +269,26 @@ comment for its full type/method inventory.
   deviation) and exactly one `GlobalSecondaryIndexUpdates` element is
   accepted per call; adding an LSI this way stays rejected (LSIs are
   create-time-only in real DynamoDB too).
+- **`TransactWriteItems` `ClientRequestToken` idempotency is implemented**
+  (ADR 0018's 2026-08-24 amendment): `wire::decode_transact_write` decodes
+  an optional token (1..=36 chars) onto `Operation::TransactWriteItems`, and
+  `wire::transact_write_fingerprint` hashes the decoded `Vec<TransactAction>`
+  (SHA-256, deterministic — every nested type is `BTreeMap`-backed) so
+  `animusd::dynamo::run_transact` can dedupe a retried token against a
+  durable record on the reserved internal `__animus_txn_idempotency` table
+  (`internal_tables` module, `is_internal_table_name`/`TXN_IDEMPOTENCY_TABLE`)
+  — an ordinary schema-registered, TTL-reaped table, invisible to
+  `ListTables`/the Data Console/every client-facing data or DDL operation.
+  New `WireError` constructors `idempotent_parameter_mismatch`/
+  `transaction_in_progress` carry the two new failure shapes a reused token
+  can produce. `TransactGetItems` carries no such token — AWS gives reads
+  nothing to deduplicate. See the ADR amendment and `animusd::dynamo::
+  run_transact`'s own doc for the full protocol (including the deliberate
+  `PENDING`→`TransactionInProgressException` conservative narrowing).
 - **Still deferred** (don't represent as a full adapter): list-index document
-  paths (`a[0]`), `TransactWriteItems`/`TransactGetItems` idempotency tokens
-  (`ClientRequestToken`) and full per-action `CancellationReasons` fidelity
-  (ADR 0018 §2/PR7 shipped atomicity itself; these wire-fidelity details
-  remain simplified). `BatchGetItem` and `ADD`/`DELETE` `UpdateExpression`
+  paths (`a[0]`) and full per-action `CancellationReasons` fidelity (ADR
+  0018 §2/PR7 shipped atomicity itself; that wire-fidelity detail remains
+  simplified). `BatchGetItem` and `ADD`/`DELETE` `UpdateExpression`
   arithmetic are both implemented (`decode_batch_get`/`decode_update_expression`
   in `wire.rs`) — see the `wire` entry point above and this crate's own unit
   tests. **`Query` now paginates exactly like `Scan`**

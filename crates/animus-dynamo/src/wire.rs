@@ -56,6 +56,7 @@ use std::collections::BTreeMap;
 use animus_control::{IndexStatus, StreamViewType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::capacity::{
     ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity, ReturnItemCollectionMetrics,
@@ -317,7 +318,14 @@ pub enum WriteRequest {
 /// One action of a `TransactWriteItems` request. Each is condition-gated like a
 /// conditional write; see [`Operation::TransactWriteItems`] for the (documented)
 /// non-atomicity caveat.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **`Serialize`/`Deserialize`** (ADR 0018's 2026-08-24 `ClientRequestToken`
+/// amendment): every nested type here already derives them (`Item` is a
+/// `BTreeMap`, so encoding is deterministic, ADR 0003), which is what lets
+/// `animusd::dynamo` compute a canonical `serde_json::to_vec` fingerprint of
+/// the whole decoded `Vec<TransactAction>` to detect a `ClientRequestToken`
+/// retry's actions matching (or not) the original request's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransactAction {
     /// `Put`: write `item` in `table`, gated on `condition`.
     Put {
@@ -370,6 +378,34 @@ impl TransactAction {
             | TransactAction::ConditionCheck { table, .. } => table,
         }
     }
+}
+
+/// A deterministic, lowercase-hex SHA-256 fingerprint of a decoded
+/// `TransactWriteItems` request's actions (ADR 0018's 2026-08-24
+/// `ClientRequestToken` amendment).
+///
+/// **Deterministic by construction**: every `TransactAction`/`Item`/
+/// `ConditionExpression` in this crate is built on `BTreeMap` (ADR 0003), so
+/// `serde_json::to_vec` of the *decoded* value — never the raw request
+/// bytes, which could reorder JSON object keys or vary in whitespace for the
+/// same logical request — renders the same bytes for the same actions
+/// regardless of how the client formatted its JSON. `animusd::dynamo::
+/// run_transact` hashes this to detect whether a retried `ClientRequestToken`
+/// carries the *same* transaction (a legitimate retry) or a *different* one
+/// reusing the token (an `IdempotentParameterMismatchException`).
+#[must_use]
+pub fn transact_write_fingerprint(actions: &[TransactAction]) -> String {
+    let bytes = serde_json::to_vec(actions).expect("TransactAction serializes");
+    hex_encode_lower(&Sha256::digest(bytes))
+}
+
+fn hex_encode_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(char::from_digit(u32::from(b >> 4), 16).expect("nibble"));
+        out.push(char::from_digit(u32::from(b & 0x0f), 16).expect("nibble"));
+    }
+    out
 }
 
 /// A parallel-`Scan` worker's slice: `Segment` of `TotalSegments`.
@@ -671,6 +707,14 @@ pub enum Operation {
     TransactWriteItems {
         /// The transaction's actions, in order.
         actions: Vec<TransactAction>,
+        /// `ClientRequestToken` (ADR 0018's 2026-08-24 amendment): an
+        /// optional idempotency token, 1..=36 characters. When present,
+        /// `animusd::dynamo::run_transact` deduplicates a retried request
+        /// carrying the same token against a durable record keyed by it —
+        /// see that function's doc for the exact preflight/outcome
+        /// protocol. `TransactGetItems` has no equivalent field: AWS gives
+        /// reads nothing to deduplicate.
+        token: Option<String>,
     },
     /// `TransactGetItems`: a consistent multi-key read (ADR 0018 §2/PR7 — a
     /// **serializable snapshot via quiescence-confirmation**, not a wait-free
@@ -801,11 +845,48 @@ impl WireError {
     /// conditional `PutItem`/`DeleteItem`/`UpdateItem` returns) — **simple
     /// form**: a single human message, not AWS's per-action
     /// `CancellationReasons` array (explicitly deferred, ADR 0018 PR1
-    /// amendment decision 4 / the PR7 amendment).
+    /// amendment decision 4 / the PR7 amendment — still deferred as of the
+    /// 2026-08-24 `ClientRequestToken` amendment, which shipped
+    /// [`idempotent_parameter_mismatch`](Self::idempotent_parameter_mismatch)/
+    /// [`transaction_in_progress`](Self::transaction_in_progress) alongside
+    /// this constructor, closing the *other* half of that same deferred
+    /// pair, but left per-action fidelity untouched).
     #[must_use]
     pub fn transaction_canceled(message: impl Into<String>) -> Self {
         Self {
             code: "TransactionCanceledException",
+            message: message.into(),
+        }
+    }
+
+    /// A `TransactWriteItems` `ClientRequestToken` was reused with a
+    /// **different** set of actions than the original request that minted
+    /// it (ADR 0018's 2026-08-24 amendment) — the fingerprint of the
+    /// decoded `Vec<TransactAction>` disagrees with the one stored under
+    /// the token. The real AWS exception type for this condition.
+    #[must_use]
+    pub fn idempotent_parameter_mismatch(message: impl Into<String>) -> Self {
+        Self {
+            code: "IdempotentParameterMismatchException",
+            message: message.into(),
+        }
+    }
+
+    /// A `TransactWriteItems` `ClientRequestToken` names a record this node
+    /// observed as still `PENDING` (ADR 0018's 2026-08-24 amendment) — the
+    /// original request with this token may still be committing, or may
+    /// have crashed before reaching an outcome; either way, retrying now is
+    /// premature. **Deliberately conservative**: real DynamoDB tolerates a
+    /// same-fingerprint retry racing a genuinely in-flight original request
+    /// and serves the eventual outcome; this adapter narrows that to
+    /// "retry later" rather than blocking or speculatively joining the
+    /// in-flight attempt — see the ADR amendment for why. The real AWS
+    /// exception type for this condition; a client's own SDK retry policy
+    /// already expects and handles it.
+    #[must_use]
+    pub fn transaction_in_progress(message: impl Into<String>) -> Self {
+        Self {
+            code: "TransactionInProgressException",
             message: message.into(),
         }
     }
@@ -1315,7 +1396,32 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
             actions.len()
         )));
     }
-    Ok(Operation::TransactWriteItems { actions })
+    let token = decode_client_request_token(obj)?;
+    Ok(Operation::TransactWriteItems { actions, token })
+}
+
+/// Decode an optional `ClientRequestToken` field: AWS requires 1..=36
+/// characters when present (ADR 0018's 2026-08-24 amendment). An absent
+/// field is `Ok(None)` — the request opts out of idempotency, unchanged
+/// prior behavior. A present-but-wrong-length value is a
+/// `ValidationException`, matching AWS's own field-length validation.
+fn decode_client_request_token(obj: &Map<String, Value>) -> Result<Option<String>, WireError> {
+    match obj.get("ClientRequestToken") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            if (1..=36).contains(&s.chars().count()) {
+                Ok(Some(s.clone()))
+            } else {
+                Err(WireError::validation(format!(
+                    "`ClientRequestToken` must be 1 to 36 characters, got {}",
+                    s.chars().count()
+                )))
+            }
+        }
+        Some(_) => Err(WireError::validation(
+            "`ClientRequestToken` must be a string",
+        )),
+    }
 }
 
 /// Decode a `BatchGetItem` body: `{"RequestItems": {"<table>": {"Keys": [..],
@@ -4994,15 +5100,141 @@ mod tests {
                        "ExpressionAttributeValues":{":v":{"N":"1"}}}},
             {"ConditionCheck":{"TableName":"t","Key":{"id":{"S":"c"}},
                                "ConditionExpression":"attribute_exists(id)"}}]}"#;
-        let Operation::TransactWriteItems { actions } =
+        let Operation::TransactWriteItems { actions, token } =
             decode_request("DynamoDB_20120810.TransactWriteItems", body).unwrap()
         else {
             panic!("expected TransactWriteItems");
         };
         assert_eq!(actions.len(), 3);
+        assert_eq!(token, None, "no ClientRequestToken in this body");
         assert!(matches!(actions[0], TransactAction::Put { .. }));
         assert!(matches!(actions[1], TransactAction::Update { .. }));
         assert!(matches!(actions[2], TransactAction::ConditionCheck { .. }));
+    }
+
+    // --- `ClientRequestToken` (ADR 0018's 2026-08-24 amendment) -----------
+
+    #[test]
+    fn transact_write_decodes_a_present_client_request_token() {
+        let body = br#"{"ClientRequestToken":"abc-123",
+            "TransactItems":[{"Put":{"TableName":"t","Item":{"id":{"S":"a"}}}}]}"#;
+        let Operation::TransactWriteItems { token, .. } =
+            decode_request("DynamoDB_20120810.TransactWriteItems", body).unwrap()
+        else {
+            panic!("expected TransactWriteItems");
+        };
+        assert_eq!(token.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn transact_write_client_request_token_absent_decodes_to_none() {
+        let body = transact_write_body(1);
+        let Operation::TransactWriteItems { token, .. } =
+            decode_request("DynamoDB_20120810.TransactWriteItems", body.as_bytes()).unwrap()
+        else {
+            panic!("expected TransactWriteItems");
+        };
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn transact_write_client_request_token_accepts_the_length_bounds() {
+        let one_char = format!(
+            r#"{{"ClientRequestToken":"x","TransactItems":[{}]}}"#,
+            r#"{"Put":{"TableName":"t","Item":{"id":{"S":"a"}}}}"#
+        );
+        let Operation::TransactWriteItems { token, .. } =
+            decode_request("DynamoDB_20120810.TransactWriteItems", one_char.as_bytes()).unwrap()
+        else {
+            panic!("expected TransactWriteItems");
+        };
+        assert_eq!(token.as_deref(), Some("x"));
+
+        let thirty_six = "x".repeat(36);
+        let at_cap = format!(
+            r#"{{"ClientRequestToken":"{thirty_six}","TransactItems":[{}]}}"#,
+            r#"{"Put":{"TableName":"t","Item":{"id":{"S":"a"}}}}"#
+        );
+        let Operation::TransactWriteItems { token, .. } =
+            decode_request("DynamoDB_20120810.TransactWriteItems", at_cap.as_bytes()).unwrap()
+        else {
+            panic!("expected TransactWriteItems");
+        };
+        assert_eq!(token.as_deref(), Some(thirty_six.as_str()));
+    }
+
+    #[test]
+    fn transact_write_rejects_a_too_long_client_request_token() {
+        let too_long = "x".repeat(37);
+        let body = format!(
+            r#"{{"ClientRequestToken":"{too_long}","TransactItems":[{}]}}"#,
+            r#"{"Put":{"TableName":"t","Item":{"id":{"S":"a"}}}}"#
+        );
+        let err = decode_request("DynamoDB_20120810.TransactWriteItems", body.as_bytes())
+            .expect_err("37 characters exceeds the AWS cap");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn transact_write_fingerprint_ignores_json_key_order() {
+        // Two bodies whose `TransactItems` array carries the same logical
+        // actions but with JSON object keys in a different order must decode
+        // to actions that fingerprint identically — the fingerprint is a
+        // property of the decoded `Vec<TransactAction>` (all `BTreeMap`),
+        // never a hash of the raw request bytes.
+        let a = br#"{"TransactItems":[{"Put":{"TableName":"t","Item":{"id":{"S":"a"}},
+            "ConditionExpression":"attribute_not_exists(id)"}}]}"#;
+        let b = br#"{"TransactItems":[{"Put":{"ConditionExpression":"attribute_not_exists(id)",
+            "Item":{"id":{"S":"a"}},"TableName":"t"}}]}"#;
+        let Operation::TransactWriteItems {
+            actions: actions_a, ..
+        } = decode_request("DynamoDB_20120810.TransactWriteItems", a).unwrap()
+        else {
+            panic!("expected TransactWriteItems");
+        };
+        let Operation::TransactWriteItems {
+            actions: actions_b, ..
+        } = decode_request("DynamoDB_20120810.TransactWriteItems", b).unwrap()
+        else {
+            panic!("expected TransactWriteItems");
+        };
+        assert_eq!(
+            transact_write_fingerprint(&actions_a),
+            transact_write_fingerprint(&actions_b)
+        );
+    }
+
+    #[test]
+    fn transact_write_fingerprint_differs_on_a_different_action() {
+        let same_key_different_item = br#"{"TransactItems":[
+            {"Put":{"TableName":"t","Item":{"id":{"S":"a"},"v":{"N":"1"}}}}]}"#;
+        let original = br#"{"TransactItems":[
+            {"Put":{"TableName":"t","Item":{"id":{"S":"a"},"v":{"N":"2"}}}}]}"#;
+        let Operation::TransactWriteItems { actions: a, .. } = decode_request(
+            "DynamoDB_20120810.TransactWriteItems",
+            same_key_different_item,
+        )
+        .unwrap() else {
+            panic!("expected TransactWriteItems");
+        };
+        let Operation::TransactWriteItems { actions: b, .. } =
+            decode_request("DynamoDB_20120810.TransactWriteItems", original).unwrap()
+        else {
+            panic!("expected TransactWriteItems");
+        };
+        assert_ne!(
+            transact_write_fingerprint(&a),
+            transact_write_fingerprint(&b)
+        );
+    }
+
+    #[test]
+    fn transact_write_rejects_an_empty_client_request_token() {
+        let body = r#"{"ClientRequestToken":"",
+            "TransactItems":[{"Put":{"TableName":"t","Item":{"id":{"S":"a"}}}}]}"#;
+        let err = decode_request("DynamoDB_20120810.TransactWriteItems", body.as_bytes())
+            .expect_err("empty token is below the AWS minimum");
+        assert_eq!(err.code, "ValidationException");
     }
 
     // --- AWS batch/transaction count caps ----------------------------------

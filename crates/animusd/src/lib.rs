@@ -2726,6 +2726,10 @@ fn console_table_summaries(metadata: &Metadata) -> Vec<console::TableSummary> {
         // than resting on an invariant that holds elsewhere in the codebase
         // today but that this function has no way to enforce if it changes.
         .filter(|(name, _)| !animus_dynamo::index::is_index_table_name(name))
+        // The reserved internal table (ADR 0018's 2026-08-24 amendment) is an
+        // ordinary schema-registered table once its lazy bootstrap has run —
+        // same belt-and-suspenders discipline as the filter just above.
+        .filter(|(name, _)| !animus_dynamo::is_internal_table_name(name))
         .map(|(name, schema)| {
             let partition_key = console_key_summary(schema, &schema.partition_key);
             // DynamoDB has at most one sort key — the one-element case of
@@ -2892,6 +2896,12 @@ fn console_gsi_detail(schema: &TableSchema, idx: &animus_control::IndexDef) -> c
 /// holding elsewhere today).
 fn console_table_detail(meta: &Metadata, table: &str) -> Option<console::TableDetail> {
     if animus_dynamo::index::is_index_table_name(table) {
+        return None;
+    }
+    // Same reserved-internal-table exclusion as `console_table_summaries`
+    // (ADR 0018's 2026-08-24 amendment) — a direct `GET /console/api/tables/
+    // {name}` naming it must 404 like any other nonexistent table.
+    if animus_dynamo::is_internal_table_name(table) {
         return None;
     }
     let schema = meta.table_schema(table)?;

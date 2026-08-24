@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 pub mod capacity;
 pub mod condition;
 pub mod index;
+pub mod internal_tables;
 pub mod registry;
 pub mod schema;
 pub mod sigv4;
@@ -36,6 +37,7 @@ pub use index::{
     ChangeRecord, FootprintEntry, GsiRowRef, IndexFootprint, ItemFootprint, LsiRowRef,
     index_table_name, is_index_table_name, split_index_table_name,
 };
+pub use internal_tables::{TXN_IDEMPOTENCY_TABLE, is_internal_table_name};
 pub use registry::{
     GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, RegistryError, SchemaRegistry,
     SecondaryIndex,

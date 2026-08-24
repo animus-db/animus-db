@@ -7693,6 +7693,33 @@ debugging anything that feels like it might have happened before.
   mechanical post-check, the same way the `NAME:`-vs-`NAME::` entry below
   recommends for path-shaped mangling.
 
+- **A "hide this table from clients" requirement and a "reuse the existing
+  per-table TTL reaper" requirement can be mutually exclusive under a
+  hidden-table naming convention that predates the second requirement
+  (2026-08-24, ADR 0018's `ClientRequestToken` amendment).** The obvious
+  design for an internal, client-invisible table was to reuse the `$`-
+  separated hidden-table convention a materialized GSI/LSI already uses
+  (`animus_dynamo::index::index_table_name`) — it looked like exactly the
+  "invisible internal table" primitive needed. It structurally cannot work
+  for a table that also needs the ADR 0051 TTL reaper: `Metadata::apply`'s
+  `CreateTableSchema` arm rejects any `$`-containing name outright (so a
+  `$`-named table never gets a `Metadata.schemas` entry at all), and the
+  reaper's own per-tick sweep requires **both** a `table_ttl` entry **and**
+  a `table_schema` entry before it will scan a table — so a `$`-named table
+  could never be TTL-enabled even if the first guard were relaxed. The fix
+  was not to weaken either guard (the `$` guard is exactly what keeps a
+  hidden index table's identity collision-free) but to pick an ordinary,
+  schema-registered table name instead, and grow the *visibility* story
+  (`is_internal_table_name`, checked at every client-facing entry point)
+  as its own, separate mechanism. **General form**: before reaching for an
+  existing "hide this from normal traffic" convention to solve a *new*
+  hiding requirement, check what else that convention's own definition
+  structurally excludes the hidden thing from — a convention built to
+  answer one question (avoid a name collision) can silently foreclose an
+  unrelated later question (participate in a background sweep) that never
+  came up when it was designed, and the foreclosure is in the *existing*
+  guards, not a new one you'd think to look for.
+
 - **A regex mass-edit over Rust must be brace-balanced, not
   next-delimiter-based (2026-08-23).** Adding `stale: false,` to every
   `ClientRequest::Get { … }` literal across the test tree with
@@ -7724,7 +7751,19 @@ debugging anything that feels like it might have happened before.
   "failure" as if it were a code problem, and prefer a full `cargo clean`
   over trying to selectively prune `target/` — the incremental cache is the
   overwhelming majority of the size and buys little across a full rebuild
-  anyway.
+  anyway. **Refinement (2026-08-24):** when the *linked test binaries*
+  dominate rather than the incremental cache — `du -sh target/debug/deps`
+  showing tens of GB of ~150-200 MB-each executables, one per `tests/*.rs`
+  file, is the tell — deleting only those executables (`find target/debug
+  target/debug/deps -maxdepth 1 -type f -executable ! -name '*.so'
+  -delete`) frees the same space in seconds while leaving every compiled
+  `.rlib`/`.rmeta` dependency artifact intact, so the next `cargo build`/
+  `test` only **relinks** the binaries it actually needs instead of
+  recompiling ~150 dependency crates from scratch. A full `cargo clean` is
+  still the right call when the incremental cache itself is the bulk of the
+  size (the original 2026-08-19 case, `target/debug/incremental` at 600
+  MB+); check which directory is actually large before choosing between
+  the two — they solve the same symptom at very different costs.
 - **Parallel agents share one `target/` dir; three concurrent
   `--all-targets` builds exhaust the session disk (2026-08-19).** Fanning three
   implementation agents across disjoint crates avoids *source* conflicts but
