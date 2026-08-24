@@ -3183,6 +3183,36 @@ debugging anything that feels like it might have happened before.
   property is a budget, and a budget that nothing enforces is a comment; this
   turns it into a test failure. Applicable anywhere a "must not block / must
   not round-trip" invariant matters and would otherwise only be documented.
+- **A theorized failure mode should be verified empirically before a test is
+  built around it — the read-before-write architecture can make an "obvious"
+  race unreachable through the surface you'd naturally test it from
+  (2026-08-24, ADR 0018's `CancellationReasons` amendment, issue #374 C2b).**
+  Building `TransactionConflict` reachability coverage, the natural test
+  looked like: stage one transaction's intent on a key and never decide it,
+  then send a real `TransactWriteItems` touching that same key through the
+  DynamoDB edge, expecting `StageOutcome::IntentBlocked` (the apply-time
+  writer-push-intents guard) to surface as `TransactionConflict`. It never
+  did — every attempt produced a generic, slow (~5s) failure instead. The
+  reason only became visible by tracing the actual call path: every DynamoDB
+  write action reads the item's *current value* first
+  (`ClientCtx::txn_stage_local` → `dynamo::eval_kind_txn_write` →
+  `cp_get_local_resolving`, needed to evaluate the action's own
+  `ConditionExpression` and diff LSI rows) — for a key already holding
+  another transaction's local pending intent, that read itself blocks
+  (`INTENT_WAIT_TIMEOUT`, 5s) or fails, so the apply-time guard the test
+  meant to exercise is never even reached; the write never gets far enough
+  to propose. The write path that DOES hit the guard directly — a raw,
+  already-known-value write (`TxnTableWrite::plain`, the plain client
+  protocol's own shape, no preceding read) — was reachable and fast (under
+  2s) once tried. **General rule**: when a test keeps producing an
+  unexpected result for what looks like a straightforward race, trace the
+  actual code path the request takes end to end (not just the two states
+  you expect to interact) before concluding the test needs a bigger timeout
+  or a cleverer timing trick — a front-loaded read, a cache, or an
+  early-return check can make a "later" failure mode structurally
+  unreachable from a particular entry point, and the fix is choosing a
+  different entry point (or documenting the narrower reachability, as this
+  amendment's own ADR section does) rather than fighting the timing harder.
 - **A per-item `WireError` raised inside a `TransactWriteItems` write action's
   evaluation does not keep its own error `code` by the time it reaches the
   wire (2026-08-24, issue #372 part 2).** `wire::apply_update`'s
@@ -7767,6 +7797,33 @@ debugging anything that feels like it might have happened before.
   mechanical post-check, the same way the `NAME:`-vs-`NAME::` entry below
   recommends for path-shaped mangling.
 
+- **A "hide this table from clients" requirement and a "reuse the existing
+  per-table TTL reaper" requirement can be mutually exclusive under a
+  hidden-table naming convention that predates the second requirement
+  (2026-08-24, ADR 0018's `ClientRequestToken` amendment).** The obvious
+  design for an internal, client-invisible table was to reuse the `$`-
+  separated hidden-table convention a materialized GSI/LSI already uses
+  (`animus_dynamo::index::index_table_name`) — it looked like exactly the
+  "invisible internal table" primitive needed. It structurally cannot work
+  for a table that also needs the ADR 0051 TTL reaper: `Metadata::apply`'s
+  `CreateTableSchema` arm rejects any `$`-containing name outright (so a
+  `$`-named table never gets a `Metadata.schemas` entry at all), and the
+  reaper's own per-tick sweep requires **both** a `table_ttl` entry **and**
+  a `table_schema` entry before it will scan a table — so a `$`-named table
+  could never be TTL-enabled even if the first guard were relaxed. The fix
+  was not to weaken either guard (the `$` guard is exactly what keeps a
+  hidden index table's identity collision-free) but to pick an ordinary,
+  schema-registered table name instead, and grow the *visibility* story
+  (`is_internal_table_name`, checked at every client-facing entry point)
+  as its own, separate mechanism. **General form**: before reaching for an
+  existing "hide this from normal traffic" convention to solve a *new*
+  hiding requirement, check what else that convention's own definition
+  structurally excludes the hidden thing from — a convention built to
+  answer one question (avoid a name collision) can silently foreclose an
+  unrelated later question (participate in a background sweep) that never
+  came up when it was designed, and the foreclosure is in the *existing*
+  guards, not a new one you'd think to look for.
+
 - **A regex mass-edit over Rust must be brace-balanced, not
   next-delimiter-based (2026-08-23).** Adding `stale: false,` to every
   `ClientRequest::Get { … }` literal across the test tree with
@@ -7831,7 +7888,43 @@ debugging anything that feels like it might have happened before.
   "failure" as if it were a code problem, and prefer a full `cargo clean`
   over trying to selectively prune `target/` — the incremental cache is the
   overwhelming majority of the size and buys little across a full rebuild
-  anyway.
+  anyway. **Refinement (2026-08-24):** when the *linked test binaries*
+  dominate rather than the incremental cache — `du -sh target/debug/deps`
+  showing tens of GB of ~150-200 MB-each executables, one per `tests/*.rs`
+  file, is the tell — deleting only those executables (`find target/debug
+  target/debug/deps -maxdepth 1 -type f -executable ! -name '*.so'
+  -delete`) frees the same space in seconds while leaving every compiled
+  `.rlib`/`.rmeta` dependency artifact intact, so the next `cargo build`/
+  `test` only **relinks** the binaries it actually needs instead of
+  recompiling ~150 dependency crates from scratch. A full `cargo clean` is
+  still the right call when the incremental cache itself is the bulk of the
+  size (the original 2026-08-19 case, `target/debug/incremental` at 600
+  MB+); check which directory is actually large before choosing between
+  the two — they solve the same symptom at very different costs.
+  **Refinement (2026-08-24, issue #374 C2): at genuinely 0 bytes free (not
+  just "low"), the agent harness's own Bash tool output capture fails with
+  ENOSPC too** — `df`, `echo hi`, even a `Write` truncation of an unrelated
+  file all failed with the harness's own "temp filesystem is full" or
+  `ENOSPC` errors, on the SAME root filesystem the repo and `/tmp` share
+  here. Every synchronous (foreground) Bash call was unusable in this state.
+  What worked: issuing the cleanup (`rm -rf target`, no other commands
+  chained) with `run_in_background: true` — a background command apparently
+  needs less headroom to start than a foreground one needs to capture its
+  own output, and once it actually deleted enough (a full `rm -rf target/`,
+  not a partial executables-only sweep, since the workspace build that
+  caused this had already grown the whole tree past what executables-only
+  deletion could recover), ordinary foreground commands worked again.
+  **General rule**: if disk hits exactly 0 and even trivial read-only
+  commands (`echo`, `df`) start failing with a filesystem-full error, stop
+  trying to diagnose via Bash — go straight to a `run_in_background` deletion
+  of the single largest, safely-regenerable directory (a repo's own
+  `target/`), and only resume foreground commands once one such background
+  job reports genuine free space back. A `CARGO_PROFILE_DEV_DEBUG=0`
+  environment variable on every subsequent `cargo build`/`test`/`clippy`
+  invocation (not just the validation-pass advice below, but every single
+  command afterward) then keeps the rebuilt tree from reaching the same
+  ceiling again — debug info alone was the difference between builds that
+  fit in the freed headroom and ones that didn't, in the same session.
 - **Parallel agents share one `target/` dir; three concurrent
   `--all-targets` builds exhaust the session disk (2026-08-19).** Fanning three
   implementation agents across disjoint crates avoids *source* conflicts but

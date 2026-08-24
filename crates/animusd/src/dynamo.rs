@@ -34,8 +34,14 @@
 //! `Put`/`Delete`/`Update`/`ConditionCheck` action commits whole-or-nothing
 //! across however many tablets/tables it spans, via
 //! [`ClientCtx::cp_txn`](crate::ClientCtx::cp_txn) — see [`run_transact`]'s doc
-//! for the exact condition-evaluation/precondition layering and the deferred
-//! per-action `CancellationReasons` fidelity. `TransactGetItems` is a
+//! for the exact condition-evaluation/precondition layering. **A cancellation
+//! carries AWS's real per-action `CancellationReasons` array** (ADR 0018's
+//! 2026-08-24 `CancellationReasons` amendment, issue #374 C2) — see that
+//! amendment for the full design, including `TxnAbortReason`'s threading
+//! through `cp_txn`'s own 2PC boundary. **`ClientRequestToken`
+//! idempotency (ADR 0018's 2026-08-24 amendment) is implemented** — see
+//! [`run_transact`]'s own doc for the dedup protocol; `TransactGetItems`
+//! carries no such token (AWS gives reads nothing to deduplicate). `TransactGetItems` is a
 //! **consistent multi-key read** (new, ADR 0018 §2/PR7) — see
 //! [`run_transact_get`]'s doc for its quiescence-confirmation semantics (a
 //! serializable snapshot via retry-on-contention, not a wait-free one).
@@ -163,7 +169,8 @@ use animus_dynamo::wire::{
 };
 use animus_dynamo::{
     AttributeValue, ChangeRecord, Comparator, ConditionExpression, Item, SortKeyCondition,
-    TableSchema, index as dynamo_index, schema as schema_bridge, storage_key,
+    TXN_IDEMPOTENCY_TABLE, TableSchema, index as dynamo_index, schema as schema_bridge,
+    storage_key,
 };
 use animus_env::{Clock, Env, Metric};
 use animus_tablet::{TOKEN_BYTES, TabletId, partition_token};
@@ -183,6 +190,20 @@ const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// request (ADR 0018 §2/PR7) — DynamoDB's own limit (1-100 items); we don't
 /// replicate AWS's fuller request-size validation, just this simple cap.
 const MAX_TRANSACT_ITEMS: usize = 100;
+
+/// `ClientRequestToken` idempotency record TTL (ADR 0018's 2026-08-24
+/// amendment) — how long a `TransactWriteItems` retry can still find and
+/// dedupe against the record its original attempt claimed, before the ADR
+/// 0051 TTL reaper reclaims it. Ten minutes comfortably covers any client
+/// retry window without keeping the internal table growing forever; there is
+/// no AWS-documented value to match (real DynamoDB does not publish one).
+const TXN_IDEMPOTENCY_TTL_SECS: u64 = 600;
+
+/// A `ClientRequestToken` record's `outcome` attribute values (ADR 0018's
+/// 2026-08-24 amendment) — see [`run_transact`]'s doc for the state machine.
+const TXN_IDEMPOTENCY_PENDING: &str = "PENDING";
+const TXN_IDEMPOTENCY_COMMITTED: &str = "COMMITTED";
+const TXN_IDEMPOTENCY_CANCELLED: &str = "CANCELLED";
 
 /// Bounded rounds `run_transact_get`'s quiescent read gives a multi-key
 /// snapshot to stabilize: the first round, a confirming round, then up to
@@ -462,6 +483,60 @@ fn error_status(err: &WireError) -> u16 {
     }
 }
 
+/// Whether `op` is a DDL mutation that names a table by identity
+/// (`CreateTable`/`UpdateTable`/`DeleteTable`/`UpdateTimeToLive`) — see
+/// [`reject_internal_table`]'s `ddl` parameter.
+fn is_ddl_mutation(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::CreateTable { .. }
+            | Operation::UpdateTable { .. }
+            | Operation::DeleteTable { .. }
+            | Operation::UpdateTimeToLive { .. }
+    )
+}
+
+/// Reject `table` when it names the reserved internal
+/// `__animus_txn_idempotency` table (ADR 0018's 2026-08-24 amendment —
+/// `animus_dynamo::internal_tables`'s doc has the full "why this table, why
+/// this name" design).
+///
+/// **Why an explicit name check, not just `table_known`/`meta.
+/// has_table_schema`**: before its first `ClientRequestToken` use the
+/// internal table has no catalog entry at all, so those checks would
+/// already say "unknown" — but the whole point of the lazy-bootstrap design
+/// is that after that first use it is an entirely ordinary, schema-
+/// registered, tablet-hosting table (so the ADR 0051 TTL reaper can reap
+/// it with zero reaper changes). Once bootstrapped, `table_known` returns
+/// `true` for it exactly like any real user table, so only a name check
+/// keeps it invisible/unreachable to a client from that point on.
+///
+/// `ddl` selects the exception shape, matching real DynamoDB's own
+/// distinction between "this name is reserved" and "this table does not
+/// exist": a `CreateTable`/`UpdateTable`/`DeleteTable`/`UpdateTimeToLive`
+/// naming it is `ValidationException` (the name genuinely is reserved, not
+/// merely absent); every data op (and read op) is `ResourceNotFoundException`
+/// (indistinguishable, from any client's point of view, from a table that
+/// was never created).
+fn reject_internal_table(table: &str, ddl: bool) -> Result<(), WireError> {
+    if !animus_dynamo::is_internal_table_name(table) {
+        return Ok(());
+    }
+    if ddl {
+        Err(WireError {
+            code: "ValidationException",
+            message: format!("`{table}` is a reserved internal table name"),
+            reasons: None,
+        })
+    } else {
+        Err(WireError {
+            code: "ResourceNotFoundException",
+            message: format!("table `{table}` does not exist"),
+            reasons: None,
+        })
+    }
+}
+
 /// Execute a decoded operation against the data plane via the shared coordinator.
 async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireError> {
     // One metadata snapshot per request (see [`metadata`]): every schema lookup /
@@ -469,6 +544,17 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
     // cloning the replicated metadata again. `CreateTable` is the exception — its
     // commit-wait must poll *fresh* views, so it reads live inside `create_table`.
     let meta = &metadata(ctx);
+    // The reserved internal table (ADR 0018's 2026-08-24 amendment) must be
+    // invisible/unreachable to every single-table client operation — checked
+    // once, here, ahead of every handler below (`BatchWriteItem`/
+    // `BatchGetItem`/`TransactWriteItems`/`TransactGetItems`/`ListTables`
+    // have no single `Operation::table()` and are guarded at their own
+    // per-table entry points instead: see `reject_internal_table`'s call
+    // sites in the `BatchWriteItem`/`BatchGetItem` arms below and in
+    // `run_transact`/`run_transact_get`).
+    if let Some(table) = op.table() {
+        reject_internal_table(table, is_ddl_mutation(&op))?;
+    }
     match op {
         Operation::CreateTable {
             table,
@@ -667,6 +753,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // is omitted from its table's list.
             let mut tables: Vec<(String, Vec<Item>)> = Vec::with_capacity(requests.len());
             for req in requests {
+                reject_internal_table(&req.table, false)?;
                 if !table_known(ctx, meta, &req.table) {
                     return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
                         req.table.clone(),
@@ -846,6 +933,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // the general same-predicate lesson is in
             // `docs/engineering-lessons.md`.)
             for (table, reqs) in &requests {
+                reject_internal_table(table, false)?;
                 // ADR 0049 fast arm: a marker table's batch needs no
                 // evaluation — commit **one `KindBatch` Raft entry per
                 // tablet**, carrying every one of that tablet's base rows
@@ -912,7 +1000,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             }
             Ok(wire::batch_write_response())
         }
-        Operation::TransactWriteItems { actions } => {
+        Operation::TransactWriteItems { actions, token } => {
             // Unlike the old serial-loop implementation, atomicity now comes
             // from `ClientCtx::cp_txn` (a real cross-tablet 2PC), not this
             // node's `rmw_lock` — `run_transact` still takes it across its own
@@ -920,7 +1008,7 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // here) so two transactions on this node can't interleave their
             // condition checks, but the lock is not what makes the *commit*
             // atomic.
-            run_transact(ctx, meta, &actions).await
+            run_transact(ctx, meta, &actions, token.as_deref()).await
         }
         Operation::TransactGetItems { gets } => run_transact_get(ctx, meta, &gets).await,
         Operation::UpdateTimeToLive {
@@ -1038,6 +1126,7 @@ async fn create_table(
         return Err(WireError {
             code: "ValidationException",
             message: format!("table name `{table}` collides with the reserved system namespace"),
+            reasons: None,
         });
     }
     // Reject a duplicate up front, matching DynamoDB's `ResourceInUseException`,
@@ -1687,6 +1776,10 @@ fn list_tables(
         .table_schemas()
         .map(|(name, _)| name.clone())
         .filter(|name| !dynamo_index::is_index_table_name(name))
+        // The reserved internal table (ADR 0018's 2026-08-24 amendment) is
+        // an ordinary schema-registered table once its lazy bootstrap has
+        // run, so it would otherwise appear here like any user table.
+        .filter(|name| !animus_dynamo::is_internal_table_name(name))
         .collect();
     let (page, last_evaluated) =
         wire::paginate_table_names(&names, exclusive_start_table_name, limit);
@@ -1807,9 +1900,14 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// reported as `TransactionCanceledException` — the real DynamoDB
 /// exception type for a transaction (as opposed to
 /// `ConditionalCheckFailedException`, which only a single-item conditional
-/// write returns) — in **simple form**: one message, not AWS's per-action
-/// `CancellationReasons` array (explicitly deferred, ADR 0018 PR1 amendment
-/// decision 4 / the PR7 amendment).
+/// write returns). **Carries AWS's real per-action `CancellationReasons`
+/// array** whenever the failing action's own index is known (ADR 0018's
+/// 2026-08-24 `CancellationReasons` amendment, issue #374 C2 — see that
+/// amendment for the three sites this function builds one at, and
+/// `cancellation_reasons_for`'s own doc for the shared builder); a
+/// structural/routing abort with no single responsible action, or a cached
+/// `CANCELLED` idempotency replay (whose original reasons were never
+/// persisted), still falls back to the pre-existing aggregate-only shape.
 ///
 /// **The all-`ConditionCheck` corner case**: `cp_txn` requires at least one
 /// write to anchor its 2PC record on. A request with no `Put`/`Delete`/
@@ -1840,10 +1938,45 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// coordinator-evaluated design would reintroduce. A `ConditionCheck`
 /// against such a table is unaffected either way (it writes nothing, so
 /// stays the ordinary cross-key precondition below).
+///
+/// **`ClientRequestToken` idempotency (ADR 0018's 2026-08-24 amendment).**
+/// When the request carries one, this function durably claims it — via
+/// [`transact_write_idempotency_preflight`] — for exactly this set of
+/// actions **before** any of the machinery above runs, entirely against the
+/// reserved internal `__animus_txn_idempotency` table (see
+/// `animus_dynamo::internal_tables`'s doc for why that table can be an
+/// ordinary schema-registered, TTL-reaped table). A fresh token claims a
+/// `PENDING` record and this function proceeds exactly as it always has,
+/// followed by a best-effort [`record_transact_write_outcome`] update to
+/// `COMMITTED`/`CANCELLED` once a terminal outcome is reached (every exit
+/// point below, including the two `ConditionCheck`-triggered cancellations).
+/// A reused token short-circuits: identical fingerprint + `COMMITTED`
+/// returns the cached success with **no re-run**; identical fingerprint +
+/// `CANCELLED` returns the cached cancellation; identical fingerprint +
+/// `PENDING` returns a retryable `TransactionInProgressException` — a
+/// **deliberately conservative narrowing** of AWS's own contract (which
+/// tolerates a same-fingerprint retry racing its own still-in-flight
+/// original and serves the eventual outcome); a **different** fingerprint
+/// under the same token is `IdempotentParameterMismatchException`. See
+/// `transact_write_idempotency_preflight`'s own doc for the exact protocol.
+///
+/// **Lock-scope constraint, load-bearing**: every idempotency-table
+/// read/write here happens either entirely BEFORE `ctx.data().rmw_lock` is
+/// acquired below (the whole preflight), or entirely AFTER it is dropped
+/// (every outcome update) — **never while it is held**. `cp_kind_write_item`
+/// can re-enter this exact node-local, non-reentrant lock (see the existing
+/// note on `cp_txn`'s own identical hazard just below), so an outcome update
+/// from inside the per-action loop would self-deadlock the instant this
+/// node also leads the internal table's own tablet — the same class of bug
+/// documented in `docs/engineering-lessons.md`'s "self-referential OCC
+/// stall" entry, here avoided structurally by deferring the one in-loop
+/// cancellation (`condition_check_failure`, below) past the lock's drop
+/// point instead of returning from inside the loop.
 async fn run_transact(
     ctx: &ClientCtx,
     meta: &Metadata,
     actions: &[TransactAction],
+    token: Option<&str>,
 ) -> Result<String, WireError> {
     if actions.is_empty() {
         return Err(WireError::validation(
@@ -1855,6 +1988,38 @@ async fn run_transact(
             "TransactWriteItems supports at most {MAX_TRANSACT_ITEMS} actions"
         )));
     }
+    // Cheap, pure validation up front (ADR 0018's 2026-08-24 amendment): every
+    // action's table must not be the reserved internal table, and no two
+    // actions may target the same item — both checked **before** the
+    // `ClientRequestToken` preflight `Put` below, so a `ValidationException`
+    // here never strands a `PENDING` idempotency record nobody will ever
+    // resolve. Mirrors (rather than shares) the identical dedup check the
+    // main loop performs below on its own resolved keys — that version is
+    // threaded through the per-action `writes`/`preconditions` construction
+    // this pure pre-pass has no reason to build.
+    {
+        let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
+        for action in actions {
+            let table = action.table();
+            reject_internal_table(table, false)?;
+            let (pk, sk) = resolve_key(ctx, meta, table, transact_action_key_item(action))?;
+            if !seen.insert((table.to_owned(), item_key(&pk, sk.as_ref()))) {
+                return Err(WireError::validation(
+                    "Transaction request cannot include multiple operations on one item",
+                ));
+            }
+        }
+    }
+
+    // `ClientRequestToken` preflight — see this function's own doc for the
+    // full protocol. Entirely before `rmw_lock` (below).
+    let idempotency_fingerprint = match token {
+        Some(token) => match transact_write_idempotency_preflight(ctx, actions, token).await? {
+            Some(cached) => return Ok(cached),
+            None => Some(wire::transact_write_fingerprint(actions)),
+        },
+        None => None,
+    };
 
     // Serialize against this node's other RMWs across the pre-read/evaluate
     // span below — exactly like every other conditional write here
@@ -1876,7 +2041,9 @@ async fn run_transact(
     // reentrant) the instant a write action targets a locally-led
     // kind-write-path table (every single-node/combined-role deployment
     // hits this immediately; a real regression a genuinely single-node
-    // `ProdEnv` transactional-write test caught).
+    // `ProdEnv` transactional-write test caught). The identical hazard is
+    // why every `ClientRequestToken` outcome update below runs only after
+    // this guard drops — see this function's own "Lock-scope constraint" doc.
     let mut writes: Vec<crate::TxnTableWrite> = Vec::new();
     let mut preconditions: Vec<crate::TxnPrecondition> = Vec::new();
     // Always empty since Train A rung 5 deleted the coordinator-valued write
@@ -1888,8 +2055,21 @@ async fn run_transact(
     let write_conditions: Vec<crate::TxnWriteCondition> = Vec::new();
     let _rmw = ctx.data().rmw_lock.lock().await;
     let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
+    // A `ConditionCheck` failure detected inside the loop must not run an
+    // idempotency-outcome update (or any other `cp_kind_write_item` call)
+    // while `_rmw` is still held — captured here and handled once, after
+    // `drop(_rmw)` below, alongside every other cancellation exit.
+    let mut condition_check_failure: Option<WireError> = None;
+    // Every action's own (table, data key), by index — populated below in
+    // the same order `actions` is iterated, so `action_keys[i]` always
+    // corresponds to `actions[i]`. `cp_txn`'s own typed `TxnAbortReason`
+    // (ADR 0018's 2026-08-24 `CancellationReasons` amendment, issue #374
+    // C2b) names a `(table, key)`, not an action index — this is what lets
+    // this function's own `cp_txn` call site (below) correlate the two
+    // without re-deriving each key a second time.
+    let mut action_keys: Vec<(String, Vec<u8>)> = Vec::with_capacity(actions.len());
 
-    for action in actions {
+    'actions: for (action_index, action) in actions.iter().enumerate() {
         let table = action.table().to_owned();
         let (key_item, condition): (&Item, Option<&ConditionExpression>) = match action {
             TransactAction::Put {
@@ -1907,6 +2087,8 @@ async fn run_transact(
                 "Transaction request cannot include multiple operations on one item",
             ));
         }
+        debug_assert_eq!(action_keys.len(), action_index);
+        action_keys.push((table.clone(), data_key.clone()));
 
         // ADR 0046 U3 (universal since ADR 0049): EVERY write action — never
         // a bare `ConditionCheck`, which writes nothing and stays the
@@ -1965,9 +2147,26 @@ async fn run_transact(
         if let Some(cond) = condition
             && !cond.evaluate(decoded.as_ref())?
         {
-            return Err(WireError::transaction_canceled(
-                "a transaction condition check failed",
-            ));
+            // ADR 0018's 2026-08-24 `CancellationReasons` amendment (issue
+            // #374 C2a): this action's own index is known here, so the
+            // reply carries the full per-action array rather than an
+            // aggregate-only message. `decoded` is this `ConditionCheck`'s
+            // own observed item — the exact "old image" AWS's `Item` field
+            // means for a check that never writes — echoed only when this
+            // action asked for `ReturnValuesOnConditionCheckFailure: ALL_OLD`.
+            let item = matches!(
+                action.rvocf(),
+                wire::ReturnValuesOnConditionCheckFailure::AllOld
+            )
+            .then_some(decoded.as_ref())
+            .flatten();
+            let reasons = cancellation_reasons_for(
+                actions,
+                action_index,
+                wire::CancellationReason::conditional_check_failed(item),
+            );
+            condition_check_failure = Some(WireError::transaction_canceled_with_reasons(reasons));
+            break 'actions;
         }
         preconditions.push((table, data_key, raw));
     }
@@ -1976,24 +2175,68 @@ async fn run_transact(
     // would self-deadlock on a combined-role node.
     drop(_rmw);
 
+    if let Some(err) = condition_check_failure {
+        if let (Some(token), Some(fingerprint)) = (token, idempotency_fingerprint.as_deref()) {
+            record_transact_write_outcome(ctx, meta, token, fingerprint, TXN_IDEMPOTENCY_CANCELLED)
+                .await;
+        }
+        return Err(err);
+    }
+
     if writes.is_empty() {
         // Every action was a `ConditionCheck` — see this function's doc for
         // why this is a documented, narrow fallback rather than a call to
         // `cp_txn` (which requires at least one write to anchor on).
-        for (table, key, expected) in &preconditions {
+        // `preconditions[i]` corresponds to `actions[i]`: this branch only
+        // runs when every action reached the `ConditionCheck` arm below
+        // (`writes.is_empty()`), and that arm pushes exactly one
+        // precondition per action, in the same iteration order — so a
+        // mismatch's index into `preconditions` is that action's own index
+        // into `actions` (ADR 0018's 2026-08-24 `CancellationReasons`
+        // amendment, issue #374 C2a).
+        for (action_index, (table, key, expected)) in preconditions.iter().enumerate() {
             let actual = raw_quorum_read(ctx, meta, table, key, ReadConsistency::Strong).await?;
             if &actual != expected {
                 ctx.data()
                     .raftkv_metrics
                     .incr(Metric::DynamoTransactWritesCanceled);
-                return Err(WireError::transaction_canceled(
-                    "a transaction condition check failed",
-                ));
+                if let (Some(token), Some(fingerprint)) =
+                    (token, idempotency_fingerprint.as_deref())
+                {
+                    record_transact_write_outcome(
+                        ctx,
+                        meta,
+                        token,
+                        fingerprint,
+                        TXN_IDEMPOTENCY_CANCELLED,
+                    )
+                    .await;
+                }
+                let decoded_item = match &actual {
+                    Some(bytes) => wire::decode_stored_item(bytes)?,
+                    None => None,
+                };
+                let item = matches!(
+                    actions[action_index].rvocf(),
+                    wire::ReturnValuesOnConditionCheckFailure::AllOld
+                )
+                .then_some(decoded_item.as_ref())
+                .flatten();
+                let reasons = cancellation_reasons_for(
+                    actions,
+                    action_index,
+                    wire::CancellationReason::conditional_check_failed(item),
+                );
+                return Err(WireError::transaction_canceled_with_reasons(reasons));
             }
         }
         ctx.data()
             .raftkv_metrics
             .incr(Metric::DynamoTransactWritesCommitted);
+        if let (Some(token), Some(fingerprint)) = (token, idempotency_fingerprint.as_deref()) {
+            record_transact_write_outcome(ctx, meta, token, fingerprint, TXN_IDEMPOTENCY_COMMITTED)
+                .await;
+        }
         return Ok(wire::empty_response());
     }
 
@@ -2002,17 +2245,382 @@ async fn run_transact(
             ctx.data()
                 .raftkv_metrics
                 .incr(Metric::DynamoTransactWritesCommitted);
+            if let (Some(token), Some(fingerprint)) = (token, idempotency_fingerprint.as_deref()) {
+                record_transact_write_outcome(
+                    ctx,
+                    meta,
+                    token,
+                    fingerprint,
+                    TXN_IDEMPOTENCY_COMMITTED,
+                )
+                .await;
+            }
             Ok(wire::empty_response())
         }
         Err(e) => {
             ctx.data()
                 .raftkv_metrics
                 .incr(Metric::DynamoTransactWritesCanceled);
-            Err(WireError::transaction_canceled(format!(
-                "transaction cancelled: {e}"
-            )))
+            if let (Some(token), Some(fingerprint)) = (token, idempotency_fingerprint.as_deref()) {
+                record_transact_write_outcome(
+                    ctx,
+                    meta,
+                    token,
+                    fingerprint,
+                    TXN_IDEMPOTENCY_CANCELLED,
+                )
+                .await;
+            }
+            // Site 3 of ADR 0018's 2026-08-24 `CancellationReasons`
+            // amendment (issue #374 C2b): `cp_txn` now returns a typed
+            // `TxnAbortReason` naming a `(table, key)` — correlate it back
+            // to its own action index via `action_keys` (built above, same
+            // order as `actions`) so a write action's own condition/
+            // conflict flags the right entry, matching sites 1/2. `Other`,
+            // or a `(table, key)` this coordinator never resolved (should
+            // not happen, but never guess an index), falls back to the
+            // aggregate-only shape.
+            let matched = match &e {
+                crate::TxnAbortReason::ConditionFailed { table, key } => action_keys
+                    .iter()
+                    .position(|(t, k)| t == table && k == key)
+                    // `Item` is deliberately omitted: the old image isn't in
+                    // hand at this site and this path must not add a read
+                    // just to populate it (see this function's own doc).
+                    .map(|i| (i, wire::CancellationReason::conditional_check_failed(None))),
+                crate::TxnAbortReason::TransactionConflict { table, key } => action_keys
+                    .iter()
+                    .position(|(t, k)| t == table && k == key)
+                    .map(|i| (i, wire::CancellationReason::transaction_conflict())),
+                crate::TxnAbortReason::Other(_) => None,
+            };
+            match matched {
+                Some((index, reason)) => {
+                    let reasons = cancellation_reasons_for(actions, index, reason);
+                    Err(WireError::transaction_canceled_with_reasons(reasons))
+                }
+                None => Err(WireError::transaction_canceled(format!(
+                    "transaction cancelled: {e}"
+                ))),
+            }
         }
     }
+}
+
+/// Build a full per-action `CancellationReasons` array (ADR 0018's
+/// 2026-08-24 `CancellationReasons` amendment, issue #374 C2): one entry per
+/// `actions`, [`wire::CancellationReason::none`] everywhere except
+/// `failing_index`, which gets `reason`. `run_transact`'s three cancellation
+/// sites each call this once they know which action caused the cancellation.
+fn cancellation_reasons_for(
+    actions: &[TransactAction],
+    failing_index: usize,
+    reason: wire::CancellationReason,
+) -> Vec<wire::CancellationReason> {
+    (0..actions.len())
+        .map(|i| {
+            if i == failing_index {
+                reason.clone()
+            } else {
+                wire::CancellationReason::none()
+            }
+        })
+        .collect()
+}
+
+/// The key-identifying `Item` of one `TransactAction` — `item` for a `Put`,
+/// `key` for everything else. Used by `run_transact`'s pure pre-pass
+/// (dedup + reserved-table validation) before any I/O.
+fn transact_action_key_item(action: &TransactAction) -> &Item {
+    match action {
+        TransactAction::Put { item, .. } => item,
+        TransactAction::Delete { key, .. }
+        | TransactAction::Update { key, .. }
+        | TransactAction::ConditionCheck { key, .. } => key,
+    }
+}
+
+/// `ClientRequestToken` preflight (ADR 0018's 2026-08-24 amendment): durably
+/// claims `token` for exactly this set of `actions` before `run_transact`
+/// does any transactional work, or resolves what a prior use of the same
+/// token already decided.
+///
+/// Returns `Ok(Some(body))` for a **cached** response the caller must return
+/// verbatim with **no re-run** (a prior attempt with the identical
+/// fingerprint already committed); `Ok(None)` when this call itself just
+/// claimed the token (a fresh `PENDING` record now exists, and the caller is
+/// responsible for eventually calling [`record_transact_write_outcome`]);
+/// `Err` for every other case — a fingerprint mismatch
+/// (`IdempotentParameterMismatchException`), an observed `PENDING` record
+/// (`TransactionInProgressException` — see that constructor's own doc for
+/// why this is deliberately conservative), or a cached `CANCELLED` outcome
+/// (`TransactionCanceledException`).
+///
+/// Entirely self-contained I/O-wise: every `cp_kind_write_item`/
+/// `raw_quorum_read` call here happens before `run_transact` ever acquires
+/// `ctx.data().rmw_lock` — see that function's own lock-scope doc.
+async fn transact_write_idempotency_preflight(
+    ctx: &ClientCtx,
+    actions: &[TransactAction],
+    token: &str,
+) -> Result<Option<String>, WireError> {
+    ensure_txn_idempotency_table(ctx).await?;
+    let meta = metadata_fresh(ctx).await;
+    let fingerprint = wire::transact_write_fingerprint(actions);
+
+    let mut retried_after_reap = false;
+    loop {
+        match idempotency_claim_put(ctx, &meta, token, &fingerprint).await? {
+            KindWriteOutcome::Ok { .. } => return Ok(None),
+            KindWriteOutcome::ConditionFailed => {}
+        }
+        let Some(record) = read_idempotency_record(ctx, &meta, token).await? else {
+            // A concurrent commit/cancel already flipped the outcome and the
+            // TTL reaper reclaimed the record between our claim `Put` and
+            // this read (a narrow, honest race — ten minutes is generous,
+            // not infinite). Retry the claim once; a second miss means
+            // something is racing this exact token faster than we can
+            // observe it, exactly the condition
+            // `WireError::transaction_in_progress` exists for.
+            if retried_after_reap {
+                return Err(WireError::transaction_in_progress(
+                    "could not claim a record for this ClientRequestToken; \
+                     retry the request",
+                ));
+            }
+            retried_after_reap = true;
+            continue;
+        };
+        if item_string(&record, "fingerprint") != Some(fingerprint.as_str()) {
+            return Err(WireError::idempotent_parameter_mismatch(
+                "this ClientRequestToken was already used with a different set \
+                 of TransactWriteItems actions",
+            ));
+        }
+        return match item_string(&record, "outcome") {
+            Some(TXN_IDEMPOTENCY_COMMITTED) => Ok(Some(wire::empty_response())),
+            Some(TXN_IDEMPOTENCY_CANCELLED) => Err(WireError::transaction_canceled(
+                "cached cancelled outcome for this ClientRequestToken",
+            )),
+            // `PENDING`, or any other/unrecognized value: treated
+            // identically and conservatively. Real DynamoDB tolerates a
+            // same-fingerprint retry racing its own still-in-flight
+            // original request and serves the eventual outcome; this
+            // adapter narrows that case to "retry later" rather than
+            // blocking on or speculatively joining the in-flight attempt,
+            // since it has no cheap way to wait for *this specific*
+            // transaction's own resolution short of polling this very
+            // record — see `WireError::transaction_in_progress`'s own doc.
+            _ => Err(WireError::transaction_in_progress(
+                "a transaction for this ClientRequestToken is still in \
+                 progress; retry the request",
+            )),
+        };
+    }
+}
+
+/// Attempt to durably claim `token` for `fingerprint`: a conditional `Put`
+/// of a fresh `PENDING` record, gated on `attribute_not_exists(pk)` — the
+/// idempotency-table equivalent of `CreateTable`'s own "first committer
+/// wins" claim. `KindWriteOutcome::ConditionFailed` means a record (this
+/// token's own prior attempt, or — vanishingly unlikely — a genuinely
+/// different request that collided on the same client-chosen token) already
+/// exists.
+async fn idempotency_claim_put(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    token: &str,
+    fingerprint: &str,
+) -> Result<KindWriteOutcome, WireError> {
+    let item = idempotency_record_item(ctx, token, fingerprint, TXN_IDEMPOTENCY_PENDING);
+    ctx.cp_kind_write_item(
+        meta,
+        TXN_IDEMPOTENCY_TABLE,
+        &AttributeValue::S(token.to_owned()),
+        None,
+        KindWriteOp::Put(item),
+        Some(&ConditionExpression::AttributeNotExists("pk".to_owned())),
+    )
+    .await
+}
+
+/// Build one `ClientRequestToken` idempotency record: `pk` = the token,
+/// `fingerprint` (lowercase hex), `outcome`, and `expires_at` — an absolute
+/// epoch second [`TXN_IDEMPOTENCY_TTL_SECS`] from now, via
+/// `ctx.env.wall_now()`. **The one and only calendar-time read in this
+/// whole feature**, matching ADR 0051's discipline: every deadline/timeout
+/// elsewhere in `run_transact`/this preflight keeps using `env.now()`,
+/// which cannot step backwards.
+fn idempotency_record_item(ctx: &ClientCtx, token: &str, fingerprint: &str, outcome: &str) -> Item {
+    let expires_at = ctx.env.wall_now().as_secs() + TXN_IDEMPOTENCY_TTL_SECS;
+    let mut item = Item::new();
+    item.insert("pk".to_owned(), AttributeValue::S(token.to_owned()));
+    item.insert(
+        "fingerprint".to_owned(),
+        AttributeValue::S(fingerprint.to_owned()),
+    );
+    item.insert("outcome".to_owned(), AttributeValue::S(outcome.to_owned()));
+    item.insert(
+        "expires_at".to_owned(),
+        AttributeValue::N(expires_at.to_string()),
+    );
+    item
+}
+
+/// Strongly read a `ClientRequestToken` idempotency record by token, decoded
+/// to an [`Item`] — the same [`raw_quorum_read`]/[`ReadConsistency::Strong`]
+/// primitive `run_transact`'s own `ConditionCheck` path uses, against the
+/// internal table's own `pk`-only key.
+async fn read_idempotency_record(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    token: &str,
+) -> Result<Option<Item>, WireError> {
+    let key = item_key(&AttributeValue::S(token.to_owned()), None);
+    let raw = raw_quorum_read(
+        ctx,
+        meta,
+        TXN_IDEMPOTENCY_TABLE,
+        &key,
+        ReadConsistency::Strong,
+    )
+    .await?;
+    match raw {
+        Some(bytes) => wire::decode_stored_item(&bytes),
+        None => Ok(None),
+    }
+}
+
+/// A top-level `S` attribute's string value, or `None` if absent/wrong type.
+fn item_string<'a>(item: &'a Item, key: &str) -> Option<&'a str> {
+    match item.get(key) {
+        Some(AttributeValue::S(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Best-effort update of a `ClientRequestToken` idempotency record to its
+/// final `COMMITTED`/`CANCELLED` outcome (ADR 0018's 2026-08-24 amendment),
+/// called by `run_transact` after every terminal outcome once `token` was
+/// present. **Every failure of this update is silently ignored** — no
+/// retry, no propagated error: the record simply stays `PENDING` until its
+/// TTL expires and the ADR 0051 reaper reclaims it. The *only* consequence
+/// of a lost update is that a *future* same-token retry observes a stale
+/// `PENDING` record and gets an over-conservative
+/// `TransactionInProgressException` instead of the cached outcome — never a
+/// re-run of an already-decided transaction, since the conditional claim
+/// `Put` in [`transact_write_idempotency_preflight`] already guarantees the
+/// transaction itself executes at most once per token regardless of
+/// whether this update ever lands.
+///
+/// Conditioned on the stored `fingerprint` still equalling ours, so a race
+/// against the TTL reaper reclaiming this exact record and a later,
+/// unrelated request reusing the same token value (vanishingly unlikely
+/// with a client-chosen token, but not impossible) can never overwrite a
+/// foreign record with our own outcome.
+///
+/// Called only ever AFTER `run_transact`'s `ctx.data().rmw_lock` guard has
+/// been dropped — see that function's own lock-scope doc for why this must
+/// never run while it is held.
+async fn record_transact_write_outcome(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    token: &str,
+    fingerprint: &str,
+    outcome: &'static str,
+) {
+    let item = idempotency_record_item(ctx, token, fingerprint, outcome);
+    let condition = ConditionExpression::Compare(
+        "fingerprint".to_owned(),
+        Comparator::Eq,
+        AttributeValue::S(fingerprint.to_owned()),
+    );
+    let _ = ctx
+        .cp_kind_write_item(
+            meta,
+            TXN_IDEMPOTENCY_TABLE,
+            &AttributeValue::S(token.to_owned()),
+            None,
+            KindWriteOp::Put(item),
+            Some(&condition),
+        )
+        .await;
+}
+
+/// Lazily bootstrap the reserved internal `__animus_txn_idempotency` table
+/// (ADR 0018's 2026-08-24 amendment) on first `ClientRequestToken` use,
+/// mirroring [`create_table`]'s own commit-wait shape (schema commit → TTL
+/// commit → tablet provision → serveable) for this one fixed schema:
+/// partition key `pk` (`S`), no sort key, TTL attribute `expires_at`. See
+/// `animus_dynamo::internal_tables`'s module doc for why this can be an
+/// ordinary schema-registered table (so the ADR 0051 TTL reaper needs zero
+/// changes) rather than the `$`-prefixed hidden-table convention a
+/// materialized GSI/LSI uses.
+///
+/// Racing a concurrent bootstrap on another node is safe: every step is
+/// first-committer-wins/idempotent (`CreateTableSchema` rejects a
+/// duplicate, `SetTableTtl` with an identical spec is a `NoOp`,
+/// `provision_tablet` creates the tablet at most once) — a second caller's
+/// redundant proposals simply commit as no-ops.
+async fn ensure_txn_idempotency_table(ctx: &ClientCtx) -> Result<(), WireError> {
+    if metadata_fresh(ctx)
+        .await
+        .has_table_schema(TXN_IDEMPOTENCY_TABLE)
+    {
+        return Ok(());
+    }
+    let dynamo_schema = TableSchema::simple("pk");
+    let key_types = [("pk".to_owned(), "S".to_owned())];
+    let control_schema = schema_bridge::to_control(&dynamo_schema, &key_types);
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::CreateTableSchema {
+            table: TXN_IDEMPOTENCY_TABLE.to_owned(),
+            schema: control_schema.clone(),
+        })
+        .await;
+        if metadata_fresh(ctx)
+            .await
+            .has_table_schema(TXN_IDEMPOTENCY_TABLE)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "the internal idempotency table's schema did not commit to the \
+                 control plane in time (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+    let ttl_spec = TtlSpec {
+        attribute_name: "expires_at".to_owned(),
+    };
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::SetTableTtl {
+            table: TXN_IDEMPOTENCY_TABLE.to_owned(),
+            spec: Some(ttl_spec.clone()),
+        })
+        .await;
+        if metadata_fresh(ctx).await.table_ttl(TXN_IDEMPOTENCY_TABLE) == Some(&ttl_spec) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "the internal idempotency table's TTL did not commit to the \
+                 control plane in time (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+    ctx.provision_tablet(TXN_IDEMPOTENCY_TABLE)
+        .await
+        .map_err(|e| internal(&e))?;
+    ctx.await_table_serveable(TXN_IDEMPOTENCY_TABLE)
+        .await
+        .map_err(|e| internal(&e))?;
+    Ok(())
 }
 
 /// `TransactGetItems`: a consistent multi-key read (ADR 0018 §2/PR7, new — no
@@ -2099,6 +2707,7 @@ async fn run_transact_get(
     let mut keys: Vec<(String, Vec<u8>)> = Vec::with_capacity(gets.len());
     let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
     for g in gets {
+        reject_internal_table(&g.table, false)?;
         let (pk, sk) = resolve_key(ctx, meta, &g.table, &g.key)?;
         let data_key = item_key(&pk, sk.as_ref());
         if !seen.insert((g.table.clone(), data_key.clone())) {
@@ -3740,26 +4349,32 @@ fn registry_error(err: animus_dynamo::RegistryError) -> WireError {
         R::NoSuchTable(t) => WireError {
             code: "ResourceNotFoundException",
             message: format!("table `{t}` does not exist"),
+            reasons: None,
         },
         R::TableExists(t) => WireError {
             code: "ResourceInUseException",
             message: format!("table `{t}` already exists"),
+            reasons: None,
         },
         R::MissingKey(k) => WireError {
             code: "ValidationException",
             message: format!("missing key attribute `{k}`"),
+            reasons: None,
         },
         R::SortKeyMismatch(t) => WireError {
             code: "ValidationException",
             message: format!("table `{t}` has no sort key for this condition"),
+            reasons: None,
         },
         R::NoSuchIndex(i) => WireError {
             code: "ValidationException",
             message: format!("index `{i}` does not exist on this table"),
+            reasons: None,
         },
         R::IndexSortMismatch(i) => WireError {
             code: "ValidationException",
             message: format!("index `{i}` is hash-only and takes no sort-key condition"),
+            reasons: None,
         },
     }
 }
@@ -4921,6 +5536,7 @@ pub(crate) fn internal(message: &str) -> WireError {
     WireError {
         code: "InternalServerError",
         message: message.to_owned(),
+        reasons: None,
     }
 }
 
@@ -4976,6 +5592,7 @@ pub(crate) fn decode_relayed_error(raw: &str) -> WireError {
             return WireError {
                 code,
                 message: message.to_owned(),
+                reasons: None,
             };
         }
     }
@@ -4996,6 +5613,7 @@ mod relayed_error_tests {
             message: "Incorrect operand type for operator or function; \
                       operator or function: size, operand type: N"
                 .into(),
+            reasons: None,
         };
         let decoded = decode_relayed_error(&encode_relayed_error(&err));
         assert_eq!(decoded.code, err.code);

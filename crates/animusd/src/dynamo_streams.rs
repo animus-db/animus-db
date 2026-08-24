@@ -117,6 +117,7 @@ fn not_found(what: &str) -> WireError {
     WireError {
         code: "ResourceNotFoundException",
         message: format!("{what} not found"),
+        reasons: None,
     }
 }
 
@@ -124,6 +125,7 @@ fn trimmed_data_access(what: &str) -> WireError {
     WireError {
         code: "TrimmedDataAccessException",
         message: format!("{what} has been trimmed and is no longer accessible"),
+        reasons: None,
     }
 }
 
