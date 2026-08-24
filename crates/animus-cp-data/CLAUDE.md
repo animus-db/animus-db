@@ -48,7 +48,13 @@ amendment — the shape predates and outlives it.)
   A.2): length-prefixed, magic/version-checked framing for `KvWire`
   messages and engine images (`serde_json`'s decimal-array `Vec<u8>`
   rendering cost ~3–4x). Decode failures are loud. The Raft WAL keeps the
-  shared control-plane serde_json `PersistedState` format.
+  shared control-plane serde_json `PersistedState` format. **A field added
+  to the shared `LogEntry`/`RaftMsg` types (`animus-control::raft`) needs an
+  explicit encode/decode arm here too** — `#[serde(default)]` only protects
+  the `serde_json` WAL path, not this hand-rolled one (version `22`, ADR
+  0058 Train 1's `learners: Option<BTreeSet<NodeId>>` field, is the
+  regression: see `docs/engineering-lessons.md`'s Code-patterns entry for
+  the general lesson).
 - **`hlc.rs`** (ADR 0018 §2) — a pure, I/O-free Hybrid Logical Clock:
   `HlcTimestamp { wall_ms, logical }` and the per-node `Hlc` (`mint`/
   `witness`, both take the caller-sampled `Nanos` — `Hlc` never touches an
@@ -179,7 +185,19 @@ existing sealed-set discipline whose durable seal marker re-latches
 `is_frozen()` at group start, refusing every later-ordered USER mutation
 (base/LSI — a consumer-bookkeeping `KindBatch` still applies) while reads
 keep serving; `propose_freeze` is idempotent and `tests/freeze.rs` is its
-suite; **transactions** (ADR 0018 §2) are covered in Key invariants
+suite; **`add_learner`/`promote_learner`/`remove_learner`/`learners`/
+`learner_caught_up`** (ADR 0058 Train 1) are thin wrappers over the shared
+`RaftCore`'s identically-named methods, mirroring `change_membership`'s own
+lock/record-metrics/wake-on-propose shape exactly — see
+`animus-control/CLAUDE.md`'s "Learner (non-voting) membership class" entry
+for the full mechanism (shared by both planes; this crate adds no
+learner-specific logic of its own beyond the wrapper). `tests/
+learner_membership.rs` in this crate is the integration-level half of the
+"Stage C audit note" discipline (a shared primitive exercised at both the
+`animus-control` core level and here); the fault-injection corpus
+(`ANIMUS_LEARNER_SEEDS`) lives in `animus-control/tests/learner_corpus.rs`
+since the property under test (quorum math, election gating) is
+plane-agnostic; **transactions** (ADR 0018 §2) are covered in Key invariants
 below. See the crate's rustdoc for the full method/accessor inventory.
 **Eventually-consistent reads (ADR 0055)** are the second read path this
 crate serves, and the one whose budget is easiest to destroy by accident:

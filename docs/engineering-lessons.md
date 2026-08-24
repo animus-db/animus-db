@@ -3231,6 +3231,31 @@ debugging anything that feels like it might have happened before.
   path must know which of these two shapes applies rather than assuming the
   bare `WireError` constructor's code survives — match on the nested message
   substring there instead. (`animusd/tests/dynamo_item_size_cap.rs`.)
+- **A `RaftCore::new`/`RaftNode::start` bootstrap's `all_nodes` argument sets
+  the node's own local `config` directly at construction, with no consensus
+  involved at all — a test that includes a not-yet-added node's own id in its
+  own `all_nodes` is trivially, unconditionally wrong from its very first
+  line, regardless of any later replication (2026-08-24, ADR 0058 Train 1's
+  learner corpus).** This bit despite `animus-cp-data/CLAUDE.md` already
+  documenting the exact gotcha ("pre-start a to-be-added node knowing only
+  the *current* voters, NOT itself") — reading the warning and then still
+  writing `RaftNode::start(env, [0,1,2,3]..)` for the node with id 3 happened
+  because the assertion that would have caught it fired *after* the real
+  `add_learner`/`change_membership` had already replicated, at which point
+  the (buggy) locally-bootstrapped value and the (correct) replicated value
+  are byte-identical and the bug is invisible. It only surfaced because this
+  corpus asserted the learner's own `config()` *before* any real membership
+  change — `learner.config()` showed `{n0,n1,n2,n3}` immediately after
+  `RaftNode::start` returned, before the leader had even proposed
+  `add_learner`. **General rule**: when a test's own assertion checks a
+  freshly-started node's config/role *before* the operation under test has
+  had a chance to replicate anything to it, the "excluded from its own
+  `all_nodes`" gotcha becomes load-bearing rather than cosmetic — and a
+  pre-existing test that only asserts *after* replication (e.g.
+  `animus-control/tests/control_membership.rs`'s own `add_a_node_...` test,
+  which includes the new node's id in its own bootstrap set and gets away
+  with it) is not proof the risky pattern is safe in general, only that its
+  own assertions never exercised the window where it would matter.
 
 ### Code patterns
 - **A convergent bookkeeping write must be routable to its own owner: derive
@@ -7912,6 +7937,32 @@ debugging anything that feels like it might have happened before.
   what "caught up" means.
   (`crates/animusd/src/index_drain.rs::split_driver_tick`,
   `FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`.)
+- **A field added to a shared, generic type (`RaftCore<C, S>`'s `LogEntry`/
+  `RaftMsg`) needs a matching update at every *hand-rolled* encoder for it,
+  not just wherever `#[derive(Serialize, Deserialize)]` already covers it —
+  the "grep every gating match site" lesson (root `CLAUDE.md`) applies to a
+  codec's field list exactly as much as to a command enum's match arms
+  (2026-08-24, ADR 0058 Train 1's `learners` field).** `LogEntry`/
+  `RaftMsg::InstallSnapshot` pick up `#[serde(default)]` handling for free
+  from `animus-control`'s own `serde_json`-based WAL/wire path, but
+  `animus-cp-data::codec.rs` is a **second, independent, hand-rolled binary
+  encoder** for the identical types (ADR 0017 A.2, built to avoid
+  `serde_json`'s ~3-4x `Vec<u8>` blowup) — its `put_entry`/`read_entry` and
+  `InstallSnapshot` arms enumerate every field explicitly, by hand, with no
+  compiler-enforced exhaustiveness the way a `match` on an enum has. A new
+  struct field added to `LogEntry`/`RaftMsg` compiles cleanly against this
+  codec with the field simply *never encoded* — no error, no warning, just a
+  silent drop the moment any message carrying it crosses the wire this codec
+  serves (which is every data-plane Raft message; `animus-control`'s own
+  `serde_json` WAL path is unaffected, since it never goes through this
+  codec at all). **General rule**: when a type has more than one encoder
+  (a derive-based one and a hand-rolled "compact wire format" one, or any
+  other duplicate-by-design serialization), a new field's checklist must
+  name *every* encoder explicitly — a derive macro's own exhaustiveness
+  cannot protect a sibling encoder it doesn't know exists. Caught here only
+  because the codec's own round-trip test (`every_wire_variant_round_trips`)
+  was updated deliberately as part of the same change, not because anything
+  would have failed on its own.
 
 ### Parallel-agent orchestration
 - **A single long-lived session can exhaust the disk on `target/` alone, with

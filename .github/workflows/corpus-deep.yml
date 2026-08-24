@@ -36,6 +36,10 @@ on:
         description: "Seeds per property (ANIMUS_QUIESCE_SEEDS, ADR 0048 quiescence corpus)"
         required: false
         default: "40"
+      learner_seeds:
+        description: "Seeds per scenario (ANIMUS_LEARNER_SEEDS, ADR 0058 Train 1 learner-membership corpus)"
+        required: false
+        default: "40"
 
 # One deep run at a time. The corpora are long-running and share the same
 # runner class as CI, so an on-demand `workflow_dispatch` queues behind a
@@ -112,3 +116,12 @@ jobs:
         env:
           ANIMUS_QUIESCE_SEEDS: ${{ github.event.inputs.quiesce_seeds || '40' }}
         run: cargo test -p animus-cp-data --test quiescence -- --nocapture
+
+      # ADR 0058 Train 1's learner (non-voting) membership-class corpus:
+      # catch-up under partition, leader change mid-catch-up, and the
+      # snapshot race, scaled to depth. Each scenario is a pure function of
+      # its seed, so a failure names one scenario + seed and is replayable.
+      - name: deep learner membership corpus (ADR 0058 Train 1)
+        env:
+          ANIMUS_LEARNER_SEEDS: ${{ github.event.inputs.learner_seeds || '40' }}
+        run: cargo test -p animus-control --test learner_corpus -- --nocapture

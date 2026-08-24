@@ -391,6 +391,68 @@ per-tablet CP data plane (`animus-cp-data`).
   (self is a pre-vote majority). `set_election_timeout(base, now, entropy)` makes
   the default-150ms base configurable for a node doing real disk I/O.
 
+- **Learner (non-voting) membership class (ADR 0058 Train 1).** `RaftCore`
+  gains a per-member `role`: alongside the existing voter `config`, a
+  parallel `learners: BTreeSet<NodeId>` is kept in sync by the identical
+  config-in-log discipline (a membership-change `LogEntry` carries both sets
+  together, gated on the same `config.is_some()` check `config_at`/
+  `config_change_in_flight` already use — see `LogEntry::learners`'s doc).
+  Three points worth stating explicitly, since they are easy to get backwards:
+  - **`peers`/`cluster_size` are derived from voters alone** (`apply_config`) —
+    a learner is never in `peers`, so `maybe_advance_commit`'s replica tally
+    and `majority()` need **zero** learner-awareness; this is what makes the
+    "a learner never counts toward quorum" safety property hold by
+    construction rather than by a scattered set of checks. A learner *is*
+    still replicated to (its `match_index` tracked in the same
+    `next_index`/`match_index` maps) via an explicit `peers ∪ learners` union
+    at exactly three call sites: `broadcast_append`'s targets,
+    `become_leader`'s next_index/match_index/last_contact seeding, and
+    `quiesce_entry_ok`'s catch-up-complete check (plus `broadcast_quiesce`'s
+    targets, so a fully-idle group's learners stop ticking too).
+  - **A learner never campaigns for free** — `start_election`/`start_pre_vote`
+    already gated on `is_voter()` before learners existed (the "pre-start a
+    to-be-added node" gotcha below), so a learner (which is never in
+    `config`) is simply a *durable* instance of that same transient state,
+    not new logic. `handle_request_vote`/`handle_pre_vote`'s granting side
+    and `handle_vote_resp`/`handle_pre_vote_resp`'s tallying side additionally
+    gate on voter membership as a second, structurally-redundant line of
+    defense (a learner is never solicited in normal operation — only voter
+    `peers` are — so this only matters against a stray/injected message).
+  - **The public surface is additive, not a signature change.** The existing
+    `change_membership(voters)` keeps its exact old signature and behavior
+    (learners untouched, byte-identical when no learner exists) — it gained
+    one guard (`voters.is_disjoint(&self.learners)`, forcing a promotion
+    through the dedicated method instead of an ambiguous direct add) but no
+    new parameter, so every pre-existing call site across `animus-control`/
+    `animus-cp-data`/`animusd` compiles unchanged. The new transitions are
+    three sibling methods: `add_learner`/`promote_learner`/`remove_learner`
+    (mirrored one-for-one as thin wrappers on `RaftNode` and
+    `animus-cp-data::RaftKvNode`, exactly like `change_membership`'s own
+    wrapper). `learner_caught_up(id, threshold)` is a pure predicate over
+    already-tracked `match_index` state — the promotion-criterion primitive a
+    later layer (the host reconciler) decides *when* to call; this train
+    ships the primitive only, not the reconciler sequencing.
+
+  Snapshot/WAL: the learner set rides the identical path the voter config
+  already does — `LogEntry::learners`, `RaftMsg::InstallSnapshot::learners`,
+  `WalRecord::Snapshot::learners`, `PersistedState::snapshot_learners` — so it
+  survives compaction, `InstallSnapshot` catch-up, and restart the same way
+  `config` does. `animus-cp-data::codec.rs`'s hand-rolled binary wire codec
+  needed its own explicit encode/decode arms for both new fields (codec
+  version bump to `22`) — the "grep every gating match site when a
+  replicated/forwarded enum gains a variant" lesson applies just as much to a
+  hand-rolled codec's field list as to a command-enum match arm; a codec that
+  silently dropped `learners` on the wire would desync every replica's view
+  of who is a learner the moment any message crossed it.
+
+  **Deliberately out of scope for this primitive** (left to the reconciler
+  layer, ADR 0058 Train 2 or later): notifying a *removed* learner of its own
+  removal the way `departing` does for a removed voter (harmless — a removed
+  learner can never campaign regardless of whether it learns about the
+  removal, since it was never in `config` to begin with; only a cleanliness
+  concern, not a safety one) and any policy for *when* to call
+  `promote_learner` (the host reconciler's replica-move sequencing).
+
 - **Leadership transfer (`RaftCore::transfer_leadership`, ADR 0029).** The
   control plane never calls it — it's a per-tablet CP-data primitive living here
   because the sync core is shared. `change_membership` always rejects removing
