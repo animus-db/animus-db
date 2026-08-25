@@ -397,6 +397,14 @@ impl EngineFactory<MemoryEngine> for FaultyTabletEngines {
     async fn destroy(&self, tablet: TabletId) {
         self.inner.destroy(tablet).await;
     }
+
+    async fn clone_engine(
+        &self,
+        source: TabletId,
+        target: TabletId,
+    ) -> Result<MemoryEngine, String> {
+        self.inner.clone_engine(source, target).await
+    }
 }
 
 /// ADR 0031 PR4 fault-injection regression: a transient `EngineFactory::open`

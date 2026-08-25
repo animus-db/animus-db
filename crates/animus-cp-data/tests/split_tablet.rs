@@ -80,9 +80,8 @@ fn fork_and_settle(
             n.is_frozen(),
             "replica {i} did not latch frozen after the fork applied (seed={seed})"
         );
-        let pending = block_on(n.pending_split()).unwrap_or_else(|| {
-            panic!("replica {i} does not see the fork payload (seed={seed})")
-        });
+        let pending = block_on(n.pending_split())
+            .unwrap_or_else(|| panic!("replica {i} does not see the fork payload (seed={seed})"));
         assert_eq!(pending.split_key, split_key, "seed={seed}");
         assert_eq!(pending.children, *children, "seed={seed}");
         // Every replica captures the SAME bootstrap voter set (the parent's

@@ -37,7 +37,7 @@ use std::time::Duration;
 use animus_env::nid;
 use animus_env::{Env, NodeId};
 use animus_storage::{MemoryEngine, StorageEngine};
-use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
+use animus_tablet::{Epoch, KeyRange, SplitChild, Tablet, TabletId};
 
 use crate::{RaftKvNode, StorageScope, wal_file};
 
@@ -67,6 +67,20 @@ pub trait EngineFactory<S: StorageEngine>: Send + Sync {
     /// closed. Idempotent — destroying an engine that never existed is a
     /// no-op.
     async fn destroy(&self, tablet: TabletId);
+
+    /// **In-place split materialization** (ADR 0058 Train 2 rung 3, Stage
+    /// 3): clone `source`'s CURRENT durable state into a NEW, independent
+    /// engine at `target` — the engine-commit half of the group-mint-at-
+    /// apply G4 crash-idempotency contract (see `host.rs`'s
+    /// `materialize_split_child`'s own doc for the full sequencing). Backed
+    /// by `LsmEngine::clone_to`/`MemoryEngine::clone_to` (ADR 0058 rung 2) —
+    /// full-engine clone only, no kind filtering or key-range trimming
+    /// (that's this module's own `trim_split_child`, run by the caller
+    /// immediately after). `source` must already exist; `target` must NOT
+    /// (this method does not itself check `probe(target)` — the caller
+    /// consults it first, per the G4 contract, to skip re-cloning after a
+    /// crash between the engine commit and the group commit).
+    async fn clone_engine(&self, source: TabletId, target: TabletId) -> Result<S, String>;
 }
 
 /// The [`MemoryEngine`] implementation of [`EngineFactory`]: an in-memory
@@ -121,6 +135,19 @@ impl EngineFactory<MemoryEngine> for MemoryTabletEngines {
             .expect("engine registry poisoned")
             .remove(&tablet.0);
     }
+
+    async fn clone_engine(
+        &self,
+        source: TabletId,
+        target: TabletId,
+    ) -> Result<MemoryEngine, String> {
+        let cloned = self.engine(source).clone_to();
+        self.engines
+            .lock()
+            .expect("engine registry poisoned")
+            .insert(target.0, cloned.clone());
+        Ok(cloned)
+    }
 }
 
 /// How many consecutive [`plan`] calls the release condition (this node
@@ -135,6 +162,15 @@ impl EngineFactory<MemoryEngine> for MemoryTabletEngines {
 /// metadata re-add (which bumps the tablet's epoch via the placement CAS)
 /// cancels a release part-way confirmed.
 pub const RELEASE_CONFIRM_TICKS: u8 = 3;
+
+/// Catch-up threshold (log entries behind the leader's `last_index`) for a
+/// learner added for an **in-place split** (ADR 0058 Train 2 rung 3, Stage
+/// 2) to count as ready — the same shape as `lib.rs`'s
+/// `RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD`, kept as its own constant since
+/// the two learner-add purposes (an ordinary replica move vs. a split's
+/// union-of-children's-homes) are conceptually distinct even though they
+/// share the identical primitive (`RaftKvNode::learner_caught_up`).
+pub(crate) const INPLACE_SPLIT_LEARNER_CATCH_UP_THRESHOLD: u64 = 4;
 
 /// An owned, minimal projection of replicated `Metadata` — *not* the whole
 /// `animus_control::Metadata` (this crate stays decoupled from the control
@@ -190,6 +226,28 @@ pub struct TabletFacts {
     /// non-voter start). Ignored once a tablet is already in
     /// [`LocalState::hosted`] — narrow-only from then on.
     pub has_data: bool,
+    /// This node's own **durable Raft voter config** for this tablet's
+    /// group (`RaftKvNode::config()`) — `Default::default()` (empty) when
+    /// `hosted` is `false`. Only consulted for a parent tablet carrying an
+    /// [`animus_tablet::InPlaceSplitIntent`] (ADR 0058 Train 2 rung 3): the
+    /// in-place-split-advancement phase needs the FULL voter set (not just
+    /// `config_excludes_me`) to decide which of the intent's children's
+    /// homes still need adding as learners.
+    pub config: BTreeSet<NodeId>,
+    /// This node's own current learner set for this tablet's group
+    /// (`RaftKvNode::learners()`) — see [`config`](Self::config)'s doc for
+    /// why this is gathered.
+    pub learners: BTreeSet<NodeId>,
+    /// The subset of [`learners`](Self::learners) that have caught up
+    /// (`RaftKvNode::learner_caught_up`, threshold
+    /// [`INPLACE_SPLIT_LEARNER_CATCH_UP_THRESHOLD`]) as of this tick's
+    /// gather — see [`config`](Self::config)'s doc.
+    pub learners_caught_up: BTreeSet<NodeId>,
+    /// This node's own view of a pending (or already-applied) in-place
+    /// split fork on this hosted tablet (`RaftKvNode::pending_split`, ADR
+    /// 0058 Train 2 Stage 3) — `None` for every ordinary tablet and for one
+    /// this replica has not yet forked locally.
+    pub pending_split: Option<crate::PendingSplit>,
 }
 
 /// This node's persistent-for-the-life-of-the-process bookkeeping that
@@ -224,6 +282,20 @@ pub struct LocalState {
     /// The release-GC epoch-stability dampener (ADR 0029): `tablet -> (epoch
     /// observed, consecutive confirming ticks)`. Mirrors `pending_release`.
     pub pending_release: BTreeMap<TabletId, (Epoch, u8)>,
+    /// **In-place split children materialized locally but not yet visible
+    /// in replicated `Metadata`** (ADR 0058 Train 2 rung 3, Stages 3-4): a
+    /// child id enters this set the instant [`plan`] emits a
+    /// [`HostAction::MaterializeSplitChild`] for it (the SAME id is also
+    /// inserted into [`hosted`](Self::hosted), reusing the ordinary claim
+    /// discipline) and is pruned the instant that id appears in `Metadata`
+    /// (`CutoverSplit` has run — the tablet is now an ordinary `Active`
+    /// entry, [`plan`]'s own first line each call). **The one thing this
+    /// set exists for**: exempting a pre-cutover child from phase 3's
+    /// reclaim check, which would otherwise immediately tear down a group
+    /// this same tick's phase just stood up (a child is, by construction,
+    /// `hosted` but absent from `view.tablets` until cutover — exactly
+    /// [`tablets_to_reclaim`]'s trigger condition for every OTHER tablet).
+    pub split_forming: BTreeSet<TabletId>,
 }
 
 impl LocalState {
@@ -402,6 +474,62 @@ pub enum HostAction {
         /// The tablet to reclaim.
         tablet: TabletId,
     },
+    /// **In-place split, Stage 1** (ADR 0058 Train 2 rung 3): add `home` as
+    /// a learner to `tablet`'s own group — one union-of-children's-homes
+    /// member per call, mirroring `Reconfigure`'s own "one single-server
+    /// step per call" discipline. Only the tablet's LEADER's execution of
+    /// this action actually proposes (every other replica's attempt
+    /// harmlessly no-ops via `RaftKvNode::add_learner`'s own leader gate);
+    /// `plan` still only emits it when `is_leader`, mirroring
+    /// [`Reconfigure`](Self::Reconfigure)'s own convention.
+    AddSplitLearner {
+        /// The parent tablet whose group gains a learner.
+        tablet: TabletId,
+        /// The node to add.
+        home: NodeId,
+    },
+    /// **In-place split, Stage 3** (ADR 0058 Train 2 rung 3): the parent's
+    /// leader proposes the single-entry atomic fork
+    /// (`RaftKvNode::propose_split_tablet`) once every learner added for
+    /// this split has caught up. Leader-only, idempotent — see
+    /// `KvCommand::SplitTablet`'s own doc.
+    ProposeSplitFork {
+        /// The parent tablet to fork.
+        tablet: TabletId,
+        /// The key the parent's range splits at.
+        split_key: Vec<u8>,
+        /// Exactly two children, left half first.
+        children: [SplitChild; 2],
+    },
+    /// **In-place split, Stage 3 materialization** (ADR 0058 Train 2 rung
+    /// 3): this replica has locally applied `parent`'s `SplitTablet` fork
+    /// (`RaftKvNode::pending_split` answered `Some`) and `child` is not yet
+    /// hosted here — clone+trim `parent`'s engine into `child`'s own
+    /// namespace and bootstrap `child`'s local `RaftKvNode`. Emitted on
+    /// EVERY fork participant for BOTH children (not filtered by `child`'s
+    /// own final `replicas` — see `materialize_split_child`'s doc for why
+    /// every fork participant hosts both children initially, trimmed to
+    /// final placement by the ordinary post-cutover `Reconfigure`).
+    MaterializeSplitChild {
+        /// The (still-hosted, not-yet-retired) parent tablet.
+        parent: TabletId,
+        /// The child to materialize.
+        child: SplitChild,
+        /// The child's own declared range (`parent`'s range split at the
+        /// fork's own `split_key`).
+        range: KeyRange,
+        /// The SIBLING's own declared range — what a fresh clone of the
+        /// parent's full data must drop from this child's own copy (ADR
+        /// 0050's copy-kinds rule: BASE/LSI/FOOTPRINT keep only `range`;
+        /// CHANGE/CURSOR are dropped whole regardless, see
+        /// `trim_split_child`).
+        drop_range: KeyRange,
+        /// The initial voter config both children bootstrap with — the
+        /// parent's own full voter-plus-learner set captured at the fork
+        /// (`PendingSplit::bootstrap_voters`), NOT `child.replicas` (see
+        /// `split.rs`'s module doc).
+        bootstrap_voters: BTreeSet<NodeId>,
+    },
 }
 
 /// The single pure decision behind every per-node tablet-host reconcile tick
@@ -427,30 +555,147 @@ pub fn plan(
     let mut next = state.clone();
     let mut actions = Vec::new();
 
+    // ADR 0058 Train 2 rung 3: a `split_forming` child is exempt from phase
+    // 3's reclaim check only until `CutoverSplit` makes it a real,
+    // `view.tablets`-visible entry — prune it the instant that happens, so
+    // a LATER genuine drop of that same child still reclaims normally
+    // rather than being permanently exempted.
+    next.split_forming
+        .retain(|child| !view.tablets.contains_key(child));
+
     // --- Phase 1: host a newly-placed tablet (a tablet's declared range is
     // immutable, ADR 0050 rung 2 — there is no scope to adjust on an
     // already-hosted one).
     let mut to_host = Vec::new();
     for (&tablet, t) in &view.tablets {
-        let Some(join_plan) = plan_join_host(base_id.clone(), &t.replicas, t.epoch) else {
+        if next.hosted.contains(&tablet) {
             continue;
-        };
-        if !next.hosted.contains(&tablet) {
-            to_host.push((tablet, t, join_plan));
+        }
+        if let Some(join_plan) = plan_join_host(base_id.clone(), &t.replicas, t.epoch) {
+            to_host.push((tablet, t, join_plan.initial_formation));
+            continue;
+        }
+        // ADR 0058 Train 2 rung 3: a node named in EITHER child's own
+        // `replicas` of a parent's in-place split intent must host the
+        // PARENT too, as a quiet non-voter — even though it is not (and
+        // never becomes) a member of the parent's own `replicas`. Without
+        // this, the parent leader's Stage 1 `add_learner(home)` targets a
+        // node with no local `RaftKvNode` running for this tablet at all —
+        // there is nothing there to receive the resulting `AppendEntries`.
+        // Exactly `plan_join_host`'s own "joining an already-led group"
+        // branch (`initial_formation: false`), just reached by a different
+        // membership test than plain `replicas` containment.
+        if let Some(intent) = &t.inplace_split {
+            let recruited = intent
+                .children
+                .iter()
+                .any(|c| c.replicas.contains(&base_id));
+            if recruited {
+                to_host.push((tablet, t, false));
+            }
         }
     }
-    for (tablet, t, join_plan) in to_host {
+    for (tablet, t, initial_formation) in to_host {
         let has_data = facts.get(&tablet).is_some_and(|f| f.has_data);
         actions.push(HostAction::Host {
             tablet,
             range: t.range.clone(),
-            initial_formation: join_plan.initial_formation || has_data,
+            initial_formation: initial_formation || has_data,
         });
         next.hosted.insert(tablet);
     }
 
-    // --- Phase 2: reconfigure every tablet this node currently leads.
+    // --- Phase 1.5: advance an in-place split intent this node is hosting
+    // the parent of (ADR 0058 Train 2 rung 3, Stages 1/3/materialization).
+    // A tablet with `inplace_split.is_some()` takes THIS branch instead of
+    // phase 2's ordinary `Reconfigure` for the duration of the split — the
+    // two must never both fire for the same tablet in the same tick (an
+    // ordinary reconfigure would see the split's added learners as
+    // `current_learners.iter().find(|n| !desired.contains(*n))` — i.e.
+    // stale — and remove them out from under Stage 2's catch-up).
     for (&tablet, t) in &view.tablets {
+        let Some(intent) = &t.inplace_split else {
+            continue;
+        };
+        let Some(fact) = facts.get(&tablet).filter(|f| f.hosted) else {
+            continue;
+        };
+        let [left, right] = &intent.children;
+        let union_homes: BTreeSet<NodeId> = left
+            .replicas
+            .iter()
+            .chain(right.replicas.iter())
+            .cloned()
+            .collect();
+
+        if let Some(pending) = &fact.pending_split {
+            // Stage 3 already forked HERE — materialize any of the two
+            // children not yet hosted on this node. Emitted for BOTH
+            // children on EVERY fork participant (see
+            // `HostAction::MaterializeSplitChild`'s own doc for why —
+            // Stage 5's post-cutover trim is what narrows each child back
+            // to its own final placement, not this gate).
+            let Some((left_range, right_range)) = t.range.split_at(&pending.split_key) else {
+                // Structurally unreachable (the control plane validated this
+                // exact split at `BeginSplitInPlace` time) — nothing to do
+                // rather than a panic in a pure planning function.
+                continue;
+            };
+            for (child, range, drop_range) in [
+                (left, left_range.clone(), right_range.clone()),
+                (right, right_range, left_range),
+            ] {
+                if next.hosted.contains(&child.id) {
+                    continue;
+                }
+                actions.push(HostAction::MaterializeSplitChild {
+                    parent: tablet,
+                    child: child.clone(),
+                    range,
+                    drop_range,
+                    bootstrap_voters: pending.bootstrap_voters.clone(),
+                });
+                next.hosted.insert(child.id);
+                next.split_forming.insert(child.id);
+            }
+            continue;
+        }
+
+        // Not forked here yet — Stage 1 (add missing learners) or Stage 3's
+        // trigger (propose the fork once every one is caught up). Leader-
+        // only, mirroring phase 2's own `Reconfigure` convention (a
+        // non-leader's `add_learner`/`propose_split_tablet` call would
+        // harmlessly no-op anyway, but emitting only on the leader keeps
+        // this phase's actions as churn-free as `Reconfigure`'s).
+        if !fact.is_leader {
+            continue;
+        }
+        let present: BTreeSet<NodeId> = fact.config.union(&fact.learners).cloned().collect();
+        if let Some(missing) = union_homes.difference(&present).next() {
+            actions.push(HostAction::AddSplitLearner {
+                tablet,
+                home: missing.clone(),
+            });
+            continue;
+        }
+        let all_ready = union_homes
+            .iter()
+            .all(|h| fact.config.contains(h) || fact.learners_caught_up.contains(h));
+        if all_ready {
+            actions.push(HostAction::ProposeSplitFork {
+                tablet,
+                split_key: intent.split_key.clone(),
+                children: intent.children.clone(),
+            });
+        }
+    }
+
+    // --- Phase 2: reconfigure every tablet this node currently leads (skips
+    // a tablet mid in-place-split — phase 1.5 owns it instead, see above).
+    for (&tablet, t) in &view.tablets {
+        if t.inplace_split.is_some() {
+            continue;
+        }
         let is_leader = facts.get(&tablet).is_some_and(|f| f.hosted && f.is_leader);
         if is_leader {
             actions.push(HostAction::Reconfigure {
@@ -465,12 +710,46 @@ pub fn plan(
     // exclusive on the same `mine` input.
     let mine: BTreeSet<TabletId> = next.hosted.clone();
 
-    for tablet in tablets_to_reclaim_set(&mine, &view.tablets) {
+    // ADR 0058 Train 2 rung 3: a `split_forming` child is `hosted` but,
+    // pre-cutover, structurally absent from `view.tablets` by design — never
+    // a reclaim candidate (see `LocalState::split_forming`'s own doc).
+    let reclaim_candidates: BTreeSet<TabletId> =
+        mine.difference(&next.split_forming).copied().collect();
+    for tablet in tablets_to_reclaim_set(&reclaim_candidates, &view.tablets) {
         actions.push(HostAction::Reclaim { tablet });
         next.pending_release.remove(&tablet);
     }
 
-    let release_candidates = tablets_to_release_set(&mine, &view.tablets, base_id);
+    // ADR 0058 Train 2 rung 3: a node recruited to host a splitting parent
+    // ONLY because it's named in one of the intent's children (never a
+    // member of the parent's own `replicas` — see phase 1's own comment) is
+    // never a release candidate for that tablet either, by the identical
+    // reasoning: `tablets_to_release_set`'s `!replicas.contains(&base_id)`
+    // trigger would otherwise fire on it immediately (it is never in
+    // `replicas`), and worse, `config_excludes_me` is trivially TRUE for a
+    // still-a-learner recruit (a learner is never in `config()` — see
+    // `RaftCore`'s own "peers/cluster_size derive from voters alone"
+    // invariant), so without this exclusion the safety anchor a few lines
+    // down would immediately wave the release through too.
+    let recruited_for_split: BTreeSet<TabletId> = mine
+        .iter()
+        .filter(|&&t| {
+            view.tablets.get(&t).is_some_and(|tab| {
+                tab.inplace_split.as_ref().is_some_and(|intent| {
+                    intent
+                        .children
+                        .iter()
+                        .any(|c| c.replicas.contains(&base_id))
+                })
+            })
+        })
+        .copied()
+        .collect();
+    let release_candidates: BTreeSet<TabletId> =
+        tablets_to_release_set(&mine, &view.tablets, base_id)
+            .into_iter()
+            .filter(|t| !recruited_for_split.contains(t))
+            .collect();
     // Drop confirm state for anything no longer a candidate (condition
     // flipped — re-added to the replica set, or reclaimed): its counter must
     // restart from scratch if it becomes a candidate again later.
@@ -751,6 +1030,36 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 HostAction::Reclaim { tablet } => {
                     self.teardown(tablet).await;
                 }
+                HostAction::AddSplitLearner { tablet, home } => {
+                    if let Some(node) = self.hosted.get(&tablet) {
+                        node.add_learner(home);
+                    }
+                }
+                HostAction::ProposeSplitFork {
+                    tablet,
+                    split_key,
+                    children,
+                } => {
+                    if let Some(node) = self.hosted.get(&tablet) {
+                        node.propose_split_tablet(split_key, children);
+                    }
+                }
+                HostAction::MaterializeSplitChild {
+                    parent,
+                    child,
+                    range,
+                    drop_range,
+                    bootstrap_voters,
+                } => {
+                    self.materialize_split_child(
+                        parent,
+                        child,
+                        range,
+                        drop_range,
+                        bootstrap_voters,
+                    )
+                    .await;
+                }
             }
         }
 
@@ -771,14 +1080,47 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         let mut facts = BTreeMap::new();
         for (&tablet, node) in &self.hosted {
             let scope_range = node.scope_range();
+            let config = node.config();
+            let config_excludes_me = !config.contains(&self.base_id);
+            // ADR 0058 Train 2 rung 3: the extra learner/fork bookkeeping is
+            // only ever consulted for a tablet the control plane currently
+            // shows an in-place split intent for — gated here so an
+            // ordinary tablet's tick pays no extra work (in particular, no
+            // extra `pending_split()` engine read).
+            let (config, learners, learners_caught_up, pending_split) = if view
+                .tablets
+                .get(&tablet)
+                .is_some_and(|t| t.inplace_split.is_some())
+            {
+                let learners = node.learners();
+                let learners_caught_up = learners
+                    .iter()
+                    .filter(|id| {
+                        node.learner_caught_up(id, INPLACE_SPLIT_LEARNER_CATCH_UP_THRESHOLD)
+                    })
+                    .cloned()
+                    .collect();
+                (
+                    config,
+                    learners,
+                    learners_caught_up,
+                    node.pending_split().await,
+                )
+            } else {
+                (config, BTreeSet::new(), BTreeSet::new(), None)
+            };
             facts.insert(
                 tablet,
                 TabletFacts {
                     hosted: true,
                     is_leader: node.is_leader(),
-                    config_excludes_me: !node.config().contains(&self.base_id),
+                    config_excludes_me,
                     scope_range: Some(scope_range),
                     has_data: false,
+                    config,
+                    learners,
+                    learners_caught_up,
+                    pending_split,
                 },
             );
         }
@@ -881,6 +1223,122 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         self.hosted.insert(tablet, node);
     }
 
+    /// Execute a [`HostAction::MaterializeSplitChild`] (ADR 0058 Train 2
+    /// rung 3, Stage 3): clone+trim `parent`'s engine into `child`'s own
+    /// namespace and bootstrap `child`'s local `RaftKvNode` with
+    /// `bootstrap_voters` as its initial voter config.
+    ///
+    /// **Every fork participant materializes BOTH children, unconditionally
+    /// — not just the one(s) it belongs to.** `bootstrap_voters` (the
+    /// parent's own full voter-plus-learner set at the fork, captured once
+    /// in `KvCommand::SplitTablet`'s apply — see `split.rs`'s module doc)
+    /// is what each child's local group actually bootstraps with, which is
+    /// a SUPERSET of either child's own final `replicas`. This is
+    /// deliberate: it is what makes Stage 5's "each child is
+    /// over-replicated relative to its own final RF immediately after the
+    /// fork" true by construction, trimmed down afterward by the ordinary
+    /// `Reconfigure` action once `CutoverSplit` records each child's real
+    /// `replicas` into `Metadata` — no new trim mechanism, `reconfigure_step`
+    /// verified, not rebuilt (its own module doc, rung 1's amendment).
+    ///
+    /// **G4 crash-idempotency contract** (ADR 0058 Train 2 rung 3's own
+    /// load-bearing detail): two commit points, checked and skipped
+    /// independently on a re-run after a crash between them —
+    /// 1. **The engine commit**: `EngineFactory::clone_engine`'s target
+    ///    manifest replace (ADR 0058 rung 2's own commit-point contract —
+    ///    "absent or complete, never torn"). Checked via
+    ///    `EngineFactory::probe(child.id)` **before** ever calling
+    ///    `clone_engine`: if the engine already exists, this replica already
+    ///    committed the clone (with an earlier crash landing after it but
+    ///    before the group started) — skip straight to re-opening it via
+    ///    `ensure_engine`, never re-clone (a second clone against a
+    ///    since-trimmed or since-written-to target would be a correctness
+    ///    bug, not merely wasted work).
+    /// 2. **The group commit**: successfully calling `RaftKvNode::
+    ///    start_hosted` and registering the result in
+    ///    [`hosted`](Self::hosted) — the SAME optimistic-claim-then-execute
+    ///    discipline [`host`](Self::host) already uses for an ordinary
+    ///    tablet (`plan` claims `child.id` into `LocalState::hosted`
+    ///    BEFORE this method ever runs; a failure here calls
+    ///    [`LocalState::release_unconfirmed_host`] to undo that claim, so
+    ///    the NEXT tick's `plan` re-emits the identical action). No
+    ///    separate "child group state" artifact needs writing: a brand-new
+    ///    Raft group bootstraps fresh from its `all_nodes` config every
+    ///    time regardless (empty log, first election) — the group's own
+    ///    identity IS `self.hosted.contains(&child.id)`.
+    ///
+    /// A crash between steps 1 and 2 therefore re-runs exactly step 2 on
+    /// retry (step 1's own idempotency is `clone_to`'s, inherited
+    /// unchanged); a crash before step 1 re-runs both, deterministically,
+    /// from the same `parent`/`child`/`range`/`bootstrap_voters` inputs
+    /// every replica computes identically from the fork entry itself.
+    async fn materialize_split_child(
+        &mut self,
+        parent: TabletId,
+        child: SplitChild,
+        range: KeyRange,
+        drop_range: KeyRange,
+        bootstrap_voters: BTreeSet<NodeId>,
+    ) {
+        let engine = if self.factory.probe(child.id).await {
+            // G4 step 1 already committed on an earlier attempt (a crash
+            // landed after the clone but before the group started) — never
+            // re-clone (the target may already be trimmed, or may already
+            // hold group state a second clone would clobber). Just recover
+            // the handle.
+            match self.factory.open(child.id).await {
+                Ok(engine) => engine,
+                Err(e) => {
+                    tracing::warn!(
+                        child = child.id.0,
+                        parent = parent.0,
+                        %e,
+                        "reconciler: reopening a split child's already-cloned engine"
+                    );
+                    self.state.release_unconfirmed_host(child.id);
+                    self.state.split_forming.remove(&child.id);
+                    return;
+                }
+            }
+        } else {
+            let engine = match self.factory.clone_engine(parent, child.id).await {
+                Ok(engine) => engine,
+                Err(e) => {
+                    tracing::warn!(
+                        child = child.id.0,
+                        parent = parent.0,
+                        %e,
+                        "reconciler: cloning a split child's engine"
+                    );
+                    self.state.release_unconfirmed_host(child.id);
+                    self.state.split_forming.remove(&child.id);
+                    return;
+                }
+            };
+            if let Err(e) = trim_split_child(&engine, &drop_range).await {
+                tracing::warn!(
+                    child = child.id.0,
+                    parent = parent.0,
+                    %e,
+                    "reconciler: trimming a freshly cloned split child"
+                );
+                self.state.release_unconfirmed_host(child.id);
+                self.state.split_forming.remove(&child.id);
+                return;
+            }
+            engine
+        };
+        self.engines.insert(child.id, engine.clone());
+        let scope = StorageScope::new(range);
+        let voters: Vec<NodeId> = bootstrap_voters.into_iter().collect();
+        let node = RaftKvNode::start_hosted(self.env.clone(), voters, engine, scope, child.id.0);
+        if let Some(after) = self.quiesce_after {
+            node.enable_quiescence(after);
+        }
+        (self.on_host)(child.id, &node);
+        self.hosted.insert(child.id, node);
+    }
+
     /// Execute a [`HostAction::Release`]/[`HostAction::Reclaim`]: unregister
     /// from the caller's routing registry first, shut the driver down and
     /// wait for it to actually stop (never touch data under a live driver),
@@ -957,6 +1415,62 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             );
         }
     }
+}
+
+/// **In-place split materialization's trim step** (ADR 0058 Train 2 rung 3,
+/// Stage 3): given `engine` — a fresh, untrimmed clone of the parent's full
+/// data (via [`EngineFactory::clone_engine`]) — delete exactly what ADR
+/// 0050's own copy-kinds rule says a split child must NOT inherit:
+///
+/// - `drop_range` (the SIBLING's own declared range) out of the
+///   BASE/LSI/FOOTPRINT scopes — leaving exactly this child's own range in
+///   each, the "full clone then trim" shape the design's G2 fork resolves
+///   to (rejecting a range-filtered clone).
+/// - The WHOLE CHANGE and CURSOR scopes, unconditionally, regardless of
+///   range — children are born with EMPTY change logs (ADR 0046 principle
+///   3, "no consumer offset ever crosses a split"), the identical rule the
+///   copy-based workflow's own `SeedBatch`/copy-kinds filter enforces,
+///   reused here verbatim at a different mechanism (a local delete instead
+///   of a filtered ship).
+///
+/// Each `delete_range` call needs its own strictly-increasing version (the
+/// engine's `put`-like monotonic contract, not `merge`'s per-key LWW) —
+/// `version` starts one above the clone's own inherited `latest_version()`
+/// and is bumped before every subsequent call.
+async fn trim_split_child<S: StorageEngine>(
+    engine: &S,
+    drop_range: &KeyRange,
+) -> Result<(), String> {
+    let mut version = engine.latest_version().wrapping_add(1);
+    for &kind in &[crate::KIND_BASE, crate::KIND_LSI, crate::KIND_FOOTPRINT] {
+        let scope = StorageScope::new(drop_range.clone()).with_kind(kind);
+        let (start, end) = scope.physical_bounds();
+        let end = end.expect(
+            "a kind scope's own physical upper bound is always finite (F2b) — see \
+             StorageScope::physical_bounds' doc",
+        );
+        if start < end {
+            engine
+                .delete_range(&start, &end, version)
+                .await
+                .map_err(|e| e.to_string())?;
+            version = version.wrapping_add(1);
+        }
+    }
+    for &kind in &[crate::KIND_CHANGE, crate::KIND_CURSOR] {
+        let scope = StorageScope::new(KeyRange::whole()).with_kind(kind);
+        let (start, end) = scope.physical_bounds();
+        let end = end.expect(
+            "a kind scope's own physical upper bound is always finite (F2b) — see \
+             StorageScope::physical_bounds' doc",
+        );
+        engine
+            .delete_range(&start, &end, version)
+            .await
+            .map_err(|e| e.to_string())?;
+        version = version.wrapping_add(1);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1206,6 +1720,7 @@ mod tests {
                 config_excludes_me: false,
                 scope_range: Some(KeyRange::new(b"".to_vec(), None)),
                 has_data: false,
+                ..Default::default()
             },
         )]
         .into_iter()

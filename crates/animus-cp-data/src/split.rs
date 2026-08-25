@@ -83,7 +83,10 @@ pub(crate) fn encode_split_value(
         out.extend_from_slice(&child.id.0.to_be_bytes());
         put_node_list(&mut out, &child.replicas);
     }
-    put_node_list(&mut out, &bootstrap_voters.iter().cloned().collect::<Vec<_>>());
+    put_node_list(
+        &mut out,
+        &bootstrap_voters.iter().cloned().collect::<Vec<_>>(),
+    );
     out.extend_from_slice(&ts.wall_ms.to_be_bytes());
     out.extend_from_slice(&ts.logical.to_be_bytes());
     out
@@ -180,8 +183,9 @@ mod tests {
                 replicas: vec![nid(4), nid(5)],
             },
         ];
-        let bootstrap_voters: BTreeSet<NodeId> =
-            [nid(0), nid(1), nid(2), nid(3), nid(4), nid(5)].into_iter().collect();
+        let bootstrap_voters: BTreeSet<NodeId> = [nid(0), nid(1), nid(2), nid(3), nid(4), nid(5)]
+            .into_iter()
+            .collect();
         let ts = HlcTimestamp {
             wall_ms: 12_345,
             logical: 7,
