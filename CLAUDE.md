@@ -299,6 +299,12 @@ truth; this map is just for navigation.
 - An incidental pre-existing bug discovered during a task gets its own
   separate PR (with its own test), never a drive-by fix folded into an
   unrelated diff.
+- **The website (`website/`) is part of the documentation.** Anything it
+  states — supported/planned wire operations, architecture, status and
+  security posture, commands, ports — must stay in sync with the code.
+  A change that alters something the site claims updates `website/` in the
+  same change; when touching the site, verify its claims against the code
+  rather than propagating stale copy.
 - Larger work ships as a stacked PR series (managed with
   [`gh-stack`](https://github.com/github/gh-stack), a `gh` CLI extension),
   reviewed per-PR and merged as one stack. **Web sessions get `gh`, the
