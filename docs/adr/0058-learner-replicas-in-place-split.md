@@ -674,6 +674,81 @@ mirroring how `tests/reconciler_corpus.rs` already stands in for a live
 control plane), the same posture this ADR's own Train 1 rung took for its
 reconciler-adoption sub-rung.
 
+**As-built (2026-08-25) — the `animusd`-level driver landed, closing the
+rung-3 residue above.** `SplitMode` (`animusd::config`), a `--split-mode
+{copy,inplace}` CLI flag (`--config`/`--cluster N` only — the same scope
+`--quiesce-after` has, with the identical documented gap for
+`--cluster-control`/`--cluster-data` and the standalone `control`/`data`/
+`join` subcommands), `ClientCtx::trigger_split`'s branch on
+`ClientCtx::split_mode` (proposing `BeginSplitInPlace` in place of
+`BeginSplit`, everything else about that call — the idempotent
+already-`Splitting` handling, the confirm loop, child-id allocation, F11
+alignment — shared verbatim), `index_drain.rs::inplace_split_driver_tick`
+(the cutover driver, wired into `change_consumer_loop` alongside the
+copy-based `split_driver_tick`, selected per-tablet by
+`Tablet::inplace_split.is_some()` — never by this node's own configured
+`split_mode`, which only governs a *future* `trigger_split` call), and a
+`ProdEnv` end-to-end regression (`animusd/tests/inplace_split_e2e.rs`) —
+a real 3-node `--split-mode inplace` cluster, a paced continuous writer
+riding kickoff through cutover, and a streams-enabled variant walking a
+`GetRecords` iterator from the parent's own shard across the fork to both
+children.
+
+**A genuine correctness gap this rung found and closed, not anticipated by
+this ADR's own residue paragraph or Stage 3's prose**: proposing
+`CutoverSplit` as soon as `pending_split()` answers `Some` (this residue's
+own literal reading) races the CP-data host reconciler's OWN,
+independent, per-node discovery of that same fact. Stages 1–3 (learner
+add, catch-up, the fork) commit nothing on the control plane, so
+`tablet_host_reconciler_loop`'s `metadata_watch` wake fires once, at
+`BeginSplitInPlace`'s own commit, and not again until `CutoverSplit`'s —
+leaving the reconciler's periodic fallback (`RECONCILE_FALLBACK_INTERVAL`,
+500ms) as the ONLY thing that can make it discover a completed fork and run
+`HostAction::MaterializeSplitChild`. The `animusd`-level driver's own tick
+(`INDEX_DRAIN_INTERVAL`, 200ms) can — and, in a real multi-process
+`ProdEnv` cluster with no GSI/stream veto to wait on, routinely does —
+observe the fork and get `CutoverSplit` committed before any given
+replica's reconciler has ticked even once since the fork happened. Once
+`CutoverSplit` removes the parent's row (and with it `Tablet::
+inplace_split`, the only signal `plan`'s phase 1.5 branch keys on), that
+replica's NEXT reconciler tick sees an ordinary freshly-`Active` tablet
+with no memory of the fork, and hosts it via the wrong (non-split) path:
+an empty engine and a `plan_join_host`-derived config with no relationship
+to `bootstrap_voters` — permanent, silent data loss and (since every
+replica computes this independently) a group whose replicas can disagree
+on their own membership badly enough to never elect a leader. Found by
+this rung's own `ProdEnv` e2e test (SimEnv's near-zero simulated latency
+and `tests/inplace_split_reconciler.rs`'s own harness — which drives the
+reconciler directly, never racing it against a second, independent
+wall-clock-paced loop — never exercised this interaction). Closed with two
+changes, both entirely inside `animusd` (no change to `animus-control`/
+`animus-cp-data`, no new replicated command):
+
+- `tablet_host_reconciler_loop` shortens its own fallback from 500ms to
+  `INPLACE_SPLIT_RECONCILE_INTERVAL` (50ms) for as long as *any* tablet
+  cluster-wide currently carries an in-place split intent — every fork
+  participant observes the same `BeginSplitInPlace` commit and flips into
+  this fast cadence together, well before Stage 3's fork ever applies, so
+  by the time it does every replica is already polling at 50ms.
+- `inplace_split_driver_tick` additionally requires, before it may propose
+  `CutoverSplit`: (a) at least `INPLACE_SPLIT_MATERIALIZE_SETTLE_MS`
+  (250ms — a small, justified multiple of the now-50ms reconciler cadence,
+  not the withdrawn 500ms one) has elapsed since the fork applied
+  (`PendingSplit::ts`, the identical `env.now()`-derived clock
+  `cutover_wall_ms` already uses — no driver-local state, so this is fully
+  re-derivable after a crash/re-lead), and (b) this replica's own
+  `ClientCtx.edge.hosted_groups()` already contains both children — a
+  direct local confirmation, never proposing ahead of its own state.
+
+Both bounds are deliberately small relative to the withdrawn naive 500ms–
+1000ms options tried while diagnosing this — a large bound would have
+reintroduced exactly the write-availability outage Stage 3–5's own design
+point (near-zero, "roughly one routing refresh") exists to avoid; the
+shipped fix keeps the reconciler's own worst-case tightly bounded instead
+of just waiting out a slow one. Measured on the e2e test's own 3-node
+cluster: the paced writer needed **zero** retries across every observed
+run — the fork/cutover transition was not visible to it at all.
+
 ## Open forks (deliberately not decided by this ADR)
 
 | # | Fork | Status |

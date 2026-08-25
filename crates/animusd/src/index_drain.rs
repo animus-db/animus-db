@@ -391,22 +391,34 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             // never vanish beneath it, and the change log is the build's
             // delta feed (the metadata-derived trim hold — driver liveness
             // never gates it, so a driver crash can never let trim advance).
-            let splitting = meta
-                .tablets
-                .get(&tablet)
-                .is_some_and(|t| t.state == TabletState::Splitting);
+            let tablet_row = meta.tablets.get(&tablet);
+            let splitting = tablet_row.is_some_and(|t| t.state == TabletState::Splitting);
             if splitting {
                 group.wake();
                 group.set_quiesce_veto(true, veto_fresh_through);
-                let build = split_builds.entry(tablet).or_default();
-                if let Err(e) = split_driver_tick(&ctx, &meta, tablet, &group, build).await {
-                    tracing::debug!(tablet = tablet.0, error = %e, "split build: tick failed");
+                // ADR 0058 Train 2 rung 3 residue: which workflow is running
+                // on THIS tablet is a durable fact of its own `Metadata` row
+                // (`Tablet::inplace_split`, set by `BeginSplitInPlace` and
+                // never by `BeginSplit`) — not this node's own configured
+                // `ClientCtx::split_mode` default, which only governs a
+                // FUTURE `trigger_split` call. A node can easily be driving
+                // one workflow's tablet while configured to trigger the
+                // other one's for the next split.
+                if tablet_row.is_some_and(|t| t.inplace_split.is_some()) {
+                    if let Err(e) = inplace_split_driver_tick(&ctx, &meta, tablet, &group).await {
+                        tracing::debug!(tablet = tablet.0, error = %e, "inplace split: tick failed");
+                    }
+                } else {
+                    let build = split_builds.entry(tablet).or_default();
+                    if let Err(e) = split_driver_tick(&ctx, &meta, tablet, &group, build).await {
+                        tracing::debug!(tablet = tablet.0, error = %e, "split build: tick failed");
+                    }
+                    ctx.data()
+                        .split_builds
+                        .lock()
+                        .expect("split_builds poisoned")
+                        .insert(tablet.0, (build.rows_shipped, build.converged, build.phase));
                 }
-                ctx.data()
-                    .split_builds
-                    .lock()
-                    .expect("split_builds poisoned")
-                    .insert(tablet.0, (build.rows_shipped, build.converged, build.phase));
             }
             // ADR 0044 phase-1 PR6: "quiesced ⇒ nothing new for the
             // sweeper" is an invariant PR5's veto makes sound — a led
@@ -724,6 +736,30 @@ const SPLIT_MAX_TAIL_PASSES: u32 = 25;
 /// cutover past an un-drained cursor.
 const FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES: u32 = 64;
 
+/// How long, in milliseconds since an in-place split's fork applied
+/// (`PendingSplit::ts`), [`inplace_split_driver_tick`] waits before it may
+/// ever propose `CutoverSplit` — a hard bound over
+/// `INPLACE_SPLIT_RECONCILE_INTERVAL` (50ms), the CP-data host reconciler's
+/// own per-node `tablet_host_reconciler_loop`'s **guaranteed** worst-case
+/// tick interval *while an in-place split is active anywhere* (that loop's
+/// own doc has the full mechanism: every fork participant independently
+/// observes the same `BeginSplitInPlace` commit and flips into this fast
+/// cadence together, well before Stage 3's fork ever applies). See this
+/// constant's call site for the full argument: proposing cutover before
+/// every replica's reconciler has had at least one guaranteed tick to
+/// observe `Tablet::inplace_split` and run `HostAction::
+/// MaterializeSplitChild` risks a replica hosting a freshly-`Active` split
+/// child via the ordinary (wrong: empty engine, wrong bootstrap voters)
+/// path instead — permanent, silent data loss, not a transient blip
+/// (found by this rung's own `ProdEnv` e2e test). 5x the fast-poll
+/// interval, not 1x: that bound is the reconciler's OWN worst case measured
+/// from ITS last tick, not from this driver's own observation of the fork,
+/// so a small multiplier absorbs scheduling jitter without reintroducing a
+/// large, ADR-0058-defeating outage the way a naive multi-hundred-ms bound
+/// would (Stage 3-5's whole point is a near-zero blip — "roughly one
+/// routing refresh").
+const INPLACE_SPLIT_MATERIALIZE_SETTLE_MS: u64 = 250;
+
 /// The copy kinds (ADR 0050): BASE (values, tombstones, intent envelopes,
 /// txn records), LSI, FOOTPRINT — **never** KIND_CHANGE (a child re-serving
 /// parent change records is the #220 duplication class; children are born
@@ -1005,6 +1041,193 @@ async fn split_driver_tick(
     //    propose is simply re-issued each tick until observed; the
     //    state/epoch CAS makes a duplicate reject cleanly.
     build.phase = "cutover";
+    let cmd = MetaCommand::CutoverSplit {
+        parent: tablet,
+        expected_epoch: parent.epoch,
+        cutover_wall_ms: ctx.env.now().0 / 1_000_000,
+    };
+    ctx.propose_schema(&cmd).await;
+    Ok(())
+}
+
+/// One **in-place split** driver tick for a `Splitting` parent (carrying an
+/// [`animus_tablet::InPlaceSplitIntent`]) this node leads (ADR 0058 Train 2
+/// rung 3's residue — the `animusd`-level layer the ADR's own as-built note
+/// names as unstarted: "the per-tick driver that watches a forked-locally
+/// parent, runs the (unmodified) GSI-drain/backfill vetoes against it, and
+/// proposes `CutoverSplit`"). Everything upstream of this — adding the
+/// fork's learners, catching them up, proposing the single-entry
+/// `KvCommand::SplitTablet` fork itself, and materializing both children's
+/// engines on every fork participant — is entirely the CP data plane's own
+/// host reconciler's job (`animus_cp_data::host`, ADR 0058 Train 2 rung 3);
+/// this function has nothing to do until that fork has already happened
+/// LOCALLY, on this replica ([`CpGroup::pending_split`] answers `Some`).
+///
+/// Once forked, the children are already fully formed and durable (Stage 3's
+/// atomic mint) — there is no build, no freeze, no tail, no final image, no
+/// convergence bound the way the copy-based endgame needs. What is left is
+/// exactly the copy-based endgame's OWN two pre-cutover consistency vetoes,
+/// run against the parent's own change log (unmodified by the fork: the
+/// parent's `KIND_CHANGE` growth stopped at the fork position, since
+/// `SplitTablet` reuses `Freeze`'s exact whole-range seal/`frozen`
+/// discipline for its ordering fence — see `animus-cp-data/CLAUDE.md`'s
+/// "In-place split" entry) — the **streams final seal** (anchored at the
+/// fork position, identical `seal_now` loop the frozen endgame uses) and the
+/// **GSI-drain veto** (`gsi_caught_up` + the identical frozen-endgame
+/// exhaustion loop, [`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`]) plus the
+/// **backfill-seeder veto** — before proposing `MetaCommand::CutoverSplit`
+/// with the identical confirm-by-observation loop the copy-based driver uses
+/// (re-issued every tick until the parent vanishes from the map; the
+/// control-plane epoch/state CAS makes a duplicate reject cleanly).
+///
+/// **Idempotent across crash/re-lead by construction, with NO driver-local
+/// state at all** (unlike [`SplitBuild`], which memoizes the copy-based
+/// build's own progress): every step here is a fresh read off durable/
+/// replicated state — `pending_split()`, the change log, the GSI cursor, the
+/// backfill catalog — so a freshly re-led driver re-derives the exact same
+/// answer a long-running one would have, on its very first tick.
+async fn inplace_split_driver_tick(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    tablet: TabletId,
+    group: &CpGroup,
+) -> Result<(), String> {
+    let Some(parent) = meta.tablets.get(&tablet) else {
+        return Ok(()); // stale view; nothing to do
+    };
+    // Not yet forked locally: the CP data plane's own host reconciler is
+    // still adding/catching-up learners (or hasn't proposed the fork yet).
+    // Nothing for this driver to do until this replica's own apply has
+    // processed `KvCommand::SplitTablet`.
+    let Some(pending) = group.pending_split().await else {
+        return Ok(());
+    };
+
+    let table = parent.table.clone().unwrap_or_default();
+
+    // Streams final seal, anchored at the fork position: identical to the
+    // copy-based endgame's own final-seal step (`seal_now`, no size/age
+    // gate) — the parent's `KIND_CHANGE` stopped growing the instant it
+    // forked, so looping to exhaustion here covers everything up to (and
+    // only up to) the fork, closing the shard so an in-flight streams
+    // iterator drains the parent shard and walks on to the children via
+    // `split_lineage` (fork F9, written identically by `CutoverSplit`'s
+    // in-place branch).
+    if !table.is_empty() && meta.table_stream(&table).is_some() {
+        while seal_now(ctx, &table, tablet, group).await?.is_some() {}
+    }
+
+    // GSI-drain veto, accelerated exactly like the copy-based frozen
+    // endgame (issue #288): the parent is static the instant it forks, so
+    // driving the drain to exhaustion here — rather than waiting on
+    // `change_consumer_loop`'s own once-per-tick `drain_tablet` call — has
+    // no fairness cost and survives a transient propose failure without
+    // costing a full extra tick to retry.
+    if !table.is_empty() && !meta.table_indexes(&table).is_empty() {
+        let gsis: Vec<IndexDef> = meta
+            .table_indexes(&table)
+            .iter()
+            .filter(|i| {
+                i.kind == IndexKind::Global
+                    && matches!(i.status, IndexStatus::Creating | IndexStatus::Active)
+            })
+            .cloned()
+            .collect();
+        if !gsis.is_empty() {
+            for _ in 0..FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES {
+                if gsi_caught_up(group).await {
+                    break;
+                }
+                if let Err(e) = drain_tablet(ctx, meta, &table, group, &gsis).await {
+                    tracing::debug!(
+                        tablet = tablet.0,
+                        error = %e,
+                        "inplace split: frozen-endgame gsi drain pass failed"
+                    );
+                }
+            }
+        }
+        if !gsi_caught_up(group).await {
+            return Ok(());
+        }
+    }
+
+    // Backfill veto: identical to the copy-based endgame — a still-
+    // `Creating` index's seeder must have finished its sweep of the (now
+    // static) parent before it may retire.
+    if !table.is_empty() {
+        for idx in meta.table_indexes(&table) {
+            if idx.status == IndexStatus::Creating
+                && !meta
+                    .index_backfill
+                    .contains_key(&(tablet, idx.name.clone()))
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    // Materialization-settled gate: `HostAction::MaterializeSplitChild`
+    // (animus-cp-data's own host reconciler, ADR 0058 Train 2 rung 3) is
+    // driven by a DIFFERENT, independent per-node loop
+    // (`tablet_host_reconciler_loop`) than this one — woken by a
+    // control-plane `metadata_watch` change or its own
+    // `RECONCILE_FALLBACK_INTERVAL` (500ms) fallback, whichever comes
+    // first. Nothing about Stage 1-3 (learner add, catch-up, the fork
+    // itself) commits a control-plane command, so once `BeginSplitInPlace`
+    // itself has woken it once, that reconciler may not tick again — and
+    // hence may not yet have run `MaterializeSplitChild` on THIS or any
+    // OTHER replica — until its own fallback timer fires. Proposing
+    // `CutoverSplit` before that happens removes the parent's own
+    // `Metadata` row (and with it `Tablet::inplace_split`, the ONLY signal
+    // `plan`'s phase 1.5 branch keys on) out from under a replica whose
+    // reconciler hasn't materialized yet — its NEXT tick then sees an
+    // ordinary newly-`Active` tablet with no memory of the fork at all,
+    // and hosts it via the wrong (non-split) path: empty engine, and a
+    // per-node `bootstrap_voters`-shaped config that was never actually
+    // used, since that path derives its own (wrong) initial config from
+    // `t.replicas` instead. This is silent, permanent data loss and a
+    // group that can never elect — found by this rung's own `ProdEnv` e2e
+    // test with quiescence disabled and no drain/veto to wait on: the
+    // gap between `pending_split()` flipping `Some` and this driver's next
+    // 200ms tick is routinely faster than the reconciler's 500ms
+    // guaranteed-worst-case fallback.
+    //
+    // Two independent, durable-state-only (no driver-local memory — crash/
+    // re-lead re-derives identically) checks close it:
+    // - **Time-bounded**: `tablet_host_reconciler_loop`'s own `select!`
+    //   guarantees it ticks at least once every `RECONCILE_FALLBACK_
+    //   INTERVAL`, unconditionally, on EVERY node — not a heuristic guess,
+    //   a hard property of that loop's own structure. Waiting comfortably
+    //   longer than that since the fork applied (`pending.ts`, minted off
+    //   this same `env.now()` clock — the identical pattern `cutover_wall_
+    //   ms` below already uses) guarantees every replica's reconciler has
+    //   had at least one full tick with `Tablet::inplace_split` still
+    //   present to observe and materialize from.
+    // - **Locally confirmed**: this replica's own `ctx.edge.hosted_groups()`
+    //   must already contain both children — a direct, cheap check that
+    //   THIS node (which is about to propose the cutover that starts the
+    //   clock on every OTHER replica's own window) has itself already
+    //   materialized, never proposing ahead of its own local state.
+    let now_ms = ctx.env.now().0 / 1_000_000;
+    let fork_age_ms = now_ms.saturating_sub(pending.ts.wall_ms);
+    if fork_age_ms < INPLACE_SPLIT_MATERIALIZE_SETTLE_MS {
+        return Ok(());
+    }
+    let [left, right] = &pending.children;
+    let hosted: BTreeSet<TabletId> = ctx
+        .edge
+        .hosted_groups()
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    if !hosted.contains(&left.id) || !hosted.contains(&right.id) {
+        return Ok(());
+    }
+
+    // Cutover: the atomic flip — both children (already fully formed since
+    // Stage 3's fork) Active, parent removed, lineage frozen. Re-issued
+    // every tick until observed (the parent vanishing from the map).
     let cmd = MetaCommand::CutoverSplit {
         parent: tablet,
         expected_epoch: parent.epoch,
@@ -3370,6 +3593,7 @@ mod stream_sealer_tests {
                 quiesce_after,
                 crate::ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
                 None,
+                crate::config::SplitMode::default(),
             )
             .await
             .expect("bring up single node with streams + quiescence");

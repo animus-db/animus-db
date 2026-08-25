@@ -619,6 +619,94 @@ unroutable tablet has no routing candidacy to fix into. E2e:
 `tests/split_build.rs` (full workflow + racing txns + post-freeze leader
 kill).
 
+**`SplitMode` (ADR 0058 Train 2 rung 3's `animusd`-level driver residue)
+selects between the copy-based workflow above and the in-place one**:
+`animusd::config::SplitMode` (`Copy`/`InPlace`, `Copy` the default and
+every existing config/test), stored as a plain `ClientCtx.split_mode`
+field — deliberately **not** a `ClusterConfig` field (unlike
+`DynamoAuthConfig`, which has no other way to reach a `--config FILE`
+process): this is threaded exactly the way `--auto-split`/`--quiesce-after`
+are, as a CLI-parsed runtime parameter down the `spawn_common_tail`/
+`start_with_growth`/`start_control_with`/`start_data_with_growth` call
+chain, so adding it never touched `ClusterConfig`'s struct-literal shape
+(which dozens of existing tests construct directly). `--split-mode
+{copy,inplace}` threads through `--config FILE --node I` and `--cluster N`
+only — the identical scope `--quiesce-after` has, including the same
+documented gap for `--cluster-control`/`--cluster-data` and the standalone
+`control`/`data`/`join` subcommands (each always runs `Copy`, no flag of
+its own). `ClientCtx::trigger_split` is still the ONE choke point both
+workflows share (see its own doc, `lib.rs`): `self.split_mode` is the sole
+branch point between proposing `MetaCommand::BeginSplit` or
+`BeginSplitInPlace`, with identical children (same shape, same fields),
+the identical idempotent already-`Splitting` handling, the identical
+confirm loop, and identical F11 alignment — `auto_split_loop`/
+`admin::action_split`/`ClientRequest::SplitTablet` all fall in behind
+whichever mode is configured automatically, with no fork of their own.
+
+**The in-place cutover driver** (`index_drain.rs::
+inplace_split_driver_tick`) is `change_consumer_loop`'s in-place sibling to
+`split_driver_tick` above, selected per-tablet — not per-node — by
+`Tablet::inplace_split.is_some()` (a durable fact of the tablet's own
+`Metadata` row, set only by `BeginSplitInPlace`): a node can be configured
+`InPlace` while driving a tablet someone else split with `BeginSplit`
+before the flag flipped, and vice versa. Everything upstream of this —
+adding the fork's learners, catching them up, proposing the single-entry
+`KvCommand::SplitTablet` fork itself, and materializing both children's
+engines on every fork participant — is entirely `animus_cp_data::host`'s
+own reconciler (ADR 0058 Train 2 rung 3, unmodified by this driver); this
+function has nothing to do until `CpGroup::pending_split()` answers `Some`
+on this replica. Once forked, there is no build, no freeze, no tail, no
+convergence bound — Stage 3's atomic mint already fully formed both
+children — so what is left is exactly the copy-based endgame's own two
+pre-cutover vetoes (GSI-drain, accelerated identically via
+`gsi_caught_up`/`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`; backfill-seeder) run
+against the parent's own (now-frozen, static — `SplitTablet` reuses
+`Freeze`'s exact whole-range seal discipline) change log, plus the
+**streams final seal** anchored at the fork position (`seal_now`, looped
+to exhaustion — identical call the copy-based endgame makes, closing the
+shard so an in-flight streams iterator drains the parent shard and walks
+on to the children via `split_lineage`), before proposing
+`MetaCommand::CutoverSplit` with the identical confirm-by-observation loop
+(re-issued every tick until the parent vanishes from the map). Fully
+idempotent across crash/re-lead with **no driver-local state at all**
+(stricter than `SplitBuild`, which memoizes real progress): every check is
+a fresh read off durable/replicated state.
+
+**Gotcha this rung found, in real `ProdEnv`, not `SimEnv`**: proposing
+`CutoverSplit` the instant `pending_split()` is `Some` races
+`animus_cp_data::host`'s own reconciler, which is a *different*,
+independently-scheduled per-node loop (`tablet_host_reconciler_loop`).
+Stages 1–3 commit nothing on the control plane, so that reconciler's
+`metadata_watch` wakes once (at `BeginSplitInPlace`'s own commit) and not
+again until `CutoverSplit`'s — leaving its `RECONCILE_FALLBACK_INTERVAL`
+(500ms) fallback as the only thing that can make it discover a completed
+fork and run `HostAction::MaterializeSplitChild`. This driver's own
+200ms-paced tick can — and, with no GSI/stream veto to wait on, routinely
+does — get `CutoverSplit` committed before some replica's reconciler has
+ticked even once since the fork, which then hosts the freshly-`Active`
+child via the *wrong* (non-split) path once the parent's row — and with it
+`Tablet::inplace_split`, the only signal that branch keys on — is gone:
+permanent, silent data loss, not a transient blip. Closed by two additions,
+both local to `animusd` (`lib.rs`): `tablet_host_reconciler_loop` shortens
+its own fallback to `INPLACE_SPLIT_RECONCILE_INTERVAL` (50ms) for as long
+as *any* tablet cluster-wide carries an in-place split intent — every fork
+participant observes the identical `BeginSplitInPlace` commit and flips
+into this cadence together, well before Stage 3 ever applies — and
+`inplace_split_driver_tick` additionally requires
+`INPLACE_SPLIT_MATERIALIZE_SETTLE_MS` (250ms, a small multiple of the new
+50ms cadence) to have elapsed since the fork applied (`PendingSplit::ts`,
+the same `env.now()`-derived clock `cutover_wall_ms` already uses — no
+driver-local timer) **and** this replica's own `ctx.edge.hosted_groups()`
+to already contain both children, before it may ever propose cutover. See
+`docs/engineering-lessons.md`'s entry for the general lesson. E2e:
+`tests/inplace_split_e2e.rs` — a real 3-node `--split-mode inplace`
+cluster, a paced continuous writer riding kickoff through cutover
+(asserting every acked write survives with its exact value, and observing
+zero write refusals across every run once the fix landed), and a
+streams-enabled variant walking a `GetRecords` iterator from the parent's
+own shard 0 across the fork to both children's own shard 0s with no loss
+or duplication.
+
 `--auto-split K` (key count), `--auto-split-bytes B` (byte size), and
 `--auto-split-change-rate RATE` (streamed tables only, ADR 0042 §14 Fork F —
 bytes/sec of a tablet's own `KIND_CHANGE` growth, `/admin/metrics`'s

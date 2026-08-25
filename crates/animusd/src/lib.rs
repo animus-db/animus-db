@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod config;
 mod index_drain;
 pub mod otel;
-pub use config::{ClusterConfig, DynamoAuthConfig};
+pub use config::{ClusterConfig, DynamoAuthConfig, SplitMode};
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
 // cluster metadata — membership status and the tablet map — without depending on
 // `animus-control` directly.
@@ -685,6 +685,19 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.is_frozen(),
             CpGroup::Mem(n) => n.is_frozen(),
+        }
+    }
+
+    /// This group's pending (or already-applied) in-place split fork, if
+    /// any (ADR 0058 Train 2 rung 3) — the `animusd`-level in-place cutover
+    /// driver's (`index_drain.rs::inplace_split_driver_tick`) own signal
+    /// that the CP data plane's own fork (`KvCommand::SplitTablet`) has
+    /// completed and both children now exist locally, fully formed. See
+    /// [`RaftKvNode::pending_split`].
+    pub(crate) async fn pending_split(&self) -> Option<animus_cp_data::PendingSplit> {
+        match self {
+            CpGroup::Lsm(n) => n.pending_split().await,
+            CpGroup::Mem(n) => n.pending_split().await,
         }
     }
 
@@ -3868,6 +3881,7 @@ fn spawn_common_tail(
     control_storage: Option<SharedEngine>,
     env: ProdEnv,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    split_mode: SplitMode,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -3889,6 +3903,7 @@ fn spawn_common_tail(
         remote_metadata: Arc::new(Mutex::new(None)),
         control_storage,
         dynamo_auth,
+        split_mode,
     };
 
     let mut tasks = Vec::with_capacity(5);
@@ -4154,6 +4169,7 @@ impl BoundNode {
             Duration::ZERO,
             ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
             None,
+            SplitMode::default(),
         )
         .await
     }
@@ -4185,6 +4201,11 @@ impl BoundNode {
     /// reading `ClusterConfig::dynamo_auth`, or `start_cluster_inner` for
     /// `--cluster N`) calls this method directly, the same layered-wrapper
     /// convention as every other knob here.
+    ///
+    /// `split_mode` (ADR 0058 Train 2 rung 3) selects which workflow this
+    /// node's `ClientCtx::trigger_split` proposes — `SplitMode::Copy`
+    /// (every caller above this layer) is byte-for-byte the original ADR
+    /// 0050 workflow. See [`SplitMode`]'s own doc.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_growth(
         self,
@@ -4206,6 +4227,7 @@ impl BoundNode {
         quiesce_after: Duration,
         ttl_sweep_interval: Duration,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+        split_mode: SplitMode,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         // The initial (static) peer book + an env clone, kept for the
@@ -4417,6 +4439,7 @@ impl BoundNode {
             Some(storage.clone()),
             self.env.clone(),
             dynamo_auth,
+            split_mode,
         );
 
         // The per-node **tablet-host reconciler** (ADR 0031 PR4): the single
@@ -5211,6 +5234,12 @@ impl BoundControlNode {
     /// of the apply task's published cache (`Metadata: DRIVER_APPLIED`)
     /// rather than an optional shadow mirror.
     ///
+    /// `split_mode` (ADR 0058 Train 2 rung 3) selects which workflow this
+    /// node's own `ClientCtx::trigger_split` proposes when it receives one
+    /// (a relayed admin/client `SplitTablet` request, or a follower-
+    /// connected `BeginSplit`/`BeginSplitInPlace` propose) — `SplitMode::
+    /// Copy` is byte-for-byte the original ADR 0050 workflow.
+    ///
     /// # Errors
     /// Propagates a failure to open the dedicated engine (LSM backend only).
     #[allow(clippy::too_many_arguments)]
@@ -5223,6 +5252,7 @@ impl BoundControlNode {
         cluster_admin_addrs: Vec<SocketAddr>,
         backend: StorageBackend,
         orphan_sweep_after: Duration,
+        split_mode: SplitMode,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         let envs = vec![self.env.clone()];
@@ -5326,6 +5356,7 @@ impl BoundControlNode {
             // A control-only node never binds the dynamo listener (ADR
             // 0057) — nothing here would ever read `ClientCtx::dynamo_auth`.
             None,
+            split_mode,
         );
 
         // Peer-sync loop (ADR 0040 PR1) — a control-only node needs it
@@ -5539,6 +5570,7 @@ impl BoundDataNode {
             segment_store_config,
             None,
             None,
+            SplitMode::default(),
         )
         .await
     }
@@ -5552,6 +5584,10 @@ impl BoundDataNode {
     /// same knob, same default-`None`-disables contract. A data-only node
     /// binds the dynamo listener (ADR 0035 PR4) just like a combined node,
     /// so this is threaded here too, not skipped.
+    ///
+    /// `split_mode` (ADR 0058 Train 2 rung 3) — see
+    /// [`BoundNode::start_with_growth`]'s doc: same knob, same
+    /// `SplitMode::Copy`-is-byte-for-byte-original contract.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_growth(
         self,
@@ -5569,6 +5605,7 @@ impl BoundDataNode {
         segment_store_config: SegmentStoreConfig,
         auto_split_change_rate: Option<u64>,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+        split_mode: SplitMode,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         let static_peers = peers;
@@ -5665,6 +5702,7 @@ impl BoundDataNode {
             None,
             self.env.clone(),
             dynamo_auth,
+            split_mode,
         );
 
         // The per-node tablet-host reconciler (ADR 0031 PR4) — identical
@@ -6575,6 +6613,16 @@ pub(crate) struct ClientCtx {
     /// "explicitly out of scope: rotation, dynamic credential API") — cheap
     /// to clone onto each connection's `ClientCtx`, never locked.
     pub(crate) dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    /// Which tablet-split workflow this node proposes when it drives
+    /// `trigger_split` (ADR 0058 Train 2 rung 3's `animusd`-level driver
+    /// residue) — `Copy` (every existing deployment/test, since this is
+    /// what every constructor below defaults to) is byte-for-byte the
+    /// original ADR 0050 workflow. See [`SplitMode`]'s own doc. Threaded
+    /// from the `--split-mode {copy,inplace}` CLI flag (`--config`/
+    /// `--cluster N` only, mirroring `--quiesce-after`'s own scope) —
+    /// plain per-node config, not gated by [`DataRole`], since a
+    /// control-only node's `trigger_split` calls need it too.
+    pub(crate) split_mode: SplitMode,
 }
 
 impl ClientCtx {
@@ -12515,6 +12563,38 @@ impl CpReconciler {
 /// "responsive enough, cheap enough" role for every node before this PR.
 const RECONCILE_FALLBACK_INTERVAL: Duration = Duration::from_millis(500);
 
+/// ADR 0058 Train 2 rung 3 residue: [`tablet_host_reconciler_loop`]'s own
+/// fallback interval while **any** tablet cluster-wide currently carries an
+/// in-place split intent (`Tablet::inplace_split.is_some()`) — far shorter
+/// than [`RECONCILE_FALLBACK_INTERVAL`].
+///
+/// **Why this exists**: Stage 1-3 of an in-place split (learner add,
+/// catch-up, the fork itself) happen entirely on the CP data plane's own
+/// per-tablet Raft log — none of it commits a control-plane command, so
+/// `metadata_watch` never fires again after `BeginSplitInPlace`'s own
+/// commit until `CutoverSplit` eventually does. Between those two points,
+/// EVERY replica's reconciler (this loop) is the only thing that ever
+/// notices "this replica's own fork has completed, materialize both
+/// children" (`HostAction::MaterializeSplitChild`, keyed on
+/// `Tablet::inplace_split` still being present) — so its own tick cadence
+/// during that window is a direct, hard bound on how long a fork can sit
+/// un-materialized on a given replica before the `animusd`-level cutover
+/// driver (`index_drain.rs::inplace_split_driver_tick`) might legally
+/// propose `CutoverSplit` and remove that signal out from under it. At the
+/// ordinary [`RECONCILE_FALLBACK_INTERVAL`] (500ms), that driver's own
+/// (much faster, `INDEX_DRAIN_INTERVAL`-paced) observation of the local
+/// fork routinely outraces this loop's next scheduled tick — proposing
+/// cutover before every fork participant has even had a chance to
+/// materialize, which is silent, permanent data loss for whichever replica
+/// loses that race (see `inplace_split_driver_tick`'s own doc for the full
+/// argument and the `ProdEnv` regression that found it). Shortening this
+/// loop's own cadence specifically during an active split closes that gap
+/// on every node — leader and follower alike, all of whom independently
+/// observe the same `BeginSplitInPlace` commit and so all flip into fast
+/// polling together — while adding no measurable steady-state cost (a
+/// cluster with no in-place split in flight never engages it).
+const INPLACE_SPLIT_RECONCILE_INTERVAL: Duration = Duration::from_millis(50);
+
 /// The single per-node **tablet-host reconciler trigger** (ADR 0031 PR4):
 /// replaces the three loops this file used to run independently
 /// (`cp_reconfigure_loop`, `cp_join_host_loop`, `cp_gc_loop`'s reclaim +
@@ -12570,10 +12650,24 @@ const RECONCILE_FALLBACK_INTERVAL: Duration = Duration::from_millis(500);
 async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconciler) {
     let watch = ctx.control.metadata_watch();
     let mut last_seen = watch.latest();
+    // ADR 0058 Train 2 rung 3 residue: whether the LAST snapshot this loop
+    // saw carried an active in-place split intent anywhere — see
+    // `INPLACE_SPLIT_RECONCILE_INTERVAL`'s own doc. Starts `false`
+    // (ordinary cadence) — the very first tick after any `BeginSplitInPlace`
+    // commits arrives via `watch.changed()` regardless (a real commit always
+    // wakes this loop immediately), so this never delays noticing a split's
+    // start; it only shortens every tick *after* that one, for as long as
+    // the intent remains present.
+    let mut inplace_split_active = false;
     loop {
+        let fallback = if inplace_split_active {
+            INPLACE_SPLIT_RECONCILE_INTERVAL
+        } else {
+            RECONCILE_FALLBACK_INTERVAL
+        };
         tokio::select! {
             _ = watch.changed(last_seen) => {}
-            _ = tokio::time::sleep(RECONCILE_FALLBACK_INTERVAL) => {}
+            _ = tokio::time::sleep(fallback) => {}
         }
         // Coalesce: take the freshest observed index regardless of which arm
         // woke the loop (the `changed()` future's own resolved value is not
@@ -12605,6 +12699,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
             .filter(|(_, m)| m.status == NodeStatus::Down)
             .map(|(id, _)| id.clone())
             .collect();
+        inplace_split_active = meta.tablets.values().any(|t| t.inplace_split.is_some());
         let view = MetadataView {
             tablets: meta.tablets,
             down,
@@ -13554,22 +13649,35 @@ const CP_CONFIRM_POLL_INIT: Duration = Duration::from_micros(200);
 const CP_CONFIRM_POLL_MAX: Duration = Duration::from_millis(5);
 
 impl ClientCtx {
-    /// Kick off a **copy-based split** of `tablet` at `split_key` (ADR 0050):
-    /// propose `MetaCommand::BeginSplit` — parent to `Splitting` (still fully
-    /// serving), two `Building` children minted at **placement-chosen final
-    /// homes** (fork F5, [`split_child_placement`]) — and confirm by
-    /// observing the parent's own state become `Splitting` (state-based,
-    /// replacing the old zero-copy epoch-advance confirm: a rebalance's
-    /// `CasTabletReplicas` also bumps the epoch, so an epoch advance alone
-    /// proves nothing about a split; observing the state does, and on a
-    /// stray epoch bump the loop re-arms its CAS instead of mis-reporting).
+    /// Kick off a split of `tablet` at `split_key` — either the **copy-based**
+    /// workflow (ADR 0050: propose `MetaCommand::BeginSplit` — parent to
+    /// `Splitting`, still fully serving, two `Building` children minted at
+    /// **placement-chosen final homes**, fork F5, [`split_child_placement`])
+    /// or the **in-place** workflow (ADR 0058 Train 2: propose
+    /// `MetaCommand::BeginSplitInPlace` — parent to `Splitting`, no tablet-map
+    /// rows minted, the intent recorded directly on the parent for the CP
+    /// data plane's own host reconciler to drive), selected by
+    /// [`ClientCtx::split_mode`] — the ONE branch point between the two;
+    /// everything else on this call (the idempotent already-`Splitting`
+    /// handling, the confirm loop, the child-id allocation, F11 token
+    /// alignment) is shared verbatim. Confirms by observing the parent's own
+    /// state become `Splitting` (state-based, replacing the old zero-copy
+    /// epoch-advance confirm: a rebalance's `CasTabletReplicas` also bumps
+    /// the epoch, so an epoch advance alone proves nothing about a split;
+    /// observing the state does, and on a stray epoch bump the loop re-arms
+    /// its CAS instead of mis-reporting).
     ///
     /// **Asynchronous by design**: success means *the split workflow
-    /// started* — the split driver (ADR 0050 stages 2–4, later rungs of
-    /// this train) seeds the children and performs the freeze/cutover; this
-    /// call never waits for that. Calling on a tablet already `Splitting`
-    /// returns success immediately ("already in flight" — the caller's
-    /// intent is accomplished-in-progress, and kickoff is idempotent).
+    /// started* — a copy-based split's own driver (ADR 0050 stages 2–4)
+    /// seeds the children and performs the freeze/cutover; an in-place
+    /// split's fork happens entirely inside the CP data plane's own Raft
+    /// apply (ADR 0058 Stage 3) and its cutover is driven by
+    /// `index_drain.rs`'s `inplace_split_driver_tick`. This call never waits
+    /// for either. Calling on a tablet already `Splitting` returns success
+    /// immediately ("already in flight" — the caller's intent is
+    /// accomplished-in-progress, and kickoff is idempotent) **regardless of
+    /// which workflow is running** — a stale-configured caller can never
+    /// re-trigger a split that already started under the other mode.
     ///
     /// Routed to the control leader (relayable, [`is_relayable_command`]), so
     /// this works from any node the client happens to be connected to.
@@ -13677,11 +13785,27 @@ impl ClientCtx {
                     Err(e) => return ClientResponse::Error(e),
                 };
                 let [left_replicas, right_replicas] = children_replicas;
-                let cmd = MetaCommand::BeginSplit {
-                    parent: tablet,
-                    expected_epoch: initial_epoch,
-                    split_key: aligned_key,
-                    children: [(left_id, left_replicas), (right_id, right_replicas)],
+                // ADR 0058 Train 2 rung 3 residue: `self.split_mode` is the
+                // ONE branch point between the two workflows — both
+                // commands share the identical `{parent, expected_epoch,
+                // split_key, children}` shape (`BeginSplitInPlace`'s own
+                // doc), the idempotent already-`Splitting` handling and the
+                // confirm loop above are unchanged either way, and neither
+                // `auto_split_loop` nor any other caller of `trigger_split`
+                // needs to know which one ran.
+                let cmd = match self.split_mode {
+                    SplitMode::Copy => MetaCommand::BeginSplit {
+                        parent: tablet,
+                        expected_epoch: initial_epoch,
+                        split_key: aligned_key,
+                        children: [(left_id, left_replicas), (right_id, right_replicas)],
+                    },
+                    SplitMode::InPlace => MetaCommand::BeginSplitInPlace {
+                        parent: tablet,
+                        expected_epoch: initial_epoch,
+                        split_key: aligned_key,
+                        children: [(left_id, left_replicas), (right_id, right_replicas)],
+                    },
                 };
                 let sent = self.propose_schema(&cmd).await;
                 next_propose_at = tokio::time::Instant::now()
@@ -14384,6 +14508,7 @@ pub async fn start_cluster_with(
         None,
         Duration::ZERO,
         None,
+        SplitMode::default(),
     )
     .await
 }
@@ -14411,6 +14536,7 @@ pub async fn start_cluster_auto_split(
         None,
         Duration::ZERO,
         None,
+        SplitMode::default(),
     )
     .await
 }
@@ -14438,6 +14564,7 @@ pub async fn start_cluster_with_auto_split(
         None,
         Duration::ZERO,
         None,
+        SplitMode::default(),
     )
     .await
 }
@@ -14468,6 +14595,7 @@ pub async fn start_cluster_with_auto_split_bytes(
         None,
         Duration::ZERO,
         None,
+        SplitMode::default(),
     )
     .await
 }
@@ -14499,6 +14627,7 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         None,
         Duration::ZERO,
         None,
+        SplitMode::default(),
     )
     .await
 }
@@ -14537,6 +14666,7 @@ pub async fn start_cluster_with_streams(
         None,
         Duration::ZERO,
         None,
+        SplitMode::default(),
     )
     .await
 }
@@ -14572,6 +14702,7 @@ pub async fn start_cluster_with_growth(
         auto_split_change_rate,
         Duration::ZERO,
         None,
+        SplitMode::default(),
     )
     .await
 }
@@ -14607,6 +14738,7 @@ pub async fn start_cluster_with_quiesce_after(
         None,
         quiesce_after,
         None,
+        SplitMode::default(),
     )
     .await
 }
@@ -14626,6 +14758,11 @@ pub async fn start_cluster_with_quiesce_after(
 /// other wrapper above) disables auth entirely, byte-identical to
 /// pre-ADR-0057 behavior.
 ///
+/// `split_mode` (ADR 0058 Train 2 rung 3) selects which split workflow the
+/// whole in-process cluster runs — `--cluster N`'s `--split-mode
+/// {copy,inplace}` CLI flag threads through here; `SplitMode::Copy` (every
+/// other wrapper above) is byte-for-byte the original ADR 0050 workflow.
+///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
 #[allow(clippy::too_many_arguments)]
@@ -14641,6 +14778,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     auto_split_change_rate: Option<u64>,
     quiesce_after: Duration,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    split_mode: SplitMode,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
@@ -14654,6 +14792,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
         auto_split_change_rate,
         quiesce_after,
         dynamo_auth,
+        split_mode,
     )
     .await
 }
@@ -14671,6 +14810,7 @@ async fn start_cluster_inner(
     auto_split_change_rate: Option<u64>,
     quiesce_after: Duration,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    split_mode: SplitMode,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -14740,6 +14880,7 @@ async fn start_cluster_inner(
                 // per-process `run_node_with_ttl_sweep_interval` instead.
                 ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
                 dynamo_auth.clone(),
+                split_mode,
             )
             .await?;
         nodes.push(node);
@@ -14950,6 +15091,12 @@ pub async fn start_split_cluster_with_growth(
                 admin_addrs.clone(),
                 backend,
                 orphan_sweep_after,
+                // `split_mode` does not thread through the split-deployment
+                // dev path yet — same documented gap this function already
+                // has for `quiesce_after` (`main.rs::run`'s own comment) and
+                // `--stream-seal-*`/`--segment-store` below: always the
+                // byte-for-byte original ADR 0050 workflow here.
+                SplitMode::default(),
             )
             .await?,
         );
@@ -14973,6 +15120,8 @@ pub async fn start_split_cluster_with_growth(
                 SegmentStoreConfig::default(),
                 auto_split_change_rate,
                 dynamo_auth.clone(),
+                // Same documented gap as the control-role loop above.
+                SplitMode::default(),
             )
             .await?,
         );
@@ -15103,6 +15252,46 @@ pub async fn run_node_with_streams_and_quiesce_after(
         stream_retention,
         quiesce_after,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        SplitMode::default(),
+    )
+    .await
+}
+
+/// Like [`run_node_with_streams_and_quiesce_after`], but also selects the
+/// **split workflow** (ADR 0058 Train 2 rung 3) instead of [`SplitMode::
+/// Copy`] — `--config FILE --node I`'s `--split-mode {copy,inplace}` CLI
+/// flag threads through here. The same layered-wrapper convention as
+/// [`run_node_with_streams_quiesce_and_ttl_sweep_interval`]'s own
+/// `ttl_sweep_interval` knob: every existing call site above keeps
+/// compiling and behaving identically at `SplitMode::Copy`.
+///
+/// # Errors
+/// As [`run_node_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_with_streams_quiesce_and_split_mode(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    quiesce_after: Duration,
+    split_mode: SplitMode,
+) -> std::io::Result<Node> {
+    run_node_with_streams_quiesce_and_ttl_sweep_interval(
+        config,
+        index,
+        dir,
+        backend,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        quiesce_after,
+        ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        split_mode,
     )
     .await
 }
@@ -15131,6 +15320,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     stream_retention: Duration,
     quiesce_after: Duration,
     ttl_sweep_interval: Duration,
+    split_mode: SplitMode,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -15183,6 +15373,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             quiesce_after,
             ttl_sweep_interval,
             dynamo_auth,
+            split_mode,
         )
         .await
 }
@@ -15215,6 +15406,7 @@ pub async fn run_node_with_ttl_sweep_interval(
         DEFAULT_STREAM_RETENTION,
         Duration::ZERO,
         ttl_sweep_interval,
+        SplitMode::default(),
     )
     .await
 }
@@ -15313,6 +15505,12 @@ pub async fn run_node_control_with_orphan_sweep_after(
             admin_addrs,
             backend,
             orphan_sweep_after,
+            // `animusd control`'s CLI surface has no `--split-mode` flag of
+            // its own (mirroring `--quiesce-after`'s identical scope gap
+            // for this same subcommand) — a control-only node's
+            // `trigger_split` calls always default to the byte-for-byte
+            // original ADR 0050 workflow.
+            SplitMode::default(),
         )
         .await
 }
@@ -15423,6 +15621,11 @@ pub async fn run_node_data(
             SegmentStoreConfig::default(),
             None,
             dynamo_auth,
+            // `animusd data --config`'s CLI surface has no `--split-mode`
+            // flag of its own (mirrors `run_node_control_with_orphan_sweep_
+            // after`'s identical scope gap) — always the byte-for-byte
+            // original ADR 0050 workflow.
+            SplitMode::default(),
         )
         .await
 }
@@ -15972,6 +16175,10 @@ async fn finish_data_join(
             SegmentStoreConfig::default(),
             None,
             dynamo_auth,
+            // `animusd data --seed` join has no `--split-mode` flag of its
+            // own (same documented gap as `run_node_data`) — always the
+            // byte-for-byte original ADR 0050 workflow.
+            SplitMode::default(),
         )
         .await
 }
