@@ -5,15 +5,16 @@
   "use strict";
 
   // ---- theme -------------------------------------------------------------
-  // Three explicit, persisted states: "light", "dark", "system". System
-  // (also the default when nothing is stored) removes data-theme entirely
-  // and lets prefers-color-scheme decide.
+  // Three explicit, persisted states: "light", "dark", "system". Light is
+  // the default when nothing is stored yet — system only takes over once a
+  // viewer chooses it, at which point data-theme is removed entirely and
+  // prefers-color-scheme decides.
   var STORE = "animusdb-theme";
   function stored() {
     try {
       var v = localStorage.getItem(STORE);
-      return (v === "light" || v === "dark") ? v : "system";
-    } catch (e) { return "system"; }
+      return (v === "light" || v === "dark" || v === "system") ? v : "light";
+    } catch (e) { return "light"; }
   }
   function apply(choice) {
     if (choice === "light" || choice === "dark") { document.documentElement.setAttribute("data-theme", choice); }
