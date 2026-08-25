@@ -1,6 +1,6 @@
 "use strict";
 // Shared state, fetch helpers, formatting utilities, theme, and tab routing
-// for the AnimusDB Console. `dashboard_overview.js`, `dashboard_placement.js`,
+// for animusd admin (ADR 0021's "AnimusDB Console"). `dashboard_overview.js`, `dashboard_placement.js`,
 // `dashboard_tablets.js`, `dashboard_streams.js`, `dashboard_browser.js`, and
 // `dashboard_storage.js` load after this file and call into it (STATE, $, esc, getJSON, postJSON,
 // pill, consoleLink, bytes, humanBytes, tokenBound, b64url, nodeIdOf, cpGroupsByTablet,
@@ -511,7 +511,7 @@ function render() {
 
 // ---- tab routing (ADR 0021 follow-up 7: real URLs, refresh/back/forward preserve the tab) ----
 // One flat set of views, presented as a sidebar (not a top nav row — the
-// AnimusDB Console design's shell). Each keeps its own id and `/admin/ui/<tab>`
+// animusd admin design's shell). Each keeps its own id and `/admin/ui/<tab>`
 // path (the server's `is_ui_path` just prefix-matches, and existing
 // bookmarks/tests target these exact leaves).
 //

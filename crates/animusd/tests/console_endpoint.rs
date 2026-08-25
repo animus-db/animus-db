@@ -1,4 +1,5 @@
-//! End-to-end test of the AnimusDB Data Console's listener (ADR 0052) over
+//! End-to-end test of animusd console's (ADR 0052's "AnimusDB Data Console")
+//! listener over
 //! real TCP (`ProdEnv`): the shell 200s as `text/html` and names itself, both
 //! static assets (CSS + the PR2 tables-list JS) 200 with the right content
 //! type, a `/console/ui/*` deep link returns the identical shell (the

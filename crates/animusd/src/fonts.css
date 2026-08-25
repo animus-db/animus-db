@@ -2,7 +2,7 @@
  *
  * The two OFL variable faces the design system uses (Latin
  * subset, one file per family across the whole weight range), carried as
- * base64 data: URIs because the dashboard and data console serve their assets
+ * base64 data: URIs because animusd admin and animusd console serve their assets
  * from `include_str!`-embedded strings and the HTTP layer's static-asset
  * responses are `String`, not bytes. Inlining keeps ADR 0021's rule intact —
  * nothing is fetched from a CDN — without refactoring that layer to serve
