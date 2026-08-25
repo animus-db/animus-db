@@ -66,6 +66,13 @@ fn b() -> NodeId {
 fn node_c() -> NodeId {
     nid(302)
 }
+/// ADR 0058 Train 1 reconciler-adoption scenarios' spare/replacement nodes.
+fn node_d() -> NodeId {
+    nid(303)
+}
+fn node_e() -> NodeId {
+    nid(304)
+}
 
 const SCENARIO_BUDGET: Duration = Duration::from_secs(150);
 const SCENARIO_STEP: Duration = Duration::from_secs(1);
@@ -630,6 +637,19 @@ fn scenario_cells() -> Vec<Scenario> {
         scenario!(
             "quiesced_group_wakes_when_a_replica_goes_down",
             scenario_quiesced_group_wakes_when_a_replica_goes_down
+        ),
+        // --- ADR 0058 Train 1 (reconciler adoption): learner-phase replica moves ---
+        scenario!(
+            "learner_move_survives_partition_during_catchup",
+            scenario_learner_move_survives_partition_during_catchup
+        ),
+        scenario!(
+            "learner_move_survives_leader_change_mid_move",
+            scenario_learner_move_survives_leader_change_mid_move
+        ),
+        scenario!(
+            "learner_crash_is_replaced_by_a_new_target",
+            scenario_learner_crash_is_replaced_by_a_new_target
         ),
     ]
 }
@@ -1667,6 +1687,338 @@ fn scenario_quiesced_group_wakes_when_a_replica_goes_down(seed: u64) {
 // the lifecycle e2es (`animusd/tests/split_lifecycle.rs`,
 // `split_build.rs`, `freeze.rs`'s corpus cells) and this corpus's own
 // crash/release/reclaim scenarios, which run against per-tablet engines.
+
+// ---------------------------------------------------------------------------
+// ADR 0058 Train 1's reconciler adoption: a replica move now goes through the
+// host reconciler's `HostAction::Reconfigure` exactly as before (no new
+// action, no new workflow — ADR 0031 discipline preserved), but the LEADER's
+// own `reconfigure_step` sequences it as add-learner -> promote -> remove-old
+// instead of a direct voter add. These three scenarios drive that sequencing
+// through the real `Reconciler`/`MetadataView` path (not a hand-driven
+// `reconfigure_step` call — see `tests/learner_reconfigure.rs` for the
+// unit-level complement) under three fault axes.
+// ---------------------------------------------------------------------------
+
+fn scenario_learner_move_survives_partition_during_catchup(seed: u64) {
+    run(seed, |sim| async move {
+        let sim2 = sim.clone();
+        let env = sim.env(a());
+        let mut c = Cluster::new(sim);
+        c.add_node(a());
+        c.add_node(b());
+        c.add_node(node_c());
+        c.add_node(node_d());
+
+        let v1 = view([tablet(1, b"", None, vec![a(), b(), node_c()])]);
+        c.tick_all(&[a(), b(), node_c()], &v1).await;
+        env.sleep(Duration::from_secs(2)).await;
+
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
+        let hc = c.node(node_c()).hosted_node(TabletId(1)).unwrap().clone();
+        let leader0 = if ha.is_leader() {
+            &ha
+        } else if hb.is_leader() {
+            &hb
+        } else {
+            &hc
+        };
+        leader0.put(b"k0".to_vec(), b"v0".to_vec());
+        env.sleep(Duration::from_secs(1)).await;
+
+        // Grow the replica set to include node_d() — a spare join at a bumped
+        // epoch, exactly `scenario_spare_join_promoted`'s shape.
+        let v2 = view([tablet_at_epoch(
+            1,
+            b"",
+            None,
+            vec![a(), b(), node_c(), node_d()],
+            2,
+        )]);
+        c.tick(node_d(), &v2).await; // node_d() joins as a quiet non-voter
+
+        // Partition node_d() away from the whole group BEFORE it ever gets a
+        // single `AppendEntries` — with `SimEnv`'s near-zero message latency
+        // a learner otherwise catches up (and gets promoted) within one or
+        // two ticks even on a genuinely empty log, so the only deterministic
+        // way to catch it "still mid-catch-up" is to cut it off before the
+        // very first reconfigure tick that adds it ever runs.
+        for other in [a(), b(), node_c()] {
+            sim2.partition_pair(node_d(), other);
+        }
+
+        // The one tick that adds node_d() as a learner (current voters =
+        // {a,b,c}, current learners = {}, desired = {a,b,c,d} ⇒ step 4 fires
+        // exactly once, deterministically).
+        c.tick_all(&[a(), b(), node_c()], &v2).await;
+        let hd = c.node(node_d()).hosted_node(TabletId(1)).unwrap().clone();
+
+        let leader = if ha.is_leader() {
+            &ha
+        } else if hb.is_leader() {
+            &hb
+        } else {
+            &hc
+        };
+        assert!(
+            leader.learners().contains(&node_d()),
+            "the leader must have added node_d() as a learner before it ever caught up"
+        );
+        assert_eq!(
+            leader.config(),
+            [a(), b(), node_c()].into_iter().collect::<BTreeSet<_>>(),
+            "the OLD 3-voter quorum must be untouched while node_d() is still a learner"
+        );
+
+        // The OLD quorum keeps serving while node_d() is stuck — and these
+        // writes also grow the log well past the promotion threshold, so a
+        // still-partitioned (zero `match_index`) learner cannot spuriously
+        // read as "caught up" merely because the log itself happens to be
+        // short (`learner_caught_up`'s gap test is absolute, not a fraction
+        // of the log — a log shorter than the threshold would trivially
+        // "catch up" any learner regardless of real replication).
+        for i in 0..20u64 {
+            let pr = leader.put(format!("k{i}").into_bytes(), format!("v{i}").into_bytes());
+            assert!(
+                matches!(pr, ProposeResult::Accepted { .. }),
+                "the old quorum must keep committing while the newcomer is partitioned: {pr:?}"
+            );
+        }
+        env.sleep(Duration::from_secs(1)).await;
+
+        for _ in 0..10 {
+            c.tick_all(&[a(), b(), node_c()], &v2).await;
+            env.sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            leader.config().len(),
+            3,
+            "a partitioned, uncaught-up learner must never be promoted into the voter set"
+        );
+        assert!(
+            !hd.config().contains(&node_d()),
+            "node_d() must still not be a voter while partitioned"
+        );
+
+        // Heal — node_d() catches up and is promoted.
+        for other in [a(), b(), node_c()] {
+            sim2.heal(node_d(), other);
+        }
+        let mut converged = false;
+        for _ in 0..200 {
+            c.tick_all(&[a(), b(), node_c()], &v2).await;
+            env.sleep(Duration::from_millis(100)).await;
+            if hd.config().contains(&node_d()) && leader.learners().is_empty() {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "node_d() was never promoted after healing (leader config: {:?}, learners: {:?})",
+            leader.config(),
+            leader.learners()
+        );
+        assert_hosted_converged(&c, node_d(), [TabletId(1)]);
+        assert_present(&c.storage(node_d(), TabletId(1)), &physical(b"k0"), b"v0").await;
+        assert_present(&c.storage(node_d(), TabletId(1)), &physical(b"k19"), b"v19").await;
+    });
+}
+
+fn scenario_learner_move_survives_leader_change_mid_move(seed: u64) {
+    run(seed, |sim| async move {
+        let env = sim.env(a());
+        let mut c = Cluster::new(sim);
+        c.add_node(a());
+        c.add_node(b());
+        c.add_node(node_c());
+        c.add_node(node_d());
+
+        let v1 = view([tablet(1, b"", None, vec![a(), b(), node_c()])]);
+        c.tick_all(&[a(), b(), node_c()], &v1).await;
+        env.sleep(Duration::from_secs(2)).await;
+
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
+        let hc = c.node(node_c()).hosted_node(TabletId(1)).unwrap().clone();
+
+        // Force node_c() to lead — the leader this scenario kills mid-move is
+        // also, deliberately, the replica the move is retiring (the shape a
+        // real rebalance-off-a-hot-leader move produces, ADR 0029 §1).
+        // Retried: a transient `NotLeader` racing a concurrent election is a
+        // benign timing blip, not a reason to fail.
+        let became_leader = wait_until(&env, 100, Duration::from_millis(100), || {
+            if hc.is_leader() {
+                return true;
+            }
+            if ha.is_leader() {
+                ha.transfer_leadership(node_c());
+            } else if hb.is_leader() {
+                hb.transfer_leadership(node_c());
+            }
+            false
+        })
+        .await;
+        assert!(became_leader, "node_c() never became leader");
+        env.sleep(Duration::from_millis(300)).await; // let any armed-transfer freeze clear
+
+        hc.put(b"k0".to_vec(), b"v0".to_vec());
+        env.sleep(Duration::from_secs(1)).await;
+
+        // Retire node_c(), replace it with node_d(). A single reconfigure
+        // tick deterministically leaves it in the "just added as a learner,
+        // not yet promoted" state (`SimEnv`'s near-zero message latency means
+        // a *second* tick could already promote it — see the sibling
+        // partition scenario's own note on this), which is the state this
+        // scenario means to kill the leader in.
+        let v2 = view([tablet_at_epoch(1, b"", None, vec![a(), b(), node_d()], 2)]);
+        c.tick(node_d(), &v2).await;
+        c.tick_all(&[a(), b(), node_c()], &v2).await;
+        assert!(
+            hc.learners().contains(&node_d()),
+            "the (soon-to-die) leader must have added node_d() as a learner before dying"
+        );
+        let hd = c.node(node_d()).hosted_node(TabletId(1)).unwrap().clone();
+
+        // The leader dies mid-move, before node_d() ever catches up. Whether
+        // or not the add-learner entry itself survived the leadership change,
+        // the new leader must converge: either it inherited the learner and
+        // just promotes it, or it re-derives "node_d() is still missing" and
+        // re-adds it — either way, never straight to a voter.
+        c.sim.stop(node_c());
+        let down_view =
+            view_with_down([tablet(1, b"", None, vec![a(), b(), node_d()])], [node_c()]);
+
+        let mut converged = false;
+        for _ in 0..250 {
+            c.tick_all(&[a(), b(), node_d()], &down_view).await;
+            env.sleep(Duration::from_millis(100)).await;
+            let leader = if ha.is_leader() {
+                Some(&ha)
+            } else if hb.is_leader() {
+                Some(&hb)
+            } else {
+                None
+            };
+            if let Some(l) = leader
+                && l.config() == [a(), b(), node_d()].into_iter().collect::<BTreeSet<_>>()
+                && l.learners().is_empty()
+            {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "the move never converged after the leader died mid-move (a: {:?}, b: {:?})",
+            ha.config(),
+            hb.config()
+        );
+        assert!(
+            hd.config().contains(&node_d()),
+            "node_d() must have been promoted to a voter on the new leader"
+        );
+        assert_hosted_converged(&c, node_d(), [TabletId(1)]);
+        assert_present(&c.storage(node_d(), TabletId(1)), &physical(b"k0"), b"v0").await;
+    });
+}
+
+fn scenario_learner_crash_is_replaced_by_a_new_target(seed: u64) {
+    run(seed, |sim| async move {
+        let env = sim.env(a());
+        let mut c = Cluster::new(sim);
+        c.add_node(a());
+        c.add_node(b());
+        c.add_node(node_c());
+        c.add_node(node_d());
+        c.add_node(node_e());
+
+        let v1 = view([tablet(1, b"", None, vec![a(), b(), node_c()])]);
+        c.tick_all(&[a(), b(), node_c()], &v1).await;
+        env.sleep(Duration::from_secs(2)).await;
+
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
+        let hc = c.node(node_c()).hosted_node(TabletId(1)).unwrap().clone();
+        let leader0 = if ha.is_leader() {
+            &ha
+        } else if hb.is_leader() {
+            &hb
+        } else {
+            &hc
+        };
+        leader0.put(b"k0".to_vec(), b"v0".to_vec());
+        env.sleep(Duration::from_secs(1)).await;
+
+        // node_d() joins as the intended replacement for node_c(), but never
+        // gets the chance to catch up. A single reconfigure tick
+        // deterministically leaves it in the "just added as a learner" state
+        // (see the sibling partition scenario's note on why more than one
+        // tick risks `SimEnv`'s near-zero latency already promoting it).
+        let v2 = view([tablet_at_epoch(1, b"", None, vec![a(), b(), node_d()], 2)]);
+        c.tick(node_d(), &v2).await;
+        c.tick_all(&[a(), b(), node_c()], &v2).await;
+        let leader = if ha.is_leader() {
+            &ha
+        } else if hb.is_leader() {
+            &hb
+        } else {
+            &hc
+        };
+        assert!(
+            leader.learners().contains(&node_d()),
+            "node_d() must have been added as a learner"
+        );
+
+        // node_d() dies for good (a real decommission/crash — never
+        // restarted) before it ever catches up.
+        c.sim.stop(node_d());
+
+        // Placement notices and retargets to node_e() instead.
+        let v3 = view([tablet_at_epoch(1, b"", None, vec![a(), b(), node_e()], 3)]);
+        c.tick(node_e(), &v3).await;
+        let he = c.node(node_e()).hosted_node(TabletId(1)).unwrap().clone();
+
+        // Tick EVERY surviving node each round — once node_e() catches up and
+        // is promoted it is a real voter and can itself be elected leader
+        // (this move, unlike the other two scenarios, never forces a specific
+        // node to hold leadership), so its own reconciler must be driven too
+        // for the final "remove node_c()" step to ever get proposed.
+        let mut converged = false;
+        for _ in 0..300 {
+            c.tick_all(&[a(), b(), node_c(), node_e()], &v3).await;
+            env.sleep(Duration::from_millis(100)).await;
+            let leader = if ha.is_leader() {
+                Some(&ha)
+            } else if hb.is_leader() {
+                Some(&hb)
+            } else if hc.is_leader() {
+                Some(&hc)
+            } else if he.is_leader() {
+                Some(&he)
+            } else {
+                None
+            };
+            if let Some(l) = leader
+                && l.config() == [a(), b(), node_e()].into_iter().collect::<BTreeSet<_>>()
+                && l.learners().is_empty()
+            {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "the move onto the replacement (node_e()) never converged after the stale \
+             learner (node_d()) died (a: {:?}, b: {:?}, c: {:?})",
+            ha.config(),
+            hb.config(),
+            hc.config()
+        );
+        assert_hosted_converged(&c, node_e(), [TabletId(1)]);
+        assert_present(&c.storage(node_e(), TabletId(1)), &physical(b"k0"), b"v0").await;
+    });
+}
 
 // ---------------------------------------------------------------------------
 // The tests.

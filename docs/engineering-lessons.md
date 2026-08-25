@@ -3256,6 +3256,49 @@ debugging anything that feels like it might have happened before.
   which includes the new node's id in its own bootstrap set and gets away
   with it) is not proof the risky pattern is safe in general, only that its
   own assertions never exercised the window where it would matter.
+- **A threshold-based "caught up" predicate measured as an absolute gap
+  (`last_index - match_index <= threshold`) cannot distinguish "genuinely
+  replicated" from "the log itself is short"** — found writing ADR 0058
+  Train 1's reconciler-adoption corpus
+  (`animus-cp-data/tests/reconciler_corpus.rs`,
+  `tests/learner_reconfigure.rs`). A test meaning to catch a newly-added
+  learner "still mid-catch-up" (e.g. to prove it survives a partition, or
+  that the old quorum keeps committing without it) partitioned the learner
+  immediately, then ticked the reconciler several times before asserting —
+  and the assertion failed, because on a log only a few entries long, a
+  learner with `match_index = 0` still satisfies `last_index - 0 <=
+  RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD` (4) and gets promoted anyway,
+  despite having received exactly zero `AppendEntries`. This is not a bug
+  in `learner_caught_up` (the primitive is documented and used as designed
+  — a fixed absolute threshold, not a fraction of the log) — it is a
+  property of the design that every test exercising "still catching up"
+  must account for: either grow the log well past the threshold *before*
+  the fault (so a genuinely-unreplicated learner's gap stays provably
+  large regardless of how short the log started), or assert immediately
+  after the single tick that performs the add (a promotion cannot happen
+  in the same call that proposes the add, so the state right after is
+  unambiguous regardless of log length). **General rule**: when a
+  liveness/catch-up gate is an absolute distance rather than a ratio,
+  don't assume "hasn't replicated anything" and "gap is small" are the
+  same condition in a test fixture — they coincide only once the log is
+  long enough, and a fixture's own small scale can silently violate that
+  precondition.
+- **When a reconciler-driven test scenario lets a promoted learner become
+  eligible for LEADERSHIP, the test's own tick/poll loop must include that
+  node, not just the original voters** — the same corpus above
+  (`learner_crash_is_replaced_by_a_new_target`) hung for the entire poll
+  budget on one seed in ~14% of variants: the newly-promoted replica won
+  the next election (perfectly legitimate — it is a real voter the moment
+  it is promoted), but the test's convergence loop only ticked the
+  *original* three nodes' reconcilers, so the one node that could actually
+  see itself leading and propose the final "remove the old replica" step
+  was never given a chance to. The group was correctly converged in every
+  way that mattered (right voters, right learners, keeps serving) —only
+  the test's own harness was blind to who was driving. **General rule**:
+  a test that lets membership grow past its initial cast of leader
+  candidates must poll/tick every member that could plausibly hold
+  leadership by the time the property under test is checked, not just the
+  set that started the scenario.
 
 ### Code patterns
 - **A convergent bookkeeping write must be routable to its own owner: derive

@@ -946,6 +946,7 @@ impl CpGroup {
                     snapshot_index: $n.snapshot_index(),
                     log_len: $n.log_len(),
                     voters: $n.config().into_iter().collect(),
+                    learners: $n.learners().into_iter().collect(),
                     key_count,
                     byte_size,
                     quiesced: $n.is_quiesced(),

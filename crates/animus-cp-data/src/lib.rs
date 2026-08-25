@@ -979,6 +979,17 @@ pub const RECOVERY_GRACE: Duration = Duration::from_secs(5);
 /// entries have been applied past the current snapshot base, bounding the WAL.
 const COMPACT_THRESHOLD: u64 = 64;
 
+/// [`RaftKvNode::reconfigure_step`]'s promotion-readiness threshold (ADR 0058
+/// Train 1's reconciler adoption): a learner within this many log entries of
+/// the leader's own `last_log_index()` (see
+/// [`RaftKvNode::learner_caught_up`]) is judged safe to promote — closing the
+/// remaining gap costs one more `AppendEntries` round, not a meaningfully
+/// long unsafe window. Same order of magnitude as the fixed thresholds the
+/// Train 1 test corpora already use (`animus-control/tests/learner_corpus.rs`,
+/// this crate's `tests/learner_membership.rs`) — not derived from either, since
+/// this one gates a *production* decision rather than a test assertion.
+const RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD: u64 = 4;
+
 /// Leader-side ReadIndex state: per in-flight read `epoch`, the term it was issued
 /// under and the set of peers (including self) that have confirmed leadership.
 #[derive(Default)]
@@ -3130,24 +3141,58 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// delta, with no in-flight change and no leader self-removal, so this picks
     /// one add/remove that makes progress and lets the next tick take the
     /// following step — a multi-server move converges one server per call.
-    /// Returns the proposed config if a step was **accepted**; `None` if already
-    /// converged, not the leader, a change is in flight, or a step was armed
-    /// but not itself a config change (the leadership-transfer case below).
+    /// Returns the proposed **voter** config if a step changed it; `None` if
+    /// already converged, not the leader, a change is in flight, or a step was
+    /// taken that doesn't itself change the voter set (a learner add/remove,
+    /// or the leadership-transfer case below).
+    ///
+    /// **ADR 0058 Train 1's reconciler adoption**: adding a replica no longer
+    /// puts it straight into the voter set. Every path that would have added a
+    /// voter directly now goes through a **learner phase** first — add as a
+    /// non-voting learner, wait for it to catch up
+    /// ([`learner_caught_up`](Self::learner_caught_up),
+    /// [`RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD`]), promote — so the old
+    /// quorum's own margin is never diluted by a newcomer that hasn't proven
+    /// it can actually ack anything yet (the hazard the learner class exists
+    /// to close; see ADR 0058's Train 1 section). A remove-only delta (no
+    /// missing member) is unaffected — the old failure-repair/healthy-move
+    /// priority order applies unchanged, straight on the voter set.
     ///
     /// Priority order, most urgent first:
     /// 1. **Remove an extra `Down` voter** (never self) — restores quorum margin
     ///    immediately; this is failure repair, and the removed node isn't going
-    ///    to ack anything anyway, so there is nothing to wait for.
-    /// 2. **Add a missing voter.** A transient `desired.len() + 1`-voter config
-    ///    is strictly safer than dropping a healthy voter first: quorum keeps
-    ///    its pre-move margin while the newcomer catches up via log/
-    ///    `InstallSnapshot`, instead of briefly running at reduced margin.
-    /// 3. **Remove an extra *healthy* voter** (never self) — but only once every
+    ///    to ack anything anyway, so there is nothing to wait for. Never touches
+    ///    a learner — a down voter is the only thing this urgent.
+    /// 2. **Drop a learner no longer wanted.** `desired` can change out from
+    ///    under a learner still mid-catch-up (its node crashed or was
+    ///    decommissioned, or a rebalance simply picked someone else) — any
+    ///    current learner absent from `desired` is stale by construction (a
+    ///    learner in `desired` would still be "missing" from the voter set, so
+    ///    `current == desired` together with a non-empty learner set can only
+    ///    mean every remaining learner is stale) and is removed directly,
+    ///    regardless of its liveness or catch-up progress. Without this, a
+    ///    replaced learner would wedge every later step forever.
+    /// 3. **Promote a learner that is both still desired and caught up** —
+    ///    advances an in-flight move before starting a new one.
+    /// 4. **Add a `desired` member that is neither a voter nor a learner, as a
+    ///    LEARNER** — never straight to voter. The old voter quorum keeps its
+    ///    pre-move margin (and majority size) untouched while the newcomer
+    ///    catches up via ordinary log replication/`InstallSnapshot`, instead of
+    ///    briefly counting an uncaught-up node toward quorum.
+    ///
+    ///    While any `desired` member is still a learner mid-catch-up (steps 2/3
+    ///    didn't apply this tick), no later step fires — in particular a
+    ///    healthy extra voter (step 5) is never removed while a replacement is
+    ///    still proving it can keep up.
+    /// 5. **Remove an extra *healthy* voter** (never self) — but only once every
     ///    member of `desired` has caught up to this leader's `commit_index`.
     ///    Skipping this gate would let a healthy move (e.g. a rebalance) drop
     ///    quorum to a still-catching-up newcomer, an availability regression
     ///    relative to just leaving the extra replica in place a little longer.
-    /// 4. **The only remaining delta is removing the leader's own replica** —
+    ///    By the time this step can fire, every `desired` member is already a
+    ///    voter (steps 2–4 handle the learner phase first), so this is exactly
+    ///    the pre-Train-1 step 3, unchanged.
+    /// 6. **The only remaining delta is removing the leader's own replica** —
     ///    `change_membership` always rejects that, so instead transfer
     ///    leadership (see [`transfer_leadership`](Self::transfer_leadership)) to
     ///    the lowest-id caught-up member of `desired`. The new leader's own next
@@ -3158,11 +3203,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         down: &BTreeSet<NodeId>,
     ) -> Option<BTreeSet<NodeId>> {
         let current = self.config();
-        if current == *desired || !self.is_leader() {
+        let current_learners = self.learners();
+        if !self.is_leader() {
+            return None;
+        }
+        // Converged: the voter set already matches `desired` AND no learner is
+        // left dangling. Must NOT return early on `current == desired` alone —
+        // a stray learner at that point is stale by construction (see step 2's
+        // doc above) and step 2 needs the chance to clean it up.
+        if current == *desired && current_learners.is_empty() {
             return None;
         }
         let me = self.env.node_id();
-        // Any extra (non-self) voter, regardless of liveness — used by step 3
+        // Any extra (non-self) voter, regardless of liveness — used by step 5
         // (a *healthy* extra). Step 1 below searches independently for a *down*
         // extra: `extra().filter(down.contains)` would only ever look at the
         // lowest-id extra (bug fixed under ADR 0029's follow-up — see the root
@@ -3181,11 +3234,63 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             c.remove(&target);
             return self.propose_config(c);
         }
-        if let Some(missing) = desired.difference(&current).next() {
-            let mut c = current.clone();
-            c.insert(missing.clone());
-            return self.propose_config(c);
+
+        // Step 2: drop a stale learner (ADR 0058 Train 1's stuck-learner
+        // cleanup — see the doc above).
+        if let Some(stale) = current_learners.iter().find(|n| !desired.contains(*n)) {
+            if !matches!(
+                self.remove_learner(stale.clone()),
+                ProposeResult::Accepted { .. }
+            ) {
+                tracing::debug!(
+                    node = %stale,
+                    "reconfigure_step: rejected removing a stale learner (retried next tick)"
+                );
+            }
+            return None;
         }
+
+        // Step 3: promote a learner that is both still desired and caught up.
+        if let Some(id) = current_learners.iter().find(|n| {
+            desired.contains(*n)
+                && self.learner_caught_up(n, RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD)
+        }) {
+            let mut c = current.clone();
+            c.insert(id.clone());
+            return match self.promote_learner(id.clone()) {
+                ProposeResult::Accepted { .. } => Some(c),
+                ProposeResult::NotLeader { .. } => None,
+            };
+        }
+
+        // A `desired` member is still mid-catch-up as a learner: nothing else
+        // to do this tick — in particular, never fall through to step 5 and
+        // remove a healthy extra voter while a replacement hasn't yet proven
+        // it can keep up (the whole point of the learner phase).
+        if desired.iter().any(|n| current_learners.contains(n)) {
+            return None;
+        }
+
+        // Step 4: a `desired` member genuinely missing from both the voter set
+        // and the learner set — add it as a LEARNER, never straight to voter.
+        if let Some(missing) = desired
+            .iter()
+            .find(|n| !current.contains(*n) && !current_learners.contains(*n))
+        {
+            if !matches!(
+                self.add_learner(missing.clone()),
+                ProposeResult::Accepted { .. }
+            ) {
+                tracing::debug!(
+                    node = %missing,
+                    "reconfigure_step: rejected adding a learner (retried next tick)"
+                );
+            }
+            return None;
+        }
+
+        // From here on every `desired` member is already a voter — the
+        // remaining deltas are exactly the pre-Train-1 steps 3/4.
         if let Some(healthy_extra) = extra() {
             let commit = self.commit_index();
             let caught_up = desired

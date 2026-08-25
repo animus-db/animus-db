@@ -266,6 +266,73 @@ corpus checks `change_membership` safety (`animus-control`'s core-level
 test plus the `animus-cp-data`-level integration one, per the "Stage C"
 audit note lesson that a primitive should be exercised at both layers).
 
+**As-built (2026-08-25) — the reconciler adoption rung landed.** The
+`RaftCore` primitive (`add_learner`/`promote_learner`/`remove_learner`/
+`learner_caught_up`, PR #383) shipped with no reconciler-layer consumer —
+`RaftKvNode::reconfigure_step` still added a missing replica straight to the
+voter set. This rung closes that gap: `reconfigure_step` now sequences a
+replica **add** as add-learner → (poll `learner_caught_up` against a fixed
+`RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD` of 4 log entries) → promote →
+remove-the-old-replica, one single-server step per call exactly as before
+(ADR 0031 discipline unchanged — no new `HostAction`, no new workflow; only
+what `reconfigure_step` proposes on each call changed). A remove-only delta
+and a brand-new group's initial bootstrap are both untouched, per this
+train's own scope note above. Concretely, `reconfigure_step`'s priority
+order gained two steps ahead of the pre-existing add/remove ladder:
+
+- **A learner no longer present in `desired` is dropped immediately**,
+  regardless of catch-up progress or liveness — the fix for "a learner
+  mid-catch-up that dies or is decommissioned must not wedge every later
+  step" (placement retargeting `desired` away from a dead newcomer is what
+  actually resolves the stuck state; the reconciler's only job is to not
+  block on a target that's no longer wanted).
+- **A caught-up learner still in `desired` is promoted** before any new
+  add is considered, so an in-flight move finishes before a new one starts.
+
+**Scope correction against the mechanism list above**: this rung is the
+**CP data plane only** (`animus-cp-data::RaftKvNode::reconfigure_step`,
+driven by `host::Reconciler`). The control plane's own runtime membership
+change (ADR 0037, `admin_add_control_member`/`RaftNode::change_membership`)
+has no automatic per-tick reconfigure loop to adopt this into — it is an
+operator-invoked single command, not a reconciler decision — so it still
+adds a control voter directly, unchanged by this rung. The bullet above
+("applies to both planes... since both instantiate the same `RaftCore`")
+was describing the *primitive*'s availability, which is genuinely
+plane-agnostic (Train 1 shipped `add_learner`/`promote_learner`/
+`remove_learner` on the shared `RaftCore`, usable by either plane); the
+*reconciler-adoption sequencing* this note documents is data-plane-only, and
+giving the control plane's own admin surface the same learner-phased
+sequencing (if ever wanted) is unstarted follow-up, not part of this rung.
+
+No `Metadata`/tablet-map representation change was needed: `Tablet::replicas`
+stays the *target* voter set placement wants, exactly as before — the
+learner bookkeeping already lives entirely in each tablet's own `RaftCore`
+state (replicated via the group's own log to every replica, voter and
+learner alike, since PR #383), which is exactly the state
+`reconfigure_step` already had local access to. Placement decides *where*;
+the reconciler decides *how to get there*, unchanged.
+
+Structural regression closed: adding a replica used to grow the voter set
+immediately (a `desired.len()+1`-voter transient), so losing one ORIGINAL
+voter while the newcomer was still uncaught-up could leave the group short
+of the *enlarged* majority even though the *original* quorum was intact.
+With the learner phase the voter set never grows until the newcomer has
+already proven it can keep up, so the original quorum's own majority is
+never diluted by a replica that hasn't earned a vote yet — proven directly
+in `animus-cp-data/tests/learner_reconfigure.rs`'s
+`old_quorum_survives_an_old_voter_loss_while_the_new_replica_is_still_a_learner`.
+Fault-injected reconciler-driven coverage (partition during catch-up, a
+leader change mid-move, a learner's node crashing and being replaced by a
+retargeted `desired`) lives in `animus-cp-data/tests/
+reconciler_corpus.rs`'s `learner_move_survives_partition_during_catchup`/
+`learner_move_survives_leader_change_mid_move`/
+`learner_crash_is_replaced_by_a_new_target` scenarios; a real multi-process
+`ProdEnv` exercise (observing the spare pass through an admin-visible
+`learners` set before ever appearing in `voters`, and confirming writes
+never stop landing during the move) lives in `animusd/tests/
+learner_reconfigure.rs`. `admin::CpRaftView` gained a `learners` field
+(`/admin/raftkv`) purely for this observability — read-only, drives nothing.
+
 ### Train 2: in-place split, replacing ADR 0050's build/freeze/cutover workflow
 
 **Stage 1 — `BeginSplit` unchanged in shape, changed in effect.** The
