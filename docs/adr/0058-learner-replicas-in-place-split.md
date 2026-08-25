@@ -1,7 +1,15 @@
 # ADR 0058 — Learner replicas and in-place tablet split
 
-- **Status:** Proposed — a design for maintainer review, not scheduled.
-- **Date:** 2026-08-24
+- **Status:** Accepted — implemented (Trains 1–2, rungs 1–3, all as-built
+  notes below; accepted by the maintainer merging the implementation stack
+  on 2026-08-25: interim GSI-drain acceleration, learner class + reconciler
+  adoption, SSTable clone, in-place split core, and the `--split-mode`
+  driver layer). The in-place path ships behind `--split-mode inplace` with
+  the ADR 0050 copy-based workflow still the default; **rung 4** (flip the
+  default and delete the copy-based workflow) remains pending on
+  trust-building (bench + corpus soak) and is this ADR's only unimplemented
+  piece.
+- **Date:** 2026-08-24 (accepted 2026-08-25)
 - **Proposes superseding:** [ADR 0050](0050-per-tablet-storage-copy-based-splits.md)'s
   **Decision 2** (the `BeginSplit`/build/freeze/`CutoverSplit`/retire
   workflow) **only**. ADR 0050's **Decision 1** (per-tablet private engines)
@@ -29,9 +37,9 @@
   (per-tablet private engines — the addressing change that reopens the
   in-place fork), [ADR 0049](0049-universal-kind-write-path.md) (the
   copy-kinds classification this design reuses unchanged).
-- **Decision record:** none yet — this ADR exists to be reviewed, forked,
-  and either accepted, amended, or rejected by Guillaume, the same way ADR
-  0050 itself went through fork review before Decision 1/2 were settled.
+- **Decision record:** accepted by Guillaume on 2026-08-25 by merging the
+  implementation stack; the G1/G4 fork resolutions recorded in the as-built
+  notes below were made during implementation and stand as decided.
 
 ## Context
 
