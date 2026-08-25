@@ -16,8 +16,12 @@ function of one seed. This is the substrate every distributed test runs on.
 - Faults: `partition`/`partition_pair`/`heal`, `crash`/`restart`, `stop`
   (process exit), `set_net_config(NetConfig)` (delay/jitter/drop),
   `set_disk_config(DiskConfig)` / `set_disk_config_for(node, ..)` (disk faults:
-  per-op injected `io::Error`s on `append`/`sync`/`read`/`read_at`/`replace`,
-  torn un-synced tails on crash, byte corruption of the torn region, and
+  per-op injected `io::Error`s on `append`/`sync`/`read`/`read_at`/`replace`/
+  `link` (ADR 0058 rung 2 — modelled as a snapshot copy into an independent
+  map slot, no inode/directory concept, since that's indistinguishable from
+  a real hard link for the trait's sanctioned use: sharing an already-fully-
+  synced, never-mutated-in-place file), torn un-synced tails on crash, byte
+  corruption of the torn region, and
   `DiskConfig::set_sync_delay` — a fixed extra virtual-time latency on every
   `append`/`sync`, issue #279's slow-disk livelock repro; unlike the other
   knobs it draws no RNG, so it's a plain fixed cost, not a seed-sampled
@@ -150,9 +154,16 @@ function of one seed. This is the substrate every distributed test runs on.
 `cargo test -p animus-sim` — `tests/determinism.rs` asserts byte-identical
 traces across runs, reproducible partitions, and the crash/disk model;
 `tests/disk_faults.rs` asserts the opt-in disk fault model is default-off
-byte-identical and seed-reproducible when enabled. The storage-facing fault
+byte-identical and seed-reproducible when enabled, including `link`
+(ADR 0058 rung 2): its own basic hard-link-semantics test (`dst` reads
+`src`'s bytes, survives a `remove` of `src`, an already-linked `dst` is
+safely overwritten on relink, a missing `src` is a clean `NotFound`) and a
+reproducibility test proving it participates in the same seeded
+error-injection schedule as every other disk op. The storage-facing fault
 corpus (LSM torn-tail recovery, injected-error write paths, CRC on corrupted
-blocks) lives in `animus-storage/tests/lsm_disk_faults.rs`. `tests/clock_skew.rs`
+blocks) lives in `animus-storage/tests/lsm_disk_faults.rs`; the SSTable-clone
+crash-safety corpus (`LsmEngine::clone_to`) lives in
+`animus-storage/tests/lsm_clone.rs`. `tests/clock_skew.rs`
 (ADR 0018 §2 sim support) proves the clock-skew knob: per-node `now()` offsets
 by exactly its configured skew while an unskewed node tracks the global clock;
 a large negative skew clamps at 0 near time zero instead of underflowing; and

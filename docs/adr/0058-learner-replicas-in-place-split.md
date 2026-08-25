@@ -266,6 +266,73 @@ corpus checks `change_membership` safety (`animus-control`'s core-level
 test plus the `animus-cp-data`-level integration one, per the "Stage C"
 audit note lesson that a primitive should be exercised at both layers).
 
+**As-built (2026-08-25) — the reconciler adoption rung landed.** The
+`RaftCore` primitive (`add_learner`/`promote_learner`/`remove_learner`/
+`learner_caught_up`, PR #383) shipped with no reconciler-layer consumer —
+`RaftKvNode::reconfigure_step` still added a missing replica straight to the
+voter set. This rung closes that gap: `reconfigure_step` now sequences a
+replica **add** as add-learner → (poll `learner_caught_up` against a fixed
+`RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD` of 4 log entries) → promote →
+remove-the-old-replica, one single-server step per call exactly as before
+(ADR 0031 discipline unchanged — no new `HostAction`, no new workflow; only
+what `reconfigure_step` proposes on each call changed). A remove-only delta
+and a brand-new group's initial bootstrap are both untouched, per this
+train's own scope note above. Concretely, `reconfigure_step`'s priority
+order gained two steps ahead of the pre-existing add/remove ladder:
+
+- **A learner no longer present in `desired` is dropped immediately**,
+  regardless of catch-up progress or liveness — the fix for "a learner
+  mid-catch-up that dies or is decommissioned must not wedge every later
+  step" (placement retargeting `desired` away from a dead newcomer is what
+  actually resolves the stuck state; the reconciler's only job is to not
+  block on a target that's no longer wanted).
+- **A caught-up learner still in `desired` is promoted** before any new
+  add is considered, so an in-flight move finishes before a new one starts.
+
+**Scope correction against the mechanism list above**: this rung is the
+**CP data plane only** (`animus-cp-data::RaftKvNode::reconfigure_step`,
+driven by `host::Reconciler`). The control plane's own runtime membership
+change (ADR 0037, `admin_add_control_member`/`RaftNode::change_membership`)
+has no automatic per-tick reconfigure loop to adopt this into — it is an
+operator-invoked single command, not a reconciler decision — so it still
+adds a control voter directly, unchanged by this rung. The bullet above
+("applies to both planes... since both instantiate the same `RaftCore`")
+was describing the *primitive*'s availability, which is genuinely
+plane-agnostic (Train 1 shipped `add_learner`/`promote_learner`/
+`remove_learner` on the shared `RaftCore`, usable by either plane); the
+*reconciler-adoption sequencing* this note documents is data-plane-only, and
+giving the control plane's own admin surface the same learner-phased
+sequencing (if ever wanted) is unstarted follow-up, not part of this rung.
+
+No `Metadata`/tablet-map representation change was needed: `Tablet::replicas`
+stays the *target* voter set placement wants, exactly as before — the
+learner bookkeeping already lives entirely in each tablet's own `RaftCore`
+state (replicated via the group's own log to every replica, voter and
+learner alike, since PR #383), which is exactly the state
+`reconfigure_step` already had local access to. Placement decides *where*;
+the reconciler decides *how to get there*, unchanged.
+
+Structural regression closed: adding a replica used to grow the voter set
+immediately (a `desired.len()+1`-voter transient), so losing one ORIGINAL
+voter while the newcomer was still uncaught-up could leave the group short
+of the *enlarged* majority even though the *original* quorum was intact.
+With the learner phase the voter set never grows until the newcomer has
+already proven it can keep up, so the original quorum's own majority is
+never diluted by a replica that hasn't earned a vote yet — proven directly
+in `animus-cp-data/tests/learner_reconfigure.rs`'s
+`old_quorum_survives_an_old_voter_loss_while_the_new_replica_is_still_a_learner`.
+Fault-injected reconciler-driven coverage (partition during catch-up, a
+leader change mid-move, a learner's node crashing and being replaced by a
+retargeted `desired`) lives in `animus-cp-data/tests/
+reconciler_corpus.rs`'s `learner_move_survives_partition_during_catchup`/
+`learner_move_survives_leader_change_mid_move`/
+`learner_crash_is_replaced_by_a_new_target` scenarios; a real multi-process
+`ProdEnv` exercise (observing the spare pass through an admin-visible
+`learners` set before ever appearing in `voters`, and confirming writes
+never stop landing during the move) lives in `animusd/tests/
+learner_reconfigure.rs`. `admin::CpRaftView` gained a `learners` field
+(`/admin/raftkv`) purely for this observability — read-only, drives nothing.
+
 ### Train 2: in-place split, replacing ADR 0050's build/freeze/cutover workflow
 
 **Stage 1 — `BeginSplit` unchanged in shape, changed in effect.** The
@@ -509,6 +576,27 @@ Train 2's single-entry mint.
 2. **SSTable-level clone in `animus-storage`** (plus a `MemoryEngine`
    equivalent for `SimEnv`) — the prerequisite ADR 0050 named as future
    storage headroom, promoted here to a hard dependency of rung 3.
+
+   **As-built (2026-08-25), landed independently of rung 3**:
+   `LsmEngine::clone_to(target_prefix)` flushes the memtable (so the clone
+   is SSTables-only with an empty WAL), hard-links every live SSTable file
+   into a fresh prefix on the same `Env`, and writes the target a new
+   manifest naming exactly those tables — full-engine only, no kind
+   filtering or key-range trimming (that stays rung 3's business, including
+   the G2 pre-trimming fork this ADR left open). The `Env` `Disk` trait
+   gained one new primitive, `link(src, dst)` — a hard link, overwriting an
+   existing `dst` so a crash-retried clone is idempotent — implemented by
+   `ProdEnv` (`std::fs::hard_link` + the usual directory fsync) and modelled
+   deterministically by `SimEnv` (a snapshot copy into an independent map
+   slot, indistinguishable from a real hard link for this trait's
+   sanctioned use, and wired into the existing disk fault-injection model).
+   The commit point is the target's manifest `Disk::replace`: before it
+   succeeds the target prefix has no manifest and opens empty, so a crash
+   mid-clone is safe to retry and never exposes a torn clone — this is the
+   contract rung 3's G4 (crash-recovery idempotency for group-mint-at-apply)
+   builds on. `MemoryEngine::clone_to` is the `SimEnv`-corpus equivalent
+   (deep-copies version history — there are no files to link).
+
 3. **The `SplitTablet` entry, group mint, and materialization**, behind
    the existing split trigger (ADR 0034) — built and proven alongside the
    still-shipping copy-based workflow, not in place of it, until it is
@@ -524,14 +612,151 @@ see that alternative for why a bound would be unsafe) should ship
 slow-convergence class on the record today (issue #288) and should not
 wait on any part of this proposal.
 
+**As-built (2026-08-25) — rung 3 landed, behind a flag, alongside the
+still-shipping copy-based workflow (rung 4 unstarted).** `MetaCommand::
+BeginSplitInPlace`/`CutoverSplit`'s in-place branch (`animus-control`),
+`KvCommand::SplitTablet` and its apply-time mint (`animus-cp-data`), and
+the host reconciler's own learner-add/fork-watch/materialize/trim sequence
+(`animus-cp-data::host`) are all in place and sim-tested; this closes forks
+G1 and G4 (below) with the resolutions decided here. Landed in three
+stages, bottom-up: the data-plane mint machinery + its own fault
+regressions (`tests/split_tablet.rs`); the host-reconciler wiring, its two
+newly-discovered correctness gaps (a node recruited only via a child's own
+`replicas` must still host the parent as a quiet non-voter, and must be
+exempted from the ordinary release check), and its own corpus
+(`tests/inplace_split_reconciler.rs`, held green through
+`ANIMUS_INPLACE_SPLIT_SEEDS=200`); then the control-plane commands
+themselves plus their unit tests.
+
+**One concrete deviation from the Stage 3 prose above**: "Raft configs
+derived deterministically from the parent's own config at that entry"
+resolves to a SPECIFIC formula, stated here rather than left implicit —
+both children's initial bootstrap voter set is the parent's own full
+`RaftCore::config() ∪ RaftCore::learners()`, read once inside the
+`SplitTablet` apply arm itself (deterministic across replicas by Raft log
+order: every earlier config-change entry has necessarily already applied
+by the time this one does). This is deliberately the SUPERSET of either
+child's own final placement, not each child's own `children[i].replicas`
+alone — it is what makes Stage 5's "each child is over-replicated relative
+to its own final RF" literally true by construction, with the ordinary
+`reconfigure_step` trim (unmodified) doing the rest once `CutoverSplit`
+records each child's real, final `replicas` into `Metadata`.
+
+**A second deviation, load-bearing and easy to miss**: the ADR's Stage 1
+prose describes the parent's reconciler adding "the union of the
+children's chosen homes" as learners, but says nothing about how a home
+that is genuinely new (never a parent voter) comes to run a `RaftKvNode`
+for the PARENT tablet at all before it can be added as a learner to it.
+`host::plan`'s phase 1 gained a second host-candidate test for exactly
+this: a node named in either child's own `replicas` (of a parent's
+in-place split intent) hosts the parent as a quiet non-voter even though
+it is never (and never becomes) a member of the parent's own `replicas` —
+without this, the leader's `add_learner(home)` targets a node with no
+local Raft instance running to receive the resulting `AppendEntries` at
+all. The identical recruited-node set is also exempted from the ordinary
+release check, which would otherwise fire on it immediately (it is never
+in the parent's own `replicas`, and `config_excludes_me` is trivially true
+for a still-a-learner recruit — a learner is never in `RaftCore::config()`
+by construction).
+
+**Residue — explicitly NOT part of this rung**, left for the layer above
+(an `animusd`-level driver, mirroring `index_drain.rs::split_driver_tick`'s
+shape for the copy-based workflow): the `--split-mode {copy,inplace}`
+operator flag itself, `ClientCtx::trigger_split`'s in-place branch (mint
++ propose `BeginSplitInPlace`), the per-tick driver that watches a
+forked-locally parent, runs the (unmodified) GSI-drain/backfill vetoes
+against it, and proposes `CutoverSplit`, and the real multi-node `ProdEnv`
+end-to-end regression (a paced continuous writer riding the fork). None of
+animus-control/animus-cp-data's own mechanism depends on this layer
+existing — every property above is proven by constructing the in-place
+path directly (`MetadataView`/`Tablet::inplace_split` built by hand,
+mirroring how `tests/reconciler_corpus.rs` already stands in for a live
+control plane), the same posture this ADR's own Train 1 rung took for its
+reconciler-adoption sub-rung.
+
+**As-built (2026-08-25) — the `animusd`-level driver landed, closing the
+rung-3 residue above.** `SplitMode` (`animusd::config`), a `--split-mode
+{copy,inplace}` CLI flag (`--config`/`--cluster N` only — the same scope
+`--quiesce-after` has, with the identical documented gap for
+`--cluster-control`/`--cluster-data` and the standalone `control`/`data`/
+`join` subcommands), `ClientCtx::trigger_split`'s branch on
+`ClientCtx::split_mode` (proposing `BeginSplitInPlace` in place of
+`BeginSplit`, everything else about that call — the idempotent
+already-`Splitting` handling, the confirm loop, child-id allocation, F11
+alignment — shared verbatim), `index_drain.rs::inplace_split_driver_tick`
+(the cutover driver, wired into `change_consumer_loop` alongside the
+copy-based `split_driver_tick`, selected per-tablet by
+`Tablet::inplace_split.is_some()` — never by this node's own configured
+`split_mode`, which only governs a *future* `trigger_split` call), and a
+`ProdEnv` end-to-end regression (`animusd/tests/inplace_split_e2e.rs`) —
+a real 3-node `--split-mode inplace` cluster, a paced continuous writer
+riding kickoff through cutover, and a streams-enabled variant walking a
+`GetRecords` iterator from the parent's own shard across the fork to both
+children.
+
+**A genuine correctness gap this rung found and closed, not anticipated by
+this ADR's own residue paragraph or Stage 3's prose**: proposing
+`CutoverSplit` as soon as `pending_split()` answers `Some` (this residue's
+own literal reading) races the CP-data host reconciler's OWN,
+independent, per-node discovery of that same fact. Stages 1–3 (learner
+add, catch-up, the fork) commit nothing on the control plane, so
+`tablet_host_reconciler_loop`'s `metadata_watch` wake fires once, at
+`BeginSplitInPlace`'s own commit, and not again until `CutoverSplit`'s —
+leaving the reconciler's periodic fallback (`RECONCILE_FALLBACK_INTERVAL`,
+500ms) as the ONLY thing that can make it discover a completed fork and run
+`HostAction::MaterializeSplitChild`. The `animusd`-level driver's own tick
+(`INDEX_DRAIN_INTERVAL`, 200ms) can — and, in a real multi-process
+`ProdEnv` cluster with no GSI/stream veto to wait on, routinely does —
+observe the fork and get `CutoverSplit` committed before any given
+replica's reconciler has ticked even once since the fork happened. Once
+`CutoverSplit` removes the parent's row (and with it `Tablet::
+inplace_split`, the only signal `plan`'s phase 1.5 branch keys on), that
+replica's NEXT reconciler tick sees an ordinary freshly-`Active` tablet
+with no memory of the fork, and hosts it via the wrong (non-split) path:
+an empty engine and a `plan_join_host`-derived config with no relationship
+to `bootstrap_voters` — permanent, silent data loss and (since every
+replica computes this independently) a group whose replicas can disagree
+on their own membership badly enough to never elect a leader. Found by
+this rung's own `ProdEnv` e2e test (SimEnv's near-zero simulated latency
+and `tests/inplace_split_reconciler.rs`'s own harness — which drives the
+reconciler directly, never racing it against a second, independent
+wall-clock-paced loop — never exercised this interaction). Closed with two
+changes, both entirely inside `animusd` (no change to `animus-control`/
+`animus-cp-data`, no new replicated command):
+
+- `tablet_host_reconciler_loop` shortens its own fallback from 500ms to
+  `INPLACE_SPLIT_RECONCILE_INTERVAL` (50ms) for as long as *any* tablet
+  cluster-wide currently carries an in-place split intent — every fork
+  participant observes the same `BeginSplitInPlace` commit and flips into
+  this fast cadence together, well before Stage 3's fork ever applies, so
+  by the time it does every replica is already polling at 50ms.
+- `inplace_split_driver_tick` additionally requires, before it may propose
+  `CutoverSplit`: (a) at least `INPLACE_SPLIT_MATERIALIZE_SETTLE_MS`
+  (250ms — a small, justified multiple of the now-50ms reconciler cadence,
+  not the withdrawn 500ms one) has elapsed since the fork applied
+  (`PendingSplit::ts`, the identical `env.now()`-derived clock
+  `cutover_wall_ms` already uses — no driver-local state, so this is fully
+  re-derivable after a crash/re-lead), and (b) this replica's own
+  `ClientCtx.edge.hosted_groups()` already contains both children — a
+  direct local confirmation, never proposing ahead of its own state.
+
+Both bounds are deliberately small relative to the withdrawn naive 500ms–
+1000ms options tried while diagnosing this — a large bound would have
+reintroduced exactly the write-availability outage Stage 3–5's own design
+point (near-zero, "roughly one routing refresh") exists to avoid; the
+shipped fix keeps the reconciler's own worst-case tightly bounded instead
+of just waiting out a slow one. Measured on the e2e test's own 3-node
+cluster: the paced writer needed **zero** retries across every observed
+run — the fork/cutover transition was not visible to it at all.
+
 ## Open forks (deliberately not decided by this ADR)
 
 | # | Fork | Status |
 |---|------|--------|
-| G1 | Parent-engine drain-then-reclaim protocol post-cutover (Stage 4) | Open — needs its own design pass before rung 3/4 |
-| G2 | Range-filtered `InstallSnapshot` for a learner at a disjoint final home, vs. accepting the ~2× bytes and pre-trimming at the clone step | Open — a mitigation choice, not blocking rung 1–3 |
+| G1 | Parent-engine drain-then-reclaim protocol post-cutover (Stage 4) | **Decided (2026-08-25), reversed from this ADR's own Stage 4 prose**: the drain gates stay PRE-cutover. The existing GSI-drain veto (now accelerated, Alternative 1/issue #288) and backfill-seeder veto run against the now-static, forked (hence write-frozen — Stage 3's own apply-time seal) parent exactly as in the copy-based endgame, gating the `CutoverSplit` propose the same way they gate it there today. Rationale: the parent's engine is retained, intact, on every fork participant until cutover reclaims it (nothing analogous to the copy-based `Freeze`-then-tear-down timing pressure exists — the fork itself is instantaneous and non-blocking), so there is no reason to invent a NEW retained-engine-after-retirement drain protocol when the existing pre-cutover one already has everything it needs merely by running against the (already fully-formed) children's own consumer state instead of the parent's. This is a caller-side (driver) concern in BOTH workflows — `MetaCommand::CutoverSplit`'s own apply never gated on drain state even in the copy-based branch — so it is entirely residue for the driver layer above (see the "Residue" paragraph above), not a change to the command shipped in this rung. |
+| G2 | Range-filtered `InstallSnapshot` for a learner at a disjoint final home, vs. accepting the ~2× bytes and pre-trimming at the clone step | Open — a mitigation choice, not blocking rung 1–3. Rung 3 landed the simpler side: full clone then trim (`trim_split_child`), no snapshot filtering. |
 | G3 | Whether ADR 0030's permanently-non-voting growth mirror is re-expressed as a learner that is never promoted, once learners exist | Open — noted, not committed to |
-| G4 | Exact crash-recovery idempotency contract for group-mint-at-apply (Stage 3) | Open — the load-bearing detail of rung 3, deliberately left to that rung's own design, not settled here |
+| G4 | Exact crash-recovery idempotency contract for group-mint-at-apply (Stage 3) | **Decided (2026-08-25)**: two independent commit points, each checked and skipped on its own before a retry redoes it. (1) **The engine commit** — `EngineFactory::clone_engine`'s target manifest replace (ADR 0058 rung 2's own "absent or complete, never torn" contract) — checked via `EngineFactory::probe(child)` BEFORE ever cloning; if the engine already exists, an earlier attempt already committed it (possibly crashing before the group started), so re-cloning is skipped entirely (a second clone against an already-trimmed, or already-written-to, target would be a correctness bug, not merely wasted work) and the existing engine is simply re-opened. (2) **The group commit** — successfully calling `RaftKvNode::start_hosted` and registering the handle in the reconciler's own `hosted` map — reuses the IDENTICAL optimistic-claim-then-execute discipline the ordinary `Host` action already has (`plan` claims the child into `LocalState::hosted` before materialization ever runs; a failure calls `LocalState::release_unconfirmed_host` so the next tick retries). No separate "child group state" artifact needs writing at all: a brand-new Raft group bootstraps fresh from its own `all_nodes` config every time regardless (empty log, first election), so the group's own identity IS simply "does a live `RaftKvNode` exist for this id" — the same fact every other tablet's lifecycle already tracks. A crash between the two commit points re-runs exactly the group commit on retry; a crash before either re-runs both, deterministically, from the same `(parent, child, range, bootstrap_voters)` inputs every replica computes identically from the fork entry itself. Proven directly in `tests/inplace_split_reconciler.rs`'s `crash_between_fork_and_materialization` scenario (a node crashes after its own Raft log replicates the fork but before its reconciler ever ticks past it, and must independently recover both children plus the pre-fork write on restart). |
 
 ## Relationship to the original ADR 0017 §4 design
 

@@ -3256,6 +3256,112 @@ debugging anything that feels like it might have happened before.
   which includes the new node's id in its own bootstrap set and gets away
   with it) is not proof the risky pattern is safe in general, only that its
   own assertions never exercised the window where it would matter.
+- **A threshold-based "caught up" predicate measured as an absolute gap
+  (`last_index - match_index <= threshold`) cannot distinguish "genuinely
+  replicated" from "the log itself is short"** — found writing ADR 0058
+  Train 1's reconciler-adoption corpus
+  (`animus-cp-data/tests/reconciler_corpus.rs`,
+  `tests/learner_reconfigure.rs`). A test meaning to catch a newly-added
+  learner "still mid-catch-up" (e.g. to prove it survives a partition, or
+  that the old quorum keeps committing without it) partitioned the learner
+  immediately, then ticked the reconciler several times before asserting —
+  and the assertion failed, because on a log only a few entries long, a
+  learner with `match_index = 0` still satisfies `last_index - 0 <=
+  RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD` (4) and gets promoted anyway,
+  despite having received exactly zero `AppendEntries`. This is not a bug
+  in `learner_caught_up` (the primitive is documented and used as designed
+  — a fixed absolute threshold, not a fraction of the log) — it is a
+  property of the design that every test exercising "still catching up"
+  must account for: either grow the log well past the threshold *before*
+  the fault (so a genuinely-unreplicated learner's gap stays provably
+  large regardless of how short the log started), or assert immediately
+  after the single tick that performs the add (a promotion cannot happen
+  in the same call that proposes the add, so the state right after is
+  unambiguous regardless of log length). **General rule**: when a
+  liveness/catch-up gate is an absolute distance rather than a ratio,
+  don't assume "hasn't replicated anything" and "gap is small" are the
+  same condition in a test fixture — they coincide only once the log is
+  long enough, and a fixture's own small scale can silently violate that
+  precondition.
+- **When a reconciler-driven test scenario lets a promoted learner become
+  eligible for LEADERSHIP, the test's own tick/poll loop must include that
+  node, not just the original voters** — the same corpus above
+  (`learner_crash_is_replaced_by_a_new_target`) hung for the entire poll
+  budget on one seed in ~14% of variants: the newly-promoted replica won
+  the next election (perfectly legitimate — it is a real voter the moment
+  it is promoted), but the test's convergence loop only ticked the
+  *original* three nodes' reconcilers, so the one node that could actually
+  see itself leading and propose the final "remove the old replica" step
+  was never given a chance to. The group was correctly converged in every
+  way that mattered (right voters, right learners, keeps serving) —only
+  the test's own harness was blind to who was driving. **General rule**:
+  a test that lets membership grow past its initial cast of leader
+  candidates must poll/tick every member that could plausibly hold
+  leadership by the time the property under test is checked, not just the
+  set that started the scenario.
+- **A "durable-before-visible" primitive that also hands back a live handle
+  to what it just made durable has an inherent asymmetry an `Err`-implies-
+  "nothing happened" test gets wrong (2026-08-25, ADR 0058 rung 2's
+  `LsmEngine::clone_to`).** `clone_to`'s crash-safety contract is: the
+  target's manifest write is the single commit point, so a fault before it
+  leaves nothing durable at the target. But `clone_to`'s own last step —
+  opening the just-committed target to return a usable engine handle — is
+  itself fallible disk I/O, so a fault landing *there* (after the manifest
+  commit already succeeded) still returns `Err` even though a fully valid
+  clone now exists on disk. A fault-injection test built on the assumption
+  "any `Err` from this call means the target must scan empty" failed
+  intermittently for exactly this reason once the source had more than one
+  SSTable (more disk ops inside `clone_to` means more chances for the fault
+  to land in the trailing reopen rather than the commit). The fix was
+  asserting the actual invariant — the target is always either **fully
+  absent** or **fully valid**, never partial — not the stronger, false one.
+  **General rule**: for any "commit, then hand back a live view of what was
+  committed" operation, write the crash-safety test (and the doc comment)
+  around "nothing or complete, never torn," not "success or no-op" — the
+  post-commit step can still fail on its own without meaning the commit
+  itself didn't happen.
+- **Two independently-scheduled per-node loops that both react to the same
+  underlying event, on different signals with different latencies, can race
+  in a way `SimEnv` won't show you (2026-08-25, ADR 0058 Train 2 rung 3, the
+  `animusd`-level in-place-split driver).** The in-place split fork
+  (`KvCommand::SplitTablet`, Stages 1-3) is deliberately **not** a control-plane
+  commit — the whole point of the in-place design is that minting the two
+  child Raft groups happens inside the CP-data group itself, off the control
+  plane's critical path. That left two consumers of "the fork happened" with
+  very different reaction times: the per-node tablet-host reconciler
+  (`animus-cp-data::host`) only wakes on `metadata_watch()` (which never fires
+  for an in-place fork, since nothing changed in `Metadata`) or its own
+  500ms fallback poll, while the new `animusd`-level cutover driver polls
+  every 200ms via the existing change-consumer loop and, seeing no vetoes
+  configured, proposed `CutoverSplit` almost immediately. `CutoverSplit`
+  deletes the parent's `Metadata` row — the reconciler's only durable memory
+  that a child tablet is a split product needing `MaterializeSplitChild`
+  (clone the parent's engine slice, bootstrap with the fork's superset voter
+  set) rather than an ordinary fresh `Host`. On any replica whose reconciler
+  hadn't yet run *its own* post-fork tick before the cutover committed, the
+  child was silently hosted via the ordinary path instead — empty engine,
+  and (because ordinary non-initial-formation hosting deliberately excludes
+  self from the voter list, for the "join an already-led group as a quiet
+  non-voter" case) a **different, wrong voter config per replica** — a
+  scenario that reads as pure success (no error, no panic) until you notice
+  the group can no longer elect a leader and every write it took is gone.
+  `SimEnv` corpora for the fork and for the reconciler each passed in
+  isolation because each drives only one of the two loops; the bug only
+  exists in the gap *between* two loops that a `ProdEnv` end-to-end test with
+  a real paced writer across the fork→cutover window could show. Fixed
+  entirely on the slow side — no protocol/replicated-command change: the
+  reconciler fast-polls (50ms) for as long as any tablet cluster-wide carries
+  an unresolved split intent (a fact every fork participant observes
+  identically, well before Stage 3 applies, so all replicas speed up
+  together), and the driver additionally requires a small local
+  materialization-settle margin *and* direct confirmation via its own
+  `hosted_groups()` before ever proposing cutover. **General rule**: when two
+  loops key off "the same underlying fact changed" but one of them learns it
+  from a slow/optional signal (a poll fallback, an absent notification) and
+  the other from a fast/mandatory one, audit what the fast side can delete or
+  invalidate before the slow side ever gets a chance to look — and prove it
+  with a real-clock test that races them, since a single-loop sim corpus
+  cannot expose an inter-loop race by construction.
 
 ### Code patterns
 - **A convergent bookkeeping write must be routable to its own owner: derive
@@ -7963,6 +8069,73 @@ debugging anything that feels like it might have happened before.
   because the codec's own round-trip test (`every_wire_variant_round_trips`)
   was updated deliberately as part of the same change, not because anything
   would have failed on its own.
+
+- **A membership-change primitive (`add_learner`/`change_membership`) only
+  ever reconfigures a group's own agreed-upon peer SET — it does nothing to
+  ensure the target actually has a live protocol instance running to
+  receive the traffic that config change generates (2026-08-25, ADR 0058
+  Train 2 rung 3).** Building the in-place split's Stage 1 (add the union
+  of both children's homes as learners to the parent), it was tempting to
+  assume "the reconciler adds a learner, Raft's own `AppendEntries` flow
+  handles the rest" — but a node named only in a CHILD's own `replicas`
+  (never the parent's) has, before this design, no reason to ever host the
+  PARENT tablet at all: the ordinary `plan_join_host`/`Host` candidate test
+  is "am I in `Tablet::replicas`," which such a node structurally fails.
+  Calling `add_learner` on it anyway appends a config entry the LEADER
+  replicates outbound — into a network inbox nothing on the target node is
+  consuming, since no `RaftKvNode` for that tablet exists there yet. The
+  fix widened the host-candidate test itself (a node recruited via EITHER
+  child's `replicas` of an in-place split intent also hosts the parent, as
+  a quiet non-voter — the identical shape `plan_join_host`'s own "joining
+  an already-led group" branch already uses, just reached by a different
+  membership test), and a corresponding second fix was needed on the
+  RELEASE side: the same recruited node is never in the parent's own
+  `replicas` either, so the ordinary release check would fire on it
+  immediately, and — a learner is never in `RaftCore::config()` by
+  construction — the release path's own "config actually excludes me"
+  safety anchor reads trivially true for a still-a-learner recruit too,
+  offering no protection. **General rule**: before wiring any new
+  membership-change call site (a replica move, a split, a rebalance) onto
+  an existing Raft membership primitive, ask "does the target already have
+  a running protocol instance for this group, and by what path did it come
+  to have one" — a primitive that changes *agreed state* is not the same
+  thing as a primitive that ensures a *listener* exists to act on it, and
+  the existing candidate/release tests for "should this node host this
+  tablet at all" were both written before any workflow needed a node to
+  host a tablet for a reason OTHER than being in its own `replicas`.
+  (`crates/animus-cp-data/src/host.rs`'s `plan` phase 1's second
+  host-candidate branch and phase 3's `recruited_for_split` exclusion.)
+- **A "clone this engine" primitive must take the caller's own already-open
+  source handle, never a bare identity it re-opens itself — re-opening the
+  same on-disk state from two independent in-process instances is a
+  correctness hazard, not just wasted I/O (2026-08-25, ADR 0058 Train 2
+  rung 3).** `EngineFactory::clone_engine`'s first draft took `source:
+  TabletId` and called `self.open(source)` internally, mirroring every
+  other `EngineFactory` method's shape (`open`/`probe`/`destroy` all
+  address a tablet by id, not a handle). This compiles and even passes the
+  `MemoryEngine` test double cleanly (its `open` is a cheap shared-`Arc`
+  registry lookup, so a second "open" of an already-open tablet is
+  harmless) — but the REAL production engine this trait also has to serve,
+  `LsmEngine`, does genuine on-disk WAL/manifest/compaction coordination
+  assuming exactly one process-local writer per prefix; a second `open()`
+  of the same prefix constructs a second, completely uncoordinated
+  in-process instance contending over the same files with no shared lock —
+  silent corruption under real concurrent use, invisible in the test
+  double that happened to make the unsafe shape look fine. The fix changed
+  the signature to take the source's own already-open handle
+  (`source: &S`) — which the caller (the host reconciler) already holds in
+  its own per-tablet engine cache for any currently-hosted tablet (the
+  clone's source, here, is always a currently-hosted parent) — so no
+  second open ever happens. **General rule**: a trait method that clones,
+  snapshots, or otherwise reads a live engine's current state should take
+  the engine handle the caller already has, not an identity it re-derives
+  a handle from internally — and a fast/shared-state test double (a
+  `MemoryEngine`-backed factory) can make exactly this class of bug
+  invisible, so the question "would this be safe against a REAL, exclusive-
+  writer-per-instance backend, not just the sim double" is worth asking
+  explicitly whenever a new `EngineFactory`-shaped seam gains a method.
+  (`crates/animus-cp-data/src/host.rs::EngineFactory::clone_engine`'s own
+  doc comment states the final contract and the hazard by name.)
 
 ### Parallel-agent orchestration
 - **A single long-lived session can exhaust the disk on `target/` alone, with

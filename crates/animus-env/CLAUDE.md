@@ -262,6 +262,30 @@ the production implementation; the deterministic implementation lives in
   simulator). Every id it writes is scoped under `"contract-test/"` and
   cleaned up before returning, so it composes with a store a caller has
   already put other data into.
+- **`Disk::link(src, dst)` (ADR 0058 rung 2) is a hard link, not a copy** —
+  added specifically for `animus-storage`'s `LsmEngine::clone_to`, which
+  needs to share an immutable SSTable file between a source engine and a
+  freshly cloned one without paying a byte copy. `dst` becomes an
+  independent directory entry over `src`'s current durable bytes; a later
+  `remove` of either name never affects the other (real hard-link
+  semantics — the underlying bytes persist until every name referencing
+  them is gone). **Overwrites `dst` if it already exists** (like `replace`,
+  but backed by a link) so a caller can safely relink the same `(src, dst)`
+  pair on retry after a crash — this is what makes `clone_to` idempotent to
+  retry. Durable on return, same as `append`/`replace`'s "namespace changes
+  are fsynced" rule — no follow-up `sync` needed. `ProdEnv` implements it
+  with `std::fs::hard_link` (removing any stale `dst` first, since
+  `hard_link` itself errors `AlreadyExists` rather than replacing) plus the
+  usual containing-directory fsync. `SimEnv` has no inode/directory model,
+  so it models a link as a snapshot copy of `src`'s current `FileState` into
+  `dst`'s own independent map slot — behaviorally indistinguishable from a
+  real hard link for this trait's sanctioned use (an already-fully-synced,
+  never-mutated-in-place file), and it participates in the disk fault model
+  exactly like `append`/`sync`/`read`/`read_at`/`replace` (an injected error
+  makes no state change). Only three `Disk` implementors exist
+  (`ProdEnv`, `SimEnv`, and `animus-storage`'s `lsm_group_commit.rs` test
+  double `CrashEnv`, which just delegates) — grep `impl Disk for` before
+  assuming there might be more to update if this trait grows again.
 - **`Disk::list` is per-env and non-recursive** (ADR 0024): it enumerates only
   the files this handle's own `Disk` methods could open — production reads the
   env's data dir without descending into any nested subdirectory. It exists so

@@ -779,6 +779,29 @@ impl Disk for ProdEnv {
         Ok(())
     }
 
+    async fn link(&self, src: &str, dst: &str) -> std::io::Result<()> {
+        let src_path = self.path(src);
+        let dst_path = self.path(dst);
+        ensure_parent(&dst_path).await?;
+        // Overwrite semantics (idempotent retry): remove any stale entry at
+        // `dst` first — `std::fs::hard_link` itself errors `AlreadyExists`
+        // rather than replacing. Best-effort: an absent `dst` (the common
+        // case) or any other removal failure is not fatal here — the
+        // following `hard_link` call is the one whose result matters.
+        let _ = tokio::fs::remove_file(&dst_path).await;
+        tokio::fs::hard_link(&src_path, &dst_path).await?;
+        // The new directory entry is a namespace change: fsync the
+        // containing directory chain or the link can be lost on power loss,
+        // mirroring `replace`'s post-rename fsync.
+        self.sync_parents(dst).await?;
+        self.inner
+            .dir_synced
+            .lock()
+            .expect("dir_synced poisoned")
+            .insert(dst.to_string());
+        Ok(())
+    }
+
     async fn list(&self) -> std::io::Result<Vec<String>> {
         // Non-recursive: a nested subdirectory is not this env's own top-level
         // disk contents. A data dir that does not exist yet reads as empty —
@@ -1073,6 +1096,64 @@ mod tests {
 
         // The nested directories really exist on disk.
         assert!(dir.join("sub/dir/file").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Disk::link` (ADR 0058 rung 2) is a real hard link: the linked file
+    /// reads back the source's bytes, the two paths share one inode, and
+    /// `remove`ing `src` leaves `dst` intact (the hard-link contract: the
+    /// bytes live as long as any name references them). Also covers the
+    /// overwrite-on-retry contract: linking again over an already-linked
+    /// `dst` (as a crash-retried clone would) succeeds rather than erroring
+    /// `AlreadyExists`, and linking a nonexistent source is a clean
+    /// `NotFound`.
+    #[tokio::test]
+    async fn disk_link_is_a_real_hard_link() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = unique_tmp_dir();
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
+            .await
+            .expect("bind");
+
+        env.append("src", b"hello").await.expect("append src");
+        env.sync("src").await.expect("sync src");
+        env.link("src", "dst").await.expect("link");
+
+        assert_eq!(env.read("dst").await.expect("read dst"), b"hello");
+        let src_meta = std::fs::metadata(dir.join("src")).expect("src exists");
+        let dst_meta = std::fs::metadata(dir.join("dst")).expect("dst exists");
+        assert_eq!(
+            src_meta.ino(),
+            dst_meta.ino(),
+            "link must share the source's inode, not copy its bytes"
+        );
+        assert!(src_meta.nlink() >= 2);
+
+        // Idempotent-on-retry: relinking over an already-linked `dst` must
+        // succeed (not `AlreadyExists`), reproducing the same state.
+        env.link("src", "dst")
+            .await
+            .expect("relink over existing dst");
+        assert_eq!(env.read("dst").await.expect("read dst again"), b"hello");
+
+        // Removing the source leaves the link's own bytes intact — the
+        // classic hard-link guarantee this primitive exists to exploit.
+        env.remove("src").await.expect("remove src");
+        assert_eq!(
+            env.read("dst").await.expect("read dst after src removed"),
+            b"hello",
+            "dst must survive removal of src — that's the whole point of a hard link"
+        );
+
+        // Linking a nonexistent source is a clean NotFound, not a panic or a
+        // silent no-op.
+        let err = env
+            .link("does-not-exist", "also-dst")
+            .await
+            .expect_err("linking a missing source must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

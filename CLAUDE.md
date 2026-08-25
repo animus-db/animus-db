@@ -121,6 +121,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_QUIESCE_SEEDS=K` | 1 | idle-tablet-group quiescence corpus depth (`animus-cp-data`, ADR 0044 phase 1) |
 | `ANIMUS_SPLIT_SEEDS=K` | 1 | split-build `SeedBatch` corpus depth (`animus-cp-data`, ADR 0050 Train B) |
 | `ANIMUS_LEARNER_SEEDS=K` | 1 | learner (non-voting) membership-class fault-injection corpus depth (`animus-control`, ADR 0058 Train 1) |
+| `ANIMUS_INPLACE_SPLIT_SEEDS=K` | 1 | in-place split group-mint-at-apply fault-injection corpus depth (`animus-cp-data`, ADR 0058 Train 2 rung 3) |
 | `ANIMUS_BENCH_{KEYS,GETS,SCAN,VALUE_BYTES,APPLY_BATCH}` | — | `engine_bench` workload tuning |
 
 The deep corpus tiers run nightly in CI

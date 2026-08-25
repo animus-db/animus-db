@@ -246,6 +246,48 @@ impl KeyRange {
 /// not the reverse).
 pub type TableName = String;
 
+/// One child of an **in-place split** (ADR 0058 Train 2, rung 3): a tablet id
+/// minted up front (before any data has moved) plus its placement-chosen
+/// final replica set. Carried by [`InPlaceSplitIntent`] and by the data
+/// plane's own `KvCommand::SplitTablet` — the SAME pair of `(id, replicas)`
+/// rides both the control-plane intent and the data-plane fork entry, so
+/// every replica derives the identical two child configs from identical
+/// inputs (the design's own "same inputs on every replica" requirement).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitChild {
+    /// The child's tablet id, minted from the same monotonic allocator a
+    /// copy-based split's `Building` children use — reserved (never
+    /// reused) the instant the intent is recorded, even though (unlike a
+    /// copy-based `Building` child) no [`Tablet`] map entry exists for it
+    /// until `MetaCommand::CutoverSplit` activates it.
+    pub id: TabletId,
+    /// The child's placement-chosen final replica set (fork F5, preserved
+    /// from the copy-based design) — the **union** of both children's
+    /// replica sets is what the parent's own group adds as learners
+    /// (ADR 0058 Train 2 Stage 1).
+    pub replicas: Vec<NodeId>,
+}
+
+/// A tablet's **in-place split intent** (ADR 0058 Train 2 rung 3, Stage 1):
+/// recorded on the parent by `MetaCommand::BeginSplitInPlace`'s apply once
+/// placement has chosen both children's final homes and their ids are
+/// minted — the smallest representation that lets every node's reconciler
+/// (`animus-cp-data::host`) discover "this hosted tablet is splitting
+/// in-place, here are its two children's ids/homes" from replicated
+/// `Metadata` alone, with **no** `Building` tablet-map entries (unlike the
+/// copy-based workflow — no data has moved yet, so there is nothing to
+/// place a routable-but-empty entry over). `split_key` is carried
+/// verbatim, not re-derived, so every replica splits the parent's range
+/// identically ([`KeyRange::split_at`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InPlaceSplitIntent {
+    /// The key the parent's range splits at (left half first, matching the
+    /// copy-based `BeginSplit` convention).
+    pub split_key: Vec<u8>,
+    /// Exactly two children, left half first.
+    pub children: [SplitChild; 2],
+}
+
 /// A tablet: a **table-scoped** key range, its replica set, and its placement
 /// epoch.
 ///
@@ -275,6 +317,14 @@ pub struct Tablet {
     /// pre-lifecycle snapshots loading as `Active`.
     #[serde(default)]
     pub state: TabletState,
+    /// This parent's **in-place split intent** (ADR 0058 Train 2 rung 3),
+    /// if a `MetaCommand::BeginSplitInPlace` is mid-workflow on it —
+    /// `None` for every ordinary tablet and for a copy-based `Splitting`
+    /// parent (whose children instead get real `Building` map entries).
+    /// `#[serde(default)]` keeps every pre-existing snapshot loading as
+    /// `None`.
+    #[serde(default)]
+    pub inplace_split: Option<InPlaceSplitIntent>,
 }
 
 /// A tablet's lifecycle state (ADR 0050, copy-based splits).
@@ -336,6 +386,7 @@ impl Tablet {
             replicas,
             epoch: Epoch::INITIAL,
             state: TabletState::default(),
+            inplace_split: None,
         }
     }
 

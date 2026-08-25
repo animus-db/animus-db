@@ -51,7 +51,7 @@ use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
 use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId, PRIMARY_STREAM};
 use animus_storage::{MergeOp, StorageEngine, Version};
-use animus_tablet::KeyRange;
+use animus_tablet::{KeyRange, SplitChild};
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
@@ -65,6 +65,7 @@ pub mod hlc;
 pub mod host;
 mod seal;
 pub mod segment;
+mod split;
 mod ts_cache;
 mod txn;
 
@@ -659,6 +660,58 @@ pub enum KvCommand {
     /// copied record is decided post-cutover by the coordinator's own
     /// retry — see rung 5's e2e).
     Freeze { ts: HlcTimestamp },
+    /// **In-place split fork** (ADR 0058 Train 2 rung 3, Stage 3): the
+    /// single-entry atomic mint that forks this parent group into two
+    /// children, proposed into the **parent's own log** by the parent's
+    /// leader once every learner added for the split (the union of both
+    /// children's placement-chosen homes, added by the host reconciler once
+    /// the control plane records the in-place split intent — see
+    /// `animus_tablet::InPlaceSplitIntent`) has caught up.
+    ///
+    /// At apply, on **every** replica (voter and learner alike — this is
+    /// why Stage 2 catches every learner up before this is ever proposed),
+    /// this entry is simultaneously:
+    ///
+    /// - **The ordering fence**: it pushes `(KeyRange::whole(), ts)` into
+    ///   the SAME sealed-range set + `frozen` latch [`KvCommand::Freeze`]'s
+    ///   apply arm uses (this crate's existing apply-time seal discipline,
+    ///   reused verbatim, not reimplemented) — no subsequent entry in the
+    ///   parent's own log describes state either child inherits. A
+    ///   later-ordered user mutation is rejected exactly like a frozen
+    ///   copy-based parent's would be (`RaftKvNode::is_frozen`); the two
+    ///   workflows never coexist on one tablet (selected by the operator's
+    ///   split-mode flag), so sharing the flag is safe.
+    /// - **The durable fork marker** (`split.rs`, mirroring `seal.rs`'s
+    ///   marker discipline): `split_key` and both `children` are merged
+    ///   into an engine-global key so a restart — even after log
+    ///   compaction — can rediscover the fork (`RaftKvNode::pending_split`).
+    ///   Idempotent: a duplicate apply over an already-forked group (a
+    ///   WAL-replay re-application) writes nothing a second time, mirroring
+    ///   `Freeze`'s own idempotent-if-already-frozen check.
+    ///
+    /// **What this entry's apply does NOT do**: materialize the two
+    /// children's engines, or bootstrap their Raft groups. That
+    /// higher-level work — the SSTable-level clone-then-trim and the
+    /// group-mint-at-apply proper — happens **outside** this sync,
+    /// I/O-free apply path, in the per-node host reconciler
+    /// (`host::Reconciler`, ADR 0031), which discovers a pending fork via
+    /// [`RaftKvNode::pending_split`] the same way it discovers every other
+    /// hosted-tablet fact. This mirrors this crate's existing
+    /// sync-core/async-driver split (the core agrees order; a driver does
+    /// the I/O) one level up, applied to the whole tablet lifecycle instead
+    /// of one Raft group — see `host.rs`'s own doc.
+    SplitTablet {
+        /// The key the parent's range splits at (left half first).
+        split_key: Vec<u8>,
+        /// Exactly two children, left half first — the SAME
+        /// `(id, replicas)` pairs the control plane's
+        /// `MetaCommand::BeginSplitInPlace` recorded, so every replica
+        /// derives identical child configs from identical inputs (this
+        /// entry's own `children` field plus the parent's own Raft
+        /// membership at this log position needs no further coordination).
+        children: [SplitChild; 2],
+        ts: HlcTimestamp,
+    },
     /// **Logged read ceiling** (ADR 0018 §2/PR2b — see `ceiling.rs`'s module
     /// doc): proposed by a group's own leader, through its **own** Raft log,
     /// when it wants to serve a read at or above the highest ceiling
@@ -978,6 +1031,17 @@ pub const RECOVERY_GRACE: Duration = Duration::from_secs(5);
 /// Compact (snapshot the engine + truncate the Raft log prefix) once this many
 /// entries have been applied past the current snapshot base, bounding the WAL.
 const COMPACT_THRESHOLD: u64 = 64;
+
+/// [`RaftKvNode::reconfigure_step`]'s promotion-readiness threshold (ADR 0058
+/// Train 1's reconciler adoption): a learner within this many log entries of
+/// the leader's own `last_log_index()` (see
+/// [`RaftKvNode::learner_caught_up`]) is judged safe to promote — closing the
+/// remaining gap costs one more `AppendEntries` round, not a meaningfully
+/// long unsafe window. Same order of magnitude as the fixed thresholds the
+/// Train 1 test corpora already use (`animus-control/tests/learner_corpus.rs`,
+/// this crate's `tests/learner_membership.rs`) — not derived from either, since
+/// this one gates a *production* decision rather than a test assertion.
+const RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD: u64 = 4;
 
 /// Leader-side ReadIndex state: per in-flight read `epoch`, the term it was issued
 /// under and the set of peers (including self) that have confirmed leadership.
@@ -2263,6 +2327,67 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         })
     }
 
+    /// Propose the **in-place split fork** (ADR 0058 Train 2 rung 3, Stage
+    /// 3 — see [`KvCommand::SplitTablet`]'s doc): the single-entry atomic
+    /// mint that forks this group into `children`. Called only by the
+    /// parent's own leader, only once every learner added for the split
+    /// has caught up (the host reconciler's job to determine — see
+    /// `host.rs`); leader-only, idempotent (a duplicate applies as a no-op
+    /// exactly like [`propose_freeze`](Self::propose_freeze) — the
+    /// reconciler may re-propose after a crash/re-lead without checking
+    /// first).
+    pub fn propose_split_tablet(
+        &self,
+        split_key: Vec<u8>,
+        children: [SplitChild; 2],
+    ) -> ProposeResult {
+        self.propose_ordered(|_term| {
+            let ts = self.hlc.mint(self.env.now());
+            // Same `last_proposed_ts` floor discipline as `propose_freeze`.
+            let floor = hlc::unpack(self.last_proposed_ts.load(Ordering::SeqCst));
+            let ts = if ts > floor {
+                ts
+            } else {
+                let pushed = self.hlc.witness(floor, self.env.now());
+                assert!(
+                    pushed > floor,
+                    "raftkv propose_split_tablet: witnessing the last-proposed floor must \
+                     strictly exceed it (floor={floor:?}, got={pushed:?}) — Hlc::witness's own \
+                     contract is broken"
+                );
+                pushed
+            };
+            KvCommand::SplitTablet {
+                split_key: split_key.clone(),
+                children: children.clone(),
+                ts,
+            }
+        })
+    }
+
+    /// This group's pending (or already-applied) in-place split fork, if
+    /// any — the one accessor the per-node host reconciler
+    /// (`host::Reconciler`) polls to discover "this hosted tablet forked
+    /// locally, here are its two children" (ADR 0058 Train 2 Stage 3). A
+    /// point read of the durable fork marker (`split.rs`) — cheap (no scan,
+    /// unlike `seal.rs`'s marker, since a tablet forks at most once) and
+    /// safe to call every reconciler tick on every hosted tablet, forked or
+    /// not. Present the instant this **replica's own** apply has processed
+    /// the `SplitTablet` entry — which, for a learner, only happens after
+    /// Stage 2's catch-up is complete and Stage 3's entry has replicated to
+    /// it, exactly the ordering the design depends on.
+    pub async fn pending_split(&self) -> Option<PendingSplit> {
+        let key = split::split_marker_key(self.stream);
+        let vv = self.storage.get(&key).await.ok().flatten()?;
+        let decoded = split::decode_split_value(&vv.value)?;
+        Some(PendingSplit {
+            split_key: decoded.split_key,
+            children: decoded.children,
+            bootstrap_voters: decoded.bootstrap_voters,
+            ts: decoded.ts,
+        })
+    }
+
     /// **Anchor stage** phase of a 2PC (ADR 0018 §2/PR3, generalized to
     /// multi-participant in PR4 — see `txn.rs`'s module doc): mint a fresh
     /// [`TxnId`], compute its record key from `writes`' first (anchor)
@@ -3130,24 +3255,58 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// delta, with no in-flight change and no leader self-removal, so this picks
     /// one add/remove that makes progress and lets the next tick take the
     /// following step — a multi-server move converges one server per call.
-    /// Returns the proposed config if a step was **accepted**; `None` if already
-    /// converged, not the leader, a change is in flight, or a step was armed
-    /// but not itself a config change (the leadership-transfer case below).
+    /// Returns the proposed **voter** config if a step changed it; `None` if
+    /// already converged, not the leader, a change is in flight, or a step was
+    /// taken that doesn't itself change the voter set (a learner add/remove,
+    /// or the leadership-transfer case below).
+    ///
+    /// **ADR 0058 Train 1's reconciler adoption**: adding a replica no longer
+    /// puts it straight into the voter set. Every path that would have added a
+    /// voter directly now goes through a **learner phase** first — add as a
+    /// non-voting learner, wait for it to catch up
+    /// ([`learner_caught_up`](Self::learner_caught_up),
+    /// [`RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD`]), promote — so the old
+    /// quorum's own margin is never diluted by a newcomer that hasn't proven
+    /// it can actually ack anything yet (the hazard the learner class exists
+    /// to close; see ADR 0058's Train 1 section). A remove-only delta (no
+    /// missing member) is unaffected — the old failure-repair/healthy-move
+    /// priority order applies unchanged, straight on the voter set.
     ///
     /// Priority order, most urgent first:
     /// 1. **Remove an extra `Down` voter** (never self) — restores quorum margin
     ///    immediately; this is failure repair, and the removed node isn't going
-    ///    to ack anything anyway, so there is nothing to wait for.
-    /// 2. **Add a missing voter.** A transient `desired.len() + 1`-voter config
-    ///    is strictly safer than dropping a healthy voter first: quorum keeps
-    ///    its pre-move margin while the newcomer catches up via log/
-    ///    `InstallSnapshot`, instead of briefly running at reduced margin.
-    /// 3. **Remove an extra *healthy* voter** (never self) — but only once every
+    ///    to ack anything anyway, so there is nothing to wait for. Never touches
+    ///    a learner — a down voter is the only thing this urgent.
+    /// 2. **Drop a learner no longer wanted.** `desired` can change out from
+    ///    under a learner still mid-catch-up (its node crashed or was
+    ///    decommissioned, or a rebalance simply picked someone else) — any
+    ///    current learner absent from `desired` is stale by construction (a
+    ///    learner in `desired` would still be "missing" from the voter set, so
+    ///    `current == desired` together with a non-empty learner set can only
+    ///    mean every remaining learner is stale) and is removed directly,
+    ///    regardless of its liveness or catch-up progress. Without this, a
+    ///    replaced learner would wedge every later step forever.
+    /// 3. **Promote a learner that is both still desired and caught up** —
+    ///    advances an in-flight move before starting a new one.
+    /// 4. **Add a `desired` member that is neither a voter nor a learner, as a
+    ///    LEARNER** — never straight to voter. The old voter quorum keeps its
+    ///    pre-move margin (and majority size) untouched while the newcomer
+    ///    catches up via ordinary log replication/`InstallSnapshot`, instead of
+    ///    briefly counting an uncaught-up node toward quorum.
+    ///
+    ///    While any `desired` member is still a learner mid-catch-up (steps 2/3
+    ///    didn't apply this tick), no later step fires — in particular a
+    ///    healthy extra voter (step 5) is never removed while a replacement is
+    ///    still proving it can keep up.
+    /// 5. **Remove an extra *healthy* voter** (never self) — but only once every
     ///    member of `desired` has caught up to this leader's `commit_index`.
     ///    Skipping this gate would let a healthy move (e.g. a rebalance) drop
     ///    quorum to a still-catching-up newcomer, an availability regression
     ///    relative to just leaving the extra replica in place a little longer.
-    /// 4. **The only remaining delta is removing the leader's own replica** —
+    ///    By the time this step can fire, every `desired` member is already a
+    ///    voter (steps 2–4 handle the learner phase first), so this is exactly
+    ///    the pre-Train-1 step 3, unchanged.
+    /// 6. **The only remaining delta is removing the leader's own replica** —
     ///    `change_membership` always rejects that, so instead transfer
     ///    leadership (see [`transfer_leadership`](Self::transfer_leadership)) to
     ///    the lowest-id caught-up member of `desired`. The new leader's own next
@@ -3158,11 +3317,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         down: &BTreeSet<NodeId>,
     ) -> Option<BTreeSet<NodeId>> {
         let current = self.config();
-        if current == *desired || !self.is_leader() {
+        let current_learners = self.learners();
+        if !self.is_leader() {
+            return None;
+        }
+        // Converged: the voter set already matches `desired` AND no learner is
+        // left dangling. Must NOT return early on `current == desired` alone —
+        // a stray learner at that point is stale by construction (see step 2's
+        // doc above) and step 2 needs the chance to clean it up.
+        if current == *desired && current_learners.is_empty() {
             return None;
         }
         let me = self.env.node_id();
-        // Any extra (non-self) voter, regardless of liveness — used by step 3
+        // Any extra (non-self) voter, regardless of liveness — used by step 5
         // (a *healthy* extra). Step 1 below searches independently for a *down*
         // extra: `extra().filter(down.contains)` would only ever look at the
         // lowest-id extra (bug fixed under ADR 0029's follow-up — see the root
@@ -3181,11 +3348,63 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             c.remove(&target);
             return self.propose_config(c);
         }
-        if let Some(missing) = desired.difference(&current).next() {
-            let mut c = current.clone();
-            c.insert(missing.clone());
-            return self.propose_config(c);
+
+        // Step 2: drop a stale learner (ADR 0058 Train 1's stuck-learner
+        // cleanup — see the doc above).
+        if let Some(stale) = current_learners.iter().find(|n| !desired.contains(*n)) {
+            if !matches!(
+                self.remove_learner(stale.clone()),
+                ProposeResult::Accepted { .. }
+            ) {
+                tracing::debug!(
+                    node = %stale,
+                    "reconfigure_step: rejected removing a stale learner (retried next tick)"
+                );
+            }
+            return None;
         }
+
+        // Step 3: promote a learner that is both still desired and caught up.
+        if let Some(id) = current_learners.iter().find(|n| {
+            desired.contains(*n)
+                && self.learner_caught_up(n, RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD)
+        }) {
+            let mut c = current.clone();
+            c.insert(id.clone());
+            return match self.promote_learner(id.clone()) {
+                ProposeResult::Accepted { .. } => Some(c),
+                ProposeResult::NotLeader { .. } => None,
+            };
+        }
+
+        // A `desired` member is still mid-catch-up as a learner: nothing else
+        // to do this tick — in particular, never fall through to step 5 and
+        // remove a healthy extra voter while a replacement hasn't yet proven
+        // it can keep up (the whole point of the learner phase).
+        if desired.iter().any(|n| current_learners.contains(n)) {
+            return None;
+        }
+
+        // Step 4: a `desired` member genuinely missing from both the voter set
+        // and the learner set — add it as a LEARNER, never straight to voter.
+        if let Some(missing) = desired
+            .iter()
+            .find(|n| !current.contains(*n) && !current_learners.contains(*n))
+        {
+            if !matches!(
+                self.add_learner(missing.clone()),
+                ProposeResult::Accepted { .. }
+            ) {
+                tracing::debug!(
+                    node = %missing,
+                    "reconfigure_step: rejected adding a learner (retried next tick)"
+                );
+            }
+            return None;
+        }
+
+        // From here on every `desired` member is already a voter — the
+        // remaining deltas are exactly the pre-Train-1 steps 3/4.
         if let Some(healthy_extra) = extra() {
             let commit = self.commit_index();
             let caught_up = desired
@@ -5837,6 +6056,67 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     frozen.store(true, Ordering::SeqCst);
                 }
             }
+            KvCommand::SplitTablet {
+                split_key,
+                children,
+                ts,
+            } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                // Idempotent, mirroring `Freeze`'s own "already sealed"
+                // check: a duplicate propose or a WAL-replay
+                // re-application over a marker-rebuilt sealed set applies
+                // nothing a second time. `frozen` is shared with `Freeze`
+                // deliberately — the two workflows are mutually exclusive
+                // per tablet (selected by the operator's split-mode flag),
+                // and every existing "refuse if frozen" gate must cover
+                // this fork too with no separate allowlist entry.
+                if !frozen.load(Ordering::SeqCst) {
+                    flush_pending(storage, &mut pending, metrics, halted).await;
+                    let whole = KeyRange::whole();
+                    let seal_marker_key = seal::seal_marker_key(tablet, &whole);
+                    storage
+                        .merge(
+                            &seal_marker_key,
+                            &seal::encode_seal_value(&whole, ts),
+                            hlc::pack(ts),
+                        )
+                        .await
+                        .expect("raftkv apply split-fork seal marker");
+                    sealed.push((whole, ts));
+                    frozen.store(true, Ordering::SeqCst);
+                    // The fork-specific durable payload (split.rs): what the
+                    // host reconciler needs to actually materialize the two
+                    // children — see `KvCommand::SplitTablet`'s own doc for
+                    // why that work happens outside this apply path.
+                    //
+                    // `bootstrap_voters` is captured HERE, once, from the
+                    // core's own config+learners at this exact apply — see
+                    // `split.rs`'s module doc for why this read is
+                    // guaranteed identical on every replica (Raft log order:
+                    // every prior config-change entry has already applied by
+                    // the time THIS entry does).
+                    let bootstrap_voters = {
+                        let core_guard = core.lock().expect("raftkv core poisoned");
+                        let mut voters = core_guard.config();
+                        voters.extend(core_guard.learners());
+                        voters
+                    };
+                    let split_marker_key = split::split_marker_key(tablet);
+                    storage
+                        .merge(
+                            &split_marker_key,
+                            &split::encode_split_value(
+                                &split_key,
+                                &children,
+                                &bootstrap_voters,
+                                ts,
+                            ),
+                            hlc::pack(ts),
+                        )
+                        .await
+                        .expect("raftkv apply split-fork marker");
+                }
+            }
             KvCommand::ReadCeiling { ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
                 // No fence, no scoped engine write — a ceiling carries no
@@ -7055,6 +7335,29 @@ struct DriveState<E: Env, S: StorageEngine> {
 /// merge-applied at the carried version by [`KvCommand::SeedBatch`].
 pub type SeedRow = (u8, Vec<u8>, Option<Vec<u8>>, u64);
 
+/// A group's own **pending (or already-applied) in-place split fork** (ADR
+/// 0058 Train 2 rung 3), as read back by
+/// [`RaftKvNode::pending_split`](RaftKvNode::pending_split) — the durable
+/// payload `KvCommand::SplitTablet`'s apply arm wrote, decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSplit {
+    /// The key the parent's range splits at.
+    pub split_key: Vec<u8>,
+    /// Exactly two children, left half first — each `replicas` is that
+    /// child's placement-chosen FINAL replica set (what `CutoverSplit`
+    /// records into `Metadata`, driving the post-cutover trim).
+    pub children: [SplitChild; 2],
+    /// The parent's own full voter-plus-learner config at the moment this
+    /// entry applied — the BOOTSTRAP voter set both children's local
+    /// `RaftKvNode` start with (a superset of either child's own final
+    /// `replicas`, deliberately: see `split.rs`'s module doc for why every
+    /// fork participant safely votes for both new groups initially, trimmed
+    /// down post-cutover by the ordinary reconciler).
+    pub bootstrap_voters: BTreeSet<NodeId>,
+    /// The HLC timestamp the fork applied at (diagnostic only).
+    pub ts: HlcTimestamp,
+}
+
 /// The `ts` a mutating [`KvCommand`] variant carries, or `None` for `NoOp`
 /// (which carries none). The one place that knows every variant's `ts`
 /// field, shared by the WAL-recovery and entry-receipt witnessing sites.
@@ -7067,6 +7370,7 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
         | KvCommand::Delete { ts, .. }
         | KvCommand::Cas { ts, .. }
         | KvCommand::Freeze { ts }
+        | KvCommand::SplitTablet { ts, .. }
         | KvCommand::ReadCeiling { ts, .. }
         | KvCommand::TxnStage { ts, .. }
         | KvCommand::TxnCommit { ts, .. }

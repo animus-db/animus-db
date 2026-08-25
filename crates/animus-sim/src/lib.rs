@@ -1140,6 +1140,33 @@ impl Disk for SimEnv {
             .map(|((_, name), _)| name.clone())
             .collect())
     }
+
+    async fn link(&self, src: &str, dst: &str) -> std::io::Result<()> {
+        // There is no inode/directory model here, so a hard link is modelled
+        // as a snapshot copy of `src`'s current (durable + buffered)
+        // `FileState` into `dst`'s own, independent map slot. This is
+        // behaviorally indistinguishable from a real hard link for this
+        // trait's sanctioned use (linking an already-fully-synced, never-
+        // mutated-in-place SSTable file): later `remove`ing either name only
+        // touches its own map entry, exactly like two directory entries
+        // sharing one inode's bytes until the last link is gone.
+        let mut st = self.shared.lock();
+        if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "link", src) {
+            return Err(e);
+        }
+        let src_key = (self.node_id.clone(), src.to_owned());
+        let Some(content) = st.disks.get(&src_key).cloned() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("link: source file {src} does not exist"),
+            ));
+        };
+        // Overwrite semantics (idempotent retry): a stale `dst` from a
+        // previous, crashed clone attempt is simply replaced.
+        let dst_key = (self.node_id.clone(), dst.to_owned());
+        st.disks.insert(dst_key, content);
+        Ok(())
+    }
 }
 
 impl Spawner for SimEnv {

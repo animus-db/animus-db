@@ -97,6 +97,13 @@ pub(crate) struct CpRaftView {
     pub(crate) snapshot_index: u64,
     pub(crate) log_len: usize,
     pub(crate) voters: Vec<NodeId>,
+    /// This tablet's current **learner** set (ADR 0058 Train 1's reconciler
+    /// adoption) — non-voting members mid-catch-up on their way into
+    /// `voters`, or a node the leader is about to add/promote/remove as its
+    /// own `reconfigure_step`'s single-step-per-tick sequencing progresses.
+    /// Empty on a converged group. Purely observational — this view never
+    /// drives anything.
+    pub(crate) learners: Vec<NodeId>,
     /// This tablet's live key count — **the cheap, non-materializing
     /// `CpGroup::approx_key_count` estimate by default**, the exact
     /// `local_pairs` count under `?exact=1` (see `CpGroup::raft_view` for

@@ -118,6 +118,25 @@
 //!   carried no ack.
 //!
 //! These properties are argued here and exercised in `tests/lsm_crash.rs`.
+//!
+//! ## Cloning (ADR 0058 rung 2)
+//!
+//! [`LsmEngine::clone_to`] clones this engine's current durable state into a
+//! **new**, independent engine at a different prefix on the same `Env`, at
+//! SSTable file granularity: flush the memtable (so the clone is
+//! SSTables-only, with no WAL to carry over), then
+//! [hard-link](animus_env::Disk::link) every live SSTable file into the
+//! target's own namespace and write it a fresh manifest naming exactly those
+//! tables. SSTable immutability is what makes sharing safe — the source and
+//! the clone hold independent directory entries over the same durable bytes,
+//! so the source's own compaction later removing a superseded file does not
+//! affect the clone. The target's manifest write is the single commit point
+//! (durable-before-visible): until it succeeds, the target prefix has no
+//! manifest and opens as empty, so a crash mid-clone leaves no half-formed
+//! clone visible and the whole operation is safe to simply retry (relinking
+//! is idempotent — see [`Disk::link`](animus_env::Disk::link)). Full-engine
+//! clone only: no kind filtering, no key-range trimming — any such filtering
+//! is a later layer's business, not this primitive's.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -1873,6 +1892,129 @@ impl<E: Env> LsmEngine<E> {
             self.run_compaction(plan).await?;
         }
         Ok(())
+    }
+
+    /// Clone this engine's current durable state into a **new**, independent
+    /// engine at `target_prefix` on the same `Env`, at SSTable file
+    /// granularity (ADR 0058 rung 2 — the prerequisite for a later split's
+    /// local materialization; this method itself knows nothing about splits).
+    ///
+    /// ## The cut
+    ///
+    /// The clone reflects the engine's *currently durable + applied* state as
+    /// of this call: the memtable is flushed first (a no-op if already
+    /// empty), so the clone is **SSTables-only, with an empty WAL** — there is
+    /// no in-memory or WAL state to transfer. Every table the post-flush
+    /// manifest names is then [hard-linked](animus_env::Disk::link) — not
+    /// copied — into `target_prefix`'s own file namespace, and a fresh
+    /// manifest is written there naming exactly those tables (same sequence
+    /// numbers, same `next_seq` floor so the target's own future flushes
+    /// never collide with an inherited seq, same `max_version`, an empty
+    /// `wal_segments`). SSTable immutability is what makes sharing bytes
+    /// instead of copying them safe: the source and the returned engine hold
+    /// independent directory entries over the same durable bytes, so the
+    /// source's own compaction later removing a superseded input file has no
+    /// effect on the clone's own link to it.
+    ///
+    /// The [`MaintenanceLock`] is held across the whole snapshot-and-link
+    /// sequence (after the flush, which takes and releases it on its own —
+    /// the lock is not reentrant), so a compaction on **this** (source)
+    /// engine cannot swap or remove a table out from under a link this call
+    /// is in the middle of making.
+    ///
+    /// ## Commit point / crash safety (durable-before-visible)
+    ///
+    /// Every linked SSTable file is durable the instant [`Disk::link`]
+    /// returns (a hard link only adds a directory entry over bytes the
+    /// source already synced when it first wrote the table — no new data
+    /// fsync is needed, only the namespace change, which `link` itself
+    /// fsyncs). The **single commit point** is the target's own manifest
+    /// [`Disk::replace`] at the end: until that succeeds, `target_prefix` has
+    /// no manifest, so [`open`](Self::open)ing it finds nothing durable —
+    /// any already-linked SSTable files sitting there are harmless,
+    /// unreferenced orphans, exactly like a crashed flush's orphan table (see
+    /// the module docs' "Crash safety" section). A crash before the manifest
+    /// commit therefore leaves **no half-clone visible**, and the whole
+    /// operation is safe to simply retry: it re-flushes (a no-op if nothing
+    /// changed), re-snapshots, and re-links — [`Disk::link`] overwrites an
+    /// already-linked `dst` name rather than erroring, so relinking the same
+    /// `(src, dst)` pairs is idempotent. A crash *after* the manifest commit
+    /// is a complete, independently-openable clone.
+    ///
+    /// **Note the one asymmetry this implies**: this method's own last step
+    /// is opening the just-committed target (to hand back a live handle), so
+    /// an `Err` from *this* call does not always mean "nothing was
+    /// committed" — a fault landing in that final open (after a successful
+    /// manifest commit) still leaves a fully valid, durable clone on disk,
+    /// just without a handle to show for it here. Either way the invariant
+    /// that matters holds: what is durable at `target_prefix` is always
+    /// either **nothing** or a **complete** clone, never a torn one. A
+    /// caller that gets `Err` back can simply retry `clone_to` (the flush and
+    /// every link are no-ops/idempotent overwrites if already done) or call
+    /// [`open`](Self::open) directly if it already knows the commit
+    /// succeeded.
+    ///
+    /// ## Scope
+    ///
+    /// Full-engine clone only — no kind filtering, no key-range trimming.
+    /// Every live table at every level is linked verbatim; any such filtering
+    /// belongs in a caller built on top of this primitive, not inside it.
+    ///
+    /// [`Disk::link`]: animus_env::Disk::link
+    ///
+    /// # Errors
+    ///
+    /// Propagates a flush or disk I/O failure. The source engine's own
+    /// manifest/readers are never touched by this method, so it leaves the
+    /// source unaffected on any error path.
+    pub async fn clone_to(&self, target_prefix: impl Into<String>) -> Result<LsmEngine<E>> {
+        let target_prefix: String = target_prefix.into();
+
+        // Flush first so the clone is SSTables-only. Done *before* taking the
+        // maintenance lock below: `flush` acquires it internally and the lock
+        // is not reentrant.
+        self.flush().await?;
+
+        // Hold the maintenance lock for the whole snapshot+link sequence so a
+        // concurrent compaction on the source cannot swap/remove a table this
+        // call is in the middle of linking (see the doc comment above).
+        let _maintenance = self.maintenance.acquire().await;
+
+        let (tables, next_seq, max_version) = {
+            let inner = self.lock();
+            (
+                inner.manifest.tables.clone(),
+                inner.manifest.next_seq,
+                inner.manifest.max_version,
+            )
+        };
+
+        for meta in &tables {
+            let src = self.sst_file(meta.seq);
+            let dst = format!("{target_prefix}sst-{:06}", meta.seq);
+            self.env.link(&src, &dst).await.map_err(io)?;
+        }
+
+        let target_manifest = Manifest {
+            next_seq,
+            tables,
+            max_version,
+            wal_segments: Vec::new(),
+        };
+        self.env
+            .replace(
+                &format!("{target_prefix}MANIFEST"),
+                &encode_manifest(&target_manifest),
+            )
+            .await
+            .map_err(io)?;
+
+        // The commit point above is durable; the maintenance lock guards only
+        // the source's own tables against a racing compaction, so it can be
+        // released before reopening the (independent) target.
+        drop(_maintenance);
+
+        LsmEngine::open_with(self.env.clone(), target_prefix, self.opts).await
     }
 }
 

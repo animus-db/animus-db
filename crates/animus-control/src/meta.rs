@@ -13,7 +13,9 @@ use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
 use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan};
-use animus_tablet::{Epoch, KeyRange, TOKEN_BYTES, Tablet, TabletId, TabletState};
+use animus_tablet::{
+    Epoch, InPlaceSplitIntent, KeyRange, SplitChild, TOKEN_BYTES, Tablet, TabletId, TabletState,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{
@@ -542,6 +544,31 @@ pub enum MetaCommand {
         /// Exactly two `(child id, replica set)` pairs, left half first.
         children: [(TabletId, Vec<NodeId>); 2],
     },
+    /// Begin an **in-place split** (ADR 0058 Train 2 rung 3, Stage 1):
+    /// consults placement for the two children's final homes exactly like
+    /// [`BeginSplit`](Self::BeginSplit) (fork F5 preserved), mints their
+    /// tablet ids up front (same monotonic allocator, same collision/floor
+    /// checks), but — unlike `BeginSplit` — mints NO `Building` tablet-map
+    /// entries: no data has moved yet, so there is nothing to place a
+    /// routable-but-empty row over. Instead the intent itself (split key +
+    /// both children's `(id, replicas)` pairs) is recorded directly on the
+    /// parent (`Tablet::inplace_split`) — the smallest representation a
+    /// hosting node's own reconciler (`animus_cp_data::host`) needs to
+    /// discover "this tablet is splitting in-place" and drive the
+    /// learner-add/fork/materialize sequence entirely inside the data
+    /// plane. Same epoch-CAS + `Active`-only state gate + F11
+    /// token-alignment seatbelt as `BeginSplit`. The parent's policy is
+    /// inherited by both children only at
+    /// [`CutoverSplit`](Self::CutoverSplit) time (there is no tablet-map
+    /// row to attach a policy to before then).
+    BeginSplitInPlace {
+        parent: TabletId,
+        expected_epoch: Epoch,
+        split_key: Vec<u8>,
+        /// Exactly two `(child id, replica set)` pairs, left half first —
+        /// each replica set is that child's placement-chosen FINAL homes.
+        children: [(TabletId, Vec<NodeId>); 2],
+    },
     /// Complete a copy-based split (ADR 0050 stage 4): atomically flip both
     /// children [`TabletState::Active`], **remove the parent from the
     /// tablet map** (fork F6 — every hosting node's reconciler then
@@ -553,6 +580,22 @@ pub enum MetaCommand {
     /// (the B4/B5 split driver) is responsible for having seeded the
     /// children and frozen the parent first — this command is the
     /// metadata flip only.
+    ///
+    /// **In-place branch (ADR 0058 Train 2 rung 3, Stage 4)**: when the
+    /// parent instead carries an [`animus_tablet::InPlaceSplitIntent`]
+    /// (`Tablet::inplace_split`, set by
+    /// [`BeginSplitInPlace`](Self::BeginSplitInPlace)), this same command
+    /// activates both children DIRECTLY from the intent's own
+    /// `(id, replicas)` pairs — never scanning for `Building` tablets, since
+    /// none were ever minted — inheriting the parent's policy at THIS
+    /// moment (the in-place workflow's only chance to, since there was no
+    /// tablet-map row to attach it to earlier) and writing `split_lineage`
+    /// for both, identically to the copy-based branch. The children are
+    /// already fully formed and durable on every fork participant by the
+    /// time this command ever runs (the data plane's own `SplitTablet`
+    /// entry, ADR 0058 Train 2 Stage 3) — there is nothing left for a
+    /// pre-cutover veto to wait for, so (unlike the copy-based endgame) NO
+    /// freeze/GSI-drain/backfill veto gates this branch at all.
     CutoverSplit {
         parent: TabletId,
         expected_epoch: Epoch,
@@ -1242,6 +1285,80 @@ impl Metadata {
                 source.epoch = source.epoch.next();
                 ApplyOutcome::Applied
             }
+            MetaCommand::BeginSplitInPlace {
+                parent,
+                expected_epoch,
+                split_key,
+                children,
+            } => {
+                let [(left_id, left_replicas), (right_id, right_replicas)] = children;
+                if left_id == right_id {
+                    return ApplyOutcome::Rejected("child ids must be distinct");
+                }
+                for id in [left_id, right_id] {
+                    if self.tablets.contains_key(id) {
+                        return ApplyOutcome::Rejected("child tablet id already exists");
+                    }
+                    // Same monotonic-allocator floor as `BeginSplit`.
+                    if id.0 < self.next_free_tablet_id().0 {
+                        return ApplyOutcome::Rejected(
+                            "child tablet id below the monotonic allocator",
+                        );
+                    }
+                }
+                let Some(source) = self.tablets.get(parent) else {
+                    return ApplyOutcome::Rejected("no such tablet");
+                };
+                // Identical epoch-CAS/state-gate discipline to `BeginSplit`.
+                if source.epoch != *expected_epoch {
+                    return ApplyOutcome::Rejected("epoch mismatch");
+                }
+                if source.state != TabletState::Active {
+                    return ApplyOutcome::Rejected("tablet is not Active");
+                }
+                // F11 seatbelt, identical to `BeginSplit`'s arm above.
+                if split_key.len() != TOKEN_BYTES
+                    && source
+                        .table
+                        .as_deref()
+                        .is_some_and(|table| self.table_stream(table).is_some())
+                {
+                    return ApplyOutcome::Rejected(
+                        "split key not token-aligned for a streamed table",
+                    );
+                }
+                // Validate the split key is strictly inside the parent's own
+                // range (same `KeyRange::split_at` check `BeginSplit` makes)
+                // WITHOUT keeping the halves — the in-place workflow derives
+                // each child's own range later, from this same split key,
+                // wherever it's actually needed (the data plane's own
+                // `SplitTablet` apply, and this command's own `CutoverSplit`
+                // counterpart below); there is no tablet-map row to place
+                // them on yet.
+                if source.range.split_at(split_key).is_none() {
+                    return ApplyOutcome::Rejected("split key not strictly inside range");
+                }
+                let intent = InPlaceSplitIntent {
+                    split_key: split_key.clone(),
+                    children: [
+                        SplitChild {
+                            id: *left_id,
+                            replicas: left_replicas.clone(),
+                        },
+                        SplitChild {
+                            id: *right_id,
+                            replicas: right_replicas.clone(),
+                        },
+                    ],
+                };
+                self.next_tablet_id = self.next_tablet_id.max(left_id.0 + 1);
+                self.next_tablet_id = self.next_tablet_id.max(right_id.0 + 1);
+                let source = self.tablets.get_mut(parent).expect("tablet present");
+                source.state = TabletState::Splitting;
+                source.inplace_split = Some(intent);
+                source.epoch = source.epoch.next();
+                ApplyOutcome::Applied
+            }
             MetaCommand::CutoverSplit {
                 parent,
                 expected_epoch,
@@ -1255,6 +1372,56 @@ impl Metadata {
                 }
                 if source.state != TabletState::Splitting {
                     return ApplyOutcome::Rejected("tablet is not Splitting");
+                }
+                // ADR 0058 Train 2 rung 3, Stage 4: an in-place split's
+                // parent carries its own intent directly — the children are
+                // already fully formed on every fork participant (the data
+                // plane's own `SplitTablet` apply), so this branch creates
+                // their tablet-map rows straight from the intent rather than
+                // scanning for `Building` entries (none were ever minted).
+                if let Some(intent) = source.inplace_split.clone() {
+                    let Some((left_range, right_range)) = source.range.split_at(&intent.split_key)
+                    else {
+                        // Structurally unreachable — `BeginSplitInPlace`
+                        // already validated this exact split against this
+                        // exact (immutable-since-then) range.
+                        return ApplyOutcome::Rejected("split key not strictly inside range");
+                    };
+                    let table = source.table.clone();
+                    let policy = self.policies.get(parent).cloned();
+                    let parents_final_epoch = self
+                        .stream_shards
+                        .range((*parent, 0)..=(*parent, u64::MAX))
+                        .next_back()
+                        .map(|(&(_, epoch), _)| epoch);
+                    for (child, range) in [
+                        (&intent.children[0], left_range),
+                        (&intent.children[1], right_range),
+                    ] {
+                        let mut t = Tablet::with_table(
+                            child.id,
+                            table.clone(),
+                            range,
+                            child.replicas.clone(),
+                        );
+                        t.state = TabletState::Active;
+                        t.epoch = t.epoch.next();
+                        self.tablets.insert(child.id, t);
+                        if let Some(policy) = policy.clone() {
+                            self.policies.insert(child.id, policy);
+                        }
+                        self.split_lineage.insert(
+                            child.id,
+                            SplitLineage {
+                                parent: *parent,
+                                parents_final_epoch,
+                                cutover_wall_ms: *cutover_wall_ms,
+                            },
+                        );
+                    }
+                    self.tablets.remove(parent);
+                    self.policies.remove(parent);
+                    return ApplyOutcome::Applied;
                 }
                 // The parent's two `Building` children are exactly the
                 // `Building` tablets whose ranges partition the parent's own —
@@ -3112,6 +3279,197 @@ mod tests {
             }),
             ApplyOutcome::Rejected("tablet is not Active")
         );
+    }
+
+    /// ADR 0058 Train 2 rung 3: `BeginSplitInPlace`'s own fixture — one
+    /// `Active` parent tablet (id 1, whole range, RF 3, a recorded policy)
+    /// plus the command splitting it at the ring midpoint into children 2
+    /// and 3 at hand-picked (distinct, DISJOINT from the parent's own
+    /// replicas — this train's own Stage 1 needs at least one genuinely new
+    /// home) homes.
+    fn begin_split_in_place_fixture() -> (Metadata, MetaCommand) {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(1),
+                policy: Some(PlacementPolicy::simple("users", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        let cmd = MetaCommand::BeginSplitInPlace {
+            parent: TabletId(1),
+            expected_epoch: Epoch::INITIAL,
+            split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            children: [
+                (TabletId(2), vec![nid(1), nid(2), nid(4)]),
+                (TabletId(3), vec![nid(2), nid(3), nid(5)]),
+            ],
+        };
+        (m, cmd)
+    }
+
+    /// `BeginSplitInPlace` marks the parent `Splitting` (range/replicas
+    /// untouched — the data plane's own fork, not this command, is what
+    /// moves data) and records the intent verbatim, WITHOUT minting any
+    /// `Building` tablet-map rows or copying the policy (there is nothing to
+    /// attach it to yet — see [`CutoverSplit`]'s own in-place test for where
+    /// that happens instead) — but DOES advance the allocator floor, so the
+    /// two minted ids can never be reused even before any tablet row for
+    /// them exists.
+    #[test]
+    fn begin_split_in_place_records_the_intent_and_marks_the_parent_splitting() {
+        let (mut m, cmd) = begin_split_in_place_fixture();
+        assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
+
+        let parent = &m.tablets[&TabletId(1)];
+        assert_eq!(parent.state, TabletState::Splitting);
+        assert_eq!(parent.range, KeyRange::whole(), "parent range untouched");
+        assert_eq!(
+            parent.replicas,
+            vec![nid(1), nid(2), nid(3)],
+            "parent replicas untouched — the intent, not this field, carries the children's homes"
+        );
+        assert_eq!(parent.epoch, Epoch::INITIAL.next());
+
+        let intent = parent.inplace_split.as_ref().expect("intent recorded");
+        let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
+        assert_eq!(intent.split_key, mid);
+        assert_eq!(intent.children[0].id, TabletId(2));
+        assert_eq!(intent.children[0].replicas, vec![nid(1), nid(2), nid(4)]);
+        assert_eq!(intent.children[1].id, TabletId(3));
+        assert_eq!(intent.children[1].replicas, vec![nid(2), nid(3), nid(5)]);
+
+        // No `Building` tablet-map rows — the in-place workflow mints
+        // nothing physical until the data plane's own fork.
+        assert!(!m.tablets.contains_key(&TabletId(2)));
+        assert!(!m.tablets.contains_key(&TabletId(3)));
+        assert!(!m.policies.contains_key(&TabletId(2)));
+        assert!(!m.policies.contains_key(&TabletId(3)));
+        // The allocator floor still advances, so ids 2/3 can never be
+        // reissued to something else even before any row exists for them.
+        assert!(m.next_free_tablet_id().0 >= 4);
+        assert!(m.split_lineage.is_empty());
+    }
+
+    /// `BeginSplitInPlace` rejects on the identical epoch/state/child-id
+    /// gates `BeginSplit` does — same discipline, same fixture shape.
+    #[test]
+    fn begin_split_in_place_rejects_bad_epoch_state_and_child_ids() {
+        let (mut m, cmd) = begin_split_in_place_fixture();
+        let MetaCommand::BeginSplitInPlace {
+            parent,
+            split_key,
+            children,
+            ..
+        } = cmd.clone()
+        else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            m.apply(&MetaCommand::BeginSplitInPlace {
+                parent,
+                expected_epoch: Epoch::INITIAL.next(),
+                split_key: split_key.clone(),
+                children: children.clone(),
+            }),
+            ApplyOutcome::Rejected("epoch mismatch")
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::BeginSplitInPlace {
+                parent,
+                expected_epoch: Epoch::INITIAL,
+                split_key: split_key.clone(),
+                children: [(TabletId(2), vec![nid(4)]), (TabletId(2), vec![nid(5)])],
+            }),
+            ApplyOutcome::Rejected("child ids must be distinct")
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::BeginSplitInPlace {
+                parent,
+                expected_epoch: Epoch::INITIAL,
+                split_key: split_key.clone(),
+                children: [(TabletId(1), vec![nid(4)]), (TabletId(9), vec![nid(5)])],
+            }),
+            ApplyOutcome::Rejected("child tablet id already exists")
+        );
+
+        assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
+        assert_eq!(
+            m.apply(&MetaCommand::BeginSplitInPlace {
+                parent,
+                expected_epoch: Epoch::INITIAL.next(),
+                split_key,
+                children: [(TabletId(10), vec![nid(4)]), (TabletId(11), vec![nid(5)])],
+            }),
+            ApplyOutcome::Rejected("tablet is not Active"),
+            "one split at a time — a re-split of an already-Splitting parent is rejected"
+        );
+    }
+
+    /// ADR 0058 Train 2 rung 3, Stage 4: `CutoverSplit`'s in-place branch
+    /// activates both children DIRECTLY from the parent's own intent — no
+    /// `Building` scan — inheriting the parent's policy at THIS moment (the
+    /// in-place workflow's only chance to), writing `split_lineage`
+    /// identically to the copy-based branch, and removing the parent.
+    #[test]
+    fn cutover_split_in_place_activates_both_children_from_the_intent() {
+        let (mut m, cmd) = begin_split_in_place_fixture();
+        assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
+        let parent_epoch = m.tablets[&TabletId(1)].epoch;
+
+        assert_eq!(
+            m.apply(&MetaCommand::CutoverSplit {
+                parent: TabletId(1),
+                expected_epoch: parent_epoch,
+                cutover_wall_ms: 99,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert!(!m.tablets.contains_key(&TabletId(1)), "parent removed");
+        assert!(
+            !m.policies.contains_key(&TabletId(1)),
+            "parent policy removed"
+        );
+
+        let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
+        let left = &m.tablets[&TabletId(2)];
+        assert_eq!(left.state, TabletState::Active);
+        assert_eq!(left.table.as_deref(), Some("users"));
+        assert_eq!(left.replicas, vec![nid(1), nid(2), nid(4)]);
+        assert_eq!(left.range.end.as_deref(), Some(mid.as_slice()));
+        assert_eq!(left.epoch, Epoch::INITIAL.next());
+        assert!(
+            left.inplace_split.is_none(),
+            "the intent does not persist onto the child"
+        );
+
+        let right = &m.tablets[&TabletId(3)];
+        assert_eq!(right.state, TabletState::Active);
+        assert_eq!(right.replicas, vec![nid(2), nid(3), nid(5)]);
+        assert_eq!(right.range.start, mid);
+
+        // The policy, only ever attachable at cutover for this workflow,
+        // is inherited by both children.
+        assert!(m.policies.contains_key(&TabletId(2)));
+        assert!(m.policies.contains_key(&TabletId(3)));
+
+        for child in [TabletId(2), TabletId(3)] {
+            let lineage = &m.split_lineage[&child];
+            assert_eq!(lineage.parent, TabletId(1));
+            assert_eq!(lineage.parents_final_epoch, None);
+            assert_eq!(lineage.cutover_wall_ms, 99);
+        }
     }
 
     /// ADR 0050 stage 4: `CutoverSplit` atomically activates both children

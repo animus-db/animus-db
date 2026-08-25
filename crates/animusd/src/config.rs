@@ -138,6 +138,52 @@ impl DynamoAuthConfig {
     }
 }
 
+/// Which tablet-split **workflow** a cluster runs when a split triggers
+/// (ADR 0058 Train 2 rung 3's `animusd`-level driver residue): the
+/// pre-existing copy-based build/freeze/cutover workflow (ADR 0050), or the
+/// newer in-place single-entry atomic fork (ADR 0058). `Copy` is the
+/// default and is byte-for-byte the original ADR 0050 workflow — every
+/// existing deployment/test keeps its exact behavior unless this is
+/// explicitly set to `InPlace`. `ClientCtx::trigger_split`'s ONE choke
+/// point reads this (from `ClientCtx::split_mode`, threaded from the
+/// `--split-mode {copy,inplace}` CLI flag — see `main.rs`'s `run`) to
+/// decide which `MetaCommand` to propose; `auto_split_loop`/
+/// `admin::action_split`/the `SplitTablet` wire handler all fall in behind
+/// it automatically since none of them build the command themselves.
+///
+/// **Deliberately not a [`ClusterConfig`] field**: unlike
+/// [`DynamoAuthConfig`] (a secret that has no other way to reach a
+/// `--config FILE` per-process deployment), this is a plain operational
+/// knob threaded exactly the way `--auto-split`/`--quiesce-after` are —
+/// through the CLI/function-parameter chain, not the JSON config file — so
+/// adding it never touches [`ClusterConfig`]'s struct-literal shape (which
+/// dozens of existing tests construct directly, all of them needing to stay
+/// byte-for-byte unmodified).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitMode {
+    /// The ADR 0050 copy-based build/freeze/cutover workflow — unchanged,
+    /// still the default.
+    #[default]
+    Copy,
+    /// The ADR 0058 Train 2 in-place single-entry atomic fork.
+    InPlace,
+}
+
+impl std::str::FromStr for SplitMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "copy" => Ok(SplitMode::Copy),
+            "inplace" => Ok(SplitMode::InPlace),
+            other => Err(format!(
+                "invalid split mode `{other}` (expected `copy` or `inplace`)"
+            )),
+        }
+    }
+}
+
 /// A whole-cluster configuration shared (identically) by every node's process.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterConfig {
