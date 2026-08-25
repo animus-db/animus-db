@@ -40,6 +40,10 @@ on:
         description: "Seeds per scenario (ANIMUS_LEARNER_SEEDS, ADR 0058 Train 1 learner-membership corpus)"
         required: false
         default: "40"
+      inplace_split_seeds:
+        description: "Seeds per scenario (ANIMUS_INPLACE_SPLIT_SEEDS, ADR 0058 Train 2 rung 3 in-place split corpus)"
+        required: false
+        default: "40"
 
 # One deep run at a time. The corpora are long-running and share the same
 # runner class as CI, so an on-demand `workflow_dispatch` queues behind a
@@ -125,3 +129,14 @@ jobs:
         env:
           ANIMUS_LEARNER_SEEDS: ${{ github.event.inputs.learner_seeds || '40' }}
         run: cargo test -p animus-control --test learner_corpus -- --nocapture
+
+      # ADR 0058 Train 2 rung 3's in-place split group-mint-at-apply corpus:
+      # the full happy path, a leader crash mid-catch-up, the G4 crash
+      # window (engine committed, group not yet started), and a concurrent
+      # unrelated rebalance racing the split's own learner-add, scaled to
+      # depth. Each scenario is a pure function of its seed, so a failure
+      # names one scenario + seed and is replayable.
+      - name: deep in-place split corpus (ADR 0058 Train 2 rung 3)
+        env:
+          ANIMUS_INPLACE_SPLIT_SEEDS: ${{ github.event.inputs.inplace_split_seeds || '40' }}
+        run: cargo test -p animus-cp-data --test inplace_split_reconciler -- --nocapture

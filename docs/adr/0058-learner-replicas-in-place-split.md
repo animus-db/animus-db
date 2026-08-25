@@ -612,14 +612,76 @@ see that alternative for why a bound would be unsafe) should ship
 slow-convergence class on the record today (issue #288) and should not
 wait on any part of this proposal.
 
+**As-built (2026-08-25) — rung 3 landed, behind a flag, alongside the
+still-shipping copy-based workflow (rung 4 unstarted).** `MetaCommand::
+BeginSplitInPlace`/`CutoverSplit`'s in-place branch (`animus-control`),
+`KvCommand::SplitTablet` and its apply-time mint (`animus-cp-data`), and
+the host reconciler's own learner-add/fork-watch/materialize/trim sequence
+(`animus-cp-data::host`) are all in place and sim-tested; this closes forks
+G1 and G4 (below) with the resolutions decided here. Landed in three
+stages, bottom-up: the data-plane mint machinery + its own fault
+regressions (`tests/split_tablet.rs`); the host-reconciler wiring, its two
+newly-discovered correctness gaps (a node recruited only via a child's own
+`replicas` must still host the parent as a quiet non-voter, and must be
+exempted from the ordinary release check), and its own corpus
+(`tests/inplace_split_reconciler.rs`, held green through
+`ANIMUS_INPLACE_SPLIT_SEEDS=200`); then the control-plane commands
+themselves plus their unit tests.
+
+**One concrete deviation from the Stage 3 prose above**: "Raft configs
+derived deterministically from the parent's own config at that entry"
+resolves to a SPECIFIC formula, stated here rather than left implicit —
+both children's initial bootstrap voter set is the parent's own full
+`RaftCore::config() ∪ RaftCore::learners()`, read once inside the
+`SplitTablet` apply arm itself (deterministic across replicas by Raft log
+order: every earlier config-change entry has necessarily already applied
+by the time this one does). This is deliberately the SUPERSET of either
+child's own final placement, not each child's own `children[i].replicas`
+alone — it is what makes Stage 5's "each child is over-replicated relative
+to its own final RF" literally true by construction, with the ordinary
+`reconfigure_step` trim (unmodified) doing the rest once `CutoverSplit`
+records each child's real, final `replicas` into `Metadata`.
+
+**A second deviation, load-bearing and easy to miss**: the ADR's Stage 1
+prose describes the parent's reconciler adding "the union of the
+children's chosen homes" as learners, but says nothing about how a home
+that is genuinely new (never a parent voter) comes to run a `RaftKvNode`
+for the PARENT tablet at all before it can be added as a learner to it.
+`host::plan`'s phase 1 gained a second host-candidate test for exactly
+this: a node named in either child's own `replicas` (of a parent's
+in-place split intent) hosts the parent as a quiet non-voter even though
+it is never (and never becomes) a member of the parent's own `replicas` —
+without this, the leader's `add_learner(home)` targets a node with no
+local Raft instance running to receive the resulting `AppendEntries` at
+all. The identical recruited-node set is also exempted from the ordinary
+release check, which would otherwise fire on it immediately (it is never
+in the parent's own `replicas`, and `config_excludes_me` is trivially true
+for a still-a-learner recruit — a learner is never in `RaftCore::config()`
+by construction).
+
+**Residue — explicitly NOT part of this rung**, left for the layer above
+(an `animusd`-level driver, mirroring `index_drain.rs::split_driver_tick`'s
+shape for the copy-based workflow): the `--split-mode {copy,inplace}`
+operator flag itself, `ClientCtx::trigger_split`'s in-place branch (mint
++ propose `BeginSplitInPlace`), the per-tick driver that watches a
+forked-locally parent, runs the (unmodified) GSI-drain/backfill vetoes
+against it, and proposes `CutoverSplit`, and the real multi-node `ProdEnv`
+end-to-end regression (a paced continuous writer riding the fork). None of
+animus-control/animus-cp-data's own mechanism depends on this layer
+existing — every property above is proven by constructing the in-place
+path directly (`MetadataView`/`Tablet::inplace_split` built by hand,
+mirroring how `tests/reconciler_corpus.rs` already stands in for a live
+control plane), the same posture this ADR's own Train 1 rung took for its
+reconciler-adoption sub-rung.
+
 ## Open forks (deliberately not decided by this ADR)
 
 | # | Fork | Status |
 |---|------|--------|
-| G1 | Parent-engine drain-then-reclaim protocol post-cutover (Stage 4) | Open — needs its own design pass before rung 3/4 |
-| G2 | Range-filtered `InstallSnapshot` for a learner at a disjoint final home, vs. accepting the ~2× bytes and pre-trimming at the clone step | Open — a mitigation choice, not blocking rung 1–3 |
+| G1 | Parent-engine drain-then-reclaim protocol post-cutover (Stage 4) | **Decided (2026-08-25), reversed from this ADR's own Stage 4 prose**: the drain gates stay PRE-cutover. The existing GSI-drain veto (now accelerated, Alternative 1/issue #288) and backfill-seeder veto run against the now-static, forked (hence write-frozen — Stage 3's own apply-time seal) parent exactly as in the copy-based endgame, gating the `CutoverSplit` propose the same way they gate it there today. Rationale: the parent's engine is retained, intact, on every fork participant until cutover reclaims it (nothing analogous to the copy-based `Freeze`-then-tear-down timing pressure exists — the fork itself is instantaneous and non-blocking), so there is no reason to invent a NEW retained-engine-after-retirement drain protocol when the existing pre-cutover one already has everything it needs merely by running against the (already fully-formed) children's own consumer state instead of the parent's. This is a caller-side (driver) concern in BOTH workflows — `MetaCommand::CutoverSplit`'s own apply never gated on drain state even in the copy-based branch — so it is entirely residue for the driver layer above (see the "Residue" paragraph above), not a change to the command shipped in this rung. |
+| G2 | Range-filtered `InstallSnapshot` for a learner at a disjoint final home, vs. accepting the ~2× bytes and pre-trimming at the clone step | Open — a mitigation choice, not blocking rung 1–3. Rung 3 landed the simpler side: full clone then trim (`trim_split_child`), no snapshot filtering. |
 | G3 | Whether ADR 0030's permanently-non-voting growth mirror is re-expressed as a learner that is never promoted, once learners exist | Open — noted, not committed to |
-| G4 | Exact crash-recovery idempotency contract for group-mint-at-apply (Stage 3) | Open — the load-bearing detail of rung 3, deliberately left to that rung's own design, not settled here |
+| G4 | Exact crash-recovery idempotency contract for group-mint-at-apply (Stage 3) | **Decided (2026-08-25)**: two independent commit points, each checked and skipped on its own before a retry redoes it. (1) **The engine commit** — `EngineFactory::clone_engine`'s target manifest replace (ADR 0058 rung 2's own "absent or complete, never torn" contract) — checked via `EngineFactory::probe(child)` BEFORE ever cloning; if the engine already exists, an earlier attempt already committed it (possibly crashing before the group started), so re-cloning is skipped entirely (a second clone against an already-trimmed, or already-written-to, target would be a correctness bug, not merely wasted work) and the existing engine is simply re-opened. (2) **The group commit** — successfully calling `RaftKvNode::start_hosted` and registering the handle in the reconciler's own `hosted` map — reuses the IDENTICAL optimistic-claim-then-execute discipline the ordinary `Host` action already has (`plan` claims the child into `LocalState::hosted` before materialization ever runs; a failure calls `LocalState::release_unconfirmed_host` so the next tick retries). No separate "child group state" artifact needs writing at all: a brand-new Raft group bootstraps fresh from its own `all_nodes` config every time regardless (empty log, first election), so the group's own identity IS simply "does a live `RaftKvNode` exist for this id" — the same fact every other tablet's lifecycle already tracks. A crash between the two commit points re-runs exactly the group commit on retry; a crash before either re-runs both, deterministically, from the same `(parent, child, range, bootstrap_voters)` inputs every replica computes identically from the fork entry itself. Proven directly in `tests/inplace_split_reconciler.rs`'s `crash_between_fork_and_materialization` scenario (a node crashes after its own Raft log replicates the fork but before its reconciler ever ticks past it, and must independently recover both children plus the pre-fork write on restart). |
 
 ## Relationship to the original ADR 0017 §4 design
 

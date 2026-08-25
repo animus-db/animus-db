@@ -8028,6 +8028,73 @@ debugging anything that feels like it might have happened before.
   was updated deliberately as part of the same change, not because anything
   would have failed on its own.
 
+- **A membership-change primitive (`add_learner`/`change_membership`) only
+  ever reconfigures a group's own agreed-upon peer SET — it does nothing to
+  ensure the target actually has a live protocol instance running to
+  receive the traffic that config change generates (2026-08-25, ADR 0058
+  Train 2 rung 3).** Building the in-place split's Stage 1 (add the union
+  of both children's homes as learners to the parent), it was tempting to
+  assume "the reconciler adds a learner, Raft's own `AppendEntries` flow
+  handles the rest" — but a node named only in a CHILD's own `replicas`
+  (never the parent's) has, before this design, no reason to ever host the
+  PARENT tablet at all: the ordinary `plan_join_host`/`Host` candidate test
+  is "am I in `Tablet::replicas`," which such a node structurally fails.
+  Calling `add_learner` on it anyway appends a config entry the LEADER
+  replicates outbound — into a network inbox nothing on the target node is
+  consuming, since no `RaftKvNode` for that tablet exists there yet. The
+  fix widened the host-candidate test itself (a node recruited via EITHER
+  child's `replicas` of an in-place split intent also hosts the parent, as
+  a quiet non-voter — the identical shape `plan_join_host`'s own "joining
+  an already-led group" branch already uses, just reached by a different
+  membership test), and a corresponding second fix was needed on the
+  RELEASE side: the same recruited node is never in the parent's own
+  `replicas` either, so the ordinary release check would fire on it
+  immediately, and — a learner is never in `RaftCore::config()` by
+  construction — the release path's own "config actually excludes me"
+  safety anchor reads trivially true for a still-a-learner recruit too,
+  offering no protection. **General rule**: before wiring any new
+  membership-change call site (a replica move, a split, a rebalance) onto
+  an existing Raft membership primitive, ask "does the target already have
+  a running protocol instance for this group, and by what path did it come
+  to have one" — a primitive that changes *agreed state* is not the same
+  thing as a primitive that ensures a *listener* exists to act on it, and
+  the existing candidate/release tests for "should this node host this
+  tablet at all" were both written before any workflow needed a node to
+  host a tablet for a reason OTHER than being in its own `replicas`.
+  (`crates/animus-cp-data/src/host.rs`'s `plan` phase 1's second
+  host-candidate branch and phase 3's `recruited_for_split` exclusion.)
+- **A "clone this engine" primitive must take the caller's own already-open
+  source handle, never a bare identity it re-opens itself — re-opening the
+  same on-disk state from two independent in-process instances is a
+  correctness hazard, not just wasted I/O (2026-08-25, ADR 0058 Train 2
+  rung 3).** `EngineFactory::clone_engine`'s first draft took `source:
+  TabletId` and called `self.open(source)` internally, mirroring every
+  other `EngineFactory` method's shape (`open`/`probe`/`destroy` all
+  address a tablet by id, not a handle). This compiles and even passes the
+  `MemoryEngine` test double cleanly (its `open` is a cheap shared-`Arc`
+  registry lookup, so a second "open" of an already-open tablet is
+  harmless) — but the REAL production engine this trait also has to serve,
+  `LsmEngine`, does genuine on-disk WAL/manifest/compaction coordination
+  assuming exactly one process-local writer per prefix; a second `open()`
+  of the same prefix constructs a second, completely uncoordinated
+  in-process instance contending over the same files with no shared lock —
+  silent corruption under real concurrent use, invisible in the test
+  double that happened to make the unsafe shape look fine. The fix changed
+  the signature to take the source's own already-open handle
+  (`source: &S`) — which the caller (the host reconciler) already holds in
+  its own per-tablet engine cache for any currently-hosted tablet (the
+  clone's source, here, is always a currently-hosted parent) — so no
+  second open ever happens. **General rule**: a trait method that clones,
+  snapshots, or otherwise reads a live engine's current state should take
+  the engine handle the caller already has, not an identity it re-derives
+  a handle from internally — and a fast/shared-state test double (a
+  `MemoryEngine`-backed factory) can make exactly this class of bug
+  invisible, so the question "would this be safe against a REAL, exclusive-
+  writer-per-instance backend, not just the sim double" is worth asking
+  explicitly whenever a new `EngineFactory`-shaped seam gains a method.
+  (`crates/animus-cp-data/src/host.rs::EngineFactory::clone_engine`'s own
+  doc comment states the final contract and the hazard by name.)
+
 ### Parallel-agent orchestration
 - **A single long-lived session can exhaust the disk on `target/` alone, with
   no parallel fan-out involved (2026-08-19)** — a solo `cargo build

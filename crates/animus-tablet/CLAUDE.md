@@ -44,6 +44,21 @@ successor invariant).
   `is_routable()` (`!Building`) is load-bearing for every routing/scan
   consumer: without the filter, map-iteration order could serve a
   half-copied engine.
+- `Tablet.inplace_split: Option<InPlaceSplitIntent>` (ADR 0058 Train 2 rung
+  3, serde-default `None`) — the **in-place split's** own intent, set by
+  `animus-control`'s `MetaCommand::BeginSplitInPlace` and consumed by
+  `animus-cp-data::host`'s reconciler. `InPlaceSplitIntent { split_key,
+  children: [SplitChild; 2] }`, `SplitChild { id: TabletId, replicas:
+  Vec<NodeId> }` — a child's `replicas` is its placement-chosen FINAL
+  homes (what `CutoverSplit` later records as the tablet's own
+  `replicas`), not the larger `bootstrap_voters` set both children
+  actually start with (that set lives entirely in the data plane's own
+  `KvCommand::SplitTablet` fork marker, `animus-cp-data::split.rs` — this
+  crate has nothing to say about it, mirroring how `split_lineage` stays
+  out of this crate's own model). Unlike the copy-based workflow, an
+  in-place split mints **no** `Building` tablet-map rows at all — this
+  field IS the intent, with no physical placeholder tablets to route
+  around.
 - `KeyRange`: `whole()`, `contains`, `contains_range` (subset containment),
   `split_at` (strictly-inside split into two half-open ranges). `abuts` —
   merge's contiguity test, production-caller-less since ADR 0044 — was

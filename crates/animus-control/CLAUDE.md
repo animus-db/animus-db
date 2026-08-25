@@ -321,6 +321,46 @@ per-tablet CP data plane (`animus-cp-data`).
   conventions; the `apply_engine.rs` differential oracle drives a full
   begin→cutover round.
 
+- **The ADR 0058 Train 2 rung 3 in-place split lifecycle:
+  `BeginSplitInPlace`/`CutoverSplit`'s in-place branch.** Same epoch-CAS +
+  `Active`-state gate + F11 seatbelt + monotonic child-id allocator as
+  `BeginSplit`, but mints **no** `Building` tablet-map rows at all — it
+  records the intent directly on the parent
+  (`Tablet::inplace_split = Some(InPlaceSplitIntent{split_key, children})`,
+  `animus-tablet`) and marks it `Splitting`, full stop. There is nothing
+  physical to place a policy on yet, so (unlike `BeginSplit`) no policy
+  copy happens here. The data plane's own `KvCommand::SplitTablet`
+  (`animus-cp-data`) — not this command — is what actually materializes
+  the two children, entirely outside control-plane Raft; this command only
+  ever sees the *intent*, never the fork itself.
+
+  `CutoverSplit` gained an in-place branch, selected by
+  `source.inplace_split.is_some()`: instead of scanning the tablet map for
+  `Building` children (none exist), it creates both children's tablet-map
+  rows DIRECTLY from the intent's own `(id, replicas)` pairs (each
+  `replicas` is that child's placement-chosen FINAL homes — the data
+  plane's own, larger `bootstrap_voters` bootstrap set is not this crate's
+  concern) and inherits the parent's policy **at this moment** — the
+  in-place workflow's only chance to, since there was no tablet row to
+  attach it to at `BeginSplitInPlace` time. Otherwise identical to the
+  copy-based branch: `split_lineage` written for both (fork F9, unchanged),
+  parent removed. **G1 (ADR 0058's own "Open forks" table, decided
+  2026-08-25, reversing that ADR's own Stage 4 draft text): the GSI-drain/
+  backfill-seeder cutover vetoes stay PRE-cutover, caller-side, exactly as
+  in the copy-based workflow** — this command's own apply never gated on
+  drain state in either branch, so nothing about this in-place branch
+  needed to change to honor that decision; the (not-yet-written)
+  `animusd`-level in-place split driver is what will run those vetoes
+  before ever proposing this command, mirroring `index_drain.rs::
+  split_driver_tick`'s existing shape for the copy-based endgame. Mirror
+  arms follow the usual per-entity conventions (`BeginSplitInPlace`:
+  parent row + allocator counter only; `CutoverSplit`'s existing arm
+  extended to also mirror each child's policy, unconditionally — a
+  harmless duplicate write for the copy-based branch, the only source for
+  the in-place one). Tests: `meta::tests::begin_split_in_place_*`/
+  `cutover_split_in_place_*`, mirroring the copy-based tests' own shape
+  scenario-for-scenario.
+
 ## What's non-obvious
 
 - **The sync/driver split is deliberate.** All consensus logic is in the sync

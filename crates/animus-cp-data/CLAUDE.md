@@ -96,6 +96,16 @@ amendment — the shape predates and outlives it.)
   lives under `animus_control::syskv::RESERVED_NAMESPACE` — engine-global,
   outside every `StorageScope` — see the module's own doc for the
   key-disjointness proof.
+- **`split.rs`** (ADR 0058 Train 2 rung 3) — the **in-place split fork
+  marker**: the durable half of `KvCommand::SplitTablet`, mirroring
+  `seal.rs`'s discipline exactly (engine-global key, survives compaction)
+  but keyed by `tablet` alone (a tablet forks AT MOST ONCE, unlike a seal's
+  per-range keying) and carrying a real payload — the split key, both
+  children's `(id, replicas)` pairs, and the `bootstrap_voters` set
+  captured once at apply from the parent's own `RaftCore::config() ∪
+  RaftCore::learners()` (see the module's own doc for why this read is
+  guaranteed identical across replicas). `RaftKvNode::pending_split()` is
+  the one accessor the host reconciler polls every tick.
 - **`segment.rs`** (ADR 0042/0043) — the stream-shard **segment codec**: a
   sealed shard's `SegmentStore` object format, pure and I/O-free. The
   module's own 50-line `//!` doc has the codec/validation list
@@ -185,7 +195,19 @@ existing sealed-set discipline whose durable seal marker re-latches
 `is_frozen()` at group start, refusing every later-ordered USER mutation
 (base/LSI — a consumer-bookkeeping `KindBatch` still applies) while reads
 keep serving; `propose_freeze` is idempotent and `tests/freeze.rs` is its
-suite; **`add_learner`/`promote_learner`/`remove_learner`/`learners`/
+suite; **`KvCommand::SplitTablet`** (ADR 0058 Train 2 rung 3, codec v23) is
+the **in-place split's** single-entry atomic fork — reuses `Freeze`'s exact
+whole-range seal/`frozen` discipline for the ordering fence (the two
+workflows share the flag-selected `frozen` latch, mutually exclusive per
+tablet in production) and additionally writes the durable fork payload
+(`split.rs`) every fork participant's `pending_split()` reads back;
+`propose_split_tablet` is idempotent and `tests/split_tablet.rs` is its
+suite (fence + idempotency + restart survival; a plain `Freeze` is proven
+to carry no fork payload, so the shared latch never confuses the two).
+**This crate's own apply does NOT bootstrap the two children** — that is
+the host reconciler's job (below), discovering the fork via
+`pending_split()` the same way it discovers every other per-tablet fact;
+**`add_learner`/`promote_learner`/`remove_learner`/`learners`/
 `learner_caught_up`** (ADR 0058 Train 1) are thin wrappers over the shared
 `RaftCore`'s identically-named methods, mirroring `change_membership`'s own
 lock/record-metrics/wake-on-propose shape exactly — see
@@ -672,10 +694,85 @@ ADR 0050 Train B rung-7 sweep.
   live control-plane `RaftNode` read this crate has no business taking)
   both stay in `animusd::tablet_host_reconciler_loop`.
 
+### In-place split (ADR 0058 Train 2 rung 3)
+
+`plan`'s phase 1.5, between `Host` and `Reconfigure`: a tablet whose
+`Metadata` row carries `Tablet::inplace_split` (the control plane's
+`MetaCommand::BeginSplitInPlace`) takes this branch INSTEAD of the
+ordinary `Reconfigure` action for as long as the intent exists — the two
+must never both fire for the same tablet in the same tick (an ordinary
+reconfigure would see the split's added learner(s) as stale — not in its
+own `desired` — and try to remove them mid-catch-up).
+
+- **Not yet forked here** (`RaftKvNode::pending_split()` answers `None`):
+  the leader adds the next missing member of the union of both children's
+  `replicas` as a learner (`HostAction::AddSplitLearner`, one per tick,
+  mirroring `reconfigure_step`'s own one-step-per-call discipline but as
+  its own action — this does NOT reuse `reconfigure_step` itself, since
+  that function's own stale-learner-removal step would fight a split's
+  learners the moment they're not in the PARENT's own `desired`). Once
+  every union member is present and caught up (a voter is trivially
+  ready), the leader proposes the fork (`HostAction::ProposeSplitFork` →
+  `RaftKvNode::propose_split_tablet`).
+- **A node named only in a CHILD's `replicas`, never the parent's own**,
+  still needs to host the PARENT (as a quiet non-voter) before it can ever
+  be added as a learner to it — phase 1 gained a second host-candidate
+  test for exactly this (a node recruited via either child's `replicas` of
+  an in-place split intent), and phase 3's release check is correspondingly
+  taught to never fire on the SAME recruited set (it is never in the
+  parent's own `replicas`, and — a learner is never in `RaftCore::config()`
+  by construction — `config_excludes_me` reads trivially true for it too).
+- **Already forked here** (`pending_split()` answers `Some`):
+  `HostAction::MaterializeSplitChild` fires for BOTH children on EVERY
+  fork participant — not filtered by either child's own final `replicas` —
+  since `pending_split().bootstrap_voters` (the parent's full
+  voter-plus-learner set at the fork, captured once in the data-plane's
+  own apply) is what both children actually bootstrap with, a deliberate
+  superset Stage 5's ordinary `Reconfigure` trims down afterward. Claimed
+  into `LocalState::hosted` optimistically (the same discipline `Host`
+  uses) AND into `LocalState::split_forming`, which exempts a pre-cutover
+  child from phase 3's reclaim check (it is `hosted` but, by design,
+  absent from `Metadata` until `CutoverSplit` runs) — pruned the instant
+  the child appears in `Metadata` as a real `Active` entry.
+- **`Reconciler::materialize_split_child`** implements the G4
+  crash-idempotency contract (see the ADR's own "Open forks" table,
+  decided as of this rung): `EngineFactory::probe(child)` before ever
+  cloning (skip re-clone if an earlier attempt already committed the
+  engine but crashed before the group started), `EngineFactory::
+  clone_engine` (over the caller's OWN already-open parent handle — never
+  a fresh re-open of the same on-disk prefix, which for `LsmEngine` would
+  be a real corruption hazard: two independent in-process engines
+  contending over one WAL/manifest with no coordination), then
+  `trim_split_child` (delete the SIBLING's own range from
+  BASE/LSI/FOOTPRINT, and the WHOLE `KIND_CHANGE`/`KIND_CURSOR` scopes
+  unconditionally — ADR 0050's copy-kinds rule, reused verbatim), then
+  `RaftKvNode::start_hosted` with `bootstrap_voters`.
+- **`EngineFactory::clone_engine(&self, source: &S, target: TabletId)`**
+  takes the source's own already-open handle, not a bare `TabletId` — see
+  its own doc for why re-opening would be unsafe.
+
+Tests: `tests/split_tablet.rs` (the data-plane mint's own fence/idempotency/
+restart suite) and `tests/inplace_split_reconciler.rs` (a self-contained
+`SimEnv` corpus, depth knob `ANIMUS_INPLACE_SPLIT_SEEDS`, mirroring
+`reconciler_corpus.rs`'s own harness shape — held green through
+`ANIMUS_INPLACE_SPLIT_SEEDS=200`): the full happy path (real learner
+catch-up, over-replication on every fork participant, exact per-child data
+partitioning, empty change/cursor scopes at birth, the post-cutover trim to
+final placement, parent reclaim), a leader crash mid-catch-up, the G4
+crash window itself, and a concurrent unrelated rebalance racing the
+split's own learner-add. **Residue, explicitly not part of this rung**
+(see the ADR's own as-built note): the `animusd`-level driver that watches
+a forked-locally parent, runs the (unmodified) GSI-drain/backfill vetoes
+against it, and proposes `CutoverSplit`; the `--split-mode` operator flag;
+a real multi-node `ProdEnv` end-to-end regression.
+
 ### HostAction
 
-**Emitted in this fixed order: `Host` → `Reconfigure` →
-`Release`/`Reclaim`.** `Release`/`Reclaim` tear down a tablet moved off or
+**Emitted in this fixed order: `Host` → (`AddSplitLearner`/
+`ProposeSplitFork`/`MaterializeSplitChild`) → `Reconfigure` →
+`Release`/`Reclaim`.** The parenthesized trio (ADR 0058 Train 2 rung 3) is
+mutually exclusive with `Reconfigure` per tablet — see "In-place split"
+above. `Release`/`Reclaim` tear down a tablet moved off or
 dropped/retired, respectively. Tablets are split-only (ADR 0044) and
 ranges immutable (ADR 0050): the zero-copy `ProposeSeal`/`NarrowScope`
 actions were deleted in the rung-7 sweep, as merge's `WidenScope`/`Absorb`
