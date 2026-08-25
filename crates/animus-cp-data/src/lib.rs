@@ -240,6 +240,69 @@ impl Future for WakePending<'_> {
     }
 }
 
+/// The **fork-observed** signal (ADR 0058 Train 2 rung 4 layer 1): the same
+/// executor-agnostic shape as [`ProposeSignal`]/[`ApplySignal`]/[`WakeSignal`],
+/// but for a caller **outside this crate** who wants to react the instant
+/// this replica's own apply task durably applies `KvCommand::SplitTablet` —
+/// the host reconciler's own tick trigger (`animusd::
+/// tablet_host_reconciler_loop`). Before this signal existed, every replica
+/// other than the parent's own campaigning leader only discovered a local
+/// fork on its next scheduled reconciler tick (the `INPLACE_SPLIT_
+/// RECONCILE_INTERVAL` 50ms fast-poll, ADR 0058 rung 3) — the residual the
+/// rung-4 measurement addendum found: a freshly-forked child's first
+/// election needs a SECOND voter's own `materialize_split_child` to run
+/// before it can win a quorum, and that voter's own materialization was
+/// riding its next poll rather than the fork itself. Raised exactly once per
+/// fork, by the apply task, right after the durable split marker
+/// (`split::split_marker_key`) commits — see `apply_and_compact`'s
+/// `KvCommand::SplitTablet` arm. Never raised for any other command: a
+/// caller reacting to it always finds `pending_split()` answers `Some`
+/// (idempotent to check twice, exactly like every other durable fact this
+/// crate publishes), so a missed or coalesced wake is never a correctness
+/// gap, only a slower discovery — the periodic fallback this signal
+/// shortcuts still runs unconditionally on its own schedule (see
+/// `docs/engineering-lessons.md`'s "move the trigger, not the mechanism"
+/// entry for the general discipline this follows).
+#[derive(Default)]
+struct ForkSignal {
+    /// Set by the apply task, consumed by whichever external caller polls
+    /// [`ForkPending`] next (typically `host::Reconciler::fork_wake`'s
+    /// fan-in over every hosted tablet).
+    pending: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl ForkSignal {
+    /// Raise the flag, then wake any parked waiter — same register-before-
+    /// check discipline as [`ProposeSignal::notify`].
+    fn notify(&self) {
+        self.pending.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+}
+
+/// A future that resolves once a local fork has been observed, for
+/// `host::Reconciler::fork_wake`'s fan-in `select_all` — the [`ForkSignal`]
+/// counterpart to [`ProposePending`]/[`ApplyPending`]/[`WakePending`].
+/// Deliberately a plain, `Unpin` struct (no `Send + 'static` boxing) so
+/// several of these — one per currently-hosted tablet — can be raced
+/// together with zero heap allocation.
+struct ForkPending<'a> {
+    signal: &'a ForkSignal,
+}
+
+impl Future for ForkPending<'_> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.signal.waker.register(cx.waker());
+        if self.signal.pending.swap(false, Ordering::AcqRel) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 /// The physical key-space a `RaftKvNode`'s group is confined to within a
 /// this tablet's own **private** `StorageEngine` (ADR 0050 Train B): every
 /// physical key this group ever writes is `[kind] || logical_key` (F2b) — no
@@ -1423,6 +1486,12 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// timer arm — the hook phase-1 PR3's quiescence (a timerless park) and
     /// PR4's proactive external wake both need. See [`WakeSignal`]'s doc.
     wake_signal: Arc<WakeSignal>,
+    /// **Fork-observed** signal (ADR 0058 Train 2 rung 4 layer 1): raised by
+    /// the apply task the instant it durably applies `KvCommand::
+    /// SplitTablet`, so `host::Reconciler::fork_wake` can wake the moment a
+    /// LOCAL fork happens instead of on this replica's next scheduled tick.
+    /// See [`ForkSignal`]'s doc.
+    fork_signal: Arc<ForkSignal>,
     /// Observability sink (ADR 0015). The public propose API records the real
     /// accept/reject outcome into it, and the consensus loop + apply task each hold
     /// a clone for the commit/apply/read-barrier/snapshot recording sites. Cheap to
@@ -1726,6 +1795,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let propose_signal = Arc::new(ProposeSignal::default());
         let apply_signal = Arc::new(ApplySignal::default());
         let wake_signal = Arc::new(WakeSignal::default());
+        let fork_signal = Arc::new(ForkSignal::default());
         let persist = Arc::new(PersistProgress::default());
         // Group-start witnessing (ADR 0018 §2 amendment): fold in whatever
         // this (possibly shared, ADR 0026/0028) engine's highest MVCC
@@ -1771,6 +1841,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             propose_signal: Arc::clone(&propose_signal),
             apply_signal: Arc::clone(&apply_signal),
             wake_signal: Arc::clone(&wake_signal),
+            fork_signal: Arc::clone(&fork_signal),
             metrics: metrics.clone(),
             scope: scope.clone(),
             kind_scopes: kind_scopes.clone(),
@@ -1806,6 +1877,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             propose_signal,
             apply_signal,
             wake_signal,
+            fork_signal,
             persist,
             metrics,
             scope,
@@ -1864,6 +1936,18 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// re-evaluating `next_deadline`), never an unwanted state change.
     pub fn wake(&self) {
         self.wake_signal.notify();
+    }
+
+    /// A future that resolves once this replica's own apply task has
+    /// observed a local `KvCommand::SplitTablet` fork (ADR 0058 Train 2
+    /// rung 4 layer 1) — see [`ForkSignal`]'s doc. Exposed `pub(crate)`
+    /// purely for [`host::Reconciler::fork_wake`]'s fan-in wait; an ordinary
+    /// caller checks the durable fact itself via
+    /// [`pending_split`](Self::pending_split) rather than awaiting this.
+    pub(crate) fn fork_wake(&self) -> ForkPending<'_> {
+        ForkPending {
+            signal: &self.fork_signal,
+        }
     }
 
     /// Opt this group into quiescence (ADR 0044 phase-1 PR3): once its leader
@@ -5747,6 +5831,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // bookkeeping, never touched by any other task.
     recovered_baseline_version: Version,
     suspicious_noop_log_budget: &mut u32,
+    // ADR 0058 Train 2 rung 4 layer 1: raised the instant `KvCommand::
+    // SplitTablet` durably applies below — see `ForkSignal`'s doc.
+    fork_signal: &ForkSignal,
     // Issue #279: the shared persist-round counter. This task is the WAL's
     // *second* drainer (its compaction rewrite), so it must number and complete
     // the rounds it consumes or the consensus loop's buffered acks strand.
@@ -6175,6 +6262,20 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         )
                         .await
                         .expect("raftkv apply split-fork marker");
+                    // ADR 0058 Train 2 rung 4 layer 1: the fork is now
+                    // durable on THIS replica (`pending_split()` will answer
+                    // `Some` from this point on, including across a crash —
+                    // it re-derives from this same marker at group start).
+                    // Wake any external caller waiting to react to a local
+                    // fork immediately, instead of leaving discovery to that
+                    // caller's own next scheduled poll — see `ForkSignal`'s
+                    // doc. Raised unconditionally on every path that reaches
+                    // here (this whole arm already only runs once, gated by
+                    // `!frozen` above), so a WAL-replay re-application after
+                    // a restart never re-notifies (the `if !frozen` guard
+                    // above skips the whole block on replay, exactly like
+                    // `Freeze`'s own idempotency).
+                    fork_signal.notify();
                 }
             }
             KvCommand::ReadCeiling { ts } => {
@@ -7372,6 +7473,9 @@ struct DriveState<E: Env, S: StorageEngine> {
     propose_signal: Arc<ProposeSignal>,
     apply_signal: Arc<ApplySignal>,
     wake_signal: Arc<WakeSignal>,
+    /// See [`RaftKvNode::fork_signal`]'s doc — threaded through to the apply
+    /// task, the only raiser.
+    fork_signal: Arc<ForkSignal>,
     /// Issue #279: persist-round accounting shared by this group's two WAL
     /// drainers (the consensus loop and the apply task's compaction rewrite).
     persist: Arc<PersistProgress>,
@@ -7503,6 +7607,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         propose_signal,
         apply_signal,
         wake_signal,
+        fork_signal,
         persist,
         metrics,
         scope,
@@ -7624,6 +7729,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         frozen,
         Arc::clone(&txn_tracker),
         Arc::clone(&apply_signal),
+        Arc::clone(&fork_signal),
         Arc::clone(&persist),
     ));
 
@@ -8067,6 +8173,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     frozen: Arc<AtomicBool>,
     txn_tracker: Arc<Mutex<TxnTracker>>,
     apply_signal: Arc<ApplySignal>,
+    fork_signal: Arc<ForkSignal>,
     persist: Arc<PersistProgress>,
 ) {
     // This apply task's own sequential, single-writer bookkeeping (see
@@ -8115,6 +8222,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &txn_tracker,
             recovered_baseline_version,
             &mut suspicious_noop_log_budget,
+            &fork_signal,
             &persist,
         )
         .await;

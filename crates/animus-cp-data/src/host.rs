@@ -1008,6 +1008,41 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         self.hosted.get(&tablet)
     }
 
+    /// A future that resolves as soon as ANY currently-hosted tablet's own
+    /// apply task observes a local `SplitTablet` fork (ADR 0058 Train 2 rung
+    /// 4 layer 1) — the caller's own tick-trigger `select` (`animusd::
+    /// tablet_host_reconciler_loop`) races this alongside its `metadata_watch`
+    /// and periodic-fallback arms so a fork's every participant, not only its
+    /// campaigning leader, materializes both children as soon as its OWN
+    /// apply task observes the fork, instead of waiting out its own next
+    /// scheduled tick.
+    ///
+    /// Cheap to rebuild every call (each hosted node's own signal is a plain
+    /// `Arc`-backed atomic + waker — see [`RaftKvNode::fork_wake`]), so a
+    /// caller reconstructs it fresh every loop iteration rather than caching
+    /// it, which is what makes it automatically track this node's *current*
+    /// hosted set (a tablet gained or lost between calls is simply included
+    /// or excluded from the next race). Never resolves on its own while
+    /// `hosted` is empty — the caller's `select!` always has its other arms
+    /// (the metadata watch, the fallback sleep) to fall back on.
+    ///
+    /// A raised-but-unconsumed signal from a tablet reclaimed before this was
+    /// next polled is simply dropped with the handle — harmless: the fact it
+    /// would have announced (`pending_split()`) is durable and re-checked by
+    /// every subsequent `plan` call regardless of whether this particular
+    /// wake ever fired.
+    pub async fn fork_wake(&self) {
+        if self.hosted.is_empty() {
+            // No hosted tablet can ever raise this signal right now — never
+            // resolve on our own; the caller's other `select!` arms cover
+            // this node.
+            std::future::pending::<()>().await;
+        } else {
+            let waits: Vec<_> = self.hosted.values().map(RaftKvNode::fork_wake).collect();
+            futures::future::select_all(waits).await;
+        }
+    }
+
     /// One reconcile tick (ADR 0031): snapshot the impure facts this node's
     /// own hosted groups + engine can answer, call [`plan`] exactly once, then
     /// execute the returned actions **in the fixed order `plan` emits them**
