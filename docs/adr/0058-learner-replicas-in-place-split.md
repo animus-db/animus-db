@@ -843,6 +843,56 @@ existing nightly `corpus-deep.yml` convention of a plain, unmodified `cargo
 test` invocation — no release-profile build was found in that convention to
 match, so none was introduced here).
 
+**Measurement note addendum (2026-08-25) — rung 4's fix for the write-blip
+regression, benched on the same host as the numbers above.** Diagnosis: a
+freshly-forked child group has no leader until *some* replica's cold,
+randomized election timeout eventually fires, and `cp_route`'s election-wait
+branch parks a write meanwhile. Fix: the replica that was the PARENT's own
+current Raft leader **at the moment it materializes a child** now campaigns
+for that child's leadership immediately (`RaftKvNode::
+start_hosted_campaigning`, `RaftCore::campaign_now` — a thin wrapper that
+runs exactly the pre-vote round an ordinary timeout would run, just
+triggered now instead of waited for), instead of every replica waiting out
+the timeout. `inplace_split_bench.rs` was rerun 3x, and — per the same
+same-host-only-comparison discipline as the table above —
+`split_build.rs`'s copy-based bench was rerun once fresh (not reused from
+the original table, in case host conditions had drifted since):
+
+| | in-place, pre-fix (rung 3, run1/run2/run3) | in-place, post-fix (run1/run2/run3) | copy-based, fresh same-host reference |
+|---|---|---|---|
+| write blip (max PUT) | 726.3ms / 509.7ms / 733.7ms | 300.7ms / 513.2ms / 508.0ms | 252.0ms |
+| write blip median | **726.3ms** | **508.0ms** | **252.0ms** |
+| put retries needed | 0 / 0 / 0 | 0 / 0 / 0 | (not instrumented) |
+
+Two honest findings, reported plainly:
+
+- **The fix is a real, substantial improvement** — median write blip drops
+  from 726ms to 508ms (≈30% down), with the best individual run (300.7ms)
+  landing right at the copy-based path's own median. Every run remains a
+  single slow request with **zero** retries, confirming the mechanism is
+  doing what it was built to do: the parked write's own wait is shorter,
+  not converted into a different kind of failure.
+- **The median does NOT reliably reach the copy path's ~300ms bar, and this
+  is reported as a genuine residual rather than forced with unrelated
+  tuning.** The immediate campaign only supplies ONE vote (the ex-parent-
+  leader's own) instantly; a 3-node child still needs a SECOND voter to
+  grant a pre-vote/vote before it can elect. That second voter is a
+  *different* replica's own `materialize_split_child` call completing and
+  starting its own `RaftKvNode` for the child — gated by *that* replica's
+  own tablet-host reconciler tick, not by anything this rung changed. Rung
+  3 already fast-forwards that cadence to `INPLACE_SPLIT_RECONCILE_INTERVAL`
+  (50ms) for the duration of an active split, but "50ms fast-poll cadence
+  plus this host's own ~100ms per-round-trip floor" (the idle GET median
+  measured here and in the rung-3 table is consistently ~108ms, the same
+  environment characteristic, not new contention) is enough to explain a
+  few-hundred-ms tail depending on how the fork's own commit instant lands
+  relative to that second replica's next tick — not a cold multi-hundred-ms
+  *randomized* timeout, but not zero either. This is squarely **rung 3's
+  reconciler-cadence design**, not rung 4's own mechanism, so tightening it
+  further is out of scope here (rung 4 is "who campaigns and when," not "how
+  fast do the other replicas materialize") — left as a candidate for a
+  future rung if the gap matters in practice, not force-fit into this one.
+
 ## Open forks (deliberately not decided by this ADR)
 
 | # | Fork | Status |

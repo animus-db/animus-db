@@ -540,6 +540,20 @@ pub enum HostAction {
         /// (`PendingSplit::bootstrap_voters`), NOT `child.replicas` (see
         /// `split.rs`'s module doc).
         bootstrap_voters: BTreeSet<NodeId>,
+        /// **ADR 0058 Train 2 rung 4**: whether this replica should
+        /// campaign for the child's leadership immediately instead of
+        /// waiting out a randomized election timeout — set by `plan` from
+        /// that same tick's `TabletFacts::is_leader` for the PARENT, i.e.
+        /// true only for the replica that was the parent's own Raft leader
+        /// at the moment it observed the fork. A purely local decision (no
+        /// new coordination): in the common case exactly one replica
+        /// campaigns per child; if the parent's leader crashed exactly at
+        /// the fork, every replica passes `false` and the child elects the
+        /// same way it always did (the untouched randomized-timeout
+        /// fallback). See `RaftKvNode::start_hosted_campaigning`'s doc for
+        /// why this is safe by construction (the self-nominating replica is
+        /// always a voter of the child).
+        campaign: bool,
     },
 }
 
@@ -665,6 +679,12 @@ pub fn plan(
                     range,
                     drop_range,
                     bootstrap_voters: pending.bootstrap_voters.clone(),
+                    // ADR 0058 Train 2 rung 4: purely local — `fact.is_leader`
+                    // is this same tick's already-gathered fact for the
+                    // PARENT tablet (`tablet`, not `child.id`), so this is
+                    // "was I the parent's leader just now," never a fact
+                    // about either child (which doesn't exist yet).
+                    campaign: fact.is_leader,
                 });
                 next.hosted.insert(child.id);
                 next.split_forming.insert(child.id);
@@ -1061,6 +1081,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     range,
                     drop_range,
                     bootstrap_voters,
+                    campaign,
                 } => {
                     self.materialize_split_child(
                         parent,
@@ -1068,6 +1089,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                         range,
                         drop_range,
                         bootstrap_voters,
+                        campaign,
                     )
                     .await;
                 }
@@ -1283,6 +1305,16 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// unchanged); a crash before step 1 re-runs both, deterministically,
     /// from the same `parent`/`child`/`range`/`bootstrap_voters` inputs
     /// every replica computes identically from the fork entry itself.
+    ///
+    /// **`campaign` (ADR 0058 Train 2 rung 4)**: `true` only for the replica
+    /// that was the PARENT's own Raft leader at the moment it observed the
+    /// fork (see [`HostAction::MaterializeSplitChild::campaign`]'s doc) —
+    /// threaded straight to [`RaftKvNode::start_hosted_campaigning`] instead
+    /// of the plain [`RaftKvNode::start_hosted`] every other replica (and
+    /// every ordinary, non-split [`host`](Self::host) call) uses. Applies
+    /// identically on both the fresh-clone and the G4 re-open branches
+    /// below — the flag governs the group's own first election, not the
+    /// engine materialization step it's independent of.
     async fn materialize_split_child(
         &mut self,
         parent: TabletId,
@@ -1290,6 +1322,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         range: KeyRange,
         drop_range: KeyRange,
         bootstrap_voters: BTreeSet<NodeId>,
+        campaign: bool,
     ) {
         let engine = if self.factory.probe(child.id).await {
             // G4 step 1 already committed on an earlier attempt (a crash
@@ -1357,7 +1390,21 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         self.engines.insert(child.id, engine.clone());
         let scope = StorageScope::new(range);
         let voters: Vec<NodeId> = bootstrap_voters.into_iter().collect();
-        let node = RaftKvNode::start_hosted(self.env.clone(), voters, engine, scope, child.id.0);
+        // ADR 0058 Train 2 rung 4: the parent-leader-at-fork replica
+        // campaigns for this child's leadership immediately instead of
+        // waiting out a cold randomized election timeout — see
+        // `start_hosted_campaigning`'s own doc for why this is safe.
+        let node = if campaign {
+            RaftKvNode::start_hosted_campaigning(
+                self.env.clone(),
+                voters,
+                engine,
+                scope,
+                child.id.0,
+            )
+        } else {
+            RaftKvNode::start_hosted(self.env.clone(), voters, engine, scope, child.id.0)
+        };
         if let Some(after) = self.quiesce_after {
             node.enable_quiescence(after);
         }

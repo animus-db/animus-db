@@ -746,10 +746,83 @@ own `desired` — and try to remove them mid-catch-up).
   `trim_split_child` (delete the SIBLING's own range from
   BASE/LSI/FOOTPRINT, and the WHOLE `KIND_CHANGE`/`KIND_CURSOR` scopes
   unconditionally — ADR 0050's copy-kinds rule, reused verbatim), then
-  `RaftKvNode::start_hosted` with `bootstrap_voters`.
+  either `RaftKvNode::start_hosted` or `start_hosted_campaigning` with
+  `bootstrap_voters`, selected by `HostAction::MaterializeSplitChild.
+  campaign` — see "Deterministic first leader" below.
 - **`EngineFactory::clone_engine(&self, source: &S, target: TabletId)`**
   takes the source's own already-open handle, not a bare `TabletId` — see
   its own doc for why re-opening would be unsafe.
+
+#### Deterministic first leader at the fork (ADR 0058 Train 2 rung 4)
+
+The rung-3 bench found a real regression the ADR's own "near-zero, roughly
+one routing refresh" framing didn't anticipate: a freshly-forked child
+group has no leader until *some* replica's cold, randomized election
+timeout fires, and `animusd::cp_route`'s election-wait branch parks a
+write meanwhile — measured at ~726ms median (vs. the copy-based path's
+~300ms), with **zero** retries needed (a single slow request, not a
+refuse-and-retry blip). The fix: the replica that was the parent's own
+Raft leader **at the moment it materializes a child** campaigns for that
+child's leadership immediately, instead of waiting out the timeout.
+
+- **The decision is made once, in `plan`, purely from already-gathered
+  local facts** — `HostAction::MaterializeSplitChild` gained a `campaign:
+  bool` field, set to that tick's `TabletFacts::is_leader` **for the
+  PARENT** (the same fact phase 1.5 already reads to gate
+  `AddSplitLearner`/`ProposeSplitFork`). No new coordination, no new
+  replicated state: every replica decides "was I the parent's leader just
+  now" independently, and in the common case exactly one replica per
+  child answers `true`.
+- **`RaftKvNode::start_hosted_campaigning`** (`lib.rs`) is
+  `start_hosted`'s sibling: identical bootstrap, except the driver
+  (`drive`, on a genuine first formation only — `state.is_empty()`, never
+  a restart) calls the new `RaftCore::campaign_now(now, entropy)` once,
+  before ever entering its `select` loop, instead of waiting for `tick`'s
+  own `election_deadline` to pass. `campaign_now` is a thin, safety-net-
+  guarded wrapper: a no-op unless the core is a voting `Follower` (never
+  demotes a sitting leader, never fires twice), and otherwise runs
+  **exactly the pre-vote round `tick` would run on timeout** — no raw,
+  term-incrementing `start_election`. This is what makes the mechanism
+  safe with zero new machinery:
+  - **Pre-vote's own lease check is the entire "don't disrupt a peer that
+    hasn't started yet" story.** A peer whose own `RaftKvNode::
+    start_hosted[_campaigning]` for this child hasn't run yet has no
+    listener on the child's stream at all — its `PreVote` sits queued in
+    the `Env`'s per-`(node, stream)` inbox (ADR 0026 queues by
+    destination regardless of whether a consumer is polling — true of
+    both `ProdEnv`'s per-stream `Demux` and `SimEnv`'s inbox map) until
+    that peer's own bootstrap reaches its first `recv_stream` call, at
+    which point the queued `PreVote` is simply its very first message.
+    Since the peer starts as a genuine `Follower` with no leader belief,
+    it grants — no different from a real timeout's own first round.
+  - **A round that gets no majority in time re-arms the ordinary election
+    timer and falls back to the untouched randomized-timeout path** —
+    `start_pre_vote` (which `campaign_now` calls) always calls
+    `reset_election_timer` regardless of outcome. Two replicas racing to
+    self-nominate the same child (a leadership change mid-fork), or the
+    parent's leader crashing exactly at the fork so nobody's tick
+    observes `is_leader: true` for any child at all, both degrade to
+    exactly the pre-existing cold-start election — no special-cased
+    recovery path exists or is needed.
+  - **A learner never campaigns, and the safety belt is structural, not
+    conventional.** The self-nominating replica is a voter of the PARENT
+    by construction (`start_election`/`become_leader` gate on
+    `is_voter()`), and every child's `bootstrap_voters` is the parent's
+    own full voter-**and**-learner union at the fork — a strict superset
+    — so it is always a voter of the child too; there are, in fact, no
+    learners at all on a freshly-bootstrapped child (every
+    `bootstrap_voters` member starts as a voter). `drive` additionally
+    `assert!`s `core.config().contains(&self_id)` immediately before
+    calling `campaign_now`, as a second, structural line of defense
+    against the upstream wiring ever computing `campaign` for the wrong
+    replica — proven to actually fire via `RaftKvNode::
+    start_hosted_campaigning_panics_if_the_caller_is_not_a_voter_of_the_
+    group` (`lib.rs`'s own `campaign_now_tests`), and
+    `RaftCore::campaign_now`'s own no-op-on-a-non-voter/learner behavior
+    is unit-tested directly in `animus-control/tests/
+    learner_membership.rs`.
+- **Quorum/term math is completely unaffected** — this changes only *who
+  starts the first election, and when*, never what it takes to win one.
 
 Tests: `tests/split_tablet.rs` (the data-plane mint's own fence/idempotency/
 restart suite) and `tests/inplace_split_reconciler.rs` (a self-contained
@@ -759,12 +832,20 @@ restart suite) and `tests/inplace_split_reconciler.rs` (a self-contained
 catch-up, over-replication on every fork participant, exact per-child data
 partitioning, empty change/cursor scopes at birth, the post-cutover trim to
 final placement, parent reclaim), a leader crash mid-catch-up, the G4
-crash window itself, and a concurrent unrelated rebalance racing the
-split's own learner-add. **Residue, explicitly not part of this rung**
-(see the ADR's own as-built note): the `animusd`-level driver that watches
-a forked-locally parent, runs the (unmodified) GSI-drain/backfill vetoes
-against it, and proposes `CutoverSplit`; the `--split-mode` operator flag;
-a real multi-node `ProdEnv` end-to-end regression.
+crash window itself, a concurrent unrelated rebalance racing the split's
+own learner-add, the immediate-campaign **fast path**
+(`campaigning_replica_wins_leadership_almost_immediately` — a leader
+within a handful of virtual ms of materializing, far short of a fresh
+group's own 150ms election-timeout base) and its **fallback**
+(`parent_leader_crash_at_fork_falls_back_to_ordinary_election` — the
+parent's leader crashes at the exact instant of the fork, before any
+replica's own materialize action ever campaigns, and both children still
+elect via the untouched randomized-timeout path). **Residue, explicitly
+not part of rung 3** (see the ADR's own as-built note): the `animusd`-
+level driver that watches a forked-locally parent, runs the (unmodified)
+GSI-drain/backfill vetoes against it, and proposes `CutoverSplit`; the
+`--split-mode` operator flag; a real multi-node `ProdEnv` end-to-end
+regression (both landed in a later rung, see `animusd/CLAUDE.md`).
 
 ### HostAction
 

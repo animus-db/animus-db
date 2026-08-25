@@ -1579,6 +1579,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             metrics,
             StorageScope::whole(),
             PRIMARY_STREAM,
+            false,
         )
     }
 
@@ -1588,7 +1589,15 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// immutable declared range and derives the per-kind key prefixes.
     pub fn start_scoped(env: E, all_nodes: Vec<NodeId>, storage: S, scope: StorageScope) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, metrics, scope, PRIMARY_STREAM)
+        Self::start_inner(
+            env,
+            all_nodes,
+            storage,
+            metrics,
+            scope,
+            PRIMARY_STREAM,
+            false,
+        )
     }
 
     /// Like [`start_scoped`](Self::start_scoped), but the group also sends/recvs
@@ -1608,7 +1617,55 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         stream: u64,
     ) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, metrics, scope, stream)
+        Self::start_inner(env, all_nodes, storage, metrics, scope, stream, false)
+    }
+
+    /// Like [`start_hosted`](Self::start_hosted), but this replica
+    /// **campaigns for leadership immediately** instead of waiting out the
+    /// freshly-bootstrapped group's own cold, randomized election timeout
+    /// (ADR 0058 Train 2 rung 4 — the fix for the in-place split's measured
+    /// write-blip regression: a forked child group with no leader parks a
+    /// write behind `cp_route`'s election-wait branch until *some* timeout
+    /// fires; this makes the fast path deterministic instead of waiting on
+    /// one).
+    ///
+    /// **Only ever pass `true` for the replica that observed itself as the
+    /// PARENT's current Raft leader at the moment it materializes this
+    /// child** (`animus-cp-data::host`'s `materialize_split_child`, driven
+    /// by `HostAction::MaterializeSplitChild.campaign` — set once, in
+    /// `plan`, from that tick's already-gathered `TabletFacts::is_leader`,
+    /// a purely local decision every replica makes independently). This is
+    /// safe by construction, not merely by convention: the parent's current
+    /// leader is necessarily a **voter** of the parent (`start_election`/
+    /// `become_leader` are gated on `is_voter()`), and every child's
+    /// `bootstrap_voters` is the parent's own full voter-**and**-learner
+    /// union at the fork — a strict superset of the parent's voter set — so
+    /// the self-nominating replica is always a voter of the child too. A
+    /// learner can never satisfy `TabletFacts::is_leader` in the first
+    /// place (a learner never campaigns, ADR 0058 Train 1), so this flag can
+    /// never even be considered for one; `drive` additionally asserts
+    /// `config().contains(&self_id)` right before calling
+    /// `RaftCore::campaign_now` as a second, structural line of defense —
+    /// see that assertion's own comment.
+    ///
+    /// In the common case exactly one replica passes `true` per child (the
+    /// parent's own leader, materializing both children at once) — this
+    /// is what gives each freshly-forked child a leader within roughly one
+    /// pre-vote+vote round trip instead of a randomized cold-start wait. If
+    /// the parent's leader crashed exactly at the fork (nobody's tick
+    /// observes `is_leader` for the parent that round), every replica calls
+    /// this with `false` and the child elects exactly the way it always did
+    /// before this rung — the ordinary randomized-timeout path is the
+    /// untouched fallback, never a second mechanism to keep in sync.
+    pub fn start_hosted_campaigning(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        scope: StorageScope,
+        stream: u64,
+    ) -> Self {
+        let metrics = env.metrics();
+        Self::start_inner(env, all_nodes, storage, metrics, scope, stream, true)
     }
 
     /// Like [`start`](Self::start), but records into the supplied `metrics` handle
@@ -1628,6 +1685,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             metrics,
             StorageScope::whole(),
             PRIMARY_STREAM,
+            false,
         )
     }
 
@@ -1638,6 +1696,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         metrics: MetricsHandle,
         scope: StorageScope,
         stream: u64,
+        campaign_immediately: bool,
     ) -> Self {
         // ADR 0041 §3: callers hand in the tablet's **parent** scope
         // (`escape(table)` + this tablet's range); the group owns one sibling
@@ -1758,6 +1817,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             txn_tracker,
             external_quiesce_veto,
             external_quiesce_veto_fresh_through,
+            campaign_immediately,
         }));
         node
     }
@@ -7327,6 +7387,10 @@ struct DriveState<E: Env, S: StorageEngine> {
     txn_tracker: Arc<Mutex<TxnTracker>>,
     external_quiesce_veto: Arc<AtomicBool>,
     external_quiesce_veto_fresh_through: Arc<AtomicU64>,
+    /// ADR 0058 Train 2 rung 4: campaign for leadership immediately on a
+    /// genuine first formation instead of waiting out the randomized
+    /// election timeout — see [`RaftKvNode::start_hosted_campaigning`]'s doc.
+    campaign_immediately: bool,
 }
 
 /// One split-build seed row (ADR 0050 Train B rung 4): `(kind index into
@@ -7450,6 +7514,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         txn_tracker,
         external_quiesce_veto,
         external_quiesce_veto_fresh_through,
+        campaign_immediately,
     } = st;
 
     let wal = wal_file(stream);
@@ -7467,7 +7532,12 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             hlc.witness(ts, env.now());
         }
     }
-    if !state.is_empty() {
+    // ADR 0058 Train 2 rung 4: captured before `state` is (conditionally)
+    // moved into `RaftCore::recovered` below — an immediate campaign is only
+    // ever safe for a genuine first formation, never a restart mid-catch-up
+    // or a replica rejoining an already-populated log.
+    let fresh_group = state.is_empty();
+    if !fresh_group {
         let recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
         *core.lock().expect("raftkv core poisoned") = recovered;
@@ -7565,6 +7635,68 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     // the lock hold that produced the mutation.
     let mut persist_fut: Option<PersistFut<'_>> = None;
     let mut gated = GatedOuts::default();
+
+    // ADR 0058 Train 2 rung 4: the deterministic first-leader mechanism.
+    // Only for a genuine first formation (`fresh_group`) of a replica the
+    // caller has identified as the parent's own leader at the fork
+    // (`campaign_immediately` — see `start_hosted_campaigning`'s doc). Runs
+    // exactly once, before this loop ever selects on the timer, so it wins
+    // the race against the group's own cold randomized election timeout
+    // rather than merely shortening it.
+    if campaign_immediately && fresh_group {
+        let entropy = env.next_u64();
+        let (campaign_outs, campaign_gate) = {
+            let mut c = core.lock().expect("raftkv core poisoned");
+            // Structural belt on top of `RaftCore::campaign_now`'s own
+            // `is_voter()` gate (which alone would make calling this on a
+            // learner or non-member a harmless no-op): the caller's own
+            // contract says this flag is only ever set for a replica that
+            // was the PARENT's leader, which is necessarily a voter of the
+            // parent, and every child's `bootstrap_voters` — this group's
+            // own `all_nodes` — is the parent's full voter-plus-learner
+            // union, a superset. So this assertion should never fire; if it
+            // does, the `plan`/`materialize_split_child` wiring upstream
+            // computed `campaign` for the wrong replica, which is exactly
+            // the class of bug this exists to catch loudly instead of
+            // silently no-op'ing away.
+            assert!(
+                c.config().contains(&env.node_id()),
+                "ADR 0058 rung 4: an immediate campaign was requested for a \
+                 replica that is not a voter of the freshly-forked child — \
+                 the parent-leader-at-fork invariant was violated upstream"
+            );
+            let outs = c.campaign_now(env.now(), entropy);
+            (outs, persist.gate(c.has_unflushed_wal()))
+        };
+        let campaign_outs: Vec<(NodeId, KvWire)> = campaign_outs
+            .into_iter()
+            .map(|(to, m)| (to, KvWire::Raft(m)))
+            .collect();
+        match campaign_gate {
+            // The common case: a pre-vote round touches no persisted hard
+            // state, so nothing is owed and this ships at once — no
+            // network hop, no consensus round, no drain to wait on beyond
+            // the pre-vote/vote round trip itself.
+            None => {
+                for (to, wire) in campaign_outs {
+                    env.send_stream(to, stream, codec::encode_wire(&wire)).await;
+                }
+            }
+            // Only reachable for a degenerate single-voter bootstrap set,
+            // where `campaign_now` runs straight through pre-vote's own
+            // self-majority short-circuit into `start_election`/
+            // `become_leader` and dirties hard state (`current_term`/
+            // `voted_for`). Mirror the main loop's own gate/release
+            // discipline (issue #279) rather than shipping anything ahead
+            // of the fsync that makes it durable — the loop's very first
+            // iteration below will start that round (`has_unflushed_wal()`
+            // is true) and its own release logic drains `gated` once it
+            // lands, with no special-casing needed here.
+            Some(round) => {
+                gated.push(round, campaign_outs);
+            }
+        }
+    }
 
     loop {
         // A requested shutdown exits *between* persist rounds so the WAL is never
@@ -8432,5 +8564,78 @@ fn ships_before_durable(wire: &KvWire) -> bool {
     match wire {
         KvWire::ReadProbe { .. } | KvWire::ReadProbeAck { .. } => true,
         KvWire::Raft(msg) => persist_round::ships_before_durable(msg),
+    }
+}
+
+/// ADR 0058 Train 2 rung 4's structural belt-and-suspenders test: the
+/// deterministic-first-leader mechanism (`start_hosted_campaigning`,
+/// `RaftCore::campaign_now`) must never be exercised for a replica that
+/// isn't itself a voter of the freshly-forked group. The upstream caller
+/// contract (`plan`/`materialize_split_child`) makes this structurally
+/// impossible in production — the self-nominating replica is always the
+/// parent's own leader, hence always a voter of both children by
+/// construction (see `start_hosted_campaigning`'s own doc) — so this proves
+/// the *tripwire* actually fires, not that the invariant can be violated in
+/// practice.
+#[cfg(test)]
+mod campaign_now_tests {
+    use super::*;
+    use animus_env::nid;
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+
+    #[test]
+    #[should_panic(expected = "parent-leader-at-fork invariant was violated upstream")]
+    fn start_hosted_campaigning_panics_if_the_caller_is_not_a_voter_of_the_group() {
+        let mut sim = Simulator::new(0x0580_0004);
+        let env: SimEnv = sim.env(nid(9));
+        // Node 9 is deliberately NOT a member of `all_nodes` at all — an
+        // upstream bug class this assertion exists to catch loudly instead
+        // of `RaftCore::campaign_now`'s own `is_voter()` gate silently
+        // no-op'ing it away.
+        let _node = RaftKvNode::<SimEnv, MemoryEngine>::start_hosted_campaigning(
+            env,
+            vec![nid(0), nid(1), nid(2)],
+            MemoryEngine::new(),
+            StorageScope::whole(),
+            77,
+        );
+        sim.run_for(Duration::from_millis(10));
+    }
+
+    /// The mirror-image happy path, proving the assertion is not simply
+    /// always-fires: a genuine bootstrap voter campaigning for its own
+    /// freshly-formed group's leadership never panics and does become
+    /// leader — the fast path this whole rung exists to provide.
+    #[test]
+    fn start_hosted_campaigning_elects_the_campaigning_voter_promptly() {
+        let mut sim = Simulator::new(0x0580_0005);
+        let all: Vec<NodeId> = vec![nid(0), nid(1), nid(2)];
+        let env0 = sim.env(nid(0));
+        let node0 = RaftKvNode::<SimEnv, MemoryEngine>::start_hosted_campaigning(
+            env0,
+            all.clone(),
+            MemoryEngine::new(),
+            StorageScope::whole(),
+            77,
+        );
+        // The other two replicas start ordinarily (no campaign) — mirrors
+        // "every fork participant materializes both children, only the
+        // parent-leader-at-fork replica campaigns."
+        for id in [nid(1), nid(2)] {
+            let env = sim.env(id);
+            let _ = RaftKvNode::<SimEnv, MemoryEngine>::start_hosted(
+                env,
+                all.clone(),
+                MemoryEngine::new(),
+                StorageScope::whole(),
+                77,
+            );
+        }
+        sim.run_for(Duration::from_millis(200));
+        assert!(
+            node0.is_leader(),
+            "the campaigning voter must win leadership well within one election timeout"
+        );
     }
 }

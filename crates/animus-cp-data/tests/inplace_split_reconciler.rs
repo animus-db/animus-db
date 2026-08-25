@@ -512,6 +512,222 @@ fn scenario_leader_crash_mid_catch_up(seed: u64) {
     });
 }
 
+/// **The fast path (ADR 0058 Train 2 rung 4)**: right after materialization,
+/// the replica that was the parent's leader at the fork campaigns
+/// immediately in both children — so a leader emerges within a handful of
+/// virtual milliseconds, far short of a freshly-bootstrapped group's own
+/// randomized election timeout (150ms base). Every home here is an original
+/// parent voter, so materialization fires on the very first pending tick
+/// with no learner catch-up in the way, keeping the scenario focused
+/// purely on this property (and distinct from `scenario_happy_path`, which
+/// exercises the fast path only incidentally while asserting the rest of
+/// the workflow).
+fn scenario_campaigning_replica_wins_leadership_almost_immediately(seed: u64) {
+    run(seed, move |sim| async move {
+        let env = sim.env(driver_id());
+        let mut c = Cluster::new(sim.clone());
+        let (p0, p1, p2) = (n(50), n(51), n(52));
+        let parents = [p0.clone(), p1.clone(), p2.clone()];
+        for id in parents.iter().cloned() {
+            c.add_node(id);
+        }
+        let homes = vec![p0.clone(), p1.clone(), p2.clone()];
+        let base_view = view([parent_tablet(homes.clone(), None)]);
+        assert!(
+            converge(&mut c, &env, &parents, &base_view, |c| {
+                leader_of(c, &parents, PARENT).is_some()
+            })
+            .await,
+            "parent never elected (seed={seed})"
+        );
+
+        let pending_view = view([parent_tablet(
+            homes.clone(),
+            Some(intent(homes.clone(), homes.clone())),
+        )]);
+        assert!(
+            converge(&mut c, &env, &parents, &pending_view, |c| {
+                parents.iter().all(|id| {
+                    let hosted = c.hosted_set(id.clone());
+                    hosted.contains(&LEFT) && hosted.contains(&RIGHT)
+                })
+            })
+            .await,
+            "both children never materialized on every fork participant (seed={seed})"
+        );
+
+        // The property under test: a handful of milliseconds of virtual
+        // time after materialization — far short of a fresh group's own
+        // 150ms randomized election-timeout base — is already enough for
+        // both children to have a leader, because `start_hosted_campaigning`
+        // solicited pre-votes at construction instead of waiting one out.
+        env.sleep(Duration::from_millis(20)).await;
+        c.tick_all(&parents, &pending_view).await;
+        assert!(
+            leader_of(&c, &parents, LEFT).is_some(),
+            "LEFT never elected a leader within 20ms of materializing — the immediate-campaign \
+             fast path did not fire (seed={seed})"
+        );
+        assert!(
+            leader_of(&c, &parents, RIGHT).is_some(),
+            "RIGHT never elected a leader within 20ms of materializing — the immediate-campaign \
+             fast path did not fire (seed={seed})"
+        );
+    });
+}
+
+/// **The fallback path (ADR 0058 Train 2 rung 4)**: the parent's leader
+/// crashes at the exact instant of the fork — before its own reconciler (or
+/// anyone else's) ever ticks past it — so no replica's materialize action
+/// ever campaigns for either child (every survivor's own `TabletFacts::
+/// is_leader` for the frozen parent reads `false`, since neither has had a
+/// chance to notice the leader is gone and campaign for the PARENT itself,
+/// let alone the children). The split must still complete and both children
+/// must still elect leaders, purely via the untouched ordinary
+/// randomized-timeout path — the "nothing breaks" half of this rung's own
+/// contract. Every home is an original parent voter, so the fork can be
+/// proposed directly (bypassing the reconciler entirely, mirroring
+/// `scenario_crash_between_fork_and_materialization`'s own raw-API
+/// technique) with no learner catch-up needed.
+fn scenario_parent_leader_crash_at_fork_falls_back_to_ordinary_election(seed: u64) {
+    run(seed, move |sim| async move {
+        let env = sim.env(driver_id());
+        let mut c = Cluster::new(sim.clone());
+        let (p0, p1, p2) = (n(60), n(61), n(62));
+        let parents = [p0.clone(), p1.clone(), p2.clone()];
+        for id in parents.iter().cloned() {
+            c.add_node(id);
+        }
+        let homes = vec![p0.clone(), p1.clone(), p2.clone()];
+        let base_view = view([parent_tablet(homes.clone(), None)]);
+        assert!(
+            converge(&mut c, &env, &parents, &base_view, |c| {
+                leader_of(c, &parents, PARENT).is_some()
+            })
+            .await,
+            "parent never elected (seed={seed})"
+        );
+
+        // Force leadership onto p0 so this scenario is deterministic
+        // regardless of which node Raft happened to elect above (mirrors
+        // `scenario_crash_between_fork_and_materialization`'s identical
+        // technique).
+        let mut on_p0 = c
+            .node(p0.clone())
+            .hosted_node(PARENT)
+            .is_some_and(|h| h.is_leader());
+        for _ in 0..150 {
+            if on_p0 {
+                break;
+            }
+            if let Some(leader) = leader_of(&c, &parents, PARENT) {
+                leader.transfer_leadership(p0.clone());
+            }
+            env.sleep(Duration::from_millis(100)).await;
+            on_p0 = c
+                .node(p0.clone())
+                .hosted_node(PARENT)
+                .is_some_and(|h| h.is_leader());
+        }
+        assert!(
+            on_p0,
+            "could not force leadership onto p0 before the crash (seed={seed})"
+        );
+
+        // Propose the fork directly via the raw API, entirely independent
+        // of any reconciler tick — nothing has had a chance to materialize
+        // (or campaign) on anyone yet.
+        let children = [
+            SplitChild {
+                id: LEFT,
+                replicas: homes.clone(),
+            },
+            SplitChild {
+                id: RIGHT,
+                replicas: homes.clone(),
+            },
+        ];
+        {
+            let leader = c
+                .node(p0.clone())
+                .hosted_node(PARENT)
+                .expect("p0 leads, forced above");
+            match leader.propose_split_tablet(split_key(), children) {
+                ProposeResult::Accepted { .. } => {}
+                other => panic!("propose_split_tablet rejected: {other:?} (seed={seed})"),
+            }
+        }
+        // Let the fork replicate+apply on ALL THREE nodes via ordinary
+        // background Raft traffic ONLY, in small enough increments that we
+        // never risk crossing an election timeout before every replica has
+        // observed it — no reconciler tick has run yet, so nothing has
+        // materialized or campaigned anywhere.
+        let mut all_forked = false;
+        for _ in 0..20 {
+            env.sleep(Duration::from_millis(5)).await;
+            all_forked = parents.iter().all(|id| {
+                c.node(id.clone())
+                    .hosted_node(PARENT)
+                    .is_some_and(|h| block_on(h.pending_split()).is_some())
+            });
+            if all_forked {
+                break;
+            }
+        }
+        assert!(
+            all_forked,
+            "the fork never replicated+applied to every parent replica with no reconciler tick \
+             involved (seed={seed})"
+        );
+
+        // The crash: p0 — the ONLY replica that has ever led this group —
+        // goes away right now, with p1/p2 still believing (correctly, from
+        // their own stale-but-unexpired view) that p0 is their leader.
+        c.crash_restart(p0.clone());
+        let survivors = [p1.clone(), p2.clone()];
+        assert!(
+            !survivors.iter().any(|id| {
+                c.node(id.clone())
+                    .hosted_node(PARENT)
+                    .is_some_and(|h| h.is_leader())
+            }),
+            "test fixture invariant: a survivor must not already believe itself leader at the \
+             instant of the crash (seed={seed})"
+        );
+        let pending_view = view([parent_tablet(
+            homes.clone(),
+            Some(intent(homes.clone(), homes.clone())),
+        )]);
+        // Ticking the survivors' reconcilers NOW, with zero further elapsed
+        // time, is the very first time either of their `TabletFacts::
+        // is_leader` for the parent is computed post-crash — it must read
+        // `false` on both, so both materialize with `campaign: false`.
+        c.tick_all(&survivors, &pending_view).await;
+        assert!(
+            !survivors.iter().any(|id| {
+                c.node(id.clone())
+                    .hosted_node(LEFT)
+                    .is_some_and(|h| h.is_leader())
+            }),
+            "test fixture invariant: materializing must not itself create a leader — only the \
+             untouched randomized-timeout path may (seed={seed})"
+        );
+
+        // The whole point of the fallback: both children must still,
+        // eventually, elect a leader via the ordinary randomized-timeout
+        // path, with no special-cased recovery.
+        let elected = converge(&mut c, &env, &survivors, &pending_view, |c| {
+            leader_of(c, &survivors, LEFT).is_some() && leader_of(c, &survivors, RIGHT).is_some()
+        })
+        .await;
+        assert!(
+            elected,
+            "neither child ever elected a leader via the ordinary fallback after the parent \
+             leader crashed exactly at the fork (seed={seed})"
+        );
+    });
+}
+
 /// **G4 crash idempotency**: a node crashes AFTER its parent has forked
 /// locally but BEFORE it materializes the children — on restart, it must
 /// independently re-derive the SAME fork (from its own durable marker) and
@@ -809,6 +1025,14 @@ fn scenario_cells() -> Vec<Scenario> {
         scenario!(
             "unrelated_rebalance_does_not_race_the_split",
             scenario_unrelated_rebalance_does_not_race_the_split
+        ),
+        scenario!(
+            "campaigning_replica_wins_leadership_almost_immediately",
+            scenario_campaigning_replica_wins_leadership_almost_immediately
+        ),
+        scenario!(
+            "parent_leader_crash_at_fork_falls_back_to_ordinary_election",
+            scenario_parent_leader_crash_at_fork_falls_back_to_ordinary_election
         ),
     ]
 }
