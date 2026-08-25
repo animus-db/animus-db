@@ -92,6 +92,7 @@ fn caught_up_follower(term: u64, commit_index: u64) -> RaftCore {
                 index: 1,
                 command: MetaCommand::NoOp,
                 config: None,
+                learners: None,
             }],
             leader_commit: commit_index,
         },

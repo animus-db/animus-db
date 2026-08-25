@@ -13,6 +13,7 @@
 //! workflow parks at convergence forever, so every cutover assertion below
 //! times out red.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1244,28 +1245,26 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     (status, body.to_owned())
 }
 
-/// Fire single-attempt `PutItem`s against `table` continuously (several
-/// concurrent connections, no delay, unique keys) until `stop` is raised,
-/// recording every non-200 reply. Shared by both issue #288 regressions
-/// below — the only difference between them is which table (indexed vs
-/// plain) the caller creates beforehand, which selects `cp_kind_write_item`'s
-/// evaluated arm vs `cp_kind_write_raw`'s fast arm.
-async fn probe_put_item_until_stopped(
+/// Fire single-attempt `PutItem`s against `table` continuously (`lanes`
+/// concurrent connections, unique keys, `pace` gap between one lane's own
+/// attempts when set) until `stop` is raised, recording every non-200
+/// reply. Shared by every issue #288 regression in this file — what
+/// differs between callers is the table (indexed vs plain, selecting
+/// `cp_kind_write_item`'s evaluated arm vs `cp_kind_write_raw`'s fast arm)
+/// and whether `pace` is set at all (see [`probe_put_item_until_stopped`]
+/// vs [`probe_put_item_unthrottled_until_stopped`]'s own docs for why both
+/// shapes exist).
+async fn probe_put_item(
     addr: SocketAddr,
     table: &str,
     stop: Arc<AtomicBool>,
+    lanes: u32,
+    pace: Option<Duration>,
 ) -> (u64, Vec<(u16, String)>) {
     let counter = Arc::new(AtomicU64::new(0));
     let bad = Arc::new(Mutex::new(Vec::new()));
     let mut probers = Vec::new();
-    // Two lanes, paced (not a max-speed hammer): dense enough to reliably
-    // cover the (sub-second, ADR 0050 rung 8's F8 contract) freeze window,
-    // gentle enough not to become the bottleneck itself — an unthrottled
-    // flood against an INDEXED table can outpace the GSI drain, and cutover
-    // itself waits on the drain's own veto (it must catch up before a
-    // parent can retire), so hammering harder here can make the split
-    // never converge rather than proving anything about issue #288.
-    for _ in 0..2u32 {
+    for _ in 0..lanes {
         let table = table.to_owned();
         let stop = Arc::clone(&stop);
         let counter = Arc::clone(&counter);
@@ -1289,7 +1288,9 @@ async fn probe_put_item_until_stopped(
                         .unwrap()
                         .push((0, "PutItem timed out (12s)".into())),
                 }
-                sleep(Duration::from_millis(20)).await;
+                if let Some(pace) = pace {
+                    sleep(pace).await;
+                }
             }
         }));
     }
@@ -1302,6 +1303,43 @@ async fn probe_put_item_until_stopped(
         .into_inner()
         .unwrap();
     (total, bad)
+}
+
+/// [`probe_put_item`], two lanes paced 20ms apart (not a max-speed hammer):
+/// dense enough to reliably cover the (sub-second, ADR 0050 rung 8's F8
+/// contract) freeze window, gentle enough not to become the bottleneck
+/// itself — an unthrottled flood against an INDEXED table can outpace the
+/// GSI drain, and cutover itself waits on the drain's own veto (it must
+/// catch up before a parent can retire), so hammering harder here can make
+/// the split never converge rather than proving anything about issue #288
+/// (see [`probe_put_item_unthrottled_until_stopped`] for the regression
+/// that exercises exactly that unpaced shape now that the frozen endgame
+/// accelerates the drain).
+async fn probe_put_item_until_stopped(
+    addr: SocketAddr,
+    table: &str,
+    stop: Arc<AtomicBool>,
+) -> (u64, Vec<(u16, String)>) {
+    probe_put_item(addr, table, stop, 2, Some(Duration::from_millis(20))).await
+}
+
+/// [`probe_put_item`], `lanes` concurrent connections at max speed (no
+/// inter-attempt delay) — the exact unpaced-flood shape issue #288's first
+/// regression draft used and that made the split livelock pre-fix
+/// (`docs/engineering-lessons.md`'s issue #288 entry): the flood built a
+/// change-log backlog faster than the once-per-tick GSI drain could clear
+/// it. The frozen-endgame acceleration (`index_drain.rs::
+/// FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`) closes this by draining to
+/// exhaustion, in a tight loop, the instant the parent freezes — the
+/// backlog is bounded but no longer growing at that point, so the drain
+/// only has to out-pace itself once, not the still-arriving flood.
+async fn probe_put_item_unthrottled_until_stopped(
+    addr: SocketAddr,
+    table: &str,
+    stop: Arc<AtomicBool>,
+    lanes: u32,
+) -> (u64, Vec<(u16, String)>) {
+    probe_put_item(addr, table, stop, lanes, None).await
 }
 
 /// Issue #288: a client `PutItem` against an **indexed** table (the
@@ -1425,6 +1463,170 @@ async fn plain_put_item_racing_the_freeze_window_retries_to_success() {
             "a plain-table PutItem racing the freeze window must retry to success, never a \
              terminal error: {bad:?}"
         );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// One page of `by-g`'s GSI, paginated via `ExclusiveStartKey`/
+/// `LastEvaluatedKey` — every item this fixture ever writes shares
+/// `g = "v"`, so a single `KeyConditionExpression` walks the whole index.
+/// `ConsistentRead` is deliberately absent: a GSI query rejects
+/// `ConsistentRead: true` outright (ADR 0041 §5, real DynamoDB's own rule —
+/// a GSI is *always* eventually consistent), which is the entire point of
+/// this being a converged-or-timeout poll (below) rather than a one-shot
+/// check.
+async fn gsi_by_g_all_pks(addr: SocketAddr, table: &str) -> BTreeSet<String> {
+    let mut pks = BTreeSet::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let esk = match &cursor {
+            Some(c) => format!(",\"ExclusiveStartKey\":{c}"),
+            None => String::new(),
+        };
+        let body = format!(
+            r#"{{"TableName":"{table}","IndexName":"by-g","Limit":500,
+                "KeyConditionExpression":"g = :v",
+                "ExpressionAttributeValues":{{":v":{{"S":"v"}}}}{esk}}}"#
+        );
+        let (status, resp) = dynamo(addr, "DynamoDB_20120810.Query", &body).await;
+        assert_eq!(status, 200, "GSI query failed: {resp}");
+        let json: Value = serde_json::from_str(&resp).expect("valid JSON Query reply");
+        for item in json["Items"].as_array().cloned().unwrap_or_default() {
+            if let Some(pk) = item["pk"]["S"].as_str() {
+                pks.insert(pk.to_owned());
+            }
+        }
+        match json.get("LastEvaluatedKey") {
+            Some(k) if !k.is_null() => cursor = Some(k.to_string()),
+            _ => return pks,
+        }
+    }
+}
+
+/// Poll [`gsi_by_g_all_pks`] until it matches `expected` exactly (both
+/// directions — missing AND spurious rows both fail), or `budget` elapses.
+/// A GSI is materialized asynchronously (ADR 0041 §4), so this must be a
+/// converged-or-timeout poll, never a fixed sleep followed by a one-shot
+/// check.
+async fn await_gsi_matches_exactly(
+    addr: SocketAddr,
+    table: &str,
+    expected: &BTreeSet<String>,
+    budget: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let got = gsi_by_g_all_pks(addr, table).await;
+        if &got == expected {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let missing: Vec<&String> = expected.difference(&got).collect();
+            let spurious: Vec<&String> = got.difference(expected).collect();
+            panic!(
+                "GSI never converged to the acked write set: {} missing, {} spurious \
+                 (missing sample: {:?}, spurious sample: {:?})",
+                missing.len(),
+                spurious.len(),
+                missing.iter().take(10).collect::<Vec<_>>(),
+                spurious.iter().take(10).collect::<Vec<_>>(),
+            );
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Issue #288's own repro shape, unthrottled (`docs/engineering-lessons.md`'s
+/// issue #288 entry): several concurrent max-speed `PutItem` lanes against a
+/// GSI-indexed table, hammering continuously from just before a split's
+/// kickoff until cutover — no pacing, unlike
+/// [`indexed_put_item_racing_the_freeze_window_retries_to_success`] above,
+/// which deliberately paces itself down specifically to avoid outrunning the
+/// pre-fix per-tick-bounded GSI drain. This test proves the SAFE fix
+/// (`index_drain.rs`'s frozen-endgame drain acceleration, issue #288):
+///
+/// 1. The split still reaches cutover within a generous budget — the
+///    flood no longer makes the GSI-drain veto livelock, because once the
+///    parent freezes (which itself still happens regardless of load, ADR
+///    0050 rung 8's `SPLIT_MAX_TAIL_PASSES` bound) the backlog is fixed and
+///    the frozen endgame drains it to exhaustion in a tight loop rather
+///    than one bounded pass per `INDEX_DRAIN_INTERVAL` tick.
+/// 2. Post-cutover, the GSI reflects **every** acked write — no lost index
+///    updates. This is the assertion that proves the fix took the safe
+///    shape design constraint #1 requires: the veto still gates cutover on
+///    the drain genuinely catching up (never a bound that force-fires
+///    cutover past an un-drained cursor), it just gets there fast now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn indexed_put_item_unthrottled_flood_racing_the_split_converges_with_no_lost_gsi_updates() {
+    timeout(Duration::from_secs(150), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let addr = nodes[0].dynamo_addr();
+
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"gsiflood288",
+                "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                "GlobalSecondaryIndexes":[
+                    {"IndexName":"by-g",
+                     "KeySchema":[{"AttributeName":"g","KeyType":"HASH"}],
+                     "Projection":{"ProjectionType":"ALL"}}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+
+        let parent = sole_tablet_of(&nodes[0], "gsiflood288");
+        let stop = Arc::new(AtomicBool::new(false));
+        // The issue's own repro used 6 lanes; 4 here keeps the same
+        // unthrottled-flood shape while avoiding the entry's noted
+        // incidental sandbox-resource-exhaustion risk under the heaviest
+        // load (a `relay to peer node failed` class of transient error,
+        // unrelated to the GSI-drain veto this regression targets) —
+        // confirmed empirically: 6 lanes on this sandbox tripped exactly
+        // that unrelated failure class rather than isolating the veto's
+        // own slowness.
+        let probing = tokio::spawn(probe_put_item_unthrottled_until_stopped(
+            addr,
+            "gsiflood288",
+            Arc::clone(&stop),
+            4,
+        ));
+        // Give the flood a moment to actually be in flight before the split
+        // starts, so the whole build→freeze→cutover window sees continuous,
+        // unthrottled write pressure, not just its tail.
+        sleep(Duration::from_millis(50)).await;
+
+        kickoff_tablet(&nodes[0], parent, "k\\u0004").await;
+        // Generous converged-or-timeout budget: the fix must make this
+        // converge well inside it, but the assertion is "does it converge
+        // at all," not a tight latency bound.
+        await_cutover_of(&nodes[0], "gsiflood288", parent, Duration::from_secs(120)).await;
+
+        stop.store(true, Ordering::Relaxed);
+        let (total, bad) = probing.await.expect("prober task panicked");
+        assert!(
+            total > 0,
+            "no PutItem attempt ever completed — test setup problem"
+        );
+        assert!(
+            bad.is_empty(),
+            "an indexed PutItem racing an unthrottled-flood split must retry to success, \
+             never a terminal error: {bad:?}"
+        );
+
+        // The teeth: every acked key (k0..k{total-1}) must show up in the
+        // GSI, on the children, with nothing missing and nothing spurious —
+        // proving the frozen-endgame acceleration never let cutover retire
+        // the parent with un-drained GSI updates still pending.
+        let expected: BTreeSet<String> = (0..total).map(|i| format!("k{i}")).collect();
+        await_gsi_matches_exactly(addr, "gsiflood288", &expected, Duration::from_secs(60)).await;
 
         for node in &nodes {
             node.shutdown_graceful().await;

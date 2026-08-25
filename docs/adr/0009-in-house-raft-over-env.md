@@ -6,6 +6,20 @@
   now `DRIVER_APPLIED` too (ADR 0038) — `RaftCore`'s sync/async split (this
   ADR's core contribution) is unchanged, but `RaftCore` no longer applies
   `MetaCommand`s in-core itself; see ADR 0038.
+- **2026-08-24 note:** `RaftCore` gains a **learner** (non-voting) membership
+  class alongside its existing voter config (ADR 0058 Train 1) — a per-member
+  `learners: BTreeSet<NodeId>`, kept in the same config-in-log discipline as
+  the voter `config` this ADR already documents (a membership-change log
+  entry carries both sets together). A learner receives `AppendEntries`/
+  `InstallSnapshot` exactly like a voter (its `match_index` is tracked the
+  same way) but is excluded from `cluster_size`/`majority()` entirely and
+  never campaigns or pre-votes (`start_election`/`start_pre_vote` gate on
+  `is_voter`, the same check that already protected a not-yet-added node —
+  see "Test gotcha (membership)" in `animus-cp-data/CLAUDE.md`, now a
+  *durable* instance of that same transient state rather than only a
+  bring-up race). Applies to both planes, since both instantiate the same
+  generic `RaftCore<C, S>`. See ADR 0058 for the full design and rationale;
+  this note only records that the primitive lives here.
 
 ## Context
 

@@ -72,6 +72,7 @@ fn follower_applies_on_commit_without_its_own_fsync() {
         index: 1,
         command: upsert(42),
         config: None,
+        learners: None,
     };
     follower.handle(
         nid(1),
@@ -163,6 +164,7 @@ fn follower_to_leader_keeps_applied_then_gates_new_proposals() {
                 index: 1,
                 command: upsert(42),
                 config: None,
+                learners: None,
             }],
             leader_commit: 1,
         },

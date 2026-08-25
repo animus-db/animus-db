@@ -166,6 +166,7 @@ fn next_deadline_is_some_mid_an_in_progress_snapshot_install() {
             total: chunk.len() as u64 * 2, // one more chunk still to come
             done: false,
             config: None,
+            learners: None,
         },
         NOW,
         7,

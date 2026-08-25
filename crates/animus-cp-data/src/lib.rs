@@ -3027,6 +3027,75 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().config()
     }
 
+    /// The group's active **learner** configuration (ADR 0058 Train 1) —
+    /// non-voting members that receive replication but never count toward
+    /// quorum. Mirrors [`config`](Self::config).
+    pub fn learners(&self) -> BTreeSet<NodeId> {
+        self.lock().learners()
+    }
+
+    /// Whether learner `id` is caught up closely enough to the leader's own
+    /// log to be a promotion candidate — see
+    /// [`RaftCore::learner_caught_up`]. A pure predicate; it does not itself
+    /// trigger a promotion.
+    pub fn learner_caught_up(&self, id: &NodeId, threshold: u64) -> bool {
+        self.lock().learner_caught_up(id, threshold)
+    }
+
+    /// Add `id` as a **learner** of this tablet group (ADR 0058 Train 1): a
+    /// new, non-voting member that catches up via the ordinary
+    /// `AppendEntries`/`InstallSnapshot` path before ever being promoted —
+    /// see [`RaftCore::add_learner`], which this is a thin wrapper over,
+    /// mirroring [`change_membership`](Self::change_membership)'s
+    /// lock/record/wake shape.
+    pub fn add_learner(&self, id: NodeId) -> ProposeResult {
+        let mut core = self.lock();
+        let result = record_reconfigure(&self.metrics, core.add_learner(id));
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            core.note_local_activity(self.env.now());
+        }
+        drop(core);
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            self.propose_signal.notify();
+            self.apply_signal.notify();
+        }
+        result
+    }
+
+    /// Promote learner `id` to **voter** (ADR 0058 Train 1) — see
+    /// [`RaftCore::promote_learner`]. The *decision* of when a learner is
+    /// ready (the promotion criterion, [`learner_caught_up`](Self::learner_caught_up))
+    /// is a caller concern; this only performs the transition once asked.
+    pub fn promote_learner(&self, id: NodeId) -> ProposeResult {
+        let mut core = self.lock();
+        let result = record_reconfigure(&self.metrics, core.promote_learner(id));
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            core.note_local_activity(self.env.now());
+        }
+        drop(core);
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            self.propose_signal.notify();
+            self.apply_signal.notify();
+        }
+        result
+    }
+
+    /// Remove learner `id` without promoting it (ADR 0058 Train 1) — see
+    /// [`RaftCore::remove_learner`].
+    pub fn remove_learner(&self, id: NodeId) -> ProposeResult {
+        let mut core = self.lock();
+        let result = record_reconfigure(&self.metrics, core.remove_learner(id));
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            core.note_local_activity(self.env.now());
+        }
+        drop(core);
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            self.propose_signal.notify();
+            self.apply_signal.notify();
+        }
+        result
+    }
+
     /// The leader's last-known replicated log index for `node` (0 if unknown).
     /// The caught-up primitive a healthy reconfigure step gates on — see
     /// [`RaftCore::peer_match`].

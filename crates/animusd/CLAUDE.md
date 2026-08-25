@@ -575,7 +575,29 @@ unoptimized)
 (`seal_now`, no size/age gate) → GSI-drain veto (`"gsi"` cursor ≥ max
 pending record) → backfill veto (`MarkIndexBackfilled` for every
 `Creating` index) → proposes `CutoverSplit` until the parent leaves the
-map (the reconciler then `Reclaim`s it everywhere). A stale-routed write
+map (the reconciler then `Reclaim`s it everywhere). **The GSI-drain veto is
+a correctness gate, not a liveness heuristic** (cutover retires the parent
+and the reconciler reclaims its engine outright — no drain-before-halt, see
+`animus-cp-data/CLAUDE.md`'s "Superseded by ADR 0044" entry — so firing
+cutover past an un-drained cursor would silently lose GSI updates forever):
+its fix for slow convergence under a write flood (issue #288) is therefore
+to accelerate the drain, never to bound or bypass the veto the way
+`SPLIT_MAX_TAIL_PASSES` bounds the *build* phase's own chase (that bound is
+safe only because the build's correctness never depended on the lag being
+zero; this veto's does). Once the parent freezes the backlog this veto
+watches is fixed, not growing, so `split_driver_tick`'s frozen endgame
+drives the GSI drain to exhaustion in a tight loop right there
+(`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`) instead of waiting on
+`change_consumer_loop`'s own once-per-`INDEX_DRAIN_INTERVAL` call to make
+progress — zero fairness cost against a static parent, and it survives a
+transient propose failure under load without costing a full extra tick to
+retry. See `docs/engineering-lessons.md`'s issue #288 entry for the general
+"accelerate a correctness gate, never bound it" rule, and
+`tests/split_build.rs::
+indexed_put_item_unthrottled_flood_racing_the_split_converges_with_no_lost_gsi_updates`
+for the regression (an unpaced flood racing a split, asserting both
+convergence and that the post-cutover GSI reflects every acked write). A
+stale-routed write
 to a frozen parent gets the retryable `FROZEN_REFUSAL` from every local
 write/txn helper (`frozen_refusal`; bookkeeping-only kind batches exempt).
 **Both `ClientCtx::cp_kind_write_item` (the evaluated arm) and

@@ -129,7 +129,13 @@ const MAGIC: u8 = 0xCB;
 /// is deleted with its last proposer (the reconciler's zero-copy handoff
 /// seal); its durable-marker core lives on as `Freeze`'s own marker (see
 /// `seal.rs`). Same house convention: a clean bump.
-const VERSION: u8 = 21;
+/// `22` (ADR 0058 Train 1): `LogEntry` gained a `learners: Option<BTreeSet<NodeId>>`
+/// field (the non-voting membership class's config-in-log counterpart to
+/// `config`) and `RaftMsg::InstallSnapshot` gained the identical field —
+/// both encoded with the same `put_opt_node_set`/`opt_node_set` helper
+/// `config` already uses. Same house convention: a clean bump, no
+/// cross-version compatibility.
+const VERSION: u8 = 22;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -734,6 +740,7 @@ fn put_entry(out: &mut Vec<u8>, e: &LogEntry<KvCommand>) {
     put_u64(out, e.index);
     put_command(out, &e.command);
     put_opt_node_set(out, &e.config);
+    put_opt_node_set(out, &e.learners);
 }
 
 fn read_entry(c: &mut Cursor<'_>) -> Result<LogEntry<KvCommand>, DecodeError> {
@@ -742,6 +749,7 @@ fn read_entry(c: &mut Cursor<'_>) -> Result<LogEntry<KvCommand>, DecodeError> {
         index: c.u64()?,
         command: read_command(c)?,
         config: c.opt_node_set()?,
+        learners: c.opt_node_set()?,
     })
 }
 
@@ -823,6 +831,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
             total,
             done,
             config,
+            learners,
         } => {
             put_u8(out, 6);
             put_u64(out, *term);
@@ -834,6 +843,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
             put_u64(out, *total);
             put_bool(out, *done);
             put_opt_node_set(out, config);
+            put_opt_node_set(out, learners);
         }
         RaftMsg::InstallSnapshotResp {
             term,
@@ -921,6 +931,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
             total: c.u64()?,
             done: c.bool()?,
             config: c.opt_node_set()?,
+            learners: c.opt_node_set()?,
         },
         7 => RaftMsg::InstallSnapshotResp {
             term: c.u64()?,
@@ -1062,6 +1073,7 @@ mod tests {
                     ts: ts(1, 0),
                 },
                 config: None,
+                learners: None,
             },
             LogEntry {
                 term: 3,
@@ -1074,6 +1086,7 @@ mod tests {
                     ts: ts(2, 5),
                 },
                 config: Some([1, 2, 3].into_iter().map(nid).collect()),
+                learners: Some([9].into_iter().map(nid).collect()),
             },
             // ADR 0046 seatbelt (PR1): `KindBatch.conditions` — exercises a
             // non-empty condition list alongside a tombstone write and a
@@ -1095,6 +1108,7 @@ mod tests {
                     ts: ts(2, 6),
                 },
                 config: None,
+                learners: None,
             },
             LogEntry {
                 term: 4,
@@ -1106,6 +1120,7 @@ mod tests {
                     ts: ts(3, 0),
                 },
                 config: None,
+                learners: None,
             },
             LogEntry {
                 term: 4,
@@ -1121,6 +1136,7 @@ mod tests {
                     ts: ts(3, 1),
                 },
                 config: None,
+                learners: None,
             },
             LogEntry {
                 term: 4,
@@ -1132,6 +1148,7 @@ mod tests {
                     ts: ts(4, 1),
                 },
                 config: None,
+                learners: None,
             },
             LogEntry {
                 term: 4,
@@ -1141,12 +1158,14 @@ mod tests {
                     ts: ts(5, 0),
                 },
                 config: None,
+                learners: None,
             },
             LogEntry {
                 term: 6,
                 index: 23,
                 command: KvCommand::ReadCeiling { ts: ts(7, 0) },
                 config: None,
+                learners: None,
             },
             LogEntry {
                 term: 7,
@@ -1187,6 +1206,7 @@ mod tests {
                     ts: ts(8, 1),
                 },
                 config: None,
+                learners: None,
             },
             LogEntry {
                 term: 7,
@@ -1200,6 +1220,7 @@ mod tests {
                     ts: ts(9, 0),
                 },
                 config: None,
+                learners: None,
             },
             LogEntry {
                 term: 7,
@@ -1214,6 +1235,7 @@ mod tests {
                     orphan_created_ts: None,
                 },
                 config: None,
+                learners: None,
             },
             // ADR 0018 §2/PR5's orphan-record fix: the `Some` branch of
             // `orphan_created_ts` (a recovery pusher synthesizing an
@@ -1231,6 +1253,7 @@ mod tests {
                     orphan_created_ts: Some(ts(7, 5)),
                 },
                 config: None,
+                learners: None,
             },
             LogEntry {
                 term: 7,
@@ -1248,12 +1271,14 @@ mod tests {
                     ts: ts(9, 2),
                 },
                 config: None,
+                learners: None,
             },
             LogEntry {
                 term: 6,
                 index: 28,
                 command: KvCommand::NoOp,
                 config: None,
+                learners: None,
             },
         ];
         let msgs: Vec<RaftMsg<KvCommand>> = vec![
@@ -1300,6 +1325,7 @@ mod tests {
                 total: 4096,
                 done: false,
                 config: Some([2, 4].into_iter().map(nid).collect()),
+                learners: Some([5].into_iter().map(nid).collect()),
             },
             RaftMsg::InstallSnapshotResp {
                 term: 7,
@@ -1384,6 +1410,7 @@ mod tests {
                     ts: ts(1, 0),
                 },
                 config: None,
+                learners: None,
             }],
             leader_commit: 0,
         });

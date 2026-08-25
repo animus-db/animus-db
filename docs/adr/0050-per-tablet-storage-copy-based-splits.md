@@ -658,3 +658,33 @@ needed at all — is a named follow-up, not attempted here (it changes the
 apply path's bookkeeping, a materially larger and riskier change than a
 drop-in read substitution, and deserves its own fork review rather than
 being folded into a "just read something O(1) instead" task).
+
+## Amendment (2026-08-24) — a successor design proposed for Decision 2
+
+[ADR 0058](0058-learner-replicas-in-place-split.md) proposes superseding
+this ADR's **Decision 2** (the `BeginSplit`/build/freeze/`CutoverSplit`/
+retire workflow) with a single-entry atomic in-place split built on Raft
+learner replicas — replacing the `SeedBatch` bulk/tail passes and the
+rung-5 final-image re-scan with ordinary Raft catch-up, and replacing the
+freeze's write-outage window with a fork that happens locally on every
+replica the parent already has. It leaves this ADR's **Decision 1**
+(per-tablet private engines) and **fork F9** (`split_lineage`, written at
+one immutable moment) in place as load-bearing prerequisites — ADR 0058
+does not touch either.
+
+Worth recording precisely, because it narrows a finding stated flatly
+above: the recon finding in this ADR's own Context section — that
+zero-copy was "the only split the layout permits," and therefore that an
+in-place split was impossible — was scoped to the **shared-engine layout
+ADR 0028 established**, where two children of one table would write
+byte-identical physical keys with nowhere to put a copy. That scoping was
+correct at the time, but this ADR's own Decision 1, adopted in the same
+change, replaced that layout: under per-tablet private engines
+(`kind || logical_key`, identity in the engine's file namespace, no table
+or tablet bytes in the key at all), co-resident children of a split are
+namespace-distinct rather than key-colliding. The argument that
+foreclosed in-place split does not survive Decision 1 unchanged — it was
+never re-examined against the layout Decision 1 itself put in place,
+which is what ADR 0058 does. ADR 0058 is **Proposed**, not accepted; this
+ADR's Decision 2 remains the implemented, as-built workflow until (and
+unless) ADR 0058 is accepted and its own rungs land.

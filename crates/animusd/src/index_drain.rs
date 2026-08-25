@@ -704,6 +704,26 @@ const SEED_CHUNK_BYTES: usize = 256 * 1024;
 /// writes, drained post-freeze.
 const SPLIT_MAX_TAIL_PASSES: u32 = 25;
 
+/// Frozen-endgame GSI-drain acceleration bound (issue #288). Pre-fix, the
+/// GSI-drain veto below only *checked* `"gsi"`'s cursor against the highest
+/// pending record and, if short, returned — leaving all the actual draining
+/// to `change_consumer_loop`'s own separately-scheduled [`drain_tablet`]
+/// call elsewhere in this same tick (or a later one). A large pre-freeze
+/// flood's backlog is bounded but can still be big, and any transient
+/// propose failure partway through a `drain_tablet` pass (real, under the
+/// same write contention that built the backlog) then cost a full
+/// `INDEX_DRAIN_INTERVAL` retry — several seconds of genuinely-avoidable
+/// wall clock for a parent that can no longer accumulate more work. Once
+/// this branch runs the parent is frozen and STATIC (Freeze rejects every
+/// later user write, and the backlog this veto watches only shrinks), so
+/// looping the drain here has no fairness cost — see this constant's use
+/// below. This is a pure **liveness** knob: it only bounds how many extra
+/// passes THIS tick gets to try to satisfy the veto before falling through
+/// to the ordinary per-tick retry; the veto's own pass/fail condition is
+/// untouched, so a persistent (non-transient) failure still can't force a
+/// cutover past an un-drained cursor.
+const FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES: u32 = 64;
+
 /// The copy kinds (ADR 0050): BASE (values, tombstones, intent envelopes,
 /// txn records), LSI, FOOTPRINT — **never** KIND_CHANGE (a child re-serving
 /// parent change records is the #220 duplication class; children are born
@@ -920,22 +940,42 @@ async fn split_driver_tick(
     //     record — markers included, whose HLCs the drain folds in), or
     //     cutover would retire records whose GSI updates were never
     //     materialized (children's change logs are empty by design).
+    //
+    //     Issue #288: drive the drain directly, to exhaustion, right here
+    //     before even checking the veto — see
+    //     [`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`]'s doc for why looping is
+    //     safe in this branch specifically (frozen, static parent) and what
+    //     class of slowness this closes (a large flood's backlog otherwise
+    //     depended on `change_consumer_loop`'s own once-per-tick
+    //     `drain_tablet` call surviving to completion, with each transient
+    //     failure under load costing a full extra tick to retry).
     if !table.is_empty() && !meta.table_indexes(&table).is_empty() {
-        let max_pending = group
-            .pending_changes()
-            .await
+        let gsis: Vec<IndexDef> = meta
+            .table_indexes(&table)
             .iter()
-            .filter_map(|(k, _)| record_hlc(k))
-            .max();
-        if let Some(max_hlc) = max_pending {
-            let caught_up = group
-                .cursor_min_watermark("gsi")
-                .await
-                .is_some_and(|wm| wm >= max_hlc);
-            if !caught_up {
-                build.phase = "gsi-veto";
-                return Ok(());
+            .filter(|i| {
+                i.kind == IndexKind::Global
+                    && matches!(i.status, IndexStatus::Creating | IndexStatus::Active)
+            })
+            .cloned()
+            .collect();
+        if !gsis.is_empty() {
+            for _ in 0..FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES {
+                if gsi_caught_up(group).await {
+                    break;
+                }
+                if let Err(e) = drain_tablet(ctx, meta, &table, group, &gsis).await {
+                    tracing::debug!(
+                        tablet = tablet.0,
+                        error = %e,
+                        "split build: frozen-endgame gsi drain pass failed"
+                    );
+                }
             }
+        }
+        if !gsi_caught_up(group).await {
+            build.phase = "gsi-veto";
+            return Ok(());
         }
     }
 
@@ -1321,6 +1361,30 @@ async fn drain_tablet(
         .await?;
     }
     Ok(())
+}
+
+/// Whether the `"gsi"` cursor has caught up to the highest pending change
+/// record on `group` — the exact predicate the split driver's GSI-drain
+/// veto (stage 3, `split_driver_tick`) checks before allowing cutover.
+/// Factored out so the frozen endgame's own exhaustion loop (issue #288)
+/// can re-check it after every [`drain_tablet`] pass without duplicating
+/// the query. `true` on no pending records at all (nothing to catch up to),
+/// matching the veto's own pre-existing "only gate when something is
+/// actually pending" rule.
+async fn gsi_caught_up(group: &CpGroup) -> bool {
+    let max_pending = group
+        .pending_changes()
+        .await
+        .iter()
+        .filter_map(|(k, _)| record_hlc(k))
+        .max();
+    match max_pending {
+        None => true,
+        Some(max_hlc) => group
+            .cursor_min_watermark(GSI_TAG)
+            .await
+            .is_some_and(|wm| wm >= max_hlc),
+    }
 }
 
 /// The HLC a change-record's key suffix encodes — the identical 8-byte

@@ -3231,6 +3231,31 @@ debugging anything that feels like it might have happened before.
   path must know which of these two shapes applies rather than assuming the
   bare `WireError` constructor's code survives — match on the nested message
   substring there instead. (`animusd/tests/dynamo_item_size_cap.rs`.)
+- **A `RaftCore::new`/`RaftNode::start` bootstrap's `all_nodes` argument sets
+  the node's own local `config` directly at construction, with no consensus
+  involved at all — a test that includes a not-yet-added node's own id in its
+  own `all_nodes` is trivially, unconditionally wrong from its very first
+  line, regardless of any later replication (2026-08-24, ADR 0058 Train 1's
+  learner corpus).** This bit despite `animus-cp-data/CLAUDE.md` already
+  documenting the exact gotcha ("pre-start a to-be-added node knowing only
+  the *current* voters, NOT itself") — reading the warning and then still
+  writing `RaftNode::start(env, [0,1,2,3]..)` for the node with id 3 happened
+  because the assertion that would have caught it fired *after* the real
+  `add_learner`/`change_membership` had already replicated, at which point
+  the (buggy) locally-bootstrapped value and the (correct) replicated value
+  are byte-identical and the bug is invisible. It only surfaced because this
+  corpus asserted the learner's own `config()` *before* any real membership
+  change — `learner.config()` showed `{n0,n1,n2,n3}` immediately after
+  `RaftNode::start` returned, before the leader had even proposed
+  `add_learner`. **General rule**: when a test's own assertion checks a
+  freshly-started node's config/role *before* the operation under test has
+  had a chance to replicate anything to it, the "excluded from its own
+  `all_nodes`" gotcha becomes load-bearing rather than cosmetic — and a
+  pre-existing test that only asserts *after* replication (e.g.
+  `animus-control/tests/control_membership.rs`'s own `add_a_node_...` test,
+  which includes the new node's id in its own bootstrap set and gets away
+  with it) is not proof the risky pattern is safe in general, only that its
+  own assertions never exercised the window where it would matter.
 
 ### Code patterns
 - **A convergent bookkeeping write must be routable to its own owner: derive
@@ -7872,6 +7897,72 @@ debugging anything that feels like it might have happened before.
   by any pre-existing test — a reminder that a new parser needs the
   ambiguous-looking cases in its own test corpus, not just the cases the old
   implementation happened to get right.
+
+- **A convergence veto that guards a correctness property must be
+  accelerated, never bounded or bypassed — the bound belongs on the *load*
+  that's slow to drain, not on the gate itself (issue #288).** The
+  split-cutover GSI-drain veto (`index_drain.rs::split_driver_tick`
+  stage 3a) blocks `CutoverSplit` until the parent's `"gsi"` cursor reaches
+  the highest pending change record — because cutover retires the parent and
+  the reconciler reclaims its engine outright (no drain-before-halt exists
+  post-ADR-0044, see `animus-cp-data/CLAUDE.md`'s "Superseded by ADR 0044"
+  entry), so firing
+  cutover past an un-drained cursor would silently lose GSI updates forever
+  (children are born with empty change logs by design). An unthrottled write
+  flood racing the split made this veto converge too slowly (several
+  10s-of-seconds retries under load, see the "unthrottled continuous write
+  flood" entry above) — but the correct fix was never to loosen the veto
+  (e.g. force cutover after N stalled ticks, mirroring `SPLIT_MAX_TAIL_
+  PASSES`'s bounded chase for the *build* phase). `SPLIT_MAX_TAIL_PASSES`
+  is safe to bound because its own correctness never depended on the lag
+  being zero (the post-freeze final drain + final image still transfer
+  everything regardless of the bound); the GSI-drain veto's correctness
+  *is* exactly "the lag is zero" — there is no compensating post-cutover
+  mechanism, so a bound here would be a straightforward data-loss bug, not
+  a liveness relaxation. The sound fix exploits a fact the *build* phase
+  doesn't have: once the parent is frozen (Freeze rejects every later user
+  write), the backlog this veto watches is fixed, not growing — so driving
+  the drain to exhaustion in a tight loop, right there in the frozen
+  endgame, has zero fairness cost and only removes the artificial one-tick
+  (`INDEX_DRAIN_INTERVAL`, 200ms) lag between "a drain pass makes progress"
+  and "the veto notices," including surviving a transient propose failure
+  under load without waiting a full extra tick to retry it. **General rule**:
+  before touching a gate that's "too slow to satisfy," classify it — is the
+  gate a correctness invariant (something bad happens if you proceed before
+  it holds) or a liveness heuristic (nothing unsafe happens, it's just an
+  imperfect proxy for "caught up")? Only the second kind may ever grow a
+  bounded-chase escape hatch; the first kind's only legal fix is making the
+  thing it's waiting on happen faster, exploiting whatever makes the wait
+  bounded now (here: the parent going static at freeze) rather than relaxing
+  what "caught up" means.
+  (`crates/animusd/src/index_drain.rs::split_driver_tick`,
+  `FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`.)
+- **A field added to a shared, generic type (`RaftCore<C, S>`'s `LogEntry`/
+  `RaftMsg`) needs a matching update at every *hand-rolled* encoder for it,
+  not just wherever `#[derive(Serialize, Deserialize)]` already covers it —
+  the "grep every gating match site" lesson (root `CLAUDE.md`) applies to a
+  codec's field list exactly as much as to a command enum's match arms
+  (2026-08-24, ADR 0058 Train 1's `learners` field).** `LogEntry`/
+  `RaftMsg::InstallSnapshot` pick up `#[serde(default)]` handling for free
+  from `animus-control`'s own `serde_json`-based WAL/wire path, but
+  `animus-cp-data::codec.rs` is a **second, independent, hand-rolled binary
+  encoder** for the identical types (ADR 0017 A.2, built to avoid
+  `serde_json`'s ~3-4x `Vec<u8>` blowup) — its `put_entry`/`read_entry` and
+  `InstallSnapshot` arms enumerate every field explicitly, by hand, with no
+  compiler-enforced exhaustiveness the way a `match` on an enum has. A new
+  struct field added to `LogEntry`/`RaftMsg` compiles cleanly against this
+  codec with the field simply *never encoded* — no error, no warning, just a
+  silent drop the moment any message carrying it crosses the wire this codec
+  serves (which is every data-plane Raft message; `animus-control`'s own
+  `serde_json` WAL path is unaffected, since it never goes through this
+  codec at all). **General rule**: when a type has more than one encoder
+  (a derive-based one and a hand-rolled "compact wire format" one, or any
+  other duplicate-by-design serialization), a new field's checklist must
+  name *every* encoder explicitly — a derive macro's own exhaustiveness
+  cannot protect a sibling encoder it doesn't know exists. Caught here only
+  because the codec's own round-trip test (`every_wire_variant_round_trips`)
+  was updated deliberately as part of the same change, not because anything
+  would have failed on its own.
 
 ### Parallel-agent orchestration
 - **A single long-lived session can exhaust the disk on `target/` alone, with

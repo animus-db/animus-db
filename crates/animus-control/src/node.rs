@@ -718,6 +718,37 @@ impl<E: Env> RaftNode<E> {
         record_reconfigure(&self.metrics, self.lock().change_membership(voters))
     }
 
+    /// The active **learner** configuration (ADR 0058 Train 1) — non-voting
+    /// control-group members. Mirrors [`config`](Self::config).
+    pub fn learners(&self) -> std::collections::BTreeSet<NodeId> {
+        self.lock().learners()
+    }
+
+    /// Whether learner `id` is caught up closely enough to be a promotion
+    /// candidate — see [`RaftCore::learner_caught_up`].
+    pub fn learner_caught_up(&self, id: &NodeId, threshold: u64) -> bool {
+        self.lock().learner_caught_up(id, threshold)
+    }
+
+    /// Add `id` as a **learner** of the control group's own Raft
+    /// configuration (ADR 0058 Train 1) — see [`RaftCore::add_learner`], which
+    /// this is a thin wrapper over, mirroring `change_membership`'s shape.
+    pub fn add_learner(&self, id: NodeId) -> ProposeResult {
+        record_reconfigure(&self.metrics, self.lock().add_learner(id))
+    }
+
+    /// Promote learner `id` to **voter** (ADR 0058 Train 1) — see
+    /// [`RaftCore::promote_learner`].
+    pub fn promote_learner(&self, id: NodeId) -> ProposeResult {
+        record_reconfigure(&self.metrics, self.lock().promote_learner(id))
+    }
+
+    /// Remove learner `id` without promoting it (ADR 0058 Train 1) — see
+    /// [`RaftCore::remove_learner`].
+    pub fn remove_learner(&self, id: NodeId) -> ProposeResult {
+        record_reconfigure(&self.metrics, self.lock().remove_learner(id))
+    }
+
     /// Arm a leadership transfer to `target` (see
     /// [`RaftCore::transfer_leadership`]) — the escape valve
     /// [`change_membership`](Self::change_membership) needs to remove the
