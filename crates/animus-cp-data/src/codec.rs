@@ -27,7 +27,7 @@ use animus_control::raft::{LogEntry, RaftMsg};
 use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
-use animus_tablet::KeyRange;
+use animus_tablet::{KeyRange, SplitChild, TabletId};
 
 use crate::hlc::HlcTimestamp;
 use crate::txn::{TxnId, TxnOutcome, TxnWrite};
@@ -135,7 +135,12 @@ const MAGIC: u8 = 0xCB;
 /// both encoded with the same `put_opt_node_set`/`opt_node_set` helper
 /// `config` already uses. Same house convention: a clean bump, no
 /// cross-version compatibility.
-const VERSION: u8 = 22;
+/// `23` (ADR 0058 Train 2 rung 3): new `KvCommand::SplitTablet` (tag 15) —
+/// the in-place split's single-entry atomic fork (see the variant's own
+/// doc): a `split_key: Vec<u8>` plus two `animus_tablet::SplitChild`
+/// `(id, replicas)` pairs and the standard trailing `ts`. Same house
+/// convention: a clean bump, no cross-version compatibility.
+const VERSION: u8 = 23;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -512,6 +517,22 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_u8(out, 14);
             put_ts(out, *ts);
         }
+        KvCommand::SplitTablet {
+            split_key,
+            children,
+            ts,
+        } => {
+            put_u8(out, 15);
+            put_bytes(out, split_key);
+            for child in children {
+                out.extend_from_slice(&child.id.0.to_be_bytes());
+                out.extend_from_slice(&(child.replicas.len() as u32).to_be_bytes());
+                for r in &child.replicas {
+                    put_node_id(out, r);
+                }
+            }
+            put_ts(out, *ts);
+        }
         KvCommand::TxnStage {
             txn_id,
             record_key,
@@ -641,6 +662,27 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
         5 => KvCommand::NoOp,
         7 => KvCommand::ReadCeiling { ts: read_ts(c)? },
         14 => KvCommand::Freeze { ts: read_ts(c)? },
+        15 => {
+            let split_key = c.bytes()?;
+            let mut children = Vec::with_capacity(2);
+            for _ in 0..2 {
+                let id = TabletId(c.u64()?);
+                let n = c.u32()?;
+                let mut replicas = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    replicas.push(c.node_id()?);
+                }
+                children.push(SplitChild { id, replicas });
+            }
+            let children: [SplitChild; 2] = children
+                .try_into()
+                .map_err(|_| "SplitTablet children must have exactly 2 entries".to_string())?;
+            KvCommand::SplitTablet {
+                split_key,
+                children,
+                ts: read_ts(c)?,
+            }
+        }
         8 => {
             let txn_id = read_txn_id(c)?;
             let record_key = c.bytes()?;
@@ -1269,6 +1311,29 @@ mod tests {
                         commit_ts: ts(9, 0),
                     },
                     ts: ts(9, 2),
+                },
+                config: None,
+                learners: None,
+            },
+            // ADR 0058 Train 2 rung 3 (version 23): the in-place split fork
+            // — a split key plus two children, each with its own replica
+            // set (exercises the version-23 wire shape).
+            LogEntry {
+                term: 8,
+                index: 29,
+                command: KvCommand::SplitTablet {
+                    split_key: b"m".to_vec(),
+                    children: [
+                        SplitChild {
+                            id: TabletId(2),
+                            replicas: vec![nid(1), nid(2), nid(3)],
+                        },
+                        SplitChild {
+                            id: TabletId(3),
+                            replicas: vec![nid(4), nid(5)],
+                        },
+                    ],
+                    ts: ts(10, 0),
                 },
                 config: None,
                 learners: None,

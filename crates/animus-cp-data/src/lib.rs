@@ -51,7 +51,7 @@ use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
 use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId, PRIMARY_STREAM};
 use animus_storage::{MergeOp, StorageEngine, Version};
-use animus_tablet::KeyRange;
+use animus_tablet::{KeyRange, SplitChild};
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
@@ -65,6 +65,7 @@ pub mod hlc;
 pub mod host;
 mod seal;
 pub mod segment;
+mod split;
 mod ts_cache;
 mod txn;
 
@@ -659,6 +660,58 @@ pub enum KvCommand {
     /// copied record is decided post-cutover by the coordinator's own
     /// retry — see rung 5's e2e).
     Freeze { ts: HlcTimestamp },
+    /// **In-place split fork** (ADR 0058 Train 2 rung 3, Stage 3): the
+    /// single-entry atomic mint that forks this parent group into two
+    /// children, proposed into the **parent's own log** by the parent's
+    /// leader once every learner added for the split (the union of both
+    /// children's placement-chosen homes, added by the host reconciler once
+    /// the control plane records the in-place split intent — see
+    /// `animus_tablet::InPlaceSplitIntent`) has caught up.
+    ///
+    /// At apply, on **every** replica (voter and learner alike — this is
+    /// why Stage 2 catches every learner up before this is ever proposed),
+    /// this entry is simultaneously:
+    ///
+    /// - **The ordering fence**: it pushes `(KeyRange::whole(), ts)` into
+    ///   the SAME sealed-range set + `frozen` latch [`KvCommand::Freeze`]'s
+    ///   apply arm uses (this crate's existing apply-time seal discipline,
+    ///   reused verbatim, not reimplemented) — no subsequent entry in the
+    ///   parent's own log describes state either child inherits. A
+    ///   later-ordered user mutation is rejected exactly like a frozen
+    ///   copy-based parent's would be (`RaftKvNode::is_frozen`); the two
+    ///   workflows never coexist on one tablet (selected by the operator's
+    ///   split-mode flag), so sharing the flag is safe.
+    /// - **The durable fork marker** (`split.rs`, mirroring `seal.rs`'s
+    ///   marker discipline): `split_key` and both `children` are merged
+    ///   into an engine-global key so a restart — even after log
+    ///   compaction — can rediscover the fork (`RaftKvNode::pending_split`).
+    ///   Idempotent: a duplicate apply over an already-forked group (a
+    ///   WAL-replay re-application) writes nothing a second time, mirroring
+    ///   `Freeze`'s own idempotent-if-already-frozen check.
+    ///
+    /// **What this entry's apply does NOT do**: materialize the two
+    /// children's engines, or bootstrap their Raft groups. That
+    /// higher-level work — the SSTable-level clone-then-trim and the
+    /// group-mint-at-apply proper — happens **outside** this sync,
+    /// I/O-free apply path, in the per-node host reconciler
+    /// (`host::Reconciler`, ADR 0031), which discovers a pending fork via
+    /// [`RaftKvNode::pending_split`] the same way it discovers every other
+    /// hosted-tablet fact. This mirrors this crate's existing
+    /// sync-core/async-driver split (the core agrees order; a driver does
+    /// the I/O) one level up, applied to the whole tablet lifecycle instead
+    /// of one Raft group — see `host.rs`'s own doc.
+    SplitTablet {
+        /// The key the parent's range splits at (left half first).
+        split_key: Vec<u8>,
+        /// Exactly two children, left half first — the SAME
+        /// `(id, replicas)` pairs the control plane's
+        /// `MetaCommand::BeginSplitInPlace` recorded, so every replica
+        /// derives identical child configs from identical inputs (this
+        /// entry's own `children` field plus the parent's own Raft
+        /// membership at this log position needs no further coordination).
+        children: [SplitChild; 2],
+        ts: HlcTimestamp,
+    },
     /// **Logged read ceiling** (ADR 0018 §2/PR2b — see `ceiling.rs`'s module
     /// doc): proposed by a group's own leader, through its **own** Raft log,
     /// when it wants to serve a read at or above the highest ceiling
@@ -2271,6 +2324,67 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 pushed
             };
             KvCommand::Freeze { ts }
+        })
+    }
+
+    /// Propose the **in-place split fork** (ADR 0058 Train 2 rung 3, Stage
+    /// 3 — see [`KvCommand::SplitTablet`]'s doc): the single-entry atomic
+    /// mint that forks this group into `children`. Called only by the
+    /// parent's own leader, only once every learner added for the split
+    /// has caught up (the host reconciler's job to determine — see
+    /// `host.rs`); leader-only, idempotent (a duplicate applies as a no-op
+    /// exactly like [`propose_freeze`](Self::propose_freeze) — the
+    /// reconciler may re-propose after a crash/re-lead without checking
+    /// first).
+    pub fn propose_split_tablet(
+        &self,
+        split_key: Vec<u8>,
+        children: [SplitChild; 2],
+    ) -> ProposeResult {
+        self.propose_ordered(|_term| {
+            let ts = self.hlc.mint(self.env.now());
+            // Same `last_proposed_ts` floor discipline as `propose_freeze`.
+            let floor = hlc::unpack(self.last_proposed_ts.load(Ordering::SeqCst));
+            let ts = if ts > floor {
+                ts
+            } else {
+                let pushed = self.hlc.witness(floor, self.env.now());
+                assert!(
+                    pushed > floor,
+                    "raftkv propose_split_tablet: witnessing the last-proposed floor must \
+                     strictly exceed it (floor={floor:?}, got={pushed:?}) — Hlc::witness's own \
+                     contract is broken"
+                );
+                pushed
+            };
+            KvCommand::SplitTablet {
+                split_key: split_key.clone(),
+                children: children.clone(),
+                ts,
+            }
+        })
+    }
+
+    /// This group's pending (or already-applied) in-place split fork, if
+    /// any — the one accessor the per-node host reconciler
+    /// (`host::Reconciler`) polls to discover "this hosted tablet forked
+    /// locally, here are its two children" (ADR 0058 Train 2 Stage 3). A
+    /// point read of the durable fork marker (`split.rs`) — cheap (no scan,
+    /// unlike `seal.rs`'s marker, since a tablet forks at most once) and
+    /// safe to call every reconciler tick on every hosted tablet, forked or
+    /// not. Present the instant this **replica's own** apply has processed
+    /// the `SplitTablet` entry — which, for a learner, only happens after
+    /// Stage 2's catch-up is complete and Stage 3's entry has replicated to
+    /// it, exactly the ordering the design depends on.
+    pub async fn pending_split(&self) -> Option<PendingSplit> {
+        let key = split::split_marker_key(self.stream);
+        let vv = self.storage.get(&key).await.ok().flatten()?;
+        let decoded = split::decode_split_value(&vv.value)?;
+        Some(PendingSplit {
+            split_key: decoded.split_key,
+            children: decoded.children,
+            bootstrap_voters: decoded.bootstrap_voters,
+            ts: decoded.ts,
         })
     }
 
@@ -5942,6 +6056,67 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     frozen.store(true, Ordering::SeqCst);
                 }
             }
+            KvCommand::SplitTablet {
+                split_key,
+                children,
+                ts,
+            } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                // Idempotent, mirroring `Freeze`'s own "already sealed"
+                // check: a duplicate propose or a WAL-replay
+                // re-application over a marker-rebuilt sealed set applies
+                // nothing a second time. `frozen` is shared with `Freeze`
+                // deliberately — the two workflows are mutually exclusive
+                // per tablet (selected by the operator's split-mode flag),
+                // and every existing "refuse if frozen" gate must cover
+                // this fork too with no separate allowlist entry.
+                if !frozen.load(Ordering::SeqCst) {
+                    flush_pending(storage, &mut pending, metrics, halted).await;
+                    let whole = KeyRange::whole();
+                    let seal_marker_key = seal::seal_marker_key(tablet, &whole);
+                    storage
+                        .merge(
+                            &seal_marker_key,
+                            &seal::encode_seal_value(&whole, ts),
+                            hlc::pack(ts),
+                        )
+                        .await
+                        .expect("raftkv apply split-fork seal marker");
+                    sealed.push((whole, ts));
+                    frozen.store(true, Ordering::SeqCst);
+                    // The fork-specific durable payload (split.rs): what the
+                    // host reconciler needs to actually materialize the two
+                    // children — see `KvCommand::SplitTablet`'s own doc for
+                    // why that work happens outside this apply path.
+                    //
+                    // `bootstrap_voters` is captured HERE, once, from the
+                    // core's own config+learners at this exact apply — see
+                    // `split.rs`'s module doc for why this read is
+                    // guaranteed identical on every replica (Raft log order:
+                    // every prior config-change entry has already applied by
+                    // the time THIS entry does).
+                    let bootstrap_voters = {
+                        let core_guard = core.lock().expect("raftkv core poisoned");
+                        let mut voters = core_guard.config();
+                        voters.extend(core_guard.learners());
+                        voters
+                    };
+                    let split_marker_key = split::split_marker_key(tablet);
+                    storage
+                        .merge(
+                            &split_marker_key,
+                            &split::encode_split_value(
+                                &split_key,
+                                &children,
+                                &bootstrap_voters,
+                                ts,
+                            ),
+                            hlc::pack(ts),
+                        )
+                        .await
+                        .expect("raftkv apply split-fork marker");
+                }
+            }
             KvCommand::ReadCeiling { ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
                 // No fence, no scoped engine write — a ceiling carries no
@@ -7160,6 +7335,29 @@ struct DriveState<E: Env, S: StorageEngine> {
 /// merge-applied at the carried version by [`KvCommand::SeedBatch`].
 pub type SeedRow = (u8, Vec<u8>, Option<Vec<u8>>, u64);
 
+/// A group's own **pending (or already-applied) in-place split fork** (ADR
+/// 0058 Train 2 rung 3), as read back by
+/// [`RaftKvNode::pending_split`](RaftKvNode::pending_split) — the durable
+/// payload `KvCommand::SplitTablet`'s apply arm wrote, decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSplit {
+    /// The key the parent's range splits at.
+    pub split_key: Vec<u8>,
+    /// Exactly two children, left half first — each `replicas` is that
+    /// child's placement-chosen FINAL replica set (what `CutoverSplit`
+    /// records into `Metadata`, driving the post-cutover trim).
+    pub children: [SplitChild; 2],
+    /// The parent's own full voter-plus-learner config at the moment this
+    /// entry applied — the BOOTSTRAP voter set both children's local
+    /// `RaftKvNode` start with (a superset of either child's own final
+    /// `replicas`, deliberately: see `split.rs`'s module doc for why every
+    /// fork participant safely votes for both new groups initially, trimmed
+    /// down post-cutover by the ordinary reconciler).
+    pub bootstrap_voters: BTreeSet<NodeId>,
+    /// The HLC timestamp the fork applied at (diagnostic only).
+    pub ts: HlcTimestamp,
+}
+
 /// The `ts` a mutating [`KvCommand`] variant carries, or `None` for `NoOp`
 /// (which carries none). The one place that knows every variant's `ts`
 /// field, shared by the WAL-recovery and entry-receipt witnessing sites.
@@ -7172,6 +7370,7 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
         | KvCommand::Delete { ts, .. }
         | KvCommand::Cas { ts, .. }
         | KvCommand::Freeze { ts }
+        | KvCommand::SplitTablet { ts, .. }
         | KvCommand::ReadCeiling { ts, .. }
         | KvCommand::TxnStage { ts, .. }
         | KvCommand::TxnCommit { ts, .. }
