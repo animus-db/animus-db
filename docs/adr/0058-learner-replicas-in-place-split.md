@@ -757,6 +757,92 @@ of just waiting out a slow one. Measured on the e2e test's own 3-node
 cluster: the paced writer needed **zero** retries across every observed
 run — the fork/cutover transition was not visible to it at all.
 
+**Measurement note (2026-08-25) — the rung-8 bench, pointed at Train 2, on
+the same host as the copy-based number it's compared against.** Per this
+ADR's own Testing plan ("the bench that proved [the convergence-predicate
+starvation] problem for ADR 0050's design is exactly the bench that should
+be pointed at this one before it is trusted"), a new sibling bench
+(`animusd/tests/inplace_split_bench.rs::
+bench_inplace_split_serve_latency_and_cutover_blip`) mirrors `split_build.
+rs`'s own committed bench byte-for-byte in workload shape — 2,000 rows,
+256-byte values, 3 nodes, the identical split key and per-tick get/put
+sampling cadence — against a `--split-mode inplace` cluster instead. Both
+benches were rerun 3x each on the same host, back to back, rather than
+trusting the copy-based path's historical 458ms/2,000-row figure (measured
+on a different host at ADR 0050 rung 8's own time) — this host runs
+noticeably slower in absolute terms (its own idle linearizable-read floor
+sits around 108ms median, evidently this environment's own ReadIndex/
+heartbeat-round cost, not sandbox contention — it was identical, to the
+millisecond, across all 6 runs of both benches), so only same-host,
+same-run numbers are compared:
+
+| | copy-based (run1 / run2 / run3) | in-place (run1 / run2 / run3) | copy-based median | in-place median |
+|---|---|---|---|---|
+| total split wall clock | 8.060s / 8.062s / 7.978s | 4.519s / 4.326s / 4.579s | **8.060s** | **4.519s** |
+| write blip (max PUT) | 303.6ms / 251.9ms / 299.9ms | 726.3ms / 509.7ms / 733.7ms | **299.9ms** | **726.3ms** |
+| put retries needed | (not instrumented) | 0 / 0 / 0 | — | **0** |
+
+Two honest, not-spun findings, one in each direction:
+
+- **Total split wall clock is markedly better**, as the ADR's core
+  structural argument predicts: ~4.5s median vs. ~8.1s median (roughly
+  1.8x faster) for the identical 2,000-row table, since Train 2 has no
+  bulk-copy/tail-chase phase to run at all — the fork is a single atomic
+  apply, and the wall clock measured here is essentially the time for the
+  two added learners to catch up over ordinary Raft replication.
+- **The write blip is NOT clearly better — it is measurably worse, and
+  this is reported plainly rather than spun.** The in-place path's own
+  worst observed PUT latency (726ms/510ms/734ms, median 726ms) is
+  **roughly 2.4x the copy-based path's own** (304ms/252ms/300ms, median
+  300ms), despite **zero** retries being needed on any of the three
+  in-place runs (the new bench's retry-counting `put_in_counting`
+  confirms this directly — every put that eventually landed slow did so
+  on its FIRST attempt, unlike the copy-based path's blip, which is a
+  fast-refused-then-retried shape). That means the elevated in-place
+  number is not the documented `FROZEN_REFUSAL`-and-retry pattern at
+  all — it is a single request that was simply slow end to end, most
+  likely `cp_route`'s `RouteDecision::Wait` branch parking the write
+  while a freshly-forked child group runs its own first election (never
+  forwarding to a non-leader during election, by design) — a real,
+  structurally different cost than the copy-based path's refuse-and-
+  retry blip, and one this ADR's own "near-zero, roughly one routing
+  refresh" framing did not anticipate. This was **not** investigated
+  further here (out of scope for a bench-and-report pass — the
+  investigation and any fix, if warranted, is separate work), but it is
+  exactly the kind of number rung 4 (flipping the default) should not
+  proceed past unexamined: **the in-place path trades a slower, more
+  numerous small-retry pattern for a rarer but larger single stall**, and
+  which shape a real client's own retry/backoff policy handles better is
+  not something this bench alone answers.
+
+**Soak (2026-08-25), same session, run after the bench above (never
+concurrently, so neither perturbs the other's timing).** All green, no
+findings:
+
+- `ANIMUS_INPLACE_SPLIT_SEEDS=500` (`animus-cp-data --test
+  inplace_split_reconciler`) — 3/3 tests passed, 18.2s wall clock.
+- `ANIMUS_LEARNER_SEEDS=200` (`animus-control --test learner_corpus`) —
+  4/4 tests passed, 39.7s wall clock.
+- `ANIMUS_RECONCILER_SEEDS=300` (`animus-cp-data --test
+  reconciler_corpus`) — 4/4 tests passed, 33.5s wall clock.
+- `animusd --test inplace_split_e2e` (both `ProdEnv` tests — the paced-
+  writer fork/cutover test and the streams-shard-lineage test), run **20
+  times** as independent process invocations (not `cargo test`'s own
+  repeat, which would share one binary but not one process — this
+  matches the "real 3-node cluster brought up and torn down fresh" shape
+  the ADR's own housed harness bug (the `tablet_host_reconciler_loop`
+  race documented above) was actually found by): **20/20 runs green**, no
+  flake — both tests passed on every run, and the writer needed zero
+  retries on every run. Per the repo's own rule, a single failure here
+  would have been reported as a real bug, not retried away; none
+  occurred.
+
+None of the three `SimEnv` corpora surfaced a failure at these depths, and
+CARGO_PROFILE_DEV_DEBUG=0 was used throughout the soak (matching the
+existing nightly `corpus-deep.yml` convention of a plain, unmodified `cargo
+test` invocation — no release-profile build was found in that convention to
+match, so none was introduced here).
+
 ## Open forks (deliberately not decided by this ADR)
 
 | # | Fork | Status |
