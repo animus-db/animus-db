@@ -2410,6 +2410,15 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // follower-connected relay path `SplitTablet` already has.
             | MetaCommand::BeginSplit { .. }
             | MetaCommand::CutoverSplit { .. }
+            // In-place split workflow (ADR 0058 Train 2 rung 3): the SAME
+            // relay reasoning as the copy-based `BeginSplit`/`CutoverSplit`
+            // pair above — `trigger_split` (in-place mode) proposes
+            // `BeginSplitInPlace` from whichever node's admin/auto-split
+            // surface fired it, and `CutoverSplit` here is proposed by the
+            // parent's own leader node once its data-plane fork has
+            // completed and its pre-cutover vetoes pass, exactly the same
+            // follower-connected relay need.
+            | MetaCommand::BeginSplitInPlace { .. }
             // Provision-at-create (ADR 0023): a `CreateTable` on a follower-connected
             // client relays the table's tablet creation + RF policy to the control
             // leader. Scoped to one tablet per table by the state machine's guard.
@@ -12442,6 +12451,25 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
                 tracing::warn!(?e, file = %f, "deleting a reclaimed tablet's engine file");
             }
         }
+    }
+
+    async fn clone_engine(
+        &self,
+        source: &LsmEngine<ProdEnv>,
+        target: TabletId,
+    ) -> Result<LsmEngine<ProdEnv>, String> {
+        // ADR 0058 Train 2 rung 3: the in-place split's Stage 3
+        // materialization, over this node's real on-disk backend —
+        // `LsmEngine::clone_to` (ADR 0058 rung 2) is the SSTable-hard-link
+        // clone; the target's own filename prefix is the SAME per-tablet
+        // naming convention every other tablet engine uses, so a restart's
+        // ordinary `open(target)` recovers it identically to any other
+        // hosted tablet. `source` is the caller's own already-open handle
+        // (see the trait's own doc for why this method never re-opens it).
+        source
+            .clone_to(tablet_lsm_prefix(target.0))
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 

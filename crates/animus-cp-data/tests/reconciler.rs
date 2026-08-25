@@ -400,7 +400,7 @@ impl EngineFactory<MemoryEngine> for FaultyTabletEngines {
 
     async fn clone_engine(
         &self,
-        source: TabletId,
+        source: &MemoryEngine,
         target: TabletId,
     ) -> Result<MemoryEngine, String> {
         self.inner.clone_engine(source, target).await

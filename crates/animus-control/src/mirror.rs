@@ -206,6 +206,15 @@ pub fn apply_and_derive_mirror(
                 }
             }
         }
+        MetaCommand::BeginSplitInPlace { parent, .. } => {
+            // ADR 0058 Train 2 rung 3, Stage 1: only the parent's own row
+            // changes (state → Splitting, `inplace_split` set, epoch
+            // bumped) plus the advanced allocator counter — no child rows
+            // exist yet (unlike `BeginSplit`, which mints `Building`
+            // tablets here).
+            writes.push(put_json(syskv::tablet_key(*parent), &meta.tablets[parent]));
+            writes.push(put_counter(NEXT_TABLET_ID_COUNTER, meta.next_tablet_id));
+        }
         MetaCommand::CutoverSplit { parent, .. } => {
             // ADR 0050 stage 4: the parent's row (and policy) are gone; both
             // children re-mirror (state → Active, epoch bumped) along with
@@ -213,6 +222,16 @@ pub fn apply_and_derive_mirror(
             // `split_lineage` rows this apply just wrote for `parent` —
             // parents are removed at cutover and tablet ids never reused, so
             // the parent id uniquely identifies this cutover's children.
+            //
+            // ADR 0058 Train 2 rung 3's in-place branch also mirrors each
+            // child's policy HERE — its own apply arm is the only place an
+            // in-place child's policy is ever set at all (there is no
+            // `Building` tablet-map row to attach it to earlier, unlike the
+            // copy-based branch, whose own `BeginSplit` arm above already
+            // mirrored it). Unconditional and idempotent for the copy-based
+            // branch too: a child's policy there was already mirrored at
+            // `BeginSplit` time, so this is a harmless duplicate write of
+            // the identical value, not a second source of truth.
             writes.push(KeyWrite::Delete(syskv::tablet_key(*parent)));
             writes.push(KeyWrite::Delete(syskv::policy_key(*parent)));
             for (child, lineage) in meta
@@ -222,6 +241,9 @@ pub fn apply_and_derive_mirror(
             {
                 writes.push(put_json(syskv::tablet_key(*child), &meta.tablets[child]));
                 writes.push(put_json(syskv::split_lineage_key(*child), lineage));
+                if let Some(policy) = meta.policies.get(child) {
+                    writes.push(put_json(syskv::policy_key(*child), policy));
+                }
             }
         }
         MetaCommand::SetTabletPolicy { tablet, policy } => match policy {

@@ -76,11 +76,22 @@ pub trait EngineFactory<S: StorageEngine>: Send + Sync {
     /// by `LsmEngine::clone_to`/`MemoryEngine::clone_to` (ADR 0058 rung 2) —
     /// full-engine clone only, no kind filtering or key-range trimming
     /// (that's this module's own `trim_split_child`, run by the caller
-    /// immediately after). `source` must already exist; `target` must NOT
+    /// immediately after).
+    ///
+    /// **`source` is the caller's own ALREADY-OPEN handle, never a bare
+    /// [`TabletId`] this method re-opens itself** — deliberately: the parent
+    /// is a currently-hosted tablet, so the reconciler already holds its one
+    /// live `LsmEngine`/`MemoryEngine` instance in
+    /// [`Reconciler`](crate::host::Reconciler)'s own engine cache; a second
+    /// independent `open()` of the same on-disk prefix would construct a
+    /// SECOND, uncoordinated in-process engine over files the first
+    /// instance's own WAL/manifest/compaction state is still managing
+    /// (`animus-storage`'s single-writer-per-engine assumption) — silent
+    /// corruption, not merely wasted work. `target` must NOT already exist
     /// (this method does not itself check `probe(target)` — the caller
     /// consults it first, per the G4 contract, to skip re-cloning after a
     /// crash between the engine commit and the group commit).
-    async fn clone_engine(&self, source: TabletId, target: TabletId) -> Result<S, String>;
+    async fn clone_engine(&self, source: &S, target: TabletId) -> Result<S, String>;
 }
 
 /// The [`MemoryEngine`] implementation of [`EngineFactory`]: an in-memory
@@ -138,10 +149,10 @@ impl EngineFactory<MemoryEngine> for MemoryTabletEngines {
 
     async fn clone_engine(
         &self,
-        source: TabletId,
+        source: &MemoryEngine,
         target: TabletId,
     ) -> Result<MemoryEngine, String> {
-        let cloned = self.engine(source).clone_to();
+        let cloned = source.clone_to();
         self.engines
             .lock()
             .expect("engine registry poisoned")
@@ -1301,7 +1312,22 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 }
             }
         } else {
-            let engine = match self.factory.clone_engine(parent, child.id).await {
+            // The parent is a currently-hosted tablet — reuse its own
+            // already-open engine handle rather than asking the factory to
+            // re-open the same on-disk prefix a second time (see
+            // `EngineFactory::clone_engine`'s own doc for why that would be
+            // unsafe for `LsmEngine`).
+            let Some(parent_engine) = self.ensure_engine(parent).await else {
+                tracing::warn!(
+                    child = child.id.0,
+                    parent = parent.0,
+                    "reconciler: parent engine unavailable while materializing a split child"
+                );
+                self.state.release_unconfirmed_host(child.id);
+                self.state.split_forming.remove(&child.id);
+                return;
+            };
+            let engine = match self.factory.clone_engine(&parent_engine, child.id).await {
                 Ok(engine) => engine,
                 Err(e) => {
                     tracing::warn!(
