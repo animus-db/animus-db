@@ -75,7 +75,7 @@ async fn console_serves_shell_assets_and_deep_links_on_combined_node() {
             "the shell is text/html, headers:\n{head}"
         );
         assert!(
-            body.contains("AnimusDB Data Console"),
+            body.contains("animusd console"),
             "the shell names itself: {body}"
         );
         assert!(
@@ -166,7 +166,7 @@ async fn console_serves_shell_on_data_only_node() {
             "the shell is text/html, headers:\n{head}"
         );
         assert!(
-            body.contains("AnimusDB Data Console"),
+            body.contains("animusd console"),
             "the shell names itself: {body}"
         );
 

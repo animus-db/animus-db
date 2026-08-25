@@ -3,18 +3,75 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AnimusDB Data Console</title>
+<title>animusd console</title>
 <link rel="stylesheet" href="/console/ui/console.css">
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><span class="name">animusd</span><span class="tag">data console</span></div>
+  <div class="brand">
+    <svg class="logo" width="19" height="19" viewBox="0 0 32 32" aria-hidden="true">
+      <g fill="none" stroke="var(--text)" stroke-width="2.4" stroke-linecap="round">
+        <path d="M16 5.5a10.5 10.5 0 0 1 9.09 5.25"></path>
+        <path d="M25.09 21.25A10.5 10.5 0 0 1 16 26.5"></path>
+        <path d="M6.91 21.25A10.5 10.5 0 0 1 6.91 10.75"></path>
+      </g>
+      <circle cx="16" cy="16" r="3.1" fill="var(--text)"></circle>
+    </svg>
+    <span class="wordmark"><span class="name">animusd</span><span class="tag">console</span></span>
+  </div>
   <span class="spacer"></span>
   <span class="scope-note">your tables &amp; items only — no cluster state</span>
+  <span class="theme-switch" id="theme-switch" role="group" aria-label="theme">
+    <button type="button" data-theme-choice="light" title="Light" aria-label="Light theme">
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke-width="1.5">
+        <circle cx="8" cy="8" r="3.2"></circle>
+        <path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"></path>
+      </svg>
+    </button>
+    <button type="button" data-theme-choice="dark" title="Dark" aria-label="Dark theme">
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke-width="1.5">
+        <path d="M13.2 9.1A5.6 5.6 0 1 1 6.9 2.8a4.4 4.4 0 0 0 6.3 6.3Z"></path>
+      </svg>
+    </button>
+    <button type="button" data-theme-choice="system" title="System" aria-label="Match system theme">
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke-width="1.5">
+        <rect x="1.6" y="2.6" width="12.8" height="8.6" rx="1.4"></rect>
+        <path d="M5.6 14h4.8M8 11.2v2.8"></path>
+      </svg>
+    </button>
+  </span>
 </header>
 <main id="app">
-  <p class="loading">Loading AnimusDB Data Console…</p>
+  <p class="loading">Loading animusd console…</p>
 </main>
+<script>
+"use strict";
+// Theme init/wiring — a UI preference only, persisted client-side. Mirrors
+// dashboard_core.js's own theme mechanism (see its comment for the full
+// rationale); duplicated here in a small inline script rather than pulled
+// into console.js because this app has no shared "core" module and the
+// logic is a handful of lines. Runs before console.js's router so the
+// correct palette is set before the app paints its first screen.
+const THEME_KEY = "animusd-console-theme";
+function applyThemeChoice(choice) {
+  const root = document.documentElement;
+  if (choice === "light" || choice === "dark") root.dataset.theme = choice;
+  else delete root.dataset.theme;
+  document.querySelectorAll(".theme-switch button[data-theme-choice]").forEach((b) => {
+    b.classList.toggle("active", b.dataset.themeChoice === choice);
+  });
+}
+(function initTheme() {
+  const saved = localStorage.getItem(THEME_KEY);
+  applyThemeChoice(saved === "dark" || saved === "system" ? saved : "light");
+})();
+document.getElementById("theme-switch").querySelectorAll("button[data-theme-choice]").forEach((b) => {
+  b.addEventListener("click", () => {
+    localStorage.setItem(THEME_KEY, b.dataset.themeChoice);
+    applyThemeChoice(b.dataset.themeChoice);
+  });
+});
+</script>
 <script src="/console/ui/console.js"></script>
 </body>
 </html>
