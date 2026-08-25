@@ -462,6 +462,38 @@ pub trait Disk: Send + Sync {
     /// prefix-named component (e.g. a dropped tablet's `db-t{id}-*` LSM files)
     /// without knowing the exact set.
     async fn list(&self) -> std::io::Result<Vec<String>>;
+
+    /// Create a hard link at `dst` over `src`'s current durable bytes — a
+    /// directory-entry-only operation, no data copy (ADR 0058 rung 2: the
+    /// primitive an SSTable-granularity engine clone needs to share immutable
+    /// files between the source and a new target engine instead of copying
+    /// their bytes).
+    ///
+    /// `dst` becomes an independent name over the same durable bytes `src`
+    /// names *at the moment of this call*. A later [`remove`](Disk::remove)
+    /// of either name never affects the other — the underlying bytes persist
+    /// as long as at least one name references them, exactly like a real
+    /// filesystem hard link. This is safe to use for sharing a file between
+    /// two live engines specifically *because* the caller only ever links
+    /// files it treats as immutable once written (an SSTable, never mutated
+    /// in place after the manifest swap that makes it live) — this trait
+    /// does not itself enforce that discipline, the same way it does not
+    /// enforce anything else about a caller's file-naming convention.
+    ///
+    /// **Overwrites `dst` if it already exists** (like
+    /// [`replace`](Disk::replace), but backed by a link rather than a byte
+    /// copy), so the primitive is idempotent on retry: relinking the same
+    /// `(src, dst)` pair after a crash mid-clone reproduces the same durable
+    /// state rather than erroring on an already-present name.
+    ///
+    /// On return the new directory entry is durable — production fsyncs the
+    /// containing directory, mirroring [`append`](Disk::append)/
+    /// [`replace`](Disk::replace)'s "namespace changes are fsynced" rule —
+    /// so no follow-up [`sync`](Disk::sync) call is needed for the link
+    /// itself.
+    ///
+    /// Returns a `NotFound` error if `src` does not exist.
+    async fn link(&self, src: &str, dst: &str) -> std::io::Result<()>;
 }
 
 /// A store for immutable, content-addressed byte blobs — the stream-shard

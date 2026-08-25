@@ -342,6 +342,22 @@ async fn main() {
         total.as_secs_f64(),
     );
 
+    // ---- Clone cost (ADR 0058 rung 2) ----
+    // `clone_to` flushes (usually a no-op here — the workload above already
+    // triggered its own flushes), hard-links every live SSTable file into a
+    // fresh prefix, and writes one manifest: no data is copied, so the cost
+    // should scale with the *table count*, not the data volume, unlike a
+    // byte-for-byte copy.
+    println!("\nLsmEngine clone_to cost (SSTable-granularity, ADR 0058 rung 2):");
+    let clone_start = Instant::now();
+    let cloned = lsm.clone_to("dbclone-").await.expect("clone_to");
+    let clone_elapsed = clone_start.elapsed();
+    println!(
+        "  clone_to                  {:>8.2}ms   sstables={}  (hard-link + manifest write, no data copy)",
+        clone_elapsed.as_secs_f64() * 1000.0,
+        cloned.sstable_count(),
+    );
+
     // ---- Concurrent-write throughput (WAL group commit) ----
     // The sequential `put` loop above coalesces nothing (one in-flight write at a
     // time). Group commit pays off when writes are concurrent: this measures

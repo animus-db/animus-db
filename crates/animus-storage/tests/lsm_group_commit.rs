@@ -264,6 +264,9 @@ impl Disk for CrashEnv {
     async fn list(&self) -> std::io::Result<Vec<String>> {
         self.inner.list().await
     }
+    async fn link(&self, src: &str, dst: &str) -> std::io::Result<()> {
+        self.inner.link(src, dst).await
+    }
 }
 
 #[async_trait::async_trait]

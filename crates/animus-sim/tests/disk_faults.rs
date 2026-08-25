@@ -445,3 +445,119 @@ fn corrupt_durable_flips_the_exact_byte() {
         "corruption must be traced (seed={seed})"
     );
 }
+
+/// `Disk::link` (ADR 0058 rung 2) models a hard link: `dst` reads back
+/// `src`'s bytes, `remove`ing `src` afterward leaves `dst` unaffected (the
+/// two are independent map slots once linked, exactly like two directory
+/// entries sharing one inode until the last one is unlinked), and relinking
+/// over an already-present `dst` succeeds — overwriting it — rather than
+/// erroring, which is what makes a crash-retried clone idempotent.
+#[test]
+fn link_models_hard_link_semantics() {
+    let seed = 0xD15C_0006;
+    let mut sim = Simulator::new(seed);
+    let env = sim.env(nid(0));
+    env.clone().spawn_task(async move {
+        env.append("src", b"hello").await.unwrap();
+        env.sync("src").await.unwrap();
+        env.link("src", "dst").await.expect("link");
+        assert_eq!(env.read("dst").await.unwrap(), b"hello");
+
+        // Overwrite-on-relink: linking again over an existing `dst` succeeds.
+        env.link("src", "dst")
+            .await
+            .expect("relink over existing dst");
+        assert_eq!(env.read("dst").await.unwrap(), b"hello");
+
+        // Removing `src` leaves `dst`'s own bytes intact.
+        env.remove("src").await.unwrap();
+        assert_eq!(
+            env.read("dst").await.unwrap(),
+            b"hello",
+            "dst must survive removal of src"
+        );
+
+        // Linking a nonexistent source is a clean NotFound.
+        let err = env
+            .link("does-not-exist", "also-dst")
+            .await
+            .expect_err("missing source must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    });
+    sim.run();
+}
+
+/// `link` participates in the same opt-in, seed-reproducible error-injection
+/// model every other disk op does: a configured error rate makes it fail
+/// (with no state change) on a schedule that is a pure function of the seed.
+#[test]
+fn link_participates_in_the_injected_error_schedule() {
+    // `src` is written with the fault disabled first, then the fault config
+    // is installed on the *same* simulator instance (a fresh `Simulator`
+    // would change the RNG stream the assertions below depend on) before the
+    // `link` calls under test.
+    fn run_with_preseeded_src(seed: u64) -> (Vec<bool>, bool) {
+        let mut sim = Simulator::new(seed);
+        {
+            let env = sim.env(nid(0));
+            env.clone().spawn_task(async move {
+                env.append("src", b"hello").await.unwrap();
+                env.sync("src").await.unwrap();
+            });
+            sim.run();
+        }
+        let mut cfg = DiskConfig::default();
+        cfg.set_error_prob(0.5);
+        sim.set_disk_config(cfg);
+        let env = sim.env(nid(0));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let dst_has_data = Arc::new(Mutex::new(false));
+        {
+            let env = env.clone();
+            let results = Arc::clone(&results);
+            let dst_has_data = Arc::clone(&dst_has_data);
+            env.clone().spawn_task(async move {
+                for i in 0..20u8 {
+                    let dst = format!("dst{i}");
+                    let ok = env.link("src", &dst).await.is_ok();
+                    results.lock().unwrap().push(ok);
+                    if ok {
+                        // `read` is itself an injectable op under this same
+                        // fault config — only check the bytes when the read
+                        // happens to succeed; a successful `link` followed by
+                        // a failed `read` says nothing about `link`'s own
+                        // correctness.
+                        if let Ok(bytes) = env.read(&dst).await {
+                            assert_eq!(bytes, b"hello", "a successful link must carry real bytes");
+                            *dst_has_data.lock().unwrap() = true;
+                        }
+                    }
+                }
+            });
+        }
+        sim.run();
+        let results = results.lock().unwrap().clone();
+        (results, *dst_has_data.lock().unwrap())
+    }
+
+    let seed = 0xD15C_0007;
+    let (a, a_had_data) = run_with_preseeded_src(seed);
+    let (b, b_had_data) = run_with_preseeded_src(seed);
+    assert_eq!(
+        a, b,
+        "seed={seed}: link's error schedule must reproduce exactly"
+    );
+    assert_eq!(a_had_data, b_had_data);
+    assert!(
+        a.iter().any(|&ok| ok),
+        "seed={seed}: expected at least one link to succeed over 20 tries at p=0.5"
+    );
+    assert!(
+        a.iter().any(|&ok| !ok),
+        "seed={seed}: expected at least one link to fail over 20 tries at p=0.5"
+    );
+    assert!(
+        a_had_data,
+        "seed={seed}: a successful link must expose the real bytes"
+    );
+}

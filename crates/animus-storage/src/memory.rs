@@ -112,6 +112,24 @@ impl MemoryEngine {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().expect("storage poisoned")
     }
+
+    /// Clone this engine's current state into a **new**, independent
+    /// [`MemoryEngine`] (ADR 0058 rung 2's `MemoryEngine` equivalent of
+    /// [`LsmEngine::clone_to`](crate::LsmEngine::clone_to), for `SimEnv`-driven
+    /// corpus use). There are no files here to link, so this deep-copies
+    /// every key's full version history (values and tombstones); the result
+    /// shares no state with the source — a write to either engine after this
+    /// call is never visible through the other.
+    #[must_use]
+    pub fn clone_to(&self) -> MemoryEngine {
+        let inner = self.lock();
+        MemoryEngine {
+            inner: Arc::new(Mutex::new(Inner {
+                data: inner.data.clone(),
+                max_version: inner.max_version,
+            })),
+        }
+    }
 }
 
 #[async_trait::async_trait]

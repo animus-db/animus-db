@@ -325,3 +325,43 @@ fn snapshot_scan_is_isolated() {
         assert_eq!(live_keys, vec![b"b".to_vec(), b"c".to_vec()]);
     });
 }
+
+/// `MemoryEngine::clone_to` (ADR 0058 rung 2's `SimEnv`-corpus equivalent of
+/// `LsmEngine::clone_to`): the clone matches the source's full record set
+/// (values, an overwrite winner, and a tombstone) at clone time, and the two
+/// engines are fully independent afterward — a write to either is never
+/// visible through the other.
+#[test]
+fn clone_to_matches_source_and_isolates_subsequent_writes() {
+    block_on(async {
+        let e = MemoryEngine::new();
+        e.put(b"a", b"1", 1).await.unwrap();
+        e.put(b"b", b"2", 2).await.unwrap();
+        e.put(b"a", b"1-overwritten", 3).await.unwrap();
+        e.delete(b"b", 4).await.unwrap();
+
+        let clone = e.clone_to();
+
+        let mut src_view = e.entries_with_tombstones().await.unwrap();
+        src_view.sort();
+        let mut clone_view = clone.entries_with_tombstones().await.unwrap();
+        clone_view.sort();
+        assert_eq!(
+            src_view, clone_view,
+            "clone must match the source's values, overwrite winner, and tombstone"
+        );
+
+        e.put(b"only-src", b"x", 5).await.unwrap();
+        clone.put(b"only-clone", b"x", 5).await.unwrap();
+        assert_eq!(
+            e.get(b"only-clone").await.unwrap(),
+            None,
+            "the source must not see a write made to the clone"
+        );
+        assert_eq!(
+            clone.get(b"only-src").await.unwrap(),
+            None,
+            "the clone must not see a write made to the source"
+        );
+    });
+}

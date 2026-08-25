@@ -308,6 +308,44 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   a crash mid-GC recovers the pre-GC inputs. Argued in `lsm.rs` module docs,
   exercised in `lsm_crash.rs` + `lsm_wal_rotation.rs` + `lsm_gc.rs`.
 
+- **`LsmEngine::clone_to(target_prefix)` (ADR 0058 rung 2) clones an engine's
+  durable state into a NEW, independent engine at SSTable-file granularity**
+  — the prerequisite for a later in-place split's local materialization
+  (rung 3; this method itself is split-agnostic — full-engine clone only, no
+  kind filtering, no key-range trimming). **The cut**: flush the memtable
+  first (a no-op if already empty), so the clone is SSTables-only with an
+  empty WAL, then [hard-link](../animus-env/CLAUDE.md) every live table into
+  `target_prefix`'s own namespace and write it a fresh manifest (same table
+  metas, same `next_seq` floor so the target's own future flushes never
+  collide with an inherited seq, same `max_version`, empty `wal_segments`).
+  SSTable immutability is what makes sharing bytes instead of copying them
+  safe: source and clone hold independent directory entries over the same
+  durable bytes, so the source's own compaction later removing a superseded
+  input has no effect on the clone. **Commit point (durable-before-visible)**:
+  the target's manifest `Disk::replace` is the single linearization point —
+  until it succeeds the target prefix has no manifest and opens empty
+  (any already-linked SSTable files are harmless orphans, exactly like a
+  crashed flush's orphan table), so a crash before it leaves no half-clone
+  visible and the whole call is safe to simply retry
+  (`Disk::link` overwrites an already-linked `dst` name rather than
+  erroring, so relinking is idempotent). **One asymmetry to know**:
+  `clone_to`'s own last step reopens the just-committed target to hand back
+  a live handle, so an `Err` from the call does *not* always mean nothing
+  was committed — a fault in that trailing open can follow a successful
+  manifest commit. Either way what's durable at `target_prefix` is always
+  **nothing** or a **complete** clone, never a torn one; the method's own
+  doc comment states this precisely. The maintenance lock is held across
+  the whole flush-then-link sequence (after the flush, which acquires/
+  releases it on its own — it is not reentrant) so a concurrent compaction
+  on the source cannot swap/remove a table mid-link. `MemoryEngine::clone_to`
+  is the equivalent for `SimEnv` corpus use — there are no files to link, so
+  it deep-copies the version history instead; same "independent state,
+  writes never cross" contract. Tests: `tests/lsm_clone.rs` (equivalence
+  including overwrites/deletes, isolation, `SimEnv` disk-fault-injected
+  crash-mid-clone + retry, source compaction racing a live clone's linked
+  files) and `tests/lsm_clone_prodenv.rs` (a real-filesystem `ProdEnv`
+  regression asserting the clone is a literal hard link via matching inode
+  numbers, not a byte copy).
 - **Observability (ADR 0015) is observe-only and deterministic.** `LsmEngine`
   records `storage_*` counters through the `Env` metrics seam at the real LSM site
   that knows the outcome: a flush *after* its manifest swap (`storage_flushes`); a
@@ -361,4 +399,7 @@ reporting flush/compaction counts. Workload is tunable via
 `ANIMUS_BENCH_KEYS`/`ANIMUS_BENCH_GETS`/`ANIMUS_BENCH_VALUE_BYTES`/
 `ANIMUS_BENCH_SCAN`/`ANIMUS_BENCH_APPLY_BATCH` (default 30, the
 sequential-apply section comparing per-op `merge` against `merge_batch` —
-the CP-data Raft apply pattern).
+the CP-data Raft apply pattern). Also reports `clone_to`'s own cost
+(ADR 0058 rung 2) on the already-populated `LsmEngine` from the put/get/scan
+section — expected to scale with table count, not data volume, since it
+hard-links rather than copies.

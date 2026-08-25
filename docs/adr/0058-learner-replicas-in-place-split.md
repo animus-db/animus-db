@@ -576,6 +576,27 @@ Train 2's single-entry mint.
 2. **SSTable-level clone in `animus-storage`** (plus a `MemoryEngine`
    equivalent for `SimEnv`) — the prerequisite ADR 0050 named as future
    storage headroom, promoted here to a hard dependency of rung 3.
+
+   **As-built (2026-08-25), landed independently of rung 3**:
+   `LsmEngine::clone_to(target_prefix)` flushes the memtable (so the clone
+   is SSTables-only with an empty WAL), hard-links every live SSTable file
+   into a fresh prefix on the same `Env`, and writes the target a new
+   manifest naming exactly those tables — full-engine only, no kind
+   filtering or key-range trimming (that stays rung 3's business, including
+   the G2 pre-trimming fork this ADR left open). The `Env` `Disk` trait
+   gained one new primitive, `link(src, dst)` — a hard link, overwriting an
+   existing `dst` so a crash-retried clone is idempotent — implemented by
+   `ProdEnv` (`std::fs::hard_link` + the usual directory fsync) and modelled
+   deterministically by `SimEnv` (a snapshot copy into an independent map
+   slot, indistinguishable from a real hard link for this trait's
+   sanctioned use, and wired into the existing disk fault-injection model).
+   The commit point is the target's manifest `Disk::replace`: before it
+   succeeds the target prefix has no manifest and opens empty, so a crash
+   mid-clone is safe to retry and never exposes a torn clone — this is the
+   contract rung 3's G4 (crash-recovery idempotency for group-mint-at-apply)
+   builds on. `MemoryEngine::clone_to` is the `SimEnv`-corpus equivalent
+   (deep-copies version history — there are no files to link).
+
 3. **The `SplitTablet` entry, group mint, and materialization**, behind
    the existing split trigger (ADR 0034) — built and proven alongside the
    still-shipping copy-based workflow, not in place of it, until it is
