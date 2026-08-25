@@ -3363,6 +3363,30 @@ debugging anything that feels like it might have happened before.
   with a real-clock test that races them, since a single-loop sim corpus
   cannot expose an inter-loop race by construction.
 
+- **A historical bench figure from a different host is not a baseline —
+  rerun it alongside the new number, on the same host, in the same
+  session (ADR 0058's rung-8-vs-Train-2 bench pass, 2026-08-25).** Asked
+  to compare a new in-place split bench against ADR 0050 rung 8's
+  documented 458ms/2,000-row copy-based figure, the honest move was to
+  rerun the OLD bench too rather than diff a new number against an old
+  one measured on unknown, unrelated hardware — this session's own host
+  produced a copy-based blip of ~300ms (not 458ms) with a rock-steady
+  ~108ms idle-read floor across every one of 6 runs, meaning the
+  absolute numbers here are simply not comparable to the ADR's own
+  historical figure, only to each other. Doing this also surfaced a
+  result worth having in hand precisely because it wasn't flattering:
+  the new (in-place) path's total wall clock was ~1.8x faster, as
+  predicted, but its own write blip was ~2.4x *worse* than the
+  same-host copy-based number, with zero retries needed on any run —
+  a single un-retried request was simply slow, a different failure
+  shape than the copy-based path's fast-refuse-and-retry blip, and one
+  the design doc's own "near-zero" framing hadn't anticipated. **General
+  rule**: when a task asks you to compare against a number from another
+  session/host/PR, treat that number as an anecdote until you've
+  reproduced it (or its equivalent) yourself under the same run — and
+  report an unflattering same-host result exactly as measured rather
+  than reframing it around the more flattering historical figure.
+
 ### Code patterns
 - **A convergent bookkeeping write must be routable to its own owner: derive
   its key from the owner's actual scope, not a normalized/truncated form of
@@ -9562,3 +9586,47 @@ the *exact* old string(s) tree-wide first, do not trust the file list a
 memory of "where the feature lives" would produce, and prefer
 `new (old)`-shaped rewrites over silent replacement wherever the old name
 might still be a search target (an ADR title, a test name, a changelog).
+
+## Move a timer's trigger, not its mechanism — and check what the seam already gives you for free (ADR 0058 rung 4)
+
+The in-place split's write-blip regression (measured ~726ms vs. the copy
+path's ~300ms, rung 3's own bench) traced to one cause: a freshly-forked
+child Raft group has no leader until *some* replica's cold, randomized
+election timeout eventually fires. The fix was **not** a new consensus
+primitive — it was making the replica that already knows it should lead
+(the parent's own current leader, a fact every replica already computes
+locally) call the *existing* pre-vote round immediately instead of waiting
+for `tick`'s timer to expire. `RaftCore::campaign_now` is three lines: a
+role guard, then `self.start_pre_vote(now, entropy)` — the identical
+function a real timeout calls.
+
+Two things worth generalizing from this:
+
+1. **When only *when* something fires needs to change, not *what* it does
+   when it fires, reuse the existing mechanism at the new trigger point
+   rather than building a parallel one.** A hand-rolled "immediate leader"
+   path would have needed its own safety argument for every interaction
+   pre-vote already has one for (a peer that hasn't started yet, two
+   replicas racing to self-nominate, a lease check against a live leader).
+   Calling `start_pre_vote` early inherits all of them for free — including
+   the fallback: a round that wins no majority in time re-arms the ordinary
+   election timer via the same `reset_election_timer` call the timeout path
+   uses, so "campaign failed" and "never campaigned at all" converge on the
+   identical retry, with no second code path to keep in sync.
+2. **Before assuming an early message needs new machinery to reach a
+   not-yet-started peer, check whether the transport already queues by
+   destination regardless of consumer readiness.** ADR 0026's multiplexed
+   `(node, stream)` addressing already queues an inbound message whether or
+   not anything is currently polling `recv_stream` for that stream — true of
+   both `ProdEnv`'s per-stream `Demux` and `SimEnv`'s inbox map. That made
+   "send a `PreVote` to a peer whose own `RaftKvNode` for this child hasn't
+   started yet" a non-problem: the message simply waits in that peer's inbox
+   until its own bootstrap reaches its first receive, at which point it's
+   just this group's first inbound message. No new buffering, no "is the
+   peer up yet" probe, no retry-until-reachable loop.
+
+The general shape: a live-timeout problem is not automatically a
+"needs-new-protocol" problem — check first whether calling the existing
+timeout handler early, at a caller-computed trigger, already has every
+safety property the new call site needs, and whether the seam underneath it
+already tolerates the ordering you're about to introduce.

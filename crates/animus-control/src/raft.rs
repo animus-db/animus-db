@@ -2262,6 +2262,56 @@ where
 
     // ---- role transitions & replication ---------------------------------
 
+    /// **Campaign for leadership immediately** instead of waiting out the
+    /// randomized election timeout `tick` would otherwise wait for (ADR 0058
+    /// Train 2 rung 4's deterministic first-leader mechanism for a
+    /// freshly-forked child group: the parent's own leader, which is a voter
+    /// of both children by construction — see `bootstrap_voters` — campaigns
+    /// in each the moment it materializes them, rather than leaving a
+    /// brand-new group leaderless until its own cold randomized timeout
+    /// fires).
+    ///
+    /// Runs exactly the **pre-vote** round `tick` runs once
+    /// `election_deadline` passes — never a raw, term-incrementing
+    /// `start_election` directly — so it inherits every one of pre-vote's
+    /// existing safety properties for free, with no new machinery: a peer
+    /// whose own child-group instance has not started yet simply never
+    /// responds (its message sits queued in the `Env`'s per-`(node, stream)`
+    /// inbox — ADR 0026's multiplexed addressing already queues by
+    /// destination regardless of whether a consumer is currently polling —
+    /// until that peer's own `start_hosted` call reaches its first
+    /// `recv_stream`, at which point it is simply this group's very first
+    /// inbound message); a round that gets no majority in time (a
+    /// late-starting peer, or two replicas racing to self-nominate at once)
+    /// re-arms the ordinary election timer exactly as a real timeout would
+    /// and falls back to the untouched randomized-timeout retry path with
+    /// **zero** special-cased recovery; and a peer that already has a live
+    /// leader (this replica's own campaign lost the race) correctly
+    /// withholds its pre-vote grant via the unmodified lease check in
+    /// [`handle_pre_vote`](Self::handle_pre_vote).
+    ///
+    /// A safe no-op unless this replica is a **voting** `Follower`:
+    /// [`start_pre_vote`](Self::start_pre_vote)'s own `is_voter()` gate is
+    /// what makes calling this on a learner, or a node not yet a member at
+    /// all, harmless (produces no messages, merely re-arms the local timer)
+    /// rather than requiring a duplicate guard here; already being
+    /// `PreCandidate`/`Candidate`/`Leader` is also a no-op — this method
+    /// **never** demotes an active leader or restarts an in-flight round.
+    /// Nothing about quorum/term math changes: this is purely a question of
+    /// *when* the first pre-vote round of a brand-new group's life runs,
+    /// never *what* it takes to win one. The caller (`animus-cp-data`'s
+    /// `drive`, gated on a freshly-bootstrapped group only) additionally
+    /// asserts `config().contains(&self_id)` before calling this, as a
+    /// structural belt on top of the `is_voter()` gate here — see that call
+    /// site's own doc for why the invariant holds by construction anyway.
+    #[must_use]
+    pub fn campaign_now(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
+        if self.role != Role::Follower {
+            return Vec::new();
+        }
+        self.start_pre_vote(now, entropy)
+    }
+
     /// Begin a **pre-vote** round (ADR 0009): become a [`PreCandidate`](Role::PreCandidate)
     /// **without** touching the term or casting a real vote, and solicit
     /// [`PreVote`](RaftMsg::PreVote)s for the prospective term (`current_term + 1`).
