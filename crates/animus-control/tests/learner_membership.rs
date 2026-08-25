@@ -177,6 +177,67 @@ fn change_membership_rejects_a_delta_that_collides_with_a_current_learner() {
     assert_eq!(c.learners(), set(&[1]), "learners must be untouched");
 }
 
+// ---- ADR 0058 Train 2 rung 4: `campaign_now` (deterministic first leader) ----
+
+/// `campaign_now` (the in-place split's immediate-campaign entry point,
+/// consumed by `animus-cp-data`'s `drive`) must be exactly as harmless on a
+/// non-voter as the ordinary timeout path already is — it is documented as
+/// running the identical `start_pre_vote` a real timeout would, so it
+/// inherits `is_voter()`'s existing gate rather than needing one of its own.
+/// A learner is simply a durable instance of the same "not a voter" state
+/// this already covers (see this crate's own CLAUDE.md on that point), so a
+/// bare non-member id is the general case, not a narrower one.
+#[test]
+fn campaign_now_is_a_no_op_for_a_node_not_in_the_voter_config() {
+    // Node 3 is not a member of the 3-voter group at all.
+    let mut c = core(3, &[0, 1, 2]);
+    assert!(!c.is_leader());
+    let outs = c.campaign_now(Nanos(0), 0);
+    assert!(
+        outs.is_empty(),
+        "a non-voter must solicit no pre-votes when asked to campaign immediately"
+    );
+    assert_eq!(
+        c.role(),
+        animus_control::raft::Role::Follower,
+        "a non-voter must stay a Follower, never advance to PreCandidate"
+    );
+}
+
+/// The positive counterpart: a genuine solo voter wins its own campaign
+/// immediately (mirrors `elect_solo_leader`'s own single-node short-circuit
+/// through pre-vote's self-majority case) — proving the gate above is
+/// specific to non-membership, not a blanket no-op.
+#[test]
+fn campaign_now_elects_a_solo_voter_immediately() {
+    let mut c = core(0, &[0]);
+    assert!(!c.is_leader());
+    let _ = c.campaign_now(Nanos(0), 0);
+    assert!(
+        c.is_leader(),
+        "a lone voter's immediate campaign must win outright, exactly as its own timeout would"
+    );
+}
+
+/// `campaign_now` must never demote an already-elected leader or disturb an
+/// in-flight round — it is a no-op for anything but a voting `Follower`.
+#[test]
+fn campaign_now_is_a_no_op_once_already_leading() {
+    let mut c = core(0, &[0]);
+    elect_solo_leader(&mut c);
+    let term_before = c.term();
+    let outs = c.campaign_now(Nanos(20_000_000_000), 0);
+    assert!(
+        outs.is_empty(),
+        "an already-elected leader must not re-campaign"
+    );
+    assert!(
+        c.is_leader(),
+        "campaign_now must never demote a sitting leader"
+    );
+    assert_eq!(c.term(), term_before, "the term must be untouched");
+}
+
 // ---- structural safety: a learner never appears in any majority computation ----
 
 #[test]
