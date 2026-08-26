@@ -21,8 +21,9 @@ use animus_control::Metadata;
 use animus_cp_data::segment;
 use animus_tablet::{TabletId, partition_token};
 use animusd::{
-    ClientRequest, ClientResponse, Node, SegmentStoreConfig, StorageBackend, StreamSealKnobs,
-    bind_cluster, read_frame, start_cluster_with_streams, write_frame,
+    ClientRequest, ClientResponse, Node, SegmentStoreConfig, SplitMode, StorageBackend,
+    StreamSealKnobs, bind_cluster, read_frame, start_cluster_with_growth_and_quiesce_after,
+    start_cluster_with_streams, write_frame,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -136,6 +137,47 @@ fn production_seal_knobs() -> StreamSealKnobs {
 
 async fn start_streamed_cluster(n: usize, dir: &Path, knobs: StreamSealKnobs) -> Vec<Node> {
     start_streamed_cluster_full(n, dir, knobs, None, None, SegmentStoreConfig::default()).await
+}
+
+/// Like [`start_streamed_cluster_full`], but pinned to `SplitMode::Copy`
+/// explicitly (ADR 0058 rung 4 layer 2 flipped the cluster-wide default to
+/// `InPlace`) via [`start_cluster_with_growth_and_quiesce_after`] rather
+/// than [`start_cluster_with_streams`]'s own `SplitMode::default()`. Used
+/// only by `multi_split_soak_streamed_gsi_table_under_mixed_load` — see
+/// that test's own doc for why: it is ADR 0050 Train B rung 8's own named
+/// acceptance soak, calibrated against the copy-based workflow's cadence,
+/// and separately, issue #298 (an unresolved, pre-existing exactly-once
+/// bug at a split boundary) reproduces far more readily under in-place's
+/// much higher splits-per-unit-time — pinning here keeps this soak a
+/// meaningful, stable regression harness for the workflow it was built to
+/// stress rather than a flaky proxy for a different, already-tracked bug.
+async fn start_streamed_cluster_full_copy_pinned(
+    n: usize,
+    dir: &Path,
+    knobs: StreamSealKnobs,
+    auto_split_keys: Option<usize>,
+    auto_split_bytes: Option<u64>,
+    store: SegmentStoreConfig,
+) -> Vec<Node> {
+    let bound = bind_cluster(n, "127.0.0.1".parse().unwrap(), dir)
+        .await
+        .unwrap();
+    start_cluster_with_growth_and_quiesce_after(
+        bound,
+        StorageBackend::default(),
+        auto_split_keys,
+        auto_split_bytes,
+        Duration::from_secs(600),
+        knobs,
+        store,
+        animusd::DEFAULT_STREAM_RETENTION,
+        None,
+        Duration::ZERO,
+        None,
+        SplitMode::Copy,
+    )
+    .await
+    .unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2523,11 +2565,29 @@ async fn cascade_split_walks_the_grandparent_chain_with_closed_shard_shape() {
 /// memory bug class: children's drains start clean (RestartFromScratch at
 /// activation) and no retired parent's watermark row survives to pollute
 /// anything.
+///
+/// **Pinned to `SplitMode::Copy` explicitly** (ADR 0058 rung 4 layer 2
+/// flipped the cluster-wide default to `InPlace`) via
+/// `start_streamed_cluster_full_copy_pinned` — this is ADR 0050's own named
+/// rung-8 acceptance soak, calibrated against the copy workflow's cadence;
+/// under in-place's much faster per-split convergence this same 300s/120-item
+/// budget drives far MORE cutovers in the same window, which reproduces
+/// issue #298 (an unresolved, pre-existing exactly-once bug at a split
+/// boundary — see this function's own diagnostic block below) close to
+/// deterministically instead of its documented occasional-sighting rate
+/// under copy. Investigating/fixing #298 is out of scope for this layer
+/// (a pre-existing bug gets its own change, per this repo's own
+/// convention) — pinning here keeps this soak meaningful as a copy-workflow
+/// regression harness rather than turning it into an unrelated, much
+/// noisier proxy for #298. See `docs/engineering-lessons.md`'s rung-4-
+/// layer-2 entry: this is a real finding the eventual copy-path deletion
+/// (this ADR's remaining rung 4 layer) will need to reckon with, since
+/// deleting `Copy` removes the option to pin away from it here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_split_soak_streamed_gsi_table_under_mixed_load() {
     tokio::time::timeout(Duration::from_secs(300), async {
         let dir = tempfile::TempDir::new().unwrap();
-        let nodes = start_streamed_cluster_full(
+        let nodes = start_streamed_cluster_full_copy_pinned(
             3,
             dir.path(),
             tiny_seal_knobs(),
@@ -2635,18 +2695,17 @@ async fn multi_split_soak_streamed_gsi_table_under_mixed_load() {
         };
 
         // 1. Zero lost writes: every acked item reads back through a node
-        //    that didn't originate most of them. `ConsistentRead: true` is
-        //    load-bearing here, not decoration (ADR 0055): the wire
-        //    default is genuinely eventually consistent (served from
-        //    *any* replica's own applied state, no read barrier), so an
-        //    unqualified read right after a cascade of cutovers can
-        //    legitimately observe a replica — including a brand-new split
-        //    child — that hasn't caught up yet. That is a real DynamoDB
-        //    client's own job to ask around, exactly like every other
-        //    write-verifying read in this codebase's test suite already
-        //    does post-ADR-0055 (see `docs/engineering-lessons.md`'s
-        //    "weakening a default is a test-suite-wide event" entry) —
-        //    this soak's own step 1 was missed in that audit.
+        //    that didn't originate most of them. `ConsistentRead:true` is
+        //    load-bearing here (ADR 0055 — see `animusd/CLAUDE.md`'s
+        //    "Testing gotcha this created" entry): the wire default
+        //    (`false`) is served from any replica's own applied state with
+        //    no read-your-writes guarantee, and this soak's own rapid-fire
+        //    cutover cascade (many splits in quick succession, unlike a
+        //    single isolated split elsewhere) narrows that staleness
+        //    window enough to flip an unqualified read from "always
+        //    happened to pass" to "flakes" — this assertion is about lost
+        //    writes, not about staleness, so it must ask for the
+        //    linearizable read.
         for id in &ids {
             let (status, body) = dynamo(
                 nodes[2].dynamo_addr(),

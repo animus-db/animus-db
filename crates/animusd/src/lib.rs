@@ -4203,9 +4203,9 @@ impl BoundNode {
     /// convention as every other knob here.
     ///
     /// `split_mode` (ADR 0058 Train 2 rung 3) selects which workflow this
-    /// node's `ClientCtx::trigger_split` proposes — `SplitMode::Copy`
-    /// (every caller above this layer) is byte-for-byte the original ADR
-    /// 0050 workflow. See [`SplitMode`]'s own doc.
+    /// node's `ClientCtx::trigger_split` proposes — `SplitMode::default()`
+    /// (every caller above this layer) is `InPlace` since rung 4 layer 2.
+    /// See [`SplitMode`]'s own doc.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_growth(
         self,
@@ -5237,8 +5237,9 @@ impl BoundControlNode {
     /// `split_mode` (ADR 0058 Train 2 rung 3) selects which workflow this
     /// node's own `ClientCtx::trigger_split` proposes when it receives one
     /// (a relayed admin/client `SplitTablet` request, or a follower-
-    /// connected `BeginSplit`/`BeginSplitInPlace` propose) — `SplitMode::
-    /// Copy` is byte-for-byte the original ADR 0050 workflow.
+    /// connected `BeginSplit`/`BeginSplitInPlace` propose) — no explicit
+    /// caller override picks up `SplitMode::default()` = `InPlace` since
+    /// rung 4 layer 2; `Copy` stays selectable.
     ///
     /// # Errors
     /// Propagates a failure to open the dedicated engine (LSM backend only).
@@ -5587,7 +5588,7 @@ impl BoundDataNode {
     ///
     /// `split_mode` (ADR 0058 Train 2 rung 3) — see
     /// [`BoundNode::start_with_growth`]'s doc: same knob, same
-    /// `SplitMode::Copy`-is-byte-for-byte-original contract.
+    /// `SplitMode::default()` (`InPlace` since rung 4 layer 2) contract.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_growth(
         self,
@@ -6615,9 +6616,11 @@ pub(crate) struct ClientCtx {
     pub(crate) dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     /// Which tablet-split workflow this node proposes when it drives
     /// `trigger_split` (ADR 0058 Train 2 rung 3's `animusd`-level driver
-    /// residue) — `Copy` (every existing deployment/test, since this is
-    /// what every constructor below defaults to) is byte-for-byte the
-    /// original ADR 0050 workflow. See [`SplitMode`]'s own doc. Threaded
+    /// residue) — `InPlace` (every constructor below that doesn't take an
+    /// explicit override defaults to `SplitMode::default()`, `InPlace`
+    /// since rung 4 layer 2) is the ADR 0058 in-place single-entry atomic
+    /// fork; `Copy` is the original ADR 0050 workflow, still selectable.
+    /// See [`SplitMode`]'s own doc. Threaded
     /// from the `--split-mode {copy,inplace}` CLI flag (`--config`/
     /// `--cluster N` only, mirroring `--quiesce-after`'s own scope) —
     /// plain per-node config, not gated by [`DataRole`], since a
@@ -14848,8 +14851,9 @@ pub async fn start_cluster_with_quiesce_after(
 ///
 /// `split_mode` (ADR 0058 Train 2 rung 3) selects which split workflow the
 /// whole in-process cluster runs — `--cluster N`'s `--split-mode
-/// {copy,inplace}` CLI flag threads through here; `SplitMode::Copy` (every
-/// other wrapper above) is byte-for-byte the original ADR 0050 workflow.
+/// {copy,inplace}` CLI flag threads through here; `SplitMode::default()`
+/// (every other wrapper above) is `InPlace` since rung 4 layer 2 — `Copy`
+/// stays selectable via the flag pending its own deletion.
 ///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
@@ -15182,8 +15186,10 @@ pub async fn start_split_cluster_with_growth(
                 // `split_mode` does not thread through the split-deployment
                 // dev path yet — same documented gap this function already
                 // has for `quiesce_after` (`main.rs::run`'s own comment) and
-                // `--stream-seal-*`/`--segment-store` below: always the
-                // byte-for-byte original ADR 0050 workflow here.
+                // `--stream-seal-*`/`--segment-store` below: always
+                // `SplitMode::default()`, `InPlace` since rung 4 layer 2
+                // (was `Copy`) — this dev shape has no `--split-mode` flag
+                // to override it with.
                 SplitMode::default(),
             )
             .await?,
@@ -15346,12 +15352,13 @@ pub async fn run_node_with_streams_and_quiesce_after(
 }
 
 /// Like [`run_node_with_streams_and_quiesce_after`], but also selects the
-/// **split workflow** (ADR 0058 Train 2 rung 3) instead of [`SplitMode::
-/// Copy`] — `--config FILE --node I`'s `--split-mode {copy,inplace}` CLI
-/// flag threads through here. The same layered-wrapper convention as
-/// [`run_node_with_streams_quiesce_and_ttl_sweep_interval`]'s own
-/// `ttl_sweep_interval` knob: every existing call site above keeps
-/// compiling and behaving identically at `SplitMode::Copy`.
+/// **split workflow** (ADR 0058 Train 2 rung 3) explicitly instead of
+/// [`SplitMode::default`] — `--config FILE --node I`'s `--split-mode
+/// {copy,inplace}` CLI flag threads through here. The same layered-wrapper
+/// convention as [`run_node_with_streams_quiesce_and_ttl_sweep_interval`]'s
+/// own `ttl_sweep_interval` knob: every existing call site above keeps
+/// compiling and behaving identically at `SplitMode::default()` (`InPlace`
+/// since rung 4 layer 2).
 ///
 /// # Errors
 /// As [`run_node_with`].
@@ -15596,8 +15603,9 @@ pub async fn run_node_control_with_orphan_sweep_after(
             // `animusd control`'s CLI surface has no `--split-mode` flag of
             // its own (mirroring `--quiesce-after`'s identical scope gap
             // for this same subcommand) — a control-only node's
-            // `trigger_split` calls always default to the byte-for-byte
-            // original ADR 0050 workflow.
+            // `trigger_split` calls always default to `SplitMode::default()`,
+            // `InPlace` since rung 4 layer 2 (was `Copy`); `--config`'s own
+            // `run` path is still the only way to pin `Copy` explicitly.
             SplitMode::default(),
         )
         .await
@@ -15711,8 +15719,8 @@ pub async fn run_node_data(
             dynamo_auth,
             // `animusd data --config`'s CLI surface has no `--split-mode`
             // flag of its own (mirrors `run_node_control_with_orphan_sweep_
-            // after`'s identical scope gap) — always the byte-for-byte
-            // original ADR 0050 workflow.
+            // after`'s identical scope gap) — always `SplitMode::default()`,
+            // `InPlace` since rung 4 layer 2 (was `Copy`).
             SplitMode::default(),
         )
         .await
@@ -16264,8 +16272,9 @@ async fn finish_data_join(
             None,
             dynamo_auth,
             // `animusd data --seed` join has no `--split-mode` flag of its
-            // own (same documented gap as `run_node_data`) — always the
-            // byte-for-byte original ADR 0050 workflow.
+            // own (same documented gap as `run_node_data`) — always
+            // `SplitMode::default()`, `InPlace` since rung 4 layer 2 (was
+            // `Copy`).
             SplitMode::default(),
         )
         .await

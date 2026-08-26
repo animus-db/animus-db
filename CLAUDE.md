@@ -207,12 +207,17 @@ truth; this map is just for navigation.
   are **table-scoped** (a table's tablets partition its own ring; no table
   prefix in keys). The escape/token primitives live here and must match the
   wire edges byte-for-byte.
-- **Tablet lifecycle** — split is a **copy-based background workflow**
-  (ADR 0050): `BeginSplit` mints two `Building` children at
-  placement-chosen homes, a driver on the parent's leader copies + tails,
-  a terminal `Freeze` stops writes, `CutoverSplit` activates the children
-  and retires the parent (children born with empty change logs; lineage
-  frozen in `split_lineage`); auto-split triggers on
+- **Tablet lifecycle** — split is, by default, an **in-place atomic fork**
+  (ADR 0058, default since rung 4 layer 2): a single Raft entry on the
+  parent's own log mints both children directly `Active`, materialized on
+  every fork participant from the committed entry, with no separate
+  build/freeze phase. The original **copy-based background workflow** (ADR
+  0050 — `BeginSplit` mints two `Building` children at placement-chosen
+  homes, a driver on the parent's leader copies + tails, a terminal
+  `Freeze` stops writes, `CutoverSplit` activates the children and retires
+  the parent) still exists, selectable via `--split-mode copy`, but is
+  deprecated pending deletion (ADR 0058's remaining rung 4 layer); lineage
+  is frozen in `split_lineage` either way. Auto-split triggers on
   **bytes** (ADR 0034, `animusd`); **tablets are split-only** — merge has
   been removed entirely (ADR 0044, supersedes ADR 0033); dropped tables'
   data is reclaimed by a convergent **GC** (ADR 0024). Tablet ids are never
