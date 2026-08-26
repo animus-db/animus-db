@@ -141,9 +141,26 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
   nav.main a { white-space: nowrap; flex: none; padding: 8px 2px; }
 }
 /* Chalk-paper wants margin: below 560px the 20px inset above steps up once
-   more so body copy never reads edge-to-edge on a phone. */
+   more so body copy never reads edge-to-edge on a phone. The nav also stops
+   scrolling here: five short links wrap into calm rows instead of a strip
+   whose last link sits half-clipped under the edge fade. */
 @media (max-width: 560px) {
   :root { --pad-x: 22px; }
+  nav.main {
+    flex-wrap: wrap; overflow-x: visible; gap: 4px 22px; padding-bottom: 8px;
+    mask-image: none; -webkit-mask-image: none;
+  }
+}
+
+/* Phone typography: most of what reads as "cramped" at 390px is leading and
+   margins, not width — multi-line headings need looser leading than the
+   desktop display cut, and blocks need clearer separation. */
+@media (max-width: 640px) {
+  h1, h2 { line-height: 1.28; }
+  h2 { margin-bottom: 0.75em; }
+  p { margin-bottom: 1.15em; }
+  .kicker { margin-bottom: 16px; }
+  .body-text { font-size: 15px; margin-bottom: 16px; }
 }
 
 /* ---------- sub-navigation (reference pages: Architecture/Compat/Perf/Licensing) ---------- */
@@ -234,8 +251,8 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
 @media (max-width: 560px) {
   .hero { padding: 44px 0 36px; }
   .hero-grid { gap: 40px; }
-  .hero h1 { font-size: clamp(1.875rem, 7vw, 2rem); margin: 8px 0 16px; }
-  .hero .lede { font-size: 15px; line-height: 1.6; margin-bottom: 24px; }
+  .hero h1 { font-size: clamp(1.875rem, 7vw, 2rem); margin: 10px 0 18px; }
+  .hero .lede { font-size: 15px; line-height: 1.65; margin-bottom: 26px; }
   .hero .btn-row { flex-direction: column; align-items: stretch; gap: 12px; }
   .hero .btn-row .btn { width: 100%; }
   .hero .fineprint { margin-top: 18px; }
@@ -253,9 +270,10 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
    of its rule so the rule reads as a divider, not an underline sitting on
    the text above it. */
 @media (max-width: 480px) {
-  .stat-row { padding-top: 26px; margin-bottom: 40px; }
-  .stat-row .stat { padding: 13px 0 3px; margin-top: 16px; }
+  .stat-row { padding-top: 28px; margin-bottom: 44px; }
+  .stat-row .stat { padding: 16px 0 6px; margin-top: 18px; }
   .stat-row .stat:first-child { margin-top: 0; padding-top: 0; }
+  .stat-row .stat .n { margin-bottom: 6px; }
 }
 
 /* ---------- sections ---------- */
@@ -268,7 +286,8 @@ section.alt, .page-section.alt { background: var(--bg-soft); border-top: 1px sol
    needs air above it, not to sit directly on the block before it. */
 @media (max-width: 640px) {
   section, .page-section { padding: 58px 0 60px; }
-  .section-head { margin-bottom: 14px; }
+  .section-head { margin-bottom: 20px; }
+  .section-head p { font-size: 15px; line-height: 1.65; }
 }
 
 /* ---------- card grids ---------- */
