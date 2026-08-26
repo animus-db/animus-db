@@ -8312,7 +8312,23 @@ debugging anything that feels like it might have happened before.
   attribute) before the default changed to an explicit value.
 
 ### Parallel-agent orchestration
-- **Headless-Chromium `--window-size` screenshots are not responsive-layout
+- **A gate command piped into `tail`/`tee` without `pipefail` reports the
+  pipe's *last* command's exit status, so the gate can fail while the
+  wrapper exits 0 (2026-08-26, ADR 0059 Train 1 PR② merge).** A
+  `cargo check --workspace --all-targets 2>&1 | tail -3` "validation" of a
+  merge-conflict resolution exited 0 while `cargo check` itself had failed
+  with E0061 — the compile error was real (main had added new
+  `run_node_with_streams_quiesce_and_split_mode` call sites in
+  `split_build.rs`/`split_lifecycle.rs` while the branch being merged had
+  widened that signature; textual auto-merge sees no conflict in files
+  only one side changed), and CI caught what the local wrapper claimed to
+  have checked. Two rules: (a) any pipeline whose exit status gates a
+  push runs under `set -o pipefail` (or checks `PIPESTATUS[0]`); (b) a
+  merge of a moved `main` into a branch that changed a function signature
+  gets its gate run on the *merged* tree specifically because the
+  dangerous call sites are the ones only `main` has — the same
+  missed-allowlist class as the "grep every gating match site" rule, at
+  merge time.
   QA (2026-08-25, website mobile pass)** — in this harness,
   `chromium --headless=new --window-size=390,H --screenshot=...` lays the
   page out at the default ~800px viewport and then *crops* the PNG to
