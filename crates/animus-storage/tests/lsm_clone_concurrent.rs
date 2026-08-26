@@ -24,7 +24,7 @@
 //! reason.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use animus_env::{ProdEnv, nid};
@@ -125,6 +125,113 @@ async fn clone_to_under_live_load_never_drops_an_acked_write() {
         .await
         .expect("writer + clone racer did not finish (deadlock?)");
     assert!(rounds >= 1, "test invalid: clone_to never ran");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **Liveness regression (2026-08-26 flush-retry-starvation fix).** Pins the
+/// property the no-lost-write test above does not: `clone_to` must
+/// **complete** — promptly, without erroring out — even against a writer
+/// that never pauses for the whole duration of the call.
+///
+/// `clone_to` used to retry `flush()` in a bounded loop until the memtable
+/// read empty, sleeping between attempts. That loop has no liveness
+/// guarantee against a *persistent* concurrent writer: the writer can refill
+/// the memtable faster than any bounded number of flushes drains it, so
+/// after exhausting its retry budget the call returned a loud
+/// `StorageError::Backend` instead of a clone — reported from CI as
+/// `clone_to_under_live_load_never_drops_an_acked_write` failing with
+/// "memtable still non-empty after 1000 flush retries" on a busier runner,
+/// even though the identical code passed on the same seed locally (a
+/// starvation flake by construction, not an infra fluke — see
+/// `docs/engineering-lessons.md`). The fix replaced "retry until empty"
+/// with a single point-in-time snapshot of whatever the memtable holds,
+/// written into the clone's own namespace — bounded, one-shot work
+/// independent of how long or how fast a writer keeps writing.
+///
+/// This test keeps a writer running in as tight a loop as the runtime
+/// allows for the ENTIRE test (never idling, never pausing — no `sleep`,
+/// no bounded op count that could race the writer finishing before
+/// `clone_to` is even called) and asserts `clone_to` still returns `Ok`
+/// well inside a generous timeout. Against the old bounded-retry
+/// implementation this reproduces the CI failure directly under a real
+/// multi-thread `ProdEnv` (the deterministic `SimEnv` cannot: see the
+/// module doc above for why).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clone_to_completes_under_a_writer_that_never_pauses() {
+    let dir = std::env::temp_dir().join(format!("animus-clone-liveness-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let addr = "127.0.0.1:0".parse().unwrap();
+    let (env, _bound) = ProdEnv::bind(nid(0), addr, &dir)
+        .await
+        .expect("bind ProdEnv");
+    // A high flush threshold so the writer's own threshold-triggered flushes
+    // don't incidentally do `clone_to`'s draining job for it — the memtable
+    // stays genuinely, persistently non-empty across the whole test.
+    let opts = LsmOptions {
+        flush_threshold_bytes: 1 << 20,
+        compaction_trigger: 4,
+        target_table_bytes: 1 << 20,
+        wal_segment_bytes: 1 << 16,
+        ..LsmOptions::default()
+    };
+    let lsm = LsmEngine::open_with(env, "db-", opts)
+        .await
+        .expect("open lsm");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let lsm = lsm.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut i: u64 = 0;
+            // No sleeps, no yields deliberately awaited — as fast and as
+            // persistent a writer as this thread can drive, for as long as
+            // the test lets it run.
+            while !stop.load(Ordering::Relaxed) {
+                let key = format!("k{i:08}");
+                let value = format!("val-{key}");
+                lsm.merge(key.as_bytes(), value.as_bytes(), i + 1)
+                    .await
+                    .expect("merge acked");
+                i += 1;
+            }
+            i
+        })
+    };
+
+    // Let the writer get genuinely underway (memtable non-empty, mid-stream)
+    // before racing `clone_to` against it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The property under test: this returns `Ok` promptly — bounded by one
+    // flush attempt plus writing out a single memtable snapshot, never by
+    // how long the writer keeps writing. The old implementation could spend
+    // its whole retry budget (~1000 attempts) racing the writer here and
+    // then return `Err`; the generous timeout only guards against a genuine
+    // hang, not against the old code's slow-then-error failure mode, which
+    // the inner `expect` below catches directly.
+    let clone_result =
+        tokio::time::timeout(Duration::from_secs(20), lsm.clone_to("db-liveness-clone-"))
+            .await
+            .expect("clone_to did not return within 20s against a persistent writer (hang)")
+            .expect(
+                "clone_to must succeed under a writer that never pauses, not error out \
+         after exhausting a bounded retry budget (the flush-retry starvation bug)",
+            );
+
+    stop.store(true, Ordering::Relaxed);
+    let writes = writer.await.unwrap();
+    assert!(
+        writes > 0,
+        "test invalid: the writer never got to run concurrently with clone_to"
+    );
+
+    // Sanity: the returned handle is a real, independently usable engine.
+    clone_result
+        .put(b"post-clone-marker", b"1", u64::MAX - 1)
+        .await
+        .expect("clone is independently writable");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -503,6 +503,16 @@ State once here; cross-referenced from the sections below.
     after each attempt. Regression: `tests/txn_recovery.rs`'s
     `stage_over_a_foreign_pending_intent_no_ops_then_a_pushed_retry_succeeds`
     and `abort_restore_never_meets_another_transactions_intent`.
+    **Gap found, not yet fixed (issue #298, 2026-08-26)**: this guard checks
+    only for a *different* txn's unresolved `Intent` — it never checks
+    whether the current value is already `Envelope::Committed`. A stale or
+    duplicate `TxnStage` propose landing after its own transaction has
+    already fully resolved is therefore never rejected: it silently
+    resurrects the key from `Committed` back into `Intent`, and a later
+    resolve can then re-materialize its derived change-log record a second
+    time at a fresh HLC. Identified by reading, not yet caught firing live
+    in a captured repro — see `docs/engineering-lessons.md`'s matching entry
+    and ADR 0058's G5 row.
 
   Other invariants, one line each: a tablet split's `split_key` is not
   token-aligned, so a split racing an in-flight transaction could in

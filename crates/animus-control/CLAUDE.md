@@ -361,6 +361,39 @@ per-tablet CP data plane (`animus-cp-data`).
   `cutover_split_in_place_*`, mirroring the copy-based tests' own shape
   scenario-for-scenario.
 
+- **The backup catalog (ADR 0059 §3, Train 1 PR ①): `BeginBackup`/
+  `RecordBackupTabletComplete`/`CompleteBackup`/`FailBackup`/`DeleteBackup`.**
+  `Metadata::backups: BTreeMap<BackupId, BackupRow>` (`BackupId = String`,
+  an opaque freshly-minted identity — never a table name, the ADR's own
+  "scar": a name-keyed catalog would let a drop-then-recreate of the same
+  table name silently poison a still-live backup row) plus `Metadata::
+  backup_tablet_progress: BTreeMap<(BackupId, TabletId), BackupTabletProgress>`
+  (mirroring `MarkIndexBackfilled`'s per-tablet-report shape). `BeginBackup`
+  derives its whole manifest stub (an owned `TableSchema` clone + the
+  table's current tablet list) from **already-agreed `Metadata` at apply
+  time**, never from anything the proposer captured — the same
+  determinism argument `BeginSplit`'s child ranges and `CutoverSplit`'s
+  child recomputation already rest on (see `docs/engineering-lessons.md`'s
+  entry on this). `CompleteBackup` requires every pinned tablet to have a
+  progress row; `RecordBackupTabletComplete` is idempotent on an identical
+  repeat but rejects a genuinely differing one outright (no repair-update
+  path yet, unlike `SealStreamShard`'s replicas-only allowance).
+  `BackupStatus` already carries an `Expired` variant for the (not yet
+  built) two-phase retention janitor's mark phase, so that later PR doesn't
+  reshape the enum. **`DropTableSchema`/`DropTableTablets` deliberately
+  never touch `Metadata::backups`/`backup_tablet_progress`** — ADR 0024's
+  explicit carve-out (ADR 0059 §3): a backup catalog row outlives its
+  source table, which is what makes "restore a table dropped days ago"
+  possible at all later in this train. `syskv::EntityKind::Backup`/
+  `BackupProgress` follow the usual mirror conventions; `backup_progress_key`
+  physically encodes `(tablet, backup_id)` (fixed-width field first, the
+  `index_backfill_key` shape) even though `Metadata`'s own map key is
+  `(BackupId, TabletId)` — see `docs/engineering-lessons.md`'s entry on why
+  those two orders are independent decisions, not the same constraint
+  twice. Scope of this PR: the catalog only — no capture driver, no
+  `SegmentStore` plumbing, no wire API, no janitor loop (later PRs in the
+  ADR 0059 stack).
+
 ## What's non-obvious
 
 - **The sync/driver split is deliberate.** All consensus logic is in the sync

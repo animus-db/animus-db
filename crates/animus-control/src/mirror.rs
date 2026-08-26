@@ -169,6 +169,20 @@ pub fn apply_and_derive_mirror(
         }
         _ => Vec::new(),
     };
+    // ADR 0059 §3: `DeleteBackup` only carries the backup id — which
+    // `(backup_id, tablet)` progress rows it is about to prune is only
+    // knowable by looking at pre-apply state, the identical
+    // "identities gone by the time `apply` returns" hazard the module doc
+    // above describes for `dropped_tablets`.
+    let pruned_backup_progress: Vec<(crate::meta::BackupId, TabletId)> = match command {
+        MetaCommand::DeleteBackup { backup_id } => meta
+            .backup_tablet_progress
+            .keys()
+            .filter(|(id, _)| id == backup_id)
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
 
     let outcome = meta.apply(command);
     if outcome != ApplyOutcome::Applied {
@@ -364,6 +378,32 @@ pub fn apply_and_derive_mirror(
                 }
             }
         }
+        MetaCommand::BeginBackup { backup_id, .. } => {
+            writes.push(put_json(
+                syskv::backup_key(backup_id),
+                &meta.backups[backup_id],
+            ));
+        }
+        MetaCommand::RecordBackupTabletComplete {
+            backup_id, tablet, ..
+        } => {
+            writes.push(put_json(
+                syskv::backup_progress_key(backup_id, *tablet),
+                &meta.backup_tablet_progress[&(backup_id.clone(), *tablet)],
+            ));
+        }
+        MetaCommand::CompleteBackup { backup_id } | MetaCommand::FailBackup { backup_id, .. } => {
+            writes.push(put_json(
+                syskv::backup_key(backup_id),
+                &meta.backups[backup_id],
+            ));
+        }
+        MetaCommand::DeleteBackup { backup_id } => {
+            writes.push(KeyWrite::Delete(syskv::backup_key(backup_id)));
+            for (id, tablet) in &pruned_backup_progress {
+                writes.push(KeyWrite::Delete(syskv::backup_progress_key(id, *tablet)));
+            }
+        }
     }
     (outcome, writes)
 }
@@ -533,6 +573,24 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             meta.split_lineage
                 .insert(TabletId(decode_u64(&id)), lineage);
         }
+        EntityKind::Backup => {
+            let backup_id = String::from_utf8(id).expect("backup id is UTF-8");
+            let row: crate::meta::BackupRow =
+                serde_json::from_slice(value).expect("mirrored backup value decodes");
+            meta.backups.insert(backup_id, row);
+        }
+        EntityKind::BackupProgress => {
+            // Physical encoding is `(tablet, backup_id)` (fixed-width
+            // field first, see `EntityKind::BackupProgress`'s own doc);
+            // `Metadata::backup_tablet_progress`'s own map key is
+            // `(backup_id, tablet)` — swapped here.
+            if let Some((tablet, backup_id)) = syskv::decode_backup_progress_id(&id) {
+                let progress: crate::meta::BackupTabletProgress =
+                    serde_json::from_slice(value).expect("mirrored backup-progress value decodes");
+                meta.backup_tablet_progress
+                    .insert((backup_id, tablet), progress);
+            }
+        }
     }
 }
 
@@ -588,6 +646,19 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // Never deleted in practice (`split_lineage` is never pruned)
             // — listed for match exhaustiveness.
             meta.split_lineage.remove(&TabletId(decode_u64(&id)));
+        }
+        EntityKind::Backup => {
+            // Reachable in practice — `DeleteBackup` tombstones a row
+            // outright (ADR 0059 §3).
+            let backup_id = String::from_utf8(id).expect("backup id is UTF-8");
+            meta.backups.remove(&backup_id);
+        }
+        EntityKind::BackupProgress => {
+            // Reachable in practice — `DeleteBackup` prunes every one of
+            // its own progress rows (ADR 0059 §3).
+            if let Some((tablet, backup_id)) = syskv::decode_backup_progress_id(&id) {
+                meta.backup_tablet_progress.remove(&(backup_id, tablet));
+            }
         }
     }
 }
@@ -1314,6 +1385,314 @@ mod tests {
         assert!(!meta.stream_shards.contains_key(&(TabletId(1), 0)));
     }
 
+    /// `BeginBackup` (ADR 0059 §3) mirrors as one `Put` of the freshly-minted
+    /// row, and a duplicate-id rejection derives no writes.
+    #[test]
+    fn begin_backup_writes_the_row() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_string()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            },
+        );
+        let command = MetaCommand::BeginBackup {
+            backup_id: "backup-1".to_string(),
+            table: "orders".to_string(),
+            created_wall_ms: 1000,
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![put_json(
+                syskv::backup_key("backup-1"),
+                &meta.backups["backup-1"]
+            )]
+        );
+
+        // A duplicate id is rejected outright — no writes derived.
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Rejected("backup id already exists"));
+        assert!(writes.is_empty());
+    }
+
+    /// `RecordBackupTabletComplete` (ADR 0059 §3/§4) mirrors as one `Put` at
+    /// the record's own `backup_progress_key`, and an identical repeat is a
+    /// `NoOp` that derives no further writes.
+    #[test]
+    fn record_backup_tablet_complete_writes_the_row() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_string()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_string(),
+                table: "orders".to_string(),
+                created_wall_ms: 1000,
+            },
+        );
+
+        let command = MetaCommand::RecordBackupTabletComplete {
+            backup_id: "backup-1".to_string(),
+            tablet: TabletId(1),
+            cut_version: 10,
+            bytes: 100,
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![put_json(
+                syskv::backup_progress_key("backup-1", TabletId(1)),
+                &meta.backup_tablet_progress[&("backup-1".to_string(), TabletId(1))]
+            )]
+        );
+
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::NoOp);
+        assert!(writes.is_empty());
+    }
+
+    /// `CompleteBackup`/`FailBackup` (ADR 0059 §3/§4) both mirror as one
+    /// `Put` of the row's now-updated status.
+    #[test]
+    fn complete_and_fail_backup_write_the_updated_row() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_string()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_string(),
+                table: "orders".to_string(),
+                created_wall_ms: 1000,
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_string(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            },
+        );
+
+        let (outcome, writes) = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_string(),
+            },
+        );
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![put_json(
+                syskv::backup_key("backup-1"),
+                &meta.backups["backup-1"]
+            )]
+        );
+
+        let mut failed_meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut failed_meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut failed_meta,
+            &MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_string()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut failed_meta,
+            &MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_string(),
+                table: "orders".to_string(),
+                created_wall_ms: 1000,
+            },
+        );
+        let (outcome, writes) = apply_and_derive_mirror(
+            &mut failed_meta,
+            &MetaCommand::FailBackup {
+                backup_id: "backup-1".to_string(),
+                reason: "timeout".to_string(),
+            },
+        );
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![put_json(
+                syskv::backup_key("backup-1"),
+                &failed_meta.backups["backup-1"]
+            )]
+        );
+    }
+
+    /// `DeleteBackup` (ADR 0059 §3) mirrors as a `Delete` of the row itself
+    /// plus a `Delete` per pruned progress record.
+    #[test]
+    fn delete_backup_deletes_the_row_and_its_progress_records() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_string()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_string(),
+                table: "orders".to_string(),
+                created_wall_ms: 1000,
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_string(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            },
+        );
+
+        let (outcome, writes) = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::DeleteBackup {
+                backup_id: "backup-1".to_string(),
+            },
+        );
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![
+                KeyWrite::Delete(syskv::backup_key("backup-1")),
+                KeyWrite::Delete(syskv::backup_progress_key("backup-1", TabletId(1))),
+            ]
+        );
+
+        // Idempotent: an already-deleted id derives no writes.
+        let (outcome, writes) = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::DeleteBackup {
+                backup_id: "backup-1".to_string(),
+            },
+        );
+        assert_eq!(outcome, ApplyOutcome::NoOp);
+        assert!(writes.is_empty());
+    }
+
+    /// The incremental-delta consumer path (`apply_key_write`) for
+    /// `DeleteBackup`'s derived deletes reaches the identical state a direct
+    /// `Metadata::apply` does — exercises `apply_delete`'s `Backup`/
+    /// `BackupProgress` arms, which a live engine scan (only ever `Put`s)
+    /// never reaches.
+    #[test]
+    fn incremental_delta_apply_matches_direct_apply_for_deleted_backups() {
+        let mut base = Metadata::default();
+        base.apply(&MetaCommand::CreateTableSchema {
+            table: "orders".to_string(),
+            schema: schema("id"),
+        });
+        base.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("orders".to_string()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        });
+        base.apply(&MetaCommand::BeginBackup {
+            backup_id: "backup-1".to_string(),
+            table: "orders".to_string(),
+            created_wall_ms: 1000,
+        });
+        base.apply(&MetaCommand::RecordBackupTabletComplete {
+            backup_id: "backup-1".to_string(),
+            tablet: TabletId(1),
+            cut_version: 10,
+            bytes: 100,
+        });
+
+        let command = MetaCommand::DeleteBackup {
+            backup_id: "backup-1".to_string(),
+        };
+
+        let mut shadow = base.clone();
+        let (outcome, writes) = apply_and_derive_mirror(&mut shadow, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(writes.len(), 2, "the row and its one progress record");
+
+        let mut direct = base.clone();
+        direct.apply(&command);
+
+        let mut mirror_side = base.clone();
+        for w in &writes {
+            apply_key_write(&mut mirror_side, w);
+        }
+
+        assert_eq!(shadow, direct);
+        assert_eq!(mirror_side, direct);
+        assert!(direct.backups.is_empty());
+        assert!(direct.backup_tablet_progress.is_empty());
+    }
+
     /// The read side: a `Metadata` rebuilt from a fresh [`MemoryEngine`] after
     /// mirroring a handful of commands equals a `Metadata` built by applying
     /// those same commands directly (no mirror involved) — the differential
@@ -1344,6 +1723,26 @@ mod tests {
             MetaCommand::CreateTableSchema {
                 table: "orders".to_string(),
                 schema: schema("id"),
+            },
+            // ADR 0059 §3: exercise both new `EntityKind`s' read side too —
+            // a `Backup` row (`table` here is data, so it can name any
+            // table; "t" was already given a schema-less tablet above,
+            // which `BeginBackup` doesn't require) and a `BackupProgress`
+            // record.
+            MetaCommand::CreateTableSchema {
+                table: "t".to_string(),
+                schema: schema("id"),
+            },
+            MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_string(),
+                table: "t".to_string(),
+                created_wall_ms: 1_000,
+            },
+            MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_string(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
             },
             MetaCommand::RegisterNode {
                 node: nid(2),
