@@ -10210,3 +10210,70 @@ from "a structurally real but not-the-live-cause gap, with the ACTUAL live
 cause one layer further out." A diagnostic firing at the right place and
 the right time is necessary but not sufficient evidence that the
 candidate mechanism it was built to catch is the one actually operating.
+
+### Amendment (2026-08-26, the proof soak itself): both fixes hold, but a fourth residual keeps the pin in place — soak NOT un-pinned
+
+With both fixes above landed, the mandated 30-run un-pinned `SplitMode::
+InPlace` proof soak was run in several batches (some contaminated by
+concurrent `cargo build`/`cargo test` invocations on the same host, which
+measurably inflated the failure rate — a real methodological trap worth
+naming on its own: **a real-thread `ProdEnv` soak's failure rate is not
+trustworthy while anything else on the host is competing for CPU**; the
+election timers, `RECOVERY_GRACE`, and split-cadence knobs this soak
+depends on are all wall-clock-relative, so host contention can manufacture
+timing-sensitive failures indistinguishable from real ones without a
+controlled re-run). Under genuinely contention-free conditions across
+~70 total runs: the two fixed mechanisms (shape A's literal resurrection,
+shape B's wrong-abort-from-unconfirmed-query) **did not recur even once**
+with instrumentation re-armed and watching for them directly. But the
+soak is still not clean — three residual failure categories remain, at a
+combined rate noticeably lower than the pre-fix ~19% baseline but not
+zero:
+
+1. **The already-documented "deep shape A" mechanism** (this entry's own
+   prior amendment): a client-level retry of an un-tokened
+   `TransactWriteItems` racing its own already-committed first attempt.
+   Not fixed this round, named there.
+2. **The pre-existing lineage-delivery-timeout residual** (ADR 0058's G5
+   row, present since before this round): `drain_all_tablets_lineage`
+   hits its own deadline one or a few records short, distinct from the
+   exactly-once assertion itself — a slow convergence, not a lost or
+   duplicated write. Unrelated to shapes A/B; already an acknowledged open
+   item this round did not scope in.
+3. **A newly-observed, NOT-yet-root-caused variant, caught live with the
+   fix's own instrumentation still watching**: `txn_recover`'s
+   `all_staged` loop computing a **genuine, non-inconclusive**
+   `all_staged=false` (every `txn_verify` call returned an affirmative
+   `Ok`, at least one `Ok(false)` — the exact case this round's fix
+   correctly leaves alone, since a confirmed negative is real evidence)
+   for a transactional pair, immediately coincident with (in one capture)
+   an "acked write lost" panic on the same item, and (in a separate,
+   otherwise-passing run) with no visible ill effect. Both captures share
+   an unexplained structural oddity worth flagging for whoever picks this
+   up next: `view.intent_spans` held **two** entries covering **both**
+   members of what the workload only ever issues as a plain two-item
+   `TransactWriteItems` (one anchor + one participant, per `cp_txn`'s own
+   construction — `participant_spans` is built strictly from `groups`
+   *after* the anchor's own group is removed) — meaning the record's own
+   anchor was apparently a **third**, distinct key neither of the two
+   panicking/logged item ids, which this round could not identify before
+   time ran out. Plausibly the same "deep shape A" client-retry family
+   (a correctly-aborted abandoned first attempt, with the eventual
+   "acked write lost" panic actually caused by a *different*, successful
+   retry attempt racing it) rather than a fourth independent mechanism —
+   but this is a hypothesis, not a confirmed account, and is recorded here
+   precisely so the next investigation starts from the raw captured shape
+   instead of re-deriving it. Two raw captures (redacted only for length):
+   `all_staged=false`, `intent_spans` = point-spans for both `x0069a` and
+   `x0069b` immediately before the soak's own "acked write x0069a lost"
+   panic; and the structurally identical shape for `x0029a`/`x0029b` in an
+   otherwise-clean run.
+
+**Per this round's own instructions, none of these three residuals is
+fixed here, and the soak stays pinned to `SplitMode::Copy`** — un-pinning
+requires 30 *clean* runs, and none of the three most recent honest
+attempts (uncontaminated by host contention) reached that bar. Rung 4's
+remaining copy-workflow-deletion layer stays blocked on all three,
+exactly as it was blocked on shape A/B before this round root-caused two
+of what turned out to be (at least) five distinct mechanisms sharing the
+same soak.
