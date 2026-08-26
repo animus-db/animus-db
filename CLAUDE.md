@@ -127,13 +127,6 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 The deep corpus tiers run nightly in CI
 (`.github/workflows/corpus-deep.yml`), not per-push.
 
-### Dashboard
-
-animusd admin (ADR 0021's "AnimusDB Console") is served by `animusd` on each node's
-**admin** address. Its assets (`crates/animusd/src/dashboard.{html,css}` +
-`dashboard_*.js`) are self-contained vanilla JS embedded via `include_str!` —
-no bundler, no build step: edit, `cargo build`, reload.
-
 ## The load-bearing constraint: determinism
 
 This is the single most important rule (ADR 0003). **All nondeterminism flows
