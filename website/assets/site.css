@@ -141,15 +141,11 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
   nav.main a { white-space: nowrap; flex: none; padding: 8px 2px; }
 }
 /* Chalk-paper wants margin: below 560px the 20px inset above steps up once
-   more so body copy never reads edge-to-edge on a phone. The nav also stops
-   scrolling here: five short links wrap into calm rows instead of a strip
-   whose last link sits half-clipped under the edge fade. */
+   more so body copy never reads edge-to-edge on a phone. (The nav keeps the
+   horizontal-scroll strip from the 860px block at every width — maintainer
+   preference over wrapping to a second row.) */
 @media (max-width: 560px) {
   :root { --pad-x: 22px; }
-  nav.main {
-    flex-wrap: wrap; overflow-x: visible; gap: 4px 22px; padding-bottom: 8px;
-    mask-image: none; -webkit-mask-image: none;
-  }
 }
 
 /* Phone typography: most of what reads as "cramped" at 390px is leading and
@@ -237,9 +233,12 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
 }
 
 /* ---------- hero (homepage) ---------- */
-.hero { padding: 52px 0 40px; }
+/* .hero shares its element with .wrap — vertical-only padding here, or it
+   clobbers .wrap's horizontal inset (invisible at desktop where max-width
+   slack centers it; flush against the screen edge on a phone). */
+.hero { padding-top: 52px; padding-bottom: 40px; }
 .hero-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 52px; align-items: start; }
-@media (max-width: 940px) { .hero-grid { grid-template-columns: minmax(0, 1fr); gap: 36px; } .hero { padding: 36px 0 30px; } }
+@media (max-width: 940px) { .hero-grid { grid-template-columns: minmax(0, 1fr); gap: 36px; } .hero { padding-top: 36px; padding-bottom: 30px; } }
 .hero h1 { font-size: clamp(2rem, 4.6vw, 2.75rem); margin: 4px 0 14px; }
 .hero .lede { font-size: 16.5px; color: var(--ink-85); margin-bottom: 22px; }
 .hero .fineprint { margin-top: 16px; font-size: 12.5px; color: var(--ink-72); }
@@ -249,7 +248,7 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
    viewport, give the block more top/bottom air, and stack the CTAs
    full-width so they read as two calm choices instead of a squeezed row. */
 @media (max-width: 560px) {
-  .hero { padding: 44px 0 36px; }
+  .hero { padding-top: 44px; padding-bottom: 36px; }
   .hero-grid { gap: 40px; }
   .hero h1 { font-size: clamp(1.875rem, 7vw, 2rem); margin: 10px 0 18px; }
   .hero .lede { font-size: 15px; line-height: 1.65; margin-bottom: 26px; }
