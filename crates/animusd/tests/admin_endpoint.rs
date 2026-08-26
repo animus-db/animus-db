@@ -67,6 +67,71 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
+/// Like [`bring_up`], but pins every node's [`animusd::SplitMode`] explicitly
+/// instead of taking whatever `SplitMode::default()` currently is — for
+/// `admin_split_kicks_off_the_copy_based_workflow` below, which asserts the
+/// ADR 0050 copy-based workflow's own intermediate states (`Splitting` +
+/// two `Building` children) and must keep exercising that workflow
+/// regardless of which mode is the cluster-wide default (ADR 0058 rung 4
+/// layer 2 flipped it to `InPlace`).
+async fn bring_up_with_split_mode(
+    n: usize,
+    dir: &std::path::Path,
+    split_mode: animusd::SplitMode,
+) -> (Vec<Node>, animusd::ClusterConfig) {
+    for attempt in 0..16 {
+        let addrs = support::free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
+                role: animusd::config::NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+            })
+            .collect();
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+        };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node_with_streams_quiesce_and_split_mode(
+                &config,
+                i,
+                dir.join(format!("node-{attempt}-{i}")),
+                animusd::StorageBackend::default(),
+                animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+                animusd::StreamSealKnobs::default(),
+                animusd::SegmentStoreConfig::default(),
+                animusd::DEFAULT_STREAM_RETENTION,
+                Duration::ZERO,
+                split_mode,
+            )
+            .await
+            {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config);
+        }
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+}
+
 async fn await_bootstrap(nodes: &[Node]) {
     timeout(Duration::from_secs(20), async {
         loop {
@@ -1010,11 +1075,19 @@ async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
 /// The workflow deliberately STOPS there in this rung (no driver/cutover
 /// yet), so the end state this asserts — parent `Splitting` + children
 /// `Building`, indefinitely — is the rung's contract, not an artifact.
+///
+/// **Pinned to `SplitMode::Copy`** (ADR 0058 rung 4 layer 2 flipped the
+/// cluster-wide default to `InPlace`): this test's whole point is the
+/// copy-based workflow's own intermediate metadata shape
+/// (`Splitting`/`Building`), which the in-place fork doesn't produce at
+/// all — an in-place split forms both children atomically with no
+/// standing `Building` window. See `bring_up_with_split_mode`'s doc.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_split_kicks_off_the_copy_based_workflow() {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
-        let (nodes, _config) = bring_up(1, dir.path()).await;
+        let (nodes, _config) =
+            bring_up_with_split_mode(1, dir.path(), animusd::SplitMode::Copy).await;
         await_bootstrap(&nodes).await;
 
         // Provision the table's bootstrap tablet through the ordinary client
