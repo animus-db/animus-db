@@ -14,6 +14,7 @@
   --radius-panel: 4px;
   --ctl-h: 44px;
   --maxw: 1120px;
+  --pad-x: 24px; /* container side inset — narrows a step at <=860/560px below */
 }
 
 * { box-sizing: border-box; }
@@ -56,7 +57,7 @@ code {
   color: var(--text);
 }
 
-.wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+.wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 var(--pad-x); }
 .narrow { max-width: 760px; }
 .mono { font-family: var(--font-mono); }
 .muted { color: var(--text3); }
@@ -123,26 +124,31 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
    nav becomes its own horizontally-scrollable strip — the 2px accent
    keyline on the active link stays visible, just scrolled to if needed. */
 @media (max-width: 860px) {
+  :root { --pad-x: 20px; }
   header.site .bar {
-    flex-wrap: wrap; height: auto; min-height: 60px; padding: 10px 16px; row-gap: 6px; gap: 12px;
+    flex-wrap: wrap; height: auto; min-height: 60px; padding: 10px var(--pad-x); row-gap: 6px; gap: 12px;
   }
   .brand { order: 1; }
   .theme-switch { order: 2; margin-left: auto; }
   nav.main {
     order: 3; flex: 1 1 100%; gap: 22px; align-items: stretch;
     overflow-x: auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch;
-    scrollbar-width: none; margin: 0 -16px; padding: 2px 16px 10px;
+    scrollbar-width: none; margin: 0 calc(-1 * var(--pad-x)); padding: 2px var(--pad-x) 10px;
     mask-image: linear-gradient(to right, transparent, black 14px, black calc(100% - 14px), transparent);
     -webkit-mask-image: linear-gradient(to right, transparent, black 14px, black calc(100% - 14px), transparent);
   }
   nav.main::-webkit-scrollbar { display: none; }
   nav.main a { white-space: nowrap; flex: none; padding: 8px 2px; }
-  .wrap { padding: 0 16px; }
+}
+/* Chalk-paper wants margin: below 560px the 20px inset above steps up once
+   more so body copy never reads edge-to-edge on a phone. */
+@media (max-width: 560px) {
+  :root { --pad-x: 22px; }
 }
 
 /* ---------- sub-navigation (reference pages: Architecture/Compat/Perf/Licensing) ---------- */
 .subnav { border-bottom: 1px solid var(--border); background: var(--bg-soft); }
-.subnav .wrap { display: flex; gap: 22px; padding: 12px 24px; flex-wrap: wrap; }
+.subnav .wrap { display: flex; gap: 22px; padding: 12px var(--pad-x); flex-wrap: wrap; }
 .subnav a {
   font: 600 11px/1 var(--font-mono); letter-spacing: 0.1em; text-transform: uppercase;
   color: var(--ink-72);
@@ -203,6 +209,16 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
 .copy-btn:hover { background: rgba(233, 229, 220, 0.16); }
 .copy-btn.done { color: #6fc493; }
 
+/* Below 640px an ink plate keeps its container inset (never full-bleed) but
+   tightens its own interior: less padding, and mono a step smaller so
+   terminal/diff lines wrap less before falling back to their own
+   overflow-x scroll. The 5px hard shadow stays clear of the viewport edge
+   because the container inset (>=20px) always exceeds the shadow offset. */
+@media (max-width: 640px) {
+  .plate .head, .code-head { padding: 7px 12px; }
+  .plate .body, .code pre { padding: 13px 14px; font-size: 11px; line-height: 1.8; }
+}
+
 /* ---------- hero (homepage) ---------- */
 .hero { padding: 52px 0 40px; }
 .hero-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 52px; align-items: start; }
@@ -211,6 +227,19 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
 .hero .lede { font-size: 16.5px; color: var(--ink-85); margin-bottom: 22px; }
 .hero .fineprint { margin-top: 16px; font-size: 12.5px; color: var(--ink-72); }
 .hero .btn-row { margin-bottom: 0; }
+/* At phone widths the headline's own weight is what makes the hero feel
+   like it's shouting: lower the clamp floor so it stops dominating the
+   viewport, give the block more top/bottom air, and stack the CTAs
+   full-width so they read as two calm choices instead of a squeezed row. */
+@media (max-width: 560px) {
+  .hero { padding: 44px 0 36px; }
+  .hero-grid { gap: 40px; }
+  .hero h1 { font-size: clamp(1.875rem, 7vw, 2rem); margin: 8px 0 16px; }
+  .hero .lede { font-size: 15px; line-height: 1.6; margin-bottom: 24px; }
+  .hero .btn-row { flex-direction: column; align-items: stretch; gap: 12px; }
+  .hero .btn-row .btn { width: 100%; }
+  .hero .fineprint { margin-top: 18px; }
+}
 
 /* horizontal stat strip, divided by rules (not boxed) */
 .stat-row { display: flex; flex-wrap: wrap; border-top: 2px solid var(--text); padding-top: 24px; margin: 0 0 46px; }
@@ -220,6 +249,14 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
 .stat-row .stat .l { font-size: 12.5px; color: var(--ink-72); line-height: 1.5; }
 @media (max-width: 700px) { .stat-row .stat { flex: 1 1 45%; border-left: none; border-top: 1px solid var(--ink-16); padding: 14px 0 0; margin-top: 14px; } .stat-row .stat:first-child { border-top: none; margin-top: 0; padding-top: 0; } }
 @media (max-width: 480px) { .stat-row .stat { flex: 1 1 100%; } }
+/* Stacked (<=480px, one entry per row): give each entry room on both sides
+   of its rule so the rule reads as a divider, not an underline sitting on
+   the text above it. */
+@media (max-width: 480px) {
+  .stat-row { padding-top: 26px; margin-bottom: 40px; }
+  .stat-row .stat { padding: 13px 0 3px; margin-top: 16px; }
+  .stat-row .stat:first-child { margin-top: 0; padding-top: 0; }
+}
 
 /* ---------- sections ---------- */
 section, .page-section { padding: 46px 0 48px; }
@@ -227,6 +264,12 @@ section.alt, .page-section.alt { background: var(--bg-soft); border-top: 1px sol
 .section-head { max-width: 760px; margin-bottom: 8px; }
 .section-head p { font-size: 15px; margin: 0; max-width: 720px; }
 .body-text { font-size: 14.5px; color: var(--ink-85); max-width: 720px; margin: 0 0 12px; }
+/* At mobile widths, widen the gap between major sections: a kicker + h2
+   needs air above it, not to sit directly on the block before it. */
+@media (max-width: 640px) {
+  section, .page-section { padding: 58px 0 60px; }
+  .section-head { margin-bottom: 14px; }
+}
 
 /* ---------- card grids ---------- */
 .cardgrid { display: grid; grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr)); gap: 16px; }
@@ -351,9 +394,12 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
   border-left: 3px solid var(--accent); margin: 24px 0; padding: 4px 0 4px 22px;
   font: 500 18px/1.55 var(--font-ui); color: var(--text);
 }
+@media (max-width: 640px) {
+  .callout, .warnbox, .aside, .pull { margin: 26px 0; }
+}
 
 /* ---------- article layout ---------- */
-.article { max-width: 720px; margin: 0 auto; padding: 44px 24px 0; }
+.article { max-width: 720px; margin: 0 auto; padding: 44px var(--pad-x) 0; }
 .article .article-head { border-bottom: 1px solid var(--border); padding-bottom: 22px; margin-bottom: 8px; }
 .article .article-head h1 { margin: 10px 0 14px; font-size: clamp(1.9rem, 4vw, 2.4rem); }
 .article .lede { font-size: 16.5px; font-style: italic; color: var(--ink-72); margin: 0; }
@@ -364,6 +410,10 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
 .article ul, .article ol { font-size: 14.5px; color: var(--ink-85); line-height: 1.7; }
 .article li { margin-bottom: 8px; }
 .article .eyebrow-line { font: 600 12px var(--font-mono); text-transform: uppercase; letter-spacing: .1em; color: var(--accent); }
+@media (max-width: 640px) {
+  .article { padding-top: 40px; }
+  .article h2 { margin: 48px 0 16px; }
+}
 
 /* ---------- TOC list ("On this page") ---------- */
 .toc { margin: 0; padding-left: 20px; font-size: 14px; line-height: 2; }
@@ -375,11 +425,29 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
 .cta h2 { margin-bottom: 12px; }
 .cta p { max-width: 46em; margin: 0 auto 24px; font-size: 15px; }
 .cta .btn-row { justify-content: center; }
+@media (max-width: 560px) {
+  .cta .btn-row { flex-direction: column; align-items: stretch; gap: 12px; }
+  .cta .btn-row .btn { width: 100%; }
+}
 
 /* ---------- page head (reference pages, docs, install) ---------- */
 .page-head { padding: 44px 0 8px; border-bottom: 1px solid var(--border); }
 .page-head h1 { font-size: clamp(1.8rem, 4vw, 2.3rem); margin-bottom: 12px; }
 .page-head p { font-size: 15.5px; max-width: 44em; margin-bottom: 24px; }
+@media (max-width: 640px) {
+  .page-head { padding: 48px 0 14px; }
+}
+
+/* Reference-page header block (architecture/compatibility/performance/
+   licence/how-it-works): kicker + h1 + on-this-page TOC directly in a
+   `.wrap`, previously an inline-styled one-off per page. `--rh-pt`/`--rh-pb`
+   preserve each page's own desktop value; the mobile media query below
+   overrides the property outright so every reference page gets the same
+   extra air at phone widths. */
+.ref-head { padding-top: var(--rh-pt, 38px); padding-bottom: var(--rh-pb, 20px); }
+@media (max-width: 640px) {
+  .ref-head { padding-top: 46px; padding-bottom: 22px; }
+}
 
 /* ---------- docs/install layout ---------- */
 .doc-layout { display: grid; grid-template-columns: 232px minmax(0, 1fr); gap: 48px; padding-block: 40px 80px; align-items: start; }
@@ -409,6 +477,12 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
   }
   .doc-nav a.active { border-color: var(--accent); }
 }
+/* A doc section's h2 is a section label sitting on a 2px rule; below 640px
+   give it real air above instead of the border-top + 6px it gets on desktop. */
+@media (max-width: 640px) {
+  .doc-body section + section { padding-top: 20px; }
+  .doc-body h2 { margin-top: 14px; padding-top: 30px; }
+}
 
 /* ---------- steps ---------- */
 .steps { counter-reset: step; list-style: none; padding: 0; margin: 0; }
@@ -432,12 +506,16 @@ footer.site ul { list-style: none; padding: 0; margin: 0; }
 footer.site li { margin: 7px 0; }
 footer.site a { color: var(--text2); font-size: 13.5px; }
 footer.site a:hover { color: var(--text); }
+@media (max-width: 640px) { footer.site { padding: 44px 0 32px; } }
 @media (max-width: 560px) {
-  footer.site a { display: inline-block; padding: 4px 0; }
+  footer.site a { display: inline-block; padding: 6px 0; }
+  footer.site h5 { margin-bottom: 14px; }
 }
+@media (max-width: 480px) { .foot-grid { gap: 28px; } }
 .foot-bottom {
   margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--border);
   display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
   font-size: 12px; color: var(--ink-72);
 }
+@media (max-width: 480px) { .foot-bottom { margin-top: 30px; padding-top: 18px; gap: 12px; } }
 .foot-bottom .spacer { flex: 1; }
