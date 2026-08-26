@@ -9493,3 +9493,51 @@ The general shape: a live-timeout problem is not automatically a
 timeout handler early, at a caller-computed trigger, already has every
 safety property the new call site needs, and whether the seam underneath it
 already tolerates the ordering you're about to introduce.
+
+## A syskv composite key's physical encoding order and a `Metadata` map's logical key order are two separate decisions (ADR 0059 §3)
+
+Adding the backup catalog's per-tablet progress collection
+(`Metadata::backup_tablet_progress: BTreeMap<(BackupId, TabletId), _>`)
+needed a `syskv` key for the same `(backup_id, tablet)` pair. The existing
+precedent (`index_backfill_key(tablet, index)`) encodes its fixed-width
+field first — `TabletId`'s 8 bytes, then the variable-length index name —
+so `decode_index_backfill_id` never has to guess where the boundary is.
+That precedent's field order happens to *also* match `Metadata::
+index_backfill`'s own map-key order, which made it easy to assume the two
+orders are the same constraint. They aren't: the physical key only needs
+its fixed-width field first (a decoding requirement); the `Metadata`
+field's own tuple order is a separate, independent choice about what
+reads naturally for that collection's own consumers (here, ADR 0059 §3
+explicitly wants `(backup_id, tablet)` — a `DescribeBackup` reader groups
+by backup first). Encoding `backup_progress_key` as `(tablet, backup_id)`
+while keeping `Metadata::backup_tablet_progress`'s key as `(BackupId,
+TabletId)` satisfies both constraints at once, at the cost of one
+documented swap at the two points that cross the boundary
+(`mirror.rs`'s `apply_put`/`apply_delete`). Worth stating plainly rather
+than silently reusing the sibling kind's field order out of habit: check
+each key shape's *own* two constraints (decodability, and what the owning
+collection's readers want) rather than assuming a lookalike precedent's
+order was load-bearing in both places it happened to hold.
+
+## Derive a command's payload from already-committed state at apply time, not from what the proposer captured (ADR 0059 §3)
+
+`BeginBackup`'s manifest stub (the source table's schema snapshot and its
+current tablet list) could have been computed once by the proposing wire
+node and carried on the command, the way a naive first draft would write
+it. That would reproduce the exact hazard `CreateTablet`/`BeginSplit`
+already avoid: two proposers (or one proposer retried after a stale read)
+computing the stub from two different snapshots would make `apply`'s
+result depend on *which proposal landed first*, even though every replica
+runs the identical deterministic function — a Raft replica's job is to
+agree on one input and compute the same output, not to trust an
+already-computed output riding along. The fix is the same one this
+codebase already uses for `BeginSplit`'s child ranges and `CutoverSplit`'s
+child recomputation: `BeginBackup`'s apply arm reads `self.schemas`/
+`self.tablets_for_table` itself, at apply time, and derives the stub from
+current agreed state — the command carries only the identity fields
+(`backup_id`, `table`, the ADR-0051-style wall-clock stamp) that *can't*
+be derived from replicated state. When a new command's payload could
+either be captured by the proposer or derived from `Metadata` already
+committed to that point, derive it — the proposer-captured version always
+requires arguing every replica sees the same input, and pure derivation
+makes that argument for free.

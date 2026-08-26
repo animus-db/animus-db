@@ -33,6 +33,7 @@
 //! - `GET  /admin/storage/key`         — on-disk versions of a key (`?tablet=&key=`)
 //! - `GET  /admin/storage/scan`        — first N live pairs (`?tablet=&start=&limit=`)
 //! - `GET  /admin/system-table`        — browse the control-plane system keyspace (`?kind=&after=&limit=`, ADR 0038 addendum)
+//! - `GET  /admin/backups`             — the replicated backup catalog: id, table, status, per-tablet progress, sizes, creation time (ADR 0059 §3; pure observer — no capture driver/wire API yet)
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — liveness/readiness
@@ -365,6 +366,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("GET", "/admin/storage/key") => storage_key(ctx, q).await,
         ("GET", "/admin/storage/scan") => storage_scan(ctx, q).await,
         ("GET", "/admin/system-table") => system_table(ctx, q).await,
+        ("GET", "/admin/backups") => (200, backups_view(ctx)),
         ("GET", "/admin/metrics") => (200, metrics_view(ctx)),
         ("GET", "/admin/metrics/history") => (200, metrics_history_view(ctx)),
         ("GET", "/admin/member/drain-status") => member_drain_status(ctx, q),
@@ -1092,6 +1094,16 @@ fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
             None => json!(key_str(id)),
         };
     }
+    if kind == syskv::EntityKind::BackupProgress {
+        // A composite (tablet, backup id) id (ADR 0059 §3/§4, physical
+        // encoding order — see `EntityKind::BackupProgress`'s own doc) —
+        // same shape as `IndexBackfill` just above; render as
+        // `"<tablet>-<backup id>"`.
+        return match syskv::decode_backup_progress_id(id) {
+            Some((tablet, backup_id)) => json!(format!("{}-{backup_id}", tablet.0)),
+            None => json!(key_str(id)),
+        };
+    }
     if system_table_id_is_numeric(kind) {
         match <[u8; 8]>::try_from(id) {
             Ok(bytes) => json!(u64::from_be_bytes(bytes).to_string()),
@@ -1138,6 +1150,11 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         // Presence-only (ADR 0045 §4: the value is always empty — the
         // row's existence is the fact).
         syskv::EntityKind::IndexBackfill => Value::Null,
+        // A `BackupRow`/`BackupTabletProgress` (ADR 0059 §3) — same JSON
+        // passthrough convention as `Schema`/`StreamShard`/etc. above.
+        syskv::EntityKind::Backup | syskv::EntityKind::BackupProgress => {
+            serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
+        }
     }
 }
 
@@ -1149,6 +1166,60 @@ fn system_table_item(kind: syskv::EntityKind, id: &[u8], value: &[u8], version: 
         "version": version,
         "value": system_table_value_display(kind, value),
     })
+}
+
+/// `GET /admin/backups` (ADR 0059 §3): the replicated backup catalog — one
+/// entry per row in `Metadata::backups`, each carrying its status, source
+/// table, creation time, total captured bytes so far, and a per-pinned-
+/// tablet progress breakdown (`Metadata::backup_tablet_progress`). Pure
+/// observer, like every other `GET` here (ADR 0020) — no capture driver
+/// exists yet in this train, so a row only ever reaches `Creating` today;
+/// this view is written to display every status the catalog can hold
+/// (`Available`/`Failed`/`Expired`) once later trains populate them.
+/// `effective_metadata()`, not `metadata_cached()` (matching `/admin/status`/
+/// `/admin/peers`): a growth/data-only node's own mirror is the honest
+/// cluster-wide view here too.
+fn backups_view(ctx: &ClientCtx) -> Value {
+    let meta = ctx.effective_metadata();
+    let backups: Vec<Value> = meta
+        .backups
+        .iter()
+        .map(|(backup_id, row)| {
+            let tablets: Vec<Value> = row
+                .manifest
+                .pinned_tablets
+                .iter()
+                .map(|pinned| {
+                    let progress = meta
+                        .backup_tablet_progress
+                        .get(&(backup_id.clone(), pinned.tablet));
+                    json!({
+                        "tablet": pinned.tablet.0.to_string(),
+                        "reported": progress.is_some(),
+                        "cut_version": progress.map(|p| p.cut_version),
+                        "bytes": progress.map(|p| p.bytes),
+                    })
+                })
+                .collect();
+            let status = match &row.status {
+                animus_control::BackupStatus::Creating => json!({"state": "CREATING"}),
+                animus_control::BackupStatus::Available => json!({"state": "AVAILABLE"}),
+                animus_control::BackupStatus::Failed { reason } => {
+                    json!({"state": "FAILED", "reason": reason})
+                }
+                animus_control::BackupStatus::Expired => json!({"state": "EXPIRED"}),
+            };
+            json!({
+                "backup_id": backup_id,
+                "table": row.table,
+                "status": status,
+                "created_wall_ms": row.manifest.created_wall_ms,
+                "total_bytes": meta.backup_total_bytes(backup_id),
+                "tablets": tablets,
+            })
+        })
+        .collect();
+    json!({ "backups": backups })
 }
 
 fn metrics_view(ctx: &ClientCtx) -> Value {

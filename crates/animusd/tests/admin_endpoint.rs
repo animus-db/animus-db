@@ -492,6 +492,165 @@ async fn admin_table_management_create_and_drop() {
     .expect("test timed out");
 }
 
+/// `GET /admin/backups` (ADR 0059 §3): a pure observer over the replicated
+/// backup catalog. No wire API/capture driver exists yet in this train, so
+/// this drives the catalog directly via `Node::propose_meta` (mirroring
+/// `system_table.rs`'s own harness-level `MetaCommand` proposals) — a
+/// real-cluster proof that the admin view reflects `Metadata::backups`/
+/// `backup_tablet_progress` end to end, including the status transition to
+/// `AVAILABLE`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_backups_view_reflects_the_catalog() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let a = nodes[0].admin_addr();
+
+        // A real table (also provisions its first tablet, via the ordinary
+        // DynamoDB `CreateTable` path).
+        let (s, body) = admin(
+            a,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable via admin proxy: {body}");
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, status) = admin_get(a, "/admin/status").await;
+                if status["schemas"]["tables"]
+                    .get("widgets")
+                    .is_some_and(|v| !v.is_null())
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("table did not appear in the catalog");
+
+        // Starts empty.
+        let (s, empty) = admin_get(a, "/admin/backups").await;
+        assert_eq!(s, 200);
+        assert_eq!(
+            empty["backups"].as_array().unwrap().len(),
+            0,
+            "no backups yet: {empty}"
+        );
+
+        // `BeginBackup`, proposed directly (no wire API in this train yet) —
+        // retried across nodes since only the control leader accepts it.
+        let begin = animus_control::MetaCommand::BeginBackup {
+            backup_id: "backup-1".to_string(),
+            table: "widgets".to_string(),
+            created_wall_ms: 1_000,
+        };
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if nodes.iter().any(|n| n.propose_meta(begin.clone())) {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("BeginBackup never accepted by a leader");
+
+        let backups = timeout(Duration::from_secs(10), async {
+            loop {
+                let (s, body) = admin_get(a, "/admin/backups").await;
+                assert_eq!(s, 200);
+                let arr = body["backups"].as_array().cloned().unwrap_or_default();
+                if arr.iter().any(|b| b["backup_id"] == "backup-1") {
+                    return body;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("backup row did not appear in /admin/backups");
+
+        let tablet_ids: Vec<u64> = {
+            let row = backups["backups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|b| b["backup_id"] == "backup-1")
+                .expect("backup-1 present");
+            assert_eq!(row["table"], "widgets");
+            assert_eq!(row["status"]["state"], "CREATING");
+            assert_eq!(row["created_wall_ms"], 1000);
+            let tablets = row["tablets"].as_array().expect("tablets array");
+            assert!(!tablets.is_empty(), "at least one pinned tablet: {row}");
+            assert!(
+                tablets.iter().all(|t| t["reported"] == false),
+                "nothing reported yet: {row}"
+            );
+            tablets
+                .iter()
+                .map(|t| t["tablet"].as_str().unwrap().parse().unwrap())
+                .collect()
+        };
+
+        // Report every pinned tablet complete, then complete the backup —
+        // proposed on the same leader in order, so Raft's log order alone
+        // guarantees `CompleteBackup` applies after every report.
+        for tablet in &tablet_ids {
+            let record = animus_control::MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_string(),
+                tablet: animus_tablet::TabletId(*tablet),
+                cut_version: 42,
+                bytes: 4_096,
+            };
+            assert!(
+                nodes.iter().any(|n| n.propose_meta(record.clone())),
+                "RecordBackupTabletComplete never accepted by a leader"
+            );
+        }
+        let complete = animus_control::MetaCommand::CompleteBackup {
+            backup_id: "backup-1".to_string(),
+        };
+        assert!(
+            nodes.iter().any(|n| n.propose_meta(complete.clone())),
+            "CompleteBackup never accepted by a leader"
+        );
+
+        let expected_total = 4_096 * tablet_ids.len() as u64;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, body) = admin_get(a, "/admin/backups").await;
+                let row = body["backups"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|b| b["backup_id"] == "backup-1")
+                    .cloned();
+                if let Some(row) = row
+                    && row["status"]["state"] == "AVAILABLE"
+                {
+                    assert_eq!(row["total_bytes"].as_u64().unwrap(), expected_total);
+                    assert!(row["tablets"].as_array().unwrap().iter().all(|t| t["reported"] == true));
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("backup never reached AVAILABLE in /admin/backups");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// The CP data plane's per-tablet Raft group must hold **stable leadership under
 /// sustained write load** — the driver-liveness guarantee (ADR 0017). Before engine
 /// apply + compaction were moved off the consensus loop, a bulk seed blocked the

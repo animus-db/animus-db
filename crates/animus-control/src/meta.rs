@@ -289,6 +289,41 @@ pub struct Metadata {
     /// — encoded as a flat JSON array of `{tablet, index}` objects instead.
     #[serde(default, with = "index_backfill_codec")]
     pub index_backfill: BTreeMap<(TabletId, String), ()>,
+    /// The **backup catalog** (ADR 0059 §3): every on-demand backup ever
+    /// begun, keyed by [`BackupId`] — an opaque, freshly-minted identity,
+    /// **never the source table name** (ADR 0059 §3's scar: a name-keyed
+    /// catalog would let a drop-then-recreate of the same table name
+    /// silently poison a still-live backup row). Mutated only through
+    /// [`MetaCommand::BeginBackup`] (mints a row), [`MetaCommand::
+    /// CompleteBackup`]/[`MetaCommand::FailBackup`] (terminal transitions),
+    /// and [`MetaCommand::DeleteBackup`] (removal). Deliberately **not**
+    /// touched by [`MetaCommand::DropTableSchema`]/[`MetaCommand::
+    /// DropTableTablets`] — a backup catalog row outlives its source table
+    /// (ADR 0024's explicit carve-out, ADR 0059 §3), reclaimed only by this
+    /// feature's own (not-yet-built) retention janitor or an explicit
+    /// `DeleteBackup`. `#[serde(default)]` keeps pre-backup snapshots
+    /// loading (empty map).
+    #[serde(default)]
+    pub backups: BTreeMap<BackupId, BackupRow>,
+    /// Per-pinned-tablet backup **capture-completion** catalog (ADR 0059
+    /// §3/§4): "this tablet has finished capturing its own share of this
+    /// backup," reported by the tablet's own capture driver (a later PR).
+    /// Keyed `(backup_id, tablet)` — ADR 0059 §3's own stated identity
+    /// order, mirroring [`index_backfill`](Self::index_backfill)'s
+    /// `(tablet, index)` shape but with the backup id leading, since a
+    /// backup (not a tablet) is the natural grouping a reader wants
+    /// (`DescribeBackup`'s per-tablet progress list). Mutated only through
+    /// [`MetaCommand::RecordBackupTabletComplete`] (idempotent insert) and
+    /// pruned by [`MetaCommand::DeleteBackup`]'s own apply arm.
+    /// `#[serde(default)]` keeps pre-backup snapshots loading (empty map).
+    ///
+    /// **Wire shape (`#[serde(with = "backup_progress_codec")]`)**: same
+    /// `serde_json` tuple-map-key hazard as `stream_shards`/`index_backfill`
+    /// above (a `(BackupId, TabletId)` key cannot serialize as a JSON
+    /// object key either) — encoded as a flat JSON array of `{backup_id,
+    /// tablet, cut_version, bytes}` objects instead.
+    #[serde(default, with = "backup_progress_codec")]
+    pub backup_tablet_progress: BTreeMap<(BackupId, TabletId), BackupTabletProgress>,
 }
 
 /// Gives [`Metadata::stream_shards`] a `serde_json`-safe wire shape — see
@@ -387,6 +422,62 @@ mod index_backfill_codec {
         Ok(entries
             .into_iter()
             .map(|entry| ((entry.tablet, entry.index), ()))
+            .collect())
+    }
+}
+
+/// Gives [`Metadata::backup_tablet_progress`] a `serde_json`-safe wire shape
+/// — the same rationale as [`stream_shards_codec`]/[`index_backfill_codec`]
+/// above (a `(BackupId, TabletId)` tuple key cannot serialize as a JSON
+/// object key either): a flat `Vec` of `{backup_id, tablet, cut_version,
+/// bytes}` objects instead.
+mod backup_progress_codec {
+    use std::collections::BTreeMap;
+
+    use animus_tablet::TabletId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{BackupId, BackupTabletProgress};
+
+    #[derive(Serialize, Deserialize)]
+    struct Entry {
+        backup_id: BackupId,
+        tablet: TabletId,
+        cut_version: u64,
+        bytes: u64,
+    }
+
+    pub fn serialize<S: Serializer>(
+        map: &BTreeMap<(BackupId, TabletId), BackupTabletProgress>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let entries: Vec<Entry> = map
+            .iter()
+            .map(|((backup_id, tablet), progress)| Entry {
+                backup_id: backup_id.clone(),
+                tablet: *tablet,
+                cut_version: progress.cut_version,
+                bytes: progress.bytes,
+            })
+            .collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<(BackupId, TabletId), BackupTabletProgress>, D::Error> {
+        let entries = Vec::<Entry>::deserialize(deserializer)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| {
+                (
+                    (entry.backup_id, entry.tablet),
+                    BackupTabletProgress {
+                        cut_version: entry.cut_version,
+                        bytes: entry.bytes,
+                    },
+                )
+            })
             .collect())
     }
 }
@@ -491,6 +582,115 @@ pub struct StreamShardRow {
     /// not-yet-marked.
     #[serde(default)]
     pub expired: bool,
+}
+
+/// A backup's opaque catalog identity (ADR 0059 §3) — an ARN-shaped string at
+/// the wire, freshly minted per `CreateBackup` request. **Never a table
+/// name**: keying the catalog by identity rather than name is what lets a
+/// backup outlive a drop-then-recreate of its source table's name (see
+/// [`Metadata::backups`]'s own doc for the full "scar" this avoids).
+pub type BackupId = String;
+
+/// One tablet pinned into a backup at [`MetaCommand::BeginBackup`] time (ADR
+/// 0059 §2/§3): its id and key range, as they stood the moment the backup
+/// began. A plain owned snapshot — never updated in place if the tablet
+/// later splits or moves; a future capture driver re-plans a retired
+/// tablet's range onto its live descendants via `Metadata::split_lineage`
+/// (ADR 0059 §6), a later PR's concern, not this catalog row's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupPinnedTablet {
+    /// The pinned tablet's id.
+    pub tablet: TabletId,
+    /// The pinned tablet's key range at pin time.
+    pub range: KeyRange,
+}
+
+/// A backup's manifest stub (ADR 0059 §2), derived **entirely from
+/// already-agreed `Metadata`** at [`MetaCommand::BeginBackup`]'s own apply —
+/// never from anything a proposer carries beyond the backup id/table name/
+/// wall-clock stamp — so every replica computes an identical stub
+/// deterministically. This is the "stub" the ADR describes: the capture
+/// driver (a later PR) fills in each pinned tablet's completion record
+/// (`Metadata::backup_tablet_progress`) as it finishes; the full manifest
+/// object written to the backup store is this stub plus that per-tablet
+/// data, assembled once the row reaches [`BackupStatus::Available`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupManifest {
+    /// An owned snapshot of the source table's schema at capture time (ADR
+    /// §2's `SourceTableFeatureDetails` capture — partition/clustering
+    /// keys, columns, and GSI/LSI definitions carried forward for restore;
+    /// `stream`/`ttl` carried too, but purely for descriptive fidelity —
+    /// `DescribeBackup` can report "this table had a stream/TTL," but
+    /// restore deliberately never re-enables either, ADR 0059 §7). A plain
+    /// clone, never a live reference into [`Metadata::schemas`] — mirrors
+    /// [`StreamShardRow::view_type`]'s own copy-not-reference convention.
+    pub schema: TableSchema,
+    /// The source table's tablet list, pinned at `BeginBackup` time.
+    pub pinned_tablets: Vec<BackupPinnedTablet>,
+    /// Wall-clock creation time, stamped at **propose** time by the
+    /// wire-serving node (`env.wall_now()`, the ADR 0051 discipline: the
+    /// pure state machine has no clock, so calendar time rides the command
+    /// as plain data) — never a timing input for this state machine, only
+    /// `DescribeBackup`-visible metadata.
+    pub created_wall_ms: u64,
+}
+
+/// One pinned tablet's capture-completion record (ADR 0059 §3/§4),
+/// proposed by that tablet's own capture driver (a later PR) once it
+/// finishes sweeping its share of the backup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupTabletProgress {
+    /// The packed-HLC watermark this tablet's own capture pinned (ADR 0059
+    /// §2/§4) — the cut version the manifest records for this tablet.
+    pub cut_version: u64,
+    /// The total bytes this tablet's own data objects occupy in the backup
+    /// store.
+    pub bytes: u64,
+}
+
+/// A backup catalog row's lifecycle status (ADR 0059 §3/§4). Modeled with
+/// room for the (not-yet-built) two-phase retention janitor's PR④ needs —
+/// see [`Expired`](Self::Expired)'s own doc — so that PR doesn't have to
+/// reshape this enum.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackupStatus {
+    /// Capture in progress: [`MetaCommand::BeginBackup`] has landed, but not
+    /// every pinned tablet has reported completion yet (or has, but the
+    /// leader aggregator hasn't yet proposed [`MetaCommand::CompleteBackup`]).
+    Creating,
+    /// Terminal success — DynamoDB's own terminal on-demand-backup status.
+    /// Reached only once every pinned tablet has reported and the manifest
+    /// itself is durably stored (ADR 0059 §4's durable-before-visible rule;
+    /// enforced by the capture driver/aggregator, a later PR — this catalog
+    /// only records the resulting state).
+    Available,
+    /// Terminal failure: a stuck-`Creating` timeout, or any other
+    /// aggregator-observed failure. `reason` is diagnostic only, never
+    /// interpreted by this state machine.
+    Failed {
+        /// A human-readable failure reason.
+        reason: String,
+    },
+    /// Marked for reclaim by the two-phase retention janitor's **mark**
+    /// phase (ADR 0043 §A9's mold, reused verbatim by ADR 0059 §3) — no
+    /// `MetaCommand` in this PR ever transitions a row into this state; it
+    /// exists purely so a later PR's janitor-mark command doesn't need to
+    /// widen this enum (and thus doesn't need to touch every existing match
+    /// on it again).
+    Expired,
+}
+
+/// A backup catalog row (`Metadata::backups`, ADR 0059 §3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupRow {
+    /// The source table this backup was taken from (data only — the
+    /// catalog is keyed by [`BackupId`], never by this name, ADR 0059 §3's
+    /// scar).
+    pub table: TableName,
+    /// This row's lifecycle status.
+    pub status: BackupStatus,
+    /// The manifest stub (ADR 0059 §2), derived once at `BeginBackup` time.
+    pub manifest: BackupManifest,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -964,6 +1164,86 @@ pub enum MetaCommand {
         node: NodeId,
         addrs: NodeAddrs,
         labels: BTreeMap<String, String>,
+    },
+    /// Begin an on-demand backup (ADR 0059 §3/§4): mints a
+    /// [`BackupStatus::Creating`] catalog row at `backup_id`. The manifest
+    /// stub (schema snapshot + pinned tablet list) is derived **entirely
+    /// from already-agreed `Metadata`** at apply time — never from anything
+    /// the proposer carries beyond `backup_id`/`table`/`created_wall_ms` —
+    /// so every replica computes an identical stub. Rejected if `backup_id`
+    /// already names a row (a fresh id is minted per request, so there is
+    /// nothing to CAS against — first-committer-wins on a brand-new
+    /// identity, mirroring [`CreateTablet`](Self::CreateTablet)'s own
+    /// shape) or if `table` has no schema.
+    BeginBackup {
+        /// The freshly-minted, never-reused backup identity.
+        backup_id: BackupId,
+        /// The source table to back up.
+        table: TableName,
+        /// Stamped at PROPOSE time by the wire-serving node
+        /// (`env.wall_now()`, ADR 0051's discipline) — the pure state
+        /// machine has no clock.
+        created_wall_ms: u64,
+    },
+    /// One pinned tablet's capture-completion report (ADR 0059 §3/§4) —
+    /// mirroring [`MarkIndexBackfilled`](Self::MarkIndexBackfilled)'s
+    /// per-tablet shape exactly, including its identity convention: keyed
+    /// `(backup_id, tablet)`, not `(table, backup_id, tablet)` (a tablet id
+    /// already implies its table). Idempotent: an identical repeat (the
+    /// capture driver's own crash-retry) is a `NoOp`. Rejected if
+    /// `backup_id` is unknown, the backup is not
+    /// [`Creating`](BackupStatus::Creating), `tablet` does not name one of
+    /// the backup's own pinned tablets, or a *different* completion is
+    /// already recorded for this `(backup_id, tablet)` (a genuine conflict
+    /// — unlike `SealStreamShard`'s replicas-only-update allowance, this
+    /// row has no repair concept in this PR, so a conflicting resubmission
+    /// is rejected outright rather than silently overwritten).
+    RecordBackupTabletComplete {
+        /// The backup this completion belongs to.
+        backup_id: BackupId,
+        /// The pinned tablet reporting completion.
+        tablet: TabletId,
+        /// The packed-HLC watermark this tablet's own capture pinned.
+        cut_version: u64,
+        /// The total bytes this tablet's own data objects occupy.
+        bytes: u64,
+    },
+    /// Complete a backup (ADR 0059 §3/§4) once every pinned tablet has
+    /// reported — proposed by the control-plane-leader aggregator (a later
+    /// PR). Rejected if `backup_id` is unknown, not
+    /// [`Creating`](BackupStatus::Creating), or any pinned tablet has not
+    /// yet reported a completion record. Flips the row to
+    /// [`BackupStatus::Available`] — DynamoDB's own terminal on-demand
+    /// status.
+    CompleteBackup {
+        /// The backup to complete.
+        backup_id: BackupId,
+    },
+    /// Fail a backup (ADR 0059 §3/§4) — a stuck-`Creating` timeout, or any
+    /// other aggregator-observed failure. Rejected if `backup_id` is
+    /// unknown, or if the row is already terminal in a way that
+    /// contradicts failure (already [`Available`](BackupStatus::Available)
+    /// — a completed backup cannot subsequently "fail" — or already
+    /// [`Expired`](BackupStatus::Expired)). Idempotent: a no-op if the row
+    /// is already `Failed` with the identical `reason`.
+    FailBackup {
+        /// The backup to fail.
+        backup_id: BackupId,
+        /// A human-readable failure reason.
+        reason: String,
+    },
+    /// Remove a backup catalog row outright (ADR 0059 §3) — an operator/
+    /// retention action, distinct from [`CompleteBackup`](Self::CompleteBackup)/
+    /// [`FailBackup`](Self::FailBackup). Idempotent: a no-op if `backup_id`
+    /// is unknown. Also prunes every one of its per-tablet completion rows
+    /// from [`Metadata::backup_tablet_progress`]. Deliberately **never**
+    /// reached as a side effect of [`DropTableSchema`](Self::DropTableSchema)/
+    /// [`DropTableTablets`](Self::DropTableTablets) — ADR 0024's explicit
+    /// carve-out (ADR 0059 §3): a backup catalog row outlives its source
+    /// table.
+    DeleteBackup {
+        /// The backup to remove.
+        backup_id: BackupId,
     },
 }
 
@@ -1637,6 +1917,130 @@ impl Metadata {
                 self.index_backfill.insert((*tablet, index.clone()), ());
                 ApplyOutcome::Applied
             }
+            MetaCommand::BeginBackup {
+                backup_id,
+                table,
+                created_wall_ms,
+            } => {
+                if self.backups.contains_key(backup_id) {
+                    return ApplyOutcome::Rejected("backup id already exists");
+                }
+                let Some(schema) = self.schemas.get(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                // The manifest stub is derived entirely from already-agreed
+                // state (this schema, this table's current tablet map) —
+                // never from anything the proposer carried beyond the three
+                // fields above — so every replica computes an identical
+                // stub deterministically (see `BackupManifest`'s own doc).
+                let pinned_tablets: Vec<BackupPinnedTablet> = self
+                    .tablets_for_table(table)
+                    .map(|(&tablet, t)| BackupPinnedTablet {
+                        tablet,
+                        range: t.range.clone(),
+                    })
+                    .collect();
+                self.backups.insert(
+                    backup_id.clone(),
+                    BackupRow {
+                        table: table.clone(),
+                        status: BackupStatus::Creating,
+                        manifest: BackupManifest {
+                            schema: schema.clone(),
+                            pinned_tablets,
+                            created_wall_ms: *created_wall_ms,
+                        },
+                    },
+                );
+                ApplyOutcome::Applied
+            }
+            MetaCommand::RecordBackupTabletComplete {
+                backup_id,
+                tablet,
+                cut_version,
+                bytes,
+            } => {
+                let Some(row) = self.backups.get(backup_id) else {
+                    return ApplyOutcome::Rejected("no such backup");
+                };
+                if !matches!(row.status, BackupStatus::Creating) {
+                    return ApplyOutcome::Rejected("backup is not Creating");
+                }
+                let pinned = row
+                    .manifest
+                    .pinned_tablets
+                    .iter()
+                    .any(|t| t.tablet == *tablet);
+                if !pinned {
+                    return ApplyOutcome::Rejected("tablet is not pinned in this backup");
+                }
+                let key = (backup_id.clone(), *tablet);
+                if let Some(existing) = self.backup_tablet_progress.get(&key) {
+                    if existing.cut_version == *cut_version && existing.bytes == *bytes {
+                        return ApplyOutcome::NoOp;
+                    }
+                    return ApplyOutcome::Rejected(
+                        "tablet already reported a different completion",
+                    );
+                }
+                self.backup_tablet_progress.insert(
+                    key,
+                    BackupTabletProgress {
+                        cut_version: *cut_version,
+                        bytes: *bytes,
+                    },
+                );
+                ApplyOutcome::Applied
+            }
+            MetaCommand::CompleteBackup { backup_id } => {
+                let Some(row) = self.backups.get(backup_id) else {
+                    return ApplyOutcome::Rejected("no such backup");
+                };
+                if !matches!(row.status, BackupStatus::Creating) {
+                    return ApplyOutcome::Rejected("backup is not Creating");
+                }
+                let all_reported = row.manifest.pinned_tablets.iter().all(|t| {
+                    self.backup_tablet_progress
+                        .contains_key(&(backup_id.clone(), t.tablet))
+                });
+                if !all_reported {
+                    return ApplyOutcome::Rejected(
+                        "not every pinned tablet has reported completion",
+                    );
+                }
+                self.backups
+                    .get_mut(backup_id)
+                    .expect("checked present above")
+                    .status = BackupStatus::Available;
+                ApplyOutcome::Applied
+            }
+            MetaCommand::FailBackup { backup_id, reason } => {
+                let Some(row) = self.backups.get_mut(backup_id) else {
+                    return ApplyOutcome::Rejected("no such backup");
+                };
+                match &row.status {
+                    BackupStatus::Failed { reason: existing } if existing == reason => {
+                        ApplyOutcome::NoOp
+                    }
+                    BackupStatus::Creating | BackupStatus::Failed { .. } => {
+                        row.status = BackupStatus::Failed {
+                            reason: reason.clone(),
+                        };
+                        ApplyOutcome::Applied
+                    }
+                    BackupStatus::Available | BackupStatus::Expired => {
+                        ApplyOutcome::Rejected("backup is not in a failable state")
+                    }
+                }
+            }
+            MetaCommand::DeleteBackup { backup_id } => {
+                if self.backups.remove(backup_id).is_none() {
+                    return ApplyOutcome::NoOp;
+                }
+                self.backup_tablet_progress
+                    .retain(|(id, _), _| id != backup_id);
+                ApplyOutcome::Applied
+            }
             MetaCommand::SetTableStream { table, spec } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
                     return ApplyOutcome::Rejected("no such table schema");
@@ -2284,6 +2688,36 @@ impl Metadata {
         let highest = self.tablets.keys().map(|t| t.0).max().unwrap_or(0);
         TabletId(self.next_tablet_id.max(highest + 1).max(1))
     }
+
+    /// The backup catalog row for `backup_id`, if any (ADR 0059 §3). A read
+    /// accessor for the admin observer surface and a future wire edge.
+    #[must_use]
+    pub fn backup(&self, backup_id: &str) -> Option<&BackupRow> {
+        self.backups.get(backup_id)
+    }
+
+    /// `backup_id`'s own per-tablet completion records (ADR 0059 §3/§4) —
+    /// `DescribeBackup`'s per-tablet progress list.
+    pub fn backup_tablet_progress_for<'a>(
+        &'a self,
+        backup_id: &'a str,
+    ) -> impl Iterator<Item = (TabletId, &'a BackupTabletProgress)> {
+        self.backup_tablet_progress
+            .iter()
+            .filter(move |((id, _), _)| id == backup_id)
+            .map(|((_, tablet), progress)| (*tablet, progress))
+    }
+
+    /// `backup_id`'s total captured bytes so far (ADR 0059 §2's "total
+    /// object sizes, for `DescribeBackup`") — the sum of every pinned
+    /// tablet's own reported [`BackupTabletProgress::bytes`], `0` before
+    /// any tablet has reported.
+    #[must_use]
+    pub fn backup_total_bytes(&self, backup_id: &str) -> u64 {
+        self.backup_tablet_progress_for(backup_id)
+            .map(|(_, progress)| progress.bytes)
+            .sum()
+    }
 }
 
 /// `Metadata` is the control plane's replicated state machine. **ADR 0038
@@ -2632,6 +3066,579 @@ mod tests {
             ApplyOutcome::Rejected("tablet is not scoped to this table")
         );
         assert!(m.index_backfill.is_empty());
+    }
+
+    // --- ADR 0059 §3: the backup catalog ---------------------------------
+
+    /// A fixture for the backup-catalog tests below: a table with one
+    /// tablet, ready for `BeginBackup`.
+    fn table_with_one_tablet(m: &mut Metadata, table: &str, tablet: TabletId) {
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: table.to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet,
+                table: Some(table.to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
+    /// `BeginBackup` (ADR 0059 §3): rejected against an unknown table;
+    /// otherwise mints a `Creating` row whose manifest stub is derived
+    /// entirely from already-agreed state (the table's current schema and
+    /// tablet list) — never from anything else the command carries. A
+    /// second `BeginBackup` for the same id is rejected outright, even
+    /// against a different table (a fresh id is minted per request, so
+    /// there is nothing to legitimately retry against).
+    #[test]
+    fn begin_backup_apply_arm() {
+        let mut m = Metadata::default();
+
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "ghost".to_owned(),
+                created_wall_ms: 1000,
+            }),
+            ApplyOutcome::Rejected("no such table schema")
+        );
+
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+            }),
+            ApplyOutcome::Applied
+        );
+        let row = m.backup("backup-1").expect("row present");
+        assert_eq!(row.table, "users");
+        assert_eq!(row.status, BackupStatus::Creating);
+        assert_eq!(row.manifest.created_wall_ms, 1000);
+        assert_eq!(row.manifest.schema, *m.table_schema("users").unwrap());
+        assert_eq!(
+            row.manifest.pinned_tablets,
+            vec![BackupPinnedTablet {
+                tablet: TabletId(1),
+                range: KeyRange::whole(),
+            }]
+        );
+
+        // A second table, ready for a would-be collision.
+        table_with_one_tablet(&mut m, "orders", TabletId(2));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "orders".to_owned(),
+                created_wall_ms: 2000,
+            }),
+            ApplyOutcome::Rejected("backup id already exists")
+        );
+        // Untouched by the rejected collision.
+        assert_eq!(m.backup("backup-1").unwrap().table, "users");
+    }
+
+    /// `RecordBackupTabletComplete` (ADR 0059 §3/§4): rejected against an
+    /// unknown backup, a backup not `Creating`, or a tablet not pinned in
+    /// it; idempotent on an identical repeat (the capture driver's own
+    /// crash-retry); rejected as a genuine conflict on a differing repeat.
+    #[test]
+    fn record_backup_tablet_complete_apply_arm() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "ghost".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::Rejected("no such backup")
+        );
+
+        // A tablet never pinned in this backup.
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(2),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::Rejected("tablet is not pinned in this backup")
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.backup_tablet_progress
+                .get(&("backup-1".to_owned(), TabletId(1))),
+            Some(&BackupTabletProgress {
+                cut_version: 10,
+                bytes: 100,
+            })
+        );
+
+        // Identical repeat: the capture driver's own crash-retry.
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        // A genuinely differing repeat is rejected, not silently applied.
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 11,
+                bytes: 100,
+            }),
+            ApplyOutcome::Rejected("tablet already reported a different completion")
+        );
+
+        // Once complete, a further report — even an identical one — is
+        // rejected: the backup is no longer `Creating`.
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::Rejected("backup is not Creating")
+        );
+    }
+
+    /// `CompleteBackup` (ADR 0059 §3/§4): rejected against an unknown
+    /// backup or one not `Creating`; rejected while any pinned tablet has
+    /// not yet reported; `Applied` (flips to `Available`) once every pinned
+    /// tablet has.
+    #[test]
+    fn complete_backup_apply_arm() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "ghost".to_owned(),
+            }),
+            ApplyOutcome::Rejected("no such backup")
+        );
+
+        // No pinned tablet has reported yet.
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Rejected("not every pinned tablet has reported completion")
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.backup("backup-1").unwrap().status,
+            BackupStatus::Available
+        );
+
+        // Already `Available`: a second `CompleteBackup` is rejected, not
+        // silently re-applied.
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Rejected("backup is not Creating")
+        );
+    }
+
+    /// `CompleteBackup` over a backup with **two** pinned tablets: rejected
+    /// until BOTH have reported, not just one.
+    #[test]
+    fn complete_backup_requires_every_pinned_tablet() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "users".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        // `CreateTablet` allows only one tablet per table (ADR 0023) — a
+        // genuine second tablet on the same table comes only from a real
+        // split, so drive `BeginSplit`/`CutoverSplit` to end up with two
+        // `Active` tablets scoped to `users`.
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+        let split_key = [0x80; TOKEN_BYTES].to_vec();
+        assert_eq!(
+            m.apply(&MetaCommand::BeginSplit {
+                parent: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key,
+                children: [(TabletId(2), vec![nid(1)]), (TabletId(3), vec![nid(1)])],
+            }),
+            ApplyOutcome::Applied
+        );
+        let parent_epoch = m.tablets[&TabletId(1)].epoch;
+        assert_eq!(
+            m.apply(&MetaCommand::CutoverSplit {
+                parent: TabletId(1),
+                expected_epoch: parent_epoch,
+                cutover_wall_ms: 500,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.backup("backup-1").unwrap().manifest.pinned_tablets.len(),
+            2
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(2),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Rejected("not every pinned tablet has reported completion")
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(3),
+                cut_version: 20,
+                bytes: 200,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.backup_total_bytes("backup-1"), 300);
+    }
+
+    /// `FailBackup` (ADR 0059 §3/§4): rejected against an unknown backup;
+    /// applies from `Creating`; idempotent on an identical repeat reason;
+    /// applies again on a differing reason while still `Failed`; rejected
+    /// once the backup is `Available` (a completed backup cannot
+    /// subsequently "fail").
+    #[test]
+    fn fail_backup_apply_arm() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::FailBackup {
+                backup_id: "ghost".to_owned(),
+                reason: "timeout".to_owned(),
+            }),
+            ApplyOutcome::Rejected("no such backup")
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::FailBackup {
+                backup_id: "backup-1".to_owned(),
+                reason: "timeout".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.backup("backup-1").unwrap().status,
+            BackupStatus::Failed {
+                reason: "timeout".to_owned()
+            }
+        );
+
+        // Identical repeat is idempotent.
+        assert_eq!(
+            m.apply(&MetaCommand::FailBackup {
+                backup_id: "backup-1".to_owned(),
+                reason: "timeout".to_owned(),
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        // A differing reason while still `Failed` applies (updates the
+        // recorded reason).
+        assert_eq!(
+            m.apply(&MetaCommand::FailBackup {
+                backup_id: "backup-1".to_owned(),
+                reason: "store unreachable".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.backup("backup-1").unwrap().status,
+            BackupStatus::Failed {
+                reason: "store unreachable".to_owned()
+            }
+        );
+
+        // An `Available` backup cannot subsequently fail.
+        let mut avail = Metadata::default();
+        table_with_one_tablet(&mut avail, "users", TabletId(1));
+        assert_eq!(
+            avail.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-2".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            avail.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-2".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            avail.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-2".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            avail.apply(&MetaCommand::FailBackup {
+                backup_id: "backup-2".to_owned(),
+                reason: "too late".to_owned(),
+            }),
+            ApplyOutcome::Rejected("backup is not in a failable state")
+        );
+    }
+
+    /// `DeleteBackup` (ADR 0059 §3): removes the row and every one of its
+    /// own per-tablet progress records; idempotent on an unknown id.
+    #[test]
+    fn delete_backup_apply_arm() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::DeleteBackup {
+                backup_id: "ghost".to_owned(),
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::DeleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.backup("backup-1").is_none());
+        assert!(m.backup_tablet_progress_for("backup-1").next().is_none());
+
+        // Idempotent: an already-deleted id is a no-op.
+        assert_eq!(
+            m.apply(&MetaCommand::DeleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::NoOp
+        );
+    }
+
+    /// ADR 0024/ADR 0059 §3's explicit carve-out: `DropTableSchema`/
+    /// `DropTableTablets` must NOT touch the backup catalog — a backup row
+    /// (and its progress records) survives a drop of its source table.
+    #[test]
+    fn backup_catalog_survives_a_table_drop() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableTablets {
+                table: "users".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableSchema {
+                table: "users".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // The table is genuinely gone...
+        assert!(!m.has_table_schema("users"));
+        assert!(!m.has_table_tablet("users"));
+        // ...but the backup row and its progress record are untouched.
+        let row = m
+            .backup("backup-1")
+            .expect("backup row survives table drop");
+        assert_eq!(row.status, BackupStatus::Available);
+        assert_eq!(row.table, "users");
+        assert_eq!(
+            m.backup_tablet_progress
+                .get(&("backup-1".to_owned(), TabletId(1))),
+            Some(&BackupTabletProgress {
+                cut_version: 10,
+                bytes: 100,
+            })
+        );
+    }
+
+    /// `Metadata` round-trips through JSON with a populated backup catalog
+    /// (mirroring the `stream_shards`/`index_backfill` tuple-key-codec
+    /// regression this crate already guards against — see
+    /// `metadata_round_trips_through_json_with_populated_stream_shards`).
+    #[test]
+    fn metadata_round_trips_through_json_with_populated_backups() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        let json = serde_json::to_string(&m).expect("serializes");
+        let round_tripped: Metadata = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(m, round_tripped);
     }
 
     /// `DropTableTablets` (ADR 0045): pruning a table's tablets also prunes
