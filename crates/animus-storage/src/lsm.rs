@@ -211,21 +211,6 @@ const BACKPRESSURE_POLL: Duration = Duration::from_millis(1);
 /// failing (e.g. a disk that never recovers) — turns what would otherwise be
 /// an unbounded retry loop into a clean, loud error.
 const BACKPRESSURE_MAX_POLLS: u32 = 10_000;
-/// How long [`LsmEngine::clone_to`] waits between retries of its own flush
-/// (issue #298) — see that method's doc for why a single `flush()` call is
-/// not enough. `applies_in_flight`'s own window is one WAL fsync+memtable
-/// apply, normally sub-millisecond; this only needs to be short enough that
-/// a handful of retries clears an ordinary race, not tuned to any specific
-/// disk's latency.
-const CLONE_FLUSH_RETRY_POLL: Duration = Duration::from_millis(1);
-/// Bound on [`LsmEngine::clone_to`]'s flush-retry loop — generous relative to
-/// the sub-millisecond window each retry targets, so this only ever fires as
-/// a loud, diagnosable error if something is persistently, not just
-/// momentarily, keeping the memtable non-empty (e.g. a caller that races
-/// this call against its OWN unthrottled concurrent write storm — not the
-/// in-place split materialization path this was written for, which clones a
-/// tablet already refusing every future user write).
-const CLONE_FLUSH_MAX_RETRIES: u32 = 1_000;
 
 /// Tuning knobs for an [`LsmEngine`]. Defaults are sized for tests; production
 /// wiring can raise them.
@@ -1916,24 +1901,51 @@ impl<E: Env> LsmEngine<E> {
     ///
     /// ## The cut
     ///
-    /// The clone reflects the engine's *currently durable + applied* state as
-    /// of this call: the memtable is flushed first (a no-op if already
-    /// empty), so the clone is **SSTables-only, with an empty WAL** — there is
-    /// no in-memory or WAL state to transfer. Every table the post-flush
-    /// manifest names is then [hard-linked](animus_env::Disk::link) — not
-    /// copied — into `target_prefix`'s own file namespace, and a fresh
-    /// manifest is written there naming exactly those tables (same sequence
-    /// numbers, same `next_seq` floor so the target's own future flushes
-    /// never collide with an inherited seq, same `max_version`, an empty
-    /// `wal_segments`). SSTable immutability is what makes sharing bytes
-    /// instead of copying them safe: the source and the returned engine hold
-    /// independent directory entries over the same durable bytes, so the
-    /// source's own compaction later removing a superseded input file has no
-    /// effect on the clone's own link to it.
+    /// The clone reflects the engine's *currently acked* state as of this
+    /// call. One best-effort `flush()` is attempted first (a no-op if the
+    /// memtable is already empty or a write is momentarily mid-apply), which
+    /// keeps the common, quiescent case producing a pure **SSTables-only,
+    /// empty-WAL** clone exactly as before. Whatever the flush leaves behind
+    /// — nothing, in the common case; real rows, under a persistent
+    /// concurrent writer that keeps refilling the memtable faster than any
+    /// bounded number of flushes could drain it — is captured by taking a
+    /// **point-in-time snapshot** of the manifest's table list *and* the
+    /// current memtable contents under one acquisition of the same lock the
+    /// write path applies under. This is sufficient by construction, not by
+    /// retrying: the write path (`log_and_apply`) only returns to its caller
+    /// after a record is both WAL-synced and applied to the memtable under
+    /// this identical lock, so any write already acked by the time a caller
+    /// invokes `clone_to` is provably present at this snapshot, either still
+    /// resident in the memtable or already folded into a table by an
+    /// intervening flush; a write a concurrent caller starts *during* this
+    /// call may legitimately land on either side of the cut.
     ///
-    /// The [`MaintenanceLock`] is held across the whole snapshot-and-link
-    /// sequence (after the flush, which takes and releases it on its own —
-    /// the lock is not reentrant), so a compaction on **this** (source)
+    /// Every table the snapshot names is [hard-linked](animus_env::Disk::link)
+    /// — not copied — into `target_prefix`'s own file namespace. Any rows the
+    /// snapshot found still resident in the memtable are written out as one
+    /// additional, brand-**new** SSTable built directly inside the clone's
+    /// own namespace (never the source's — the source's manifest, WAL, and
+    /// files are untouched either way), at a sequence number past the
+    /// source's own `next_seq` floor. A fresh manifest is then written naming
+    /// every linked table plus that new one if any rows needed it (same
+    /// `next_seq` floor, bumped past the new table if one was written, so the
+    /// target's own future flushes never collide with an inherited seq; same
+    /// `max_version`; an empty `wal_segments`). SSTable immutability is what
+    /// makes sharing the linked bytes instead of copying them safe: the
+    /// source and the returned engine hold independent directory entries over
+    /// the same durable bytes, so the source's own compaction later removing
+    /// a superseded input file has no effect on the clone's own link to it.
+    ///
+    /// **This never spins**: unlike an earlier version of this method (which
+    /// retried `flush()` in a bounded loop until the memtable read empty), no
+    /// step here depends on a concurrent writer ever pausing — the snapshot
+    /// is exactly one lock acquisition and the leftover write, if any, is
+    /// exactly one SSTable sized to that one snapshot, regardless of how long
+    /// or how fast a writer keeps writing after this call starts.
+    ///
+    /// The [`MaintenanceLock`] is held across the whole snapshot/link/leftover-
+    /// write sequence (after the flush, which takes and releases it on its
+    /// own — the lock is not reentrant), so a compaction on **this** (source)
     /// engine cannot swap or remove a table out from under a link this call
     /// is in the middle of making.
     ///
@@ -1943,18 +1955,26 @@ impl<E: Env> LsmEngine<E> {
     /// returns (a hard link only adds a directory entry over bytes the
     /// source already synced when it first wrote the table — no new data
     /// fsync is needed, only the namespace change, which `link` itself
-    /// fsyncs). The **single commit point** is the target's own manifest
+    /// fsyncs); the leftover-memtable table, if written, is synced before its
+    /// meta is added to the target manifest, the same as an ordinary flush.
+    /// The **single commit point** is the target's own manifest
     /// [`Disk::replace`] at the end: until that succeeds, `target_prefix` has
     /// no manifest, so [`open`](Self::open)ing it finds nothing durable —
-    /// any already-linked SSTable files sitting there are harmless,
-    /// unreferenced orphans, exactly like a crashed flush's orphan table (see
-    /// the module docs' "Crash safety" section). A crash before the manifest
-    /// commit therefore leaves **no half-clone visible**, and the whole
-    /// operation is safe to simply retry: it re-flushes (a no-op if nothing
-    /// changed), re-snapshots, and re-links — [`Disk::link`] overwrites an
-    /// already-linked `dst` name rather than erroring, so relinking the same
-    /// `(src, dst)` pairs is idempotent. A crash *after* the manifest commit
-    /// is a complete, independently-openable clone.
+    /// any already-linked SSTable files, or an already-written leftover
+    /// table, sitting there are harmless, unreferenced orphans, exactly like
+    /// a crashed flush's orphan table (see the module docs' "Crash safety"
+    /// section). A crash before the manifest commit therefore leaves **no
+    /// half-clone visible**, and the whole operation is safe to simply retry:
+    /// it re-flushes (a no-op if nothing changed), re-snapshots, re-links,
+    /// and rewrites the leftover table if the snapshot still finds one —
+    /// [`Disk::link`] overwrites an already-linked `dst` name rather than
+    /// erroring, so relinking the same `(src, dst)` pairs is idempotent. A
+    /// retry's own leftover table (if any) is written at a seq derived from
+    /// the source's *then-current* `next_seq`, which may differ from a
+    /// failed attempt's — any such earlier attempt's own leftover file is
+    /// simply left behind as a harmless, unreferenced orphan, exactly like
+    /// any other crashed write's orphan table. A crash *after* the manifest
+    /// commit is a complete, independently-openable clone.
     ///
     /// **Note the one asymmetry this implies**: this method's own last step
     /// is opening the just-committed target (to hand back a live handle), so
@@ -1985,65 +2005,60 @@ impl<E: Env> LsmEngine<E> {
     pub async fn clone_to(&self, target_prefix: impl Into<String>) -> Result<LsmEngine<E>> {
         let target_prefix: String = target_prefix.into();
 
-        // Flush first so the clone is SSTables-only. Done *before* taking the
-        // maintenance lock below: `flush` acquires it internally and the lock
-        // is not reentrant.
+        // One best-effort flush attempt, so the common (quiescent) case still
+        // produces a pure SSTable-only clone exactly as before. Done *before*
+        // taking the maintenance lock below: `flush` acquires it internally
+        // and the lock is not reentrant.
         //
-        // **A single `flush()` call is not enough (issue #298).** `flush`
-        // itself silently no-ops — returning `Ok(())` with nothing written —
-        // whenever `applies_in_flight > 0`: a concurrent writer is between
-        // its own WAL fsync and memtable apply, and `flush` correctly
-        // refuses to snapshot a torn memtable rather than risk it. That
-        // no-op is safe for `flush`'s *other* callers (the write-path
-        // threshold trigger and the admin `flush_now` action), which only
-        // ever want "flush what's there, harmlessly skip if a write is mid-
-        // flight, it'll trigger again soon" — but this caller's own
-        // contract is stronger: everything durably in the engine at the
-        // moment this is called must end up in the clone, because the
-        // clone becomes the ONLY forward-going copy for a split child a
-        // reconciler on a different task can start hosting the instant
-        // this returns. A caller reasoning "the memtable held the row when
-        // I scanned it a moment ago" has no way to know `flush()` just
-        // silently skipped it — the row stays resident only in a memtable
-        // this method is about to leave behind (the target's own manifest
-        // is SSTables-only, `wal_segments: Vec::new()`), a permanent,
-        // silent loss the instant the source (a frozen in-place-split
-        // parent) is later reclaimed. Confirmed live: a captured repro
-        // showed a row present in a direct `scan()` of the source
-        // immediately before this call and absent from the freshly cloned
-        // child immediately after, on the replica that also happened to be
-        // the busiest (leading, and hence apply-task-active for, the whole
-        // split lineage) — exactly the shape a `applies_in_flight` race
-        // predicts. Retrying until the memtable is confirmed empty (not
-        // just until `flush()` returns without erroring) closes it: the
-        // race window is one WAL fsync+apply, so an ordinary race clears in
-        // one or two retries.
-        for _ in 0..CLONE_FLUSH_MAX_RETRIES {
-            self.flush().await?;
-            if self.lock().memtable.is_empty() {
-                break;
-            }
-            self.env.sleep(CLONE_FLUSH_RETRY_POLL).await;
-        }
-        if !self.lock().memtable.is_empty() {
-            return Err(StorageError::Backend(format!(
-                "clone_to({target_prefix}): memtable still non-empty after \
-                 {CLONE_FLUSH_MAX_RETRIES} flush retries — a concurrent writer is \
-                 persistently racing this clone"
-            )));
-        }
+        // **A single `flush()` call is not a correctness requirement any
+        // more — it's just an optimization (issue #298 / its 2026-08-26
+        // starvation follow-up).** `flush` itself silently no-ops whenever
+        // `applies_in_flight > 0` (a concurrent writer is between its own
+        // WAL fsync and memtable apply) or the memtable is already empty, so
+        // there is no guarantee it leaves the memtable empty. The retry loop
+        // that used to sit here — call `flush()`, check `memtable.is_empty
+        // ()`, sleep, repeat up to a fixed bound — chases a moving target: a
+        // *persistent* concurrent writer can refill the memtable faster than
+        // flush drains it, so "retry until empty" has no liveness guarantee
+        // at all, only a false sense of one from the bound eventually giving
+        // up with a loud error (a starvation flake reported against CI: the
+        // identical code that passes locally errors out under real
+        // contention on a busier runner — this is not an infra flake, it's
+        // the retry loop's own structure). See
+        // `docs/engineering-lessons.md` for the general rule this
+        // generalizes to (bounded retry against a live producer).
+        //
+        // The fix drops the "must reach empty" goal entirely in favor of a
+        // point-in-time **snapshot**: below, `tables` + whatever is left in
+        // the memtable are read under the SAME `Inner` lock acquisition.
+        // That single critical section is enough on its own — no retry, no
+        // sleep — to satisfy `clone_to`'s real contract ("every write ACKED
+        // before this call must appear in the clone"): `log_and_apply`
+        // (this engine's one write path) only returns to its caller *after*
+        // the record has both synced to the WAL and been applied to the
+        // memtable under this identical lock, so by the time any caller
+        // observes a write as acked, that write is already durably present
+        // under the next acquisition of this lock — either still in the
+        // memtable (captured by the snapshot below) or already folded into
+        // an SSTable by an intervening flush (captured by `tables`). A write
+        // a concurrent caller starts *during* this call is legitimately
+        // allowed to land on either side of the cut (it raced `clone_to`,
+        // not a bug); this snapshot cannot ever miss one that completed
+        // strictly before.
+        self.flush().await?;
 
         // Hold the maintenance lock for the whole snapshot+link sequence so a
         // concurrent compaction on the source cannot swap/remove a table this
         // call is in the middle of linking (see the doc comment above).
         let _maintenance = self.maintenance.acquire().await;
 
-        let (tables, next_seq, max_version) = {
+        let (tables, mut next_seq, max_version, leftover) = {
             let inner = self.lock();
             (
                 inner.manifest.tables.clone(),
                 inner.manifest.next_seq,
                 inner.manifest.max_version,
+                flatten_memtable(&inner.memtable),
             )
         };
 
@@ -2053,9 +2068,32 @@ impl<E: Env> LsmEngine<E> {
             self.env.link(&src, &dst).await.map_err(io)?;
         }
 
+        // Anything still resident in the memtable at snapshot time — the
+        // ordinary case is empty (the flush above already drained it), but a
+        // persistent concurrent writer, or one that simply landed between
+        // the flush and the snapshot, can leave real rows here — is written
+        // out as a **new** SSTable directly into the CLONE's own namespace,
+        // never the source's. This never touches the source's manifest, WAL,
+        // or files (the source's own integrity, flush/compaction cadence,
+        // and this call's own crash-safety contract are all unaffected); it
+        // is bounded, one-shot work sized to a single point-in-time memtable
+        // snapshot, never a race against however long a writer keeps
+        // writing. The new table's seq comes from the source's own
+        // `next_seq` floor (bumped so the clone's future flushes never
+        // collide with it), landing at L0 like an ordinary flush.
+        let mut target_tables = tables;
+        if !leftover.is_empty() {
+            let seq = next_seq + 1;
+            let file = format!("{target_prefix}sst-{seq:06}");
+            let meta = SsTableWriter::write(&self.env, &file, seq, 0, &leftover).await?;
+            self.env.sync(&file).await.map_err(io)?;
+            target_tables.push(meta);
+            next_seq = seq;
+        }
+
         let target_manifest = Manifest {
             next_seq,
-            tables,
+            tables: target_tables,
             max_version,
             wal_segments: Vec::new(),
         };
