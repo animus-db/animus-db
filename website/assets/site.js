@@ -1,19 +1,21 @@
 /* AnimusDB site behaviour — vanilla, no dependencies, no build step.
-   Four small things: theme switch (three-state, persisted), mobile nav,
-   copy-to-clipboard on code blocks, and scrollspy for the docs sidebar. */
+   Three small things: theme switch (three-state, persisted),
+   copy-to-clipboard on code blocks, and scrollspy for the docs sidebar.
+   Small-viewport nav is CSS-only (wrap + horizontal scroll) — no JS. */
 (function () {
   "use strict";
 
   // ---- theme -------------------------------------------------------------
-  // Three explicit, persisted states: "light", "dark", "system". System
-  // (also the default when nothing is stored) removes data-theme entirely
-  // and lets prefers-color-scheme decide.
+  // Three explicit, persisted states: "light", "dark", "system". Light is
+  // the default when nothing is stored yet — system only takes over once a
+  // viewer chooses it, at which point data-theme is removed entirely and
+  // prefers-color-scheme decides.
   var STORE = "animusdb-theme";
   function stored() {
     try {
       var v = localStorage.getItem(STORE);
-      return (v === "light" || v === "dark") ? v : "system";
-    } catch (e) { return "system"; }
+      return (v === "light" || v === "dark" || v === "system") ? v : "light";
+    } catch (e) { return "light"; }
   }
   function apply(choice) {
     if (choice === "light" || choice === "dark") { document.documentElement.setAttribute("data-theme", choice); }
@@ -40,22 +42,6 @@
           try { localStorage.setItem(STORE, choice); } catch (e) { /* private mode */ }
           syncPressed(choice);
         });
-      });
-    }
-
-    // ---- mobile nav ------------------------------------------------------
-    var toggle = document.querySelector(".nav-toggle");
-    var nav = document.querySelector("nav.main");
-    if (toggle && nav) {
-      toggle.addEventListener("click", function () {
-        var open = nav.classList.toggle("open");
-        toggle.setAttribute("aria-expanded", String(open));
-      });
-      nav.addEventListener("click", function (e) {
-        if (e.target.tagName === "A") {
-          nav.classList.remove("open");
-          toggle.setAttribute("aria-expanded", "false");
-        }
       });
     }
 

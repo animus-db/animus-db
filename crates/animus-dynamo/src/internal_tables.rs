@@ -4,7 +4,8 @@
 //! An "internal table" is an **ordinary** catalog table — a real schema, real
 //! tablets, TTL-reaper eligibility, everything a user table gets — that must
 //! nonetheless be invisible and unreachable to any DynamoDB client:
-//! `ListTables` never lists it, the Data Console never shows it, and every
+//! `ListTables` never lists it, animusd console (ADR 0052's "AnimusDB Data
+//! Console") never shows it, and every
 //! client-facing data/DDL wire operation treats its name as if it did not
 //! exist. [`is_internal_table_name`] is the single predicate every one of
 //! those guards checks — a future internal table joins this same set instead
@@ -33,7 +34,7 @@ use crate::index::INDEX_TABLE_SEPARATOR;
 pub const TXN_IDEMPOTENCY_TABLE: &str = "__animus_txn_idempotency";
 
 /// Whether `name` names a reserved internal table (see the module doc):
-/// invisible to `ListTables`, the Data Console, and every client-facing
+/// invisible to `ListTables`, animusd console, and every client-facing
 /// data/DDL wire operation.
 ///
 /// A future second internal table extends this match arm rather than

@@ -140,11 +140,15 @@ impl DynamoAuthConfig {
 
 /// Which tablet-split **workflow** a cluster runs when a split triggers
 /// (ADR 0058 Train 2 rung 3's `animusd`-level driver residue): the
-/// pre-existing copy-based build/freeze/cutover workflow (ADR 0050), or the
-/// newer in-place single-entry atomic fork (ADR 0058). `Copy` is the
-/// default and is byte-for-byte the original ADR 0050 workflow — every
-/// existing deployment/test keeps its exact behavior unless this is
-/// explicitly set to `InPlace`. `ClientCtx::trigger_split`'s ONE choke
+/// original copy-based build/freeze/cutover workflow (ADR 0050), or the
+/// in-place single-entry atomic fork (ADR 0058). **`InPlace` is the default
+/// (ADR 0058 rung 4 layer 2)** — measurement on this branch showed it
+/// ~1.8× faster to converge (355.7ms vs. copy's 447.9ms same-session blip,
+/// 500-seed + repeated-e2e soak) with no correctness gap, so every
+/// deployment shape now splits in-place unless this is explicitly set to
+/// `Copy`. The copy path stays fully selectable — `--split-mode copy` on
+/// every shape that plumbs the flag — pending its own deletion in a later
+/// rung; it is not yet removed. `ClientCtx::trigger_split`'s ONE choke
 /// point reads this (from `ClientCtx::split_mode`, threaded from the
 /// `--split-mode {copy,inplace}` CLI flag — see `main.rs`'s `run`) to
 /// decide which `MetaCommand` to propose; `auto_split_loop`/
@@ -162,11 +166,13 @@ impl DynamoAuthConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SplitMode {
-    /// The ADR 0050 copy-based build/freeze/cutover workflow — unchanged,
-    /// still the default.
-    #[default]
+    /// The original ADR 0050 copy-based build/freeze/cutover workflow —
+    /// unchanged, still selectable via `--split-mode copy`, but no longer
+    /// the default (deprecated pending deletion, ADR 0058 rung 4).
     Copy,
-    /// The ADR 0058 Train 2 in-place single-entry atomic fork.
+    /// The ADR 0058 Train 2 in-place single-entry atomic fork — the
+    /// default since rung 4 layer 2.
+    #[default]
     InPlace,
 }
 

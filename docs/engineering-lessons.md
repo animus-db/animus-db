@@ -8227,8 +8227,138 @@ debugging anything that feels like it might have happened before.
   two_cluster_segment_stores_on_the_same_node_stay_isolated_by_stream`
   (two instances, two streams, a same-object-id racing `put` from the same
   node, asserting each store's own local copy holds its own payload).
+- **A full design-token rewrite ("keep the names, change the values") is only
+  safe once you've counted every consumer, and a mockup's literal CSS can
+  silently redefine what an existing token means (2026-08-25, ADR 0056,
+  the "Ledger" visual system).** Rewriting `tokens.css` in place (new
+  palette, light-default instead of dark-default, glow-means-live replaced
+  by keyline-means-live) while keeping every token *name* stable — so the
+  two consumer stylesheets (`dashboard.css`, `console.css`, ~600 lines
+  combined) and every `dashboard_*.js`/`console.js` render function needed
+  zero call-site edits — only worked because a `grep -c "var(--$t)"` sweep
+  across every consumer was run *before* writing the new file, for every
+  single token name. That surfaced two things a values-only read of the old
+  file would have missed: (1) several tokens (`--glow-*`, `--live-underline`,
+  `--accent-hi`, `--shadow-recessed`, motion timing) had **zero** consumers
+  outside `tokens.css` itself, so they were safe to gut/repoint freely
+  without a wider search; (2) `button.primary`/`.btn-new`/`.btn-save`/
+  `.seg-group button.active`/`.seg-opt.selected` all filled with
+  `var(--accent)` + `var(--accent-ink)` under the old system, but the new
+  mockups' own literal CSS filled the equivalent controls with the *ink*
+  color (`background:#211f1a;color:#fafaf9` in the light mockup) — i.e. the
+  new system's "ONE accent role" rule (accent for links/underlines/hatch
+  only, never a solid fill) is a *component* decision the token file alone
+  can't express; it required rewriting those five call sites' `background`/
+  `color` properties, not just relying on `--accent`'s new value. Trusting
+  the token rename to carry that change silently would have shipped
+  accent-filled primary buttons that merely looked different (a legal but
+  spec-violating shade) instead of catching that the button recipe itself
+  had changed. **General rule**: before a "same names, new values" token
+  rewrite, grep every consumer for every token name being touched — a
+  zero-hit token is safe to redefine freely (or even fold into another
+  token), and a token whose *default recipe* the new mockups visibly
+  contradict (a filled control's authoritative markup uses a different
+  color than the token that used to supply it) needs its call sites edited
+  by hand, because the rename alone will compile clean and still be wrong.
+  (`crates/animusd/src/tokens.css`, `dashboard.css`, `console.css`.)
+- **Renaming a branded UI surface needs its Rust test *assertions* fixed to
+  stay green, but its doc-comment prose is a separate, lower-priority sweep
+  — don't conflate the two passes (2026-08-25, ADR 0056, admin/console
+  rename).** Renaming the operator dashboard's brand text ("AnimusDB
+  Console" → "animusd admin") and the data app's ("AnimusDB Data Console" →
+  "animusd console") broke exactly two integration-test files
+  (`dashboard_endpoint.rs`, `console_endpoint.rs`) whose `body.contains(...)`
+  assertions checked the old literal strings — found by grepping `tests/`
+  for the old names *before* editing the HTML, per this repo's standing
+  rule, then fixed alongside the HTML in the same change so the gate never
+  went red. Dozens of *other* hits for the same old strings remain, on
+  purpose: module-doc `//!` comments and inline comments across
+  `dashboard.rs`, `dashboard_core.js`, `console.js`, and every
+  `crates/animusd/tests/console_*.rs` file's own header comment. None of
+  those are asserted by any test (confirmed by grep), so they don't fail
+  the gate — but they are exactly the "stranded documentation" class this
+  log already names (see the `ReplicationMode`-removal entry above): prose
+  that now describes a surface by a name the code no longer uses, silently,
+  with nothing failing to point at it. Left as a deliberate, separate
+  follow-up (out of this change's stated file scope) rather than folded in,
+  since a partial prose sweep across a ~2000-line crate guide risks
+  introducing exactly the kind of drift it would be fixing. **General
+  rule**: when a rename's brief says "update every asserted string," that
+  is a narrower, harder requirement than "update every occurrence" — grep
+  for assertions specifically (`.contains(`, `assert_eq!` against the
+  literal, etc.) to find the must-fix set, and treat every remaining
+  prose hit as a tracked, intentional gap rather than either silently
+  ignoring it or scope-creeping the change to chase it down.
+- **A theme toggle whose default writes an explicit attribute defeats a
+  static dark-mode QA render unless the toggle script is neutralized first
+  (2026-08-25, website rebuild on the Ledger system).** `site.js` applies
+  `stored()` on every load — and once "light" (not "system") is the
+  documented default, that call sets `data-theme="light"` on `<html>`
+  explicitly rather than leaving the attribute absent. A QA render that
+  hand-edits a scratch copy of a page to add `data-theme="dark"` and then
+  loads it with the page's own script still attached gets silently
+  overwritten back to light before first paint — the screenshot comes out
+  byte-identical to the light render (same file size, confirmed before
+  looking closer), which reads as "dark mode is broken" when the actual bug
+  is the QA method fighting the app's own initialization order. The fix is
+  to strip the theme script from the scratch copy for a static-render check
+  (the CSS is what's under test, not the runtime toggle), not to debug the
+  CSS. **General rule**: before concluding a themed page's dark styling is
+  broken from a scripted/automated screenshot, check whether the page's own
+  JS re-applies a *default* state on load — a `checked`/`data-*`/class
+  toggle with a persisted-with-fallback default will clobber any attribute
+  a test harness sets by editing the static HTML, and the fallback is easy
+  to miss precisely because it used to be a no-op ("system" removed the
+  attribute) before the default changed to an explicit value.
 
 ### Parallel-agent orchestration
+- **A gate command piped into `tail`/`tee` without `pipefail` reports the
+  pipe's *last* command's exit status, so the gate can fail while the
+  wrapper exits 0 (2026-08-26, ADR 0059 Train 1 PR② merge).** A
+  `cargo check --workspace --all-targets 2>&1 | tail -3` "validation" of a
+  merge-conflict resolution exited 0 while `cargo check` itself had failed
+  with E0061 — the compile error was real (main had added new
+  `run_node_with_streams_quiesce_and_split_mode` call sites in
+  `split_build.rs`/`split_lifecycle.rs` while the branch being merged had
+  widened that signature; textual auto-merge sees no conflict in files
+  only one side changed), and CI caught what the local wrapper claimed to
+  have checked. Two rules: (a) any pipeline whose exit status gates a
+  push runs under `set -o pipefail` (or checks `PIPESTATUS[0]`); (b) a
+  merge of a moved `main` into a branch that changed a function signature
+  gets its gate run on the *merged* tree specifically because the
+  dangerous call sites are the ones only `main` has — the same
+  missed-allowlist class as the "grep every gating match site" rule, at
+  merge time.
+  QA (2026-08-25, website mobile pass)** — in this harness,
+  `chromium --headless=new --window-size=390,H --screenshot=...` lays the
+  page out at the default ~800px viewport and then *crops* the PNG to
+  390px, which is visually indistinguishable from the page overflowing
+  (text "clipped" mid-glyph at the right edge). A mobile layout was
+  wrongly diagnosed as broken twice this way while the DOM was fine.
+  **Rule:** for any viewport-dependent check, drive the browser with
+  Playwright (`/opt/node22/lib/node_modules/playwright`, executablePath
+  `/opt/pw-browsers/chromium`) and set `viewport: {width, height}` on the
+  page, asserting `document.documentElement.scrollWidth` and
+  element `getBoundingClientRect()` from inside the page; keep raw
+  `--screenshot` for fixed-width artboards only. Note `scrollWidth`
+  alone can also pass while content is cut (an `overflow: hidden`
+  ancestor eats the evidence) — pair it with a bounding-rect sweep for
+  elements extending past the viewport that are not inside a deliberate
+  `overflow-x: auto` container.
+- **A subagent that launches its validation gate as a *background* task and
+  then ends its turn to "wait for the notification" stalls the whole
+  pipeline (2026-08-25, Ledger design delivery)** — background-task
+  completion notifications go to the *orchestrating* session, not to a
+  subagent that has already stopped; the subagent just sits "finished"
+  with an uncommitted tree while the orchestrator sees a completion notice
+  whose result is "waiting for tests". Two of three implementation agents
+  in one delivery did this independently, each needing a manual resume
+  ("your test task already finished — run checks foreground and commit").
+  **Rule:** subagent briefs must say *run every check as a synchronous
+  foreground command and do not end your turn before the commit exists* —
+  and when an agent's completion notice reads like a status update rather
+  than a result, resume it immediately with that instruction instead of
+  waiting for a notification that will never come.
 - **A single long-lived session can exhaust the disk on `target/` alone, with
   no parallel fan-out involved (2026-08-19)** — a solo `cargo build
   --workspace --all-targets` on this repo hit `rustc-LLVM ERROR: IO failure …
@@ -9517,6 +9647,46 @@ weight range. The cost was first estimated per weight, which was wrong by about
 4x and nearly drove a font substitution that was not needed. Fetch the file and
 look before costing it.
 
+## Closing a deferred prose sweep: rewrite in place as "new name (ADR NNNN's 'old name')" (2026-08-25, ADR 0056/0021/0052 rename follow-up)
+
+The Ledger delivery's first PR deliberately left a prose sweep as a tracked
+follow-up (see the "Renaming a branded UI surface..." entry above): dozens
+of module-doc `//!`/`//` comments across `dashboard.rs`, `lib.rs`,
+`console.rs`, every JS file header, every `console_*.rs` test header, two
+crate `CLAUDE.md`s, and the root `CLAUDE.md` still said "AnimusDB Console"/
+"AnimusDB Data Console" after the code was renamed to "animusd admin"/
+"animusd console". Closing that follow-up found two things worth keeping
+as a pattern:
+
+1. **The old strings do not live in one obvious place.** They span doc
+   comments (`rustdoc`-visible, so a stale one looks authoritative),
+   ordinary `//`/`//!` file-header comments, and test-file header comments
+   in three different crates — `rg -in "<old name>"` across the whole
+   `crates/`+`docs/` tree (excluding the ADRs themselves and the
+   engineering-lessons log, both of which are supposed to keep the
+   historical name on record) is the only way to find the full set; a
+   scan scoped to "the crate that owns the feature" misses the sibling
+   crate's references (`animus-dynamo/CLAUDE.md`'s two mentions of "the
+   Data Console" had nothing to do with `animusd` and would not have
+   turned up in an `animusd`-scoped grep).
+2. **Rewrite each hit as `new name (ADR NNNN's "old name")`, not a bare
+   swap.** A plain find-and-replace to the new name loses the old name
+   entirely, which breaks anyone (or any future grep) still searching for
+   the term the ADR itself, an old commit message, or an old bug report
+   uses; keeping the literal old string in quotes right next to the new
+   one keeps both searchable from the same line, at the cost of a few
+   extra words per comment. This is the same move ADR 0021's and ADR
+   0052's own "naming disambiguation" amendments already made in prose;
+   applying it at the comment-string level too avoids re-litigating "did
+   we mean the old system or the new one" the next time someone greps for
+   either name.
+
+General rule: when a rename's brief says "sweep the deferred prose," grep
+the *exact* old string(s) tree-wide first, do not trust the file list a
+memory of "where the feature lives" would produce, and prefer
+`new (old)`-shaped rewrites over silent replacement wherever the old name
+might still be a search target (an ADR title, a test name, a changelog).
+
 ## Move a timer's trigger, not its mechanism — and check what the seam already gives you for free (ADR 0058 rung 4)
 
 The in-place split's write-blip regression (measured ~726ms vs. the copy
@@ -9674,3 +9844,475 @@ obligation been met" — build one shared accessor that resolves identity
 to its *current* authoritative set first, and audit every existing
 consumer of the raw per-identity map for the same latent assumption, not
 just the new caller that motivated the change.
+- **A per-tick consumer arm superseded by a dedicated driver during one
+  lifecycle phase needs the SAME exclusion guard as every sibling arm the
+  driver also supersedes — audit them together, not one at a time (issue
+  #298, `animusd::index_drain::change_consumer_loop`).** `trim_janitor`
+  was correctly gated `if !splitting` (a `Splitting` tablet's own endgame
+  driver holds trim for the whole build/freeze window), but `seal_tick` —
+  two lines below it, in the same per-tick loop, over the same
+  `splitting` boolean already in scope — was not, so it could fire
+  concurrently with that same driver's own dedicated final-seal loop for
+  the identical tablet. Reproduced directly: the same record delivered
+  twice under two *adjacent* epochs of one tablet (never within one
+  epoch), which is the tell that distinguishes this from a same-epoch
+  proposal collision (that shape is already caught and retried around by
+  a content-aware confirm) — two independently-computed, non-colliding
+  epoch numbers whose *coverage* silently overlapped instead. The general
+  rule: when a lifecycle phase hands one concern (trim, seal, drain,
+  whatever) to a dedicated driver for its duration, grep every *sibling*
+  per-tick arm in the same loop for the identical exclusion condition —
+  a driver superseding one arm and not its neighbor is exactly the kind
+  of asymmetry a reviewer skims past because the superseded arm's own
+  gate reads correctly in isolation.
+- **"A read feeding a non-retried, permanent decision must use
+  `metadata_fresh()`" extends to "a decision that becomes immutable
+  bytes the instant it's made" — not just literal one-shot writes (issue
+  #298, `animusd::index_drain::seal_now`).** This crate's own
+  `CLAUDE.md` already names the first case (a schema commit-wait, a
+  conditional-write existence gate). `seal_now`'s watermark/next-epoch
+  computation looked like a routine, retried-if-wrong read — it feeds a
+  loop that keeps calling `seal_now` until nothing is left to seal, so a
+  wrong read *seems* self-correcting. It isn't: the read decides which
+  bytes go into a segment that is written to the object store and
+  cataloged in the same call, and a sealed segment is never revised —
+  only ever superseded by a later, non-overlapping one. Under
+  `effective_metadata()`'s ordinary staleness (a local node's own
+  just-committed control-plane proposal not yet reflected in its own
+  cache), a "retry" is really a *second, independent* decision computed
+  against a floor that doesn't yet exclude what the first one already
+  covered, silently producing overlapping immutable output with no later
+  correction point. The generalized discipline: a decision is
+  "non-retried" for this purpose if *what it decides* is committed to
+  something immutable in the same call, even if the *calling loop*
+  retries — the loop retrying doesn't make the decision retriable if
+  each attempt's own output can never be taken back.
+- **An "unreachable from this caller by construction" branch is a claim
+  about the absence of concurrent structural change, not a permanent
+  fact — re-derive it whenever splits (or any other lifecycle event that
+  moves/removes state) enter the picture (issue #298, `animusd::
+  txn_resolver_loop`).** The comment justifying `None` as `txn_recover`'s
+  orphan-path hint was correct the day it was written: `pending_txns`
+  only ever tracks a genuine, locally-anchored `Pending` record, so the
+  record-absent branch that hint feeds "can't" run for this caller. That
+  reasoning implicitly assumed the record stays reachable at its logical
+  position for the whole recovery window — true until a transaction
+  record turned out to be an ordinary logical key of its anchor tablet,
+  riding the identical split clone/trim path every other row does. Once
+  splits could relocate or (per a related, still-open investigation)
+  possibly drop that row, the "unreachable" branch became reachable, and
+  with no hint it had no fallback at all — it reported "still pending"
+  forever, matching an observed transaction stuck reporting
+  "TransactionConflict: ongoing" for a full test budget. The fix (passing
+  the `created_ts` this caller already had on hand, previously discarded
+  as `_created_ts`) is a no-op when the original assumption still holds
+  and only takes effect in exactly the case the comment said couldn't
+  happen. The general check: when a comment justifies skipping a
+  fallback because "X can't happen from this caller," ask whether X's
+  impossibility depends on nothing else in the system moving the state X
+  would need — a lifecycle mechanism added *after* that comment was
+  written (here, in-place split) is exactly the kind of change that can
+  quietly invalidate it without touching the caller at all.
+
+## A wake that only shortcuts discovery of a durable fact never needs to be durable itself (ADR 0058 rung 4 layer 1)
+
+The rung-4 fix above closed the first-vote latency; a second residual
+remained — the SECOND voter a fresh child needs to grant that vote was
+still discovering the fork on its own next *scheduled* poll (up to the
+50ms fast-poll interval, on top of this host's ~100ms round-trip floor).
+The fix followed the identical "move the trigger, not the mechanism"
+shape one more time: a new signal (`ForkSignal`, the same `AtomicBool` +
+`AtomicWaker` pattern `animus-cp-data` already uses for `ProposeSignal`/
+`ApplySignal`/`WakeSignal`) wakes the reconciler's tick the instant the
+apply task observes the fork, instead of waiting out the poll — but the
+materialization logic it wakes is untouched.
+
+The part worth generalizing on its own: **the new signal is deliberately
+not durable, and that is fine precisely because the fact it announces
+already is.** A crash between the apply task raising `ForkSignal` and
+anything consuming it loses the wake completely — a restarted replica has
+no memory it ever fired. That is safe by construction, not by luck,
+because the wake never became the *only* way to learn the fact: the
+reconciler's ordinary periodic tick already re-derives "did this tablet
+fork" from a durable marker (`pending_split()`) on every single pass,
+whether or not any wake ever arrived. The eager path is purely additive —
+it makes the common case fast; the unconditional fallback (already
+required for the crash-recovery case a slower poll always had to handle)
+is what makes correctness independent of whether the wake landed at all.
+
+This generalizes beyond this one signal: **when adding an eager
+notification on top of an existing polling/fallback loop, resist the urge
+to make the notification itself crash-safe.** Persisting it (or rebuilding
+it deterministically across a restart) is extra machinery solving a
+problem that doesn't exist as long as the poll loop it shortcuts remains
+correct and unconditional on its own. The corollary is a real, checkable
+test obligation, not just an argument: prove the crash-loses-the-wake case
+explicitly (this rung's `crash_after_apply_loses_the_eager_wake_but_
+reconciler_fallback_recovers` scenario), rather than treating "the eager
+path worked in every other test" as evidence the fallback still does its
+job unattended.
+
+A second, smaller point the same rung's own corpus cell needed: **an eager
+notification and the fallback it shortcuts are, by construction, going to
+race** — the eager wake fires a tick, and the ordinary periodic tick can
+still land moments later on the identical already-handled state. This is
+not a bug to prevent; it is a property to prove benign. If the mechanism
+being triggered is already idempotent (as any correct crash-recovery path
+must be — G4's optimistic-claim-then-execute discipline here), the fix
+needs no debouncing, coordination, or "only once" bookkeeping between the
+two triggers at all — just a test that fires both, back to back, and
+asserts nothing changed the second time.
+
+## Flipping an enum's `#[default]` silently re-points every `.default()` pin — audit callers for ones that meant "the current default," not "whatever the default is" (ADR 0058 rung 4 layer 2)
+
+`animusd::config::SplitMode` had a documented "pinned to `Copy`" convention:
+every deployment shape/test that didn't have an explicit override called
+`SplitMode::default()`, and the doc comments at each of those call sites
+said things like "byte-for-byte the original ADR 0050 workflow." Flipping
+`#[default]` from `Copy` to `InPlace` (the whole point of this layer) is a
+one-line change at the enum, but it silently changes the behavior of every
+one of those `.default()` call sites at once — including ones nobody was
+thinking about when they wrote `SplitMode::default()` instead of
+`SplitMode::Copy` explicitly. That fan-out is exactly the feature for
+production code (it is what makes "every deployment shape splits in-place
+unless told otherwise" a one-line change) and exactly the hazard for tests:
+a test that calls a `.default()`-threading bring-up helper because it
+never needed to think about the knob is fine either way, but a test that
+calls it because it happens to currently produce the behavior the test
+actually asserts on will silently start asserting on the wrong thing, with
+no compiler error and — if the two workflows converge to similar-looking
+end states — sometimes no test failure either.
+
+The concrete miss this rung found: two test files
+(`animusd/tests/split_lifecycle.rs`, `animusd/tests/admin_endpoint.rs`'s
+`admin_split_kicks_off_the_copy_based_workflow`) poll for a `Splitting`
+parent with exactly two `Building` children — an intermediate metadata
+shape that only the ADR 0050 copy workflow ever produces (the ADR 0058
+in-place fork mints both children directly `Active` at cutover, with no
+`Building` row ever recorded). Both files brought clusters up through
+`animusd::run_node`, which threads `SplitMode::default()` with no override.
+Before this layer, that was an accurate (if implicit) pin to `Copy`; after
+it, the exact same code silently starts requesting `BeginSplitInPlace`
+instead, and the poll would simply never observe `building.len() == 2` —
+a hang-then-timeout failure with a confusing symptom (the assertion
+message names the state it never saw, not the mode that made it
+unreachable). `split_build.rs` (ADR 0050's own end-to-end file: build,
+freeze, tail, cutover, and the copy bench) had the identical exposure. All
+three were fixed the same way — call the split-mode-taking entry point
+directly with `SplitMode::Copy` explicit, with a comment naming *why* (this
+file/test is about the copy workflow's own mechanics, not "a split" in
+general) so a future default flip doesn't quietly re-break the same
+assertion.
+
+The generalizable rule: **when a type's `#[default]` is about to change,
+grep every `Type::default()` call site, not just the ones with a comment
+already flagging them as pinned** — a caller that never explicitly named
+the variant is exactly the one most likely to be *relying* on today's
+default without saying so. Classify each one: does this caller want
+"whatever the type's default currently is" (generic behavior, safe to let
+ride the flip — and often the *point* of flipping the default, since it's
+how the new behavior gets exercised by the existing test suite for free),
+or does it want "the specific variant that happens to be the default
+today" (needs an explicit pin, or it silently starts testing something
+else, or nothing at all). The tell for the second category in this
+codebase was assertions on a workflow's own *intermediate* state shape
+(not just its converged end state) — two different mechanisms that
+converge to equivalent-looking final outcomes can still have completely
+different, mutually exclusive transient states along the way, and a test
+built around one mechanism's transient will simply never fire under the
+other's.
+
+## A much faster mechanism doesn't just change latency numbers — it changes how often a fixed test budget exercises the thing that was already flaky (ADR 0058 rung 4 layer 2)
+
+Two more `animusd/tests/streams_e2e.rs` failures surfaced flipping
+`SplitMode`'s default, past the intermediate-state-shape ones above, and
+they generalize differently.
+
+**The first was a pre-existing, mislabeled test bug this flip merely made
+visible.** `multi_split_soak_streamed_gsi_table_under_mixed_load`'s
+"zero lost writes" check read an item back via a bare `GetItem` — no
+`ConsistentRead: true` — exactly the ADR 0055 gotcha this crate's own
+`CLAUDE.md` already documents ("a read that verifies a write must ask for
+the linearizable read"). Under the copy workflow's slower, seconds-long
+per-split timeline, the eventually-consistent replica this test happened
+to read from had ample time to catch up between the write and the
+verification read, so the missing annotation never mattered in practice.
+In-place's much faster convergence didn't introduce a new staleness
+window — it didn't shrink the window fast enough relative to the rest of
+the test to hide the *pre-existing* one, and the read started actually
+observing it. Fixed the only way ADR 0055 sanctions: add
+`ConsistentRead: true` to the read that is asserting durability, not
+staleness tolerance.
+
+**The second is a real, already-tracked-but-unresolved bug (issue #298,
+an exactly-once duplication/deficit at a split boundary, root cause
+unknown) that the flip made dramatically easier to hit — not by changing
+its trigger condition, but by changing how many times a fixed-duration
+test exercises that trigger.** `multi_split_soak_streamed_gsi_table_under_
+mixed_load` runs a fixed workload (120 writes, a 300s budget) that
+auto-splits repeatedly; under copy's per-split cost, that budget fits
+however many splits copy's cadence allows, and #298 was rare enough to be
+"occasionally sighted" in that regime. In-place's ~1.8x-faster convergence
+lets dramatically more splits complete inside the identical fixed budget
+— every one of them another roll of the dice against whatever race #298
+actually is — and three consecutive runs under in-place reproduced it
+every time (a deficit-shaped failure on one run, an over-count-shaped one
+on another — both are #298's documented symptom family, just its two
+different faces). Pinning this one soak back to `SplitMode::Copy`
+(`start_streamed_cluster_full_copy_pinned`) restored its original,
+rare-in-practice flake rate — 3/3 green in the retest — without touching
+#298 itself, which stays out of scope here (a pre-existing bug gets its
+own investigation and its own change, never a drive-by fix riding an
+unrelated default flip).
+
+**The generalizable point**: when a change makes something *faster*, audit
+every fixed-duration/fixed-iteration-count test that exercises the sped-up
+path for whether it now completes measurably more repetitions of that path
+per run — a soak/stress test's own bug-detection power is a function of
+repetitions-per-budget, not just wall-clock coverage, and a large enough
+speedup can turn "reproduces rarely enough to file and defer" into
+"reproduces every run" without the underlying bug changing at all. That
+shift is worth surfacing loudly (as this entry does) rather than either
+silently loosening the newly-flaky assertion or silently pinning it away
+without a trail: **`Copy`'s eventual deletion (this same ADR's next rung)
+removes the option to pin away from this exact soak**, so whoever does
+that deletion needs to know, going in, that issue #298 will need to
+actually be resolved (or the soak's own budget/iteration count
+deliberately re-tuned) before that layer can ship — not rediscovered cold
+at that point.
+
+## A mobile `grid-template-columns: 1fr` override silently reintroduces the desktop overflow it was meant to fix (website responsive pass, ADR 0056 skin)
+
+The site's desktop grids (`.hero-grid`, `.split`, `.foot-grid`) were all
+written correctly, as `minmax(0, 1fr) minmax(0, 1fr)` — the standard
+CSS-grid guard against a track's "automatic minimum size" defaulting to the
+*min-content* width of whatever's inside it. But their `@media` overrides for
+the mobile single-column layout were written as plain `grid-template-columns:
+1fr;`, dropping the `minmax(0, ...)` the desktop rule had. Nothing looked
+wrong reading the CSS in isolation — a single `1fr` column obviously fills
+100% of the container, so it read as strictly *simpler* than the two-column
+desktop version, not weaker.
+
+It broke exactly where a grid item contained an unbreakable line: a
+`.plate .cl` terminal/diff line has `white-space: pre`, and one such line
+(`- endpoint: dynamodb.eu-west-1.amazonaws.com`) was longer than the mobile
+viewport. Its nested `overflow-x: auto` container did make *it* scroll
+locally as intended — but the plain-`1fr` grid track one level up still sized
+itself to that line's min-content width first, so the grid item's own box
+(not just its content) rendered wider than the viewport and the page itself
+gained horizontal scroll. A descendant's own `overflow: auto` does **not**
+rescue an ancestor grid/flex track's auto-min-size calculation; only
+`minmax(0, ...)` (or `min-width: 0` on the item) on the track/item that is
+actually oversized does that — matching what the desktop rule already relied
+on for the exact same content.
+
+General rule: **`minmax(0, 1fr)` is not a two-column-only idiom** — carry it
+into every breakpoint override of a `grid-template-columns` declaration,
+including the single-column ones, whenever any descendant might contain
+unbreakable content (`white-space: nowrap`/`pre`, a long token, a wide inline
+code/terminal line). A quick audit technique: `grep grid-template-columns` the
+stylesheet and check that every bare `1fr`/`Npx` track (not already wrapped in
+`minmax(0, ...)` or `min(...)`) has one — a bare `repeat(N, 1fr)` mobile
+override is the same bug with more columns. Verifying "no viewport overflow"
+by reading the CSS's collapse breakpoints is not enough; render at the target
+width and check `document.documentElement.scrollWidth`, because this class of
+bug is invisible in the source and only appears against real content.
+
+- **A Playwright `waitUntil: 'networkidle'` goto against the `website/`
+  pages can hang indefinitely in this sandbox (2026-08-26, mobile spacing
+  pass)** — the pages pull Google Fonts over HTTPS through the proxy; most
+  of the time that request resolves quickly, but occasionally it (or some
+  other cross-origin request) stays pending and `networkidle` never fires
+  because it waits for a quiet network, not a deadline. A batch script
+  driving many pages back-to-back (an 11-page x 5-width overflow matrix)
+  looked like it was making progress — earlier `ok` lines kept appearing in
+  the output — right up until it silently wedged on one page, with no error
+  and no timeout to report. Two fixes, both worth doing together: pass an
+  explicit `timeout` on every `goto` (Playwright's default is generous but
+  finite; the real risk is a bare `networkidle` promise with no timeout
+  argument at all in a batch loop), and for anything that doesn't need the
+  fonts to actually render (an overflow/scrollWidth check, not a screenshot)
+  `page.route('**://fonts.*/**', route => route.abort())` before `goto` and
+  use `waitUntil: 'load'` instead — it removes the flaky external dependency
+  entirely and the check runs in a fraction of the time. Keep `networkidle`
+  (with a timeout) for visual screenshots where you want the real fonts
+  loaded, and keep it consistent between a before/after pair — a pixel-diff
+  comparing a real-fonts render against a fallback-fonts render reports
+  every glyph as changed, which reads as a layout regression that isn't one.
+
+## A bounded retry against a live producer is a starvation flake by construction — snapshot the point-in-time state instead of retrying until it goes quiet (2026-08-26, `LsmEngine::clone_to`)
+
+The issue #298 fix (immediately above the code this touches, ADR 0058 rung
+2/Train 2) closed a correctness hole in `clone_to` — a single `flush()`
+call could silently no-op while `applies_in_flight > 0`, permanently
+dropping an acked-but-still-memtable-only row — by retrying `flush()` in a
+loop (`CLONE_FLUSH_MAX_RETRIES = 1_000`, 1ms apart) until the memtable read
+empty. That fix was correct about the *hole* but wrong about the *shape of
+the fix*: "retry until X goes quiet" only terminates if X is guaranteed to
+go quiet within the retry budget, and nothing here guaranteed that. A
+*persistent* concurrent writer — exactly `lsm_clone_concurrent.rs`'s own
+regression workload, and a real shape in production (a frozen split
+parent's own frozen-tablet exemption still lets consumer-bookkeeping
+writes land) — can refill the memtable faster than any bounded number of
+flushes drains it, so the loop doesn't just get *slow* under contention, it
+has no liveness guarantee **at all**: CI (PR #404, unrelated to this crate)
+reported the identical code failing with "memtable still non-empty after
+1000 flush retries" on a busier runner, while the same seed had passed
+locally days earlier. This is the general shape of a *starvation flake*,
+not an infra fluke, and the tell is structural, not statistical: a fixed
+retry bound racing an **unbounded** producer will eventually lose on some
+runner, no matter how generous the bound — raising it only moves the
+flake's probability, never removes it (explicitly avoided here per the
+task's own instruction, and worth calling out as a trap: "just retry more"
+is the natural first fix to reach for and is never actually a fix for this
+shape of race).
+
+**The actual fix drops the goal of "reach quiescence" entirely.** `clone_to`
+doesn't need the memtable to ever go empty — it needs to capture every
+write ACKED before the call started, and a single point-in-time snapshot
+already guarantees that for free: the write path (`log_and_apply`) only
+returns to its caller after a record is both WAL-synced and applied to the
+memtable **under the same lock** `clone_to` snapshots through, so any
+write a caller has already observed as acked is provably present at the
+next acquisition of that lock, no matter how the retry-vs-write race plays
+out. One best-effort `flush()` (kept purely as an optimization — it
+produces the pre-existing pure-SSTable-only clone shape when the source is
+quiescent) followed by one atomic snapshot of `(manifest.tables,
+memtable-contents)` is sufficient and involves no retrying, no sleeping,
+and no dependency on the writer ever pausing. Whatever the snapshot finds
+still resident in the memtable is written out as one new SSTable **inside
+the clone's own namespace** (never the source's — the fix touches nothing
+about the source's manifest/WAL/files beyond the pre-existing hard-link
+scheme), sized to exactly that one point-in-time snapshot regardless of
+how long or how fast the writer keeps going afterward. Bounded, one-shot
+work replaces unbounded-in-principle retrying.
+
+**General rule**: when a fix for "a producer can race my read of shared
+state" takes the shape of "retry until the state stops changing," stop and
+ask whether the actual correctness contract needs the state to stop
+changing at all, or only needs a *consistent snapshot* of it. The retry
+loop is usually solving the wrong problem — it's trying to wait out an
+unbounded producer instead of taking a well-defined instant of that
+producer's output, and any fixed bound put on such a loop is a deferred
+flake, not a fix, discoverable only by asking "what happens if the
+producer never stops" rather than "what happens in the common case." See
+`crates/animus-storage/CLAUDE.md`'s `clone_to` entry for the as-built
+mechanism and `crates/animus-storage/tests/lsm_clone_concurrent.rs`'s
+`clone_to_completes_under_a_writer_that_never_pauses` for the liveness
+regression (reproduces the CI failure directly against the old
+bounded-retry code, real multi-thread `ProdEnv`, `SimEnv` cannot reach this
+race — see that file's own module doc).
+
+## Issue #298, a fifth shape: two candidate mechanisms found, neither confirmed as root cause (2026-08-26)
+
+A fresh investigation (ADR 0058's G5 row, all four previously-fixed #298
+mechanisms already on `main`) re-ran `streams_e2e.rs::multi_split_soak_
+streamed_gsi_table_under_mixed_load` un-pinned from `SplitMode::Copy` to the
+default (`InPlace`) 21 times. 4/21 (~19%) failed, in two distinct shapes —
+consistent with the rung-4-layer-2 entry's own point that in-place's higher
+splits-per-budget just gives a rare pre-existing race far more rolls of the
+dice, not a new trigger condition.
+
+**Shape A (2 runs) — the literal "shape 5" this investigation was scoped
+to**: the delivered count came back *over*, not under, expected
+(`delivered=146/144`), and one member of a transactional write pair
+appeared **twice under the SAME shard (tablet+epoch)** with two distinct
+sequence numbers — a genuine double-append into the hot change log before
+either copy was ever sealed, not a seal-boundary race (which would show as
+two *different* epochs, per mechanism (2)'s own already-fixed signature).
+In one of the two runs, the OTHER member of the identical pair *did* show
+that already-fixed cross-epoch signature in the same run — the clean
+interpretation is one shared underlying event (the transaction's own
+resolve running more than once) landing on two different tablets, one of
+which happened to have a seal race between the two applies (cross-epoch)
+and one of which didn't (same-epoch, hence "shape 5"'s literal signature) —
+not two independent bugs coincidentally co-occurring.
+
+**Shape B (2 runs) — found by the same soak, not previously documented
+under #298**: `ClientCtx::txn_recover`'s in-doubt-recovery sweep decided
+**Abort** (diagnostic: `all_staged=false`) for a transaction whose write the
+test's own client had already recorded as acked (a `TransactWriteItems` 200
+response) — permanently losing that item (one run failed the immediate
+`ConsistentRead: true` read-back; a second, independent run failed the same
+way further downstream, via the lineage-delivery deadline timing out one
+record short). This is a live instance of the "duelling decider" hazard ADR
+0018 §2/PR5's own amendment names as *legal* — but that legality rests on
+both deciders reaching an objectively correct decision from independently
+verified state, an assumption a false-negative verify breaks.
+
+**Method**: `crates/animus-test/tests/stream_lineage_corpus.rs` (the
+`ANIMUS_STREAM_SEEDS` corpus) was checked first, per this round's own
+"SimEnv repro is worth more than a ProdEnv soak hit" instruction, and ruled
+out as a repro vehicle for this specific bug — it drives the copy-based
+split's lineage *purely at the `Metadata`/`MetaCommand::BeginSplit`/
+`CutoverSplit` level* (`complete_copy_split`), never through `animusd`'s own
+async orchestration (`cp_txn`, `txn_resolver_loop`, `resolve_all_parallel`'s
+timeout) where this bug's candidate mechanisms live — and `animusd` itself
+has no `animus-sim` dependency at all (already named as a gap in ADR 0058's
+G5 row for mechanism (2)), so a deterministic seed-reproducible repro of
+this specific race is not reachable without new cross-crate test
+infrastructure, out of scope for this pass. The soak itself reproduced
+fast: ~30s/run, first hit on run 5 of the first 7 unpinned attempts.
+Temporary `eprintln!` instrumentation (propose/resolve/recovery tracing at
+`cp_txn`'s participant-stage-error, abort-vs-actual-outcome, awaited-resolve
+timeout, and `TxnStage`'s apply-time "would this re-stage land on an
+already-Committed value" check; `txn_recover`'s own decide call) — modeled
+on this file's own "land a permanent diagnostic before any fix attempt"
+entry above, but kept local to the investigation and reverted before
+committing, never shipped — captured shape B live (the exact `all_staged=
+false`/`proposed=Aborted` sequence immediately preceding the lost-write
+panic) across ~15 further runs, but never caught a live full causal chain
+for shape A's own double-materialize, and the "re-stage over an
+already-Committed value" diagnostic never fired in any captured run either
+— so the candidate mechanism below for shape A is a **confirmed code gap
+via reading**, not a confirmed root cause via a captured trace.
+
+**Two structural gaps found, presented as candidates for the next
+investigation, neither fixed this round (no speculative fix, per this
+round's standing rule)**:
+
+1. `KvCommand::TxnStage`'s apply arm (`crates/animus-cp-data/src/lib.rs`,
+   the `blocked_by` computation) only rejects a stage that would overwrite a
+   *different* transaction's currently-unresolved `Envelope::Intent` — it
+   never checks whether the target key's current value is already
+   `Envelope::Committed`. Same-txn re-staging is documented as deliberately
+   unaffected ("a WAL-replay re-application"), but nothing distinguishes
+   that from a genuinely late/duplicate `TxnStage` propose landing *after*
+   its own transaction has already fully resolved: such a propose would
+   silently resurrect the key from `Committed` back into `Intent`, and a
+   later resolve (the normal flow, the resolver-loop safety net, or a
+   recovery push) would then re-run `materialize_derived` a second time, at
+   a fresh HLC — the literal "two distinct sequence ids for one write"
+   signature. (The per-key resolve path itself, checked carefully during
+   this investigation, *is* idempotent once a value is genuinely
+   `Committed` — `TxnResolve`'s own apply only materializes when the target
+   key currently holds `Envelope::Intent` naming that exact `txn_id`; the
+   gap is specifically that `TxnStage` has no equivalent guard preventing a
+   value from re-entering `Intent` state to begin with.)
+2. `ClientCtx::txn_recover`'s `all_staged` loop (`crates/animusd/src/
+   lib.rs`) folds `Ok(false)` (genuinely not staged) and `Err(_)` (the
+   verify call itself failed — most commonly `txn_verify`'s own
+   `"no CP group leader reachable"`/forwarding error, exactly what a
+   participant's tablet mid-fork/cutover produces routinely) into the same
+   `all_staged = false` bucket. A transient routing failure during exactly
+   the high-split-cadence window this soak stresses gets treated identically
+   to a permanent "never staged" fact, which can push recovery to Abort a
+   transaction whose coordinator (`cp_txn`) is concurrently deciding — or
+   has already decided — Commit from its own, unaffected view.
+
+**General lesson**: an exactly-once investigation under a much-higher
+split cadence should expect **more than one** symptom shape to fall out of
+the same soak run, not just the one shape it was scoped to chase — shape B
+here was found purely because the same instrumented soak was run enough
+times to surface it, not because it was anticipated. Treat every distinct
+panic/diagnostic signature a soak produces as its own data point even when
+only one was the assignment, and say so explicitly in the writeup rather
+than only reporting against the originally-named shape. Related to the
+"an intermittent deficit... should get a permanent on-failure diagnostic
+landed... before any fix attempt" entry above: here the diagnostic was
+temporary and reverted (this round's own instruction), which is the right
+call for an exploratory pass, but it means shape A's own root cause is
+still only a well-argued candidate, not a captured fact — a durable,
+committed diagnostic (gated by an env var or `#[cfg(test)]`, never firing
+in production) is the natural next step before the next investigation round
+attempts a fix.

@@ -1,4 +1,5 @@
-//! End-to-end tests for the AnimusDB Data Console's table page Config tab
+//! End-to-end tests for animusd console's (ADR 0052's "AnimusDB Data
+//! Console") table page Config tab
 //! endpoints (ADR 0052 PR3): `GET /console/api/tables/{name}` (full
 //! configuration), adding/dropping a GSI, toggling the stream, setting/
 //! clearing TTL, and deleting a table — all through the **console** port,

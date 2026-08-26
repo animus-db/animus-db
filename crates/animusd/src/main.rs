@@ -94,14 +94,15 @@
 //! closes; see that constant's own doc.
 //!
 //! `--split-mode {copy,inplace}` (ADR 0058 Train 2 rung 3) selects which
-//! tablet-split workflow `ClientCtx::trigger_split` proposes: `copy` (the
-//! default, and every entry point that omits the flag) is the byte-for-byte
-//! original ADR 0050 build/freeze/cutover workflow; `inplace` is the ADR
-//! 0058 single-entry atomic fork. Threads through `--config`/`--node` and
-//! `--cluster N` only — the same scope `--quiesce-after` has, and the same
-//! documented gap for `--cluster-control`/`--cluster-data` and the
-//! standalone `control`/`data`/`join` subcommands (each always runs
-//! `copy`).
+//! tablet-split workflow `ClientCtx::trigger_split` proposes: `inplace` (the
+//! default since rung 4 layer 2, and every entry point that omits the flag)
+//! is the ADR 0058 single-entry atomic fork; `copy` is the original ADR
+//! 0050 build/freeze/cutover workflow, still selectable pending its own
+//! deletion. Threads through `--config`/`--node` and `--cluster N` only —
+//! the same scope `--quiesce-after` has, and the same documented gap for
+//! `--cluster-control`/`--cluster-data` and the standalone
+//! `control`/`data`/`join` subcommands (each always runs `inplace`, with no
+//! flag to select `copy` on those shapes).
 //!
 //! `--dynamo-auth PATH` (ADR 0057) points at a JSON file holding the client
 //! DynamoDB port's SigV4 credential store — the same shape as a
@@ -328,12 +329,17 @@ async fn run(args: &[String]) -> Result<(), String> {
     let mut quiesce_after: Option<u64> = None;
     // `--split-mode {copy,inplace}` (ADR 0058 Train 2 rung 3): selects which
     // tablet-split workflow `ClientCtx::trigger_split` proposes. `None` (the
-    // flag omitted) keeps `animusd::SplitMode::Copy` — the byte-for-byte
-    // original ADR 0050 build/freeze/cutover workflow — on every mode below,
-    // exactly as if this flag never existed. Threads through `--config`/
-    // `--cluster N` only (the same scope as `--quiesce-after`); silently
-    // unused for `--cluster-control`/`--cluster-data` (a documented gap
-    // matching that path's existing `--quiesce-after` one).
+    // flag omitted) keeps `animusd::SplitMode::default()`, which is
+    // `InPlace` as of ADR 0058 rung 4 layer 2 (the ADR 0058 in-place
+    // single-entry atomic fork; was `Copy`, the original ADR 0050
+    // build/freeze/cutover workflow, until this layer flipped the default)
+    // on every mode below. `--split-mode copy` still selects the original
+    // workflow explicitly, pending its own deletion. Threads through
+    // `--config`/`--cluster N` only (the same scope as `--quiesce-after`);
+    // silently unused for `--cluster-control`/`--cluster-data` (a documented
+    // gap matching that path's existing `--quiesce-after` one) — that dev
+    // shape and the standalone `control`/`data`/`join` subcommands all get
+    // `SplitMode::default()` = `InPlace` too, with no way to override it.
     let mut split_mode: Option<animusd::SplitMode> = None;
     // `--dynamo-auth PATH` (ADR 0057): a JSON file of the same shape as a
     // `ClusterConfig`'s `dynamo_auth` section (`{"credentials": {"AKID":
@@ -1078,8 +1084,13 @@ async fn run_in_process_cluster(
             "animusd: streamed-table auto-split ALSO fires above {rate} change-bytes/sec/tablet"
         );
     }
-    if split_mode == animusd::SplitMode::InPlace {
-        println!("animusd: split-mode = inplace (ADR 0058 Train 2)");
+    match split_mode {
+        animusd::SplitMode::InPlace => {
+            println!("animusd: split-mode = inplace (ADR 0058, the default since rung 4 layer 2)")
+        }
+        animusd::SplitMode::Copy => {
+            println!("animusd: split-mode = copy (ADR 0050, explicitly selected)")
+        }
     }
     for (i, node) in nodes.iter().enumerate() {
         println!(

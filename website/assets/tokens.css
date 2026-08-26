@@ -1,117 +1,157 @@
-/* AnimusDB design tokens — the "Readout" design system (ADR 0056).
+/* AnimusDB design tokens — the "Ledger" design system (ADR 0056).
  *
  * THIS FILE IS THE SHARED BASE. It is byte-identical to
  * `website/assets/tokens.css`; `dashboard::tokens_css_matches_website_copy`
  * fails the build's test gate if the two drift. Edit one, copy to the other.
  *
  * What lives here is what is genuinely the same on every surface: the colour
- * palette, the two type families, status colours, glow, and motion. What does
- * NOT live here is geometry — radius, spacing rhythm, control height, type
- * sizes — because those are the *skin*, and the marketing site (roomy, read at
- * leisure) and the in-product consoles (dense, scanned all day) deliberately
- * differ. Each consumer sets its own skin on top of this base.
+ * palette, the two type families, status colours, and the ink-alpha ramp.
+ * What does NOT live here is geometry — radius, spacing rhythm, control
+ * height, type sizes — because those are the *skin*, and the marketing site
+ * (roomy, read at leisure) and the in-product consoles (dense, scanned all
+ * day) deliberately differ. Each consumer sets its own skin on top of this
+ * base.
  *
- * Dark is the default state. Light is a full theme, not a filter:
- * `[data-theme=light]` and `prefers-color-scheme` both override.
+ * Light is the default state (the previous "Readout" system was dark-first;
+ * Ledger flips that). Dark ("ink") is a full theme, not a filter:
+ * `[data-theme=dark]` and `prefers-color-scheme: dark` both override.
  *
- * The one rule that defines this system: GLOW MEANS LIVE. Static content never
- * glows, which is what makes a glow readable as information rather than
- * decoration. A glow on paper reads as a printing fault, so the light theme
- * substitutes a keyline (`--live-underline`) in the same position.
+ * The one rule that defines this system: KEYLINE MEANS LIVE, replacing the
+ * old glow-means-live device. A live/updating value or an active nav/tab
+ * state gets a 2px solid accent underline (`.live`, `--live-underline`) —
+ * that is the only emphasis device in the system. There is no glow, no
+ * panel gradient, and no blur/soft shadow anywhere; the surviving
+ * `--glow-*` tokens below are kept (unused) at `none` only because their
+ * names are referenced by this comment's own history — no rule in either
+ * consumer stylesheet reads them.
  */
 
 :root {
   /* --- ground --- */
-  --bg: #07080a;
-  --bg-soft: #08090c;
-  --surface: #12161c;
-  --surface2: #1a1f26;
-  --panel: linear-gradient(#12161c, #0c0f13);
-  --recessed: #0b0e12;
-  --code-bg: #060709;
+  --bg: #fafaf9;
+  --bg-soft: #f4f4f2; /* alt-section background */
+  --surface: #ffffff;
+  --surface2: #f0efec; /* neutral fill */
+  --panel: var(--surface); /* flat — Ledger has no panel gradients */
+  --recessed: var(--surface2);
+  --code-bg: #151310; /* ink-plate interior background (terminal/log surfaces) */
 
   /* --- edges --- */
-  --border: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.16);
-  --lit: rgba(255, 255, 255, 0.06);
-  --grid: rgba(255, 255, 255, 0.035);
+  --border: rgba(33, 31, 26, 0.16); /* "rule" ramp stop */
+  --border-strong: rgba(33, 31, 26, 0.3); /* "strong rule" ramp stop */
+  --lit: rgba(255, 255, 255, 0.9);
+  --grid: rgba(33, 31, 26, 0.08);
 
-  /* --- ink --- */
-  --text: #eceef0;
-  --text2: rgba(236, 238, 240, 0.78);
-  --text3: rgba(236, 238, 240, 0.6);
+  /* --- ink (text) + the alpha ramp, snapped to the system's six stops --- */
+  --text: #211f1a;
+  --ink-85: rgba(33, 31, 26, 0.85); /* strong body */
+  --ink-72: rgba(33, 31, 26, 0.72); /* muted */
+  --ink-55: rgba(33, 31, 26, 0.55); /* faint */
+  --ink-50: rgba(33, 31, 26, 0.5); /* icons */
+  --ink-30: rgba(33, 31, 26, 0.3); /* strong rule */
+  --ink-16: rgba(33, 31, 26, 0.16); /* rule */
+  --text2: var(--ink-72);
+  --text3: var(--ink-55);
 
-  /* --- accent --- */
-  --accent: oklch(72% 0.15 250);
-  --accent-hi: oklch(84% 0.11 250);
-  --accent-soft: oklch(30% 0.06 250);
-  --accent-ink: #07080a;
-  --accent-glow: rgba(106, 168, 255, 0.4);
+  /* --- accent (ONE accent role: links, live-keylines, hatch fills) --- */
+  --accent: #2f4da8;
+  --accent-hi: #24418f; /* hover */
+  --accent-soft: #dfe6f6; /* accent tint — toggle tracks, subtle fills */
+  --accent-ink: var(--bg); /* contrast text on a solid-accent surface */
+  --accent-glow: transparent;
+  --hatch: rgba(47, 77, 168, 0.55); /* bar/gauge hatch stripe */
 
   /* --- status --- */
-  --ok: oklch(74% 0.15 155);
-  --warn: oklch(80% 0.15 85);
-  --danger: oklch(70% 0.19 25);
-  --ok-bg: rgba(80, 220, 160, 0.12);
-  --warn-bg: rgba(230, 190, 90, 0.12);
-  --danger-bg: rgba(240, 90, 90, 0.12);
+  --ok: #1e6b45;
+  --warn: #6f5409;
+  --danger: #a03123;
+  --ok-bg: rgba(30, 107, 69, 0.12);
+  --warn-bg: rgba(190, 150, 40, 0.12);
+  --danger-bg: rgba(160, 49, 35, 0.12);
 
-  /* --- illumination: glow in dark, keyline in light --- */
-  --glow-s: 0 0 7px currentColor;
-  --glow-m: 0 0 16px var(--accent-glow);
-  --glow-l: 0 0 28px var(--accent-glow);
-  --glow-text: 0 0 18px var(--accent-glow);
-  --live-underline: 0;
+  /* --- ink plate: terminal/log surfaces, interior identical in both themes --- */
+  --plate-bg: #151310;
+  --plate-border: 1.5px solid #211f1a;
+  --plate-shadow: 5px 5px 0 rgba(33, 31, 26, 0.14);
+  --plate-text: #e9e5dc;
+  --plate-comment: rgba(233, 229, 220, 0.55);
+  --plate-output: rgba(233, 229, 220, 0.75);
+  --plate-accent: #8fa7e6;
+  --plate-header: rgba(233, 229, 220, 0.66);
+  --plate-rule: rgba(233, 229, 220, 0.25);
 
-  /* Readout has no drop shadows: depth is the panel gradient + lit top edge. */
-  --shadow: inset 0 1px 0 var(--lit);
-  --shadow-recessed: inset 0 1px 3px rgba(0, 0, 0, 0.6);
+  /* --- emphasis: keyline means live (glow is gone) --- */
+  --glow-s: none;
+  --glow-m: none;
+  --glow-l: none;
+  --glow-text: none;
+  --live-underline: 2px;
+
+  /* Ledger has no drop shadows, no panel gradients, no blur. */
+  --shadow: none;
+  --shadow-recessed: none;
 
   /* --- type --- */
   --font-ui: "Space Grotesk", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Roboto, sans-serif;
   --font-mono: "Martian Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 
-  /* --- motion --- */
+  /* --- motion (kept minimal — no glow to animate) --- */
   --t-control: 120ms;
   --t-panel: 220ms;
-  --t-glow: 400ms;
+  --t-glow: 0ms;
   --ease: cubic-bezier(0.2, 0, 0, 1);
 
-  color-scheme: dark;
+  color-scheme: light;
 }
 
-/* Light theme values. Token NAMES are identical — only values change. Status
- * hues drop lightness and gain chroma so they stay legible on paper. */
-:root[data-theme="light"] {
-  --bg: #fbfaf7;
-  --bg-soft: #f6f4ef;
-  --surface: #ffffff;
-  --surface2: #f2f0ea;
-  --panel: linear-gradient(#ffffff, #f7f5f1);
-  --recessed: #f2f0ea;
-  --code-bg: #15181d;
+/* Dark ("ink") theme values. Token NAMES are identical — only values change. */
+:root[data-theme="dark"] {
+  --bg: #131210;
+  --bg-soft: #191713;
+  --surface: #1b1916;
+  --surface2: #242220;
+  --panel: var(--surface);
+  --recessed: var(--surface2);
+  --code-bg: #0e0d0b;
 
-  --border: rgba(20, 20, 15, 0.11);
-  --border-strong: rgba(20, 20, 15, 0.22);
-  --lit: rgba(255, 255, 255, 0.9);
-  --grid: rgba(20, 20, 15, 0.045);
+  --border: rgba(233, 229, 220, 0.16);
+  --border-strong: rgba(233, 229, 220, 0.3);
+  --lit: rgba(255, 255, 255, 0.08);
+  --grid: rgba(233, 229, 220, 0.08);
 
-  --text: #1a1a17;
-  --text2: rgba(26, 26, 23, 0.76);
-  --text3: rgba(26, 26, 23, 0.58);
+  --text: #e9e5dc;
+  --ink-85: rgba(233, 229, 220, 0.85);
+  --ink-72: rgba(233, 229, 220, 0.72);
+  --ink-55: rgba(233, 229, 220, 0.55);
+  --ink-50: rgba(233, 229, 220, 0.5);
+  --ink-30: rgba(233, 229, 220, 0.3);
+  --ink-16: rgba(233, 229, 220, 0.16);
+  --text2: var(--ink-72);
+  --text3: var(--ink-55);
 
-  --accent: oklch(52% 0.17 250);
-  --accent-hi: oklch(44% 0.18 250);
-  --accent-soft: oklch(93% 0.03 250);
-  --accent-ink: #ffffff;
+  --accent: #8fa7e6;
+  --accent-hi: #b3c4f0;
+  --accent-soft: #2a3040;
+  --accent-ink: var(--bg);
   --accent-glow: transparent;
+  --hatch: rgba(143, 167, 230, 0.45);
 
-  --ok: oklch(48% 0.13 155);
-  --warn: oklch(52% 0.14 80);
-  --danger: oklch(52% 0.19 25);
-  --ok-bg: rgba(30, 150, 100, 0.1);
-  --warn-bg: rgba(180, 140, 30, 0.12);
-  --danger-bg: rgba(200, 50, 40, 0.08);
+  --ok: #6fc493;
+  --warn: #d8b45c;
+  --danger: #dd8873;
+  --ok-bg: rgba(111, 196, 147, 0.12);
+  --warn-bg: rgba(216, 180, 92, 0.12);
+  --danger-bg: rgba(221, 136, 115, 0.12);
+
+  --plate-bg: #0e0d0b;
+  --plate-border: 1px solid rgba(233, 229, 220, 0.25);
+  --plate-shadow: 5px 5px 0 rgba(0, 0, 0, 0.5);
+  --plate-text: #e9e5dc;
+  --plate-comment: rgba(233, 229, 220, 0.55);
+  --plate-output: rgba(233, 229, 220, 0.75);
+  --plate-accent: #8fa7e6;
+  --plate-header: rgba(233, 229, 220, 0.66);
+  --plate-rule: rgba(233, 229, 220, 0.25);
 
   --glow-s: none;
   --glow-m: none;
@@ -119,43 +159,60 @@
   --glow-text: none;
   --live-underline: 2px;
 
-  --shadow: inset 0 1px 0 var(--lit);
-  --shadow-recessed: inset 0 1px 2px rgba(20, 20, 15, 0.08);
+  --shadow: none;
+  --shadow-recessed: none;
 
-  color-scheme: light;
+  color-scheme: dark;
 }
 
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
-    --bg: #fbfaf7;
-    --bg-soft: #f6f4ef;
-    --surface: #ffffff;
-    --surface2: #f2f0ea;
-    --panel: linear-gradient(#ffffff, #f7f5f1);
-    --recessed: #f2f0ea;
-    --code-bg: #15181d;
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131210;
+    --bg-soft: #191713;
+    --surface: #1b1916;
+    --surface2: #242220;
+    --panel: var(--surface);
+    --recessed: var(--surface2);
+    --code-bg: #0e0d0b;
 
-    --border: rgba(20, 20, 15, 0.11);
-    --border-strong: rgba(20, 20, 15, 0.22);
-    --lit: rgba(255, 255, 255, 0.9);
-    --grid: rgba(20, 20, 15, 0.045);
+    --border: rgba(233, 229, 220, 0.16);
+    --border-strong: rgba(233, 229, 220, 0.3);
+    --lit: rgba(255, 255, 255, 0.08);
+    --grid: rgba(233, 229, 220, 0.08);
 
-    --text: #1a1a17;
-    --text2: rgba(26, 26, 23, 0.76);
-    --text3: rgba(26, 26, 23, 0.58);
+    --text: #e9e5dc;
+    --ink-85: rgba(233, 229, 220, 0.85);
+    --ink-72: rgba(233, 229, 220, 0.72);
+    --ink-55: rgba(233, 229, 220, 0.55);
+    --ink-50: rgba(233, 229, 220, 0.5);
+    --ink-30: rgba(233, 229, 220, 0.3);
+    --ink-16: rgba(233, 229, 220, 0.16);
+    --text2: var(--ink-72);
+    --text3: var(--ink-55);
 
-    --accent: oklch(52% 0.17 250);
-    --accent-hi: oklch(44% 0.18 250);
-    --accent-soft: oklch(93% 0.03 250);
-    --accent-ink: #ffffff;
+    --accent: #8fa7e6;
+    --accent-hi: #b3c4f0;
+    --accent-soft: #2a3040;
+    --accent-ink: var(--bg);
     --accent-glow: transparent;
+    --hatch: rgba(143, 167, 230, 0.45);
 
-    --ok: oklch(48% 0.13 155);
-    --warn: oklch(52% 0.14 80);
-    --danger: oklch(52% 0.19 25);
-    --ok-bg: rgba(30, 150, 100, 0.1);
-    --warn-bg: rgba(180, 140, 30, 0.12);
-    --danger-bg: rgba(200, 50, 40, 0.08);
+    --ok: #6fc493;
+    --warn: #d8b45c;
+    --danger: #dd8873;
+    --ok-bg: rgba(111, 196, 147, 0.12);
+    --warn-bg: rgba(216, 180, 92, 0.12);
+    --danger-bg: rgba(221, 136, 115, 0.12);
+
+    --plate-bg: #0e0d0b;
+    --plate-border: 1px solid rgba(233, 229, 220, 0.25);
+    --plate-shadow: 5px 5px 0 rgba(0, 0, 0, 0.5);
+    --plate-text: #e9e5dc;
+    --plate-comment: rgba(233, 229, 220, 0.55);
+    --plate-output: rgba(233, 229, 220, 0.75);
+    --plate-accent: #8fa7e6;
+    --plate-header: rgba(233, 229, 220, 0.66);
+    --plate-rule: rgba(233, 229, 220, 0.25);
 
     --glow-s: none;
     --glow-m: none;
@@ -163,15 +220,15 @@
     --glow-text: none;
     --live-underline: 2px;
 
-    --shadow: inset 0 1px 0 var(--lit);
-    --shadow-recessed: inset 0 1px 2px rgba(20, 20, 15, 0.08);
+    --shadow: none;
+    --shadow-recessed: none;
 
-    color-scheme: light;
+    color-scheme: dark;
   }
 }
 
-/* Shared primitives. A `.panel` is the one surface recipe in the system; a
- * `.live` value is the one thing allowed to glow. */
+/* Shared primitives. `.panel` is the flat surface recipe; a `.live` value
+ * carries the one emphasis device the system has — a 2px accent keyline. */
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -179,15 +236,15 @@
 }
 
 .live {
-  color: var(--accent-hi);
-  text-shadow: var(--glow-text);
+  color: var(--text);
   border-bottom: var(--live-underline) solid var(--accent);
+  padding-bottom: 3px;
 }
 
 .num {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.05em;
+  letter-spacing: -0.03em;
 }
 
 @media (prefers-reduced-motion: reduce) {
