@@ -1,4 +1,4 @@
-//! The AnimusDB **Data Console** (ADR 0052): a DynamoDB-shaped data app for
+//! animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
 //! application developers — browsing/querying/editing their own tables and
 //! items — deliberately separate from the operator dashboard the admin port
 //! serves (`dashboard.rs`, ADR 0021). Its defining rule, enforced structurally

@@ -2,7 +2,7 @@
 // The Storage view: folded-in debug tools that don't fit the console's other
 // views — per-tablet-per-node WAL/LSM inspection and a raw key
 // browser/inspector. Ported from the pre-redesign dashboard (unchanged
-// behavior, restyled), since the AnimusDB Console design doesn't include this
+// behavior, restyled), since the animusd admin design doesn't include this
 // level of manual storage debugging at all and it would otherwise be lost.
 // (The bulk-seed tool used to live here too; it writes real DynamoDB items
 // now, so it moved to the Data Browser's DynamoDB panel,

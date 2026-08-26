@@ -1,4 +1,5 @@
-//! End-to-end tests for the AnimusDB Data Console's table page Stream data
+//! End-to-end tests for animusd console's (ADR 0052's "AnimusDB Data
+//! Console") table page Stream data
 //! tab (ADR 0052): a table's stream shards and the records inside them, all
 //! through the **console** port, never the admin port — modeled on
 //! `tests/console_items.rs`. The property most worth a regression test here
