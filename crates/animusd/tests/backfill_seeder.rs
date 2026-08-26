@@ -775,14 +775,17 @@ async fn split_during_backfill_converges_with_correct_final_gsi() {
         matches!(resp, ClientResponse::PutOk),
         "split trigger rejected: {resp:?}"
     );
-    // The copy-based workflow (ADR 0050 rung 5) runs build → freeze →
-    // backfill-veto → cutover on its own; with an index still `Creating`
-    // the cutover deliberately WAITS for the parent's seeder to finish
-    // (the rung-5 backfill veto this test now exercises end to end), so
-    // the budget is generous. Done = the parent (1) has left the map and
-    // two Active children of the base table cover it (the GSI's hidden
-    // table may add its own tablet at any point — count only the base
-    // table's).
+    // This node's own `SplitMode` (`SplitMode::default()` = `InPlace` since
+    // ADR 0058 rung 4 layer 2; the ADR 0050 copy-based build → freeze →
+    // backfill-veto → cutover workflow still runs identically under
+    // `--split-mode copy`) drives the split on its own; with an index still
+    // `Creating` the cutover deliberately WAITS for the parent's seeder to
+    // finish (the backfill veto this test exercises end to end — both
+    // workflows share it, see `animusd/CLAUDE.md`'s in-place cutover driver
+    // entry), so the budget is generous. Done = the parent (1) has left the
+    // map and two Active children of the base table cover it (the GSI's
+    // hidden table may add its own tablet at any point — count only the
+    // base table's).
     timeout(Duration::from_secs(90), async {
         loop {
             let done = nodes.iter().all(|n| {

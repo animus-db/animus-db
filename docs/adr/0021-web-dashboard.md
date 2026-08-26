@@ -416,3 +416,17 @@ admin port, exactly as this ADR describes; the Data Console is an
 barred from showing anything this dashboard shows — on its own new port.
 Neither renames nor merges into the other; see ADR 0052's own "Naming,
 deliberately addressed" section for the full reasoning.
+
+## Amendment (2026-08-25, ADR 0056) — branded "animusd admin"
+
+This dashboard's own internal name — "the AnimusDB Console," per the
+naming-disambiguation amendment just above — is retired as of the Ledger
+design revision ([ADR 0056](0056-design-system.md)). It is branded
+**animusd admin** now (page `<title>`, topbar wordmark, source comments):
+the same **operator** surface this ADR describes — cluster health,
+placement, Raft, storage, on the admin port — under a new name, not a new
+or merged surface. Every "AnimusDB Console" reference in this ADR's own
+body and in the amendment above is historical: read it as naming the
+surface now called animusd admin. ADR 0052's data console is renamed
+alongside it, to **animusd console** — see that ADR's own matching
+amendment.

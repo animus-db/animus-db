@@ -526,6 +526,16 @@ State once here; cross-referenced from the sections below.
     after each attempt. Regression: `tests/txn_recovery.rs`'s
     `stage_over_a_foreign_pending_intent_no_ops_then_a_pushed_retry_succeeds`
     and `abort_restore_never_meets_another_transactions_intent`.
+    **Gap found, not yet fixed (issue #298, 2026-08-26)**: this guard checks
+    only for a *different* txn's unresolved `Intent` — it never checks
+    whether the current value is already `Envelope::Committed`. A stale or
+    duplicate `TxnStage` propose landing after its own transaction has
+    already fully resolved is therefore never rejected: it silently
+    resurrects the key from `Committed` back into `Intent`, and a later
+    resolve can then re-materialize its derived change-log record a second
+    time at a fresh HLC. Identified by reading, not yet caught firing live
+    in a captured repro — see `docs/engineering-lessons.md`'s matching entry
+    and ADR 0058's G5 row.
 
   Other invariants, one line each: a tablet split's `split_key` is not
   token-aligned, so a split racing an in-flight transaction could in
@@ -869,6 +879,80 @@ level driver that watches a forked-locally parent, runs the (unmodified)
 GSI-drain/backfill vetoes against it, and proposes `CutoverSplit`; the
 `--split-mode` operator flag; a real multi-node `ProdEnv` end-to-end
 regression (both landed in a later rung, see `animusd/CLAUDE.md`).
+
+#### Eager child materialization at the fork (ADR 0058 Train 2 rung 4 layer 1)
+
+The rung-4 measurement addendum found a SECOND residual on top of the
+deterministic-first-leader fix immediately above: the campaigning replica
+supplies only ONE vote instantly — a fresh 3-node child still needs a
+SECOND voter to grant a pre-vote before it can elect, and that voter's own
+`materialize_split_child` used to run only on its next *scheduled*
+tablet-host-reconciler tick (even at rung 3's fast-polled
+`INPLACE_SPLIT_RECONCILE_INTERVAL`, 50ms). The fix: **every replica
+triggers its own materialization the instant it applies `SplitTablet`
+locally**, on every hosted tablet, not only the campaigning one.
+
+- **The trigger moved; the mechanism did not** (the same discipline PR
+  #394's own campaign fix followed, and the general lesson
+  `docs/engineering-lessons.md` already names): `Reconciler::
+  materialize_split_child`'s clone/trim/host logic and its G4
+  crash-idempotency contract (above) are byte-for-byte unchanged. What's
+  new is purely a WAKE that makes the reconciler's own tick fire sooner.
+- **`ForkSignal`** (`lib.rs`, private): the same executor-agnostic
+  `AtomicBool` + `AtomicWaker` shape as this crate's existing
+  `ProposeSignal`/`ApplySignal`/`WakeSignal` — one per `RaftKvNode`,
+  raised exactly once by the **async apply task** (`apply_and_compact`'s
+  `KvCommand::SplitTablet` arm), immediately after the durable split
+  marker (`split::split_marker_key`) commits. **Never raised from the sync,
+  I/O-free `RaftCore`** (ADR 0003/0038 discipline: apply is sync and
+  I/O-free; this notify is a plain in-memory flag+wake, no I/O of its own,
+  called from the async driver-side apply exactly like every other signal
+  in this file) — this is a wake, not an inline call into the
+  materialization path itself, which stays fully async and reachable only
+  through the ordinary reconciler tick.
+- **`RaftKvNode::fork_wake(&self) -> ForkPending<'_>`** (`pub(crate)`) and
+  **`host::Reconciler::fork_wake(&self)`** (`pub`, the fan-in used outside
+  this crate): the latter resolves as soon as ANY currently-hosted
+  tablet's own signal fires (`futures::future::select_all` over each
+  hosted node's `fork_wake()`, rebuilt fresh every call — cheap, since
+  each is a plain `Arc`-backed atomic + waker — so it automatically tracks
+  this node's *current* hosted set) and never resolves on its own when
+  `hosted` is empty (`std::future::pending`), leaving a caller's other
+  `select!` arms to cover that case. `animusd::
+  tablet_host_reconciler_loop` races this as a third arm alongside
+  `metadata_watch`/the periodic fallback — see that function's own doc.
+- **Deliberately NOT durable, and recovery does not depend on it.** A
+  crash between the apply task raising the signal and any tick consuming
+  it simply loses it — on restart there is no signal left at all (a fresh
+  `RaftKvNode` starts with a fresh, unraised `ForkSignal`), and WAL replay
+  of the already-applied `SplitTablet` entry never re-raises it either
+  (the `if !frozen` idempotency guard around the whole apply arm skips the
+  block on replay, exactly like `Freeze`'s own). This is safe **by
+  construction**, not by luck: the signal only ever shortcuts discovery of
+  a fact (`pending_split()`) that is independently durable and that the
+  reconciler's ordinary periodic tick already re-derives on every pass
+  regardless of whether any wake ever fired — proven directly by `tests/
+  inplace_split_reconciler.rs`'s `crash_after_apply_loses_the_eager_wake_
+  but_reconciler_fallback_recovers` scenario.
+- **The eager attempt and a later reconciler tick may race benignly.**
+  Nothing prevents `fork_wake()` firing a tick that materializes both
+  children, immediately followed by the reconciler's own next periodic
+  tick re-observing the identical already-forked state — this is exactly
+  the existing G4 double-attempt discipline (`EngineFactory::probe` skips
+  a re-clone; the optimistic `LocalState::hosted` claim skips a re-host),
+  now exercised by a second, genuinely independent caller instead of only
+  by a crash-retry. Proven directly by `tests/inplace_split_reconciler.rs`'s
+  `eager_wake_and_reconciler_tick_race_benignly` scenario: `fork_wake()`
+  resolves with zero prior ticks, the first tick after it materializes
+  both children, and a second, back-to-back tick changes nothing — same
+  hosted set, same two engines, byte-for-byte.
+
+**Measured effect** (ADR 0058's own rung-4-layer-1 measurement addendum):
+median write blip drops from 508.0ms (rung 4, campaign only) to 355.7ms —
+landing at or below a same-session copy-based reference run (447.9ms) for
+the first time, though with real run-to-run variance the addendum reports
+honestly rather than smoothing over. See the ADR for the full before/after
+table.
 
 ### HostAction
 

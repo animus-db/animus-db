@@ -309,7 +309,8 @@ comment for its full type/method inventory.
   durable record on the reserved internal `__animus_txn_idempotency` table
   (`internal_tables` module, `is_internal_table_name`/`TXN_IDEMPOTENCY_TABLE`)
   — an ordinary schema-registered, TTL-reaped table, invisible to
-  `ListTables`/the Data Console/every client-facing data or DDL operation.
+  `ListTables`/animusd console (ADR 0052's "AnimusDB Data Console")/every
+  client-facing data or DDL operation.
   New `WireError` constructors `idempotent_parameter_mismatch`/
   `transaction_in_progress` carry the two new failure shapes a reused token
   can produce. `TransactGetItems` carries no such token — AWS gives reads
@@ -340,7 +341,7 @@ comment for its full type/method inventory.
   tests. **`Query` now paginates exactly like `Scan`**
   (`decode_query` parses `Limit`/`ExclusiveStartKey` the same way
   `decode_scan` does, sharing the decode helpers; found and closed while
-  building the Data Console's Items tab, ADR 0052 PR4, which needed it and
+  building animusd console's Items tab, ADR 0052 PR4, which needed it and
   had to work around its absence): `animusd::dynamo::run_base_query`/
   `run_gsi_query`/`run_lsi_query` push `limit` down via
   `paginated_table_examine`/`paginated_kind_examine_one` bounded to the

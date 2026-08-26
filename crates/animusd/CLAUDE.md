@@ -58,8 +58,8 @@ reusing the captured config is the point of the test.
   it from position — `from_json` hard-errors on a duplicate) and the
   **six-port stride** (ADR 0047 + ADR 0052 + ADR 0053: `base_port + 6*i +
   {internal,client,dynamo,admin,intra,console}` — `intra` at offset 4
-  (the client/intra-cluster RPC port split), `console` at offset 5 (the
-  AnimusDB Data Console, ADR 0052 — a DynamoDB-shaped data app on its own
+  (the client/intra-cluster RPC port split), `console` at offset 5 (animusd
+  console, ADR 0052's "AnimusDB Data Console" — a DynamoDB-shaped data app on its own
   port, deliberately separate from the operator dashboard the admin port
   serves; bound on combined/data-only nodes, never control-only, which
   hosts no CP-data tablet). `generate`/`generate_split` mint `"n{i}"`,
@@ -305,8 +305,8 @@ reusing the captured config is the point of the test.
   untouched), `headers` is purely additive.
 - **`otel.rs`** — OTLP/HTTP distributed-tracing seam (ADR 0027); opt-in, no-op
   unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Scoped to this crate only.
-- **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** — the
-  "AnimusDB Console" SPA (ADR 0021): `include_str!`'d and served as
+- **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** —
+  animusd admin (ADR 0021's "AnimusDB Console") SPA: `include_str!`'d and served as
   distinct static assets, vanilla JS, no bundler/CDN/build step — edit,
   `cargo build`, reload. Tabs are role-gated client-side (ADR 0035 PR7). The
   Streams tab — shown on **every** role now, including control-only; only
@@ -320,7 +320,7 @@ reusing the captured config is the point of the test.
   admin port; see `console.rs`'s own entry and ADR 0052's "Naming,
   deliberately addressed" for the full disambiguation.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
-  — the AnimusDB **Data Console** (ADR 0052): a DynamoDB-shaped data app for
+  — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —
   never the admin port (documented no-auth, trusted-interface-only, ADR
   0020) and never a route on the DynamoDB wire listener. Bound on combined
@@ -621,25 +621,36 @@ kill).
 
 **`SplitMode` (ADR 0058 Train 2 rung 3's `animusd`-level driver residue)
 selects between the copy-based workflow above and the in-place one**:
-`animusd::config::SplitMode` (`Copy`/`InPlace`, `Copy` the default and
-every existing config/test), stored as a plain `ClientCtx.split_mode`
-field — deliberately **not** a `ClusterConfig` field (unlike
-`DynamoAuthConfig`, which has no other way to reach a `--config FILE`
-process): this is threaded exactly the way `--auto-split`/`--quiesce-after`
-are, as a CLI-parsed runtime parameter down the `spawn_common_tail`/
-`start_with_growth`/`start_control_with`/`start_data_with_growth` call
-chain, so adding it never touched `ClusterConfig`'s struct-literal shape
-(which dozens of existing tests construct directly). `--split-mode
-{copy,inplace}` threads through `--config FILE --node I` and `--cluster N`
-only — the identical scope `--quiesce-after` has, including the same
-documented gap for `--cluster-control`/`--cluster-data` and the standalone
-`control`/`data`/`join` subcommands (each always runs `Copy`, no flag of
-its own). `ClientCtx::trigger_split` is still the ONE choke point both
-workflows share (see its own doc, `lib.rs`): `self.split_mode` is the sole
-branch point between proposing `MetaCommand::BeginSplit` or
-`BeginSplitInPlace`, with identical children (same shape, same fields),
-the identical idempotent already-`Splitting` handling, the identical
-confirm loop, and identical F11 alignment — `auto_split_loop`/
+`animusd::config::SplitMode` (`Copy`/`InPlace`; **`InPlace` is the default
+since ADR 0058 rung 4 layer 2** — measurement showed it ~1.8× faster to
+converge with no correctness gap, see that ADR's rung-4-layer-2 as-built
+note — `Copy` was the default and every config/test's implicit behavior
+before this layer, and stays fully selectable via `--split-mode copy`
+pending its own deletion, not yet done), stored as a plain
+`ClientCtx.split_mode` field — deliberately **not** a `ClusterConfig` field
+(unlike `DynamoAuthConfig`, which has no other way to reach a `--config
+FILE` process): this is threaded exactly the way `--auto-split`/
+`--quiesce-after` are, as a CLI-parsed runtime parameter down the
+`spawn_common_tail`/`start_with_growth`/`start_control_with`/
+`start_data_with_growth` call chain, so adding it never touched
+`ClusterConfig`'s struct-literal shape (which dozens of existing tests
+construct directly). `--split-mode {copy,inplace}` threads through
+`--config FILE --node I` and `--cluster N` only — the identical scope
+`--quiesce-after` has, including the same documented gap for
+`--cluster-control`/`--cluster-data` and the standalone
+`control`/`data`/`join` subcommands (each always runs `SplitMode::
+default()` = `InPlace`, no flag of its own to select `Copy`). A test that
+specifically exercises the copy workflow's own mechanics (its
+`Splitting`/`Building` intermediate metadata shape, its build/freeze/tail
+driver, its own bench) must pin `SplitMode::Copy` explicitly rather than
+relying on `SplitMode::default()`/`run_node` — see
+`docs/engineering-lessons.md`'s rung-4-layer-2 entry for the audit and the
+two test files this caught. `ClientCtx::trigger_split` is still the ONE
+choke point both workflows share (see its own doc, `lib.rs`): `self.
+split_mode` is the sole branch point between proposing `MetaCommand::
+BeginSplit` or `BeginSplitInPlace`, with identical children (same shape,
+same fields), the identical idempotent already-`Splitting` handling, the
+identical confirm loop, and identical F11 alignment — `auto_split_loop`/
 `admin::action_split`/`ClientRequest::SplitTablet` all fall in behind
 whichever mode is configured automatically, with no fork of their own.
 
@@ -961,6 +972,20 @@ loop` recovery path went through the buggy grouping. `KvCommand::
 TxnResolve`'s own `fence` (`animus-cp-data/CLAUDE.md`'s Key invariants
 entry) is the structural seatbelt against a repeat of this specific
 mistake, in this function or any future caller.
+
+**Gap found, not yet fixed (issue #298, 2026-08-26)**: `txn_recover`'s
+`all_staged` loop folds a `txn_verify` `Err` (most commonly a transient
+"no CP group leader reachable" while a participant's tablet is mid-fork/
+cutover) into the same bucket as a genuine `Ok(false)` ("never staged").
+Under a high split cadence this can push recovery to Abort a transaction
+whose own coordinator (`cp_txn`) is concurrently deciding, or has already
+decided, Commit — a live instance of the "duelling decider" hazard ADR
+0018 §2/PR5 accepts as legal only because both deciders are assumed to
+reach an objectively correct decision from independently verified state.
+Caught live (a captured `all_staged=false`/`Aborted` decision immediately
+preceding a "acked write lost" panic) during a `SplitMode::InPlace`-unpinned
+soak; not yet fixed — see `docs/engineering-lessons.md`'s matching entry
+and ADR 0058's G5 row.
 
 **A wire-reachable panic found (and fixed) while testing this**:
 `RaftKvNode::txn_stage`'s anchor-key-length assert (ADR 0022, `TOKEN_BYTES`)
@@ -2042,3 +2067,43 @@ deployment shape, and the `WatchMetadata`/system-table/OTel/metrics support
 surfaces.
 `support/mod.rs` holds the shared bring-up helpers (port-TOCTOU retries,
 split-cluster bring-up).
+
+## Benchmark
+
+`benches/cluster_bench.rs` (`cargo bench -p animusd`) is a hand-rolled
+(no criterion, zero new dependencies), `harness = false` bench of the
+DynamoDB JSON/HTTP wire over a real in-process cluster — `ProdEnv`, real
+sockets/disk/clock, following `animus-storage/benches/engine_bench.rs`'s
+style. It measures, per operation class, p50/p99/p99.9/mean latency and
+throughput: `PutItem`, `GetItem` with `ConsistentRead: true` and `false`
+**reported separately, never blended** (ADR 0055's two read paths),
+`Query` within a partition, a paged `Scan`, a concurrent-`PutItem`
+throughput sweep at `ANIMUS_BENCH_CLIENTS` client counts (each its own
+persistent TCP connection), and a **degraded phase**: after the
+healthy-cluster classes it finds and kills the bench tablet's own leader
+node (`/admin/raftkv`'s `is_leader`) and re-measures `PutItem`/
+`GetItem(ConsistentRead:true)` through the resulting election, via a
+bounded-retry wire helper that counts (and reports) retries rather than
+failing on a transient "not the leader here". Cluster bring-up follows
+`tests/inplace_split_bench.rs`/`tests/split_build.rs`'s bounded-retry
+port-TOCTOU idiom. Workload knobs: `ANIMUS_BENCH_NODES` (3),
+`ANIMUS_BENCH_ITEMS` (2_000, preload size), `ANIMUS_BENCH_OPS` (1_000,
+measured ops per class), `ANIMUS_BENCH_VALUE_BYTES` (256),
+`ANIMUS_BENCH_CLIENTS` ("1,8,32"), and `ANIMUS_BENCH_JSON=<path>` to also
+write a machine-readable results document. Its methodology deliberately
+tracks `website/performance.html`'s stated commitments (tail percentiles
+not averages, both read modes reported apart, a failure phase in every
+run, no DynamoDB comparison) — see that file and this bench's own module
+doc for the full mapping.
+
+**Manual/local only — this bench does not run in CI.** Real sockets, real
+disk, and real elapsed wall clock make it unsuitable for a shared runner's
+noise floor (the same reason `tests/inplace_split_bench.rs`/
+`split_build.rs`'s own benches are `#[ignore]`d rather than part of the
+default `cargo test` run). Run it locally when you need a number, not as
+a gate. **Numbers are comparable only to another run on the same host, in
+the same session** — never across machines or sessions, per
+`docs/engineering-lessons.md`'s "a historical bench figure from a
+different host is not a baseline" entry: if you need to compare against
+an earlier figure, rerun the earlier configuration alongside the new one
+on this same host rather than trusting a number quoted from elsewhere.
