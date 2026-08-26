@@ -973,6 +973,20 @@ TxnResolve`'s own `fence` (`animus-cp-data/CLAUDE.md`'s Key invariants
 entry) is the structural seatbelt against a repeat of this specific
 mistake, in this function or any future caller.
 
+**Gap found, not yet fixed (issue #298, 2026-08-26)**: `txn_recover`'s
+`all_staged` loop folds a `txn_verify` `Err` (most commonly a transient
+"no CP group leader reachable" while a participant's tablet is mid-fork/
+cutover) into the same bucket as a genuine `Ok(false)` ("never staged").
+Under a high split cadence this can push recovery to Abort a transaction
+whose own coordinator (`cp_txn`) is concurrently deciding, or has already
+decided, Commit — a live instance of the "duelling decider" hazard ADR
+0018 §2/PR5 accepts as legal only because both deciders are assumed to
+reach an objectively correct decision from independently verified state.
+Caught live (a captured `all_staged=false`/`Aborted` decision immediately
+preceding a "acked write lost" panic) during a `SplitMode::InPlace`-unpinned
+soak; not yet fixed — see `docs/engineering-lessons.md`'s matching entry
+and ADR 0058's G5 row.
+
 **A wire-reachable panic found (and fixed) while testing this**:
 `RaftKvNode::txn_stage`'s anchor-key-length assert (ADR 0022, `TOKEN_BYTES`)
 was a sound "caller invariant" before `ClientRequest::Txn` existed — no
