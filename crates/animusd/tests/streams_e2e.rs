@@ -2635,12 +2635,25 @@ async fn multi_split_soak_streamed_gsi_table_under_mixed_load() {
         };
 
         // 1. Zero lost writes: every acked item reads back through a node
-        //    that didn't originate most of them.
+        //    that didn't originate most of them. `ConsistentRead: true` is
+        //    load-bearing here, not decoration (ADR 0055): the wire
+        //    default is genuinely eventually consistent (served from
+        //    *any* replica's own applied state, no read barrier), so an
+        //    unqualified read right after a cascade of cutovers can
+        //    legitimately observe a replica — including a brand-new split
+        //    child — that hasn't caught up yet. That is a real DynamoDB
+        //    client's own job to ask around, exactly like every other
+        //    write-verifying read in this codebase's test suite already
+        //    does post-ADR-0055 (see `docs/engineering-lessons.md`'s
+        //    "weakening a default is a test-suite-wide event" entry) —
+        //    this soak's own step 1 was missed in that audit.
         for id in &ids {
             let (status, body) = dynamo(
                 nodes[2].dynamo_addr(),
                 "DynamoDB_20120810.GetItem",
-                &format!(r#"{{"TableName":"soak","Key":{{"id":{{"S":"{id}"}}}}}}"#),
+                &format!(
+                    r#"{{"TableName":"soak","Key":{{"id":{{"S":"{id}"}}}},"ConsistentRead":true}}"#
+                ),
             )
             .await;
             assert_eq!(status, 200, "GetItem({id}) failed");

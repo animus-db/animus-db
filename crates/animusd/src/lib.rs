@@ -7786,10 +7786,47 @@ impl ClientCtx {
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
+        self.cp_kind_write_raw_bounded(table, writes, change_log, CLIENT_TIMEOUT)
+            .await
+    }
+
+    /// [`cp_kind_write_raw`](Self::cp_kind_write_raw)'s single-attempt
+    /// sibling: identical write, but a `FROZEN_REFUSAL`-shaped failure
+    /// returns immediately instead of retrying for `CLIENT_TIMEOUT` (issue
+    /// #298). The one caller today is `reconcile_partition`'s GSI row
+    /// write, invoked from the frozen-endgame acceleration loop
+    /// (`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`) — see
+    /// `index_drain::is_retryable_elsewhere`'s doc for why that loop must
+    /// not spend up to `CLIENT_TIMEOUT` *per pass* blocked on a write whose
+    /// own target tablet can, under a cascade, be mid-split and needing
+    /// this SAME node's own `change_consumer_loop` to reach its turn before
+    /// it ever un-freezes — multiplying a per-write retry budget by a
+    /// per-pass loop count is exactly the shape that turned a few co-hosted
+    /// splits into a multi-minute self-inflicted stall. A single fast
+    /// failure here costs a fraction of a millisecond, so the loop's own
+    /// pass count (or `change_consumer_loop`'s next ordinary 200ms tick)
+    /// is the only retry budget actually spent.
+    pub(crate) async fn cp_kind_write_raw_once(
+        &self,
+        table: &str,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        self.cp_kind_write_raw_bounded(table, writes, change_log, Duration::ZERO)
+            .await
+    }
+
+    async fn cp_kind_write_raw_bounded(
+        &self,
+        table: &str,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
+        timeout: Duration,
+    ) -> Result<(), String> {
         let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
         };
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let err = match self.cp_route(table, &first).await {
                 CpRoute::Local(leader) => {
