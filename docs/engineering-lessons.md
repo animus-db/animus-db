@@ -8245,6 +8245,23 @@ debugging anything that feels like it might have happened before.
   attribute) before the default changed to an explicit value.
 
 ### Parallel-agent orchestration
+- **Headless-Chromium `--window-size` screenshots are not responsive-layout
+  QA (2026-08-25, website mobile pass)** — in this harness,
+  `chromium --headless=new --window-size=390,H --screenshot=...` lays the
+  page out at the default ~800px viewport and then *crops* the PNG to
+  390px, which is visually indistinguishable from the page overflowing
+  (text "clipped" mid-glyph at the right edge). A mobile layout was
+  wrongly diagnosed as broken twice this way while the DOM was fine.
+  **Rule:** for any viewport-dependent check, drive the browser with
+  Playwright (`/opt/node22/lib/node_modules/playwright`, executablePath
+  `/opt/pw-browsers/chromium`) and set `viewport: {width, height}` on the
+  page, asserting `document.documentElement.scrollWidth` and
+  element `getBoundingClientRect()` from inside the page; keep raw
+  `--screenshot` for fixed-width artboards only. Note `scrollWidth`
+  alone can also pass while content is cut (an `overflow: hidden`
+  ancestor eats the evidence) — pair it with a bounding-rect sweep for
+  elements extending past the viewport that are not inside a deliberate
+  `overflow-x: auto` container.
 - **A subagent that launches its validation gate as a *background* task and
   then ends its turn to "wait for the notification" stalls the whole
   pipeline (2026-08-25, Ledger design delivery)** — background-task
