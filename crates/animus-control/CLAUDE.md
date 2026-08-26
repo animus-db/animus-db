@@ -390,9 +390,35 @@ per-tablet CP data plane (`animus-cp-data`).
   `index_backfill_key` shape) even though `Metadata`'s own map key is
   `(BackupId, TabletId)` — see `docs/engineering-lessons.md`'s entry on why
   those two orders are independent decisions, not the same constraint
-  twice. Scope of this PR: the catalog only — no capture driver, no
+  twice. Scope of PR ①: the catalog only — no capture driver, no
   `SegmentStore` plumbing, no wire API, no janitor loop (later PRs in the
   ADR 0059 stack).
+
+  **§6 (the backup-vs-split race), added by Train 1 PR③**: `RecordBackup
+  TabletComplete`'s admission check and `CompleteBackup`'s completeness
+  check both went from a bare direct-membership test to `traces_to_pinned`
+  (walk a reporting tablet's own `split_lineage` chain up until a pinned
+  tablet is found, or the chain runs out) / `pinned_tablet_capture_complete`
+  (a pinned tablet is satisfied once every one of its current live
+  `split_lineage` descendants — `live_split_descendants`, walking the
+  chain the other direction — has its own progress row), so a re-planned
+  split descendant's completion report is accepted even though it was
+  never itself pinned. `backup_manifest_tablet_progress` is the one
+  accessor every consumer of "what tablets does this backup's manifest
+  actually cover" now shares (`backup_total_bytes`, the completion
+  aggregator's manifest assembly, `animusd`'s `/admin/backups` view) —
+  **not** a blanket scan of `Metadata::backup_tablet_progress`, because a
+  pinned tablet that reported directly and only *then* happened to split
+  (an ordinary, backup-unrelated split racing an already-finished tablet)
+  leaves its own report behind as a harmless orphan row once its
+  descendants become the authoritative reporters instead; summing both
+  would double-count that range in the final manifest. `backup_ready_to_
+  complete`/`backup_capture_target` are the two pure predicates the
+  capture driver and completion aggregator (`animusd`, PR③) — and the
+  `ANIMUS_BACKUP_SEEDS` corpus (`animus-test`) — all share rather than
+  re-deriving independently. See `docs/engineering-lessons.md`'s entry on
+  why this needed one canonical accessor rather than a per-consumer
+  re-derivation.
 
 ## What's non-obvious
 
