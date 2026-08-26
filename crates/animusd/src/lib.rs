@@ -2745,7 +2745,7 @@ pub struct RoleAddrs {
     /// ephemeral loopback port.
     #[serde(default = "default_ephemeral_addr")]
     pub admin: SocketAddr,
-    /// The **AnimusDB Console** (ADR 0052) — a DynamoDB-shaped data app for
+    /// **animusd console** (ADR 0052's "AnimusDB Data Console") — a DynamoDB-shaped data app for
     /// application developers, deliberately separate from the operator
     /// dashboard the admin port serves (ADR 0021): it must never surface
     /// cluster-shaped state (nodes, replicas, tablets, Raft, quorum,
@@ -2793,7 +2793,7 @@ pub struct BoundNode {
     /// sequence.
     intra_listener: TcpListener,
     intra_addr: SocketAddr,
-    /// The AnimusDB Data Console's own listener (ADR 0052) — a combined node
+    /// animusd console's own listener (ADR 0052's "AnimusDB Data Console") — a combined node
     /// hosts CP-data tablets, so it always binds one; see
     /// [`console`](crate::console)'s module doc.
     console_listener: TcpListener,
@@ -2856,7 +2856,7 @@ pub(crate) struct AdminInfo {
     pub(crate) auto_split_bytes_threshold: Option<u64>,
 }
 
-/// Project the replicated schema catalog into the AnimusDB Data Console's own
+/// Project the replicated schema catalog into animusd console's own
 /// [`console::TableSummary`] rows (ADR 0052 PR2 — the tables-list screen's
 /// data source). Lives here, in `lib.rs` — not in `console.rs` — on purpose:
 /// this is the one function in the whole node that reads `Metadata`'s schema
@@ -3035,7 +3035,7 @@ fn console_gsi_detail(schema: &TableSchema, idx: &animus_control::IndexDef) -> c
     }
 }
 
-/// Project one table's full configuration for the Data Console's table page
+/// Project one table's full configuration for animusd console's table page
 /// Config tab (ADR 0052 PR3, `GET /console/api/tables/{name}`) — the
 /// `TableDetail`-shaped sibling of [`console_table_summaries`]'s per-table
 /// `TableSummary` (every count there becomes a full declaration here).
@@ -3123,7 +3123,7 @@ fn is_valid_key_attribute_type(t: &str) -> bool {
     matches!(t, "S" | "N" | "B")
 }
 
-/// The Data Console's mutating-endpoint seam (ADR 0052 PR3, widened by PR6's
+/// animusd console's mutating-endpoint seam (ADR 0052 PR3, widened by PR6's
 /// `create_table`) — [`console::ConsoleBackend`]'s one implementor. Every
 /// method either reuses the same DynamoDB wire path the real edge/
 /// `/admin/data/dynamo` use (`crate::dynamo::execute_routed`, this PR's
@@ -3968,7 +3968,7 @@ fn spawn_common_tail(
     )));
     // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020).
     tasks.push(tokio::spawn(admin::serve(admin_listener, ctx.clone())));
-    // The AnimusDB Data Console (ADR 0052) — `None` on a control-only node
+    // animusd console (ADR 0052's "AnimusDB Data Console") — `None` on a control-only node
     // (it hosts no CP-data tablet, so it has nothing for the console to
     // show; see `BoundControlNode::start_control_with`, the only caller that
     // passes `None`). Still takes no `ClientCtx` directly: a
@@ -4741,7 +4741,7 @@ pub struct Node {
     /// populated — every deployment shape binds and (from `intra/2-cutover`
     /// onward) serves it.
     intra_addr: SocketAddr,
-    /// `None` on a control-only node (ADR 0052) — the AnimusDB Data Console
+    /// `None` on a control-only node (ADR 0052) — the animusd console
     /// listener is never bound there (it hosts no CP-data tablet). See
     /// [`console_addr`](Self::console_addr)'s doc.
     console_addr: Option<SocketAddr>,
@@ -4912,7 +4912,7 @@ impl Node {
         self.intra_addr
     }
 
-    /// The address the AnimusDB Data Console listens on (ADR 0052).
+    /// The address animusd console listens on (ADR 0052).
     ///
     /// # Panics
     /// If this node has no data role — see [`dynamo_addr`](Self::dynamo_addr)'s
@@ -5429,7 +5429,7 @@ pub struct BoundDataNode {
     admin_addr: SocketAddr,
     intra_listener: TcpListener,
     intra_addr: SocketAddr,
-    /// The AnimusDB Data Console's own listener (ADR 0052) — a data-only
+    /// animusd console's own listener (ADR 0052's "AnimusDB Data Console") — a data-only
     /// node hosts real CP-data tablets, so it always binds one; see
     /// [`console`](crate::console)'s module doc.
     console_listener: TcpListener,
@@ -5452,7 +5452,7 @@ impl BoundDataNode {
         self.admin_addr
     }
 
-    /// The address the AnimusDB Data Console listens on (ADR 0052).
+    /// The address animusd console listens on (ADR 0052).
     pub fn console_addr(&self) -> SocketAddr {
         self.console_addr
     }

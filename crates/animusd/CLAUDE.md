@@ -58,8 +58,8 @@ reusing the captured config is the point of the test.
   it from position — `from_json` hard-errors on a duplicate) and the
   **six-port stride** (ADR 0047 + ADR 0052 + ADR 0053: `base_port + 6*i +
   {internal,client,dynamo,admin,intra,console}` — `intra` at offset 4
-  (the client/intra-cluster RPC port split), `console` at offset 5 (the
-  AnimusDB Data Console, ADR 0052 — a DynamoDB-shaped data app on its own
+  (the client/intra-cluster RPC port split), `console` at offset 5 (animusd
+  console, ADR 0052's "AnimusDB Data Console" — a DynamoDB-shaped data app on its own
   port, deliberately separate from the operator dashboard the admin port
   serves; bound on combined/data-only nodes, never control-only, which
   hosts no CP-data tablet). `generate`/`generate_split` mint `"n{i}"`,
@@ -305,8 +305,8 @@ reusing the captured config is the point of the test.
   untouched), `headers` is purely additive.
 - **`otel.rs`** — OTLP/HTTP distributed-tracing seam (ADR 0027); opt-in, no-op
   unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Scoped to this crate only.
-- **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** — the
-  "AnimusDB Console" SPA (ADR 0021): `include_str!`'d and served as
+- **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** —
+  animusd admin (ADR 0021's "AnimusDB Console") SPA: `include_str!`'d and served as
   distinct static assets, vanilla JS, no bundler/CDN/build step — edit,
   `cargo build`, reload. Tabs are role-gated client-side (ADR 0035 PR7). The
   Streams tab — shown on **every** role now, including control-only; only
@@ -320,7 +320,7 @@ reusing the captured config is the point of the test.
   admin port; see `console.rs`'s own entry and ADR 0052's "Naming,
   deliberately addressed" for the full disambiguation.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
-  — the AnimusDB **Data Console** (ADR 0052): a DynamoDB-shaped data app for
+  — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —
   never the admin port (documented no-auth, trusted-interface-only, ADR
   0020) and never a route on the DynamoDB wire listener. Bound on combined

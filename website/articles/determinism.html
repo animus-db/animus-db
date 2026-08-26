@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Determinism, and why you should care — AnimusDB</title>
+<meta name="description" content="Deterministic simulation testing framed as risk reduction, with its boundaries drawn honestly and six questions to interrogate anyone who claims it.">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="canonical" href="https://animusdb.io/articles/determinism.html">
+<meta property="og:title" content="Determinism, and why you should care — AnimusDB">
+<meta property="og:description" content="Deterministic simulation testing framed as risk reduction, with its boundaries drawn honestly and six questions to interrogate anyone who claims it.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Martian+Mono:wght@400;700&display=swap">
+<link rel="stylesheet" href="../assets/tokens.css">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<div class="banner">
+  <b>Pre-alpha</b> — not ready for production data. <a href="../index.html#status">Where it stands →</a>
+</div>
+
+<header class="site">
+  <div class="wrap bar">
+    <a class="brand" href="../index.html">
+      <svg width="24" height="24" viewBox="0 0 32 32" aria-hidden="true">
+        <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+          <path d="M16 5.5a10.5 10.5 0 0 1 9.09 5.25"/>
+          <path d="M25.09 21.25A10.5 10.5 0 0 1 16 26.5"/>
+          <path d="M6.91 21.25A10.5 10.5 0 0 1 6.91 10.75"/>
+        </g>
+        <circle cx="16" cy="16" r="3.1" fill="currentColor"/>
+      </svg>
+      AnimusDB
+    </a>
+    <nav class="main">
+      <a href="../index.html">Overview</a>
+      <a href="../how-it-works.html">How it works</a>
+      <a href="../docs.html">Docs</a>
+      <a href="../install.html">Install</a>
+      <a href="https://github.com/animus-db/animus-db">GitHub</a>
+    </nav>
+    <div class="theme-switch" role="group" aria-label="Theme">
+      <button type="button" data-theme-choice="light" aria-pressed="false" aria-label="Light theme">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"/>
+        </svg>
+      </button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false" aria-label="Dark theme">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M13.2 9.1A5.6 5.6 0 1 1 6.9 2.8a4.4 4.4 0 0 0 6.3 6.3Z"/>
+        </svg>
+      </button>
+      <button type="button" data-theme-choice="system" aria-pressed="false" aria-label="System theme">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="1.6" y="2.6" width="12.8" height="8.6" rx="1.4"/><path d="M5.6 14h4.8M8 11.2v2.8"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+<article class="article">
+  <div class="article-head">
+    <span class="eyebrow-line">Risk</span>
+    <h1>Determinism, and why you should care</h1>
+    <p class="lede">Simulation testing is usually explained as an engineering practice. For someone deciding whether to trust a database with real data, it is better understood as a claim about which failures you will meet in production — and how fast they get fixed when you do.</p>
+  </div>
+
+  <p>Start with the class of bug that matters, because it is not the class your test suite is aimed at.</p>
+  <p>Unit tests catch logic errors. Integration tests catch interface mismatches. Both are worth having and neither finds the bugs that take distributed databases down. Those come from <strong>partial failure</strong>: the node that is not dead but not answering; the network that delivers the message, late, after the retry has already been delivered; the leader that has been replaced but hasn't noticed; the disk that reports a successful write it did not actually make durable.</p>
+  <p>These bugs need a specific interleaving of events to appear. In a system with any real concurrency, the space of interleavings is astronomically large, and almost all of them are fine. You do not have a correctness problem in the ordinary case. You have a correctness problem in one arrangement out of ten thousand — which, at production request rates, is a Tuesday.</p>
+
+  <h2>Why staging doesn't find them</h2>
+  <p>The standard answer is to run a copy of production and hope. It does not work, for two reasons that compound each other.</p>
+  <p>The first is that you cannot <em>schedule</em> the conditions. You can wait for a partition to occur naturally between two of your zones, and you will wait a long time, and when it happens it will not coincide with a leader election and a slow disk. The interesting failures are conjunctions, and conjunctions of rare events are rarer still.</p>
+  <p>The second is worse. On the rare occasion staging does produce one, <strong>you cannot reproduce it</strong>. You have a log fragment, an assertion that fired once, and a system whose behaviour depends on thread scheduling and network timing you do not control. Engineers then spend days trying to provoke the failure again, because a bug you cannot reproduce is a bug you cannot confidently fix. Frequently the outcome is a plausible patch, an unprovable claim that it worked, and a ticket closed on optimism.</p>
+  <div class="pull">Finding a distributed-systems bug is the cheap half. Reproducing it is where the money goes.</div>
+
+  <h2>What deterministic simulation actually is</h2>
+  <p>The idea is to remove every source of non-determinism from the system, so that a run is a pure function of its inputs.</p>
+  <p>Everything that could vary between executions — the clock, the network, the disk, task scheduling, random numbers — is accessed through an abstraction rather than directly. In production, that abstraction is the operating system. Under test, it is a deterministic substitute:</p>
+  <ul>
+    <li><strong>Time</strong> is virtual. It advances when the simulation says so, which means a week of cluster life runs in seconds and a timeout can be made to fire at the precise moment that hurts.</li>
+    <li><strong>The network</strong> is a queue whose delivery order, delays, drops, duplicates and partitions are chosen by a seeded generator.</li>
+    <li><strong>The disk</strong> can be told to be slow, to fail, to reorder, or to lose data that was never flushed — the way real disks behave when a machine loses power.</li>
+    <li><strong>Scheduling</strong> is controlled by the simulation rather than by the operating system, so the interleaving is chosen deliberately instead of observed by luck.</li>
+  </ul>
+  <p>A whole cluster then runs inside a single process, faster than real time, with faults injected on purpose rather than awaited. Instead of hoping to encounter one bad interleaving, you sample the space of them systematically, for as many machine-hours as you care to spend.</p>
+
+  <h3>Then the important part</h3>
+  <p>Because nothing varies except the seed, <strong>a failing run is fully described by one number</strong>. Hand that number to a colleague and they get the identical failure. Put it in CI and the failure replays a year later, on different hardware, after a refactor.</p>
+  <p>This is what converts the expensive half of a distributed bug into a constant. The fix is verified by re-running the seed. The regression test <em>is</em> the seed. Nobody has to argue about whether a patch worked.</p>
+
+  <h2>What it buys you, as the person signing off</h2>
+  <ul>
+    <li><strong>Failures move earlier.</strong> The one-in-ten-thousand interleaving is met in development, when it is a test run, rather than in production, when it is an incident.</li>
+    <li><strong>Fix times become predictable.</strong> The unbounded step — reproduce it — is removed. That changes what an SLA on bug turnaround can honestly promise.</li>
+    <li><strong>Fault handling is exercised, not assumed.</strong> The recovery paths that normally run for the first time during an outage have run thousands of times.</li>
+    <li><strong>Correctness is checked continuously.</strong> Invariants such as linearizability can be asserted on every simulated run, not sampled during an occasional chaos exercise.</li>
+  </ul>
+
+  <h2>What it does not buy</h2>
+  <p>Any claim this strong deserves its boundary drawn by the people making it, so here is ours.</p>
+  <p><strong>It is not a proof.</strong> Simulation samples the space of executions; it does not exhaust it. Confidence rises with machine-hours, and it never reaches certainty.</p>
+  <p><strong>It only tests what was modelled.</strong> The simulator injects the faults we thought of. Real environments are more inventive: firmware that lies about flushing, a NIC that corrupts one packet in a billion, a kernel bug, an operator running the wrong command. Nothing under the simulator sees any of that.</p>
+  <p><strong>It only covers what is under it.</strong> A design where half the system bypasses the abstraction is only half tested, and the untested half is exactly where you would not want to be surprised.</p>
+  <p><strong>It says nothing about performance.</strong> Virtual time is what makes the technique work, and it is also why a simulated run tells you nothing about latency on real hardware. Those numbers have to be measured separately — and, for AnimusDB, <a href="../performance.html">have not been</a>.</p>
+  <p><strong>It is not a substitute for production experience.</strong> It is the best available substitute for the specific class of bug described at the top of this page, which is a narrower and more defensible claim.</p>
+
+  <h2>This is not a novel idea</h2>
+  <p>The technique is well established, and it is worth knowing the lineage rather than taking it on trust from us.</p>
+  <p>FoundationDB is the canonical case: it built a deterministic simulator before it built the database, and its reputation for durability is generally attributed to that decision more than to any other. TigerBeetle applies the same approach to a financial transactions database and publishes its simulator's results openly. Antithesis exists as a company selling deterministic simulation as a service, which is a reasonable signal that the industry considers the problem real.</p>
+  <p>AnimusDB is in that tradition rather than inventing anything: the simulator came first, and the database is written to live inside it.</p>
+
+  <h2>How to interrogate anyone who claims this</h2>
+  <p>"Deterministic simulation testing" is becoming a marketing phrase, and it covers a wide range of actual rigour. If a vendor claims it — this one included — these are the questions that separate the claim from the practice.</p>
+  <ol>
+    <li><strong>What fraction of the system runs under the simulator?</strong> The consensus layer only, or the storage engine and the API layer too? Coverage is the whole game.</li>
+    <li><strong>Is time virtual, or merely accelerated?</strong> If timeouts still depend on the wall clock, runs are not deterministic and seeds do not replay.</li>
+    <li><strong>Which faults are injected?</strong> Partitions and crashes are the easy ones. Ask about clock skew, disk faults, message duplication and reordering, and partial writes.</li>
+    <li><strong>How many seed-hours run per release, and where do you publish that?</strong> A technique that runs nightly on one machine is a different claim from one that runs on a fleet.</li>
+    <li><strong>When a seed fails, does it become a permanent test?</strong> If found seeds are not kept and replayed in CI, the same bug can return.</li>
+    <li><strong>What escaped anyway?</strong> The most useful answer any project can give is a specific bug that the simulator missed, and what was added to the model afterwards.</li>
+  </ol>
+  <p>Ask us those six. The answers are in the <a href="https://github.com/animus-db/animus-db">repository</a> and in the design records, which is where they belong — a claim about testing that you cannot inspect is just a claim.</p>
+
+  <h2>Why this matters more for a young project</h2>
+  <p>Mature databases have a different kind of evidence: years of production use, across thousands of deployments, with the worst bugs found by other people. That is genuinely the strongest evidence there is, and AnimusDB does not have it. It is pre-alpha, and <a href="../index.html#status">nobody has run it in production</a>, including us.</p>
+  <p>Deterministic simulation is not a replacement for that evidence. It is the only thing available that partially substitutes for it — a way for a young system to have already survived failures that a mature one accumulated the slow way. When you are weighing a database with no operational history, the right question is not whether it has been tested. It is whether the testing was designed to find the failures that history would have found.</p>
+
+  <span class="kicker" style="display:block;margin:34px 0 12px;border-top:1px solid var(--border);padding-top:24px">Keep reading</span>
+  <div class="cardgrid c2" style="margin-bottom:40px">
+    <div class="lcard"><span class="tag">Mechanism</span><h3><a href="../architecture.html#determinism">Determinism, from the inside</a></h3><p>How the environment abstraction works, and how it fits the two-plane design.</p></div>
+    <div class="lcard"><span class="tag">Status</span><h3><a href="../index.html#status">Where it stands</a></h3><p>What works today, what is planned, and what is honestly not there yet.</p></div>
+  </div>
+</article>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div>
+        <h5>Product</h5>
+        <ul>
+          <li><a href="../index.html">Overview</a></li>
+          <li><a href="../how-it-works.html">How it works</a></li>
+          <li><a href="../install.html">Install</a></li>
+          <li><a href="../docs.html">Documentation</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Reference</h5>
+        <ul>
+          <li><a href="../architecture.html">Architecture</a></li>
+          <li><a href="../compatibility.html">Compatibility</a></li>
+          <li><a href="../performance.html">Performance</a></li>
+          <li><a href="../licence.html">Licensing</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Writing</h5>
+        <ul>
+          <li><a href="why-lock-in-compounds.html">Why lock-in compounds</a></li>
+          <li><a href="what-self-hosting-costs.html">What self-hosting actually costs</a></li>
+          <li><a href="determinism.html">Determinism, and why you should care</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Project</h5>
+        <ul>
+          <li><a href="https://github.com/animus-db/animus-db">GitHub</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/issues">Issues</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contributing</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">Design records</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/LICENSE">Licence text</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>Pre-alpha — not ready for production data.</span>
+      <span class="spacer"></span>
+      <span class="mono">AGPL-3.0 · animusdb.io</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,4 +1,5 @@
-//! End-to-end tests for the AnimusDB Data Console's table page Items tab
+//! End-to-end tests for animusd console's (ADR 0052's "AnimusDB Data
+//! Console") table page Items tab
 //! (ADR 0052 PR4): `Scan` (paginated), `Query` by partition key, and the
 //! `GetItem`/`PutItem`/`DeleteItem` round trip — all through the
 //! **console** port, never the admin port, modeled on

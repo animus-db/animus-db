@@ -1,6 +1,6 @@
 "use strict";
 // Shared state, fetch helpers, formatting utilities, theme, and tab routing
-// for the AnimusDB Console. `dashboard_overview.js`, `dashboard_placement.js`,
+// for animusd admin (ADR 0021's "AnimusDB Console"). `dashboard_overview.js`, `dashboard_placement.js`,
 // `dashboard_tablets.js`, `dashboard_streams.js`, `dashboard_browser.js`, and
 // `dashboard_storage.js` load after this file and call into it (STATE, $, esc, getJSON, postJSON,
 // pill, consoleLink, bytes, humanBytes, tokenBound, b64url, nodeIdOf, cpGroupsByTablet,
@@ -45,22 +45,36 @@ async function loadSelf() {
 }
 
 // ---- theme ----
-// A UI preference, not data — persisted client-side only. Both palettes are
-// fully defined in dashboard.css; this just toggles which one applies.
-const THEME_KEY = "animusdb-console-theme";
-function applyTheme(theme) {
-  document.documentElement.dataset.theme = theme;
-  const btn = $("theme-toggle");
-  if (btn) btn.textContent = theme === "light" ? "Light" : "Dark";
+// A UI preference, not data — persisted client-side only. Both palettes
+// (light default, dark "ink") are fully defined in tokens.css; this just
+// picks which one applies. Three choices: "light"/"dark" pin an explicit
+// palette via `data-theme`; "system" clears the attribute entirely so
+// tokens.css's `prefers-color-scheme` media query decides (and keeps
+// deciding live — no JS listener needed, the media query re-evaluates on
+// its own when the OS preference changes). Light is the default when
+// nothing is stored yet (ADR 0056 flips the old dark-by-default).
+const THEME_KEY = "animusd-admin-theme";
+function applyThemeChoice(choice) {
+  const root = document.documentElement;
+  if (choice === "light" || choice === "dark") root.dataset.theme = choice;
+  else delete root.dataset.theme;
+  document.querySelectorAll(".theme-switch button[data-theme-choice]").forEach((b) => {
+    b.classList.toggle("active", b.dataset.themeChoice === choice);
+  });
 }
 function initTheme() {
   const saved = localStorage.getItem(THEME_KEY);
-  applyTheme(saved === "light" ? "light" : "dark");
+  applyThemeChoice(saved === "dark" || saved === "system" ? saved : "light");
 }
-function toggleTheme() {
-  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-  localStorage.setItem(THEME_KEY, next);
-  applyTheme(next);
+function wireThemeSwitch(containerId) {
+  const el = $(containerId);
+  if (!el) return;
+  el.querySelectorAll("button[data-theme-choice]").forEach((b) => {
+    b.addEventListener("click", () => {
+      localStorage.setItem(THEME_KEY, b.dataset.themeChoice);
+      applyThemeChoice(b.dataset.themeChoice);
+    });
+  });
 }
 
 // Fetch JSON from `base + path`; throws on network/HTTP error.
@@ -497,7 +511,7 @@ function render() {
 
 // ---- tab routing (ADR 0021 follow-up 7: real URLs, refresh/back/forward preserve the tab) ----
 // One flat set of views, presented as a sidebar (not a top nav row — the
-// AnimusDB Console design's shell). Each keeps its own id and `/admin/ui/<tab>`
+// animusd admin design's shell). Each keeps its own id and `/admin/ui/<tab>`
 // path (the server's `is_ui_path` just prefix-matches, and existing
 // bookmarks/tests target these exact leaves).
 //
