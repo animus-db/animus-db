@@ -616,7 +616,37 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
                     );
                 }
             }
-            if stream_enabled
+            // `!splitting`, mirroring `trim_janitor`'s own guard just below
+            // (issue #298): a `Splitting` tablet's endgame driver
+            // (`split_driver_tick`/`inplace_split_driver_tick`, above) owns
+            // this tablet's terminal seal exclusively — it loops `seal_now`
+            // to exhaustion, anchored at the frozen tablet's own final
+            // position, as one step of its fixed endgame sequence. Letting
+            // this ordinary per-tick seal arm ALSO fire for the same
+            // `Splitting` tablet raced it against that dedicated call: both
+            // independently read `ClientCtx::effective_metadata()` (staleness-
+            // tolerant by design, not `metadata_fresh()`) to compute their own
+            // `watermark`/`next_epoch` inside `seal_now`, so an in-flight or
+            // just-committed sibling seal is not guaranteed visible yet —
+            // each can independently conclude "nothing sealed past here,
+            // mint the next epoch" and commit two DIFFERENT epoch numbers
+            // covering the SAME records (unlike a same-epoch collision,
+            // which `seal_now`'s content-aware confirm already catches and
+            // retries around). Every downstream consumer walks the shard
+            // chain by epoch and has no way to know two epochs overlap, so
+            // it delivers the covered records once per epoch — the
+            // duplicate-delivery shape this issue tracks. A frozen tablet's
+            // backlog is static (nothing new can land past the freeze), so
+            // skipping this arm here costs nothing: there is no size/age
+            // trigger left to fire that the endgame's own exhaustive loop
+            // doesn't already cover before it ever proposes `CutoverSplit`.
+            // Pre-existing in both split workflows (this guard's absence
+            // predates ADR 0058's in-place split by construction — the
+            // copy-based endgame's own final seal loop is exposed to the
+            // identical race) — in-place split's much higher splits-per-
+            // soak-run rate just gave it far more chances to fire.
+            if !splitting
+                && stream_enabled
                 && let Err(e) =
                     seal_tick(&ctx, &meta, &table, tablet, &group, &mut first_hot_seen).await
             {
@@ -2344,7 +2374,34 @@ pub(crate) async fn seal_now(
     tablet: TabletId,
     group: &CpGroup,
 ) -> Result<Option<u64>, String> {
-    let meta = ctx.effective_metadata();
+    // `metadata_fresh()`, not `effective_metadata()` (issue #298): this
+    // read decides `watermark`/`next_epoch`, which become IMMUTABLE
+    // segment-store bytes the instant this call proposes — a permanent
+    // decision, never retried against a corrected view once made (this
+    // crate's own `CLAUDE.md`: "a read feeding a non-retried, permanent
+    // decision must use `metadata_fresh()`"). `effective_metadata()`'s
+    // local cache is fed by `Metadata`'s own `DRIVER_APPLIED` async apply
+    // task (ADR 0038) and can lag this SAME node's own just-committed
+    // control-plane proposal by an uncontrolled amount — ordinarily
+    // negligible, but under this soak's own concurrent-split load a prior
+    // `SealStreamShard` this exact node committed moments ago (its own
+    // OWN prior loop iteration, or a losing seal's very next retry
+    // attempt one `INDEX_DRAIN_INTERVAL` tick later) can still be
+    // invisible to a fresh call's own `watermark`/`next_epoch`
+    // computation. When that happens, this call is not "racing a
+    // stranger" — it silently re-derives the SAME already-sealed span
+    // (the epoch number BECOMES a fresh N+1 the instant the cache catches
+    // up, but the byte RANGE was computed against a floor that doesn't yet
+    // exclude what epoch N already covers), writing a genuinely new,
+    // non-colliding epoch whose own content OVERLAPS its predecessor's —
+    // sealed segment bytes are immutable once written, so nothing later
+    // ever detects or corrects this the way the same-epoch collision path
+    // (this function's own commit-wait poll, below) does. This is a
+    // strictly stronger guarantee than that poll's own content-aware
+    // check: that poll only catches a LOSING same-epoch collision;
+    // `metadata_fresh()` here prevents the DIFFERENT-epoch overlap this
+    // read was never able to see coming.
+    let meta = ctx.metadata_fresh().await;
     // The label to seal under: the table's *current* schema label if it has
     // one (the ordinary case, and F12-b's disable path — the final seal
     // runs before `SetTableStream{None}` ever proposes, so the schema still
