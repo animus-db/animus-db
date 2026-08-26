@@ -1,4 +1,4 @@
-// AnimusDB Data Console — client-side app (ADR 0052). Vanilla JS, no
+// animusd console (ADR 0052's "AnimusDB Data Console") — client-side app. Vanilla JS, no
 // bundler, no dependencies: this file and `console.html`/`console.css` are
 // the whole client. Every screen is a pure client of the console's own
 // `/console/api/*` JSON endpoints — nothing here ever renders a node id, a

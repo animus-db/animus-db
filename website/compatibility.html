@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compatibility — AnimusDB</title>
+<meta name="description" content="Which DynamoDB operations AnimusDB supports, which it doesn't, and the four differences that will show up in your code.">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="canonical" href="https://animusdb.io/compatibility.html">
+<meta property="og:title" content="Compatibility — AnimusDB">
+<meta property="og:description" content="Which DynamoDB operations AnimusDB supports, which it doesn't, and the four differences that will show up in your code.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Martian+Mono:wght@400;700&display=swap">
+<link rel="stylesheet" href="assets/tokens.css">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<div class="banner">
+  <b>Pre-alpha</b> — not ready for production data. <a href="index.html#status">Where it stands →</a>
+</div>
+
+<header class="site">
+  <div class="wrap bar">
+    <a class="brand" href="index.html">
+      <svg width="24" height="24" viewBox="0 0 32 32" aria-hidden="true">
+        <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+          <path d="M16 5.5a10.5 10.5 0 0 1 9.09 5.25"/>
+          <path d="M25.09 21.25A10.5 10.5 0 0 1 16 26.5"/>
+          <path d="M6.91 21.25A10.5 10.5 0 0 1 6.91 10.75"/>
+        </g>
+        <circle cx="16" cy="16" r="3.1" fill="currentColor"/>
+      </svg>
+      AnimusDB
+    </a>
+    <nav class="main">
+      <a href="index.html">Overview</a>
+      <a href="how-it-works.html">How it works</a>
+      <a href="docs.html">Docs</a>
+      <a href="install.html">Install</a>
+      <a href="https://github.com/animus-db/animus-db">GitHub</a>
+    </nav>
+    <div class="theme-switch" role="group" aria-label="Theme">
+      <button type="button" data-theme-choice="light" aria-pressed="false" aria-label="Light theme">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"/>
+        </svg>
+      </button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false" aria-label="Dark theme">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M13.2 9.1A5.6 5.6 0 1 1 6.9 2.8a4.4 4.4 0 0 0 6.3 6.3Z"/>
+        </svg>
+      </button>
+      <button type="button" data-theme-choice="system" aria-pressed="false" aria-label="System theme">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="1.6" y="2.6" width="12.8" height="8.6" rx="1.4"/><path d="M5.6 14h4.8M8 11.2v2.8"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<div class="subnav">
+  <div class="wrap">
+    <a href="architecture.html">Architecture</a>
+    <a href="compatibility.html" class="on">Compatibility</a>
+    <a href="performance.html">Performance</a>
+    <a href="licence.html">Licensing</a>
+  </div>
+</div>
+
+<main id="main">
+
+<div class="wrap ref-head" style="--rh-pt:38px;--rh-pb:20px">
+  <span class="kicker">Compatibility</span>
+  <h1>What your SDK can call, and what it can't.</h1>
+  <p style="font-size:15.5px;color:var(--ink-78,var(--ink-72));max-width:740px;margin-bottom:20px">AnimusDB speaks the DynamoDB wire protocol, so the AWS SDKs and the <code>aws</code> CLI work against it unmodified. Compatibility is not the same as identity, and this page is where the differences are written down rather than discovered.</p>
+  <div class="plate" style="max-width:560px">
+    <div class="head"><span class="t">the entire integration</span><span class="ext">diff</span></div>
+    <div class="body">
+      <div class="cl dm">- endpoint: dynamodb.eu-west-1.amazonaws.com</div>
+      <div class="cl dp">+ endpoint: animus.internal:7102</div>
+    </div>
+  </div>
+</div>
+
+<section>
+  <div class="wrap">
+    <span class="kicker">The data model</span>
+    <h2>A partitioned, sorted map of maps.</h2>
+    <p class="body-text">A wide-column key/value store in the Dynamo lineage. Tables hold items addressed by a partition key and an optional sort key. Attributes are schemaless: strings, numbers, binaries, booleans, nulls, lists, maps and sets.</p>
+    <p class="body-text">If you have modelled for DynamoDB, you have modelled for this. Single-table designs, composite sort keys, sparse indexes and the rest all carry over, because they are properties of the API rather than of the service behind it.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <span class="kicker">API status</span>
+    <h2>Operation by operation.</h2>
+    <div class="table-scroll" style="margin-top:14px">
+      <table>
+        <thead><tr><th>Operation</th><th style="width:120px">Status</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>CreateTable</code></td><td><span class="pill yes">Supported</span></td><td class="d">Partition and sort keys, GSIs and LSIs at creation</td></tr>
+          <tr><td><code>DescribeTable</code></td><td><span class="pill yes">Supported</span></td><td class="d">Includes index status and stream configuration</td></tr>
+          <tr><td><code>UpdateTable</code></td><td><span class="pill yes">Supported</span></td><td class="d">Add or drop a GSI on a populated table, with online backfill</td></tr>
+          <tr><td><code>PutItem</code> · <code>GetItem</code> · <code>DeleteItem</code></td><td><span class="pill yes">Supported</span></td><td class="d">Condition expressions, projections, all attribute types</td></tr>
+          <tr><td><code>UpdateItem</code></td><td><span class="pill yes">Supported</span></td><td class="d">Update expressions with conditions</td></tr>
+          <tr><td><code>Query</code></td><td><span class="pill yes">Supported</span></td><td class="d">Key conditions, filters, index queries, pagination</td></tr>
+          <tr><td><code>Scan</code></td><td><span class="pill yes">Supported</span></td><td class="d">Filters and pagination. Ordered by token — see the differences below</td></tr>
+          <tr><td><code>BatchWriteItem</code> · <code>BatchGetItem</code></td><td><span class="pill yes">Supported</span></td><td class="d">Per-request atomicity, DynamoDB-faithful</td></tr>
+          <tr><td><code>TransactWriteItems</code> · <code>TransactGetItems</code></td><td><span class="pill yes">Supported</span></td><td class="d">Put, Update, Delete and ConditionCheck actions</td></tr>
+          <tr><td><code>UpdateTimeToLive</code> · <code>DescribeTimeToLive</code></td><td><span class="pill yes">Supported</span></td><td class="d">—</td></tr>
+          <tr><td>Streams API</td><td><span class="pill yes">Supported</span></td><td class="d"><code>ListStreams</code>, <code>DescribeStream</code>, <code>GetShardIterator</code>, <code>GetRecords</code></td></tr>
+          <tr><td><code>DeleteTable</code> · <code>ListTables</code></td><td><span class="pill yes">Supported</span></td><td class="d">On the DynamoDB endpoint; also in the admin API and the consoles</td></tr>
+          <tr><td>Authentication (SigV4)</td><td><span class="pill opt">Opt-in</span></td><td class="d">Off by default. Without it, any caller that can reach the port is trusted</td></tr>
+          <tr><td>Backups, global tables, on-demand billing</td><td><span class="pill out">Out of scope</span></td><td class="d">These are properties of a managed service, not of the API</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <span class="kicker">Differences that will show up in your code</span>
+    <h2>Four things to check before you assume a drop-in.</h2>
+    <div class="cardgrid c4" style="margin-top:16px">
+      <div class="lcard"><span class="tag">Ordering</span><h3>Scans are ordered by token</h3><p>A full <code>Scan</code> returns items in token order, not partition-key order. Sort-key ordering within a partition is preserved. If your code relies on the order a scan happens to produce, it was already relying on something DynamoDB does not promise — but it will now notice.</p></div>
+      <div class="lcard"><span class="tag">Capacity</span><h3>No provisioned or on-demand capacity</h3><p>There are no RCUs, WCUs or throttling responses to plan around, because there is no billing meter. Your capacity limit is the hardware you gave it, and you find it with monitoring rather than with a quota.</p></div>
+      <div class="lcard"><span class="tag">Identity</span><h3>Credential checks are opt-in</h3><p>SigV4 verification exists on the client port and is off by default. Until you switch it on, any value works — and everything IAM would enforce, per-table access, condition keys, encryption context, has to be enforced somewhere else.</p></div>
+      <div class="lcard"><span class="tag">Ecosystem</span><h3>The AWS-side integrations aren't there</h3><p>Streams work, but they aren't Lambda triggers. There is no PITR, no global tables, no DAX, no CloudWatch. Where a design leans on one of those, that part is a port rather than a config change.</p></div>
+    </div>
+    <div class="aside"><strong>How to test the claim rather than believe it.</strong> Point your existing integration suite at a local three-node cluster with <code>--endpoint-url</code> and run it. That takes an afternoon and it is worth more than this table.</div>
+    <div class="ctalink-row">
+      <a class="ctalink" href="install.html">Install and try it →</a>
+      <a class="ctalink" href="how-it-works.html">Back to how it works →</a>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div>
+        <h5>Product</h5>
+        <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="how-it-works.html">How it works</a></li>
+          <li><a href="install.html">Install</a></li>
+          <li><a href="docs.html">Documentation</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Reference</h5>
+        <ul>
+          <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="compatibility.html">Compatibility</a></li>
+          <li><a href="performance.html">Performance</a></li>
+          <li><a href="licence.html">Licensing</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Writing</h5>
+        <ul>
+          <li><a href="articles/why-lock-in-compounds.html">Why lock-in compounds</a></li>
+          <li><a href="articles/what-self-hosting-costs.html">What self-hosting actually costs</a></li>
+          <li><a href="articles/determinism.html">Determinism, and why you should care</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Project</h5>
+        <ul>
+          <li><a href="https://github.com/animus-db/animus-db">GitHub</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/issues">Issues</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contributing</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">Design records</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/LICENSE">Licence text</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>Pre-alpha — not ready for production data.</span>
+      <span class="spacer"></span>
+      <span class="mono">AGPL-3.0 · animusdb.io</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

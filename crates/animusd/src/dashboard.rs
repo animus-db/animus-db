@@ -1,4 +1,4 @@
-//! The AnimusDB Console (ADR 0021): a self-contained single-page app served
+//! animusd admin (ADR 0021's "AnimusDB Console"): a self-contained single-page app served
 //! from the admin port for manual cluster testing and operation — Overview,
 //! Placement, Tablets, Data Browser, and Storage. ADR 0035 PR7 adds a sixth
 //! view, Node; a Streams view (ADR 0042/0043) is a seventh — DynamoDB Streams'

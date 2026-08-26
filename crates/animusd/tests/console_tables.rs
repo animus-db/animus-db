@@ -1,4 +1,5 @@
-//! End-to-end tests for the AnimusDB Data Console's tables-list JSON
+//! End-to-end tests for animusd console's (ADR 0052's "AnimusDB Data
+//! Console") tables-list JSON
 //! endpoint (`GET /console/api/tables`, ADR 0052 PR2): the projection from
 //! the replicated schema catalog is correct for a table with a sort key, one
 //! without, one carrying GSIs and LSIs, one with a stream, and one with TTL

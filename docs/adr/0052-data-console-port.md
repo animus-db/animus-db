@@ -785,3 +785,16 @@ static credentials (default-off). The **console and admin ports are
 unchanged** — their trusted-operator-network posture stands, and auth
 there remains the flagged prerequisite this ADR states before the console
 is exposed more widely.
+
+## Amendment (2026-08-25, ADR 0056) — branded "animusd console"
+
+This ADR's own name for the surface it introduces — "the AnimusDB Data
+Console" (title, body, and the file's own naming section) — is retired as
+of the Ledger design revision ([ADR 0056](0056-design-system.md)). It is
+branded **animusd console** now (page `<title>`, source comments): the
+same **application-developer** surface this ADR describes — tables and
+items only, on its own port, structurally barred from the operator's
+cluster-shaped state — under a new name. Every "AnimusDB Data Console"
+reference in this ADR's body is historical: read it as naming the surface
+now called animusd console. ADR 0021's dashboard is renamed alongside it,
+to **animusd admin** — see that ADR's own matching amendment.
