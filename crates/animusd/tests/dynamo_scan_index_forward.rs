@@ -251,11 +251,17 @@ fn sk_order(body: &str) -> Vec<String> {
 async fn descending_query_returns_the_partition_in_reverse_sort_order() {
     let (_dir, nodes, addrs) = setup().await;
 
+    // Both reads verify writes, so both ask for `ConsistentRead: true`
+    // (ADR 0055): the wire default is served from whichever replica the
+    // receiving node holds — read-your-writes deliberately does not hold —
+    // and the descending read below deliberately targets a different node,
+    // so an unqualified pair can miss the most recent write on either leg.
     let (status, asc) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
         r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
+            "ExpressionAttributeValues":{":p":{"S":"p1"}},
+            "ConsistentRead":true}"#,
     )
     .await;
     assert_eq!(status, 200, "ascending query failed: {asc}");
@@ -270,6 +276,7 @@ async fn descending_query_returns_the_partition_in_reverse_sort_order() {
         "DynamoDB_20120810.Query",
         r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"p1"}},
+            "ConsistentRead":true,
             "ScanIndexForward":false}"#,
     )
     .await;
