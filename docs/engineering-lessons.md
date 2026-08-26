@@ -8160,8 +8160,122 @@ debugging anything that feels like it might have happened before.
   explicitly whenever a new `EngineFactory`-shaped seam gains a method.
   (`crates/animus-cp-data/src/host.rs::EngineFactory::clone_engine`'s own
   doc comment states the final contract and the hazard by name.)
+- **A full design-token rewrite ("keep the names, change the values") is only
+  safe once you've counted every consumer, and a mockup's literal CSS can
+  silently redefine what an existing token means (2026-08-25, ADR 0056,
+  the "Ledger" visual system).** Rewriting `tokens.css` in place (new
+  palette, light-default instead of dark-default, glow-means-live replaced
+  by keyline-means-live) while keeping every token *name* stable — so the
+  two consumer stylesheets (`dashboard.css`, `console.css`, ~600 lines
+  combined) and every `dashboard_*.js`/`console.js` render function needed
+  zero call-site edits — only worked because a `grep -c "var(--$t)"` sweep
+  across every consumer was run *before* writing the new file, for every
+  single token name. That surfaced two things a values-only read of the old
+  file would have missed: (1) several tokens (`--glow-*`, `--live-underline`,
+  `--accent-hi`, `--shadow-recessed`, motion timing) had **zero** consumers
+  outside `tokens.css` itself, so they were safe to gut/repoint freely
+  without a wider search; (2) `button.primary`/`.btn-new`/`.btn-save`/
+  `.seg-group button.active`/`.seg-opt.selected` all filled with
+  `var(--accent)` + `var(--accent-ink)` under the old system, but the new
+  mockups' own literal CSS filled the equivalent controls with the *ink*
+  color (`background:#211f1a;color:#fafaf9` in the light mockup) — i.e. the
+  new system's "ONE accent role" rule (accent for links/underlines/hatch
+  only, never a solid fill) is a *component* decision the token file alone
+  can't express; it required rewriting those five call sites' `background`/
+  `color` properties, not just relying on `--accent`'s new value. Trusting
+  the token rename to carry that change silently would have shipped
+  accent-filled primary buttons that merely looked different (a legal but
+  spec-violating shade) instead of catching that the button recipe itself
+  had changed. **General rule**: before a "same names, new values" token
+  rewrite, grep every consumer for every token name being touched — a
+  zero-hit token is safe to redefine freely (or even fold into another
+  token), and a token whose *default recipe* the new mockups visibly
+  contradict (a filled control's authoritative markup uses a different
+  color than the token that used to supply it) needs its call sites edited
+  by hand, because the rename alone will compile clean and still be wrong.
+  (`crates/animusd/src/tokens.css`, `dashboard.css`, `console.css`.)
+- **Renaming a branded UI surface needs its Rust test *assertions* fixed to
+  stay green, but its doc-comment prose is a separate, lower-priority sweep
+  — don't conflate the two passes (2026-08-25, ADR 0056, admin/console
+  rename).** Renaming the operator dashboard's brand text ("AnimusDB
+  Console" → "animusd admin") and the data app's ("AnimusDB Data Console" →
+  "animusd console") broke exactly two integration-test files
+  (`dashboard_endpoint.rs`, `console_endpoint.rs`) whose `body.contains(...)`
+  assertions checked the old literal strings — found by grepping `tests/`
+  for the old names *before* editing the HTML, per this repo's standing
+  rule, then fixed alongside the HTML in the same change so the gate never
+  went red. Dozens of *other* hits for the same old strings remain, on
+  purpose: module-doc `//!` comments and inline comments across
+  `dashboard.rs`, `dashboard_core.js`, `console.js`, and every
+  `crates/animusd/tests/console_*.rs` file's own header comment. None of
+  those are asserted by any test (confirmed by grep), so they don't fail
+  the gate — but they are exactly the "stranded documentation" class this
+  log already names (see the `ReplicationMode`-removal entry above): prose
+  that now describes a surface by a name the code no longer uses, silently,
+  with nothing failing to point at it. Left as a deliberate, separate
+  follow-up (out of this change's stated file scope) rather than folded in,
+  since a partial prose sweep across a ~2000-line crate guide risks
+  introducing exactly the kind of drift it would be fixing. **General
+  rule**: when a rename's brief says "update every asserted string," that
+  is a narrower, harder requirement than "update every occurrence" — grep
+  for assertions specifically (`.contains(`, `assert_eq!` against the
+  literal, etc.) to find the must-fix set, and treat every remaining
+  prose hit as a tracked, intentional gap rather than either silently
+  ignoring it or scope-creeping the change to chase it down.
+- **A theme toggle whose default writes an explicit attribute defeats a
+  static dark-mode QA render unless the toggle script is neutralized first
+  (2026-08-25, website rebuild on the Ledger system).** `site.js` applies
+  `stored()` on every load — and once "light" (not "system") is the
+  documented default, that call sets `data-theme="light"` on `<html>`
+  explicitly rather than leaving the attribute absent. A QA render that
+  hand-edits a scratch copy of a page to add `data-theme="dark"` and then
+  loads it with the page's own script still attached gets silently
+  overwritten back to light before first paint — the screenshot comes out
+  byte-identical to the light render (same file size, confirmed before
+  looking closer), which reads as "dark mode is broken" when the actual bug
+  is the QA method fighting the app's own initialization order. The fix is
+  to strip the theme script from the scratch copy for a static-render check
+  (the CSS is what's under test, not the runtime toggle), not to debug the
+  CSS. **General rule**: before concluding a themed page's dark styling is
+  broken from a scripted/automated screenshot, check whether the page's own
+  JS re-applies a *default* state on load — a `checked`/`data-*`/class
+  toggle with a persisted-with-fallback default will clobber any attribute
+  a test harness sets by editing the static HTML, and the fallback is easy
+  to miss precisely because it used to be a no-op ("system" removed the
+  attribute) before the default changed to an explicit value.
 
 ### Parallel-agent orchestration
+- **Headless-Chromium `--window-size` screenshots are not responsive-layout
+  QA (2026-08-25, website mobile pass)** — in this harness,
+  `chromium --headless=new --window-size=390,H --screenshot=...` lays the
+  page out at the default ~800px viewport and then *crops* the PNG to
+  390px, which is visually indistinguishable from the page overflowing
+  (text "clipped" mid-glyph at the right edge). A mobile layout was
+  wrongly diagnosed as broken twice this way while the DOM was fine.
+  **Rule:** for any viewport-dependent check, drive the browser with
+  Playwright (`/opt/node22/lib/node_modules/playwright`, executablePath
+  `/opt/pw-browsers/chromium`) and set `viewport: {width, height}` on the
+  page, asserting `document.documentElement.scrollWidth` and
+  element `getBoundingClientRect()` from inside the page; keep raw
+  `--screenshot` for fixed-width artboards only. Note `scrollWidth`
+  alone can also pass while content is cut (an `overflow: hidden`
+  ancestor eats the evidence) — pair it with a bounding-rect sweep for
+  elements extending past the viewport that are not inside a deliberate
+  `overflow-x: auto` container.
+- **A subagent that launches its validation gate as a *background* task and
+  then ends its turn to "wait for the notification" stalls the whole
+  pipeline (2026-08-25, Ledger design delivery)** — background-task
+  completion notifications go to the *orchestrating* session, not to a
+  subagent that has already stopped; the subagent just sits "finished"
+  with an uncommitted tree while the orchestrator sees a completion notice
+  whose result is "waiting for tests". Two of three implementation agents
+  in one delivery did this independently, each needing a manual resume
+  ("your test task already finished — run checks foreground and commit").
+  **Rule:** subagent briefs must say *run every check as a synchronous
+  foreground command and do not end your turn before the commit exists* —
+  and when an agent's completion notice reads like a status update rather
+  than a result, resume it immediately with that instruction instead of
+  waiting for a notification that will never come.
 - **A single long-lived session can exhaust the disk on `target/` alone, with
   no parallel fan-out involved (2026-08-19)** — a solo `cargo build
   --workspace --all-targets` on this repo hit `rustc-LLVM ERROR: IO failure …
@@ -9450,6 +9564,46 @@ weight range. The cost was first estimated per weight, which was wrong by about
 4x and nearly drove a font substitution that was not needed. Fetch the file and
 look before costing it.
 
+## Closing a deferred prose sweep: rewrite in place as "new name (ADR NNNN's 'old name')" (2026-08-25, ADR 0056/0021/0052 rename follow-up)
+
+The Ledger delivery's first PR deliberately left a prose sweep as a tracked
+follow-up (see the "Renaming a branded UI surface..." entry above): dozens
+of module-doc `//!`/`//` comments across `dashboard.rs`, `lib.rs`,
+`console.rs`, every JS file header, every `console_*.rs` test header, two
+crate `CLAUDE.md`s, and the root `CLAUDE.md` still said "AnimusDB Console"/
+"AnimusDB Data Console" after the code was renamed to "animusd admin"/
+"animusd console". Closing that follow-up found two things worth keeping
+as a pattern:
+
+1. **The old strings do not live in one obvious place.** They span doc
+   comments (`rustdoc`-visible, so a stale one looks authoritative),
+   ordinary `//`/`//!` file-header comments, and test-file header comments
+   in three different crates — `rg -in "<old name>"` across the whole
+   `crates/`+`docs/` tree (excluding the ADRs themselves and the
+   engineering-lessons log, both of which are supposed to keep the
+   historical name on record) is the only way to find the full set; a
+   scan scoped to "the crate that owns the feature" misses the sibling
+   crate's references (`animus-dynamo/CLAUDE.md`'s two mentions of "the
+   Data Console" had nothing to do with `animusd` and would not have
+   turned up in an `animusd`-scoped grep).
+2. **Rewrite each hit as `new name (ADR NNNN's "old name")`, not a bare
+   swap.** A plain find-and-replace to the new name loses the old name
+   entirely, which breaks anyone (or any future grep) still searching for
+   the term the ADR itself, an old commit message, or an old bug report
+   uses; keeping the literal old string in quotes right next to the new
+   one keeps both searchable from the same line, at the cost of a few
+   extra words per comment. This is the same move ADR 0021's and ADR
+   0052's own "naming disambiguation" amendments already made in prose;
+   applying it at the comment-string level too avoids re-litigating "did
+   we mean the old system or the new one" the next time someone greps for
+   either name.
+
+General rule: when a rename's brief says "sweep the deferred prose," grep
+the *exact* old string(s) tree-wide first, do not trust the file list a
+memory of "where the feature lives" would produce, and prefer
+`new (old)`-shaped rewrites over silent replacement wherever the old name
+might still be a search target (an ADR title, a test name, a changelog).
+
 ## Move a timer's trigger, not its mechanism — and check what the seam already gives you for free (ADR 0058 rung 4)
 
 The in-place split's write-blip regression (measured ~726ms vs. the copy
@@ -9563,3 +9717,62 @@ already tolerates the ordering you're about to introduce.
   would need — a lifecycle mechanism added *after* that comment was
   written (here, in-place split) is exactly the kind of change that can
   quietly invalidate it without touching the caller at all.
+
+## A mobile `grid-template-columns: 1fr` override silently reintroduces the desktop overflow it was meant to fix (website responsive pass, ADR 0056 skin)
+
+The site's desktop grids (`.hero-grid`, `.split`, `.foot-grid`) were all
+written correctly, as `minmax(0, 1fr) minmax(0, 1fr)` — the standard
+CSS-grid guard against a track's "automatic minimum size" defaulting to the
+*min-content* width of whatever's inside it. But their `@media` overrides for
+the mobile single-column layout were written as plain `grid-template-columns:
+1fr;`, dropping the `minmax(0, ...)` the desktop rule had. Nothing looked
+wrong reading the CSS in isolation — a single `1fr` column obviously fills
+100% of the container, so it read as strictly *simpler* than the two-column
+desktop version, not weaker.
+
+It broke exactly where a grid item contained an unbreakable line: a
+`.plate .cl` terminal/diff line has `white-space: pre`, and one such line
+(`- endpoint: dynamodb.eu-west-1.amazonaws.com`) was longer than the mobile
+viewport. Its nested `overflow-x: auto` container did make *it* scroll
+locally as intended — but the plain-`1fr` grid track one level up still sized
+itself to that line's min-content width first, so the grid item's own box
+(not just its content) rendered wider than the viewport and the page itself
+gained horizontal scroll. A descendant's own `overflow: auto` does **not**
+rescue an ancestor grid/flex track's auto-min-size calculation; only
+`minmax(0, ...)` (or `min-width: 0` on the item) on the track/item that is
+actually oversized does that — matching what the desktop rule already relied
+on for the exact same content.
+
+General rule: **`minmax(0, 1fr)` is not a two-column-only idiom** — carry it
+into every breakpoint override of a `grid-template-columns` declaration,
+including the single-column ones, whenever any descendant might contain
+unbreakable content (`white-space: nowrap`/`pre`, a long token, a wide inline
+code/terminal line). A quick audit technique: `grep grid-template-columns` the
+stylesheet and check that every bare `1fr`/`Npx` track (not already wrapped in
+`minmax(0, ...)` or `min(...)`) has one — a bare `repeat(N, 1fr)` mobile
+override is the same bug with more columns. Verifying "no viewport overflow"
+by reading the CSS's collapse breakpoints is not enough; render at the target
+width and check `document.documentElement.scrollWidth`, because this class of
+bug is invisible in the source and only appears against real content.
+
+- **A Playwright `waitUntil: 'networkidle'` goto against the `website/`
+  pages can hang indefinitely in this sandbox (2026-08-26, mobile spacing
+  pass)** — the pages pull Google Fonts over HTTPS through the proxy; most
+  of the time that request resolves quickly, but occasionally it (or some
+  other cross-origin request) stays pending and `networkidle` never fires
+  because it waits for a quiet network, not a deadline. A batch script
+  driving many pages back-to-back (an 11-page x 5-width overflow matrix)
+  looked like it was making progress — earlier `ok` lines kept appearing in
+  the output — right up until it silently wedged on one page, with no error
+  and no timeout to report. Two fixes, both worth doing together: pass an
+  explicit `timeout` on every `goto` (Playwright's default is generous but
+  finite; the real risk is a bare `networkidle` promise with no timeout
+  argument at all in a batch loop), and for anything that doesn't need the
+  fonts to actually render (an overflow/scrollWidth check, not a screenshot)
+  `page.route('**://fonts.*/**', route => route.abort())` before `goto` and
+  use `waitUntil: 'load'` instead — it removes the flaky external dependency
+  entirely and the check runs in a fraction of the time. Keep `networkidle`
+  (with a timeout) for visual screenshots where you want the real fonts
+  loaded, and keep it consistent between a before/after pair — a pixel-diff
+  comparing a real-fonts render against a fallback-fonts render reports
+  every glyph as changed, which reads as a layout regression that isn't one.

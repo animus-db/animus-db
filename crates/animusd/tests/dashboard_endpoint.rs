@@ -159,7 +159,7 @@ async fn dashboard_serves_spa_with_cors_and_peers() {
             "dashboard response carries CORS, headers:\n{head}"
         );
         assert!(
-            body.contains("AnimusDB Console") && body.contains("dashboard_core.js"),
+            body.contains("animusd admin") && body.contains("dashboard_core.js"),
             "served the console shell, referencing its script assets"
         );
         // The/admin/data/dynamo item form locks key attribute rows (no delete
@@ -367,7 +367,7 @@ async fn dashboard_role_gating_split_deployment() {
                 "shell is html: {head}"
             );
             assert!(
-                body.contains("AnimusDB Console") && body.contains("dashboard_node.js"),
+                body.contains("animusd admin") && body.contains("dashboard_node.js"),
                 "shell references the new Node view asset: {body}"
             );
             let (s, _, node_js) = raw(addr, "GET", "/admin/ui/dashboard_node.js").await;
