@@ -83,13 +83,13 @@ function renderOverview() {
   // than counted here.
   const atRiskCount = h.quorumLostCount + h.underReplicatedCount;
   const tiles = [
-    { label: "Nodes", value: `${nodeCount - h.downCount}/${nodeCount}`, sub: h.downCount ? `${h.downCount} down` : "all up" },
-    { label: "Tablets", value: `${tabletIds.length}`, sub: `across ${Object.keys((status && status.schemas && status.schemas.tables) || {}).length} table(s)` },
+    { label: "Nodes", value: `${nodeCount - h.downCount}/${nodeCount}`, sub: h.downCount ? `${h.downCount} down` : "all up", live: true },
+    { label: "Tablets", value: `${tabletIds.length}`, sub: `across ${Object.keys((status && status.schemas && status.schemas.tables) || {}).length} table(s)`, live: true },
     { label: "At risk", value: `${atRiskCount}`, sub: atRiskCount ? "needs attention" : (h.formingCount ? `${h.formingCount} forming` : "none") },
     { label: "Control plane", value: h.controlLeader ? `node ${esc(nodeDisplayId(h.controlLeader))}` : "—", sub: controlTermText },
   ];
   $("ov-tiles").innerHTML = tiles.map((t) =>
-    `<div class="stat-tile"><div class="label">${esc(t.label)}</div><div class="value">${t.value}</div><div class="sub">${esc(t.sub)}</div></div>`
+    `<div class="stat-tile"><div class="label">${esc(t.label)}</div><div class="value${t.live ? " live" : ""}">${t.value}</div><div class="sub">${esc(t.sub)}</div></div>`
   ).join("");
 
   // ---- nodes list ----

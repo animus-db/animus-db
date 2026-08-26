@@ -1,13 +1,15 @@
 # ADR 0058 — Learner replicas and in-place tablet split
 
-- **Status:** Accepted — implemented (Trains 1–2, rungs 1–3, all as-built
-  notes below; accepted by the maintainer merging the implementation stack
-  on 2026-08-25: interim GSI-drain acceleration, learner class + reconciler
-  adoption, SSTable clone, in-place split core, and the `--split-mode`
-  driver layer). The in-place path ships behind `--split-mode inplace` with
-  the ADR 0050 copy-based workflow still the default; **rung 4** (flip the
-  default and delete the copy-based workflow) remains pending on
-  trust-building (bench + corpus soak) and is this ADR's only unimplemented
+- **Status:** Accepted — implemented (Trains 1–2, rungs 1–4 layers 1–2, all
+  as-built notes below; accepted by the maintainer merging the
+  implementation stack on 2026-08-25: interim GSI-drain acceleration,
+  learner class + reconciler adoption, SSTable clone, in-place split core,
+  the `--split-mode` driver layer, the rung-4 write-blip fixes, and the
+  rung-4 layer-2 default flip). **`InPlace` is now `SplitMode`'s default
+  everywhere** — `--split-mode copy` still selects the original ADR 0050
+  workflow explicitly. **Rung 4's remaining layer** (delete the ADR 0050
+  build driver, the freeze-as-outage path, and the cutover vetoes now that
+  the copy path is no longer the default) is this ADR's only unimplemented
   piece.
 - **Date:** 2026-08-24 (accepted 2026-08-25)
 - **Proposes superseding:** [ADR 0050](0050-per-tablet-storage-copy-based-splits.md)'s
@@ -611,7 +613,11 @@ Train 2's single-entry mint.
    trusted.
 4. **Delete the ADR 0050 build driver, the freeze-as-outage path, and the
    cutover vetoes**, in the same bottom-up, red→green-per-cell discipline
-   ADR 0050's own Train B used.
+   ADR 0050's own Train B used. **As-built: split into layers** — layer 1
+   (eager child materialization, closing the write-blip tail) and layer 2
+   (flip `SplitMode`'s default to `InPlace`, below) landed first, with the
+   copy path kept fully selectable; the deletion itself is this rung's
+   remaining, still-unstarted layer.
 
 **Independent of this sequencing**, the interim GSI-drain endgame
 acceleration (Alternative 1 — an acceleration, deliberately *not* a bound;
@@ -893,6 +899,141 @@ Two honest findings, reported plainly:
   fast do the other replicas materialize") — left as a candidate for a
   future rung if the gap matters in practice, not force-fit into this one.
 
+**Measurement note addendum (2026-08-25) — rung 4 layer 1: eager child
+materialization at the fork, closing the residual the addendum immediately
+above named.** Diagnosis (confirmed exactly as predicted): a freshly-forked
+child's SECOND voter — the one that must grant the campaigning replica's
+pre-vote before it can win a quorum — only ran its own
+`materialize_split_child` on that replica's *next scheduled* tablet-host-
+reconciler tick, which (even at rung 3's fast-polled
+`INPLACE_SPLIT_RECONCILE_INTERVAL`, 50ms) could land anywhere up to 50ms
+after the fork itself, on top of this host's own ~100ms per-round-trip
+floor. Fix: **every replica now triggers its own materialization the
+instant it applies `SplitTablet` locally**, instead of waiting for its next
+scheduled tick — a new executor-agnostic **fork-observed signal**
+(`ForkSignal`, the same `AtomicBool`+`AtomicWaker` shape as this crate's
+existing `ProposeSignal`/`ApplySignal`/`WakeSignal`), raised by the
+**async apply task** (`apply_and_compact`'s `KvCommand::SplitTablet` arm,
+right after the durable split marker commits — never by the sync,
+I/O-free `RaftCore`, per ADR 0003/0038 discipline) and consumed by a new
+`host::Reconciler::fork_wake()` fan-in future that `animusd::
+tablet_host_reconciler_loop`'s own `tokio::select!` races as a third arm
+alongside `metadata_watch`/the periodic fallback. This is deliberately a
+**wake, not a duplicated mechanism** — the trigger moved; `materialize_
+split_child`'s clone/trim/host logic, its per-child G4 commit points, and
+its idempotent re-derivation from the durable split marker are all
+byte-for-byte unchanged, following the same discipline PR #394's own
+"move the trigger, not the mechanism" lesson already named
+(`docs/engineering-lessons.md`). The eager wake is deliberately **not
+durable** — a crash between the apply task raising it and any tick
+consuming it simply loses the signal (see `docs/engineering-lessons.md`'s
+new entry) — recovery is unaffected because it was never on the critical
+path: the reconciler's ordinary periodic tick still re-derives the fork
+from the durable marker (`pending_split()`) exactly as it always did.
+
+`inplace_split_bench.rs` was rerun 3x, and `split_build.rs`'s copy-based
+bench was rerun once fresh, same-host, same-session, immediately
+afterward (never concurrently), following the same discipline as every
+prior measurement in this ADR:
+
+| | in-place, rung 4 (campaign only, prior session) | in-place, + layer 1 (run1/run2/run3) | copy-based, fresh same-host reference |
+|---|---|---|---|
+| write blip (max PUT) | 300.7 / 513.2 / 508.0 ms | 775.0 / 355.7 / 258.7 ms | 447.9 ms |
+| write blip median | **508.0ms** | **355.7ms** | **447.9ms** |
+| put retries needed | 0 / 0 / 0 | 0 / 0 / 0 | (not instrumented) |
+| fork/build wall clock | ~4.5s (prior session) | 4.55 / 4.17 / 4.15s | 8.04s |
+| idle GET floor (this host) | ~108ms | 108ms (identical across all 3 runs) | 108ms |
+
+Findings, reported plainly, in both directions:
+
+- **The median write blip drops again**, from 508.0ms to 355.7ms (≈30%
+  further down, and ≈51% down from rung 3's original 726.3ms) — and, for
+  the first time, lands **at or below** a same-session copy-based
+  reference run (447.9ms), meeting this rung's own acceptance target. The
+  best individual run (258.7ms) sits comfortably inside the copy path's
+  own historically-observed 250–300ms band; every run remains a single
+  slow request with **zero** retries, so the mechanism is doing what it
+  was built to do — shortening the parked write's own wait, not changing
+  its failure shape.
+- **Variance is still real and reported honestly, not smoothed over.**
+  One of the three runs (775.0ms) is the single *worst* write-blip number
+  measured anywhere in this ADR's whole measurement history, including
+  every pre-fix number — and the fresh copy-based reference run (447.9ms)
+  itself reads noticeably higher than this ADR's own earlier copy-path
+  numbers (252–304ms, rung 3/4's tables above). The one measurement that
+  stayed **exactly** stable across every run, in both benches, on both
+  sides of this addendum (108ms, to the millisecond) is the idle
+  linearizable-read floor — the same host-characteristic anchor rung 3/4
+  already used to argue this is measurement variance, not a regression:
+  whatever is producing the wider spread is landing in the "how long does
+  this one parked write wait" component specifically (still bounded by
+  the same small constants — the 50ms fast-poll cadence and this host's
+  own ~100ms round-trip floor — this rung's own fix reasons about), not a
+  change in the underlying mechanism's correctness or a new source of
+  cost. Median-of-3 remains the right statistic to compare here for
+  exactly the reason rung 3/4 already gave: a single run either side could
+  read as "regressed" or "fixed" depending on which one you drew.
+- **The eager wake's own contribution is structurally distinct from
+  rung 4's campaign fix**, and this addendum's corpus cells (below) prove
+  it directly rather than only inferring it from the bench: `ANIMUS_
+  INPLACE_SPLIT_SEEDS`'s new `eager_wake_and_reconciler_tick_race_
+  benignly` cell proves a hosted tablet's `fork_wake()` resolves with
+  **zero** reconciler ticks having run, and that a second, immediately
+  following tick (standing in for the ordinary periodic fallback
+  rediscovering the identical state) is a byte-for-byte no-op; `crash_
+  after_apply_loses_the_eager_wake_but_reconciler_fallback_recovers`
+  proves the signal's own non-durability is harmless — a crash that
+  strands the wake unconsumed still recovers, purely off the periodic
+  tick reading the durable marker, with no special-cased path.
+
+**As-built (2026-08-25) — rung 4 layer 2: `SplitMode`'s default flips from
+`Copy` to `InPlace`.** The measurement record above — the layer-1 addendum's
+355.7ms in-place median vs. its own same-session 447.9ms copy-based
+reference (≈1.8× faster), the 500-seed `ANIMUS_INPLACE_SPLIT_SEEDS` +
+20-run repeated-`inplace_split_e2e` soak, and the still-open, honestly
+reported write-blip-tail residual (this addendum's own "Variance is still
+real" finding, squarely rung-3's reconciler-cadence design, not a
+correctness gap) — was judged sufficient to trust the in-place path as the
+default, with the copy path staying fully selectable behind `--split-mode
+copy` while its own deletion (this ADR's remaining rung 4 layer) is
+sequenced as separate follow-up work rather than folded into the flip
+itself. `animusd::config::SplitMode`'s `#[default]` variant moved from
+`Copy` to `InPlace`; every call site that reads `SplitMode::default()`
+rather than a caller-supplied value picked up the new default for free,
+including the `--cluster-control`/`--cluster-data` dev-cluster shape and
+the standalone `control`/`data`/`join` subcommands (rung C2's report had
+flagged these as pinned to `Copy` with no flag plumbed through them — they
+are now pinned to `InPlace` the same way, still with no `--split-mode` flag
+of their own). `--split-mode {copy,inplace}` itself is unchanged — it still
+threads through `--config`/`--node` and `--cluster N` only, and still
+accepts `copy` explicitly for as long as the workflow exists. Every test
+that specifically exercises the ADR 0050 copy workflow's own mechanics
+(its `Splitting`/`Building` intermediate metadata shape, its
+build/freeze/tail driver, its own bench) was audited and pinned to
+`SplitMode::Copy` explicitly rather than silently riding the new default;
+tests that exercise a split generically (auto-split, transactions racing a
+split, streams/GSI convergence across a split) were left on the default and
+now cover the in-place path instead — see
+`crates/animusd/CLAUDE.md`'s `SplitMode` entry and
+`docs/engineering-lessons.md` for the audit's own record of which tests
+moved to which mode and why.
+
+**A finding from that audit worth flagging explicitly, not just logging**:
+`tests/streams_e2e.rs::multi_split_soak_streamed_gsi_table_under_mixed_load`
+(rung 8's own named acceptance soak) went from "issue #298 occasionally
+sighted" under copy to reproducing #298 on every run once its fixed
+120-write/300s budget ran under in-place's much faster per-split
+convergence — the flip didn't change #298's trigger condition, it let far
+more splits complete inside the same fixed test budget, and #298 is a
+per-split-boundary race. Pinned back to `Copy` for now (see G5 below and
+`docs/engineering-lessons.md`'s matching entry for the general lesson).
+This is a real, load-bearing dependency for **this ADR's own remaining
+rung 4 layer**: deleting the copy workflow removes the option to pin away
+from #298 here, so that deletion cannot ship until #298 is either fixed or
+this soak's own budget is deliberately re-tuned to reproduce it at a
+tolerable rate under in-place — whichever the maintainer decides, it needs
+deciding before that layer, not discovered mid-deletion.
+
 ## Open forks (deliberately not decided by this ADR)
 
 | # | Fork | Status |
@@ -901,6 +1042,7 @@ Two honest findings, reported plainly:
 | G2 | Range-filtered `InstallSnapshot` for a learner at a disjoint final home, vs. accepting the ~2× bytes and pre-trimming at the clone step | Open — a mitigation choice, not blocking rung 1–3. Rung 3 landed the simpler side: full clone then trim (`trim_split_child`), no snapshot filtering. |
 | G3 | Whether ADR 0030's permanently-non-voting growth mirror is re-expressed as a learner that is never promoted, once learners exist | Open — noted, not committed to |
 | G4 | Exact crash-recovery idempotency contract for group-mint-at-apply (Stage 3) | **Decided (2026-08-25)**: two independent commit points, each checked and skipped on its own before a retry redoes it. (1) **The engine commit** — `EngineFactory::clone_engine`'s target manifest replace (ADR 0058 rung 2's own "absent or complete, never torn" contract) — checked via `EngineFactory::probe(child)` BEFORE ever cloning; if the engine already exists, an earlier attempt already committed it (possibly crashing before the group started), so re-cloning is skipped entirely (a second clone against an already-trimmed, or already-written-to, target would be a correctness bug, not merely wasted work) and the existing engine is simply re-opened. (2) **The group commit** — successfully calling `RaftKvNode::start_hosted` and registering the handle in the reconciler's own `hosted` map — reuses the IDENTICAL optimistic-claim-then-execute discipline the ordinary `Host` action already has (`plan` claims the child into `LocalState::hosted` before materialization ever runs; a failure calls `LocalState::release_unconfirmed_host` so the next tick retries). No separate "child group state" artifact needs writing at all: a brand-new Raft group bootstraps fresh from its own `all_nodes` config every time regardless (empty log, first election), so the group's own identity IS simply "does a live `RaftKvNode` exist for this id" — the same fact every other tablet's lifecycle already tracks. A crash between the two commit points re-runs exactly the group commit on retry; a crash before either re-runs both, deterministically, from the same `(parent, child, range, bootstrap_voters)` inputs every replica computes identically from the fork entry itself. Proven directly in `tests/inplace_split_reconciler.rs`'s `crash_between_fork_and_materialization` scenario (a node crashes after its own Raft log replicates the fork but before its reconciler ever ticks past it, and must independently recover both children plus the pre-fork write on restart). |
+| G5 | Issue #298 (exactly-once duplication/deficit at a split boundary) reproduces far more readily under in-place's higher splits-per-unit-time than the copy-based workflow ever exercised it, and blocks rung 4's remaining copy-deletion layer, which removes the option to pin the affected soak to `Copy` while investigating | **Partially resolved (this branch's #298 fix PR).** Three mechanisms found and fixed, all confirmed **pre-existing** (none specific to in-place split's own fork/materialize path — in-place's density of splits-per-soak-run just gave each far more chances to fire per fixed test budget): (1) the frozen-endgame GSI-drain acceleration loop could self-deadlock across two co-hosted, cross-referencing tablets (`is_retryable_elsewhere` break-early + a fail-fast `cp_kind_write_raw_once` write primitive); (2) the ordinary per-tick seal arm (`seal_tick`) was missing the same `!splitting` guard `trim_janitor` already had, letting it race a `Splitting` tablet's own dedicated endgame seal loop and, combined with `seal_now` reading `effective_metadata()` instead of `metadata_fresh()` for a decision that becomes immutable segment bytes, produce two adjacent, non-colliding epochs with silently overlapping coverage — the confirmed mechanism behind the literal duplicate-record symptom, fixed by adding the guard and switching to `metadata_fresh()`; (3) `txn_resolver_loop`'s own recovery sweep discarded the `created_ts` hint `txn_recover`'s orphan-abort fallback needs, so a transaction record made unreachable by a split had no path to ever resolve — fixed by passing the hint through. **Not fully resolved**: a fourth, distinct failure shape — an intermittent base-row miss under a linearizable (`ConsistentRead: true`) read — remains open. One classified repro pins it as a **leader-side gap**: the row was present on both non-leader replicas of the owning tablet but absent specifically on that tablet's own current leader, which is what a `ConsistentRead` read always resolves to regardless of what followers hold — ruling out routing/caching as the explanation. Subsequently root-caused and FIXED in this same PR: `LsmEngine::clone_to` trusted `flush()`'s `Ok(())`, but `flush()` silently no-ops while a concurrent apply is in flight, so a materialization clone could hard-link the SSTable list while acked rows were still memtable-only — permanently excluding them from the child (Train-2-introduced; red/green multi-thread ProdEnv regression `lsm_clone_concurrent.rs`; zero recurrences in 15 post-fix soak runs). A related gap in `txn_resolver_loop`'s OWN `unresolved_decided` sweep (no fallback at all when its own record lookup fails, unlike the `pending_txns` path fixed above) is identified but not fixed — needs new driver-local state to track how long a decided-but-unresolved transaction has been stuck, judged too large for this pass. **Named gap**: no dedicated deterministic regression was added for the seal-boundary mechanism (2) — `animusd` has no `animus-sim` dependency, so it isn't `SimEnv`-reachable, and a precise `ProdEnv` unit repro of the exact interleaving would need new test-hook plumbing this pass didn't build; the soak itself (`tiny_seal_knobs()`, cascading splits) is what caught it and is what validates the fix (10 consecutive clean in-place runs). Rung 4's remaining copy-deletion layer stays blocked on the one still-open residual: a rarer (~1 in 15 soak runs) stream-delivery-count failure beyond the fixed mechanisms, plus the named `unresolved_decided` fallback gap — the soak stays pinned to `Copy` until that residual is resolved. |
 
 ## Relationship to the original ADR 0017 §4 design
 

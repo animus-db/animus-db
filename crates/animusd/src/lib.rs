@@ -2745,7 +2745,7 @@ pub struct RoleAddrs {
     /// ephemeral loopback port.
     #[serde(default = "default_ephemeral_addr")]
     pub admin: SocketAddr,
-    /// The **AnimusDB Console** (ADR 0052) — a DynamoDB-shaped data app for
+    /// **animusd console** (ADR 0052's "AnimusDB Data Console") — a DynamoDB-shaped data app for
     /// application developers, deliberately separate from the operator
     /// dashboard the admin port serves (ADR 0021): it must never surface
     /// cluster-shaped state (nodes, replicas, tablets, Raft, quorum,
@@ -2793,7 +2793,7 @@ pub struct BoundNode {
     /// sequence.
     intra_listener: TcpListener,
     intra_addr: SocketAddr,
-    /// The AnimusDB Data Console's own listener (ADR 0052) — a combined node
+    /// animusd console's own listener (ADR 0052's "AnimusDB Data Console") — a combined node
     /// hosts CP-data tablets, so it always binds one; see
     /// [`console`](crate::console)'s module doc.
     console_listener: TcpListener,
@@ -2856,7 +2856,7 @@ pub(crate) struct AdminInfo {
     pub(crate) auto_split_bytes_threshold: Option<u64>,
 }
 
-/// Project the replicated schema catalog into the AnimusDB Data Console's own
+/// Project the replicated schema catalog into animusd console's own
 /// [`console::TableSummary`] rows (ADR 0052 PR2 — the tables-list screen's
 /// data source). Lives here, in `lib.rs` — not in `console.rs` — on purpose:
 /// this is the one function in the whole node that reads `Metadata`'s schema
@@ -3035,7 +3035,7 @@ fn console_gsi_detail(schema: &TableSchema, idx: &animus_control::IndexDef) -> c
     }
 }
 
-/// Project one table's full configuration for the Data Console's table page
+/// Project one table's full configuration for animusd console's table page
 /// Config tab (ADR 0052 PR3, `GET /console/api/tables/{name}`) — the
 /// `TableDetail`-shaped sibling of [`console_table_summaries`]'s per-table
 /// `TableSummary` (every count there becomes a full declaration here).
@@ -3123,7 +3123,7 @@ fn is_valid_key_attribute_type(t: &str) -> bool {
     matches!(t, "S" | "N" | "B")
 }
 
-/// The Data Console's mutating-endpoint seam (ADR 0052 PR3, widened by PR6's
+/// animusd console's mutating-endpoint seam (ADR 0052 PR3, widened by PR6's
 /// `create_table`) — [`console::ConsoleBackend`]'s one implementor. Every
 /// method either reuses the same DynamoDB wire path the real edge/
 /// `/admin/data/dynamo` use (`crate::dynamo::execute_routed`, this PR's
@@ -3968,7 +3968,7 @@ fn spawn_common_tail(
     )));
     // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020).
     tasks.push(tokio::spawn(admin::serve(admin_listener, ctx.clone())));
-    // The AnimusDB Data Console (ADR 0052) — `None` on a control-only node
+    // animusd console (ADR 0052's "AnimusDB Data Console") — `None` on a control-only node
     // (it hosts no CP-data tablet, so it has nothing for the console to
     // show; see `BoundControlNode::start_control_with`, the only caller that
     // passes `None`). Still takes no `ClientCtx` directly: a
@@ -4203,9 +4203,9 @@ impl BoundNode {
     /// convention as every other knob here.
     ///
     /// `split_mode` (ADR 0058 Train 2 rung 3) selects which workflow this
-    /// node's `ClientCtx::trigger_split` proposes — `SplitMode::Copy`
-    /// (every caller above this layer) is byte-for-byte the original ADR
-    /// 0050 workflow. See [`SplitMode`]'s own doc.
+    /// node's `ClientCtx::trigger_split` proposes — `SplitMode::default()`
+    /// (every caller above this layer) is `InPlace` since rung 4 layer 2.
+    /// See [`SplitMode`]'s own doc.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_growth(
         self,
@@ -4741,7 +4741,7 @@ pub struct Node {
     /// populated — every deployment shape binds and (from `intra/2-cutover`
     /// onward) serves it.
     intra_addr: SocketAddr,
-    /// `None` on a control-only node (ADR 0052) — the AnimusDB Data Console
+    /// `None` on a control-only node (ADR 0052) — the animusd console
     /// listener is never bound there (it hosts no CP-data tablet). See
     /// [`console_addr`](Self::console_addr)'s doc.
     console_addr: Option<SocketAddr>,
@@ -4912,7 +4912,7 @@ impl Node {
         self.intra_addr
     }
 
-    /// The address the AnimusDB Data Console listens on (ADR 0052).
+    /// The address animusd console listens on (ADR 0052).
     ///
     /// # Panics
     /// If this node has no data role — see [`dynamo_addr`](Self::dynamo_addr)'s
@@ -5237,8 +5237,9 @@ impl BoundControlNode {
     /// `split_mode` (ADR 0058 Train 2 rung 3) selects which workflow this
     /// node's own `ClientCtx::trigger_split` proposes when it receives one
     /// (a relayed admin/client `SplitTablet` request, or a follower-
-    /// connected `BeginSplit`/`BeginSplitInPlace` propose) — `SplitMode::
-    /// Copy` is byte-for-byte the original ADR 0050 workflow.
+    /// connected `BeginSplit`/`BeginSplitInPlace` propose) — no explicit
+    /// caller override picks up `SplitMode::default()` = `InPlace` since
+    /// rung 4 layer 2; `Copy` stays selectable.
     ///
     /// # Errors
     /// Propagates a failure to open the dedicated engine (LSM backend only).
@@ -5428,7 +5429,7 @@ pub struct BoundDataNode {
     admin_addr: SocketAddr,
     intra_listener: TcpListener,
     intra_addr: SocketAddr,
-    /// The AnimusDB Data Console's own listener (ADR 0052) — a data-only
+    /// animusd console's own listener (ADR 0052's "AnimusDB Data Console") — a data-only
     /// node hosts real CP-data tablets, so it always binds one; see
     /// [`console`](crate::console)'s module doc.
     console_listener: TcpListener,
@@ -5451,7 +5452,7 @@ impl BoundDataNode {
         self.admin_addr
     }
 
-    /// The address the AnimusDB Data Console listens on (ADR 0052).
+    /// The address animusd console listens on (ADR 0052).
     pub fn console_addr(&self) -> SocketAddr {
         self.console_addr
     }
@@ -5587,7 +5588,7 @@ impl BoundDataNode {
     ///
     /// `split_mode` (ADR 0058 Train 2 rung 3) — see
     /// [`BoundNode::start_with_growth`]'s doc: same knob, same
-    /// `SplitMode::Copy`-is-byte-for-byte-original contract.
+    /// `SplitMode::default()` (`InPlace` since rung 4 layer 2) contract.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_growth(
         self,
@@ -6615,9 +6616,11 @@ pub(crate) struct ClientCtx {
     pub(crate) dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     /// Which tablet-split workflow this node proposes when it drives
     /// `trigger_split` (ADR 0058 Train 2 rung 3's `animusd`-level driver
-    /// residue) — `Copy` (every existing deployment/test, since this is
-    /// what every constructor below defaults to) is byte-for-byte the
-    /// original ADR 0050 workflow. See [`SplitMode`]'s own doc. Threaded
+    /// residue) — `InPlace` (every constructor below that doesn't take an
+    /// explicit override defaults to `SplitMode::default()`, `InPlace`
+    /// since rung 4 layer 2) is the ADR 0058 in-place single-entry atomic
+    /// fork; `Copy` is the original ADR 0050 workflow, still selectable.
+    /// See [`SplitMode`]'s own doc. Threaded
     /// from the `--split-mode {copy,inplace}` CLI flag (`--config`/
     /// `--cluster N` only, mirroring `--quiesce-after`'s own scope) —
     /// plain per-node config, not gated by [`DataRole`], since a
@@ -7786,10 +7789,47 @@ impl ClientCtx {
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
+        self.cp_kind_write_raw_bounded(table, writes, change_log, CLIENT_TIMEOUT)
+            .await
+    }
+
+    /// [`cp_kind_write_raw`](Self::cp_kind_write_raw)'s single-attempt
+    /// sibling: identical write, but a `FROZEN_REFUSAL`-shaped failure
+    /// returns immediately instead of retrying for `CLIENT_TIMEOUT` (issue
+    /// #298). The one caller today is `reconcile_partition`'s GSI row
+    /// write, invoked from the frozen-endgame acceleration loop
+    /// (`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`) — see
+    /// `index_drain::is_retryable_elsewhere`'s doc for why that loop must
+    /// not spend up to `CLIENT_TIMEOUT` *per pass* blocked on a write whose
+    /// own target tablet can, under a cascade, be mid-split and needing
+    /// this SAME node's own `change_consumer_loop` to reach its turn before
+    /// it ever un-freezes — multiplying a per-write retry budget by a
+    /// per-pass loop count is exactly the shape that turned a few co-hosted
+    /// splits into a multi-minute self-inflicted stall. A single fast
+    /// failure here costs a fraction of a millisecond, so the loop's own
+    /// pass count (or `change_consumer_loop`'s next ordinary 200ms tick)
+    /// is the only retry budget actually spent.
+    pub(crate) async fn cp_kind_write_raw_once(
+        &self,
+        table: &str,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        self.cp_kind_write_raw_bounded(table, writes, change_log, Duration::ZERO)
+            .await
+    }
+
+    async fn cp_kind_write_raw_bounded(
+        &self,
+        table: &str,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
+        timeout: Duration,
+    ) -> Result<(), String> {
         let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
         };
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let err = match self.cp_route(table, &first).await {
                 CpRoute::Local(leader) => {
@@ -12550,6 +12590,14 @@ impl CpReconciler {
             CpReconciler::Mem(r) => r.enable_quiescence(after),
         }
     }
+
+    /// ADR 0058 Train 2 rung 4 layer 1 — see [`Reconciler::fork_wake`]'s doc.
+    async fn fork_wake(&self) {
+        match self {
+            CpReconciler::Lsm(r) => r.fork_wake().await,
+            CpReconciler::Mem(r) => r.fork_wake().await,
+        }
+    }
 }
 
 /// How often [`tablet_host_reconciler_loop`] falls back to a plain poll when
@@ -12628,6 +12676,19 @@ const INPLACE_SPLIT_RECONCILE_INTERVAL: Duration = Duration::from_millis(50);
 /// several commits under bulk load collapses into one tick, not one per
 /// entry.
 ///
+/// **A third arm, `reconciler.fork_wake()` (ADR 0058 Train 2 rung 4 layer
+/// 1)**: resolves the instant any tablet this node currently hosts observes
+/// its own local `SplitTablet` fork apply, so this node's own tick fires
+/// immediately rather than riding out its own next scheduled wake (a real
+/// residual the rung-4 measurement addendum found — a freshly-forked
+/// child's first election needs a SECOND voter's own `materialize_split_
+/// child` to run before it can win a quorum, and that voter's own
+/// materialization used to ride its next poll rather than the fork itself).
+/// Harmless to race unconditionally: `CpReconciler::fork_wake` never
+/// resolves on its own when this node hosts nothing, and a spurious extra
+/// tick is exactly as cheap as the fallback sleep's own — `plan` is pure and
+/// idempotent regardless of what woke the loop.
+///
 /// The `last_applied() == 0` pre-recovery guard (see
 /// `animus_cp_data::host::plan`'s own doc: deciding "dropped" from *absence*
 /// is sound only over recovered, durable metadata — an empty pre-recovery
@@ -12668,6 +12729,13 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
         tokio::select! {
             _ = watch.changed(last_seen) => {}
             _ = tokio::time::sleep(fallback) => {}
+            // ADR 0058 Train 2 rung 4 layer 1: wake the instant ANY hosted
+            // tablet's own apply task observes a local `SplitTablet` fork,
+            // instead of waiting out this loop's own next scheduled tick
+            // (previously up to `INPLACE_SPLIT_RECONCILE_INTERVAL`, 50ms, per
+            // replica) — see `CpReconciler::fork_wake`'s doc for why this is
+            // safe to race unconditionally alongside the two arms above.
+            _ = reconciler.fork_wake() => {}
         }
         // Coalesce: take the freshest observed index regardless of which arm
         // woke the loop (the `changed()` future's own resolved value is not
@@ -12752,12 +12820,35 @@ async fn txn_resolver_loop(ctx: ClientCtx) {
                 continue; // legacy whole-keyspace tablet, or a stale view — skip this tick
             };
 
-            for (txn_id, (record_key, _created_ts)) in group.pending_txns() {
-                // No intent hint needed/available here — `pending_txns` only
-                // ever tracks a genuine, locally-anchored `Pending` record
-                // (never an orphan), so `txn_recover`'s record-absent branch
-                // is unreachable from this caller by construction.
-                if let Err(e) = ctx.txn_recover(&table, &record_key, &txn_id, None).await {
+            for (txn_id, (record_key, created_ts)) in group.pending_txns() {
+                // `created_ts` as the orphan-path hint (issue #298): passing
+                // `None` here rested on "`pending_txns` only ever tracks a
+                // genuine, locally-anchored `Pending` record, so
+                // `txn_recover`'s record-absent branch is unreachable from
+                // this caller by construction" — true only as long as the
+                // record stays reachable at that same logical position for
+                // the whole recovery window. A txn record is an ordinary
+                // in-scope logical key of its anchor tablet (`txn.rs`'s own
+                // doc), so it rides the identical split clone/trim path
+                // every other row does — if a split ever misplaces or drops
+                // it (the same class of bug a live base-row investigation
+                // under this issue found, still open), `txn_record_view`'s
+                // lookup inside `txn_recover` genuinely can fail for a
+                // record this loop just enumerated moments ago, and with
+                // `None` there is no fallback: the record-absent branch
+                // immediately returns `Pending` with no grace-period-then-
+                // decide path at all, so this call would retry forever
+                // without ever making progress — the exact "stuck reporting
+                // TransactionConflict indefinitely" shape observed. Passing
+                // the hint costs nothing when the comment's own assumption
+                // holds (the record-absent branch simply never runs), and
+                // gives the existing, already-reviewed orphan-abort
+                // fallback a real timestamp to bound its grace period by
+                // when it doesn't.
+                if let Err(e) = ctx
+                    .txn_recover(&table, &record_key, &txn_id, Some(created_ts))
+                    .await
+                {
                     tracing::debug!(
                         tablet = tablet.0,
                         ?txn_id,
@@ -14760,8 +14851,9 @@ pub async fn start_cluster_with_quiesce_after(
 ///
 /// `split_mode` (ADR 0058 Train 2 rung 3) selects which split workflow the
 /// whole in-process cluster runs — `--cluster N`'s `--split-mode
-/// {copy,inplace}` CLI flag threads through here; `SplitMode::Copy` (every
-/// other wrapper above) is byte-for-byte the original ADR 0050 workflow.
+/// {copy,inplace}` CLI flag threads through here; `SplitMode::default()`
+/// (every other wrapper above) is `InPlace` since rung 4 layer 2 — `Copy`
+/// stays selectable via the flag pending its own deletion.
 ///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
@@ -15094,8 +15186,10 @@ pub async fn start_split_cluster_with_growth(
                 // `split_mode` does not thread through the split-deployment
                 // dev path yet — same documented gap this function already
                 // has for `quiesce_after` (`main.rs::run`'s own comment) and
-                // `--stream-seal-*`/`--segment-store` below: always the
-                // byte-for-byte original ADR 0050 workflow here.
+                // `--stream-seal-*`/`--segment-store` below: always
+                // `SplitMode::default()`, `InPlace` since rung 4 layer 2
+                // (was `Copy`) — this dev shape has no `--split-mode` flag
+                // to override it with.
                 SplitMode::default(),
             )
             .await?,
@@ -15258,12 +15352,13 @@ pub async fn run_node_with_streams_and_quiesce_after(
 }
 
 /// Like [`run_node_with_streams_and_quiesce_after`], but also selects the
-/// **split workflow** (ADR 0058 Train 2 rung 3) instead of [`SplitMode::
-/// Copy`] — `--config FILE --node I`'s `--split-mode {copy,inplace}` CLI
-/// flag threads through here. The same layered-wrapper convention as
-/// [`run_node_with_streams_quiesce_and_ttl_sweep_interval`]'s own
-/// `ttl_sweep_interval` knob: every existing call site above keeps
-/// compiling and behaving identically at `SplitMode::Copy`.
+/// **split workflow** (ADR 0058 Train 2 rung 3) explicitly instead of
+/// [`SplitMode::default`] — `--config FILE --node I`'s `--split-mode
+/// {copy,inplace}` CLI flag threads through here. The same layered-wrapper
+/// convention as [`run_node_with_streams_quiesce_and_ttl_sweep_interval`]'s
+/// own `ttl_sweep_interval` knob: every existing call site above keeps
+/// compiling and behaving identically at `SplitMode::default()` (`InPlace`
+/// since rung 4 layer 2).
 ///
 /// # Errors
 /// As [`run_node_with`].
@@ -15508,8 +15603,9 @@ pub async fn run_node_control_with_orphan_sweep_after(
             // `animusd control`'s CLI surface has no `--split-mode` flag of
             // its own (mirroring `--quiesce-after`'s identical scope gap
             // for this same subcommand) — a control-only node's
-            // `trigger_split` calls always default to the byte-for-byte
-            // original ADR 0050 workflow.
+            // `trigger_split` calls always default to `SplitMode::default()`,
+            // `InPlace` since rung 4 layer 2 (was `Copy`); `--config`'s own
+            // `run` path is still the only way to pin `Copy` explicitly.
             SplitMode::default(),
         )
         .await
@@ -15623,8 +15719,8 @@ pub async fn run_node_data(
             dynamo_auth,
             // `animusd data --config`'s CLI surface has no `--split-mode`
             // flag of its own (mirrors `run_node_control_with_orphan_sweep_
-            // after`'s identical scope gap) — always the byte-for-byte
-            // original ADR 0050 workflow.
+            // after`'s identical scope gap) — always `SplitMode::default()`,
+            // `InPlace` since rung 4 layer 2 (was `Copy`).
             SplitMode::default(),
         )
         .await
@@ -16176,8 +16272,9 @@ async fn finish_data_join(
             None,
             dynamo_auth,
             // `animusd data --seed` join has no `--split-mode` flag of its
-            // own (same documented gap as `run_node_data`) — always the
-            // byte-for-byte original ADR 0050 workflow.
+            // own (same documented gap as `run_node_data`) — always
+            // `SplitMode::default()`, `InPlace` since rung 4 layer 2 (was
+            // `Copy`).
             SplitMode::default(),
         )
         .await

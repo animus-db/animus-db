@@ -258,11 +258,13 @@ pub(crate) const INDEX_DRAIN_INTERVAL: Duration = Duration::from_millis(200);
 /// see the module doc).
 const GSI_TAG: &str = "gsi";
 
-/// How long the seal arm's [`ClientCtx::propose_and_await`] waits for a
-/// proposed `MetaCommand::SealStreamShard` to commit before giving up (this
-/// tick retries; ADR 0043 §A3's recovery discipline). Generous, matching
+/// How long [`seal_now`]'s own commit-wait poll waits for a proposed
+/// `MetaCommand::SealStreamShard` to commit before giving up (this tick
+/// retries; ADR 0043 §A3's recovery discipline). Generous, matching
 /// `SCHEMA_COMMIT_TIMEOUT` (`lib.rs`) — a fresh cluster may still be
-/// electing a control leader.
+/// electing a control leader. Not `ClientCtx::propose_and_await` itself
+/// (issue #298) — see `seal_now`'s own doc for why its commit-wait needs a
+/// content-aware confirm predicate that generic helper doesn't express.
 const SEAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The packed HLC suffix every change-record key ends with (see
@@ -614,7 +616,37 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
                     );
                 }
             }
-            if stream_enabled
+            // `!splitting`, mirroring `trim_janitor`'s own guard just below
+            // (issue #298): a `Splitting` tablet's endgame driver
+            // (`split_driver_tick`/`inplace_split_driver_tick`, above) owns
+            // this tablet's terminal seal exclusively — it loops `seal_now`
+            // to exhaustion, anchored at the frozen tablet's own final
+            // position, as one step of its fixed endgame sequence. Letting
+            // this ordinary per-tick seal arm ALSO fire for the same
+            // `Splitting` tablet raced it against that dedicated call: both
+            // independently read `ClientCtx::effective_metadata()` (staleness-
+            // tolerant by design, not `metadata_fresh()`) to compute their own
+            // `watermark`/`next_epoch` inside `seal_now`, so an in-flight or
+            // just-committed sibling seal is not guaranteed visible yet —
+            // each can independently conclude "nothing sealed past here,
+            // mint the next epoch" and commit two DIFFERENT epoch numbers
+            // covering the SAME records (unlike a same-epoch collision,
+            // which `seal_now`'s content-aware confirm already catches and
+            // retries around). Every downstream consumer walks the shard
+            // chain by epoch and has no way to know two epochs overlap, so
+            // it delivers the covered records once per epoch — the
+            // duplicate-delivery shape this issue tracks. A frozen tablet's
+            // backlog is static (nothing new can land past the freeze), so
+            // skipping this arm here costs nothing: there is no size/age
+            // trigger left to fire that the endgame's own exhaustive loop
+            // doesn't already cover before it ever proposes `CutoverSplit`.
+            // Pre-existing in both split workflows (this guard's absence
+            // predates ADR 0058's in-place split by construction — the
+            // copy-based endgame's own final seal loop is exposed to the
+            // identical race) — in-place split's much higher splits-per-
+            // soak-run rate just gave it far more chances to fire.
+            if !splitting
+                && stream_enabled
                 && let Err(e) =
                     seal_tick(&ctx, &meta, &table, tablet, &group, &mut first_hot_seen).await
             {
@@ -1006,6 +1038,15 @@ async fn split_driver_tick(
                         error = %e,
                         "split build: frozen-endgame gsi drain pass failed"
                     );
+                    // See `is_retryable_elsewhere`'s doc (issue #298): a
+                    // dirty partition's GSI row write can target a
+                    // *different*, also-mid-split tablet that only THIS
+                    // node's own next tick can unblock — spending the rest
+                    // of this pass budget spinning on it here would starve
+                    // that other tablet's own turn on this same loop.
+                    if is_retryable_elsewhere(&e) {
+                        break;
+                    }
                 }
             }
         }
@@ -1144,6 +1185,15 @@ async fn inplace_split_driver_tick(
                         error = %e,
                         "inplace split: frozen-endgame gsi drain pass failed"
                     );
+                    // See `is_retryable_elsewhere`'s doc (issue #298): a
+                    // dirty partition's GSI row write can target a
+                    // *different*, also-mid-split tablet that only THIS
+                    // node's own next tick can unblock — spending the rest
+                    // of this pass budget spinning on it here would starve
+                    // that other tablet's own turn on this same loop.
+                    if is_retryable_elsewhere(&e) {
+                        break;
+                    }
                 }
             }
         }
@@ -1610,6 +1660,40 @@ async fn gsi_caught_up(group: &CpGroup) -> bool {
     }
 }
 
+/// Whether a [`drain_tablet`] pass failure is the house `"; retry"`
+/// transient-condition shape (`FROZEN_REFUSAL` and its siblings — see
+/// `ClientCtx::read_should_retry`'s identical predicate) rather than a
+/// genuine error. Load-bearing for the frozen-endgame GSI-drain
+/// acceleration loops in both [`split_driver_tick`] and
+/// [`inplace_split_driver_tick`] (issue #298): a dirty partition's GSI row
+/// write (`reconcile_partition` → `ClientCtx::cp_kind_write_raw`) targets
+/// the table's own **hidden index table**, a *different* tablet from the
+/// one whose endgame is running this loop — and that hidden table's own
+/// tablet can itself be mid-split (frozen, awaiting its own cutover) at the
+/// exact same moment, especially under a cascade where several tablets fork
+/// within the same narrow window. When BOTH tablets happen to be led by
+/// this same node, only this node's own `change_consumer_loop` can ever
+/// drive the hidden table's tablet to cutover and unfreeze the write — but
+/// that loop cannot reach that other tablet's turn until it returns from
+/// *this* tablet's endgame first. Retrying the write here up to
+/// [`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`] times, each attempt internally
+/// re-retrying for its own `CLIENT_TIMEOUT`, multiplies into a self-
+/// inflicted stall (observed empirically at several minutes, well past
+/// this soak's own bounded client-retry budget) that only clears once an
+/// unrelated event — a leader change, a timing accident — lets the other
+/// tablet's cutover run on some other replica instead. Detecting the shape
+/// and breaking out immediately, rather than spending the rest of this
+/// pass budget on a condition only a *sibling* tick of this same loop can
+/// clear, is what actually closes it: the veto's own correctness is
+/// unaffected (an un-caught-up GSI still blocks cutover exactly as before,
+/// `change_consumer_loop`'s own next ordinary tick — 200ms later — simply
+/// retries from scratch, and by then this node's loop has had its chance to
+/// service the blocking tablet too). See `docs/engineering-lessons.md` for
+/// the full incident (issue #298).
+fn is_retryable_elsewhere(e: &str) -> bool {
+    e.ends_with("; retry")
+}
+
 /// The HLC a change-record's key suffix encodes — the identical 8-byte
 /// big-endian packing [`cursor::encode_watermark`] uses for a watermark value
 /// (see `KvCommand::KindBatch`'s `change_log` doc: the key is completed at
@@ -1718,9 +1802,16 @@ async fn reconcile_partition(
     // and no GSI of its own, so the zero-expected-terms trim rule deletes
     // them. One `KindBatch` entry per row, same entry count as the plain
     // `cp_write`/`cp_delete` calls this replaces.
+    // `_once` (issue #298): `index_table` is a *different* tablet from the
+    // one this reconciliation is running for — the table's own hidden GSI
+    // table — and under a cascade it can itself be mid-split at this exact
+    // moment. See `cp_kind_write_raw_once`'s own doc for why a single fast
+    // failure here, not a `CLIENT_TIMEOUT`-bounded retry, is what keeps the
+    // frozen-endgame acceleration loop from starving that other tablet's
+    // own turn on this node's `change_consumer_loop`.
     for (index_table, key, value) in writes {
         let marker = crate::dynamo::marker_change_log(&key, Vec::new());
-        ctx.cp_kind_write_raw(
+        ctx.cp_kind_write_raw_once(
             &index_table,
             vec![(KIND_BASE, key, Some(value))],
             vec![marker],
@@ -1734,9 +1825,10 @@ async fn reconcile_partition(
     // log this very drain consumes), but an index row is wholly derived — a
     // dead one has no reader to inform, and nothing would ever reclaim a
     // sentinel from a hidden index table.
+    // `_once` for the identical reason as the write loop above.
     for (index_table, key) in stale {
         let marker = crate::dynamo::marker_change_log(&key, Vec::new());
-        ctx.cp_kind_write_raw(&index_table, vec![(KIND_BASE, key, None)], vec![marker])
+        ctx.cp_kind_write_raw_once(&index_table, vec![(KIND_BASE, key, None)], vec![marker])
             .await?;
     }
 
@@ -2265,21 +2357,51 @@ async fn seal_tick(
 /// attempt's own proposal actually committed despite the caller never
 /// seeing the ack (the retry's own proposal then hits a genuine content
 /// conflict — its own fresh `object_id` never matches the already-committed
-/// row's), the surrounding `propose_and_await` poll (below) already treats
-/// "the row now exists" as success regardless of which attempt's proposal
-/// is the one that landed — so the retry still reports success, and its own
-/// freshly-written (never cataloged) object becomes a permanent orphan,
-/// reclaimed by the segment janitor's own orphan sweep
-/// (`segment_janitor::reap_orphans`), never overwritten. This is exactly
-/// what closes the data-loss bug the old shared-deterministic-id scheme had
-/// — see `animus_cp_data::segment`'s own module doc for the full incident.
+/// row's), the commit-wait poll below already treats "the row now exists,
+/// with content covering at least what I intended" as success regardless of
+/// which attempt's proposal is the one that landed — so the retry still
+/// reports success, and its own freshly-written (never cataloged) object
+/// becomes a permanent orphan, reclaimed by the segment janitor's own orphan
+/// sweep (`segment_janitor::reap_orphans`), never overwritten. This is
+/// exactly what closes the data-loss bug the old shared-deterministic-id
+/// scheme had — see `animus_cp_data::segment`'s own module doc for the full
+/// incident. **The "content covering at least what I intended" qualifier is
+/// load-bearing (issue #298)** — see the commit-wait poll's own doc for the
+/// dueling-seal race a bare presence check misses.
 pub(crate) async fn seal_now(
     ctx: &ClientCtx,
     table: &str,
     tablet: TabletId,
     group: &CpGroup,
 ) -> Result<Option<u64>, String> {
-    let meta = ctx.effective_metadata();
+    // `metadata_fresh()`, not `effective_metadata()` (issue #298): this
+    // read decides `watermark`/`next_epoch`, which become IMMUTABLE
+    // segment-store bytes the instant this call proposes — a permanent
+    // decision, never retried against a corrected view once made (this
+    // crate's own `CLAUDE.md`: "a read feeding a non-retried, permanent
+    // decision must use `metadata_fresh()`"). `effective_metadata()`'s
+    // local cache is fed by `Metadata`'s own `DRIVER_APPLIED` async apply
+    // task (ADR 0038) and can lag this SAME node's own just-committed
+    // control-plane proposal by an uncontrolled amount — ordinarily
+    // negligible, but under this soak's own concurrent-split load a prior
+    // `SealStreamShard` this exact node committed moments ago (its own
+    // OWN prior loop iteration, or a losing seal's very next retry
+    // attempt one `INDEX_DRAIN_INTERVAL` tick later) can still be
+    // invisible to a fresh call's own `watermark`/`next_epoch`
+    // computation. When that happens, this call is not "racing a
+    // stranger" — it silently re-derives the SAME already-sealed span
+    // (the epoch number BECOMES a fresh N+1 the instant the cache catches
+    // up, but the byte RANGE was computed against a floor that doesn't yet
+    // exclude what epoch N already covers), writing a genuinely new,
+    // non-colliding epoch whose own content OVERLAPS its predecessor's —
+    // sealed segment bytes are immutable once written, so nothing later
+    // ever detects or corrects this the way the same-epoch collision path
+    // (this function's own commit-wait poll, below) does. This is a
+    // strictly stronger guarantee than that poll's own content-aware
+    // check: that poll only catches a LOSING same-epoch collision;
+    // `metadata_fresh()` here prevents the DIFFERENT-epoch overlap this
+    // read was never able to see coming.
+    let meta = ctx.metadata_fresh().await;
     // The label to seal under: the table's *current* schema label if it has
     // one (the ordinary case, and F12-b's disable path — the final seal
     // runs before `SetTableStream{None}` ever proposes, so the schema still
@@ -2394,41 +2516,86 @@ pub(crate) async fn seal_now(
         replicas,
         object_id: seg_id,
     };
-    // Retry-after-lost-ack semantics (ledger-named-object amendment): this
-    // check function already treats "the row now exists" as success
-    // regardless of whose proposal actually committed it — a genuine
-    // content-conflict `NoOp`/`Rejected` for THIS attempt's own proposal
-    // (its fresh `object_id` can never match an already-committed row's) is
-    // therefore not distinguished from an ordinary "still waiting to
-    // commit" here. Either the original attempt's proposal committed (lost
-    // ack) or a genuinely different, independently-computed attempt won the
-    // race — both cases converge to the identical outcome from this
-    // caller's point of view: the epoch is sealed, report success, and this
-    // attempt's own now-uncataloged object is a permanent orphan for the
-    // segment janitor's sweep to reclaim.
-    match ctx
-        .propose_and_await(cmd, SEAL_COMMIT_TIMEOUT, || async {
-            ctx.metadata_fresh()
-                .await
-                .stream_shards
-                .contains_key(&(tablet, next_epoch))
-                .then_some(())
-        })
-        .await
-    {
-        Ok(()) => {
-            ctx.data().raftkv_metrics.incr(Metric::StreamSealsTotal);
-            Ok(Some(next_epoch))
+    // Retry-after-lost-ack semantics (ledger-named-object amendment): a
+    // genuine same-attempt retry (this exact call re-proposing after a lost
+    // ack) always re-mints the identical `object_id`/`hlc_range`, so seeing
+    // the row present with THIS content is unambiguous success regardless
+    // of which of our own attempts actually committed it.
+    //
+    // **The dueling-seal case needs one more check than presence alone
+    // (issue #298).** A genuinely different, independently-computed
+    // attempt CAN win this same `(tablet, next_epoch)` slot — most
+    // plausibly a concurrent CP-data leadership change for this tablet
+    // (this command rides the *separate*, cluster-wide control Raft, so
+    // any node believing itself this tablet's leader at the moment can
+    // propose one) racing this call, each side computing `next_epoch` from
+    // a snapshot that hasn't yet observed the other's in-flight proposal.
+    // `Metadata::apply`'s own first-committer-wins-on-content rule already
+    // rejects the loser's proposal outright — but if this call is the
+    // loser and the *winner's* own `hlc_range.1` is LOWER than our own
+    // `end_inclusive`, blindly reporting success here would silently drop
+    // every record strictly between the winner's end and ours: they stay
+    // physically present (nothing sealed them), yet this loop would
+    // believe this epoch is done and move on, and a LATER seal computing
+    // its own watermark from the winner's (lower) end would re-discover
+    // them as "new" and re-seal them under a later epoch — the exact
+    // duplicate-delivery shape this issue tracks (the same bytes end up in
+    // two different sealed segments). Detected by comparing the winning
+    // row's own `hlc_range.1` against our own intended `end_inclusive`:
+    // covered ⇒ genuine success (a real retry-of-ourselves, or a
+    // differently-attempted proposal that happens to cover at least as
+    // much); NOT covered ⇒ report failure immediately (no reason to wait
+    // out the rest of `SEAL_COMMIT_TIMEOUT` — the outcome is already known)
+    // so the caller's very next pass recomputes a fresh watermark/epoch
+    // from the now-visible winner and correctly re-seals exactly the
+    // residual gap, once, under a new epoch number. This attempt's own
+    // now-uncataloged object is a permanent orphan either way, reclaimed
+    // by the segment janitor's sweep.
+    let deadline = tokio::time::Instant::now() + SEAL_COMMIT_TIMEOUT;
+    let mut next_propose_at = tokio::time::Instant::now();
+    loop {
+        match ctx
+            .metadata_fresh()
+            .await
+            .stream_shards
+            .get(&(tablet, next_epoch))
+        {
+            Some(row) if row.hlc_range.1 >= end_inclusive => {
+                ctx.data().raftkv_metrics.incr(Metric::StreamSealsTotal);
+                return Ok(Some(next_epoch));
+            }
+            Some(row) => {
+                ctx.data()
+                    .raftkv_metrics
+                    .incr(Metric::StreamSealFailuresTotal);
+                return Err(format!(
+                    "SealStreamShard({}, {next_epoch}) lost to a concurrent seal covering only \
+                     up to {}, short of our own {end_inclusive}; retry",
+                    tablet.0, row.hlc_range.1
+                ));
+            }
+            None => {}
         }
-        Err(()) => {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             ctx.data()
                 .raftkv_metrics
                 .incr(Metric::StreamSealFailuresTotal);
-            Err(format!(
+            return Err(format!(
                 "SealStreamShard({}, {next_epoch}) did not commit in time",
                 tablet.0
-            ))
+            ));
         }
+        if now >= next_propose_at {
+            let sent = ctx.propose_schema(&cmd).await;
+            next_propose_at = now
+                + if sent {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::ZERO
+                };
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

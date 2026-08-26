@@ -21,6 +21,15 @@ mod support;
 
 /// Bring up an `n`-node cluster, one process per node — the same
 /// port-TOCTOU-retrying shape as `admin_endpoint.rs`'s copy.
+///
+/// **Pinned to `SplitMode::Copy` explicitly** (ADR 0058 rung 4 layer 2
+/// flipped the cluster-wide default to `InPlace`): this file's whole point
+/// is the copy-based workflow's own metadata lifecycle (`Splitting` +
+/// two `Building` children, minted at kickoff and never routable) — the
+/// in-place fork never mints `Building` rows at all (both children are
+/// formed atomically only at cutover), so this file's assertions would
+/// simply time out under the new default. See `split_build.rs::bring_up`'s
+/// identical note.
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
     for attempt in 0..16 {
         let addrs = support::free_addrs(n * 6);
@@ -43,7 +52,20 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
+            match animusd::run_node_with_streams_quiesce_and_split_mode(
+                &config,
+                i,
+                dir.join(format!("node-{attempt}-{i}")),
+                animusd::StorageBackend::default(),
+                animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+                animusd::StreamSealKnobs::default(),
+                animusd::SegmentStoreConfig::default(),
+                animusd::DEFAULT_STREAM_RETENTION,
+                Duration::ZERO,
+                animusd::SplitMode::Copy,
+            )
+            .await
+            {
                 Ok(node) => nodes.push(node),
                 Err(_) => {
                     failed = true;

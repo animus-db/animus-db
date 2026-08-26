@@ -1,17 +1,29 @@
 # animusdb.io — the AnimusDB marketing site
 
-Static HTML/CSS/JS. **No build step, no bundler, no external requests** — the
-same constraint the in-product consoles carry (ADR 0021): edit a file, commit,
-and it ships. Fonts are system stacks; every asset is local.
+Static HTML/CSS/JS on the "Ledger" design system (ADR 0056). **No build step,
+no bundler** — edit a file, commit, and it ships. Google Fonts (Space
+Grotesk + Martian Mono) is the one external request the site makes; every
+other asset is local.
 
 ```
 website/
-  index.html      landing page — what AnimusDB is and does
-  docs.html       documentation — concepts, architecture, API, operations
-  install.html    build, run a cluster, connect, deploy
+  index.html            overview — what AnimusDB is, and where it stands
+  how-it-works.html     the whole system on one page
+  architecture.html     reference: the two planes, consistency, deployment, ports, limits
+  compatibility.html    reference: DynamoDB operation-by-operation status
+  performance.html      reference: the cost model (no benchmarks yet, and why)
+  licence.html          reference: AGPL-3.0 scenario by scenario
+  docs.html             documentation — concepts, architecture, API, operations
+  install.html          build, run a cluster, connect, deploy
+  articles/
+    why-lock-in-compounds.html
+    what-self-hosting-costs.html
+    determinism.html
   assets/
-    site.css      design tokens (shared family with crates/animusd/src/dashboard.css)
-    site.js       theme switch (light/dark/system), mobile nav, copy buttons, docs scrollspy
+    tokens.css    shared design tokens — byte-identical to crates/animusd/src/tokens.css
+    site.css      the site's own skin (geometry) on top of the shared tokens
+    site.js       theme switch (light/dark/system; light is the default), mobile nav,
+                  copy buttons, docs scrollspy
     favicon.svg
   CNAME           custom domain: animusdb.io
   .nojekyll       Pages serves the files as-is
@@ -37,13 +49,19 @@ Pages will keep trying to serve the site there.
 ## Keeping it honest
 
 Product claims on these pages track what is actually implemented, not what is
-designed. When a capability lands or a gap closes, the pages that name it are:
+designed — verify against the code (`crates/animusd/src/dynamo.rs`, the ADR
+index) before propagating a claim, never from memory of what an older page
+said. When a capability lands or a gap closes, the pages that name it are:
 
-- `index.html` — the compatibility table and the status section
+- `index.html` — the status cards (`#status`) and the warning box
+- `architecture.html` — `#consistency`, `#day2`, and `#limits`
+- `compatibility.html` — the operation-by-operation table
 - `docs.html` — `#api`, `#consistency`, and `#limits`
 - `install.html` — the ports table
 
-The known-gap list (`docs.html#limits`) is the load-bearing one: it currently
-states no auth/TLS, no format compatibility between revisions, no backup/restore,
-no `BatchGetItem`/`DeleteTable`/`ListTables`, no tablet merge, and no
-Kubernetes operator.
+The known-limits list (`architecture.html#limits`) is the load-bearing one: it
+currently states no TLS on any port, no authentication beyond opt-in SigV4 on
+the client DynamoDB port (ADR 0057), no format compatibility between
+revisions, no backup/restore, no tablet merge, and no Kubernetes operator.
+`BatchGetItem`, `DeleteTable` and `ListTables` are implemented — don't
+reintroduce them as gaps without checking the code first.

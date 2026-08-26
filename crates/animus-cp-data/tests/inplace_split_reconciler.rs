@@ -983,6 +983,313 @@ fn scenario_unrelated_rebalance_does_not_race_the_split(seed: u64) {
     });
 }
 
+/// **ADR 0058 Train 2 rung 4 layer 1 — the eager wake fires with NO tick
+/// involved, and a second, immediately-following tick (standing in for the
+/// reconciler's own later periodic fallback tick rediscovering the
+/// identical already-forked state) is a benign no-op.** Isolates p2's own
+/// reconciler from ever ticking (mirroring `scenario_crash_between_fork_
+/// and_materialization`'s own isolation technique) while its Raft group
+/// replicates+applies the fork purely via ordinary background `AppendEntries`
+/// — so `fork_wake()` resolving is the FIRST thing that ever happens to p2's
+/// reconciler with respect to this split, with no tick preceding it. The
+/// first tick after that must materialize both children; a second,
+/// back-to-back tick right after (the double-attempt this rung's own G4
+/// discipline must absorb — `EngineFactory::probe` skips the re-clone, the
+/// optimistic `LocalState::hosted` claim skips the re-host) must change
+/// nothing.
+fn scenario_eager_wake_and_reconciler_tick_race_benignly(seed: u64) {
+    run(seed, move |sim| async move {
+        let env = sim.env(driver_id());
+        let mut c = Cluster::new(sim.clone());
+        let (p0, p1, p2) = (n(70), n(71), n(72));
+        let parents = [p0.clone(), p1.clone(), p2.clone()];
+        for id in parents.iter().cloned() {
+            c.add_node(id);
+        }
+        let homes = vec![p0.clone(), p1.clone(), p2.clone()];
+        let base_view = view([parent_tablet(homes.clone(), None)]);
+        assert!(
+            converge(&mut c, &env, &parents, &base_view, |c| leader_of(
+                c, &parents, PARENT
+            )
+            .is_some())
+            .await,
+            "parent never elected (seed={seed})"
+        );
+        // This scenario deliberately ticks only p0/p1's reconcilers below —
+        // force leadership onto p0 first (mirroring `scenario_crash_
+        // between_fork_and_materialization`'s identical technique) so that
+        // window can actually observe a `ProposeSplitFork` action; Raft
+        // election has no reason to prefer p0/p1 over p2 on its own.
+        let mut on_p0 = c
+            .node(p0.clone())
+            .hosted_node(PARENT)
+            .is_some_and(|h| h.is_leader());
+        for _ in 0..150 {
+            if on_p0 {
+                break;
+            }
+            if let Some(leader) = leader_of(&c, &parents, PARENT) {
+                leader.transfer_leadership(p0.clone());
+            }
+            env.sleep(Duration::from_millis(100)).await;
+            on_p0 = c
+                .node(p0.clone())
+                .hosted_node(PARENT)
+                .is_some_and(|h| h.is_leader());
+        }
+        assert!(
+            on_p0,
+            "could not force leadership onto p0 before ticking only p0/p1 (seed={seed})"
+        );
+
+        let pending_view = view([parent_tablet(
+            homes.clone(),
+            Some(intent(homes.clone(), homes.clone())),
+        )]);
+        // Every home is an original parent voter, so p0's very first tick
+        // proposes the fork directly (no learner catch-up needed) — drive
+        // ONLY p0/p1, never p2, so p2's own Raft group applies the fork
+        // purely via background replication with its reconciler an
+        // untouched bystander throughout.
+        let drivers = [p0.clone(), p1.clone()];
+        assert!(
+            converge(&mut c, &env, &drivers, &pending_view, |c| {
+                drivers.iter().all(|id| {
+                    c.node(id.clone())
+                        .hosted_node(PARENT)
+                        .is_some_and(|h| block_on(h.pending_split()).is_some())
+                })
+            })
+            .await,
+            "the fork never applied on p0/p1 (seed={seed})"
+        );
+        assert!(
+            !c.hosted_set(p2.clone()).contains(&LEFT),
+            "test fixture invariant: p2's reconciler must never have ticked past the fork \
+             (seed={seed})"
+        );
+
+        // The property under test: p2's OWN fork_wake() resolves once its
+        // own apply task observes the fork — with zero ticks of p2's
+        // reconciler ever having run beforehand. Reduced to a plain `bool`
+        // (rather than keeping the `Either` around) so the still-borrowing
+        // "loser" future is dropped, and the borrow of `c` it holds
+        // released, before `c` is used mutably below.
+        let fork_seen = match futures::future::select(
+            Box::pin(c.node(p2.clone()).fork_wake()),
+            Box::pin(env.sleep(Duration::from_secs(10))),
+        )
+        .await
+        {
+            futures::future::Either::Left(_) => true,
+            futures::future::Either::Right(_) => false,
+        };
+        assert!(
+            fork_seen,
+            "p2's fork_wake() never resolved even though its own Raft log already applied the \
+             fork (seed={seed})"
+        );
+
+        // The eager attempt: the very first tick after the wake resolved
+        // must materialize both children.
+        c.tick(p2.clone(), &pending_view).await;
+        let after_first = c.hosted_set(p2.clone());
+        assert!(
+            after_first.contains(&LEFT) && after_first.contains(&RIGHT),
+            "p2 did not materialize both children on its first tick after fork_wake() resolved \
+             (seed={seed})"
+        );
+        let left_engine = c.storage(p2.clone(), LEFT);
+        let right_engine = c.storage(p2.clone(), RIGHT);
+
+        // The race: a second, immediately-following tick — standing in for
+        // the reconciler's own later periodic fallback tick rediscovering
+        // the identical already-forked, already-materialized state — must
+        // be a pure no-op: same hosted set, same two engines (no re-clone,
+        // no double-host).
+        c.tick(p2.clone(), &pending_view).await;
+        let after_second = c.hosted_set(p2.clone());
+        assert_eq!(
+            after_first, after_second,
+            "a second, immediately-following tick changed p2's hosted set — the eager/\
+             reconciler double-attempt race is not benign (seed={seed})"
+        );
+        // `hosted_node` returning a live handle for both children after the
+        // second tick (rather than, say, a torn-down-and-rehosted one) is
+        // the structural half of "no double-host"; `after_first ==
+        // after_second` above is the behavioral half. Cross-check the
+        // engines themselves are still exactly the SAME two, not a second
+        // clone silently replacing the first (which `EngineFactory::probe`
+        // gating is supposed to prevent).
+        assert_eq!(
+            left_engine.entries_with_tombstones().await.unwrap(),
+            c.storage(p2.clone(), LEFT)
+                .entries_with_tombstones()
+                .await
+                .unwrap(),
+            "LEFT's engine content changed across the double-attempt (seed={seed})"
+        );
+        assert_eq!(
+            right_engine.entries_with_tombstones().await.unwrap(),
+            c.storage(p2.clone(), RIGHT)
+                .entries_with_tombstones()
+                .await
+                .unwrap(),
+            "RIGHT's engine content changed across the double-attempt (seed={seed})"
+        );
+    });
+}
+
+/// **ADR 0058 Train 2 rung 4 layer 1 — the eager wake is NOT durable, and
+/// recovery must never depend on it.** `ForkSignal` is a plain in-memory
+/// flag+waker (`animus-cp-data/CLAUDE.md`'s own discipline: apply is sync
+/// and I/O-free, so this notify is best-effort, never persisted) — a crash
+/// on this replica right after its own apply task raises it, but strictly
+/// BEFORE any tick (eager or otherwise) ever consumes it, discards the
+/// signal along with the rest of the process's in-memory state. This
+/// scenario proves that loss is harmless: on restart this replica has no
+/// signal left to wait on at all, and must instead re-discover the fork the
+/// ordinary way — the reconciler's ordinary periodic tick reading the
+/// durable `pending_split()` marker straight off its own re-opened engine
+/// (the identical G4 recovery path `scenario_crash_between_fork_and_
+/// materialization` already proves; this cell's own point is narrower and
+/// additive: that the LOST eager wake specifically is not on the critical
+/// path for that recovery).
+fn scenario_crash_after_apply_loses_the_eager_wake_but_reconciler_fallback_recovers(seed: u64) {
+    run(seed, move |sim| async move {
+        let env = sim.env(driver_id());
+        let mut c = Cluster::new(sim.clone());
+        let (p0, p1, p2) = (n(80), n(81), n(82));
+        let parents = [p0.clone(), p1.clone(), p2.clone()];
+        for id in parents.iter().cloned() {
+            c.add_node(id);
+        }
+        let homes = vec![p0.clone(), p1.clone(), p2.clone()];
+        let base_view = view([parent_tablet(homes.clone(), None)]);
+        assert!(
+            converge(&mut c, &env, &parents, &base_view, |c| leader_of(
+                c, &parents, PARENT
+            )
+            .is_some())
+            .await,
+            "parent never elected (seed={seed})"
+        );
+        // This scenario deliberately ticks only p0/p1's reconcilers below —
+        // force leadership onto p0 first (mirroring `scenario_crash_
+        // between_fork_and_materialization`'s identical technique) so that
+        // window can actually observe a `ProposeSplitFork` action.
+        let mut on_p0 = c
+            .node(p0.clone())
+            .hosted_node(PARENT)
+            .is_some_and(|h| h.is_leader());
+        for _ in 0..150 {
+            if on_p0 {
+                break;
+            }
+            if let Some(leader) = leader_of(&c, &parents, PARENT) {
+                leader.transfer_leadership(p0.clone());
+            }
+            env.sleep(Duration::from_millis(100)).await;
+            on_p0 = c
+                .node(p0.clone())
+                .hosted_node(PARENT)
+                .is_some_and(|h| h.is_leader());
+        }
+        assert!(
+            on_p0,
+            "could not force leadership onto p0 before ticking only p0/p1 (seed={seed})"
+        );
+
+        {
+            let leader = leader_of(&c, &parents, PARENT).expect("elected above");
+            match leader.put(b"left-key".to_vec(), b"lv".to_vec()) {
+                ProposeResult::Accepted { .. } => {}
+                other => panic!("pre-fork put rejected: {other:?} (seed={seed})"),
+            }
+        }
+        env.sleep(Duration::from_millis(300)).await;
+
+        let pending_view = view([parent_tablet(
+            homes.clone(),
+            Some(intent(homes.clone(), homes.clone())),
+        )]);
+        let drivers = [p0.clone(), p1.clone()];
+        assert!(
+            converge(&mut c, &env, &drivers, &pending_view, |c| {
+                drivers.iter().all(|id| {
+                    c.node(id.clone())
+                        .hosted_node(PARENT)
+                        .is_some_and(|h| block_on(h.pending_split()).is_some())
+                })
+            })
+            .await,
+            "the fork never applied on p0/p1 (seed={seed})"
+        );
+        // p2's own Raft group replicates+applies the fork purely via
+        // background `AppendEntries` — which is also where its own apply
+        // task raises (and, since nobody ever polls it, strands) the eager
+        // `ForkSignal` this scenario is about losing.
+        let mut p2_forked = false;
+        for _ in 0..100 {
+            if c.node(p2.clone())
+                .hosted_node(PARENT)
+                .is_some_and(|h| block_on(h.pending_split()).is_some())
+            {
+                p2_forked = true;
+                break;
+            }
+            env.sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            p2_forked,
+            "p2's own Raft log never replicated the fork (seed={seed})"
+        );
+        assert!(
+            !c.hosted_set(p2.clone()).contains(&LEFT),
+            "test fixture invariant: p2's reconciler must never have ticked past the fork — the \
+             eager wake must still be sitting unconsumed at the moment of the crash below \
+             (seed={seed})"
+        );
+
+        // The crash: p2's entire process (including its in-memory, never-
+        // durable `ForkSignal`) is gone. `crash_restart` rebuilds a fresh
+        // `Reconciler`/`RaftKvNode` over the SAME durable engine registry —
+        // there is no signal left for the new instance to inherit; the only
+        // way it can ever learn the fork happened is the marker `split.rs`
+        // wrote into its own (durable) engine.
+        c.crash_restart(p2.clone());
+        assert!(
+            !c.hosted_set(p2.clone()).contains(&LEFT),
+            "test fixture invariant: a freshly restarted reconciler must start with an empty \
+             hosted set (seed={seed})"
+        );
+
+        // Recovery: driving every parent's reconciler via ORDINARY ticks —
+        // no `fork_wake()` involved at all — must still converge, purely
+        // off `pending_split()`'s durable read.
+        let recovered = converge(&mut c, &env, &parents, &pending_view, |c| {
+            let hosted = c.hosted_set(p2.clone());
+            hosted.contains(&LEFT) && hosted.contains(&RIGHT)
+        })
+        .await;
+        assert!(
+            recovered,
+            "p2 never re-materialized both children after losing its eager wake to a crash \
+             (seed={seed})"
+        );
+        let left_engine = c.storage(p2.clone(), LEFT);
+        assert!(
+            left_engine
+                .get(&physical(b"left-key"))
+                .await
+                .unwrap()
+                .is_some(),
+            "p2's recovered LEFT child lost the pre-fork write (seed={seed})"
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // The frozen corpus.
 // ---------------------------------------------------------------------------
@@ -1033,6 +1340,14 @@ fn scenario_cells() -> Vec<Scenario> {
         scenario!(
             "parent_leader_crash_at_fork_falls_back_to_ordinary_election",
             scenario_parent_leader_crash_at_fork_falls_back_to_ordinary_election
+        ),
+        scenario!(
+            "eager_wake_and_reconciler_tick_race_benignly",
+            scenario_eager_wake_and_reconciler_tick_race_benignly
+        ),
+        scenario!(
+            "crash_after_apply_loses_the_eager_wake_but_reconciler_fallback_recovers",
+            scenario_crash_after_apply_loses_the_eager_wake_but_reconciler_fallback_recovers
         ),
     ]
 }

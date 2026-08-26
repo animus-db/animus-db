@@ -58,8 +58,8 @@ reusing the captured config is the point of the test.
   it from position — `from_json` hard-errors on a duplicate) and the
   **six-port stride** (ADR 0047 + ADR 0052 + ADR 0053: `base_port + 6*i +
   {internal,client,dynamo,admin,intra,console}` — `intra` at offset 4
-  (the client/intra-cluster RPC port split), `console` at offset 5 (the
-  AnimusDB Data Console, ADR 0052 — a DynamoDB-shaped data app on its own
+  (the client/intra-cluster RPC port split), `console` at offset 5 (animusd
+  console, ADR 0052's "AnimusDB Data Console" — a DynamoDB-shaped data app on its own
   port, deliberately separate from the operator dashboard the admin port
   serves; bound on combined/data-only nodes, never control-only, which
   hosts no CP-data tablet). `generate`/`generate_split` mint `"n{i}"`,
@@ -305,8 +305,8 @@ reusing the captured config is the point of the test.
   untouched), `headers` is purely additive.
 - **`otel.rs`** — OTLP/HTTP distributed-tracing seam (ADR 0027); opt-in, no-op
   unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Scoped to this crate only.
-- **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** — the
-  "AnimusDB Console" SPA (ADR 0021): `include_str!`'d and served as
+- **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** —
+  animusd admin (ADR 0021's "AnimusDB Console") SPA: `include_str!`'d and served as
   distinct static assets, vanilla JS, no bundler/CDN/build step — edit,
   `cargo build`, reload. Tabs are role-gated client-side (ADR 0035 PR7). The
   Streams tab — shown on **every** role now, including control-only; only
@@ -320,7 +320,7 @@ reusing the captured config is the point of the test.
   admin port; see `console.rs`'s own entry and ADR 0052's "Naming,
   deliberately addressed" for the full disambiguation.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
-  — the AnimusDB **Data Console** (ADR 0052): a DynamoDB-shaped data app for
+  — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —
   never the admin port (documented no-auth, trusted-interface-only, ADR
   0020) and never a route on the DynamoDB wire listener. Bound on combined
@@ -621,25 +621,36 @@ kill).
 
 **`SplitMode` (ADR 0058 Train 2 rung 3's `animusd`-level driver residue)
 selects between the copy-based workflow above and the in-place one**:
-`animusd::config::SplitMode` (`Copy`/`InPlace`, `Copy` the default and
-every existing config/test), stored as a plain `ClientCtx.split_mode`
-field — deliberately **not** a `ClusterConfig` field (unlike
-`DynamoAuthConfig`, which has no other way to reach a `--config FILE`
-process): this is threaded exactly the way `--auto-split`/`--quiesce-after`
-are, as a CLI-parsed runtime parameter down the `spawn_common_tail`/
-`start_with_growth`/`start_control_with`/`start_data_with_growth` call
-chain, so adding it never touched `ClusterConfig`'s struct-literal shape
-(which dozens of existing tests construct directly). `--split-mode
-{copy,inplace}` threads through `--config FILE --node I` and `--cluster N`
-only — the identical scope `--quiesce-after` has, including the same
-documented gap for `--cluster-control`/`--cluster-data` and the standalone
-`control`/`data`/`join` subcommands (each always runs `Copy`, no flag of
-its own). `ClientCtx::trigger_split` is still the ONE choke point both
-workflows share (see its own doc, `lib.rs`): `self.split_mode` is the sole
-branch point between proposing `MetaCommand::BeginSplit` or
-`BeginSplitInPlace`, with identical children (same shape, same fields),
-the identical idempotent already-`Splitting` handling, the identical
-confirm loop, and identical F11 alignment — `auto_split_loop`/
+`animusd::config::SplitMode` (`Copy`/`InPlace`; **`InPlace` is the default
+since ADR 0058 rung 4 layer 2** — measurement showed it ~1.8× faster to
+converge with no correctness gap, see that ADR's rung-4-layer-2 as-built
+note — `Copy` was the default and every config/test's implicit behavior
+before this layer, and stays fully selectable via `--split-mode copy`
+pending its own deletion, not yet done), stored as a plain
+`ClientCtx.split_mode` field — deliberately **not** a `ClusterConfig` field
+(unlike `DynamoAuthConfig`, which has no other way to reach a `--config
+FILE` process): this is threaded exactly the way `--auto-split`/
+`--quiesce-after` are, as a CLI-parsed runtime parameter down the
+`spawn_common_tail`/`start_with_growth`/`start_control_with`/
+`start_data_with_growth` call chain, so adding it never touched
+`ClusterConfig`'s struct-literal shape (which dozens of existing tests
+construct directly). `--split-mode {copy,inplace}` threads through
+`--config FILE --node I` and `--cluster N` only — the identical scope
+`--quiesce-after` has, including the same documented gap for
+`--cluster-control`/`--cluster-data` and the standalone
+`control`/`data`/`join` subcommands (each always runs `SplitMode::
+default()` = `InPlace`, no flag of its own to select `Copy`). A test that
+specifically exercises the copy workflow's own mechanics (its
+`Splitting`/`Building` intermediate metadata shape, its build/freeze/tail
+driver, its own bench) must pin `SplitMode::Copy` explicitly rather than
+relying on `SplitMode::default()`/`run_node` — see
+`docs/engineering-lessons.md`'s rung-4-layer-2 entry for the audit and the
+two test files this caught. `ClientCtx::trigger_split` is still the ONE
+choke point both workflows share (see its own doc, `lib.rs`): `self.
+split_mode` is the sole branch point between proposing `MetaCommand::
+BeginSplit` or `BeginSplitInPlace`, with identical children (same shape,
+same fields), the identical idempotent already-`Splitting` handling, the
+identical confirm loop, and identical F11 alignment — `auto_split_loop`/
 `admin::action_split`/`ClientRequest::SplitTablet` all fall in behind
 whichever mode is configured automatically, with no fork of their own.
 

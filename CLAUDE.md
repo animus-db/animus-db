@@ -127,13 +127,6 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 The deep corpus tiers run nightly in CI
 (`.github/workflows/corpus-deep.yml`), not per-push.
 
-### Dashboard
-
-The "AnimusDB Console" (ADR 0021) is served by `animusd` on each node's
-**admin** address. Its assets (`crates/animusd/src/dashboard.{html,css}` +
-`dashboard_*.js`) are self-contained vanilla JS embedded via `include_str!` —
-no bundler, no build step: edit, `cargo build`, reload.
-
 ## The load-bearing constraint: determinism
 
 This is the single most important rule (ADR 0003). **All nondeterminism flows
@@ -214,12 +207,17 @@ truth; this map is just for navigation.
   are **table-scoped** (a table's tablets partition its own ring; no table
   prefix in keys). The escape/token primitives live here and must match the
   wire edges byte-for-byte.
-- **Tablet lifecycle** — split is a **copy-based background workflow**
-  (ADR 0050): `BeginSplit` mints two `Building` children at
-  placement-chosen homes, a driver on the parent's leader copies + tails,
-  a terminal `Freeze` stops writes, `CutoverSplit` activates the children
-  and retires the parent (children born with empty change logs; lineage
-  frozen in `split_lineage`); auto-split triggers on
+- **Tablet lifecycle** — split is, by default, an **in-place atomic fork**
+  (ADR 0058, default since rung 4 layer 2): a single Raft entry on the
+  parent's own log mints both children directly `Active`, materialized on
+  every fork participant from the committed entry, with no separate
+  build/freeze phase. The original **copy-based background workflow** (ADR
+  0050 — `BeginSplit` mints two `Building` children at placement-chosen
+  homes, a driver on the parent's leader copies + tails, a terminal
+  `Freeze` stops writes, `CutoverSplit` activates the children and retires
+  the parent) still exists, selectable via `--split-mode copy`, but is
+  deprecated pending deletion (ADR 0058's remaining rung 4 layer); lineage
+  is frozen in `split_lineage` either way. Auto-split triggers on
   **bytes** (ADR 0034, `animusd`); **tablets are split-only** — merge has
   been removed entirely (ADR 0044, supersedes ADR 0033); dropped tables'
   data is reclaimed by a convergent **GC** (ADR 0024). Tablet ids are never
@@ -278,7 +276,7 @@ truth; this map is just for navigation.
 - **Observability & operations** — metrics seam (`animus-env`, ADR 0015,
   additive/no-op under sim); OTLP tracing (`animusd::otel`, ADR 0027, opt-in);
   the admin/debug HTTP-JSON interface (`animusd::admin`, ADR 0020, pure
-  observer + gated actions); the web dashboard / AnimusDB Console
+  observer + gated actions); the web dashboard / animusd admin
   (`animusd::dashboard*`, ADR 0021, role-gated tabs per ADR 0035).
 - **Runnable node** — `animusd`, `animus-cli`. v1 (ADR 0019) assembles the
   **control plane + the CP data plane** over `ProdEnv` — all client
@@ -310,6 +308,12 @@ truth; this map is just for navigation.
 - An incidental pre-existing bug discovered during a task gets its own
   separate PR (with its own test), never a drive-by fix folded into an
   unrelated diff.
+- **The website (`website/`) is part of the documentation.** Anything it
+  states — supported/planned wire operations, architecture, status and
+  security posture, commands, ports — must stay in sync with the code.
+  A change that alters something the site claims updates `website/` in the
+  same change; when touching the site, verify its claims against the code
+  rather than propagating stale copy.
 - Larger work ships as a stacked PR series (managed with
   [`gh-stack`](https://github.com/github/gh-stack), a `gh` CLI extension),
   reviewed per-PR and merged as one stack. **Web sessions get `gh`, the
