@@ -12587,6 +12587,14 @@ impl CpReconciler {
             CpReconciler::Mem(r) => r.enable_quiescence(after),
         }
     }
+
+    /// ADR 0058 Train 2 rung 4 layer 1 — see [`Reconciler::fork_wake`]'s doc.
+    async fn fork_wake(&self) {
+        match self {
+            CpReconciler::Lsm(r) => r.fork_wake().await,
+            CpReconciler::Mem(r) => r.fork_wake().await,
+        }
+    }
 }
 
 /// How often [`tablet_host_reconciler_loop`] falls back to a plain poll when
@@ -12665,6 +12673,19 @@ const INPLACE_SPLIT_RECONCILE_INTERVAL: Duration = Duration::from_millis(50);
 /// several commits under bulk load collapses into one tick, not one per
 /// entry.
 ///
+/// **A third arm, `reconciler.fork_wake()` (ADR 0058 Train 2 rung 4 layer
+/// 1)**: resolves the instant any tablet this node currently hosts observes
+/// its own local `SplitTablet` fork apply, so this node's own tick fires
+/// immediately rather than riding out its own next scheduled wake (a real
+/// residual the rung-4 measurement addendum found — a freshly-forked
+/// child's first election needs a SECOND voter's own `materialize_split_
+/// child` to run before it can win a quorum, and that voter's own
+/// materialization used to ride its next poll rather than the fork itself).
+/// Harmless to race unconditionally: `CpReconciler::fork_wake` never
+/// resolves on its own when this node hosts nothing, and a spurious extra
+/// tick is exactly as cheap as the fallback sleep's own — `plan` is pure and
+/// idempotent regardless of what woke the loop.
+///
 /// The `last_applied() == 0` pre-recovery guard (see
 /// `animus_cp_data::host::plan`'s own doc: deciding "dropped" from *absence*
 /// is sound only over recovered, durable metadata — an empty pre-recovery
@@ -12705,6 +12726,13 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
         tokio::select! {
             _ = watch.changed(last_seen) => {}
             _ = tokio::time::sleep(fallback) => {}
+            // ADR 0058 Train 2 rung 4 layer 1: wake the instant ANY hosted
+            // tablet's own apply task observes a local `SplitTablet` fork,
+            // instead of waiting out this loop's own next scheduled tick
+            // (previously up to `INPLACE_SPLIT_RECONCILE_INTERVAL`, 50ms, per
+            // replica) — see `CpReconciler::fork_wake`'s doc for why this is
+            // safe to race unconditionally alongside the two arms above.
+            _ = reconciler.fork_wake() => {}
         }
         // Coalesce: take the freshest observed index regardless of which arm
         // woke the loop (the `changed()` future's own resolved value is not

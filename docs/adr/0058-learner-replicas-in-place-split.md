@@ -893,6 +893,93 @@ Two honest findings, reported plainly:
   fast do the other replicas materialize") — left as a candidate for a
   future rung if the gap matters in practice, not force-fit into this one.
 
+**Measurement note addendum (2026-08-25) — rung 4 layer 1: eager child
+materialization at the fork, closing the residual the addendum immediately
+above named.** Diagnosis (confirmed exactly as predicted): a freshly-forked
+child's SECOND voter — the one that must grant the campaigning replica's
+pre-vote before it can win a quorum — only ran its own
+`materialize_split_child` on that replica's *next scheduled* tablet-host-
+reconciler tick, which (even at rung 3's fast-polled
+`INPLACE_SPLIT_RECONCILE_INTERVAL`, 50ms) could land anywhere up to 50ms
+after the fork itself, on top of this host's own ~100ms per-round-trip
+floor. Fix: **every replica now triggers its own materialization the
+instant it applies `SplitTablet` locally**, instead of waiting for its next
+scheduled tick — a new executor-agnostic **fork-observed signal**
+(`ForkSignal`, the same `AtomicBool`+`AtomicWaker` shape as this crate's
+existing `ProposeSignal`/`ApplySignal`/`WakeSignal`), raised by the
+**async apply task** (`apply_and_compact`'s `KvCommand::SplitTablet` arm,
+right after the durable split marker commits — never by the sync,
+I/O-free `RaftCore`, per ADR 0003/0038 discipline) and consumed by a new
+`host::Reconciler::fork_wake()` fan-in future that `animusd::
+tablet_host_reconciler_loop`'s own `tokio::select!` races as a third arm
+alongside `metadata_watch`/the periodic fallback. This is deliberately a
+**wake, not a duplicated mechanism** — the trigger moved; `materialize_
+split_child`'s clone/trim/host logic, its per-child G4 commit points, and
+its idempotent re-derivation from the durable split marker are all
+byte-for-byte unchanged, following the same discipline PR #394's own
+"move the trigger, not the mechanism" lesson already named
+(`docs/engineering-lessons.md`). The eager wake is deliberately **not
+durable** — a crash between the apply task raising it and any tick
+consuming it simply loses the signal (see `docs/engineering-lessons.md`'s
+new entry) — recovery is unaffected because it was never on the critical
+path: the reconciler's ordinary periodic tick still re-derives the fork
+from the durable marker (`pending_split()`) exactly as it always did.
+
+`inplace_split_bench.rs` was rerun 3x, and `split_build.rs`'s copy-based
+bench was rerun once fresh, same-host, same-session, immediately
+afterward (never concurrently), following the same discipline as every
+prior measurement in this ADR:
+
+| | in-place, rung 4 (campaign only, prior session) | in-place, + layer 1 (run1/run2/run3) | copy-based, fresh same-host reference |
+|---|---|---|---|
+| write blip (max PUT) | 300.7 / 513.2 / 508.0 ms | 775.0 / 355.7 / 258.7 ms | 447.9 ms |
+| write blip median | **508.0ms** | **355.7ms** | **447.9ms** |
+| put retries needed | 0 / 0 / 0 | 0 / 0 / 0 | (not instrumented) |
+| fork/build wall clock | ~4.5s (prior session) | 4.55 / 4.17 / 4.15s | 8.04s |
+| idle GET floor (this host) | ~108ms | 108ms (identical across all 3 runs) | 108ms |
+
+Findings, reported plainly, in both directions:
+
+- **The median write blip drops again**, from 508.0ms to 355.7ms (≈30%
+  further down, and ≈51% down from rung 3's original 726.3ms) — and, for
+  the first time, lands **at or below** a same-session copy-based
+  reference run (447.9ms), meeting this rung's own acceptance target. The
+  best individual run (258.7ms) sits comfortably inside the copy path's
+  own historically-observed 250–300ms band; every run remains a single
+  slow request with **zero** retries, so the mechanism is doing what it
+  was built to do — shortening the parked write's own wait, not changing
+  its failure shape.
+- **Variance is still real and reported honestly, not smoothed over.**
+  One of the three runs (775.0ms) is the single *worst* write-blip number
+  measured anywhere in this ADR's whole measurement history, including
+  every pre-fix number — and the fresh copy-based reference run (447.9ms)
+  itself reads noticeably higher than this ADR's own earlier copy-path
+  numbers (252–304ms, rung 3/4's tables above). The one measurement that
+  stayed **exactly** stable across every run, in both benches, on both
+  sides of this addendum (108ms, to the millisecond) is the idle
+  linearizable-read floor — the same host-characteristic anchor rung 3/4
+  already used to argue this is measurement variance, not a regression:
+  whatever is producing the wider spread is landing in the "how long does
+  this one parked write wait" component specifically (still bounded by
+  the same small constants — the 50ms fast-poll cadence and this host's
+  own ~100ms round-trip floor — this rung's own fix reasons about), not a
+  change in the underlying mechanism's correctness or a new source of
+  cost. Median-of-3 remains the right statistic to compare here for
+  exactly the reason rung 3/4 already gave: a single run either side could
+  read as "regressed" or "fixed" depending on which one you drew.
+- **The eager wake's own contribution is structurally distinct from
+  rung 4's campaign fix**, and this addendum's corpus cells (below) prove
+  it directly rather than only inferring it from the bench: `ANIMUS_
+  INPLACE_SPLIT_SEEDS`'s new `eager_wake_and_reconciler_tick_race_
+  benignly` cell proves a hosted tablet's `fork_wake()` resolves with
+  **zero** reconciler ticks having run, and that a second, immediately
+  following tick (standing in for the ordinary periodic fallback
+  rediscovering the identical state) is a byte-for-byte no-op; `crash_
+  after_apply_loses_the_eager_wake_but_reconciler_fallback_recovers`
+  proves the signal's own non-durability is harmless — a crash that
+  strands the wake unconsumed still recovers, purely off the periodic
+  tick reading the durable marker, with no special-cased path.
+
 ## Open forks (deliberately not decided by this ADR)
 
 | # | Fork | Status |
