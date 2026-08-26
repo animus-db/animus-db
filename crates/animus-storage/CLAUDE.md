@@ -312,40 +312,75 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   durable state into a NEW, independent engine at SSTable-file granularity**
   — the prerequisite for a later in-place split's local materialization
   (rung 3; this method itself is split-agnostic — full-engine clone only, no
-  kind filtering, no key-range trimming). **The cut**: flush the memtable
-  first (a no-op if already empty), so the clone is SSTables-only with an
-  empty WAL, then [hard-link](../animus-env/CLAUDE.md) every live table into
-  `target_prefix`'s own namespace and write it a fresh manifest (same table
-  metas, same `next_seq` floor so the target's own future flushes never
-  collide with an inherited seq, same `max_version`, empty `wal_segments`).
-  SSTable immutability is what makes sharing bytes instead of copying them
-  safe: source and clone hold independent directory entries over the same
-  durable bytes, so the source's own compaction later removing a superseded
-  input has no effect on the clone. **Commit point (durable-before-visible)**:
-  the target's manifest `Disk::replace` is the single linearization point —
-  until it succeeds the target prefix has no manifest and opens empty
-  (any already-linked SSTable files are harmless orphans, exactly like a
+  kind filtering, no key-range trimming). **The cut**: one best-effort
+  `flush()` attempt (a no-op if the memtable is already empty, or if a write
+  is momentarily mid-apply — `applies_in_flight > 0`), which is enough on
+  its own to make the common, quiescent case a pure SSTables-only clone
+  with an empty WAL. What matters for correctness happens next: a **single
+  point-in-time snapshot** of `(manifest.tables, memtable-contents)` taken
+  under one acquisition of the same lock the write path applies under. That
+  one snapshot — no retrying, no polling for the memtable to go empty — is
+  sufficient to satisfy the real contract ("every write ACKED before this
+  call must appear in the clone"), because the write path
+  (`log_and_apply`) only returns to its caller after a record is both
+  WAL-synced and applied to the memtable under that identical lock: any
+  write already acked by the time a caller invokes `clone_to` is therefore
+  provably present at the snapshot, either still resident in the memtable
+  or already folded into a table by an intervening flush. Every table the
+  snapshot names is [hard-linked](../animus-env/CLAUDE.md) — not copied —
+  into `target_prefix`'s own namespace; anything the snapshot still found
+  in the memtable is written out as one additional, brand-**new** SSTable
+  built directly inside the **clone's own** namespace (never the source's)
+  at a seq past the source's own `next_seq` floor. A fresh manifest is then
+  written naming every linked table plus that new one if any rows needed
+  it (`next_seq` bumped past it so the target's own future flushes never
+  collide, same `max_version`, empty `wal_segments`). SSTable immutability
+  is what makes sharing the linked bytes instead of copying them safe:
+  source and clone hold independent directory entries over the same
+  durable bytes, so the source's own compaction later removing a
+  superseded input has no effect on the clone. **This never spins**: no
+  step depends on a concurrent writer ever pausing, unlike an earlier
+  version of this method that retried `flush()` in a bounded loop
+  (`CLONE_FLUSH_MAX_RETRIES`) until the memtable read empty — a starvation
+  flake by construction against a *persistent* writer (see
+  `docs/engineering-lessons.md`'s 2026-08-26 entry for the incident and the
+  general rule: a bounded retry against a live, unbounded producer has no
+  liveness guarantee at any bound). **Commit point (durable-before-
+  visible)**: the target's manifest `Disk::replace` is the single
+  linearization point — until it succeeds the target prefix has no
+  manifest and opens empty (any already-linked SSTable files, or an
+  already-written leftover table, are harmless orphans, exactly like a
   crashed flush's orphan table), so a crash before it leaves no half-clone
-  visible and the whole call is safe to simply retry
-  (`Disk::link` overwrites an already-linked `dst` name rather than
-  erroring, so relinking is idempotent). **One asymmetry to know**:
+  visible and the whole call is safe to simply retry (`Disk::link`
+  overwrites an already-linked `dst` name rather than erroring, so
+  relinking is idempotent; a retry's own leftover table lands at whatever
+  seq the source's *then-current* `next_seq` implies, which may differ
+  from a failed attempt's — any earlier attempt's own leftover file is
+  simply left behind as a harmless orphan). **One asymmetry to know**:
   `clone_to`'s own last step reopens the just-committed target to hand back
   a live handle, so an `Err` from the call does *not* always mean nothing
   was committed — a fault in that trailing open can follow a successful
   manifest commit. Either way what's durable at `target_prefix` is always
   **nothing** or a **complete** clone, never a torn one; the method's own
   doc comment states this precisely. The maintenance lock is held across
-  the whole flush-then-link sequence (after the flush, which acquires/
-  releases it on its own — it is not reentrant) so a concurrent compaction
-  on the source cannot swap/remove a table mid-link. `MemoryEngine::clone_to`
-  is the equivalent for `SimEnv` corpus use — there are no files to link, so
-  it deep-copies the version history instead; same "independent state,
-  writes never cross" contract. Tests: `tests/lsm_clone.rs` (equivalence
-  including overwrites/deletes, isolation, `SimEnv` disk-fault-injected
-  crash-mid-clone + retry, source compaction racing a live clone's linked
-  files) and `tests/lsm_clone_prodenv.rs` (a real-filesystem `ProdEnv`
-  regression asserting the clone is a literal hard link via matching inode
-  numbers, not a byte copy).
+  the whole snapshot/link/leftover-write sequence (after the flush, which
+  acquires/releases it on its own — it is not reentrant) so a concurrent
+  compaction on the source cannot swap/remove a table mid-link.
+  `MemoryEngine::clone_to` is the equivalent for `SimEnv` corpus use — there
+  are no files to link, so it deep-copies the version history instead
+  (no retry-vs-writer race exists there: `SimEnv` is single-threaded); same
+  "independent state, writes never cross" contract. Tests:
+  `tests/lsm_clone.rs` (equivalence including overwrites/deletes, isolation,
+  `SimEnv` disk-fault-injected crash-mid-clone + retry, source compaction
+  racing a live clone's linked files), `tests/lsm_clone_prodenv.rs` (a
+  real-filesystem `ProdEnv` regression asserting the clone is a literal
+  hard link via matching inode numbers, not a byte copy), and
+  `tests/lsm_clone_concurrent.rs` (real multi-thread `ProdEnv` — the
+  deterministic `SimEnv` cannot reproduce a flush racing a writer's own
+  apply, see that file's module doc — covering both no-lost-acked-write
+  under a racing writer and, since the 2026-08-26 starvation fix, that
+  `clone_to` *completes* promptly against a writer that never pauses for
+  the whole call).
 - **Observability (ADR 0015) is observe-only and deterministic.** `LsmEngine`
   records `storage_*` counters through the `Env` metrics seam at the real LSM site
   that knows the outcome: a flush *after* its manifest swap (`storage_flushes`); a
