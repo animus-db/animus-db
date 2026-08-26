@@ -1685,6 +1685,42 @@ route below the edge through the same `ClientCtx` CP primitives.
   site defaults internally to `StreamSealKnobs::default()` (4 MiB / 4h) /
   `SegmentStoreConfig::default()` (`Cluster`) / `DEFAULT_STREAM_RETENTION`
   (24h). Full per-parameter/per-call-site detail: `docs/streams-notes.md`.
+- **The on-demand backup subsystem's own store handle is wired the
+  identical way, as a deliberately parallel (not shared) second knob** (ADR
+  0059 §1, Train 1 PR②): `main.rs`'s `--backup-store cluster|fs:PATH` flag
+  (same `--config/--node`-and-`--cluster N`-only scope as `--segment-store`,
+  parsed by `parse_backup_store`) selects `BackupStoreConfig` — a distinct
+  enum from `SegmentStoreConfig`, not a second value of the same type, kept
+  separate because the ADR documents the two knobs' durability tradeoffs
+  independently even though the shapes are identical today (`Cluster` |
+  `Fs(PathBuf)`). `build_backup_store` mirrors `build_segment_store` exactly
+  (same `ClusterSegmentStore<ProdEnv, FsSegmentStore>`/`FsSegmentStore`
+  backends — this crate has no `SimEnv` dependency at all, so unlike
+  `animus-cp-data`'s own sim corpus neither store handle ever constructs a
+  `SimSegmentStore` here) but roots the cluster variant's local building
+  block at `dir.join("backups")` instead of `dir.join("segments")` — kept
+  physically separate from the streams store's own local directory even
+  though the two stores' object namespaces
+  (`animus_cp_data::backup::backup_manifest_object_id`/
+  `backup_data_object_id` vs. `animus_cp_data::segment::segment_id`) are
+  already disjoint, the same belt-and-suspenders posture the ADR itself
+  takes for the namespace split. `BackupStoreHandle` (`DataRole::
+  backup_store`, alongside `DataRole::segment_store`) is threaded through
+  combined (`BoundNode::start_with_growth`) and data-only
+  (`BoundDataNode::start_data_with_growth`) node assembly — **never**
+  control-only (`BoundControlNode::start_control_with` takes no such
+  parameter at all), the identical "no data role, no `SegmentStoreHandle`-
+  shaped handle" gap the streams segment janitor already documents for ADR
+  0043 §A9, inherited rather than fixed here. **Plumbing only as of this
+  PR**: `#[allow(dead_code)]` on `BackupStoreHandle`/its impl/`DataRole::
+  backup_store` is deliberate and temporary — no capture driver, janitor, or
+  wire surface calls any of it yet; a later PR's capture driver is the first
+  real consumer, and removing those allows is part of that PR's own diff,
+  not something to "clean up" here. `data --config`/`data --seed`/`control`/
+  `join`/`--cluster-control`+`--cluster-data` all default to
+  `BackupStoreConfig::Cluster` internally — no CLI flag reaches any of them,
+  the identical documented gap `--segment-store` already has on those same
+  entry points.
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and

@@ -57,6 +57,7 @@ use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
 
+pub mod backup;
 mod ceiling;
 pub mod cluster_segment_store;
 mod codec;

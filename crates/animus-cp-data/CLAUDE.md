@@ -37,6 +37,29 @@ amendment — the shape predates and outlives it.)
   `NarrowScope`/`ProposeSeal` actions were deleted in the ADR 0050 rung-7
   sweep, as the merge-dual `Absorb`/`WidenScope` were by ADR 0044). See
   "The host module".
+- **`backup.rs`** (ADR 0059 §2/§4, Train 1 PR②) — the on-demand-backup
+  **object naming + codec**: `backup_manifest_object_id`/
+  `backup_data_object_id` (`backup/{backup_id}/manifest` and
+  `backup/{backup_id}/{tablet}/{chunk}`, a fixed namespace the stream
+  sealer's own `{table}/{label}/{tablet}/{epoch}` shape never produces
+  except for a table literally named `backup` — an accepted, documented
+  edge case; the real collision-freedom guarantee is `animusd`'s separate
+  `--backup-store` handle/instance, never the streams one, per the ADR);
+  `encode_data_chunk`/`decode_data_chunk` (a magic+version-headed binary
+  codec over `SeedRow` — the identical `(kind, logical_key,
+  value-or-tombstone, version)` tuple `engine_image`/`install_engine_image`
+  already use for split-build snapshot transfer, ADR 0050, reused rather
+  than a second tuple codec); `BackupManifestObject`/`encode_manifest_
+  object`/`decode_manifest_object` (a magic+version envelope, `segment.rs`'s
+  own discipline, wrapping a plain `serde_json` payload of PR①'s
+  `animus_control::BackupManifest` stub plus the per-tablet
+  `BackupTabletProgress` completion records — JSON rather than a hand-rolled
+  binary encoder because `BackupManifest` nests the multi-field, evolving
+  `TableSchema` shape and this object is written/read once per backup, never
+  a hot path). **Plumbing only**: no capture driver, janitor, or wire
+  surface reads or writes through this module yet — see `animusd`'s
+  `BackupStoreConfig`/`BackupStoreHandle` (that crate's `CLAUDE.md`) for the
+  store-handle half of the same PR.
 - **`cluster_segment_store.rs`** (ADR 0043 §A7b) — `ClusterSegmentStore<E,
   S>`: the **default** `SegmentStore` for the stream-shard subsystem, K-way
   replication of an immutable segment over `E`'s `Network` seam. The

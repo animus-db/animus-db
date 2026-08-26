@@ -3594,6 +3594,7 @@ mod stream_sealer_tests {
                 crate::ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
                 None,
                 crate::config::SplitMode::default(),
+                crate::BackupStoreConfig::default(),
             )
             .await
             .expect("bring up single node with streams + quiescence");
