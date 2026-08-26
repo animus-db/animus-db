@@ -10057,3 +10057,75 @@ still only a well-argued candidate, not a captured fact — a durable,
 committed diagnostic (gated by an env var or `#[cfg(test)]`, never firing
 in production) is the natural next step before the next investigation round
 attempts a fix.
+
+### Amendment (2026-08-26, later the same day): shape B confirmed and fixed; a second, sibling conflation found and fixed alongside it
+
+A follow-up round re-instrumented both candidate sites from the entry above
+(temporary `eprintln!`s, reverted before this amendment's own commit) and
+re-ran the un-pinned `SplitMode::InPlace` soak. **Shape B fired and was
+captured live within the first ~12 runs**: the exact predicted sequence —
+`ClientCtx::txn_verify` returning `Err` for a participant span, folded into
+`all_staged = false`, immediately followed by `txn_recover` proposing
+`Aborted` and the test's own "acked write lost" panic on the identical item.
+Confirmed mechanism: `txn_recover`'s `all_staged` loop (`crates/animusd/src/
+lib.rs`) treated `Ok(false)` (genuinely not staged) and `Err(_)` (the verify
+query itself failed, most commonly a transient routing hiccup while a
+participant's tablet is mid-fork/cutover) identically. **Fixed** by
+separating them: any `Err` now makes the whole push **inconclusive** —
+`txn_recover` declines (returns `Pending`, proposes nothing) instead of ever
+letting an unconfirmed span feed a decision. A new `txn_resolver_loop`-local
+grace tracker (mirroring `unresolved_decided`'s own lookup-failure tracker,
+issue #298 residuals commit) logs+meters once (`Metric::
+CpTxnRecoveryStuckInconclusive`) if a transaction stays inconclusive well
+past `RECOVERY_GRACE`, purely a liveness signal — correctness never depends
+on it firing.
+
+**A sibling conflation, found while chasing a SECOND "acked write lost"
+recurrence after the first fix landed**: `RaftKvNode::txn_record_view`
+(`animus-cp-data`) — the primitive `txn_recover`'s *orphan-record* branch
+reads to decide "does no record exist at all, past grace, so an abort
+tombstone is safe" — had the exact same shape of bug, one level up: its
+plain `Option` return conflated "not served" (this replica's own read
+barrier failed, e.g. mid-fork/cutover) with "genuinely no record" into the
+same bare `None`. `ClientCtx::txn_record_view`'s wrapper turned *any* `None`
+into `Err`, and `txn_recover`'s orphan branch treated *any* `Err` as
+license to proceed toward an orphan-abort decision once past grace — so a
+transient barrier failure on this ONE read could synthesize an abort
+tombstone for a transaction whose record was fine (staged, or already
+committing) and simply unreachable by this one query attempt. This is the
+**general lesson generalized**: an "an `Err`/`None` from a query is UNKNOWN,
+never evidence of absence" audit must cover *every* query a decision is
+built on, not just the first one found — a fix scoped to the `intent_spans`
+verify loop alone left an identically-shaped gap one level up in the same
+function. **Fixed** by widening `RaftKvNode::txn_record_view` to the
+existing `stale_get_served`/`linearizable_get_served` "served" discipline
+this crate already uses elsewhere: `Option<Option<TxnRecordView>>` — outer
+`None` = not served (decline), `Some(None)` = definitively no record
+(the ONLY value that may feed an orphan-abort decision), `Some(Some(view))`
+= found. Propagated through `ClientCtx::txn_record_view` (now `Result<Option
+<TxnRecordView>, String>`, not `Result<TxnRecordView, String>`) and the
+`ClientRequest::TxnRecordView`/`ClientResponse::TxnRecordViewReply` wire
+pair (`view: Option<TxnRecordView>`, `TxnRecordView` gaining `Serialize`/
+`Deserialize`). Every caller that only ever collapsed both `Option` layers
+for a best-effort read (the `/admin/txns` diagnostic view, `animus-cli`'s
+raw-reply printer) keeps doing exactly that — `.flatten()` is correct there,
+since nothing downstream makes a safety decision off the distinction; only
+`txn_recover`'s own two call sites needed to keep the layers apart.
+
+**Method note**: a captured live trace matching a predicted symptom exactly
+(diagnostic fires, panic follows immediately, same item) is strong enough
+confirmation to fix from directly — no need to *also* chase a fully
+deterministic `SimEnv` repro when the mechanism is this legible from one
+clean trace, especially given `animusd` has no `animus-sim` dependency at
+all (a standing gap this round didn't attempt to close). The nearest thing
+to a deterministic regression is `animus-cp-data/tests/
+txn_record_view_served.rs`, proving the FIXED primitive's own "served"
+contract directly (a genuinely absent key answers `Some(None)`; a deposed/
+partitioned leader's own barrier failure answers the outer `None`; a real
+staged record answers `Some(Some(view))`) — and `animus-test/tests/
+txn_serializable.rs`'s own `push`/`resolver_tick` (a SimEnv-based
+reimplementation of this exact recovery protocol, ADR 0018 §4 PR6) was
+independently carrying the identical two conflations in its own test-double
+logic; both were fixed to match, closing the gap for that corpus's own
+future fault-injection scenarios too, even though today's frozen scenario
+set never happened to trip either one.
