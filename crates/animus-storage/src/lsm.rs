@@ -211,6 +211,21 @@ const BACKPRESSURE_POLL: Duration = Duration::from_millis(1);
 /// failing (e.g. a disk that never recovers) — turns what would otherwise be
 /// an unbounded retry loop into a clean, loud error.
 const BACKPRESSURE_MAX_POLLS: u32 = 10_000;
+/// How long [`LsmEngine::clone_to`] waits between retries of its own flush
+/// (issue #298) — see that method's doc for why a single `flush()` call is
+/// not enough. `applies_in_flight`'s own window is one WAL fsync+memtable
+/// apply, normally sub-millisecond; this only needs to be short enough that
+/// a handful of retries clears an ordinary race, not tuned to any specific
+/// disk's latency.
+const CLONE_FLUSH_RETRY_POLL: Duration = Duration::from_millis(1);
+/// Bound on [`LsmEngine::clone_to`]'s flush-retry loop — generous relative to
+/// the sub-millisecond window each retry targets, so this only ever fires as
+/// a loud, diagnosable error if something is persistently, not just
+/// momentarily, keeping the memtable non-empty (e.g. a caller that races
+/// this call against its OWN unthrottled concurrent write storm — not the
+/// in-place split materialization path this was written for, which clones a
+/// tablet already refusing every future user write).
+const CLONE_FLUSH_MAX_RETRIES: u32 = 1_000;
 
 /// Tuning knobs for an [`LsmEngine`]. Defaults are sized for tests; production
 /// wiring can raise them.
@@ -1973,7 +1988,50 @@ impl<E: Env> LsmEngine<E> {
         // Flush first so the clone is SSTables-only. Done *before* taking the
         // maintenance lock below: `flush` acquires it internally and the lock
         // is not reentrant.
-        self.flush().await?;
+        //
+        // **A single `flush()` call is not enough (issue #298).** `flush`
+        // itself silently no-ops — returning `Ok(())` with nothing written —
+        // whenever `applies_in_flight > 0`: a concurrent writer is between
+        // its own WAL fsync and memtable apply, and `flush` correctly
+        // refuses to snapshot a torn memtable rather than risk it. That
+        // no-op is safe for `flush`'s *other* callers (the write-path
+        // threshold trigger and the admin `flush_now` action), which only
+        // ever want "flush what's there, harmlessly skip if a write is mid-
+        // flight, it'll trigger again soon" — but this caller's own
+        // contract is stronger: everything durably in the engine at the
+        // moment this is called must end up in the clone, because the
+        // clone becomes the ONLY forward-going copy for a split child a
+        // reconciler on a different task can start hosting the instant
+        // this returns. A caller reasoning "the memtable held the row when
+        // I scanned it a moment ago" has no way to know `flush()` just
+        // silently skipped it — the row stays resident only in a memtable
+        // this method is about to leave behind (the target's own manifest
+        // is SSTables-only, `wal_segments: Vec::new()`), a permanent,
+        // silent loss the instant the source (a frozen in-place-split
+        // parent) is later reclaimed. Confirmed live: a captured repro
+        // showed a row present in a direct `scan()` of the source
+        // immediately before this call and absent from the freshly cloned
+        // child immediately after, on the replica that also happened to be
+        // the busiest (leading, and hence apply-task-active for, the whole
+        // split lineage) — exactly the shape a `applies_in_flight` race
+        // predicts. Retrying until the memtable is confirmed empty (not
+        // just until `flush()` returns without erroring) closes it: the
+        // race window is one WAL fsync+apply, so an ordinary race clears in
+        // one or two retries.
+        for _ in 0..CLONE_FLUSH_MAX_RETRIES {
+            self.flush().await?;
+            if self.lock().memtable.is_empty() {
+                break;
+            }
+            self.env.sleep(CLONE_FLUSH_RETRY_POLL).await;
+        }
+        if !self.lock().memtable.is_empty() {
+            return Err(StorageError::Backend(format!(
+                "clone_to({target_prefix}): memtable still non-empty after \
+                 {CLONE_FLUSH_MAX_RETRIES} flush retries — a concurrent writer is \
+                 persistently racing this clone"
+            )));
+        }
 
         // Hold the maintenance lock for the whole snapshot+link sequence so a
         // concurrent compaction on the source cannot swap/remove a table this

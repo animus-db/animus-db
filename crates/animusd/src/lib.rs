@@ -7789,10 +7789,47 @@ impl ClientCtx {
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
+        self.cp_kind_write_raw_bounded(table, writes, change_log, CLIENT_TIMEOUT)
+            .await
+    }
+
+    /// [`cp_kind_write_raw`](Self::cp_kind_write_raw)'s single-attempt
+    /// sibling: identical write, but a `FROZEN_REFUSAL`-shaped failure
+    /// returns immediately instead of retrying for `CLIENT_TIMEOUT` (issue
+    /// #298). The one caller today is `reconcile_partition`'s GSI row
+    /// write, invoked from the frozen-endgame acceleration loop
+    /// (`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`) — see
+    /// `index_drain::is_retryable_elsewhere`'s doc for why that loop must
+    /// not spend up to `CLIENT_TIMEOUT` *per pass* blocked on a write whose
+    /// own target tablet can, under a cascade, be mid-split and needing
+    /// this SAME node's own `change_consumer_loop` to reach its turn before
+    /// it ever un-freezes — multiplying a per-write retry budget by a
+    /// per-pass loop count is exactly the shape that turned a few co-hosted
+    /// splits into a multi-minute self-inflicted stall. A single fast
+    /// failure here costs a fraction of a millisecond, so the loop's own
+    /// pass count (or `change_consumer_loop`'s next ordinary 200ms tick)
+    /// is the only retry budget actually spent.
+    pub(crate) async fn cp_kind_write_raw_once(
+        &self,
+        table: &str,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        self.cp_kind_write_raw_bounded(table, writes, change_log, Duration::ZERO)
+            .await
+    }
+
+    async fn cp_kind_write_raw_bounded(
+        &self,
+        table: &str,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
+        timeout: Duration,
+    ) -> Result<(), String> {
         let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
         };
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let err = match self.cp_route(table, &first).await {
                 CpRoute::Local(leader) => {
@@ -12783,12 +12820,35 @@ async fn txn_resolver_loop(ctx: ClientCtx) {
                 continue; // legacy whole-keyspace tablet, or a stale view — skip this tick
             };
 
-            for (txn_id, (record_key, _created_ts)) in group.pending_txns() {
-                // No intent hint needed/available here — `pending_txns` only
-                // ever tracks a genuine, locally-anchored `Pending` record
-                // (never an orphan), so `txn_recover`'s record-absent branch
-                // is unreachable from this caller by construction.
-                if let Err(e) = ctx.txn_recover(&table, &record_key, &txn_id, None).await {
+            for (txn_id, (record_key, created_ts)) in group.pending_txns() {
+                // `created_ts` as the orphan-path hint (issue #298): passing
+                // `None` here rested on "`pending_txns` only ever tracks a
+                // genuine, locally-anchored `Pending` record, so
+                // `txn_recover`'s record-absent branch is unreachable from
+                // this caller by construction" — true only as long as the
+                // record stays reachable at that same logical position for
+                // the whole recovery window. A txn record is an ordinary
+                // in-scope logical key of its anchor tablet (`txn.rs`'s own
+                // doc), so it rides the identical split clone/trim path
+                // every other row does — if a split ever misplaces or drops
+                // it (the same class of bug a live base-row investigation
+                // under this issue found, still open), `txn_record_view`'s
+                // lookup inside `txn_recover` genuinely can fail for a
+                // record this loop just enumerated moments ago, and with
+                // `None` there is no fallback: the record-absent branch
+                // immediately returns `Pending` with no grace-period-then-
+                // decide path at all, so this call would retry forever
+                // without ever making progress — the exact "stuck reporting
+                // TransactionConflict indefinitely" shape observed. Passing
+                // the hint costs nothing when the comment's own assumption
+                // holds (the record-absent branch simply never runs), and
+                // gives the existing, already-reviewed orphan-abort
+                // fallback a real timestamp to bound its grace period by
+                // when it doesn't.
+                if let Err(e) = ctx
+                    .txn_recover(&table, &record_key, &txn_id, Some(created_ts))
+                    .await
+                {
                     tracing::debug!(
                         tablet = tablet.0,
                         ?txn_id,
