@@ -9697,6 +9697,124 @@ needs no debouncing, coordination, or "only once" bookkeeping between the
 two triggers at all — just a test that fires both, back to back, and
 asserts nothing changed the second time.
 
+## Flipping an enum's `#[default]` silently re-points every `.default()` pin — audit callers for ones that meant "the current default," not "whatever the default is" (ADR 0058 rung 4 layer 2)
+
+`animusd::config::SplitMode` had a documented "pinned to `Copy`" convention:
+every deployment shape/test that didn't have an explicit override called
+`SplitMode::default()`, and the doc comments at each of those call sites
+said things like "byte-for-byte the original ADR 0050 workflow." Flipping
+`#[default]` from `Copy` to `InPlace` (the whole point of this layer) is a
+one-line change at the enum, but it silently changes the behavior of every
+one of those `.default()` call sites at once — including ones nobody was
+thinking about when they wrote `SplitMode::default()` instead of
+`SplitMode::Copy` explicitly. That fan-out is exactly the feature for
+production code (it is what makes "every deployment shape splits in-place
+unless told otherwise" a one-line change) and exactly the hazard for tests:
+a test that calls a `.default()`-threading bring-up helper because it
+never needed to think about the knob is fine either way, but a test that
+calls it because it happens to currently produce the behavior the test
+actually asserts on will silently start asserting on the wrong thing, with
+no compiler error and — if the two workflows converge to similar-looking
+end states — sometimes no test failure either.
+
+The concrete miss this rung found: two test files
+(`animusd/tests/split_lifecycle.rs`, `animusd/tests/admin_endpoint.rs`'s
+`admin_split_kicks_off_the_copy_based_workflow`) poll for a `Splitting`
+parent with exactly two `Building` children — an intermediate metadata
+shape that only the ADR 0050 copy workflow ever produces (the ADR 0058
+in-place fork mints both children directly `Active` at cutover, with no
+`Building` row ever recorded). Both files brought clusters up through
+`animusd::run_node`, which threads `SplitMode::default()` with no override.
+Before this layer, that was an accurate (if implicit) pin to `Copy`; after
+it, the exact same code silently starts requesting `BeginSplitInPlace`
+instead, and the poll would simply never observe `building.len() == 2` —
+a hang-then-timeout failure with a confusing symptom (the assertion
+message names the state it never saw, not the mode that made it
+unreachable). `split_build.rs` (ADR 0050's own end-to-end file: build,
+freeze, tail, cutover, and the copy bench) had the identical exposure. All
+three were fixed the same way — call the split-mode-taking entry point
+directly with `SplitMode::Copy` explicit, with a comment naming *why* (this
+file/test is about the copy workflow's own mechanics, not "a split" in
+general) so a future default flip doesn't quietly re-break the same
+assertion.
+
+The generalizable rule: **when a type's `#[default]` is about to change,
+grep every `Type::default()` call site, not just the ones with a comment
+already flagging them as pinned** — a caller that never explicitly named
+the variant is exactly the one most likely to be *relying* on today's
+default without saying so. Classify each one: does this caller want
+"whatever the type's default currently is" (generic behavior, safe to let
+ride the flip — and often the *point* of flipping the default, since it's
+how the new behavior gets exercised by the existing test suite for free),
+or does it want "the specific variant that happens to be the default
+today" (needs an explicit pin, or it silently starts testing something
+else, or nothing at all). The tell for the second category in this
+codebase was assertions on a workflow's own *intermediate* state shape
+(not just its converged end state) — two different mechanisms that
+converge to equivalent-looking final outcomes can still have completely
+different, mutually exclusive transient states along the way, and a test
+built around one mechanism's transient will simply never fire under the
+other's.
+
+## A much faster mechanism doesn't just change latency numbers — it changes how often a fixed test budget exercises the thing that was already flaky (ADR 0058 rung 4 layer 2)
+
+Two more `animusd/tests/streams_e2e.rs` failures surfaced flipping
+`SplitMode`'s default, past the intermediate-state-shape ones above, and
+they generalize differently.
+
+**The first was a pre-existing, mislabeled test bug this flip merely made
+visible.** `multi_split_soak_streamed_gsi_table_under_mixed_load`'s
+"zero lost writes" check read an item back via a bare `GetItem` — no
+`ConsistentRead: true` — exactly the ADR 0055 gotcha this crate's own
+`CLAUDE.md` already documents ("a read that verifies a write must ask for
+the linearizable read"). Under the copy workflow's slower, seconds-long
+per-split timeline, the eventually-consistent replica this test happened
+to read from had ample time to catch up between the write and the
+verification read, so the missing annotation never mattered in practice.
+In-place's much faster convergence didn't introduce a new staleness
+window — it didn't shrink the window fast enough relative to the rest of
+the test to hide the *pre-existing* one, and the read started actually
+observing it. Fixed the only way ADR 0055 sanctions: add
+`ConsistentRead: true` to the read that is asserting durability, not
+staleness tolerance.
+
+**The second is a real, already-tracked-but-unresolved bug (issue #298,
+an exactly-once duplication/deficit at a split boundary, root cause
+unknown) that the flip made dramatically easier to hit — not by changing
+its trigger condition, but by changing how many times a fixed-duration
+test exercises that trigger.** `multi_split_soak_streamed_gsi_table_under_
+mixed_load` runs a fixed workload (120 writes, a 300s budget) that
+auto-splits repeatedly; under copy's per-split cost, that budget fits
+however many splits copy's cadence allows, and #298 was rare enough to be
+"occasionally sighted" in that regime. In-place's ~1.8x-faster convergence
+lets dramatically more splits complete inside the identical fixed budget
+— every one of them another roll of the dice against whatever race #298
+actually is — and three consecutive runs under in-place reproduced it
+every time (a deficit-shaped failure on one run, an over-count-shaped one
+on another — both are #298's documented symptom family, just its two
+different faces). Pinning this one soak back to `SplitMode::Copy`
+(`start_streamed_cluster_full_copy_pinned`) restored its original,
+rare-in-practice flake rate — 3/3 green in the retest — without touching
+#298 itself, which stays out of scope here (a pre-existing bug gets its
+own investigation and its own change, never a drive-by fix riding an
+unrelated default flip).
+
+**The generalizable point**: when a change makes something *faster*, audit
+every fixed-duration/fixed-iteration-count test that exercises the sped-up
+path for whether it now completes measurably more repetitions of that path
+per run — a soak/stress test's own bug-detection power is a function of
+repetitions-per-budget, not just wall-clock coverage, and a large enough
+speedup can turn "reproduces rarely enough to file and defer" into
+"reproduces every run" without the underlying bug changing at all. That
+shift is worth surfacing loudly (as this entry does) rather than either
+silently loosening the newly-flaky assertion or silently pinning it away
+without a trail: **`Copy`'s eventual deletion (this same ADR's next rung)
+removes the option to pin away from this exact soak**, so whoever does
+that deletion needs to know, going in, that issue #298 will need to
+actually be resolved (or the soak's own budget/iteration count
+deliberately re-tuned) before that layer can ship — not rediscovered cold
+at that point.
+
 ## A mobile `grid-template-columns: 1fr` override silently reintroduces the desktop overflow it was meant to fix (website responsive pass, ADR 0056 skin)
 
 The site's desktop grids (`.hero-grid`, `.split`, `.foot-grid`) were all

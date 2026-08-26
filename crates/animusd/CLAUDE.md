@@ -621,25 +621,36 @@ kill).
 
 **`SplitMode` (ADR 0058 Train 2 rung 3's `animusd`-level driver residue)
 selects between the copy-based workflow above and the in-place one**:
-`animusd::config::SplitMode` (`Copy`/`InPlace`, `Copy` the default and
-every existing config/test), stored as a plain `ClientCtx.split_mode`
-field — deliberately **not** a `ClusterConfig` field (unlike
-`DynamoAuthConfig`, which has no other way to reach a `--config FILE`
-process): this is threaded exactly the way `--auto-split`/`--quiesce-after`
-are, as a CLI-parsed runtime parameter down the `spawn_common_tail`/
-`start_with_growth`/`start_control_with`/`start_data_with_growth` call
-chain, so adding it never touched `ClusterConfig`'s struct-literal shape
-(which dozens of existing tests construct directly). `--split-mode
-{copy,inplace}` threads through `--config FILE --node I` and `--cluster N`
-only — the identical scope `--quiesce-after` has, including the same
-documented gap for `--cluster-control`/`--cluster-data` and the standalone
-`control`/`data`/`join` subcommands (each always runs `Copy`, no flag of
-its own). `ClientCtx::trigger_split` is still the ONE choke point both
-workflows share (see its own doc, `lib.rs`): `self.split_mode` is the sole
-branch point between proposing `MetaCommand::BeginSplit` or
-`BeginSplitInPlace`, with identical children (same shape, same fields),
-the identical idempotent already-`Splitting` handling, the identical
-confirm loop, and identical F11 alignment — `auto_split_loop`/
+`animusd::config::SplitMode` (`Copy`/`InPlace`; **`InPlace` is the default
+since ADR 0058 rung 4 layer 2** — measurement showed it ~1.8× faster to
+converge with no correctness gap, see that ADR's rung-4-layer-2 as-built
+note — `Copy` was the default and every config/test's implicit behavior
+before this layer, and stays fully selectable via `--split-mode copy`
+pending its own deletion, not yet done), stored as a plain
+`ClientCtx.split_mode` field — deliberately **not** a `ClusterConfig` field
+(unlike `DynamoAuthConfig`, which has no other way to reach a `--config
+FILE` process): this is threaded exactly the way `--auto-split`/
+`--quiesce-after` are, as a CLI-parsed runtime parameter down the
+`spawn_common_tail`/`start_with_growth`/`start_control_with`/
+`start_data_with_growth` call chain, so adding it never touched
+`ClusterConfig`'s struct-literal shape (which dozens of existing tests
+construct directly). `--split-mode {copy,inplace}` threads through
+`--config FILE --node I` and `--cluster N` only — the identical scope
+`--quiesce-after` has, including the same documented gap for
+`--cluster-control`/`--cluster-data` and the standalone
+`control`/`data`/`join` subcommands (each always runs `SplitMode::
+default()` = `InPlace`, no flag of its own to select `Copy`). A test that
+specifically exercises the copy workflow's own mechanics (its
+`Splitting`/`Building` intermediate metadata shape, its build/freeze/tail
+driver, its own bench) must pin `SplitMode::Copy` explicitly rather than
+relying on `SplitMode::default()`/`run_node` — see
+`docs/engineering-lessons.md`'s rung-4-layer-2 entry for the audit and the
+two test files this caught. `ClientCtx::trigger_split` is still the ONE
+choke point both workflows share (see its own doc, `lib.rs`): `self.
+split_mode` is the sole branch point between proposing `MetaCommand::
+BeginSplit` or `BeginSplitInPlace`, with identical children (same shape,
+same fields), the identical idempotent already-`Splitting` handling, the
+identical confirm loop, and identical F11 alignment — `auto_split_loop`/
 `admin::action_split`/`ClientRequest::SplitTablet` all fall in behind
 whichever mode is configured automatically, with no fork of their own.
 
