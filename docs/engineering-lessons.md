@@ -10129,3 +10129,84 @@ independently carrying the identical two conflations in its own test-double
 logic; both were fixed to match, closing the gap for that corpus's own
 future fault-injection scenarios too, even though today's frozen scenario
 set never happened to trip either one.
+
+### Amendment (2026-08-26, later still): shape A's literal double-delivery confirmed live — but its real trigger is a THIRD, deeper mechanism than either candidate named
+
+The same re-instrumented soak that caught shape B (above) also caught
+shape A's own literal signature directly: `delivered=146/144`, with
+`x0079a` appearing **twice under the identical shard** (tablet 67, epoch
+0, two distinct sequence numbers) and its transactional sibling `x0079b`
+appearing twice **cross-epoch** (the already-fixed mechanism-2 pattern) —
+exactly the "one shared underlying event manifesting two ways depending on
+whether a seal happened to land between the two applies" shape the
+original investigation predicted. The `TxnStage`-over-`Committed`
+diagnostic fired for both keys at the moment of the resurrecting stage,
+confirming the structural gap named in the base entry above is real and
+reachable.
+
+**But tracing the captured `txn_id`s through the trace showed the live
+mechanism is narrower AND deeper than either original candidate**: the
+*resurrecting* stage used a genuinely fresh `txn_id`, distinct from
+whatever transaction first wrote `x0079a`/`x0079b` (never captured, since
+the diagnostic only fires on the resurrecting attempt) — this is not "the
+same transaction re-staging its own already-resolved key" (the shape the
+`blocked_by` gap's literal wording suggested), it is **two independent
+transactions, each individually legitimate from `KvCommand::TxnStage`'s
+own narrow point of view, racing to write the identical logical item**.
+The only way that happens for ids the workload never reuses is a
+**client-level retry**: `dynamo_retrying_transact`'s own retry loop
+resubmits `TransactWriteItems` (an un-tokened call, exactly DynamoDB's own
+documented duplicate-execution risk) whenever the response is a 500, or a
+400 whose message carries the house `"; retry"` convention — and
+`cp_txn`/`txn_prepare_pushing`'s own error messages for a **confirmation
+loss** (`"CP group leader moved during participant/anchor stage/commit;
+retry"`, minted whenever `wait_stage_outcome`/the leader handle races a
+leadership change mid-poll) carry that exact suffix. Unlike a
+`StageOutcome::Fenced` outcome — provably a no-op, since the apply-time
+gate rejected it before anything landed — a confirmation loss proves
+**nothing** about whether the underlying stage/commit actually applied; it
+only means *this* call couldn't learn the answer. A retry that mints a
+fresh `txn_id` after a confirmation-lost first attempt that in fact
+succeeded races its own already-committed work, and `KvCommand::
+TxnStage`'s missing already-Committed check (the base entry's own finding)
+is exactly what lets the retry silently win instead of being rejected.
+
+**This is the general lesson from the shape B amendment above, at a third
+layer**: "an unconfirmed outcome is UNKNOWN, never evidence of a specific
+result" needed applying not just to `txn_recover`'s own two queries, but
+to the **coordinator's own error-reporting convention** — marking a
+confirmation-loss message retryable with the same blanket `"; retry"` tag
+a provably-safe `Fenced` refusal uses conflates "retry costs nothing" with
+"retry might race your own prior success." Not fixed this round (a
+coordinator-side fix — verify-before-erroring on a lost confirmation,
+mirroring the self-verification `txn_prepare_pushing` already does for the
+*known* `IntentBlocked` case — is a genuinely new, substantial mechanism,
+out of scope for a same-round stacked fix per this repo's own "an
+incidental bug gets its own PR" convention); see ADR 0018's shape B
+amendment §6 for the pointer carried forward.
+
+**What WAS fixed this round, on its own merits, regardless of not being
+the live trigger**: `KvCommand::TxnStage`'s apply arm now rejects a stage
+targeting a key that THIS EXACT `txn_id` already resolved on this group
+(`TxnTracker::recently_resolved`, a bounded best-effort seatbelt, checked
+by `(key, txn_id)` identity — the same "never trust an outcome without
+confirming it names the SAME thing" discipline the `KindBatchOutcome`
+false-ack fix established). This closes the narrower same-txn resurrection
+the original candidate mechanism's wording named (a genuine gap, still
+worth closing even though it wasn't what fired in the captured trace) and
+is red/green proven directly:
+`animus-cp-data`'s in-crate `pr5_orphan_and_resurrection_tests::
+a_resolved_key_rejects_a_same_txn_restage_issue_298_shape_a`. **It does
+not close the live trigger** — a genuinely different, fresh `txn_id`
+staging over an already-`Committed` value from an unrelated (or, as here,
+duplicate-client-retried) transaction is the ordinary, correct write path
+and must keep succeeding; only same-identity resurrection is rejected.
+
+**Method note, reinforcing the base entry's own lesson**: tracing a
+captured diagnostic's own identity fields (here, `txn_id`) all the way
+through — not just confirming the diagnostic fired at the predicted
+symptom — is what separated "the named candidate mechanism is confirmed"
+from "a structurally real but not-the-live-cause gap, with the ACTUAL live
+cause one layer further out." A diagnostic firing at the right place and
+the right time is necessary but not sufficient evidence that the
+candidate mechanism it was built to catch is the one actually operating.
