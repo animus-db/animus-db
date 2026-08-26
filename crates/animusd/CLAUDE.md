@@ -973,6 +973,20 @@ TxnResolve`'s own `fence` (`animus-cp-data/CLAUDE.md`'s Key invariants
 entry) is the structural seatbelt against a repeat of this specific
 mistake, in this function or any future caller.
 
+**Gap found, not yet fixed (issue #298, 2026-08-26)**: `txn_recover`'s
+`all_staged` loop folds a `txn_verify` `Err` (most commonly a transient
+"no CP group leader reachable" while a participant's tablet is mid-fork/
+cutover) into the same bucket as a genuine `Ok(false)` ("never staged").
+Under a high split cadence this can push recovery to Abort a transaction
+whose own coordinator (`cp_txn`) is concurrently deciding, or has already
+decided, Commit — a live instance of the "duelling decider" hazard ADR
+0018 §2/PR5 accepts as legal only because both deciders are assumed to
+reach an objectively correct decision from independently verified state.
+Caught live (a captured `all_staged=false`/`Aborted` decision immediately
+preceding a "acked write lost" panic) during a `SplitMode::InPlace`-unpinned
+soak; not yet fixed — see `docs/engineering-lessons.md`'s matching entry
+and ADR 0058's G5 row.
+
 **A wire-reachable panic found (and fixed) while testing this**:
 `RaftKvNode::txn_stage`'s anchor-key-length assert (ADR 0022, `TOKEN_BYTES`)
 was a sound "caller invariant" before `ClientRequest::Txn` existed — no
@@ -2017,3 +2031,43 @@ deployment shape, and the `WatchMetadata`/system-table/OTel/metrics support
 surfaces.
 `support/mod.rs` holds the shared bring-up helpers (port-TOCTOU retries,
 split-cluster bring-up).
+
+## Benchmark
+
+`benches/cluster_bench.rs` (`cargo bench -p animusd`) is a hand-rolled
+(no criterion, zero new dependencies), `harness = false` bench of the
+DynamoDB JSON/HTTP wire over a real in-process cluster — `ProdEnv`, real
+sockets/disk/clock, following `animus-storage/benches/engine_bench.rs`'s
+style. It measures, per operation class, p50/p99/p99.9/mean latency and
+throughput: `PutItem`, `GetItem` with `ConsistentRead: true` and `false`
+**reported separately, never blended** (ADR 0055's two read paths),
+`Query` within a partition, a paged `Scan`, a concurrent-`PutItem`
+throughput sweep at `ANIMUS_BENCH_CLIENTS` client counts (each its own
+persistent TCP connection), and a **degraded phase**: after the
+healthy-cluster classes it finds and kills the bench tablet's own leader
+node (`/admin/raftkv`'s `is_leader`) and re-measures `PutItem`/
+`GetItem(ConsistentRead:true)` through the resulting election, via a
+bounded-retry wire helper that counts (and reports) retries rather than
+failing on a transient "not the leader here". Cluster bring-up follows
+`tests/inplace_split_bench.rs`/`tests/split_build.rs`'s bounded-retry
+port-TOCTOU idiom. Workload knobs: `ANIMUS_BENCH_NODES` (3),
+`ANIMUS_BENCH_ITEMS` (2_000, preload size), `ANIMUS_BENCH_OPS` (1_000,
+measured ops per class), `ANIMUS_BENCH_VALUE_BYTES` (256),
+`ANIMUS_BENCH_CLIENTS` ("1,8,32"), and `ANIMUS_BENCH_JSON=<path>` to also
+write a machine-readable results document. Its methodology deliberately
+tracks `website/performance.html`'s stated commitments (tail percentiles
+not averages, both read modes reported apart, a failure phase in every
+run, no DynamoDB comparison) — see that file and this bench's own module
+doc for the full mapping.
+
+**Manual/local only — this bench does not run in CI.** Real sockets, real
+disk, and real elapsed wall clock make it unsuitable for a shared runner's
+noise floor (the same reason `tests/inplace_split_bench.rs`/
+`split_build.rs`'s own benches are `#[ignore]`d rather than part of the
+default `cargo test` run). Run it locally when you need a number, not as
+a gate. **Numbers are comparable only to another run on the same host, in
+the same session** — never across machines or sessions, per
+`docs/engineering-lessons.md`'s "a historical bench figure from a
+different host is not a baseline" entry: if you need to compare against
+an earlier figure, rerun the earlier configuration alongside the new one
+on this same host rather than trusting a number quoted from elsewhere.

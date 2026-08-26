@@ -95,6 +95,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo deny check                                   # licenses + advisories (cargo install cargo-deny)
 cargo bench -p animus-storage                      # ProdEnv smoke of the write/IO path
+cargo bench -p animusd                             # cluster wire benchmark: latency percentiles + degraded phase
 ```
 
 All five gates (fmt, clippy `-D warnings`, build, test, deny) must be green; CI
@@ -122,7 +123,8 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_SPLIT_SEEDS=K` | 1 | split-build `SeedBatch` corpus depth (`animus-cp-data`, ADR 0050 Train B) |
 | `ANIMUS_LEARNER_SEEDS=K` | 1 | learner (non-voting) membership-class fault-injection corpus depth (`animus-control`, ADR 0058 Train 1) |
 | `ANIMUS_INPLACE_SPLIT_SEEDS=K` | 1 | in-place split group-mint-at-apply fault-injection corpus depth (`animus-cp-data`, ADR 0058 Train 2 rung 3) |
-| `ANIMUS_BENCH_{KEYS,GETS,SCAN,VALUE_BYTES,APPLY_BATCH}` | — | `engine_bench` workload tuning |
+| `ANIMUS_BENCH_{KEYS,GETS,SCAN,VALUE_BYTES,APPLY_BATCH}` | — | `animus-storage`'s `engine_bench` workload tuning |
+| `ANIMUS_BENCH_{NODES,ITEMS,OPS,VALUE_BYTES,CLIENTS,JSON}` | — | `animusd`'s `cluster_bench` workload tuning (node count, preload size, measured ops/class, item size, concurrent-client sweep, JSON output path) |
 
 The deep corpus tiers run nightly in CI
 (`.github/workflows/corpus-deep.yml`), not per-push.
@@ -262,6 +264,17 @@ truth; this map is just for navigation.
   kind-write path, so index/stream/change-log maintenance is inherited
   rather than reimplemented. Reads are **AWS-faithful** — an expired item
   stays visible until it is reaped, deliberately not filtered.
+- **Backup and restore** (`CreateBackup`/`RestoreTableFromBackup`,
+  `UpdateContinuousBackups`/`RestoreTableToPointInTime`, ADR 0059,
+  proposed): on-demand backups and PITR as one internal snapshots-plus-
+  change-log mechanism over a separately configured `SegmentStore` handle
+  (`--backup-store`) — a manifest plus chunked BASE/LSI/FOOTPRINT-only data
+  objects, a backup catalog keyed by backup id (never table name, and
+  outliving the source table), per-tablet leader-side capture reading
+  through intent resolution, the backup-vs-split race closed via
+  `split_lineage` re-planning, and PITR sealing continuously as a fifth
+  change-log consumer beside periodic base snapshots; S3 export/import and
+  an S3 `SegmentStore` backend are deferred follow-ups.
 - **Observability & operations** — metrics seam (`animus-env`, ADR 0015,
   additive/no-op under sim); OTLP tracing (`animusd::otel`, ADR 0027, opt-in);
   the admin/debug HTTP-JSON interface (`animusd::admin`, ADR 0020, pure
