@@ -9608,3 +9608,69 @@ either be captured by the proposer or derived from `Metadata` already
 committed to that point, derive it — the proposer-captured version always
 requires arguing every replica sees the same input, and pure derivation
 makes that argument for free.
+
+## A new kind-scan primitive must filter transaction-record marker keys too, not just resolve envelopes (ADR 0059 §4/§5)
+
+Building `RaftKvNode::local_scan_kind_snapshot` (the backup capture
+driver's snapshot-pinned, intent-resolved sweep) by composing `storage
+.scan_at` + `resolve_once_step` looked complete — every value came back
+correctly resolved (committed, or silently dropped if still `Pending`).
+The very first test against a genuine staged-but-unresolved transaction
+failed anyway: the decoded row set contained an extra entry that turned
+out to be `txn.rs`'s own internal record-marker key (`txn::record_key`,
+the atomic-commit-point row `TxnStage` writes into the anchor's own
+scope), not anything a caller ever wrote. `resolve_scan_rows` — the
+existing shared post-processing step every other scan in this crate
+already goes through — has always dropped these (`if
+txn::is_record_key(&key) { continue; }`) before resolving, but that
+check lives in `resolve_scan_rows` itself, not in `resolve_once_step`
+(the lower-level per-row resolver `local_scan_kind_snapshot` composed
+directly, to get its own cursor/limit semantics). Building a new scan
+primitive directly on `resolve_once_step` instead of the existing
+`resolve_scan_rows`/`local_scan_kind_ordered` wrappers silently loses
+every filter those wrappers apply, not just the ones a superficial read of
+`resolve_once_step`'s own doc would expect. General rule: when a new read
+primitive needs its own cursor/limit shape but the *value-resolution* part
+is identical to an existing scan, grep every filter step the existing
+wrapper applies (record-marker keys today; whatever gets added next) and
+carry each one forward explicitly — never assume "I called the same
+low-level resolver" is equivalent to "I inherited the same scan
+semantics." A unit test exercising a real staged-and-never-resolved
+transaction (not just a value-only round trip) is what caught this in one
+run; a primitive whose only test coverage is "committed values resolve
+correctly" would have shipped this defect silently.
+
+## A catalog's "who satisfies this obligation" predicate must be the SAME accessor everywhere it's asked, or a stale report double-counts (ADR 0059 §6)
+
+The backup-vs-split race (a pinned tablet retires mid-capture; its live
+`split_lineage` descendants take over its share) has a subtler failure
+mode than "the retired tablet's own report is missing": it's still
+*possible* for the retired tablet to have reported successfully **before**
+splitting (a `RecordBackupTabletComplete` that legitimately committed
+first, on an ordinary unrelated split racing an already-finished tablet).
+That report is real and harmless to leave on file — but once the split
+lands, the retired id's own row in `Metadata::backup_tablet_progress`
+becomes a **stale, superseded** entry: the tablet's current live
+capture-frontier is its two children, and if a naive "sum every progress
+row tagged with this backup id" accessor is used to build the final
+manifest, the retired parent's full-range capture and its two children's
+own (later, independent, narrower-range) captures all land in the
+manifest side by side — a real content bug (every row in the split
+range appears in the backup twice), not just an efficiency loss. The fix
+was to derive one canonical accessor
+(`Metadata::backup_manifest_tablet_progress`, built on
+`live_split_descendants`) that always answers "the tablet whose id is
+authoritative for the completed capture of this pinned tablet's range,
+right now" — and to route *every* consumer through it: the readiness
+check (`backup_ready_to_complete`), the manifest assembly (the completion
+aggregator), and even the pre-existing `backup_total_bytes` display
+figure (which had the identical latent double-count bug before this PR,
+just never triggered — no code path had ever produced two progress rows
+covering the same range before ADR 0059 §6 made that possible). General
+rule: when a catalog gains a "this identity's obligation may transfer to
+a different identity later" relationship (a retired-and-replaced key), a
+single row's own presence is never sufficient to answer "has this
+obligation been met" — build one shared accessor that resolves identity
+to its *current* authoritative set first, and audit every existing
+consumer of the raw per-identity map for the same latent assumption, not
+just the new caller that motivated the change.

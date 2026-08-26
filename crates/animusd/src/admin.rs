@@ -33,7 +33,7 @@
 //! - `GET  /admin/storage/key`         — on-disk versions of a key (`?tablet=&key=`)
 //! - `GET  /admin/storage/scan`        — first N live pairs (`?tablet=&start=&limit=`)
 //! - `GET  /admin/system-table`        — browse the control-plane system keyspace (`?kind=&after=&limit=`, ADR 0038 addendum)
-//! - `GET  /admin/backups`             — the replicated backup catalog: id, table, status, per-tablet progress, sizes, creation time (ADR 0059 §3; pure observer — no capture driver/wire API yet)
+//! - `GET  /admin/backups`             — the replicated backup catalog: id, table, status, per-tablet progress (including split re-planning, ADR 0059 §6), sizes, creation time (ADR 0059 §3/§4; pure observer — no wire API yet)
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — liveness/readiness
@@ -1168,17 +1168,27 @@ fn system_table_item(kind: syskv::EntityKind, id: &[u8], value: &[u8], version: 
     })
 }
 
-/// `GET /admin/backups` (ADR 0059 §3): the replicated backup catalog — one
-/// entry per row in `Metadata::backups`, each carrying its status, source
-/// table, creation time, total captured bytes so far, and a per-pinned-
-/// tablet progress breakdown (`Metadata::backup_tablet_progress`). Pure
-/// observer, like every other `GET` here (ADR 0020) — no capture driver
-/// exists yet in this train, so a row only ever reaches `Creating` today;
-/// this view is written to display every status the catalog can hold
-/// (`Available`/`Failed`/`Expired`) once later trains populate them.
-/// `effective_metadata()`, not `metadata_cached()` (matching `/admin/status`/
-/// `/admin/peers`): a growth/data-only node's own mirror is the honest
-/// cluster-wide view here too.
+/// `GET /admin/backups` (ADR 0059 §3/§4/§6): the replicated backup catalog —
+/// one entry per row in `Metadata::backups`, each carrying its status,
+/// source table, creation time, total captured bytes so far, and a
+/// per-pinned-tablet progress breakdown. Pure observer, like every other
+/// `GET` here (ADR 0020). `effective_metadata()`, not `metadata_cached()`
+/// (matching `/admin/status`/`/admin/peers`): a growth/data-only node's own
+/// mirror is the honest cluster-wide view here too.
+///
+/// **Split re-planning visibility (ADR 0059 §6, Train 1 PR③)**: each
+/// pinned-tablet entry's own `tablet`/`reported`/`cut_version`/`bytes`
+/// fields keep their PR① meaning exactly (a direct report at that tablet
+/// id, when it has one) for backward compatibility, but `reported` is now
+/// computed against the tablet's own **current live capture frontier**
+/// (`Metadata::live_split_descendants`) rather than a bare direct-progress
+/// check — so a pinned tablet that split mid-capture correctly shows
+/// `reported: true` only once every one of its live descendants has
+/// reported, not "never" forever. Two new fields make the re-planning
+/// itself visible rather than merely folded into a boolean: `retired`
+/// (this pinned tablet id is no longer live) and `capturing` (every one of
+/// its current live descendants — one entry, itself, for a tablet that
+/// never split).
 fn backups_view(ctx: &ClientCtx) -> Value {
     let meta = ctx.effective_metadata();
     let backups: Vec<Value> = meta
@@ -1190,14 +1200,36 @@ fn backups_view(ctx: &ClientCtx) -> Value {
                 .pinned_tablets
                 .iter()
                 .map(|pinned| {
-                    let progress = meta
+                    let direct_progress = meta
                         .backup_tablet_progress
                         .get(&(backup_id.clone(), pinned.tablet));
+                    let live_descendants = meta.live_split_descendants(pinned.tablet);
+                    let capturing: Vec<Value> = live_descendants
+                        .iter()
+                        .map(|&tablet| {
+                            let progress = meta
+                                .backup_tablet_progress
+                                .get(&(backup_id.clone(), tablet));
+                            json!({
+                                "tablet": tablet.0.to_string(),
+                                "reported": progress.is_some(),
+                                "cut_version": progress.map(|p| p.cut_version),
+                                "bytes": progress.map(|p| p.bytes),
+                            })
+                        })
+                        .collect();
+                    let reported = !live_descendants.is_empty()
+                        && live_descendants.iter().all(|&tablet| {
+                            meta.backup_tablet_progress
+                                .contains_key(&(backup_id.clone(), tablet))
+                        });
                     json!({
                         "tablet": pinned.tablet.0.to_string(),
-                        "reported": progress.is_some(),
-                        "cut_version": progress.map(|p| p.cut_version),
-                        "bytes": progress.map(|p| p.bytes),
+                        "reported": reported,
+                        "cut_version": direct_progress.map(|p| p.cut_version),
+                        "bytes": direct_progress.map(|p| p.bytes),
+                        "retired": !meta.tablets.contains_key(&pinned.tablet),
+                        "capturing": capturing,
                     })
                 })
                 .collect();

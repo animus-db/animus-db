@@ -56,10 +56,12 @@ amendment — the shape predates and outlives it.)
   `BackupTabletProgress` completion records — JSON rather than a hand-rolled
   binary encoder because `BackupManifest` nests the multi-field, evolving
   `TableSchema` shape and this object is written/read once per backup, never
-  a hot path). **Plumbing only**: no capture driver, janitor, or wire
-  surface reads or writes through this module yet — see `animusd`'s
-  `BackupStoreConfig`/`BackupStoreHandle` (that crate's `CLAUDE.md`) for the
-  store-handle half of the same PR.
+  a hot path). **Consumed since Train 1 PR③** by `animusd`'s capture driver
+  (`backup_capture.rs`, writing chunked data objects) and completion
+  aggregator (`backup_completion.rs`, assembling + writing the manifest
+  object) — see `animusd`'s `CLAUDE.md` for both, and its
+  `BackupStoreConfig`/`BackupStoreHandle` for the store-handle half of PR②.
+  Still no janitor/wire surface (later trains).
 - **`cluster_segment_store.rs`** (ADR 0043 §A7b) — `ClusterSegmentStore<E,
   S>`: the **default** `SegmentStore` for the stream-shard subsystem, K-way
   replication of an immutable segment over `E`'s `Network` seam. The
@@ -363,6 +365,29 @@ Four rules that aren't derivable from a doc comment:
 - **`engine_applied_index()`** is the confirm-by-index primitive
   linearizable reads gate on, so a proposer confirms a specific
   `Accepted { index }` applied instead of polling value equality.
+- **`engine_latest_version()`/`local_scan_kind_snapshot(kind, start,
+  version_ceiling, limit)`** (ADR 0059 §4/§5, Train 1 PR③) are the on-demand
+  backup capture driver's own read primitives (`animusd::backup_capture`, a
+  later PR consumes them; `tests/backup_capture_scan.rs` proves them in
+  isolation). The first is a synchronous, purely local
+  `StorageEngine::latest_version()` read — the watermark a capture pins
+  **once**, at a tablet's own capture start, and replays on every later
+  tick (never re-derived — a wider re-pinned watermark after a leader
+  change would change content at an already-`put` chunk index, breaking
+  `SegmentStore::put`'s write-once contract). The second is
+  `local_scan_kind`'s snapshot-pinned, resumable-cursor sibling: unlike
+  `local_scan_kind` (always "latest"), every row is read **as of
+  `version_ceiling`** (`StorageEngine::scan_at`, the same primitive
+  `scan_at` reads a live transaction against) and resolved through the
+  identical intent-resolution discipline `resolve_scan_rows` already gives
+  every ordinary scan (a still-`Pending` intent silently omitted, never its
+  raw envelope — including dropping `txn::is_record_key` marker rows, the
+  one thing this primitive's own first draft missed, see
+  `docs/engineering-lessons.md`'s entry on it) — so a capture spanning many
+  ticks, and across a leader change many different replicas, always
+  resolves the identical row set. Cost model matches `local_scan_kind`/
+  `animusd`'s TTL-reaper `local_scan_kind_capped`: `limit` bounds returned
+  rows, not engine I/O (a documented follow-up, not a correctness gap).
 
 ## Key invariants
 
