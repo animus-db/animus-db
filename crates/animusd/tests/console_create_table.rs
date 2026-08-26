@@ -1,5 +1,6 @@
-//! End-to-end tests for the AnimusDB Data Console's create-table form (ADR
-//! 0052, the stack's final PR): `POST /console/api/tables` — table name,
+//! End-to-end tests for animusd console's (ADR 0052's "AnimusDB Data
+//! Console") create-table form (the stack's final PR): `POST
+//! /console/api/tables` — table name,
 //! partition key, an optional sort key, LSIs (declarable **only** here),
 //! GSIs (with a projection), a stream, and TTL, all in one call — through
 //! the **console** port, never the admin port, exactly like every other

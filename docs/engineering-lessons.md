@@ -8160,8 +8160,105 @@ debugging anything that feels like it might have happened before.
   explicitly whenever a new `EngineFactory`-shaped seam gains a method.
   (`crates/animus-cp-data/src/host.rs::EngineFactory::clone_engine`'s own
   doc comment states the final contract and the hazard by name.)
+- **A full design-token rewrite ("keep the names, change the values") is only
+  safe once you've counted every consumer, and a mockup's literal CSS can
+  silently redefine what an existing token means (2026-08-25, ADR 0056,
+  the "Ledger" visual system).** Rewriting `tokens.css` in place (new
+  palette, light-default instead of dark-default, glow-means-live replaced
+  by keyline-means-live) while keeping every token *name* stable — so the
+  two consumer stylesheets (`dashboard.css`, `console.css`, ~600 lines
+  combined) and every `dashboard_*.js`/`console.js` render function needed
+  zero call-site edits — only worked because a `grep -c "var(--$t)"` sweep
+  across every consumer was run *before* writing the new file, for every
+  single token name. That surfaced two things a values-only read of the old
+  file would have missed: (1) several tokens (`--glow-*`, `--live-underline`,
+  `--accent-hi`, `--shadow-recessed`, motion timing) had **zero** consumers
+  outside `tokens.css` itself, so they were safe to gut/repoint freely
+  without a wider search; (2) `button.primary`/`.btn-new`/`.btn-save`/
+  `.seg-group button.active`/`.seg-opt.selected` all filled with
+  `var(--accent)` + `var(--accent-ink)` under the old system, but the new
+  mockups' own literal CSS filled the equivalent controls with the *ink*
+  color (`background:#211f1a;color:#fafaf9` in the light mockup) — i.e. the
+  new system's "ONE accent role" rule (accent for links/underlines/hatch
+  only, never a solid fill) is a *component* decision the token file alone
+  can't express; it required rewriting those five call sites' `background`/
+  `color` properties, not just relying on `--accent`'s new value. Trusting
+  the token rename to carry that change silently would have shipped
+  accent-filled primary buttons that merely looked different (a legal but
+  spec-violating shade) instead of catching that the button recipe itself
+  had changed. **General rule**: before a "same names, new values" token
+  rewrite, grep every consumer for every token name being touched — a
+  zero-hit token is safe to redefine freely (or even fold into another
+  token), and a token whose *default recipe* the new mockups visibly
+  contradict (a filled control's authoritative markup uses a different
+  color than the token that used to supply it) needs its call sites edited
+  by hand, because the rename alone will compile clean and still be wrong.
+  (`crates/animusd/src/tokens.css`, `dashboard.css`, `console.css`.)
+- **Renaming a branded UI surface needs its Rust test *assertions* fixed to
+  stay green, but its doc-comment prose is a separate, lower-priority sweep
+  — don't conflate the two passes (2026-08-25, ADR 0056, admin/console
+  rename).** Renaming the operator dashboard's brand text ("AnimusDB
+  Console" → "animusd admin") and the data app's ("AnimusDB Data Console" →
+  "animusd console") broke exactly two integration-test files
+  (`dashboard_endpoint.rs`, `console_endpoint.rs`) whose `body.contains(...)`
+  assertions checked the old literal strings — found by grepping `tests/`
+  for the old names *before* editing the HTML, per this repo's standing
+  rule, then fixed alongside the HTML in the same change so the gate never
+  went red. Dozens of *other* hits for the same old strings remain, on
+  purpose: module-doc `//!` comments and inline comments across
+  `dashboard.rs`, `dashboard_core.js`, `console.js`, and every
+  `crates/animusd/tests/console_*.rs` file's own header comment. None of
+  those are asserted by any test (confirmed by grep), so they don't fail
+  the gate — but they are exactly the "stranded documentation" class this
+  log already names (see the `ReplicationMode`-removal entry above): prose
+  that now describes a surface by a name the code no longer uses, silently,
+  with nothing failing to point at it. Left as a deliberate, separate
+  follow-up (out of this change's stated file scope) rather than folded in,
+  since a partial prose sweep across a ~2000-line crate guide risks
+  introducing exactly the kind of drift it would be fixing. **General
+  rule**: when a rename's brief says "update every asserted string," that
+  is a narrower, harder requirement than "update every occurrence" — grep
+  for assertions specifically (`.contains(`, `assert_eq!` against the
+  literal, etc.) to find the must-fix set, and treat every remaining
+  prose hit as a tracked, intentional gap rather than either silently
+  ignoring it or scope-creeping the change to chase it down.
+- **A theme toggle whose default writes an explicit attribute defeats a
+  static dark-mode QA render unless the toggle script is neutralized first
+  (2026-08-25, website rebuild on the Ledger system).** `site.js` applies
+  `stored()` on every load — and once "light" (not "system") is the
+  documented default, that call sets `data-theme="light"` on `<html>`
+  explicitly rather than leaving the attribute absent. A QA render that
+  hand-edits a scratch copy of a page to add `data-theme="dark"` and then
+  loads it with the page's own script still attached gets silently
+  overwritten back to light before first paint — the screenshot comes out
+  byte-identical to the light render (same file size, confirmed before
+  looking closer), which reads as "dark mode is broken" when the actual bug
+  is the QA method fighting the app's own initialization order. The fix is
+  to strip the theme script from the scratch copy for a static-render check
+  (the CSS is what's under test, not the runtime toggle), not to debug the
+  CSS. **General rule**: before concluding a themed page's dark styling is
+  broken from a scripted/automated screenshot, check whether the page's own
+  JS re-applies a *default* state on load — a `checked`/`data-*`/class
+  toggle with a persisted-with-fallback default will clobber any attribute
+  a test harness sets by editing the static HTML, and the fallback is easy
+  to miss precisely because it used to be a no-op ("system" removed the
+  attribute) before the default changed to an explicit value.
 
 ### Parallel-agent orchestration
+- **A subagent that launches its validation gate as a *background* task and
+  then ends its turn to "wait for the notification" stalls the whole
+  pipeline (2026-08-25, Ledger design delivery)** — background-task
+  completion notifications go to the *orchestrating* session, not to a
+  subagent that has already stopped; the subagent just sits "finished"
+  with an uncommitted tree while the orchestrator sees a completion notice
+  whose result is "waiting for tests". Two of three implementation agents
+  in one delivery did this independently, each needing a manual resume
+  ("your test task already finished — run checks foreground and commit").
+  **Rule:** subagent briefs must say *run every check as a synchronous
+  foreground command and do not end your turn before the commit exists* —
+  and when an agent's completion notice reads like a status update rather
+  than a result, resume it immediately with that instruction instead of
+  waiting for a notification that will never come.
 - **A single long-lived session can exhaust the disk on `target/` alone, with
   no parallel fan-out involved (2026-08-19)** — a solo `cargo build
   --workspace --all-targets` on this repo hit `rustc-LLVM ERROR: IO failure …
@@ -9449,6 +9546,46 @@ turned out to be **variable** fonts, so one 22–23 KB Latin file covers the ent
 weight range. The cost was first estimated per weight, which was wrong by about
 4x and nearly drove a font substitution that was not needed. Fetch the file and
 look before costing it.
+
+## Closing a deferred prose sweep: rewrite in place as "new name (ADR NNNN's 'old name')" (2026-08-25, ADR 0056/0021/0052 rename follow-up)
+
+The Ledger delivery's first PR deliberately left a prose sweep as a tracked
+follow-up (see the "Renaming a branded UI surface..." entry above): dozens
+of module-doc `//!`/`//` comments across `dashboard.rs`, `lib.rs`,
+`console.rs`, every JS file header, every `console_*.rs` test header, two
+crate `CLAUDE.md`s, and the root `CLAUDE.md` still said "AnimusDB Console"/
+"AnimusDB Data Console" after the code was renamed to "animusd admin"/
+"animusd console". Closing that follow-up found two things worth keeping
+as a pattern:
+
+1. **The old strings do not live in one obvious place.** They span doc
+   comments (`rustdoc`-visible, so a stale one looks authoritative),
+   ordinary `//`/`//!` file-header comments, and test-file header comments
+   in three different crates — `rg -in "<old name>"` across the whole
+   `crates/`+`docs/` tree (excluding the ADRs themselves and the
+   engineering-lessons log, both of which are supposed to keep the
+   historical name on record) is the only way to find the full set; a
+   scan scoped to "the crate that owns the feature" misses the sibling
+   crate's references (`animus-dynamo/CLAUDE.md`'s two mentions of "the
+   Data Console" had nothing to do with `animusd` and would not have
+   turned up in an `animusd`-scoped grep).
+2. **Rewrite each hit as `new name (ADR NNNN's "old name")`, not a bare
+   swap.** A plain find-and-replace to the new name loses the old name
+   entirely, which breaks anyone (or any future grep) still searching for
+   the term the ADR itself, an old commit message, or an old bug report
+   uses; keeping the literal old string in quotes right next to the new
+   one keeps both searchable from the same line, at the cost of a few
+   extra words per comment. This is the same move ADR 0021's and ADR
+   0052's own "naming disambiguation" amendments already made in prose;
+   applying it at the comment-string level too avoids re-litigating "did
+   we mean the old system or the new one" the next time someone greps for
+   either name.
+
+General rule: when a rename's brief says "sweep the deferred prose," grep
+the *exact* old string(s) tree-wide first, do not trust the file list a
+memory of "where the feature lives" would produce, and prefer
+`new (old)`-shaped rewrites over silent replacement wherever the old name
+might still be a search target (an ADR title, a test name, a changelog).
 
 ## Move a timer's trigger, not its mechanism — and check what the seam already gives you for free (ADR 0058 rung 4)
 

@@ -260,7 +260,7 @@ truth; this map is just for navigation.
 - **Observability & operations** — metrics seam (`animus-env`, ADR 0015,
   additive/no-op under sim); OTLP tracing (`animusd::otel`, ADR 0027, opt-in);
   the admin/debug HTTP-JSON interface (`animusd::admin`, ADR 0020, pure
-  observer + gated actions); the web dashboard / AnimusDB Console
+  observer + gated actions); the web dashboard / animusd admin
   (`animusd::dashboard*`, ADR 0021, role-gated tabs per ADR 0035).
 - **Runnable node** — `animusd`, `animus-cli`. v1 (ADR 0019) assembles the
   **control plane + the CP data plane** over `ProdEnv` — all client
@@ -292,6 +292,12 @@ truth; this map is just for navigation.
 - An incidental pre-existing bug discovered during a task gets its own
   separate PR (with its own test), never a drive-by fix folded into an
   unrelated diff.
+- **The website (`website/`) is part of the documentation.** Anything it
+  states — supported/planned wire operations, architecture, status and
+  security posture, commands, ports — must stay in sync with the code.
+  A change that alters something the site claims updates `website/` in the
+  same change; when touching the site, verify its claims against the code
+  rather than propagating stale copy.
 - Larger work ships as a stacked PR series (managed with
   [`gh-stack`](https://github.com/github/gh-stack), a `gh` CLI extension),
   reviewed per-PR and merged as one stack. **Web sessions get `gh`, the

@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why lock-in compounds — AnimusDB</title>
+<meta name="description" content="Vendor lock-in is an options problem, not a price problem — and the switching cost grows whether or not you ever leave. Includes an explicit concession that this is not an argument against AWS.">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="canonical" href="https://animusdb.io/articles/why-lock-in-compounds.html">
+<meta property="og:title" content="Why lock-in compounds — AnimusDB">
+<meta property="og:description" content="Vendor lock-in is an options problem, not a price problem — and the switching cost grows whether or not you ever leave.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Martian+Mono:wght@400;700&display=swap">
+<link rel="stylesheet" href="../assets/tokens.css">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<div class="banner">
+  <b>Pre-alpha</b> — not ready for production data. <a href="../index.html#status">Where it stands →</a>
+</div>
+
+<header class="site">
+  <div class="wrap bar">
+    <a class="brand" href="../index.html">
+      <svg width="24" height="24" viewBox="0 0 32 32" aria-hidden="true">
+        <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+          <path d="M16 5.5a10.5 10.5 0 0 1 9.09 5.25"/>
+          <path d="M25.09 21.25A10.5 10.5 0 0 1 16 26.5"/>
+          <path d="M6.91 21.25A10.5 10.5 0 0 1 6.91 10.75"/>
+        </g>
+        <circle cx="16" cy="16" r="3.1" fill="currentColor"/>
+      </svg>
+      AnimusDB
+    </a>
+    <nav class="main">
+      <a href="../index.html">Overview</a>
+      <a href="../how-it-works.html">How it works</a>
+      <a href="../docs.html">Docs</a>
+      <a href="../install.html">Install</a>
+      <a href="https://github.com/animus-db/animus-db">GitHub</a>
+    </nav>
+    <div class="theme-switch" role="group" aria-label="Theme">
+      <button type="button" data-theme-choice="light" aria-pressed="false" aria-label="Light theme">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"/>
+        </svg>
+      </button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false" aria-label="Dark theme">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M13.2 9.1A5.6 5.6 0 1 1 6.9 2.8a4.4 4.4 0 0 0 6.3 6.3Z"/>
+        </svg>
+      </button>
+      <button type="button" data-theme-choice="system" aria-pressed="false" aria-label="System theme">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="1.6" y="2.6" width="12.8" height="8.6" rx="1.4"/><path d="M5.6 14h4.8M8 11.2v2.8"/>
+        </svg>
+      </button>
+    </div>
+    <button class="icon-btn nav-toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+<article class="article">
+  <div class="article-head">
+    <span class="eyebrow-line">The lock-in argument</span>
+    <h1>Why lock-in compounds</h1>
+    <p class="lede">Vendor lock-in is usually argued as a price problem. It isn't. It is a problem about options, and options decay quietly, on a schedule nobody sets and nobody reviews.</p>
+  </div>
+
+  <p>Every procurement process your company runs assumes one thing: that you could walk. The discount you get, the SLA you extract, the roadmap commitment you extract with it — all of it is priced off the credibility of your alternative. Strip the alternative out and the negotiation is not a hard negotiation. It is a briefing.</p>
+  <p>Most infrastructure dependencies keep the alternative alive without anyone maintaining it. Swap one object store for another and the work is measured in weeks. Change CI providers and you rewrite some YAML. These are dependencies you could leave, which is exactly why you rarely need to.</p>
+  <p>Databases are not like that, and DynamoDB is a particularly clean example of why.</p>
+
+  <h2>What you actually bought</h2>
+  <p>You did not buy a key/value store. Those are commodities and always have been. What you bought was a way of thinking about your data that turned out to be extremely good: partition keys, sort keys, single-table designs, sparse and overloaded indexes, conditional writes standing in for locks, streams standing in for change capture.</p>
+  <p>That model is genuinely excellent. It is also the thing that binds you, because it is not confined to a data-access layer you could swap. It is diffused through your application — in the shape of your keys, the assumptions your services make about what a read costs, the retry logic built around throttling responses, the Lambda triggers hanging off your streams, the way your team reasons about a new feature before anyone opens an editor.</p>
+  <p>You cannot refactor that out in a quarter, because it is not in one place. It is in everything.</p>
+
+  <h2>The bill nobody decides to run up</h2>
+  <p>Here is the part that deserves the word <em>compounds</em>.</p>
+  <p>On the day you adopted DynamoDB, your switching cost was close to zero. You had one table and a prototype. Nobody made a subsequent decision to increase it. But every feature shipped since then added access patterns. Every access pattern added coupling. Every new engineer learned the model as the way things are done here, and reproduced it. Every incident postmortem hardened some workaround that assumes the specific behaviour of the specific service.</p>
+  <p>Nothing on that list was a bad call. Each was locally correct. But the aggregate is a switching cost that grows monotonically, that nobody owns, that appears on no plan, and that is never reviewed — because reviewing it would require someone to price a migration nobody is proposing.</p>
+  <div class="pull">The switching cost is not what you pay to leave. It is the interest rate on a decision you made years ago, and it is charged whether or not you ever leave.</div>
+  <p>By the time a reason to move arrives — an acquisition, a regulator, a price change, a region that doesn't exist, a customer contract with a data-residency clause — the cost of moving has been compounding for six years. It gets refused on those grounds. And the refusal is correct. That is what makes it a trap rather than a mistake.</p>
+
+  <h2>The renegotiation you can't have</h2>
+  <p>Consider what you are actually accepting when the exit is closed.</p>
+  <p>One vendor sets the price, and revises it on their schedule. One vendor decides which regions exist, and therefore which jurisdictions you can promise a customer. One vendor defines your recovery-time objective, because when it is down you are down and the honest content of your incident update is that you are waiting. One vendor decides what happens to a service when it stops being strategically interesting to them.</p>
+  <p>None of these are hypothetical grievances against a specific provider. They are the structural position of any buyer without an alternative, and you would never knowingly sign it. You did not knowingly sign it here. It accumulated.</p>
+
+  <h2>What an exit is worth if you never take it</h2>
+  <p>The reflex objection to any of this is: we are not going to migrate our database, so who cares.</p>
+  <p>Probably you are not, and probably you shouldn't. But an option has value distinct from exercising it, and the value shows up in places that never look like migrations:</p>
+  <ul>
+    <li><strong>In the contract.</strong> A credible alternative is the only thing that makes a renewal a conversation.</li>
+    <li><strong>In sales.</strong> "Yes, we can run that dataset inside your jurisdiction" is a sentence that closes enterprise deals. Today it is a sentence you can only say if a region happens to exist and a compliance officer accepts the answer.</li>
+    <li><strong>In architecture.</strong> Teams that know the data layer is portable design differently — and, as it happens, better. Coupling you can see is coupling you can bound.</li>
+    <li><strong>In risk registers.</strong> "Single-supplier dependency, no mitigation" is an entry your board can read. Auditors increasingly ask for the exit plan by name.</li>
+  </ul>
+  <p>An unexercised exit is cheap insurance against a scenario that is unlikely each year and near-certain across a decade.</p>
+
+  <h2>Where the cost actually sits</h2>
+  <p>If you did decide to price a move today, the estimate would be dominated by one line: rewriting every access pattern against a different data model, and re-earning the operational knowledge that goes with it. Cassandra, Postgres and MongoDB are all fine databases, and all of them ask for that rewrite.</p>
+  <p>That is the line AnimusDB is aimed at, and it is the only line it removes. The API stays. The SDKs stay. The keys, the queries, the conditional writes, the pagination and the mental model all stay. What changes is who runs the cluster and where it sits.</p>
+  <div class="callout">
+    <h4>What it does not remove</h4>
+    <p>Everything behind the endpoint becomes yours: capacity planning, upgrades, backups, monitoring, and a pager that now rings for the database. Swapping a compounding switching cost for an ongoing operational cost is a real trade, not a free one.</p>
+    <p>We have written that bill out in <a href="what-self-hosting-costs.html">What self-hosting actually costs</a>, on the theory that you should read it from us rather than discover it in month three.</p>
+  </div>
+
+  <h2>This is not an argument against AWS</h2>
+  <p>It would be easy to read all of the above as a case against a company. It isn't, and it is worth being explicit, because an argument that needs a villain is usually a weak argument.</p>
+  <p>DynamoDB is an outstanding piece of engineering. Its data model has aged better than almost anything else from its era, its operational record is one very few teams could match, and the decision to build on it was, for most people who made it, correct. AWS has earned its position by being reliably better than the alternatives for a long time.</p>
+  <p>Most teams should stay on managed services, including this one. If you are on AWS, happy, and expect to be in five years, self-hosting a database is a downgrade in every dimension you will feel day to day. Operational burden is real and a managed service absorbing it is worth a great deal of money.</p>
+  <p>The argument here is narrower, and it survives all of that being true: <strong>a dependency you cannot leave is priced differently from one you can, and the difference grows.</strong> Wanting an exit is not a complaint about the current supplier. It is the ordinary posture of a buyer who intends to still be a buyer in ten years.</p>
+
+  <h2>What to do about it, concretely</h2>
+  <p>Nothing on this list requires adopting anything.</p>
+  <ol>
+    <li><strong>Price the move.</strong> Not to do it — to know the number. If nobody in the company can produce an estimate, that is itself the finding.</li>
+    <li><strong>Find the coupling that isn't the API.</strong> Streams consumers, IAM policy as authorisation logic, throttling-aware retry code, anything that assumes a specific region list. This is where migrations actually die.</li>
+    <li><strong>Write the exit clause into the risk register</strong>, with an owner and a review date, so the number gets recalculated while it is still small enough to act on.</li>
+    <li><strong>Keep the option warm.</strong> An alternative you have never run is not an alternative. An afternoon pointing your integration suite at something else is the cheapest hedge available.</li>
+  </ol>
+  <p>AnimusDB is pre-alpha and you should not put production data in it. But the fourth item on that list costs an afternoon, and the first three cost nothing at all.</p>
+
+  <span class="kicker" style="display:block;margin:34px 0 12px;border-top:1px solid var(--border);padding-top:24px">Keep reading</span>
+  <div class="cardgrid c2" style="margin-bottom:40px">
+    <div class="lcard"><span class="tag">Next</span><h3><a href="what-self-hosting-costs.html">What self-hosting actually costs</a></h3><p>The other half of the trade, priced honestly: the line items, who pays them, and when self-hosting is the wrong answer.</p></div>
+    <div class="lcard"><span class="tag">The product</span><h3><a href="../index.html">One line of configuration</a></h3><p>What adoption looks like in your codebase, and what the project can and can't do today.</p></div>
+  </div>
+</article>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div>
+        <h5>Product</h5>
+        <ul>
+          <li><a href="../index.html">Overview</a></li>
+          <li><a href="../how-it-works.html">How it works</a></li>
+          <li><a href="../install.html">Install</a></li>
+          <li><a href="../docs.html">Documentation</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Reference</h5>
+        <ul>
+          <li><a href="../architecture.html">Architecture</a></li>
+          <li><a href="../compatibility.html">Compatibility</a></li>
+          <li><a href="../performance.html">Performance</a></li>
+          <li><a href="../licence.html">Licensing</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Writing</h5>
+        <ul>
+          <li><a href="why-lock-in-compounds.html">Why lock-in compounds</a></li>
+          <li><a href="what-self-hosting-costs.html">What self-hosting actually costs</a></li>
+          <li><a href="determinism.html">Determinism, and why you should care</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Project</h5>
+        <ul>
+          <li><a href="https://github.com/animus-db/animus-db">GitHub</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/issues">Issues</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contributing</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">Design records</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/LICENSE">Licence text</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>Pre-alpha — not ready for production data.</span>
+      <span class="spacer"></span>
+      <span class="mono">AGPL-3.0 · animusdb.io</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

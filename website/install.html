@@ -20,9 +20,7 @@
 <a class="skip-link" href="#main">Skip to content</a>
 
 <div class="banner">
-  <span class="dot"></span>
-  <b>Pre-alpha.</b> AnimusDB is under active development and is not ready for production data.
-  <a href="https://github.com/animus-db/animus-db">Follow along on GitHub&nbsp;→</a>
+  <b>Pre-alpha</b> — not ready for production data. <a href="index.html#status">Where it stands →</a>
 </div>
 
 <header class="site">
@@ -37,8 +35,9 @@
     </a>
     <nav class="main">
       <a href="index.html">Overview</a>
+      <a href="how-it-works.html">How it works</a>
       <a href="docs.html">Docs</a>
-      <a href="install.html" aria-current="page">Install</a>
+      <a href="install.html" class="here" aria-current="page">Install</a>
       <a href="https://github.com/animus-db/animus-db">GitHub</a>
     </nav>
     <div class="theme-switch" role="group" aria-label="Theme">
@@ -186,8 +185,9 @@
 
       <h3>The AWS CLI</h3>
       <p>
-        There is no authentication yet, but the AWS CLI insists on credentials being present —
-        any placeholder values work.
+        SigV4 signature verification is opt-in and off by default, but the AWS CLI insists on
+        credentials being present regardless — any placeholder values work unless you've turned
+        verification on.
       </p>
       <div class="code">
         <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">aws cli</span></div>
@@ -271,7 +271,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
           <p>On the <strong>console</strong> port. A DynamoDB-shaped app for application developers: browse tables, inspect and edit items, review a table's configuration and its stream.</p>
         </div>
       </div>
-      <p class="muted" style="margin-top:18px">Both are printed in the startup banner. Neither has authentication — see <a href="#trouble">the security note</a>.</p>
+      <p class="muted" style="margin-top:18px">Both are printed in the startup banner. Neither has authentication — see <a href="#trouble">the security note</a>. (SigV4 verification, when enabled, applies only to the DynamoDB client port.)</p>
     </section>
 
     <section id="multinode">
@@ -384,8 +384,9 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
         </table>
       </div>
       <p class="muted" style="margin-top:14px">
-        Nothing authenticates callers yet, so "trusted" means a network you control. Keep the
-        internal, reserved, intra, admin and console ports off any externally reachable address.
+        Only the DynamoDB port can verify a caller, and only if you turn on SigV4 — off by
+        default. Everywhere else "trusted" means a network you control. Keep the internal,
+        reserved, intra, admin and console ports off any externally reachable address.
       </p>
     </section>
 
@@ -448,7 +449,8 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
       <h3>The AWS SDK rejects the endpoint</h3>
       <p>
         Set a region and placeholder credentials — the SDKs require them even though AnimusDB
-        ignores them today — and use <code>http://</code>, not <code>https://</code>. There is no TLS yet.
+        doesn't check them unless SigV4 verification is switched on — and use <code>http://</code>,
+        not <code>https://</code>. There is no TLS yet.
       </p>
 
       <h3>Something is wrong and it looks like a bug</h3>
@@ -466,8 +468,8 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
   <h2>Next: how it actually works.</h2>
   <p>Tablets, the two planes, the consistency model, and the full API surface.</p>
   <div class="btn-row">
-    <a class="btn primary" href="docs.html">Read the docs</a>
-    <a class="btn" href="https://github.com/animus-db/animus-db">GitHub</a>
+    <a class="btn primary" href="how-it-works.html">How it works</a>
+    <a class="btn" href="docs.html">Read the docs</a>
   </div>
 </div>
 
@@ -476,24 +478,30 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
 <footer class="site">
   <div class="wrap">
     <div class="foot-grid">
-      <div class="about">
-        <a class="brand" href="index.html">
-          <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true">
-            <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
-              <path d="M16 5.5a10.5 10.5 0 0 1 9.09 5.25"/><path d="M25.09 21.25A10.5 10.5 0 0 1 16 26.5"/><path d="M6.91 21.25A10.5 10.5 0 0 1 6.91 10.75"/>
-            </g><circle cx="16" cy="16" r="3.1" fill="currentColor"/>
-          </svg>
-          AnimusDB
-        </a>
-        <p class="muted">A masterless, strongly consistent NoSQL database written in Rust, verified by deterministic simulation testing.</p>
-      </div>
       <div>
         <h5>Product</h5>
         <ul>
           <li><a href="index.html">Overview</a></li>
-          <li><a href="docs.html">Documentation</a></li>
+          <li><a href="how-it-works.html">How it works</a></li>
           <li><a href="install.html">Install</a></li>
-          <li><a href="docs.html#api">API compatibility</a></li>
+          <li><a href="docs.html">Documentation</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Reference</h5>
+        <ul>
+          <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="compatibility.html">Compatibility</a></li>
+          <li><a href="performance.html">Performance</a></li>
+          <li><a href="licence.html">Licensing</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Writing</h5>
+        <ul>
+          <li><a href="articles/why-lock-in-compounds.html">Why lock-in compounds</a></li>
+          <li><a href="articles/what-self-hosting-costs.html">What self-hosting actually costs</a></li>
+          <li><a href="articles/determinism.html">Determinism, and why you should care</a></li>
         </ul>
       </div>
       <div>
@@ -503,20 +511,15 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
           <li><a href="https://github.com/animus-db/animus-db/issues">Issues</a></li>
           <li><a href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contributing</a></li>
           <li><a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">Design records</a></li>
-        </ul>
-      </div>
-      <div>
-        <h5>Legal</h5>
-        <ul>
-          <li><a href="https://github.com/animus-db/animus-db/blob/main/LICENSE">AGPL-3.0 licence</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/LICENSE">Licence text</a></li>
           <li><a href="https://github.com/animus-db/animus-db/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a></li>
         </ul>
       </div>
     </div>
     <div class="foot-bottom">
-      <span>© 2026 The AnimusDB authors.</span>
+      <span>Pre-alpha — not ready for production data.</span>
       <span class="spacer"></span>
-      <span class="mono">pre-alpha · not for production data</span>
+      <span class="mono">AGPL-3.0 · animusdb.io</span>
     </div>
   </div>
 </footer>
