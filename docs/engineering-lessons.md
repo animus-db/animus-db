@@ -9630,3 +9630,40 @@ The general shape: a live-timeout problem is not automatically a
 timeout handler early, at a caller-computed trigger, already has every
 safety property the new call site needs, and whether the seam underneath it
 already tolerates the ordering you're about to introduce.
+
+## A mobile `grid-template-columns: 1fr` override silently reintroduces the desktop overflow it was meant to fix (website responsive pass, ADR 0056 skin)
+
+The site's desktop grids (`.hero-grid`, `.split`, `.foot-grid`) were all
+written correctly, as `minmax(0, 1fr) minmax(0, 1fr)` — the standard
+CSS-grid guard against a track's "automatic minimum size" defaulting to the
+*min-content* width of whatever's inside it. But their `@media` overrides for
+the mobile single-column layout were written as plain `grid-template-columns:
+1fr;`, dropping the `minmax(0, ...)` the desktop rule had. Nothing looked
+wrong reading the CSS in isolation — a single `1fr` column obviously fills
+100% of the container, so it read as strictly *simpler* than the two-column
+desktop version, not weaker.
+
+It broke exactly where a grid item contained an unbreakable line: a
+`.plate .cl` terminal/diff line has `white-space: pre`, and one such line
+(`- endpoint: dynamodb.eu-west-1.amazonaws.com`) was longer than the mobile
+viewport. Its nested `overflow-x: auto` container did make *it* scroll
+locally as intended — but the plain-`1fr` grid track one level up still sized
+itself to that line's min-content width first, so the grid item's own box
+(not just its content) rendered wider than the viewport and the page itself
+gained horizontal scroll. A descendant's own `overflow: auto` does **not**
+rescue an ancestor grid/flex track's auto-min-size calculation; only
+`minmax(0, ...)` (or `min-width: 0` on the item) on the track/item that is
+actually oversized does that — matching what the desktop rule already relied
+on for the exact same content.
+
+General rule: **`minmax(0, 1fr)` is not a two-column-only idiom** — carry it
+into every breakpoint override of a `grid-template-columns` declaration,
+including the single-column ones, whenever any descendant might contain
+unbreakable content (`white-space: nowrap`/`pre`, a long token, a wide inline
+code/terminal line). A quick audit technique: `grep grid-template-columns` the
+stylesheet and check that every bare `1fr`/`Npx` track (not already wrapped in
+`minmax(0, ...)` or `min(...)`) has one — a bare `repeat(N, 1fr)` mobile
+override is the same bug with more columns. Verifying "no viewport overflow"
+by reading the CSS's collapse breakpoints is not enough; render at the target
+width and check `document.documentElement.scrollWidth`, because this class of
+bug is invisible in the source and only appears against real content.

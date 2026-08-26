@@ -104,7 +104,6 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
   display: inline-flex; align-items: center; justify-content: center; padding: 0;
 }
 .icon-btn:hover { border-color: var(--border-strong); color: var(--text); }
-.nav-toggle { display: none; flex: none; }
 
 /* Three bare icons (sun/moon/monitor), no group box: active gets a full-ink
    stroke + 2px accent keyline; inactive is a faint stroke, transparent border. */
@@ -119,17 +118,25 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
 .theme-switch button[aria-pressed="true"] { color: var(--text); border-bottom-color: var(--accent); }
 .theme-switch button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 
+/* Below 860px, brand + 5 links + the theme switch no longer fit one row.
+   CSS-only, no drawer/hamburger JS: the bar wraps to a second row and the
+   nav becomes its own horizontally-scrollable strip — the 2px accent
+   keyline on the active link stays visible, just scrolled to if needed. */
 @media (max-width: 860px) {
-  nav.main {
-    position: fixed; inset: 66px 0 auto 0; flex-direction: column; align-items: stretch;
-    gap: 0; background: var(--bg); border-bottom: 1px solid var(--border); padding: 8px 24px 18px;
-    display: none;
+  header.site .bar {
+    flex-wrap: wrap; height: auto; min-height: 60px; padding: 10px 16px; row-gap: 6px; gap: 12px;
   }
-  nav.main.open { display: flex; }
-  nav.main a { padding: 12px 0; border-bottom: 1px solid var(--border); font-size: 16px; }
-  .theme-switch { margin-left: auto; }
-  .nav-toggle { display: inline-flex; }
-  header.site .bar { gap: 12px; padding: 0 16px; }
+  .brand { order: 1; }
+  .theme-switch { order: 2; margin-left: auto; }
+  nav.main {
+    order: 3; flex: 1 1 100%; gap: 22px; align-items: stretch;
+    overflow-x: auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch;
+    scrollbar-width: none; margin: 0 -16px; padding: 2px 16px 10px;
+    mask-image: linear-gradient(to right, transparent, black 14px, black calc(100% - 14px), transparent);
+    -webkit-mask-image: linear-gradient(to right, transparent, black 14px, black calc(100% - 14px), transparent);
+  }
+  nav.main::-webkit-scrollbar { display: none; }
+  nav.main a { white-space: nowrap; flex: none; padding: 8px 2px; }
   .wrap { padding: 0 16px; }
 }
 
@@ -199,7 +206,7 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
 /* ---------- hero (homepage) ---------- */
 .hero { padding: 52px 0 40px; }
 .hero-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 52px; align-items: start; }
-@media (max-width: 940px) { .hero-grid { grid-template-columns: 1fr; gap: 36px; } .hero { padding: 36px 0 30px; } }
+@media (max-width: 940px) { .hero-grid { grid-template-columns: minmax(0, 1fr); gap: 36px; } .hero { padding: 36px 0 30px; } }
 .hero h1 { font-size: clamp(2rem, 4.6vw, 2.75rem); margin: 4px 0 14px; }
 .hero .lede { font-size: 16.5px; color: var(--ink-85); margin-bottom: 22px; }
 .hero .fineprint { margin-top: 16px; font-size: 12.5px; color: var(--ink-72); }
@@ -212,6 +219,7 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
 .stat-row .stat .n { font: 600 20px/1.25 var(--font-ui); letter-spacing: -0.01em; color: var(--text); margin-bottom: 4px; }
 .stat-row .stat .l { font-size: 12.5px; color: var(--ink-72); line-height: 1.5; }
 @media (max-width: 700px) { .stat-row .stat { flex: 1 1 45%; border-left: none; border-top: 1px solid var(--ink-16); padding: 14px 0 0; margin-top: 14px; } .stat-row .stat:first-child { border-top: none; margin-top: 0; padding-top: 0; } }
+@media (max-width: 480px) { .stat-row .stat { flex: 1 1 100%; } }
 
 /* ---------- sections ---------- */
 section, .page-section { padding: 46px 0 48px; }
@@ -254,10 +262,14 @@ section.alt, .page-section.alt { background: var(--bg-soft); border-top: 1px sol
 .diagram-plate {
   border: 1px solid var(--border-strong); background: var(--surface);
   box-shadow: 5px 5px 0 rgba(33, 31, 26, 0.12); padding: 16px;
+  overflow-x: auto;
 }
 :root[data-theme="dark"] .diagram-plate { box-shadow: 5px 5px 0 rgba(0, 0, 0, 0.5); }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .diagram-plate { box-shadow: 5px 5px 0 rgba(0, 0, 0, 0.5); } }
-.diagram-plate svg { width: 100%; height: auto; display: block; }
+/* Below ~640px these annotated diagrams shrink past legibility if scaled to
+   fit; a min-width floor keeps the labels readable and the plate scrolls
+   horizontally in its own box instead (the page itself never scrolls). */
+.diagram-plate svg { width: 100%; height: auto; display: block; min-width: 640px; }
 .diagram-cap {
   font: 400 12px var(--font-ui); color: var(--ink-72); border-top: 1px solid var(--border);
   margin-top: 14px; padding-top: 10px;
@@ -280,11 +292,14 @@ section.alt, .page-section.alt { background: var(--bg-soft); border-top: 1px sol
 /* ---------- feature split ---------- */
 .split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 48px; align-items: center; }
 .split.rev > *:first-child { order: 2; }
-@media (max-width: 940px) { .split { grid-template-columns: 1fr; gap: 30px; } .split.rev > *:first-child { order: 0; } }
+@media (max-width: 940px) { .split { grid-template-columns: minmax(0, 1fr); gap: 30px; } .split.rev > *:first-child { order: 0; } }
 
 /* ---------- tables ---------- */
 .table-scroll { overflow-x: auto; border: 1px solid var(--border); background: var(--surface); }
-table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+/* Below its natural width a data table gets cramped, multi-line cells long
+   before it needs to — a min-width keeps cells legible and scrolls the
+   table sideways inside .table-scroll instead (the page itself doesn't). */
+table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: 13.5px; }
 th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
 th { font-weight: 600; color: var(--ink-72); font-size: 11px; letter-spacing: .05em; text-transform: uppercase; border-bottom: 2px solid var(--text); }
 tr:last-child td { border-bottom: none; }
@@ -410,12 +425,16 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
 /* ---------- footer ---------- */
 footer.site { border-top: 2px solid var(--text); padding: 40px 0 30px; }
 .foot-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 32px; }
-@media (max-width: 780px) { .foot-grid { grid-template-columns: 1fr 1fr; gap: 26px; } }
+@media (max-width: 780px) { .foot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 26px; } }
+@media (max-width: 480px) { .foot-grid { grid-template-columns: minmax(0, 1fr); gap: 22px; } }
 footer.site h5 { font: 600 11px/1 var(--font-mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-72); margin: 0 0 12px; }
 footer.site ul { list-style: none; padding: 0; margin: 0; }
 footer.site li { margin: 7px 0; }
 footer.site a { color: var(--text2); font-size: 13.5px; }
 footer.site a:hover { color: var(--text); }
+@media (max-width: 560px) {
+  footer.site a { display: inline-block; padding: 4px 0; }
+}
 .foot-bottom {
   margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--border);
   display: flex; flex-wrap: wrap; gap: 10px; align-items: center;

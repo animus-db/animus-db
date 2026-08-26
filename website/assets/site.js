@@ -1,6 +1,7 @@
 /* AnimusDB site behaviour — vanilla, no dependencies, no build step.
-   Four small things: theme switch (three-state, persisted), mobile nav,
-   copy-to-clipboard on code blocks, and scrollspy for the docs sidebar. */
+   Three small things: theme switch (three-state, persisted),
+   copy-to-clipboard on code blocks, and scrollspy for the docs sidebar.
+   Small-viewport nav is CSS-only (wrap + horizontal scroll) — no JS. */
 (function () {
   "use strict";
 
@@ -41,22 +42,6 @@
           try { localStorage.setItem(STORE, choice); } catch (e) { /* private mode */ }
           syncPressed(choice);
         });
-      });
-    }
-
-    // ---- mobile nav ------------------------------------------------------
-    var toggle = document.querySelector(".nav-toggle");
-    var nav = document.querySelector("nav.main");
-    if (toggle && nav) {
-      toggle.addEventListener("click", function () {
-        var open = nav.classList.toggle("open");
-        toggle.setAttribute("aria-expanded", String(open));
-      });
-      nav.addEventListener("click", function (e) {
-        if (e.target.tagName === "A") {
-          nav.classList.remove("open");
-          toggle.setAttribute("aria-expanded", "false");
-        }
       });
     }
 
