@@ -149,6 +149,26 @@ pub enum EntityKind {
     /// `MetaCommand::CutoverSplit`'s apply. The value is the JSON-encoded
     /// `SplitLineage`, same convention as `Tablet`/`Schema`/etc.
     SplitLineage,
+    /// A backup catalog row (`Metadata::backups`, ADR 0059 §3), keyed by
+    /// its opaque `BackupId` string — never a table name (that catalog's
+    /// own "scar", see `Metadata::backups`' doc). The value is the
+    /// JSON-encoded `BackupRow`, same convention as `Schema`/etc.
+    Backup,
+    /// One pinned tablet's backup capture-completion record
+    /// (`Metadata::backup_tablet_progress`, ADR 0059 §3/§4), keyed by the
+    /// composite `(TabletId, BackupId)` pair — the tablet's 8 big-endian
+    /// bytes followed by the backup id's raw UTF-8 bytes
+    /// ([`backup_progress_key`]), the identical fixed-width-prefix-then-
+    /// variable-suffix shape [`IndexBackfill`](Self::IndexBackfill) already
+    /// uses (unambiguous decode: the tablet always occupies exactly the
+    /// first 8 bytes). **`Metadata::backup_tablet_progress`'s own in-memory
+    /// map key is `(BackupId, TabletId)`** — ADR 0059 §3's stated identity
+    /// order — so [`decode_backup_progress_id`] returns `(TabletId,
+    /// BackupId)` (matching the physical encoding) and callers (`mirror.rs`)
+    /// swap the pair back; only this module's own key encoding needs the
+    /// fixed-width field first. The value is the JSON-encoded
+    /// `BackupTabletProgress`.
+    BackupProgress,
 }
 
 impl EntityKind {
@@ -170,6 +190,8 @@ impl EntityKind {
             EntityKind::StreamShard => "stream_shard",
             EntityKind::IndexBackfill => "index_backfill",
             EntityKind::SplitLineage => "split_lineage",
+            EntityKind::Backup => "backup",
+            EntityKind::BackupProgress => "backup_progress",
         }
     }
 
@@ -192,6 +214,8 @@ impl EntityKind {
             b"stream_shard" => EntityKind::StreamShard,
             b"index_backfill" => EntityKind::IndexBackfill,
             b"split_lineage" => EntityKind::SplitLineage,
+            b"backup" => EntityKind::Backup,
+            b"backup_progress" => EntityKind::BackupProgress,
             _ => return None,
         })
     }
@@ -381,6 +405,46 @@ pub fn decode_index_backfill_id(id: &[u8]) -> Option<(TabletId, String)> {
     let tablet = u64::from_be_bytes(id[..8].try_into().expect("checked length"));
     let index = String::from_utf8(id[8..].to_vec()).ok()?;
     Some((TabletId(tablet), index))
+}
+
+/// A backup id's key under [`EntityKind::Backup`] (ADR 0059 §3).
+#[must_use]
+pub fn backup_key(backup_id: &str) -> Vec<u8> {
+    entity_key(EntityKind::Backup, backup_id.as_bytes())
+}
+
+/// A `(backup_id, tablet)` pair's key under [`EntityKind::BackupProgress`]
+/// (ADR 0059 §3/§4): the tablet's 8 big-endian bytes followed by the backup
+/// id's raw UTF-8 bytes — the tablet leads (fixed-width) so
+/// [`decode_backup_progress_id`] always knows exactly where the boundary
+/// is, mirroring [`index_backfill_key`]'s identical shape. See
+/// [`EntityKind::BackupProgress`]'s own doc for why this differs from
+/// `Metadata::backup_tablet_progress`'s own `(BackupId, TabletId)` map-key
+/// order.
+#[must_use]
+pub fn backup_progress_key(backup_id: &str, tablet: TabletId) -> Vec<u8> {
+    let mut id = Vec::with_capacity(8 + backup_id.len());
+    id.extend_from_slice(&tablet.0.to_be_bytes());
+    id.extend_from_slice(backup_id.as_bytes());
+    entity_key(EntityKind::BackupProgress, &id)
+}
+
+/// The inverse of [`backup_progress_key`]'s id half: split a decoded
+/// [`EntityKind::BackupProgress`] id back into `(tablet, backup_id)` — note
+/// the tablet-leading order, matching the physical encoding, not
+/// `Metadata::backup_tablet_progress`'s own `(BackupId, TabletId)` map-key
+/// order (callers swap the pair). `None` if `id` is shorter than the 8-byte
+/// tablet prefix, or if the remaining bytes aren't valid UTF-8 — this
+/// module never writes anything else at this kind's keys, so either is an
+/// internal bug, not a data problem.
+#[must_use]
+pub fn decode_backup_progress_id(id: &[u8]) -> Option<(TabletId, String)> {
+    if id.len() < 8 {
+        return None;
+    }
+    let tablet = u64::from_be_bytes(id[..8].try_into().expect("checked length"));
+    let backup_id = String::from_utf8(id[8..].to_vec()).ok()?;
+    Some((TabletId(tablet), backup_id))
 }
 
 /// The decoded form of a system-keyspace key ([`decode_key`]'s result).
@@ -623,6 +687,46 @@ mod tests {
     fn decode_index_backfill_id_rejects_a_too_short_id() {
         assert_eq!(decode_index_backfill_id(&[0u8; 7]), None);
         assert_eq!(decode_index_backfill_id(&[]), None);
+    }
+
+    #[test]
+    fn backup_key_round_trips() {
+        let key = backup_key("backup-1");
+        assert_eq!(
+            decode_key(&key),
+            Some(DecodedKey::Entity {
+                kind: EntityKind::Backup,
+                id: b"backup-1".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn backup_progress_key_round_trips() {
+        let key = backup_progress_key("backup-1", TabletId(7));
+        let Some(DecodedKey::Entity { kind, id }) = decode_key(&key) else {
+            panic!("expected a decodable entity key");
+        };
+        assert_eq!(kind, EntityKind::BackupProgress);
+        assert_eq!(
+            decode_backup_progress_id(&id),
+            Some((TabletId(7), "backup-1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn backup_progress_key_distinguishes_tablet_and_backup_id() {
+        let a = backup_progress_key("backup-1", TabletId(1));
+        let b = backup_progress_key("backup-1", TabletId(2));
+        assert_ne!(a, b);
+        let c = backup_progress_key("backup-2", TabletId(1));
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn decode_backup_progress_id_rejects_a_too_short_id() {
+        assert_eq!(decode_backup_progress_id(&[0u8; 7]), None);
+        assert_eq!(decode_backup_progress_id(&[]), None);
     }
 
     #[test]
