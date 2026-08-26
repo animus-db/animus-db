@@ -19,6 +19,10 @@ path = "src/lib.rs"
 name = "animusd"
 path = "src/main.rs"
 
+[[bench]]
+name = "cluster_bench"
+harness = false
+
 [dependencies]
 async-trait.workspace = true
 animus-env.workspace = true

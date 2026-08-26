@@ -159,6 +159,7 @@
       </table>
     </div>
     <div class="aside">Until then, the honest summary is the one on the status section of the overview: <strong>not benchmarked at scale, and therefore no performance claims.</strong> If you need numbers to proceed, AnimusDB is not ready for you yet, and that is the correct conclusion to draw.</div>
+    <p class="body-text" style="margin-top:16px">The reproducible bench suite this table commits to already lives in the repository — <code>cargo bench -p animusd</code> runs it against a real in-process cluster and prints p50/p99/p99.9/mean latency and throughput per operation class, <code>ConsistentRead</code>'s two read paths reported apart, and a failure phase (a node killed mid-run) in every pass. What isn't here yet is a published number from disclosed hardware: run it yourself and you'll see exactly what it measures, on your own machine, before we publish anything drawn from ours.</p>
     <div class="ctalink-row">
       <a class="ctalink" href="architecture.html">How the architecture produces these costs →</a>
       <a class="ctalink" href="how-it-works.html">Back to how it works →</a>
