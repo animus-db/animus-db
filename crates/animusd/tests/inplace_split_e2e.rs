@@ -97,6 +97,7 @@ async fn bring_up_inplace(
                 animusd::DEFAULT_STREAM_RETENTION,
                 Duration::ZERO,
                 SplitMode::InPlace,
+                animusd::BackupStoreConfig::default(),
             )
             .await
             {

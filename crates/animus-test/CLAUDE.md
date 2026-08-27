@@ -28,6 +28,7 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_TXN_SEEDS=K` | 1 | K seed variants per multi-tablet transaction-corpus cell (ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | K seed variants per DynamoDB Streams lineage-walk cell (ADR 0042/0043) |
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | K seed variants per secondary-index backfill fault-injection cell (ADR 0045) |
+| `ANIMUS_BACKUP_SEEDS=K` | 1 | K seed variants per on-demand backup capture fault-injection cell (ADR 0059 Train 1) |
 
 ## What's non-obvious
 
@@ -377,3 +378,53 @@ retrievable from git history.)
   engine-global markers already rely on. See
   `docs/engineering-lessons.md` for the general lesson and
   `advance_backfill_cursor`'s own doc for the full account.
+
+### Elle-adjacent, but not Elle: the on-demand backup capture fault corpus (ADR 0059 Train 1 PR③)
+
+- `backup_fault_corpus.rs` — the identical layering fix `backfill_fault_
+  corpus.rs`/`stream_lineage_corpus.rs` set for the backup capture driver
+  (`animusd::backup_capture::backup_capture_tick`) and completion
+  aggregator (`animusd::backup_completion::backup_completion_tick`), both
+  `animusd`-only: a self-contained reimplementation of both functions'
+  exact algorithms directly over `RaftKvNode`, a bare `Metadata`, and
+  `animus-sim`'s `SimSegmentStore` (ADR 0043 §A7's existing fault-injection
+  store, reused verbatim per the ADR's own testing-plan instruction — never
+  built anew). **The §6 split-re-planning DECISION is real production
+  code, never reimplemented**: `Metadata::backup_capture_target`/
+  `live_split_descendants`/`backup_ready_to_complete`/`backup_manifest_
+  tablet_progress` (`animus-control`) are called directly — only the
+  driver's own scan/chunk/cursor mechanics and the aggregator's own
+  manifest-assembly/stuck-timeout mechanics are mirrored.
+- **Verification is direct decode-and-diff, not restore** (Train 2's own
+  concern, not yet built): `assert_backup_matches_model` fetches the
+  completed backup's manifest object and every chunk object a reporting
+  tablet's own id names, decodes them, and diffs the result against an
+  independently-tracked model of the source table's committed state at
+  each tablet's own capture-pin moment — asserting no key is ever decoded
+  twice across two different reporting tablets (the §6 double-count
+  hazard `Metadata::backup_manifest_tablet_progress`'s own doc names) and
+  that no decoded value ever matches one only ever staged inside a
+  pending, never-resolved transaction intent (ADR 0059 §5's "committed
+  values only, never a raw envelope" rule, checked directly rather than
+  merely by construction).
+- **Frozen named cells**: `single_tablet_backup_converges_under_concurrent_
+  writes` (a genuine staged-and-unresolved intent alongside pre-/post-pin
+  writes), `leader_kill_mid_capture` (`sim.crash` + failover to a
+  different replica, proving cursor durability), `capture_driver_node_
+  crash_restart` (a **true process restart** — `sim.stop` + a fresh
+  `RaftKvNode::start_hosted` on the same id and the same durable
+  `MemoryEngine`, mirroring `raftkv_linearizable.rs`'s own `StopRestart`
+  nemesis — as opposed to the previous cell's live-but-muted crash),
+  `split_races_capture_and_replans_onto_descendants` (the named §6
+  scenario: a split cuts over mid-capture, the parent's own unfinished
+  progress is simply abandoned, and each child restarts its own share from
+  scratch — `SplitPolicy::RestartFromScratch`), and `store_faults_ack_
+  lost_puts_still_converge` (`SimSegmentStore`'s existing ack-lost-put
+  fault, at probability 0.5). A sixth cell, `a_wedged_capture_fails_after_
+  the_stuck_timeout`, proves the aggregator's own stuck-`Creating` mark
+  phase directly against the sim's virtual `Clock` (env-time, deterministic
+  — this corpus's own reimplementation is not bound by `animusd`'s real
+  `tokio::time::Instant`, which this crate can't reach anyway) — both that
+  it fires once genuinely stuck and that it does **not** fire early.
+  Depth knob `ANIMUS_BACKUP_SEEDS` (default 1 = the frozen cells; held
+  green at `=200` in ~5s).

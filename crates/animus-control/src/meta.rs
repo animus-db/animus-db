@@ -1966,12 +1966,10 @@ impl Metadata {
                 if !matches!(row.status, BackupStatus::Creating) {
                     return ApplyOutcome::Rejected("backup is not Creating");
                 }
-                let pinned = row
-                    .manifest
-                    .pinned_tablets
-                    .iter()
-                    .any(|t| t.tablet == *tablet);
-                if !pinned {
+                // ADR 0059 §6: `tablet` need not be directly pinned — a
+                // re-planned live descendant of a retired (split) pinned
+                // tablet is admitted too, via its own `split_lineage` chain.
+                if !self.traces_to_pinned(&row.manifest.pinned_tablets, *tablet) {
                     return ApplyOutcome::Rejected("tablet is not pinned in this backup");
                 }
                 let key = (backup_id.clone(), *tablet);
@@ -1999,10 +1997,15 @@ impl Metadata {
                 if !matches!(row.status, BackupStatus::Creating) {
                     return ApplyOutcome::Rejected("backup is not Creating");
                 }
-                let all_reported = row.manifest.pinned_tablets.iter().all(|t| {
-                    self.backup_tablet_progress
-                        .contains_key(&(backup_id.clone(), t.tablet))
-                });
+                // ADR 0059 §6: a pinned tablet that retired via a split is
+                // satisfied once every one of its LIVE `split_lineage`
+                // descendants has its own progress row, not by a (now
+                // impossible) direct report from the retired id itself.
+                let all_reported = row
+                    .manifest
+                    .pinned_tablets
+                    .iter()
+                    .all(|t| self.pinned_tablet_capture_complete(backup_id, t.tablet));
                 if !all_reported {
                     return ApplyOutcome::Rejected(
                         "not every pinned tablet has reported completion",
@@ -2689,6 +2692,172 @@ impl Metadata {
         TabletId(self.next_tablet_id.max(highest + 1).max(1))
     }
 
+    /// **ADR 0059 §6 (the backup-vs-split race)**: every currently-**live**
+    /// tablet whose `split_lineage` chain traces back to `ancestor`,
+    /// transitively. `ancestor` itself, as a single-element vec, if it is
+    /// still live (the common case — most tablets never split during a
+    /// backup's own capture window); otherwise the union of its live
+    /// descendants, recursing through however many generations a cascading
+    /// split chain produced (`split_lineage` is a tree keyed child → parent,
+    /// walked here in the opposite direction via a linear scan — cheap
+    /// enough for this catalog's size, and this accessor is a background-
+    /// loop-tick concern, never a hot path). Empty only if `ancestor` is
+    /// neither live nor has ever recorded a child in `split_lineage` — a
+    /// tablet retired some way other than a split (today, only a dropped
+    /// table's `DropTableTablets`) has no live descendant to substitute, and
+    /// a caller sees "nothing to capture from," not a false completion (see
+    /// [`pinned_tablet_capture_complete`](Self::pinned_tablet_capture_complete)'s
+    /// own empty-set handling).
+    #[must_use]
+    pub fn live_split_descendants(&self, ancestor: TabletId) -> Vec<TabletId> {
+        if self.tablets.contains_key(&ancestor) {
+            return vec![ancestor];
+        }
+        let mut out = Vec::new();
+        for (&child, lineage) in &self.split_lineage {
+            if lineage.parent == ancestor {
+                out.extend(self.live_split_descendants(child));
+            }
+        }
+        out
+    }
+
+    /// **ADR 0059 §6**: does `tablet`'s own `split_lineage` chain trace back
+    /// to one of `pinned`'s tablets (directly, or through one or more
+    /// cascading splits)? The admission test
+    /// [`MetaCommand::RecordBackupTabletComplete`]'s apply arm uses this in
+    /// place of a bare direct-membership check, so a re-planned split
+    /// descendant's own completion report is accepted — the tablet id it
+    /// carries was never itself pinned, but its lineage proves it captured
+    /// exactly the range a pinned (now-retired) ancestor would have.
+    /// Bounded by `split_lineage`'s own size against a malformed/cyclic
+    /// chain, which should never occur (`split_lineage` is a tree, written
+    /// once per child at `CutoverSplit`) but must never spin forever if it
+    /// somehow did.
+    fn traces_to_pinned(&self, pinned: &[BackupPinnedTablet], tablet: TabletId) -> bool {
+        let mut cur = tablet;
+        for _ in 0..=self.split_lineage.len() {
+            if pinned.iter().any(|t| t.tablet == cur) {
+                return true;
+            }
+            let Some(lineage) = self.split_lineage.get(&cur) else {
+                return false;
+            };
+            cur = lineage.parent;
+        }
+        false
+    }
+
+    /// **ADR 0059 §4/§6**: has `pinned` tablet's own share of `backup_id`
+    /// been fully captured? True directly (a progress row at `pinned`
+    /// itself) when `pinned` is still live and never split; otherwise —
+    /// `pinned` retired via a split — true once **every** one of its live
+    /// `split_lineage` descendants
+    /// ([`live_split_descendants`](Self::live_split_descendants)) has its
+    /// own progress row. `false` when that descendant set is empty (a
+    /// tablet retired some way other than a split has nothing to wait on
+    /// that could ever report — see `live_split_descendants`'s own doc), so
+    /// this never treats a vacuous "every descendant reported" over an
+    /// empty set as completion.
+    fn pinned_tablet_capture_complete(&self, backup_id: &str, pinned: TabletId) -> bool {
+        let live = self.live_split_descendants(pinned);
+        !live.is_empty()
+            && live.iter().all(|t| {
+                self.backup_tablet_progress
+                    .contains_key(&(backup_id.to_owned(), *t))
+            })
+    }
+
+    /// **ADR 0059 §3/§4/§6**: is every one of `backup_id`'s pinned tablets
+    /// fully captured (directly, or via re-planned live split descendants)?
+    /// The pure readiness predicate the completion aggregator (`animusd`, a
+    /// later PR) polls before proposing
+    /// [`MetaCommand::CompleteBackup`] — sharing
+    /// [`pinned_tablet_capture_complete`](Self::pinned_tablet_capture_complete)
+    /// with that command's own apply-time re-check rather than
+    /// re-deriving the same decision twice. `false` for an unknown backup id
+    /// or one not currently [`Creating`](BackupStatus::Creating).
+    #[must_use]
+    pub fn backup_ready_to_complete(&self, backup_id: &str) -> bool {
+        let Some(row) = self.backups.get(backup_id) else {
+            return false;
+        };
+        if !matches!(row.status, BackupStatus::Creating) {
+            return false;
+        }
+        row.manifest
+            .pinned_tablets
+            .iter()
+            .all(|t| self.pinned_tablet_capture_complete(backup_id, t.tablet))
+    }
+
+    /// **ADR 0059 §4/§6**: is `tablet` (a **live** tablet) currently a
+    /// capture target of `backup_id` — i.e. should a capture driver leading
+    /// `tablet` be doing work for this backup right now? True when
+    /// `backup_id` is [`Creating`](BackupStatus::Creating), `tablet` is
+    /// live, and `tablet` is directly pinned or traces back to a pinned
+    /// (now-retired) ancestor via `split_lineage`
+    /// ([`traces_to_pinned`](Self::traces_to_pinned)). The one predicate
+    /// both the capture driver (a later PR, deciding what to work on) and
+    /// this corpus's own driver-tick mirror evaluate — never re-derived
+    /// independently, so the two can't drift on what counts as "pinned."
+    #[must_use]
+    pub fn backup_capture_target(&self, backup_id: &str, tablet: TabletId) -> bool {
+        let Some(row) = self.backups.get(backup_id) else {
+            return false;
+        };
+        matches!(row.status, BackupStatus::Creating)
+            && self.tablets.contains_key(&tablet)
+            && self.traces_to_pinned(&row.manifest.pinned_tablets, tablet)
+    }
+
+    /// **ADR 0059 §3/§4/§6**: the manifest object's own authoritative
+    /// per-tablet completion-record list for `backup_id` — every one of its
+    /// pinned tablets' **current live** `split_lineage` frontier
+    /// ([`live_split_descendants`](Self::live_split_descendants)), each
+    /// paired with its own progress row (`None` until it has actually
+    /// reported).
+    ///
+    /// Deliberately **not** a blanket iteration of every
+    /// `Metadata::backup_tablet_progress` row tagged with this backup id.
+    /// Consider a pinned tablet that reports its own completion directly
+    /// and *only then* happens to split (an ordinary, backup-unrelated
+    /// split racing a backup that had already finished that one tablet's
+    /// share before the split ever committed): its direct report at the
+    /// now-retired id is genuine and harmless to leave on file, but once
+    /// the split lands that id is no longer part of its own
+    /// `live_split_descendants` frontier — its two children are — so a
+    /// naive "every progress row tagged with this backup" scan would put
+    /// **three** overlapping entries in the final manifest (the retired
+    /// parent's full-range capture, plus each child's own independent
+    /// re-capture of a sub-range of that same range), double-counting rows
+    /// a restore/verification pass would then see twice. This accessor is
+    /// what keeps that stale, superseded report out of the manifest: the
+    /// authoritative reporting tablet set for a pinned ancestor is always
+    /// exactly its current live frontier, never "whatever tablet id
+    /// happened to report, ever."
+    #[must_use]
+    pub fn backup_manifest_tablet_progress(
+        &self,
+        backup_id: &str,
+    ) -> Vec<(TabletId, Option<BackupTabletProgress>)> {
+        let Some(row) = self.backups.get(backup_id) else {
+            return Vec::new();
+        };
+        row.manifest
+            .pinned_tablets
+            .iter()
+            .flat_map(|p| self.live_split_descendants(p.tablet))
+            .map(|t| {
+                let progress = self
+                    .backup_tablet_progress
+                    .get(&(backup_id.to_owned(), t))
+                    .copied();
+                (t, progress)
+            })
+            .collect()
+    }
+
     /// The backup catalog row for `backup_id`, if any (ADR 0059 §3). A read
     /// accessor for the admin observer surface and a future wire edge.
     #[must_use]
@@ -2710,12 +2879,19 @@ impl Metadata {
 
     /// `backup_id`'s total captured bytes so far (ADR 0059 §2's "total
     /// object sizes, for `DescribeBackup`") — the sum of every pinned
-    /// tablet's own reported [`BackupTabletProgress::bytes`], `0` before
-    /// any tablet has reported.
+    /// tablet's own **currently authoritative** reported
+    /// [`BackupTabletProgress::bytes`]
+    /// ([`backup_manifest_tablet_progress`](Self::backup_manifest_tablet_progress),
+    /// never a blanket sum over every `backup_tablet_progress` row tagged
+    /// with this id — that accessor's own doc explains why a pinned
+    /// tablet's stale, split-superseded direct report must never be
+    /// double-counted alongside its live descendants' own shares). `0`
+    /// before any (still-authoritative) tablet has reported.
     #[must_use]
     pub fn backup_total_bytes(&self, backup_id: &str) -> u64 {
-        self.backup_tablet_progress_for(backup_id)
-            .map(|(_, progress)| progress.bytes)
+        self.backup_manifest_tablet_progress(backup_id)
+            .iter()
+            .filter_map(|(_, progress)| progress.map(|p| p.bytes))
             .sum()
     }
 }
@@ -3607,6 +3783,231 @@ mod tests {
                 cut_version: 10,
                 bytes: 100,
             })
+        );
+    }
+
+    /// ADR 0059 §6: a pinned tablet that splits mid-capture re-plans onto
+    /// its live descendants — `live_split_descendants`/
+    /// `backup_capture_target`/`traces_to_pinned` all agree, and the split
+    /// child's own completion report (never itself pinned) is admitted.
+    #[test]
+    fn backup_survives_a_split_of_its_pinned_tablet() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1_000,
+            }),
+            ApplyOutcome::Applied
+        );
+        let pinned = m
+            .backup("backup-1")
+            .unwrap()
+            .manifest
+            .pinned_tablets
+            .clone();
+        assert_eq!(
+            pinned,
+            vec![BackupPinnedTablet {
+                tablet: TabletId(1),
+                range: KeyRange::whole(),
+            }]
+        );
+
+        // Before the split: tablet 1 is its own sole live descendant, and is
+        // the one and only capture target.
+        assert_eq!(m.live_split_descendants(TabletId(1)), vec![TabletId(1)]);
+        assert!(m.backup_capture_target("backup-1", TabletId(1)));
+        assert!(!m.backup_ready_to_complete("backup-1"));
+
+        // Split tablet 1 into 2 (left) / 3 (right) mid-capture — the parent
+        // retires from `Metadata::tablets` entirely.
+        split_tablet(&mut m, TabletId(1), b"m".to_vec(), TabletId(2));
+        assert!(!m.tablets.contains_key(&TabletId(1)));
+
+        // The retired parent is no longer itself a capture target (it's
+        // gone); its two live children now are, via `split_lineage`.
+        assert!(!m.backup_capture_target("backup-1", TabletId(1)));
+        assert!(m.backup_capture_target("backup-1", TabletId(2)));
+        assert!(m.backup_capture_target("backup-1", TabletId(3)));
+        let mut descendants = m.live_split_descendants(TabletId(1));
+        descendants.sort();
+        assert_eq!(descendants, vec![TabletId(2), TabletId(3)]);
+
+        // A tablet unrelated to this lineage is never a target.
+        assert!(!m.backup_capture_target("backup-1", TabletId(99)));
+
+        // A retired parent's own completion report is still ADMITTED (it is
+        // directly pinned — `traces_to_pinned` doesn't care whether the id
+        // is still live), covering the legitimate race where the parent
+        // genuinely finished its whole-range capture before an unrelated
+        // split retired it. But it does NOT count toward completion (its id
+        // is no longer part of its own `live_split_descendants` frontier —
+        // the two children are), so it must not let the backup complete
+        // with only the children's shares half-done, and (per
+        // `backup_manifest_tablet_progress`'s own doc) never becomes a
+        // stale, double-counted entry in the eventual manifest.
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 1,
+                bytes: 1,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m.backup_ready_to_complete("backup-1"));
+        assert!(
+            m.backup_manifest_tablet_progress("backup-1")
+                .iter()
+                .all(|(t, _)| *t != TabletId(1)),
+            "the retired parent's own orphaned report must never surface in the manifest's \
+             authoritative tablet list, which is always the current live frontier"
+        );
+
+        // Only the left child reports: not ready yet — the right child's
+        // own share is still outstanding.
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(2),
+                cut_version: 10,
+                bytes: 111,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m.backup_ready_to_complete("backup-1"));
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Rejected("not every pinned tablet has reported completion")
+        );
+
+        // The right child reports too: now ready, and `CompleteBackup`
+        // succeeds — the manifest's own `pinned_tablets` list still names
+        // the retired parent (a historical, never-mutated stub), while the
+        // catalog's actual progress is keyed by the two real descendants.
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(3),
+                cut_version: 12,
+                bytes: 222,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.backup_ready_to_complete("backup-1"));
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.backup("backup-1").unwrap().status,
+            BackupStatus::Available
+        );
+        assert_eq!(m.backup_total_bytes("backup-1"), 111 + 222);
+        assert_eq!(
+            m.backup("backup-1").unwrap().manifest.pinned_tablets,
+            vec![BackupPinnedTablet {
+                tablet: TabletId(1),
+                range: KeyRange::whole(),
+            }],
+            "the manifest stub's pinned-tablet list is a frozen historical \
+             snapshot, never rewritten onto the re-planned descendants"
+        );
+    }
+
+    /// A cascading split (a re-planned descendant splitting again before it
+    /// finishes its own share) re-plans transitively — `traces_to_pinned`/
+    /// `live_split_descendants` walk however many generations it takes.
+    #[test]
+    fn backup_survives_a_cascading_split_of_a_split_descendant() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1_000,
+            }),
+            ApplyOutcome::Applied
+        );
+        split_tablet(&mut m, TabletId(1), b"m".to_vec(), TabletId(2));
+        // Split the LEFT child (tablet 2) again before it ever reports.
+        split_tablet(&mut m, TabletId(2), b"g".to_vec(), TabletId(4));
+        assert!(!m.tablets.contains_key(&TabletId(2)));
+
+        let mut descendants = m.live_split_descendants(TabletId(1));
+        descendants.sort();
+        assert_eq!(
+            descendants,
+            vec![TabletId(3), TabletId(4), TabletId(5)],
+            "tablet 1's live frontier is now three generations-2 tablets: \
+             the once-split-then-split-again left branch's two children, \
+             plus the untouched right child"
+        );
+        for &t in &descendants {
+            assert!(m.backup_capture_target("backup-1", t));
+        }
+        assert!(!m.backup_capture_target("backup-1", TabletId(1)));
+        assert!(!m.backup_capture_target("backup-1", TabletId(2)));
+
+        for &t in &descendants {
+            assert_eq!(
+                m.apply(&MetaCommand::RecordBackupTabletComplete {
+                    backup_id: "backup-1".to_owned(),
+                    tablet: t,
+                    cut_version: 1,
+                    bytes: 10,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert!(m.backup_ready_to_complete("backup-1"));
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
+    /// A tablet with no lineage relationship to `backup_id`'s pinned list at
+    /// all is never admitted, split or not — `traces_to_pinned` must not
+    /// accept an unrelated tablet just because *some* `split_lineage` entry
+    /// exists somewhere in the catalog.
+    #[test]
+    fn record_backup_tablet_complete_rejects_an_unrelated_tablets_report_even_with_other_splits_on_file()
+     {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        table_with_one_tablet(&mut m, "other", TabletId(10));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1_000,
+            }),
+            ApplyOutcome::Applied
+        );
+        // An unrelated table's tablet splits — its lineage must never leak
+        // into backup-1's own admission decision.
+        split_tablet(&mut m, TabletId(10), b"m".to_vec(), TabletId(11));
+        assert!(!m.backup_capture_target("backup-1", TabletId(11)));
+        assert!(!m.backup_capture_target("backup-1", TabletId(12)));
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(11),
+                cut_version: 1,
+                bytes: 1,
+            }),
+            ApplyOutcome::Rejected("tablet is not pinned in this backup")
         );
     }
 

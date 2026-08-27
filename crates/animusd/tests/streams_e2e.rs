@@ -175,6 +175,7 @@ async fn start_streamed_cluster_full_copy_pinned(
         Duration::ZERO,
         None,
         SplitMode::Copy,
+        animusd::BackupStoreConfig::default(),
     )
     .await
     .unwrap()

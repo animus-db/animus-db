@@ -2977,7 +2977,28 @@ debugging anything that feels like it might have happened before.
   serde and the rest to rebuild); deleting `target/debug/incremental`
   alone freed 5GB more. Prefer targeted `cargo test -p <crate> --test
   <name>` over full sweeps when disk-constrained — it also happens to
-  match how CI runs.
+  match how CI runs. **Addendum (2026-08-26): `CARGO_PROFILE_DEV_DEBUG=0`
+  avoids the problem at the source** rather than cleaning up after it —
+  running the five gates for a plumbing-sized PR (ADR 0059 Train 1 PR②)
+  hit the identical symptom (`cargo build --workspace --all-targets`
+  exhausting a fresh sandbox's whole root filesystem, not just this
+  workspace's `target/`, since `/tmp` shares the same device), even after
+  the incremental/`cargo clean -p` cleanup above: `target/debug/deps`
+  alone held 2493 files, 24GB of which was debug-info-laden test/bin
+  **executables** (not `.rlib`/`.rmeta`/`.d`, which incremental
+  compilation actually needs) from binaries that had already run and
+  would never be reused. Two independent fixes, both safe to combine:
+  (1) `find target/debug/deps -maxdepth 1 -type f ! -name '*.rlib' !
+  -name '*.rmeta' ! -name '*.d' -delete` reclaims a spent test binary's
+  space without invalidating any dependency crate's incremental cache
+  (unlike `cargo clean -p`, which does); (2) prefixing the build/test
+  invocation with `CARGO_PROFILE_DEV_DEBUG=0` (a `dev`-profile override,
+  not a workspace `Cargo.toml` edit — nothing to revert) drops full debug
+  info from every artifact for that invocation, shrinking a from-scratch
+  `cargo build --workspace --all-targets` from ~28GB to ~9GB. Prefer (2)
+  proactively before a from-scratch `--all-targets` gate run in a
+  disk-constrained sandbox; reach for (1) if a run has already ballooned
+  `target/` and a full `cargo clean` would be too slow to recover from.
 - **"Converges slowly" and "never converges" produce the same panic message
   and need different investigation methods — instrument the poll itself
   before theorizing** (2026-08-22, `streams_e2e.rs::multi_split_soak_
@@ -8160,6 +8181,52 @@ debugging anything that feels like it might have happened before.
   explicitly whenever a new `EngineFactory`-shaped seam gains a method.
   (`crates/animus-cp-data/src/host.rs::EngineFactory::clone_engine`'s own
   doc comment states the final contract and the hazard by name.)
+- **Reusing a "one instance per node" primitive for a second, independent
+  instance needs the primitive to stop hardcoding its own singleton
+  identity first — the same "exclusive resource per instance" class of bug
+  as the `clone_engine` entry above, but at the network layer instead of
+  disk (2026-08-26, ADR 0059 Train 1 PR②, `animus-cp-data::
+  cluster_segment_store`).** `ClusterSegmentStore`'s own doc was explicit
+  and correct: "`(node, stream)` is single-consumer (ADR 0026), and this is
+  THE ONE task that consumes this node's `SEGMENT_STREAM` inbox" — but
+  `SEGMENT_STREAM` was a hardcoded `pub const`, not a constructor
+  parameter, because until this PR only one subsystem (DynamoDB Streams)
+  ever built one. Wiring `animusd::build_backup_store` — a second,
+  independent `ClusterSegmentStore` instance for on-demand backups,
+  constructed on every combined/data-only node by
+  `BackupStoreConfig::default() == Cluster` — reused the type without
+  reading that invariant as a constraint on the *type*, not just on "don't
+  call `start` twice from the same call site": both instances' serving
+  tasks called `env.recv_stream(SEGMENT_STREAM)` on the same node,
+  racing for one single-consumer inbox and silently stealing each other's
+  requests/replies. **This was NOT caught by `cargo build`, `cargo clippy`,
+  or a single test binary run in isolation** — every test still passed
+  individually, because a lone `ClusterSegmentStore` on its own inbox has
+  no contender. It surfaced only as intermittent, seed-independent
+  failures across *unrelated* `animusd` integration tests
+  (`dynamo_streams.rs`, `streams_e2e.rs` — 1 to 4 tests failing per run,
+  different tests and different symptoms — a timeout once, a spurious
+  "shard has been trimmed" 400 once) once every test node's bring-up
+  started constructing the second store by default, reproducing even with
+  `--test-threads=1` on a single binary in isolation (ruling out cross-test
+  contention as the cause — the two racing consumers live *inside* one
+  node's own bring-up). **The generalizable rule**: before reusing any
+  "exactly one of these per node/process" primitive for a second logical
+  consumer, grep its own doc for the word "exactly" or "the one" and verify
+  the singleton identity it's protecting (a stream id, a file prefix, a
+  port, a lock name) becomes a real per-instance parameter, not an
+  implicit constant — the type system cannot catch a second value of a
+  type whose identity is baked into a `pub const` rather than a field.
+  Fixed by threading a `stream: u64` field through
+  `ClusterSegmentStore::{new,with_k,start,start_with_k}` and `serve_loop`,
+  with the pre-existing `SEGMENT_STREAM` staying the streams call site's
+  explicit argument and a new, equally explicit
+  `animus_cp_data::backup::BACKUP_SEGMENT_STREAM` for the backup call
+  site. Regression:
+  `animus-cp-data/tests/cluster_segment_store.rs::
+  two_cluster_segment_stores_on_the_same_node_stay_isolated_by_stream`
+  (two instances, two streams, a same-object-id racing `put` from the same
+  node, asserting each store's own local copy holds its own payload).
 - **A full design-token rewrite ("keep the names, change the values") is only
   safe once you've counted every consumer, and a mockup's literal CSS can
   silently redefine what an existing token means (2026-08-25, ADR 0056,
@@ -8245,7 +8312,23 @@ debugging anything that feels like it might have happened before.
   attribute) before the default changed to an explicit value.
 
 ### Parallel-agent orchestration
-- **Headless-Chromium `--window-size` screenshots are not responsive-layout
+- **A gate command piped into `tail`/`tee` without `pipefail` reports the
+  pipe's *last* command's exit status, so the gate can fail while the
+  wrapper exits 0 (2026-08-26, ADR 0059 Train 1 PR② merge).** A
+  `cargo check --workspace --all-targets 2>&1 | tail -3` "validation" of a
+  merge-conflict resolution exited 0 while `cargo check` itself had failed
+  with E0061 — the compile error was real (main had added new
+  `run_node_with_streams_quiesce_and_split_mode` call sites in
+  `split_build.rs`/`split_lifecycle.rs` while the branch being merged had
+  widened that signature; textual auto-merge sees no conflict in files
+  only one side changed), and CI caught what the local wrapper claimed to
+  have checked. Two rules: (a) any pipeline whose exit status gates a
+  push runs under `set -o pipefail` (or checks `PIPESTATUS[0]`); (b) a
+  merge of a moved `main` into a branch that changed a function signature
+  gets its gate run on the *merged* tree specifically because the
+  dangerous call sites are the ones only `main` has — the same
+  missed-allowlist class as the "grep every gating match site" rule, at
+  merge time.
   QA (2026-08-25, website mobile pass)** — in this harness,
   `chromium --headless=new --window-size=390,H --screenshot=...` lays the
   page out at the default ~800px viewport and then *crops* the PNG to
@@ -9695,6 +9778,72 @@ either be captured by the proposer or derived from `Metadata` already
 committed to that point, derive it — the proposer-captured version always
 requires arguing every replica sees the same input, and pure derivation
 makes that argument for free.
+
+## A new kind-scan primitive must filter transaction-record marker keys too, not just resolve envelopes (ADR 0059 §4/§5)
+
+Building `RaftKvNode::local_scan_kind_snapshot` (the backup capture
+driver's snapshot-pinned, intent-resolved sweep) by composing `storage
+.scan_at` + `resolve_once_step` looked complete — every value came back
+correctly resolved (committed, or silently dropped if still `Pending`).
+The very first test against a genuine staged-but-unresolved transaction
+failed anyway: the decoded row set contained an extra entry that turned
+out to be `txn.rs`'s own internal record-marker key (`txn::record_key`,
+the atomic-commit-point row `TxnStage` writes into the anchor's own
+scope), not anything a caller ever wrote. `resolve_scan_rows` — the
+existing shared post-processing step every other scan in this crate
+already goes through — has always dropped these (`if
+txn::is_record_key(&key) { continue; }`) before resolving, but that
+check lives in `resolve_scan_rows` itself, not in `resolve_once_step`
+(the lower-level per-row resolver `local_scan_kind_snapshot` composed
+directly, to get its own cursor/limit semantics). Building a new scan
+primitive directly on `resolve_once_step` instead of the existing
+`resolve_scan_rows`/`local_scan_kind_ordered` wrappers silently loses
+every filter those wrappers apply, not just the ones a superficial read of
+`resolve_once_step`'s own doc would expect. General rule: when a new read
+primitive needs its own cursor/limit shape but the *value-resolution* part
+is identical to an existing scan, grep every filter step the existing
+wrapper applies (record-marker keys today; whatever gets added next) and
+carry each one forward explicitly — never assume "I called the same
+low-level resolver" is equivalent to "I inherited the same scan
+semantics." A unit test exercising a real staged-and-never-resolved
+transaction (not just a value-only round trip) is what caught this in one
+run; a primitive whose only test coverage is "committed values resolve
+correctly" would have shipped this defect silently.
+
+## A catalog's "who satisfies this obligation" predicate must be the SAME accessor everywhere it's asked, or a stale report double-counts (ADR 0059 §6)
+
+The backup-vs-split race (a pinned tablet retires mid-capture; its live
+`split_lineage` descendants take over its share) has a subtler failure
+mode than "the retired tablet's own report is missing": it's still
+*possible* for the retired tablet to have reported successfully **before**
+splitting (a `RecordBackupTabletComplete` that legitimately committed
+first, on an ordinary unrelated split racing an already-finished tablet).
+That report is real and harmless to leave on file — but once the split
+lands, the retired id's own row in `Metadata::backup_tablet_progress`
+becomes a **stale, superseded** entry: the tablet's current live
+capture-frontier is its two children, and if a naive "sum every progress
+row tagged with this backup id" accessor is used to build the final
+manifest, the retired parent's full-range capture and its two children's
+own (later, independent, narrower-range) captures all land in the
+manifest side by side — a real content bug (every row in the split
+range appears in the backup twice), not just an efficiency loss. The fix
+was to derive one canonical accessor
+(`Metadata::backup_manifest_tablet_progress`, built on
+`live_split_descendants`) that always answers "the tablet whose id is
+authoritative for the completed capture of this pinned tablet's range,
+right now" — and to route *every* consumer through it: the readiness
+check (`backup_ready_to_complete`), the manifest assembly (the completion
+aggregator), and even the pre-existing `backup_total_bytes` display
+figure (which had the identical latent double-count bug before this PR,
+just never triggered — no code path had ever produced two progress rows
+covering the same range before ADR 0059 §6 made that possible). General
+rule: when a catalog gains a "this identity's obligation may transfer to
+a different identity later" relationship (a retired-and-replaced key), a
+single row's own presence is never sufficient to answer "has this
+obligation been met" — build one shared accessor that resolves identity
+to its *current* authoritative set first, and audit every existing
+consumer of the raw per-identity map for the same latent assumption, not
+just the new caller that motivated the change.
 - **A per-tick consumer arm superseded by a dedicated driver during one
   lifecycle phase needs the SAME exclusion guard as every sibling arm the
   driver also supersedes — audit them together, not one at a time (issue

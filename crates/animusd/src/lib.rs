@@ -42,6 +42,8 @@ pub use animus_control::{
 };
 
 mod admin;
+mod backup_capture;
+mod backup_completion;
 mod console;
 mod control_handle;
 mod dashboard;
@@ -746,6 +748,38 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.cursor_min_watermark(consumer).await,
             CpGroup::Mem(n) => n.cursor_min_watermark(consumer).await,
+        }
+    }
+
+    /// This replica's current engine watermark — the backup capture
+    /// driver's own snapshot-pin primitive (ADR 0059 §4). See
+    /// [`RaftKvNode::engine_latest_version`].
+    pub(crate) fn engine_latest_version(&self) -> u64 {
+        match self {
+            CpGroup::Lsm(n) => n.engine_latest_version(),
+            CpGroup::Mem(n) => n.engine_latest_version(),
+        }
+    }
+
+    /// A snapshot-pinned, intent-resolved, resumable-cursor sweep of a kind
+    /// scope — the backup capture driver's own read primitive (ADR 0059
+    /// §4/§5). See [`RaftKvNode::local_scan_kind_snapshot`].
+    pub(crate) async fn local_scan_kind_snapshot(
+        &self,
+        kind: u8,
+        start: &[u8],
+        version_ceiling: u64,
+        limit: usize,
+    ) -> (Vec<(Vec<u8>, Vec<u8>, u64)>, Option<Vec<u8>>) {
+        match self {
+            CpGroup::Lsm(n) => {
+                n.local_scan_kind_snapshot(kind, start, version_ceiling, limit)
+                    .await
+            }
+            CpGroup::Mem(n) => {
+                n.local_scan_kind_snapshot(kind, start, version_ceiling, limit)
+                    .await
+            }
         }
     }
 
@@ -2681,6 +2715,19 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // "no seed answered" — see `tests/seed_join_allocated.rs`'s
             // follower-connected-seed case.
             | MetaCommand::RegisterNode { .. }
+            // On-demand backup per-tablet completion record (ADR 0059 §3/§4):
+            // a tablet leader's own "I finished capturing my share of this
+            // backup" proposal, from wherever that leader actually runs —
+            // the identical relay reasoning as `MarkIndexBackfilled`/
+            // `SealStreamShard` just above. `CompleteBackup`/`FailBackup`
+            // are deliberately NOT included here: their only intended
+            // production caller (the completion aggregator, a
+            // control-plane-leader-only background loop, this crate) already
+            // proposes them directly off its own live `RaftNode` handle,
+            // exactly the same `ExpireStreamShards` precedent this function's
+            // own doc states above — no wire surface exists yet for either
+            // (Train 1 PR④'s concern) to need a relay path of its own.
+            | MetaCommand::RecordBackupTabletComplete { .. }
     )
 }
 
@@ -4389,6 +4436,7 @@ impl BoundNode {
             ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
             None,
             SplitMode::default(),
+            BackupStoreConfig::default(),
         )
         .await
     }
@@ -4425,6 +4473,14 @@ impl BoundNode {
     /// node's `ClientCtx::trigger_split` proposes — `SplitMode::default()`
     /// (every caller above this layer) is `InPlace` since rung 4 layer 2.
     /// See [`SplitMode`]'s own doc.
+    ///
+    /// `backup_store_config` (ADR 0059 §1) selects this node's second,
+    /// backup-dedicated [`BackupStoreHandle`] — `BackupStoreConfig::Cluster`
+    /// (every caller above this layer) is the default K-replicated store;
+    /// `--config`/`--node`'s and `--cluster N`'s own `--backup-store
+    /// cluster|fs:PATH` CLI flag threads through here. **Plumbing only**
+    /// (ADR 0059 Train 1 PR②) — nothing yet reads or writes through the
+    /// resulting handle.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_growth(
         self,
@@ -4447,6 +4503,7 @@ impl BoundNode {
         ttl_sweep_interval: Duration,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         split_mode: SplitMode,
+        backup_store_config: BackupStoreConfig,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         // The initial (static) peer book + an env clone, kept for the
@@ -4625,11 +4682,23 @@ impl BoundNode {
             my_id.clone(),
             &segment_store_config,
         );
+        // This node's backup store (ADR 0059 §1) — a second, independently
+        // configured handle alongside `segment_store` above; see
+        // `build_backup_store`'s own doc. Plumbing only (Train 1 PR②): no
+        // consumer reads or writes through it yet.
+        let backup_store = build_backup_store(
+            &self.env,
+            &self.dir,
+            ControlHandle::Local(raft.clone()),
+            my_id.clone(),
+            &backup_store_config,
+        );
         let data_role = DataRole {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
             base_id: my_id.clone(),
             segment_store,
+            backup_store,
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
             split_builds: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4855,6 +4924,14 @@ impl BoundNode {
             ttl_sweep_interval,
         )));
 
+        // The on-demand backup capture driver (ADR 0059 §4/§5/§6, Train 1
+        // PR③): sweeps a `Creating` backup's pinned/re-planned tablets into
+        // chunked backup-store objects. Same "run everywhere, self-gate per
+        // tablet on leadership" shape as the GSI drain/TTL reaper above.
+        tasks.push(tokio::spawn(backup_capture::backup_capture_loop(
+            ctx.clone(),
+        )));
+
         // The segment janitor (ADR 0043 §A9, round-3 PR7): retention +
         // replica repair over the whole stream-shard catalog. Control-
         // plane-leader-only (self-gated every tick, `segment_janitor.rs`'s
@@ -4873,6 +4950,16 @@ impl BoundNode {
         // `index_backfill.rs`'s own doc) — spawned unconditionally here,
         // exactly like the segment janitor just above.
         tasks.push(tokio::spawn(index_backfill::index_backfill_loop(
+            ctx.clone(),
+        )));
+
+        // The on-demand backup completion aggregator (ADR 0059 §3/§4, Train
+        // 1 PR③): completes/fails a `Creating` backup once every pinned (or
+        // re-planned) tablet has reported, or a stuck-timeout elapses.
+        // Control-plane-leader-only (self-gated every tick,
+        // `backup_completion.rs`'s own doc) — spawned unconditionally here,
+        // exactly like the segment janitor/backfill aggregator above.
+        tasks.push(tokio::spawn(backup_completion::backup_completion_loop(
             ctx.clone(),
         )));
 
@@ -5611,6 +5698,20 @@ impl BoundControlNode {
             ctx.clone(),
         )));
 
+        // The on-demand backup completion aggregator (ADR 0059 §3/§4, Train
+        // 1 PR③): a control-only node can genuinely become the control-plane
+        // leader (ADR 0035 split deployment), so it needs this loop too —
+        // *failing* a stuck backup needs only `Metadata`, but *completing*
+        // one needs a `BackupStoreHandle` to durably `put` the manifest,
+        // which no control-only node provisions — see
+        // `backup_completion.rs`'s own doc for the documented gap this
+        // leaves (a pure split deployment's control-only leader marks a
+        // fully-captured backup ready but cannot itself flip it to
+        // `Available`, until a data-capable node takes the lead instead).
+        tasks.push(tokio::spawn(backup_completion::backup_completion_loop(
+            ctx.clone(),
+        )));
+
         Ok(Node {
             raft: ControlHandle::Local(raft),
             envs,
@@ -5791,6 +5892,7 @@ impl BoundDataNode {
             None,
             None,
             SplitMode::default(),
+            BackupStoreConfig::default(),
         )
         .await
     }
@@ -5808,6 +5910,13 @@ impl BoundDataNode {
     /// `split_mode` (ADR 0058 Train 2 rung 3) — see
     /// [`BoundNode::start_with_growth`]'s doc: same knob, same
     /// `SplitMode::default()` (`InPlace` since rung 4 layer 2) contract.
+    ///
+    /// `backup_store_config` (ADR 0059 §1) — see [`BoundNode::
+    /// start_with_growth`]'s doc: same knob, same default-`Cluster`
+    /// contract. A data-only node gets a real, independently-configured
+    /// backup store handle too (ADR 0059's own asymmetry is that a
+    /// *control-only* node gets none — see [`BoundControlNode::
+    /// start_control_with`], which takes no such parameter at all).
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_growth(
         self,
@@ -5826,6 +5935,7 @@ impl BoundDataNode {
         auto_split_change_rate: Option<u64>,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         split_mode: SplitMode,
+        backup_store_config: BackupStoreConfig,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         let static_peers = peers;
@@ -5887,11 +5997,23 @@ impl BoundDataNode {
             my_id.clone(),
             &segment_store_config,
         );
+        // This node's backup store (ADR 0059 §1) — see `BoundNode::
+        // start_with_growth`'s identical construction; `control` here is
+        // `ControlHandle::Remote`, which `ControlPlacementView` reads
+        // through unchanged, exactly as `segment_store` above does.
+        let backup_store = build_backup_store(
+            &self.env,
+            &self.dir,
+            control.clone(),
+            my_id.clone(),
+            &backup_store_config,
+        );
         let data_role = DataRole {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
             base_id: my_id.clone(),
             segment_store,
+            backup_store,
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
             split_builds: Arc::new(Mutex::new(BTreeMap::new())),
@@ -6023,6 +6145,19 @@ impl BoundDataNode {
         tasks.push(tokio::spawn(ttl_reaper::ttl_reaper_loop(
             ctx.clone(),
             ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        )));
+
+        // The on-demand backup capture driver (ADR 0059 §4/§5/§6, Train 1
+        // PR③) — same shape as the GSI drain/TTL reaper just above. No
+        // completion aggregator on this data-only path: a data-only node's
+        // control handle is `ControlHandle::Remote` (never a genuine
+        // control-plane leader), so `backup_completion_loop`'s own
+        // `ctx.edge.leader_handle()` self-gate would always be `None` here
+        // — spawning it would be pure dead weight, the same reasoning
+        // `index_backfill_loop`/`segment_janitor_loop` already apply by
+        // their own absence from this spawn site.
+        tasks.push(tokio::spawn(backup_capture::backup_capture_loop(
+            ctx.clone(),
         )));
 
         if auto_split_threshold.is_some()
@@ -6578,10 +6713,172 @@ fn build_segment_store(
                     env.clone(),
                     local,
                     placement,
+                    animus_cp_data::cluster_segment_store::SEGMENT_STREAM,
                 ),
             )
         }
         SegmentStoreConfig::Fs(path) => SegmentStoreHandle::Fs(FsSegmentStore::new(path.clone())),
+    }
+}
+
+/// This node's **backup** [`SegmentStore`](animus_env::SegmentStore) handle
+/// (ADR 0059 §1) — a second, backup-dedicated instance built the same way
+/// [`SegmentStoreHandle`] is (`ClusterSegmentStore<ProdEnv, FsSegmentStore>`/
+/// `FsSegmentStore` — this crate has no `SimEnv` dependency at all, ADR 0043
+/// §A7b's `SimSegmentStore` variant is `animus-cp-data`'s own sim-corpus
+/// concern, never reached from here), but from its own `--backup-store` CLI
+/// knob and its own object namespace
+/// (`animus_cp_data::backup`'s `backup/{backup_id}/...` ids, disjoint from
+/// the stream sealer's `{table}/{label}/{tablet}/{epoch}` shape — see that
+/// module's own doc). **Plumbing only** (ADR 0059 Train 1 PR②): nothing yet
+/// reads or writes through this handle — no capture driver, no janitor, no
+/// wire surface — it is threaded down to where a later PR's capture driver
+/// will live (alongside [`DataRole::segment_store`]) and no further.
+///
+/// A distinct type from [`SegmentStoreHandle`], not a second value of that
+/// same type, so a reader can never mix up which knob/object-namespace a
+/// given handle answers for — the two are mechanically identical today
+/// (same variant shapes, same underlying store types) but are documented,
+/// configured, and will evolve independently (ADR 0059 §1's own
+/// `fs:PATH`-durability-tradeoff note is a backup-specific operational
+/// concern the streams knob doesn't share).
+///
+/// **Consumed since ADR 0059 Train 1 PR③**: the per-tablet capture driver
+/// (`backup_capture.rs`) `put`s chunked data objects through this handle,
+/// and the completion aggregator (`backup_completion.rs`) `put`s the
+/// manifest object — see each module's own doc.
+#[derive(Clone)]
+pub(crate) enum BackupStoreHandle {
+    Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
+    Fs(FsSegmentStore),
+}
+
+impl BackupStoreHandle {
+    /// Push a backup object's bytes durably to this store, returning the
+    /// replica set a later PR's catalog bookkeeping would record — mirrors
+    /// [`SegmentStoreHandle::put_sealed`]'s exact contract (an empty
+    /// `Vec` for the single-directory `Fs` opt-in, the same "no per-node
+    /// replica concept, ask any node" signal).
+    pub(crate) async fn put(&self, id: &str, bytes: &[u8]) -> std::io::Result<Vec<NodeId>> {
+        match self {
+            BackupStoreHandle::Cluster(c) => c.put_replicated(id, bytes).await,
+            BackupStoreHandle::Fs(fs) => {
+                use animus_env::SegmentStore;
+                fs.put(id, bytes).await?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Fetch a backup object's bytes — mirrors
+    /// [`SegmentStoreHandle::get_sealed`]'s exact contract (`replicas`
+    /// ignored for the single-directory `Fs` opt-in). **Unused until
+    /// Train 2** (`RestoreTableFromBackup` is this method's first reader) —
+    /// left in rather than stubbed, per this type's own module-level doc.
+    #[allow(dead_code)]
+    pub(crate) async fn get(
+        &self,
+        replicas: &[NodeId],
+        id: &str,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        use animus_env::SegmentStore;
+        match self {
+            BackupStoreHandle::Cluster(c) => c.get_from(replicas, id).await,
+            BackupStoreHandle::Fs(fs) => fs.get(id).await,
+        }
+    }
+
+    /// Delete a backup object at every one of `replicas` — mirrors
+    /// [`SegmentStoreHandle::delete_sealed`]'s exact contract. **Unused
+    /// until the retention janitor's reclaim phase** (ADR 0059 §3/§9, a
+    /// later train) — left in rather than stubbed, per this type's own
+    /// module-level doc.
+    #[allow(dead_code)]
+    pub(crate) async fn delete(&self, replicas: &[NodeId], id: &str) -> std::io::Result<()> {
+        use animus_env::SegmentStore;
+        match self {
+            BackupStoreHandle::Cluster(c) => c.delete_from(replicas, id).await,
+            BackupStoreHandle::Fs(fs) => fs.delete(id).await,
+        }
+    }
+
+    /// List every id starting with `prefix` on **this node's own local**
+    /// backup directory — mirrors [`SegmentStoreHandle::list_local`]'s exact
+    /// contract (debug/sweep only, never load-bearing for correctness: the
+    /// replicated backup catalog, ADR 0059 §3, is the sole authority for
+    /// what backup data exists). **Unused until a debug/sweep admin surface
+    /// or the retention janitor's orphan sweep needs it** (a later train) —
+    /// left in rather than stubbed, per this type's own module-level doc.
+    #[allow(dead_code)]
+    pub(crate) async fn list_local(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        use animus_env::SegmentStore;
+        match self {
+            BackupStoreHandle::Cluster(c) => c.local().list(prefix).await,
+            BackupStoreHandle::Fs(fs) => fs.list(prefix).await,
+        }
+    }
+}
+
+/// `--backup-store cluster|fs:PATH` CLI opt-in (ADR 0059 §1), defaulting to
+/// `Cluster` — the existing K-replicated `ClusterSegmentStore`, so a fresh
+/// install needs nothing extra configured. `Fs(PATH)` (parsed by `main.rs`
+/// from `--backup-store fs:PATH`) selects a bare, single-directory
+/// `FsSegmentStore` at `PATH` instead.
+///
+/// **Unlike [`SegmentStoreConfig`]'s identically-shaped `--segment-store
+/// dir:PATH` knob, the ADR spells out an explicit `cluster` keyword as well
+/// as `fs:PATH`** (`parse_backup_store` in `main.rs` accepts both the
+/// omitted flag and the literal string `cluster` as `Cluster`) — kept as a
+/// distinct enum from `SegmentStoreConfig`, not a reuse, for the same reason
+/// [`BackupStoreHandle`] is its own type: a backup store's durability
+/// tradeoff is worth documenting and configuring on its own terms, even
+/// though the two enums are shaped identically today.
+///
+/// **The default (`Cluster`) does not survive a whole-cluster loss** — it
+/// replicates within the same cluster the backups protect data *from*
+/// (operator/application mistakes), not from a total cluster failure.
+/// `fs:PATH` pointed at separately backed-up or replicated storage — and,
+/// later, an S3 backend (ADR 0059's own named follow-up) — is the actual
+/// disaster-recovery story. Stated here once, plainly, per the ADR's own
+/// instruction that this must not be left to be discovered the hard way.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum BackupStoreConfig {
+    #[default]
+    Cluster,
+    Fs(PathBuf),
+}
+
+/// Build (and, for the cluster variant, **start**) this node's
+/// [`BackupStoreHandle`] (ADR 0059 §1) — mirrors [`build_segment_store`]'s
+/// exact shape, rooting the cluster variant's per-node local
+/// `FsSegmentStore` building block at `dir.join("backups")` rather than
+/// `dir.join("segments")` — kept physically separate from the streams
+/// store's own local directory even though the two stores' object
+/// namespaces are already disjoint (`animus_cp_data::backup`'s own module
+/// doc), the same belt-and-suspenders posture ADR 0059 §1 takes for the
+/// namespace split itself.
+fn build_backup_store(
+    env: &ProdEnv,
+    dir: &Path,
+    control: ControlHandle,
+    self_id: NodeId,
+    config: &BackupStoreConfig,
+) -> BackupStoreHandle {
+    match config {
+        BackupStoreConfig::Cluster => {
+            let local = FsSegmentStore::new(dir.join("backups"));
+            let placement: Arc<dyn animus_cp_data::cluster_segment_store::PlacementView> =
+                Arc::new(ControlPlacementView { control, self_id });
+            BackupStoreHandle::Cluster(
+                animus_cp_data::cluster_segment_store::ClusterSegmentStore::start(
+                    env.clone(),
+                    local,
+                    placement,
+                    animus_cp_data::backup::BACKUP_SEGMENT_STREAM,
+                ),
+            )
+        }
+        BackupStoreConfig::Fs(path) => BackupStoreHandle::Fs(FsSegmentStore::new(path.clone())),
     }
 }
 
@@ -6722,6 +7019,12 @@ struct DataRole {
     /// sealer's `SegmentStore::put` target, `index_drain.rs`'s
     /// `change_consumer_loop` seal arm's only consumer today.
     pub(crate) segment_store: SegmentStoreHandle,
+    /// This node's **backup** [`BackupStoreHandle`] (ADR 0059 §1) — a
+    /// second, backup-dedicated store handle alongside `segment_store`
+    /// above, built from its own `--backup-store` CLI knob. Consumed by the
+    /// per-tablet capture driver (`backup_capture.rs`) and the completion
+    /// aggregator (`backup_completion.rs`) since ADR 0059 Train 1 PR③.
+    pub(crate) backup_store: BackupStoreHandle,
     /// The DynamoDB Streams sealer's own size/age knobs (ADR 0042 §13).
     pub(crate) stream_seal_knobs: StreamSealKnobs,
     /// Growth PR3 Fork F (ADR 0042 §14): this node's own per-tablet
@@ -15026,6 +15329,7 @@ pub async fn start_cluster_with(
         Duration::ZERO,
         None,
         SplitMode::default(),
+        BackupStoreConfig::default(),
     )
     .await
 }
@@ -15054,6 +15358,7 @@ pub async fn start_cluster_auto_split(
         Duration::ZERO,
         None,
         SplitMode::default(),
+        BackupStoreConfig::default(),
     )
     .await
 }
@@ -15082,6 +15387,7 @@ pub async fn start_cluster_with_auto_split(
         Duration::ZERO,
         None,
         SplitMode::default(),
+        BackupStoreConfig::default(),
     )
     .await
 }
@@ -15113,6 +15419,7 @@ pub async fn start_cluster_with_auto_split_bytes(
         Duration::ZERO,
         None,
         SplitMode::default(),
+        BackupStoreConfig::default(),
     )
     .await
 }
@@ -15145,6 +15452,7 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         Duration::ZERO,
         None,
         SplitMode::default(),
+        BackupStoreConfig::default(),
     )
     .await
 }
@@ -15184,6 +15492,7 @@ pub async fn start_cluster_with_streams(
         Duration::ZERO,
         None,
         SplitMode::default(),
+        BackupStoreConfig::default(),
     )
     .await
 }
@@ -15220,6 +15529,7 @@ pub async fn start_cluster_with_growth(
         Duration::ZERO,
         None,
         SplitMode::default(),
+        BackupStoreConfig::default(),
     )
     .await
 }
@@ -15256,6 +15566,7 @@ pub async fn start_cluster_with_quiesce_after(
         quiesce_after,
         None,
         SplitMode::default(),
+        BackupStoreConfig::default(),
     )
     .await
 }
@@ -15281,6 +15592,11 @@ pub async fn start_cluster_with_quiesce_after(
 /// (every other wrapper above) is `InPlace` since rung 4 layer 2 — `Copy`
 /// stays selectable via the flag pending its own deletion.
 ///
+/// `backup_store_config` (ADR 0059 §1) selects the whole in-process
+/// cluster's backup store — `--cluster N`'s `--backup-store cluster|fs:PATH`
+/// CLI flag threads through here; `BackupStoreConfig::Cluster` (every other
+/// wrapper above) is the default. Plumbing only (ADR 0059 Train 1 PR②).
+///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
 #[allow(clippy::too_many_arguments)]
@@ -15297,6 +15613,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     quiesce_after: Duration,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     split_mode: SplitMode,
+    backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
@@ -15311,6 +15628,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
         quiesce_after,
         dynamo_auth,
         split_mode,
+        backup_store_config,
     )
     .await
 }
@@ -15329,6 +15647,7 @@ async fn start_cluster_inner(
     quiesce_after: Duration,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     split_mode: SplitMode,
+    backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -15399,6 +15718,7 @@ async fn start_cluster_inner(
                 ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
                 dynamo_auth.clone(),
                 split_mode,
+                backup_store_config.clone(),
             )
             .await?;
         nodes.push(node);
@@ -15642,6 +15962,7 @@ pub async fn start_split_cluster_with_growth(
                 dynamo_auth.clone(),
                 // Same documented gap as the control-role loop above.
                 SplitMode::default(),
+                BackupStoreConfig::default(),
             )
             .await?,
         );
@@ -15773,6 +16094,7 @@ pub async fn run_node_with_streams_and_quiesce_after(
         quiesce_after,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         SplitMode::default(),
+        BackupStoreConfig::default(),
     )
     .await
 }
@@ -15785,6 +16107,10 @@ pub async fn run_node_with_streams_and_quiesce_after(
 /// own `ttl_sweep_interval` knob: every existing call site above keeps
 /// compiling and behaving identically at `SplitMode::default()` (`InPlace`
 /// since rung 4 layer 2).
+///
+/// `backup_store_config` (ADR 0059 §1) — `--config FILE --node I`'s own
+/// `--backup-store cluster|fs:PATH` CLI flag threads through here. Plumbing
+/// only (ADR 0059 Train 1 PR②).
 ///
 /// # Errors
 /// As [`run_node_with`].
@@ -15800,6 +16126,7 @@ pub async fn run_node_with_streams_quiesce_and_split_mode(
     stream_retention: Duration,
     quiesce_after: Duration,
     split_mode: SplitMode,
+    backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Node> {
     run_node_with_streams_quiesce_and_ttl_sweep_interval(
         config,
@@ -15813,6 +16140,7 @@ pub async fn run_node_with_streams_quiesce_and_split_mode(
         quiesce_after,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         split_mode,
+        backup_store_config,
     )
     .await
 }
@@ -15842,6 +16170,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     quiesce_after: Duration,
     ttl_sweep_interval: Duration,
     split_mode: SplitMode,
+    backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -15895,6 +16224,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             ttl_sweep_interval,
             dynamo_auth,
             split_mode,
+            backup_store_config,
         )
         .await
 }
@@ -15928,6 +16258,7 @@ pub async fn run_node_with_ttl_sweep_interval(
         Duration::ZERO,
         ttl_sweep_interval,
         SplitMode::default(),
+        BackupStoreConfig::default(),
     )
     .await
 }
@@ -16148,6 +16479,10 @@ pub async fn run_node_data(
             // after`'s identical scope gap) — always `SplitMode::default()`,
             // `InPlace` since rung 4 layer 2 (was `Copy`).
             SplitMode::default(),
+            // Same documented gap for `--backup-store` (ADR 0059 §1): no
+            // CLI flag reaches `animusd data --config` yet, so this always
+            // gets the default `Cluster` store.
+            BackupStoreConfig::default(),
         )
         .await
 }
@@ -16702,6 +17037,8 @@ async fn finish_data_join(
             // `SplitMode::default()`, `InPlace` since rung 4 layer 2 (was
             // `Copy`).
             SplitMode::default(),
+            // Same documented gap for `--backup-store` as `run_node_data`.
+            BackupStoreConfig::default(),
         )
         .await
 }
