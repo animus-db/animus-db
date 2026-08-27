@@ -45,6 +45,7 @@ mod admin;
 mod backup_capture;
 mod backup_completion;
 mod backup_janitor;
+mod backup_restore;
 mod console;
 mod control_handle;
 mod dashboard;
@@ -2525,6 +2526,16 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // a live `RaftNode` handle, the identical `ExpireStreamShards`
             // precedent this function's own doc states above.
             | MetaCommand::MarkBackupDeleted { .. }
+            // Restore workflow (ADR 0059 §7, Train 2): `RestoreTableFromBackup`
+            // (`animusd::dynamo::restore_table_from_backup`) may land on any
+            // node, exactly like `CreateTable`; the restore driver
+            // (`animusd::backup_restore`) proposes `CompleteRestore`/
+            // `FailRestore` from wherever its target tablet's own leader
+            // happens to run — the identical relay reasoning as
+            // `RecordBackupTabletComplete` above.
+            | MetaCommand::BeginRestore { .. }
+            | MetaCommand::CompleteRestore { .. }
+            | MetaCommand::FailRestore { .. }
     )
 }
 
@@ -4727,6 +4738,14 @@ impl BoundNode {
             ctx.clone(),
         )));
 
+        // The restore driver (ADR 0059 §7, Train 2): seeds a `Seeding`
+        // restore's single `Building` tablet from its backup's data
+        // objects, then activates it. Same "run everywhere, self-gate per
+        // tablet on leadership" shape as the backup capture driver above.
+        tasks.push(tokio::spawn(backup_restore::backup_restore_loop(
+            ctx.clone(),
+        )));
+
         // The segment janitor (ADR 0043 §A9, round-3 PR7): retention +
         // replica repair over the whole stream-shard catalog. Control-
         // plane-leader-only (self-gated every tick, `segment_janitor.rs`'s
@@ -5979,6 +5998,13 @@ impl BoundDataNode {
             ctx.clone(),
         )));
 
+        // The restore driver (ADR 0059 §7, Train 2) — same shape/reasoning
+        // as the backup capture driver just above (data-role-only, no
+        // control-plane-leader dependency).
+        tasks.push(tokio::spawn(backup_restore::backup_restore_loop(
+            ctx.clone(),
+        )));
+
         if auto_split_threshold.is_some()
             || auto_split_bytes_threshold.is_some()
             || auto_split_change_rate.is_some()
@@ -6603,6 +6629,27 @@ impl BackupStoreHandle {
         use animus_env::SegmentStore;
         match self {
             BackupStoreHandle::Cluster(c) => c.get_from(replicas, id).await,
+            BackupStoreHandle::Fs(fs) => fs.get(id).await,
+        }
+    }
+
+    /// Fetch a backup object's bytes from **any** reachable copy — the
+    /// restore driver's own read primitive (ADR 0059 §7, Train 2). Unlike
+    /// [`get`](Self::get), this needs no recorded `replicas` list (no
+    /// backup object carries one, see [`get`](Self::get)'s own doc and
+    /// `backup_janitor.rs`'s module doc for why): it goes through the
+    /// trait's own [`animus_env::SegmentStore::get`], which for `Cluster`
+    /// tries the local copy first, then every one of the store's *current*
+    /// placement candidates — a best-effort "ask any node" contract,
+    /// exactly what a restore reading immutable, already-`Available`
+    /// backup objects needs (this is the identical primitive
+    /// `list_local`/`delete_local` deliberately do NOT use, since those two
+    /// are scoped local-only by the janitor's own design; a read has no
+    /// such constraint).
+    pub(crate) async fn get_any(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
+        use animus_env::SegmentStore;
+        match self {
+            BackupStoreHandle::Cluster(c) => c.get(id).await,
             BackupStoreHandle::Fs(fs) => fs.get(id).await,
         }
     }

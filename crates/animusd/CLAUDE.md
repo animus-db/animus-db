@@ -1744,11 +1744,18 @@ route below the edge through the same `ClientCtx` CP primitives.
   object — see both modules' own entries below. **`list_local`/`delete_local`
   consumed since Train 1 PR④** by the backup janitor's own local-only
   reclaim sweep (`backup_janitor.rs`'s own entry below has the full
-  design/residual). `get`/`delete` (the explicit-`replicas` pair) stay
-  individually `#[allow(dead_code)]`-marked — Train 2's restore is `get`'s
-  first real reader, and `delete` (unlike the janitor's own `delete_local`)
-  has no caller yet since no backup object carries a recorded `replicas`
-  list to call it with (see `backup_janitor.rs`'s doc for why).
+  design/residual). **`get_any` (Train 2's own addition, not `get`) is the
+  restore driver's own read primitive** — `get`'s explicit-`replicas`
+  contract needs a recorded replica list no backup object carries (the same
+  residual `backup_janitor.rs`'s doc names for `delete`), so `get_any` goes
+  through the trait's own best-effort `SegmentStore::get(id)` instead
+  (local copy first, then every one of the store's *current* placement
+  candidates) — sound because a backup's own data objects are immutable and
+  `Available`-gated, so "ask any node" always finds an already-committed
+  answer. `get`/`delete` (the explicit-`replicas` pair) stay individually
+  `#[allow(dead_code)]`-marked — neither gained a caller in Train 2 either
+  (`delete`, unlike the janitor's own `delete_local`, still has no recorded
+  `replicas` list to call it with; restore never deletes anything).
   `data --config`/`data --seed`/`control`/`join`/`--cluster-control`+
   `--cluster-data` all default to `BackupStoreConfig::Cluster` internally —
   no CLI flag reaches any of them, the identical documented gap
@@ -1829,6 +1836,63 @@ route below the edge through the same `ClientCtx` CP primitives.
   document (object reclaim needs a `BackupStoreHandle`, which no
   control-only node provisions) — spawned on combined and control-only
   nodes, never data-only.
+- **`backup_restore.rs`** (ADR 0059 §7, Train 2) — the **restore driver**:
+  a per-tablet, leader-side, event-driven loop (`backup_restore_loop`, the
+  identical "run everywhere, self-gate per tablet on `group.is_leader()`"
+  shape as `backup_capture.rs`/the GSI drain/TTL reaper) that seeds a
+  `Seeding` restore's single destination tablet from its backup's data
+  objects, then activates it. **Deliberately no durable per-tablet cursor**
+  (unlike `backup_capture.rs`'s own `CaptureCursor`) — each tick's own
+  `restore_tick` call sweeps the WHOLE manifest from its first chunk, safe
+  because `KvCommand::SeedBatch`'s merge-at-carried-version is idempotent
+  regardless of how many times a chunk repeats; a crash/leader-change
+  simply restarts the full sweep from scratch on whatever engine state a
+  new leader already has. **Every captured value is re-wrapped via
+  `animus_cp_data::backup::encode_restored_value`** before merging — a real
+  bug found by this train's own first end-to-end test (a `SeedBatch` merge
+  of a capture's already-resolved, envelope-less value corrupts the engine
+  from a later read's point of view; see that function's own doc and
+  `docs/engineering-lessons.md` for the full incident). Bounded liveness:
+  a driver-local (non-durable) per-restore progress clock
+  (`RESTORE_STUCK_TIMEOUT`, 10 minutes) proposes `MetaCommand::FailRestore`
+  once a `Seeding` restore goes that long with no observed forward
+  progress — embedded directly in this per-tablet driver rather than a
+  separate control-plane-leader aggregator (unlike `backup_completion.rs`),
+  since a restore has exactly one destination tablet, so its own leader is
+  already the sole authority on its progress. Once every chunk is seeded,
+  `complete_restore` proposes `MetaCommand::CompleteRestore` and then — in
+  the same step, not before — declares every one of `RestoreRow::gsi_defs`
+  via `MetaCommand::CreateTableIndex` (ADR 0059 §8): see
+  `animus-control/CLAUDE.md`'s restore-catalog entry for why this ordering
+  is load-bearing, not incidental. Spawned on combined and data-only nodes
+  only (mirrors `backup_capture.rs`'s own scope — a control-only node hosts
+  no CP-data tablet).
+- **`dynamo.rs`'s `restore_table_from_backup` (ADR 0059 §7, Train 2)** —
+  `RestoreTableFromBackup`'s wire handler: validates the backup
+  (`BackupNotFoundException`/`BackupInUseException`, `visible_backup`'s own
+  "`Expired`/`Failed` read as not-found" convention) and the target name
+  (reserved-namespace check; `ResourceInUseException` — the identical code
+  `create_table`'s own duplicate-name check uses — if it already exists),
+  proposes `CreateTableSchema` (the manifest's schema stripped of
+  `indexes`/`stream`/`ttl` — TTL/streams are deliberately never
+  re-enabled) then `CreateTableIndex` for every LSI the manifest recorded
+  (LSIs are always `Active`, colocated physical data this restore is about
+  to seed — no backfill involved), resolves the restore's own GSI plan
+  (`GlobalSecondaryIndexOverride` or the manifest's own GSIs, forced
+  `Creating`) without yet declaring it, then proposes `MetaCommand::
+  BeginRestore` and returns **immediately** — unlike `create_table`'s own
+  blocking `await_table_serveable` wait, this is asynchronous by design
+  (the restore driver above does the seeding/activation/GSI-declare in the
+  background). `dynamo::table_status` derives `DescribeTable`'s
+  `TableStatus` purely from whether every one of a table's *current*
+  tablets is `Active` (`CREATING` while any is `Building`) — no new
+  persisted state, the identical "derive from live state" discipline an
+  `IndexStatus`/`BackupStatus` already follow. **A deliberate, named AWS
+  deviation**: the restore response (and any `DescribeTable` before
+  completion) shows no GSIs at all, not even `CREATING` — they only appear
+  once the base table activates and `CreateTableIndex` actually declares
+  them (see the ADR's Train 2 amendment for the full reasoning and the
+  wire-layer-only follow-up that would close this gap).
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and
@@ -2155,7 +2219,15 @@ janitor's own row-removal convergence, `ListBackups` pagination, and the
 error shapes; its own follower-relay regression for `DeleteBackup`
 (`MetaCommand::MarkBackupDeleted` on the `is_relayable_command` allowlist)
 lives beside the rest of `schema_ddl_relay.rs`'s DDL suite, mirroring
-`UpdateTimeToLive`'s own precedent exactly), restart/durability across every
+`UpdateTimeToLive`'s own precedent exactly), the ADR 0059 Train 2 restore
+surface end to end (`dynamo_restore.rs` — the full `CreateBackup` →
+`AVAILABLE` → write-more-data → `RestoreTableFromBackup` → converged round
+trip proving the restored table serves exactly the backup-time rows with a
+queryable, converged GSI; restore-after-source-drop; and the
+`BackupNotFoundException`/`BackupInUseException`/`ResourceInUseException`
+error shapes; its own follower-relay regression for `BeginRestore`/
+`CompleteRestore` lives beside the rest of `schema_ddl_relay.rs`'s DDL
+suite, the same precedent again), restart/durability across every
 deployment shape, and the `WatchMetadata`/system-table/OTel/metrics support
 surfaces.
 `support/mod.rs` holds the shared bring-up helpers (port-TOCTOU retries,
