@@ -451,7 +451,7 @@ retrievable from git history.)
   (default 1 = the frozen cells; held green at `=100` for the restore cells,
   `=200` for the whole file, both in well under a second).
 
-### Elle-adjacent, but not Elle: the PITR sealing corpus (ADR 0059 §9, Train 3)
+### Elle-adjacent, but not Elle: the PITR sealing + restore corpus (ADR 0059 §9/§10, Train 3)
 
 - `pitr_fault_corpus.rs` — the identical layering fix `stream_lineage_
   corpus.rs`/`backup_fault_corpus.rs` set for the fifth consumer arm
@@ -513,3 +513,55 @@ retrievable from git history.)
   empty`'s own (already-correct) three-separate-maps precedent, which this
   file's first draft failed to copy faithfully. See `docs/engineering-
   lessons.md` for the general lesson.
+- **Train 3 PR② adds a `RestoreTableToPointInTime` tier**: five more named
+  cells, verified against the **real** `Metadata::pitr_replay_segments`
+  (called directly, never reimplemented) applied to segments this
+  corpus's own `pitr_seal_now` reimplementation sealed, decoded and
+  reduced last-writer-wins-by-HLC, and diffed against an independently-
+  tracked model — `assert_replay_matches_model`, the restore-side sibling
+  of `verify_pitr_lineage` above. `restore_to_random_second_matches_the_
+  model_with_a_leader_kill` (the flagship property: mixed writes across
+  several rounds, a leader kill mid-stream, checked against a model
+  snapshotted at *every* successful seal, not just the last one — proving
+  replay is correct at any point in the timeline, not merely at the end)
+  and `restore_to_random_second_matches_the_model_across_a_split` (the
+  same property carried across a cutover, parent and both children sealing
+  independently) join `pitr_restore_window_scopes_to_the_latest_
+  generation_under_random_cycles` (the generation-gap validation property
+  under randomized disable/re-enable cycling, not just one hand-picked
+  gap), `deleted_table_pitr_restore_matches_the_model` (a table dropped,
+  not split, still replays correctly — this is the regression shape for
+  the `live_split_descendants` bug below), and
+  `use_latest_restorable_time_matches_the_full_model`. Held green at
+  `ANIMUS_PITR_SEEDS=300` (~8s) alongside the PR① cells above (same file,
+  same knob).
+- **A real production bug this restore tier's own first run found, not
+  review**: the first `Metadata::pitr_replay_segments` was built on
+  `live_split_descendants` (ADR 0059 §6's on-demand-capture re-planning
+  accessor), which returns empty for a tablet retired by an ordinary
+  `DropTableTablets` (no `split_lineage` entry — that map only ever gets a
+  row from a *split*) — so a deleted-table PITR restore silently replayed
+  nothing. Rewritten as a direct forward DFS over `split_lineage` that
+  includes every visited tablet's own segments regardless of current
+  liveness; see the ADR's Train 3 PR② as-built amendment for the full
+  account.
+- **Three harness bugs this tier's own build found in itself, not in
+  production** (fixed before the cells were trusted at depth): (1) a
+  leader-kill scenario calling `pitr_seal_now` on the newly-elected leader
+  immediately after the kill, with no intervening confirmed write, could
+  read `pending_changes()` before that leader's own apply cursor caught up
+  to the crashed leader's last committed entry — leadership and
+  apply-catchup are not the same event; fixed by moving the kill to
+  *before* that round's own write burst, whose internal confirm-by-
+  applied-index forces the catchup as a side effect. (2) the split
+  scenario picked write keys from the *whole* keyspace for both children,
+  so a write occasionally targeted a key outside its own group's declared
+  range and silently no-op'd at apply time (the routing-bug tripwire this
+  file's `animusd/CLAUDE.md` entry names) — fixed with a `write_burst_
+  ranged` helper taking an explicit per-group key range. (3) the
+  deleted-table scenario proposed `DropTableTablets` on a tablet never
+  registered via `MetaCommand::CreateTablet`, so the drop was silently a
+  `NoOp` and the test proved nothing — fixed by registering the tablet
+  first. All three are hand-scripted-`Metadata`-corpus pitfalls, not bugs
+  in `pitr_replay_segments`/`pitr_seal_now` themselves; see
+  `docs/engineering-lessons.md` for the general lessons.

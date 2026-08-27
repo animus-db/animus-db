@@ -255,12 +255,12 @@
         <li><strong>Node failure</strong> — replicas are re-created automatically; no operator action.</li>
         <li><strong>Control-plane membership</strong> — voters can be changed at runtime without rebuilding the cluster.</li>
         <li><strong>Dropping a table</strong> — tablets are marked for reclamation and each node's reclaim loop stops the groups and deletes the storage.</li>
+        <li><strong>Backup and restore</strong> — on-demand backups and continuous backups (point-in-time recovery to any second); both outlive a dropped source table and restore into a brand-new one.</li>
         <li><strong>Metrics</strong> — a line-oriented <code>name value</code> export at <code>GET /metrics</code> on the DynamoDB port: counters and leadership gauges.</li>
         <li><strong>Tracing</strong> — optional OpenTelemetry export with W3C trace-context propagation.</li>
         <li><strong>Introspection</strong> — admin JSON endpoints for health, Raft state, storage internals, in-flight transactions and the tablet map, per node, plus a dashboard that renders them with no external dependencies.</li>
       </ul></div>
       <div class="lcard"><h3>Missing</h3><ul>
-        <li><strong>Backup and restore</strong> — there is no tooling. Replication is not a backup: it faithfully replicates your mistakes.</li>
         <li><strong>Upgrades</strong> — on-disk formats change between revisions, so upgrading means recreating the cluster and reloading the data.</li>
         <li><strong>TLS</strong> — absent on every port. <strong>Authentication</strong> — opt-in SigV4 on the client DynamoDB port only; every other port is unauthenticated.</li>
         <li><strong>Alerting rules</strong> — metrics are exported, but no reference dashboards or alert definitions ship with them.</li>
@@ -277,7 +277,7 @@
     <ul style="font-size:14.5px;max-width:720px">
       <li>No TLS on any port, and no authentication beyond opt-in SigV4 on the client DynamoDB port.</li>
       <li>No format compatibility between revisions. Upgrading means recreating the cluster.</li>
-      <li>No backup or restore tooling.</li>
+      <li>Restore always creates a brand-new table, never in-place.</li>
       <li>Tablets never merge, so a table that shrinks keeps its tablet count.</li>
       <li>Not benchmarked at scale, and no performance claims are made for that reason.</li>
       <li>No production use by anyone, including us.</li>

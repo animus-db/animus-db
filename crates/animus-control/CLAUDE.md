@@ -513,6 +513,44 @@ per-tablet CP data plane (`animus-cp-data`).
   existing, an explicit override of the streams drop-table retention-zero
   rule (ADR 0059 §9/§10).
 
+  **`RestoreTableToPointInTime` (ADR 0059 §10, Train 3 PR②) reuses the
+  restore catalog above rather than inventing a second one**:
+  `RestoreRow`/`MetaCommand::BeginRestore` gained one optional field,
+  `pitr: Option<PitrRestorePlan>` (`{target_wall_ms, segments:
+  Vec<PitrReplaySegmentRef>}`), carried verbatim exactly like `gsi_defs`
+  already is — a PITR restore is otherwise indistinguishable from an
+  on-demand one to every downstream consumer (activation, GSI declare,
+  `/admin/restores`). Two new pure accessors, both taking `&self` and
+  doing no I/O:
+  - `Metadata::pitr_restore_window(table) -> Option<PitrRestoreWindow>`
+    (`{generation, earliest_ms, latest_ms}`) is the validation gate's
+    `EarliestRestorableDateTime`/`LatestRestorableDateTime` — scoped to the
+    table's **current** generation only (an earlier generation's own
+    window, crossed by a disable/re-enable cycle, is never reachable
+    through this accessor, which is what makes a generation-gap `T` reject
+    on the ordinary out-of-bounds check rather than needing a dedicated
+    error path), and it answers correctly whether or not the source
+    table's schema still exists (falls back to `Metadata::pitr_generation`'s
+    own surviving counter) — a deleted table's PITR history stays
+    queryable, mirroring the backup catalog's own ADR 0024 carve-out.
+  - `Metadata::pitr_replay_segments(base_tablet_progress, cutoff_wall_ms)
+    -> Vec<PitrReplaySegmentRef>` selects which segments a restore must
+    replay: a forward DFS over `split_lineage` starting from each of the
+    chosen base snapshot's own pinned tablets, including **every** visited
+    tablet's own `pitr_segments` rows regardless of that tablet's current
+    liveness (a root tablet's floor is the base snapshot's own recorded
+    cut version; a descendant's floor is 0, since ADR 0050's copy-based
+    split gives every child an empty change log at birth). **Built on a
+    direct DFS, deliberately not `live_split_descendants`** (§6's
+    on-demand-capture re-planning accessor) — that accessor answers "live"
+    descendants only and returns empty for a tablet retired by an ordinary
+    `DropTableTablets` (no `split_lineage` entry, unlike a split), which
+    silently dropped every segment of a deleted-and-never-split table's
+    own tablet the first time this function was built that way. See the
+    ADR's Train 3 PR② as-built amendment for the full incident; regression:
+    `meta::tests::
+    pitr_replay_segments_still_finds_a_dropped_never_split_tablets_own_segments`.
+
 ## What's non-obvious
 
 - **The sync/driver split is deliberate.** All consensus logic is in the sync

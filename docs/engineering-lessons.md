@@ -9613,6 +9613,27 @@ debugging anything that feels like it might have happened before.
   call (delegate anything multi-file/exploratory/build-heavy, inline only
   trivial one-file work; stack whenever there is more than one reviewable
   logical step, flat PRs state why).
+- **A finished-but-unpushed tree is one container recycle from gone — commit
+  per logical unit AND push the WIP branch after every commit, not just at
+  the end (2026-08-27, ADR 0059 Train 3 PR②).** A first attempt at this
+  exact task (`RestoreTableToPointInTime`) ran for a long single session,
+  accumulated the full catalog/wire/replay-driver/e2e implementation, and
+  was lost in its entirety to a container recycle before a single commit
+  landed — every finding, every fix, every test had to be redone from
+  scratch by the next session. The fix is procedural, not technical, and
+  costs almost nothing: split the work into its natural logical units
+  (catalog+validation; replay mechanism; wire+driver; corpus; docs) *as a
+  task-planning decision made up front*, and after each one, commit **and**
+  `git push` immediately — including WIP-quality commits on a branch with
+  no PR yet. A branch pushed to the remote survives a container recycle;
+  an uncommitted working tree does not. This session split the redo into
+  exactly two implementation commits plus one corpus commit plus this docs
+  commit, pushing after each, so no unit larger than roughly "one build+test
+  cycle" was ever at risk again. **Generalizable rule**: for any
+  long-running implementation task in an ephemeral session, treat "commit
+  and push" as part of finishing a logical unit, not as a wrap-up step
+  saved for the end — the session's own lifetime is not a resource the task
+  plan can assume.
 
 ## Duplicated config needs a test, not a comment (ADR 0056)
 
@@ -10582,3 +10603,98 @@ every *sibling* command proposed the same way (same wire-handler shape,
 same `ctx.propose_schema` call) while you're in the allowlist anyway — a
 gap next to the one you're fixing is exactly the kind of thing a narrowly-
 scoped PR walks right past.
+
+## A driver stamped a wall-clock field from the monotonic clock — the two `Env` time sources look interchangeable until a value crosses a wire boundary (ADR 0059 §9/§10, Train 3 PR②)
+
+`pitr_seal_now`/`pitr_tick` (`animusd::index_drain`) stamped
+`PitrSegmentRow::seal_wall_ms` from `ctx.env.now()` — `Nanos`,
+monotonic-since-process-start, the ordinary timer/timeout/backoff seam —
+instead of `ctx.env.wall_now()`, ADR 0051's one real-calendar-time seam.
+Both compile, both return a plausible-looking integer, and every existing
+test passed: nothing *inside* the sealing path ever compares
+`seal_wall_ms` to a real timestamp, so the bug was invisible until a
+consumer that does — `PitrSpec::enabled_wall_ms` (genuinely wall-clock,
+set from a wire-facing `UpdateContinuousBackups` call) compared against
+this field to derive `LatestRestorableDateTime` — silently collapsed the
+whole PITR restore window to zero width, forever, the instant any tablet
+ever sealed. It shipped in Train 3 PR① and sat undetected through that
+PR's own full corpus and review, because PR①'s own scope never *read*
+`seal_wall_ms` against a real timestamp; PR②, the first consumer to do so
+in earnest, hit it on its very first end-to-end run.
+
+**The generalizable rule**: when a field's own doc or name says "wall
+clock" / "real time" / anything that will eventually be compared against a
+value carried in from *outside* the simulation seam (a wire timestamp, an
+external system's clock, ADR 0051's `wall_now()` in this codebase), audit
+every site that *writes* it as carefully as the sites that read it —
+`env.now()` and `env.wall_now()` return the same Rust type from the same
+trait and both "just work" in isolation, so a writer-side mixup produces
+no type error, no panic, and no test failure until something finally
+diffs the written value against a genuinely wall-clock one. A codebase
+with two clock seams needs a grep sweep of every write site for a
+wall-clock-typed field whenever that field gains its first real consumer,
+not just a review of the consumer's own new code.
+
+## An accessor scoped to "currently live" is the wrong tool for "everything that ever happened," even when it's the closest existing primitive (ADR 0059 §10, Train 3 PR②)
+
+`Metadata::pitr_replay_segments`'s first implementation was built on
+`live_split_descendants` (ADR 0059 §6's own on-demand-capture
+re-planning accessor: "given a pinned tablet, which of its *currently
+live* descendants must report for the backup to be considered complete").
+It looked like the obvious tool for "given a base snapshot's pinned
+tablet, which tablets' segments must be replayed" — both questions start
+from a pinned tablet and walk forward through splits — but the two
+questions are not the same question: capture-completeness only cares
+about tablets that still *exist*, while replay must cover every tablet
+that *ever* held relevant data, including one retired by an ordinary
+`DropTableTablets` (no split at all). `live_split_descendants` answers
+empty for exactly that case (a dropped-not-split tablet has no
+`split_lineage` entry), so replay silently produced zero segments for
+any deleted table's own un-split tablet — caught by this PR's own first
+end-to-end test (a deleted-table PITR restore), not by review, and fixed
+by writing a direct forward DFS over `split_lineage` that includes every
+*visited* tablet regardless of current liveness.
+
+**The generalizable rule**: when a new need "starts from a pinned entity
+and walks forward through the same lineage table" as an existing
+accessor, don't reach for that accessor just because the traversal shape
+matches — check what its own *filter* condition means, since a
+completeness predicate ("must this thing still exist to matter") and a
+coverage predicate ("did this thing ever hold matter") are easy to
+conflate when they happen to agree on every input a first draft's tests
+exercise (a table that's still alive, or was split rather than dropped).
+Two nearly-identical unit-test names in this PR's own regression suite —
+one proving the accessor is re-planned correctly onto live split
+descendants, the other proving it still finds a dropped-never-split
+tablet's own segments — is the shape that catches this: write the
+"the entity is GONE, not just re-planned" case explicitly rather than
+assuming a lineage-walking accessor's existing split coverage implies
+drop coverage too.
+
+## A corpus's own leader-kill-then-seal step needs a confirmed write between them, not just a re-election (ADR 0059 §9/§10, Train 3 PR② corpus)
+
+The PITR restore corpus's flagship leader-kill scenario called
+`pitr_seal_now` on the newly-elected leader immediately after killing the
+old one, with no write in between. At `ANIMUS_PITR_SEEDS=100` this
+produced a genuine (harness-only) failure: "the group has a leader" and
+"the group's own apply cursor has caught up to everything the crashed
+leader had committed" are two different facts, and nothing forces the
+second to be true the instant the first becomes true — `pending_changes()`
+read on the fresh leader before its apply loop caught up saw a truncated
+backlog, corrupting the scenario's own expected seal content. The fix
+was to reorder the scenario: move the leader kill to *before* that
+round's own write burst rather than immediately before the seal, so the
+burst's own confirm-by-applied-index wait (already present, since every
+write in this corpus confirms before moving on) forces the catch-up as a
+side effect, with no new synchronization primitive needed.
+
+**The generalizable rule, restated for corpus/harness authors
+specifically** (the underlying principle — durable-before-visible,
+leadership isn't apply-completeness — is already a top-level house rule):
+a hand-scripted scenario that kills a leader and then immediately reads
+group-local state on the replacement must interpose a confirmed write
+(or an explicit apply-catchup wait) between the kill and the read, exactly
+as a real client would experience via its own confirm loop — "the group
+elected a new leader" is not the same wait condition as "the group is
+caught up," and a scenario that conflates them can manufacture a
+test-only data loss that looks identical to a real one.
