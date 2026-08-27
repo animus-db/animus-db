@@ -578,3 +578,138 @@ async fn delete_backup_on_a_follower_is_relayed_to_the_leader() {
         n.shutdown_graceful().await;
     }
 }
+
+/// ADR 0059 §7 (Train 2)'s own instance of this file's regression class:
+/// `RestoreTableFromBackup` issued against a DynamoDB listener on a node
+/// that is **not** the control-plane leader must still commit —
+/// `MetaCommand::BeginRestore`/`CompleteRestore` must be on the relay
+/// allowlist, or this times out on exactly this shape (the schema/tablet-
+/// mint steps relay via `BeginRestore`; the restore driver's own eventual
+/// `CompleteRestore` relays too, from whichever node happens to lead the
+/// destination tablet).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn restore_table_from_backup_on_a_follower_is_relayed_to_the_leader() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(3, dir.path()).await;
+
+    let leader = nodes.iter().position(Node::is_control_leader).unwrap();
+    let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
+    let leader_dynamo = config.nodes[leader].dynamo;
+    let follower_dynamo = config.nodes[follower].dynamo;
+
+    let (status, body) = dynamo(
+        leader_dynamo,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"restore_relay_t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "body: {body}");
+
+    let (status, body) = dynamo(
+        leader_dynamo,
+        "DynamoDB_20120810.PutItem",
+        r#"{"TableName":"restore_relay_t","Item":{"id":{"S":"a"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "body: {body}");
+
+    let (status, body) = dynamo(
+        leader_dynamo,
+        "DynamoDB_20120810.CreateBackup",
+        r#"{"TableName":"restore_relay_t","BackupName":"restore-relay-backup-1"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "body: {body}");
+    let created: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let backup_arn = created["BackupDetails"]["BackupArn"]
+        .as_str()
+        .expect("BackupArn")
+        .to_owned();
+
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if nodes[leader]
+                .metadata()
+                .backup(&backup_arn)
+                .is_some_and(|row| row.status == animus_control::BackupStatus::Available)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("backup did not become AVAILABLE in 20s");
+
+    // The regression: `RestoreTableFromBackup`, issued against the
+    // FOLLOWER's own DynamoDB listener, must relay to the leader and
+    // commit its schema + tablet-mint steps.
+    let (status, body) = timeout(Duration::from_secs(20), async {
+        loop {
+            let (status, body) = dynamo(
+                follower_dynamo,
+                "DynamoDB_20120810.RestoreTableFromBackup",
+                &format!(r#"{{"BackupArn":"{backup_arn}","TargetTableName":"restored_relay_t"}}"#),
+            )
+            .await;
+            if status == 200 {
+                return (status, body);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("follower-issued RestoreTableFromBackup did not commit via relay in 20s");
+    assert_eq!(status, 200, "body: {body}");
+    assert!(
+        body.contains("\"TableStatus\":\"CREATING\""),
+        "body: {body}"
+    );
+
+    // The restore driver's own `CompleteRestore` (proposed from whichever
+    // node leads the destination tablet, possibly the follower itself)
+    // must also relay/commit — converging every node's own replicated
+    // catalog to `TableStatus: ACTIVE`, never stuck `CREATING`.
+    let dynamo_addrs = [
+        config.nodes[0].dynamo,
+        config.nodes[1].dynamo,
+        config.nodes[2].dynamo,
+    ];
+    for (i, addr) in dynamo_addrs.into_iter().enumerate() {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let (status, body) = dynamo(
+                    addr,
+                    "DynamoDB_20120810.DescribeTable",
+                    r#"{"TableName":"restored_relay_t"}"#,
+                )
+                .await;
+                if status == 200 && body.contains("\"TableStatus\":\"ACTIVE\"") {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "node {i}: restored_relay_t did not converge to ACTIVE within 20s of \
+                 follower-relayed RestoreTableFromBackup"
+            )
+        });
+    }
+
+    let (status, body) = dynamo(
+        leader_dynamo,
+        "DynamoDB_20120810.GetItem",
+        r#"{"TableName":"restored_relay_t","Key":{"id":{"S":"a"}},"ConsistentRead":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "body: {body}");
+    assert!(body.contains("\"S\":\"a\""), "body: {body}");
+
+    for n in &nodes {
+        n.shutdown_graceful().await;
+    }
+}

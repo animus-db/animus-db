@@ -200,10 +200,11 @@
         <li>Growing: a joining node needs the intra-cluster address of any running node</li>
         <li>Shrinking: <code>drain</code>, <code>drain-status</code>, <code>decommission</code></li>
         <li>Node failure: replicas re-created automatically, no operator action</li>
+        <li>On-demand backup and restore to a new table (DynamoDB's own <code>CreateBackup</code>/<code>RestoreTableFromBackup</code>)</li>
         <li>Metrics, OpenTelemetry tracing, admin JSON endpoints and a built-in dashboard</li>
       </ul></div>
       <div class="lcard"><h3>Day two, missing</h3><ul>
-        <li>Backup and restore — no tooling exists</li>
+        <li>Continuous backups (point-in-time recovery)</li>
         <li>Upgrades — formats change between revisions, so upgrading means recreating the cluster</li>
         <li>TLS — absent on every port; authentication — opt-in SigV4 on the client port only</li>
       </ul></div>

@@ -28,7 +28,7 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_TXN_SEEDS=K` | 1 | K seed variants per multi-tablet transaction-corpus cell (ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | K seed variants per DynamoDB Streams lineage-walk cell (ADR 0042/0043) |
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | K seed variants per secondary-index backfill fault-injection cell (ADR 0045) |
-| `ANIMUS_BACKUP_SEEDS=K` | 1 | K seed variants per on-demand backup capture fault-injection cell (ADR 0059 Train 1) |
+| `ANIMUS_BACKUP_SEEDS=K` | 1 | K seed variants per on-demand backup capture + restore fault-injection cell (ADR 0059 Train 1/2) |
 
 ## What's non-obvious
 
@@ -426,5 +426,26 @@ retrievable from git history.)
   — this corpus's own reimplementation is not bound by `animusd`'s real
   `tokio::time::Instant`, which this crate can't reach anyway) — both that
   it fires once genuinely stuck and that it does **not** fire early.
-  Depth knob `ANIMUS_BACKUP_SEEDS` (default 1 = the frozen cells; held
-  green at `=200` in ~5s).
+  **Train 2 (ADR 0059 §7) adds five restore cells**, the identical
+  self-contained-reimplementation technique now driving a completed backup
+  through `RestoreTableFromBackup`'s own mechanics
+  (`animusd::backup_restore`, mirrored — never imported — the same layering
+  reason as the capture half): `restore_round_trip_matches_model_at_
+  capture_cut_version` (including a staged-never-resolved intent, proving
+  restore only ever sees resolved values), `restore_driver_crash_restart_
+  resumes`/`restore_leader_kill_mid_seed_converges` (a true process restart,
+  and a live crash/failover, both mid-seed — each manufactures a genuine
+  partial-progress precondition via a direct partial seed, since a
+  whole-manifest-sweep-per-tick call has no natural interruption point of
+  its own within one synchronous test invocation), `restore_store_faults_
+  still_converge` (the store genuinely unavailable partway through, healing
+  later — `SegmentFaultConfig`'s ack-lost thresholds are `put`/`delete`-only,
+  so a read fault uses `SimSegmentStore::set_unavailable_until` instead),
+  and `restore_after_source_drop`. GSI-rebuild convergence is deliberately
+  **not** reimplemented here a third time — it's `backfill_fault_corpus.rs`'s
+  own already-proven machinery, applied to an ordinary `Active` tablet
+  indistinguishable from any other (ADR 0059 §8's own point); the real
+  production stack's GSI-after-restore convergence is
+  `animusd/tests/dynamo_restore.rs`'s job. Depth knob `ANIMUS_BACKUP_SEEDS`
+  (default 1 = the frozen cells; held green at `=100` for the restore cells,
+  `=200` for the whole file, both in well under a second).
