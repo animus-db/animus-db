@@ -3194,6 +3194,23 @@ debugging anything that feels like it might have happened before.
   segment fleets, any "collect from each node then compare" assertion. None
   of them mention consistency, the compiler cannot see them, and most will
   pass most of the time.
+- **A stale doc comment is a third way the same ADR 0055 bug hides, next to
+  the two above.** `kind_scan.rs`'s LSI-query round-robin (the same
+  every-node-in-turn pattern as the entry just above, but for an LSI) omitted
+  `ConsistentRead` and asserted `Count:3` unconditionally; CI caught a
+  lagging replica-local read returning `Count:2`. The test's own comment
+  ("a query is strongly consistent — no polling needed") and `dynamo.rs`'s
+  LSI-branch doc comments ("an LSI is strongly consistent by construction…
+  `consistent_read` is simply dropped on that branch") both predated ADR
+  0055 and were never updated when the flag started selecting a real read
+  path there too, so a reader trusting either comment would conclude the
+  missing annotation was fine. Fixed the same way: `ConsistentRead: true`,
+  since the loop is a write-verification read exercising the forwarded path.
+  Generalized: an ADR that changes a default's behavior obsoletes every doc
+  comment written under the old behavior, not just the code calling it —
+  grep for the old invariant's wording (`strongly consistent`, `by
+  construction`, `is simply dropped`) wherever the changed path is
+  documented, not only at its call sites.
 - **A test can prove "this path never blocks" by how it drives the path.**
   `animus-cp-data`'s `tests/stale_read.rs` deliberately drives the ADR 0055
   eventual reads with `block_on` instead of this crate's usual spawn-and-
@@ -9733,6 +9750,27 @@ debugging anything that feels like it might have happened before.
   call (delegate anything multi-file/exploratory/build-heavy, inline only
   trivial one-file work; stack whenever there is more than one reviewable
   logical step, flat PRs state why).
+- **A finished-but-unpushed tree is one container recycle from gone — commit
+  per logical unit AND push the WIP branch after every commit, not just at
+  the end (2026-08-27, ADR 0059 Train 3 PR②).** A first attempt at this
+  exact task (`RestoreTableToPointInTime`) ran for a long single session,
+  accumulated the full catalog/wire/replay-driver/e2e implementation, and
+  was lost in its entirety to a container recycle before a single commit
+  landed — every finding, every fix, every test had to be redone from
+  scratch by the next session. The fix is procedural, not technical, and
+  costs almost nothing: split the work into its natural logical units
+  (catalog+validation; replay mechanism; wire+driver; corpus; docs) *as a
+  task-planning decision made up front*, and after each one, commit **and**
+  `git push` immediately — including WIP-quality commits on a branch with
+  no PR yet. A branch pushed to the remote survives a container recycle;
+  an uncommitted working tree does not. This session split the redo into
+  exactly two implementation commits plus one corpus commit plus this docs
+  commit, pushing after each, so no unit larger than roughly "one build+test
+  cycle" was ever at risk again. **Generalizable rule**: for any
+  long-running implementation task in an ephemeral session, treat "commit
+  and push" as part of finishing a logical unit, not as a wrap-up step
+  saved for the end — the session's own lifetime is not a resource the task
+  plan can assume.
 
 ## Duplicated config needs a test, not a comment (ADR 0056)
 
@@ -10511,6 +10549,417 @@ committed diagnostic (gated by an env var or `#[cfg(test)]`, never firing
 in production) is the natural next step before the next investigation round
 attempts a fix.
 
+## A post-propose confirm-poll must accept "the effect already fully happened" as success, not just "the intermediate state I expected" (ADR 0059 §3, Train 1 PR④, `DeleteBackup`)
+
+`animusd::dynamo::delete_backup` proposed `MetaCommand::MarkBackupDeleted`
+(the two-phase janitor's own mark step) and then polled
+`metadata_fresh(ctx).await.backup(backup_arn)` waiting to observe
+`BackupStatus::Expired` before building its response. On a lightly loaded
+single-node test cluster this flaked intermittently: the backup janitor
+(`animusd::backup_janitor`, a 200ms tick) sometimes observed the mark,
+reclaimed every object, and proposed the finalizing `MetaCommand::
+DeleteBackup` (removing the row entirely) **before** `delete_backup`'s own
+next poll ever ran — so the poll found `meta.backup(backup_arn) == None`
+forever after, never `Some(Expired)`, and spun until `SCHEMA_COMMIT_TIMEOUT`
+(5s) before returning a bogus `InternalServerError` ("did not commit... no
+leader reachable?") for an operation that had, in fact, already fully
+succeeded moments earlier.
+
+The general shape: **when a proposer's own confirm-poll checks for one
+named intermediate state of a value that a second, independent, faster
+process can advance PAST that state (here: past `Expired` all the way to
+"row removed"), the poll must treat every state at-or-beyond the expected
+one as success — not just an exact match.** Checking only for `Expired` was
+implicitly assuming this caller would always be the fastest reader, which
+held in every manual/low-concurrency test run but not under the specific
+timing this bug needed (a fast local reclaim + a slightly-delayed next
+poll). The fix: capture the row's own data **before** proposing (needed for
+the response body regardless, since a client-visible `DescribeBackup`-shaped
+reply must describe *some* row state), then treat `None` on the post-propose
+read as an equally valid success signal — "gone" only ever follows a
+successful mark in this design (nothing else removes a row), so it can never
+be confused with "never happened."
+
+This generalizes past this one call site: any commit-wait loop watching for
+one named state on a value that a background convergent process can advance
+past that state (a retention janitor, a compaction sweep, an aggregator)
+needs to ask "has it been reached or superseded?", not "does the value
+currently equal exactly this?" — the same class of bug as polling for
+`status == Creating -> Active`
+transitions while ignoring that a stuck-timeout path can skip straight to
+`Failed`+reclaimed+gone without ever stopping at an intermediate value the
+poll was watching for. Caught by a real flake under `cargo test`, not by
+design review — the codebase's own "a flaky `ProdEnv` test is a real bug"
+rule held exactly as advertised. See `crates/animusd/src/dynamo.rs`'s
+`delete_backup` for the fix in place.
+
+**The same PR shipped a sibling instance of this exact bug in its own
+regression test**, not just the production code above:
+`delete_backup_on_a_follower_is_relayed_to_the_leader`
+(`crates/animusd/tests/schema_ddl_relay.rs`) issues `DeleteBackup` against a
+follower, then polls every node's `Metadata::backup(&backup_arn)` waiting for
+`BackupStatus::Expired` — the identical named-intermediate-state trap, one
+level up: fixing the production confirm-poll to accept "gone" as success
+didn't also fix a *test* that independently re-derived the same wrong check
+against the same janitor race. It flaked ~50-55% under a repeated single-test
+loop (`cargo test -p animusd --test schema_ddl_relay
+delete_backup_on_a_follower -- --test-threads=1`, run 15-20x), always with
+"backup not marked Expired within 20s" on whichever node the fast 200ms
+janitor tick reclaimed-and-finalized first. Fix mirrors `delete_backup`'s own:
+accept `Some(Expired) | None` as convergence, not `Some(Expired)` alone. The
+lesson generalizes one more notch: **when fixing a "poll for an intermediate
+state that can be skipped past" bug, grep for other pollers of the same
+value** — a test asserting the same field is exactly as exposed to the race
+as the production code was, and copying the assertion pattern (rather than
+the fix) into a new test silently reintroduces the bug.
+
+## A live-derived accessor scoped to "currently resolvable" state silently drops to a degenerate value once its inputs are torn down — freeze the figure while it's still derivable (ADR 0059 §3, Train 1 PR④, `BackupRow::total_bytes`)
+
+`Metadata::backup_total_bytes` sums a backup's captured bytes via
+`backup_manifest_tablet_progress`, which resolves each pinned tablet to its
+**currently live** `split_lineage` descendant(s) (`live_split_descendants`)
+— deliberately, so a tablet that split mid-capture is credited via whichever
+descendant actually reported, never double-counted against a stale,
+split-superseded ancestor's own orphan report. That "live" scoping is
+exactly right while the source table still exists. The moment the whole
+table is dropped, every one of the backup's tablets vanishes from
+`Metadata::tablets` at once, `live_split_descendants` returns nothing for
+every pinned tablet (its own fallback path only returns `[ancestor]` when
+`self.tablets.contains_key(&ancestor)`), and `backup_total_bytes` silently
+collapses to `0` — even though the catalog row and its per-tablet progress
+records are untouched (ADR 0024's own explicit carve-out is working exactly
+as designed for *those*). Nothing in `backup_total_bytes`'s own signature or
+doc comment flags this: it reads as an ordinary accessor, and it answers
+`0` — a legitimate-looking value, not an error or a panic — so a caller has
+no signal that the answer just became meaningless.
+
+This was caught by re-reading the accessor's own implementation against ADR
+0059 §3's "a backup outlives its source table" promise while wiring
+`DescribeBackup`'s size field, not by a failing test (none existed yet that
+dropped a table between capture-complete and describe — added afterward,
+`dynamo_backup.rs`'s `create_backup_round_trip_survives_table_drop_and_
+janitor_reclaims`, asserting the reported size is byte-identical before and
+after the drop). The fix generalizes: **any accessor whose answer depends on
+resolving through currently-live state (a tablet map, a membership set, a
+liveness check) must have its result frozen into durable storage at the one
+point in the object's lifecycle where that resolution is still meaningful,
+if any later consumer needs the answer to survive the inputs going away.**
+Re-deriving on every read is only safe for the lifetime of whatever the
+derivation depends on; past that lifetime it isn't "stale," it's simply
+answering a different, degenerate question that happens to typecheck.
+`BackupRow::total_bytes` is exactly this freeze, written once by
+`MetaCommand::CompleteBackup`'s own apply arm at the last moment the live
+accessor is still authoritative.
+
+## A byte-passthrough merge primitive and a value-producing read primitive can disagree about who owns the envelope tag (ADR 0059 §7, Train 2 restore)
+
+Building the restore driver (`animusd::backup_restore`), the first real
+end-to-end test run panicked on an ordinary `ConsistentRead: true` `GetItem`
+against a freshly-restored row: `txn: unknown envelope tag 123 (corrupt
+engine value)`. Not a fault-injection scenario — every seed, every time,
+on the very first row read back.
+
+The root cause was two correct primitives disagreeing about a byte-format
+contract neither one's own doc stated explicitly enough to catch by
+inspection. `animus-cp-data`'s apply path wraps every ordinary write's
+value in a 1-byte-tagged envelope (`0` = committed, `1` = intent) before
+merging it into the engine — every read path unwraps this before a caller
+ever sees a value. `KvCommand::SeedBatch` (the split-build driver's own
+history-transfer command, reused verbatim by restore per ADR 0050) is
+deliberately the *exception*: it merges the exact bytes handed to it,
+envelope tag included, because a split child's rows are still-enveloped
+physical bytes from the same live transaction blast radius as their
+parent — copying them verbatim is what lets an in-flight intent continue
+resolving correctly wherever it lands.
+
+Backup capture (ADR 0059 §5) reads through intent resolution by design —
+it deliberately stores each row's already-*resolved*, plain value, with no
+envelope tag at all, specifically so a restored table never carries a
+dangling, unresolvable intent envelope pointing at an anchor that may not
+even exist anymore. That decision is exactly right on capture's own side.
+It just means the restore driver's own input (a plain resolved value) and
+`SeedBatch`'s own contract (an already-enveloped physical byte string) are
+not the same shape — feeding one into the other merges a byte string whose
+first byte the read path's decoder can't recognize as either envelope tag,
+producing exactly the panic above the moment anything ever reads the row
+back.
+
+**The general form**: a merge primitive that is deliberately "verbatim
+bytes in, verbatim bytes out" (no re-encoding, by design, for its own
+documented reason) is not a safe target for a *different* producer whose
+own output was already decoded/normalized one layer down from what that
+primitive expects — even when both producers are "giving it a value" in
+the loosest sense. The fix is never to make the merge primitive smarter
+(that would break the property it exists for); it's to make the seam
+between the two explicit: `animus_cp_data::backup::encode_restored_value`
+is a one-line, clearly-doc'd wrapper the restore driver calls on every
+captured value before it ever reaches `SeedBatch`, named after what it's
+for rather than what it does, so a future caller reads its doc before
+reusing the pattern instead of rediscovering the panic. Before wiring a
+second producer into an existing "verbatim passthrough" primitive, check
+what shape its *existing* callers actually hand it — "the same trait
+method" is not "the same byte contract."
+
+Caught by the project's own first real integration test for the feature,
+not by review or a fault-injection sweep — a reminder that an end-to-end
+test exercising the full production stack (not just the unit-level pieces)
+remains the cheapest way to catch a cross-module contract mismatch that
+both sides' own type signatures happily agree on.
+
+## A newly-discovered pre-existing flake: `delete_backup_on_a_follower_is_relayed_to_the_leader` (~25-30% under real time, confirmed unrelated to ADR 0059 Train 2)
+
+While running the full `animusd` gate for the Train 2 (restore) work, the
+**pre-existing** Train 1 PR④ test `schema_ddl_relay::delete_backup_on_a_
+follower_is_relayed_to_the_leader` failed once in a full-suite run
+(`node 1: backup not marked Expired within 20s of follower-relayed
+DeleteBackup`) and intermittently in isolated reruns on this branch. Before
+assuming Train 2 had regressed it (a plausible worry — Train 2 spawns a new
+per-data-node background loop, `backup_restore_loop`, into the same task
+set every combined/data-only node already runs), it was reproduced on the
+**pre-Train-2** tip (`claude/backup-wire-apis`, no restore code at all) via
+a disposable `git worktree`: 2 failures in 6 isolated reruns there too, the
+identical ~21.8-22.4s timing signature (just over the test's own 20s
+budget). **Confirmed pre-existing, not a regression** — recorded here
+rather than silently worked around, per this log's own standing rule that a
+flaky `ProdEnv` test is a real bug, not noise, even when it isn't the one
+you're currently touching.
+
+The mechanism: the test's 20s budget covers a **two-hop convergent
+process** — the relay itself (`ProposeSchema` one hop to the control
+leader) *plus* the backup janitor's own two-phase reclaim (mark → object
+delete → finalize), which polls on its own independent tick. On an
+unloaded machine this converges in ~1.8s; under any real scheduling
+pressure (a `--test-threads=1` run is still real OS thread/process
+contention across whatever else is running, and CI runners are noisier
+still) it occasionally needs more than one janitor tick's worth of slack
+past 20s and the test times out outright rather than converging late. This
+is the general shape the root `CLAUDE.md` warns about with "an eventual
+property gets a converged-or-timeout poll, never a fixed-deadline
+one-shot" — the poll here already isn't a one-shot, but its **budget**
+was sized without accounting for the second independent convergent
+process riding underneath the first one it was visibly testing.
+
+**Not fixed in this change** (per the standing rule: an incidental
+pre-existing bug found mid-task gets its own separate PR, never a
+drive-by fix folded into an unrelated diff) — noted here so the next
+person to see it red doesn't waste time bisecting a change that isn't the
+cause; worth its own tracked issue alongside #406/#298's own flake family. A
+real fix likely widens the timeout or asserts on the *janitor's own*
+tick cadence rather than wall-clock margin.
+
+## A shared test-harness "fresh engines map" must genuinely be fresh per tablet, not per scenario (ADR 0059 §9, Train 3 PITR corpus)
+
+Building `pitr_fault_corpus.rs`'s split scenario (a parent tablet cutting
+over to two children, each sealing its own PITR segment independently), the
+very first run failed with every group's own decoded content showing
+exactly double the records it should have. Root cause: the scenario created
+**one** `engines()` map (`BTreeMap<NodeId, MemoryEngine>`) and passed it to
+`start_group` for the parent AND both children — since `MemoryEngine::
+clone()` is a cheap handle clone (shared underlying state, not a deep copy),
+all three "sibling" tablets ended up sharing the identical physical engine
+per node. A child's own `pending_changes()` scan then legitimately saw the
+parent's pre-split records too (nothing in the harness partitions by
+tablet — that separation is what a *real* per-tablet-private engine, ADR
+0050 rung 1/2, provides in production, and what `StorageScope`'s declared
+range narrows only the *logical* key space within, not the physical engine
+instance). `stream_lineage_corpus.rs`'s own `copy_split_children_born_
+empty` scenario already gets this right — three separate `engines()` calls
+(`parent_engines`/`left_engines`/`right_engines`) — but this file's first
+draft, written by close analogy rather than by copying that scenario's
+exact structure line-for-line, missed it.
+
+**The generalizable lesson**: when a sim-test harness models "sibling
+tablets" (a split, or any other multi-group scenario), a fresh engines map
+is required **per group**, not per scenario — reusing one `engines()` call
+across more than one `start_group` call silently reintroduces exactly the
+shared-physical-storage hazard the production tablet-privacy design (ADR
+0050) exists to prevent, and the resulting corruption (double-counted
+records, not a crash) is easy to misattribute to the mechanism actually
+under test rather than the harness. When copying a multi-group scenario's
+shape from a sibling corpus, copy the engine-provisioning lines exactly,
+don't just replicate the general pattern from memory.
+
+## `BeginBackup` is missing from `is_relayable_command` — a pre-existing Train 1 gap, found but out of scope (ADR 0059 §9, Train 3)
+
+While auditing the relay allowlist for the new PITR `MetaCommand`s
+(`UpdateContinuousBackups`/`SealPitrSegment`/`MarkBackupPitrBase`, all
+added to `is_relayable_command`), a grep for every existing `MetaCommand::
+BeginBackup` construction site turned up that `MetaCommand::BeginBackup`
+itself is **not** on the allowlist, despite `dynamo.rs::create_backup`
+calling `ctx.propose_schema(&MetaCommand::BeginBackup { .. })` — the exact
+same "may run on any node, must relay to the control leader" shape every
+other DDL-class command (`SetTableTtl`, `SetTableStream`, etc.) already has
+an allowlist entry for. `ClientCtx::propose_schema` relays via
+`ClientRequest::ProposeSchema` whenever the local node has no live control
+leader handle of its own; the receiving node's `is_relayable_command` gate
+would reject `BeginBackup` outright, and `create_backup`'s own commit-wait
+loop would then exhaust `CREATE_BACKUP_ID_ATTEMPTS` retries (minting a
+fresh id each time, since it can't distinguish "rejected" from "never
+reached a leader") and finally return a timeout error — meaning
+`CreateBackup` issued against a **follower-connected** node in a real
+multi-node deployment likely fails today, every time, until a data-role
+node happens to become the control leader.
+
+Not fixed here: this is a genuine, real bug, but it predates this PR
+(Train 1 PR④), is unrelated to PITR's own mechanism, and root `CLAUDE.md`'s
+own engineering practices are explicit that "an incidental pre-existing bug
+discovered during a task gets its own separate PR ... never a drive-by fix
+folded into an unrelated diff." Recorded here so it isn't silently
+rediscovered later: the fix is one line (`MetaCommand::BeginBackup { .. }`
+added to `is_relayable_command`'s allowlist) plus a
+`schema_ddl_relay.rs`-style regression test mirroring `update_time_to_live_
+on_a_follower_is_relayed_to_the_leader`. **Generalizable lesson**: when a
+new wire operation's `MetaCommand` gets a relay-allowlist entry, grep for
+every *sibling* command proposed the same way (same wire-handler shape,
+same `ctx.propose_schema` call) while you're in the allowlist anyway — a
+gap next to the one you're fixing is exactly the kind of thing a narrowly-
+scoped PR walks right past.
+
+## A driver stamped a wall-clock field from the monotonic clock — the two `Env` time sources look interchangeable until a value crosses a wire boundary (ADR 0059 §9/§10, Train 3 PR②)
+
+`pitr_seal_now`/`pitr_tick` (`animusd::index_drain`) stamped
+`PitrSegmentRow::seal_wall_ms` from `ctx.env.now()` — `Nanos`,
+monotonic-since-process-start, the ordinary timer/timeout/backoff seam —
+instead of `ctx.env.wall_now()`, ADR 0051's one real-calendar-time seam.
+Both compile, both return a plausible-looking integer, and every existing
+test passed: nothing *inside* the sealing path ever compares
+`seal_wall_ms` to a real timestamp, so the bug was invisible until a
+consumer that does — `PitrSpec::enabled_wall_ms` (genuinely wall-clock,
+set from a wire-facing `UpdateContinuousBackups` call) compared against
+this field to derive `LatestRestorableDateTime` — silently collapsed the
+whole PITR restore window to zero width, forever, the instant any tablet
+ever sealed. It shipped in Train 3 PR① and sat undetected through that
+PR's own full corpus and review, because PR①'s own scope never *read*
+`seal_wall_ms` against a real timestamp; PR②, the first consumer to do so
+in earnest, hit it on its very first end-to-end run.
+
+**The generalizable rule**: when a field's own doc or name says "wall
+clock" / "real time" / anything that will eventually be compared against a
+value carried in from *outside* the simulation seam (a wire timestamp, an
+external system's clock, ADR 0051's `wall_now()` in this codebase), audit
+every site that *writes* it as carefully as the sites that read it —
+`env.now()` and `env.wall_now()` return the same Rust type from the same
+trait and both "just work" in isolation, so a writer-side mixup produces
+no type error, no panic, and no test failure until something finally
+diffs the written value against a genuinely wall-clock one. A codebase
+with two clock seams needs a grep sweep of every write site for a
+wall-clock-typed field whenever that field gains its first real consumer,
+not just a review of the consumer's own new code.
+
+## An accessor scoped to "currently live" is the wrong tool for "everything that ever happened," even when it's the closest existing primitive (ADR 0059 §10, Train 3 PR②)
+
+`Metadata::pitr_replay_segments`'s first implementation was built on
+`live_split_descendants` (ADR 0059 §6's own on-demand-capture
+re-planning accessor: "given a pinned tablet, which of its *currently
+live* descendants must report for the backup to be considered complete").
+It looked like the obvious tool for "given a base snapshot's pinned
+tablet, which tablets' segments must be replayed" — both questions start
+from a pinned tablet and walk forward through splits — but the two
+questions are not the same question: capture-completeness only cares
+about tablets that still *exist*, while replay must cover every tablet
+that *ever* held relevant data, including one retired by an ordinary
+`DropTableTablets` (no split at all). `live_split_descendants` answers
+empty for exactly that case (a dropped-not-split tablet has no
+`split_lineage` entry), so replay silently produced zero segments for
+any deleted table's own un-split tablet — caught by this PR's own first
+end-to-end test (a deleted-table PITR restore), not by review, and fixed
+by writing a direct forward DFS over `split_lineage` that includes every
+*visited* tablet regardless of current liveness.
+
+**The generalizable rule**: when a new need "starts from a pinned entity
+and walks forward through the same lineage table" as an existing
+accessor, don't reach for that accessor just because the traversal shape
+matches — check what its own *filter* condition means, since a
+completeness predicate ("must this thing still exist to matter") and a
+coverage predicate ("did this thing ever hold matter") are easy to
+conflate when they happen to agree on every input a first draft's tests
+exercise (a table that's still alive, or was split rather than dropped).
+Two nearly-identical unit-test names in this PR's own regression suite —
+one proving the accessor is re-planned correctly onto live split
+descendants, the other proving it still finds a dropped-never-split
+tablet's own segments — is the shape that catches this: write the
+"the entity is GONE, not just re-planned" case explicitly rather than
+assuming a lineage-walking accessor's existing split coverage implies
+drop coverage too.
+
+## A corpus's own leader-kill-then-seal step needs a confirmed write between them, not just a re-election (ADR 0059 §9/§10, Train 3 PR② corpus)
+
+The PITR restore corpus's flagship leader-kill scenario called
+`pitr_seal_now` on the newly-elected leader immediately after killing the
+old one, with no write in between. At `ANIMUS_PITR_SEEDS=100` this
+produced a genuine (harness-only) failure: "the group has a leader" and
+"the group's own apply cursor has caught up to everything the crashed
+leader had committed" are two different facts, and nothing forces the
+second to be true the instant the first becomes true — `pending_changes()`
+read on the fresh leader before its apply loop caught up saw a truncated
+backlog, corrupting the scenario's own expected seal content. The fix
+was to reorder the scenario: move the leader kill to *before* that
+round's own write burst rather than immediately before the seal, so the
+burst's own confirm-by-applied-index wait (already present, since every
+write in this corpus confirms before moving on) forces the catch-up as a
+side effect, with no new synchronization primitive needed.
+
+**The generalizable rule, restated for corpus/harness authors
+specifically** (the underlying principle — durable-before-visible,
+leadership isn't apply-completeness — is already a top-level house rule):
+a hand-scripted scenario that kills a leader and then immediately reads
+group-local state on the replacement must interpose a confirmed write
+(or an explicit apply-catchup wait) between the kill and the read, exactly
+as a real client would experience via its own confirm loop — "the group
+elected a new leader" is not the same wait condition as "the group is
+caught up," and a scenario that conflates them can manufacture a
+test-only data loss that looks identical to a real one.
+
+## A correctness fix that changes record SIZE broke a sibling test's hardcoded-epoch assumption, caught only by the final full-suite gate (ADR 0059 §9/§10, Train 3 PR②)
+
+Fixing `table_change_records_carry_images` to include PITR (recorded above:
+a PITR-only table used to get image-less markers, which PITR replay cannot
+reconstruct content from) is unambiguously correct and necessary. It has a
+side effect nothing in that fix's own review caught: every change record on
+a PITR-enabled table is now a **full item image** instead of a tiny marker
+— dramatically bigger. `index_drain.rs`'s own pre-existing
+`pitr_seal_happy_path_and_disable_reenable_continues_epoch_chain` test (from
+Train 3 PR①, unmodified by this PR) writes 10 padded items against a
+`seal_bytes: 200` threshold and then hardcodes `pitr_segments[&(tablet, 1)]`
+as "the seal that happens after re-enable." With markers, the whole 10-item
+burst apparently stayed within one seal (epoch 0); with full images, the
+same burst legitimately crosses the 200-byte threshold **three times**
+before the test ever reaches its own disable call (epochs 0, 1, and 2 all
+minted under generation 1, confirmed by instrumenting the test directly)
+— so the test's own hardcoded `(tablet, 1)` lookup found a stale
+pre-disable row instead of the new post-re-enable one, and asserted the
+wrong generation. This was caught only by this task's own final full
+`cargo test -p animusd --lib --tests -- --test-threads=1` gate — neither
+`cargo test -p animusd --lib` scoped to the new code, nor this PR's own new
+e2e suite, exercises that pre-existing test at all, and its silent
+pre-existing passing state gave no signal that its own assumption had
+become load-bearing on marker-sized records specifically.
+
+**The fix**: make the test observe reality instead of asserting a specific
+epoch number — capture "whatever the chain's own current tip epoch is"
+immediately before the disable call, then wait for and assert against
+`tip + 1` afterward, exactly mirroring what the analogous stream test
+(`disable_final_seal_then_reenable_continues_the_epoch_chain`) already does
+by using a deliberately *huge* `seal_bytes` so its own burst never
+size-triggers on its own — a pattern worth copying directly rather than
+reinventing when writing a new disable/re-enable epoch-continuity test.
+
+**The generalizable rule**: a test that hardcodes a specific epoch/index/
+sequence number as "the Nth thing to happen" is implicitly asserting a
+fixed number of trigger firings from a fixed byte budget — a completely
+independent, unrelated correctness fix that changes per-record *size*
+(image vs. marker, a longer key, an added field) can silently invalidate
+that count without changing anything the two features would ever be
+reviewed together for. Prefer asserting against a *chain's own observed
+tip* (or an explicitly huge/disabled trigger threshold, forcing the seal to
+happen only at the deliberate point the test controls) over a literal
+epoch/sequence number whenever the trigger is size- or count-based rather
+than a single explicit action. And: run the full existing test suite (not
+just new/directly-touched tests) before considering ANY change to a shared
+gating predicate (`table_change_records_carry_images` here) complete — a
+predicate widening is exactly the shape of change whose blast radius is
+everything downstream of its own `true` branch, not just the feature that
+motivated it.
 ### Amendment (2026-08-26, later the same day): shape B confirmed and fixed; a second, sibling conflation found and fixed alongside it
 
 A follow-up round re-instrumented both candidate sites from the entry above
@@ -10905,3 +11354,20 @@ soak stays pinned to `Copy` — `start_streamed_cluster_full_copy_pinned`'s
 pin is unchanged from `main`. Rung 4's remaining copy-workflow-deletion
 layer stays blocked on this one residual, down from the three this round
 began with.
+
+## A converged-or-timeout poll can still race if its condition is weaker than what the assertion after it needs (issue #421)
+
+`cluster.rs`/`per_process.rs`'s `await_bootstrap` helpers polled for
+`!n.metadata().members.is_empty()` — true the instant the *first* member
+registers — then the test's very next line asserted the *full* member
+count (`meta.members.len() == 3`). Membership registration is one node at
+a time, so this is the same "eventual property, one-shot assert" shape
+the rest of this log warns about, just hiding one level down: the poll
+loop itself wasn't a bare one-shot, but the condition it converged on
+wasn't the condition the caller actually depended on. The fix is to poll
+for the exact predicate the following assertion needs (here,
+`n.metadata().members.len() == nodes.len()` on every node), not a weaker
+stand-in that merely correlates with it. When reviewing a `await_*`-style
+helper before trusting it to cover an assertion, check that its loop
+condition and the assertion's condition are the same fact, not two facts
+that are merely close together in bring-up order.

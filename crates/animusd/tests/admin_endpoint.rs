@@ -609,12 +609,15 @@ async fn admin_backups_view_reflects_the_catalog() {
             "no backups yet: {empty}"
         );
 
-        // `BeginBackup`, proposed directly (no wire API in this train yet) —
+        // `BeginBackup`, proposed directly (this test predates the Train 1
+        // PR④ wire surface and stays scoped to the admin observer alone —
+        // `dynamo_backup.rs` covers the real `CreateBackup` wire path) —
         // retried across nodes since only the control leader accepts it.
         let begin = animus_control::MetaCommand::BeginBackup {
             backup_id: "backup-1".to_string(),
             table: "widgets".to_string(),
             created_wall_ms: 1_000,
+            backup_name: "backup".to_string(),
         };
         timeout(Duration::from_secs(10), async {
             loop {

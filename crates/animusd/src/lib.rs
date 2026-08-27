@@ -44,6 +44,8 @@ pub use animus_control::{
 mod admin;
 mod backup_capture;
 mod backup_completion;
+mod backup_janitor;
+mod backup_restore;
 mod console;
 mod control_handle;
 mod dashboard;
@@ -51,6 +53,7 @@ mod dynamo;
 mod dynamo_streams;
 mod http;
 mod index_backfill;
+mod pitr_janitor;
 mod segment_janitor;
 mod topology;
 mod ttl_reaper;
@@ -2080,6 +2083,15 @@ pub enum ClientRequest {
     /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
     /// only through the `Forwarded` arm.
     ForceSeal { tablet: u64 },
+    /// **The PITR force-seal RPC (ADR 0059 §9, Train 3)** — the PITR twin of
+    /// [`ForceSeal`](Self::ForceSeal), identical shape and identical
+    /// reasoning (addressed by `tablet` directly; bare delivery refused;
+    /// not a `MetaCommand`, so `is_relayable_command` does not apply; real
+    /// handling lives in `cp_serve_forwarded`'s match). Used only by
+    /// `dynamo.rs`'s `update_continuous_backups` disable path
+    /// (`ClientCtx::force_pitr_seal_tablet`), mirroring `disable_stream`'s
+    /// own `force_seal_tablet` call.
+    ForcePitrSeal { tablet: u64 },
     /// **Internal manual-growth split-trigger RPC — never sent bare, only
     /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0042 §14, growth
     /// PR3's `POST /admin/stream/grow`): materialize `tablet`'s own live
@@ -2554,6 +2566,7 @@ fn surface_of(request: &ClientRequest) -> Surface {
         | ClientRequest::KindScan { .. }
         | ClientRequest::GetSnapshot { .. }
         | ClientRequest::ForceSeal { .. }
+        | ClientRequest::ForcePitrSeal { .. }
         | ClientRequest::TriggerAutoSplit { .. }
         | ClientRequest::StreamHotRead { .. }
         | ClientRequest::ClearBackfillCursor { .. }
@@ -2715,6 +2728,18 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // "no seed answered" — see `tests/seed_join_allocated.rs`'s
             // follower-connected-seed case.
             | MetaCommand::RegisterNode { .. }
+            // `CreateBackup` wire operation (ADR 0059 §3/§4, Train 1 PR④):
+            // an operator's `CreateBackup` call may land on any node, exactly
+            // like `CreateTable`/`UpdateTimeToLive` — relaying `BeginBackup`
+            // (`animusd::dynamo::create_backup`'s own propose) to the control
+            // leader is the same schema-catalog-class need every DDL-shaped
+            // wire mutation above already has. Missing this arm is the exact
+            // bimodal per-process flake the root `CLAUDE.md` warns about: a
+            // `CreateBackup` that happens to land on a follower-connected
+            // node would hang for `SCHEMA_COMMIT_TIMEOUT` instead of relaying
+            // — see `tests/schema_ddl_relay.rs`'s
+            // `create_backup_on_a_follower_is_relayed_to_the_leader`.
+            | MetaCommand::BeginBackup { .. }
             // On-demand backup per-tablet completion record (ADR 0059 §3/§4):
             // a tablet leader's own "I finished capturing my share of this
             // backup" proposal, from wherever that leader actually runs —
@@ -2728,6 +2753,50 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // own doc states above — no wire surface exists yet for either
             // (Train 1 PR④'s concern) to need a relay path of its own.
             | MetaCommand::RecordBackupTabletComplete { .. }
+            // `DeleteBackup` wire operation (ADR 0059 §3, Train 1 PR④): an
+            // operator's `DeleteBackup` call may land on any node, exactly
+            // like `CreateTable`/`UpdateTimeToLive` — relaying
+            // `MarkBackupDeleted` (the two-phase janitor's own **mark**
+            // step) to the control leader is the same schema-catalog-class
+            // need every DDL-shaped wire mutation above already has.
+            // `DeleteBackup` (the existing, unmodified **finalizing**
+            // command) is deliberately NOT added here — its only intended
+            // caller is the backup janitor (`animusd::backup_janitor`), a
+            // control-plane-leader-only background loop that already holds
+            // a live `RaftNode` handle, the identical `ExpireStreamShards`
+            // precedent this function's own doc states above.
+            | MetaCommand::MarkBackupDeleted { .. }
+            // Restore workflow (ADR 0059 §7, Train 2): `RestoreTableFromBackup`
+            // (`animusd::dynamo::restore_table_from_backup`) may land on any
+            // node, exactly like `CreateTable`; the restore driver
+            // (`animusd::backup_restore`) proposes `CompleteRestore`/
+            // `FailRestore` from wherever its target tablet's own leader
+            // happens to run — the identical relay reasoning as
+            // `RecordBackupTabletComplete` above.
+            | MetaCommand::BeginRestore { .. }
+            | MetaCommand::CompleteRestore { .. }
+            | MetaCommand::FailRestore { .. }
+            // PITR (ADR 0059 §9, Train 3): `UpdateContinuousBackups` (the
+            // wire operation's own catalog toggle) may land on any node,
+            // exactly like `UpdateTimeToLive` — schema-catalog class, same
+            // relay reason as `SetTableTtl` above.
+            | MetaCommand::UpdateContinuousBackups { .. }
+            // PITR segment catalog commit: a tablet leader's own seal
+            // proposal, from wherever that leader actually runs — the
+            // identical relay reasoning as `SealStreamShard` above.
+            | MetaCommand::SealPitrSegment { .. }
+            // Tagging a `BeginBackup` row as a PITR base snapshot: proposed
+            // by `pitr_janitor::pitr_snapshot_loop`, a control-plane-
+            // leader-only background loop with its own live `RaftNode`
+            // handle on every node shape it runs on — this crate never
+            // relays it through the wire edge today, but it is included
+            // here defensively, mirroring `SealPitrSegment`'s own class,
+            // rather than surfacing as an opaque relay refusal if that ever
+            // changes. `ExpirePitrSegments` is deliberately NOT included,
+            // for the identical reason `ExpireStreamShards` isn't: its only
+            // intended caller (`pitr_janitor::pitr_janitor_loop`) already
+            // proposes directly off its own live `RaftNode` handle.
+            | MetaCommand::MarkBackupPitrBase { .. }
     )
 }
 
@@ -4437,6 +4506,7 @@ impl BoundNode {
             None,
             SplitMode::default(),
             BackupStoreConfig::default(),
+            pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
         )
         .await
     }
@@ -4481,6 +4551,16 @@ impl BoundNode {
     /// cluster|fs:PATH` CLI flag threads through here. **Plumbing only**
     /// (ADR 0059 Train 1 PR②) — nothing yet reads or writes through the
     /// resulting handle.
+    ///
+    /// `pitr_snapshot_cadence` (ADR 0059 §9/§10, Train 3) is `pitr_janitor::
+    /// pitr_snapshot_loop`'s own periodic-base-snapshot interval —
+    /// `pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE` (6 hours; every caller
+    /// above this layer) is the production default, the identical
+    /// "no CLI knob yet" shape that module's own doc already names. A test
+    /// that needs a PITR base snapshot to actually exist within its own
+    /// budget (`RestoreTableToPointInTime`'s own e2e coverage) calls
+    /// [`run_node_with_streams_and_pitr_snapshot_cadence`] instead of
+    /// waiting out six hours.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_growth(
         self,
@@ -4504,6 +4584,7 @@ impl BoundNode {
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         split_mode: SplitMode,
         backup_store_config: BackupStoreConfig,
+        pitr_snapshot_cadence: Duration,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         // The initial (static) peer book + an env clone, kept for the
@@ -4932,6 +5013,14 @@ impl BoundNode {
             ctx.clone(),
         )));
 
+        // The restore driver (ADR 0059 §7, Train 2): seeds a `Seeding`
+        // restore's single `Building` tablet from its backup's data
+        // objects, then activates it. Same "run everywhere, self-gate per
+        // tablet on leadership" shape as the backup capture driver above.
+        tasks.push(tokio::spawn(backup_restore::backup_restore_loop(
+            ctx.clone(),
+        )));
+
         // The segment janitor (ADR 0043 §A9, round-3 PR7): retention +
         // replica repair over the whole stream-shard catalog. Control-
         // plane-leader-only (self-gated every tick, `segment_janitor.rs`'s
@@ -4961,6 +5050,29 @@ impl BoundNode {
         // exactly like the segment janitor/backfill aggregator above.
         tasks.push(tokio::spawn(backup_completion::backup_completion_loop(
             ctx.clone(),
+        )));
+
+        // The on-demand backup janitor (ADR 0059 §3, Train 1 PR④): two-phase
+        // reclaim of a `DeleteBackup`-marked (or stuck-`Failed`) backup's
+        // store objects, then the row itself. Control-plane-leader-only
+        // (self-gated every tick, `backup_janitor.rs`'s own doc) — spawned
+        // unconditionally here, exactly like the segment janitor/backfill/
+        // backup-completion aggregators above.
+        tasks.push(tokio::spawn(backup_janitor::backup_janitor_loop(
+            ctx.clone(),
+        )));
+
+        // PITR periodic base snapshots + retention (ADR 0059 §9, Train 3):
+        // two control-plane-leader-only loops, mirroring the segment/backup
+        // janitors above exactly (self-gated every tick,
+        // `pitr_janitor.rs`'s own doc) — spawned unconditionally here.
+        tasks.push(tokio::spawn(pitr_janitor::pitr_snapshot_loop(
+            ctx.clone(),
+            pitr_snapshot_cadence,
+        )));
+        tasks.push(tokio::spawn(pitr_janitor::pitr_janitor_loop(
+            ctx.clone(),
+            pitr_janitor::DEFAULT_PITR_RETENTION,
         )));
 
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
@@ -5712,6 +5824,37 @@ impl BoundControlNode {
             ctx.clone(),
         )));
 
+        // The on-demand backup janitor (ADR 0059 §3, Train 1 PR④): a
+        // control-only node can genuinely become the control-plane leader
+        // (ADR 0035 split deployment), so it needs this loop too — the
+        // *mark* half (a wire `DeleteBackup` proposing `MarkBackupDeleted`)
+        // needs only `Metadata`, but the actual object reclaim needs a
+        // `BackupStoreHandle`, which no control-only node provisions — see
+        // `backup_janitor.rs`'s own doc for the documented gap this leaves
+        // (identical shape to the segment janitor's own, above): rows
+        // accumulate marked-but-unreclaimed until a data-capable node takes
+        // the lead instead.
+        tasks.push(tokio::spawn(backup_janitor::backup_janitor_loop(
+            ctx.clone(),
+        )));
+
+        // PITR periodic base snapshots + retention (ADR 0059 §9, Train 3): a
+        // control-only node can genuinely become the control-plane leader
+        // (ADR 0035 split deployment), so it needs both loops too — the
+        // identical documented gap as the segment/backup janitors above:
+        // marking needs only `Metadata`, but the snapshot loop's own
+        // `BeginBackup` capture and the retention loop's own segment-object
+        // reclaim both need a data role no control-only node provisions
+        // (see `pitr_janitor.rs`'s own doc).
+        tasks.push(tokio::spawn(pitr_janitor::pitr_snapshot_loop(
+            ctx.clone(),
+            pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        )));
+        tasks.push(tokio::spawn(pitr_janitor::pitr_janitor_loop(
+            ctx.clone(),
+            pitr_janitor::DEFAULT_PITR_RETENTION,
+        )));
+
         Ok(Node {
             raft: ControlHandle::Local(raft),
             envs,
@@ -6157,6 +6300,13 @@ impl BoundDataNode {
         // `index_backfill_loop`/`segment_janitor_loop` already apply by
         // their own absence from this spawn site.
         tasks.push(tokio::spawn(backup_capture::backup_capture_loop(
+            ctx.clone(),
+        )));
+
+        // The restore driver (ADR 0059 §7, Train 2) — same shape/reasoning
+        // as the backup capture driver just above (data-role-only, no
+        // control-plane-leader dependency).
+        tasks.push(tokio::spawn(backup_restore::backup_restore_loop(
             ctx.clone(),
         )));
 
@@ -6788,6 +6938,27 @@ impl BackupStoreHandle {
         }
     }
 
+    /// Fetch a backup object's bytes from **any** reachable copy — the
+    /// restore driver's own read primitive (ADR 0059 §7, Train 2). Unlike
+    /// [`get`](Self::get), this needs no recorded `replicas` list (no
+    /// backup object carries one, see [`get`](Self::get)'s own doc and
+    /// `backup_janitor.rs`'s module doc for why): it goes through the
+    /// trait's own [`animus_env::SegmentStore::get`], which for `Cluster`
+    /// tries the local copy first, then every one of the store's *current*
+    /// placement candidates — a best-effort "ask any node" contract,
+    /// exactly what a restore reading immutable, already-`Available`
+    /// backup objects needs (this is the identical primitive
+    /// `list_local`/`delete_local` deliberately do NOT use, since those two
+    /// are scoped local-only by the janitor's own design; a read has no
+    /// such constraint).
+    pub(crate) async fn get_any(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
+        use animus_env::SegmentStore;
+        match self {
+            BackupStoreHandle::Cluster(c) => c.get(id).await,
+            BackupStoreHandle::Fs(fs) => fs.get(id).await,
+        }
+    }
+
     /// Delete a backup object at every one of `replicas` — mirrors
     /// [`SegmentStoreHandle::delete_sealed`]'s exact contract. **Unused
     /// until the retention janitor's reclaim phase** (ADR 0059 §3/§9, a
@@ -6806,15 +6977,30 @@ impl BackupStoreHandle {
     /// backup directory — mirrors [`SegmentStoreHandle::list_local`]'s exact
     /// contract (debug/sweep only, never load-bearing for correctness: the
     /// replicated backup catalog, ADR 0059 §3, is the sole authority for
-    /// what backup data exists). **Unused until a debug/sweep admin surface
-    /// or the retention janitor's orphan sweep needs it** (a later train) —
-    /// left in rather than stubbed, per this type's own module-level doc.
-    #[allow(dead_code)]
+    /// what backup data exists). **Consumed since Train 1 PR④** by the
+    /// backup janitor's own reclaim sweep (`backup_janitor.rs`) — see that
+    /// module's own doc for why a *local-only* sweep is this train's
+    /// deliberate, documented simplification for backup object reclaim
+    /// specifically (unlike the segment janitor's own cataloged-row phase,
+    /// a backup object carries no recorded per-object `replicas` list to
+    /// reclaim against directly).
     pub(crate) async fn list_local(&self, prefix: &str) -> std::io::Result<Vec<String>> {
         use animus_env::SegmentStore;
         match self {
             BackupStoreHandle::Cluster(c) => c.local().list(prefix).await,
             BackupStoreHandle::Fs(fs) => fs.list(prefix).await,
+        }
+    }
+
+    /// Delete `id` from **this node's own local** backup directory only —
+    /// the backup janitor's own reclaim step (`backup_janitor.rs`), mirroring
+    /// [`SegmentStoreHandle::delete_local`]'s identical "no recorded
+    /// `replicas` to consult" shape and its own doc's reasoning.
+    pub(crate) async fn delete_local(&self, id: &str) -> std::io::Result<()> {
+        use animus_env::SegmentStore;
+        match self {
+            BackupStoreHandle::Cluster(c) => c.local().delete(id).await,
+            BackupStoreHandle::Fs(fs) => fs.delete(id).await,
         }
     }
 }
@@ -11723,6 +11909,26 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
+            // ADR 0059 §9, Train 3: the PITR force-seal RPC — the PITR twin
+            // of `ForceSeal` just above, identical shape.
+            ClientRequest::ForcePitrSeal { tablet } => {
+                let tablet = TabletId(tablet);
+                let Some(leader) = self.edge.cp_leader(tablet) else {
+                    return self.not_leader_refusal(Some(tablet));
+                };
+                let table = self
+                    .effective_metadata()
+                    .tablets
+                    .get(&tablet)
+                    .and_then(|t| t.table.clone());
+                let Some(table) = table else {
+                    return ClientResponse::Error("no such tablet".into());
+                };
+                match index_drain::pitr_seal_now(self, &table, tablet, &leader).await {
+                    Ok(_) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
             // ADR 0050 Train B rung 4: the split-build seed RPC — addressed
             // by `tablet` (a Building child, deliberately unroutable by
             // key) directly, mirroring `ForceSeal` just above. One shared
@@ -14216,6 +14422,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::KindWriteItem { .. } => "kind_write_item",
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
+        ClientRequest::ForcePitrSeal { .. } => "force_pitr_seal",
         ClientRequest::TriggerAutoSplit { .. } => "trigger_auto_split",
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
         ClientRequest::ClearBackfillCursor { .. } => "clear_backfill_cursor",
@@ -14463,6 +14670,11 @@ async fn handle_request(
         ),
         ClientRequest::ForceSeal { .. } => ClientResponse::Error(
             "this request is an internal seal-trigger RPC and must be sent wrapped in \
+             `Forwarded`"
+                .into(),
+        ),
+        ClientRequest::ForcePitrSeal { .. } => ClientResponse::Error(
+            "this request is an internal PITR seal-trigger RPC and must be sent wrapped in \
              `Forwarded`"
                 .into(),
         ),
@@ -15055,6 +15267,54 @@ impl ClientCtx {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err("force-seal did not reach a tablet leader in time".into());
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Force one PITR seal pass of `tablet`'s own hot tail (ADR 0059 §9,
+    /// Train 3's disable-triggered final seal) — the PITR twin of
+    /// [`force_seal_tablet`](Self::force_seal_tablet), identical shape and
+    /// identical forwarding discipline.
+    pub(crate) async fn force_pitr_seal_tablet(&self, tablet: TabletId) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            match self.resolve_cp_route(tablet) {
+                Some(CpRoute::Local(leader)) => {
+                    let table = self
+                        .effective_metadata()
+                        .tablets
+                        .get(&tablet)
+                        .and_then(|t| t.table.clone());
+                    let Some(table) = table else {
+                        return Err("no such tablet".into());
+                    };
+                    return index_drain::pitr_seal_now(self, &table, tablet, &leader)
+                        .await
+                        .map(|_| ());
+                }
+                Some(CpRoute::Forward(addr)) => {
+                    let request = ClientRequest::ForcePitrSeal { tablet: tablet.0 };
+                    match self
+                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .await
+                    {
+                        ClientResponse::PutOk => return Ok(()),
+                        ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
+                            return Err(e);
+                        }
+                        ClientResponse::Error(_) => {} // retry below
+                        other => {
+                            return Err(format!(
+                                "unexpected reply to forwarded PITR force-seal: {other:?}"
+                            ));
+                        }
+                    }
+                }
+                Some(CpRoute::None) | None => {} // not settled yet, retry
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("PITR force-seal did not reach a tablet leader in time".into());
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
@@ -15777,6 +16037,7 @@ async fn start_cluster_inner(
                 dynamo_auth.clone(),
                 split_mode,
                 backup_store_config.clone(),
+                pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
             )
             .await?;
         nodes.push(node);
@@ -16153,6 +16414,49 @@ pub async fn run_node_with_streams_and_quiesce_after(
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         SplitMode::default(),
         BackupStoreConfig::default(),
+        pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+    )
+    .await
+}
+
+/// Like [`run_node_with_streams`], but with an explicit **PITR periodic
+/// base-snapshot cadence** (ADR 0059 §9/§10, Train 3) instead of
+/// [`pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE`] (6 hours) — the same
+/// "widen the innermost layer, mint a thin test-facing wrapper" convention
+/// `quiesce_after`/`ttl_sweep_interval` already established. A
+/// `RestoreTableToPointInTime` end-to-end test needs at least one PITR base
+/// snapshot to actually exist within its own budget (this codebase's own
+/// testing discipline: never wait out a real 6-hour production cadence) —
+/// calls this directly with a millisecond-scale duration instead.
+///
+/// # Errors
+/// As [`run_node_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    pitr_snapshot_cadence: Duration,
+) -> std::io::Result<Node> {
+    run_node_with_streams_quiesce_and_ttl_sweep_interval(
+        config,
+        index,
+        dir,
+        backend,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        Duration::ZERO,
+        ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        SplitMode::default(),
+        BackupStoreConfig::default(),
+        pitr_snapshot_cadence,
     )
     .await
 }
@@ -16199,6 +16503,7 @@ pub async fn run_node_with_streams_quiesce_and_split_mode(
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         split_mode,
         backup_store_config,
+        pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
     )
     .await
 }
@@ -16229,6 +16534,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     ttl_sweep_interval: Duration,
     split_mode: SplitMode,
     backup_store_config: BackupStoreConfig,
+    pitr_snapshot_cadence: Duration,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -16283,6 +16589,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             dynamo_auth,
             split_mode,
             backup_store_config,
+            pitr_snapshot_cadence,
         )
         .await
 }
@@ -16317,6 +16624,7 @@ pub async fn run_node_with_ttl_sweep_interval(
         ttl_sweep_interval,
         SplitMode::default(),
         BackupStoreConfig::default(),
+        pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
     )
     .await
 }

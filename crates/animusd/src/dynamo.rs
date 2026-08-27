@@ -21,7 +21,12 @@
 //!
 //! Supported: `CreateTable`, `PutItem`, `GetItem`, `DeleteItem`, `Query`,
 //! `Scan`, `UpdateItem`, `BatchWriteItem`, `TransactWriteItems`,
-//! `TransactGetItems`. The data-plane key for an item is `escape(table) ||
+//! `TransactGetItems`, and — ADR 0059, Train 1 PR④ — the on-demand backup
+//! surface `CreateBackup`/`DescribeBackup`/`ListBackups`/`DeleteBackup` (see
+//! [`create_backup`]/[`describe_backup`]/[`list_backups`]/[`delete_backup`]'s
+//! own doc comments; capture itself is `animusd::backup_capture`/
+//! `backup_completion`, and reclaim is `animusd::backup_janitor` — this
+//! module only owns the wire surface). The data-plane key for an item is `escape(table) ||
 //! escape(pk) || sk` (so tables share one keyspace without colliding). The data
 //! plane has no native delete, so `DeleteItem` writes a tombstone value that
 //! `GetItem` reads back as absent. `UpdateItem` is a read-modify-write
@@ -136,9 +141,13 @@
 //!   not a bug: the drain provisions the hidden table lazily, on its first tick
 //!   with records to apply.
 //! - An **LSI** `Query` ([`run_lsi_query`]) scans the *base table's own tablet*
-//!   over its `KIND_LSI` scope (`ClientCtx::cp_scan_kind`, a linearizable
-//!   ReadIndex scan, ADR 0041 §3/§5) — strongly consistent, since LSI rows
-//!   commit in the same Raft entry as the base row they derive from.
+//!   over its `KIND_LSI` scope (`ClientCtx::cp_scan_kind`, ADR 0041 §3/§5).
+//!   Since ADR 0055, `ConsistentRead` selects a real read path here too:
+//!   `true` is a linearizable ReadIndex scan; `false` (the wire default) is
+//!   the cheap, eventual, replica-local one — an LSI row commits in the same
+//!   Raft entry as the base row it derives from, but a lagging replica can
+//!   still legitimately serve a stale LSI read, same as any other eventual
+//!   read.
 //!
 //! A sort condition narrows the scan (an `Equals` GSI condition) or filters the
 //! decoded rows by recovering the sort segment from the row's own key
@@ -158,6 +167,7 @@ use std::time::Duration;
 
 use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjection, IndexStatus};
 use animus_control::{MetaCommand, Metadata, TtlSpec};
+use animus_cp_data::backup as backup_codec;
 use animus_cp_data::{KIND_BASE, KIND_LSI};
 use animus_dynamo::capacity::{
     self, ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity,
@@ -172,8 +182,8 @@ use animus_dynamo::{
     TXN_IDEMPOTENCY_TABLE, TableSchema, index as dynamo_index, schema as schema_bridge,
     storage_key,
 };
-use animus_env::{Clock, Env, Metric};
-use animus_tablet::{TOKEN_BYTES, TabletId, partition_token};
+use animus_env::{Clock, Env, Metric, Rng};
+use animus_tablet::{TOKEN_BYTES, TabletId, TabletState, partition_token};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::http;
@@ -493,6 +503,7 @@ fn is_ddl_mutation(op: &Operation) -> bool {
             | Operation::UpdateTable { .. }
             | Operation::DeleteTable { .. }
             | Operation::UpdateTimeToLive { .. }
+            | Operation::UpdateContinuousBackups { .. }
     )
 }
 
@@ -1017,6 +1028,63 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             enabled,
         } => update_time_to_live(ctx, &table, &attribute_name, enabled).await,
         Operation::DescribeTimeToLive { table } => describe_time_to_live(ctx, meta, &table),
+        Operation::UpdateContinuousBackups { table, enabled } => {
+            update_continuous_backups(ctx, &table, enabled).await
+        }
+        Operation::DescribeContinuousBackups { table } => {
+            describe_continuous_backups(ctx, meta, &table)
+        }
+        Operation::CreateBackup { table, backup_name } => {
+            create_backup(ctx, &table, &backup_name).await
+        }
+        Operation::DescribeBackup { backup_arn } => describe_backup(meta, &backup_arn),
+        Operation::ListBackups {
+            table,
+            limit,
+            exclusive_start_backup_arn,
+            time_range_lower_bound_ms,
+            time_range_upper_bound_ms,
+            backup_type,
+        } => list_backups(
+            meta,
+            table.as_deref(),
+            limit,
+            exclusive_start_backup_arn.as_deref(),
+            time_range_lower_bound_ms,
+            time_range_upper_bound_ms,
+            backup_type,
+        ),
+        Operation::DeleteBackup { backup_arn } => delete_backup(ctx, &backup_arn).await,
+        Operation::RestoreTableFromBackup {
+            backup_arn,
+            target_table_name,
+            global_secondary_index_override,
+        } => {
+            restore_table_from_backup(
+                ctx,
+                &backup_arn,
+                &target_table_name,
+                global_secondary_index_override.as_deref(),
+            )
+            .await
+        }
+        Operation::RestoreTableToPointInTime {
+            source_table_name,
+            target_table_name,
+            restore_date_time_ms,
+            use_latest_restorable_time,
+            global_secondary_index_override,
+        } => {
+            restore_table_to_point_in_time(
+                ctx,
+                &source_table_name,
+                &target_table_name,
+                restore_date_time_ms,
+                use_latest_restorable_time,
+                global_secondary_index_override.as_deref(),
+            )
+            .await
+        }
     }
 }
 
@@ -1101,6 +1169,953 @@ fn describe_time_to_live(
         attribute_name: ttl.map(|t| t.attribute_name.clone()),
     };
     Ok(wire::describe_time_to_live_response(&desc))
+}
+
+// --- PITR (ADR 0059 §9, Train 3) -------------------------------------------
+
+/// This table's PITR configuration and currently-restorable window (ADR
+/// 0059 §9), shared by [`update_continuous_backups`] and
+/// [`describe_continuous_backups`]. `None` in the catalog renders as fully
+/// disabled (no window reported at all — matching AWS).
+///
+/// **`EarliestRestorableDateTime`** is `max(retention floor, this
+/// generation's own enable time)` — never earlier than enable (a fresh
+/// generation has no history before it, ADR 0059 §9's "no fake
+/// continuity"), and never earlier than the retention floor even when
+/// enable predates it (a segment/base snapshot older than retention is the
+/// janitor's to reclaim regardless of when PITR was enabled).
+///
+/// **`LatestRestorableDateTime`** honestly trails "now" by seal lag (ADR
+/// 0059 §9: "never claim 'now'") — derived from the table's own tablets'
+/// *actually sealed* coverage: the minimum, over every current tablet, of
+/// that tablet's own last PITR seal wall time (or this generation's enable
+/// time for a tablet that has never sealed yet — the trivially-restorable
+/// "nothing has happened since enable" floor). The minimum, not the
+/// maximum, because a client's own point-in-time restore must be coherent
+/// across every tablet: reporting a later time than the *slowest* tablet's
+/// own coverage would silently promise a restore this adapter cannot
+/// actually reconstruct for that tablet's own range.
+fn pitr_description(ctx: &ClientCtx, meta: &Metadata, table: &str) -> wire::PitrDescription {
+    let Some(spec) = meta.table_pitr(table) else {
+        return wire::PitrDescription {
+            enabled: false,
+            earliest_restorable_ms: None,
+            latest_restorable_ms: None,
+        };
+    };
+    let now_ms = ctx.env.wall_now().0;
+    let retention_ms = crate::pitr_janitor::DEFAULT_PITR_RETENTION.as_millis() as u64;
+    let floor_ms = now_ms.saturating_sub(retention_ms);
+    let earliest_ms = floor_ms.max(spec.enabled_wall_ms);
+
+    let tablets: Vec<TabletId> = meta.tablets_for_table(table).map(|(&t, _)| t).collect();
+    let latest_ms = tablets
+        .iter()
+        .map(|&t| {
+            meta.last_pitr_seal_wall_ms(t)
+                .unwrap_or(spec.enabled_wall_ms)
+        })
+        .min()
+        .unwrap_or(spec.enabled_wall_ms)
+        .max(earliest_ms);
+
+    wire::PitrDescription {
+        enabled: true,
+        earliest_restorable_ms: Some(earliest_ms),
+        latest_restorable_ms: Some(latest_ms),
+    }
+}
+
+/// `UpdateContinuousBackups` (ADR 0059 §9): enable or disable `table`'s
+/// PITR. Validates the table exists (`TableNotFoundException`, matching
+/// `CreateBackup`'s own choice for this specific call). Disabling first
+/// force-seals every one of the table's tablets — the identical
+/// `disable_stream`-mirroring "final seal before the disable itself
+/// commits" sequencing F12-b established for streams (see
+/// `ClientCtx::force_pitr_seal_tablet`'s own doc) — so nothing is ever left
+/// unprotected in the hot log the instant `pitr_enabled` flips to `false`
+/// and `trim_janitor` stops holding a PITR term for it.
+async fn update_continuous_backups(
+    ctx: &ClientCtx,
+    table: &str,
+    enabled: bool,
+) -> Result<String, WireError> {
+    let meta = metadata_fresh(ctx).await;
+    if !meta.has_table_schema(table) {
+        return Err(WireError {
+            code: "TableNotFoundException",
+            message: format!("table `{table}` does not exist"),
+            reasons: None,
+        });
+    }
+    if !enabled && meta.table_pitr(table).is_some() {
+        let tablets: Vec<TabletId> = meta.tablets_for_table(table).map(|(&t, _)| t).collect();
+        for tablet in tablets {
+            ctx.force_pitr_seal_tablet(tablet).await.map_err(|e| {
+                internal(&format!(
+                    "final PITR seal of tablet {} before disabling table `{table}`'s PITR: {e}",
+                    tablet.0
+                ))
+            })?;
+        }
+    }
+    let wall_ms = ctx.env.wall_now().0;
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::UpdateContinuousBackups {
+            table: table.to_owned(),
+            enabled,
+            wall_ms,
+        })
+        .await;
+        let fresh = metadata_fresh(ctx).await;
+        if fresh.table_pitr(table).is_some() == enabled {
+            return Ok(wire::update_continuous_backups_response(&pitr_description(
+                ctx, &fresh, table,
+            )));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "UpdateContinuousBackups did not commit to the control plane in time \
+                 (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+}
+
+/// `DescribeContinuousBackups` (ADR 0059 §9): a pure read of the replicated
+/// catalog plus sealed-coverage state, mirroring [`describe_time_to_live`]'s
+/// shape.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_continuous_backups(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+) -> Result<String, WireError> {
+    if !meta.has_table_schema(table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    Ok(wire::describe_continuous_backups_response(
+        &pitr_description(ctx, meta, table),
+    ))
+}
+
+// --- Backups (ADR 0059 §3/§4, Train 1 PR④) ---------------------------------
+
+/// How many times [`create_backup`] mints a fresh backup id and retries
+/// after an (astronomically unlikely — a 64-bit random draw) collision with
+/// an existing catalog row, mirroring `NodeId::mint`'s own bounded
+/// registration-CAS retry (`animusd/CLAUDE.md`'s "Self-minted member ids"
+/// entry) rather than failing outright on the first collision.
+const CREATE_BACKUP_ID_ATTEMPTS: u32 = 3;
+
+/// `CreateBackup` (ADR 0059 §3/§4, Train 1 PR④): begin an on-demand backup
+/// of `table`, named `backup_name`. Validates the table exists
+/// (`TableNotFoundException` — AWS's own error for this specific call,
+/// distinct from the generic `ResourceNotFoundException` most other
+/// operations use) and mints a fresh opaque backup identity as an ARN
+/// (`wire::backup_arn`, ADR 0059 §3's own "an ARN-shaped string at the
+/// wire" convention — the ARN itself **is** the catalog's `BackupId` key,
+/// so nothing here or anywhere else in this adapter ever parses one back
+/// apart), stamped with `env.wall_now()` (ADR 0051's discipline: the pure
+/// state machine has no clock), then proposes `MetaCommand::BeginBackup`
+/// and commit-waits only for the **row to appear** — **never** for
+/// `AVAILABLE`. Capture proceeds asynchronously from here via the capture
+/// driver (`animusd::backup_capture`) and the completion aggregator
+/// (`animusd::backup_completion`).
+async fn create_backup(
+    ctx: &ClientCtx,
+    table: &str,
+    backup_name: &str,
+) -> Result<String, WireError> {
+    let meta = metadata_fresh(ctx).await;
+    if !meta.has_table_schema(table) {
+        return Err(WireError {
+            code: "TableNotFoundException",
+            message: format!("table `{table}` does not exist"),
+            reasons: None,
+        });
+    }
+    let created_wall_ms = ctx.env.wall_now().0;
+    let timeout_err =
+        internal("CreateBackup did not commit to the control plane in time (no leader reachable?)");
+    for _ in 0..CREATE_BACKUP_ID_ATTEMPTS {
+        let backup_arn = wire::backup_arn(table, &format!("{:016x}", ctx.env.next_u64()));
+        ctx.propose_schema(&MetaCommand::BeginBackup {
+            backup_id: backup_arn.clone(),
+            table: table.to_owned(),
+            created_wall_ms,
+            backup_name: backup_name.to_owned(),
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            if let Some(row) = metadata_fresh(ctx).await.backup(&backup_arn) {
+                return Ok(wire::create_backup_response(&wire::BackupDetails {
+                    backup_arn,
+                    backup_name: backup_name.to_owned(),
+                    status: "CREATING",
+                    creation_wall_ms: row.manifest.created_wall_ms,
+                    size_bytes: 0,
+                }));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // Either a (vanishingly unlikely) id collision rejected this
+                // attempt outright, or the propose itself never reached a
+                // leader — either way, mint a fresh id and retry rather than
+                // trying to distinguish the two (`propose_schema`'s own
+                // return means "reached a log somewhere," never "the state
+                // machine accepted it").
+                break;
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+    Err(timeout_err)
+}
+
+/// A backup catalog row's own AWS-faithful wire status (ADR 0059, Train 1
+/// PR④): `CREATING`/`AVAILABLE` map directly; `Expired`/`Failed` both map to
+/// `DELETED` — this adapter's internal two-phase-reclaim states have no
+/// analogue in AWS's own three-value on-demand `BackupStatus` enum, and both
+/// are, from a client's point of view, simply "this backup is gone" (the
+/// janitor, `animusd::backup_janitor`, is physically reclaiming either
+/// asynchronously). No wildcard arm: a future `BackupStatus` variant fails
+/// to compile here until this mapping is a deliberate decision.
+fn backup_wire_status(status: &animus_control::BackupStatus) -> &'static str {
+    match status {
+        animus_control::BackupStatus::Creating => "CREATING",
+        animus_control::BackupStatus::Available => "AVAILABLE",
+        animus_control::BackupStatus::Expired | animus_control::BackupStatus::Failed { .. } => {
+            "DELETED"
+        }
+    }
+}
+
+/// A backup row visible at the wire — `Expired`/`Failed` are treated as
+/// already gone (`BackupNotFoundException`, AWS's own contract that a
+/// deleted backup's ARN is immediately invalid, real DynamoDB's `DeleteBackup`
+/// takes effect from the caller's point of view the instant it returns even
+/// though this adapter's own physical reclaim is asynchronous) — shared by
+/// [`describe_backup`]/[`delete_backup`]/[`list_backups`]'s own filter.
+fn visible_backup<'a>(
+    meta: &'a Metadata,
+    backup_arn: &str,
+) -> Result<&'a animus_control::BackupRow, WireError> {
+    match meta.backup(backup_arn) {
+        Some(row)
+            if !matches!(
+                row.status,
+                animus_control::BackupStatus::Expired | animus_control::BackupStatus::Failed { .. }
+            ) =>
+        {
+            Ok(row)
+        }
+        _ => Err(WireError {
+            code: "BackupNotFoundException",
+            message: format!("backup `{backup_arn}` does not exist"),
+            reasons: None,
+        }),
+    }
+}
+
+/// `DescribeBackup` (ADR 0059 §2/§3/§4, Train 1 PR④): a pure read of one
+/// backup's catalog row by its ARN. **Works even after the source table has
+/// been dropped** — every field this renders comes from the manifest's own
+/// captured `TableSchema`/stream/TTL snapshot (ADR 0059 §2), never a live
+/// `Metadata::table_schema`/`table_stream`/`table_ttl` lookup, and the
+/// reported size is the row's own frozen `total_bytes` (`MetaCommand::
+/// CompleteBackup`'s apply-time freeze, `BackupRow::total_bytes`'s own doc)
+/// rather than a live re-derivation — both are exactly what makes a backup
+/// outlive its source table meaningful at the wire (ADR 0024's explicit
+/// carve-out, ADR 0059 §3).
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_backup(meta: &Metadata, backup_arn: &str) -> Result<String, WireError> {
+    let row = visible_backup(meta, backup_arn)?;
+    Ok(backup_description_json(
+        backup_arn,
+        row,
+        backup_wire_status(&row.status),
+    ))
+}
+
+/// Build the `DescribeBackup`/`DeleteBackup`-shared `BackupDescription` JSON
+/// body from one catalog row — see [`describe_backup`]'s doc for why every
+/// field comes from the manifest's own captured snapshot, never a live
+/// catalog lookup. `status` is a separate parameter, not derived from
+/// `row.status` internally, because [`delete_backup`] must be able to render
+/// `"DELETED"` from a row it captured **before** proposing the mark (see
+/// that function's own doc for why re-reading the row back after proposing
+/// is unsound — the janitor can race ahead and remove it entirely before the
+/// caller's own next read).
+fn backup_description_json(
+    backup_arn: &str,
+    row: &animus_control::BackupRow,
+    status: &'static str,
+) -> String {
+    let details = wire::BackupDetails {
+        backup_arn: backup_arn.to_owned(),
+        backup_name: row.backup_name.clone(),
+        status,
+        creation_wall_ms: row.manifest.created_wall_ms,
+        size_bytes: row.total_bytes,
+    };
+    let dynamo_schema = schema_bridge::to_dynamo(&row.manifest.schema);
+    let indexes = schema_bridge::indexes_to_dynamo(&row.manifest.schema.indexes);
+    let stream_desc = row.manifest.schema.stream.as_ref().map(stream_description);
+    let ttl_desc = row
+        .manifest
+        .schema
+        .ttl
+        .as_ref()
+        .map(|t| wire::TtlDescription {
+            enabled: true,
+            attribute_name: Some(t.attribute_name.clone()),
+        });
+    wire::backup_description_response(
+        &details,
+        &row.table,
+        &dynamo_schema,
+        &indexes,
+        stream_desc.as_ref(),
+        ttl_desc.as_ref(),
+    )
+}
+
+/// `ListBackups` (ADR 0059 §3, Train 1 PR④): paginated backup summaries in
+/// ascending-ARN order — `Metadata::backups`' own `BTreeMap<BackupId, _>`
+/// iteration order, which is exactly the order [`wire::
+/// paginate_backup_summaries`] relies on, since a `BackupId` **is** its own
+/// ARN (ADR 0059 §3, [`wire::backup_arn`]'s doc). `Expired`/`Failed` rows
+/// are excluded before pagination (the identical "already gone" filter
+/// [`visible_backup`] applies to a single lookup, generalized to a scan).
+#[allow(clippy::too_many_arguments)] // mirrors `run_operation`'s own thin unpack-and-forward shape
+fn list_backups(
+    meta: &Metadata,
+    table: Option<&str>,
+    limit: Option<usize>,
+    exclusive_start_backup_arn: Option<&str>,
+    time_range_lower_bound_ms: Option<u64>,
+    time_range_upper_bound_ms: Option<u64>,
+    backup_type: wire::BackupTypeFilter,
+) -> Result<String, WireError> {
+    // ADR 0059 §9, Train 3: a PITR base snapshot is a `SYSTEM`-type backup
+    // (real internal machinery, never a user's own `CreateBackup`) —
+    // invisible under the default `USER` filter, visible under `SYSTEM`/
+    // `ALL`. `AWS_BACKUP` is still never produced at all.
+    let wants_user = backup_type.matches_user_backup();
+    let wants_system = matches!(
+        backup_type,
+        wire::BackupTypeFilter::System | wire::BackupTypeFilter::All
+    );
+    if !wants_user && !wants_system {
+        // This adapter never produces an `AWS_BACKUP` backup — an honest
+        // empty page, not an error (matching AWS: an unusual but legal
+        // filter that simply never has anything to return here).
+        return Ok(wire::list_backups_response(&[], None));
+    }
+    let candidates: Vec<wire::BackupSummary> = meta
+        .backups
+        .iter()
+        .filter(|(id, _)| {
+            let is_pitr_base = meta.pitr_base_backups.contains(*id);
+            (is_pitr_base && wants_system) || (!is_pitr_base && wants_user)
+        })
+        .filter(|(_, row)| {
+            !matches!(
+                row.status,
+                animus_control::BackupStatus::Expired | animus_control::BackupStatus::Failed { .. }
+            )
+        })
+        .filter(|(_, row)| table.is_none_or(|t| row.table == t))
+        .filter(|(_, row)| {
+            time_range_lower_bound_ms.is_none_or(|lo| row.manifest.created_wall_ms >= lo)
+        })
+        .filter(|(_, row)| {
+            time_range_upper_bound_ms.is_none_or(|hi| row.manifest.created_wall_ms <= hi)
+        })
+        .map(|(backup_id, row)| wire::BackupSummary {
+            table: row.table.clone(),
+            details: wire::BackupDetails {
+                backup_arn: backup_id.clone(),
+                backup_name: row.backup_name.clone(),
+                status: backup_wire_status(&row.status),
+                creation_wall_ms: row.manifest.created_wall_ms,
+                size_bytes: row.total_bytes,
+            },
+        })
+        .collect();
+    let (page, last_evaluated) =
+        wire::paginate_backup_summaries(&candidates, exclusive_start_backup_arn, limit);
+    Ok(wire::list_backups_response(
+        &page,
+        last_evaluated.as_deref(),
+    ))
+}
+
+/// `DeleteBackup` (ADR 0059 §3, Train 1 PR④): mark a backup for reclaim by
+/// its ARN. Rejects an unknown/already-gone backup (`BackupNotFoundException`)
+/// and one still `CREATING` (`BackupInUseException`, AWS-faithful — a
+/// backup capture in progress cannot be deleted); otherwise proposes
+/// `MetaCommand::MarkBackupDeleted` (the two-phase janitor's own **mark**
+/// step, `animusd::backup_janitor`) and commit-waits for the row to reflect
+/// it, then returns the same `BackupDescription` shape [`describe_backup`]
+/// does — with `BackupStatus: DELETED`, matching real DynamoDB's own
+/// (synchronous, from the caller's point of view) `DeleteBackup` contract.
+/// **Actual object reclaim is the janitor's own async job** — this call
+/// never waits for it.
+///
+/// **The response body is built from the row captured up front, before ever
+/// proposing** — never from a post-propose re-read. The backup janitor
+/// (`animusd::backup_janitor`) polls on its own fast, independent tick
+/// (200ms): on a lightly loaded single/small cluster it can observe the
+/// mark, reclaim every object, and finalize (physically remove the row) all
+/// before this function's *own* post-propose poll ever gets a look — a
+/// post-propose re-read finding the row already gone must be treated as
+/// exactly as much a success as finding it `Expired` (both mean the mark
+/// landed), and once gone there is nothing left to re-read the manifest
+/// from anyway. Found live via a genuinely fast-reclaiming single-node test.
+async fn delete_backup(ctx: &ClientCtx, backup_arn: &str) -> Result<String, WireError> {
+    let meta = metadata_fresh(ctx).await;
+    let row = visible_backup(&meta, backup_arn)?.clone();
+    if matches!(row.status, animus_control::BackupStatus::Creating) {
+        return Err(WireError {
+            code: "BackupInUseException",
+            message: format!("backup `{backup_arn}` is still being created"),
+            reasons: None,
+        });
+    }
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::MarkBackupDeleted {
+            backup_id: backup_arn.to_owned(),
+        })
+        .await;
+        match metadata_fresh(ctx).await.backup(backup_arn) {
+            Some(fresh_row)
+                if matches!(fresh_row.status, animus_control::BackupStatus::Expired) =>
+            {
+                return Ok(backup_description_json(backup_arn, fresh_row, "DELETED"));
+            }
+            None => {
+                // The janitor already reclaimed and removed the row — the
+                // mark unambiguously landed (nothing removes a row except
+                // the janitor's own finalize step, which only ever follows
+                // a successful mark). Render from the pre-propose snapshot.
+                return Ok(backup_description_json(backup_arn, &row, "DELETED"));
+            }
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "DeleteBackup did not commit to the control plane in time (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+}
+
+/// How many fresh-id retries [`restore_table_from_backup`] attempts before
+/// giving up — mirrors [`CREATE_BACKUP_ID_ATTEMPTS`]'s own reasoning
+/// exactly (a restore id collision is vanishingly unlikely; a repeated
+/// timeout more likely means no leader is reachable at all).
+const RESTORE_ID_ATTEMPTS: u32 = 3;
+
+/// `RestoreTableFromBackup` (ADR 0059 §7, Train 2): restore `backup_arn`
+/// into a brand-new table `target_table_name`, replaying the table's own
+/// creation machinery from the backup's captured `SourceTableFeatureDetails`
+/// snapshot rather than inventing a parallel bootstrap path:
+///
+/// 1. Validate: the backup exists and is `Available`
+///    (`BackupNotFoundException`/`BackupInUseException`, AWS-faithful — see
+///    [`visible_backup`]'s own doc for why `Expired`/`Failed` both read as
+///    "not found"), the target name isn't reserved, and the target doesn't
+///    already exist (`ResourceInUseException` — the identical code
+///    `create_table`'s own duplicate-name check already uses, via
+///    [`registry_error`]'s `TableExists` arm; re-checked by the state
+///    machine's own `CreateTableSchema` first-committer-wins guard too, so a
+///    race between two concurrent restores to the same name is decided
+///    there, not by this client-side check alone).
+/// 2. Propose `CreateTableSchema` from the manifest's schema, stripped of
+///    its `indexes`/`stream`/`ttl` (ADR 0059 §7 step 2: TTL and streams are
+///    deliberately never re-enabled), then propose `CreateTableIndex` for
+///    every **LSI** the manifest recorded — the identical commit-wait shape
+///    [`create_table`] itself uses, since LSI rows are colocated physical
+///    data this restore is about to seed and LSIs are always `Active` by
+///    construction (create-time-only, never backfilled).
+/// 3. Resolve this restore's own GSI plan (`GlobalSecondaryIndexOverride`
+///    if given — entirely replacing the manifest's own GSI set — else every
+///    `Global`-kind index the manifest recorded), forced to
+///    [`IndexStatus::Creating`] regardless of the source's own status (ADR
+///    0059 §8: a restored GSI is always rebuilt from scratch). **Not**
+///    declared on the schema yet — see [`RestoreRow::gsi_defs`]'s own doc
+///    for why declaring it before the tablet is seeded would be a real
+///    backfill-completion race, and [`crate::backup_restore`]'s module doc
+///    for where it actually gets declared (after `CompleteRestore`).
+/// 4. Propose `MetaCommand::BeginRestore` — mints the single `Building`
+///    destination tablet (ADR 0059 Train 2's own pinned-tablets-vs-fresh-
+///    layout decision, see `crate::backup_restore`'s module doc) at a
+///    freshly-selected replica set (the identical `provision_tablet`
+///    convention: the first `min(N, MAX_REPLICATION_FACTOR)` `Active`
+///    members) and the `Seeding` restore row.
+/// 5. Return immediately — **asynchronous**, unlike `create_table`'s own
+///    blocking `await_table_serveable` wait: the restore driver
+///    (`crate::backup_restore`) seeds and activates the tablet in the
+///    background, so `DescribeTable` reports `CREATING`
+///    ([`table_status`]) until it converges. The returned
+///    `TableDescription` reflects only what has committed by this point
+///    (the base schema + any LSIs) — the target's GSIs are not yet visible
+///    at all (a deliberate Train 2 deviation from AWS, which shows them
+///    `CREATING`/backfilling immediately; see the ADR's own as-built note).
+async fn restore_table_from_backup(
+    ctx: &ClientCtx,
+    backup_arn: &str,
+    target_table_name: &str,
+    global_secondary_index_override: Option<&[animus_dynamo::SecondaryIndex]>,
+) -> Result<String, WireError> {
+    let meta = metadata_fresh(ctx).await;
+    let row = visible_backup(&meta, backup_arn)?;
+    match row.status {
+        animus_control::BackupStatus::Available => {}
+        animus_control::BackupStatus::Creating => {
+            return Err(WireError {
+                code: "BackupInUseException",
+                message: format!("backup `{backup_arn}` is still being created"),
+                reasons: None,
+            });
+        }
+        // `visible_backup` already filters `Expired`/`Failed` out as
+        // "not found" — unreachable, kept so this match stays exhaustive.
+        animus_control::BackupStatus::Expired | animus_control::BackupStatus::Failed { .. } => {
+            return Err(WireError {
+                code: "BackupNotFoundException",
+                message: format!("backup `{backup_arn}` does not exist"),
+                reasons: None,
+            });
+        }
+    }
+    let source_table = row.table.clone();
+    let manifest_schema = row.manifest.schema.clone();
+    let provision = provision_restore_target(
+        ctx,
+        target_table_name,
+        &manifest_schema,
+        global_secondary_index_override,
+    )
+    .await?;
+    finish_restore_kickoff(
+        ctx,
+        backup_arn,
+        &source_table,
+        target_table_name,
+        &provision,
+        None,
+    )
+    .await
+}
+
+/// The GSI/LSI/schema half of a restore's own setup (ADR 0059 §7 step 2/3),
+/// shared by [`restore_table_from_backup`] (Train 2) and
+/// [`restore_table_to_point_in_time`] (ADR 0059 §10, Train 3 PR②): both
+/// replay a table's own creation machinery from a captured
+/// `SourceTableFeatureDetails` schema snapshot rather than inventing a
+/// second bootstrap path, and the two differ only in *which* backup's
+/// manifest schema they start from (a client-named ARN vs. the newest PITR
+/// base snapshot at or before the requested second) — everything from "reject
+/// a reserved/existing target name" through "every LSI committed" is
+/// identical between them.
+struct RestoreProvision {
+    /// The stripped (no `indexes`/`stream`/`ttl`) base schema, already
+    /// committed via `CreateTableSchema`.
+    base_schema: animus_control::TableSchema,
+    /// Every LSI the manifest recorded, already committed via
+    /// `CreateTableIndex` (LSIs are always `Active`, colocated physical
+    /// data — no backfill involved, ADR 0059 §7 step 2).
+    lsi_defs: Vec<IndexDef>,
+    /// This restore's own resolved GSI plan (ADR 0059 §8) — **not yet**
+    /// declared on the schema; see [`RestoreRow::gsi_defs`]'s own doc for
+    /// why (`animus_control::RestoreRow`).
+    gsi_defs: Vec<IndexDef>,
+}
+
+async fn provision_restore_target(
+    ctx: &ClientCtx,
+    target_table_name: &str,
+    manifest_schema: &animus_control::TableSchema,
+    global_secondary_index_override: Option<&[animus_dynamo::SecondaryIndex]>,
+) -> Result<RestoreProvision, WireError> {
+    if animus_control::syskv::is_reserved_name(target_table_name) {
+        return Err(WireError::validation(format!(
+            "table name `{target_table_name}` collides with the reserved system namespace"
+        )));
+    }
+    if metadata_fresh(ctx)
+        .await
+        .has_table_schema(target_table_name)
+    {
+        return Err(registry_error(animus_dynamo::RegistryError::TableExists(
+            target_table_name.to_owned(),
+        )));
+    }
+
+    let mut base_schema = manifest_schema.clone();
+    let manifest_indexes = std::mem::take(&mut base_schema.indexes);
+    base_schema.stream = None;
+    base_schema.ttl = None;
+
+    let lsi_defs: Vec<IndexDef> = manifest_indexes
+        .iter()
+        .filter(|d| d.kind == IndexKind::Local)
+        .cloned()
+        .collect();
+    let gsi_defs: Vec<IndexDef> = match global_secondary_index_override {
+        Some(overrides) => {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut out = Vec::with_capacity(overrides.len());
+            for idx in overrides {
+                if animus_control::syskv::is_reserved_name(idx.name()) || idx.name().contains('$') {
+                    return Err(WireError::validation(format!(
+                        "index name `{}` is reserved or contains `$`",
+                        idx.name()
+                    )));
+                }
+                if !seen.insert(idx.name().to_owned()) {
+                    return Err(WireError::validation(format!(
+                        "duplicate index name `{}`",
+                        idx.name()
+                    )));
+                }
+                let mut def = schema_bridge::index_to_control(idx, &base_schema.partition_key);
+                def.status = IndexStatus::Creating;
+                out.push(def);
+            }
+            out
+        }
+        None => manifest_indexes
+            .into_iter()
+            .filter(|d| d.kind == IndexKind::Global)
+            .map(|mut d| {
+                d.status = IndexStatus::Creating;
+                d
+            })
+            .collect(),
+    };
+
+    // Step 2: base schema, then every LSI — the identical commit-wait shape
+    // `create_table` itself uses.
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::CreateTableSchema {
+            table: target_table_name.to_owned(),
+            schema: base_schema.clone(),
+        })
+        .await;
+        if metadata_fresh(ctx)
+            .await
+            .has_table_schema(target_table_name)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "restore did not commit its target schema in time (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+    for lsi in &lsi_defs {
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            ctx.propose_schema(&MetaCommand::CreateTableIndex {
+                table: target_table_name.to_owned(),
+                index: lsi.clone(),
+            })
+            .await;
+            if metadata_fresh(ctx)
+                .await
+                .table_indexes(target_table_name)
+                .iter()
+                .any(|d| d.name == lsi.name)
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(internal(
+                    "restore did not commit an LSI definition in time (no leader reachable?)",
+                ));
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    Ok(RestoreProvision {
+        base_schema,
+        lsi_defs,
+        gsi_defs,
+    })
+}
+
+/// Mint the single destination tablet + propose `MetaCommand::BeginRestore`
+/// (ADR 0059 §7 step 4/5), shared by [`restore_table_from_backup`] and
+/// [`restore_table_to_point_in_time`] — the only difference between the two
+/// callers is `backup_id` (a client-named ARN vs. the chosen PITR base
+/// snapshot's own ARN) and `pitr` (`None` vs. `Some` the resolved
+/// [`animus_control::PitrRestorePlan`]). The replica set mirrors
+/// `provision_tablet`'s own convention — the first `min(N,
+/// MAX_REPLICATION_FACTOR)` `Active` members, best-effort under-sized if the
+/// cluster is still bootstrapping (nothing here self-heals an under-sized
+/// set the way `reconcile_placement` does for an ordinary tablet's recorded
+/// RF policy, a named residual: this restore tablet gets no
+/// `SetTabletPolicy` at all, so it is never a `reconcile_placement`/
+/// `rebalance_placement` candidate — a smaller follow-up, not a correctness
+/// gap, since restore still succeeds with fewer replicas than the target
+/// RF). Returns immediately once the row commits — **asynchronous**, unlike
+/// `create_table`'s own blocking `await_table_serveable` wait: the restore
+/// driver (`crate::backup_restore`) seeds and activates the tablet in the
+/// background.
+async fn finish_restore_kickoff(
+    ctx: &ClientCtx,
+    backup_id: &str,
+    source_table: &str,
+    target_table_name: &str,
+    provision: &RestoreProvision,
+    pitr: Option<animus_control::PitrRestorePlan>,
+) -> Result<String, WireError> {
+    let timeout_err =
+        internal("restore did not commit its restore row in time (no leader reachable?)");
+    for _ in 0..RESTORE_ID_ATTEMPTS {
+        let restore_id = format!("restore-{:016x}", ctx.env.next_u64());
+        let fresh = metadata_fresh(ctx).await;
+        let tablet = fresh.next_free_tablet_id();
+        let mut replicas: Vec<_> = fresh
+            .members
+            .iter()
+            .filter(|(_, m)| m.status == animus_control::NodeStatus::Active)
+            .map(|(id, _)| id.clone())
+            .collect();
+        replicas.truncate(crate::MAX_REPLICATION_FACTOR);
+        ctx.propose_schema(&MetaCommand::BeginRestore {
+            restore_id: restore_id.clone(),
+            backup_id: backup_id.to_owned(),
+            source_table: source_table.to_owned(),
+            target_table: target_table_name.to_owned(),
+            tablet,
+            replicas,
+            gsi_defs: provision.gsi_defs.clone(),
+            pitr: pitr.clone(),
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            if metadata_fresh(ctx).await.restore(&restore_id).is_some() {
+                let final_meta = metadata_fresh(ctx).await;
+                let dynamo_schema = schema_bridge::to_dynamo(&provision.base_schema);
+                let dynamo_lsis = schema_bridge::indexes_to_dynamo(&provision.lsi_defs);
+                return Ok(wire::restore_table_response(
+                    target_table_name,
+                    &dynamo_schema,
+                    &dynamo_lsis,
+                    table_status(&final_meta, target_table_name),
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break; // mint a fresh id and retry
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+    Err(timeout_err)
+}
+
+// --- Point-in-time recovery restore (ADR 0059 §10, Train 3 PR②) -----------
+
+/// `RestoreTableToPointInTime` (ADR 0059 §10, Train 3 PR②): restore
+/// `source_table_name`'s PITR history into a brand-new table
+/// `target_table_name`, as of a target wall-clock second (`restore_date_time`,
+/// AWS's own 1-second granularity — a JSON `Timestamp`, epoch seconds,
+/// possibly fractional, truncated here) or the table's own current
+/// `LatestRestorableDateTime` (`use_latest_restorable_time`).
+///
+/// 1. **Resolve the current-generation restorable window**
+///    (`Metadata::pitr_restore_window`) — works whether or not the source
+///    table still exists (ADR 0059 §9/§10's own "a dropped table's PITR
+///    history survives" carve-out — see `tests/dynamo_pitr.rs`'s
+///    deleted-table restore regression). `None` — this table name has never enabled
+///    PITR at all — is `TableNotFoundException` when the table doesn't
+///    currently exist either (genuinely unknown source, no history at all),
+///    else `PointInTimeRecoveryUnavailableException` (a real, live table
+///    that has simply never turned PITR on).
+/// 2. **Validate the requested second** against `[Earliest, Latest]`
+///    (folding in the retention floor exactly like [`pitr_description`]) —
+///    outside the window is `InvalidRestoreTimeException`, AWS's own code
+///    for this. This settles ADR 0059's own Train 3 PR① "not yet decided"
+///    question about a `T` crossing a disable/re-enable generation
+///    boundary: `pitr_restore_window` scopes to the table's **latest**
+///    generation only, so a `T` inside an earlier, now-superseded
+///    generation's own coverage (including one sitting inside the gap
+///    itself) is simply never in `[Earliest, Latest]` at all — rejected
+///    outright, with no separate gap-detection rule needed.
+/// 3. **Pick the newest PITR base snapshot at or before the target second**
+///    (`Metadata::pitr_base_backups_for_table` — never re-derived from
+///    `ListBackups`, per that ADR train's own open question). None found
+///    (a narrow, accepted residual: a request landing in the brief window
+///    right after PITR's own enable, before its first periodic base
+///    snapshot has completed) is also `InvalidRestoreTimeException`.
+/// 4. **Resolve the replay plan** (`Metadata::pitr_replay_segments`) from
+///    that base's own frozen manifest **object** (fetched from the backup
+///    store — decoding it is this handler's job, not the pure state
+///    machine's, which is why the plan rides `MetaCommand::BeginRestore`
+///    as already-resolved data) plus this same fresh `Metadata` read.
+/// 5. From here, identical to [`restore_table_from_backup`]: provision the
+///    target schema/LSIs/GSI-plan from the chosen base's own manifest
+///    schema ([`provision_restore_target`]), then [`finish_restore_kickoff`]
+///    with the resolved plan attached — the restore driver
+///    (`crate::backup_restore`) does the actual seeding-plus-replay in the
+///    background exactly like an ordinary on-demand restore, just with one
+///    more source of `SeedRow`s to sweep (see that module's own doc).
+async fn restore_table_to_point_in_time(
+    ctx: &ClientCtx,
+    source_table_name: &str,
+    target_table_name: &str,
+    restore_date_time_ms: Option<u64>,
+    use_latest_restorable_time: bool,
+    global_secondary_index_override: Option<&[animus_dynamo::SecondaryIndex]>,
+) -> Result<String, WireError> {
+    if !use_latest_restorable_time && restore_date_time_ms.is_none() {
+        return Err(WireError::validation(
+            "one of `RestoreDateTime` or `UseLatestRestorableTime` is required",
+        ));
+    }
+    let meta = metadata_fresh(ctx).await;
+    let Some(window) = meta.pitr_restore_window(source_table_name) else {
+        return Err(if meta.has_table_schema(source_table_name) {
+            WireError {
+                code: "PointInTimeRecoveryUnavailableException",
+                message: format!(
+                    "point-in-time recovery is not enabled for table `{source_table_name}`"
+                ),
+                reasons: None,
+            }
+        } else {
+            WireError {
+                code: "TableNotFoundException",
+                message: format!(
+                    "table `{source_table_name}` does not exist and has no point-in-time \
+                     recovery history"
+                ),
+                reasons: None,
+            }
+        });
+    };
+
+    let now_ms = ctx.env.wall_now().0;
+    let retention_ms = crate::pitr_janitor::DEFAULT_PITR_RETENTION.as_millis() as u64;
+    let floor_ms = now_ms.saturating_sub(retention_ms);
+    let earliest_ms = window.earliest_ms.max(floor_ms);
+    let latest_ms = window.latest_ms.max(earliest_ms);
+    // `RestoreDateTime` is truncated to the whole second below, so the
+    // floor it's checked against must be too — comparing a second-
+    // granular `T` against a millisecond-precise `earliest_ms` would
+    // reject a `T` naming the very same wall-clock second PITR was
+    // enabled in purely because enabling didn't happen to land on that
+    // second's own first millisecond (found while building this test's
+    // own e2e coverage, which enables PITR and writes/seals within a
+    // single real second under tiny test knobs — a real, if rare,
+    // deployment case too: a restore request landing in the enable
+    // second itself).
+    let earliest_floor_ms = (earliest_ms / 1000) * 1000;
+
+    let cutoff_ms = if use_latest_restorable_time {
+        latest_ms
+    } else {
+        let precise_ms = restore_date_time_ms.expect("checked above");
+        // Truncate to the whole second — AWS's own `RestoreDateTime`
+        // granularity (ADR 0059 §10's own opening line).
+        let t_ms = (precise_ms / 1000) * 1000;
+        if t_ms < earliest_floor_ms || t_ms > latest_ms {
+            return Err(WireError {
+                code: "InvalidRestoreTimeException",
+                message: format!(
+                    "`RestoreDateTime` ({t_ms}ms) is outside the currently restorable window \
+                     [{earliest_ms}ms, {latest_ms}ms] for table `{source_table_name}`'s current \
+                     point-in-time recovery generation"
+                ),
+                reasons: None,
+            });
+        }
+        t_ms.saturating_add(999) // cover this whole target second
+    };
+
+    let bases: Vec<(String, animus_control::BackupRow)> = meta
+        .pitr_base_backups_for_table(source_table_name)
+        .filter(|(_, row)| matches!(row.status, animus_control::BackupStatus::Available))
+        .map(|(id, row)| (id.clone(), row.clone()))
+        .collect();
+    let Some((base_id, base_row)) = bases
+        .into_iter()
+        .rev()
+        .find(|(_, row)| row.manifest.created_wall_ms <= cutoff_ms)
+    else {
+        return Err(WireError {
+            code: "InvalidRestoreTimeException",
+            message: format!(
+                "no point-in-time recovery base snapshot is available at or before the \
+                 requested time for table `{source_table_name}` yet"
+            ),
+            reasons: None,
+        });
+    };
+
+    let manifest_object_id = backup_codec::backup_manifest_object_id(&base_id);
+    let manifest_bytes = ctx
+        .data()
+        .backup_store
+        .get_any(&manifest_object_id)
+        .await
+        .map_err(|e| {
+            internal(&format!(
+                "reading point-in-time base snapshot manifest: {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            internal(&format!(
+                "point-in-time base snapshot `{base_id}` has no manifest object yet"
+            ))
+        })?;
+    let manifest_object = backup_codec::decode_manifest_object(&manifest_bytes).map_err(|e| {
+        internal(&format!(
+            "corrupt point-in-time base snapshot manifest: {e}"
+        ))
+    })?;
+    let base_tablet_progress: Vec<(TabletId, u64)> = manifest_object
+        .tablet_progress
+        .iter()
+        .map(|e| (e.tablet, e.progress.cut_version))
+        .collect();
+    let segments = meta.pitr_replay_segments(&base_tablet_progress, cutoff_ms);
+
+    let provision = provision_restore_target(
+        ctx,
+        target_table_name,
+        &base_row.manifest.schema,
+        global_secondary_index_override,
+    )
+    .await?;
+    finish_restore_kickoff(
+        ctx,
+        &base_id,
+        source_table_name,
+        target_table_name,
+        &provision,
+        Some(animus_control::PitrRestorePlan {
+            target_wall_ms: cutoff_ms,
+            segments,
+        }),
+    )
+    .await
 }
 
 /// Propose `table`'s key schema **and each declared secondary-index definition**
@@ -1669,12 +2684,36 @@ async fn drop_table_index(ctx: &ClientCtx, table: &str, index: &str) -> Result<(
     }
 }
 
+/// `table`'s own `TableStatus` (ADR 0059 §7, Train 2's own contribution to
+/// `DescribeTable`): `"CREATING"` while any of its tablets is not yet
+/// `Active` (a restore's single tablet stays `Building` for the whole
+/// seed/activate window; a fresh `CreateTable`'s tablet never observably is,
+/// since that wire path blocks on `await_table_serveable` before ever
+/// returning — so this can only read `CREATING` for a restoring table in
+/// practice), `"ACTIVE"` otherwise — including a table with **no** tablets
+/// yet (a vanishingly brief `CreateTableSchema`-committed-but-not-yet-
+/// provisioned window), since `"ACTIVE"` was this adapter's own behavior for
+/// every table before this derivation existed and nothing here should
+/// change that default. Derived fresh from the live tablet map every call,
+/// never stored redundantly on the schema/catalog row.
+fn table_status(meta: &Metadata, table: &str) -> &'static str {
+    if meta
+        .tablets_for_table(table)
+        .any(|(_, t)| t.state != TabletState::Active)
+    {
+        "CREATING"
+    } else {
+        "ACTIVE"
+    }
+}
+
 /// `DescribeTable` (ADR 0042 §2): a pure read of the replicated catalog — key
 /// schema, secondary-index definitions (each with its **real** lifecycle
-/// `IndexStatus`, ADR 0045 §6 Fork D), and stream configuration (+ ARN).
-/// `ctx` is unused today (every input comes from `meta`) but kept for
-/// signature symmetry with the other operation handlers and in case a
-/// future addition needs it (e.g. live tablet stats).
+/// `IndexStatus`, ADR 0045 §6 Fork D), stream configuration (+ ARN), and
+/// (ADR 0059 §7, Train 2) the table's own live `TableStatus`
+/// ([`table_status`]) — `ctx` is otherwise unused (every other input comes
+/// from `meta`) but kept for signature symmetry with the other operation
+/// handlers.
 #[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
 fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<String, WireError> {
     let Some(control_schema) = meta.table_schema(table) else {
@@ -1701,6 +2740,7 @@ fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<Stri
         &indexes,
         &index_statuses,
         stream_desc.as_ref(),
+        table_status(meta, table),
     ))
 }
 
@@ -3365,10 +4405,11 @@ async fn run_base_query(
 /// (`IndexSortMismatch`) before either path runs. `ConsistentRead: true`
 /// against a **global** index is rejected here too, matching DynamoDB exactly
 /// (§5: "`ConsistentRead=true` against a GSI is an error… against an LSI it is
-/// honoured and already true") — an LSI is strongly consistent by
-/// construction (written atomically with the base row), so `consistent_read`
-/// is simply dropped on that branch, same as a base `Query`/`Scan`/`GetItem`.
-/// A non-`Active` index (`Creating`/`Deleting`, ADR 0045 §6) is rejected too,
+/// honoured"). Since ADR 0055, `consistent_read` is **not** dropped on the LSI
+/// branch: `true` runs a linearizable ReadIndex scan, `false` (the default)
+/// the cheap eventual, replica-local one — same real-path selection a base
+/// `Query`/`Scan`/`GetItem` gets. A non-`Active` index (`Creating`/`Deleting`,
+/// ADR 0045 §6) is rejected too,
 /// beside that same `ConsistentRead` check.
 #[allow(clippy::too_many_arguments)] // mirrors `run_query`'s own full decoded shape
 async fn run_index_query(
@@ -3622,12 +4663,16 @@ async fn run_gsi_query(
     ))
 }
 
-/// An **LSI** `Query` (ADR 0041 §5): a **linearizable** range scan of the
-/// *base table's own tablet*, over its `KIND_LSI` scope
-/// (`ClientCtx::cp_scan_kind`) — strongly consistent, since LSI rows commit in
-/// the same Raft entry as the base row they derive from (ADR 0041 §2). Scans
-/// the partition's whole LSI-index sub-range (`lsi_index_prefix`) and filters
-/// by any sort condition on the recovered alt-sort segment
+/// An **LSI** `Query` (ADR 0041 §5): a range scan of the *base table's own
+/// tablet*, over its `KIND_LSI` scope (`ClientCtx::cp_scan_kind`). Since ADR
+/// 0055, `consistency` selects the real read path: `ConsistentRead: true` is
+/// a linearizable ReadIndex scan; `false` (the default) is the cheap,
+/// eventual, replica-local one. LSI rows commit in the same Raft entry as the
+/// base row they derive from (ADR 0041 §2), but that only makes the *strong*
+/// path immediately fresh — the eventual default can still observe a lagging
+/// replica. Scans the partition's whole LSI-index sub-range
+/// (`lsi_index_prefix`) and filters by any sort condition on the recovered
+/// alt-sort segment
 /// (`parse_lsi_row_key`) — LSI rows also store the projected item (see
 /// `kind_writes_for_item`), so this decodes them directly.
 ///
@@ -4029,18 +5074,20 @@ async fn run_gsi_scan(
     ))
 }
 
-/// An **LSI** `Scan` (ADR 0041 §5): a **table-wide** linearizable fan-out over
-/// the base table's `KIND_LSI` scope (`ClientCtx::cp_scan_kind_table`) — unlike
-/// an LSI `Query`, which is scoped to one base partition and hence one tablet,
-/// a table-wide `Scan` sweeps every tablet of `table`'s own ring. One
+/// An **LSI** `Scan` (ADR 0041 §5): a **table-wide** fan-out over the base
+/// table's `KIND_LSI` scope (`ClientCtx::cp_scan_kind_table`) — unlike an LSI
+/// `Query`, which is scoped to one base partition and hence one tablet, a
+/// table-wide `Scan` sweeps every tablet of `table`'s own ring. One
 /// partition's LSI rows across *every* declared index interleave within that
 /// scope ([`animus_dynamo::index::lsi_index_prefix`]'s layout — sorted by
 /// index name ahead of the alt-sort value), so [`paginated_kind_examine`]'s
 /// `keep` closure filters each raw row to the requested index by its own key
 /// (`parse_lsi_row_key`) — a row of a *different* index is skipped without
 /// consuming a `Limit` slot, exactly like a tombstone in the base scan.
-/// `ConsistentRead: true` is accepted (already true — an LSI row commits
-/// atomically with its base row).
+/// `ConsistentRead: true` is accepted, same as an LSI `Query` (unlike a GSI
+/// `Scan`, which rejects it): since ADR 0055, `consistency` picks the real
+/// per-tablet read path, linearizable ReadIndex when `true`, the cheap
+/// eventual replica-local one by default.
 #[allow(clippy::too_many_arguments)] // mirrors `run_lsi_query`'s own full decoded shape
 async fn run_lsi_scan(
     ctx: &ClientCtx,
@@ -5393,7 +6440,22 @@ fn marker_record(partition_prefix: &[u8], base_sk: Vec<u8>, staged: bool) -> (Ve
 /// *shape*, never whether one exists ("images follow the stream/index
 /// declarations; the record itself follows nothing — it always exists").
 pub(crate) fn table_change_records_carry_images(meta: &Metadata, table: &str) -> bool {
-    !meta.table_indexes(table).is_empty() || meta.table_stream(table).is_some()
+    !meta.table_indexes(table).is_empty()
+        || meta.table_stream(table).is_some()
+        // ADR 0059 §10 (Train 3 PR②) — a real, load-bearing gap found
+        // building PITR restore: a table with PITR enabled but no GSI/LSI/
+        // stream of its own used to write only image-less markers (ADR
+        // 0049 §1), which carry no row content at all — PITR's own sealed
+        // segments would then have nothing for a later
+        // `RestoreTableToPointInTime` to reconstruct row state from. PITR
+        // needs the identical before/after images a stream or index
+        // already forces, so it joins this gate exactly like they do.
+        // Deliberate, accepted cost: every write on a PITR-enabled table
+        // now takes the slower evaluate-at-leader path
+        // (`kind_write_item_at_leader`) instead of the ADR 0049 fast
+        // marker-write arm — real DynamoDB's own PITR carries an
+        // analogous (if internally different) continuous-capture cost.
+        || meta.table_pitr(table).is_some()
 }
 
 /// Whether `cp_txn` must **await** its post-commit resolve under the ADR
@@ -5523,7 +6585,7 @@ mod txn_resolve_awaited_tests {
 /// ([`eval_kind_txn_write`]'s own call always passes `false`, since a
 /// transaction never carries a service identity).
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
-fn kind_writes_for_item(
+pub(crate) fn kind_writes_for_item(
     meta: &Metadata,
     table: &str,
     pk: &AttributeValue,
@@ -6647,5 +7709,242 @@ mod segment_tests {
         let (from, bound) = scan_bounds(None, inside.clone());
         assert_eq!(from, inside);
         assert_eq!(bound, None);
+    }
+}
+
+/// `list_backups`'s own filter logic (ADR 0059, Train 1 PR④) — table,
+/// time-range, and `BackupType` filtering over a hand-`.apply()`-driven
+/// `Metadata`, no live node needed at all (this crate's own lightest-harness
+/// idiom, mirroring `segment_janitor.rs`'s `orphan_reap_tests` in
+/// `animusd` proper). Pagination itself (`Limit`/`ExclusiveStartBackupArn`)
+/// is `wire::paginate_backup_summaries`'s own unit-tested contract
+/// (`animus-dynamo`'s `wire` test module) — not re-proven here.
+#[cfg(test)]
+mod list_backups_tests {
+    use animus_control::{ApplyOutcome, ColumnType, MetaCommand, TableSchema};
+    use animus_tablet::{KeyRange, TabletId};
+
+    use super::*;
+
+    /// One table + one completed, `Available` backup of it, stamped with
+    /// `created_wall_ms`. `tablet` must be distinct across every table this
+    /// test builds (a bare `Metadata`, no allocator to dedupe for it).
+    fn add_backup(
+        meta: &mut Metadata,
+        table: &str,
+        tablet: TabletId,
+        backup_arn: &str,
+        created_wall_ms: u64,
+    ) {
+        if !meta.has_table_schema(table) {
+            assert_eq!(
+                meta.apply(&MetaCommand::CreateTableSchema {
+                    table: table.to_owned(),
+                    schema: TableSchema::simple("id", ColumnType::String),
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        // A table gets exactly one tablet from `CreateTablet` (a second
+        // real tablet only ever comes from a split) — reuse the table's
+        // existing one for a second backup of the same table rather than
+        // trying to mint a colliding second whole-range tablet.
+        if meta.tablets_for_table(table).next().is_none() {
+            assert_eq!(
+                meta.apply(&MetaCommand::CreateTablet {
+                    tablet,
+                    table: Some(table.to_owned()),
+                    range: KeyRange::whole(),
+                    replicas: Vec::new(),
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        let tablet = meta
+            .tablets_for_table(table)
+            .next()
+            .map(|(&id, _)| id)
+            .expect("just created above");
+        assert_eq!(
+            meta.apply(&MetaCommand::BeginBackup {
+                backup_id: backup_arn.to_owned(),
+                table: table.to_owned(),
+                created_wall_ms,
+                backup_name: "b".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            meta.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: backup_arn.to_owned(),
+                tablet,
+                cut_version: 1,
+                bytes: 10,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            meta.apply(&MetaCommand::CompleteBackup {
+                backup_id: backup_arn.to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
+    fn arns(body: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        v["BackupSummaries"]
+            .as_array()
+            .expect("BackupSummaries array")
+            .iter()
+            .map(|s| s["BackupArn"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// A fixture with three `Available` backups (two of `orders`, one of
+    /// `users`, at three different creation times) plus one `Expired`
+    /// `orders` backup — every scenario below asserts the `Expired` one
+    /// never appears, regardless of which other filter is applied.
+    fn fixture() -> Metadata {
+        let mut meta = Metadata::default();
+        add_backup(&mut meta, "orders", TabletId(1), "arn-a", 1_000);
+        add_backup(&mut meta, "orders", TabletId(2), "arn-b", 2_000);
+        add_backup(&mut meta, "users", TabletId(3), "arn-c", 1_500);
+        add_backup(&mut meta, "orders", TabletId(4), "arn-d-expired", 1_800);
+        assert_eq!(
+            meta.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "arn-d-expired".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        meta
+    }
+
+    #[test]
+    fn no_filters_lists_every_non_expired_backup_in_arn_order() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            None,
+            None,
+            None,
+            None,
+            None,
+            wire::BackupTypeFilter::User,
+        )
+        .expect("list_backups");
+        assert_eq!(arns(&body), vec!["arn-a", "arn-b", "arn-c"]);
+    }
+
+    #[test]
+    fn table_filter_narrows_to_the_named_table_only() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            Some("orders"),
+            None,
+            None,
+            None,
+            None,
+            wire::BackupTypeFilter::User,
+        )
+        .expect("list_backups");
+        assert_eq!(arns(&body), vec!["arn-a", "arn-b"]);
+    }
+
+    #[test]
+    fn table_filter_on_an_unknown_table_is_an_empty_page_not_an_error() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            Some("ghost"),
+            None,
+            None,
+            None,
+            None,
+            wire::BackupTypeFilter::User,
+        )
+        .expect("list_backups");
+        assert!(arns(&body).is_empty());
+    }
+
+    #[test]
+    fn time_range_lower_bound_excludes_earlier_backups() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            None,
+            None,
+            None,
+            Some(1_600),
+            None,
+            wire::BackupTypeFilter::User,
+        )
+        .expect("list_backups");
+        assert_eq!(arns(&body), vec!["arn-b"]);
+    }
+
+    #[test]
+    fn time_range_upper_bound_excludes_later_backups() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            None,
+            None,
+            None,
+            None,
+            Some(1_600),
+            wire::BackupTypeFilter::User,
+        )
+        .expect("list_backups");
+        assert_eq!(arns(&body), vec!["arn-a", "arn-c"]);
+    }
+
+    #[test]
+    fn a_time_range_window_intersects_both_bounds() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            None,
+            None,
+            None,
+            Some(1_200),
+            Some(1_900),
+            wire::BackupTypeFilter::User,
+        )
+        .expect("list_backups");
+        assert_eq!(arns(&body), vec!["arn-c"]);
+    }
+
+    #[test]
+    fn a_non_user_backup_type_is_an_empty_page() {
+        let meta = fixture();
+        for backup_type in [
+            wire::BackupTypeFilter::System,
+            wire::BackupTypeFilter::AwsBackup,
+        ] {
+            let body = list_backups(&meta, None, None, None, None, None, backup_type)
+                .expect("list_backups");
+            assert!(
+                arns(&body).is_empty(),
+                "this adapter has never produced a {backup_type:?} backup"
+            );
+        }
+    }
+
+    #[test]
+    fn backup_type_all_includes_every_user_backup() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            None,
+            None,
+            None,
+            None,
+            None,
+            wire::BackupTypeFilter::All,
+        )
+        .expect("list_backups");
+        assert_eq!(arns(&body), vec!["arn-a", "arn-b", "arn-c"]);
     }
 }

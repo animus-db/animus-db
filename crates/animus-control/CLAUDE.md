@@ -420,6 +420,137 @@ per-tablet CP data plane (`animus-cp-data`).
   why this needed one canonical accessor rather than a per-consumer
   re-derivation.
 
+  **Train 1 PR④ (wire surface + janitor) additions**: one new command,
+  `MetaCommand::MarkBackupDeleted { backup_id }` — the two-phase janitor's
+  own **mark** step (`Available`/`Failed` → `Expired`, idempotent once
+  `Expired`, rejects `Creating` as an apply-time seatbelt behind the wire
+  edge's own `BackupInUseException` check), proposed by the `DeleteBackup`
+  wire operation (`animusd::dynamo::delete_backup`) — never by the janitor
+  itself. The pre-existing `MetaCommand::DeleteBackup` (PR①'s own row-plus-
+  progress removal) is unchanged and becomes the janitor's own
+  **finalizing** command instead, proposed only once every one of a marked
+  backup's objects has been reclaimed (`animusd::backup_janitor`); no new
+  `BackupStatus` variant was needed (`Expired` already existed for exactly
+  this). Two new `BackupRow` fields: `backup_name: String` (the client's
+  `CreateBackup` request field, threaded through a new `MetaCommand::
+  BeginBackup.backup_name` field — recorded verbatim, never interpreted,
+  never part of this row's own identity) and `total_bytes: u64` (frozen
+  **once**, by `CompleteBackup`'s own apply arm, from `Metadata::
+  backup_total_bytes` at the moment every pinned tablet's live descendant is
+  still resolvable — **not** re-derived live by the wire surface, which
+  would silently collapse to zero the instant the source table is dropped;
+  see `docs/engineering-lessons.md`'s entry on this). `backup_name` being a
+  new required `MetaCommand::BeginBackup` field meant updating every
+  existing `BeginBackup{..}` construction site across this crate's own
+  tests, `animus-test`, and `animusd`'s tests — compiler-enumerated, the
+  same "grep every site" fan-out root `CLAUDE.md`'s engineering-practices
+  log already documents for this class of change; `total_bytes` needed no
+  such fan-out (it is derived and stored only inside `Metadata::apply`'s own
+  `BeginBackup`/`CompleteBackup` arms, never constructed by a caller).
+
+- **The restore catalog (ADR 0059 §7, Train 2): `BeginRestore`/
+  `CompleteRestore`/`FailRestore`.** `Metadata::restores: BTreeMap<RestoreId,
+  RestoreRow>` (`RestoreId = String`, an opaque internally-minted identity —
+  never wire-visible, unlike `BackupId`, since `RestoreTableFromBackup` has
+  no AWS-defined "restore id" to echo back). `BeginRestore` mints exactly
+  **one** `Building` tablet over the whole ring for the target table
+  (`Tablet::with_table` + `state = Building`, the identical monotonic-
+  allocator-floor seatbelt `CreateTablet`/`BeginSplit` already enforce) plus
+  the `Seeding` row — the ADR's own as-built decision to mint a *fresh*
+  single-tablet layout rather than mirror the backup's historical
+  multi-tablet topology (see the ADR's Train 2 amendment for the full
+  reasoning: this needs no `range` field anywhere, since a single
+  destination tablet needs no per-row key routing at all). `CompleteRestore`
+  activates that tablet (`Building` → `Active`, epoch bumped — mirroring
+  `CutoverSplit`'s own activation, minus the "retire a parent" half) and
+  flips the row `Done`; `FailRestore` mirrors `FailBackup`'s own idempotent-
+  on-identical-repeat, rejects-a-terminal-contradiction shape, deliberately
+  leaving the tablet `Building` forever (never routable, never half-serving
+  — an ordinary `DeleteTable` cleans it up exactly like any other tablet,
+  state-agnostic). `RestoreRow::gsi_defs: Vec<IndexDef>` carries the
+  restore's own resolved GSI plan (the wire caller's
+  `GlobalSecondaryIndexOverride`, or the backup manifest's own captured
+  GSIs, forced to `IndexStatus::Creating` regardless of the source's status)
+  from propose time to the restore driver (`animusd::backup_restore`),
+  which declares them via `CreateTableIndex` only **after** `CompleteRestore`
+  — declaring them earlier would let the backfill seeder observe an empty/
+  `Building` tablet and mark it backfilled before any row is ever seeded,
+  silently losing every restored row's GSI entry forever (see the ADR's own
+  amendment for the full incident this ordering avoids). No new `syskv`
+  companion progress kind exists for restore the way `Backup`/
+  `BackupProgress` pair up — a restore mints exactly one destination tablet,
+  so `RestoreRow` alone carries everything a restore has to say;
+  `syskv::EntityKind::Restore` mirrors `Backup`'s own plain-string-key
+  convention. **Deliberately no restore reclaim/delete command** yet (a
+  named Train 2 residual, not a correctness gap — rows are small, bounded
+  one-per-`RestoreTableFromBackup`-call, and never referenced again once
+  terminal).
+
+- **PITR (ADR 0059 §9, Train 3): `UpdateContinuousBackups`/
+  `SealPitrSegment`/`ExpirePitrSegments`/`MarkBackupPitrBase`.** A fifth
+  consumer's own catalog, deliberately mirroring the backup/stream ones'
+  conventions rather than inventing new shapes: `TableSchema.pitr:
+  Option<PitrSpec>` (generation + enable wall-clock, the `SetTableStream`/
+  `SetTableTtl` schema-catalog class) toggled by `UpdateContinuousBackups`,
+  which mints a fresh `generation` from `Metadata::pitr_generation`'s own
+  never-rewound per-table counter (reusing `EntityKind::Counter` with a
+  `"pitr_gen:{table}"`-prefixed name rather than a new entity kind).
+  `Metadata::pitr_segments: BTreeMap<(TabletId, u64), PitrSegmentRow>`
+  mirrors `stream_shards` exactly (same tuple-key JSON codec workaround,
+  same first-committer-wins-on-content `SealPitrSegment`/two-phase
+  `ExpirePitrSegments` shape, same epoch-derivation-guard obligation on the
+  caller) but is a fully separate collection — a table's stream and its
+  PITR coverage never share a row or gate each other. **`Metadata::
+  pitr_base_backups: BTreeSet<BackupId>`, not a `BackupRow`/`BeginBackup`
+  field**: tags an already-`BeginBackup`'d row as a PITR base snapshot
+  without widening `MetaCommand::BeginBackup`'s own signature (which would
+  have touched every one of its ~30 existing construction sites) — see
+  `MetaCommand::MarkBackupPitrBase`'s own doc and the ADR's Train 3 PR①
+  as-built amendment for the self-healing-tag residual this trades for.
+  PITR segments/generation floor deliberately **survive**
+  `DropTableSchema`/`DropTableTablets`, the identical ADR 0024 carve-out
+  `backups` already gets — never gated on the source table's schema still
+  existing, an explicit override of the streams drop-table retention-zero
+  rule (ADR 0059 §9/§10).
+
+  **`RestoreTableToPointInTime` (ADR 0059 §10, Train 3 PR②) reuses the
+  restore catalog above rather than inventing a second one**:
+  `RestoreRow`/`MetaCommand::BeginRestore` gained one optional field,
+  `pitr: Option<PitrRestorePlan>` (`{target_wall_ms, segments:
+  Vec<PitrReplaySegmentRef>}`), carried verbatim exactly like `gsi_defs`
+  already is — a PITR restore is otherwise indistinguishable from an
+  on-demand one to every downstream consumer (activation, GSI declare,
+  `/admin/restores`). Two new pure accessors, both taking `&self` and
+  doing no I/O:
+  - `Metadata::pitr_restore_window(table) -> Option<PitrRestoreWindow>`
+    (`{generation, earliest_ms, latest_ms}`) is the validation gate's
+    `EarliestRestorableDateTime`/`LatestRestorableDateTime` — scoped to the
+    table's **current** generation only (an earlier generation's own
+    window, crossed by a disable/re-enable cycle, is never reachable
+    through this accessor, which is what makes a generation-gap `T` reject
+    on the ordinary out-of-bounds check rather than needing a dedicated
+    error path), and it answers correctly whether or not the source
+    table's schema still exists (falls back to `Metadata::pitr_generation`'s
+    own surviving counter) — a deleted table's PITR history stays
+    queryable, mirroring the backup catalog's own ADR 0024 carve-out.
+  - `Metadata::pitr_replay_segments(base_tablet_progress, cutoff_wall_ms)
+    -> Vec<PitrReplaySegmentRef>` selects which segments a restore must
+    replay: a forward DFS over `split_lineage` starting from each of the
+    chosen base snapshot's own pinned tablets, including **every** visited
+    tablet's own `pitr_segments` rows regardless of that tablet's current
+    liveness (a root tablet's floor is the base snapshot's own recorded
+    cut version; a descendant's floor is 0, since ADR 0050's copy-based
+    split gives every child an empty change log at birth). **Built on a
+    direct DFS, deliberately not `live_split_descendants`** (§6's
+    on-demand-capture re-planning accessor) — that accessor answers "live"
+    descendants only and returns empty for a tablet retired by an ordinary
+    `DropTableTablets` (no `split_lineage` entry, unlike a split), which
+    silently dropped every segment of a deleted-and-never-split table's
+    own tablet the first time this function was built that way. See the
+    ADR's Train 3 PR② as-built amendment for the full incident; regression:
+    `meta::tests::
+    pitr_replay_segments_still_finds_a_dropped_never_split_tablets_own_segments`.
+
 ## What's non-obvious
 
 - **The sync/driver split is deliberate.** All consensus logic is in the sync

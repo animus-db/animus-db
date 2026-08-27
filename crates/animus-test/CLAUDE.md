@@ -28,7 +28,8 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_TXN_SEEDS=K` | 1 | K seed variants per multi-tablet transaction-corpus cell (ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | K seed variants per DynamoDB Streams lineage-walk cell (ADR 0042/0043) |
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | K seed variants per secondary-index backfill fault-injection cell (ADR 0045) |
-| `ANIMUS_BACKUP_SEEDS=K` | 1 | K seed variants per on-demand backup capture fault-injection cell (ADR 0059 Train 1) |
+| `ANIMUS_BACKUP_SEEDS=K` | 1 | K seed variants per on-demand backup capture + restore fault-injection cell (ADR 0059 Train 1/2) |
+| `ANIMUS_PITR_SEEDS=K` | 1 | K seed variants per PITR sealing fault-injection cell (ADR 0059 Train 3) |
 
 ## What's non-obvious
 
@@ -426,5 +427,141 @@ retrievable from git history.)
   — this corpus's own reimplementation is not bound by `animusd`'s real
   `tokio::time::Instant`, which this crate can't reach anyway) — both that
   it fires once genuinely stuck and that it does **not** fire early.
-  Depth knob `ANIMUS_BACKUP_SEEDS` (default 1 = the frozen cells; held
-  green at `=200` in ~5s).
+  **Train 2 (ADR 0059 §7) adds five restore cells**, the identical
+  self-contained-reimplementation technique now driving a completed backup
+  through `RestoreTableFromBackup`'s own mechanics
+  (`animusd::backup_restore`, mirrored — never imported — the same layering
+  reason as the capture half): `restore_round_trip_matches_model_at_
+  capture_cut_version` (including a staged-never-resolved intent, proving
+  restore only ever sees resolved values), `restore_driver_crash_restart_
+  resumes`/`restore_leader_kill_mid_seed_converges` (a true process restart,
+  and a live crash/failover, both mid-seed — each manufactures a genuine
+  partial-progress precondition via a direct partial seed, since a
+  whole-manifest-sweep-per-tick call has no natural interruption point of
+  its own within one synchronous test invocation), `restore_store_faults_
+  still_converge` (the store genuinely unavailable partway through, healing
+  later — `SegmentFaultConfig`'s ack-lost thresholds are `put`/`delete`-only,
+  so a read fault uses `SimSegmentStore::set_unavailable_until` instead),
+  and `restore_after_source_drop`. GSI-rebuild convergence is deliberately
+  **not** reimplemented here a third time — it's `backfill_fault_corpus.rs`'s
+  own already-proven machinery, applied to an ordinary `Active` tablet
+  indistinguishable from any other (ADR 0059 §8's own point); the real
+  production stack's GSI-after-restore convergence is
+  `animusd/tests/dynamo_restore.rs`'s job. Depth knob `ANIMUS_BACKUP_SEEDS`
+  (default 1 = the frozen cells; held green at `=100` for the restore cells,
+  `=200` for the whole file, both in well under a second).
+
+### Elle-adjacent, but not Elle: the PITR sealing + restore corpus (ADR 0059 §9/§10, Train 3)
+
+- `pitr_fault_corpus.rs` — the identical layering fix `stream_lineage_
+  corpus.rs`/`backup_fault_corpus.rs` set for the fifth consumer arm
+  (`animusd::index_drain::pitr_tick`/`pitr_seal_now`), `animusd`-only: a
+  self-contained reimplementation of `pitr_seal_now`'s exact algorithm
+  directly over `RaftKvNode`, a bare `Metadata`, and `animus-sim`'s
+  `SimSegmentStore` (standing in for the backup store — both are the
+  identical `SegmentStore` trait, ADR 0059 §1). Verification is
+  decode-and-diff against an independently-tracked write journal
+  (`verify_pitr_lineage`), the PITR twin of `stream_lineage_corpus.rs`'s
+  `verify_lineage` — with one deliberate scoping difference: exactly-once
+  delivery is checked **within each tablet's own chain**, not globally
+  across a multi-tablet `lineage` array, since packed-HLC uniqueness is a
+  per-group guarantee only (no node-id bits, ADR 0018 §2) — two independent
+  sibling tablets can legitimately mint the identical packed value absent
+  production's real `SeedBatch` witnessing, which this corpus doesn't model
+  (sealing, not the split-build workflow, is what's under test here).
+- **Periodic base snapshots and the retention janitor's own loop plumbing
+  are deliberately NOT re-simulated end-to-end** — `animusd::pitr_janitor::
+  pitr_snapshot_loop` reuses Train 1's `BeginBackup`/capture-driver/
+  completion-aggregator machinery completely unmodified (already proven by
+  `backup_fault_corpus.rs`), so re-testing that path here would just be a
+  second, weaker copy of that corpus. What genuinely is new PITR logic —
+  the retention janitor's own **keep-anchor predicate** (never mark a
+  table's newest base-snapshot-at-or-before-the-floor for reclaim, since
+  every still-retained segment sealed after it needs it as a replay base)
+  — is reproduced verbatim from `animusd::pitr_janitor`'s own unit-tested
+  pure function and proven here under **randomized** interleavings of
+  base-snapshot/segment seal times, not just the janitor's own hand-picked
+  cases.
+- **Frozen named cells**: `quiet_table_pitr_rollover` (baseline seal +
+  content match), `idle_group_never_proposes_a_pitr_seal` (the quiescence
+  contract's structural half: nothing pending ⇒ no store `put`, no
+  propose), `kill_sealing_leader_pitr_converges` (a crash between the
+  store `put` and the catalog commit, then a leader failover, then the
+  idempotent retry re-seals the full backlog), `disable_then_reenable_
+  resets_generation_and_continues_epoch_chain` (a fresh generation, but the
+  SAME tablet's own epoch chain continues, never resets), `split_children_
+  seal_independently_and_inherit_generation` (a control-metadata-only
+  `BeginSplit`/`CutoverSplit` cutover; each child seals its own epoch 0
+  independently, inheriting PITR from the table spec with zero
+  special-casing since `table_pitr` is table- not tablet-scoped; the union
+  of parent-plus-children content covers the full journal with no
+  double-counting), `drop_table_then_segments_and_generation_floor_survive`
+  (the catalog's deliberate outlives-the-table override of the streams
+  retention-zero rule), and `retention_keep_anchor_never_orphans_a_needed_
+  replay_base` (the randomized keep-anchor property, above). Depth knob
+  `ANIMUS_PITR_SEEDS` (default 1 = the frozen cells; held green at `=300`
+  in ~1s release / well under a minute debug).
+- **A real modeling bug this corpus found on its own split scenario's
+  first run** (not a production bug — a test-harness one): the scenario
+  originally reused the PARENT's own `engines()` map for both split
+  children, giving parent and children the identical physical
+  `MemoryEngine` per node — sibling tablets share nothing in production
+  (ADR 0050 rung 1/2's whole point), so a child's own `pending_changes()`
+  scan silently saw the parent's pre-split records too, corrupting the
+  seal content. Fixed by giving each child its own fresh `engines()` map,
+  mirroring `stream_lineage_corpus.rs::scenario_copy_split_children_born_
+  empty`'s own (already-correct) three-separate-maps precedent, which this
+  file's first draft failed to copy faithfully. See `docs/engineering-
+  lessons.md` for the general lesson.
+- **Train 3 PR② adds a `RestoreTableToPointInTime` tier**: five more named
+  cells, verified against the **real** `Metadata::pitr_replay_segments`
+  (called directly, never reimplemented) applied to segments this
+  corpus's own `pitr_seal_now` reimplementation sealed, decoded and
+  reduced last-writer-wins-by-HLC, and diffed against an independently-
+  tracked model — `assert_replay_matches_model`, the restore-side sibling
+  of `verify_pitr_lineage` above. `restore_to_random_second_matches_the_
+  model_with_a_leader_kill` (the flagship property: mixed writes across
+  several rounds, a leader kill mid-stream, checked against a model
+  snapshotted at *every* successful seal, not just the last one — proving
+  replay is correct at any point in the timeline, not merely at the end)
+  and `restore_to_random_second_matches_the_model_across_a_split` (the
+  same property carried across a cutover, parent and both children sealing
+  independently) join `pitr_restore_window_scopes_to_the_latest_
+  generation_under_random_cycles` (the generation-gap validation property
+  under randomized disable/re-enable cycling, not just one hand-picked
+  gap), `deleted_table_pitr_restore_matches_the_model` (a table dropped,
+  not split, still replays correctly — this is the regression shape for
+  the `live_split_descendants` bug below), and
+  `use_latest_restorable_time_matches_the_full_model`. Held green at
+  `ANIMUS_PITR_SEEDS=300` (~8s) alongside the PR① cells above (same file,
+  same knob).
+- **A real production bug this restore tier's own first run found, not
+  review**: the first `Metadata::pitr_replay_segments` was built on
+  `live_split_descendants` (ADR 0059 §6's on-demand-capture re-planning
+  accessor), which returns empty for a tablet retired by an ordinary
+  `DropTableTablets` (no `split_lineage` entry — that map only ever gets a
+  row from a *split*) — so a deleted-table PITR restore silently replayed
+  nothing. Rewritten as a direct forward DFS over `split_lineage` that
+  includes every visited tablet's own segments regardless of current
+  liveness; see the ADR's Train 3 PR② as-built amendment for the full
+  account.
+- **Three harness bugs this tier's own build found in itself, not in
+  production** (fixed before the cells were trusted at depth): (1) a
+  leader-kill scenario calling `pitr_seal_now` on the newly-elected leader
+  immediately after the kill, with no intervening confirmed write, could
+  read `pending_changes()` before that leader's own apply cursor caught up
+  to the crashed leader's last committed entry — leadership and
+  apply-catchup are not the same event; fixed by moving the kill to
+  *before* that round's own write burst, whose internal confirm-by-
+  applied-index forces the catchup as a side effect. (2) the split
+  scenario picked write keys from the *whole* keyspace for both children,
+  so a write occasionally targeted a key outside its own group's declared
+  range and silently no-op'd at apply time (the routing-bug tripwire this
+  file's `animusd/CLAUDE.md` entry names) — fixed with a `write_burst_
+  ranged` helper taking an explicit per-group key range. (3) the
+  deleted-table scenario proposed `DropTableTablets` on a tablet never
+  registered via `MetaCommand::CreateTablet`, so the drop was silently a
+  `NoOp` and the test proved nothing — fixed by registering the tablet
+  first. All three are hand-scripted-`Metadata`-corpus pitfalls, not bugs
+  in `pitr_replay_segments`/`pitr_seal_now` themselves; see
+  `docs/engineering-lessons.md` for the general lessons.

@@ -48,6 +48,10 @@ on:
         description: "Seeds per scenario (ANIMUS_BACKUP_SEEDS, ADR 0059 Train 1 backup-capture fault corpus)"
         required: false
         default: "40"
+      pitr_seeds:
+        description: "Seeds per scenario (ANIMUS_PITR_SEEDS, ADR 0059 Train 3 PITR sealing fault corpus)"
+        required: false
+        default: "40"
 
 # One deep run at a time. The corpora are long-running and share the same
 # runner class as CI, so an on-demand `workflow_dispatch` queues behind a
@@ -155,3 +159,12 @@ jobs:
         env:
           ANIMUS_BACKUP_SEEDS: ${{ github.event.inputs.backup_seeds || '40' }}
         run: cargo test -p animus-test --test backup_fault_corpus -- --nocapture
+
+      # ADR 0059 Train 3's PITR sealing consumer arm: leader kills mid-seal,
+      # disable/re-enable generation resets, split interplay, and the
+      # retention janitor's own keep-anchor predicate under randomized
+      # interleavings, scaled to depth.
+      - name: deep PITR sealing corpus (ADR 0059 Train 3)
+        env:
+          ANIMUS_PITR_SEEDS: ${{ github.event.inputs.pitr_seeds || '40' }}
+        run: cargo test -p animus-test --test pitr_fault_corpus -- --nocapture

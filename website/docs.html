@@ -366,7 +366,9 @@
             <tr><td><code>BatchGetItem</code></td><td><span class="pill yes">Yes</span></td><td>Per-request atomicity, DynamoDB-faithful</td></tr>
             <tr><td><code>DeleteTable</code> · <code>ListTables</code></td><td><span class="pill yes">Yes</span></td><td>On the DynamoDB endpoint; also through the admin API and the consoles</td></tr>
             <tr><td>Authentication (SigV4)</td><td><span class="pill opt">Opt-in</span></td><td>Off by default. Without it, any caller that can reach the port is trusted</td></tr>
-            <tr><td>Backups, global tables, on-demand capacity accounting</td><td><span class="pill no">No</span></td><td>Out of scope for now</td></tr>
+            <tr><td><code>CreateBackup</code> · <code>DescribeBackup</code> · <code>ListBackups</code> · <code>DeleteBackup</code> · <code>RestoreTableFromBackup</code></td><td><span class="pill yes">Yes</span></td><td>On-demand backups and restore. A backup outlives a dropped source table and restores into a brand-new table</td></tr>
+            <tr><td><code>UpdateContinuousBackups</code> · <code>DescribeContinuousBackups</code> · <code>RestoreTableToPointInTime</code></td><td><span class="pill yes">Yes</span></td><td>Continuous backups (PITR). Restore to any second within the continuous-coverage window, into a brand-new table; works even if the source table has since been dropped</td></tr>
+            <tr><td>Global tables, on-demand capacity accounting</td><td><span class="pill no">No</span></td><td>Out of scope for now</td></tr>
           </tbody>
         </table>
       </div>
@@ -549,7 +551,10 @@
           client DynamoDB port. Every other endpoint assumes a trusted network.</li>
         <li><strong>No format compatibility between revisions.</strong> Upgrading means recreating
           the cluster.</li>
-        <li><strong>No backup or restore</strong> tooling.</li>
+        <li><strong>Restore always creates a brand-new table, never in-place</strong> — matching
+          real DynamoDB, for both on-demand backups (<code>RestoreTableFromBackup</code>) and
+          continuous backups (<code>RestoreTableToPointInTime</code>); a source table's backup
+          history and PITR coverage both outlive the table if it's later dropped.</li>
         <li><strong>Tablets never merge</strong>, so a table that shrinks keeps its tablet count.</li>
         <li><strong>No Kubernetes operator</strong> yet, though the port layout is built for one.</li>
         <li><strong>Not benchmarked at scale.</strong> No performance claims are made here for a
