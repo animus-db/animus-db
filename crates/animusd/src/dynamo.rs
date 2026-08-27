@@ -3000,6 +3000,65 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// under the same token is `IdempotentParameterMismatchException`. See
 /// `transact_write_idempotency_preflight`'s own doc for the exact protocol.
 ///
+/// **An AMBIGUOUS `cp_txn` outcome is never recorded `CANCELLED`** (ADR
+/// 0018's issue #298 "deep shape A" amendment, 2026-08-27):
+/// `TxnAbortReason::is_ambiguous` — a `"; retry"`-suffixed `Other`, meaning
+/// this coordinator could not confirm whether the transaction committed —
+/// leaves the idempotency record exactly as the preflight's claim left it
+/// (`PENDING`) and returns a retryable `TransactionInProgressException`
+/// instead, never a false `TransactionCanceledException`.
+///
+/// **Ambiguous splits into two structurally different sub-cases, retried
+/// differently** — see `TxnAbortReason::is_safe_to_retry_fresh`'s own doc
+/// for the exact (deliberately allowlisted, not denylisted) boundary:
+/// - **Allowlisted, provably a no-op** (a frozen-tablet refusal, no route
+///   reachable, a leader-side read failure, `StageOutcome::Fenced`'s
+///   structural causes — every reason `is_safe_to_retry_fresh` recognizes as
+///   occurring BEFORE any Raft propose for this transaction could have
+///   applied): retried HERE, in this function, with a fresh `TxnId` each
+///   attempt, bounded by `CLIENT_TIMEOUT`. Safe regardless of which hop
+///   failed or whether an earlier hop already staged, because 2PC's own
+///   atomicity means a provably-never-staged participant can only ever be
+///   recovered as `Abort` — see that method's own doc for the full
+///   argument. This is the common case in practice (the ADR 0050 F8
+///   frozen-cutover blip this soak's own aggressive split threshold
+///   triggers routinely).
+/// - **Everything else ambiguous** (every reason NOT on that allowlist —
+///   the anchor/participant stage's own leader-moved case, and every
+///   DECIDE-phase confirmation loss: "CP group leader moved during anchor
+///   commit/abort", "after decide", "during orphan abort", and their
+///   forwarded-hop equivalents): **never retried at this level,
+///   deliberately**. A fresh attempt racing an original whose fate is
+///   merely unconfirmed (not proven a no-op) is exactly the
+///   double-materialize race this amendment closes, not a safe recovery
+///   from it — and, critically, a confirmed DECIDE (unlike a confirmed
+///   STAGE) fully materializes every participant's derived writes, so this
+///   bucket is NOT limited to the stage-time leader-moved case alone.
+///   Confirmed the hard way, twice, during this amendment's own proof-soak:
+///   first with a denylist that retried every ambiguous reason blindly,
+///   then with a denylist that only excluded the two stage-time messages
+///   (missing the decide-phase ones entirely) — both reproduced the literal
+///   `delivered=146/144` duplicate-pair signature the amendment exists to
+///   close. The allowlist shape fails safe against a message this bucket
+///   does not yet name; a denylist, as demonstrated twice, does not. A
+///   same-identity retry one layer down (`txn_prepare_pushing`, re-issuing
+///   the SAME already-established `TxnId`) was tried for the stage-time
+///   case specifically and ALSO reverted — for the anchor's own
+///   leader-moved case, there is no existing identity to reuse (nothing
+///   staged yet), so that retry minted a fresh identity every attempt
+///   anyway, and a tight retry loop there was observed to pile up
+///   self-inflicted orphaned intents on the same key faster than
+///   `txn_resolver_loop`'s `RECOVERY_GRACE`-gated sweep clears them, each
+///   one capable of `IntentBlocked`-ing the next attempt — a
+///   self-contention livelock, not a fix, worse in practice than the plain
+///   unconfirmed `TransactionInProgressException` this bucket now returns
+///   instead. Absorbing this bucket safely would need a way to verify a
+///   SPECIFIC attempt's own resolution before ever retrying it, which
+///   `transact_write_idempotency_preflight`'s own doc already named and
+///   deferred as a genuinely new mechanism, not a narrow fix; this amendment
+///   does not build it — see the ADR amendment's own "what was tried and
+///   reverted" section for the full account of every discarded design.
+///
 /// **Lock-scope constraint, load-bearing**: every idempotency-table
 /// read/write here happens either entirely BEFORE `ctx.data().rmw_lock` is
 /// acquired below (the whole preflight), or entirely AFTER it is dropped
@@ -3280,7 +3339,44 @@ async fn run_transact(
         return Ok(wire::empty_response());
     }
 
-    match ctx.cp_txn(writes, preconditions, write_conditions).await {
+    // `cp_txn`'s own ALLOWLISTED, provably-a-no-op failures (a frozen-tablet
+    // refusal, no route reachable, a leader-side read failure,
+    // `StageOutcome::Fenced`'s structural causes; see
+    // `TxnAbortReason::is_safe_to_retry_fresh`'s own doc for the exact,
+    // deliberately allowlisted boundary and why it is safe) are retried
+    // HERE with a fresh `TxnId` each attempt, bounded by
+    // `CLIENT_TIMEOUT`/`SCHEMA_POLL_INTERVAL` — the same deadline-bounded-
+    // loop shape `cp_read`/`cp_kind_write_item` already use for this exact
+    // class of transient error, and the ONLY class of `cp_txn` failure this
+    // function ever retries: everything else ambiguous (including every
+    // DECIDE-phase confirmation loss, not just the stage-time one) is NEVER
+    // retried at this level — a brand-new attempt racing an original whose
+    // own fate is merely unconfirmed (not proven a no-op) is exactly the
+    // double-materialize race this amendment exists to close, not a safe
+    // recovery from it, confirmed the hard way TWICE during this
+    // amendment's own proof-soak with two different denylist shapes (see
+    // this function's own doc for the full "what was tried and reverted"
+    // account).
+    let cp_txn_deadline = tokio::time::Instant::now() + crate::CLIENT_TIMEOUT;
+    let outcome = loop {
+        match ctx
+            .cp_txn(
+                writes.clone(),
+                preconditions.clone(),
+                write_conditions.clone(),
+            )
+            .await
+        {
+            Ok(commit_ts) => break Ok(commit_ts),
+            Err(e)
+                if e.is_safe_to_retry_fresh() && tokio::time::Instant::now() < cp_txn_deadline =>
+            {
+                tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    match outcome {
         Ok(_commit_ts) => {
             ctx.data()
                 .raftkv_metrics
@@ -3296,6 +3392,29 @@ async fn run_transact(
                 .await;
             }
             Ok(wire::empty_response())
+        }
+        Err(e) if e.is_ambiguous() => {
+            // Either a genuine confirmation loss (never retried, see this
+            // function's own doc) or a provably-a-no-op case that stayed
+            // stuck through the whole `CLIENT_TIMEOUT` retry budget above
+            // (e.g. a tablet frozen for an unusually long cutover): either
+            // way, never record `CANCELLED` — the transaction may in fact
+            // have committed via a path this call never observed.
+            // Deliberately mirrors `transact_write_idempotency_preflight`'s
+            // own `PENDING` narrowing (this function's own doc, ADR 0018's
+            // 2026-08-24 amendment §4): leave the idempotency record exactly
+            // as the preflight's claim `Put` left it (`PENDING`, if a token
+            // was present at all) so it self-heals via the ADR 0051 TTL
+            // reaper rather than freezing a possibly-wrong terminal answer —
+            // a future same-token retry gets the same conservative
+            // `TransactionInProgressException` a genuinely still-in-flight
+            // original produces, never a false `TransactionCanceledException`.
+            ctx.data()
+                .raftkv_metrics
+                .incr(Metric::DynamoTransactWritesAmbiguous);
+            Err(WireError::transaction_in_progress(format!(
+                "transaction outcome could not be confirmed: {e}"
+            )))
         }
         Err(e) => {
             ctx.data()
@@ -5467,6 +5586,70 @@ pub(crate) enum KindWriteOutcome {
     ConditionFailed,
 }
 
+/// **Issue #412: classify a leader-side old-image read failure before
+/// wrapping it**, shared by [`kind_write_item_at_leader`] and its
+/// transactional twin [`eval_kind_txn_write`]. Every error
+/// `ClientCtx::cp_get_local_resolving` can produce already carries the
+/// house `"; retry"` suffix (a leader-moved condition, a stale-routing
+/// scope miss, an in-flight transaction resolution race — see that
+/// function's own doc) — this makes threading that retryability through to
+/// the wrapped [`WireError`] an explicit, structural decision at the one
+/// place both callers turn this read's failure into their own error type,
+/// mirroring how `FROZEN_REFUSAL` is threaded, rather than leaving it an
+/// accident of `{e}` happening to sit last in a `format!` string that a
+/// future edit (e.g. appending more context after the interpolated error)
+/// could silently break. `e` is placed at the very end of the returned
+/// message on purpose: a caller — `ClientCtx::cp_kind_write_item`'s retry
+/// loop for the ordinary path, `ClientCtx::txn_prepare_pushing`'s for the
+/// transactional one — keys on that exact suffix
+/// (`ClientCtx::read_should_retry`) to decide whether to re-resolve routing
+/// and retry. A read failure that is NOT retryable-shaped (a genuine
+/// storage/decode error) is unaffected — it stays exactly the terminal
+/// `InternalServerError` it always was.
+fn leader_read_failure(e: String) -> WireError {
+    internal(&format!("leader-side old-image read failed: {e}"))
+}
+
+/// Test-only fault injector for the issue #412 regression: forces the next
+/// `count` leader-side old-image reads for `table`
+/// ([`kind_write_item_at_leader`]/[`eval_kind_txn_write`]'s shared read
+/// step) to fail with the retryable `"CP group leader moved; retry"` shape,
+/// without needing to orchestrate a real leadership change. Mirrors
+/// [`rmw285_confirm_gate`]'s arm/consume idiom.
+#[cfg(test)]
+pub(crate) mod leader_read_failure_gate {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static ARMED: OnceLock<Mutex<Option<(String, u32)>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<(String, u32)>> {
+        ARMED.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Arm the gate: the next `count` leader-side old-image reads for
+    /// `table` fail before the gate disarms and reads proceed normally.
+    pub(crate) fn arm(table: &str, count: u32) {
+        *slot().lock().expect("leader_read_failure_gate poisoned") =
+            Some((table.to_string(), count));
+    }
+
+    /// Consult the gate right before the real read. Returns `Some(err)`
+    /// (consuming one shot) while armed with a remaining count for `table`;
+    /// a no-op (`None`, real read proceeds) once exhausted or for any other
+    /// table.
+    pub(crate) fn maybe_fail(table: &str) -> Option<String> {
+        let mut guard = slot().lock().expect("leader_read_failure_gate poisoned");
+        match guard.as_mut() {
+            Some((armed_table, remaining)) if armed_table == table && *remaining > 0 => {
+                *remaining -= 1;
+                Some("CP group leader moved; retry".to_string())
+            }
+            _ => None,
+        }
+    }
+}
+
 /// **The evaluate-at-leader write path (ADR 0046 U3)** for `PutItem`/
 /// `DeleteItem`/`UpdateItem` on an indexed or streamed table — replaces
 /// `index_aware_write`'s edge-evaluated design, which had a real cross-node
@@ -5576,10 +5759,14 @@ pub(crate) async fn kind_write_item_at_leader(
     // scoping this mirrors.
     let (old, new, writes, change_log, seatbelt) = {
         let _rmw = ctx.data().rmw_lock.lock().await;
+        #[cfg(test)]
+        if let Some(err) = leader_read_failure_gate::maybe_fail(table) {
+            return Err(leader_read_failure(err));
+        }
         let raw_old = ctx
             .cp_get_local_resolving(leader, &base_key)
             .await
-            .map_err(|e| internal(&format!("leader-side old-image read failed: {e}")))?;
+            .map_err(leader_read_failure)?;
         let old = match &raw_old {
             Some(bytes) => wire::decode_stored_item(bytes)?,
             None => None,
@@ -5805,10 +5992,14 @@ pub(crate) async fn eval_kind_txn_write(
     condition: Option<&ConditionExpression>,
 ) -> Result<Option<KindTxnWriteEval>, WireError> {
     let base_key = item_key(pk, sk);
+    #[cfg(test)]
+    if let Some(err) = leader_read_failure_gate::maybe_fail(table) {
+        return Err(leader_read_failure(err));
+    }
     let raw_old = ctx
         .cp_get_local_resolving(leader, &base_key)
         .await
-        .map_err(|e| internal(&format!("leader-side old-image read failed: {e}")))?;
+        .map_err(leader_read_failure)?;
     let old = match &raw_old {
         Some(bytes) => wire::decode_stored_item(bytes)?,
         None => None,

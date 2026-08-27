@@ -112,7 +112,7 @@
           <tr><td><code>Query</code></td><td><span class="pill yes">Supported</span></td><td class="d">Key conditions, filters, index queries, pagination</td></tr>
           <tr><td><code>Scan</code></td><td><span class="pill yes">Supported</span></td><td class="d">Filters and pagination. Ordered by token — see the differences below</td></tr>
           <tr><td><code>BatchWriteItem</code> · <code>BatchGetItem</code></td><td><span class="pill yes">Supported</span></td><td class="d">Per-request atomicity, DynamoDB-faithful</td></tr>
-          <tr><td><code>TransactWriteItems</code> · <code>TransactGetItems</code></td><td><span class="pill yes">Supported</span></td><td class="d">Put, Update, Delete and ConditionCheck actions</td></tr>
+          <tr><td><code>TransactWriteItems</code> · <code>TransactGetItems</code></td><td><span class="pill yes">Supported</span></td><td class="d">Put, Update, Delete and ConditionCheck actions; <code>ClientRequestToken</code> idempotency on writes</td></tr>
           <tr><td><code>UpdateTimeToLive</code> · <code>DescribeTimeToLive</code></td><td><span class="pill yes">Supported</span></td><td class="d">—</td></tr>
           <tr><td>Streams API</td><td><span class="pill yes">Supported</span></td><td class="d"><code>ListStreams</code>, <code>DescribeStream</code>, <code>GetShardIterator</code>, <code>GetRecords</code></td></tr>
           <tr><td><code>DeleteTable</code> · <code>ListTables</code></td><td><span class="pill yes">Supported</span></td><td class="d">On the DynamoDB endpoint; also in the admin API and the consoles</td></tr>

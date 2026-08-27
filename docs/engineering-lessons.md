@@ -3425,7 +3425,127 @@ debugging anything that feels like it might have happened before.
   report an unflattering same-host result exactly as measured rather
   than reframing it around the more flattering historical figure.
 
+- **A one-shot admin action whose every refusal reason maps to the same HTTP
+  status is not itself proof of progress — a test (or a caller) must
+  distinguish "armed and in flight" from "failed outright" some other way,
+  or retry on the status alone (issue #405).** `tests/
+  heartbeat_live_destinations.rs::
+  heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader` called
+  `POST /admin/control/member/remove` (`ClientCtx::
+  admin_remove_control_member`'s leader-self-removal branch) **once**,
+  asserted `status == 409`, and then separately polled the new voter's own
+  `is_control_leader()` for up to 15s. But `RaftCore::transfer_leadership`
+  only arms if the target's `peer_match` has already caught up to
+  `commit_index` **at that exact instant** (its own doc: deliberately no
+  "eventually" — a caller that needs that is expected to re-arm every tick,
+  which this one-shot admin action does not), and the control group's own
+  background churn (the failure detector's liveness `UpsertMember` for the
+  freshly-added voter, `reconcile_loop`'s placement bookkeeping) can advance
+  `commit_index` past the runtime-added voter's replicated position in the
+  narrow window between the test's own voter-set convergence check and this
+  call — a window real machine contention widens. Every refusal this action
+  can return — "could not arm," "armed but the target never finished
+  stepping up within its own internal poll," "already not the leader" —
+  maps identically to HTTP 409 (`admin.rs::action_remove_control_member`
+  converts every `Err` the same way), so a single 409 says nothing about
+  which of those happened: pre-fix, a "failed to arm" 409 (plausible under
+  load, since arming needs the target's replication caught up at that exact
+  instant) left the test's own 15s poll waiting on a transfer that was never
+  actually driving forward — no code anywhere was going to retry the arm,
+  since this admin action deliberately does not retry itself (a human
+  operator does, per its own error text, which literally says "retry").
+  **General rule**: when a test (or any caller) issues a single mutating
+  admin call and then polls for a *separate* side effect, check whether that
+  admin call's own documented contract is "fire once, the effect either
+  starts or the response tells you to retry" — if so, the poll must retry
+  the **call itself**, not just wait on the side effect, or a single failed
+  attempt strands the poll for its entire budget with nothing left able to
+  produce the effect. Fixed by folding the single call + separate poll into
+  one loop that checks the side effect first and re-issues the admin call
+  (tolerating repeated 409s) until it succeeds — safe here specifically
+  because a re-arm of an already-armed *same* target is a documented no-op
+  that doesn't reset the transfer deadline, so a retry can never make a
+  transfer already succeeding worse. (`crates/animusd/tests/
+  heartbeat_live_destinations.rs`, `crates/animusd/src/lib.rs::ClientCtx::
+  admin_remove_control_member`, `crates/animus-control/src/raft.rs::
+  RaftCore::transfer_leadership`.)
+
+- **A converged-or-timeout poll on one read path does not prove convergence
+  on a *different* read path over the same data — check which consistency
+  contract each assertion actually rides before trusting an earlier poll's
+  green result (issue #400).** `tests/update_table_drop_index.rs::
+  create_drop_recreate_same_index_name_backfills_from_scratch` polled
+  `await_row_count` (the raw client protocol's linearizable `Scan`,
+  `stale: false`, direct against the recreated GSI's hidden table) to
+  convergence, then immediately followed it with a **fixed, one-shot**
+  per-row `Query` through the real DynamoDB wire — `assert!` on the very
+  first response, no poll at all. That `Query` can never request
+  `ConsistentRead: true` against a GSI (ADR 0041 §5 — a `ValidationException`),
+  so it is unconditionally served by ADR 0055's eventually-consistent,
+  replica-local path: the linearizable Scan proving the row durably present
+  says nothing about whether the *specific replica this Query happens to
+  land on* has caught up yet, and under real load (slower replica apply) it
+  routinely hadn't — the CI failure shape was `Count:0` reading back a row
+  the immediately-prior linearizable Scan had just confirmed present.
+  **General rule**: when a test chains two assertions against what looks
+  like "the same data," don't assume the second inherits the first's
+  convergence — trace which consistency mode each request actually rides
+  (a raw client-protocol call vs. the DynamoDB wire's `ConsistentRead`
+  default, and whether the operation in question can even ask for the
+  strong mode at all) and give **every** eventually-consistent assertion its
+  own converged-or-timeout poll, never borrow one poll's outcome for a
+  later, differently-served read. Fixed by wrapping each per-row `Query` in
+  a poll across every node's dynamo address (`await_gsi_query`/
+  `await_gsi_query_everywhere`, duplicated from `dynamo_query_pagination.rs`
+  per this file's own "sibling test modules keep their own fixtures
+  independent" convention — see that file's identical helpers for the
+  general pattern any GSI-`Query`-asserting test should follow).
+  (`crates/animusd/tests/update_table_drop_index.rs`.)
+
 ### Code patterns
+- **A retryable-shaped error (the house `"; retry"` suffix) surviving string
+  formatting into a caller's own error type is not the same guarantee as
+  something in that caller's *call chain* actually checking for it — audit
+  every hop between the throw site and the nearest retry loop, not just the
+  throw site's own wrapping (issue #412).** `dynamo::kind_write_item_at_
+  leader`'s leader-side old-image read failure (`ClientCtx::
+  cp_get_local_resolving`, e.g. a "CP group leader moved; retry" leadership
+  race) already produced a message ending `"; retry"` even before this
+  fix — `internal(&format!("leader-side old-image read failed: {e}"))`
+  places the interpolated error last, so the suffix survived by construction
+  — and `ClientCtx::cp_kind_write_item`'s own retry loop (`read_should_
+  retry`, suffix-matched) already retried it correctly. The *identical*
+  wrapping in `eval_kind_txn_write` (the stage-time evaluator
+  `TransactWriteItems` uses) produced an equally well-shaped
+  `TxnAbortReason::Other(msg)` — but `ClientCtx::txn_prepare_pushing`'s own
+  bounded retry loop only pattern-matched `StageOutcome::IntentBlocked`
+  *inside* an `Ok` result; a stage attempt that failed **before ever
+  reaching propose** (this read failure, or the identical leadership race in
+  `leader.txn_stage`/`txn_stage_participant` returning `None`) came back as
+  an `Err` from `txn_prepare` and escaped the whole loop via `?` on the very
+  first attempt, regardless of how retryable-shaped its message was — no
+  code anywhere in that path ever called `.ends_with("; retry")` on it. It
+  then surfaced through `cp_txn`/`dynamo::run_transact`'s `TxnAbortReason::
+  Other` arm as a terminal `TransactionCanceledException` for a condition
+  the very next attempt would routinely have cleared. **The generalizable
+  check**: when auditing "does X get retried," don't stop at confirming the
+  error *carries* the retryable marker — trace every intermediate `?`/
+  `map_err` between the throw site and the nearest loop that actually
+  branches on that marker, since a marker that nothing reads is
+  indistinguishable, at the call site, from one that was never set. Fixed by
+  making `txn_prepare_pushing` catch `Err(TxnAbortReason::Other(msg)) if
+  msg.ends_with("; retry")` from `txn_prepare` itself and retry the stage
+  attempt exactly like `IntentBlocked` (safe because nothing was proposed
+  yet on that attempt, and re-invoking `txn_prepare` re-resolves `cp_route`
+  fresh each time — the same "safe to retry, re-route every attempt"
+  discipline the ordinary write path already has). Regression:
+  `issue_412_tests::txn_prepare_pushing_retries_a_leader_moved_read_
+  failure_to_success` (`dynamo::leader_read_failure_gate`, a deterministic
+  fault-injection hook mirroring `dynamo::rmw285_confirm_gate`'s idiom,
+  used since orchestrating a real leadership change mid-read is not
+  reliably reproducible on demand). (`crates/animusd/src/dynamo.rs`,
+  `crates/animusd/src/lib.rs::ClientCtx::txn_prepare_pushing`.)
+
 - **A convergent bookkeeping write must be routable to its own owner: derive
   its key from the owner's actual scope, not a normalized/truncated form of
   it.** Issue #355's root cause (see the Testing entry above for the full
@@ -11059,6 +11179,181 @@ remaining copy-workflow-deletion layer stays blocked on all three,
 exactly as it was blocked on shape A/B before this round root-caused two
 of what turned out to be (at least) five distinct mechanisms sharing the
 same soak.
+
+## A durable idempotency cache needs its OWN confirmed-vs-unconfirmed audit — the recovery path that reads state isn't the only place that writes it (issue #298 "deep shape A", closed 2026-08-27)
+
+This round closed the one residual named — and deliberately left open — by
+this file's own two amendments above: **residual 1, a client-level retry of
+an un-tokened `TransactWriteItems` racing its own already-committed first
+attempt.** See ADR 0018's 2026-08-27 amendment for the full account; this
+entry is the generalizable lesson.
+
+**The bug, once found, was almost embarrassingly close to the two this file
+already fixed twice over**: `dynamo.rs::run_transact`'s `ClientRequestToken`
+idempotency preflight (already shipped, 2026-08-24 amendment — a durable
+`token → outcome` record, conditionally claimed so the transaction executes
+at most once per token regardless of bookkeeping) recorded **every** `cp_txn`
+failure as a confirmed `CANCELLED`, including a genuinely ambiguous one (a
+leader move mid stage, no leader reachable at all, or a `StageOutcome::
+Fenced` naming a concurrent in-doubt-recovery decision) where the
+transaction might have committed via a path that exact call never observed.
+This is the identical "an unconfirmed `Err` is UNKNOWN, never evidence of a
+specific outcome" defect this file's two amendments above already fixed in
+`RaftKvNode::txn_recover`'s `all_staged` loop and, one level deeper, in
+`RaftKvNode::txn_record_view` — found a **third** time in a completely
+different function, written by a different amendment, three days apart.
+
+**The generalizable lesson**: when a system gains a durable idempotency/
+outcome cache sitting in front of an existing fallible operation, the cache's
+own write path needs the identical confirmed-vs-unconfirmed audit the
+*read*/*recovery* side already got — auditing `txn_recover`'s two queries
+alone (as both prior amendments did, carefully) left an identically-shaped
+gap sitting in the ONE OTHER function in the codebase that also decides
+"did this transaction commit or not" from a fallible call's result, because
+it was added later, for an unrelated feature, and nobody re-ran the same
+audit against it. **A search for this defect class should grep for every
+site that classifies a `Result`/`Option` from a distributed call into a
+committed/aborted decision, not just the ones a previous investigation
+already found** — "already fixed this bug class" is not the same claim as
+"already fixed every site the bug class reaches," and a feature shipped
+between two rounds of the same investigation is exactly the kind of site an
+audit scoped to "the functions this investigation started with" will miss.
+
+**The fix generalizes too**: reuse the SAME retryability convention the rest
+of the codebase already carries (the `"; retry"` message suffix,
+`Self::read_should_retry`'s own shape) rather than inventing a second
+ambiguity taxonomy — `TxnAbortReason::is_ambiguous` is a one-line
+`.ends_with("; retry")` check, and auditing every `TxnAbortReason::Other`
+construction site against it found exactly one real gap (`CpRoute::None`'s
+message was missing the suffix) rather than needing a new mechanism. Where a
+false-negative "definitely didn't happen" is the failure mode (not a false
+"definitely succeeded" — the two are not symmetric; only the negative
+direction here can cause a client to safely-in-appearance retry into a
+double-execution class of bug), the safe default on "I genuinely don't know"
+is to retry the underlying operation a bounded number of times first (a
+fresh attempt after a transient blip usually just works — bounded internal
+retry absorbed the overwhelming common case here, mirroring
+`txn_prepare_pushing`'s own `IntentBlocked` retry one layer down), and if
+still unconfirmed, leave the cache exactly as ambiguous as it already was
+(`PENDING`, not a fabricated `CANCELLED`) rather than manufacturing a
+confident wrong answer — the identical "bound the retry, don't fabricate a
+decision" rule this file's own `unresolved_decided` entry already states for
+the sibling recovery-side case, now confirmed to generalize to a cache
+sitting in front of the same underlying operation, not just to the
+operation's own recovery path.
+
+**Verifying a soak failure under host contention, reinforced**: the mandated
+30-run un-pinned `SplitMode::InPlace` proof-soak batches for this round (see
+below) hit the exact contention trap this file already names — a
+`cargo test --workspace` run surfaced one `multi_split_soak_streamed_gsi_
+table_under_mixed_load` failure (`drain_all_tablets_lineage` one record
+short of 144, the already-documented lineage-delivery-timeout residual, ADR
+0058's G5 row), which reran clean in isolation on the first attempt. Treated
+as contention noise, not counted against the soak, per this file's own
+standing instruction — restated here only because it is the mechanism this
+round's own dedicated 30-run batches (isolated, one at a time) were run to
+avoid in the first place.
+
+## A safety-critical retry classification must be an allowlist of proven-safe cases, never a denylist of known-dangerous ones (issue #298 "deep shape A", same round)
+
+The fix above went through three shapes before it was safe, and the
+difference between the second and third is the more important lesson of
+the two. **First shape**: retry every ambiguous `cp_txn` outcome
+unconditionally. Reproduced the target bug immediately (a fresh `TxnId`
+racing an original that had, in fact, already fully committed via a path
+the retrying call never observed) — expected, this shape was never meant to
+ship. **Second shape**: retry every ambiguous outcome EXCEPT a small,
+explicitly-named denylist of the two message shapes then believed to be
+the only genuine confirmation losses (`"CP group leader moved during
+{anchor,participant} stage"`). This shape looked principled — it was
+built by tracing the actual apply-time code paths, not guessed — and it
+still reproduced the identical `delivered=146/144` duplicate-pair
+signature on essentially the next soak run. **The denylist had missed a
+whole call-site FAMILY**: `resolve_all`'s own DECIDE-phase confirmation-
+loss messages ("CP group leader moved during anchor commit/abort", "after
+decide", "during orphan abort", and their forwarded-hop twins) were never
+enumerated, so by construction of "retry unless denylisted" they fell
+through to "safe to retry" — and a confirmed DECIDE, unlike a confirmed
+STAGE, fully materializes every participant's derived writes, so retrying
+one with a fresh identity is exactly the race being closed. **Third shape,
+the one that shipped**: invert the predicate into an ALLOWLIST — name only
+the reasons proven safe (occurring before any propose for this transaction
+could have applied at all), and let everything else, known or not-yet-
+discovered, default to the conservative, never-retried path.
+
+**Why this generalizes beyond this one bug**: a denylist and an allowlist
+look symmetric in code (`if excluded { deny } else { allow }` vs. `if
+included { allow } else { deny }`) but are not remotely symmetric in
+failure mode. A denylist's blind spot is silent and unbounded — any call
+site this file's author didn't happen to trace, present today or added by
+someone else next month, is automatically "safe" the moment it starts
+emitting the same `"; retry"` convention every other transient error here
+already uses, with no compiler warning and no test failure until a soak
+happens to exercise it. An allowlist's blind spot is loud and bounded — an
+unrecognized reason degrades to the SAFE default (here, "leave the
+idempotency record `PENDING`, self-heal via TTL"), which can cost latency
+but never correctness, and is trivially auditable by reading one function
+top to bottom rather than having to prove a negative across the whole
+codebase. **The general rule: when classifying inputs for a safety-
+relevant decision (retry-or-not, trust-or-not, allow-or-not) where the two
+outcomes have asymmetric cost — one side is merely slow, the other side is
+silently wrong — enumerate the cheap, provably-safe side and default
+everything else to the expensive-but-safe side, never the reverse.** This
+is the identical shape as `Self::is_confirmation_loss`'s own doomed first
+draft mirrors: a denylist of "known-dangerous" strings is a poor substitute
+for a real characterization of *why* a case is safe, since a denylist can
+only ever encode what's already been found, and one soak run is all it
+took to find the gap here — see `TxnAbortReason::is_safe_to_retry_fresh`
+(`crates/animusd/src/lib.rs`) for the shipped allowlist and its own unit
+test for the denylist's exact counterexamples now pinned as regressions.
+
+**Soak result with the shipped (allowlist) design: 24/25 clean, one residual
+found, soak stays pinned to `Copy`.** Two isolated, contention-free batches
+(15 runs, then a further 10 chasing the one failure with a targeted
+diagnostic that did not happen to recur) totalled 24 clean runs and one
+failure — none of the earlier double-materialize signature, and none of the
+old lineage-delivery-timeout residual either. The one failure was a
+**genuine, non-ambiguous** `TransactionCanceledException` ("cached
+cancelled outcome for this ClientRequestToken") on a transaction the soak's
+own writer never conditions and never reuses a key for — meaning either a
+real `ConditionFailed` (impossible by construction here) or a real
+`TransactionConflict` (`IntentBlocked` exhausted). **Leading hypothesis, not
+confirmed**: `is_safe_to_retry_fresh`'s own allowlisted retries mint a
+FRESH `TxnId` per attempt; if one such attempt's `Fenced`/frozen-refusal
+classification is a false negative for one specific replica's own read
+(i.e. the stage in fact partially applied on some participant despite the
+coordinator seeing a provably-safe-shaped refusal), a SUBSEQUENT retry's
+own fresh `TxnId` could hit that first attempt's still-unresolved intent on
+the same key and exhaust `TXN_STAGE_PUSH_ATTEMPTS`' worth of
+`IntentBlocked` pushes before `txn_resolver_loop`'s passive sweep ever gets
+a chance to clear it (`TXN_STAGE_PUSH_ATTEMPTS`/`TXN_STAGE_PUSH_BACKOFF`'s
+combined budget, 3 × 250ms, is far shorter than `RECOVERY_GRACE`'s 5s) —
+a genuine `TransactionConflict`, correctly definite from `cp_txn`'s own
+point of view, but a self-inflicted one this feature's own retry loop
+created rather than a pre-existing race. **Not confirmed live** — this
+round's time ran out before a diagnostic could capture the exact
+`TxnId`/key of a reproduced instance — recorded here, per this file's own
+standing "capture the raw shape, don't re-derive it" instruction, so the
+next investigation starts from a real hypothesis instead of from zero. If
+confirmed, the fix is likely narrow: either shorten
+`is_safe_to_retry_fresh`'s own backoff so a fresh retry only fires after
+giving the FIRST attempt's own possible partial effects a chance to
+resolve, or have `txn_prepare_pushing`'s `IntentBlocked` handling
+recognize "blocked by a `TxnId` this same coordinator minted moments ago
+for the identical logical request" as a signal to wait longer rather than
+exhausting the ordinary cross-transaction contention budget. **Genuinely
+correctness-safe either way**: a real `TransactionConflict` is a definite,
+non-ambiguous abort — `run_transact` correctly records `CANCELLED` for it
+and never risks a double-materialize; the residual is a spurious-failure/
+liveness cost, not a data-safety one, unlike the bug this round's own fix
+closed.
+
+**Un-pin decision: NOT taken.** Per this task's own standing instruction, a
+single failure in the mandated clean-run bar means the `SplitMode::InPlace`
+soak stays pinned to `Copy` — `start_streamed_cluster_full_copy_pinned`'s
+pin is unchanged from `main`. Rung 4's remaining copy-workflow-deletion
+layer stays blocked on this one residual, down from the three this round
+began with.
 
 ## A converged-or-timeout poll can still race if its condition is weaker than what the assertion after it needs (issue #421)
 

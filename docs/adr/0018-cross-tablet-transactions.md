@@ -2,7 +2,10 @@
 
 - **Status:** Accepted — implemented (PR1-PR7 + corpus-found fixes + the
   apply-time write-key conditions follow-up + the 2026-08-24
-  `ClientRequestToken` idempotency amendment; CQL transactional surface,
+  `ClientRequestToken` idempotency amendment + the 2026-08-27 amendment
+  closing issue #298's "deep shape A" double-materialize mechanism (a new,
+  distinct residual surfaced by the same proof-soak — `SplitMode::InPlace`
+  stays pinned to `Copy`, see the amendment's §7); CQL transactional surface,
   CancellationReasons fidelity, and manual txn-resolution admin actions
   deferred). PR1: HLC + sim clock skew; PR2:
   HLC commit timestamps as the CP-plane MVCC version + the range-seal
@@ -3166,3 +3169,249 @@ its own already-committed first attempt; see this file's shape B amendment
 account of that deeper, still-open mechanism). Both fixes ship together
 because each is independently correct and worth having regardless of which
 one the next live trace turns out to hit.
+
+## Amendment (2026-08-27, issue #298 "deep shape A" residual: a client-level un-tokened retry, closed)
+
+This amendment closes the one residual the shape B/shape A amendments above
+both named and deliberately left open: **a client-level retry of an
+un-tokened `TransactWriteItems` racing its own already-committed first
+attempt** — the proof-soak's own remaining reason the `SplitMode::InPlace`
+un-pin (ADR 0058's G5 row) stayed blocked.
+
+### 1. Design decision: extend the existing token→outcome record, don't derive `TxnId` from the token
+
+Two designs were on the table going in:
+
+- **Derive `TxnId` deterministically from the `ClientRequestToken`** (plus a
+  table-set/content hash for the mismatch check), so a same-token retry
+  literally *is* the same transaction and the existing txn-record/decision
+  machinery makes replay idempotent for free.
+- **A durable `token → (fingerprint, outcome)` record**, checked as a
+  preflight in front of an otherwise-unmodified `cp_txn` — the design the
+  2026-08-24 `ClientRequestToken` amendment above already built and shipped.
+
+The token→outcome record was already live on `main` when this round began
+(landed three days earlier, per this file's own amendment above) — so the
+real decision this round faced was not "which design," but "is the shipped
+design sound, or does it need replacing." Tracing `cp_txn`/`KvCommand::
+TxnStage`/`TxnResolve`/`RaftKvNode::txn_recover` (per this round's own
+instruction to derive rather than guess) found the shipped design
+structurally sound — its **conditional-claim `Put`** (§1 of the prior
+amendment, `attribute_not_exists(pk)`) already guarantees a transaction
+executes **at most once** per token regardless of what its own outcome
+bookkeeping records: a same-token retry racing a still-`PENDING` claim
+never reaches `cp_txn` a second time, full stop. The residual was never "the
+retry can re-execute the transaction" — it was a **narrower, specific bug**
+one layer up: what `run_transact` recorded as that transaction's *outcome*
+could be wrong, which mattered because a wrong outcome record — not a
+re-execution — is what let a duplicate-execution symptom reach the wire.
+Fixing that bug in place is a small, targeted change; re-deriving `TxnId`
+from the token would have been a substantially larger rearchitecture
+(threading the token through every txn-record/intent/resolve primitive
+`animus-cp-data` owns) to fix a bug that doesn't live in `TxnId`'s identity
+at all. **Deterministic-`TxnId`-from-token remains a valid alternative
+design for a future round if the token→outcome record ever proves
+insufficient for a reason this round didn't find** — nothing here forecloses
+it — but it was not needed to close this residual.
+
+### 2. The actual bug: an unconfirmed `cp_txn` outcome recorded as a confirmed `CANCELLED`
+
+`dynamo.rs::run_transact`'s `Err(e)` arm (the `cp_txn` call site) recorded
+**every** `cp_txn` failure as `TXN_IDEMPOTENCY_CANCELLED`, with no
+distinction between the two structurally different reasons `TxnAbortReason`
+carries:
+
+- **Definite**: `ConditionFailed`/`TransactionConflict` — a condition
+  genuinely evaluated false, or an intent genuinely still blocked past every
+  retry `txn_prepare_pushing` budgets for. The transaction provably did not
+  commit; `CANCELLED` is correct.
+- **Ambiguous**: an `Other` reason carrying the house-wide `"; retry"`
+  retryability suffix (`TxnAbortReason::is_ambiguous`, new) — a leader moved
+  mid anchor/participant stage, no leader was reachable at all, or
+  `StageOutcome::Fenced` fired naming "a concurrent in-doubt-recovery
+  decision." **This coordinator could not confirm what happened** — the
+  underlying transaction may have committed via a path this exact call never
+  observed (its own participant's leadership moved to a replica that went on
+  to stage and commit normally, or a concurrent recovery sweep already
+  decided `Commit` for this exact `txn_id`). Recording `CANCELLED` here told
+  a future same-token retry (and the client) the write **definitely never
+  happened** when it may already have — the false-negative half of exactly
+  the "an unconfirmed outcome is UNKNOWN, never evidence of a specific
+  result" defect class `docs/engineering-lessons.md`'s issue #298 shape
+  B/shape A amendments already fixed twice over in `txn_recover`'s own two
+  queries (`all_staged`'s inconclusive-vs-negative fold,
+  `txn_record_view`'s `None`-conflation) — this is the same class's third
+  instance, one layer further out, in the `ClientRequestToken` outcome
+  cache rather than in recovery itself.
+
+A client that received that false `CANCELLED` and, per ordinary DynamoDB
+client behavior, retried with a **fresh** token (having been told the first
+attempt definitely failed) would race its own already-committed write with
+a second, independent transaction — the literal mechanism the shape B
+amendment's §6 named as the live trigger for the "delivered over expected"
+signature. Note the asymmetry with `StageOutcome::Fenced` reached via the
+**already-resolved-same-`txn_id`** path (the shape A amendment's own fix,
+`TxnTracker::recently_resolved`): that Fenced is *proven* a no-op (this
+exact `txn_id` already resolved this exact key — nothing to record either
+way, since the caller already knows its own attempt's fate from the earlier
+resolve). The Fenced reachable from `txn_prepare_pushing`'s own stage
+attempt (this amendment's concern) carries no such proof — it can equally
+mean "a **different** decider already resolved this **fresh** `txn_id`
+Commit," which is exactly the ambiguity that matters here.
+
+### 3. The fix
+
+- **`TxnAbortReason::is_ambiguous(&self) -> bool`** (`animusd::lib.rs`):
+  `false` for both typed variants (always definite); for `Other(msg)`, `msg.
+  ends_with("; retry")` — reusing the identical house-wide retryability
+  convention `Self::read_should_retry` already tests for the unrelated
+  CP-read retry loop, rather than inventing a second one. Audited every
+  `TxnAbortReason::Other` construction site in the anchor/participant
+  stage/decide chain to confirm the convention already held everywhere
+  except one: `txn_prepare`'s `CpRoute::None` arm ("no CP group leader
+  reachable for txn prepare") was missing the suffix — a real gap (no
+  leader reachable *right now* is exactly as transient/ambiguous as a
+  leader having just moved), fixed by appending it there rather than
+  widening the predicate to paper over an inconsistent message.
+- **`TxnAbortReason::is_safe_to_retry_fresh(&self) -> bool`** — the narrow,
+  **allowlisted** subset of `is_ambiguous` where retrying `cp_txn` from
+  scratch with a fresh `TxnId` is provably safe: a frozen-tablet refusal
+  (`FROZEN_REFUSAL`), no route reachable, a leader-side read failure
+  (`"txn prepare: leader-side evaluation failed:"`, always a pre-propose
+  read), and `StageOutcome::Fenced`'s own stage-time message. Every one of
+  these occurs **before** any Raft propose for this transaction could have
+  applied, so a fresh attempt can never race an already-landed one; for
+  `Fenced` specifically, tracing its one apply-time source
+  (`animus_cp_data`'s `already_decided`) shows its "concurrent in-doubt-
+  recovery decision" wording can only fire when the stored record's
+  `txn_id` equals the CURRENT attempt's own — impossible for a freshly-
+  minted `TxnId`, so a fresh retry hitting `Fenced` is always its other,
+  genuinely structural cause (a stale route or an out-of-fence range).
+  **`dynamo.rs::run_transact`'s `cp_txn` call site retries only this
+  allowlisted subset**, bounded by `CLIENT_TIMEOUT`/`SCHEMA_POLL_INTERVAL`
+  (the identical deadline-bounded-loop shape `cp_read`/`cp_kind_write_item`
+  already use for this exact class of transient error) — a fresh `cp_txn`
+  call (a new `TxnId`) each attempt. `ConditionFailed`/`TransactionConflict`
+  and every OTHER ambiguous reason (including every DECIDE-phase
+  confirmation loss — see the allowlist-vs-denylist account below) still
+  return immediately, unretried.
+- **If a retry-eligible failure exhausts its budget still ambiguous, or the
+  failure was never retry-eligible to begin with, the idempotency record is
+  never marked `CANCELLED`** — left exactly as the preflight's claim `Put`
+  left it (`PENDING`, mirroring `transact_write_idempotency_preflight`'s own
+  §4 conservative narrowing), so it self-heals via the ADR 0051 TTL reaper
+  instead of freezing a possibly-wrong terminal answer. The client gets a
+  genuine `TransactionInProgressException` — the same documented,
+  SDK-tolerated exception a real still-in-flight original produces — never
+  a false `TransactionCanceledException`. New
+  `Metric::DynamoTransactWritesAmbiguous` (liveness-only; correctness never
+  depends on it firing) counts this case.
+
+**Allowlist, not a denylist — found the hard way, twice, in this
+amendment's own proof-soak.** The first implementation retried on
+`is_ambiguous() && !is_confirmation_loss()`, where `is_confirmation_loss`
+named the two STAGE-time leader-moved messages as the only excluded
+reasons. This reproduced the literal `delivered=146/144` duplicate-pair
+signature immediately: `resolve_all`'s own DECIDE-phase confirmation-loss
+messages ("CP group leader moved during anchor commit/abort", "after
+decide", "during orphan abort", and their forwarded-hop equivalents) were
+never on the excluded list, so they fell through to "safe to retry" by
+default — and a confirmed DECIDE, unlike a confirmed STAGE, fully
+materializes every participant's derived writes, so retrying one with a
+fresh `TxnId` is exactly the double-materialize race this amendment exists
+to close. The fix was not to enumerate more excluded messages (a denylist
+approach that had already missed a whole call site once) but to invert the
+predicate entirely: `is_safe_to_retry_fresh` names only the reasons proven
+safe, and everything this file does not yet know about — including any
+future call site's own new `"; retry"` wording — defaults to the
+conservative, never-retried bucket. See `docs/engineering-lessons.md`'s
+matching entry for the general lesson this generalizes to.
+
+**What this does NOT do, deliberately**: it does not attempt to observe a
+specific in-flight transaction's own eventual resolution from outside it
+(the §4 narrowing's own named-but-rejected alternative) — the internal retry
+loop above absorbs the overwhelming common case (the ADR 0050 F8
+frozen-cutover blip and analogous pre-propose rejections, resolving within
+seconds, well inside `CLIENT_TIMEOUT`) without that machinery; the rarer
+non-allowlisted ambiguous tail stays exactly as conservative as an ordinary
+still-`PENDING` original, self-healing via TTL.
+
+### 4. The soak's own client, made production-faithful
+
+`animusd/tests/streams_e2e.rs`'s proof soak
+(`multi_split_soak_streamed_gsi_table_under_mixed_load`) issued every
+`TransactWriteItems` **without** a `ClientRequestToken` and retried an
+un-tokened request verbatim on a retryable error — exactly the residual's
+own precondition, and exactly what a real DynamoDB client is documented not
+to do. Fixed: the soak now mints one token per transactional write
+(`format!("soak-txn-{i:04}")`) and reuses the identical request body (token
+included) across every retry attempt — `dynamo_retrying_transact`'s own
+retry loop already resent `body` verbatim, so this alone makes every retry
+a safe no-op against the durable idempotency record instead of a second,
+racing execution. `dynamo_retrying_transact`'s retryable-status
+classification also widened to include `TransactionInProgressException`
+(previously only the `"; retry"`-suffixed `TransactionCanceledException`
+shape) — the wire-visible status a same-token retry now gets while its
+original attempt's outcome is still `PENDING` or genuinely ambiguous.
+
+### 5. Tests
+
+`animusd/tests/dynamo_txn_idempotency.rs` gained two scenarios beyond the
+2026-08-24 amendment's own four:
+
+- `same_token_retry_after_a_killed_connection_is_exactly_once_including_
+  the_stream` — the residual's own literal client-observable shape: a
+  request is fully sent and its connection abandoned before any response is
+  read (a real killed-connection/timeout ambiguity), then retried with the
+  identical token over a fresh connection. Asserts the retry is a cached
+  no-op and — since a repeated `PutItem` of the same item is
+  indistinguishable from itself on the data alone — that the table's stream
+  carries **exactly one** record per item, never two.
+- `a_participant_leader_kill_racing_a_tokened_transaction_never_falsely_
+  cancels` — a genuinely **server-side** ambiguous outcome: a two-table
+  transaction's participant tablet leader is killed immediately before the
+  request is issued (racing the election, not waiting it out first). Asserts
+  the client-observable contract holds regardless of which internal shape
+  the race takes (`cp_forward`'s own hinted retry absorbing the blip
+  entirely, or `run_transact`'s new bounded internal retry over a genuinely
+  ambiguous outcome): eventual success, never a `TransactionCanceledException`
+  surfacing for an unconfirmed outcome, a same-token retry converging to a
+  real terminal answer (not stuck `TransactionInProgressException`), and
+  exactly one stream record for the participant item.
+
+`TxnAbortReason::is_ambiguous`'s own in-crate unit test
+(`txn_abort_reason_tests::is_ambiguous_classifies_by_the_house_retry_
+suffix`) proves the classification directly: both typed variants always
+`false`; an `Other` `true` only when `"; retry"`-suffixed.
+`is_safe_to_retry_fresh`'s own sibling unit test
+(`is_safe_to_retry_fresh_is_a_narrow_allowlist_not_a_denylist`) proves the
+allowlist boundary directly, including every DECIDE-phase message the
+first (denylist) implementation missed.
+
+### 6. What ships with this amendment
+
+`TxnAbortReason::is_ambiguous`/`is_safe_to_retry_fresh`; `run_transact`'s
+bounded internal `cp_txn` retry restricted to the allowlisted subset;
+never recording a possibly-wrong `CANCELLED` for any ambiguous outcome
+(retried-and-exhausted, or never retry-eligible to begin with); the
+`CpRoute::None` message fix; `Metric::DynamoTransactWritesAmbiguous`; the
+soak's own token-bearing, production-faithful retry client. This closes
+the residual named in the shape B amendment's §6 and the shape A
+amendment's own closing paragraph above.
+
+### 7. Soak result
+
+The mandated un-pinned `SplitMode::InPlace` proof soak ran 24 clean of 25
+total across two contention-free batches, with neither the double-
+materialize signature this amendment closes nor the pre-existing lineage-
+delivery-timeout residual recurring even once. One new, different residual
+surfaced — a genuine (non-ambiguous) `TransactionConflict` cancellation,
+likely `is_safe_to_retry_fresh`'s own fresh-`TxnId` retries racing a prior
+attempt's still-unresolved intent on the same key faster than
+`txn_resolver_loop` clears it — not confirmed live before this round's time
+ran out. Correctness-safe either way (a definite `TransactionConflict` is
+correctly never recorded `CANCELLED`-then-retried into a double-
+materialize; this is a spurious-failure cost, not a data-safety one). Per
+the mandate's own "any failure keeps the pin" instruction, `SplitMode::
+InPlace` stays **not** un-pinned — see `docs/engineering-lessons.md`'s
+matching entry for the full tally, hypothesis, and un-pin decision.

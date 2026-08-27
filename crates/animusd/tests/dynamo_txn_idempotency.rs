@@ -19,6 +19,24 @@
 //! 4. `the_internal_table_is_invisible_and_unreachable` — `ListTables` omits
 //!    it, a direct `PutItem`/`GetItem` naming it is `ResourceNotFoundException`,
 //!    and `CreateTable` of that name is `ValidationException`.
+//! 5. `same_token_retry_after_a_killed_connection_is_exactly_once_including_
+//!    the_stream` — issue #298's "deep shape A" residual, live: the FIRST
+//!    attempt's request is fully sent and abandoned before its response is
+//!    ever read (a killed connection — the client cannot tell whether it
+//!    committed), then retried with the identical token over a fresh
+//!    connection. Asserts the retry is a cached no-op (never a second,
+//!    racing execution) AND — the residual's own literal symptom, over-
+//!    delivery — that the table's stream carries exactly one record per
+//!    item, never two.
+//! 6. `a_participant_leader_kill_racing_a_tokened_transaction_never_falsely_
+//!    cancels` — `TxnAbortReason::is_ambiguous`'s own reason for existing: the
+//!    transaction's *server-side* `cp_txn` call itself hits a genuine
+//!    "CP group leader moved during participant stage; retry" (a participant
+//!    tablet's leader killed mid-transaction), not merely a client-observed
+//!    ambiguity. Asserts `run_transact`'s bounded internal retry converges to
+//!    a real 200 (not a false `TransactionCanceledException`) and the
+//!    idempotency record never passes through a `CANCELLED` state a
+//!    same-token retry could have observed.
 //!
 //! Real TCP/time → polls with generous timeouts, never a fixed sleep.
 
@@ -466,5 +484,370 @@ async fn the_internal_table_is_invisible_and_unreachable() {
 
     for node in &nodes {
         node.shutdown_graceful().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (5) Exactly-once under a killed-connection ambiguous ack, same-token
+//     retry — issue #298's "deep shape A" residual, closed.
+// ---------------------------------------------------------------------------
+
+/// `CreateTable` with a stream enabled (`NEW_AND_OLD_IMAGES`), returning the
+/// stream's ARN — the one scenario in this suite that needs to assert
+/// exactly-once **stream** delivery (a double execution of the identical
+/// transaction would show up as two records for the same key, not as a data
+/// anomaly a plain `GetItem` would ever catch, since a repeated `PutItem` of
+/// the same item is naturally idempotent on the data itself).
+async fn create_streamed_table(dynamo_addr: SocketAddr, table: &str) -> String {
+    let (status, body) = dynamo(
+        dynamo_addr,
+        "DynamoDB_20120810.CreateTable",
+        &format!(
+            r#"{{"TableName":"{table}",
+                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
+                "StreamSpecification":{{"StreamEnabled":true,
+                    "StreamViewType":"NEW_AND_OLD_IMAGES"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable({table}) failed: {body}");
+    let label = raw_field(&body, "LatestStreamLabel");
+    format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{label}")
+}
+
+/// A raw (nesting-agnostic) string-field extraction — mirrors
+/// `streams_e2e.rs`'s own `field` helper; kept local here rather than shared
+/// since this is the only place in this suite that needs it.
+fn raw_field(body: &str, name: &str) -> String {
+    let needle = format!("\"{name}\":\"");
+    let start = body
+        .find(&needle)
+        .unwrap_or_else(|| panic!("field `{name}` not found in: {body}"))
+        + needle.len();
+    let end = body[start..].find('"').expect("closing quote") + start;
+    body[start..end].to_owned()
+}
+
+/// Send a DynamoDB request, flush it fully to the server, then abandon the
+/// connection **without ever reading a response**. Models a real client's
+/// "ambiguous ack" (a killed connection, a client-side timeout that gives up
+/// before the response arrives): the request has been durably transmitted
+/// and the server may commit it in full — whether it did is now something
+/// only the server knows, exactly what a same-`ClientRequestToken` retry
+/// exists to resolve safely.
+async fn dynamo_fire_and_abandon(addr: SocketAddr, target: &str, body: &str) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
+    let request = format!(
+        "POST / HTTP/1.1\r\n\
+         Host: animus\r\n\
+         X-Amz-Target: {target}\r\n\
+         Content-Type: application/x-amz-json-1.0\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len(),
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send request");
+    stream.flush().await.expect("flush");
+    // Deliberately drop `stream` here, unread — see this function's own doc.
+}
+
+/// Whether `id` currently exists in `table`, via a strongly-consistent
+/// `GetItem`.
+async fn item_exists(dynamo_addr: SocketAddr, table: &str, id: &str) -> bool {
+    let (status, body) = dynamo(
+        dynamo_addr,
+        "DynamoDB_20120810.GetItem",
+        &format!(
+            r#"{{"ConsistentRead":true,"TableName":"{table}","Key":{{"id":{{"S":"{id}"}}}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "GetItem({id}) failed: {body}");
+    let v: Value = serde_json::from_str(&body).expect("valid JSON GetItem response");
+    !v["Item"].is_null()
+}
+
+/// Every `dynamodb.Keys.id.S` value across a fully-drained stream shard,
+/// starting at `TRIM_HORIZON` — used to prove exactly-once delivery (a
+/// duplicate execution of the same transaction shows up as a repeated key
+/// here, never as a data-level anomaly).
+async fn drain_shard0_keys(dynamo_addr: SocketAddr, stream_arn: &str) -> Vec<String> {
+    let (status, body) = dynamo(
+        dynamo_addr,
+        "DynamoDBStreams_20120810.DescribeStream",
+        &format!(r#"{{"StreamArn":"{stream_arn}"}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeStream failed: {body}");
+    let v: Value = serde_json::from_str(&body).expect("valid JSON DescribeStream response");
+    let shard_id = v["StreamDescription"]["Shards"][0]["ShardId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no shard in DescribeStream response: {body}"))
+        .to_owned();
+
+    let (status, body) = dynamo(
+        dynamo_addr,
+        "DynamoDBStreams_20120810.GetShardIterator",
+        &format!(
+            r#"{{"StreamArn":"{stream_arn}","ShardId":"{shard_id}","ShardIteratorType":"TRIM_HORIZON"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "GetShardIterator failed: {body}");
+    let v: Value = serde_json::from_str(&body).expect("valid JSON GetShardIterator response");
+    let mut iterator = v["ShardIterator"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no ShardIterator in: {body}"))
+        .to_owned();
+
+    let mut keys = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (status, body) = dynamo(
+            dynamo_addr,
+            "DynamoDBStreams_20120810.GetRecords",
+            &format!(r#"{{"ShardIterator":"{iterator}"}}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "GetRecords failed: {body}");
+        let v: Value = serde_json::from_str(&body).expect("valid JSON GetRecords response");
+        let records = v["Records"].as_array().cloned().unwrap_or_default();
+        for r in &records {
+            if let Some(k) = r["dynamodb"]["Keys"]["id"]["S"].as_str() {
+                keys.push(k.to_owned());
+            }
+        }
+        match v["NextShardIterator"].as_str() {
+            Some(next) if tokio::time::Instant::now() < deadline => {
+                iterator = next.to_owned();
+                if records.is_empty() {
+                    sleep(Duration::from_millis(150)).await;
+                }
+            }
+            _ => break,
+        }
+    }
+    keys
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn same_token_retry_after_a_killed_connection_is_exactly_once_including_the_stream() {
+    let n = 2;
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(n, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let addr = config.nodes[0].dynamo;
+
+    let stream_arn = create_streamed_table(addr, "killedconn1").await;
+
+    let token = "killed-conn-token";
+    let body = format!(
+        r#"{{"ClientRequestToken":"{token}",
+            "TransactItems":[
+                {{"Put":{{"TableName":"killedconn1","Item":{{"id":{{"S":"p1"}}}}}}}},
+                {{"Put":{{"TableName":"killedconn1","Item":{{"id":{{"S":"p2"}}}}}}}}]}}"#
+    );
+
+    // Attempt 1: fire the request, then abandon the connection before ever
+    // reading a response — the server may commit successfully with the
+    // client never learning it (the literal "ambiguous ack" a client-side
+    // timeout or a killed connection produces).
+    dynamo_fire_and_abandon(addr, "DynamoDB_20120810.TransactWriteItems", &body).await;
+
+    // Poll (converged-or-timeout, never a fixed sleep) until the abandoned
+    // attempt's own write actually lands.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if item_exists(addr, "killedconn1", "p1").await {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the abandoned attempt's own write never landed within 20s");
+
+    // Attempt 2: retry the byte-identical request (same token) over a fresh
+    // connection, exactly as a real client does after a timeout. Must be a
+    // cached no-op success, never a second, independent execution racing
+    // the first's own already-committed write. **Tolerate a transient
+    // `TransactionInProgressException`**: the data landing (just polled
+    // above) and `run_transact`'s own best-effort idempotency-record outcome
+    // update (`PENDING` → `COMMITTED`) are two separate, sequential writes —
+    // a retry can legitimately land in the narrow window between them, and
+    // a real client's own SDK retry policy already handles exactly this
+    // documented, retryable exception (see `dynamo.rs::run_transact`'s doc).
+    let (status, resp) = timeout(Duration::from_secs(10), async {
+        loop {
+            let (status, resp) = dynamo(addr, "DynamoDB_20120810.TransactWriteItems", &body).await;
+            if status != 400 || !resp.contains("TransactionInProgressException") {
+                return (status, resp);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the same-token retry never left TransactionInProgressException within 10s");
+    assert_eq!(
+        status, 200,
+        "same-token retry after a killed connection: {resp}"
+    );
+
+    assert!(item_exists(addr, "killedconn1", "p1").await);
+    assert!(item_exists(addr, "killedconn1", "p2").await);
+
+    // Exactly-once on the STREAM — the residual's own literal symptom
+    // (issue #298's "delivered over expected" over-delivery) was a
+    // duplicate record for one member of a transactional pair; a data-only
+    // check above cannot catch that (a repeated `PutItem` of the identical
+    // item is indistinguishable from itself), the record count can.
+    let keys = drain_shard0_keys(addr, &stream_arn).await;
+    let p1_count = keys.iter().filter(|k| *k == "p1").count();
+    let p2_count = keys.iter().filter(|k| *k == "p2").count();
+    assert_eq!(
+        p1_count, 1,
+        "p1 must be delivered exactly once, got keys: {keys:?}"
+    );
+    assert_eq!(
+        p2_count, 1,
+        "p2 must be delivered exactly once, got keys: {keys:?}"
+    );
+
+    for node in &nodes {
+        node.shutdown_graceful().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (6) A genuinely ambiguous SERVER-side `cp_txn` outcome (a participant
+//     tablet's leader killed immediately before the request) must never
+//     surface as a false cancellation, and must never leave the idempotency
+//     record in a state a same-token retry could observe incorrectly.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_participant_leader_kill_racing_a_tokened_transaction_never_falsely_cancels() {
+    let n = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(n, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let addr0 = config.nodes[0].dynamo;
+
+    // Two separate (single-tablet) tables, so a transaction touching one item
+    // on each is a genuine anchor+participant 2PC, not a single-group write —
+    // `TxnAbortReason::Other`'s ambiguous ("; retry"-suffixed) shapes this
+    // amendment targets (a leader move mid participant-stage, or no leader
+    // reachable at all) only arise on the participant hop.
+    create_table(addr0, "atab1").await;
+    let stream_arn = create_streamed_table(addr0, "ptab1").await;
+
+    // The participant table's own tablet leader — kill it, then IMMEDIATELY
+    // (no wait) issue a token-bearing transaction touching both tables from
+    // a surviving node. Whichever internal shape this takes (`cp_forward`'s
+    // own hinted retry absorbing the blip entirely, or `run_transact`'s
+    // bounded internal retry over a genuinely ambiguous `cp_txn` outcome —
+    // see that function's own doc), the client-observable contract must
+    // hold: eventual success, never a spurious cancellation, and the
+    // idempotency record never stuck in a state a same-token retry
+    // interprets as "this definitely did not happen."
+    let tablet = timeout(Duration::from_secs(20), async {
+        loop {
+            for node in &nodes {
+                if let Some((tablet, _)) = node.metadata().tablets_for_table("ptab1").next() {
+                    return tablet.0;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("ptab1's own tablet never appeared in metadata within 20s");
+    let leader_idx = await_tablet_leader_index(&config, tablet).await;
+    nodes[leader_idx].shutdown_graceful().await;
+    let surviving: Vec<SocketAddr> = config
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != leader_idx)
+        .map(|(_, a)| a.dynamo)
+        .collect();
+    assert!(surviving.len() >= 2, "at least two nodes must survive");
+
+    let token = "participant-kill-token";
+    let body = format!(
+        r#"{{"ClientRequestToken":"{token}",
+            "TransactItems":[
+                {{"Put":{{"TableName":"atab1","Item":{{"id":{{"S":"a"}}}}}}}},
+                {{"Put":{{"TableName":"ptab1","Item":{{"id":{{"S":"b"}}}}}}}}]}}"#
+    );
+
+    // Issued immediately, no settling delay — the point is to race the
+    // election, not wait it out first. Bounded by a generous deadline
+    // (covering `cp_forward`'s own `CLIENT_TIMEOUT` plus `run_transact`'s
+    // own, should both layers need to retry) and, critically, never
+    // accepting a `TransactionCanceledException` as tolerable — the whole
+    // point of this regression is that a genuinely ambiguous outcome must
+    // never present to the client as a definite cancellation.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let final_status_body = loop {
+        let (status, resp) =
+            dynamo(surviving[0], "DynamoDB_20120810.TransactWriteItems", &body).await;
+        if status == 200 {
+            break (status, resp);
+        }
+        assert!(
+            !resp.contains("TransactionCanceledException"),
+            "a genuinely ambiguous cp_txn outcome must never present as a \
+             definite cancellation to the client: {resp}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "transaction never converged to success within 45s: status {status}, body {resp}"
+        );
+        sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(final_status_body.0, 200);
+
+    assert!(item_exists(surviving[0], "atab1", "a").await);
+    assert!(item_exists(surviving[0], "ptab1", "b").await);
+
+    // A same-token retry, now that the dust has settled, must be the cached
+    // success — never a re-run, and never a `TransactionInProgressException`
+    // stuck past this point (the idempotency record must have reached a
+    // real terminal outcome, not stayed `PENDING` forever).
+    let (status, resp) = timeout(Duration::from_secs(20), async {
+        loop {
+            let (status, resp) =
+                dynamo(surviving[0], "DynamoDB_20120810.TransactWriteItems", &body).await;
+            if status != 400 || !resp.contains("TransactionInProgressException") {
+                return (status, resp);
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the post-settle same-token retry never left TransactionInProgressException");
+    assert_eq!(status, 200, "post-settle same-token retry: {resp}");
+
+    // Exactly-once on the stream — a duplicate execution (the anchor
+    // succeeding twice under two different `txn_id`s, the exact "deep shape
+    // A" mechanism this amendment closes) would show up as two `b` records.
+    let keys = drain_shard0_keys(surviving[0], &stream_arn).await;
+    let b_count = keys.iter().filter(|k| *k == "b").count();
+    assert_eq!(
+        b_count, 1,
+        "the participant item must be delivered exactly once, got keys: {keys:?}"
+    );
+
+    for (i, node) in nodes.iter().enumerate() {
+        if i != leader_idx {
+            node.shutdown_graceful().await;
+        }
     }
 }
