@@ -4094,6 +4094,7 @@ mod stream_sealer_tests {
                 None,
                 crate::config::SplitMode::default(),
                 crate::BackupStoreConfig::default(),
+                crate::pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
             )
             .await
             .expect("bring up single node with streams + quiescence");

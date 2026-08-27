@@ -4287,6 +4287,7 @@ impl BoundNode {
             None,
             SplitMode::default(),
             BackupStoreConfig::default(),
+            pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
         )
         .await
     }
@@ -4331,6 +4332,16 @@ impl BoundNode {
     /// cluster|fs:PATH` CLI flag threads through here. **Plumbing only**
     /// (ADR 0059 Train 1 PR②) — nothing yet reads or writes through the
     /// resulting handle.
+    ///
+    /// `pitr_snapshot_cadence` (ADR 0059 §9/§10, Train 3) is `pitr_janitor::
+    /// pitr_snapshot_loop`'s own periodic-base-snapshot interval —
+    /// `pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE` (6 hours; every caller
+    /// above this layer) is the production default, the identical
+    /// "no CLI knob yet" shape that module's own doc already names. A test
+    /// that needs a PITR base snapshot to actually exist within its own
+    /// budget (`RestoreTableToPointInTime`'s own e2e coverage) calls
+    /// [`run_node_with_streams_and_pitr_snapshot_cadence`] instead of
+    /// waiting out six hours.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_growth(
         self,
@@ -4354,6 +4365,7 @@ impl BoundNode {
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         split_mode: SplitMode,
         backup_store_config: BackupStoreConfig,
+        pitr_snapshot_cadence: Duration,
     ) -> std::io::Result<Node> {
         self.env.set_peers(peers.clone());
         // The initial (static) peer book + an env clone, kept for the
@@ -4837,7 +4849,7 @@ impl BoundNode {
         // `pitr_janitor.rs`'s own doc) — spawned unconditionally here.
         tasks.push(tokio::spawn(pitr_janitor::pitr_snapshot_loop(
             ctx.clone(),
-            pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+            pitr_snapshot_cadence,
         )));
         tasks.push(tokio::spawn(pitr_janitor::pitr_janitor_loop(
             ctx.clone(),
@@ -15541,6 +15553,7 @@ async fn start_cluster_inner(
                 dynamo_auth.clone(),
                 split_mode,
                 backup_store_config.clone(),
+                pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
             )
             .await?;
         nodes.push(node);
@@ -15917,6 +15930,49 @@ pub async fn run_node_with_streams_and_quiesce_after(
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         SplitMode::default(),
         BackupStoreConfig::default(),
+        pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+    )
+    .await
+}
+
+/// Like [`run_node_with_streams`], but with an explicit **PITR periodic
+/// base-snapshot cadence** (ADR 0059 §9/§10, Train 3) instead of
+/// [`pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE`] (6 hours) — the same
+/// "widen the innermost layer, mint a thin test-facing wrapper" convention
+/// `quiesce_after`/`ttl_sweep_interval` already established. A
+/// `RestoreTableToPointInTime` end-to-end test needs at least one PITR base
+/// snapshot to actually exist within its own budget (this codebase's own
+/// testing discipline: never wait out a real 6-hour production cadence) —
+/// calls this directly with a millisecond-scale duration instead.
+///
+/// # Errors
+/// As [`run_node_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    pitr_snapshot_cadence: Duration,
+) -> std::io::Result<Node> {
+    run_node_with_streams_quiesce_and_ttl_sweep_interval(
+        config,
+        index,
+        dir,
+        backend,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        Duration::ZERO,
+        ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        SplitMode::default(),
+        BackupStoreConfig::default(),
+        pitr_snapshot_cadence,
     )
     .await
 }
@@ -15963,6 +16019,7 @@ pub async fn run_node_with_streams_quiesce_and_split_mode(
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         split_mode,
         backup_store_config,
+        pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
     )
     .await
 }
@@ -15993,6 +16050,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     ttl_sweep_interval: Duration,
     split_mode: SplitMode,
     backup_store_config: BackupStoreConfig,
+    pitr_snapshot_cadence: Duration,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -16047,6 +16105,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             dynamo_auth,
             split_mode,
             backup_store_config,
+            pitr_snapshot_cadence,
         )
         .await
 }
@@ -16081,6 +16140,7 @@ pub async fn run_node_with_ttl_sweep_interval(
         ttl_sweep_interval,
         SplitMode::default(),
         BackupStoreConfig::default(),
+        pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
     )
     .await
 }

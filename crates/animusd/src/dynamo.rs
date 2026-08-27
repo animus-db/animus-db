@@ -2012,6 +2012,17 @@ async fn restore_table_to_point_in_time(
     let floor_ms = now_ms.saturating_sub(retention_ms);
     let earliest_ms = window.earliest_ms.max(floor_ms);
     let latest_ms = window.latest_ms.max(earliest_ms);
+    // `RestoreDateTime` is truncated to the whole second below, so the
+    // floor it's checked against must be too — comparing a second-
+    // granular `T` against a millisecond-precise `earliest_ms` would
+    // reject a `T` naming the very same wall-clock second PITR was
+    // enabled in purely because enabling didn't happen to land on that
+    // second's own first millisecond (found while building this test's
+    // own e2e coverage, which enables PITR and writes/seals within a
+    // single real second under tiny test knobs — a real, if rare,
+    // deployment case too: a restore request landing in the enable
+    // second itself).
+    let earliest_floor_ms = (earliest_ms / 1000) * 1000;
 
     let cutoff_ms = if use_latest_restorable_time {
         latest_ms
@@ -2020,7 +2031,7 @@ async fn restore_table_to_point_in_time(
         // Truncate to the whole second — AWS's own `RestoreDateTime`
         // granularity (ADR 0059 §10's own opening line).
         let t_ms = (precise_ms / 1000) * 1000;
-        if t_ms < earliest_ms || t_ms > latest_ms {
+        if t_ms < earliest_floor_ms || t_ms > latest_ms {
             return Err(WireError {
                 code: "InvalidRestoreTimeException",
                 message: format!(
