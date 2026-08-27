@@ -1038,10 +1038,16 @@ impl CpGroup {
 
         let mut pending_views = Vec::with_capacity(pending.len());
         for (txn_id, (record_key, created_ts)) in pending {
+            // Best-effort admin diagnostic only — collapsing "not served"
+            // and "genuinely no record" (`flatten`) is fine here, unlike
+            // `ClientCtx::txn_recover`'s own use of this same primitive,
+            // which must keep the two distinguishable (see
+            // `RaftKvNode::txn_record_view`'s doc, issue #298 shape B fix).
             let view: Option<TxnRecordView> = match self {
                 CpGroup::Lsm(n) => n.txn_record_view(&record_key).await,
                 CpGroup::Mem(n) => n.txn_record_view(&record_key).await,
-            };
+            }
+            .flatten();
             let intent_spans = view.map(|v| {
                 v.intent_spans
                     .iter()
@@ -1317,8 +1323,12 @@ impl CpGroup {
     }
 
     /// **Recovery view of a record** (status + intent_spans + created_ts).
-    /// See [`RaftKvNode::txn_record_view`].
-    async fn txn_record_view(&self, record_key: &[u8]) -> Option<animus_cp_data::TxnRecordView> {
+    /// See [`RaftKvNode::txn_record_view`] — outer `None` = not served,
+    /// `Some(None)` = definitively no record, `Some(Some(view))` = found.
+    async fn txn_record_view(
+        &self,
+        record_key: &[u8],
+    ) -> Option<Option<animus_cp_data::TxnRecordView>> {
         match self {
             CpGroup::Lsm(n) => n.txn_record_view(record_key).await,
             CpGroup::Mem(n) => n.txn_record_view(record_key).await,
@@ -2739,11 +2749,13 @@ pub enum ClientResponse {
     /// current (possibly still-`Pending`) status.
     TxnStatusReply { status: TxnDecisionStatus },
     /// Reply to [`TxnRecordView`](ClientRequest::TxnRecordView) (ADR 0018
-    /// §2/PR5).
+    /// §2/PR5). `None` means the answering leader's own read barrier
+    /// confirmed **definitively no record** at this key — distinct from a
+    /// `ClientResponse::Error` reply, which means the query could not be
+    /// served at all (issue #298 shape B fix: the caller must never treat
+    /// the two as interchangeable, see `RaftKvNode::txn_record_view`'s doc).
     TxnRecordViewReply {
-        status: TxnDecisionStatus,
-        intent_spans: Vec<(String, KeyRange)>,
-        created_ts: HlcTimestamp,
+        view: Option<animus_cp_data::TxnRecordView>,
     },
     /// Reply to [`TxnVerify`](ClientRequest::TxnVerify) (ADR 0018 §2/PR5):
     /// does the answering tablet still hold a live intent for the queried
@@ -9179,16 +9191,30 @@ impl ClientCtx {
     /// (`record_table`'s own tablet) — the recovery-view dual of
     /// [`txn_status`](Self::txn_status): also returns `intent_spans`/
     /// `created_ts`, everything [`txn_recover`](Self::txn_recover) needs.
+    ///
+    /// **`Result<Option<..>, String>`, not `Result<.., String>` (issue #298
+    /// shape B fix)**: `Ok(None)` means the answering leader's own read
+    /// barrier **definitively confirmed no record exists** at this key —
+    /// this is a real, trustworthy fact the orphan-record recovery path may
+    /// safely act on. `Err(_)` means the query could not be served at all
+    /// (routing failure, or the local leader's own barrier failing — see
+    /// `RaftKvNode::txn_record_view`'s doc) — an inconclusive "I don't know,"
+    /// never evidence of absence. Collapsing these two into one `Err`/`None`
+    /// bucket (the pre-fix shape) let `txn_recover`'s orphan branch treat a
+    /// merely-unreachable-right-now record identically to a genuinely
+    /// nonexistent one, incorrectly synthesizing an abort tombstone for a
+    /// transaction whose record (and live coordinator) was fine all along —
+    /// the exact sibling of this same fix's `all_staged`/`txn_verify` half.
     async fn txn_record_view(
         &self,
         record_table: &str,
         record_key: &[u8],
-    ) -> Result<animus_cp_data::TxnRecordView, String> {
+    ) -> Result<Option<animus_cp_data::TxnRecordView>, String> {
         match self.cp_route(record_table, record_key).await {
             CpRoute::Local(leader) => leader
                 .txn_record_view(record_key)
                 .await
-                .ok_or_else(|| "CP group leader moved, or no record yet; retry".to_string()),
+                .ok_or_else(|| "CP group leader moved during txn record view; retry".to_string()),
             CpRoute::Forward(addr) => {
                 let request = ClientRequest::TxnRecordView {
                     table: record_table.to_owned(),
@@ -9198,15 +9224,7 @@ impl ClientCtx {
                     .cp_forward(record_table, record_key, addr, request)
                     .await
                 {
-                    ClientResponse::TxnRecordViewReply {
-                        status,
-                        intent_spans,
-                        created_ts,
-                    } => Ok(animus_cp_data::TxnRecordView {
-                        status,
-                        intent_spans,
-                        created_ts,
-                    }),
+                    ClientResponse::TxnRecordViewReply { view } => Ok(view),
                     ClientResponse::Error(e) => Err(e),
                     other => Err(format!(
                         "unexpected reply to forwarded TxnRecordView: {other:?}"
@@ -9406,8 +9424,23 @@ impl ClientCtx {
         intent_ts_hint: Option<HlcTimestamp>,
     ) -> Result<TxnDecisionStatus, String> {
         let view = match self.txn_record_view(record_table, record_key).await {
-            Ok(view) => view,
-            Err(_) => {
+            Ok(Some(view)) => view,
+            // ADR 0018 §2/PR5 correctness amendment (issue #298 shape B, the
+            // `txn_record_view` sibling of the `txn_verify` fix below): an
+            // `Err` here means the query itself could not be served (a
+            // routing failure, or this replica's own read barrier failing —
+            // e.g. mid-fork/cutover, exactly what a high split cadence
+            // produces routinely) — it is UNKNOWN whether a record exists,
+            // never evidence that it doesn't. Only `Ok(None)` — the
+            // answering leader's own barrier-confirmed, definitive "no
+            // record at this key" — may ever feed the orphan-abort logic
+            // below. Treating an `Err` identically used to let a transient
+            // routing hiccup synthesize an abort tombstone for a
+            // transaction whose record was fine and simply unreachable by
+            // *this* particular query attempt — permanently losing an
+            // already-staged (or already-committed) write.
+            Err(_) => return Ok(TxnDecisionStatus::Pending),
+            Ok(None) => {
                 // Step 1b: no record at all. Without a substitute clock we
                 // cannot tell "genuinely stale" from "the anchor's stage is
                 // simply still in flight" — decline rather than guess.
@@ -9443,7 +9476,7 @@ impl ClientCtx {
                 // `cp_get_local_resolving`) still finishes its own read
                 // off the returned status regardless of whether this
                 // fan-out resolve runs.
-                if let Ok(final_view) = self.txn_record_view(record_table, record_key).await {
+                if let Ok(Some(final_view)) = self.txn_record_view(record_table, record_key).await {
                     self.recovery_resolve(
                         txn_id.clone(),
                         record_key.to_vec(),
@@ -9485,12 +9518,51 @@ impl ClientCtx {
             return Ok(TxnDecisionStatus::Pending);
         }
 
+        // ADR 0018 §2/PR5 correctness amendment (issue #298 shape B): a
+        // `txn_verify` `Err` is a transient routing failure (most commonly
+        // "no CP group leader reachable" while a participant's tablet is
+        // mid-fork/cutover) — it means "could not verify," never "verified
+        // absent." Folding it into the same bucket as a genuine `Ok(false)`
+        // used to let recovery decide **Abort** for a transaction whose
+        // coordinator (`cp_txn`) is concurrently committing (or has already
+        // committed) from its own, unaffected view — losing an already-acked
+        // write. Only a span that is either affirmatively verified staged
+        // (`Ok(true)`) or affirmatively verified NOT staged (`Ok(false)`) may
+        // ever feed a decision; any `Err` makes the whole push inconclusive
+        // and this call **declines** (returns `Pending`, proposing nothing)
+        // instead of guessing — the identical "never fabricate a fact this
+        // call didn't actually observe" discipline `recovery_resolve`'s own
+        // doc already holds callers to for `intent_spans`.
         let mut all_staged = true;
+        let mut inconclusive = false;
         for (table, span) in &view.intent_spans {
             match self.txn_verify(table, span, txn_id).await {
                 Ok(true) => {}
-                Ok(false) | Err(_) => all_staged = false,
+                Ok(false) => all_staged = false,
+                Err(_) => inconclusive = true,
             }
+        }
+        if inconclusive {
+            // Metered (never logged at more than debug — an in-flight split
+            // routinely produces a handful of these, not worth `warn!`
+            // volume on its own) so an operator can see how often recovery
+            // is going inconclusive; `txn_resolver_loop`'s own grace tracker
+            // is what escalates a **stuck** case (this call declining on
+            // every tick for the same txn_id well past `RECOVERY_GRACE`) to
+            // a `warn!` + a distinct metric.
+            if let Some(data) = self.data.as_ref() {
+                data.raftkv_metrics
+                    .incr(Metric::CpTxnRecoveryVerifyInconclusive);
+            }
+            tracing::debug!(
+                ?txn_id,
+                record_table,
+                ?record_key,
+                "txn_recover: at least one participant's txn_verify errored (transient routing \
+                 failure, e.g. mid-fork/cutover) — declining rather than risking a wrong Abort \
+                 against a possibly still-live coordinator; retried next sweep"
+            );
+            return Ok(TxnDecisionStatus::Pending);
         }
 
         let candidate = view.created_ts;
@@ -11675,14 +11747,9 @@ impl ClientCtx {
                     return self.not_leader_refusal(tablet);
                 };
                 match leader.txn_record_view(&record_key).await {
-                    Some(view) => ClientResponse::TxnRecordViewReply {
-                        status: view.status,
-                        intent_spans: view.intent_spans,
-                        created_ts: view.created_ts,
-                    },
+                    Some(view) => ClientResponse::TxnRecordViewReply { view },
                     None => ClientResponse::Error(
-                        "CP group leader moved, or no record yet, during record view query; retry"
-                            .into(),
+                        "CP group leader moved during record view query; retry".into(),
                     ),
                 }
             }
@@ -13152,6 +13219,18 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
 /// source for a background loop none of its siblings use either.
 const TXN_RESOLVER_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a record may stay `Pending` (measured from its own
+/// `created_ts`, past `RECOVERY_GRACE`'s own initial window) before
+/// `txn_resolver_loop` treats it as **stuck** and logs+meters once (issue
+/// #298 shape B fix) — a generous multiple of `RECOVERY_GRACE` so ordinary
+/// grace-window/occasional-inconclusive-verify Pending never trips it: only
+/// a record that has been declining a decision (via `txn_recover`'s own
+/// "an `Err` from `txn_verify` is never evidence of not-staged" discipline)
+/// tick after tick for this long is worth an operator's attention. Purely a
+/// liveness signal — correctness never depends on this firing, or on how
+/// long it takes to.
+const RECOVERY_STUCK_GRACE: Duration = Duration::from_secs(30);
+
 /// The **intent-resolver background task** (ADR 0018 §2/PR5) — what makes a
 /// crashed coordinator harmless (the Decision section's Recovery bullet)
 /// and lets [`ClientCtx::cp_txn`]'s successful-commit resolve be async/
@@ -13164,8 +13243,46 @@ const TXN_RESOLVER_INTERVAL: Duration = Duration::from_secs(1);
 /// ([`RaftKvNode::unresolved_decided`]). Errors are logged and swallowed —
 /// this is a best-effort background sweep; the next tick retries.
 async fn txn_resolver_loop(ctx: ClientCtx) {
+    // Driver-local grace tracker for `unresolved_decided()` entries whose
+    // `txn_record_view` lookup fails (issue #298 residuals) — same
+    // ownership/bounding discipline as `index_drain::change_consumer_loop`'s
+    // `first_hot_seen`/`marker_bytes_seen`: per-driver, in-memory only,
+    // pruned every tick against whatever `unresolved_decided()` actually
+    // reported this tick (never against a fixed universe, since a stuck
+    // entry's own tablet may itself retire while it's being tracked — the
+    // exact shape this exists for). Keyed by `TxnId` rather than
+    // `(tablet, TxnId)`: `unresolved_decided()` is already scoped to one
+    // `group`/tablet per call, and a `TxnId` never legitimately appears
+    // `Pending`/decided-unresolved on two different tablets' anchors at
+    // once, so the flat key is unambiguous and survives a same-node
+    // re-host under a different tablet id across a split with no special
+    // case. `first_seen` is milliseconds off whichever led group's own
+    // `Env::now()` first observed the failure — not wall-clock-comparable
+    // across nodes, but this map never leaves this node, so that's fine.
+    let mut unresolved_first_seen: BTreeMap<TxnId, u64> = BTreeMap::new();
+    // Entries already past grace for which this loop has already logged +
+    // metered the "giving up on background resolution for now" signal —
+    // separate from `unresolved_first_seen` so that signal fires exactly
+    // once per stuck episode instead of every tick thereafter.
+    let mut unresolved_stuck_warned: BTreeSet<TxnId> = BTreeSet::new();
+    // Stuck-recovery grace tracker (issue #298 shape B fix): `txn_id`s this
+    // loop has already logged+metered as stuck past `RECOVERY_STUCK_GRACE`
+    // — mirrors the driver-local, tick-pruned memo discipline
+    // `index_drain::change_consumer_loop`'s own `first_hot_seen`/
+    // `marker_bytes_seen` use (and the identical shape a sibling
+    // `unresolved_decided`-lookup-failure tracker uses for the same reason:
+    // fire the signal exactly once per stuck episode, not every tick
+    // thereafter). Pruned every tick against whatever `pending_txns()`
+    // actually reports, so a txn that finally decides (or whose tablet
+    // moves off this node) drops out with no explicit cleanup needed.
+    let mut stuck_recovery_warned: BTreeSet<TxnId> = BTreeSet::new();
     loop {
         tokio::time::sleep(TXN_RESOLVER_INTERVAL).await;
+        // Every `TxnId` `unresolved_decided()` reports this tick, across
+        // every hosted group — the live set the two maps above are pruned
+        // against once the tick's tablet loop below finishes.
+        let mut unresolved_seen_this_tick: BTreeSet<TxnId> = BTreeSet::new();
+        let mut pending_seen_this_tick: BTreeSet<TxnId> = BTreeSet::new();
         for (tablet, group) in ctx.edge.hosted_groups() {
             if !group.is_leader() {
                 continue;
@@ -13189,6 +13306,7 @@ async fn txn_resolver_loop(ctx: ClientCtx) {
             };
 
             for (txn_id, (record_key, created_ts)) in group.pending_txns() {
+                pending_seen_this_tick.insert(txn_id.clone());
                 // `created_ts` as the orphan-path hint (issue #298): passing
                 // `None` here rested on "`pending_txns` only ever tracks a
                 // genuine, locally-anchored `Pending` record, so
@@ -13213,26 +13331,115 @@ async fn txn_resolver_loop(ctx: ClientCtx) {
                 // gives the existing, already-reviewed orphan-abort
                 // fallback a real timestamp to bound its grace period by
                 // when it doesn't.
-                if let Err(e) = ctx
+                match ctx
                     .txn_recover(&table, &record_key, &txn_id, Some(created_ts))
                     .await
                 {
-                    tracing::debug!(
-                        tablet = tablet.0,
-                        ?txn_id,
-                        error = %e,
-                        "txn_resolver_loop: recovery push failed this tick"
-                    );
+                    Ok(TxnDecisionStatus::Pending) => {
+                        // Still undecided after this tick's own attempt —
+                        // either genuinely within `RECOVERY_GRACE` (routine,
+                        // never worth a signal) or `txn_recover` declined on
+                        // an inconclusive `txn_verify` (also routine in
+                        // isolation — a single split/cutover blip). Only a
+                        // record that has been `Pending` this long past its
+                        // OWN creation is worth flagging, and only once.
+                        let now_ms = group.env().now().0 / 1_000_000;
+                        if now_ms.saturating_sub(created_ts.wall_ms)
+                            >= RECOVERY_STUCK_GRACE.as_millis() as u64
+                            && stuck_recovery_warned.insert(txn_id.clone())
+                        {
+                            tracing::warn!(
+                                tablet = tablet.0,
+                                ?txn_id,
+                                "txn_resolver_loop: recovery has been unable to reach a \
+                                 decision past RECOVERY_STUCK_GRACE (repeated inconclusive \
+                                 txn_verify, or a persistently unreachable participant) — \
+                                 correctness is unaffected (the record stays safely Pending, \
+                                 never wrongly decided); this is a liveness signal only"
+                            );
+                            if let Some(data) = ctx.data.as_ref() {
+                                data.raftkv_metrics
+                                    .incr(Metric::CpTxnRecoveryStuckInconclusive);
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        stuck_recovery_warned.remove(&txn_id);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            tablet = tablet.0,
+                            ?txn_id,
+                            error = %e,
+                            "txn_resolver_loop: recovery push failed this tick"
+                        );
+                    }
                 }
             }
             for (txn_id, (record_key, outcome)) in group.unresolved_decided() {
+                unresolved_seen_this_tick.insert(txn_id.clone());
                 // `unresolved_decided` only carries `(record_key, outcome)`
                 // — re-read the record's own `intent_spans` (every
                 // participant table this transaction touched) rather than
                 // guess it.
-                let Ok(view) = ctx.txn_record_view(&table, &record_key).await else {
-                    continue; // transient — retried next tick
+                let Ok(Some(view)) = ctx.txn_record_view(&table, &record_key).await else {
+                    // Lookup-failure fallback (issue #298 residuals): unlike
+                    // `pending_txns`'s orphan path above, there is no
+                    // decision left to make here — `outcome` is already
+                    // known (`Committed`/`Aborted`); a failed
+                    // `txn_record_view` only means `intent_spans` (which
+                    // keys/tables to actually resolve) is unreachable right
+                    // now, e.g. because the record's own tablet retired
+                    // mid-recovery (the same class of split-clone/trim
+                    // hazard `pending_txns`'s own comment names — a txn
+                    // record is an ordinary logical key of its anchor
+                    // tablet, so it rides the identical path every other
+                    // row does). Retrying forever on a permanent case would
+                    // burn a tick's work on every hosted group forever with
+                    // no bound and no signal — the exact silent-stall shape
+                    // this issue is about. So: track first-seen per
+                    // `txn_id`, keep quietly retrying (a transient failure —
+                    // a route flap, a not-yet-caught-up follower — should
+                    // still self-heal next tick), and once
+                    // `RECOVERY_GRACE` has passed with no success, log +
+                    // meter it once and move on. This never fabricates an
+                    // `intent_spans` list to resolve against, so it is
+                    // conservative by construction — it can only ever make
+                    // this loop STOP claiming background progress it isn't
+                    // making; it cannot mis-resolve anything. Correctness
+                    // for the stuck transaction's participants still comes
+                    // from the independent on-demand foreign-intent
+                    // read-path push (ADR 0018 §2/PR5 §3): any reader that
+                    // later hits one of its intents directly resolves it
+                    // right then, regardless of what this background loop
+                    // has given up on.
+                    let now_ms = group.env().now().0 / 1_000_000;
+                    let first_seen = *unresolved_first_seen
+                        .entry(txn_id.clone())
+                        .or_insert(now_ms);
+                    if now_ms.saturating_sub(first_seen)
+                        >= animus_cp_data::RECOVERY_GRACE.as_millis() as u64
+                        && unresolved_stuck_warned.insert(txn_id.clone())
+                    {
+                        tracing::warn!(
+                            tablet = tablet.0,
+                            ?txn_id,
+                            "txn_resolver_loop: unresolved_decided record has \
+                             been unreachable past RECOVERY_GRACE — giving up \
+                             on background resolution for now (no readable \
+                             intent_spans to act on); correctness is still \
+                             covered by the on-demand foreign-intent read-path \
+                             push (ADR 0018 §2/PR5 §3)"
+                        );
+                        if let Some(data) = ctx.data.as_ref() {
+                            data.raftkv_metrics
+                                .incr(Metric::CpTxnUnresolvedDecidedStuck);
+                        }
+                    }
+                    continue; // transient-or-parked — retried next tick regardless
                 };
+                unresolved_first_seen.remove(&txn_id);
+                unresolved_stuck_warned.remove(&txn_id);
                 ctx.recovery_resolve(
                     txn_id,
                     record_key,
@@ -13242,6 +13449,9 @@ async fn txn_resolver_loop(ctx: ClientCtx) {
                 .await;
             }
         }
+        unresolved_first_seen.retain(|id, _| unresolved_seen_this_tick.contains(id));
+        unresolved_stuck_warned.retain(|id| unresolved_seen_this_tick.contains(id));
+        stuck_recovery_warned.retain(|id| pending_seen_this_tick.contains(id));
         if let Some(data) = ctx.data.as_ref() {
             data.raftkv_metrics.incr(Metric::CpTxnResolverRuns);
         }
