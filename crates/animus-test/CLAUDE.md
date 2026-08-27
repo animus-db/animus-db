@@ -29,6 +29,7 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_STREAM_SEEDS=K` | 1 | K seed variants per DynamoDB Streams lineage-walk cell (ADR 0042/0043) |
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | K seed variants per secondary-index backfill fault-injection cell (ADR 0045) |
 | `ANIMUS_BACKUP_SEEDS=K` | 1 | K seed variants per on-demand backup capture + restore fault-injection cell (ADR 0059 Train 1/2) |
+| `ANIMUS_PITR_SEEDS=K` | 1 | K seed variants per PITR sealing fault-injection cell (ADR 0059 Train 3) |
 
 ## What's non-obvious
 
@@ -449,3 +450,66 @@ retrievable from git history.)
   `animusd/tests/dynamo_restore.rs`'s job. Depth knob `ANIMUS_BACKUP_SEEDS`
   (default 1 = the frozen cells; held green at `=100` for the restore cells,
   `=200` for the whole file, both in well under a second).
+
+### Elle-adjacent, but not Elle: the PITR sealing corpus (ADR 0059 §9, Train 3)
+
+- `pitr_fault_corpus.rs` — the identical layering fix `stream_lineage_
+  corpus.rs`/`backup_fault_corpus.rs` set for the fifth consumer arm
+  (`animusd::index_drain::pitr_tick`/`pitr_seal_now`), `animusd`-only: a
+  self-contained reimplementation of `pitr_seal_now`'s exact algorithm
+  directly over `RaftKvNode`, a bare `Metadata`, and `animus-sim`'s
+  `SimSegmentStore` (standing in for the backup store — both are the
+  identical `SegmentStore` trait, ADR 0059 §1). Verification is
+  decode-and-diff against an independently-tracked write journal
+  (`verify_pitr_lineage`), the PITR twin of `stream_lineage_corpus.rs`'s
+  `verify_lineage` — with one deliberate scoping difference: exactly-once
+  delivery is checked **within each tablet's own chain**, not globally
+  across a multi-tablet `lineage` array, since packed-HLC uniqueness is a
+  per-group guarantee only (no node-id bits, ADR 0018 §2) — two independent
+  sibling tablets can legitimately mint the identical packed value absent
+  production's real `SeedBatch` witnessing, which this corpus doesn't model
+  (sealing, not the split-build workflow, is what's under test here).
+- **Periodic base snapshots and the retention janitor's own loop plumbing
+  are deliberately NOT re-simulated end-to-end** — `animusd::pitr_janitor::
+  pitr_snapshot_loop` reuses Train 1's `BeginBackup`/capture-driver/
+  completion-aggregator machinery completely unmodified (already proven by
+  `backup_fault_corpus.rs`), so re-testing that path here would just be a
+  second, weaker copy of that corpus. What genuinely is new PITR logic —
+  the retention janitor's own **keep-anchor predicate** (never mark a
+  table's newest base-snapshot-at-or-before-the-floor for reclaim, since
+  every still-retained segment sealed after it needs it as a replay base)
+  — is reproduced verbatim from `animusd::pitr_janitor`'s own unit-tested
+  pure function and proven here under **randomized** interleavings of
+  base-snapshot/segment seal times, not just the janitor's own hand-picked
+  cases.
+- **Frozen named cells**: `quiet_table_pitr_rollover` (baseline seal +
+  content match), `idle_group_never_proposes_a_pitr_seal` (the quiescence
+  contract's structural half: nothing pending ⇒ no store `put`, no
+  propose), `kill_sealing_leader_pitr_converges` (a crash between the
+  store `put` and the catalog commit, then a leader failover, then the
+  idempotent retry re-seals the full backlog), `disable_then_reenable_
+  resets_generation_and_continues_epoch_chain` (a fresh generation, but the
+  SAME tablet's own epoch chain continues, never resets), `split_children_
+  seal_independently_and_inherit_generation` (a control-metadata-only
+  `BeginSplit`/`CutoverSplit` cutover; each child seals its own epoch 0
+  independently, inheriting PITR from the table spec with zero
+  special-casing since `table_pitr` is table- not tablet-scoped; the union
+  of parent-plus-children content covers the full journal with no
+  double-counting), `drop_table_then_segments_and_generation_floor_survive`
+  (the catalog's deliberate outlives-the-table override of the streams
+  retention-zero rule), and `retention_keep_anchor_never_orphans_a_needed_
+  replay_base` (the randomized keep-anchor property, above). Depth knob
+  `ANIMUS_PITR_SEEDS` (default 1 = the frozen cells; held green at `=300`
+  in ~1s release / well under a minute debug).
+- **A real modeling bug this corpus found on its own split scenario's
+  first run** (not a production bug — a test-harness one): the scenario
+  originally reused the PARENT's own `engines()` map for both split
+  children, giving parent and children the identical physical
+  `MemoryEngine` per node — sibling tablets share nothing in production
+  (ADR 0050 rung 1/2's whole point), so a child's own `pending_changes()`
+  scan silently saw the parent's pre-split records too, corrupting the
+  seal content. Fixed by giving each child its own fresh `engines()` map,
+  mirroring `stream_lineage_corpus.rs::scenario_copy_split_children_born_
+  empty`'s own (already-correct) three-separate-maps precedent, which this
+  file's first draft failed to copy faithfully. See `docs/engineering-
+  lessons.md` for the general lesson.

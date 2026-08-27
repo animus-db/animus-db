@@ -177,6 +177,18 @@ pub enum EntityKind {
     /// `BackupProgress`): a restore mints exactly one destination tablet, so
     /// `RestoreRow` carries everything a restore has to say.
     Restore,
+    /// A sealed PITR segment catalog row (`Metadata::pitr_segments`, ADR
+    /// 0059 §9, Train 3), keyed by the composite `(TabletId, epoch)` pair —
+    /// the identical fixed-width 16-byte shape [`StreamShard`](Self::StreamShard)
+    /// uses ([`pitr_segment_key`]). The value is the JSON-encoded
+    /// `PitrSegmentRow`, same convention as `StreamShard`/`Schema`/etc.
+    PitrSegment,
+    /// A tag row marking a [`Backup`](Self::Backup) row as a PITR base
+    /// snapshot (`Metadata::pitr_base_backups`, ADR 0059 §9), keyed by the
+    /// backup's own opaque `BackupId` string ([`pitr_base_backup_key`]). The
+    /// value is always empty (presence alone is the fact) — the identical
+    /// convention [`IndexBackfill`](Self::IndexBackfill) uses.
+    PitrBaseBackup,
 }
 
 impl EntityKind {
@@ -201,6 +213,8 @@ impl EntityKind {
             EntityKind::Backup => "backup",
             EntityKind::BackupProgress => "backup_progress",
             EntityKind::Restore => "restore",
+            EntityKind::PitrSegment => "pitr_segment",
+            EntityKind::PitrBaseBackup => "pitr_base_backup",
         }
     }
 
@@ -226,6 +240,8 @@ impl EntityKind {
             b"backup" => EntityKind::Backup,
             b"backup_progress" => EntityKind::BackupProgress,
             b"restore" => EntityKind::Restore,
+            b"pitr_segment" => EntityKind::PitrSegment,
+            b"pitr_base_backup" => EntityKind::PitrBaseBackup,
             _ => return None,
         })
     }
@@ -344,6 +360,41 @@ pub fn counter_key(name: &str) -> Vec<u8> {
     entity_key(EntityKind::Counter, name.as_bytes())
 }
 
+/// The [`EntityKind::Counter`] name prefix for a table's PITR generation
+/// allocator (`Metadata::pitr_generation`, ADR 0059 §9) — one counter per
+/// table name, unlike [`mirror::NEXT_TABLET_ID_COUNTER`](crate::mirror::NEXT_TABLET_ID_COUNTER)'s
+/// single fixed process-wide counter. Reusing [`EntityKind::Counter`]
+/// (rather than a dedicated `EntityKind`) avoids a whole new key/value
+/// shape for what is, physically, still "one named `u64` scalar" — the
+/// prefix is what tells [`pitr_generation_table`] apart from the fixed
+/// [`mirror::NEXT_TABLET_ID_COUNTER`](crate::mirror::NEXT_TABLET_ID_COUNTER)
+/// name.
+const PITR_GENERATION_COUNTER_PREFIX: &str = "pitr_gen:";
+
+/// This table's PITR generation counter's own [`EntityKind::Counter`] name
+/// (the `name` argument [`counter_key`]/`mirror::put_counter` expect) —
+/// callers that need the full encoded key use [`counter_key`] directly with
+/// this; `mirror::put_counter` takes the bare name.
+#[must_use]
+pub fn pitr_generation_counter_name(table: &str) -> String {
+    format!("{PITR_GENERATION_COUNTER_PREFIX}{table}")
+}
+
+/// A table's PITR generation counter key under [`EntityKind::Counter`].
+#[must_use]
+pub fn pitr_generation_key(table: &str) -> Vec<u8> {
+    counter_key(&pitr_generation_counter_name(table))
+}
+
+/// If `id` (an [`EntityKind::Counter`] id) is a PITR-generation counter's
+/// own id, the table name it counts for.
+#[must_use]
+pub fn pitr_generation_table(id: &[u8]) -> Option<&str> {
+    std::str::from_utf8(id)
+        .ok()?
+        .strip_prefix(PITR_GENERATION_COUNTER_PREFIX)
+}
+
 /// A [`NodeId`]'s key under [`EntityKind::CpMemberAddr`] (PR2, the legacy
 /// `Metadata::cp_member_addrs`/`cp_member_tablets` pair). See [`member_key`]'s
 /// doc for the ADR 0040 PR3 string-id encoding change.
@@ -384,6 +435,35 @@ pub fn decode_stream_shard_id(id: &[u8]) -> Option<(TabletId, u64)> {
     let tablet = u64::from_be_bytes(id[..8].try_into().expect("checked length"));
     let epoch = u64::from_be_bytes(id[8..].try_into().expect("checked length"));
     Some((TabletId(tablet), epoch))
+}
+
+/// A `(tablet, epoch)` pair's key under [`EntityKind::PitrSegment`] (ADR
+/// 0059 §9, Train 3) — the identical raw 16-byte fixed-width shape
+/// [`stream_shard_key`] uses.
+#[must_use]
+pub fn pitr_segment_key(tablet: TabletId, epoch: u64) -> Vec<u8> {
+    let mut id = Vec::with_capacity(16);
+    id.extend_from_slice(&tablet.0.to_be_bytes());
+    id.extend_from_slice(&epoch.to_be_bytes());
+    entity_key(EntityKind::PitrSegment, &id)
+}
+
+/// The inverse of [`pitr_segment_key`]'s id half — mirrors
+/// [`decode_stream_shard_id`] exactly.
+#[must_use]
+pub fn decode_pitr_segment_id(id: &[u8]) -> Option<(TabletId, u64)> {
+    if id.len() != 16 {
+        return None;
+    }
+    let tablet = u64::from_be_bytes(id[..8].try_into().expect("checked length"));
+    let epoch = u64::from_be_bytes(id[8..].try_into().expect("checked length"));
+    Some((TabletId(tablet), epoch))
+}
+
+/// A backup id's key under [`EntityKind::PitrBaseBackup`] (ADR 0059 §9).
+#[must_use]
+pub fn pitr_base_backup_key(backup_id: &str) -> Vec<u8> {
+    entity_key(EntityKind::PitrBaseBackup, backup_id.as_bytes())
 }
 
 /// A `(tablet, index name)` pair's key under [`EntityKind::IndexBackfill`]
@@ -530,7 +610,12 @@ pub fn decode_key(key: &[u8]) -> Option<DecodedKey> {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [EntityKind; 9] = [
+    // NOTE (found while adding `PitrSegment`/`PitrBaseBackup`, ADR 0059 §9):
+    // this list was already missing `SplitLineage`/`Backup`/`BackupProgress`/
+    // `Restore` — pre-existing drift from `EntityKind`'s real variant count,
+    // out of this change's scope to backfill (see `docs/engineering-
+    // lessons.md`). The two kinds this PR adds ARE included below.
+    const ALL_KINDS: [EntityKind; 11] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
@@ -540,6 +625,8 @@ mod tests {
         EntityKind::CpMemberAddr,
         EntityKind::StreamShard,
         EntityKind::IndexBackfill,
+        EntityKind::PitrSegment,
+        EntityKind::PitrBaseBackup,
     ];
 
     // --- reserved-name guard -------------------------------------------------
@@ -784,6 +871,50 @@ mod tests {
                 id: b"next_tablet_id".to_vec(),
             })
         );
+    }
+
+    #[test]
+    fn pitr_segment_key_round_trips() {
+        let key = pitr_segment_key(TabletId(7), 3);
+        let Some(DecodedKey::Entity { kind, id }) = decode_key(&key) else {
+            panic!("expected a decodable entity key");
+        };
+        assert_eq!(kind, EntityKind::PitrSegment);
+        assert_eq!(decode_pitr_segment_id(&id), Some((TabletId(7), 3)));
+    }
+
+    #[test]
+    fn pitr_segment_key_distinguishes_tablet_and_epoch() {
+        let a = pitr_segment_key(TabletId(7), 3);
+        let b = pitr_segment_key(TabletId(3), 7);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn pitr_base_backup_key_round_trips() {
+        let key = pitr_base_backup_key("backup-1");
+        assert_eq!(
+            decode_key(&key),
+            Some(DecodedKey::Entity {
+                kind: EntityKind::PitrBaseBackup,
+                id: b"backup-1".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn pitr_generation_key_round_trips_and_names_the_table() {
+        let key = pitr_generation_key("orders");
+        let Some(DecodedKey::Entity { kind, id }) = decode_key(&key) else {
+            panic!("expected a decodable entity key");
+        };
+        assert_eq!(kind, EntityKind::Counter);
+        assert_eq!(pitr_generation_table(&id), Some("orders"));
+    }
+
+    #[test]
+    fn pitr_generation_table_does_not_match_the_fixed_tablet_id_counter() {
+        assert_eq!(pitr_generation_table(b"next_tablet_id"), None);
     }
 
     #[test]

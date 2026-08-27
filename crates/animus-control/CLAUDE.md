@@ -486,6 +486,33 @@ per-tablet CP data plane (`animus-cp-data`).
   one-per-`RestoreTableFromBackup`-call, and never referenced again once
   terminal).
 
+- **PITR (ADR 0059 §9, Train 3): `UpdateContinuousBackups`/
+  `SealPitrSegment`/`ExpirePitrSegments`/`MarkBackupPitrBase`.** A fifth
+  consumer's own catalog, deliberately mirroring the backup/stream ones'
+  conventions rather than inventing new shapes: `TableSchema.pitr:
+  Option<PitrSpec>` (generation + enable wall-clock, the `SetTableStream`/
+  `SetTableTtl` schema-catalog class) toggled by `UpdateContinuousBackups`,
+  which mints a fresh `generation` from `Metadata::pitr_generation`'s own
+  never-rewound per-table counter (reusing `EntityKind::Counter` with a
+  `"pitr_gen:{table}"`-prefixed name rather than a new entity kind).
+  `Metadata::pitr_segments: BTreeMap<(TabletId, u64), PitrSegmentRow>`
+  mirrors `stream_shards` exactly (same tuple-key JSON codec workaround,
+  same first-committer-wins-on-content `SealPitrSegment`/two-phase
+  `ExpirePitrSegments` shape, same epoch-derivation-guard obligation on the
+  caller) but is a fully separate collection — a table's stream and its
+  PITR coverage never share a row or gate each other. **`Metadata::
+  pitr_base_backups: BTreeSet<BackupId>`, not a `BackupRow`/`BeginBackup`
+  field**: tags an already-`BeginBackup`'d row as a PITR base snapshot
+  without widening `MetaCommand::BeginBackup`'s own signature (which would
+  have touched every one of its ~30 existing construction sites) — see
+  `MetaCommand::MarkBackupPitrBase`'s own doc and the ADR's Train 3 PR①
+  as-built amendment for the self-healing-tag residual this trades for.
+  PITR segments/generation floor deliberately **survive**
+  `DropTableSchema`/`DropTableTablets`, the identical ADR 0024 carve-out
+  `backups` already gets — never gated on the source table's schema still
+  existing, an explicit override of the streams drop-table retention-zero
+  rule (ADR 0059 §9/§10).
+
 ## What's non-obvious
 
 - **The sync/driver split is deliberate.** All consensus logic is in the sync

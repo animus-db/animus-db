@@ -471,6 +471,95 @@ async fn update_time_to_live_on_a_follower_is_relayed_to_the_leader() {
     }
 }
 
+/// ADR 0059 §9 (Train 3)'s own instance of the `is_relayable_command`
+/// regression class this file exists for: `UpdateContinuousBackups` issued
+/// against a DynamoDB listener on a node that is **not** the control-plane
+/// leader must still commit — `MetaCommand::UpdateContinuousBackups` must be
+/// on the relay allowlist, or this times out on exactly this shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn update_continuous_backups_on_a_follower_is_relayed_to_the_leader() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(3, dir.path()).await;
+
+    let leader = nodes.iter().position(Node::is_control_leader).unwrap();
+    let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
+
+    let create = MetaCommand::CreateTableSchema {
+        table: "pitr_relay_t".into(),
+        schema: TableSchema::simple("id", ColumnType::String),
+    };
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let _ = call(
+                config.nodes[leader].intra,
+                ClientRequest::ProposeSchema(create.clone()),
+            )
+            .await;
+            if nodes[leader].metadata().has_table_schema("pitr_relay_t") {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("CreateTableSchema did not commit in 20s");
+
+    // The regression: `UpdateContinuousBackups`, issued against the
+    // FOLLOWER's own DynamoDB listener, must relay to the leader and
+    // replicate everywhere.
+    let follower_dynamo = config.nodes[follower].dynamo;
+    let (status, body) = timeout(Duration::from_secs(20), async {
+        loop {
+            let (status, body) = dynamo(
+                follower_dynamo,
+                "DynamoDB_20120810.UpdateContinuousBackups",
+                r#"{"TableName":"pitr_relay_t","PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true}}"#,
+            )
+            .await;
+            if status == 200 {
+                return (status, body);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("follower-issued UpdateContinuousBackups did not commit via relay in 20s");
+    assert_eq!(status, 200, "body: {body}");
+    assert!(
+        body.contains("\"PointInTimeRecoveryStatus\":\"ENABLED\""),
+        "{body}"
+    );
+
+    // It replicated to *every* node's own replicated catalog.
+    for (i, n) in nodes.iter().enumerate() {
+        assert_eq!(
+            n.metadata()
+                .table_pitr("pitr_relay_t")
+                .map(|s| s.generation),
+            Some(1),
+            "node {i}: PITR spec missing after follower-relayed UpdateContinuousBackups"
+        );
+    }
+
+    // `DescribeContinuousBackups` against the (different) follower reads the
+    // same committed spec back — a pure catalog read, no relay involved.
+    let (status, body) = dynamo(
+        follower_dynamo,
+        "DynamoDB_20120810.DescribeContinuousBackups",
+        r#"{"TableName":"pitr_relay_t"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "body: {body}");
+    assert!(
+        body.contains("\"PointInTimeRecoveryStatus\":\"ENABLED\""),
+        "{body}"
+    );
+
+    for n in &nodes {
+        n.shutdown_graceful().await;
+    }
+}
+
 /// ADR 0059 §3 (Train 1 PR④)'s own instance of this file's regression
 /// class: `DeleteBackup` issued against a DynamoDB listener on a node that
 /// is **not** the control-plane leader must still commit —

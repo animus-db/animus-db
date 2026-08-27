@@ -53,6 +53,7 @@ mod dynamo;
 mod dynamo_streams;
 mod http;
 mod index_backfill;
+mod pitr_janitor;
 mod segment_janitor;
 mod topology;
 mod ttl_reaper;
@@ -1875,6 +1876,15 @@ pub enum ClientRequest {
     /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
     /// only through the `Forwarded` arm.
     ForceSeal { tablet: u64 },
+    /// **The PITR force-seal RPC (ADR 0059 §9, Train 3)** — the PITR twin of
+    /// [`ForceSeal`](Self::ForceSeal), identical shape and identical
+    /// reasoning (addressed by `tablet` directly; bare delivery refused;
+    /// not a `MetaCommand`, so `is_relayable_command` does not apply; real
+    /// handling lives in `cp_serve_forwarded`'s match). Used only by
+    /// `dynamo.rs`'s `update_continuous_backups` disable path
+    /// (`ClientCtx::force_pitr_seal_tablet`), mirroring `disable_stream`'s
+    /// own `force_seal_tablet` call.
+    ForcePitrSeal { tablet: u64 },
     /// **Internal manual-growth split-trigger RPC — never sent bare, only
     /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0042 §14, growth
     /// PR3's `POST /admin/stream/grow`): materialize `tablet`'s own live
@@ -2349,6 +2359,7 @@ fn surface_of(request: &ClientRequest) -> Surface {
         | ClientRequest::KindScan { .. }
         | ClientRequest::GetSnapshot { .. }
         | ClientRequest::ForceSeal { .. }
+        | ClientRequest::ForcePitrSeal { .. }
         | ClientRequest::TriggerAutoSplit { .. }
         | ClientRequest::StreamHotRead { .. }
         | ClientRequest::ClearBackfillCursor { .. }
@@ -2558,6 +2569,27 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             | MetaCommand::BeginRestore { .. }
             | MetaCommand::CompleteRestore { .. }
             | MetaCommand::FailRestore { .. }
+            // PITR (ADR 0059 §9, Train 3): `UpdateContinuousBackups` (the
+            // wire operation's own catalog toggle) may land on any node,
+            // exactly like `UpdateTimeToLive` — schema-catalog class, same
+            // relay reason as `SetTableTtl` above.
+            | MetaCommand::UpdateContinuousBackups { .. }
+            // PITR segment catalog commit: a tablet leader's own seal
+            // proposal, from wherever that leader actually runs — the
+            // identical relay reasoning as `SealStreamShard` above.
+            | MetaCommand::SealPitrSegment { .. }
+            // Tagging a `BeginBackup` row as a PITR base snapshot: proposed
+            // by `pitr_janitor::pitr_snapshot_loop`, a control-plane-
+            // leader-only background loop with its own live `RaftNode`
+            // handle on every node shape it runs on — this crate never
+            // relays it through the wire edge today, but it is included
+            // here defensively, mirroring `SealPitrSegment`'s own class,
+            // rather than surfacing as an opaque relay refusal if that ever
+            // changes. `ExpirePitrSegments` is deliberately NOT included,
+            // for the identical reason `ExpireStreamShards` isn't: its only
+            // intended caller (`pitr_janitor::pitr_janitor_loop`) already
+            // proposes directly off its own live `RaftNode` handle.
+            | MetaCommand::MarkBackupPitrBase { .. }
     )
 }
 
@@ -4811,6 +4843,19 @@ impl BoundNode {
             ctx.clone(),
         )));
 
+        // PITR periodic base snapshots + retention (ADR 0059 §9, Train 3):
+        // two control-plane-leader-only loops, mirroring the segment/backup
+        // janitors above exactly (self-gated every tick,
+        // `pitr_janitor.rs`'s own doc) — spawned unconditionally here.
+        tasks.push(tokio::spawn(pitr_janitor::pitr_snapshot_loop(
+            ctx.clone(),
+            pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        )));
+        tasks.push(tokio::spawn(pitr_janitor::pitr_janitor_loop(
+            ctx.clone(),
+            pitr_janitor::DEFAULT_PITR_RETENTION,
+        )));
+
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
         // it leads once it exceeds **either** configured threshold (it checks
         // leadership per tablet, so running it on every node is harmless).
@@ -5572,6 +5617,23 @@ impl BoundControlNode {
         // the lead instead.
         tasks.push(tokio::spawn(backup_janitor::backup_janitor_loop(
             ctx.clone(),
+        )));
+
+        // PITR periodic base snapshots + retention (ADR 0059 §9, Train 3): a
+        // control-only node can genuinely become the control-plane leader
+        // (ADR 0035 split deployment), so it needs both loops too — the
+        // identical documented gap as the segment/backup janitors above:
+        // marking needs only `Metadata`, but the snapshot loop's own
+        // `BeginBackup` capture and the retention loop's own segment-object
+        // reclaim both need a data role no control-only node provisions
+        // (see `pitr_janitor.rs`'s own doc).
+        tasks.push(tokio::spawn(pitr_janitor::pitr_snapshot_loop(
+            ctx.clone(),
+            pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        )));
+        tasks.push(tokio::spawn(pitr_janitor::pitr_janitor_loop(
+            ctx.clone(),
+            pitr_janitor::DEFAULT_PITR_RETENTION,
         )));
 
         Ok(Node {
@@ -11561,6 +11623,26 @@ impl ClientCtx {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
+            // ADR 0059 §9, Train 3: the PITR force-seal RPC — the PITR twin
+            // of `ForceSeal` just above, identical shape.
+            ClientRequest::ForcePitrSeal { tablet } => {
+                let tablet = TabletId(tablet);
+                let Some(leader) = self.edge.cp_leader(tablet) else {
+                    return self.not_leader_refusal(Some(tablet));
+                };
+                let table = self
+                    .effective_metadata()
+                    .tablets
+                    .get(&tablet)
+                    .and_then(|t| t.table.clone());
+                let Some(table) = table else {
+                    return ClientResponse::Error("no such tablet".into());
+                };
+                match index_drain::pitr_seal_now(self, &table, tablet, &leader).await {
+                    Ok(_) => ClientResponse::PutOk,
+                    Err(e) => ClientResponse::Error(e),
+                }
+            }
             // ADR 0050 Train B rung 4: the split-build seed RPC — addressed
             // by `tablet` (a Building child, deliberately unroutable by
             // key) directly, mirroring `ForceSeal` just above. One shared
@@ -14054,6 +14136,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::KindWriteItem { .. } => "kind_write_item",
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
+        ClientRequest::ForcePitrSeal { .. } => "force_pitr_seal",
         ClientRequest::TriggerAutoSplit { .. } => "trigger_auto_split",
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
         ClientRequest::ClearBackfillCursor { .. } => "clear_backfill_cursor",
@@ -14301,6 +14384,11 @@ async fn handle_request(
         ),
         ClientRequest::ForceSeal { .. } => ClientResponse::Error(
             "this request is an internal seal-trigger RPC and must be sent wrapped in \
+             `Forwarded`"
+                .into(),
+        ),
+        ClientRequest::ForcePitrSeal { .. } => ClientResponse::Error(
+            "this request is an internal PITR seal-trigger RPC and must be sent wrapped in \
              `Forwarded`"
                 .into(),
         ),
@@ -14893,6 +14981,54 @@ impl ClientCtx {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err("force-seal did not reach a tablet leader in time".into());
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Force one PITR seal pass of `tablet`'s own hot tail (ADR 0059 §9,
+    /// Train 3's disable-triggered final seal) — the PITR twin of
+    /// [`force_seal_tablet`](Self::force_seal_tablet), identical shape and
+    /// identical forwarding discipline.
+    pub(crate) async fn force_pitr_seal_tablet(&self, tablet: TabletId) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            match self.resolve_cp_route(tablet) {
+                Some(CpRoute::Local(leader)) => {
+                    let table = self
+                        .effective_metadata()
+                        .tablets
+                        .get(&tablet)
+                        .and_then(|t| t.table.clone());
+                    let Some(table) = table else {
+                        return Err("no such tablet".into());
+                    };
+                    return index_drain::pitr_seal_now(self, &table, tablet, &leader)
+                        .await
+                        .map(|_| ());
+                }
+                Some(CpRoute::Forward(addr)) => {
+                    let request = ClientRequest::ForcePitrSeal { tablet: tablet.0 };
+                    match self
+                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .await
+                    {
+                        ClientResponse::PutOk => return Ok(()),
+                        ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
+                            return Err(e);
+                        }
+                        ClientResponse::Error(_) => {} // retry below
+                        other => {
+                            return Err(format!(
+                                "unexpected reply to forwarded PITR force-seal: {other:?}"
+                            ));
+                        }
+                    }
+                }
+                Some(CpRoute::None) | None => {} // not settled yet, retry
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("PITR force-seal did not reach a tablet leader in time".into());
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }

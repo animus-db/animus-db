@@ -878,6 +878,25 @@ pub enum Operation {
         /// A full replacement GSI declaration, if given.
         global_secondary_index_override: Option<Vec<SecondaryIndex>>,
     },
+    /// `UpdateContinuousBackups` (ADR 0059 §9, Train 3): enable or disable
+    /// `table`'s point-in-time recovery (PITR). `animusd` validates the
+    /// table exists (`TableNotFoundException`) and proposes the catalog
+    /// toggle; enabling starts the retention window at "now," disabling
+    /// then re-enabling resets it (a fresh generation, never fake
+    /// continuity — see `animus_control::PitrSpec`'s own doc).
+    UpdateContinuousBackups {
+        /// Target table name.
+        table: String,
+        /// Whether PITR is being enabled (`true`) or disabled (`false`).
+        enabled: bool,
+    },
+    /// `DescribeContinuousBackups` (ADR 0059 §9, Train 3): a pure read of a
+    /// table's PITR configuration and its currently-restorable window
+    /// (`animusd` derives both from the replicated catalog).
+    DescribeContinuousBackups {
+        /// Target table name.
+        table: String,
+    },
 }
 
 /// `ListBackups`'s `BackupType` filter — AWS's own `USER`/`SYSTEM`/
@@ -928,6 +947,8 @@ impl Operation {
             | Operation::UpdateItem { table, .. }
             | Operation::UpdateTimeToLive { table, .. }
             | Operation::DescribeTimeToLive { table, .. }
+            | Operation::UpdateContinuousBackups { table, .. }
+            | Operation::DescribeContinuousBackups { table, .. }
             | Operation::CreateBackup { table, .. } => Some(table),
             // `RestoreTableFromBackup` targets its brand-new *target* table
             // (mirroring `CreateTable`'s own "the table about to exist" —
@@ -1311,6 +1332,10 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "TransactGetItems" => decode_transact_get(obj),
         "UpdateTimeToLive" => decode_update_time_to_live(obj),
         "DescribeTimeToLive" => Ok(Operation::DescribeTimeToLive {
+            table: table_name(obj)?,
+        }),
+        "UpdateContinuousBackups" => decode_update_continuous_backups(obj),
+        "DescribeContinuousBackups" => Ok(Operation::DescribeContinuousBackups {
             table: table_name(obj)?,
         }),
         "CreateBackup" => decode_create_backup(obj),
@@ -2572,6 +2597,28 @@ fn decode_update_time_to_live(obj: &Map<String, Value>) -> Result<Operation, Wir
         attribute_name,
         enabled,
     })
+}
+
+/// Decode an `UpdateContinuousBackups` request (ADR 0059 §9): `TableName`
+/// plus a `PointInTimeRecoverySpecification` object carrying
+/// `PointInTimeRecoveryEnabled`.
+fn decode_update_continuous_backups(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table = table_name(obj)?;
+    let spec = obj
+        .get("PointInTimeRecoverySpecification")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            WireError::validation("missing object field `PointInTimeRecoverySpecification`")
+        })?;
+    let enabled = spec
+        .get("PointInTimeRecoveryEnabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            WireError::validation(
+                "`PointInTimeRecoverySpecification` missing `PointInTimeRecoveryEnabled`",
+            )
+        })?;
+    Ok(Operation::UpdateContinuousBackups { table, enabled })
 }
 
 /// Decode the optional `ConditionExpression` + `ExpressionAttributeValues` of a
@@ -4584,6 +4631,84 @@ pub fn describe_time_to_live_response(desc: &TtlDescription) -> String {
     let mut obj = Map::new();
     obj.insert("TimeToLiveDescription".into(), Value::Object(inner));
     serde_json::to_string(&Value::Object(obj)).expect("describe-ttl response serializes")
+}
+
+/// A table's point-in-time recovery (PITR) configuration and restorable
+/// window (ADR 0059 §9), as both `UpdateContinuousBackups` and
+/// `DescribeContinuousBackups` render it. `animusd` derives every field
+/// from the replicated catalog plus sealed-segment/base-snapshot coverage —
+/// this crate never computes any of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PitrDescription {
+    /// Whether PITR is currently enabled for this table.
+    pub enabled: bool,
+    /// The earliest wall-clock instant (epoch milliseconds) this table can
+    /// currently be restored to — the retention floor or this generation's
+    /// own enable time, whichever is later. `None` iff `enabled` is `false`
+    /// (this adapter never reports a window for a disabled table, matching
+    /// AWS's own contract).
+    pub earliest_restorable_ms: Option<u64>,
+    /// The latest wall-clock instant (epoch milliseconds) this table can
+    /// currently be restored to — honestly trailing "now" by seal lag
+    /// (ADR 0059 §9: "never claim 'now'"). `None` iff `enabled` is `false`.
+    pub latest_restorable_ms: Option<u64>,
+}
+
+/// The shared `ContinuousBackupsDescription` object both
+/// `UpdateContinuousBackups` and `DescribeContinuousBackups` respond with:
+/// `{"ContinuousBackupsStatus": "ENABLED", "PointInTimeRecoveryDescription":
+/// {"PointInTimeRecoveryStatus": "ENABLED"|"DISABLED",
+/// "EarliestRestorableDateTime": .., "LatestRestorableDateTime": ..}}`.
+/// `ContinuousBackupsStatus` (the outer field — whether the continuous-
+/// backups *infrastructure itself* is available, as opposed to whether
+/// *this table* has opted in) is always `"ENABLED"` in this adapter: PITR
+/// infrastructure always exists here (there is no
+/// `ContinuousBackupsUnavailableException` case to model). `Earliest`/
+/// `LatestRestorableDateTime` are omitted entirely while disabled — the
+/// identical "omit rather than render a meaningless value" convention
+/// [`describe_time_to_live_response`]'s own `AttributeName` omission uses.
+fn continuous_backups_description_object(desc: &PitrDescription) -> Value {
+    let mut pitr = Map::new();
+    pitr.insert(
+        "PointInTimeRecoveryStatus".into(),
+        Value::String(if desc.enabled { "ENABLED" } else { "DISABLED" }.into()),
+    );
+    if let Some(ms) = desc.earliest_restorable_ms {
+        pitr.insert("EarliestRestorableDateTime".into(), wall_ms_timestamp(ms));
+    }
+    if let Some(ms) = desc.latest_restorable_ms {
+        pitr.insert("LatestRestorableDateTime".into(), wall_ms_timestamp(ms));
+    }
+    let mut outer = Map::new();
+    outer.insert(
+        "ContinuousBackupsStatus".into(),
+        Value::String("ENABLED".into()),
+    );
+    outer.insert("PointInTimeRecoveryDescription".into(), Value::Object(pitr));
+    Value::Object(outer)
+}
+
+/// The JSON body for a successful `UpdateContinuousBackups` (ADR 0059 §9):
+/// `{"ContinuousBackupsDescription": {..}}` — AWS's own contract renders
+/// the resulting description, matching `describe_continuous_backups_response`'s
+/// exact shape (a caller cannot tell the two calls' responses apart by body
+/// shape alone, matching real DynamoDB).
+#[must_use]
+pub fn update_continuous_backups_response(desc: &PitrDescription) -> String {
+    let mut obj = Map::new();
+    obj.insert(
+        "ContinuousBackupsDescription".into(),
+        continuous_backups_description_object(desc),
+    );
+    serde_json::to_string(&Value::Object(obj))
+        .expect("update-continuous-backups response serializes")
+}
+
+/// The JSON body for a successful `DescribeContinuousBackups` (ADR 0059
+/// §9) — identical shape to [`update_continuous_backups_response`].
+#[must_use]
+pub fn describe_continuous_backups_response(desc: &PitrDescription) -> String {
+    update_continuous_backups_response(desc)
 }
 
 /// DynamoDB's own `SCREAMING_SNAKE_CASE` rendering of an [`IndexStatus`].

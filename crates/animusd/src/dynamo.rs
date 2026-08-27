@@ -502,6 +502,7 @@ fn is_ddl_mutation(op: &Operation) -> bool {
             | Operation::UpdateTable { .. }
             | Operation::DeleteTable { .. }
             | Operation::UpdateTimeToLive { .. }
+            | Operation::UpdateContinuousBackups { .. }
     )
 }
 
@@ -1026,6 +1027,12 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             enabled,
         } => update_time_to_live(ctx, &table, &attribute_name, enabled).await,
         Operation::DescribeTimeToLive { table } => describe_time_to_live(ctx, meta, &table),
+        Operation::UpdateContinuousBackups { table, enabled } => {
+            update_continuous_backups(ctx, &table, enabled).await
+        }
+        Operation::DescribeContinuousBackups { table } => {
+            describe_continuous_backups(ctx, meta, &table)
+        }
         Operation::CreateBackup { table, backup_name } => {
             create_backup(ctx, &table, &backup_name).await
         }
@@ -1144,6 +1151,138 @@ fn describe_time_to_live(
         attribute_name: ttl.map(|t| t.attribute_name.clone()),
     };
     Ok(wire::describe_time_to_live_response(&desc))
+}
+
+// --- PITR (ADR 0059 §9, Train 3) -------------------------------------------
+
+/// This table's PITR configuration and currently-restorable window (ADR
+/// 0059 §9), shared by [`update_continuous_backups`] and
+/// [`describe_continuous_backups`]. `None` in the catalog renders as fully
+/// disabled (no window reported at all — matching AWS).
+///
+/// **`EarliestRestorableDateTime`** is `max(retention floor, this
+/// generation's own enable time)` — never earlier than enable (a fresh
+/// generation has no history before it, ADR 0059 §9's "no fake
+/// continuity"), and never earlier than the retention floor even when
+/// enable predates it (a segment/base snapshot older than retention is the
+/// janitor's to reclaim regardless of when PITR was enabled).
+///
+/// **`LatestRestorableDateTime`** honestly trails "now" by seal lag (ADR
+/// 0059 §9: "never claim 'now'") — derived from the table's own tablets'
+/// *actually sealed* coverage: the minimum, over every current tablet, of
+/// that tablet's own last PITR seal wall time (or this generation's enable
+/// time for a tablet that has never sealed yet — the trivially-restorable
+/// "nothing has happened since enable" floor). The minimum, not the
+/// maximum, because a client's own point-in-time restore must be coherent
+/// across every tablet: reporting a later time than the *slowest* tablet's
+/// own coverage would silently promise a restore this adapter cannot
+/// actually reconstruct for that tablet's own range.
+fn pitr_description(ctx: &ClientCtx, meta: &Metadata, table: &str) -> wire::PitrDescription {
+    let Some(spec) = meta.table_pitr(table) else {
+        return wire::PitrDescription {
+            enabled: false,
+            earliest_restorable_ms: None,
+            latest_restorable_ms: None,
+        };
+    };
+    let now_ms = ctx.env.wall_now().0;
+    let retention_ms = crate::pitr_janitor::DEFAULT_PITR_RETENTION.as_millis() as u64;
+    let floor_ms = now_ms.saturating_sub(retention_ms);
+    let earliest_ms = floor_ms.max(spec.enabled_wall_ms);
+
+    let tablets: Vec<TabletId> = meta.tablets_for_table(table).map(|(&t, _)| t).collect();
+    let latest_ms = tablets
+        .iter()
+        .map(|&t| {
+            meta.last_pitr_seal_wall_ms(t)
+                .unwrap_or(spec.enabled_wall_ms)
+        })
+        .min()
+        .unwrap_or(spec.enabled_wall_ms)
+        .max(earliest_ms);
+
+    wire::PitrDescription {
+        enabled: true,
+        earliest_restorable_ms: Some(earliest_ms),
+        latest_restorable_ms: Some(latest_ms),
+    }
+}
+
+/// `UpdateContinuousBackups` (ADR 0059 §9): enable or disable `table`'s
+/// PITR. Validates the table exists (`TableNotFoundException`, matching
+/// `CreateBackup`'s own choice for this specific call). Disabling first
+/// force-seals every one of the table's tablets — the identical
+/// `disable_stream`-mirroring "final seal before the disable itself
+/// commits" sequencing F12-b established for streams (see
+/// `ClientCtx::force_pitr_seal_tablet`'s own doc) — so nothing is ever left
+/// unprotected in the hot log the instant `pitr_enabled` flips to `false`
+/// and `trim_janitor` stops holding a PITR term for it.
+async fn update_continuous_backups(
+    ctx: &ClientCtx,
+    table: &str,
+    enabled: bool,
+) -> Result<String, WireError> {
+    let meta = metadata_fresh(ctx).await;
+    if !meta.has_table_schema(table) {
+        return Err(WireError {
+            code: "TableNotFoundException",
+            message: format!("table `{table}` does not exist"),
+            reasons: None,
+        });
+    }
+    if !enabled && meta.table_pitr(table).is_some() {
+        let tablets: Vec<TabletId> = meta.tablets_for_table(table).map(|(&t, _)| t).collect();
+        for tablet in tablets {
+            ctx.force_pitr_seal_tablet(tablet).await.map_err(|e| {
+                internal(&format!(
+                    "final PITR seal of tablet {} before disabling table `{table}`'s PITR: {e}",
+                    tablet.0
+                ))
+            })?;
+        }
+    }
+    let wall_ms = ctx.env.wall_now().0;
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::UpdateContinuousBackups {
+            table: table.to_owned(),
+            enabled,
+            wall_ms,
+        })
+        .await;
+        let fresh = metadata_fresh(ctx).await;
+        if fresh.table_pitr(table).is_some() == enabled {
+            return Ok(wire::update_continuous_backups_response(&pitr_description(
+                ctx, &fresh, table,
+            )));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "UpdateContinuousBackups did not commit to the control plane in time \
+                 (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+}
+
+/// `DescribeContinuousBackups` (ADR 0059 §9): a pure read of the replicated
+/// catalog plus sealed-coverage state, mirroring [`describe_time_to_live`]'s
+/// shape.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_continuous_backups(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+) -> Result<String, WireError> {
+    if !meta.has_table_schema(table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    Ok(wire::describe_continuous_backups_response(
+        &pitr_description(ctx, meta, table),
+    ))
 }
 
 // --- Backups (ADR 0059 §3/§4, Train 1 PR④) ---------------------------------
@@ -1345,15 +1484,28 @@ fn list_backups(
     time_range_upper_bound_ms: Option<u64>,
     backup_type: wire::BackupTypeFilter,
 ) -> Result<String, WireError> {
-    if !backup_type.matches_user_backup() {
-        // This adapter has never produced a `SYSTEM`/`AWS_BACKUP` backup —
-        // an honest empty page, not an error (matching AWS: an unusual but
-        // legal filter that simply never has anything to return here).
+    // ADR 0059 §9, Train 3: a PITR base snapshot is a `SYSTEM`-type backup
+    // (real internal machinery, never a user's own `CreateBackup`) —
+    // invisible under the default `USER` filter, visible under `SYSTEM`/
+    // `ALL`. `AWS_BACKUP` is still never produced at all.
+    let wants_user = backup_type.matches_user_backup();
+    let wants_system = matches!(
+        backup_type,
+        wire::BackupTypeFilter::System | wire::BackupTypeFilter::All
+    );
+    if !wants_user && !wants_system {
+        // This adapter never produces an `AWS_BACKUP` backup — an honest
+        // empty page, not an error (matching AWS: an unusual but legal
+        // filter that simply never has anything to return here).
         return Ok(wire::list_backups_response(&[], None));
     }
     let candidates: Vec<wire::BackupSummary> = meta
         .backups
         .iter()
+        .filter(|(id, _)| {
+            let is_pitr_base = meta.pitr_base_backups.contains(*id);
+            (is_pitr_base && wants_system) || (!is_pitr_base && wants_user)
+        })
         .filter(|(_, row)| {
             !matches!(
                 row.status,

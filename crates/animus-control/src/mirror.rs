@@ -183,6 +183,15 @@ pub fn apply_and_derive_mirror(
             .collect(),
         _ => Vec::new(),
     };
+    // `DeleteBackup`'s own apply arm also prunes `pitr_base_backups` (ADR
+    // 0059 §9) — captured before apply for the identical reason
+    // `pruned_backup_progress` is: the fact is gone from `meta` by the time
+    // this function would otherwise want to derive "should I emit a delete
+    // write for this key."
+    let was_pitr_base = matches!(
+        command,
+        MetaCommand::DeleteBackup { backup_id } if meta.pitr_base_backups.contains(backup_id)
+    );
 
     let outcome = meta.apply(command);
     if outcome != ApplyOutcome::Applied {
@@ -309,6 +318,23 @@ pub fn apply_and_derive_mirror(
                 writes.push(put_json(syskv::schema_key(table), schema));
             }
         }
+        MetaCommand::UpdateContinuousBackups { table, .. } => {
+            // ADR 0059 §9: same schema-catalog mirror as `SetTableStream`/
+            // `SetTableTtl` above, plus the separate never-rewound
+            // generation-allocator counter (`Metadata::pitr_generation`)
+            // when this apply actually minted a fresh generation — a
+            // no-op disable, or a redundant re-enable, leaves that counter
+            // untouched, so nothing to mirror for it either.
+            if let Some(schema) = meta.schemas.get(table) {
+                writes.push(put_json(syskv::schema_key(table), schema));
+            }
+            if let Some(&generation) = meta.pitr_generation.get(table) {
+                writes.push(put_counter(
+                    &syskv::pitr_generation_counter_name(table),
+                    generation,
+                ));
+            }
+        }
         MetaCommand::MarkIndexBackfilled { tablet, index, .. } => {
             // The value is always empty (presence alone is the fact).
             writes.push(KeyWrite::Put(
@@ -378,6 +404,33 @@ pub fn apply_and_derive_mirror(
                 }
             }
         }
+        MetaCommand::SealPitrSegment { tablet, epoch, .. } => {
+            writes.push(put_json(
+                syskv::pitr_segment_key(*tablet, *epoch),
+                &meta.pitr_segments[&(*tablet, *epoch)],
+            ));
+        }
+        MetaCommand::ExpirePitrSegments { rows, .. } => {
+            // Same idempotent-either-way shape as `ExpireStreamShards` above.
+            for (tablet, epoch) in rows {
+                match meta.pitr_segments.get(&(*tablet, *epoch)) {
+                    Some(row) => {
+                        writes.push(put_json(syskv::pitr_segment_key(*tablet, *epoch), row));
+                    }
+                    None => {
+                        writes.push(KeyWrite::Delete(syskv::pitr_segment_key(*tablet, *epoch)));
+                    }
+                }
+            }
+        }
+        MetaCommand::MarkBackupPitrBase { backup_id } => {
+            // The value is always empty (presence alone is the fact) — the
+            // identical convention `MarkIndexBackfilled` uses.
+            writes.push(KeyWrite::Put(
+                syskv::pitr_base_backup_key(backup_id),
+                Vec::new(),
+            ));
+        }
         MetaCommand::BeginBackup { backup_id, .. } => {
             writes.push(put_json(
                 syskv::backup_key(backup_id),
@@ -402,6 +455,9 @@ pub fn apply_and_derive_mirror(
             writes.push(KeyWrite::Delete(syskv::backup_key(backup_id)));
             for (id, tablet) in &pruned_backup_progress {
                 writes.push(KeyWrite::Delete(syskv::backup_progress_key(id, *tablet)));
+            }
+            if was_pitr_base {
+                writes.push(KeyWrite::Delete(syskv::pitr_base_backup_key(backup_id)));
             }
         }
         MetaCommand::MarkBackupDeleted { backup_id } => {
@@ -583,6 +639,8 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             let value = decode_u64(value);
             if id == NEXT_TABLET_ID_COUNTER.as_bytes() {
                 meta.next_tablet_id = value;
+            } else if let Some(table) = syskv::pitr_generation_table(&id) {
+                meta.pitr_generation.insert(table.to_owned(), value);
             }
         }
         EntityKind::CpMemberAddr => {
@@ -637,6 +695,18 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
                 serde_json::from_slice(value).expect("mirrored restore value decodes");
             meta.restores.insert(restore_id, row);
         }
+        EntityKind::PitrSegment => {
+            let Some(key) = syskv::decode_pitr_segment_id(&id) else {
+                return;
+            };
+            let row: crate::meta::PitrSegmentRow =
+                serde_json::from_slice(value).expect("mirrored pitr-segment value decodes");
+            meta.pitr_segments.insert(key, row);
+        }
+        EntityKind::PitrBaseBackup => {
+            let backup_id = String::from_utf8(id).expect("backup id is UTF-8");
+            meta.pitr_base_backups.insert(backup_id);
+        }
     }
 }
 
@@ -666,7 +736,9 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
         }
         EntityKind::Counter => {
             // Never deleted in practice (a monotonic counter is only ever
-            // `Put`) — listed for match exhaustiveness.
+            // `Put`) — listed for match exhaustiveness. This covers both
+            // `NEXT_TABLET_ID_COUNTER` and every per-table PITR generation
+            // counter (`syskv::pitr_generation_key`).
         }
         EntityKind::CpMemberAddr => {
             let node = decode_node_id(id);
@@ -712,6 +784,19 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // doc) — listed for match exhaustiveness.
             let restore_id = String::from_utf8(id).expect("restore id is UTF-8");
             meta.restores.remove(&restore_id);
+        }
+        EntityKind::PitrSegment => {
+            // Reachable in practice — `ExpirePitrSegments { remove: true }`
+            // genuinely tombstones a row (ADR 0059 §9's retention janitor).
+            if let Some(key) = syskv::decode_pitr_segment_id(&id) {
+                meta.pitr_segments.remove(&key);
+            }
+        }
+        EntityKind::PitrBaseBackup => {
+            // Reachable in practice — `DeleteBackup` prunes its own tag row
+            // (ADR 0059 §9).
+            let backup_id = String::from_utf8(id).expect("backup id is UTF-8");
+            meta.pitr_base_backups.remove(&backup_id);
         }
     }
 }
@@ -1436,6 +1521,275 @@ mod tests {
             vec![KeyWrite::Delete(syskv::stream_shard_key(TabletId(1), 0))]
         );
         assert!(!meta.stream_shards.contains_key(&(TabletId(1), 0)));
+    }
+
+    // --- ADR 0059 §9: PITR mirror coverage (Train 3) -------------------
+
+    fn pitr_seal_cmd(tablet: TabletId, epoch: u64, end: u64) -> MetaCommand {
+        MetaCommand::SealPitrSegment {
+            table: "orders".to_string(),
+            generation: 1,
+            tablet,
+            epoch,
+            hlc_range: (end.saturating_sub(100), end),
+            count: 1,
+            seal_wall_ms: 1_700_000_000_000,
+            replicas: vec![nid(1), nid(2)],
+            object_id: format!("backup/pitr/orders/{}/{epoch}/test", tablet.0),
+        }
+    }
+
+    /// `UpdateContinuousBackups` mirrors as a `Put` of the updated schema
+    /// row plus the freshly-bumped generation counter.
+    #[test]
+    fn update_continuous_backups_writes_the_schema_and_counter() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let command = MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_string(),
+            enabled: true,
+            wall_ms: 1_000,
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![
+                put_json(
+                    syskv::schema_key("orders"),
+                    meta.schemas.get("orders").unwrap()
+                ),
+                put_counter(&syskv::pitr_generation_counter_name("orders"), 1),
+            ]
+        );
+    }
+
+    /// A no-op `UpdateContinuousBackups` (redundant re-enable) derives no
+    /// writes at all.
+    #[test]
+    fn update_continuous_backups_noop_derives_no_writes() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_string(),
+                enabled: true,
+                wall_ms: 1_000,
+            },
+        );
+        let (outcome, writes) = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_string(),
+                enabled: true,
+                wall_ms: 2_000,
+            },
+        );
+        assert_eq!(outcome, ApplyOutcome::NoOp);
+        assert!(writes.is_empty());
+    }
+
+    /// `SealPitrSegment` mirrors as one `Put` of the freshly-inserted row —
+    /// the PITR twin of `seal_stream_shard_writes_the_row`.
+    #[test]
+    fn seal_pitr_segment_writes_the_row() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_string(),
+                enabled: true,
+                wall_ms: 1_000,
+            },
+        );
+        let command = pitr_seal_cmd(TabletId(1), 0, 100);
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![put_json(
+                syskv::pitr_segment_key(TabletId(1), 0),
+                &meta.pitr_segments[&(TabletId(1), 0)]
+            )]
+        );
+    }
+
+    /// `ExpirePitrSegments`'s mark/remove phases mirror exactly like
+    /// `ExpireStreamShards`'s own — `Put` (still-present, now `expired`),
+    /// then `Delete`.
+    #[test]
+    fn expire_pitr_segments_marks_as_put_and_removes_as_delete() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_string(),
+                enabled: true,
+                wall_ms: 1_000,
+            },
+        );
+        let _ = apply_and_derive_mirror(&mut meta, &pitr_seal_cmd(TabletId(1), 0, 100));
+
+        let mark = MetaCommand::ExpirePitrSegments {
+            rows: vec![(TabletId(1), 0)],
+            remove: false,
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &mark);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![put_json(
+                syskv::pitr_segment_key(TabletId(1), 0),
+                &meta.pitr_segments[&(TabletId(1), 0)]
+            )]
+        );
+        assert!(meta.pitr_segments[&(TabletId(1), 0)].expired);
+
+        let remove = MetaCommand::ExpirePitrSegments {
+            rows: vec![(TabletId(1), 0)],
+            remove: true,
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &remove);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![KeyWrite::Delete(syskv::pitr_segment_key(TabletId(1), 0))]
+        );
+        assert!(!meta.pitr_segments.contains_key(&(TabletId(1), 0)));
+    }
+
+    /// `MarkBackupPitrBase` mirrors as one presence `Put`; `DeleteBackup`
+    /// mirrors it away again alongside the row it tags.
+    #[test]
+    fn mark_backup_pitr_base_writes_presence_and_delete_backup_prunes_it() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_string()),
+                range: animus_tablet::KeyRange::whole(),
+                replicas: Vec::new(),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::BeginBackup {
+                backup_id: "b1".to_string(),
+                table: "orders".to_string(),
+                created_wall_ms: 1_000,
+                backup_name: "pitr-base".to_string(),
+            },
+        );
+        let (outcome, writes) = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::MarkBackupPitrBase {
+                backup_id: "b1".to_string(),
+            },
+        );
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![KeyWrite::Put(syskv::pitr_base_backup_key("b1"), Vec::new())]
+        );
+
+        let (outcome, writes) = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::DeleteBackup {
+                backup_id: "b1".to_string(),
+            },
+        );
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert!(writes.contains(&KeyWrite::Delete(syskv::pitr_base_backup_key("b1"))));
+    }
+
+    /// A round trip through `apply_key_write`'s put/delete halves (the
+    /// bulk-rebuild path) recovers a PITR segment row and a PITR base tag
+    /// identically to the live-apply state.
+    #[test]
+    fn pitr_entities_round_trip_through_apply_key_write() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_string(),
+                enabled: true,
+                wall_ms: 1_000,
+            },
+        );
+        let _ = apply_and_derive_mirror(&mut meta, &pitr_seal_cmd(TabletId(1), 0, 100));
+
+        let mut rebuilt = Metadata::default();
+        apply_key_write(
+            &mut rebuilt,
+            &put_json(
+                syskv::schema_key("orders"),
+                meta.schemas.get("orders").unwrap(),
+            ),
+        );
+        apply_key_write(
+            &mut rebuilt,
+            &KeyWrite::Put(
+                syskv::pitr_generation_key("orders"),
+                1u64.to_be_bytes().to_vec(),
+            ),
+        );
+        apply_key_write(
+            &mut rebuilt,
+            &put_json(
+                syskv::pitr_segment_key(TabletId(1), 0),
+                &meta.pitr_segments[&(TabletId(1), 0)],
+            ),
+        );
+        assert_eq!(rebuilt.pitr_generation.get("orders"), Some(&1));
+        assert_eq!(
+            rebuilt.pitr_segments.get(&(TabletId(1), 0)),
+            meta.pitr_segments.get(&(TabletId(1), 0))
+        );
+
+        apply_delete(&mut rebuilt, &syskv::pitr_segment_key(TabletId(1), 0));
+        assert!(!rebuilt.pitr_segments.contains_key(&(TabletId(1), 0)));
     }
 
     /// `BeginBackup` (ADR 0059 §3) mirrors as one `Put` of the freshly-minted
