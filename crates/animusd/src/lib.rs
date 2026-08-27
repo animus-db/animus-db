@@ -4586,7 +4586,16 @@ impl BoundNode {
         backup_store_config: BackupStoreConfig,
         pitr_snapshot_cadence: Duration,
     ) -> std::io::Result<Node> {
-        self.env.set_peers(peers.clone());
+        // ProdEnv's peer book is now keyed by address string (advertise/dial
+        // split groundwork) — this boundary still deals in `SocketAddr`
+        // until a later change moves the surrounding route/peer plumbing
+        // itself onto strings.
+        self.env.set_peers(
+            peers
+                .iter()
+                .map(|(id, addr)| (id.clone(), addr.to_string()))
+                .collect(),
+        );
         // The initial (static) peer book + an env clone, kept for the
         // **peer-sync loop** (ADR 0040 PR1: one identity per node, one
         // shared internal env — this collapses the pre-PR1 `peer_sync_loop`/
@@ -5673,7 +5682,16 @@ impl BoundControlNode {
         orphan_sweep_after: Duration,
         split_mode: SplitMode,
     ) -> std::io::Result<Node> {
-        self.env.set_peers(peers.clone());
+        // ProdEnv's peer book is now keyed by address string (advertise/dial
+        // split groundwork) — this boundary still deals in `SocketAddr`
+        // until a later change moves the surrounding route/peer plumbing
+        // itself onto strings.
+        self.env.set_peers(
+            peers
+                .iter()
+                .map(|(id, addr)| (id.clone(), addr.to_string()))
+                .collect(),
+        );
         let envs = vec![self.env.clone()];
 
         let admin_info = Arc::new(AdminInfo {
@@ -6080,7 +6098,16 @@ impl BoundDataNode {
         split_mode: SplitMode,
         backup_store_config: BackupStoreConfig,
     ) -> std::io::Result<Node> {
-        self.env.set_peers(peers.clone());
+        // ProdEnv's peer book is now keyed by address string (advertise/dial
+        // split groundwork) — this boundary still deals in `SocketAddr`
+        // until a later change moves the surrounding route/peer plumbing
+        // itself onto strings.
+        self.env.set_peers(
+            peers
+                .iter()
+                .map(|(id, addr)| (id.clone(), addr.to_string()))
+                .collect(),
+        );
         let static_peers = peers;
         let sync_env = self.env.clone();
         let hook_env = self.env.clone();
@@ -12543,7 +12570,7 @@ impl ClientCtx {
             // env — every other control-role node's `peer_sync_loop` only
             // ever learns an updated address from `Metadata.node_addrs`,
             // never from this call's local `merge_peer` side effect.
-            leader.env().merge_peer(node.clone(), addr);
+            leader.env().merge_peer(node.clone(), addr.to_string());
             let meta = self.control.metadata_cached();
             if let Some(mut addrs) = meta.node_addrs.get(&node).cloned()
                 && addrs.internal != addr.to_string()
@@ -12635,7 +12662,7 @@ impl ClientCtx {
                 }
             }
         }
-        leader.env().merge_peer(node.clone(), addr);
+        leader.env().merge_peer(node.clone(), addr.to_string());
         let mut voters = current;
         voters.insert(node.clone());
         match leader.change_membership(voters) {
@@ -12960,7 +12987,14 @@ async fn peer_sync_loop(ctx: ClientCtx, env: ProdEnv, static_peers: BTreeMap<Nod
                 book.insert(id, sa);
             }
         }
-        env.set_peers(book);
+        // ProdEnv's own peer book is now string-keyed (advertise/dial split
+        // groundwork) — convert at this boundary until a later change moves
+        // this loop's `book` itself onto strings.
+        env.set_peers(
+            book.iter()
+                .map(|(id, addr)| (id.clone(), addr.to_string()))
+                .collect(),
+        );
         tokio::time::sleep(PEER_SYNC_INTERVAL).await;
     }
 }
