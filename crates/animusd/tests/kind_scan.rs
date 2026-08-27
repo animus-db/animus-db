@@ -104,12 +104,17 @@ async fn lsi_query_succeeds_through_every_node_including_non_leaders() {
     }
 
     // LSI rows are written atomically with the base row (ADR 0041 §2), so a
-    // query is strongly consistent — no polling needed, unlike a GSI.
+    // *strongly consistent* query sees them immediately — no polling needed,
+    // unlike a GSI. But since ADR 0055 `ConsistentRead` selects a real read
+    // path and defaults to `false` (the eventual, replica-local one), this
+    // write-verification read must ask for `ConsistentRead: true` explicitly
+    // — which also happens to be what exercises the forwarded ReadIndex path
+    // through non-leaders this test is actually after.
     for (i, node) in nodes.iter().enumerate() {
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.Query",
-            r#"{"TableName":"events","IndexName":"by-ts",
+            r#"{"TableName":"events","IndexName":"by-ts","ConsistentRead":true,
                 "KeyConditionExpression":"pk = :p",
                 "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
         )
