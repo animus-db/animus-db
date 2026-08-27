@@ -452,10 +452,19 @@
       </p>
       <h3>Kubernetes</h3>
       <p>
-        The intended production target is an operator-managed cluster. Node-to-node traffic —
-        Raft, forwarding, metadata mirroring, seed and join — has its own listeners, separate
-        from the client-facing DynamoDB edge, so only the client edge needs to be exposed
-        outside the cluster. The operator itself is not written yet.
+        An operator (the <code>animus-operator</code> crate) manages an <code>AnimusCluster</code>
+        custom resource: one <code>StatefulSet</code> per cluster, a headless internal
+        <code>Service</code> plus a <code>NetworkPolicy</code> for node-to-node traffic — Raft,
+        forwarding, metadata mirroring, seed and join — and a separate client-facing
+        <code>Service</code> for the DynamoDB edge, the only one meant to be reachable outside
+        the cluster. Scaling a cluster is a spec edit (<code>kubectl patch</code> its
+        <code>nodes</code> field); deleting the custom resource tears down everything it owns
+        through ordinary Kubernetes garbage collection. A CI-gated smoke test exercises a real
+        <code>kind</code> cluster end-to-end — create, bootstrap, scale, delete — on every change
+        to this surface. The operator's own container image isn't published yet, so today it
+        runs out-of-cluster or from a locally built image. Kubernetes' own rolling update
+        replaces pods one at a time on an image change, but AnimusDB gives no format-compatibility
+        guarantee between revisions, so an upgrade still means recreating the cluster in practice.
       </p>
     </section>
 
@@ -556,7 +565,11 @@
           continuous backups (<code>RestoreTableToPointInTime</code>); a source table's backup
           history and PITR coverage both outlive the table if it's later dropped.</li>
         <li><strong>Tablets never merge</strong>, so a table that shrinks keeps its tablet count.</li>
-        <li><strong>No Kubernetes operator</strong> yet, though the port layout is built for one.</li>
+        <li><strong>The Kubernetes operator is new and unpublished</strong> — its own container
+          image isn't built/published yet (run it out-of-cluster, or build the image locally),
+          and it ships no admission webhook, so an invalid spec edit (e.g. changing
+          <code>controlNodes</code> after creation) is caught by the controller after the fact,
+          not rejected up front.</li>
         <li><strong>Not benchmarked at scale.</strong> No performance claims are made here for a
           reason.</li>
       </ul>

@@ -83,6 +83,7 @@ the relevant one before working in a crate:
 | `animus-node` | [crates/animus-node/CLAUDE.md](crates/animus-node/CLAUDE.md) |
 | `animusd` | [crates/animusd/CLAUDE.md](crates/animusd/CLAUDE.md) |
 | `animus-cli` | [crates/animus-cli/CLAUDE.md](crates/animus-cli/CLAUDE.md) |
+| `animus-operator` | [crates/animus-operator/CLAUDE.md](crates/animus-operator/CLAUDE.md) |
 
 ## Commands
 
@@ -354,12 +355,24 @@ truth; this map is just for navigation.
   (in-process split cluster for dev), `gen-config`, and `--auto-split[-bytes]`.
   A config can mix combined-mode indices with control-only/data-only ones for
   an incremental migration.
-- **Deployment target (Kubernetes operator)** — the intended production shape:
-  a K8s operator runs the cluster with seed/intra node-to-node traffic kept
-  cluster-internal (never on an externally-reachable Service); only the
-  client-facing wire edge (DynamoDB) is exposed outside the cluster.
-  This is what motivated the ADR 0047 client/intra port split — review any
-  design touching listeners, ports, or address resolution against this shape.
+- **Kubernetes operator** (ADR 0060) — `animus-operator`: a `kube-rs`
+  controller for the `AnimusCluster` custom resource, reconciling it into a
+  `ConfigMap` (an `animusd::config::ClusterConfig` mirror + dispatch
+  script), a headless internal `Service` + `NetworkPolicy` for node-to-node
+  traffic, a client-facing `dynamo` `Service`, and a `StatefulSet` — one per
+  cluster. Only the client-facing wire edge (DynamoDB) is exposed outside
+  the cluster; this is what motivated the ADR 0047 client/intra port split
+  — review any design touching listeners, ports, or address resolution
+  against this shape. An e2e smoke (`scripts/e2e-kind.sh`,
+  `.github/workflows/e2e-kind.yml`, CI-gated on every push/PR touching this
+  surface) drives a real `kind` cluster through create → bootstrap → scale
+  → delete with the DynamoDB wire exercised throughout — the mechanism no
+  unit test can reach; see `crates/animus-operator/CLAUDE.md`'s e2e section
+  for what it does and does not prove, including a sandbox environment that
+  cannot run it at all (no `CAP_SYS_RESOURCE`, which `kind`'s own
+  control-plane bootstrap needs independent of anything here). The
+  operator's own container image is not yet published — it runs
+  out-of-cluster (or from a locally built image) until that lands.
 
 ## Conventions
 
