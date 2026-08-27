@@ -873,12 +873,15 @@ async fn push(
     let Some(leader) = leader_of(record_nodes).cloned() else {
         return;
     };
-    let Some(view) = leader.txn_record_view(&record_key).await else {
-        // This corpus injects no seal/fence-miss faults, so the anchor's own
-        // stage never silently no-ops — the record-absent/orphan branch
-        // (ADR 0018 §2/PR5 §2b) is out of this corpus's scope; it is
-        // already covered by `animus-cp-data/tests/txn_recovery.rs` and the
-        // in-crate `pr5_orphan_and_resurrection_tests`.
+    // `txn_record_view`'s outer `Option` is the "served" bit (issue #298
+    // shape B fix, mirroring `animusd::ClientCtx::txn_recover`): `None`
+    // means "could not tell" — decline, exactly like the genuinely-absent
+    // case below (this corpus injects no seal/fence-miss faults, so the
+    // anchor's own stage never silently no-ops — the record-absent/orphan
+    // branch, ADR 0018 §2/PR5 §2b, is out of this corpus's scope; it is
+    // already covered by `animus-cp-data/tests/txn_recovery.rs` and the
+    // in-crate `pr5_orphan_and_resurrection_tests`).
+    let Some(Some(view)) = leader.txn_record_view(&record_key).await else {
         return;
     };
     if !matches!(view.status, TxnDecisionStatus::Pending) {
@@ -893,17 +896,28 @@ async fn push(
         return; // decline: a still-live coordinator gets room to finish.
     }
 
+    // ADR 0018 §2/PR5 correctness amendment (issue #298 shape B): only an
+    // affirmative `Some(true)`/`Some(false)` may ever feed `all_staged` — an
+    // unreachable participant (no leader found) or a `txn_verify_staged`
+    // `None` (not served) is UNKNOWN, never evidence of "not staged," and
+    // must make the whole push decline rather than risk an Abort racing a
+    // still-live coordinator's own Commit.
     let mut all_staged = true;
+    let mut inconclusive = false;
     for (table, span) in &view.intent_spans {
         let nodes = topo.for_table(table);
         let Some(participant) = leader_of(nodes).cloned() else {
-            all_staged = false;
+            inconclusive = true;
             continue;
         };
         match participant.txn_verify_staged(span, &txn_id).await {
             Some(true) => {}
-            _ => all_staged = false,
+            Some(false) => all_staged = false,
+            None => inconclusive = true,
         }
+    }
+    if inconclusive {
+        return;
     }
 
     let Some(anchor) = leader_of(record_nodes).cloned() else {
@@ -920,7 +934,7 @@ async fn push(
     let Some(anchor2) = leader_of(record_nodes).cloned() else {
         return;
     };
-    if let Some(final_view) = anchor2.txn_record_view(&record_key).await
+    if let Some(Some(final_view)) = anchor2.txn_record_view(&record_key).await
         && let Some(outcome) = to_outcome(&final_view.status)
     {
         recovery_resolve(
@@ -1364,7 +1378,7 @@ async fn resolver_tick(env: &SimEnv, topo: &Topology) {
             push(env, topo, nodes, record_key, txn_id).await;
         }
         for (txn_id, (record_key, outcome)) in leader.unresolved_decided() {
-            if let Some(view) = leader.txn_record_view(&record_key).await {
+            if let Some(Some(view)) = leader.txn_record_view(&record_key).await {
                 recovery_resolve(env, topo, record_key, txn_id, &view.intent_spans, &outcome).await;
             }
         }

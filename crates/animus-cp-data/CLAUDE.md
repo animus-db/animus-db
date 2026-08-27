@@ -563,16 +563,50 @@ State once here; cross-referenced from the sections below.
     after each attempt. Regression: `tests/txn_recovery.rs`'s
     `stage_over_a_foreign_pending_intent_no_ops_then_a_pushed_retry_succeeds`
     and `abort_restore_never_meets_another_transactions_intent`.
-    **Gap found, not yet fixed (issue #298, 2026-08-26)**: this guard checks
-    only for a *different* txn's unresolved `Intent` — it never checks
-    whether the current value is already `Envelope::Committed`. A stale or
-    duplicate `TxnStage` propose landing after its own transaction has
-    already fully resolved is therefore never rejected: it silently
-    resurrects the key from `Committed` back into `Intent`, and a later
-    resolve can then re-materialize its derived change-log record a second
-    time at a fresh HLC. Identified by reading, not yet caught firing live
-    in a captured repro — see `docs/engineering-lessons.md`'s matching entry
-    and ADR 0058's G5 row.
+    **Fixed (issue #298 shape A, confirmed and closed 2026-08-26)**: this
+    guard used to check only for a *different* txn's unresolved `Intent` —
+    never whether the current value was already `Envelope::Committed`, so
+    a stale/duplicate `TxnStage` propose landing after its own transaction
+    had already fully resolved was never rejected: it would silently
+    resurrect the key from `Committed` back into `Intent`, letting a later
+    resolve re-materialize its derived change-log record a second time at
+    a fresh HLC — caught live (`delivered=146/144`, one member of a
+    transactional pair duplicated under a single sealed shard) during the
+    same `SplitMode::InPlace`-unpinned soak that caught shape B. **Fixed**
+    via a new bounded, best-effort per-group memo, `TxnTracker::
+    recently_resolved` (`physical_key -> txn_id`, populated at every
+    `TxnResolve` apply, checked by `(key, txn_id)` identity): `TxnStage`'s
+    apply arm now rejects (folds into the same `Fenced` bucket as
+    `already_decided`) a stage whose target key was already resolved by
+    THIS EXACT transaction on this group. **Tracing the captured trace's
+    own `txn_id`s past this fix showed the LIVE trigger is narrower and
+    deeper than this guard alone closes** — see `docs/engineering-
+    lessons.md`'s shape A amendment for the full account: the resurrecting
+    stage used a genuinely *different*, fresh `txn_id` (a client-level
+    retry of an un-tokened `TransactWriteItems` racing its own
+    already-committed first attempt, enabled by `cp_txn`'s own
+    confirmation-loss error messages being marked retryable identically to
+    a provably-safe `Fenced` refusal) — a real, still-open, deeper
+    coordinator-side mechanism this fix does not close, named but not
+    fixed this round per this repo's "an incidental bug gets its own PR"
+    convention. Regression for the fix that DID land:
+    `pr5_orphan_and_resurrection_tests::
+    a_resolved_key_rejects_a_same_txn_restage_issue_298_shape_a` (this
+    crate's own in-crate test module, red/green proven).
+  - **`RaftKvNode::txn_record_view` uses the `stale_get_served`/
+    `linearizable_get_served` "served" discipline (fixed 2026-08-26, issue
+    #298 shape B)**: `Option<Option<TxnRecordView>>`, not a plain `Option`
+    — outer `None` = **not served** (this replica's own read barrier
+    failed, e.g. mid-fork/cutover), `Some(None)` = definitively no record
+    at this key, `Some(Some(view))` = found. `animusd::ClientCtx::
+    txn_recover`'s orphan-record branch makes a real decision (whether to
+    synthesize an abort tombstone) directly off "no record" — before this
+    fix, the plain-`Option` return conflated the two into one bare `None`,
+    letting a transient barrier failure be read as a confirmed absence and
+    incorrectly abort a transaction whose record was fine and merely
+    unreachable by that one query. See `docs/engineering-lessons.md`'s
+    issue #298 shape B amendment for the full incident and
+    `tests/txn_record_view_served.rs` for the primitive's own regression.
 
   Other invariants, one line each: a tablet split's `split_key` is not
   token-aligned, so a split racing an in-flight transaction could in

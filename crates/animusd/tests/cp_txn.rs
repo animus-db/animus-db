@@ -338,6 +338,141 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
     }
 }
 
+/// **Issue #298 residuals, item 2: `unresolved_decided`'s lookup-failure
+/// fallback (`txn_resolver_loop`) — "a decided txn whose record's tablet
+/// retires before resolve."** Unlike the sibling test above, the split
+/// happens **after** the decide, not before: the anchor's own record sits
+/// `Committed`-but-unresolved in tablet 1's `TxnTracker` when tablet 1 itself
+/// is split and retires (ADR 0058 in-place fork, the default split mode).
+/// The record's key rides the ordinary base-row clone/trim path onto
+/// whichever child inherits its range — exactly like any other row — so the
+/// child's own group-start `rebuild_txn_tracker` scan (not log replay, see
+/// that function's doc) must re-derive the identical `unresolved_decided`
+/// entry from the cloned, still-`Committed`-tagged record, and
+/// `txn_resolver_loop` must keep driving it to a real resolve on whichever
+/// node now leads the child — with no coordinator, and no second `TxnDecide`
+/// or `TxnResolve` ever sent by this test.
+///
+/// **A `Scan` is the discriminating probe**, not a plain `Get` — for the
+/// identical reason `recovery_resolve_correctly_commits_both_tablets_of_a_
+/// two_tablet_transaction` uses one: a point read resolves a still-`Pending`
+/// intent on the fly the moment it can determine the record's decided
+/// status, which would trivially succeed here (the record is already
+/// `Committed` before the split even starts) and mask whether the
+/// *physical* rewrite — the thing `unresolved_decided`/`txn_resolver_loop`
+/// are actually responsible for — ever happened on the child at all. A scan
+/// silently omits a still-physically-unresolved intent instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn decided_but_unresolved_record_survives_its_own_tablet_splitting_before_resolve() {
+    let n = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(n, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let addr0 = config.nodes[0].client;
+    let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
+
+    put_until_ok(addr0, "txn_split_retire", b"k1", b"seed-lower").await;
+    put_until_ok(addr0, "txn_split_retire", b"k9", b"seed-upper").await;
+
+    // Single-key, single-participant transaction — the anchor's own record
+    // is the whole story here, so no second `TxnPrepare` is needed. The key
+    // sits well below the split point chosen further down, so it lands on
+    // the LOWER child once the split this test drives actually cuts over.
+    let record_data_key = txn_key("k2", "-retire");
+    let (txn_id, record_key, _record_table, anchor_ts) = prepare_via_any_node(
+        &all_addrs,
+        ClientRequest::TxnPrepare {
+            table: "txn_split_retire".to_string(),
+            anchor: None,
+            writes: vec![animus_cp_data::TxnWrite::plain(
+                record_data_key.clone(),
+                Some(b"retire-committed".to_vec()),
+            )],
+            conditions: Vec::new(),
+            participant_spans: Vec::new(),
+            pending_kind_writes: Vec::new(),
+        },
+    )
+    .await;
+
+    // Drive the anchor's own decision directly (mirrors
+    // `commit_already_applied_but_unresolved_converges_via_reads`): the
+    // record is genuinely `Committed`, in tablet 1's own `unresolved_decided`
+    // map, with `TxnResolve` never sent — "the coordinator decided and then
+    // vanished before resolving" — same as that test, except THIS test now
+    // splits tablet 1 itself before anything else ever touches this record.
+    let outcome = decide_via_any_node(
+        &all_addrs,
+        "txn_split_retire".to_string(),
+        txn_id,
+        record_key,
+        true,
+        anchor_ts,
+    )
+    .await;
+    assert!(
+        matches!(outcome, animus_cp_data::TxnOutcome::Committed { .. }),
+        "the anchor's own decision should be a genuine commit here: {outcome:?}"
+    );
+
+    // Split tablet 1 (still hosting the just-decided, unresolved record)
+    // *after* the decide — `split_and_settle` also seeds a harmless probe
+    // key well outside `record_data_key`'s own range, confirming cutover
+    // completed before this test proceeds.
+    split_and_settle(&nodes, addr0, "txn_split_retire", b"k5").await;
+
+    // No second `TxnDecide`/`TxnResolve` ever sent. The only thing that can
+    // still finish rewriting `record_data_key` is `txn_resolver_loop`
+    // running on whichever node now leads the CHILD tablet that inherited
+    // it — which first requires that child's own `rebuild_txn_tracker` to
+    // have picked the entry back up from its cloned engine state.
+    let mut scan_end = record_data_key.clone();
+    scan_end.push(0);
+    let by_key = timeout(Duration::from_secs(30), async {
+        loop {
+            if let ClientResponse::Pairs(pairs) = call(
+                addr0,
+                ClientRequest::Scan {
+                    start: record_data_key.clone(),
+                    end: Some(scan_end.clone()),
+                    limit: None,
+                    reverse: false,
+                    table: "txn_split_retire".to_string(),
+                    stale: false,
+                },
+            )
+            .await
+            {
+                let by_key: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+                    pairs.into_iter().collect();
+                if by_key.contains_key(&record_data_key) {
+                    return by_key;
+                }
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "record_data_key never became visible to a Scan within 30s after its own \
+             tablet split and retired mid-recovery — the child tablet that inherited it \
+             must rebuild the decided-but-unresolved entry from its own cloned engine \
+             state and txn_resolver_loop must still drive it to a real resolve (issue \
+             #298 residuals item 2)"
+        )
+    });
+    assert_eq!(
+        by_key.get(&record_data_key).map(Vec::as_slice),
+        Some(b"retire-committed".as_slice()),
+        "record_data_key must scan back as committed"
+    );
+
+    for node in &nodes {
+        node.shutdown_graceful().await;
+    }
+}
+
 /// A key at least [`TOKEN_BYTES`]-long (ADR 0022's floor `cp_txn` enforces
 /// for every transaction write, since `RaftKvNode::txn_stage`'s anchor-key
 /// assert is now wire-reachable — see `cp_txn`'s doc), embedding `suffix`
