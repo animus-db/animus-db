@@ -4539,6 +4539,70 @@ pub(crate) enum KindWriteOutcome {
     ConditionFailed,
 }
 
+/// **Issue #412: classify a leader-side old-image read failure before
+/// wrapping it**, shared by [`kind_write_item_at_leader`] and its
+/// transactional twin [`eval_kind_txn_write`]. Every error
+/// `ClientCtx::cp_get_local_resolving` can produce already carries the
+/// house `"; retry"` suffix (a leader-moved condition, a stale-routing
+/// scope miss, an in-flight transaction resolution race — see that
+/// function's own doc) — this makes threading that retryability through to
+/// the wrapped [`WireError`] an explicit, structural decision at the one
+/// place both callers turn this read's failure into their own error type,
+/// mirroring how `FROZEN_REFUSAL` is threaded, rather than leaving it an
+/// accident of `{e}` happening to sit last in a `format!` string that a
+/// future edit (e.g. appending more context after the interpolated error)
+/// could silently break. `e` is placed at the very end of the returned
+/// message on purpose: a caller — `ClientCtx::cp_kind_write_item`'s retry
+/// loop for the ordinary path, `ClientCtx::txn_prepare_pushing`'s for the
+/// transactional one — keys on that exact suffix
+/// (`ClientCtx::read_should_retry`) to decide whether to re-resolve routing
+/// and retry. A read failure that is NOT retryable-shaped (a genuine
+/// storage/decode error) is unaffected — it stays exactly the terminal
+/// `InternalServerError` it always was.
+fn leader_read_failure(e: String) -> WireError {
+    internal(&format!("leader-side old-image read failed: {e}"))
+}
+
+/// Test-only fault injector for the issue #412 regression: forces the next
+/// `count` leader-side old-image reads for `table`
+/// ([`kind_write_item_at_leader`]/[`eval_kind_txn_write`]'s shared read
+/// step) to fail with the retryable `"CP group leader moved; retry"` shape,
+/// without needing to orchestrate a real leadership change. Mirrors
+/// [`rmw285_confirm_gate`]'s arm/consume idiom.
+#[cfg(test)]
+pub(crate) mod leader_read_failure_gate {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static ARMED: OnceLock<Mutex<Option<(String, u32)>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<(String, u32)>> {
+        ARMED.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Arm the gate: the next `count` leader-side old-image reads for
+    /// `table` fail before the gate disarms and reads proceed normally.
+    pub(crate) fn arm(table: &str, count: u32) {
+        *slot().lock().expect("leader_read_failure_gate poisoned") =
+            Some((table.to_string(), count));
+    }
+
+    /// Consult the gate right before the real read. Returns `Some(err)`
+    /// (consuming one shot) while armed with a remaining count for `table`;
+    /// a no-op (`None`, real read proceeds) once exhausted or for any other
+    /// table.
+    pub(crate) fn maybe_fail(table: &str) -> Option<String> {
+        let mut guard = slot().lock().expect("leader_read_failure_gate poisoned");
+        match guard.as_mut() {
+            Some((armed_table, remaining)) if armed_table == table && *remaining > 0 => {
+                *remaining -= 1;
+                Some("CP group leader moved; retry".to_string())
+            }
+            _ => None,
+        }
+    }
+}
+
 /// **The evaluate-at-leader write path (ADR 0046 U3)** for `PutItem`/
 /// `DeleteItem`/`UpdateItem` on an indexed or streamed table — replaces
 /// `index_aware_write`'s edge-evaluated design, which had a real cross-node
@@ -4648,10 +4712,14 @@ pub(crate) async fn kind_write_item_at_leader(
     // scoping this mirrors.
     let (old, new, writes, change_log, seatbelt) = {
         let _rmw = ctx.data().rmw_lock.lock().await;
+        #[cfg(test)]
+        if let Some(err) = leader_read_failure_gate::maybe_fail(table) {
+            return Err(leader_read_failure(err));
+        }
         let raw_old = ctx
             .cp_get_local_resolving(leader, &base_key)
             .await
-            .map_err(|e| internal(&format!("leader-side old-image read failed: {e}")))?;
+            .map_err(leader_read_failure)?;
         let old = match &raw_old {
             Some(bytes) => wire::decode_stored_item(bytes)?,
             None => None,
@@ -4877,10 +4945,14 @@ pub(crate) async fn eval_kind_txn_write(
     condition: Option<&ConditionExpression>,
 ) -> Result<Option<KindTxnWriteEval>, WireError> {
     let base_key = item_key(pk, sk);
+    #[cfg(test)]
+    if let Some(err) = leader_read_failure_gate::maybe_fail(table) {
+        return Err(leader_read_failure(err));
+    }
     let raw_old = ctx
         .cp_get_local_resolving(leader, &base_key)
         .await
-        .map_err(|e| internal(&format!("leader-side old-image read failed: {e}")))?;
+        .map_err(leader_read_failure)?;
     let old = match &raw_old {
         Some(bytes) => wire::decode_stored_item(bytes)?,
         None => None,

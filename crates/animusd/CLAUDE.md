@@ -2006,7 +2006,22 @@ route below the edge through the same `ClientCtx` CP primitives.
   `control-remove` as part of decommission," never "skip its safety
   checks"). See ADR 0037 (and ADR 0040's amendment on it) for the full
   design, and `docs/engineering-lessons.md` for the id-space-mismatch and
-  self-registration/admin-action-clobber war stories.
+  self-registration/admin-action-clobber war stories. **Self-removal's
+  leadership-transfer arm is one-shot, not auto-retried (issue #405)**:
+  `admin_remove_control_member`'s `node == my_id` branch calls
+  `RaftCore::transfer_leadership` exactly once — if the target's
+  `peer_match` hasn't caught up to `commit_index()` at that precise
+  instant (plausible right after a runtime `control/member/add`, since
+  ordinary background churn — a liveness `UpsertMember`, a placement
+  reconcile — can keep advancing `commit_index`, worse under load), the
+  call returns a `409` indistinguishable, by status code alone, from
+  "armed, but the target took the full internal poll to step up." Every
+  refusal this action can return says "retry" for exactly this reason —
+  a caller (a human operator, or a test standing in for one) must retry
+  the **whole call**, not just wait on the side effect; see
+  `crates/animus-control/CLAUDE.md`'s "Leadership transfer" entry and
+  `docs/engineering-lessons.md`'s issue #405 entry for the full mechanism
+  and `tests/heartbeat_live_destinations.rs`'s fix.
 - **The CP group is durable by default** — and since ADR 0050 Train B rung
   1, **each hosted tablet gets its OWN private `LsmEngine`** (filename
   prefix `tablet_lsm_prefix(t)` = `db-t{t}-`; the trailing `-` keeps

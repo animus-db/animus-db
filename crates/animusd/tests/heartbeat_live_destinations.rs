@@ -287,18 +287,44 @@ async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
     // completing the removal (mirrors `control_membership_admin.rs`'s own
     // self-removal tests) — the voter set stays `{0,1}`; only leadership
     // moves.
-    let (status, _body) = remove_control_member(node0_admin, 0).await;
-    assert_eq!(
-        status, 409,
-        "self-removal should report the armed transfer, not silently succeed"
-    );
-
-    timeout(Duration::from_secs(15), async {
+    // Issue #405: `admin_remove_control_member`'s self-removal branch arms
+    // `RaftCore::transfer_leadership` **once** per call, and that arm only
+    // succeeds if the target's `peer_match` has already caught up to this
+    // leader's `commit_index` at that exact instant (see that method's own
+    // doc — the gate is deliberately `>=`, not "eventually", because a
+    // caller is expected to re-arm every tick if it needs to, which this
+    // one-shot admin action does not). The control group's own background
+    // churn (the failure detector's liveness `UpsertMember` proposal for
+    // the freshly-added voter, `reconcile_loop`'s placement bookkeeping)
+    // can advance `commit_index` past the runtime-added voter's replicated
+    // position in the window between the {0,1} config-convergence check
+    // above and this call — a window real machine contention widens.
+    // EVERY refusal this action can return (failed to arm; armed but the
+    // target never finished stepping up within its own internal
+    // `CONTROL_TRANSFER_POLL_TIMEOUT`) maps identically to HTTP 409
+    // (`admin.rs::action_remove_control_member`), so a single 409 proves
+    // nothing about whether a transfer actually got armed — pre-fix, this
+    // test treated any 409 as "in progress" and then polled only the side
+    // effect, so a single failed-to-arm attempt permanently stranded it:
+    // nothing was left to drive the transfer forward, no matter how long
+    // the poll below waited. Every one of this action's own refusal
+    // messages says "retry" — exactly what a real operator (`animus admin
+    // control-remove`) is expected to do by hand, since this admin action
+    // deliberately does not retry itself (see its own doc). Retrying the
+    // whole call here is safe: a re-arm of the same already-armed target
+    // is a documented no-op that does not push the deadline out.
+    timeout(Duration::from_secs(30), async {
         loop {
             if grown.is_control_leader() {
                 return;
             }
-            sleep(Duration::from_millis(50)).await;
+            let (status, _body) = remove_control_member(node0_admin, 0).await;
+            assert_eq!(
+                status, 409,
+                "self-removal should report the armed transfer or a retryable \
+                 refusal, never silently succeed"
+            );
+            sleep(Duration::from_millis(100)).await;
         }
     })
     .await
