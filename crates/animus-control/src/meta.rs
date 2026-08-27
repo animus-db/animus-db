@@ -955,8 +955,116 @@ pub struct RestoreRow {
     /// range, mark it backfilled, and then silently miss every row this
     /// restore seeds afterward.
     pub gsi_defs: Vec<IndexDef>,
+    /// `Some` for a `RestoreTableToPointInTime` restore (ADR 0059 §10, Train
+    /// 3 PR②) — the segment-replay plan the wire handler resolved once,
+    /// client-side, before ever proposing (the identical "client-supplied,
+    /// recorded verbatim" convention [`gsi_defs`](Self::gsi_defs) already
+    /// uses, and for the same reason: computing this needs the backup
+    /// store's own manifest object, which this pure state machine cannot
+    /// read). `None` for an ordinary `RestoreTableFromBackup` restore — in
+    /// that case `backup_id` alone is everything the restore driver
+    /// (`animusd::backup_restore`) needs, unchanged from Train 2. See
+    /// [`PitrRestorePlan`]'s own doc for the plan shape and
+    /// [`Metadata::pitr_replay_segments`] for how it is computed.
+    pub pitr: Option<PitrRestorePlan>,
     /// This row's lifecycle status.
     pub status: RestoreStatus,
+}
+
+/// One PITR segment to replay, as part of a [`PitrRestorePlan`] (ADR 0059
+/// §10, Train 3 PR②) — a thin reference into the already-committed
+/// [`Metadata::pitr_segments`] catalog (never re-derived by the restore
+/// driver, which reads only this plan), resolved once by the wire handler
+/// from a **fresh** `Metadata` read at propose time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PitrReplaySegmentRef {
+    /// The tablet (possibly a live split descendant of the PITR base
+    /// snapshot's own pinned tablet, ADR 0059 §6's re-planning technique
+    /// applied here too) whose own chain this segment belongs to —
+    /// diagnostic only; the driver never needs it to fetch or decode.
+    pub tablet: TabletId,
+    /// This segment's own epoch within `tablet`'s chain — diagnostic only.
+    pub epoch: u64,
+    /// The backup store object id (`PitrSegmentRow::object_id`) to fetch.
+    pub object_id: String,
+    /// The `(start_exclusive, end_inclusive)` packed-HLC range to slice this
+    /// segment's decoded records to (`segment::decode_and_slice`) — **not**
+    /// necessarily the catalog row's own full `hlc_range`: for a segment
+    /// straddling the PITR base snapshot's own captured cut version, the
+    /// lower bound is raised to that cut version so an already-captured
+    /// record is never replayed a second time (harmless either way, since
+    /// `SeedBatch`'s own merge-at-carried-version is idempotent, but
+    /// avoided here rather than relied upon).
+    pub replay_range: (u64, u64),
+}
+
+/// A PITR restore's own segment-replay plan (ADR 0059 §10, Train 3 PR②) —
+/// resolved once, client-side, by `animusd::dynamo::
+/// restore_table_to_point_in_time` from a fresh `Metadata` read plus the
+/// chosen PITR base snapshot's own manifest object (fetched from the backup
+/// store — something this pure state machine has no access to, which is why
+/// this plan rides the command as already-resolved data rather than being
+/// recomputed inside `MetaCommand::BeginRestore`'s own apply arm the way
+/// `BeginBackup`'s manifest stub is). See [`Metadata::pitr_replay_segments`]
+/// for the plan-computation algorithm.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PitrRestorePlan {
+    /// The restore's own target wall-clock cutoff, in epoch milliseconds
+    /// (the requested `RestoreDateTime`, truncated to the second and pushed
+    /// to that second's own last millisecond — or `LatestRestorableDateTime`
+    /// verbatim for `UseLatestRestorableTime`). Every included segment's own
+    /// `seal_wall_ms` is at or before this value (ADR 0059 §10's
+    /// per-tablet-cutoff rule, at this codebase's own segment-granularity
+    /// precision — see `pitr_replay_segments`'s own doc for the full
+    /// argument). Diagnostic/observability only, once the plan below is
+    /// already resolved.
+    pub target_wall_ms: u64,
+    /// Every PITR segment to replay, across every one of the base
+    /// snapshot's own pinned tablets and their live split descendants, in
+    /// no particular cross-tablet order (`SeedBatch`'s merge-at-carried-
+    /// version is order-independent by construction — see
+    /// `animusd::backup_restore`'s own doc for the full argument).
+    pub segments: Vec<PitrReplaySegmentRef>,
+}
+
+/// The current-generation PITR restorable window for `table` (ADR 0059
+/// §10) — the basis `RestoreTableToPointInTime`'s validation gate reads,
+/// valid whether or not the table still exists (a dropped table's PITR
+/// history survives `DropTableSchema`/`DropTableTablets`, ADR 0059 §9/§10's
+/// own carve-out). Deliberately scoped to the **latest** generation this
+/// table name has ever used, never an older one superseded by a disable/
+/// re-enable cycle — this is what makes a `T` before this generation's own
+/// coverage start (including one that falls inside an earlier disable/
+/// re-enable gap) uniformly rejected as "too early," without needing a
+/// separate gap-detection rule (this settles the ADR's own "Not yet
+/// decided" question from the Train 3 PR① amendment: option 1, reject
+/// outright, chosen over "find no coverage and use a generic error" —
+/// because scoping to the latest generation alone already produces exactly
+/// that rejection for free).
+///
+/// Distinct from (but answering the identical underlying question as)
+/// `animusd::dynamo::pitr_description`'s own `DescribeContinuousBackups`
+/// formula: that one is more precise for a **live** table (it takes the
+/// minimum over the table's *current* tablets' own last-seal times); this
+/// one instead takes the minimum over every tablet that ever sealed a
+/// segment of this generation, which is the only formulation that still
+/// makes sense once the table (and with it `Metadata::tablets_for_table`)
+/// is gone. The two agree for a live, quiescent table but can differ
+/// slightly for a live table mid-split (a retired parent's own tablet id
+/// still counts here, harmlessly conservative) — never a correctness
+/// concern for restore's own gate, which only needs a **safe** (never too
+/// generous) bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PitrRestoreWindow {
+    /// The generation this window describes.
+    pub generation: u64,
+    /// The earliest wall-clock instant (epoch milliseconds), **before** the
+    /// retention floor is folded in (the caller, holding `env.wall_now()`,
+    /// does that — this pure accessor takes no "now" input at all).
+    pub earliest_ms: u64,
+    /// The latest wall-clock instant (epoch milliseconds) this generation's
+    /// own coverage can currently support a restore to.
+    pub latest_ms: u64,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -1645,6 +1753,11 @@ pub enum MetaCommand {
         /// [`RestoreRow::gsi_defs`]'s own doc for why these are recorded now
         /// but not declared on the schema until then.
         gsi_defs: Vec<IndexDef>,
+        /// `Some` for a `RestoreTableToPointInTime` restore (ADR 0059 §10,
+        /// Train 3 PR②) — see [`RestoreRow::pitr`]'s own doc. Carried
+        /// verbatim onto the new [`RestoreRow`], never inspected or
+        /// recomputed by this apply arm.
+        pitr: Option<PitrRestorePlan>,
     },
     /// Complete a restore (ADR 0059 §7 step 5): activates this restore's
     /// tablet (`Building` → `Active`, epoch bumped — mirroring
@@ -2520,6 +2633,7 @@ impl Metadata {
                 tablet,
                 replicas,
                 gsi_defs,
+                pitr,
             } => {
                 if self.restores.contains_key(restore_id) {
                     return ApplyOutcome::Rejected("restore id already exists");
@@ -2549,6 +2663,7 @@ impl Metadata {
                         target_table: target_table.clone(),
                         tablet: *tablet,
                         gsi_defs: gsi_defs.clone(),
+                        pitr: pitr.clone(),
                         status: RestoreStatus::Seeding,
                     },
                 );
@@ -3325,6 +3440,158 @@ impl Metadata {
             .collect();
         rows.sort_by_key(|(_, row)| row.manifest.created_wall_ms);
         rows.into_iter()
+    }
+
+    /// **ADR 0059 §10 (Train 3 PR②)**: the ordered plan of PITR segments to
+    /// replay forward from a chosen PITR base snapshot's own per-tablet cut
+    /// versions (`base_tablet_progress`, taken verbatim from that backup's
+    /// frozen manifest **object** — never from this catalog, which never
+    /// held that per-tablet detail in the first place) up to
+    /// `cutoff_wall_ms`.
+    ///
+    /// **Split-lineage aware**, mirroring [`live_split_descendants`]'s own
+    /// re-planning technique (ADR 0059 §6) applied here to PITR replay
+    /// instead of on-demand capture: a base tablet that has since split
+    /// contributes its own remaining segments (those past the base's own
+    /// cut version) plus every live descendant's own **full** chain (a
+    /// copy-based split child's PITR chain starts fresh at its own epoch 0,
+    /// ADR 0059 §9) — walked one full ancestor-to-descendant path per live
+    /// leaf, so a cascading split (parent → mid → {a, b}) replays the
+    /// parent's own tail, then `mid`'s own full chain, then `a`'s (or
+    /// `b`'s) own full chain.
+    ///
+    /// **Precision, stated plainly rather than left to be discovered by
+    /// diffing this against the ADR's own prose**: [`PitrSegmentRow::
+    /// seal_wall_ms`] is pinned once **per segment**, never per record — a
+    /// segment is included or excluded as a whole unit against
+    /// `cutoff_wall_ms`, never split mid-body. This is a **safe**
+    /// (never-includes-a-later-write) approximation of "the packed-HLC
+    /// cutoff corresponding to wall-clock second `T`": every record inside
+    /// an included segment was durably committed strictly before that
+    /// segment's own seal, itself at or before `cutoff_wall_ms` by this
+    /// function's own filter. The cost is the opposite direction: a record
+    /// truly committed just before `T` but batched into a segment sealed
+    /// just after it is excluded, not included — bounded to at most one
+    /// seal interval's worth of imprecision, and the identical direction
+    /// ADR 0059 §9's own "never claim `now`" `LatestRestorableDateTime`
+    /// rule already accepts.
+    ///
+    /// Deliberately **not** sorted or interleaved across tablets in the
+    /// returned `Vec` — see [`PitrRestorePlan::segments`]'s own doc for why
+    /// the restore driver's replay order never matters.
+    #[must_use]
+    pub fn pitr_replay_segments(
+        &self,
+        base_tablet_progress: &[(TabletId, u64)],
+        cutoff_wall_ms: u64,
+    ) -> Vec<PitrReplaySegmentRef> {
+        let mut out = Vec::new();
+        for &(base_tablet, base_cut_version) in base_tablet_progress {
+            for descendant in self.live_split_descendants(base_tablet) {
+                // Walk from `descendant` back up to `base_tablet` via
+                // `split_lineage`, bounded exactly like `traces_to_pinned`'s
+                // own defensive loop against a malformed/cyclic chain (which
+                // should never occur — `split_lineage` is a tree, written
+                // once per child).
+                let mut path = vec![descendant];
+                let mut cur = descendant;
+                for _ in 0..=self.split_lineage.len() {
+                    if cur == base_tablet {
+                        break;
+                    }
+                    let Some(lineage) = self.split_lineage.get(&cur) else {
+                        break;
+                    };
+                    cur = lineage.parent;
+                    path.push(cur);
+                }
+                path.reverse(); // base_tablet ..= descendant, ancestor-first
+
+                for (i, &tablet) in path.iter().enumerate() {
+                    // Only the path's own first tablet (`base_tablet`
+                    // itself) is floored at the base snapshot's own cut
+                    // version — every split child born after it starts its
+                    // own PITR chain fresh at epoch 0 (ADR 0059 §9), so
+                    // nothing of its own was ever captured by that base.
+                    let floor = if i == 0 { base_cut_version } else { 0 };
+                    for (&(_, epoch), row) in
+                        self.pitr_segments.range((tablet, 0)..=(tablet, u64::MAX))
+                    {
+                        if row.hlc_range.1 <= floor {
+                            continue; // fully covered by the base snapshot already
+                        }
+                        if row.seal_wall_ms > cutoff_wall_ms {
+                            // Deliberately `continue`, not `break`: seal
+                            // order and `seal_wall_ms` order should
+                            // coincide within one tablet's own chain, but a
+                            // leader change's own per-node clock is not
+                            // provably monotonic against a predecessor's —
+                            // never rely on early-exit here for
+                            // correctness, only ever for a cheap skip.
+                            continue;
+                        }
+                        out.push(PitrReplaySegmentRef {
+                            tablet,
+                            epoch,
+                            object_id: row.object_id.clone(),
+                            replay_range: (floor.max(row.hlc_range.0), row.hlc_range.1),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// See [`PitrRestoreWindow`]'s own doc for the full contract.
+    #[must_use]
+    pub fn pitr_restore_window(&self, table: &str) -> Option<PitrRestoreWindow> {
+        let live_spec = self.table_pitr(table);
+        let generation = live_spec
+            .map(|s| s.generation)
+            .or_else(|| self.pitr_generation.get(table).copied())?;
+        if generation == 0 {
+            return None; // this table name has never enabled PITR at all
+        }
+        let enabled_ms = live_spec
+            .filter(|s| s.generation == generation)
+            .map(|s| s.enabled_wall_ms);
+
+        let bases: Vec<&BackupRow> = self
+            .pitr_base_backups_for_table(table)
+            .map(|(_, row)| row)
+            .collect();
+        let segment_tablets: BTreeSet<TabletId> = self
+            .pitr_segments
+            .iter()
+            .filter(|(_, row)| row.table == table && row.generation == generation)
+            .map(|((t, _), _)| *t)
+            .collect();
+
+        let earliest_ms = enabled_ms
+            .or_else(|| bases.first().map(|r| r.manifest.created_wall_ms))
+            .or_else(|| {
+                self.pitr_segments
+                    .iter()
+                    .filter(|(_, row)| row.table == table && row.generation == generation)
+                    .map(|(_, row)| row.seal_wall_ms)
+                    .min()
+            })?;
+
+        let latest_ms = if segment_tablets.is_empty() {
+            bases.last().map(|r| r.manifest.created_wall_ms)
+        } else {
+            segment_tablets
+                .iter()
+                .map(|&t| self.last_pitr_seal_wall_ms(t).unwrap_or(earliest_ms))
+                .min()
+        }?;
+
+        Some(PitrRestoreWindow {
+            generation,
+            earliest_ms,
+            latest_ms: latest_ms.max(earliest_ms),
+        })
     }
 
     /// The tablets scoped to `table` (ADR 0023), in ascending tablet-id order.
@@ -4619,6 +4886,7 @@ mod tests {
                 tablet: TabletId(5),
                 replicas: vec![nid(1)],
                 gsi_defs: Vec::new(),
+                pitr: None,
             }),
             ApplyOutcome::Applied
         );
@@ -4645,6 +4913,7 @@ mod tests {
                 tablet: TabletId(6),
                 replicas: vec![nid(1)],
                 gsi_defs: Vec::new(),
+                pitr: None,
             }),
             ApplyOutcome::Rejected("restore id already exists")
         );
@@ -4659,6 +4928,7 @@ mod tests {
                 tablet: TabletId(5),
                 replicas: vec![nid(1)],
                 gsi_defs: Vec::new(),
+                pitr: None,
             }),
             ApplyOutcome::Rejected("tablet already exists")
         );
@@ -4673,6 +4943,7 @@ mod tests {
                 tablet: TabletId(0),
                 replicas: vec![nid(1)],
                 gsi_defs: Vec::new(),
+                pitr: None,
             }),
             ApplyOutcome::Rejected("tablet id below the monotonic allocator")
         );
@@ -4702,6 +4973,7 @@ mod tests {
                 tablet: TabletId(5),
                 replicas: vec![nid(1)],
                 gsi_defs: Vec::new(),
+                pitr: None,
             }),
             ApplyOutcome::Applied
         );
@@ -4754,6 +5026,7 @@ mod tests {
                 tablet: TabletId(6),
                 replicas: vec![nid(1)],
                 gsi_defs: Vec::new(),
+                pitr: None,
             }),
             ApplyOutcome::Applied
         );
@@ -5160,6 +5433,7 @@ mod tests {
                     projection: crate::schema::IndexProjection::All,
                     status: IndexStatus::Creating,
                 }],
+                pitr: None,
             }),
             ApplyOutcome::Applied
         );

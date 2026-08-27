@@ -2426,7 +2426,11 @@ async fn pitr_tick(
         return Ok(());
     }
 
-    let now_ms = ctx.env.now().0 / 1_000_000;
+    // `env.wall_now()`, matching `pitr_seal_now`'s own fix (see that
+    // function's doc) — both sides of this arm's `backlog_ms` delta must
+    // read the same clock, and `last_pitr_seal_wall_ms` is now a real
+    // wall-clock stamp.
+    let now_ms = ctx.env.wall_now().0;
     let last_seal_ms = match meta.last_pitr_seal_wall_ms(tablet) {
         Some(ms) => {
             first_pitr_hot_seen.remove(&tablet);
@@ -2435,21 +2439,27 @@ async fn pitr_tick(
         None => match first_pitr_hot_seen.get(&tablet).copied() {
             Some(ms) => ms,
             None => {
-                // Same one-time real-scan bootstrap `seal_tick` uses for its
-                // own never-sealed fallback (see that function's own doc for
-                // the full "why 'now' is wrong for a split child" argument):
-                // the true oldest pending record's HLC, memoized once per
-                // tablet lifetime.
-                let oldest = group
-                    .pending_changes()
-                    .await
-                    .iter()
-                    .filter_map(|(key, _)| record_hlc(key))
-                    .map(|ts| ts.wall_ms)
-                    .min()
-                    .unwrap_or(now_ms);
-                first_pitr_hot_seen.insert(tablet, oldest);
-                oldest
+                // Deliberately NOT `seal_tick`'s own "true oldest pending
+                // record's HLC" fallback: that basis is `ts.wall_ms`, a
+                // component of the packed HLC — monotonic-since-process-
+                // start (`Hlc::mint(env.now())`), never wall-clock — which
+                // stopped being comparable to this arm's own `now_ms` the
+                // moment it became a real `env.wall_now()` reading (see
+                // this function's own doc on `pitr_seal_now`'s twin fix).
+                // Mixing the two here would manufacture a backlog of
+                // "now minus a monotonic-since-start millisecond count," an
+                // enormous bogus age that fires `age_hot` on this tablet's
+                // very first tick regardless of true backlog age. Seeding
+                // at `now_ms` instead reintroduces `seal_tick`'s own
+                // documented (narrow, stream-only) split-child
+                // underestimate for PITR's arm too — accepted here: it only
+                // delays a never-yet-sealed tablet's own first seal by at
+                // most one `--stream-seal-age` interval, never a
+                // correctness issue (the `size_hot` trigger is unaffected,
+                // and a delayed first seal still seals the FULL backlog
+                // once it fires).
+                first_pitr_hot_seen.insert(tablet, now_ms);
+                now_ms
             }
         },
     };
@@ -2535,7 +2545,25 @@ pub(crate) async fn pitr_seal_now(
     // stream sealer uses, reused verbatim (it has no stream-specific
     // content at all).
     let parent_shard_id = meta.stream_shard_parent_id(tablet, next_epoch);
-    let seal_wall_ms = ctx.env.now().0 / 1_000_000;
+    // ADR 0059 §10 (Train 3 PR②) bug fix: this used to be `ctx.env.now().0
+    // / 1_000_000` — the monotonic-since-process-start clock, mirroring the
+    // stream sealer's own `seal_now` (whose `seal_wall_ms` is genuinely
+    // observability-only, never compared against a real calendar
+    // timestamp). PITR's own `seal_wall_ms` is different: `Metadata::
+    // last_pitr_seal_wall_ms` feeds directly into `EarliestRestorableDateTime`/
+    // `LatestRestorableDateTime` (`dynamo::pitr_description`) and — as of
+    // this PR — `RestoreTableToPointInTime`'s own window/segment-selection
+    // math, both of which compare it against `PitrSpec::enabled_wall_ms`
+    // (a genuine `env.wall_now()` epoch-millisecond stamp, ADR 0051
+    // discipline). Left as `env.now()`, a PITR-enabled table's
+    // `LatestRestorableDateTime` silently collapsed to `EarliestRestorableDateTime`
+    // forever the instant any tablet sealed even once (the tiny
+    // monotonic-ms value always lost to the `.max(earliest_ms)` clamp) —
+    // found while implementing this PR's own restore validation gate, not
+    // by a failing test (the existing `dynamo_pitr.rs` lifecycle test
+    // happened not to assert `latest` ever *exceeds* `earliest`). See
+    // `docs/engineering-lessons.md` for the general lesson.
+    let seal_wall_ms = ctx.env.wall_now().0;
     let header = segment::new_header(
         table.to_owned(),
         format!("gen{generation}"),

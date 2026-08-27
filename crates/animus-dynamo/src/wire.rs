@@ -878,6 +878,34 @@ pub enum Operation {
         /// A full replacement GSI declaration, if given.
         global_secondary_index_override: Option<Vec<SecondaryIndex>>,
     },
+    /// `RestoreTableToPointInTime` (ADR 0059 §10, Train 3 PR②): restore
+    /// `source_table_name`'s point-in-time recovery (PITR) history into a
+    /// brand-new table `target_table_name`, as of a target wall-clock
+    /// second (`restore_date_time_secs`, AWS's own `Timestamp` shape — epoch
+    /// seconds, possibly fractional, truncated to the second by `animusd`)
+    /// or the table's own current `LatestRestorableDateTime`
+    /// (`use_latest_restorable_time`). Exactly one of the two must be
+    /// meaningful (`animusd` validates); `global_secondary_index_override`
+    /// is the identical full-replacement GSI knob
+    /// [`RestoreTableFromBackup`](Self::RestoreTableFromBackup) already has.
+    RestoreTableToPointInTime {
+        /// The source table's name (may already be dropped — ADR 0059
+        /// §9/§10's own "PITR history survives the source table" carve-out).
+        source_table_name: String,
+        /// The new table's name.
+        target_table_name: String,
+        /// `RestoreDateTime`, decoded to epoch **milliseconds**
+        /// ([`decode_backup_timestamp_ms`]'s own shape — full precision;
+        /// `animusd` truncates to the whole second per AWS's own
+        /// `RestoreDateTime` granularity) — `None` when
+        /// `UseLatestRestorableTime` is set instead.
+        restore_date_time_ms: Option<u64>,
+        /// `UseLatestRestorableTime` — restore to the table's own current
+        /// `LatestRestorableDateTime` rather than a caller-named second.
+        use_latest_restorable_time: bool,
+        /// A full replacement GSI declaration, if given.
+        global_secondary_index_override: Option<Vec<SecondaryIndex>>,
+    },
     /// `UpdateContinuousBackups` (ADR 0059 §9, Train 3): enable or disable
     /// `table`'s point-in-time recovery (PITR). `animusd` validates the
     /// table exists (`TableNotFoundException`) and proposes the catalog
@@ -954,6 +982,9 @@ impl Operation {
             // (mirroring `CreateTable`'s own "the table about to exist" —
             // the target doesn't exist yet either way).
             Operation::RestoreTableFromBackup {
+                target_table_name, ..
+            }
+            | Operation::RestoreTableToPointInTime {
                 target_table_name, ..
             } => Some(target_table_name),
             Operation::BatchWriteItem { .. }
@@ -1347,6 +1378,7 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
             backup_arn: backup_arn_field(obj)?,
         }),
         "RestoreTableFromBackup" => decode_restore_table_from_backup(obj),
+        "RestoreTableToPointInTime" => decode_restore_table_to_point_in_time(obj),
         _ => Err(WireError::unknown_operation(target)),
     }
 }
@@ -1489,6 +1521,76 @@ fn decode_restore_table_from_backup(obj: &Map<String, Value>) -> Result<Operatio
     Ok(Operation::RestoreTableFromBackup {
         backup_arn,
         target_table_name,
+        global_secondary_index_override,
+    })
+}
+
+/// Decode a `RestoreTableToPointInTime` body (ADR 0059 §10, Train 3 PR②):
+/// `SourceTableName` + `TargetTableName`, plus `RestoreDateTime` (an AWS
+/// `Timestamp` — epoch seconds, possibly fractional) and/or
+/// `UseLatestRestorableTime` (a bare boolean — only `true` is meaningful;
+/// `false`/absent means "not requested," mirroring AWS's own optional-flag
+/// shape), and the identical `GlobalSecondaryIndexOverride` array
+/// [`decode_restore_table_from_backup`] already decodes. **Not** validating
+/// here that exactly one of the two time selectors was given, or that
+/// `RestoreDateTime` is present when required — `animusd` does, since it
+/// alone knows the currently-restorable window to explain a rejection
+/// against.
+fn decode_restore_table_to_point_in_time(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let source_table_name = obj
+        .get("SourceTableName")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("missing string field `SourceTableName`"))?
+        .to_owned();
+    let target_table_name = obj
+        .get("TargetTableName")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("missing string field `TargetTableName`"))?
+        .to_owned();
+    let restore_date_time_ms = decode_backup_timestamp_ms(obj, "RestoreDateTime")?;
+    let use_latest_restorable_time = match obj.get("UseLatestRestorableTime") {
+        None | Some(Value::Null) => false,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| WireError::validation("`UseLatestRestorableTime` must be a boolean"))?,
+    };
+    let global_secondary_index_override = match obj.get("GlobalSecondaryIndexOverride") {
+        None | Some(Value::Null) => None,
+        Some(gsis) => {
+            let gsis = gsis.as_array().ok_or_else(|| {
+                WireError::validation("`GlobalSecondaryIndexOverride` must be an array")
+            })?;
+            if gsis.len() > MAX_GSI_PER_TABLE {
+                return Err(WireError::validation(format!(
+                    "too many GlobalSecondaryIndexOverride entries: {} declared, at most \
+                     {MAX_GSI_PER_TABLE} allowed per table",
+                    gsis.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(gsis.len());
+            let mut seen = std::collections::BTreeSet::new();
+            for gsi in gsis {
+                let (name, schema, projection) = decode_index_entry(gsi, "GSI")?;
+                if !seen.insert(name.clone()) {
+                    return Err(WireError::validation(format!(
+                        "duplicate index name `{name}` in GlobalSecondaryIndexOverride"
+                    )));
+                }
+                out.push(SecondaryIndex::Global(GlobalSecondaryIndex {
+                    name,
+                    key_attribute: schema.partition_key,
+                    sort_attribute: schema.sort_key,
+                    projection,
+                }));
+            }
+            Some(out)
+        }
+    };
+    Ok(Operation::RestoreTableToPointInTime {
+        source_table_name,
+        target_table_name,
+        restore_date_time_ms,
+        use_latest_restorable_time,
         global_secondary_index_override,
     })
 }

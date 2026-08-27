@@ -163,6 +163,7 @@ use std::time::Duration;
 
 use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjection, IndexStatus};
 use animus_control::{MetaCommand, Metadata, TtlSpec};
+use animus_cp_data::backup as backup_codec;
 use animus_cp_data::{KIND_BASE, KIND_LSI};
 use animus_dynamo::capacity::{
     self, ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity,
@@ -1063,6 +1064,23 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             )
             .await
         }
+        Operation::RestoreTableToPointInTime {
+            source_table_name,
+            target_table_name,
+            restore_date_time_ms,
+            use_latest_restorable_time,
+            global_secondary_index_override,
+        } => {
+            restore_table_to_point_in_time(
+                ctx,
+                &source_table_name,
+                &target_table_name,
+                restore_date_time_ms,
+                use_latest_restorable_time,
+                global_secondary_index_override.as_deref(),
+            )
+            .await
+        }
     }
 }
 
@@ -1654,11 +1672,6 @@ async fn restore_table_from_backup(
     target_table_name: &str,
     global_secondary_index_override: Option<&[animus_dynamo::SecondaryIndex]>,
 ) -> Result<String, WireError> {
-    if animus_control::syskv::is_reserved_name(target_table_name) {
-        return Err(WireError::validation(format!(
-            "table name `{target_table_name}` collides with the reserved system namespace"
-        )));
-    }
     let meta = metadata_fresh(ctx).await;
     let row = visible_backup(&meta, backup_arn)?;
     match row.status {
@@ -1680,14 +1693,71 @@ async fn restore_table_from_backup(
             });
         }
     }
-    if meta.has_table_schema(target_table_name) {
+    let source_table = row.table.clone();
+    let manifest_schema = row.manifest.schema.clone();
+    let provision = provision_restore_target(
+        ctx,
+        target_table_name,
+        &manifest_schema,
+        global_secondary_index_override,
+    )
+    .await?;
+    finish_restore_kickoff(
+        ctx,
+        backup_arn,
+        &source_table,
+        target_table_name,
+        &provision,
+        None,
+    )
+    .await
+}
+
+/// The GSI/LSI/schema half of a restore's own setup (ADR 0059 §7 step 2/3),
+/// shared by [`restore_table_from_backup`] (Train 2) and
+/// [`restore_table_to_point_in_time`] (ADR 0059 §10, Train 3 PR②): both
+/// replay a table's own creation machinery from a captured
+/// `SourceTableFeatureDetails` schema snapshot rather than inventing a
+/// second bootstrap path, and the two differ only in *which* backup's
+/// manifest schema they start from (a client-named ARN vs. the newest PITR
+/// base snapshot at or before the requested second) — everything from "reject
+/// a reserved/existing target name" through "every LSI committed" is
+/// identical between them.
+struct RestoreProvision {
+    /// The stripped (no `indexes`/`stream`/`ttl`) base schema, already
+    /// committed via `CreateTableSchema`.
+    base_schema: animus_control::TableSchema,
+    /// Every LSI the manifest recorded, already committed via
+    /// `CreateTableIndex` (LSIs are always `Active`, colocated physical
+    /// data — no backfill involved, ADR 0059 §7 step 2).
+    lsi_defs: Vec<IndexDef>,
+    /// This restore's own resolved GSI plan (ADR 0059 §8) — **not yet**
+    /// declared on the schema; see [`RestoreRow::gsi_defs`]'s own doc for
+    /// why (`animus_control::RestoreRow`).
+    gsi_defs: Vec<IndexDef>,
+}
+
+async fn provision_restore_target(
+    ctx: &ClientCtx,
+    target_table_name: &str,
+    manifest_schema: &animus_control::TableSchema,
+    global_secondary_index_override: Option<&[animus_dynamo::SecondaryIndex]>,
+) -> Result<RestoreProvision, WireError> {
+    if animus_control::syskv::is_reserved_name(target_table_name) {
+        return Err(WireError::validation(format!(
+            "table name `{target_table_name}` collides with the reserved system namespace"
+        )));
+    }
+    if metadata_fresh(ctx)
+        .await
+        .has_table_schema(target_table_name)
+    {
         return Err(registry_error(animus_dynamo::RegistryError::TableExists(
             target_table_name.to_owned(),
         )));
     }
 
-    let mut base_schema = row.manifest.schema.clone();
-    let source_table = row.table.clone();
+    let mut base_schema = manifest_schema.clone();
     let manifest_indexes = std::mem::take(&mut base_schema.indexes);
     base_schema.stream = None;
     base_schema.ttl = None;
@@ -1747,8 +1817,7 @@ async fn restore_table_from_backup(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(internal(
-                "RestoreTableFromBackup did not commit its target schema in time \
-                 (no leader reachable?)",
+                "restore did not commit its target schema in time (no leader reachable?)",
             ));
         }
         tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
@@ -1771,27 +1840,48 @@ async fn restore_table_from_backup(
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(internal(
-                    "RestoreTableFromBackup did not commit an LSI definition in time \
-                     (no leader reachable?)",
+                    "restore did not commit an LSI definition in time (no leader reachable?)",
                 ));
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
-    // Step 4: mint the single destination tablet + the `Seeding` restore
-    // row. The replica set mirrors `provision_tablet`'s own convention —
-    // the first `min(N, MAX_REPLICATION_FACTOR)` `Active` members, best-
-    // effort under-sized if the cluster is still bootstrapping (nothing
-    // here self-heals an under-sized set the way `reconcile_placement`
-    // does for an ordinary tablet's recorded RF policy, a named residual:
-    // this restore tablet gets no `SetTabletPolicy` at all, so it is never
-    // a `reconcile_placement`/`rebalance_placement` candidate — a smaller
-    // Train 2.5 follow-up, not a correctness gap, since restore still
-    // succeeds with fewer replicas than the target RF).
-    let timeout_err = internal(
-        "RestoreTableFromBackup did not commit its restore row in time (no leader reachable?)",
-    );
+    Ok(RestoreProvision {
+        base_schema,
+        lsi_defs,
+        gsi_defs,
+    })
+}
+
+/// Mint the single destination tablet + propose `MetaCommand::BeginRestore`
+/// (ADR 0059 §7 step 4/5), shared by [`restore_table_from_backup`] and
+/// [`restore_table_to_point_in_time`] — the only difference between the two
+/// callers is `backup_id` (a client-named ARN vs. the chosen PITR base
+/// snapshot's own ARN) and `pitr` (`None` vs. `Some` the resolved
+/// [`animus_control::PitrRestorePlan`]). The replica set mirrors
+/// `provision_tablet`'s own convention — the first `min(N,
+/// MAX_REPLICATION_FACTOR)` `Active` members, best-effort under-sized if the
+/// cluster is still bootstrapping (nothing here self-heals an under-sized
+/// set the way `reconcile_placement` does for an ordinary tablet's recorded
+/// RF policy, a named residual: this restore tablet gets no
+/// `SetTabletPolicy` at all, so it is never a `reconcile_placement`/
+/// `rebalance_placement` candidate — a smaller follow-up, not a correctness
+/// gap, since restore still succeeds with fewer replicas than the target
+/// RF). Returns immediately once the row commits — **asynchronous**, unlike
+/// `create_table`'s own blocking `await_table_serveable` wait: the restore
+/// driver (`crate::backup_restore`) seeds and activates the tablet in the
+/// background.
+async fn finish_restore_kickoff(
+    ctx: &ClientCtx,
+    backup_id: &str,
+    source_table: &str,
+    target_table_name: &str,
+    provision: &RestoreProvision,
+    pitr: Option<animus_control::PitrRestorePlan>,
+) -> Result<String, WireError> {
+    let timeout_err =
+        internal("restore did not commit its restore row in time (no leader reachable?)");
     for _ in 0..RESTORE_ID_ATTEMPTS {
         let restore_id = format!("restore-{:016x}", ctx.env.next_u64());
         let fresh = metadata_fresh(ctx).await;
@@ -1805,20 +1895,21 @@ async fn restore_table_from_backup(
         replicas.truncate(crate::MAX_REPLICATION_FACTOR);
         ctx.propose_schema(&MetaCommand::BeginRestore {
             restore_id: restore_id.clone(),
-            backup_id: backup_arn.to_owned(),
-            source_table: source_table.clone(),
+            backup_id: backup_id.to_owned(),
+            source_table: source_table.to_owned(),
             target_table: target_table_name.to_owned(),
             tablet,
             replicas,
-            gsi_defs: gsi_defs.clone(),
+            gsi_defs: provision.gsi_defs.clone(),
+            pitr: pitr.clone(),
         })
         .await;
         let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
         loop {
             if metadata_fresh(ctx).await.restore(&restore_id).is_some() {
                 let final_meta = metadata_fresh(ctx).await;
-                let dynamo_schema = schema_bridge::to_dynamo(&base_schema);
-                let dynamo_lsis = schema_bridge::indexes_to_dynamo(&lsi_defs);
+                let dynamo_schema = schema_bridge::to_dynamo(&provision.base_schema);
+                let dynamo_lsis = schema_bridge::indexes_to_dynamo(&provision.lsi_defs);
                 return Ok(wire::restore_table_response(
                     target_table_name,
                     &dynamo_schema,
@@ -1833,6 +1924,183 @@ async fn restore_table_from_backup(
         }
     }
     Err(timeout_err)
+}
+
+// --- Point-in-time recovery restore (ADR 0059 §10, Train 3 PR②) -----------
+
+/// `RestoreTableToPointInTime` (ADR 0059 §10, Train 3 PR②): restore
+/// `source_table_name`'s PITR history into a brand-new table
+/// `target_table_name`, as of a target wall-clock second (`restore_date_time`,
+/// AWS's own 1-second granularity — a JSON `Timestamp`, epoch seconds,
+/// possibly fractional, truncated here) or the table's own current
+/// `LatestRestorableDateTime` (`use_latest_restorable_time`).
+///
+/// 1. **Resolve the current-generation restorable window**
+///    (`Metadata::pitr_restore_window`) — works whether or not the source
+///    table still exists (ADR 0059 §9/§10's own "a dropped table's PITR
+///    history survives" carve-out — see `tests/dynamo_pitr.rs`'s
+///    deleted-table restore regression). `None` — this table name has never enabled
+///    PITR at all — is `TableNotFoundException` when the table doesn't
+///    currently exist either (genuinely unknown source, no history at all),
+///    else `PointInTimeRecoveryUnavailableException` (a real, live table
+///    that has simply never turned PITR on).
+/// 2. **Validate the requested second** against `[Earliest, Latest]`
+///    (folding in the retention floor exactly like [`pitr_description`]) —
+///    outside the window is `InvalidRestoreTimeException`, AWS's own code
+///    for this. This settles ADR 0059's own Train 3 PR① "not yet decided"
+///    question about a `T` crossing a disable/re-enable generation
+///    boundary: `pitr_restore_window` scopes to the table's **latest**
+///    generation only, so a `T` inside an earlier, now-superseded
+///    generation's own coverage (including one sitting inside the gap
+///    itself) is simply never in `[Earliest, Latest]` at all — rejected
+///    outright, with no separate gap-detection rule needed.
+/// 3. **Pick the newest PITR base snapshot at or before the target second**
+///    (`Metadata::pitr_base_backups_for_table` — never re-derived from
+///    `ListBackups`, per that ADR train's own open question). None found
+///    (a narrow, accepted residual: a request landing in the brief window
+///    right after PITR's own enable, before its first periodic base
+///    snapshot has completed) is also `InvalidRestoreTimeException`.
+/// 4. **Resolve the replay plan** (`Metadata::pitr_replay_segments`) from
+///    that base's own frozen manifest **object** (fetched from the backup
+///    store — decoding it is this handler's job, not the pure state
+///    machine's, which is why the plan rides `MetaCommand::BeginRestore`
+///    as already-resolved data) plus this same fresh `Metadata` read.
+/// 5. From here, identical to [`restore_table_from_backup`]: provision the
+///    target schema/LSIs/GSI-plan from the chosen base's own manifest
+///    schema ([`provision_restore_target`]), then [`finish_restore_kickoff`]
+///    with the resolved plan attached — the restore driver
+///    (`crate::backup_restore`) does the actual seeding-plus-replay in the
+///    background exactly like an ordinary on-demand restore, just with one
+///    more source of `SeedRow`s to sweep (see that module's own doc).
+async fn restore_table_to_point_in_time(
+    ctx: &ClientCtx,
+    source_table_name: &str,
+    target_table_name: &str,
+    restore_date_time_ms: Option<u64>,
+    use_latest_restorable_time: bool,
+    global_secondary_index_override: Option<&[animus_dynamo::SecondaryIndex]>,
+) -> Result<String, WireError> {
+    if !use_latest_restorable_time && restore_date_time_ms.is_none() {
+        return Err(WireError::validation(
+            "one of `RestoreDateTime` or `UseLatestRestorableTime` is required",
+        ));
+    }
+    let meta = metadata_fresh(ctx).await;
+    let Some(window) = meta.pitr_restore_window(source_table_name) else {
+        return Err(if meta.has_table_schema(source_table_name) {
+            WireError {
+                code: "PointInTimeRecoveryUnavailableException",
+                message: format!(
+                    "point-in-time recovery is not enabled for table `{source_table_name}`"
+                ),
+                reasons: None,
+            }
+        } else {
+            WireError {
+                code: "TableNotFoundException",
+                message: format!(
+                    "table `{source_table_name}` does not exist and has no point-in-time \
+                     recovery history"
+                ),
+                reasons: None,
+            }
+        });
+    };
+
+    let now_ms = ctx.env.wall_now().0;
+    let retention_ms = crate::pitr_janitor::DEFAULT_PITR_RETENTION.as_millis() as u64;
+    let floor_ms = now_ms.saturating_sub(retention_ms);
+    let earliest_ms = window.earliest_ms.max(floor_ms);
+    let latest_ms = window.latest_ms.max(earliest_ms);
+
+    let cutoff_ms = if use_latest_restorable_time {
+        latest_ms
+    } else {
+        let precise_ms = restore_date_time_ms.expect("checked above");
+        // Truncate to the whole second — AWS's own `RestoreDateTime`
+        // granularity (ADR 0059 §10's own opening line).
+        let t_ms = (precise_ms / 1000) * 1000;
+        if t_ms < earliest_ms || t_ms > latest_ms {
+            return Err(WireError {
+                code: "InvalidRestoreTimeException",
+                message: format!(
+                    "`RestoreDateTime` ({t_ms}ms) is outside the currently restorable window \
+                     [{earliest_ms}ms, {latest_ms}ms] for table `{source_table_name}`'s current \
+                     point-in-time recovery generation"
+                ),
+                reasons: None,
+            });
+        }
+        t_ms.saturating_add(999) // cover this whole target second
+    };
+
+    let bases: Vec<(String, animus_control::BackupRow)> = meta
+        .pitr_base_backups_for_table(source_table_name)
+        .filter(|(_, row)| matches!(row.status, animus_control::BackupStatus::Available))
+        .map(|(id, row)| (id.clone(), row.clone()))
+        .collect();
+    let Some((base_id, base_row)) = bases
+        .into_iter()
+        .rev()
+        .find(|(_, row)| row.manifest.created_wall_ms <= cutoff_ms)
+    else {
+        return Err(WireError {
+            code: "InvalidRestoreTimeException",
+            message: format!(
+                "no point-in-time recovery base snapshot is available at or before the \
+                 requested time for table `{source_table_name}` yet"
+            ),
+            reasons: None,
+        });
+    };
+
+    let manifest_object_id = backup_codec::backup_manifest_object_id(&base_id);
+    let manifest_bytes = ctx
+        .data()
+        .backup_store
+        .get_any(&manifest_object_id)
+        .await
+        .map_err(|e| {
+            internal(&format!(
+                "reading point-in-time base snapshot manifest: {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            internal(&format!(
+                "point-in-time base snapshot `{base_id}` has no manifest object yet"
+            ))
+        })?;
+    let manifest_object = backup_codec::decode_manifest_object(&manifest_bytes).map_err(|e| {
+        internal(&format!(
+            "corrupt point-in-time base snapshot manifest: {e}"
+        ))
+    })?;
+    let base_tablet_progress: Vec<(TabletId, u64)> = manifest_object
+        .tablet_progress
+        .iter()
+        .map(|e| (e.tablet, e.progress.cut_version))
+        .collect();
+    let segments = meta.pitr_replay_segments(&base_tablet_progress, cutoff_ms);
+
+    let provision = provision_restore_target(
+        ctx,
+        target_table_name,
+        &base_row.manifest.schema,
+        global_secondary_index_override,
+    )
+    .await?;
+    finish_restore_kickoff(
+        ctx,
+        &base_id,
+        source_table_name,
+        target_table_name,
+        &provision,
+        Some(animus_control::PitrRestorePlan {
+            target_wall_ms: cutoff_ms,
+            segments,
+        }),
+    )
+    .await
 }
 
 /// Propose `table`'s key schema **and each declared secondary-index definition**
@@ -5959,7 +6227,22 @@ fn marker_record(partition_prefix: &[u8], base_sk: Vec<u8>, staged: bool) -> (Ve
 /// *shape*, never whether one exists ("images follow the stream/index
 /// declarations; the record itself follows nothing — it always exists").
 pub(crate) fn table_change_records_carry_images(meta: &Metadata, table: &str) -> bool {
-    !meta.table_indexes(table).is_empty() || meta.table_stream(table).is_some()
+    !meta.table_indexes(table).is_empty()
+        || meta.table_stream(table).is_some()
+        // ADR 0059 §10 (Train 3 PR②) — a real, load-bearing gap found
+        // building PITR restore: a table with PITR enabled but no GSI/LSI/
+        // stream of its own used to write only image-less markers (ADR
+        // 0049 §1), which carry no row content at all — PITR's own sealed
+        // segments would then have nothing for a later
+        // `RestoreTableToPointInTime` to reconstruct row state from. PITR
+        // needs the identical before/after images a stream or index
+        // already forces, so it joins this gate exactly like they do.
+        // Deliberate, accepted cost: every write on a PITR-enabled table
+        // now takes the slower evaluate-at-leader path
+        // (`kind_write_item_at_leader`) instead of the ADR 0049 fast
+        // marker-write arm — real DynamoDB's own PITR carries an
+        // analogous (if internally different) continuous-capture cost.
+        || meta.table_pitr(table).is_some()
 }
 
 /// Whether `cp_txn` must **await** its post-commit resolve under the ADR
@@ -6089,7 +6372,7 @@ mod txn_resolve_awaited_tests {
 /// ([`eval_kind_txn_write`]'s own call always passes `false`, since a
 /// transaction never carries a service identity).
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
-fn kind_writes_for_item(
+pub(crate) fn kind_writes_for_item(
     meta: &Metadata,
     table: &str,
     pk: &AttributeValue,
