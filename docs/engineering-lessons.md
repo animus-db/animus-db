@@ -3432,7 +3432,82 @@ debugging anything that feels like it might have happened before.
   admin_remove_control_member`, `crates/animus-control/src/raft.rs::
   RaftCore::transfer_leadership`.)
 
+- **A converged-or-timeout poll on one read path does not prove convergence
+  on a *different* read path over the same data — check which consistency
+  contract each assertion actually rides before trusting an earlier poll's
+  green result (issue #400).** `tests/update_table_drop_index.rs::
+  create_drop_recreate_same_index_name_backfills_from_scratch` polled
+  `await_row_count` (the raw client protocol's linearizable `Scan`,
+  `stale: false`, direct against the recreated GSI's hidden table) to
+  convergence, then immediately followed it with a **fixed, one-shot**
+  per-row `Query` through the real DynamoDB wire — `assert!` on the very
+  first response, no poll at all. That `Query` can never request
+  `ConsistentRead: true` against a GSI (ADR 0041 §5 — a `ValidationException`),
+  so it is unconditionally served by ADR 0055's eventually-consistent,
+  replica-local path: the linearizable Scan proving the row durably present
+  says nothing about whether the *specific replica this Query happens to
+  land on* has caught up yet, and under real load (slower replica apply) it
+  routinely hadn't — the CI failure shape was `Count:0` reading back a row
+  the immediately-prior linearizable Scan had just confirmed present.
+  **General rule**: when a test chains two assertions against what looks
+  like "the same data," don't assume the second inherits the first's
+  convergence — trace which consistency mode each request actually rides
+  (a raw client-protocol call vs. the DynamoDB wire's `ConsistentRead`
+  default, and whether the operation in question can even ask for the
+  strong mode at all) and give **every** eventually-consistent assertion its
+  own converged-or-timeout poll, never borrow one poll's outcome for a
+  later, differently-served read. Fixed by wrapping each per-row `Query` in
+  a poll across every node's dynamo address (`await_gsi_query`/
+  `await_gsi_query_everywhere`, duplicated from `dynamo_query_pagination.rs`
+  per this file's own "sibling test modules keep their own fixtures
+  independent" convention — see that file's identical helpers for the
+  general pattern any GSI-`Query`-asserting test should follow).
+  (`crates/animusd/tests/update_table_drop_index.rs`.)
+
 ### Code patterns
+- **A retryable-shaped error (the house `"; retry"` suffix) surviving string
+  formatting into a caller's own error type is not the same guarantee as
+  something in that caller's *call chain* actually checking for it — audit
+  every hop between the throw site and the nearest retry loop, not just the
+  throw site's own wrapping (issue #412).** `dynamo::kind_write_item_at_
+  leader`'s leader-side old-image read failure (`ClientCtx::
+  cp_get_local_resolving`, e.g. a "CP group leader moved; retry" leadership
+  race) already produced a message ending `"; retry"` even before this
+  fix — `internal(&format!("leader-side old-image read failed: {e}"))`
+  places the interpolated error last, so the suffix survived by construction
+  — and `ClientCtx::cp_kind_write_item`'s own retry loop (`read_should_
+  retry`, suffix-matched) already retried it correctly. The *identical*
+  wrapping in `eval_kind_txn_write` (the stage-time evaluator
+  `TransactWriteItems` uses) produced an equally well-shaped
+  `TxnAbortReason::Other(msg)` — but `ClientCtx::txn_prepare_pushing`'s own
+  bounded retry loop only pattern-matched `StageOutcome::IntentBlocked`
+  *inside* an `Ok` result; a stage attempt that failed **before ever
+  reaching propose** (this read failure, or the identical leadership race in
+  `leader.txn_stage`/`txn_stage_participant` returning `None`) came back as
+  an `Err` from `txn_prepare` and escaped the whole loop via `?` on the very
+  first attempt, regardless of how retryable-shaped its message was — no
+  code anywhere in that path ever called `.ends_with("; retry")` on it. It
+  then surfaced through `cp_txn`/`dynamo::run_transact`'s `TxnAbortReason::
+  Other` arm as a terminal `TransactionCanceledException` for a condition
+  the very next attempt would routinely have cleared. **The generalizable
+  check**: when auditing "does X get retried," don't stop at confirming the
+  error *carries* the retryable marker — trace every intermediate `?`/
+  `map_err` between the throw site and the nearest loop that actually
+  branches on that marker, since a marker that nothing reads is
+  indistinguishable, at the call site, from one that was never set. Fixed by
+  making `txn_prepare_pushing` catch `Err(TxnAbortReason::Other(msg)) if
+  msg.ends_with("; retry")` from `txn_prepare` itself and retry the stage
+  attempt exactly like `IntentBlocked` (safe because nothing was proposed
+  yet on that attempt, and re-invoking `txn_prepare` re-resolves `cp_route`
+  fresh each time — the same "safe to retry, re-route every attempt"
+  discipline the ordinary write path already has). Regression:
+  `issue_412_tests::txn_prepare_pushing_retries_a_leader_moved_read_
+  failure_to_success` (`dynamo::leader_read_failure_gate`, a deterministic
+  fault-injection hook mirroring `dynamo::rmw285_confirm_gate`'s idiom,
+  used since orchestrating a real leadership change mid-read is not
+  reliably reproducible on demand). (`crates/animusd/src/dynamo.rs`,
+  `crates/animusd/src/lib.rs::ClientCtx::txn_prepare_pushing`.)
+
 - **A convergent bookkeeping write must be routable to its own owner: derive
   its key from the owner's actual scope, not a normalized/truncated form of
   it.** Issue #355's root cause (see the Testing entry above for the full

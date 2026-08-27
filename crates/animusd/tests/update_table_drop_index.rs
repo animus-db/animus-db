@@ -300,6 +300,53 @@ fn fire_and_forget_dynamo(addr: SocketAddr, target: &'static str, body: String) 
     });
 }
 
+/// Poll a GSI `Query` on `addr` until `accept` is satisfied. A GSI is
+/// materialized **asynchronously** by the drain (ADR 0041 §4/§5), and a
+/// `Query` against one can never request `ConsistentRead: true` (ADR 0041
+/// §5 — that combination is a `ValidationException`), so a GSI `Query`'s
+/// result is always the ADR 0055 eventually-consistent, replica-local
+/// read — asserting against it must be a converged-or-timeout poll, never
+/// a fixed sleep + one-shot check. Duplicated from `dynamo_query_
+/// pagination.rs::await_gsi_query` rather than shared, per this file's own
+/// `bring_up` doc ("sibling test modules keep their own fixtures
+/// independent").
+async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> bool) -> String {
+    let last = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = std::sync::Arc::clone(&last);
+    let converged = async move {
+        loop {
+            let (status, got) = dynamo(addr, "DynamoDB_20120810.Query", body).await;
+            if status == 200 && accept(&got) {
+                return got;
+            }
+            *seen.lock().unwrap() = got;
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    match timeout(Duration::from_secs(15), converged).await {
+        Ok(body) => body,
+        Err(_) => panic!(
+            "GSI query never converged within 15s (last saw: {})",
+            last.lock().unwrap()
+        ),
+    }
+}
+
+/// [`await_gsi_query`]'s multi-node form (ADR 0055, `dynamo_query_
+/// pagination.rs::await_gsi_query_everywhere`'s identical shape): poll on
+/// **every** address until each satisfies `accept` — a `ConsistentRead:
+/// false` read is served from whichever replica the *receiving* node
+/// holds, so converging on one node says nothing about another.
+async fn await_gsi_query_everywhere(
+    addrs: &[SocketAddr],
+    body: &str,
+    accept: impl Fn(&str) -> bool + Copy,
+) {
+    for &addr in addrs {
+        await_gsi_query(addr, body, accept).await;
+    }
+}
+
 async fn await_row_count(addr: SocketAddr, table: &str, want: usize, what: &str) {
     let last = std::sync::Arc::new(std::sync::Mutex::new(None::<usize>));
     let seen = std::sync::Arc::clone(&last);
@@ -631,22 +678,29 @@ async fn create_drop_recreate_same_index_name_backfills_from_scratch() {
             "recreated index backfills every pre-existing row from scratch (not 0)",
         )
         .await;
+        // Issue #400: `await_row_count` just above converges via the raw
+        // client protocol's linearizable `Scan` (`stale: false`) against the
+        // hidden index table directly — it says nothing about the DynamoDB
+        // `Query` API's own view. A `Query` against a GSI can never request
+        // `ConsistentRead: true` (ADR 0041 §5), so it is always served by
+        // ADR 0055's eventually-consistent, replica-local path — a fixed
+        // one-shot `Query` right after the row-count convergence above can
+        // observe a replica that has not yet caught up with the just-
+        // materialized backfill rows, especially under load (a slower
+        // replica apply lag), even though the data is already durably and
+        // linearizably present. Every id is polled on **every** node's
+        // dynamo address (`await_gsi_query_everywhere`), not just node 0's.
+        let dynamo_addrs: Vec<SocketAddr> = nodes.iter().map(Node::dynamo_addr).collect();
         for id in &ids {
-            let (status, body) = dynamo(
-                dynamo_addr,
-                "DynamoDB_20120810.Query",
-                &format!(
-                    r#"{{"TableName":"{table}","IndexName":"{index}",
-                        "KeyConditionExpression":"g = :v",
-                        "ExpressionAttributeValues":{{":v":{{"S":"{id}@x"}}}}}}"#
-                ),
-            )
-            .await;
-            assert_eq!(status, 200, "recreated-index Query failed: {body}");
-            assert!(
-                body.contains("\"Count\":1") && body.contains(&format!(r#""id":{{"S":"{id}"}}"#)),
-                "recreated index missing pre-existing row {id}: {body}"
+            let body = format!(
+                r#"{{"TableName":"{table}","IndexName":"{index}",
+                    "KeyConditionExpression":"g = :v",
+                    "ExpressionAttributeValues":{{":v":{{"S":"{id}@x"}}}}}}"#
             );
+            await_gsi_query_everywhere(&dynamo_addrs, &body, |got| {
+                got.contains("\"Count\":1") && got.contains(&format!(r#""id":{{"S":"{id}"}}"#))
+            })
+            .await;
         }
 
         for n in &nodes {
