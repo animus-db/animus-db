@@ -678,6 +678,211 @@ fn assert_backup_matches_model(
     );
 }
 
+// --- restore driver mirror (ADR 0059 §7, Train 2) --------------------------
+//
+// Mirrors `animusd::backup_restore::restore_tick`'s exact algorithm: a
+// **whole-manifest sweep per call** (not one chunk per tick the way capture
+// paces itself — see that function's own doc for why), no durable resume
+// position at all (unlike `CaptureCursor` above), relying entirely on
+// `KvCommand::SeedBatch`'s merge-at-carried-version idempotency for safe
+// re-derivation after any partial failure or leader change. Every captured
+// value is re-wrapped via `backup_codec::encode_restored_value` before
+// merging — the identical fix the production driver needed (see that
+// function's own doc for the corrupt-engine-value hazard this closes).
+
+/// One restore step against `dest` for `backup_id` — `false` on any store
+/// read fault or a not-yet-`Available` manifest (retry next tick, mirroring
+/// production exactly); `true` once every reporting tablet's every chunk
+/// has been proposed to `dest` and confirmed applied.
+fn restore_tick(
+    sim: &mut Simulator,
+    dest: &KvNode,
+    store: &SimSegmentStore,
+    backup_id: &str,
+) -> bool {
+    let Ok(Some(manifest_bytes)) =
+        block_on(store.get(&backup_codec::backup_manifest_object_id(backup_id)))
+    else {
+        return false;
+    };
+    let manifest = backup_codec::decode_manifest_object(&manifest_bytes).expect("manifest decodes");
+    for entry in &manifest.tablet_progress {
+        let mut chunk = 0u64;
+        loop {
+            let object_id = backup_codec::backup_data_object_id(backup_id, entry.tablet.0, chunk);
+            let bytes = match block_on(store.get(&object_id)) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => break, // this reporting tablet's own chunks are exhausted
+                Err(_) => return false,
+            };
+            let rows: Vec<SeedRow> = backup_codec::decode_data_chunk(&bytes)
+                .expect("chunk decodes")
+                .into_iter()
+                .map(|(kind, key, value, version)| {
+                    (
+                        kind,
+                        key,
+                        value.map(|v| backup_codec::encode_restored_value(&v)),
+                        version,
+                    )
+                })
+                .collect();
+            if !rows.is_empty() {
+                let result = dest.propose_seed_batch(rows);
+                match result {
+                    ProposeResult::Accepted { index, .. } => confirm(sim, dest, index, 0),
+                    other => panic!("restore seed batch not accepted: {other:?}"),
+                }
+            }
+            chunk += 1;
+        }
+    }
+    true
+}
+
+/// Drives `dest`'s own restore to completion (re-electing a leader every
+/// tick, tolerating a leadership change mid-sweep) and proposes
+/// `CompleteRestore` against `meta` once done.
+#[allow(clippy::too_many_arguments)] // mirrors `drive_tablet_capture_to_reported`'s own shape, one arg wider (restore_id + backup_id both needed, capture only needs one id)
+fn drive_restore_to_done(
+    sim: &mut Simulator,
+    meta: &mut Metadata,
+    dest: &Group,
+    live: &[usize],
+    store: &SimSegmentStore,
+    restore_id: &str,
+    backup_id: &str,
+    seed: u64,
+) {
+    for _ in 0..10_000 {
+        let leader = elect(sim, dest, live, seed);
+        if restore_tick(sim, &dest.nodes[leader], store, backup_id) {
+            let outcome = meta.apply(&MetaCommand::CompleteRestore {
+                restore_id: restore_id.to_owned(),
+            });
+            assert_eq!(
+                outcome,
+                ApplyOutcome::Applied,
+                "[seed={seed}] CompleteRestore rejected: {outcome:?}"
+            );
+            return;
+        }
+        sim.run_for(Duration::from_millis(10));
+    }
+    panic!("[seed={seed}] restore {restore_id} never reached Done");
+}
+
+/// Seed only the manifest's FIRST reporting tablet's chunk `0` directly onto
+/// `dest` — a stand-in for "an earlier `restore_tick` call already
+/// committed this much before crashing mid-sweep" (a whole-manifest-sweep
+/// call has no natural interruption point of its own to exploit within one
+/// synchronous test invocation, since nothing here re-enters the sim
+/// between chunks the way a real multi-tick production driver would): used
+/// by the crash/leader-kill resumption scenarios to manufacture a genuine,
+/// incomplete partial state before the fault, so what they actually prove
+/// (a fresh full sweep safely re-derives/re-merges the rest, with no
+/// duplication or loss) is exercised against a real partial precondition
+/// rather than an empty one.
+fn seed_first_chunk_directly(
+    sim: &mut Simulator,
+    dest: &KvNode,
+    store: &SimSegmentStore,
+    backup_id: &str,
+) {
+    let manifest_bytes = block_on(store.get(&backup_codec::backup_manifest_object_id(backup_id)))
+        .expect("store get ok")
+        .expect("manifest present");
+    let manifest = backup_codec::decode_manifest_object(&manifest_bytes).expect("manifest decodes");
+    let first_tablet = manifest
+        .tablet_progress
+        .first()
+        .expect("at least one reporting tablet")
+        .tablet;
+    let chunk_bytes = block_on(store.get(&backup_codec::backup_data_object_id(
+        backup_id,
+        first_tablet.0,
+        0,
+    )))
+    .expect("store get ok")
+    .expect("chunk 0 present");
+    let rows: Vec<SeedRow> = backup_codec::decode_data_chunk(&chunk_bytes)
+        .expect("chunk decodes")
+        .into_iter()
+        .map(|(kind, key, value, version)| {
+            (
+                kind,
+                key,
+                value.map(|v| backup_codec::encode_restored_value(&v)),
+                version,
+            )
+        })
+        .collect();
+    let result = dest.propose_seed_batch(rows);
+    match result {
+        ProposeResult::Accepted { index, .. } => confirm(sim, dest, index, 0),
+        other => panic!("restore seed batch not accepted: {other:?}"),
+    }
+}
+
+/// Mints `restore_id`'s catalog row + its single destination tablet
+/// (`animus_control::MetaCommand::BeginRestore` — real production code,
+/// never reimplemented) over a freshly-created target table schema.
+fn begin_restore(
+    meta: &mut Metadata,
+    restore_id: &str,
+    backup_id: &str,
+    target_table: &str,
+    tablet: TabletId,
+) {
+    assert_eq!(
+        meta.apply(&MetaCommand::CreateTableSchema {
+            table: target_table.to_owned(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        }),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(
+        meta.apply(&MetaCommand::BeginRestore {
+            restore_id: restore_id.to_owned(),
+            backup_id: backup_id.to_owned(),
+            source_table: TABLE.to_owned(),
+            target_table: target_table.to_owned(),
+            tablet,
+            replicas: NODES.iter().copied().map(nid).collect(),
+            gsi_defs: Vec::new(),
+        }),
+        ApplyOutcome::Applied
+    );
+}
+
+/// Every `KIND_BASE` row `node` currently holds, read through the identical
+/// snapshot-scan + intent-resolution primitive capture itself uses
+/// (`local_scan_kind_snapshot`) — so a value round-trips byte-for-byte back
+/// to what [`write_base_row`]'s own `model` recorded, proving
+/// [`backup_codec::encode_restored_value`]'s envelope re-wrap and
+/// `SeedBatch`'s merge are both transparent to an ordinary read.
+fn read_all_base_rows(node: &KvNode) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    let mut next_key = Vec::new();
+    let ceiling = node.engine_latest_version();
+    loop {
+        let (rows, next) =
+            block_on(node.local_scan_kind_snapshot(KIND_BASE, &next_key, ceiling, 1000));
+        let got_any = !rows.is_empty();
+        for (k, v, _version) in rows {
+            out.insert(k, v);
+        }
+        match next {
+            Some(k) => next_key = k,
+            None => break,
+        }
+        if !got_any {
+            break;
+        }
+    }
+    out
+}
+
 // --- cell 1: single_tablet_backup_converges_under_concurrent_writes --------
 
 fn scenario_single_tablet_backup_converges_under_concurrent_writes(seed: u64) {
@@ -1156,5 +1361,507 @@ fn a_wedged_capture_fails_after_the_stuck_timeout() {
     for_each_seed(
         "a_wedged_capture_fails_after_the_stuck_timeout",
         scenario_a_wedged_capture_fails_after_the_stuck_timeout,
+    );
+}
+
+// ============================================================================
+// Restore corpus (ADR 0059 §7, Train 2) — the same `SimSegmentStore`-backed
+// self-contained-reimplementation technique, now driving a backup all the
+// way through `RestoreTableFromBackup`'s own mechanics
+// (`animusd::backup_restore`) and comparing the DESTINATION tablet's own
+// committed rows against the identical `model` the backup half already
+// built and verified. GSI-rebuild convergence is deliberately **not**
+// reimplemented a third time here — it is the exact `index_backfill.rs`/
+// `index_drain.rs` machinery `backfill_fault_corpus.rs` already proves at
+// depth, applied to an ordinary `Active` tablet indistinguishable from any
+// other (ADR 0059 §8's own point); the real production stack's end-to-end
+// GSI-after-restore convergence is covered by `animusd/tests/
+// dynamo_restore.rs` instead.
+// ============================================================================
+
+// --- cell 6: restore_round_trip_matches_model_at_capture_cut_version -------
+
+/// The headline round trip: capture a backup (including a genuinely staged,
+/// never-resolved transaction intent — proving restore only ever sees the
+/// *resolved* committed value, never a raw envelope or staged content, ADR
+/// 0059 §5), restore it into a fresh destination tablet, and assert the
+/// destination's own committed rows match the model **exactly** — the
+/// backup-time cut, never a post-pin write.
+fn scenario_restore_round_trip_matches_model_at_capture_cut_version(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let source_engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let group = start_group(&sim, &source_engines, TabletId(1), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..15 {
+        let pk = format!("p{i:03}");
+        let value = format!("v{i}").into_bytes();
+        write_base_row(&mut sim, &group.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+
+    // A staged, never-resolved intent — its value must never surface in the
+    // restored table either.
+    let staged_key = logical(b"pending-intent");
+    let staged_value = b"never-committed".to_vec();
+    let write = TxnWrite {
+        key: staged_key,
+        value: Some(staged_value.clone()),
+        kind_writes: Vec::new(),
+        change_log: None,
+        stage_marker: None,
+    };
+    let n = group.nodes[leader].clone();
+    let env = n.env().clone();
+    let slot: std::sync::Arc<std::sync::Mutex<Option<_>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let s = std::sync::Arc::clone(&slot);
+    env.spawn_task(async move {
+        let r = n
+            .txn_stage_anchor("t", vec![write], Vec::new(), Vec::new())
+            .await;
+        *s.lock().unwrap() = Some(r);
+    });
+    sim.run_for(Duration::from_millis(300));
+    assert!(
+        slot.lock().unwrap().take().flatten().is_some(),
+        "[seed={seed}] the intent must stage"
+    );
+
+    begin_backup(&mut meta, "backup-1", 1_000);
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &group, &live, &store, "backup-1", seed);
+    let env = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env, &mut meta, &store, "backup-1", seed);
+    assert_backup_matches_model(
+        &store,
+        "backup-1",
+        &model,
+        std::slice::from_ref(&staged_value),
+        seed,
+    );
+
+    // Post-backup writes: must never appear in the restored table.
+    let leader = elect(&mut sim, &group, &live, seed);
+    write_base_row(&mut sim, &group.nodes[leader], b"post-backup", b"late");
+
+    begin_restore(
+        &mut meta,
+        "restore-1",
+        "backup-1",
+        "widgets_restored",
+        TabletId(2),
+    );
+    let dest_engines = engines();
+    let dest = start_group(&sim, &dest_engines, TabletId(2), KeyRange::whole());
+    sim.run_for(Duration::from_secs(2));
+    drive_restore_to_done(
+        &mut sim,
+        &mut meta,
+        &dest,
+        &live,
+        &store,
+        "restore-1",
+        "backup-1",
+        seed,
+    );
+    assert_eq!(
+        meta.restore("restore-1").map(|r| r.status.clone()),
+        Some(animus_control::RestoreStatus::Done)
+    );
+    assert_eq!(
+        meta.tablets[&TabletId(2)].state,
+        animus_tablet::TabletState::Active
+    );
+
+    let dest_leader = elect(&mut sim, &dest, &live, seed);
+    let restored = read_all_base_rows(&dest.nodes[dest_leader]);
+    assert_eq!(
+        restored, model,
+        "[seed={seed}] restored table content does not match the model"
+    );
+    for forbidden in [staged_value, b"late".to_vec()] {
+        assert!(
+            !restored.values().any(|v| v == &forbidden),
+            "[seed={seed}] a forbidden value leaked into the restored table"
+        );
+    }
+}
+
+#[test]
+fn restore_round_trip_matches_model_at_capture_cut_version() {
+    for_each_seed(
+        "restore_round_trip_matches_model_at_capture_cut_version",
+        scenario_restore_round_trip_matches_model_at_capture_cut_version,
+    );
+}
+
+// --- cell 7: restore_driver_crash_restart_resumes ---------------------------
+
+/// A **true process restart** of the destination tablet's leader mid-seed —
+/// mirrors [`capture_driver_node_crash_restart`]'s identical technique
+/// (`sim.stop` + a fresh `RaftKvNode::start_hosted` on the same id and the
+/// same durable engine), proving restore's own deliberately cursor-less
+/// design (see `animusd::backup_restore`'s module doc): the restarted
+/// leader's engine already holds whatever `SeedBatch`es committed before
+/// the crash, and a fresh full sweep re-derives + safely re-merges the rest.
+fn scenario_restore_driver_crash_restart_resumes(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let source_engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let group = start_group(&sim, &source_engines, TabletId(1), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..24 {
+        let pk = format!("p{i:03}");
+        let value = format!("v{i}").into_bytes();
+        write_base_row(&mut sim, &group.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+    begin_backup(&mut meta, "backup-1", 1_000);
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &group, &live, &store, "backup-1", seed);
+    let env0 = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env0, &mut meta, &store, "backup-1", seed);
+
+    begin_restore(
+        &mut meta,
+        "restore-1",
+        "backup-1",
+        "widgets_restored",
+        TabletId(2),
+    );
+    let dest_engines = engines();
+    let mut dest = start_group(&sim, &dest_engines, TabletId(2), KeyRange::whole());
+    sim.run_for(Duration::from_secs(2));
+
+    // Manufacture the partial progress a real earlier `restore_tick` call
+    // would have committed before crashing mid-sweep: seed just the FIRST
+    // reporting tablet's first chunk directly onto the pre-crash leader — a
+    // genuine `SeedBatch` commit, not a no-op — leaving the rest of the
+    // manifest's rows unseeded when the crash hits.
+    let dest_leader = elect(&mut sim, &dest, &live, seed);
+    seed_first_chunk_directly(&mut sim, &dest.nodes[dest_leader], &store, "backup-1");
+    let partial = read_all_base_rows(&dest.nodes[dest_leader]);
+    assert!(
+        !partial.is_empty() && partial.len() < model.len(),
+        "[seed={seed}] the manufactured partial progress must be real but incomplete"
+    );
+
+    let restarted_id = NODES[dest_leader];
+    sim.stop(nid(restarted_id));
+    let ids: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let fresh: KvNode = RaftKvNode::start_hosted(
+        sim.env(nid(restarted_id)),
+        ids,
+        dest_engines[&restarted_id].clone(),
+        StorageScope::new(dest.range.clone()),
+        dest.id.0,
+    );
+    dest.nodes[dest_leader] = fresh;
+    sim.run_for(Duration::from_secs(2));
+
+    drive_restore_to_done(
+        &mut sim,
+        &mut meta,
+        &dest,
+        &live,
+        &store,
+        "restore-1",
+        "backup-1",
+        seed,
+    );
+    let dest_leader = elect(&mut sim, &dest, &live, seed);
+    let restored = read_all_base_rows(&dest.nodes[dest_leader]);
+    assert_eq!(
+        restored, model,
+        "[seed={seed}] restored table content does not match the model after a \
+         restore-driver process restart"
+    );
+}
+
+#[test]
+fn restore_driver_crash_restart_resumes() {
+    for_each_seed(
+        "restore_driver_crash_restart_resumes",
+        scenario_restore_driver_crash_restart_resumes,
+    );
+}
+
+// --- cell 8: restore_leader_kill_mid_seed_converges -------------------------
+
+/// A live-but-muted leader kill (`sim.crash`, failover to a *different*
+/// replica) mid-seed — the sibling of [`restore_driver_crash_restart_
+/// resumes`]'s true process restart: here the dying replica's own engine is
+/// simply gone, and the *newly elected* leader (a different replica
+/// entirely) must independently re-derive and finish the sweep from
+/// whatever its own already-replicated log holds plus a fresh read of the
+/// (untouched, immutable) backup store.
+fn scenario_restore_leader_kill_mid_seed_converges(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let source_engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let group = start_group(&sim, &source_engines, TabletId(1), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..24 {
+        let pk = format!("p{i:03}");
+        let value = format!("v{i}").into_bytes();
+        write_base_row(&mut sim, &group.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+    begin_backup(&mut meta, "backup-1", 1_000);
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &group, &live, &store, "backup-1", seed);
+    let env0 = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env0, &mut meta, &store, "backup-1", seed);
+
+    begin_restore(
+        &mut meta,
+        "restore-1",
+        "backup-1",
+        "widgets_restored",
+        TabletId(2),
+    );
+    let dest_engines = engines();
+    let dest = start_group(&sim, &dest_engines, TabletId(2), KeyRange::whole());
+    sim.run_for(Duration::from_secs(2));
+
+    // Manufacture partial progress under the pre-kill leader, exactly as
+    // [`restore_driver_crash_restart_resumes`] does — see that scenario's
+    // own comment for why a direct partial seed stands in for "an earlier
+    // `restore_tick` call already committed this much before the kill."
+    let dest_leader = elect(&mut sim, &dest, &live, seed);
+    seed_first_chunk_directly(&mut sim, &dest.nodes[dest_leader], &store, "backup-1");
+    let partial = read_all_base_rows(&dest.nodes[dest_leader]);
+    assert!(
+        !partial.is_empty() && partial.len() < model.len(),
+        "[seed={seed}] the manufactured partial progress must be real but incomplete"
+    );
+
+    let dying = dest_leader;
+    sim.crash(nid(NODES[dying]));
+    live.retain(|&i| i != dying);
+
+    drive_restore_to_done(
+        &mut sim,
+        &mut meta,
+        &dest,
+        &live,
+        &store,
+        "restore-1",
+        "backup-1",
+        seed,
+    );
+    let dest_leader = elect(&mut sim, &dest, &live, seed);
+    let restored = read_all_base_rows(&dest.nodes[dest_leader]);
+    assert_eq!(
+        restored, model,
+        "[seed={seed}] restored table content does not match the model after a \
+         restore-tablet leader kill mid-seed"
+    );
+}
+
+#[test]
+fn restore_leader_kill_mid_seed_converges() {
+    for_each_seed(
+        "restore_leader_kill_mid_seed_converges",
+        scenario_restore_leader_kill_mid_seed_converges,
+    );
+}
+
+// --- cell 9: restore_store_faults_still_converge ----------------------------
+
+/// The backup store goes genuinely unavailable (`SimSegmentStore::
+/// set_unavailable_until` — every op errors with no state change) partway
+/// through the restore sweep, then heals — mirrors the ADR's own testing-
+/// plan instruction to reuse `SimSegmentStore`'s existing fault injection
+/// rather than build a second mechanism. **`SegmentFaultConfig`'s own
+/// ack-lost thresholds are `put`/`delete`-only** (checked directly against
+/// `animus-sim`'s source — no per-`get` ack-lost fault exists), so a read
+/// fault for restore's own `get`-only workload is `set_unavailable_until`,
+/// not `SegmentFaultConfig`; restore's own retry-next-tick discipline
+/// (`restore_tick` returning `false` on any read error, never a partial/
+/// torn seed) is what this cell actually exercises.
+fn scenario_restore_store_faults_still_converge(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let source_engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let group = start_group(&sim, &source_engines, TabletId(1), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..12 {
+        let pk = format!("p{i:03}");
+        let value = format!("v{i}").into_bytes();
+        write_base_row(&mut sim, &group.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+    begin_backup(&mut meta, "backup-1", 1_000);
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &group, &live, &store, "backup-1", seed);
+    let env0 = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env0, &mut meta, &store, "backup-1", seed);
+
+    begin_restore(
+        &mut meta,
+        "restore-1",
+        "backup-1",
+        "widgets_restored",
+        TabletId(2),
+    );
+    let dest_engines = engines();
+    let dest = start_group(&sim, &dest_engines, TabletId(2), KeyRange::whole());
+    sim.run_for(Duration::from_secs(2));
+
+    // The store goes unavailable right away — the first several ticks must
+    // make zero progress and never panic.
+    let deadline = sim
+        .env(nid(NODES[0]))
+        .now()
+        .saturating_add(Duration::from_secs(3));
+    store.set_unavailable_until(deadline);
+    for _ in 0..5 {
+        let dest_leader = elect(&mut sim, &dest, &live, seed);
+        assert!(
+            !restore_tick(&mut sim, &dest.nodes[dest_leader], &store, "backup-1"),
+            "[seed={seed}] a restore tick must not report done while the store is \
+             unavailable"
+        );
+        sim.run_for(Duration::from_millis(200));
+    }
+    assert!(
+        read_all_base_rows(&dest.nodes[elect(&mut sim, &dest, &live, seed)]).is_empty(),
+        "[seed={seed}] nothing should have seeded while the store was unavailable"
+    );
+
+    // Heal, and the sweep converges normally from here.
+    sim.run_for(Duration::from_secs(2));
+    drive_restore_to_done(
+        &mut sim,
+        &mut meta,
+        &dest,
+        &live,
+        &store,
+        "restore-1",
+        "backup-1",
+        seed,
+    );
+    let dest_leader = elect(&mut sim, &dest, &live, seed);
+    let restored = read_all_base_rows(&dest.nodes[dest_leader]);
+    assert_eq!(
+        restored, model,
+        "[seed={seed}] restored table content does not match the model after a \
+         store outage"
+    );
+}
+
+#[test]
+fn restore_store_faults_still_converge() {
+    for_each_seed(
+        "restore_store_faults_still_converge",
+        scenario_restore_store_faults_still_converge,
+    );
+}
+
+// --- cell 10: restore_after_source_drop -------------------------------------
+
+/// Restore works from a backup whose source table has since been dropped
+/// (ADR 0059's own "restore a table dropped days ago" case): `DropTableTablets`
+/// removes the source's own tablet/policy rows from `Metadata` (real
+/// production code, never reimplemented) — restore never touches
+/// `Metadata::tablets` for the source at all, reading exclusively from the
+/// backup store's own already-`Available` objects, so this changes nothing
+/// about how the restore sweep runs; the assertion is that it still runs
+/// at all and still matches the model.
+fn scenario_restore_after_source_drop(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let source_engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let group = start_group(&sim, &source_engines, TabletId(1), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..10 {
+        let pk = format!("p{i:03}");
+        let value = format!("v{i}").into_bytes();
+        write_base_row(&mut sim, &group.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+    begin_backup(&mut meta, "backup-1", 1_000);
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &group, &live, &store, "backup-1", seed);
+    let env0 = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env0, &mut meta, &store, "backup-1", seed);
+    assert_backup_matches_model(&store, "backup-1", &model, &[], seed);
+
+    // The source table is dropped entirely — its tablet/policy rows are
+    // gone, but the backup catalog row survives (ADR 0024's explicit
+    // carve-out, ADR 0059 §3) untouched.
+    assert_eq!(
+        meta.apply(&MetaCommand::DropTableTablets {
+            table: TABLE.to_owned(),
+        }),
+        ApplyOutcome::Applied
+    );
+    assert!(!meta.tablets.contains_key(&TabletId(1)));
+    assert_eq!(
+        meta.backup("backup-1").map(|r| r.status.clone()),
+        Some(BackupStatus::Available)
+    );
+
+    begin_restore(
+        &mut meta,
+        "restore-1",
+        "backup-1",
+        "widgets_restored",
+        TabletId(2),
+    );
+    let dest_engines = engines();
+    let dest = start_group(&sim, &dest_engines, TabletId(2), KeyRange::whole());
+    sim.run_for(Duration::from_secs(2));
+    drive_restore_to_done(
+        &mut sim,
+        &mut meta,
+        &dest,
+        &live,
+        &store,
+        "restore-1",
+        "backup-1",
+        seed,
+    );
+    let dest_leader = elect(&mut sim, &dest, &live, seed);
+    let restored = read_all_base_rows(&dest.nodes[dest_leader]);
+    assert_eq!(
+        restored, model,
+        "[seed={seed}] restored table content does not match the model after a \
+         source-table drop"
+    );
+}
+
+#[test]
+fn restore_after_source_drop() {
+    for_each_seed(
+        "restore_after_source_drop",
+        scenario_restore_after_source_drop,
     );
 }

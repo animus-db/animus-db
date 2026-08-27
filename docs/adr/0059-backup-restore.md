@@ -1,7 +1,7 @@
 # ADR 0059 — Backup and restore: on-demand backups + point-in-time recovery
 
 - **Status:** Accepted — Train 1 (catalog, backup-store plumbing, capture
-  driver, wire surface, janitor) implemented; Train 2 (restore) and Train 3
+  driver, wire surface, janitor) and Train 2 (restore) implemented; Train 3
   (PITR) pending.
 - **Date:** 2026-08-26
 - **Amends:** [ADR 0013](0013-replicated-schemas.md) (a table's manifest
@@ -737,3 +737,147 @@ prose against code:
   (neither exists today), both out of this PR's scope. See
   `backup_janitor.rs`'s own module doc and `docs/engineering-lessons.md`
   for the fuller note.
+
+## As-built amendment (2026-08-27, Train 2 — restore)
+
+Six deviations/decisions from this ADR's own text, found building
+`RestoreTableFromBackup` and the restore driver, recorded here rather than
+left for a reader to discover by diffing prose against code.
+
+- **Settled: pinned-tablets-vs-fresh-layout (PR③'s own open question) —
+  restore mints exactly ONE fresh `Building` tablet over the whole ring,
+  never one per the backup's original (possibly many) pinned/reporting
+  tablets.** §7 step 3's text ("mint fresh `Building` tablets matching the
+  backup's key ranges") describes mirroring the historical topology; PR③'s
+  as-built note explicitly left the door open to the alternative it names
+  itself: "restore is free to choose an entirely fresh tablet layout for
+  the whole table — e.g. one tablet per the placement engine's own
+  preference." Taken at its simplest. This sidesteps the open question
+  entirely: `BackupManifestTabletEntry` needed **no** new `range` field,
+  because nothing in the restore driver ever needs to know which physical
+  tablet originally captured a given row — every data object across every
+  one of the manifest's `tablet_progress` entries seeds into the SAME
+  single destination tablet, verbatim, with no per-row key routing at all.
+  This matches ordinary `CreateTable`'s own "one tablet over the whole
+  ring" provisioning convention exactly (`ClientCtx::provision_tablet`),
+  and the existing auto-split machinery reshapes the restored table's
+  tablet count afterward, exactly as it would for any freshly-populated
+  table. **Acknowledged tradeoff**: every one of a backup's original
+  tablets funnels through one Raft group during the seed phase, so
+  restore's own write throughput on a large, many-tablet source table is
+  bounded by a single group until auto-split (if enabled) kicks in
+  afterward. A Train 2.5 follow-up could mint N tablets up front (e.g. one
+  per `pinned_tablets` entry, reusing its already-recorded `range` — no new
+  field needed even for that) and route each captured row to whichever
+  fresh tablet's range contains it — a real, but narrow and diagnosable
+  (not correctness-affecting), performance improvement rather than a gap.
+  See `animusd::backup_restore`'s own module doc for the mechanism this
+  decision produced.
+- **A real bug found building the seeder, not by design review: captured
+  values must be re-wrapped in the engine's committed envelope before
+  `SeedBatch` merges them, or a read panics.** ADR §5 states plainly that
+  capture "reads through intent resolution" and stores each row's
+  already-*resolved* value — correct, and unchanged. What §7 step 4's text
+  glossed over is that `KvCommand::SeedBatch` (reused verbatim from ADR
+  0050) is a **raw envelope-tag-included byte passthrough** — sound for the
+  split-build driver, whose child rows are still-enveloped physical bytes
+  from the same live transaction blast radius, but not sound for a
+  captured, already-resolved value, which carries no envelope tag at all.
+  Feeding one straight into `SeedBatch` merges an unwrapped value the
+  read path's envelope decoder cannot parse — the byte a real read
+  interprets as the envelope tag is instead the value's own first content
+  byte, an "unknown envelope tag" panic reachable from an ordinary
+  `ConsistentRead` `GetItem` on a restored row. Caught immediately by this
+  train's own first end-to-end test run, not by review. Fixed by
+  `animus_cp_data::backup::encode_restored_value` (a thin, well-documented
+  wrapper the restore driver calls on every `Some` value before seeding) —
+  see that function's own doc for the full mechanism, and
+  `docs/engineering-lessons.md` for the generalized lesson.
+- **A restored table's GSIs are declared on the schema only AFTER
+  activation, not up front alongside the base schema/LSIs — narrower
+  sequencing than §7's own text implies.** §7 doesn't explicitly order GSI
+  declaration against tablet activation; §8 does say GSIs are rebuilt
+  "once the restored base table's rows are seeded and activated," but
+  doesn't say *when the `CreateTableIndex` proposal itself happens*. Doing
+  it early (alongside the base schema, mirroring how `create_table` itself
+  declares every index up front) is actively wrong here: the backfill
+  seeder would observe the still-empty/`Building` destination tablet,
+  find its `KIND_BASE` scan already exhausted, and mark it backfilled
+  before this restore ever seeds a single row — silently dropping every
+  restored row from the GSI forever. The restore driver (`animusd::
+  backup_restore::complete_restore`) proposes each of `RestoreRow::
+  gsi_defs`'s `CreateTableIndex` calls **immediately after, in the same
+  step as,** `CompleteRestore` — the earliest point the tablet is
+  genuinely `Active` and fully seeded, so the backfill seeder's very next
+  sweep finds real data. `RestoreRow::gsi_defs` itself (a new `Vec<IndexDef>`
+  field, resolved once client-side by the wire handler from
+  `GlobalSecondaryIndexOverride` or the manifest's own captured GSIs,
+  forced to `IndexStatus::Creating` regardless of the source's own status)
+  is what carries this plan from propose time to the driver, since the two
+  steps can run on different nodes at very different times.
+- **A visible, deliberate AWS deviation this ordering choice produces**:
+  the `RestoreTableFromBackup` response, and any `DescribeTable` call
+  before the restore completes, do not show the target's GSIs **at all**
+  — not even as `CREATING`/backfilling, which is what real DynamoDB shows
+  from the very first response. They appear only once the base table
+  finishes seeding and activates, at which point they follow the ordinary
+  `Creating` → backfill → `Active` lifecycle a client would recognize from
+  any `UpdateTable`-added GSI. Named here rather than silently shipped as
+  if AWS-faithful; closing it (showing a synthetic pre-declared `Creating`
+  GSI in the response before the schema itself carries one) is a
+  wire-layer-only follow-up, not a data-model change.
+- **`TableStatus` needed no new persisted state at all** — derived
+  (`animusd::dynamo::table_status`) purely from whether every one of a
+  table's *current* tablets is `Active`: `CREATING` while any is
+  `Building` (true for a restore's own single tablet until activation;
+  structurally unreachable for an ordinary `CreateTable`, which blocks on
+  `await_table_serveable` before ever returning 200), `ACTIVE` otherwise.
+  This is the same "derive from live tablet state, never a redundant
+  status field" discipline the codebase already applies to a GSI's own
+  `IndexStatus` and to `BackupStatus`'s relationship to capture progress.
+- **A restore does not pin/lock its source backup against a concurrent
+  `DeleteBackup`** — a narrow, accepted residual, not a defended property.
+  If a backup is marked deleted (and, rarer still, actually reclaimed by
+  the janitor) while a restore reading from it is still in flight, the
+  restore driver's own defensive check (re-reading the backup's live
+  status each tick) fails the restore outright (`FailRestore`) rather than
+  serving a half-seeded table — never a correctness violation, but a
+  liveness one an operator could hit by deleting a backup at an unlucky
+  moment mid-restore. Closing it (a reference count, or refusing
+  `DeleteBackup` while any `Seeding` restore names the backup) is a named
+  follow-up, not implemented in this train.
+
+**Corpus** (`crates/animus-test/tests/backup_fault_corpus.rs`,
+`ANIMUS_BACKUP_SEEDS`): five restore cells, the identical self-contained-
+reimplementation technique the capture half already established —
+`restore_round_trip_matches_model_at_capture_cut_version` (including a
+staged-and-never-resolved intent, proving restore only ever sees resolved
+values), `restore_driver_crash_restart_resumes` (a true process restart of
+the destination leader mid-seed), `restore_leader_kill_mid_seed_converges`
+(a live leader kill/failover mid-seed), `restore_store_faults_still_converge`
+(the backup store genuinely unavailable partway through the sweep, healing
+later — `SegmentFaultConfig`'s own ack-lost thresholds are `put`/`delete`-
+only, checked directly against `animus-sim`'s source, so a read fault for
+restore's `get`-only workload is `SimSegmentStore::set_unavailable_until`,
+not `SegmentFaultConfig`), and `restore_after_source_drop`. GSI-rebuild
+convergence is deliberately not reimplemented a third time in this corpus —
+it is the exact `index_backfill.rs`/`index_drain.rs` machinery
+`backfill_fault_corpus.rs` already proves at depth, applied to an ordinary
+`Active` tablet indistinguishable from any other (§8's own point); the real
+production stack's end-to-end GSI-after-restore convergence is covered by
+`animusd/tests/dynamo_restore.rs` instead, alongside the full
+`CreateBackup` → `AVAILABLE` → write-more-data → `RestoreTableFromBackup` →
+converged round trip, restore-after-source-drop, and the AWS-faithful error
+shapes.
+
+**Open questions carried into Train 3 (PITR)**: none of Train 2's own
+decisions above constrain PITR's design — `RestoreTableToPointInTime` (§10)
+reuses "the same restore path as `RestoreTableFromBackup`" for its own
+seeding, so PITR inherits both the single-fresh-tablet layout decision and
+the GSI-after-activation sequencing unchanged. The one item worth a future
+PITR author's attention: whether PITR's own replay (a snapshot plus a
+change-log walk, producing the identical `SeedRow` shape per §10) needs the
+same `encode_restored_value` envelope re-wrap — very likely yes, since its
+output is described as "exactly the same `(kind, logical_key, value,
+version)` shape an on-demand backup's data objects carry," which is the
+exact shape this train found needed the wrap.

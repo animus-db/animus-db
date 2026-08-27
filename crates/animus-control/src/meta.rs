@@ -324,6 +324,27 @@ pub struct Metadata {
     /// tablet, cut_version, bytes}` objects instead.
     #[serde(default, with = "backup_progress_codec")]
     pub backup_tablet_progress: BTreeMap<(BackupId, TabletId), BackupTabletProgress>,
+    /// The **restore catalog** (ADR 0059 §7, Train 2): every
+    /// `RestoreTableFromBackup` ever begun, keyed by [`RestoreId`] — an
+    /// opaque, freshly-minted identity, mirroring [`backups`](Self::backups)'
+    /// own "never a name" discipline (a restore's *target* table name is data
+    /// on the row, not its key, so two restores racing the same target name
+    /// are simply two unrelated rows — the state machine's own
+    /// `CreateTableSchema` first-committer-wins guard is what actually
+    /// decides which one's target table survives, ADR 0059 §7's
+    /// "TableAlreadyExistsException" case). Mutated only through
+    /// [`MetaCommand::BeginRestore`] (mints a row + this restore's single
+    /// `Building` tablet, ADR 0059's Train 2 as-built note on the
+    /// pinned-tablets-vs-fresh-layout decision), [`MetaCommand::
+    /// CompleteRestore`]/[`MetaCommand::FailRestore`] (terminal transitions).
+    /// Deliberately **no** delete/reclaim command yet — a restore row is
+    /// small, bounded (one row per `RestoreTableFromBackup` call, never
+    /// per-tablet fan-out, since Train 2 mints exactly one destination
+    /// tablet per restore), and never referenced once terminal; a retention
+    /// sweep is a named Train 2 residual, not a correctness gap.
+    /// `#[serde(default)]` keeps pre-restore snapshots loading (empty map).
+    #[serde(default)]
+    pub restores: BTreeMap<RestoreId, RestoreRow>,
 }
 
 /// Gives [`Metadata::stream_shards`] a `serde_json`-safe wire shape — see
@@ -718,6 +739,83 @@ pub struct BackupRow {
     /// pre-existing snapshot/fixture that predates this field.
     #[serde(default)]
     pub total_bytes: u64,
+}
+
+/// A restore's opaque catalog identity (ADR 0059 §7, Train 2) — an
+/// internally-minted identity, never wire-visible (unlike [`BackupId`], which
+/// doubles as the wire ARN) since `RestoreTableFromBackup` has no AWS-defined
+/// "restore id" of its own to echo back — a client only ever sees the
+/// resulting `TableDescription`.
+pub type RestoreId = String;
+
+/// A restore-in-progress catalog row's lifecycle status (ADR 0059 §7). Unlike
+/// [`BackupStatus`] there is no `Expired` — a restore row has no retention
+/// janitor yet (see [`Metadata::restores`]'s own doc).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestoreStatus {
+    /// The restore driver (`animusd::backup_restore`) is seeding the target
+    /// tablet from the backup's data objects. The target table's own
+    /// `TableStatus` reads `CREATING` for the whole duration this row stays
+    /// in this state (derived from its tablet's own `Building` state, not
+    /// stored redundantly here — see `animusd::dynamo::table_status`).
+    Seeding,
+    /// Terminal success: the target tablet has been fully seeded and
+    /// activated (`MetaCommand::CompleteRestore`).
+    Done,
+    /// Terminal failure — a stuck-`Seeding` timeout, or a source backup that
+    /// became unreadable mid-restore (e.g. deleted and reclaimed by the
+    /// backup janitor while restore was still reading it, ADR 0059's Train 2
+    /// as-built note on this narrow, accepted race). `reason` is diagnostic
+    /// only, never interpreted. The target table's schema and its
+    /// permanently-`Building` (never-served) tablet are left in place —
+    /// `DropTableTablets`/the reconciler's ordinary `Reclaim` action already
+    /// clean up a `Building` tablet exactly like any other (state-agnostic),
+    /// so a failed restore's target table is a clean, ordinary `DeleteTable`
+    /// away from full cleanup, never half-serving.
+    Failed {
+        /// A human-readable failure reason.
+        reason: String,
+    },
+}
+
+/// A restore-in-progress catalog row (`Metadata::restores`, ADR 0059 §7).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreRow {
+    /// The backup this restore reads from.
+    pub backup_id: BackupId,
+    /// The backup's own source table, purely descriptive (`DescribeBackup`-
+    /// adjacent observability; never re-derived from live `Metadata`, since
+    /// the source table may have been dropped — the whole point of ADR
+    /// 0059's "restore a table dropped days ago" case).
+    pub source_table: TableName,
+    /// The new table this restore is populating.
+    pub target_table: TableName,
+    /// The single `Building` tablet minted for this restore (ADR 0059 Train
+    /// 2 as-built note: restore mints exactly **one** fresh tablet over the
+    /// whole ring, matching ordinary `CreateTable`'s own provisioning
+    /// convention, rather than mirroring the backup's historical
+    /// multi-tablet topology — see that note for the full reasoning). The
+    /// restore driver seeds this tablet from every one of the backup's data
+    /// objects, regardless of which physical tablet originally captured
+    /// them (a single destination tablet needs no per-row key routing).
+    pub tablet: TabletId,
+    /// The GSI definitions to create once this restore activates its
+    /// tablet (ADR 0059 §8): the caller's own `GlobalSecondaryIndexOverride`
+    /// if given, else every `Global`-kind index the backup's own manifest
+    /// recorded — resolved once, client-side, by the wire handler
+    /// (`animusd::dynamo::restore_table_from_backup`) before ever proposing,
+    /// the identical "client-supplied, recorded verbatim" convention
+    /// [`BackupRow::backup_name`] already uses. Each already carries
+    /// [`IndexStatus::Creating`] (mirroring `create_index`'s own override
+    /// convention) — **deliberately not declared on the target schema until
+    /// [`MetaCommand::CompleteRestore`] fires** (see that command's own doc
+    /// and the restore driver's module doc): declaring a GSI before the
+    /// tablet is seeded would let the backfill seeder observe an empty
+    /// range, mark it backfilled, and then silently miss every row this
+    /// restore seeds afterward.
+    pub gsi_defs: Vec<IndexDef>,
+    /// This row's lifecycle status.
+    pub status: RestoreStatus,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -1302,6 +1400,67 @@ pub enum MetaCommand {
     MarkBackupDeleted {
         /// The backup to mark for reclaim.
         backup_id: BackupId,
+    },
+    /// Begin a restore (ADR 0059 §7, Train 2): mints a fresh
+    /// [`RestoreRow`] in [`RestoreStatus::Seeding`] plus this restore's
+    /// single `Building` tablet, bound to `target_table` (whose schema must
+    /// already exist — the wire caller proposes `CreateTableSchema`/
+    /// `CreateTableIndex` for the LSIs first, exactly the ordering
+    /// `provision_tablet` already requires of `CreateTable`). Rejected if
+    /// `restore_id` already exists (first-committer-wins, mirroring
+    /// [`BeginBackup`](Self::BeginBackup)'s own fresh-identity collision
+    /// case) or if `tablet` already exists or sits below the monotonic
+    /// allocator floor (the identical seatbelt
+    /// [`BeginSplit`](Self::BeginSplit)/[`CreateTablet`](Self::CreateTablet)
+    /// already enforce). No epoch-CAS: like `BeginBackup`, there is nothing
+    /// to CAS against for a freshly-minted identity.
+    BeginRestore {
+        /// This restore's own opaque identity.
+        restore_id: RestoreId,
+        /// The backup being restored from.
+        backup_id: BackupId,
+        /// The backup's own source table (descriptive only, see
+        /// [`RestoreRow::source_table`]'s doc).
+        source_table: TableName,
+        /// The new table being populated.
+        target_table: TableName,
+        /// This restore's single destination tablet id (caller-allocated,
+        /// same convention as `CreateTablet`/`BeginSplit`'s own children).
+        tablet: TabletId,
+        /// The destination tablet's initial replica set.
+        replicas: Vec<NodeId>,
+        /// The GSI definitions to create once this restore completes — see
+        /// [`RestoreRow::gsi_defs`]'s own doc for why these are recorded now
+        /// but not declared on the schema until then.
+        gsi_defs: Vec<IndexDef>,
+    },
+    /// Complete a restore (ADR 0059 §7 step 5): activates this restore's
+    /// tablet (`Building` → `Active`, epoch bumped — mirroring
+    /// [`CutoverSplit`](Self::CutoverSplit)'s own activation, minus the
+    /// "retire a parent" half, since restore has no parent) and flips the
+    /// row to [`RestoreStatus::Done`]. Rejected if `restore_id` is unknown,
+    /// not currently [`Seeding`](RestoreStatus::Seeding), or its tablet is
+    /// not `Building` (defense-in-depth against a doubly-proposed
+    /// completion racing something else entirely — this command's own
+    /// producer, the restore driver, `animusd::backup_restore`, only ever
+    /// proposes it once per restore in practice).
+    CompleteRestore {
+        /// The restore to complete.
+        restore_id: RestoreId,
+    },
+    /// Fail a restore past a bounded stuck-timeout, or on an unreadable
+    /// source backup (ADR 0059 §7's crash/liveness contract — mirroring
+    /// [`FailBackup`](Self::FailBackup)'s own idempotent terminal-transition
+    /// shape). Idempotent on an identical repeat; contradicts (rejects) an
+    /// already-[`Done`](RestoreStatus::Done) row. The tablet is
+    /// deliberately left `Building` (never activated, never routable) —
+    /// see [`RestoreStatus::Failed`]'s own doc for why this still leaves a
+    /// cleanly deletable target table.
+    FailRestore {
+        /// The restore to fail.
+        restore_id: RestoreId,
+        /// A human-readable failure reason.
+        reason: String,
     },
 }
 
@@ -2135,6 +2294,87 @@ impl Metadata {
                     }
                 }
             }
+            MetaCommand::BeginRestore {
+                restore_id,
+                backup_id,
+                source_table,
+                target_table,
+                tablet,
+                replicas,
+                gsi_defs,
+            } => {
+                if self.restores.contains_key(restore_id) {
+                    return ApplyOutcome::Rejected("restore id already exists");
+                }
+                if self.tablets.contains_key(tablet) {
+                    return ApplyOutcome::Rejected("tablet already exists");
+                }
+                // Same monotonic-allocator floor as `CreateTablet`/`BeginSplit`
+                // (and for the same dropped-data-resurrection reason).
+                if tablet.0 < self.next_free_tablet_id().0 {
+                    return ApplyOutcome::Rejected("tablet id below the monotonic allocator");
+                }
+                let mut t = Tablet::with_table(
+                    *tablet,
+                    Some(target_table.clone()),
+                    KeyRange::whole(),
+                    replicas.clone(),
+                );
+                t.state = TabletState::Building;
+                self.tablets.insert(*tablet, t);
+                self.next_tablet_id = self.next_tablet_id.max(tablet.0 + 1);
+                self.restores.insert(
+                    restore_id.clone(),
+                    RestoreRow {
+                        backup_id: backup_id.clone(),
+                        source_table: source_table.clone(),
+                        target_table: target_table.clone(),
+                        tablet: *tablet,
+                        gsi_defs: gsi_defs.clone(),
+                        status: RestoreStatus::Seeding,
+                    },
+                );
+                ApplyOutcome::Applied
+            }
+            MetaCommand::CompleteRestore { restore_id } => {
+                let Some(row) = self.restores.get(restore_id) else {
+                    return ApplyOutcome::Rejected("no such restore");
+                };
+                if !matches!(row.status, RestoreStatus::Seeding) {
+                    return ApplyOutcome::Rejected("restore is not Seeding");
+                }
+                let tablet_id = row.tablet;
+                let Some(t) = self.tablets.get_mut(&tablet_id) else {
+                    return ApplyOutcome::Rejected("restore's tablet no longer exists");
+                };
+                if t.state != TabletState::Building {
+                    return ApplyOutcome::Rejected("restore's tablet is not Building");
+                }
+                t.state = TabletState::Active;
+                t.epoch = t.epoch.next();
+                self.restores
+                    .get_mut(restore_id)
+                    .expect("checked present above")
+                    .status = RestoreStatus::Done;
+                ApplyOutcome::Applied
+            }
+            MetaCommand::FailRestore { restore_id, reason } => {
+                let Some(row) = self.restores.get_mut(restore_id) else {
+                    return ApplyOutcome::Rejected("no such restore");
+                };
+                match &row.status {
+                    RestoreStatus::Failed { reason: existing } if existing == reason => {
+                        ApplyOutcome::NoOp
+                    }
+                    RestoreStatus::Seeding | RestoreStatus::Failed { .. } => {
+                        row.status = RestoreStatus::Failed {
+                            reason: reason.clone(),
+                        };
+                        ApplyOutcome::Applied
+                    }
+                    RestoreStatus::Done => ApplyOutcome::Rejected("restore already completed"),
+                }
+            }
             MetaCommand::SetTableStream { table, spec } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
                     return ApplyOutcome::Rejected("no such table schema");
@@ -2954,6 +3194,13 @@ impl Metadata {
     #[must_use]
     pub fn backup(&self, backup_id: &str) -> Option<&BackupRow> {
         self.backups.get(backup_id)
+    }
+
+    /// The restore catalog row for `restore_id`, if any (ADR 0059 §7). A
+    /// read accessor for the restore driver and observability surfaces.
+    #[must_use]
+    pub fn restore(&self, restore_id: &str) -> Option<&RestoreRow> {
+        self.restores.get(restore_id)
     }
 
     /// `backup_id`'s own per-tablet completion records (ADR 0059 §3/§4) —
@@ -3933,6 +4180,207 @@ mod tests {
         );
     }
 
+    // --- ADR 0059 §7, Train 2: the restore catalog -----------------------
+
+    /// `BeginRestore` (ADR 0059 §7): mints exactly one fresh `Building`
+    /// tablet over the whole ring, scoped to the target table, plus a
+    /// `Seeding` restore row — rejected on a duplicate restore id, a
+    /// colliding tablet id, or a tablet id below the monotonic allocator
+    /// floor.
+    #[test]
+    fn begin_restore_apply_arm() {
+        let mut m = Metadata::default();
+        // The target table's schema is created first, exactly as
+        // `provision_tablet` requires ahead of an ordinary `CreateTable`.
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "restored".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-1".to_owned(),
+                backup_id: "backup-1".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored".to_owned(),
+                tablet: TabletId(5),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+            }),
+            ApplyOutcome::Applied
+        );
+        let row = m.restore("restore-1").expect("row present");
+        assert_eq!(row.backup_id, "backup-1");
+        assert_eq!(row.source_table, "users");
+        assert_eq!(row.target_table, "restored");
+        assert_eq!(row.tablet, TabletId(5));
+        assert_eq!(row.status, RestoreStatus::Seeding);
+        let tablet = &m.tablets[&TabletId(5)];
+        assert_eq!(tablet.state, TabletState::Building);
+        assert_eq!(tablet.range, KeyRange::whole());
+        assert_eq!(tablet.table.as_deref(), Some("restored"));
+        assert!(!tablet.is_routable());
+
+        // A second `BeginRestore` at the same restore id is rejected
+        // outright, even naming a different (also-fresh) tablet.
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-1".to_owned(),
+                backup_id: "backup-2".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored".to_owned(),
+                tablet: TabletId(6),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+            }),
+            ApplyOutcome::Rejected("restore id already exists")
+        );
+
+        // A colliding tablet id.
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-2".to_owned(),
+                backup_id: "backup-2".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored2".to_owned(),
+                tablet: TabletId(5),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+            }),
+            ApplyOutcome::Rejected("tablet already exists")
+        );
+
+        // Below the monotonic allocator floor.
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-3".to_owned(),
+                backup_id: "backup-2".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored3".to_owned(),
+                tablet: TabletId(0),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+            }),
+            ApplyOutcome::Rejected("tablet id below the monotonic allocator")
+        );
+    }
+
+    /// `CompleteRestore`/`FailRestore` (ADR 0059 §7): completion activates
+    /// the tablet and flips the row `Done`; failure leaves the tablet
+    /// `Building` (never served) and flips the row `Failed`. Both reject a
+    /// terminal-contradicting call, and `FailRestore` is idempotent on an
+    /// identical repeat.
+    #[test]
+    fn complete_and_fail_restore_apply_arms() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "restored".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-1".to_owned(),
+                backup_id: "backup-1".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored".to_owned(),
+                tablet: TabletId(5),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteRestore {
+                restore_id: "ghost".to_owned(),
+            }),
+            ApplyOutcome::Rejected("no such restore")
+        );
+
+        let before_epoch = m.tablets[&TabletId(5)].epoch;
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteRestore {
+                restore_id: "restore-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.restore("restore-1").unwrap().status, RestoreStatus::Done);
+        let tablet = &m.tablets[&TabletId(5)];
+        assert_eq!(tablet.state, TabletState::Active);
+        assert!(tablet.is_routable());
+        assert!(tablet.epoch > before_epoch);
+
+        // Already `Done` — a second completion is rejected, not idempotent
+        // (mirroring `CompleteBackup`'s own already-`Available` rejection).
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteRestore {
+                restore_id: "restore-1".to_owned(),
+            }),
+            ApplyOutcome::Rejected("restore is not Seeding")
+        );
+        // ...and `FailRestore` cannot contradict a completed restore either.
+        assert_eq!(
+            m.apply(&MetaCommand::FailRestore {
+                restore_id: "restore-1".to_owned(),
+                reason: "too late".to_owned(),
+            }),
+            ApplyOutcome::Rejected("restore already completed")
+        );
+
+        // A second, independent restore that fails instead: the tablet
+        // stays `Building` (never served, but cleanly droppable).
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-2".to_owned(),
+                backup_id: "backup-2".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored2".to_owned(),
+                tablet: TabletId(6),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::FailRestore {
+                restore_id: "restore-2".to_owned(),
+                reason: "stuck".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.restore("restore-2").unwrap().status,
+            RestoreStatus::Failed {
+                reason: "stuck".to_owned()
+            }
+        );
+        assert_eq!(m.tablets[&TabletId(6)].state, TabletState::Building);
+        // Idempotent on an identical repeat.
+        assert_eq!(
+            m.apply(&MetaCommand::FailRestore {
+                restore_id: "restore-2".to_owned(),
+                reason: "stuck".to_owned(),
+            }),
+            ApplyOutcome::NoOp
+        );
+        // A genuinely differing reason still transitions (mirrors
+        // `FailBackup`'s own "not a repair path, but a differing repeat
+        // still applies" shape).
+        assert_eq!(
+            m.apply(&MetaCommand::FailRestore {
+                restore_id: "restore-2".to_owned(),
+                reason: "stuck again".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
     /// ADR 0024/ADR 0059 §3's explicit carve-out: `DropTableSchema`/
     /// `DropTableTablets` must NOT touch the backup catalog — a backup row
     /// (and its progress records) survives a drop of its source table.
@@ -4261,6 +4709,47 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        let json = serde_json::to_string(&m).expect("serializes");
+        let round_tripped: Metadata = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(m, round_tripped);
+    }
+
+    /// ADR 0059 §7 (Train 2): `Metadata::restores` round-trips through JSON
+    /// with a populated row (its key is a plain `String`, not a tuple, so
+    /// this doesn't hit the `serde_json` non-string-map-key hazard the
+    /// `stream_shards`/`index_backfill`/`backup_tablet_progress` tests above
+    /// exist for — but an empty collection still can't prove the *value*
+    /// shape round-trips, including its nested `gsi_defs: Vec<IndexDef>`).
+    #[test]
+    fn metadata_round_trips_through_json_with_populated_restores() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "restored".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-1".to_owned(),
+                backup_id: "backup-1".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored".to_owned(),
+                tablet: TabletId(5),
+                replicas: vec![nid(1)],
+                gsi_defs: vec![IndexDef {
+                    name: "by-status".to_owned(),
+                    kind: crate::schema::IndexKind::Global,
+                    hash_attribute: "status".to_owned(),
+                    sort_attribute: None,
+                    projection: crate::schema::IndexProjection::All,
+                    status: IndexStatus::Creating,
+                }],
             }),
             ApplyOutcome::Applied
         );

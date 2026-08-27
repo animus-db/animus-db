@@ -10492,6 +10492,102 @@ answering a different, degenerate question that happens to typecheck.
 `BackupRow::total_bytes` is exactly this freeze, written once by
 `MetaCommand::CompleteBackup`'s own apply arm at the last moment the live
 accessor is still authoritative.
+
+## A byte-passthrough merge primitive and a value-producing read primitive can disagree about who owns the envelope tag (ADR 0059 §7, Train 2 restore)
+
+Building the restore driver (`animusd::backup_restore`), the first real
+end-to-end test run panicked on an ordinary `ConsistentRead: true` `GetItem`
+against a freshly-restored row: `txn: unknown envelope tag 123 (corrupt
+engine value)`. Not a fault-injection scenario — every seed, every time,
+on the very first row read back.
+
+The root cause was two correct primitives disagreeing about a byte-format
+contract neither one's own doc stated explicitly enough to catch by
+inspection. `animus-cp-data`'s apply path wraps every ordinary write's
+value in a 1-byte-tagged envelope (`0` = committed, `1` = intent) before
+merging it into the engine — every read path unwraps this before a caller
+ever sees a value. `KvCommand::SeedBatch` (the split-build driver's own
+history-transfer command, reused verbatim by restore per ADR 0050) is
+deliberately the *exception*: it merges the exact bytes handed to it,
+envelope tag included, because a split child's rows are still-enveloped
+physical bytes from the same live transaction blast radius as their
+parent — copying them verbatim is what lets an in-flight intent continue
+resolving correctly wherever it lands.
+
+Backup capture (ADR 0059 §5) reads through intent resolution by design —
+it deliberately stores each row's already-*resolved*, plain value, with no
+envelope tag at all, specifically so a restored table never carries a
+dangling, unresolvable intent envelope pointing at an anchor that may not
+even exist anymore. That decision is exactly right on capture's own side.
+It just means the restore driver's own input (a plain resolved value) and
+`SeedBatch`'s own contract (an already-enveloped physical byte string) are
+not the same shape — feeding one into the other merges a byte string whose
+first byte the read path's decoder can't recognize as either envelope tag,
+producing exactly the panic above the moment anything ever reads the row
+back.
+
+**The general form**: a merge primitive that is deliberately "verbatim
+bytes in, verbatim bytes out" (no re-encoding, by design, for its own
+documented reason) is not a safe target for a *different* producer whose
+own output was already decoded/normalized one layer down from what that
+primitive expects — even when both producers are "giving it a value" in
+the loosest sense. The fix is never to make the merge primitive smarter
+(that would break the property it exists for); it's to make the seam
+between the two explicit: `animus_cp_data::backup::encode_restored_value`
+is a one-line, clearly-doc'd wrapper the restore driver calls on every
+captured value before it ever reaches `SeedBatch`, named after what it's
+for rather than what it does, so a future caller reads its doc before
+reusing the pattern instead of rediscovering the panic. Before wiring a
+second producer into an existing "verbatim passthrough" primitive, check
+what shape its *existing* callers actually hand it — "the same trait
+method" is not "the same byte contract."
+
+Caught by the project's own first real integration test for the feature,
+not by review or a fault-injection sweep — a reminder that an end-to-end
+test exercising the full production stack (not just the unit-level pieces)
+remains the cheapest way to catch a cross-module contract mismatch that
+both sides' own type signatures happily agree on.
+
+## A newly-discovered pre-existing flake: `delete_backup_on_a_follower_is_relayed_to_the_leader` (~25-30% under real time, confirmed unrelated to ADR 0059 Train 2)
+
+While running the full `animusd` gate for the Train 2 (restore) work, the
+**pre-existing** Train 1 PR④ test `schema_ddl_relay::delete_backup_on_a_
+follower_is_relayed_to_the_leader` failed once in a full-suite run
+(`node 1: backup not marked Expired within 20s of follower-relayed
+DeleteBackup`) and intermittently in isolated reruns on this branch. Before
+assuming Train 2 had regressed it (a plausible worry — Train 2 spawns a new
+per-data-node background loop, `backup_restore_loop`, into the same task
+set every combined/data-only node already runs), it was reproduced on the
+**pre-Train-2** tip (`claude/backup-wire-apis`, no restore code at all) via
+a disposable `git worktree`: 2 failures in 6 isolated reruns there too, the
+identical ~21.8-22.4s timing signature (just over the test's own 20s
+budget). **Confirmed pre-existing, not a regression** — recorded here
+rather than silently worked around, per this log's own standing rule that a
+flaky `ProdEnv` test is a real bug, not noise, even when it isn't the one
+you're currently touching.
+
+The mechanism: the test's 20s budget covers a **two-hop convergent
+process** — the relay itself (`ProposeSchema` one hop to the control
+leader) *plus* the backup janitor's own two-phase reclaim (mark → object
+delete → finalize), which polls on its own independent tick. On an
+unloaded machine this converges in ~1.8s; under any real scheduling
+pressure (a `--test-threads=1` run is still real OS thread/process
+contention across whatever else is running, and CI runners are noisier
+still) it occasionally needs more than one janitor tick's worth of slack
+past 20s and the test times out outright rather than converging late. This
+is the general shape the root `CLAUDE.md` warns about with "an eventual
+property gets a converged-or-timeout poll, never a fixed-deadline
+one-shot" — the poll here already isn't a one-shot, but its **budget**
+was sized without accounting for the second independent convergent
+process riding underneath the first one it was visibly testing.
+
+**Not fixed in this change** (per the standing rule: an incidental
+pre-existing bug found mid-task gets its own separate PR, never a
+drive-by fix folded into an unrelated diff) — noted here so the next
+person to see it red doesn't waste time bisecting a change that isn't the
+cause; worth its own tracked issue alongside #406/#298's own flake family. A
+real fix likely widens the timeout or asserts on the *janitor's own*
+tick cadence rather than wall-clock margin.
 ### Amendment (2026-08-26, later the same day): shape B confirmed and fixed; a second, sibling conflation found and fixed alongside it
 
 A follow-up round re-instrumented both candidate sites from the entry above

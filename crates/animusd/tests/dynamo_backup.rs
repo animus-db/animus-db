@@ -7,8 +7,8 @@
 //! property is a converged-or-timeout poll, never a fixed sleep (this
 //! codebase's own testing discipline).
 //!
-//! `RestoreTableFromBackup` is out of scope (ADR 0059 Train 2) — nothing
-//! here exercises restore.
+//! `RestoreTableFromBackup` (ADR 0059 Train 2) has its own dedicated file,
+//! `tests/dynamo_restore.rs` — nothing here exercises restore.
 
 use std::net::SocketAddr;
 use std::time::Duration;

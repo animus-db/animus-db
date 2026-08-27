@@ -178,7 +178,7 @@ use animus_dynamo::{
     storage_key,
 };
 use animus_env::{Clock, Env, Metric, Rng};
-use animus_tablet::{TOKEN_BYTES, TabletId, partition_token};
+use animus_tablet::{TOKEN_BYTES, TabletId, TabletState, partition_token};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::http;
@@ -1043,6 +1043,19 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             backup_type,
         ),
         Operation::DeleteBackup { backup_arn } => delete_backup(ctx, &backup_arn).await,
+        Operation::RestoreTableFromBackup {
+            backup_arn,
+            target_table_name,
+            global_secondary_index_override,
+        } => {
+            restore_table_from_backup(
+                ctx,
+                &backup_arn,
+                &target_table_name,
+                global_secondary_index_override.as_deref(),
+            )
+            .await
+        }
     }
 }
 
@@ -1429,6 +1442,245 @@ async fn delete_backup(ctx: &ClientCtx, backup_arn: &str) -> Result<String, Wire
         }
         tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
     }
+}
+
+/// How many fresh-id retries [`restore_table_from_backup`] attempts before
+/// giving up — mirrors [`CREATE_BACKUP_ID_ATTEMPTS`]'s own reasoning
+/// exactly (a restore id collision is vanishingly unlikely; a repeated
+/// timeout more likely means no leader is reachable at all).
+const RESTORE_ID_ATTEMPTS: u32 = 3;
+
+/// `RestoreTableFromBackup` (ADR 0059 §7, Train 2): restore `backup_arn`
+/// into a brand-new table `target_table_name`, replaying the table's own
+/// creation machinery from the backup's captured `SourceTableFeatureDetails`
+/// snapshot rather than inventing a parallel bootstrap path:
+///
+/// 1. Validate: the backup exists and is `Available`
+///    (`BackupNotFoundException`/`BackupInUseException`, AWS-faithful — see
+///    [`visible_backup`]'s own doc for why `Expired`/`Failed` both read as
+///    "not found"), the target name isn't reserved, and the target doesn't
+///    already exist (`ResourceInUseException` — the identical code
+///    `create_table`'s own duplicate-name check already uses, via
+///    [`registry_error`]'s `TableExists` arm; re-checked by the state
+///    machine's own `CreateTableSchema` first-committer-wins guard too, so a
+///    race between two concurrent restores to the same name is decided
+///    there, not by this client-side check alone).
+/// 2. Propose `CreateTableSchema` from the manifest's schema, stripped of
+///    its `indexes`/`stream`/`ttl` (ADR 0059 §7 step 2: TTL and streams are
+///    deliberately never re-enabled), then propose `CreateTableIndex` for
+///    every **LSI** the manifest recorded — the identical commit-wait shape
+///    [`create_table`] itself uses, since LSI rows are colocated physical
+///    data this restore is about to seed and LSIs are always `Active` by
+///    construction (create-time-only, never backfilled).
+/// 3. Resolve this restore's own GSI plan (`GlobalSecondaryIndexOverride`
+///    if given — entirely replacing the manifest's own GSI set — else every
+///    `Global`-kind index the manifest recorded), forced to
+///    [`IndexStatus::Creating`] regardless of the source's own status (ADR
+///    0059 §8: a restored GSI is always rebuilt from scratch). **Not**
+///    declared on the schema yet — see [`RestoreRow::gsi_defs`]'s own doc
+///    for why declaring it before the tablet is seeded would be a real
+///    backfill-completion race, and [`crate::backup_restore`]'s module doc
+///    for where it actually gets declared (after `CompleteRestore`).
+/// 4. Propose `MetaCommand::BeginRestore` — mints the single `Building`
+///    destination tablet (ADR 0059 Train 2's own pinned-tablets-vs-fresh-
+///    layout decision, see `crate::backup_restore`'s module doc) at a
+///    freshly-selected replica set (the identical `provision_tablet`
+///    convention: the first `min(N, MAX_REPLICATION_FACTOR)` `Active`
+///    members) and the `Seeding` restore row.
+/// 5. Return immediately — **asynchronous**, unlike `create_table`'s own
+///    blocking `await_table_serveable` wait: the restore driver
+///    (`crate::backup_restore`) seeds and activates the tablet in the
+///    background, so `DescribeTable` reports `CREATING`
+///    ([`table_status`]) until it converges. The returned
+///    `TableDescription` reflects only what has committed by this point
+///    (the base schema + any LSIs) — the target's GSIs are not yet visible
+///    at all (a deliberate Train 2 deviation from AWS, which shows them
+///    `CREATING`/backfilling immediately; see the ADR's own as-built note).
+async fn restore_table_from_backup(
+    ctx: &ClientCtx,
+    backup_arn: &str,
+    target_table_name: &str,
+    global_secondary_index_override: Option<&[animus_dynamo::SecondaryIndex]>,
+) -> Result<String, WireError> {
+    if animus_control::syskv::is_reserved_name(target_table_name) {
+        return Err(WireError::validation(format!(
+            "table name `{target_table_name}` collides with the reserved system namespace"
+        )));
+    }
+    let meta = metadata_fresh(ctx).await;
+    let row = visible_backup(&meta, backup_arn)?;
+    match row.status {
+        animus_control::BackupStatus::Available => {}
+        animus_control::BackupStatus::Creating => {
+            return Err(WireError {
+                code: "BackupInUseException",
+                message: format!("backup `{backup_arn}` is still being created"),
+                reasons: None,
+            });
+        }
+        // `visible_backup` already filters `Expired`/`Failed` out as
+        // "not found" — unreachable, kept so this match stays exhaustive.
+        animus_control::BackupStatus::Expired | animus_control::BackupStatus::Failed { .. } => {
+            return Err(WireError {
+                code: "BackupNotFoundException",
+                message: format!("backup `{backup_arn}` does not exist"),
+                reasons: None,
+            });
+        }
+    }
+    if meta.has_table_schema(target_table_name) {
+        return Err(registry_error(animus_dynamo::RegistryError::TableExists(
+            target_table_name.to_owned(),
+        )));
+    }
+
+    let mut base_schema = row.manifest.schema.clone();
+    let source_table = row.table.clone();
+    let manifest_indexes = std::mem::take(&mut base_schema.indexes);
+    base_schema.stream = None;
+    base_schema.ttl = None;
+
+    let lsi_defs: Vec<IndexDef> = manifest_indexes
+        .iter()
+        .filter(|d| d.kind == IndexKind::Local)
+        .cloned()
+        .collect();
+    let gsi_defs: Vec<IndexDef> = match global_secondary_index_override {
+        Some(overrides) => {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut out = Vec::with_capacity(overrides.len());
+            for idx in overrides {
+                if animus_control::syskv::is_reserved_name(idx.name()) || idx.name().contains('$') {
+                    return Err(WireError::validation(format!(
+                        "index name `{}` is reserved or contains `$`",
+                        idx.name()
+                    )));
+                }
+                if !seen.insert(idx.name().to_owned()) {
+                    return Err(WireError::validation(format!(
+                        "duplicate index name `{}`",
+                        idx.name()
+                    )));
+                }
+                let mut def = schema_bridge::index_to_control(idx, &base_schema.partition_key);
+                def.status = IndexStatus::Creating;
+                out.push(def);
+            }
+            out
+        }
+        None => manifest_indexes
+            .into_iter()
+            .filter(|d| d.kind == IndexKind::Global)
+            .map(|mut d| {
+                d.status = IndexStatus::Creating;
+                d
+            })
+            .collect(),
+    };
+
+    // Step 2: base schema, then every LSI — the identical commit-wait shape
+    // `create_table` itself uses.
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::CreateTableSchema {
+            table: target_table_name.to_owned(),
+            schema: base_schema.clone(),
+        })
+        .await;
+        if metadata_fresh(ctx)
+            .await
+            .has_table_schema(target_table_name)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "RestoreTableFromBackup did not commit its target schema in time \
+                 (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+    for lsi in &lsi_defs {
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            ctx.propose_schema(&MetaCommand::CreateTableIndex {
+                table: target_table_name.to_owned(),
+                index: lsi.clone(),
+            })
+            .await;
+            if metadata_fresh(ctx)
+                .await
+                .table_indexes(target_table_name)
+                .iter()
+                .any(|d| d.name == lsi.name)
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(internal(
+                    "RestoreTableFromBackup did not commit an LSI definition in time \
+                     (no leader reachable?)",
+                ));
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    // Step 4: mint the single destination tablet + the `Seeding` restore
+    // row. The replica set mirrors `provision_tablet`'s own convention —
+    // the first `min(N, MAX_REPLICATION_FACTOR)` `Active` members, best-
+    // effort under-sized if the cluster is still bootstrapping (nothing
+    // here self-heals an under-sized set the way `reconcile_placement`
+    // does for an ordinary tablet's recorded RF policy, a named residual:
+    // this restore tablet gets no `SetTabletPolicy` at all, so it is never
+    // a `reconcile_placement`/`rebalance_placement` candidate — a smaller
+    // Train 2.5 follow-up, not a correctness gap, since restore still
+    // succeeds with fewer replicas than the target RF).
+    let timeout_err = internal(
+        "RestoreTableFromBackup did not commit its restore row in time (no leader reachable?)",
+    );
+    for _ in 0..RESTORE_ID_ATTEMPTS {
+        let restore_id = format!("restore-{:016x}", ctx.env.next_u64());
+        let fresh = metadata_fresh(ctx).await;
+        let tablet = fresh.next_free_tablet_id();
+        let mut replicas: Vec<_> = fresh
+            .members
+            .iter()
+            .filter(|(_, m)| m.status == animus_control::NodeStatus::Active)
+            .map(|(id, _)| id.clone())
+            .collect();
+        replicas.truncate(crate::MAX_REPLICATION_FACTOR);
+        ctx.propose_schema(&MetaCommand::BeginRestore {
+            restore_id: restore_id.clone(),
+            backup_id: backup_arn.to_owned(),
+            source_table: source_table.clone(),
+            target_table: target_table_name.to_owned(),
+            tablet,
+            replicas,
+            gsi_defs: gsi_defs.clone(),
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            if metadata_fresh(ctx).await.restore(&restore_id).is_some() {
+                let final_meta = metadata_fresh(ctx).await;
+                let dynamo_schema = schema_bridge::to_dynamo(&base_schema);
+                let dynamo_lsis = schema_bridge::indexes_to_dynamo(&lsi_defs);
+                return Ok(wire::restore_table_response(
+                    target_table_name,
+                    &dynamo_schema,
+                    &dynamo_lsis,
+                    table_status(&final_meta, target_table_name),
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break; // mint a fresh id and retry
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+    Err(timeout_err)
 }
 
 /// Propose `table`'s key schema **and each declared secondary-index definition**
@@ -1997,12 +2249,36 @@ async fn drop_table_index(ctx: &ClientCtx, table: &str, index: &str) -> Result<(
     }
 }
 
+/// `table`'s own `TableStatus` (ADR 0059 §7, Train 2's own contribution to
+/// `DescribeTable`): `"CREATING"` while any of its tablets is not yet
+/// `Active` (a restore's single tablet stays `Building` for the whole
+/// seed/activate window; a fresh `CreateTable`'s tablet never observably is,
+/// since that wire path blocks on `await_table_serveable` before ever
+/// returning — so this can only read `CREATING` for a restoring table in
+/// practice), `"ACTIVE"` otherwise — including a table with **no** tablets
+/// yet (a vanishingly brief `CreateTableSchema`-committed-but-not-yet-
+/// provisioned window), since `"ACTIVE"` was this adapter's own behavior for
+/// every table before this derivation existed and nothing here should
+/// change that default. Derived fresh from the live tablet map every call,
+/// never stored redundantly on the schema/catalog row.
+fn table_status(meta: &Metadata, table: &str) -> &'static str {
+    if meta
+        .tablets_for_table(table)
+        .any(|(_, t)| t.state != TabletState::Active)
+    {
+        "CREATING"
+    } else {
+        "ACTIVE"
+    }
+}
+
 /// `DescribeTable` (ADR 0042 §2): a pure read of the replicated catalog — key
 /// schema, secondary-index definitions (each with its **real** lifecycle
-/// `IndexStatus`, ADR 0045 §6 Fork D), and stream configuration (+ ARN).
-/// `ctx` is unused today (every input comes from `meta`) but kept for
-/// signature symmetry with the other operation handlers and in case a
-/// future addition needs it (e.g. live tablet stats).
+/// `IndexStatus`, ADR 0045 §6 Fork D), stream configuration (+ ARN), and
+/// (ADR 0059 §7, Train 2) the table's own live `TableStatus`
+/// ([`table_status`]) — `ctx` is otherwise unused (every other input comes
+/// from `meta`) but kept for signature symmetry with the other operation
+/// handlers.
 #[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
 fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<String, WireError> {
     let Some(control_schema) = meta.table_schema(table) else {
@@ -2029,6 +2305,7 @@ fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<Stri
         &indexes,
         &index_statuses,
         stream_desc.as_ref(),
+        table_status(meta, table),
     ))
 }
 

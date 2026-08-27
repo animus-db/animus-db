@@ -117,7 +117,8 @@
           <tr><td>Streams API</td><td><span class="pill yes">Supported</span></td><td class="d"><code>ListStreams</code>, <code>DescribeStream</code>, <code>GetShardIterator</code>, <code>GetRecords</code></td></tr>
           <tr><td><code>DeleteTable</code> · <code>ListTables</code></td><td><span class="pill yes">Supported</span></td><td class="d">On the DynamoDB endpoint; also in the admin API and the consoles</td></tr>
           <tr><td>Authentication (SigV4)</td><td><span class="pill opt">Opt-in</span></td><td class="d">Off by default. Without it, any caller that can reach the port is trusted</td></tr>
-          <tr><td>Backups, global tables, on-demand billing</td><td><span class="pill out">Out of scope</span></td><td class="d">These are properties of a managed service, not of the API</td></tr>
+          <tr><td>On-demand backup and restore</td><td><span class="pill yes">Supported</span></td><td class="d"><code>CreateBackup</code>/<code>DescribeBackup</code>/<code>ListBackups</code>/<code>DeleteBackup</code>/<code>RestoreTableFromBackup</code> — a backup outlives a dropped source table; restore always creates a new table</td></tr>
+          <tr><td>Continuous backups (PITR), global tables, on-demand billing</td><td><span class="pill out">Out of scope</span></td><td class="d">Point-in-time recovery is planned; global tables and on-demand billing are properties of a managed service, not of the API</td></tr>
         </tbody>
       </table>
     </div>

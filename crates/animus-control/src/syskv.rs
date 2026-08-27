@@ -169,6 +169,14 @@ pub enum EntityKind {
     /// fixed-width field first. The value is the JSON-encoded
     /// `BackupTabletProgress`.
     BackupProgress,
+    /// A restore catalog row (`Metadata::restores`, ADR 0059 §7), keyed by
+    /// its opaque `RestoreId` string — never a table name, mirroring
+    /// [`Backup`](Self::Backup)'s own identity discipline. The value is the
+    /// JSON-encoded `RestoreRow`, same convention as `Schema`/etc. No
+    /// per-tablet progress companion kind (unlike `Backup`/
+    /// `BackupProgress`): a restore mints exactly one destination tablet, so
+    /// `RestoreRow` carries everything a restore has to say.
+    Restore,
 }
 
 impl EntityKind {
@@ -192,6 +200,7 @@ impl EntityKind {
             EntityKind::SplitLineage => "split_lineage",
             EntityKind::Backup => "backup",
             EntityKind::BackupProgress => "backup_progress",
+            EntityKind::Restore => "restore",
         }
     }
 
@@ -216,6 +225,7 @@ impl EntityKind {
             b"split_lineage" => EntityKind::SplitLineage,
             b"backup" => EntityKind::Backup,
             b"backup_progress" => EntityKind::BackupProgress,
+            b"restore" => EntityKind::Restore,
             _ => return None,
         })
     }
@@ -411,6 +421,12 @@ pub fn decode_index_backfill_id(id: &[u8]) -> Option<(TabletId, String)> {
 #[must_use]
 pub fn backup_key(backup_id: &str) -> Vec<u8> {
     entity_key(EntityKind::Backup, backup_id.as_bytes())
+}
+
+/// A restore id's key under [`EntityKind::Restore`] (ADR 0059 §7).
+#[must_use]
+pub fn restore_key(restore_id: &str) -> Vec<u8> {
+    entity_key(EntityKind::Restore, restore_id.as_bytes())
 }
 
 /// A `(backup_id, tablet)` pair's key under [`EntityKind::BackupProgress`]

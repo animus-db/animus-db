@@ -129,6 +129,27 @@ pub fn backup_data_object_id(backup_id: &str, tablet: u64, chunk: u64) -> String
     format!("{}{tablet}/{chunk}", backup_prefix(backup_id))
 }
 
+/// Re-wrap a captured data-object value in the engine's committed envelope
+/// (tag `0`) before feeding it to `KvCommand::SeedBatch` (ADR 0059 §7,
+/// Train 2's restore driver). **Load-bearing, not cosmetic**: capture reads
+/// through intent resolution (ADR 0059 §5) and stores each row's *plain,
+/// already-resolved* value — no envelope tag at all — but `SeedBatch`'s own
+/// merge is a raw, envelope-tag-included byte passthrough (the ADR 0050
+/// split-build convention this restore driver reuses verbatim for its
+/// seeding, since a split child's rows carry their *physical* bytes,
+/// intents included). Feeding a plain resolved value straight into
+/// `SeedBatch` unwrapped merges bytes the read path's envelope decoder
+/// cannot parse (its first byte is read as an unrecognized tag, a corrupt-
+/// engine-value panic) — this function is the fix, applied to every `Some`
+/// value a restored data chunk carries (never to a tombstone, which restore
+/// never actually produces — capture's own snapshot scan never yields one —
+/// but the caller passes `None` through unchanged regardless, matching
+/// `SeedRow`'s own general shape).
+#[must_use]
+pub fn encode_restored_value(value: &[u8]) -> Vec<u8> {
+    crate::txn::encode_committed(value)
+}
+
 // --- shared cursor (decode side, both codecs below) ------------------------
 
 struct Cursor<'a> {

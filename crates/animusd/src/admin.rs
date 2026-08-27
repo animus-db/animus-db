@@ -34,6 +34,7 @@
 //! - `GET  /admin/storage/scan`        — first N live pairs (`?tablet=&start=&limit=`)
 //! - `GET  /admin/system-table`        — browse the control-plane system keyspace (`?kind=&after=&limit=`, ADR 0038 addendum)
 //! - `GET  /admin/backups`             — the replicated backup catalog: id, name, table, status, per-tablet progress (including split re-planning, ADR 0059 §6), sizes, creation time (ADR 0059 §3/§4; pure observer — the DynamoDB wire surface, `CreateBackup`/`DescribeBackup`/`ListBackups`/`DeleteBackup`, is Train 1 PR④, `animusd::dynamo`)
+//! - `GET  /admin/restores`            — the replicated restore catalog: id, backup id, source/target table, status, destination tablet + its live state (ADR 0059 §7, Train 2; pure observer — the DynamoDB wire surface, `RestoreTableFromBackup`, is `animusd::dynamo::restore_table_from_backup`)
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — liveness/readiness
@@ -367,6 +368,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("GET", "/admin/storage/scan") => storage_scan(ctx, q).await,
         ("GET", "/admin/system-table") => system_table(ctx, q).await,
         ("GET", "/admin/backups") => (200, backups_view(ctx)),
+        ("GET", "/admin/restores") => (200, restores_view(ctx)),
         ("GET", "/admin/metrics") => (200, metrics_view(ctx)),
         ("GET", "/admin/metrics/history") => (200, metrics_history_view(ctx)),
         ("GET", "/admin/member/drain-status") => member_drain_status(ctx, q),
@@ -1155,6 +1157,9 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         syskv::EntityKind::Backup | syskv::EntityKind::BackupProgress => {
             serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
         }
+        // A `RestoreRow` (ADR 0059 §7, Train 2) — same JSON passthrough
+        // convention as `Backup`/etc. above.
+        syskv::EntityKind::Restore => serde_json::from_slice::<Value>(value).unwrap_or(Value::Null),
     }
 }
 
@@ -1267,6 +1272,45 @@ fn backups_view(ctx: &ClientCtx) -> Value {
         })
         .collect();
     json!({ "backups": backups })
+}
+
+/// `GET /admin/restores` (ADR 0059 §7, Train 2): the replicated restore
+/// catalog — one entry per row in `Metadata::restores`, each carrying its
+/// status, source backup/table, target table, and the destination tablet's
+/// own live state (`Building` while seeding, `Active` once
+/// `CompleteRestore` has landed — the same tablet-state derivation
+/// `dynamo::table_status` uses for `DescribeTable`'s `TableStatus`). Pure
+/// observer, like every other `GET` here (ADR 0020).
+fn restores_view(ctx: &ClientCtx) -> Value {
+    let meta = ctx.effective_metadata();
+    let restores: Vec<Value> = meta
+        .restores
+        .iter()
+        .map(|(restore_id, row)| {
+            let status = match &row.status {
+                animus_control::RestoreStatus::Seeding => json!({"state": "SEEDING"}),
+                animus_control::RestoreStatus::Done => json!({"state": "DONE"}),
+                animus_control::RestoreStatus::Failed { reason } => {
+                    json!({"state": "FAILED", "reason": reason})
+                }
+            };
+            let tablet_state = meta
+                .tablets
+                .get(&row.tablet)
+                .map(|t| format!("{:?}", t.state));
+            json!({
+                "restore_id": restore_id,
+                "backup_id": row.backup_id,
+                "source_table": row.source_table,
+                "target_table": row.target_table,
+                "status": status,
+                "tablet": row.tablet.0.to_string(),
+                "tablet_state": tablet_state,
+                "gsi_names": row.gsi_defs.iter().map(|d| d.name.clone()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({ "restores": restores })
 }
 
 fn metrics_view(ctx: &ClientCtx) -> Value {

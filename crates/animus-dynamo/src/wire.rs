@@ -860,6 +860,24 @@ pub enum Operation {
         /// The backup's ARN.
         backup_arn: String,
     },
+    /// `RestoreTableFromBackup` (ADR 0059 §7, Train 2): restore `backup_arn`
+    /// into a brand-new table named `target_table_name` — always a new
+    /// table, never a merge/in-place restore (AWS's own contract; `animusd`
+    /// rejects a pre-existing target with `TableAlreadyExistsException`).
+    /// `global_secondary_index_override`, when `Some`, entirely **replaces**
+    /// the backup's own captured GSI set (AWS's own
+    /// `GlobalSecondaryIndexOverride` knob — `Some(vec![])` restores with no
+    /// GSIs at all); `None` restores every GSI the backup's manifest
+    /// recorded, unchanged. LSIs are never overridable (create-time-only,
+    /// same as `CreateTable`) and always come from the manifest verbatim.
+    RestoreTableFromBackup {
+        /// The source backup's ARN.
+        backup_arn: String,
+        /// The new table's name.
+        target_table_name: String,
+        /// A full replacement GSI declaration, if given.
+        global_secondary_index_override: Option<Vec<SecondaryIndex>>,
+    },
 }
 
 /// `ListBackups`'s `BackupType` filter — AWS's own `USER`/`SYSTEM`/
@@ -911,6 +929,12 @@ impl Operation {
             | Operation::UpdateTimeToLive { table, .. }
             | Operation::DescribeTimeToLive { table, .. }
             | Operation::CreateBackup { table, .. } => Some(table),
+            // `RestoreTableFromBackup` targets its brand-new *target* table
+            // (mirroring `CreateTable`'s own "the table about to exist" —
+            // the target doesn't exist yet either way).
+            Operation::RestoreTableFromBackup {
+                target_table_name, ..
+            } => Some(target_table_name),
             Operation::BatchWriteItem { .. }
             | Operation::BatchGetItem { .. }
             | Operation::TransactWriteItems { .. }
@@ -1297,6 +1321,7 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "DeleteBackup" => Ok(Operation::DeleteBackup {
             backup_arn: backup_arn_field(obj)?,
         }),
+        "RestoreTableFromBackup" => decode_restore_table_from_backup(obj),
         _ => Err(WireError::unknown_operation(target)),
     }
 }
@@ -1385,6 +1410,61 @@ fn decode_list_backups(obj: &Map<String, Value>) -> Result<Operation, WireError>
         time_range_lower_bound_ms,
         time_range_upper_bound_ms,
         backup_type,
+    })
+}
+
+/// Decode a `RestoreTableFromBackup` body (ADR 0059 §7, Train 2):
+/// `BackupArn` + `TargetTableName`, plus an optional
+/// `GlobalSecondaryIndexOverride` array — decoded via the identical
+/// GSI-array logic [`decode_indexes`] uses for `CreateTable`'s own
+/// `GlobalSecondaryIndexes` field (same shape, same [`MAX_GSI_PER_TABLE`]
+/// cap, same duplicate-name rejection), just reading a differently-named
+/// top-level field and never looking at `LocalSecondaryIndexes` at all (an
+/// LSI is never overridable — real DynamoDB's own contract, and this
+/// adapter's manifest is the only source for one either way).
+fn decode_restore_table_from_backup(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let backup_arn = backup_arn_field(obj)?;
+    let target_table_name = obj
+        .get("TargetTableName")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("missing string field `TargetTableName`"))?
+        .to_owned();
+    let global_secondary_index_override = match obj.get("GlobalSecondaryIndexOverride") {
+        None | Some(Value::Null) => None,
+        Some(gsis) => {
+            let gsis = gsis.as_array().ok_or_else(|| {
+                WireError::validation("`GlobalSecondaryIndexOverride` must be an array")
+            })?;
+            if gsis.len() > MAX_GSI_PER_TABLE {
+                return Err(WireError::validation(format!(
+                    "too many GlobalSecondaryIndexOverride entries: {} declared, at most \
+                     {MAX_GSI_PER_TABLE} allowed per table",
+                    gsis.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(gsis.len());
+            let mut seen = std::collections::BTreeSet::new();
+            for gsi in gsis {
+                let (name, schema, projection) = decode_index_entry(gsi, "GSI")?;
+                if !seen.insert(name.clone()) {
+                    return Err(WireError::validation(format!(
+                        "duplicate index name `{name}` in GlobalSecondaryIndexOverride"
+                    )));
+                }
+                out.push(SecondaryIndex::Global(GlobalSecondaryIndex {
+                    name,
+                    key_attribute: schema.partition_key,
+                    sort_attribute: schema.sort_key,
+                    projection,
+                }));
+            }
+            Some(out)
+        }
+    };
+    Ok(Operation::RestoreTableFromBackup {
+        backup_arn,
+        target_table_name,
+        global_secondary_index_override,
     })
 }
 
@@ -3946,6 +4026,7 @@ fn table_description_object(
     indexes: &[SecondaryIndex],
     index_statuses: &[(String, IndexStatus)],
     stream: Option<&StreamDescription>,
+    status: &str,
 ) -> Map<String, Value> {
     let mut key_schema = vec![key_schema_entry(&schema.partition_key, "HASH")];
     if let Some(sk) = &schema.sort_key {
@@ -3954,7 +4035,7 @@ fn table_description_object(
     let mut desc = Map::new();
     desc.insert("TableName".into(), Value::String(table.to_owned()));
     desc.insert("KeySchema".into(), Value::Array(key_schema));
-    desc.insert("TableStatus".into(), Value::String("ACTIVE".into()));
+    desc.insert("TableStatus".into(), Value::String(status.to_owned()));
 
     let mut gsis = Vec::new();
     let mut lsis = Vec::new();
@@ -4021,10 +4102,40 @@ pub fn create_table_response(
 ) -> String {
     // Every index a `CreateTable` declares is `Active` by construction (ADR
     // 0041 §5: an empty, just-created table) — no status side channel needed.
-    let desc = table_description_object(table, schema, indexes, &[], stream);
+    // `CreateTable` always blocks (`ClientCtx::await_table_serveable`) until
+    // the table is genuinely `ACTIVE` before ever returning, so this is
+    // never `CREATING` here the way `RestoreTableFromBackup`'s own initial
+    // response can be (see `restore_table_response`).
+    let desc = table_description_object(table, schema, indexes, &[], stream, "ACTIVE");
     let mut obj = Map::new();
     obj.insert("TableDescription".into(), Value::Object(desc));
     serde_json::to_string(&Value::Object(obj)).expect("create-table response serializes")
+}
+
+/// The JSON body for a successful `RestoreTableFromBackup` kickoff (ADR
+/// 0059 §7, Train 2): the identical `TableDescription` shape
+/// [`create_table_response`] wraps, but with an explicit `status` (always
+/// `"CREATING"` in practice — the restore driver runs asynchronously, so
+/// this response fires the instant the schema/tablet-mint steps commit, well
+/// before the tablet is actually seeded/`Active`) and no `StreamSpecification`
+/// (a restored table never starts with a stream, ADR 0059 §7 step 2). Every
+/// GSI/LSI rendered here is `Active` by construction of the caller having
+/// already declared it via `CreateTableIndex` before ever building this
+/// response — `index_statuses` is deliberately not threaded through, since a
+/// GSI added mid-restore genuinely starts `Creating`/backfilling and this
+/// response's own caller (`animusd::dynamo::restore_table_from_backup`)
+/// builds it strictly from the already-committed schema before that point.
+#[must_use]
+pub fn restore_table_response(
+    table: &str,
+    schema: &TableSchema,
+    indexes: &[SecondaryIndex],
+    status: &str,
+) -> String {
+    let desc = table_description_object(table, schema, indexes, &[], None, status);
+    let mut obj = Map::new();
+    obj.insert("TableDescription".into(), Value::Object(desc));
+    serde_json::to_string(&Value::Object(obj)).expect("restore-table response serializes")
 }
 
 /// The JSON body for a successful `DescribeTable` (ADR 0042 §2): the same
@@ -4034,7 +4145,11 @@ pub fn create_table_response(
 /// `CreateTable`/`UpdateTable`'s `TableDescription`). `index_statuses` is the
 /// caller's Fork-D side channel of each index's *real* replicated-catalog
 /// status (`animusd::dynamo::describe_table` reads it off `Metadata`) — see
-/// [`table_description_object`]'s doc.
+/// [`table_description_object`]'s doc. `status` is `"ACTIVE"` for every table
+/// except one still mid-`RestoreTableFromBackup` (ADR 0059 §7, Train 2),
+/// which reports `"CREATING"` — `animusd::dynamo::table_status` derives it
+/// from the table's own tablet states (`Building` ⇒ `CREATING`), never
+/// stored redundantly.
 #[must_use]
 pub fn describe_table_response(
     table: &str,
@@ -4043,8 +4158,9 @@ pub fn describe_table_response(
     indexes: &[SecondaryIndex],
     index_statuses: &[(String, IndexStatus)],
     stream: Option<&StreamDescription>,
+    status: &str,
 ) -> String {
-    let mut desc = table_description_object(table, schema, indexes, index_statuses, stream);
+    let mut desc = table_description_object(table, schema, indexes, index_statuses, stream, status);
     desc.insert(
         "AttributeDefinitions".into(),
         Value::Array(attribute_definitions(schema, key_types)),
@@ -4073,7 +4189,12 @@ pub fn delete_table_response(
     index_statuses: &[(String, IndexStatus)],
     stream: Option<&StreamDescription>,
 ) -> String {
-    let mut desc = table_description_object(table, schema, indexes, index_statuses, stream);
+    // "ACTIVE" here is a placeholder immediately overridden below —
+    // `table_description_object` always needs a status, but this response's
+    // whole point is to report `DELETING` regardless of the table's actual
+    // last-known status.
+    let mut desc =
+        table_description_object(table, schema, indexes, index_statuses, stream, "ACTIVE");
     desc.insert("TableStatus".into(), Value::String("DELETING".into()));
     desc.insert(
         "AttributeDefinitions".into(),
@@ -5442,6 +5563,7 @@ mod tests {
             &[],
             &[],
             Some(&stream),
+            "ACTIVE",
         );
         assert!(body.contains("\"Table\""));
         assert!(body.contains("\"AttributeDefinitions\""));
@@ -5476,6 +5598,7 @@ mod tests {
                 std::slice::from_ref(&gsi),
                 &[("by-email".into(), status)],
                 None,
+                "ACTIVE",
             );
             assert!(
                 body.contains(&format!("\"IndexStatus\":\"{want_status_str}\"")),
