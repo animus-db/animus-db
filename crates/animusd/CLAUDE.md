@@ -973,19 +973,33 @@ TxnResolve`'s own `fence` (`animus-cp-data/CLAUDE.md`'s Key invariants
 entry) is the structural seatbelt against a repeat of this specific
 mistake, in this function or any future caller.
 
-**Gap found, not yet fixed (issue #298, 2026-08-26)**: `txn_recover`'s
-`all_staged` loop folds a `txn_verify` `Err` (most commonly a transient
-"no CP group leader reachable" while a participant's tablet is mid-fork/
-cutover) into the same bucket as a genuine `Ok(false)` ("never staged").
-Under a high split cadence this can push recovery to Abort a transaction
-whose own coordinator (`cp_txn`) is concurrently deciding, or has already
-decided, Commit — a live instance of the "duelling decider" hazard ADR
-0018 §2/PR5 accepts as legal only because both deciders are assumed to
-reach an objectively correct decision from independently verified state.
+**Fixed (issue #298, confirmed 2026-08-26, closed the same day)**:
+`txn_recover`'s `all_staged` loop used to fold a `txn_verify` `Err` (most
+commonly a transient "no CP group leader reachable" while a participant's
+tablet is mid-fork/cutover) into the same bucket as a genuine `Ok(false)`
+("never staged"). Under a high split cadence this could push recovery to
+Abort a transaction whose own coordinator (`cp_txn`) was concurrently
+deciding, or had already decided, Commit — a live instance of the
+"duelling decider" hazard ADR 0018 §2/PR5 accepts as legal only because
+both deciders are assumed to reach an objectively correct decision from
+independently verified state; an unconfirmed `Err` breaks that assumption.
 Caught live (a captured `all_staged=false`/`Aborted` decision immediately
-preceding a "acked write lost" panic) during a `SplitMode::InPlace`-unpinned
-soak; not yet fixed — see `docs/engineering-lessons.md`'s matching entry
-and ADR 0058's G5 row.
+preceding an "acked write lost" panic) during a `SplitMode::InPlace`-
+unpinned soak. **Fix**: any `Err` now makes the whole recovery push
+*inconclusive* — `txn_recover` declines (`Pending`, proposes nothing)
+rather than ever letting an unconfirmed span feed a decision; a
+`txn_resolver_loop`-local grace tracker logs+meters a transaction stuck
+inconclusive well past `RECOVERY_GRACE` (`Metric::
+CpTxnRecoveryStuckInconclusive`), a pure liveness signal. A **sibling**
+conflation was found and fixed in the same pass: `RaftKvNode::
+txn_record_view` (the primitive the orphan-record branch reads) had the
+identical shape one level up — see `animus-cp-data/CLAUDE.md`'s matching
+entry and `docs/engineering-lessons.md`'s amendment for the full account,
+including why an `Err`/`None` audit must cover every query a decision is
+built on, not just the first one found. Regression:
+`animus-cp-data/tests/txn_record_view_served.rs` (the fixed primitive's own
+"served" contract) and the mirrored fix in `animus-test/tests/
+txn_serializable.rs`'s own `push`/`resolver_tick`.
 
 **A wire-reachable panic found (and fixed) while testing this**:
 `RaftKvNode::txn_stage`'s anchor-key-length assert (ADR 0022, `TOKEN_BYTES`)

@@ -220,9 +220,14 @@ fn record_view(
     record_key: Vec<u8>,
 ) -> Option<animus_cp_data::TxnRecordView> {
     let n = node.clone();
+    // `txn_record_view` is now `Option<Option<TxnRecordView>>` (outer =
+    // served, inner = found — issue #298 shape B fix); this test helper's
+    // own callers only ever care about "found" vs "not," so collapse both
+    // `Option` layers `drive`'s own wrapper adds on top.
     drive(sim, node.env(), SETTLE, async move {
         n.txn_record_view(&record_key).await
     })
+    .flatten()
     .flatten()
 }
 

@@ -726,8 +726,8 @@ fn print_response(response: &ClientResponse) {
         }
         // Internal recovery RPCs (ADR 0018 §2/PR5) — never requested by any
         // CLI subcommand; printed raw if one ever surfaces here.
-        ClientResponse::TxnRecordViewReply { status, .. } => {
-            println!("txn record view: {status:?}");
+        ClientResponse::TxnRecordViewReply { view } => {
+            println!("txn record view: {view:?}");
         }
         ClientResponse::TxnVerifyReply { staged } => {
             println!("txn verify: staged={staged}");
