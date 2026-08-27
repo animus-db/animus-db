@@ -10698,3 +10698,54 @@ as a real client would experience via its own confirm loop — "the group
 elected a new leader" is not the same wait condition as "the group is
 caught up," and a scenario that conflates them can manufacture a
 test-only data loss that looks identical to a real one.
+
+## A correctness fix that changes record SIZE broke a sibling test's hardcoded-epoch assumption, caught only by the final full-suite gate (ADR 0059 §9/§10, Train 3 PR②)
+
+Fixing `table_change_records_carry_images` to include PITR (recorded above:
+a PITR-only table used to get image-less markers, which PITR replay cannot
+reconstruct content from) is unambiguously correct and necessary. It has a
+side effect nothing in that fix's own review caught: every change record on
+a PITR-enabled table is now a **full item image** instead of a tiny marker
+— dramatically bigger. `index_drain.rs`'s own pre-existing
+`pitr_seal_happy_path_and_disable_reenable_continues_epoch_chain` test (from
+Train 3 PR①, unmodified by this PR) writes 10 padded items against a
+`seal_bytes: 200` threshold and then hardcodes `pitr_segments[&(tablet, 1)]`
+as "the seal that happens after re-enable." With markers, the whole 10-item
+burst apparently stayed within one seal (epoch 0); with full images, the
+same burst legitimately crosses the 200-byte threshold **three times**
+before the test ever reaches its own disable call (epochs 0, 1, and 2 all
+minted under generation 1, confirmed by instrumenting the test directly)
+— so the test's own hardcoded `(tablet, 1)` lookup found a stale
+pre-disable row instead of the new post-re-enable one, and asserted the
+wrong generation. This was caught only by this task's own final full
+`cargo test -p animusd --lib --tests -- --test-threads=1` gate — neither
+`cargo test -p animusd --lib` scoped to the new code, nor this PR's own new
+e2e suite, exercises that pre-existing test at all, and its silent
+pre-existing passing state gave no signal that its own assumption had
+become load-bearing on marker-sized records specifically.
+
+**The fix**: make the test observe reality instead of asserting a specific
+epoch number — capture "whatever the chain's own current tip epoch is"
+immediately before the disable call, then wait for and assert against
+`tip + 1` afterward, exactly mirroring what the analogous stream test
+(`disable_final_seal_then_reenable_continues_the_epoch_chain`) already does
+by using a deliberately *huge* `seal_bytes` so its own burst never
+size-triggers on its own — a pattern worth copying directly rather than
+reinventing when writing a new disable/re-enable epoch-continuity test.
+
+**The generalizable rule**: a test that hardcodes a specific epoch/index/
+sequence number as "the Nth thing to happen" is implicitly asserting a
+fixed number of trigger firings from a fixed byte budget — a completely
+independent, unrelated correctness fix that changes per-record *size*
+(image vs. marker, a longer key, an added field) can silently invalidate
+that count without changing anything the two features would ever be
+reviewed together for. Prefer asserting against a *chain's own observed
+tip* (or an explicitly huge/disabled trigger threshold, forcing the seal to
+happen only at the deliberate point the test controls) over a literal
+epoch/sequence number whenever the trigger is size- or count-based rather
+than a single explicit action. And: run the full existing test suite (not
+just new/directly-touched tests) before considering ANY change to a shared
+gating predicate (`table_change_records_carry_images` here) complete — a
+predicate widening is exactly the shape of change whose blast radius is
+everything downstream of its own `true` branch, not just the feature that
+motivated it.

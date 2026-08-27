@@ -4354,6 +4354,21 @@ mod stream_sealer_tests {
             assert_eq!(decoded.header.hlc_range, row.hlc_range);
             assert!(row.object_id.starts_with("backup/pitr/"));
 
+            // The initial burst's own records now carry full images (this
+            // table's PITR enablement puts it on `table_change_records_
+            // carry_images`'s gate), which are large enough that the burst
+            // can legitimately cross `seal_bytes` more than once — so more
+            // than epoch 0 may already exist by this point. The epoch-
+            // continuity property under test only needs "whatever the
+            // chain's own current tip is," never a hardcoded epoch number.
+            let (epoch_before_disable, last_pre_disable_row) = node
+                .metadata()
+                .pitr_segments
+                .range((tablet, 0)..=(tablet, u64::MAX))
+                .next_back()
+                .map(|(&(_, epoch), row)| (epoch, row.clone()))
+                .expect("at least epoch 0 sealed by now");
+
             // Disable: the final seal runs before the disable itself
             // commits, so the hot tail is fully covered the instant PITR
             // reports disabled.
@@ -4376,15 +4391,18 @@ mod stream_sealer_tests {
                 Some(2)
             );
             put_item_padded(node.dynamo_addr(), table, "o-after-reenable", 250).await;
+            let next_epoch = epoch_before_disable + 1;
             await_true(20, "a second-generation PITR seal commits", || {
-                node.metadata().pitr_segments.contains_key(&(tablet, 1))
+                node.metadata()
+                    .pitr_segments
+                    .contains_key(&(tablet, next_epoch))
             })
             .await;
-            let row2 = node.metadata().pitr_segments[&(tablet, 1)].clone();
+            let row2 = node.metadata().pitr_segments[&(tablet, next_epoch)].clone();
             assert_eq!(row2.generation, 2, "the new generation, not the old one");
             assert!(
-                row2.hlc_range.0 >= row.hlc_range.1,
-                "epoch 1 starts exactly where epoch 0 left off"
+                row2.hlc_range.0 >= last_pre_disable_row.hlc_range.1,
+                "the new epoch starts exactly where the chain's prior tip left off"
             );
         })
         .await
