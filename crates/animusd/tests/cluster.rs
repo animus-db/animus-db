@@ -51,13 +51,19 @@ async fn put_retry(addr: std::net::SocketAddr, key: &[u8], value: &[u8]) -> Clie
     }
 }
 
-/// Wait until every node has the bootstrap tablet replicated, or panic.
+/// Wait until every node has the bootstrap tablet replicated *and* has
+/// converged on the full membership set, or panic. Membership registration
+/// is asynchronous (each node joins the control group one at a time), so
+/// polling for "some members" rather than "all `nodes.len()` members" would
+/// let a caller observe a partially-registered cluster.
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
             let leader = nodes.iter().any(Node::is_control_leader);
-            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().members.is_empty());
-            if leader && everyone_has_tablet {
+            let everyone_registered = nodes
+                .iter()
+                .all(|n| n.metadata().members.len() == nodes.len());
+            if leader && everyone_registered {
                 return;
             }
             sleep(Duration::from_millis(50)).await;
